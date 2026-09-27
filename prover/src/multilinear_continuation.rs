@@ -2239,6 +2239,48 @@ impl ContinuationProof {
     }
 }
 
+/// What the WHIR base shares with its observer: DECODE's univariate root and
+/// its prepared commitment, both derived once above the epoch loop — the second
+/// by a device commit, which the lead-in must not make. Read only by the tree
+/// drivers, which are tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SharedDecode<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    pub(crate) root: Commitment,
+    pub(crate) prepared: std::sync::Arc<DecodePrepared<H>>,
+}
+
+/// An [`crate::continuation::EpochObserver`] for the WHIR base, as the
+/// thread-local holds it.
+pub(crate) type SharedEpochObserver =
+    std::sync::Arc<dyn crate::continuation::EpochObserver<EpochProof> + Send + Sync>;
+
+thread_local! {
+    /// The observer the WHIR base proved on THIS thread reports to: installed
+    /// by [`with_epoch_observer`] for the duration of a call, `None` otherwise —
+    /// and with `None` the base runs as it does with no observer at all. The
+    /// STARK base's is `crate::continuation::with_epoch_observer`.
+    static BASE_OBSERVER: std::cell::RefCell<Option<SharedEpochObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `observer` installed for every WHIR base proved on this thread
+/// inside it, restoring what was there before on return or unwind.
+#[cfg(test)]
+pub(crate) fn with_epoch_observer<R>(observer: SharedEpochObserver, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<SharedEpochObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            BASE_OBSERVER.with(|o| *o.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(BASE_OBSERVER.with(|o| o.borrow_mut().replace(observer)));
+    f()
+}
+
 /// Proves a whole run: every epoch, then the one cross-epoch proof that chains
 /// their memory.
 pub fn prove_continuation(
@@ -2257,9 +2299,10 @@ pub fn prove_continuation(
 pub struct BaseDecode {
     /// The univariate DECODE commitment, `commitment_from_elf(elf, opts)`.
     pub commitment: Commitment,
-    /// The [`DecodePrepared<H>`] the base proved under, for the `H` the
-    /// process's hash dispatch chose. Type-erased because `H` is chosen inside
-    /// that dispatch; [`BaseDecode::prepared`] recovers it.
+    /// The [`DecodePrepared<H>`] the base proved under (an
+    /// `Arc<DecodePrepared<H>>`), for the `H` the process's hash dispatch chose.
+    /// Type-erased because `H` is chosen inside that dispatch;
+    /// [`BaseDecode::prepared`] recovers it.
     prepared: Box<dyn std::any::Any + Send + Sync>,
 }
 
@@ -2270,7 +2313,9 @@ impl BaseDecode {
     where
         H: multilinear::whir_hash::WhirHash + 'static,
     {
-        self.prepared.downcast_ref::<DecodePrepared<H>>()
+        self.prepared
+            .downcast_ref::<std::sync::Arc<DecodePrepared<H>>>()
+            .map(|prepared| prepared.as_ref())
     }
 }
 
@@ -2304,10 +2349,18 @@ pub(crate) fn prove_continuation_scheduled(
     opts: &ProofOptions,
     prep_ahead: bool,
 ) -> Result<(ContinuationProof, BaseDecode), Error> {
+    // The observer a caller installed for this thread, if any (see
+    // [`crate::continuation::EpochObserver`]). It sees the pipeline and changes
+    // nothing in it.
+    let installed = BASE_OBSERVER.with(|o| o.borrow().clone());
+    let observer: Option<&dyn crate::continuation::EpochObserver<EpochProof>> = installed
+        .as_deref()
+        .map(|o| o as &dyn crate::continuation::EpochObserver<EpochProof>);
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
+    let on_count = observer.map(|o| move |n: usize| o.on_epoch_count(n));
 
     let mut epochs = Vec::new();
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
@@ -2315,31 +2368,47 @@ pub(crate) fn prove_continuation_scheduled(
     // every epoch. Inside `prove_epoch` it could not outlive one call.
     // `prep_ahead` (the default): each epoch's host preparation runs on the
     // producer thread, ahead of its prove, and the global proof's once the last
-    // epoch is out.
+    // epoch is out. The prepared DECODE opening is shared (an `Arc`) with the
+    // observer, when one is installed, before any epoch.
     let (boundaries, prepared, global_prepped) = crate::with_whir_hash!(|H| {
-        let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
+        let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
+        if let Some(observer) = observer {
+            observer.on_base_shared(std::sync::Arc::new(SharedDecode {
+                root: decode_commitment,
+                prepared: prepared.clone(),
+            }));
+        }
+        let on_count = on_count.as_ref().map(|f| f as &(dyn Fn(usize) + Sync));
         let (boundaries, global_prepped) = if prep_ahead {
             let (boundaries, global) = crate::continuation::for_each_epoch_overlapped_prepped(
                 &elf,
                 private_inputs,
                 epoch_size_log2,
                 &artifacts,
+                on_count,
                 |p| prep_epoch_ahead(&elf, p, opts, Some(decode_commitment)),
                 |boundaries| prep_global_ahead(boundaries, &elf, private_inputs, opts),
                 |p| {
-                    epochs.push(prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?);
+                    let index = p.index as usize;
+                    let proof = prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?;
+                    if let Some(observer) = observer {
+                        observer.on_epoch_proved(index, &proof);
+                    }
+                    epochs.push(proof);
                     Ok(())
                 },
             )?;
             (boundaries, Some(global))
         } else {
-            let boundaries = crate::continuation::for_each_epoch_overlapped(
+            let boundaries = crate::continuation::for_each_epoch_overlapped_counted(
                 &elf,
                 private_inputs,
                 epoch_size_log2,
                 &artifacts,
+                on_count,
                 |p| {
-                    epochs.push(prove_epoch::<H>(
+                    let index = p.index as usize;
+                    let proof = prove_epoch::<H>(
                         &elf,
                         elf_bytes,
                         &p.register_init,
@@ -2350,7 +2419,11 @@ pub(crate) fn prove_continuation_scheduled(
                         opts,
                         Some(decode_commitment),
                         &prepared,
-                    )?);
+                    )?;
+                    if let Some(observer) = observer {
+                        observer.on_epoch_proved(index, &proof);
+                    }
+                    epochs.push(proof);
                     Ok(())
                 },
             )?;
