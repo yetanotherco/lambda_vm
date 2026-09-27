@@ -1307,10 +1307,12 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// they do
 ///
 /// The host commits with `commit_bit_reversed_with::<_, H::Batched<F>>(evals,
-/// ROWS_PER_LEAF)`. The device builds its leaves from the row-major LDE. These
-/// are already required to agree: `multi_prove` rebuilds the precomputed tree on
-/// the device from the row-major main trace and REFUSES the proof when its root
-/// differs from the one the AIR declares (`ProvingError::PrecomputedCommitmentMismatch`),
+/// ROWS_PER_LEAF)`. The device builds its leaves from its LDE (column-major under
+/// the default engine, row-major on the legacy path), over the same bit-reversed
+/// rows. These are already required to agree: `multi_prove` rebuilds the
+/// precomputed tree on the device from the row-major main trace and REFUSES the
+/// proof when its root differs from the one the AIR declares
+/// (`ProvingError::PrecomputedCommitmentMismatch`),
 /// and for an LFM proof the declared root is exactly what the host artifact build
 /// produced. Every GPU recursion proof passes that check today. The six
 /// `registry_drift_*` tests are the gate that keeps it true for this caller.

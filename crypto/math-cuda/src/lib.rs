@@ -19,6 +19,7 @@ pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
+pub mod lde_cm;
 pub mod logup;
 pub mod merkle;
 pub mod ntt;

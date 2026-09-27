@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-ntt-cm-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -573,6 +573,7 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	# type-level test next to it cannot observe.
 	cargo test -p lambda-vm-prover --features hash-metrics --test whir_transcript_configuration
 	$(MAKE) test-rpx-host-kat
+	$(MAKE) test-ntt-cm-host-kat
 
 # === Quick test shortcuts ===
 
@@ -665,6 +666,18 @@ test-rpx-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
 	./target/host_kat/rpx_host_kat
+
+# Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`), run
+# on the HOST through the same shim: every pass shape against the
+# textbook radix-2 levels, whole transforms against the naive DFT, and the LDE
+# the driver runs (DIF iNTT, bit-reversed weights, DIT with the fused coset
+# spread) against direct interpolation and evaluation on the coset. Arithmetic
+# and index math only; execution stays with `tests/ntt_cm_parity.rs`.
+test-ntt-cm-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/ntt_cm_host_kat $(HOST_KAT_DIR)/ntt_cm_host_kat.cpp
+	./target/host_kat/ntt_cm_host_kat
 
 # SECOND-SOURCE validation of the 6-round vectors the KAT above trusts.
 #
