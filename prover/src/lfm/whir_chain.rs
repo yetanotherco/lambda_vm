@@ -535,6 +535,7 @@ pub fn emit_verify_weighted(
         shape.rounds(),
         "one set of wires per scheduled round"
     );
+    let g = super::phase::enter("cap_auth");
     let one = b.ext_const(&FEE::one());
     let (grind_folding, grind_ood, grind_query) = shape.grind;
 
@@ -543,6 +544,7 @@ pub fn emit_verify_weighted(
     // Tree 0: its cap (when it has one) is authenticated against the root
     // here, once; every later tree where its root is absorbed.
     let mut current_tree = tree_auth(b, shape.caps[0], rounds[0].current_cap, root_lanes);
+    drop(g);
     let mut current_domain = domain.clone();
     // Each out-of-domain claim: its batching weight, its point, and how many
     // variables were bound when it entered.
@@ -552,12 +554,16 @@ pub fn emit_verify_weighted(
         let k = shape.schedule[r];
         assert_eq!(round.sumcheck.len(), k, "round {r} folds {k} variables");
 
+        let _round = super::phase::enter("round");
+        let g = super::phase::enter("grind_fold");
         emit_grind_check(b, transcript, grind_folding as u8, round.nonces.folding);
+        drop(g);
 
         // The sumcheck, interleaved: a round's challenge is drawn only after
         // its evaluations are absorbed, which is the order `verify_rounds`
         // takes (`sumcheck.rs:386-390`) and the seam the round primitive was
         // left with.
+        let g = super::phase::enter("sumcheck");
         let mut point = Vec::with_capacity(k);
         for evaluations in round.sumcheck {
             assert_eq!(evaluations.len(), SUMCHECK_DEGREE);
@@ -579,6 +585,8 @@ pub fn emit_verify_weighted(
 
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
+                drop(g);
+                let g = super::phase::enter("ood");
                 let lanes = b.unpack(next_root);
                 transcript.absorb_felts(b, &lanes);
 
@@ -598,17 +606,29 @@ pub fn emit_verify_weighted(
                 let ood_point: Vec<Ext> = powers[..shape.num_vars - bound].to_vec();
 
                 transcript.absorb_ext(b, y0);
+                drop(g);
+                let g = super::phase::enter("grind_ood");
                 emit_grind_check(b, transcript, grind_ood as u8, round.nonces.ood);
+                drop(g);
+                let g = super::phase::enter("ood");
                 let gamma = transcript.sample_ext(b);
                 claim = b.emul_add(gamma, y0, claim);
                 ood.push((gamma, ood_point, bound));
+                drop(g);
 
+                let g = super::phase::enter("grind_query");
                 emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
+                drop(g);
+                let _g = super::phase::enter("cap_auth");
                 Some(tree_auth(b, shape.caps[r + 1], round.next_cap, &lanes))
             }
             (None, None, None) => {
+                drop(g);
                 assert!(round.next_cap.is_empty(), "the last round has no successor");
+                let g = super::phase::enter("final_fs");
                 transcript.absorb_ext(b, final_value);
+                drop(g);
+                let _g = super::phase::enter("grind_query");
                 emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
                 None
             }
@@ -640,12 +660,15 @@ pub fn emit_verify_weighted(
 
     // The accumulated weight: the caller's own, plus each out-of-domain claim's
     // batched `eq` over the challenges that came after it.
+    let g = super::phase::enter("final_weight");
     let mut weight = weight_at(b, &alphas);
     for (gamma, point, bound) in &ood {
         let eq = emit_eq_eval(b, point, &alphas[*bound..]);
         weight = b.emul_add(*gamma, eq, weight);
     }
 
+    drop(g);
+    let _g = super::phase::enter("final_check");
     emit_final_check(b, claim, weight, final_value, one);
 }
 
@@ -730,9 +753,11 @@ fn emit_query_phase(
     let depth = shape.current_depth(r);
     debug_assert_eq!(current_tree.cap_height(), shape.caps[r]);
     assert_eq!(round.current.len(), shape.num_queries);
+    let g = super::phase::enter("query_idx");
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
+    drop(g);
 
     match (next_tree, shape.next_depth(r)) {
         (Some(next_tree), Some(next_depth)) => {
@@ -741,15 +766,22 @@ fn emit_query_phase(
             for (q, bits) in queries.iter().enumerate() {
                 let current = &round.current[q];
                 let next = &round.next[q];
+                let g = super::phase::enter("open_cur");
                 current_tree.verify_opening(b, current.values, bits, current.siblings);
+                drop(g);
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
                 // leaf and the high ones choose the slot inside it. Both bounds
                 // are powers of two, so this is a partition of the bits.
                 let (leaf_bits, slot_bits) = bits.split_at(next_depth);
+                let g = super::phase::enter("open_next");
                 next_tree.verify_opening(b, next.values, leaf_bits, next.siblings);
+                drop(g);
 
+                let g = super::phase::enter("fold");
                 let folded =
                     emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
+                drop(g);
+                let _g = super::phase::enter("slot_mux");
                 let claimed = emit_slot_mux(b, &block_ext(next.values), slot_bits);
                 b.assert_eq_ext(folded, claimed);
                 debug_assert_eq!(1usize << slot_bits.len(), next_block);
@@ -758,7 +790,10 @@ fn emit_query_phase(
         _ => {
             for (q, bits) in queries.iter().enumerate() {
                 let current = &round.current[q];
+                let g = super::phase::enter("open_cur");
                 current_tree.verify_opening(b, current.values, bits, current.siblings);
+                drop(g);
+                let _g = super::phase::enter("fold");
                 let folded =
                     emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
                 b.assert_eq_ext(folded, final_value);

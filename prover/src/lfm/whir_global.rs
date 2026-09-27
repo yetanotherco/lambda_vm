@@ -872,6 +872,7 @@ pub fn whir_global_program(
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(total);
     let mut at = 0u32;
+    let _global = super::phase::enter("global");
 
     let carried: Vec<Cell> = proof
         .roots
@@ -958,6 +959,7 @@ pub fn whir_global_program(
         .collect();
     let routes = plan.routes(&views);
     let slots = plan.slots();
+    let g = super::phase::enter("table_walk");
     let walk = emit_table_walk(
         &mut b,
         &mut transcript,
@@ -969,6 +971,7 @@ pub fn whir_global_program(
         &ladder,
         beta,
     );
+    drop(g);
 
     // 4. The closure, against the literal zero.
     emit_global_closure(&mut b, &walk.outputs);
@@ -1050,7 +1053,9 @@ pub fn whir_global_program(
             domain: &plan.group_domains[group],
         })
         .collect();
+    let g = super::phase::enter("group_walk");
     emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);
+    drop(g);
 
     // 5b. ★★ THE PREPARED GENESIS OPENING — `multi_verify`'s last step
     //     (`multilinear_table.rs:1489`), and check (d) with it.
@@ -1117,6 +1122,7 @@ pub fn whir_global_program(
             layout.placements().len(),
             points.len(),
         );
+        let _g = super::phase::enter("prepared");
         super::whir_stacked::emit_stacked_verify(
             &mut b,
             &mut transcript,

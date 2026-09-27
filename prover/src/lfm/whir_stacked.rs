@@ -332,11 +332,13 @@ pub fn emit_stacked_verify(
         "every stacked polynomial has the stack's variables"
     );
 
+    let g = super::phase::enter("batch_fs");
     for value in values {
         transcript.absorb_ext(b, *value);
     }
     let gamma = transcript.sample_ext(b);
     let weights = emit_challenge_powers(b, gamma, values.len());
+    drop(g);
 
     let claims: Vec<ColumnClaim<'_>> = (0..values.len())
         .map(|column| ColumnClaim {
@@ -346,8 +348,11 @@ pub fn emit_stacked_verify(
         .collect();
 
     for (i, poly) in polys.iter().enumerate() {
+        let _chain = super::phase::enter("chain");
+        let g = super::phase::enter("claimed");
         let root_lanes = b.unpack(poly.root);
         let claimed = emit_claimed(b, layout, i, values, &weights);
+        drop(g);
         emit_verify_weighted(
             b,
             transcript,
@@ -357,7 +362,10 @@ pub fn emit_stacked_verify(
             claimed,
             shape,
             domain,
-            |b, at| emit_weight_at(b, layout, i, &claims, at),
+            |b, at| {
+                let _g = super::phase::enter("weight_at");
+                emit_weight_at(b, layout, i, &claims, at)
+            },
         );
     }
 

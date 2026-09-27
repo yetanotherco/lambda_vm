@@ -348,6 +348,7 @@ pub fn emit_table_verify(
     let degree = shape.sumcheck_degree();
 
     // The table's share of the bus, before anything is drawn from it.
+    let g = super::phase::enter("gkr_fs");
     transcript.absorb_ext(b, proof.bus_output.0);
     transcript.absorb_ext(b, proof.bus_output.1);
 
@@ -369,9 +370,13 @@ pub fn emit_table_verify(
         let c = transcript.sample_ext(b);
         drawn.push(GkrLayerChallenges { lambda, rounds, c });
     }
+    drop(g);
+    let g = super::phase::enter("gkr_check");
     let gkr_claim = emit_gkr_verify(b, proof.bus_output, proof.gkr, &drawn);
+    drop(g);
 
     // The zerocheck's own weight point.
+    let g = super::phase::enter("batch_fs");
     let r: Vec<Ext> = (0..num_vars).map(|_| transcript.sample_ext(b)).collect();
     let (weight_r, weight_z) = weight_slots(shape.kinds.len());
 
@@ -393,6 +398,8 @@ pub fn emit_table_verify(
     let claimed = b.emul(lambdas[1], gkr_claim.p);
     let claimed = b.emul_add(lambdas[2], gkr_claim.q, claimed);
 
+    drop(g);
+    let g = super::phase::enter("sumcheck_fs");
     let mut point: Vec<Ext> = Vec::with_capacity(num_vars);
     for evaluations in proof.sumcheck {
         assert_eq!(
@@ -405,10 +412,14 @@ pub fn emit_table_verify(
         }
         point.push(transcript.sample_ext(b));
     }
+    drop(g);
+    let g = super::phase::enter("sumcheck_rounds");
     let residual = emit_sumcheck_rounds(b, claimed, proof.sumcheck, &point);
+    drop(g);
 
     // `values_at`: the selectors the AIR made public, then the two weight
     // tables, woven back together with the committed values.
+    let g = super::phase::enter("selectors_eq");
     let mut public: Vec<Ext> = shape
         .ir
         .public_selectors()
@@ -421,8 +432,12 @@ pub fn emit_table_verify(
 
     // The three rules at that point. `IrShape::program` applies the zerocheck's
     // own weight, which `combine` does not (`multilinear_air.rs:889-916`).
+    drop(g);
+    let g = super::phase::enter("combine");
     let combined = emit_combine(b, shape.ir, &betas, &values);
     let zerocheck = b.emul(values[weight_r], combined);
+    drop(g);
+    let g = super::phase::enter("bus_claims");
     let bus = emit_claim_statements(
         b,
         shape.bus,
@@ -437,12 +452,16 @@ pub fn emit_table_verify(
     );
 
     // `Σ lambda^i · rule_i`, and the first weight is the literal one.
+    drop(g);
+    let g = super::phase::enter("rule_check");
     let rebuilt = b.emul_add(lambdas[1], bus.numerator, zerocheck);
     let rebuilt = b.emul_add(lambdas[2], bus.denominator, rebuilt);
     // The host's `BatchMismatch`: a division by zero has no satisfying
     // assignment, so a proof that fails it cannot be executed.
     b.assert_eq_ext(rebuilt, residual);
+    drop(g);
 
+    let g = super::phase::enter("reduce");
     let reduced = emit_claim_reduce_verify(
         b,
         transcript,
@@ -452,6 +471,7 @@ pub fn emit_table_verify(
         &point,
         shape.num_columns,
     );
+    drop(g);
 
     TableVerdictWires {
         bus_output: proof.bus_output,

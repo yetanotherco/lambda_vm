@@ -969,8 +969,11 @@ pub fn emit_table_walk(
     };
 
     for (index, ((proof, shape), plan)) in tables.iter().zip(shapes).zip(plans).enumerate() {
+        let _table = super::phase::enter("table");
         let verdict = emit_table_verify(b, transcript, proof, shape, z, alpha_powers, beta);
+        let prep = super::phase::enter("prep");
         emit_preprocessed_leg(b, plan, slots[index], shape, &verdict);
+        drop(prep);
         walk.outputs.push(verdict.bus_output);
         walk.widths.push(verdict.column_values.len());
         walk.values.extend(verdict.column_values.iter().copied());
@@ -997,6 +1000,7 @@ fn emit_preprocessed_leg(
                 plan.settled, 0,
                 "BITWISE's columns are covered by the closed form, not by an opening"
             );
+            let _g = super::phase::enter("bitwise");
             let targets = preprocessed_targets(slot_of, shape.kinds, NUM_PRECOMPUTED_COLS);
             let values = emit_bitwise_preprocessed(b, &verdict.point);
             for (value, &target) in values.iter().zip(&targets) {
@@ -1017,6 +1021,7 @@ fn emit_preprocessed_leg(
                 1usize << verdict.point.len(),
                 "OFFSET must have one entry per row of its table"
             );
+            let _g = super::phase::enter("page");
             let ramp = super::preprocessed::emit_offset_ramp(b, &verdict.point);
             b.assert_eq_ext(ramp, verdict.column_values[targets[0]]);
             if let Some(init) = init {
@@ -1040,6 +1045,7 @@ fn emit_preprocessed_leg(
     if remaining.is_empty() {
         return;
     }
+    let _g = super::phase::enter("const_mle");
     let targets = preprocessed_targets(slot_of, shape.kinds, columns.len());
     let values = emit_const_mle_at(b, remaining, &verdict.point);
     for (value, &target) in values.iter().zip(&targets[plan.settled..]) {
@@ -1204,6 +1210,7 @@ pub fn emit_group_walk(
     let mut gammas = Vec::with_capacity(groups.len());
     for (group, &size) in groups.iter().zip(sizes) {
         let width: usize = walk.widths[statement_at..statement_at + size].iter().sum();
+        let _group = super::phase::enter("group");
         gammas.push(emit_stacked_verify(
             b,
             transcript,
@@ -1573,6 +1580,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     let arena = b.declare_arena(total);
     let mut at = 0u32;
 
+    let g = super::phase::enter("carried_hints");
     let carried: Vec<Cell> = proof
         .roots
         .iter()
@@ -1584,6 +1592,8 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .collect();
 
     // 1. The statement, which is entirely program text.
+    drop(g);
+    let g = super::phase::enter("statement");
     let mut transcript = WhirTranscript::new();
     super::whir_statement::emit_epoch_statement(
         &mut transcript,
@@ -1611,7 +1621,10 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .iter()
         .map(super::algebraic_commit::commitment_to_digest)
         .collect();
+    drop(g);
+    let g = super::phase::enter("roots_block");
     let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &derived);
+    drop(g);
 
     // The shared alpha ladder. ⚠ EPOCH-LEVEL: `emit_interaction` reads
     // `alpha_powers[i + 1]` and one ladder of the longest table's length serves
@@ -1623,13 +1636,17 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .map(|shape| super::whir_bus::alpha_powers_read(shape.bus))
         .max()
         .unwrap_or(1);
+    let g = super::phase::enter("alpha_ladder");
     let ladder = super::whir_poly::emit_challenge_powers(&mut b, alpha, ladder_len);
+    drop(g);
 
     // 3. The per-table walk, with each table's proof wires hinted first.
+    let g = super::phase::enter("table_hints");
     let mut store = Vec::with_capacity(proof.tables.len());
     for table in &proof.tables {
         store.push(hint_table_wires(&mut b, arena, &mut at, table));
     }
+    drop(g);
     let wires: Vec<TableProofWires<'_>> = store.iter().map(TableWires::borrow).collect();
     let views: Vec<Vec<&[FE]>> = plan
         .preprocessed
@@ -1638,6 +1655,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .collect();
     let routes = plan.routes(&views);
     let slots = plan.slots();
+    let g = super::phase::enter("table_walk");
     let walk = emit_table_walk(
         &mut b,
         &mut transcript,
@@ -1653,7 +1671,9 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     // 4. The closure: the bus balance against the epoch's expected value. Its
     //    balance is the published set's TAIL word, which is why the wires come
     //    back rather than being dropped.
+    drop(g);
     let start_index = u64::from(epoch.position.register_init[crate::tables::register::X254_INDEX]);
+    let g = super::phase::enter("closure");
     let closure = emit_epoch_closure(
         &mut b,
         &walk.outputs,
@@ -1664,11 +1684,14 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     );
 
     // 5. The commitment groups.
+    drop(g);
+    let g = super::phase::enter("group_hints");
     let mut chains = Vec::with_capacity(proof.columns.len());
     for (group, opening) in proof.columns.iter().enumerate() {
         let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
         chains.push(hint_group_chains(&mut b, arena, &mut at, opening, &shape));
     }
+    drop(g);
     let group_shapes: Vec<ChainShape> = plan
         .group_layouts
         .iter()
@@ -1723,7 +1746,9 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
             domain: &plan.group_domains[group],
         })
         .collect();
+    let g = super::phase::enter("group_walk");
     emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);
+    drop(g);
 
     // 6. The prepared opening, last, on DECODE's own layout and domain at the
     //    EPOCH's config. Its root is the SAME interned constant the roots block
@@ -1734,11 +1759,13 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .as_ref()
         .expect("an epoch carries DECODE's prepared opening");
     let prepared_shape = ChainShape::new(&plan.config, plan.decode_layout.n_stack());
+    let g = super::phase::enter("prepared_hints");
     let held = hint_group_chains(&mut b, arena, &mut at, prepared, &prepared_shape);
     let decode_roots: Vec<Cell> = derived
         .iter()
         .map(|word| b.digest_const(*word).as_cell())
         .collect();
+    drop(g);
     let prepared_openings: Vec<_> = held
         .storage
         .iter()
@@ -1759,6 +1786,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .collect();
     let column_at = walk.column_at(plan.decode_at);
     let settled = plan.preprocessed[plan.decode_at].len();
+    let g = super::phase::enter("prepared");
     emit_prepared_group(
         &mut b,
         &mut transcript,
@@ -1770,6 +1798,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         &walk.values[column_at..column_at + settled],
     );
 
+    drop(g);
     assert_eq!(
         at, total,
         "the program must hint exactly the words the arena writes"
@@ -1797,6 +1826,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
          field covers one root's lanes; a bookend split into {l2g_polys} \
          publishes a set this layout does not describe"
     );
+    let g = super::phase::enter("publish");
     let layout = emit_epoch_publishes(
         &mut b,
         &EpochPublishes {
@@ -1813,6 +1843,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
             balance: closure.balance,
         },
     );
+    drop(g);
 
     let program = super::compiler::compile(b.finish());
     layout.assert_covers(program.public_len as usize);

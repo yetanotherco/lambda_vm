@@ -246,7 +246,10 @@ pub fn emit_verify_opening(
         siblings.len(),
         "one sibling and one index bit per level of the tree"
     );
+    let g = super::phase::enter("leaf");
     let leaf = emit_block_leaf(b, values);
+    drop(g);
+    let _g = super::phase::enter("merkle");
     let walked = edsl::wrap_merkle_walk(b, leaf, index_bits, siblings);
     edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(root_lanes));
 }
@@ -294,7 +297,10 @@ impl TreeAuth {
                     index_bits.len(),
                     "a path to the cap: one sibling per level below it"
                 );
+                let g = super::phase::enter("leaf");
                 let leaf = emit_block_leaf(b, values);
+                drop(g);
+                let _g = super::phase::enter("merkle");
                 cap.verify_path(b, leaf, index_bits, siblings);
             }
         }

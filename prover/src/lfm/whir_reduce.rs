@@ -167,6 +167,7 @@ pub fn emit_claim_reduce_verify(
         "every factor reads a column the table committed"
     );
 
+    let g = super::phase::enter("fs");
     for &value in factor_values {
         transcript.absorb_ext(b, value);
     }
@@ -191,8 +192,12 @@ pub fn emit_claim_reduce_verify(
         }
         point.push(transcript.sample_ext(b));
     }
+    drop(g);
+    let g = super::phase::enter("sumcheck_rounds");
     let residual = emit_sumcheck_rounds(b, claimed, proof.sumcheck, &point);
+    drop(g);
 
+    let g = super::phase::enter("shift_eval");
     let mut rebuilt: Option<Ext> = None;
     for offset in distinct_offsets(sources) {
         let members: Vec<usize> = (0..sources.len())
@@ -216,7 +221,9 @@ pub fn emit_claim_reduce_verify(
         });
     }
     b.assert_eq_ext(rebuilt.expect("a table has at least one offset"), residual);
+    drop(g);
 
+    let _g = super::phase::enter("fs");
     for &value in proof.column_values {
         transcript.absorb_ext(b, value);
     }
