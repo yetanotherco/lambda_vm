@@ -50,6 +50,13 @@ static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// is where an opening runs without the turn its group asked for (see
 /// `stacked_eval::StackedCommitment`).
 static OPEN_HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Groups that gave their room back when their commits ended.
+static ROOM_PARKS: AtomicU64 = AtomicU64::new(0);
+/// Group openings that took their room back.
+static ROOM_TURNS: AtomicU64 = AtomicU64::new(0);
+/// ★ Group openings whose room the card would not give back — see
+/// [`take_turn`] for what the opening does then.
+static ROOM_TURN_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -117,6 +124,21 @@ pub fn open_calls() -> u64 {
     OPEN_CALLS.load(Ordering::Relaxed)
 }
 
+/// Groups that gave their room back when their commits ended.
+pub fn room_parks() -> u64 {
+    ROOM_PARKS.load(Ordering::Relaxed)
+}
+
+/// Group openings that took their room back.
+pub fn room_turns() -> u64 {
+    ROOM_TURNS.load(Ordering::Relaxed)
+}
+
+/// Group openings whose room the card would not give back.
+pub fn room_turn_refusals() -> u64 {
+    ROOM_TURN_REFUSALS.load(Ordering::Relaxed)
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     HOST_FALLBACKS.store(0, Ordering::Relaxed);
@@ -129,6 +151,9 @@ pub fn reset_call_counters() {
     LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    ROOM_PARKS.store(0, Ordering::Relaxed);
+    ROOM_TURNS.store(0, Ordering::Relaxed);
+    ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -233,6 +258,102 @@ pub fn reserve_room(_bytes: u64) -> Option<DeviceRoom> {
     None
 }
 
+/// Whether a group gives its room back between its last commit and its first
+/// opening, and takes it again for the openings ([`take_turn`]). `true` unless
+/// `LAMBDA_VM_NO_WHIR_ROOM_PARK` is set, which holds it from the commit to the
+/// last opening as before — the A/B's control, off the same binary.
+///
+/// Between the two runs the whole per-table argument, which reserves against
+/// the same budget and never touches the room: the room is a promise for the
+/// turns the commits and the openings take, and the argument takes none. Held
+/// across it, it is a codeword's worth of budget the argument is refused.
+pub(crate) fn room_park() -> bool {
+    match ROOM_PARK_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_PARK").is_some())
+        }
+    }
+}
+
+static ROOM_PARK_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_PARK` for the whole process — for a test
+/// that commits and opens both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_room_park(on: Option<bool>) {
+    ROOM_PARK_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Called where a group gives its room back after its commits.
+pub(crate) fn note_room_parked() {
+    ROOM_PARKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Takes a parked group's room back for its openings: `bytes` promised until
+/// the returned handle drops, or `None`, counted and said.
+///
+/// ⛔ WHY IT CAN BE REFUSED. Anything that reserves between the group's last
+/// commit and this call can have taken the bytes. In the production drivers
+/// that is the argument of the same proof, whose reservations are all released
+/// by the time its last table is argued — and the leaf layers the commits
+/// retained, which `reserve` evicts on a miss, so a retained layer never
+/// outranks a turn. A second proof on the same card in the same process is the
+/// case that can hold the bytes past this point, and a test binary running in
+/// parallel is one. The full argument is in `thoughts/zf/gap/fix/WBATCH.md`.
+///
+/// ⛔ WHAT A REFUSAL DOES: the opening runs on the device anyway, UNPROMISED.
+/// Its codewords are on the card with no host copy (`fold_held` has nowhere to
+/// fold a device codeword the device declines) and the transcript has absorbed
+/// their roots, so there is no host path to fall back to — declining here would
+/// be failing the proof. What runs unpromised is one opening's working set:
+/// with the lean opening and the fused fold, about a quarter of a codeword —
+/// where before them every opening ran nearly three codewords past the room it
+/// had. If the card then really is full, the factors fall to the host and
+/// [`open_host_fallbacks`] counts them, or a fold fails with
+/// [`crate::Error::DeviceFailed`] — both loud, neither silent.
+pub(crate) fn take_turn(bytes: u64, polys: usize, n_stack: usize) -> Option<DeviceRoom> {
+    if let Some(room) = reserve_room(bytes) {
+        ROOM_TURNS.fetch_add(1, Ordering::Relaxed);
+        return Some(room);
+    }
+    let count = ROOM_TURN_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] opening turn REFUSED: {} MiB for a group of {polys} at 2^{n_stack}, {} — \
+         opening on the device UNPROMISED; room turn refusals {count}",
+        bytes >> 20,
+        budget_headroom(),
+    );
+    None
+}
+
+/// The budget left to promise, for a refusal's line.
+#[cfg(feature = "cuda")]
+fn budget_headroom() -> String {
+    match math_cuda::device::backend() {
+        Ok(be) => format!(
+            "budget headroom {} MiB",
+            be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) >> 20
+        ),
+        Err(_) => "no device".to_string(),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn budget_headroom() -> String {
+    "no device".to_string()
+}
+
 /// What a device sumcheck that runs to the end hands back: the round proofs,
 /// and the challenges the rounds were bound at.
 ///
@@ -259,6 +380,11 @@ pub struct DeviceRoom(#[allow(dead_code)] math_cuda::device::DeviceReservation);
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug)]
 pub struct DeviceRoom(std::convert::Infallible);
+
+impl DeviceRoom {
+    /// Gives the promise back now, rather than when its holder drops.
+    pub(crate) fn give_back(self) {}
+}
 
 /// How much room handing the input layer back has to save before it is worth
 /// doing.

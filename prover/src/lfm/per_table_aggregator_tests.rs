@@ -8466,6 +8466,14 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   open host fallbacks {}",
         multilinear::gpu::open_host_fallbacks()
     );
+    // The stacked groups' room: given back after the commits, taken back for
+    // the openings, and — the number that must read zero — refused.
+    println!(
+        "   room turns: {} parked, {} taken back, {} refused",
+        multilinear::gpu::room_parks(),
+        multilinear::gpu::room_turns(),
+        multilinear::gpu::room_turn_refusals()
+    );
     // ★ ROUND-3 ARGUE DISCRIMINATOR (diagnostic): per-surface DEVICE-path reserved
     // bytes + op counts, whole-run. Divided by the `argue` wall time printed
     // above, the total bytes give an achieved HBM bandwidth — near the ~1.7 TB/s
