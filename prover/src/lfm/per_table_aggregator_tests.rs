@@ -6779,6 +6779,15 @@ fn the_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+    // The PROTO lane's proof-size read-out, after the whole-run window has
+    // closed so no timed stage pays for the serialization.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+        .expect("the base bundle must serialize")
+        .len();
+    println!(
+        "   GAP PROTO SIZES: base bundle {bytes} bytes rkyv ({} epochs + the global proof)",
+        bundle.num_epochs()
+    );
 }
 
 // ========================= the WHIR production tree ========================
@@ -8492,6 +8501,19 @@ fn the_whir_production_tree_composes_to_a_root() {
     println!(
         "   reserved high-water {:.0} MiB",
         math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
+    );
+    // The PROTO lane's proof-size read-out, after the whole-run window has
+    // closed so no timed stage pays for the serialization.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+        .expect("the WHIR base bundle must serialize")
+        .len();
+    let global = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle.global)
+        .expect("the WHIR global proof must serialize")
+        .len();
+    println!(
+        "   GAP PROTO SIZES: base bundle {bytes} bytes rkyv ({} epochs + the global proof \
+         of {global} bytes)",
+        bundle.num_epochs()
     );
 }
 
