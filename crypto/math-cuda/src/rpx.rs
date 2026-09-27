@@ -1153,6 +1153,9 @@ impl ChainBench {
 pub fn chain_probe_resident_threads(variant: u32) -> Result<u64> {
     use cudarc::driver::sys::CUdevice_attribute;
     let be = backend()?;
+    // The occupancy query needs the context current on this thread, and cudarc
+    // does not bind it for that call (see `grinding::queue_grid`).
+    be.ctx.bind_to_thread()?;
     let sms = be
         .ctx
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?

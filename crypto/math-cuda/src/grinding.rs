@@ -385,30 +385,55 @@ pub fn search_queue_counted(
 /// ⚠ GAP K4: blocks of [`RPX_BLOCK_DIM`] the queue kernel keeps resident on
 /// this card — multiprocessors × the driver's occupancy for the kernel — so one
 /// launch fills the card exactly (the shipped grid of 1024 is 0.86 of it on a
-/// 5090). Read once; printed once.
+/// 5090). Printed once.
+///
+/// ⚠ The occupancy query needs the context current on the CALLING thread.
+/// cudarc binds it before `num_regs` but not before this query, and
+/// `backend()` binds only the thread that created it. Unbound, the query
+/// failed, and while the failure was cached every RPX grind of the process
+/// then fell to the host search. So this binds first, and caches only a grid
+/// it read: a failed read sends that one grind to the host and the next grind
+/// reads again. `tests/grind_queue_grid_thread.rs` pins it.
 pub fn queue_grid() -> Option<u32> {
     use cudarc::driver::sys::CUdevice_attribute;
-    static GRID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let be = backend().ok()?;
+    static GRID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(&grid) = GRID.get() {
+        return Some(grid);
+    }
+    // `backend()` warns on its own failure.
+    let be = backend().ok()?;
+    let read = || -> crate::Result<(u32, u32)> {
+        be.ctx.bind_to_thread()?;
         let sms = be
             .ctx
-            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .ok()?
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
             .max(1) as u32;
         let per_sm = be
             .rpx_grind_search_queue
-            .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)
-            .ok()?
+            .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)?
             .max(1);
-        let regs = be.rpx_grind_search_queue.num_regs().unwrap_or(0);
-        println!(
-            "★ GAP K4 GRIND: queue kernel, grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \
-             ({regs} regs/thread), chunk 32 nonces per warp claim",
+        Ok((sms, per_sm))
+    };
+    match read() {
+        Ok((sms, per_sm)) => Some(*GRID.get_or_init(|| {
+            let regs = be.rpx_grind_search_queue.num_regs().unwrap_or(0);
+            println!(
+                "★ GAP K4 GRIND: queue kernel, grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \
+                 ({regs} regs/thread), chunk 32 nonces per warp claim",
+                sms * per_sm
+            );
             sms * per_sm
-        );
-        Some(sms * per_sm)
-    })
+        })),
+        Err(e) => {
+            // eprintln for the reason the crypto dispatch gives for its own
+            // fallback line: it is the only sign the K4 arm left the device.
+            eprintln!(
+                "[gpu] GAP K4: the queue grid could not be read ({e}); this RPX grind falls \
+                 back to the CPU search"
+            );
+            None
+        }
+    }
 }
 
 /// The queue arm of [`search`]: the same contiguous range walk from 0, the
