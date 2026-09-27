@@ -110,7 +110,7 @@ fn keeping_bitwise_keeps_every_tag_and_air_count() {
         }
     }
     assert_eq!(ChipSet::FULL.as_tag(), 0b011);
-    assert!(ChipSet::FULL.bitwise);
+    const { assert!(ChipSet::FULL.bitwise) };
 }
 
 /// The mask follows the program: a program with no byte lookups drops
