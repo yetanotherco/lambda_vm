@@ -16,8 +16,8 @@ use crate::tables::types::FE;
 use stark::config::Commitment;
 
 use super::airs::{
-    BITWISE_SLOT, ChipSet, HASH_SLOT, LFM_CHIP_NAMES, gap_knob_value, gap_r1_enabled,
-    lfm_chip_census_masked,
+    BITWISE_SLOT, ChipSet, HASH_SLOT, KEEP_BITWISE_ENV, LFM_CHIP_NAMES, LfmAirs, env_switch,
+    keep_bitwise, keep_bitwise_setting, lfm_chip_census_masked,
 };
 use super::chunking::HashChunking;
 use super::hash::HasherKind;
@@ -49,23 +49,39 @@ fn family_masks() -> [ChipSet; 4] {
 }
 
 #[test]
-fn the_gap_knob_reads_zero_one_and_unset() {
-    assert!(!gap_knob_value("K", None), "unset is off");
-    assert!(!gap_knob_value("K", Some("")), "empty is unset");
-    assert!(!gap_knob_value("K", Some("0")));
-    assert!(!gap_knob_value("K", Some(" 0 ")));
-    assert!(gap_knob_value("K", Some("1")));
-    assert!(gap_knob_value("K", Some(" 1\n")));
+fn an_on_off_switch_reads_zero_one_and_unset() {
+    assert_eq!(env_switch("K", None), None, "unset is the switch's default");
+    assert_eq!(env_switch("K", Some("")), None, "empty is unset");
+    assert_eq!(env_switch("K", Some("0")), Some(false));
+    assert_eq!(env_switch("K", Some(" 0 ")), Some(false));
+    assert_eq!(env_switch("K", Some("1")), Some(true));
+    assert_eq!(env_switch("K", Some(" 1\n")), Some(true));
 }
 
-/// A typo stops the run rather than proving the default under the lever's name.
+/// A typo stops the run rather than proving the default under the other arm's
+/// name.
 #[test]
 #[should_panic(expected = "must be 0 or 1")]
-fn a_malformed_gap_knob_stops_the_run() {
-    let _ = gap_knob_value("LAMBDA_VM_GAP_R1", Some("yes"));
+fn a_malformed_switch_stops_the_run() {
+    let _ = keep_bitwise_setting(Some("yes"));
 }
 
-/// ★ THE PREMISE R1 RESTS ON, read off the interaction lists: the only chips
+/// The default drops `BITWISE` where nothing sends to it; the opt-out keeps it.
+#[test]
+fn the_bitwise_default_drops_the_table_and_the_opt_out_keeps_it() {
+    assert_eq!(KEEP_BITWISE_ENV, "LAMBDA_VM_LFM_KEEP_BITWISE");
+    assert!(!keep_bitwise_setting(None), "unset: the default drops it");
+    assert!(!keep_bitwise_setting(Some("0")));
+    assert!(keep_bitwise_setting(Some("1")), "the opt-out keeps it");
+    let trivial = trivial_program();
+    for (raw, kept) in [(None, false), (Some("1"), true)] {
+        let mask =
+            ChipSet::for_program_under(&trivial, HasherKind::Rpx, !keep_bitwise_setting(raw));
+        assert_eq!(mask.bitwise, kept, "{raw:?}");
+    }
+}
+
+/// ★ THE PREMISE THE MASK RESTS ON, read off the interaction lists: the only chips
 /// that touch a bus `BITWISE` receives are the keccak family, `LFM_BLAKE3`, and
 /// the hash chip under the BLAKE3 socket. If any other chip gains a byte lookup,
 /// this fails — and so does every mask that would have dropped its receiver.
@@ -113,10 +129,11 @@ fn keeping_bitwise_keeps_every_tag_and_air_count() {
 }
 
 /// The mask follows the program: a program with no byte lookups drops
-/// `BITWISE` under R1 and keeps it without; a keccak program keeps it either
-/// way; the BLAKE3 socket keeps it for a program with no family at all.
+/// `BITWISE` by default and keeps it under the opt-out; a keccak program keeps
+/// it either way; the BLAKE3 socket keeps it for a program with no family at
+/// all.
 #[test]
-fn the_r1_mask_follows_the_program() {
+fn the_bitwise_mask_follows_the_program() {
     let trivial = trivial_program();
     let chain = keccak_chain_program();
     for hasher in [HasherKind::Test, HasherKind::Rpx] {
@@ -126,10 +143,10 @@ fn the_r1_mask_follows_the_program() {
             !off.keccak && !off.blake3,
             "the trivial program uses no family"
         );
-        assert!(off.bitwise, "R1 off keeps BITWISE");
+        assert!(off.bitwise, "the opt-out keeps BITWISE");
         assert!(
             !on.bitwise,
-            "R1 on drops it from a program that sends it nothing"
+            "the default drops it from a program that sends it nothing"
         );
         assert_eq!((on.keccak, on.blake3), (off.keccak, off.blake3));
         assert!(ChipSet::for_program_under(&chain, hasher, true).bitwise);
@@ -138,7 +155,7 @@ fn the_r1_mask_follows_the_program() {
     // The process mask is the same rule at the process's own setting.
     assert_eq!(
         ChipSet::for_program_with_hasher(&trivial, HasherKind::Rpx),
-        ChipSet::for_program_under(&trivial, HasherKind::Rpx, gap_r1_enabled())
+        ChipSet::for_program_under(&trivial, HasherKind::Rpx, !keep_bitwise())
     );
 }
 
@@ -171,6 +188,56 @@ fn the_census_follows_the_mask() {
         .map(|c| c.main_cells() + 3 * c.aux_cells())
         .sum::<u64>();
     assert_eq!(cells(&with) - cells(&without), bitwise_cells);
+}
+
+/// A trace set whose builder dropped `BITWISE` pairs the all-zero table when the
+/// artifacts being proved keep it — exactly the builder's own table for a
+/// program that sends it nothing — so which programs carry `BITWISE` is decided
+/// by the artifacts alone and proving never reads the process setting.
+#[test]
+fn artifacts_that_keep_bitwise_pair_the_all_zero_table() {
+    let program = trivial_program();
+    let hasher = HasherKind::Rpx;
+    let exec =
+        super::executor::execute(&program, &trivial_arenas(), &hasher).expect("the program runs");
+    let mut traces = super::trace::build_traces_with_hasher(&program, &exec.records, hasher);
+    if !keep_bitwise() {
+        assert_eq!(
+            traces.bitwise.num_rows(),
+            0,
+            "the builder skips the table for a program that sends it nothing"
+        );
+    }
+    let built = build_artifacts_with_hasher(&program, &options(), hasher);
+    let kept = under_mask(
+        &built,
+        ChipSet {
+            bitwise: true,
+            ..built.chip_set
+        },
+    );
+    let airs = LfmAirs::for_artifacts(&kept, &options());
+    let bitwise = LFM_CHIP_NAMES[BITWISE_SLOT];
+    let paired: Vec<String> = airs
+        .air_trace_pairs(&mut traces)
+        .iter()
+        .map(|(air, _, _)| air.name().to_string())
+        .collect();
+    assert_eq!(
+        paired
+            .iter()
+            .filter(|name| name.as_str() == bitwise)
+            .count(),
+        1,
+        "the artifacts keep BITWISE, so the proof carries it"
+    );
+    assert!(
+        traces.bitwise.main_table.row_major_data()
+            == crate::tables::bitwise::generate_bitwise_trace()
+                .main_table
+                .row_major_data(),
+        "the paired table is the all-zero BITWISE"
+    );
 }
 
 // ============================ proving (box) ================================
@@ -208,9 +275,11 @@ fn under_mask(artifacts: &LfmArtifacts, chip_set: ChipSet) -> LfmArtifacts {
     out
 }
 
-/// ★ R1 end to end on a program with no byte lookups: it proves and verifies
-/// with `BITWISE` dropped, carries one sub-proof fewer, is a different program
-/// identity, and neither proof verifies as the other program.
+/// ★ The drop end to end on a program with no byte lookups: it proves and
+/// verifies with `BITWISE` dropped, carries one sub-proof fewer, is a different
+/// program identity, and neither proof verifies as the other program. Both arms
+/// prove in one process whatever its setting: the arm that keeps `BITWISE`
+/// gets the all-zero table at pairing if the trace builder dropped it.
 #[test]
 fn a_program_without_byte_lookups_proves_and_verifies_without_bitwise() {
     let opts = options();

@@ -498,7 +498,8 @@ pub const GAP_R2_ENV: &str = "LAMBDA_VM_GAP_R2";
 pub fn gap_r2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = super::airs::gap_knob_value(GAP_R2_ENV, std::env::var(GAP_R2_ENV).ok().as_deref());
+        let on = super::airs::env_switch(GAP_R2_ENV, std::env::var(GAP_R2_ENV).ok().as_deref())
+            .unwrap_or(false);
         if on {
             println!(
                 "GAP R2: {GAP_R2_ENV}=1 — LFM_HASH split into two power-of-two instances \

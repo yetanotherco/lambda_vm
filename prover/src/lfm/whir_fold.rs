@@ -369,7 +369,8 @@ impl FoldEmission {
         static PROCESS: std::sync::OnceLock<FoldEmission> = std::sync::OnceLock::new();
         *PROCESS.get_or_init(|| {
             let lean =
-                super::airs::gap_knob_value(GAP_R4_ENV, std::env::var(GAP_R4_ENV).ok().as_deref());
+                super::airs::env_switch(GAP_R4_ENV, std::env::var(GAP_R4_ENV).ok().as_deref())
+                    .unwrap_or(false);
             if lean {
                 println!("GAP R4: {GAP_R4_ENV}=1 — WHIR coset folds emitted lean");
                 FoldEmission::Lean

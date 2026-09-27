@@ -504,10 +504,11 @@ pub(super) fn build_traces_walked(
             .collect();
         histogram.add_ops(&blake3_socket::bitwise_ops_for(&rows));
     }
-    // GAP R1: a program whose mask drops BITWISE never pairs this trace, so the
-    // `2^20`-row fill is skipped and an empty placeholder stands in the struct.
-    // The histogram above is empty in exactly that case — the mask drops the
-    // table only when no instantiated chip sends it a lookup.
+    // A program whose mask drops BITWISE skips the `2^20`-row fill, and an
+    // empty placeholder stands in the struct. The histogram above is empty in
+    // exactly that case — the mask drops the table only when no instantiated
+    // chip sends it a lookup — so the table it stands for is all zero, which is
+    // what `LfmAirs::air_trace_pairs` pairs if the artifacts keep BITWISE.
     let bitwise_trace = if super::airs::ChipSet::for_program_with_hasher(program, hasher).bitwise {
         let mut trace = bitwise::generate_bitwise_trace();
         histogram.fill_multiplicities(&mut trace);

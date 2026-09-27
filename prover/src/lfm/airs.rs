@@ -100,7 +100,7 @@ pub const HASH_SLOT: usize = 5;
 pub const KECCAK_SLOT: usize = 6;
 pub const BLAKE3_SLOT: usize = 11;
 pub const KECCAK_RC_SLOT: usize = 13;
-/// Slot of `BITWISE`, the one class [`ChipSet::bitwise`] gates (GAP R1).
+/// Slot of `BITWISE`, the one class [`ChipSet::bitwise`] gates.
 pub const BITWISE_SLOT: usize = 14;
 
 /// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
@@ -151,34 +151,46 @@ pub const fn num_lfm_airs(keccak_rnd_chunks: usize, blake3_chunks: usize) -> usi
 /// directly and keep the keccak family no matter what the production hash is.
 /// Keying off the global would have silently broken exactly those.
 ///
-/// ## `BITWISE`, under GAP R1
+/// ## `BITWISE`
 ///
-/// [`Self::bitwise`] is the third bit, and it is NOT a family: it is on for
-/// every program unless [`GAP_R1_ENV`] is set, and then it is on exactly when
-/// some chip this mask instantiates has an interaction on a bus `BITWISE`
-/// receives ([`Self::bitwise_required`]). Derived from the chips' own
-/// interaction lists rather than from the two family bits, because the hash
-/// chip is a `BITWISE` sender under one hasher (`HasherKind::Blake3`) and not
-/// under the others.
+/// [`Self::bitwise`] is the third bit, and it is NOT a family: it is on exactly
+/// when some chip this mask instantiates has an interaction on a bus `BITWISE`
+/// receives ([`Self::bitwise_required`]), or for every program under
+/// [`KEEP_BITWISE_ENV`]. Derived from the chips' own interaction lists rather
+/// than from the two family bits, because the hash chip is a `BITWISE` sender
+/// under one hasher (`HasherKind::Blake3`) and not under the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChipSet {
     /// `LFM_KECCAK`, every `KECCAK_RND` chunk, and `KECCAK_RC`.
     pub keccak: bool,
     /// `LFM_BLAKE3`.
     pub blake3: bool,
-    /// `BITWISE`, the fixed `2^20`-row byte-lookup table. Always on unless
-    /// [`GAP_R1_ENV`] drops it from a program that sends it nothing.
+    /// `BITWISE`, the fixed `2^20`-row byte-lookup table. Off for a program
+    /// whose chips send it nothing, unless [`KEEP_BITWISE_ENV`] keeps it.
     pub bitwise: bool,
 }
 
-/// ★ GAP R1, a TEMPORARY knob: `LAMBDA_VM_GAP_R1=1` drops `BITWISE` from every
-/// program whose instantiated chips send it no lookup.
+/// ★ `LAMBDA_VM_LFM_KEEP_BITWISE=1` keeps `BITWISE` in every program this
+/// process builds: the machine as it was before the table became conditional,
+/// every tag, AIR list, trace and `program_id` byte for byte — the A/B arm and
+/// the rollback switch.
 ///
-/// Unset (or `0`) is today's machine byte for byte: `BITWISE` in every proof.
-/// Read ONCE per process, at program-emission time, like the chunking knobs —
-/// the mask it produces is stored in the artifacts and folded into
-/// `program_id`, and every verifier takes it from there, never from a proof.
-/// Removed (the drop becoming unconditional) when the fix is integrated.
+/// By default a program carries `BITWISE` only when one of its instantiated
+/// chips sends it a lookup ([`ChipSet::bitwise_required`]). Every recursion
+/// program of the WHIR pipeline sends none, and so do the nodes, the global
+/// parent and the root of the STARK pipeline (its wraps keep the table: their
+/// `program_id` fold is a keccak permutation). Each of those proves one
+/// sub-proof fewer and its parent re-verifies one fewer — a `2^20`-row table,
+/// 26.2 M census cells a proof. Measured on block 25368371 (one RTX 5090,
+/// ABBA): WHIR −4.70 s, STARK −5.30 s.
+///
+/// Read ONCE per process, at program-emission time, like the chunking
+/// policies: the mask is stored in the artifacts and folded into `program_id`,
+/// and every verifier takes it from there, never from a proof. Registry rows
+/// carry the mask they were blessed with (the default), whatever this process
+/// reads. Proving does not depend on the setting either: a trace set whose
+/// builder dropped the table gets it back, all zero, when the artifacts keep
+/// it ([`LfmAirs::air_trace_pairs`]).
 ///
 /// Why dropping is sound: `BITWISE` only RECEIVES, with prover-chosen
 /// multiplicity columns. With no sender in the proof, the honest multiplicities
@@ -188,28 +200,39 @@ pub struct ChipSet {
 /// [`ChipSet::bitwise_required`] is the predicate that keeps it unreachable: it
 /// reads every instantiated chip's interactions, and the verifier re-checks it
 /// against the mask it was handed (`proof::verify_against_chunked_with`).
-pub const GAP_R1_ENV: &str = "LAMBDA_VM_GAP_R1";
+pub const KEEP_BITWISE_ENV: &str = "LAMBDA_VM_LFM_KEEP_BITWISE";
 
-/// Whether [`GAP_R1_ENV`] is on for this process. Prints one line when it is,
-/// so a log states the setting it ran under.
-pub fn gap_r1_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = gap_knob_value(GAP_R1_ENV, std::env::var(GAP_R1_ENV).ok().as_deref());
-        if on {
-            println!("GAP R1: {GAP_R1_ENV}=1 — BITWISE dropped from programs that send it nothing");
+/// [`KEEP_BITWISE_ENV`]'s reading of a raw value: unset keeps the default
+/// (drop the table where nothing sends to it).
+pub fn keep_bitwise_setting(raw: Option<&str>) -> bool {
+    env_switch(KEEP_BITWISE_ENV, raw).unwrap_or(false)
+}
+
+/// Whether this process keeps `BITWISE` in every program it builds
+/// ([`KEEP_BITWISE_ENV`]). Read once; prints the setting either way — to stderr,
+/// so a generator's stdout stays its output — and a log states which programs
+/// it proved.
+pub fn keep_bitwise() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let keep = keep_bitwise_setting(std::env::var(KEEP_BITWISE_ENV).ok().as_deref());
+        if keep {
+            eprintln!("LFM BITWISE: kept in every program ({KEEP_BITWISE_ENV}=1)");
+        } else {
+            eprintln!("LFM BITWISE: only where a chip sends it a lookup (the default)");
         }
-        on
+        keep
     })
 }
 
-/// A `LAMBDA_VM_GAP_*` knob's value: unset, empty or `0` is off, `1` is on, and
-/// anything else stops the run — a typo read as "off" would prove arm A under
-/// arm B's name.
-pub fn gap_knob_value(name: &str, raw: Option<&str>) -> bool {
+/// A `LAMBDA_VM_*` on/off switch's value: unset or empty is `None` (the
+/// switch's default), `0` is off, `1` is on, and anything else stops the run —
+/// a typo read as the default would prove one arm under the other's name.
+pub fn env_switch(name: &str, raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") => None,
+        Some("0") => Some(false),
+        Some("1") => Some(true),
         Some(other) => panic!("{name} must be 0 or 1, got {other:?}"),
     }
 }
@@ -229,17 +252,17 @@ impl ChipSet {
     }
 
     /// The mask a compiled program proved under `hasher` gets: the families it
-    /// uses and, under [`GAP_R1_ENV`], whether it keeps `BITWISE`.
+    /// uses and whether it keeps `BITWISE` (see [`KEEP_BITWISE_ENV`]).
     pub fn for_program_with_hasher(
         program: &super::compiler::LfmProgram,
         hasher: HasherKind,
     ) -> Self {
-        Self::for_program_under(program, hasher, gap_r1_enabled())
+        Self::for_program_under(program, hasher, !keep_bitwise())
     }
 
-    /// [`Self::for_program_with_hasher`] with GAP R1's setting supplied rather
-    /// than read from the environment, so a test can build both masks in one
-    /// process.
+    /// [`Self::for_program_with_hasher`] with the `BITWISE` setting supplied
+    /// rather than read from the environment, so a test can build both masks in
+    /// one process.
     pub fn for_program_under(
         program: &super::compiler::LfmProgram,
         hasher: HasherKind,
@@ -303,7 +326,7 @@ impl ChipSet {
         // The classes no family owns: all 15 less KECCAK_RND (counted per
         // chunk below), less LFM_KECCAK and KECCAK_RC (keccak's), less
         // LFM_BLAKE3 (blake3's, counted per chunk below). BITWISE is among
-        // them and leaves only under GAP R1.
+        // them and leaves when no instantiated chip sends it a lookup.
         let mut n = NUM_LFM_CHIPS - 4;
         if self.keccak {
             n += 2 + keccak_rnd_chunks;
@@ -334,8 +357,9 @@ impl ChipSet {
     /// not merely by a root that happens to differ.
     ///
     /// `BITWISE` rides bit 2 INVERTED — set when the table is dropped — so every
-    /// mask that keeps it (every mask with GAP R1 off) has the tag it always
-    /// had, and no digest moves.
+    /// mask that keeps it has the tag it had before the table became
+    /// conditional: a program that sends `BITWISE` lookups, and every program
+    /// under [`KEEP_BITWISE_ENV`], keeps its digest.
     pub const fn as_tag(self) -> u8 {
         (self.keccak as u8) | ((self.blake3 as u8) << 1) | ((!self.bitwise as u8) << 2)
     }
@@ -1245,15 +1269,16 @@ impl LfmAirs {
             "LFM_BLAKE3 chunk count differs between the AIR set and the traces \
              — artifacts and traces were built from different chunking policies"
         );
-        // GAP R1: the trace builder skips BITWISE when the PROCESS mask drops it,
-        // so a set whose artifacts keep it (a registry entry, under the knob)
-        // would pair an empty placeholder. Refused here by name rather than deep
-        // inside the prover.
-        assert!(
-            !self.chip_set.bitwise || traces.bitwise.num_rows() > 0,
-            "BITWISE is in this AIR set but its trace was not built — the \
-             artifacts' mask and this process's LAMBDA_VM_GAP_R1 disagree"
-        );
+        // The trace builder skips BITWISE's `2^20`-row fill when the mask IT
+        // derives drops the table, and it drops the table only for a program
+        // whose chips send it nothing — so every multiplicity would be zero. A
+        // set whose artifacts keep BITWISE for such a program (built under
+        // `KEEP_BITWISE_ENV`, or under a different setting than this process)
+        // gets exactly that all-zero table here: which programs keep BITWISE is
+        // the artifacts' decision, and no proof depends on the process setting.
+        if self.chip_set.bitwise && traces.bitwise.num_rows() == 0 {
+            traces.bitwise = crate::tables::bitwise::generate_bitwise_trace();
+        }
         let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> = vec![
             (&self.const_, &mut traces.const_, &()),
             (&self.balu, &mut traces.balu, &()),
