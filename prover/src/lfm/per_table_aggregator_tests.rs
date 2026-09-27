@@ -8455,6 +8455,20 @@ fn the_whir_production_tree_composes_to_a_root() {
     // uncounted. Printed here, whole-run, so the launcher can refuse a block
     // number unless BOTH read zero.
     println!("   commit fallbacks {}", multilinear::gpu::host_fallbacks());
+    // Of which the device was asked and answered with an error (each is also
+    // logged with its error as it happens): a failed launch, copy or allocation,
+    // or a refused reservation — never a policy decline.
+    println!(
+        "   commit device errors {}",
+        multilinear::gpu::commit_errors()
+    );
+    // Merkle trees over a HOST codeword (the folds of a chain the host holds)
+    // that the device was asked for and answered with an error; the host hashed
+    // them instead. Not commit fallbacks, so counted apart from the line above.
+    println!(
+        "   tree commit device errors {}",
+        multilinear::gpu::tree_commit_errors()
+    );
     println!(
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()

@@ -30,10 +30,19 @@
 //! which nothing downstream observes (the hashes and the serialisation
 //! canonicalise).
 //!
+//! The WHIR commit's encoding (`whir::commit_from`) is one column of the same
+//! forward transform with no coset: the coefficients, spread at the blowup's
+//! spacing, go through the forward passes ([`spread_ntt_column`]) with the
+//! spread fused into the first. It reads an 8 KiB windowed root table, where
+//! the legacy encoding reads `Backend::fwd_twiddles_for`: `2^(log_n − 1)`
+//! values per codeword size, built on the host and cached on the card for the
+//! life of the process, outside the VRAM ledger (512 MiB for a `2^27`
+//! codeword, 2 GiB for `2^29`).
+//!
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
 //! stays for what the engine does not take — a caller that wants the row-major
-//! LDE back on the host, and shapes outside [`supports`] — and, whole, under
-//! [`LEGACY_ENV`].
+//! LDE back on the host, and shapes outside [`supports`] (for the encoding,
+//! [`spread_supports`]) — and, whole, under [`LEGACY_ENV`].
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,8 +58,9 @@ use crate::Result;
 use crate::device::Backend;
 
 /// `LAMBDA_VM_LDE_LEGACY=1` sends every LDE back to the legacy per-level
-/// pipeline — an A/B and rollback switch, not a tuning knob: both produce the
-/// same values, roots and proofs. Read once per process.
+/// pipeline, the commits' trace LDEs and the WHIR commit's encoding alike — an
+/// A/B and rollback switch, not a tuning knob: both produce the same values,
+/// roots and proofs. Read once per process.
 pub const LEGACY_ENV: &str = "LAMBDA_VM_LDE_LEGACY";
 
 thread_local! {
@@ -59,7 +69,8 @@ thread_local! {
     static ENGINE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Whether the calling thread's LDEs take this engine (where it applies).
+/// Whether the calling thread's LDEs and WHIR encodings take this engine (where
+/// it applies).
 pub fn engine_enabled() -> bool {
     if let Some(on) = ENGINE_OVERRIDE.with(Cell::get) {
         return on;
@@ -104,6 +115,15 @@ pub fn columns_extended() -> u64 {
     COLUMNS_EXTENDED.load(Ordering::Relaxed)
 }
 
+/// Codewords [`spread_ntt_column`] has encoded, process-wide: the counter a
+/// test reads to know the engine, and not the legacy path, did a WHIR encoding.
+static CODEWORDS_ENCODED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`CODEWORDS_ENCODED`].
+pub fn codewords_encoded() -> u64 {
+    CODEWORDS_ENCODED.load(Ordering::Relaxed)
+}
+
 /// Smallest trace a column can have here: a pass holds 16 elements per
 /// thread, so a transform needs at least 2^4 of them.
 pub const MIN_LOG_N: u32 = 4;
@@ -121,6 +141,17 @@ pub fn supports(n: usize, blowup: usize) -> bool {
         && n.trailing_zeros() >= MIN_LOG_N
         && blowup.trailing_zeros() <= MAX_LOG_BLOWUP
         && (n * blowup).trailing_zeros() <= GoldilocksField::TWO_ADICITY as u32
+}
+
+/// Whether a length-`2^log_n` transform of an input spread at spacing
+/// `2^log_blowup` fits [`spread_ntt_column`]: the first pass must hold a whole
+/// spacing (`2^log_blowup <= 2^k`, `k >= 4`). Spacing 1 (`log_blowup = 0`) is a
+/// plain transform of a bit-reversed input.
+pub fn spread_supports(log_n: u32, log_blowup: u32) -> bool {
+    log_n >= MIN_LOG_N
+        && log_n <= GoldilocksField::TWO_ADICITY as u32
+        && log_blowup <= MAX_LOG_BLOWUP
+        && log_blowup <= log_n
 }
 
 /// Pass sizes for a length-`2^l` transform: `ceil(l / 8)` passes of 4..=8
@@ -454,6 +485,55 @@ pub(crate) fn lde_columns(
     Ok(())
 }
 
+/// The forward transform of ONE spread column — the WHIR commit's encoding
+/// (`whir::commit_from`; the legacy path is `ntt.cu`'s `lift_spread` then
+/// `ntt::run_ntt_body`), fused: position `2^log_blowup · q` of the
+/// length-`2^log_n` DIT input (bit-reversed in, natural out) is `src[q]`,
+/// every other position zero, and `dst` receives the natural-order transform.
+/// The spread is the first pass's load, so the padding is never stored or
+/// read, and the transform is `ceil(log_n / 8)` passes instead of the spread
+/// pass, the fused 8-level pass and one 5-level tile per five levels above it.
+/// `src` (`2^(log_n - log_blowup)` values) and `dst` (`2^log_n`) must not
+/// overlap. Nothing synchronises.
+pub(crate) fn spread_ntt_column(
+    stream: &CudaStream,
+    be: &Backend,
+    src: sys::CUdeviceptr,
+    dst: sys::CUdeviceptr,
+    log_n: u32,
+    log_blowup: u32,
+) -> Result<()> {
+    assert!(
+        spread_supports(log_n, log_blowup),
+        "a spread transform of 2^{log_n} at spacing 2^{log_blowup} is outside the engine"
+    );
+    let tables = root_tables(be)?;
+    let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
+    let one = |ptr| Cols { ptr, stride: 0 };
+    let mut s = 0;
+    for (i, &k) in plan(log_n).iter().enumerate() {
+        let first = i == 0;
+        launch_pass(
+            stream,
+            be,
+            true,
+            k,
+            log_n,
+            s,
+            log_blowup,
+            if first { F_SPREAD } else { 0 },
+            one(if first { src } else { dst }),
+            one(dst),
+            fwd_roots,
+            0,
+            1,
+        )?;
+        s += k;
+    }
+    CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Hash the leaves of a column-major matrix: `num_cols` columns of `num_rows`
 /// rows at `cols` (column stride `col_stride` elements), `rows_per_leaf`
 /// bit-reversed rows per leaf, into `leaves` (`num_rows / rows_per_leaf`
@@ -608,6 +688,19 @@ mod tests {
                 "radix entry {j}"
             );
         }
+    }
+
+    #[test]
+    fn spread_shapes_outside_the_engine_are_declined() {
+        assert!(spread_supports(4, 0), "spacing 1 is a plain transform");
+        assert!(spread_supports(24, 2), "the WHIR production shape");
+        assert!(spread_supports(8, 4));
+        assert!(!spread_supports(3, 0), "transform below 2^4");
+        assert!(
+            !spread_supports(20, 5),
+            "spacing beyond one first-pass tile"
+        );
+        assert!(!spread_supports(33, 2), "beyond the two-adicity");
     }
 
     #[test]

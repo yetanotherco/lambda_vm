@@ -9,7 +9,9 @@
 //!   the engine may leave a different non-canonical representative, which
 //!   nothing downstream observes — the hashes and serialisation canonicalise);
 //! - the trace-domain snapshot is identical, raw u64 for raw u64;
-//! - the host outputs of the batched entry points are identical (canonically).
+//! - the host outputs of the batched entry points are identical (canonically);
+//! - the WHIR commit's codeword (canonically) and Merkle nodes (bytes) are
+//!   identical under either encoding.
 //!
 //! The engine's arithmetic is also pinned on the host by
 //! `tests/host_kat/ntt_cm_host_kat.cpp`; `engine_matches_the_cpu_lde` anchors the
@@ -22,7 +24,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsPrimeField;
 use math::polynomial::Polynomial;
 use math_cuda::DeviceHash;
-use math_cuda::lde_cm::{columns_extended, with_engine};
+use math_cuda::lde_cm::{codewords_encoded, columns_extended, spread_supports, with_engine};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -506,5 +508,51 @@ fn engine_matches_the_cpu_lde() {
         .expect("cpu lde");
         let cpu: Vec<u64> = cpu.iter().map(|e| *e.value()).collect();
         assert_same_values(&gpu, &cpu, &format!("cpu log_n={log_n} blowup={blowup}"));
+    }
+}
+
+/// The WHIR commit's encoding (spread + NTT of one codeword) through the column
+/// engine against the legacy `lift_spread` + `run_ntt_body`: the codeword
+/// (canonically) and the Merkle nodes (bytes) are identical. `(1, 2)` is below
+/// the engine's smallest transform and must stay on the legacy path.
+#[test]
+fn whir_codeword_engine_matches_legacy() {
+    let shapes: &[(usize, usize, usize)] = &[
+        // (log_evals, log_blowup, log_folding)
+        (1, 2, 1),
+        (2, 2, 1),
+        (4, 0, 2),
+        (6, 2, 4),
+        (8, 4, 4),
+        (10, 1, 4),
+        (12, 2, 4),
+        (16, 3, 4),
+        (18, 2, 4),
+        (21, 2, 4),
+    ];
+    for (i, &(log_evals, log_blowup, log_folding)) in shapes.iter().enumerate() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x3171_0000 + i as u64);
+        // The commit takes canonical hypercube values.
+        let evals = canon(&random(&mut rng, 1usize << log_evals));
+        let hash = [DeviceHash::Rpx256, DeviceHash::Keccak256][i % 2];
+        let what = format!("whir log_evals={log_evals} log_blowup={log_blowup} {hash:?}");
+        let before = codewords_encoded();
+        let (engine_vals, engine_nodes) = with_engine(true, || {
+            math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
+        })
+        .expect("engine commit");
+        let routed = codewords_encoded() > before;
+        let supported = spread_supports((log_evals + log_blowup) as u32, log_blowup as u32);
+        // Other tests may encode concurrently, so only the supported shapes'
+        // "it routed" is certain; an unsupported one is checked by its values.
+        if supported {
+            assert!(routed, "{what}: the encoding did not take the engine");
+        }
+        let (vals, nodes) = with_engine(false, || {
+            math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
+        })
+        .expect("legacy commit");
+        assert_same_values(&engine_vals, &vals, &what);
+        assert_eq!(engine_nodes, nodes, "{what}: Merkle nodes");
     }
 }
