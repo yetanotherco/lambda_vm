@@ -3708,7 +3708,33 @@ fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, u
     );
     let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
     let step = (fan_in + 1) as f64 / fan_in as f64;
+    // GAP R2: a split `LFM_HASH` is two census entries, printed as ONE panel line —
+    // real and committed rows summed, the chunk heights in a trailing
+    // `[split a+b]` — so a panel never repeats a chip name (the box reader treats a
+    // repeat as two interleaved panels) and `LFM_HASH` real rows stay the
+    // permutation count. Unsplit programs print exactly as before.
+    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+    let hash_chunks: Vec<&super::airs::LfmChipCells> =
+        panel.iter().filter(|c| c.name == hash).collect();
     for c in &panel {
+        if c.name == hash && hash_chunks.len() > 1 {
+            if !std::ptr::eq(c, hash_chunks[0]) {
+                continue;
+            }
+            let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
+            let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
+            let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
+            println!(
+                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
+                c.name,
+                real,
+                rows,
+                100.0 * (rows - real) as f64 / rows as f64,
+                hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
+                heights.join("+"),
+            );
+            continue;
+        }
         println!(
             "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
             c.name,
