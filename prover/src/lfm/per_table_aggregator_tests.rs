@@ -3705,34 +3705,16 @@ fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
 }
 
 fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
-    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
     let (main, aux) =
         super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
     let cells = main + 3 * aux;
-    println!(
-        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
-        program.instrs.len(),
-        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
-    );
     let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
-    let step = (fan_in + 1) as f64 / fan_in as f64;
-    for c in &panel {
-        println!(
-            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
-            c.name,
-            c.real_rows,
-            c.rows,
-            100.0 * c.headroom(),
-            if c.at_risk() { "AT RISK" } else { "fixed  " },
-            c.cliff_cost(),
-        );
-    }
-    let stepping: Vec<&str> = panel
-        .iter()
-        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
-        .map(|c| c.name)
-        .collect();
-    println!("     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}");
+    // ONE `print!` for the whole panel, never a `println!` per line: see
+    // `census_panel_text`.
+    print!(
+        "{}",
+        census_panel_text(label, cells, program.instrs.len(), &panel, fan_in)
+    );
     // ★ Lane E's dependency measurement, on the SAME production programs the
     // panel above describes — folded in here rather than given its own fixture
     // because this is the one call site every shape already passes through
@@ -3749,6 +3731,181 @@ fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, u
         println!("     (profile took {:.1}s)", t.elapsed().as_secs_f64());
     }
     (cells, program.instrs.len())
+}
+
+/// A program's census line, its chip panel and its step line, as the ONE string
+/// [`census_and_panel`] prints.
+///
+/// One `print!` holds the stdout lock for the whole panel. Printed a line at a
+/// time, the panels of proofs census'd at once (level 0's wraps in flight,
+/// sibling nodes, the level pool) interleaved LINE BY LINE with each other and
+/// with any other thread's output, and a chip line carries no label: a reader
+/// of the log could only tell whose line it was from the numbers on it. The
+/// bytes are exactly what the per-line `println!`s wrote
+/// ([`the_census_panel_is_the_per_line_bytes`]), so every reader of the panel
+/// parses it unchanged.
+fn census_panel_text(
+    label: &str,
+    cells: u64,
+    instrs: usize,
+    panel: &[super::airs::LfmChipCells],
+    fan_in: usize,
+) -> String {
+    use std::fmt::Write as _;
+    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
+        instrs,
+        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+    );
+    let step = (fan_in + 1) as f64 / fan_in as f64;
+    for c in panel {
+        let _ = writeln!(
+            out,
+            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+            c.name,
+            c.real_rows,
+            c.rows,
+            100.0 * c.headroom(),
+            if c.at_risk() { "AT RISK" } else { "fixed  " },
+            c.cliff_cost(),
+        );
+    }
+    let stepping: Vec<&str> = panel
+        .iter()
+        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+        .map(|c| c.name)
+        .collect();
+    let _ = writeln!(
+        out,
+        "     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}"
+    );
+    out
+}
+
+/// ★ [`census_panel_text`] is byte for byte what the per-line `println!`s of the
+/// census panel wrote: one `print!` changes when the panel reaches the log, and
+/// nothing about what reaches it.
+///
+/// Two references. A panel the per-line code printed on the box — L1N0 of a WHIR
+/// tree over block 25368371, eleven chips at fan-in 3 — copied from the log byte
+/// for byte. And the per-line code itself, kept below with each `println!(f, ..)`
+/// written as `format!(f, ..)` plus the `\n` that `println!` appends, over chips
+/// under all three height rules, a zero-row chip, an empty step list and fan-ins
+/// 1 to 3. Only a chip's `main_cols + 3 · aux_cols` reaches the text (as its
+/// cliff), so each chip below carries its logged cliff over its rows as columns.
+#[test]
+fn the_census_panel_is_the_per_line_bytes() {
+    use super::airs::{HeightRule, LfmChipCells};
+
+    fn per_line(
+        label: &str,
+        cells: u64,
+        instrs: usize,
+        panel: &[LfmChipCells],
+        fan_in: usize,
+    ) -> String {
+        const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+        let mut out = String::new();
+        let mut println = |line: String| {
+            out.push_str(&line);
+            out.push('\n');
+        };
+        println(format!(
+            "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
+            instrs,
+            100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+        ));
+        let step = (fan_in + 1) as f64 / fan_in as f64;
+        for c in panel {
+            println(format!(
+                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+                c.name,
+                c.real_rows,
+                c.rows,
+                100.0 * c.headroom(),
+                if c.at_risk() { "AT RISK" } else { "fixed  " },
+                c.cliff_cost(),
+            ));
+        }
+        let stepping: Vec<&str> = panel
+            .iter()
+            .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+            .map(|c| c.name)
+            .collect();
+        println(format!(
+            "     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}"
+        ));
+        out
+    }
+
+    let chip = |name, real_rows, rows, height_rule, main_cols| LfmChipCells {
+        name,
+        rows,
+        real_rows,
+        height_rule,
+        main_cols,
+        aux_cols: 0,
+    };
+    let (w, f, c) = (HeightRule::Workload, HeightRule::Fixed, HeightRule::Chunked);
+    let l1n0 = [
+        chip("LFM_CONST", 656, 1_024, w, 4),
+        chip("LFM_BALU", 473_628, 524_288, w, 10),
+        chip("LFM_XALU", 2_073_486, 2_097_152, w, 18),
+        chip("LFM_SELECT", 622_710, 1_048_576, w, 26),
+        chip("LFM_BITDEC", 7_143, 8_192, w, 168),
+        chip("LFM_HASH", 438_983, 524_288, w, 325),
+        chip("LFM_LANES", 408_681, 524_288, w, 19),
+        chip("LFM_HINT", 871_809, 1_048_576, w, 7),
+        chip("LFM_PUBLIC", 144, 256, w, 7),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    let logged = r#"   ★ CENSUS L1N0 (arity 3): 285808384 cells (4897240 instructions), floor 9.3%
+     LFM_CONST             656/      1024  headroom  35.9%  AT RISK  cliff +4096 cells
+     LFM_BALU           473628/    524288  headroom   9.7%  AT RISK  cliff +5242880 cells
+     LFM_XALU          2073486/   2097152  headroom   1.1%  AT RISK  cliff +37748736 cells
+     LFM_SELECT         622710/   1048576  headroom  40.6%  AT RISK  cliff +27262976 cells
+     LFM_BITDEC           7143/      8192  headroom  12.8%  AT RISK  cliff +1376256 cells
+     LFM_HASH           438983/    524288  headroom  16.3%  AT RISK  cliff +170393600 cells
+     LFM_LANES          408681/    524288  headroom  22.1%  AT RISK  cliff +9961472 cells
+     LFM_HINT           871809/   1048576  headroom  16.9%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            144/       256  headroom  43.8%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     BITWISE           1048576/   1048576  headroom   0.0%  fixed    cliff +26214400 cells
+     ⇒ at 1.333× the workload these would STEP: ["LFM_BALU", "LFM_XALU", "LFM_BITDEC", "LFM_HASH", "LFM_LANES", "LFM_HINT"]
+"#;
+    assert_eq!(
+        census_panel_text("L1N0 (arity 3)", 285_808_384, 4_897_240, &l1n0, 3),
+        logged,
+        "the panel as the box logged it"
+    );
+
+    // Every height rule, a zero-row chip (headroom 0, cliff 0), and a panel whose
+    // step list is empty.
+    let shapes = [
+        chip("LFM_CONST", 121, 128, w, 4),
+        chip("LFM_KECCAK", 0, 0, w, 900),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("LFM_BLAKE3", 3, 4, c, 300),
+        chip("KECCAK_RND", 524_280, 524_288, c, 60),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    for fan_in in 1..=3 {
+        for (label, cells, instrs, panel) in [
+            ("L1N0 (arity 3)", 285_808_384, 4_897_240, &l1n0[..]),
+            ("wrap 7", 459_288_992, 4_237_668, &shapes[..]),
+            ("the BLOCK-ARTIFACT ROOT", 285_808_384, 0, &shapes[2..]),
+        ] {
+            assert_eq!(
+                census_panel_text(label, cells, instrs, panel, fan_in),
+                per_line(label, cells, instrs, panel, fan_in),
+                "{label} at fan-in {fan_in}"
+            );
+        }
+    }
 }
 
 /// The measured host cost of one RPX permutation, so the reach ladder reads in
