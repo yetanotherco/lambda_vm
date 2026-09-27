@@ -6716,6 +6716,7 @@ fn the_production_tree_composes_to_a_root() {
     );
     mark("AFTER the base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the base"));
+    println!("   AFTER the base: {}", math_cuda::device::staging_report());
 
     let shape = tree_shape(bundle.num_epochs(), fan_in);
     let top = shape.len();
@@ -7484,6 +7485,7 @@ fn the_production_tree_composes_to_a_root() {
         "\nWHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
         t_all.elapsed().as_secs_f64()
     );
+    println!("   whole-run {}", math_cuda::device::staging_report());
     match &ceiling {
         Ok(g) => println!(
             "           = {:.1}% of the {g:.2} GiB cgroup ceiling",
@@ -8745,6 +8747,10 @@ fn the_whir_production_tree_composes_to_a_root() {
     );
     mark("AFTER the WHIR base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the WHIR base"));
+    println!(
+        "   AFTER the WHIR base: {}",
+        math_cuda::device::staging_report()
+    );
     whir_base_split_readback(base_secs);
     // ⛔ ROUND-3 TREE PROBE, ARMED AT THE BASE BOUNDARY (diagnostic, OFF by
     // default — `LAMBDA_VM_TREE_BUSY_PROBE`). Everything below this line is the
@@ -9243,6 +9249,7 @@ fn the_whir_production_tree_composes_to_a_root() {
         "\n★★★ WHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
         t_all.elapsed().as_secs_f64(),
     );
+    println!("   whole-run {}", math_cuda::device::staging_report());
     match &ceiling {
         Ok(c) => println!(
             "           = {:.1}% of the {c:.2} GiB cgroup ceiling",
