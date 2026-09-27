@@ -320,6 +320,38 @@ mod leaf_key_tests {
     }
 }
 
+#[cfg(test)]
+mod fold_transient_tests {
+    use super::fold_transient_bytes;
+
+    /// ★ The round-0 fold's transient, in numbers: level by level the first
+    /// two levels' outputs are live together — 2.25× the committed base
+    /// codeword `C` — while fused it is only the output, `3C/64` at six levels
+    /// (extension values, a 64th as many). At the fat stack's 2^28 variables
+    /// (a 2^30 codeword, `C` = 8 GiB) that is 18 GiB against 384 MiB.
+    #[test]
+    fn a_fused_fold_holds_only_its_output() {
+        for n in [25usize, 27, 28] {
+            let log_elements = n + 2;
+            let codeword = 8u64 << log_elements;
+            let stepped = fold_transient_bytes(log_elements, 6, false);
+            let fused = fold_transient_bytes(log_elements, 6, true);
+            println!(
+                "2^{n}: level by level {:.2} C, fused {:.4} C",
+                stepped as f64 / codeword as f64,
+                fused as f64 / codeword as f64
+            );
+            assert_eq!(stepped * 4, codeword * 9);
+            assert_eq!(fused * 64, codeword * 3);
+            assert!(fused * 48 == stepped);
+        }
+        assert_eq!(
+            fold_transient_bytes(20, 1, false),
+            fold_transient_bytes(20, 1, true)
+        );
+    }
+}
+
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -364,6 +396,14 @@ impl DeviceCodeword {
 
     pub fn is_base(&self) -> bool {
         self.base
+    }
+
+    /// Every limb, read back — one per value for a base codeword, three for an
+    /// extension one. For the parity tests; a chain only ever gathers cosets.
+    pub fn to_host(&self) -> Result<Vec<u64>> {
+        let values = self.stream.clone_dtoh(self.buffer.as_ref())?;
+        self.stream.synchronize()?;
+        Ok(values)
     }
 
     /// The first value, which is what the last fold leaves behind.
@@ -1255,6 +1295,101 @@ pub fn fold_resident(
         room: codeword.room.clone(),
         // A fold is its own codeword for retention too: its own slot, its own
         // registry entry once it captures.
+        registered: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// The widest fold [`fold_resident_fused`] takes in one launch
+/// (`WHIR_MAX_FOLD` in `whir_fold.cu`): the chain's `MAX_FOLD`.
+pub const FUSED_MAX_FOLD: usize = 6;
+
+/// The most a `levels`-level fold of a `2^log_elements` codeword holds beside
+/// its input: level by level, the first level's output and the second's live
+/// together (`3·8·(2^(N−1) + 2^(N−2))` bytes; one level holds just its own);
+/// fused, only the output (`3·8·2^(N−levels)`).
+pub const fn fold_transient_bytes(log_elements: usize, levels: usize, fused: bool) -> u64 {
+    if fused || levels == 1 {
+        24u64 << (log_elements - levels)
+    } else {
+        (24u64 << (log_elements - 1)) + (24u64 << (log_elements - 2))
+    }
+}
+
+/// [`fold_resident`]'s result in ONE launch, with nothing but the output
+/// allocated.
+///
+/// Level by level, the first fold of a committed codeword writes `2^(n+1)`
+/// extension values — 1.5× the codeword — and holds them beside the second
+/// level's while the codeword is still resident: a 2.25× transient that grows
+/// with the stack. Here each output folds its own strided coset in registers
+/// (`whir_fold_k_*` in `whir_fold.cu`), so the transient is the output alone,
+/// `3·2^(n+2−levels)` limbs.
+///
+/// ★ Raw-identical to [`fold_resident`], not merely equal: every pair runs
+/// that kernel's operation sequence on the same raw inputs, `pow_base`'s
+/// squares and multiplication order included (`tests/whir_fold.rs`).
+pub fn fold_resident_fused(
+    codeword: &DeviceCodeword,
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<DeviceCodeword> {
+    let levels = g_invs.len();
+    assert!(
+        (1..=FUSED_MAX_FOLD).contains(&levels),
+        "a fused fold takes 1..={FUSED_MAX_FOLD} levels, not {levels}"
+    );
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.elements >> levels >= 1,
+        "{levels} folds do not fit"
+    );
+
+    let be = backend()?;
+    let stream = codeword.stream.clone();
+    let g_dev = crate::device::htod_or_trim(&stream, g_invs)?;
+    let alpha = crate::device::htod_or_trim(&stream, alphas)?;
+    let n_out = codeword.elements >> levels;
+    // SAFETY: the kernel writes every output element.
+    let mut out = unsafe { alloc_or_trim::<u64>(&stream, n_out * 3) }?;
+    let n_out_arg = n_out as u64;
+    let levels_arg = levels as u32;
+    let kernel = if codeword.base {
+        &be.whir_fold_k_base_ext3
+    } else {
+        &be.whir_fold_k_ext3
+    };
+    // 256 threads: a thread carries a pending value per level, and a 1024-wide
+    // block would cap its registers below what that needs.
+    let block = 256u32;
+    let grid = (n_out as u64).div_ceil(block as u64) as u32;
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(codeword.buffer.as_ref())
+            .arg(&n_out_arg)
+            .arg(&levels_arg)
+            .arg(&two_inv)
+            .arg(&g_dev)
+            .arg(&alpha)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (grid.max(1), 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+
+    Ok(DeviceCodeword {
+        buffer: Arc::new(out),
+        stream,
+        elements: n_out,
+        base: false,
+        // A fold is its own codeword, as `fold_resident`'s is.
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: codeword.room.clone(),
         registered: Arc::new(AtomicBool::new(false)),
     })
 }

@@ -348,6 +348,11 @@ pub struct Backend {
     pub whir_fold_base_ext3: CudaFunction,
     pub whir_fold_ext3: CudaFunction,
     pub gather_cosets: CudaFunction,
+    pub whir_fold_k_base_ext3: CudaFunction,
+    pub whir_fold_k_ext3: CudaFunction,
+    pub whir_lean_colmap: CudaFunction,
+    pub whir_lean_round: CudaFunction,
+    pub whir_lean_materialize: CudaFunction,
 
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
@@ -999,6 +1004,11 @@ impl Backend {
             whir_fold_base_ext3: whir_fold.load_function("whir_fold_base_ext3")?,
             whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
             gather_cosets: whir_fold.load_function("gather_cosets")?,
+            whir_fold_k_base_ext3: whir_fold.load_function("whir_fold_k_base_ext3")?,
+            whir_fold_k_ext3: whir_fold.load_function("whir_fold_k_ext3")?,
+            whir_lean_colmap: whir_fold.load_function("whir_lean_colmap")?,
+            whir_lean_round: whir_fold.load_function("whir_lean_round")?,
+            whir_lean_materialize: whir_fold.load_function("whir_lean_materialize")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
             sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
