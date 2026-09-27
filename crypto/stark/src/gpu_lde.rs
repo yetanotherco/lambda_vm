@@ -1477,15 +1477,44 @@ where
     B: DeviceTreeBackend,
 {
     debug_assert_eq!(nodes.len() % 32, 0);
-    let nodes: Vec<[u8; 32]> = nodes
-        .chunks_exact(32)
-        .map(|c| {
-            let mut n = [0u8; 32];
-            n.copy_from_slice(c);
-            n
-        })
-        .collect();
+    // Gap fix I5: the byte buffer becomes the node vector in place instead of
+    // being copied node by node into a second one.
+    let nodes: Vec<[u8; 32]> = if math_cuda::gap::i5_pinned_tree_download() {
+        nodes_in_place(nodes)
+    } else {
+        nodes
+            .chunks_exact(32)
+            .map(|c| {
+                let mut n = [0u8; 32];
+                n.copy_from_slice(c);
+                n
+            })
+            .collect()
+    };
     MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
+/// `bytes` reinterpreted as 32-byte nodes without a copy, when its length and
+/// capacity are whole nodes (always, for a buffer allocated at a node count);
+/// otherwise the same nodes, copied.
+fn nodes_in_place(bytes: Vec<u8>) -> Vec<[u8; 32]> {
+    if bytes.len() % 32 != 0 || bytes.capacity() % 32 != 0 {
+        return bytes
+            .chunks_exact(32)
+            .map(|c| c.try_into().expect("a 32-byte chunk"))
+            .collect();
+    }
+    let mut bytes = std::mem::ManuallyDrop::new(bytes);
+    // SAFETY: `[u8; 32]` has `u8`'s alignment (1), so the allocation's layout
+    // — `capacity` bytes at alignment 1 — is exactly `capacity / 32` nodes at
+    // alignment 1, and the first `len / 32` nodes are the initialized bytes.
+    unsafe {
+        Vec::from_raw_parts(
+            bytes.as_mut_ptr().cast::<[u8; 32]>(),
+            bytes.len() / 32,
+            bytes.capacity() / 32,
+        )
+    }
 }
 
 /// Preprocessed-table variant of [`try_expand_leaf_and_tree_row_major_keep`]:
@@ -4655,5 +4684,27 @@ mod split_tree_tests {
         // spot-check a few cells against the row-major host LDE.
         assert_eq!(handle.m, m);
         assert_eq!(handle.lde_size, n * blowup);
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod node_bytes_tests {
+    use super::nodes_in_place;
+
+    /// Gap fix I5's in-place reinterpretation yields exactly the nodes the
+    /// copying conversion builds, and a buffer whose capacity is not whole
+    /// nodes takes the copy instead.
+    #[test]
+    fn nodes_in_place_equals_the_copy() {
+        let bytes: Vec<u8> = (0..32 * 1000).map(|i| (i * 7 + 3) as u8).collect();
+        let copied: Vec<[u8; 32]> = bytes
+            .chunks_exact(32)
+            .map(|c| c.try_into().expect("a 32-byte chunk"))
+            .collect();
+        assert_eq!(nodes_in_place(bytes.clone()), copied);
+
+        let mut odd: Vec<u8> = Vec::with_capacity(32 * 10 + 5);
+        odd.extend_from_slice(&bytes[..320]);
+        assert_eq!(nodes_in_place(odd), copied[..10].to_vec());
     }
 }

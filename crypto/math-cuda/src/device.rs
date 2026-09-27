@@ -40,7 +40,7 @@ unsafe impl Send for PinnedStaging {}
 unsafe impl Sync for PinnedStaging {}
 
 impl PinnedStaging {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             capacity_elems: 0,

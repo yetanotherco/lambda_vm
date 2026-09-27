@@ -6804,6 +6804,24 @@ fn the_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+    precomputed_download_line();
+}
+
+/// Gap fix I5's mechanism, printed on both arms: the precomputed subset trees
+/// this process downloaded to the host, and the time from each tree's build
+/// being queued to its host copy being ready.
+fn precomputed_download_line() {
+    let (trees, bytes, secs) = math_cuda::lde::precomputed_tree_downloads();
+    println!(
+        "   PRECOMPUTED TREE DOWNLOADS (whole run): {trees} trees · {:.2} GiB · {secs:.2}s \
+         from build queued to host copy ready ({})",
+        bytes as f64 / (1u64 << 30) as f64,
+        if math_cuda::gap::i5_pinned_tree_download() {
+            "pinned slab, gap fix I5"
+        } else {
+            "pageable copy"
+        },
+    );
 }
 
 // ========================= the WHIR production tree ========================
@@ -8511,6 +8529,7 @@ fn the_whir_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+    precomputed_download_line();
 
     // ⛔ THE FALLBACK COUNTS, WHOLE-RUN SCOPE, ALWAYS PRINTED — two DIFFERENT
     // device surfaces, each of which silently moves work to the host and leaves

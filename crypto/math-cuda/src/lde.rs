@@ -1547,6 +1547,92 @@ pub fn coset_lde_row_major_split_trees(
     )
 }
 
+/// How many pinned slabs precomputed-tree downloads spread over (gap fix I5):
+/// one per concurrently committing table at the record's `TABLE_PARALLELISM`.
+const TREE_DOWNLOAD_SLABS: usize = 4;
+
+/// A pinned slab for one precomputed-tree download (gap fix I5): the first one
+/// no other download holds, else the next in turn. Kept apart from the
+/// per-worker staging slabs, which every driver thread's trace upload shares,
+/// so a tree download neither waits on nor stalls an upload. Grow-only, like
+/// them: at most `TREE_DOWNLOAD_SLABS` × the largest tree, allocated once.
+fn tree_download_slab() -> &'static std::sync::Mutex<crate::device::PinnedStaging> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SLABS: OnceLock<Vec<Mutex<crate::device::PinnedStaging>>> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let slabs = SLABS.get_or_init(|| {
+        (0..TREE_DOWNLOAD_SLABS)
+            .map(|_| Mutex::new(crate::device::PinnedStaging::empty()))
+            .collect()
+    });
+    // A free slab if there is one: `try_lock` only probes, and the guard is
+    // dropped at once — `async_dtoh_via` takes the lock itself, and waits for
+    // it if another download won the race in between.
+    for slab in slabs {
+        if slab.try_lock().is_ok() {
+            return slab;
+        }
+    }
+    &slabs[NEXT.fetch_add(1, Ordering::Relaxed) % slabs.len()]
+}
+
+/// A fresh `Vec` holding `src`, copied by a few scoped threads.
+///
+/// ⛔ Not rayon: this runs under a pinned slab's lock, and a rayon worker that
+/// steals work while it holds one can self-deadlock (see
+/// `Backend::pinned_staging`). Nothing here takes a lock, so plain threads
+/// cannot.
+fn copy_out_parallel(src: &[u8]) -> Vec<u8> {
+    const THREADS: usize = 4;
+    const MIN_PER_THREAD: usize = 8 << 20;
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let chunk = src.len().div_ceil(THREADS).max(MIN_PER_THREAD);
+    {
+        let dst = &mut out.spare_capacity_mut()[..src.len()];
+        std::thread::scope(|scope| {
+            for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                scope.spawn(move || {
+                    // SAFETY: `MaybeUninit<u8>` has `u8`'s layout, and the two
+                    // chunks have equal lengths and do not overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr().cast(), s.len())
+                    };
+                });
+            }
+        });
+    }
+    // SAFETY: every byte of `0..src.len()` was written above.
+    unsafe { out.set_len(src.len()) };
+    out
+}
+
+static PRECOMPUTED_DOWNLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRECOMPUTED_DOWNLOAD_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PRECOMPUTED_DOWNLOAD_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_precomputed_download(bytes: usize, took: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PRECOMPUTED_DOWNLOADS.fetch_add(1, Relaxed);
+    PRECOMPUTED_DOWNLOAD_BYTES.fetch_add(bytes as u64, Relaxed);
+    PRECOMPUTED_DOWNLOAD_NANOS.fetch_add(took.as_nanos() as u64, Relaxed);
+}
+
+/// Precomputed subset trees downloaded to the host over the life of the
+/// process: `(trees, bytes, seconds)`. The seconds run from the tree's build
+/// being queued to its host copy being ready, on both download paths, so the
+/// two arms of gap fix I5 read on one boundary.
+pub fn precomputed_tree_downloads() -> (u64, u64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PRECOMPUTED_DOWNLOADS.load(Relaxed),
+        PRECOMPUTED_DOWNLOAD_BYTES.load(Relaxed),
+        PRECOMPUTED_DOWNLOAD_NANOS.load(Relaxed) as f64 / 1e9,
+    )
+}
+
 /// [`coset_lde_row_major_split_trees`] with `rows_per_leaf` rows per Merkle
 /// leaf in BOTH subset trees (a table has one leaf layout): 2 = row pair,
 /// 1 = S2 one row.
@@ -1620,23 +1706,48 @@ pub fn coset_lde_row_major_split_trees_rpl(
 
     // Precomputed subset tree: full nodes to host (feeds the process-wide
     // host tree cache keyed by root; built once per prove on cache miss).
-    let precomputed_nodes = if build_precomputed {
+    //
+    // Gap fix I5: under the knob the download is a DMA into a pinned slab,
+    // enqueued here and copied out below while the multiplicity tree builds,
+    // instead of a synchronous copy into pageable memory.
+    let download_t0 = build_precomputed.then(std::time::Instant::now);
+    let mut precomputed_nodes = None;
+    let mut pending_pre = None;
+    if build_precomputed {
         let nodes_dev = build_subset_tree_dev(0, split_col as u64)?;
-        let mut nodes_host = vec![0u8; nodes_bytes];
-        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
-        Some(nodes_host)
-    } else {
-        None
-    };
+        if crate::gap::i5_pinned_tree_download() {
+            let pending = crate::device::async_dtoh_via(
+                &stream,
+                tree_download_slab(),
+                &be.ctx,
+                &nodes_dev,
+                nodes_bytes,
+            )?;
+            pending_pre = Some((pending, nodes_dev));
+        } else {
+            let mut nodes_host = vec![0u8; nodes_bytes];
+            stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
+            precomputed_nodes = Some(nodes_host);
+        }
+    }
     // Multiplicity subset tree: resident (per-epoch; the ~2x-leaves node
     // download and host rebuild it used to pay are dropped — R4 openings
     // gather paths on device).
+    let mult_nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
+    if let Some((pending, nodes_dev)) = pending_pre {
+        // The multiplicity tree is queued behind the D2H, so this copy-out
+        // runs while its kernels do. `nodes_dev` lives until the DMA landed.
+        precomputed_nodes = Some(pending.wait_and_read(copy_out_parallel)?);
+        drop(nodes_dev);
+    }
+    if let Some(t0) = download_t0 {
+        note_precomputed_download(nodes_bytes, t0.elapsed());
+    }
     let mult_tree = {
-        let nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
         let mut root = [0u8; 32];
-        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        stream.memcpy_dtoh(&mult_nodes_dev.slice(0..32), &mut root)?;
         GpuMerkleTree {
-            nodes: Arc::new(nodes_dev),
+            nodes: Arc::new(mult_nodes_dev),
             leaves_len: num_leaves,
             root,
         }
@@ -3184,4 +3295,21 @@ fn run_batched_ntt_body(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tree_download_tests {
+    use super::copy_out_parallel;
+
+    /// Gap fix I5's copy-out is a plain copy at every size: below one thread's
+    /// share, across uneven chunk boundaries, and empty.
+    #[test]
+    fn copy_out_parallel_copies_every_byte() {
+        for len in [0usize, 1, 31, 4096, (8 << 20) + 7, (33 << 20) + 13] {
+            let src: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(131) ^ (i >> 9)) as u8)
+                .collect();
+            assert_eq!(copy_out_parallel(&src), src, "len {len}");
+        }
+    }
 }
