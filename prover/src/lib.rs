@@ -16,6 +16,7 @@ pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+pub mod gap_proto;
 pub mod hash_pin;
 #[cfg(feature = "instruments")]
 pub mod instruments;

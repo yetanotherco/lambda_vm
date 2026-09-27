@@ -43,7 +43,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ChainConfig, GrindBits};
+use multilinear::whir_chain::ChainConfig;
 use stark::multilinear_air::Uniforms;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -91,8 +91,16 @@ pub struct MultilinearVmProof {
 /// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
 /// (`whir_cap=auto`, `whir_folds=first6`); both knobs at their off spellings
 /// give the legacy config.
+///
+/// The PROTO lane's measurement-only base-parameter variants
+/// ([`GapProto`](crate::gap_proto::GapProto), `LAMBDA_VM_GAP_P1_WHIR`,
+/// `_P2_WHIR`) are read here too; unset, they are today's config.
 pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
-    chain_config_under(crate::zf_format::ZfFormat::global(), shapes)
+    chain_config_with(
+        crate::zf_format::ZfFormat::global(),
+        crate::gap_proto::GapProto::global(),
+        shapes,
+    )
 }
 
 /// [`chain_config`] under an explicit format, so a test can build a knob-on
@@ -102,18 +110,30 @@ pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
 /// (`with_security_folds`): the schedule is part of the security accounting,
 /// not a label stamped on afterwards.
 pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> ChainConfig {
+    chain_config_with(format, &crate::gap_proto::GapProto::OFF, shapes)
+}
+
+/// [`chain_config_under`] with the PROTO lane's variants: the rate and the
+/// proof of work come from `proto`, and the query count is re-derived from
+/// them by the same rule. [`GapProto::OFF`](crate::gap_proto::GapProto::OFF)
+/// is today's config.
+pub fn chain_config_with(
+    format: &crate::zf_format::ZfFormat,
+    proto: &crate::gap_proto::GapProto,
+    shapes: &[Shape],
+) -> ChainConfig {
     let tallest = shapes
         .iter()
         .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
         .max()
         .unwrap_or(1);
     let config = ChainConfig::with_security_folds(
-        2,
+        proto.whir_log_blowup(),
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
         format.whir_folds,
         tallest,
         128,
-        GrindBits::uniform(20),
+        proto.whir_grind(),
     );
     format.chain(config)
 }

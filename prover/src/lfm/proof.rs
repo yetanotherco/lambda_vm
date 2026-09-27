@@ -609,6 +609,14 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 /// Not [`crate::recursion::Preset::options`] itself: that value also fixes
 /// the RV64 recursion guest's verifier, which stays on the LEGACY format
 /// (its presets name it).
+///
+/// The preset is [`GapProto::stark_base_preset`](crate::gap_proto::GapProto::stark_base_preset):
+/// blowup 4 unless the PROTO lane's measurement-only `LAMBDA_VM_GAP_P1_STARK`
+/// is set.
 pub fn block_base_options() -> ProofOptions {
-    crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
+    crate::zf_format::ZfFormat::global().options(
+        crate::gap_proto::GapProto::global()
+            .stark_base_preset()
+            .options(),
+    )
 }
