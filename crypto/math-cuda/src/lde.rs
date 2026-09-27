@@ -14,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys;
 use cudarc::driver::{
-    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, LaunchConfig, PushKernelArg,
+    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 
 use crate::DeviceHash;
@@ -1025,6 +1026,211 @@ fn expand_row_major_on_stream(
     Ok((buf, trace_col_major))
 }
 
+/// The GAP K1 form of [`expand_row_major_on_stream`] (see [`crate::lde_cm`]):
+/// the same LDE, produced COLUMN-major (column `c` at `c · lde_size`) — the
+/// layout every downstream kernel reads — so there is no row-major LDE to
+/// transpose afterwards, and no zero fill.
+///
+/// The trace still arrives row-major. A host trace is staged at the TAIL of
+/// the LDE buffer. The column-major trace-domain source the engine reads is
+/// then either the snapshot, when the caller retains one (the engine only
+/// reads its source), or the buffer's HEAD (column `c` at `c · n`), which the
+/// engine walks in descending chunks so no chunk overwrites a column it has
+/// not read yet (`ChunkOrder::Descending`). Head and tail are disjoint because
+/// the blowup is at least 2 (`lde_cm::supports`).
+#[allow(clippy::too_many_arguments)]
+fn expand_col_major_on_stream(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    input: InnerInput,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_trace_col_major: bool,
+) -> Result<(CudaSlice<u64>, Option<CudaSlice<u64>>)> {
+    use crate::lde_cm::{ChunkOrder, Cols, Input, lde_columns};
+    debug_assert!(crate::lde_cm::supports(n, blowup_factor));
+    let lde_size = n * blowup_factor;
+    let total = lde_size * total_cols;
+    let trace = n * total_cols;
+    let tail = total - trace;
+    // SAFETY: every element is written before it is read — the staging and the
+    // head source by the upload and the transpose, the LDE columns by each
+    // column's forward transform, which stores all `lde_size` rows.
+    let mut buf = unsafe { stream.alloc::<u64>(total) }?;
+    let buf_ptr = buf.device_ptr(stream).0;
+    const PINNED_H2D_MIN_U64: usize = 1 << 20;
+    if let InnerInput::Host(h) = input {
+        let mut staged = buf.slice_mut(tail..total);
+        if h.len() >= PINNED_H2D_MIN_U64 {
+            crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut staged)?;
+        } else {
+            stream.memcpy_htod(h, &mut staged)?;
+        }
+    }
+
+    let (snapshot, src, order) = {
+        let (mut head, staged) = buf.split_at_mut(tail);
+        let row_major = match input {
+            InnerInput::Host(_) => staged.slice(0..trace),
+            InnerInput::Dev(d) => d.slice(0..trace),
+        };
+        if retain_trace_col_major {
+            // SAFETY: the transpose writes all `n × total_cols` elements.
+            let mut snap = unsafe { stream.alloc::<u64>(trace) }?;
+            launch_transpose_tiles(
+                stream,
+                be,
+                &row_major,
+                &mut snap.slice_mut(..),
+                n,
+                total_cols,
+                n as u64,
+            )?;
+            let ptr = snap.device_ptr(stream).0;
+            let src = Cols {
+                ptr,
+                stride: n as u64,
+            };
+            (Some(snap), src, ChunkOrder::Ascending)
+        } else {
+            launch_transpose_tiles(
+                stream,
+                be,
+                &row_major,
+                &mut head.slice_mut(0..trace),
+                n,
+                total_cols,
+                n as u64,
+            )?;
+            let src = Cols {
+                ptr: buf_ptr,
+                stride: n as u64,
+            };
+            (None, src, ChunkOrder::Descending)
+        }
+    };
+    lde_columns(
+        stream,
+        be,
+        src,
+        buf_ptr,
+        total_cols,
+        n,
+        blowup_factor,
+        weights,
+        Input::Evals,
+        order,
+    )?;
+    Ok((buf, snapshot))
+}
+
+/// Leaves of the column range `[col_start, col_end)` of a column-major LDE
+/// (`lde_size` rows per column) into the leaf slab of `nodes_dev`.
+#[allow(clippy::too_many_arguments)]
+fn col_major_leaves_into_tree(
+    hash: DeviceHash,
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    lde_size: usize,
+    col_start: usize,
+    col_end: usize,
+    rows_per_leaf: usize,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_offset: usize,
+) -> Result<()> {
+    let cols = buf.device_ptr(stream).0 + (col_start * lde_size * 8) as u64;
+    let leaves = nodes_dev.device_ptr(stream).0 + leaves_offset as u64;
+    crate::lde_cm::launch_col_major_leaves(
+        hash,
+        stream,
+        be,
+        cols,
+        lde_size as u64,
+        (col_end - col_start) as u64,
+        lde_size as u64,
+        rows_per_leaf,
+        leaves,
+    )
+}
+
+/// The GAP K1 form of [`coset_lde_row_major_inner`]: the same tree and the
+/// same column-major handle, with the LDE built column-major
+/// ([`expand_col_major_on_stream`]) and its leaves hashed from that layout by
+/// the column-major twins of the row-major leaf kernels. Returns
+/// `(tree, column-major LDE, optional snapshot, ready)`; the host LDE copy is
+/// never produced here (the callers route `retain_host_lde` to the legacy
+/// path, whose host copy is row-major).
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn coset_lde_row_major_inner_k1(
+    input: InnerInput,
+    hash: DeviceHash,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_trace_col_major: bool,
+    rows_per_leaf: usize,
+) -> Result<(
+    GpuMerkleTree,
+    CudaSlice<u64>,
+    Option<CudaSlice<u64>>,
+    Arc<crate::device::PooledEvent>,
+)> {
+    let lde_size = n * blowup_factor;
+    let num_leaves = lde_size / rows_per_leaf;
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let (buf, trace_col_major) = expand_col_major_on_stream(
+        &stream,
+        be,
+        input,
+        n,
+        total_cols,
+        blowup_factor,
+        weights,
+        retain_trace_col_major,
+    )?;
+
+    // SAFETY: the leaf kernel fills the leaf slab, the inner levels the rest.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+    col_major_leaves_into_tree(
+        hash,
+        &stream,
+        be,
+        &buf,
+        lde_size,
+        0,
+        total_cols,
+        rows_per_leaf,
+        &mut nodes_dev,
+        leaves_offset,
+    )?;
+    build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+    let tree = GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    };
+    Ok((tree, buf, trace_col_major, Arc::new(ready)))
+}
+
+/// Whether a row-major commit takes the GAP K1 form: the knob is on, the shape
+/// fits the engine, and the caller wants no host copy of the row-major LDE.
+fn row_major_commit_takes_k1(n: usize, blowup_factor: usize, retain_host_lde: bool) -> bool {
+    !retain_host_lde && crate::lde_cm::k1_enabled() && crate::lde_cm::supports(n, blowup_factor)
+}
+
 /// Shared row-major LDE + leaf-hash + Merkle pipeline for the base and ext3
 /// paths, committing with the kernel family `hash` selects.
 ///
@@ -1287,6 +1493,19 @@ fn coset_lde_row_major_inner(
         rows_per_leaf == 1 || rows_per_leaf == 2,
         "rows_per_leaf must be 1 or 2"
     );
+    if row_major_commit_takes_k1(n, blowup_factor, retain_host_lde) {
+        let (tree, col_major_dev, trace_col_major, ready) = coset_lde_row_major_inner_k1(
+            input,
+            hash,
+            n,
+            total_cols,
+            blowup_factor,
+            weights,
+            retain_trace_col_major,
+            rows_per_leaf,
+        )?;
+        return Ok((tree, col_major_dev, Vec::new(), trace_col_major, ready));
+    }
     let num_leaves = lde_size / rows_per_leaf;
     let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
     let lde_u64 = lde_size as u64;
@@ -1592,6 +1811,21 @@ pub fn coset_lde_row_major_split_trees_rpl(
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
     };
+    if row_major_commit_takes_k1(n, blowup_factor, retain_host_lde) {
+        return coset_lde_row_major_split_trees_k1(
+            &stream,
+            be,
+            input,
+            hash,
+            n,
+            m,
+            blowup_factor,
+            weights,
+            split_col,
+            build_precomputed,
+            rows_per_leaf,
+        );
+    }
     let (buf, trace_col_major) =
         expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
 
@@ -1675,6 +1909,86 @@ pub fn coset_lde_row_major_split_trees_rpl(
         trace_rows: n,
     };
     Ok((precomputed_nodes, handle, lde_out))
+}
+
+/// The GAP K1 form of [`coset_lde_row_major_split_trees_rpl`]: the LDE built
+/// column-major ([`expand_col_major_on_stream`], snapshot retained), each
+/// subset tree hashed from its contiguous run of columns. Same trees, same
+/// handle, no transpose; the host LDE copy is never produced here.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn coset_lde_row_major_split_trees_k1(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    input: InnerInput,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    split_col: usize,
+    build_precomputed: bool,
+    rows_per_leaf: usize,
+) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+    let lde_size = n * blowup_factor;
+    let num_leaves = lde_size / rows_per_leaf;
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let (buf, trace_col_major) =
+        expand_col_major_on_stream(stream, be, input, n, m, blowup_factor, weights, true)?;
+
+    let build_subset_tree_dev = |col_start: usize, col_end: usize| -> Result<CudaSlice<u8>> {
+        // SAFETY: the leaf kernel fills the leaf slab, the inner levels the rest.
+        let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+        col_major_leaves_into_tree(
+            hash,
+            stream,
+            be,
+            &buf,
+            lde_size,
+            col_start,
+            col_end,
+            rows_per_leaf,
+            &mut nodes_dev,
+            leaves_offset,
+        )?;
+        build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        Ok(nodes_dev)
+    };
+
+    // As the legacy path: the precomputed tree's nodes go to host (the
+    // process-wide tree cache), the multiplicity tree stays resident.
+    let precomputed_nodes = if build_precomputed {
+        let nodes_dev = build_subset_tree_dev(0, split_col)?;
+        let mut nodes_host = vec![0u8; nodes_bytes];
+        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
+        Some(nodes_host)
+    } else {
+        None
+    };
+    let mult_tree = {
+        let nodes_dev = build_subset_tree_dev(split_col, m)?;
+        let mut root = [0u8; 32];
+        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        GpuMerkleTree {
+            nodes: Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        }
+    };
+    let ready = be.take_event()?;
+    ready.event().record(stream)?;
+
+    let handle = GpuLdeBase {
+        buf: Arc::new(buf),
+        m,
+        lde_size,
+        tree: Some(mult_tree),
+        ready: Some(Arc::new(ready)),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((precomputed_nodes, handle, Vec::new()))
 }
 
 /// Row-major ext3 LDE + leaf hashing + Merkle, all on-device.
@@ -1986,8 +2300,6 @@ pub fn coset_lde_batch_base(
     }
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, "coset_lde_batch_base lde_size");
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -2009,9 +2321,16 @@ pub fn coset_lde_batch_base(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
-    // tail of each column is already the zero-pad the CPU path does.
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Column layout: `buf[c * lde_size + r]`. Zeroed for the legacy
+    // transform, so the [n, lde_size) tail of each column is already the
+    // zero-pad the CPU path does; the K1 engine reads only the first n.
+    let k1 = slabs_take_k1(n, blowup_factor);
+    let mut buf = if k1 {
+        // SAFETY: the upload writes each slab's first n, the LDE the rest.
+        unsafe { stream.alloc::<u64>(m * lde_size) }?
+    } else {
+        stream.alloc_zeros::<u64>(m * lde_size)?
+    };
     // Any `?` between the first upload below and `sync_event` would release
     // the slot with async H2D reads of the slab still in flight; this guard
     // (declared after `staging`, so it drops first) drains the stream on
@@ -2031,68 +2350,16 @@ pub fn coset_lde_batch_base(
     // point. It is waited just before the D2H drain re-acquires the slot.
     staging.record_event(&stream)?;
 
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // === 1. Bit-reverse first N of every column ===
-    launch_bit_reverse_batched(
-        stream.as_ref(),
+    lde_in_slabs(
+        &stream,
         be,
         &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 2. iNTT body over all columns ===
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 3. Pointwise multiply by coset weights (includes 1/N) ===
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 4. Bit-reverse full LDE of every column ===
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 5. Forward NTT on full LDE of every column ===
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
+        m,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Evals,
+        k1,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -2171,8 +2438,6 @@ pub fn coset_lde_batch_base_into(
         assert_eq!(o.len(), lde_size, "each output must be lde_size");
     }
     assert_u32_domain(lde_size, "coset_lde_batch_base_into lde_size");
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -2186,7 +2451,15 @@ pub fn coset_lde_batch_base_into(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
+    // each slab as the zero padding; the K1 engine reads only the first n.
+    let k1 = slabs_take_k1(n, blowup_factor);
+    let mut buf = if k1 {
+        // SAFETY: the upload writes each slab's first n, the LDE the rest.
+        unsafe { stream.alloc::<u64>(m * lde_size) }?
+    } else {
+        stream.alloc_zeros::<u64>(m * lde_size)?
+    };
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
@@ -2195,60 +2468,16 @@ pub fn coset_lde_batch_base_into(
     // slot stays locked until this event fires (waited before the drain).
     staging.record_event(&stream)?;
 
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // iNTT bit-reverse + body, pointwise mul, forward bit-reverse + body.
-    launch_bit_reverse_batched(
-        stream.as_ref(),
+    lde_in_slabs(
+        &stream,
         be,
         &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
+        m,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Evals,
+        k1,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -2349,8 +2578,6 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let num_leaves = lde_size / rows_per_leaf;
     let nodes_dev_bytes = commit.total_nodes_bytes(num_leaves);
     assert_eq!(nodes_out.len(), nodes_dev_bytes);
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -2366,7 +2593,15 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
+    // each slab as the zero padding; the K1 engine reads only the first n.
+    let k1 = slabs_take_k1(n, blowup_factor);
+    let mut buf = if k1 {
+        // SAFETY: the upload writes each slab's first n, the LDE the rest.
+        unsafe { stream.alloc::<u64>(m * lde_size) }?
+    } else {
+        stream.alloc_zeros::<u64>(m * lde_size)?
+    };
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
@@ -2375,62 +2610,20 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     // slot stays locked until this event fires (waited before the drain).
     staging.record_event(&stream)?;
 
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
+    lde_in_slabs(
+        &stream,
+        be,
+        &mut buf,
+        m,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Evals,
+        k1,
+    )?;
 
-    let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // iNTT
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-    // forward NTT at LDE size
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
 
     // Allocate the device output buffer. In `LeavesOnly` mode this is just
     // `num_leaves * 32` bytes (the leaves themselves); in `FullTree` mode it's
@@ -2651,7 +2844,15 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 
     pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
+    // each slab as the zero padding; the K1 engine reads only the first n.
+    let k1 = slabs_take_k1(n, blowup_factor);
+    let mut buf = if k1 {
+        // SAFETY: the upload writes each slab's first n, the LDE the rest.
+        unsafe { stream.alloc::<u64>(mb * lde_size) }?
+    } else {
+        stream.alloc_zeros::<u64>(mb * lde_size)?
+    };
     for s in 0..mb {
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
         stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
@@ -2660,44 +2861,20 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     // slot stays locked until this event fires (waited before the drain).
     staging.record_event(&stream)?;
 
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
+    lde_in_slabs(
+        &stream,
+        be,
+        &mut buf,
+        mb,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Coeffs,
+        k1,
+    )?;
 
-    let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-
-    // Bit-reverse full lde_size slab, then forward DIT NTT.
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
 
     // Optional R2-style row-pair Merkle tree build on the LDE buffer, queued
     // ahead of the drains below.
@@ -2875,8 +3052,6 @@ pub fn coset_lde_batch_ext3_into(
         assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
     }
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_into lde_size");
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
 
     // 3 base slabs per ext3 column; slab index `c*3 + k` holds component `k`.
     let mb = 3 * m;
@@ -2891,8 +3066,16 @@ pub fn coset_lde_batch_ext3_into(
 
     pack_ext3_to_pinned_slabs(columns, pinned, n);
 
-    // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    // Device buffer holding 3M slabs of `lde_size`, zeroed for the legacy
+    // transform, which reads the [n, lde_size) tail of each slab as the zero
+    // padding; the K1 engine reads only the first n.
+    let k1 = slabs_take_k1(n, blowup_factor);
+    let mut buf = if k1 {
+        // SAFETY: the upload writes each slab's first n, the LDE the rest.
+        unsafe { stream.alloc::<u64>(mb * lde_size) }?
+    } else {
+        stream.alloc_zeros::<u64>(mb * lde_size)?
+    };
     // H2D: slab by slab into the first N slots of each `lde_size`-slab.
     for s in 0..mb {
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
@@ -2902,61 +3085,16 @@ pub fn coset_lde_batch_ext3_into(
     // slot stays locked until this event fires (waited before the drain).
     staging.record_event(&stream)?;
 
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    // === Butterflies: identical to the base-field batched path, but with
-    // grid.y = 3M instead of M. ===
-    launch_bit_reverse_batched(
-        stream.as_ref(),
+    lde_in_slabs(
+        &stream,
         be,
         &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
+        mb,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Evals,
+        k1,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -3015,63 +3153,19 @@ pub fn coset_lde_batch_ext3_slabs_keep(
         }
     }
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
 
     let be = backend()?;
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    launch_bit_reverse_batched(
-        stream.as_ref(),
+    let k1 = slabs_take_k1(n, blowup_factor);
+    lde_in_slabs(
+        stream,
         be,
         &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
+        mb,
+        n,
+        blowup_factor,
+        weights,
+        SlabInput::Evals,
+        k1,
     )?;
 
     let ready = match outputs {
@@ -3107,6 +3201,124 @@ pub fn coset_lde_batch_ext3_slabs_keep(
         tree: None,
         ready,
     })
+}
+
+/// What the first `n` elements of each slab hold before [`lde_in_slabs`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlabInput {
+    /// Trace-domain evaluations; `weights[i] = g^i / n`.
+    Evals,
+    /// Coefficients; `weights[k] = g^k` (no iNTT, so no `1/n`).
+    Coeffs,
+}
+
+/// Whether the batched column-major entry points take the GAP K1 engine for
+/// an `n`-row, blowup-`blowup` LDE. Decided once per call, before the buffer
+/// is allocated: under K1 nothing reads the zero padding, so the call skips
+/// the zero fill.
+fn slabs_take_k1(n: usize, blowup: usize) -> bool {
+    crate::lde_cm::k1_enabled() && crate::lde_cm::supports(n, blowup)
+}
+
+/// The transform every batched column-major entry point runs: `slabs` slabs of
+/// `n · blowup` in `buf`, the first `n` of each holding values or
+/// coefficients (`input`); afterwards every slab holds its coset LDE. `k1`
+/// picks the column-major engine ([`crate::lde_cm`], which reads nothing
+/// beyond each slab's first `n`) or the legacy per-level batched kernels,
+/// which need the slabs' tails zeroed.
+#[allow(clippy::too_many_arguments)]
+fn lde_in_slabs(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    slabs: usize,
+    n: usize,
+    blowup: usize,
+    weights: &[u64],
+    input: SlabInput,
+    k1: bool,
+) -> Result<()> {
+    let lde_size = n * blowup;
+    if k1 {
+        let ptr = buf.device_ptr(stream).0;
+        // Each slab's source is its own first `n`: a chunk copies or
+        // transforms it into the engine's scratch before it writes the slab,
+        // and no chunk writes another chunk's slabs, so any order is safe.
+        return crate::lde_cm::lde_columns(
+            stream,
+            be,
+            crate::lde_cm::Cols {
+                ptr,
+                stride: lde_size as u64,
+            },
+            ptr,
+            slabs,
+            n,
+            blowup,
+            weights,
+            match input {
+                SlabInput::Evals => crate::lde_cm::Input::Evals,
+                SlabInput::Coeffs => crate::lde_cm::Input::Coeffs,
+            },
+            crate::lde_cm::ChunkOrder::Ascending,
+        );
+    }
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let slabs_u32 = slabs as u32;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+    if input == SlabInput::Evals {
+        let inv_tw = be.inv_twiddles_for(log_n)?;
+        launch_bit_reverse_batched(
+            stream.as_ref(),
+            be,
+            buf,
+            n_u64,
+            log_n,
+            col_stride_u64,
+            slabs_u32,
+        )?;
+        run_batched_ntt_body(
+            stream.as_ref(),
+            buf,
+            inv_tw.as_ref(),
+            n_u64,
+            log_n,
+            col_stride_u64,
+            slabs_u32,
+        )?;
+    }
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        slabs_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        slabs_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        slabs_u32,
+    )
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched
@@ -3184,4 +3396,224 @@ fn run_batched_ntt_body(
         }
     }
     Ok(())
+}
+
+/// GAP K1 microbenchmark: the row-major commit's stages under the legacy
+/// engine and under the column-major one, on one `n × m` matrix already
+/// resident on the device, with a host synchronize after each stage — the
+/// same stages and shapes as the W3/K0 same-input comparison with ZisK
+/// (`thoughts/zf/gap/W3-KERNELS.md`). Measurement only; nothing on a proving
+/// path calls it.
+#[doc(hidden)]
+pub mod k1_bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// Stage times of one commit, and its root's first eight bytes (the two
+    /// engines must agree on it).
+    #[derive(Debug, Clone, Copy)]
+    pub struct StageTimes {
+        /// Everything before the leaves: staging, snapshot, the LDE — the
+        /// production expansion of the engine under test.
+        pub expand_ms: f64,
+        /// K1 only, timed after the root is read by re-running the expansion
+        /// in two timed halves: `stage_ms` puts the column-major trace where
+        /// the engine reads it (0 when the snapshot is retained: it is the
+        /// source), `lde_ms` is the engine alone, column-major source to
+        /// column-major LDE — the like-for-like with ZisK's `LDE(dst, src)`.
+        pub stage_ms: f64,
+        pub lde_ms: f64,
+        pub leaves_ms: f64,
+        pub inner_ms: f64,
+        /// Legacy only: the in-place transpose to column-major; 0 for K1.
+        pub transpose_ms: f64,
+        pub root0: u64,
+    }
+
+    /// Upload a deterministic `n × m` row-major matrix once.
+    pub fn upload(n: usize, m: usize) -> Result<CudaSlice<u64>> {
+        let be = backend()?;
+        let stream = be.next_stream();
+        let host: Vec<u64> = (0..n * m)
+            .map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001)
+            .collect();
+        let d = stream.clone_htod(&host)?;
+        stream.synchronize()?;
+        Ok(d)
+    }
+
+    fn weights(n: usize) -> Vec<u64> {
+        (0..n as u64).map(|i| i.wrapping_mul(7) + 1).collect()
+    }
+
+    fn ms(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
+    /// One commit of the device-resident `input` (`n × m`, row-major) at
+    /// `blowup`, `rows_per_leaf` rows per leaf, under the engine `k1` picks.
+    /// `snapshot` retains the trace-domain snapshot as the main commits do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        input: &CudaSlice<u64>,
+        hash: DeviceHash,
+        n: usize,
+        m: usize,
+        blowup: usize,
+        rows_per_leaf: usize,
+        snapshot: bool,
+        k1: bool,
+    ) -> Result<StageTimes> {
+        let be = backend()?;
+        let stream = be.next_stream();
+        let w = weights(n);
+        let lde_size = n * blowup;
+        let num_leaves = lde_size / rows_per_leaf;
+        let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
+        let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+
+        stream.synchronize()?;
+        let t0 = Instant::now();
+        let (mut buf, snap) = if k1 {
+            expand_col_major_on_stream(
+                &stream,
+                be,
+                InnerInput::Dev(input),
+                n,
+                m,
+                blowup,
+                &w,
+                snapshot,
+            )?
+        } else {
+            expand_row_major_on_stream(
+                &stream,
+                be,
+                InnerInput::Dev(input),
+                n,
+                m,
+                blowup,
+                &w,
+                snapshot,
+            )?
+        };
+        stream.synchronize()?;
+        let expand_ms = ms(t0);
+
+        let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+        stream.synchronize()?;
+        let t1 = Instant::now();
+        if k1 {
+            col_major_leaves_into_tree(
+                hash,
+                &stream,
+                be,
+                &buf,
+                lde_size,
+                0,
+                m,
+                rows_per_leaf,
+                &mut nodes_dev,
+                leaves_offset,
+            )?;
+        } else {
+            let mut leaves_view =
+                nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+            launch_row_major_leaves(
+                hash,
+                stream.as_ref(),
+                be,
+                &buf,
+                m as u64,
+                0,
+                m as u64,
+                lde_size as u64,
+                rows_per_leaf,
+                &mut leaves_view,
+            )?;
+        }
+        stream.synchronize()?;
+        let leaves_ms = ms(t1);
+
+        let t2 = Instant::now();
+        build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        stream.synchronize()?;
+        let inner_ms = ms(t2);
+        let mut root = [0u8; 32];
+        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        drop(nodes_dev);
+
+        let (mut stage_ms, mut lde_ms, mut transpose_ms) = (0.0, 0.0, 0.0);
+        if k1 {
+            // The root is read; the LDE is recomputed in place, in two timed
+            // halves, from the same kind of source the expansion used.
+            let buf_ptr = buf.device_ptr(&stream).0;
+            let (src, order) = match &snap {
+                Some(s) => (
+                    crate::lde_cm::Cols {
+                        ptr: s.device_ptr(&stream).0,
+                        stride: n as u64,
+                    },
+                    crate::lde_cm::ChunkOrder::Ascending,
+                ),
+                None => {
+                    stream.synchronize()?;
+                    let t = Instant::now();
+                    launch_transpose_tiles(
+                        &stream,
+                        be,
+                        &input.slice(0..n * m),
+                        &mut buf.slice_mut(0..n * m),
+                        n,
+                        m,
+                        n as u64,
+                    )?;
+                    stream.synchronize()?;
+                    stage_ms = ms(t);
+                    (
+                        crate::lde_cm::Cols {
+                            ptr: buf_ptr,
+                            stride: n as u64,
+                        },
+                        crate::lde_cm::ChunkOrder::Descending,
+                    )
+                }
+            };
+            stream.synchronize()?;
+            let t = Instant::now();
+            crate::lde_cm::lde_columns(
+                &stream,
+                be,
+                src,
+                buf_ptr,
+                m,
+                n,
+                blowup,
+                &w,
+                crate::lde_cm::Input::Evals,
+                order,
+            )?;
+            stream.synchronize()?;
+            lde_ms = ms(t);
+            drop(buf);
+        } else {
+            stream.synchronize()?;
+            let t3 = Instant::now();
+            let cm = transpose_lde_in_place(&stream, be, buf, lde_size, m)?;
+            stream.synchronize()?;
+            drop(cm);
+            transpose_ms = ms(t3);
+        }
+        drop(snap);
+        stream.synchronize()?;
+        Ok(StageTimes {
+            expand_ms,
+            stage_ms,
+            lde_ms,
+            leaves_ms,
+            inner_ms,
+            transpose_ms,
+            root0: u64::from_le_bytes(root[..8].try_into().unwrap()),
+        })
+    }
 }
