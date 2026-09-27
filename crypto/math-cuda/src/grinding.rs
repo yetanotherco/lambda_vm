@@ -341,9 +341,9 @@ pub fn generate_nonce_gpu_at(
 /// algebraic digest's own output, which `digest_to_commitment` writes as four
 /// canonical big-endian `u64`s.
 pub fn generate_nonce_rpx_gpu(inner_felts: &[u64; 4], grinding_factor: u8) -> Option<u64> {
-    // ⚠ GAP K4 (temporary): the work-queue kernel on a card-filling grid.
-    // Same nonce — see `rpx_grind_search_queue`.
-    if crate::gap_hash::knobs().k4 {
+    // The work-queue kernel on a card-filling grid (the default,
+    // `rpx_paths::grind_queue`). Same nonce — see `rpx_grind_search_queue`.
+    if crate::rpx_paths::grind_queue() {
         return search_queue(
             inner_felts,
             grinding_factor,
@@ -356,11 +356,11 @@ pub fn generate_nonce_rpx_gpu(inner_felts: &[u64; 4], grinding_factor: u8) -> Op
     search(Arm::Rpx256, inner_felts, grinding_factor, knobs_in_effect())
 }
 
-/// ⚠ GAP K4: the RPX grind through the work-queue kernel, at the scan factor of
-/// `knobs` and a grid of `grid` blocks — the production arm passes
-/// [`queue_grid`]. Returns the same nonce as [`generate_nonce_rpx_gpu_at`]:
-/// the smallest valid nonce, a function of the inner hash and the factor
-/// alone. Exposed so a test can run both arms in one process.
+/// The RPX grind through the work-queue kernel, at the scan factor of `knobs`
+/// and a grid of `grid` blocks — the production arm passes [`queue_grid`].
+/// Returns the same nonce as [`generate_nonce_rpx_gpu_at`]: the smallest valid
+/// nonce, a function of the inner hash and the factor alone. Exposed so a test
+/// can run both arms in one process.
 pub fn generate_nonce_rpx_gpu_queue_at(
     inner_felts: &[u64; 4],
     grinding_factor: u8,
@@ -371,8 +371,8 @@ pub fn generate_nonce_rpx_gpu_queue_at(
 }
 
 /// ⛔ DIAGNOSTIC: [`generate_nonce_rpx_gpu_queue_at`] with the counted twin, so
-/// a bench reads the permutations the queue EXECUTED — the K4 mechanism — in the
-/// same slots as [`search_counted`].
+/// a bench reads the permutations the queue EXECUTED — what the queue saves — in
+/// the same slots as [`search_counted`].
 pub fn search_queue_counted(
     inner_felts: &[u64; 4],
     grinding_factor: u8,
@@ -382,9 +382,9 @@ pub fn search_queue_counted(
     search_queue(inner_felts, grinding_factor, knobs, grid, true)
 }
 
-/// ⚠ GAP K4: blocks of [`RPX_BLOCK_DIM`] the queue kernel keeps resident on
-/// this card — multiprocessors × the driver's occupancy for the kernel — so one
-/// launch fills the card exactly (the shipped grid of 1024 is 0.86 of it on a
+/// Blocks of [`RPX_BLOCK_DIM`] the queue kernel keeps resident on this card —
+/// multiprocessors × the driver's occupancy for the kernel — so one launch
+/// fills the card exactly (the stride kernel's grid of 1024 is 0.86 of it on a
 /// 5090). Printed once.
 ///
 /// ⚠ The occupancy query needs the context current on the CALLING thread.
@@ -417,18 +417,18 @@ pub fn queue_grid() -> Option<u32> {
     match read() {
         Ok((sms, per_sm)) => Some(*GRID.get_or_init(|| {
             let regs = be.rpx_grind_search_queue.num_regs().unwrap_or(0);
-            println!(
-                "★ GAP K4 GRIND: queue kernel, grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \
-                 ({regs} regs/thread), chunk 32 nonces per warp claim",
+            eprintln!(
+                "[gpu] RPX grind queue: grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \
+                 ({regs} regs/thread), 32 nonces per warp claim",
                 sms * per_sm
             );
             sms * per_sm
         })),
         Err(e) => {
             // eprintln for the reason the crypto dispatch gives for its own
-            // fallback line: it is the only sign the K4 arm left the device.
+            // fallback line: it is the only sign the queue grind left the device.
             eprintln!(
-                "[gpu] GAP K4: the queue grid could not be read ({e}); this RPX grind falls \
+                "[gpu] RPX grind queue: the grid could not be read ({e}); this grind falls \
                  back to the CPU search"
             );
             None

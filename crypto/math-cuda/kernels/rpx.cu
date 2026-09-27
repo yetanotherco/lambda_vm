@@ -78,11 +78,12 @@
 #define RPX_LAUNCH_BOUNDS(n)
 #endif
 
-// ★ GAP K5 — which field multiply the permutation runs, as a compile-time bit
-// set. 0 is the shipped arithmetic (`goldilocks::mul` for every product and
-// square), and every kernel in a cubin uses `RPX_PERMUTE_VARIANT`. build.rs
-// compiles this file as `rpx.cubin` at 0 and as `rpx_k5_v<V>.cubin` at each
-// candidate V; `LAMBDA_VM_GAP_K5=<V>` loads the latter. The bits:
+// ★ RPX_PERMUTE_VARIANT — which field multiply the permutation runs, as a
+// compile-time bit set. 0 is `goldilocks::mul` for every product and square,
+// and every kernel in a cubin uses `RPX_PERMUTE_VARIANT`. build.rs compiles this
+// file twice: `rpx_v0.cubin` at 0 and `rpx_v5.cubin` at 5 (limb multiply,
+// `square_n` unrolled), the default; `LAMBDA_VM_RPX_LIMB_PERMUTE=0` loads the
+// former (math-cuda `rpx_paths`). The bits:
 //   RPX_V_LIMB_MUL     products through `mul_limb` (32-bit limbs, carry chains);
 //   RPX_V_LIMB_SQR     squarings through `sqr_limb` (three limb products);
 //   RPX_V_UNROLL_SQN   `square_n` unrolled by four;
@@ -201,7 +202,7 @@ static OpCount g_ops = {0, 0, 0};
 #endif
 
 // ---------------------------------------------------------------------------
-// GAP K5: the 32-bit-limb multiply. The 128-bit product is built from four
+// The 32-bit-limb multiply. The 128-bit product is built from four
 // 32×32 partial products with the carries in the add chain, then folded to
 // `[0, 2^64)` in three steps (the reduction sppark's `gl64_t` ships, Apache-2.0,
 // which pil2-stark uses): `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`.
@@ -404,7 +405,7 @@ template <int V, int N>
 __device__ __forceinline__ uint64_t square_n_v(uint64_t x) {
     // Rolled: the chain is serial anyway, and unrolled it is what made one
     // permutation ~49k lines of PTX. The unroll factor here is a tuning knob
-    // (GAP K5's RPX_V_UNROLL_SQN).
+    // (RPX_V_UNROLL_SQN).
     if constexpr ((V & RPX_V_UNROLL_SQN) != 0) {
 #pragma unroll 4
         for (int i = 0; i < N; ++i) x = fsqr_v<V>(x);
@@ -441,7 +442,7 @@ __device__ __forceinline__ uint64_t inv_sbox_v(uint64_t x) {
     return fmul_v<V>(a, b);
 }
 
-// The shipped names, at this cubin's variant (the host KAT calls these).
+// The names every kernel calls, at this cubin's variant (the host KAT calls these).
 __device__ __forceinline__ uint64_t sbox(uint64_t x) { return sbox_v<RPX_PERMUTE_VARIANT>(x); }
 
 template <int N>
@@ -571,7 +572,7 @@ __device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS], int r) {
 // the call; the `-Xptxas -v` report and the unroll factors of `square_n` and
 // the lane loops are the tuning knobs, in that order.
 //
-// `permute_v<V>` is the permutation at GAP K5 variant V; every instantiation
+// `permute_v<V>` is the permutation at variant V; every instantiation
 // is its own called body. `permute` — what every kernel calls — is this
 // cubin's variant.
 template <int V>
@@ -1338,11 +1339,11 @@ extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
 #endif  // __CUDACC__
 
 // ===========================================================================
-// ★ GAP CAMPAIGN, HASH LANE — kernels behind LAMBDA_VM_GAP_K3 / K4 / K5.
-//
-// Nothing on a proving path launches these unless its knob is set; the probes
-// are for the parity tests and the benches. Every kernel here produces the
-// same bytes (nodes, nonces, digests) as the shipped kernel it stands in for.
+// ★ The half-warp Merkle kernels and the work-queue grind (the defaults, which
+// math-cuda `rpx_paths` switches back to `rpx_merkle_level`/`rpx_merkle_tail`
+// and `rpx_grind_search`), and the probes the parity tests and benches use.
+// Every kernel here produces the same bytes (nodes, nonces, digests) as the
+// kernel it stands in for.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -1351,7 +1352,7 @@ extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
 // a wrong step anywhere reaches the output. `rpx_limb_probe` returns the two
 // limb primitives and `goldilocks::mul` side by side on raw pairs, so the PTX
 // is checked against 128-bit arithmetic on the device itself. V is a template
-// argument, so probe v0 is the shipped arithmetic in every cubin.
+// argument, so probe v0 is the 64-bit multiply in every cubin.
 // ---------------------------------------------------------------------------
 template <int V>
 __device__ __forceinline__ void permute_chain_probe(const uint64_t *states, uint64_t n,
@@ -1390,7 +1391,7 @@ extern "C" __global__ void rpx_limb_probe(const uint64_t *a, const uint64_t *b, 
 }
 
 // The poll of a word other threads update with atomics: a volatile load on the
-// device (the shipped grind's `LDG.E.64.STRONG.SYS`), an atomic load under the
+// device (the stride grind's `LDG.E.64.STRONG.SYS`), an atomic load under the
 // host SIMT shim, whose lanes are real threads.
 __device__ __forceinline__ unsigned long long rpx_poll_u64(unsigned long long *p) {
 #if defined(__CUDA_ARCH__)
@@ -1405,7 +1406,7 @@ __device__ __forceinline__ unsigned long long rpx_poll_u64(unsigned long long *p
 // ---------------------------------------------------------------------------
 // K4 — the grind with nonces claimed from a WORK QUEUE, in increasing order.
 //
-// The shipped kernel gives thread `t` the fixed nonces `t, t + stride, …`, so a
+// The stride kernel gives thread `t` the fixed nonces `t, t + stride, …`, so a
 // warp that runs ahead scans nonces far above the answer while a slow warp is
 // still below it; the search cannot stop until the slowest owner of a nonce
 // below the answer gets there. The counted twin measured the cost: 3.30 strides
@@ -1475,7 +1476,7 @@ __device__ __forceinline__ void grind_queue(const uint64_t *inner_felts, uint64_
         }
         const uint64_t first = base + off;
         // `first < base`: the u64 wrap on the final block, unreachable in
-        // practice (the launcher bails first), as in the shipped kernel.
+        // practice (the launcher bails first), as in the stride kernel.
         if (first < base || first >= best) break;
         const uint64_t i = off + lane;
         if (i < count) {

@@ -1,5 +1,5 @@
-// Host checks for the RPX kernels whose lanes COOPERATE — GAP K3's half-warp
-// permutation and Merkle kernels, and GAP K4's work-queue grind — run through
+// Host checks for the RPX kernels whose lanes COOPERATE — the half-warp
+// permutation and Merkle kernels, and the work-queue grind — run through
 // `cuda_host_simt_shim.h`, where every lane is a real thread.
 //
 // Every check here is against the SHIPPED kernel or the shipped device
@@ -240,7 +240,7 @@ void queue_grind_returns_the_shipped_nonce() {
 }  // namespace
 
 int main() {
-    printf("RPX cooperative-lane kernels (GAP K3/K4), host SIMT replay of crypto/math-cuda/kernels/rpx.cu\n\n");
+    printf("RPX cooperative-lane kernels (half-warp Merkle, queue grind), host SIMT replay of crypto/math-cuda/kernels/rpx.cu\n\n");
     warp_permutation_matches_the_shipped_permutation();
     warp_merkle_kernels_match_the_shipped_tree();
     queue_grind_returns_the_shipped_nonce();

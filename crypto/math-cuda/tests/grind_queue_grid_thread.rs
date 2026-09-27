@@ -1,10 +1,10 @@
-//! ★ The K4 grid must read the same on every thread.
+//! ★ The grind queue's grid must read the same on every thread.
 //!
-//! `grinding::queue_grid` sizes the K4 grind by the queue kernel's occupancy, a
+//! `grinding::queue_grid` sizes the queue grind by the queue kernel's occupancy, a
 //! driver query that needs the CUDA context current on the CALLING thread.
 //! `backend()` makes the context current only on the thread that created it,
 //! and cudarc binds it before `num_regs` but not before the occupancy query. So
-//! a first K4 grind on any other thread got an error there, the `None` was
+//! a first queue grind on any other thread got an error there, the `None` was
 //! cached for the whole process, and every RPX grind after it fell to the host
 //! search. Nothing failed; the device counter just stopped moving.
 //! `rpx_grind_device` showed it on the runs where its keccak test happened to
@@ -46,7 +46,7 @@ fn the_queue_grid_reads_on_a_thread_that_did_not_create_the_backend() {
     let grid = thread::spawn(queue_grid)
         .join()
         .unwrap()
-        .expect("the K4 grid must read on a thread that did not create the backend");
+        .expect("the queue grid must read on a thread that did not create the backend");
     let sms = backend()
         .expect("a CUDA device")
         .ctx

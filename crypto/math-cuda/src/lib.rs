@@ -15,7 +15,6 @@ pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
-pub mod gap_hash;
 pub mod gkr;
 pub mod grinding;
 pub mod inverse;
@@ -26,6 +25,7 @@ pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
 pub mod rpx;
+pub mod rpx_paths;
 pub mod sumcheck;
 pub mod whir;
 pub mod whir_open;

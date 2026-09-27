@@ -167,9 +167,9 @@ pub(crate) fn build_inner_tree_levels(
 ) -> Result<()> {
     let (level_fn, tail_fn) = match hash {
         crate::DeviceHash::Keccak256 => (&be.keccak_merkle_level, &be.keccak_merkle_tail),
-        // ⚠ GAP K3 (temporary): with the knob on, the RPX walk is `crate::rpx`'s,
-        // where the half-warp kernels live; off, this path is unchanged.
-        crate::DeviceHash::Rpx256 if crate::gap_hash::knobs().k3 => {
+        // The half-warp Merkle tops (the default, `rpx_paths::warp_merkle`)
+        // live in `crate::rpx`'s walk; switched off, RPX takes the walk below.
+        crate::DeviceHash::Rpx256 if crate::rpx_paths::warp_merkle() => {
             return crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len);
         }
         crate::DeviceHash::Rpx256 => (&be.rpx_merkle_level, &be.rpx_merkle_tail),

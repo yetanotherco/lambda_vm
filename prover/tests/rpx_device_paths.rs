@@ -1,20 +1,23 @@
-//! ⚠ GAP campaign, HASH lane (K3, K4, K5): the new RPX device paths produce the
-//! shipped paths' bytes, and the benches that measure what each one moves.
+//! The RPX device paths `math_cuda::rpx_paths` switches between produce the
+//! same bytes, and the benches that measure what each one moves.
 //!
-//! - K3: the half-warp permutation and the Merkle walk that uses it for narrow
-//!   levels and the tail (`math_cuda::rpx::TreeWalk::WARP`).
-//! - K4: the work-queue grind on a card-filling grid.
-//! - K5: the permutation's limb multiply and the compiled variants.
+//! - The Merkle tops: the half-warp permutation and the walk that uses it for
+//!   narrow levels and the tail (`math_cuda::rpx::TreeWalk::WARP`, the
+//!   default), against a thread per parent (`TreeWalk::ThreadPerParent`).
+//! - The grind: the work-queue kernel on a card-filling grid (the default),
+//!   against the stride kernel.
+//! - The permutation: the limb multiply and every variant the source
+//!   instantiates, against the 64-bit multiply and the host.
 //!
 //! Every parity test runs both paths in one process through explicit entry
-//! points, so none of them depends on the `LAMBDA_VM_GAP_*` environment. The
+//! points, so none of them depends on the `LAMBDA_VM_RPX_*` switches. The
 //! comparisons are byte for byte (nodes, nonces) or raw word for word
-//! (permutation states), against the shipped device path and, where it is cheap,
-//! against the host oracle.
+//! (permutation states), path against path and, where it is cheap, against the
+//! host oracle.
 //!
 //! ```text
-//! cargo test -p lambda-vm-prover --release --features cuda --test rpx_gap_hash -- --nocapture
-//! cargo test -p lambda-vm-prover --release --features cuda --test rpx_gap_hash -- --ignored --nocapture --test-threads=1
+//! cargo test -p lambda-vm-prover --release --features cuda --test rpx_device_paths -- --nocapture
+//! cargo test -p lambda-vm-prover --release --features cuda --test rpx_device_paths -- --ignored --nocapture --test-threads=1
 //! ```
 #![cfg(feature = "cuda")]
 
@@ -74,13 +77,13 @@ fn host_permute(s: &[u64; 12]) -> [u64; 12] {
 }
 
 // ===========================================================================
-// K5 — the limb multiply and the permutation variants.
+// The permutation: the limb multiply and the variants.
 // ===========================================================================
 
 /// The device PTX of `mul_limb` / `sqr_limb` against 128-bit arithmetic: the
 /// words are congruent to the product (they need not be canonical).
 #[test]
-fn k5_limb_primitives_match_128_bit_arithmetic_on_the_device() {
+fn limb_primitives_match_128_bit_arithmetic_on_the_device() {
     let edges = [
         0u64,
         1,
@@ -125,7 +128,7 @@ fn k5_limb_primitives_match_128_bit_arithmetic_on_the_device() {
 /// Every compiled variant reproduces the host oracle, raw, one permutation and
 /// three chained.
 #[test]
-fn k5_every_permutation_variant_matches_the_host_oracle() {
+fn every_permutation_variant_matches_the_host_oracle() {
     let states = probe_states(0x0052_5058, 509);
     let variants = math_cuda::rpx::chain_probe_variants().expect("variants (needs a GPU)");
     assert_eq!(variants, vec![0, 1, 3, 4, 5, 7, 9], "the probe set");
@@ -142,17 +145,17 @@ fn k5_every_permutation_variant_matches_the_host_oracle() {
             assert_eq!(got3[n], thrice[n], "variant {v}, state {n}, three chained");
         }
     }
-    // The module's own permutation (this cubin's variant) through the shipped probe.
-    let shipped = math_cuda::rpx::permute_probe(&states).expect("permute probe");
-    assert_eq!(shipped, once, "rpx_permute_probe must match the oracle");
+    // The module's own permutation (this cubin's variant) through `rpx_permute_probe`.
+    let module = math_cuda::rpx::permute_probe(&states).expect("permute probe");
+    assert_eq!(module, once, "rpx_permute_probe must match the oracle");
 }
 
 // ===========================================================================
-// K3 — the half-warp permutation and the warp tree walk.
+// The Merkle tops: the half-warp permutation and the warp tree walk.
 // ===========================================================================
 
 #[test]
-fn k3_warp_permutation_matches_the_host_oracle() {
+fn the_half_warp_permutation_matches_the_host_oracle() {
     // An odd count, so the last warp has a dead half.
     let states = probe_states(0x5117, 1001);
     let got = math_cuda::rpx::permute_warp_probe(&states).expect("warp probe (needs a GPU)");
@@ -166,12 +169,12 @@ fn random_leaves(num_leaves: usize, seed: u64) -> Vec<u8> {
     (0..num_leaves * 32).map(|_| rng.next() as u8).collect()
 }
 
-/// Every walk builds the same tree as the shipped walk, node for node, from 2
-/// to 2^18 leaves — which covers every regime: tail only, warp levels into the
-/// tail, and shipped wide levels above them. Arbitrary leaf bytes are fair here:
+/// Every warp walk builds the same tree as a thread per parent, node for node,
+/// from 2 to 2^18 leaves — which covers every regime: tail only, warp levels
+/// into the tail, and wide per-parent levels above them. Arbitrary leaf bytes are fair here:
 /// both walks decode big-endian words without reducing them.
 #[test]
-fn k3_warp_walks_match_the_shipped_walk() {
+fn warp_walks_match_the_thread_per_parent_walk() {
     let walks = [
         TreeWalk::WARP,
         // Every narrow level through the warp level kernel, and a short tail.
@@ -179,7 +182,7 @@ fn k3_warp_walks_match_the_shipped_walk() {
             level_max_pairs: u64::MAX,
             tail_max_pairs: 2,
         },
-        // No warp level at all: shipped levels straight into the warp tail.
+        // No warp level at all: per-parent levels straight into the warp tail.
         TreeWalk::Warp {
             level_max_pairs: 0,
             tail_max_pairs: 64,
@@ -187,14 +190,15 @@ fn k3_warp_walks_match_the_shipped_walk() {
     ];
     for log in 1u32..=18 {
         let leaves = random_leaves(1 << log, 0x7EE + log as u64);
-        let want = math_cuda::rpx::build_merkle_tree_on_device_with(&leaves, TreeWalk::Shipped)
-            .expect("shipped walk (needs a GPU)");
+        let want =
+            math_cuda::rpx::build_merkle_tree_on_device_with(&leaves, TreeWalk::ThreadPerParent)
+                .expect("per-parent walk (needs a GPU)");
         for walk in walks {
             let got =
                 math_cuda::rpx::build_merkle_tree_on_device_with(&leaves, walk).expect("warp walk");
             assert!(
                 got == want,
-                "{walk:?} differs from the shipped walk at 2^{log} leaves"
+                "{walk:?} differs from the per-parent walk at 2^{log} leaves"
             );
         }
         // A control that can fail: one flipped bit in the LAST leaf must move
@@ -214,9 +218,9 @@ fn k3_warp_walks_match_the_shipped_walk() {
 }
 
 /// The warp walk against the HOST tree (the Pair backend's FRI-layer tree),
-/// node for node — the oracle the shipped walk is pinned to elsewhere.
+/// node for node — the oracle the per-parent walk is pinned to elsewhere.
 #[test]
-fn k3_warp_walk_matches_the_host_tree() {
+fn the_warp_walk_matches_the_host_tree() {
     for log in [1u32, 3, 6, 7, 8, 10, 13, 15] {
         let num_leaves = 1usize << log;
         let mut rng = SplitMix(0xABC + log as u64);
@@ -251,7 +255,7 @@ fn k3_warp_walk_matches_the_host_tree() {
 }
 
 // ===========================================================================
-// K4 — the work-queue grind.
+// The grind: the work-queue kernel.
 // ===========================================================================
 
 fn seed_for(i: usize) -> [u8; 32] {
@@ -261,11 +265,11 @@ fn seed_for(i: usize) -> [u8; 32] {
     seed
 }
 
-/// The queue returns the shipped kernel's nonce for 256 seeds at the production
-/// factor, at the card-filling grid, at the shipped grid and at a small one,
+/// The queue returns the stride kernel's nonce for 256 seeds at the production
+/// factor, at the card-filling grid, at the stride kernel's grid and a small one,
 /// and at scan factor 1 (where some seeds miss their first block and relaunch).
 #[test]
-fn k4_queue_grind_returns_the_shipped_nonce() {
+fn the_queue_grind_returns_the_stride_grinds_nonce() {
     let factor = 20u8;
     let fill = math_cuda::grinding::queue_grid().expect("queue grid (needs a GPU)");
     let scan1 = Knobs {
@@ -277,7 +281,7 @@ fn k4_queue_grind_returns_the_shipped_nonce() {
         let seed = seed_for(i);
         let felts = stark::grinding::inner_hash_felts::<RpxGrind>(&seed, factor);
         let want = math_cuda::grinding::generate_nonce_rpx_gpu_at(&felts, factor, Knobs::DEFAULT)
-            .expect("shipped grind (needs a GPU)");
+            .expect("stride grind (needs a GPU)");
         for grid in [fill, 1024, 170] {
             let got = math_cuda::grinding::generate_nonce_rpx_gpu_queue_at(
                 &felts,
@@ -300,13 +304,13 @@ fn k4_queue_grind_returns_the_shipped_nonce() {
         "scan 1 must have exercised a relaunch on some seed"
     );
     println!(
-        "K4 parity: 256 seeds x 4 queue arms identical; {relaunched} seeds needed a relaunch at scan 1"
+        "queue parity: 256 seeds x 4 queue arms identical; {relaunched} seeds needed a relaunch at scan 1"
     );
 }
 
 /// Small factors against the HOST's smallest valid nonce.
 #[test]
-fn k4_queue_grind_returns_the_host_smallest_nonce() {
+fn the_queue_grind_returns_the_host_smallest_nonce() {
     let fill = math_cuda::grinding::queue_grid().expect("queue grid (needs a GPU)");
     for factor in [12u8, 13, 14, 16] {
         for i in 0..16 {
@@ -338,13 +342,13 @@ fn median(xs: &mut [f64]) -> f64 {
     xs[xs.len() / 2]
 }
 
-/// ★ K4 MECHANISM: permutations EXECUTED and milliseconds per grind, shipped vs
-/// queue, same 256 seeds, arms interleaved per seed. Pre-registered (the
-/// brief's note, before the run): executed ratio queue/shipped 0.68–0.80, ms
+/// ★ THE QUEUE GRIND'S MECHANISM: permutations EXECUTED and milliseconds per
+/// grind, stride vs queue, same 256 seeds, arms interleaved per seed.
+/// Pre-registered (before the run): executed ratio queue/stride 0.68–0.80, ms
 /// ratio 0.60–0.80, nonces identical 256/256.
 #[test]
 #[ignore = "bench: run on an idle GPU with --ignored --nocapture --test-threads=1"]
-fn k4_bench_grind_executed_and_time() {
+fn bench_grind_executed_and_time() {
     let factor = 20u8;
     let fill = math_cuda::grinding::queue_grid().expect("queue grid (needs a GPU)");
     let posture = Knobs::DEFAULT;
@@ -356,8 +360,8 @@ fn k4_bench_grind_executed_and_time() {
     let _ = math_cuda::grinding::generate_nonce_rpx_gpu_queue_at(&w, factor, posture, fill);
     let _ = math_cuda::grinding::search_queue_counted(&w, factor, posture, fill);
 
-    let (mut ms_ship, mut ms_queue) = (Vec::new(), Vec::new());
-    let (mut ex_ship, mut ex_queue, mut nonces) = (0u128, 0u128, 0u128);
+    let (mut ms_stride, mut ms_queue) = (Vec::new(), Vec::new());
+    let (mut ex_stride, mut ex_queue, mut nonces) = (0u128, 0u128, 0u128);
     for i in 0..256 {
         let felts = stark::grinding::inner_hash_felts::<RpxGrind>(&seed_for(i), factor);
         let time = |queue: bool| -> (u64, f64) {
@@ -376,7 +380,7 @@ fn k4_bench_grind_executed_and_time() {
         let (b2, tb2) = time(true);
         let (a2, ta2) = time(false);
         assert!(a1 == b1 && b1 == b2 && b2 == a2, "seed {i}: nonces differ");
-        ms_ship.push((ta1 + ta2) / 2.0);
+        ms_stride.push((ta1 + ta2) / 2.0);
         ms_queue.push((tb1 + tb2) / 2.0);
         let cs = math_cuda::grinding::search_counted(&felts, factor, posture, 1).expect("counted");
         let cq = math_cuda::grinding::search_queue_counted(&felts, factor, posture, fill)
@@ -385,84 +389,86 @@ fn k4_bench_grind_executed_and_time() {
             cs.nonce == a1 && cq.nonce == a1,
             "seed {i}: counted nonces differ"
         );
-        ex_ship += cs.executed as u128;
+        ex_stride += cs.executed as u128;
         ex_queue += cq.executed as u128;
         nonces += a1 as u128;
     }
     let n = 256.0;
-    let (mean_ship, mean_queue) = (
-        ms_ship.iter().sum::<f64>() / n,
+    let (mean_stride, mean_queue) = (
+        ms_stride.iter().sum::<f64>() / n,
         ms_queue.iter().sum::<f64>() / n,
     );
     println!(
-        "★ K4 GRIND BENCH (factor {factor}, scan {}, 256 seeds, per-seed ABBA)",
+        "★ GRIND BENCH (factor {factor}, scan {}, 256 seeds, per-seed ABBA)",
         posture.scan
     );
     println!(
-        "  shipped: grid {} (stride {stride}); queue: grid {fill} (stride {})",
+        "  stride kernel: grid {} (stride {stride}); queue: grid {fill} (stride {})",
         posture.grid,
         fill as u64 * math_cuda::grinding::RPX_BLOCK_DIM as u64
     );
     println!(
-        "  mean nonce {:.0}; executed/seed shipped {:.0} = nonce + {:.2} strides; queue {:.0} = nonce + {:.2} x its grid's threads",
+        "  mean nonce {:.0}; executed/seed stride {:.0} = nonce + {:.2} strides; queue {:.0} = nonce + {:.2} x its grid's threads",
         nonces as f64 / n,
-        ex_ship as f64 / n,
-        (ex_ship as f64 - nonces as f64) / n / stride as f64,
+        ex_stride as f64 / n,
+        (ex_stride as f64 - nonces as f64) / n / stride as f64,
         ex_queue as f64 / n,
         (ex_queue as f64 - nonces as f64) / n / (fill as f64 * 128.0),
     );
     println!(
-        "  EXECUTED ratio queue/shipped {:.4}  (pre-registered 0.68-0.80)",
-        ex_queue as f64 / ex_ship as f64
+        "  EXECUTED ratio queue/stride {:.4}  (pre-registered 0.68-0.80)",
+        ex_queue as f64 / ex_stride as f64
     );
     println!(
-        "  ms/grind mean shipped {mean_ship:.3} queue {mean_queue:.3}; median shipped {:.3} queue {:.3}; MS ratio (means) {:.4}  (pre-registered 0.60-0.80)",
-        median(&mut ms_ship.clone()),
+        "  ms/grind mean stride {mean_stride:.3} queue {mean_queue:.3}; median stride {:.3} queue {:.3}; MS ratio (means) {:.4}  (pre-registered 0.60-0.80)",
+        median(&mut ms_stride.clone()),
         median(&mut ms_queue.clone()),
-        mean_queue / mean_ship
+        mean_queue / mean_stride
     );
 }
 
-/// ★ K3 MECHANISM: seconds per launch of each level kernel by width, and per
-/// whole inner-tree walk by tree size. Pre-registered: a level of ≤ 16,384
-/// pairs costs the shipped kernel ≈ 110–125 µs (one single-thread chain) and
+/// ★ THE WARP MERKLE TOPS' MECHANISM: seconds per launch of each level kernel by
+/// width, and per whole inner-tree walk by tree size. Pre-registered: a level
+/// of ≤ 16,384 pairs costs a thread per parent ≈ 110–125 µs (one chain) and
 /// the warp kernel ≤ 70 µs at 16,384 pairs and ≤ 20 µs at ≤ 2,048; the tree
 /// TOP (levels ≤ 16,384 pairs, tail included) drops from ≈ 1.6–1.8 ms to
 /// 0.2–0.5 ms per tree.
 #[test]
 #[ignore = "bench: run on an idle GPU with --ignored --nocapture --test-threads=1"]
-fn k3_bench_levels_and_trees() {
-    println!("★ K3 LEVEL BENCH: µs per launch (200 back-to-back launches, warm-up excluded)");
+fn bench_merkle_levels_and_trees() {
+    println!("★ MERKLE LEVEL BENCH: µs per launch (200 back-to-back launches, warm-up excluded)");
     println!(
         "{:>10} {:>12} {:>12} {:>8}",
-        "pairs", "shipped", "warp", "ratio"
+        "pairs", "per-parent", "warp", "ratio"
     );
     let mut p = 128u64;
     while p <= 1 << 17 {
-        let s =
-            math_cuda::rpx::level_bench(LevelKernel::Shipped, p, 200).expect("bench (needs a GPU)");
+        let s = math_cuda::rpx::level_bench(LevelKernel::ThreadPerParent, p, 200)
+            .expect("bench (needs a GPU)");
         let w = math_cuda::rpx::level_bench(LevelKernel::Warp, p, 200).expect("bench");
         println!("{p:>10} {:>12.2} {:>12.2} {:>8.3}", s * 1e6, w * 1e6, w / s);
         p *= 2;
     }
-    let st = math_cuda::rpx::level_bench(LevelKernel::ShippedTail, 128, 200).expect("bench");
+    let st = math_cuda::rpx::level_bench(LevelKernel::BlockTail, 128, 200).expect("bench");
     let wt = math_cuda::rpx::level_bench(LevelKernel::WarpTail, 64, 200).expect("bench");
     let wl = math_cuda::rpx::level_bench(LevelKernel::Warp, 128, 200).expect("bench");
     println!(
-        "  tails: shipped 128 pairs -> root {:.2} µs; warp level 128 + warp tail 64 -> root {:.2} µs",
+        "  tails: block tail 128 pairs -> root {:.2} µs; warp level 128 + warp tail 64 -> root {:.2} µs",
         st * 1e6,
         (wl + wt) * 1e6
     );
 
-    println!("★ K3 TREE BENCH: µs per inner-tree walk (median of 5 rounds x 20 walks)");
+    println!("★ MERKLE TREE BENCH: µs per inner-tree walk (median of 5 rounds x 20 walks)");
     println!(
         "{:>8} {:>12} {:>12} {:>10}",
-        "leaves", "shipped", "warp", "delta"
+        "leaves", "per-parent", "warp", "delta"
     );
     for log in [8u32, 12, 15, 16, 18, 20, 21, 22] {
         let (mut s, mut w) = (Vec::new(), Vec::new());
         for _ in 0..5 {
-            s.push(math_cuda::rpx::tree_bench(1 << log, TreeWalk::Shipped, 20).expect("bench"));
+            s.push(
+                math_cuda::rpx::tree_bench(1 << log, TreeWalk::ThreadPerParent, 20).expect("bench"),
+            );
             w.push(math_cuda::rpx::tree_bench(1 << log, TreeWalk::WARP, 20).expect("bench"));
         }
         let (s, w) = (median(&mut s), median(&mut w));
@@ -474,7 +480,7 @@ fn k3_bench_levels_and_trees() {
             (w - s) * 1e6
         );
     }
-    println!("★ K3 THRESHOLD SWEEP at 2^22 leaves (level_max_pairs; tail 64)");
+    println!("★ MERKLE THRESHOLD SWEEP at 2^22 leaves (level_max_pairs; tail 64)");
     for level_max_pairs in [2048u64, 4096, 8192, 16_384, 32_768, 65_536] {
         let walk = TreeWalk::Warp {
             level_max_pairs,
@@ -491,7 +497,7 @@ fn k3_bench_levels_and_trees() {
     }
 }
 
-/// ★ K5 MECHANISM: nanoseconds per permutation of each compiled variant, on
+/// ★ THE PERMUTATION VARIANTS' MECHANISM: nanoseconds per permutation of each variant, on
 /// the chained probe (4 full waves of that variant's own occupancy x 16
 /// permutations x 16 launches — variants differ in registers, so a fixed launch
 /// size would give each a different wave tail), variants interleaved over 7
@@ -501,7 +507,7 @@ fn k3_bench_levels_and_trees() {
 /// 9) at 0.88–1.02 of their rolled twins.
 #[test]
 #[ignore = "bench: run on an idle GPU with --ignored --nocapture --test-threads=1"]
-fn k5_bench_permutation_variants() {
+fn bench_permutation_variants() {
     let variants = math_cuda::rpx::chain_probe_variants().expect("variants (needs a GPU)");
     let (k, iters) = (16u64, 16usize);
     let sizes: Vec<usize> = variants
@@ -524,7 +530,7 @@ fn k5_bench_permutation_variants() {
     }
     let base = median(&mut per[0].clone());
     println!(
-        "★ K5 PERMUTATION BENCH: ns per permutation, whole card (4 full waves x 16 chained x 16 launches, median of 7)"
+        "★ PERMUTATION BENCH: ns per permutation, whole card (4 full waves x 16 chained x 16 launches, median of 7)"
     );
     println!(
         "{:>8} {:>10} {:>8} {:>6} {:>10} {:>9}",
@@ -541,10 +547,11 @@ fn k5_bench_permutation_variants() {
         );
     }
     println!(
-        "  this process's rpx module: {}",
-        match math_cuda::gap_hash::knobs().k5 {
-            Some(v) => format!("variant {v} (LAMBDA_VM_GAP_K5={v})"),
-            None => "variant 0 (LAMBDA_VM_GAP_K5 off)".to_string(),
+        "  this process's rpx module: variant {}",
+        if math_cuda::rpx_paths::limb_permute() {
+            math_cuda::rpx_paths::LIMB_PERMUTE_VARIANT
+        } else {
+            0
         }
     );
 }

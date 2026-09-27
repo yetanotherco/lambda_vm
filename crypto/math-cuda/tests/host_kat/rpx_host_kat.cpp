@@ -1209,7 +1209,7 @@ void grind_kernel_finds_the_nonce_the_host_predicate_accepts() {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 9 — GAP K5: the limb multiply and every permutation variant.
+// Layer 9 — the limb multiply and every permutation variant.
 //
 // `mul_limb` / `sqr_limb` return a word congruent to the product and below
 // 2^64, not `goldilocks::mul`'s word, so they are checked against the
@@ -1351,7 +1351,7 @@ int main() {
     permute_probe_matches_the_oracle_table();
     printf("\n-- layer 8: the proof-of-work grind kernel against the host predicate --\n");
     grind_kernel_finds_the_nonce_the_host_predicate_accepts();
-    printf("\n-- layer 9: GAP K5 limb arithmetic and the permutation variants --\n");
+    printf("\n-- layer 9: limb arithmetic and the permutation variants --\n");
     limb_primitives_match_schoolbook_arithmetic();
     every_permutation_variant_reproduces_the_oracle();
     if (failures != 0) {
