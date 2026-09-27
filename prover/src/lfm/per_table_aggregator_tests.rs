@@ -3627,6 +3627,27 @@ fn tree_top_overlap(default: bool) -> bool {
     }
 }
 
+/// `LFM_TREE_REDERIVE_DECODE=1`: level 0's lead-in derives DECODE's
+/// commitment (and, on WHIR, its prepared opening) from the ELF again instead of
+/// taking the ones the base derived. Unset or `0`: take the base's. They are the
+/// same function of the same ELF and options, so no program identity moves
+/// either way; a base loaded from a cache has none to hand over, and the lead-in
+/// derives them regardless. Read once, and named on stderr.
+fn l0_takes_base_decode() -> bool {
+    const ENV: &str = "LFM_TREE_REDERIVE_DECODE";
+    static TAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TAKE.get_or_init(|| {
+        let rederive =
+            super::airs::env_switch(ENV, std::env::var(ENV).ok().as_deref()).unwrap_or(false);
+        super::airs::announce(if rederive {
+            "L0 DECODE: re-derived from the ELF (LFM_TREE_REDERIVE_DECODE=1)"
+        } else {
+            "L0 DECODE: taken from the base (the default)"
+        });
+        !rederive
+    })
+}
+
 fn tree_siblings_l0() -> usize {
     let k = std::env::var("LFM_TREE_K_L0").ok();
     let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
@@ -6258,6 +6279,10 @@ fn the_production_tree_composes_to_a_root() {
     // 100 Hz for 67 s, which is what every other stage already pays.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
+    // The DECODE commitment the base derived, kept for level 0's lead-in.
+    // `None` under `LFM_TREE_REDERIVE_DECODE=1` or when the base was loaded
+    // rather than proved, and the lead-in then derives it from the ELF.
+    let mut base_decode: Option<stark::config::Commitment> = None;
     let bundle = cached_bundle(
         if lo == 0 {
             stage_mode(0)
@@ -6266,13 +6291,25 @@ fn the_production_tree_composes_to_a_root() {
         },
         stage_path(cache_dir.as_deref(), "bundle"),
         || {
-            crate::continuation::prove_continuation(
-                &inputs.elf_bytes,
-                &inputs.private_input,
-                inputs.epoch_log2,
-                &inner,
-            )
-            .expect("the block must prove")
+            if l0_takes_base_decode() {
+                let (bundle, decode) = crate::continuation::prove_continuation_keeping_decode(
+                    &inputs.elf_bytes,
+                    &inputs.private_input,
+                    inputs.epoch_log2,
+                    &inner,
+                )
+                .expect("the block must prove");
+                base_decode = Some(decode);
+                bundle
+            } else {
+                crate::continuation::prove_continuation(
+                    &inputs.elf_bytes,
+                    &inputs.private_input,
+                    inputs.epoch_log2,
+                    &inner,
+                )
+                .expect("the block must prove")
+            }
         },
     );
     let base_secs = t.elapsed().as_secs_f64();
@@ -6354,10 +6391,17 @@ fn the_production_tree_composes_to_a_root() {
     // does — this loop parsed 3.4 MB of ELF nineteen times and built the same
     // commitment thirty-eight. `prove_continuation` hoists exactly this pair and
     // says so; the driver did not inherit it.
-    let epoch_konsts = stamped("EpochConstants::load (ELF + DECODE commitment)", || {
-        super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
-            .expect("the inner ELF and its DECODE commitment must build once")
-    });
+    let epoch_konsts = stamped(
+        if base_decode.is_some() {
+            "EpochConstants::load (ELF; DECODE commitment from the base)"
+        } else {
+            "EpochConstants::load (ELF + DECODE commitment)"
+        },
+        || {
+            super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, base_decode)
+                .expect("the inner ELF and its DECODE commitment must build once")
+        },
+    );
     // ★★★ LEVEL-0 CONCURRENCY. Armed with its OWN count and disarmed straight
     // after, so the interior's knob and this one never reach across.
     //
@@ -7083,6 +7127,7 @@ fn whir_level_zero<H>(
     siblings: usize,
     fan_in: usize,
     top_overlap: bool,
+    base_decode: Option<&crate::multilinear_continuation::BaseDecode>,
 ) -> (
     Vec<RealChild>,
     Vec<super::per_table_aggregator::SchemaLayout>,
@@ -7090,7 +7135,7 @@ fn whir_level_zero<H>(
     Option<WhirGlobalChild>,
 )
 where
-    H: multilinear::whir_hash::WhirHash,
+    H: multilinear::whir_hash::WhirHash + 'static,
 {
     use super::per_table_aggregator::SchemaLayout;
     use super::program_census::build_artifacts_counted;
@@ -7132,14 +7177,37 @@ where
     // level. The driver's block walk makes the same ordering choice.
     crate::multilinear_continuation::reset_decode_derivations();
     let t = Instant::now();
-    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
-        .expect("DECODE's prepared opening, once per bundle");
-    let decode_root = crate::tables::decode::commitment_from_elf(elf, inner)
-        .expect("DECODE's univariate commitment, once per bundle");
+    // The base's own two derivations when it handed them over, else both from
+    // the ELF here.
+    let derived_prepared;
+    let (prepared, decode_root) = match base_decode {
+        Some(base) => (
+            base.prepared::<H>().expect(
+                "the base's DECODE prepared opening is for the hash this process \
+                 dispatches on; one process picks one hash",
+            ),
+            base.commitment,
+        ),
+        None => {
+            derived_prepared =
+                crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
+                    .expect("DECODE's prepared opening, once per bundle");
+            (
+                &derived_prepared,
+                crate::tables::decode::commitment_from_elf(elf, inner)
+                    .expect("DECODE's univariate commitment, once per bundle"),
+            )
+        }
+    };
     println!(
-        "   ★ WHIR LEVEL 0: both DECODE derivations hoisted in {:.2}s \
+        "   ★ WHIR LEVEL 0: both DECODE derivations {} in {:.2}s \
          (the prepared opening and the univariate root — different objects, \
          one each per bundle rather than one each per epoch)",
+        if base_decode.is_some() {
+            "taken from the base"
+        } else {
+            "hoisted"
+        },
         t.elapsed().as_secs_f64()
     );
     // ⛔⛔ THE COUNTER IS A THREAD-LOCAL `Cell`, AND THAT DECIDES WHERE THESE
@@ -7157,10 +7225,11 @@ where
     // preparing that wrap derived NOTHING. The second is the one that catches a
     // regression, and it fires on whichever worker regressed.
     let hoisted = crate::multilinear_continuation::decode_derivations();
+    let expected = if base_decode.is_some() { 0 } else { 1 };
     assert_eq!(
-        hoisted, 1,
-        "the hoist must derive the prepared opening exactly once on this thread, \
-         and it derived {hoisted} times"
+        hoisted, expected,
+        "the hoist must derive the prepared opening exactly {expected} time(s) on \
+         this thread (none when the base handed it over), and it derived {hoisted} times"
     );
 
     type WhirWrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
@@ -7188,7 +7257,7 @@ where
             bundle,
             k,
             Some(decode_root),
-            Some(&prepared),
+            Some(prepared),
         )
         .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
         let t_harvest_epoch = t.elapsed().as_secs_f64();
@@ -8159,13 +8228,27 @@ fn the_whir_production_tree_composes_to_a_root() {
     // bundle's, which is a second reason `cached_bundle` does not apply here.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
-    .expect("the WHIR block must prove");
+    // The base hands its DECODE derivations to level 0's lead-in, which under
+    // `LFM_TREE_REDERIVE_DECODE=1` derives both from the ELF again.
+    let (bundle, base_decode) = if l0_takes_base_decode() {
+        let (bundle, decode) = crate::multilinear_continuation::prove_continuation_keeping_decode(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the WHIR block must prove");
+        (bundle, Some(decode))
+    } else {
+        let bundle = crate::multilinear_continuation::prove_continuation(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the WHIR block must prove");
+        (bundle, None)
+    };
     let base_secs = t.elapsed().as_secs_f64();
     let (base_peak, base_at) = base_sampler.stop();
     println!(
@@ -8290,8 +8373,11 @@ fn the_whir_production_tree_composes_to_a_root() {
             l0_siblings,
             fan_in,
             top_overlap,
+            base_decode.as_ref(),
         )
     });
+    // Level 0 was their last reader.
+    drop(base_decode);
 
     super::device_permit::arm(1);
     let level0_wall = t_level.elapsed().as_secs_f64();
@@ -8860,8 +8946,21 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     let fan_in = 2;
 
     let t_all = Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
+    // As the production driver runs it: level 0 takes the base's DECODE
+    // derivations instead of deriving them again (unless
+    // `LFM_TREE_REDERIVE_DECODE=1`).
+    let (bundle, base_decode) = if l0_takes_base_decode() {
+        let (bundle, decode) = crate::multilinear_continuation::prove_continuation_keeping_decode(
+            &elf_bytes, &input, 2, &inner,
+        )
         .expect("the fixture continuation must prove under WHIR");
+        (bundle, Some(decode))
+    } else {
+        let bundle =
+            crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
+                .expect("the fixture continuation must prove under WHIR");
+        (bundle, None)
+    };
     // ⛔ THE BASE WALL IS TAKEN HERE, NOT RECOMPUTED BELOW. `t_all` keeps
     // running for the whole tree, so a second `elapsed()` further down would
     // hand the split a denominator that includes level 0 and the interior, and
@@ -8899,9 +8998,19 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     super::device_permit::arm(1);
     let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
         whir_level_zero::<H>(
-            &bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1, fan_in, false,
+            &bundle,
+            &elf_bytes,
+            &elf,
+            &inner,
+            &wrap_opts,
+            &ceiling,
+            1,
+            fan_in,
+            false,
+            base_decode.as_ref(),
         )
     });
+    drop(base_decode);
     assert!(
         no_overlapped_global.is_none(),
         "the overlap is off on this arm, so level 0 must not have produced a global child"
