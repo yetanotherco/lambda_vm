@@ -3753,7 +3753,34 @@ fn census_panel_text(
         100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
     );
     let step = (fan_in + 1) as f64 / fan_in as f64;
+    // GAP R2: a split `LFM_HASH` is two census entries, printed as ONE panel line —
+    // real and committed rows summed, the chunk heights in a trailing
+    // `[split a+b]` — so a panel never repeats a chip name (the box reader treats a
+    // repeat as two interleaved panels) and `LFM_HASH` real rows stay the
+    // permutation count. Unsplit programs print exactly as before.
+    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+    let hash_chunks: Vec<&super::airs::LfmChipCells> =
+        panel.iter().filter(|c| c.name == hash).collect();
     for c in panel {
+        if c.name == hash && hash_chunks.len() > 1 {
+            if !std::ptr::eq(c, hash_chunks[0]) {
+                continue;
+            }
+            let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
+            let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
+            let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
+            let _ = writeln!(
+                out,
+                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
+                c.name,
+                real,
+                rows,
+                100.0 * (rows - real) as f64 / rows as f64,
+                hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
+                heights.join("+"),
+            );
+            continue;
+        }
         let _ = writeln!(
             out,
             "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
@@ -3781,9 +3808,10 @@ fn census_panel_text(
 /// census panel wrote: one `print!` changes when the panel reaches the log, and
 /// nothing about what reaches it.
 ///
-/// Two references. A panel the per-line code printed on the box — L1N0 of a WHIR
-/// tree over block 25368371, eleven chips at fan-in 3 — copied from the log byte
-/// for byte. And the per-line code itself, kept below with each `println!(f, ..)`
+/// Two references. Panels the per-line code printed on the box, copied from the
+/// log byte for byte — L1N0 of a WHIR tree over block 25368371, eleven chips at
+/// fan-in 3, and wrap 2 of a STARK tree with a split `LFM_HASH` printed as its
+/// one merged line. And the per-line code itself, kept below with each `println!(f, ..)`
 /// written as `format!(f, ..)` plus the `\n` that `println!` appends, over chips
 /// under all three height rules, a zero-row chip, an empty step list and fan-ins
 /// 1 to 3. Only a chip's `main_cols + 3 · aux_cols` reaches the text (as its
@@ -3811,7 +3839,27 @@ fn the_census_panel_is_the_per_line_bytes() {
             100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
         ));
         let step = (fan_in + 1) as f64 / fan_in as f64;
+        let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+        let hash_chunks: Vec<&LfmChipCells> = panel.iter().filter(|c| c.name == hash).collect();
         for c in panel {
+            if c.name == hash && hash_chunks.len() > 1 {
+                if !std::ptr::eq(c, hash_chunks[0]) {
+                    continue;
+                }
+                let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
+                let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
+                let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
+                println(format!(
+                    "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
+                    c.name,
+                    real,
+                    rows,
+                    100.0 * (rows - real) as f64 / rows as f64,
+                    hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
+                    heights.join("+"),
+                ));
+                continue;
+            }
             println(format!(
                 "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
                 c.name,
@@ -3875,6 +3923,48 @@ fn the_census_panel_is_the_per_line_bytes() {
         "the panel as the box logged it"
     );
 
+    // A split `LFM_HASH` — two census entries, one panel line — as the box logged
+    // it: wrap 2 of a STARK tree over block 25368371 with the split on.
+    let wrap2 = [
+        chip("LFM_CONST", 1_411, 2_048, w, 4),
+        chip("LFM_BALU", 257_780, 262_144, w, 10),
+        chip("LFM_XALU", 1_011_252, 1_048_576, w, 18),
+        chip("LFM_SELECT", 399_850, 524_288, w, 26),
+        chip("LFM_BITDEC", 2_608, 4_096, w, 168),
+        chip("LFM_HASH", 262_144, 262_144, c, 325),
+        chip("LFM_HASH", 31_634, 32_768, w, 325),
+        chip("LFM_KECCAK", 1, 4, w, 1_000),
+        chip("LFM_LANES", 372_395, 524_288, w, 19),
+        chip("LFM_HINT", 619_003, 1_048_576, w, 7),
+        chip("LFM_PUBLIC", 145, 256, w, 7),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("KECCAK_RND", 24, 32, c, 3_028),
+        chip("KECCAK_RC", 32, 32, f, 4),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    let logged_split = r#"   ★ CENSUS wrap 2: 175550880 cells (2958223 instructions), floor 15.1%
+     LFM_CONST            1411/      2048  headroom  31.1%  AT RISK  cliff +8192 cells
+     LFM_BALU           257780/    262144  headroom   1.7%  AT RISK  cliff +2621440 cells
+     LFM_XALU          1011252/   1048576  headroom   3.6%  AT RISK  cliff +18874368 cells
+     LFM_SELECT         399850/    524288  headroom  23.7%  AT RISK  cliff +13631488 cells
+     LFM_BITDEC           2608/      4096  headroom  36.3%  AT RISK  cliff +688128 cells
+     LFM_HASH           293778/    294912  headroom   0.4%  AT RISK  cliff +95846400 cells  [split 262144+32768]
+     LFM_KECCAK              1/         4  headroom  75.0%  AT RISK  cliff +4000 cells
+     LFM_LANES          372395/    524288  headroom  29.0%  AT RISK  cliff +9961472 cells
+     LFM_HINT           619003/   1048576  headroom  41.0%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            145/       256  headroom  43.4%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     KECCAK_RND             24/        32  headroom  25.0%  fixed    cliff +96896 cells
+     KECCAK_RC              32/        32  headroom   0.0%  fixed    cliff +128 cells
+     BITWISE           1048576/   1048576  headroom   0.0%  fixed    cliff +26214400 cells
+     ⇒ at 2.000× the workload these would STEP: ["LFM_CONST", "LFM_BALU", "LFM_XALU", "LFM_SELECT", "LFM_BITDEC", "LFM_HASH", "LFM_LANES", "LFM_HINT", "LFM_PUBLIC"]
+"#;
+    assert_eq!(
+        census_panel_text("wrap 2", 175_550_880, 2_958_223, &wrap2, 1),
+        logged_split,
+        "a split LFM_HASH as the box logged it"
+    );
+
     // Every height rule, a zero-row chip (headroom 0, cliff 0), and a panel whose
     // step list is empty.
     let shapes = [
@@ -3888,6 +3978,7 @@ fn the_census_panel_is_the_per_line_bytes() {
     for fan_in in 1..=3 {
         for (label, cells, instrs, panel) in [
             ("L1N0 (arity 3)", 285_808_384, 4_897_240, &l1n0[..]),
+            ("wrap 2", 175_550_880, 2_958_223, &wrap2[..]),
             ("wrap 7", 459_288_992, 4_237_668, &shapes[..]),
             ("the BLOCK-ARTIFACT ROOT", 285_808_384, 0, &shapes[2..]),
         ] {
