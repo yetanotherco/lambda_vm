@@ -1170,14 +1170,16 @@ fn check_transcript_pins(
     // transcript this is, and it reaches the posture through this function.
     let max_rows_log2 = crate::tables::max_rows_log2_override();
     // ★ The bases were MEASURED at the legacy WHIR format (uniform
-    // folds, no cap). A run at any other WHIR format — the production default
-    // included — is a different measurement: it SKIPS and says so, like a run
-    // at another table cap. Re-pinning at the default needs a box measurement.
+    // folds, no cap, stack 25). A run at any other WHIR format — the
+    // production default included — is a different measurement: it SKIPS and
+    // says so, like a run at another table cap. Re-pinning at the default needs
+    // a box measurement.
     let whir_format = crate::zf_format::ZfFormat::global().chain_format();
     if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT {
         println!(
             "{:<12} transcript pin SKIPPED - WHIR format {:?} (the bases were measured at the \
-             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4)",
+             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4 \
+             LAMBDA_VM_ZF_WHIR_STACK=25)",
             "WHIR",
             whir_format,
             multilinear::whir_chain::ChainFormat::DEFAULT,
