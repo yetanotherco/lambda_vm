@@ -354,6 +354,40 @@ fn budget_headroom() -> String {
     "no device".to_string()
 }
 
+/// Opens a window over the device ledger's peak
+/// ([`math_cuda::device::reset_window_high_water`]); nothing without a device.
+#[cfg(feature = "cuda")]
+pub fn reset_reserved_window() {
+    math_cuda::device::reset_window_high_water();
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reset_reserved_window() {}
+
+/// The ledger's peak since [`reset_reserved_window`]; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn reserved_window_peak() -> u64 {
+    math_cuda::device::window_high_water()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reserved_window_peak() -> u64 {
+    0
+}
+
+/// What the ledger may promise in all; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn reserve_budget() -> u64 {
+    math_cuda::device::backend()
+        .map(|be| be.vram_budget_bytes())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reserve_budget() -> u64 {
+    0
+}
+
 /// Whether a group's room is sized to the turns it covers — its commits', two
 /// in flight, and one chain's opening, as the kernels that run them allocate —
 /// rather than one base codeword. `true` unless `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`

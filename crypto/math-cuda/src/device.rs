@@ -698,9 +698,19 @@ pub(crate) fn note_device_fallback() {
 /// stays below the budget by construction.
 static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
-/// Note that `be.reserved` just rose to `now`, keeping the peak.
+/// ★ The same peak over a WINDOW a caller opens and closes — one phase of one
+/// proof — beside the whole-run one, which it never touches.
+///
+/// The whole-run number says how close the process came to the budget; it
+/// cannot say WHEN. A change that moves one phase's reservations — giving a
+/// group's room back across the argument, say — is tested by that phase's peak,
+/// epoch by epoch, and a run's single maximum hides every epoch but one.
+static WINDOW_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `be.reserved` just rose to `now`, keeping both peaks.
 fn note_reserved(now: u64) {
     RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+    WINDOW_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
 }
 
 /// The peak simultaneous device reservation this process reached — see
@@ -712,6 +722,24 @@ pub fn reserved_high_water() -> u64 {
 /// Zero the reservation high-water. For a test asserting a delta.
 pub fn reset_reserved_high_water() {
     RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
+}
+
+/// Opens a window ([`WINDOW_HIGH_WATER`]): its peak starts at what is promised
+/// NOW, not at zero, because the total only reports when it RISES — a phase
+/// that reserved nothing peaked at whatever it inherited, and a window started
+/// at zero would read that as nothing held at all.
+///
+/// Process-wide, like the whole-run peak: a window is one phase's only while
+/// nothing else in the process reserves during it. The WHIR base proves one
+/// epoch at a time; a caller that cannot say the same must mark what it reads.
+pub fn reset_window_high_water() {
+    let now = backend().map(|be| be.reserved_bytes()).unwrap_or(0);
+    WINDOW_HIGH_WATER.store(now, Ordering::Relaxed);
+}
+
+/// The peak promised since the last [`reset_window_high_water`].
+pub fn window_high_water() -> u64 {
+    WINDOW_HIGH_WATER.load(Ordering::Relaxed)
 }
 
 /// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs

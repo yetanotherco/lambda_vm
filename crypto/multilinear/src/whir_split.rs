@@ -175,6 +175,57 @@ pub fn bump(counter: &Counter) {
     }
 }
 
+// ── the device ledger's peak per phase ──────────────────────────────────────
+
+/// The device reservation ledger's peak over one phase of one prove, in bytes.
+/// Process-global and cleared when read, like [`Slot`].
+///
+/// ★ WHY PER PHASE. The run's one `reserved high-water` says how close the
+/// process came to the budget and not when; a change that moves one phase's
+/// reservations — a group giving its room back across the argument — is tested
+/// by that phase's peak, epoch by epoch. The whole-run number is untouched: it
+/// is a different atomic.
+#[derive(Debug)]
+pub struct Peak(AtomicU64);
+
+impl Peak {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    /// Read and CLEAR, for the reason [`Slot::take`] does.
+    fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// `commit_grouped`: the epoch's columns onto the card and every group
+/// committed.
+pub static RESERVED_COMMIT: Peak = Peak::new();
+/// The per-table argument loop.
+pub static RESERVED_ARGUE: Peak = Peak::new();
+/// The openings: every group's, then the prepared one.
+pub static RESERVED_OPEN: Peak = Peak::new();
+
+/// Opens a ledger window for a phase: its peak starts at what is promised now.
+/// `false`, and nothing touched, when the instrument is off.
+#[inline]
+pub fn open_reserved() -> bool {
+    if !enabled() {
+        return false;
+    }
+    crate::gpu::reset_reserved_window();
+    true
+}
+
+/// Closes the window [`open_reserved`] opened, into `peak`.
+#[inline]
+pub fn close_reserved(peak: &Peak, opened: bool) {
+    if opened {
+        peak.0
+            .store(crate::gpu::reserved_window_peak(), Ordering::Relaxed);
+    }
+}
+
 /// `absorb_roots_and_challenge`: the roots into the transcript and the
 /// challenge out. Host.
 pub static CHALLENGE: Slot = Slot::new();
@@ -508,6 +559,13 @@ pub struct ProverSplit {
     pub chain_count: u64,
     pub round_count: u64,
     pub rebuild_calls: u64,
+    /// The device ledger's peak over `commit_grouped`, the argument and the
+    /// openings, and the budget it is promised against — bytes, 0 without a
+    /// device ([`RESERVED_COMMIT`], [`RESERVED_ARGUE`], [`RESERVED_OPEN`]).
+    pub reserved_commit: u64,
+    pub reserved_argue: u64,
+    pub reserved_open: u64,
+    pub reserve_budget: u64,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -594,6 +652,34 @@ impl ProverSplit {
     pub fn is_global(&self) -> bool {
         self.index == GLOBAL_INDEX
     }
+    /// Who the record is, as both of its lines name it: `#k` for epoch `k`
+    /// (0-based), `GLOBAL (in base)` for the cross-epoch stage.
+    fn who(&self) -> String {
+        if self.is_global() {
+            "GLOBAL (in base)".to_string()
+        } else {
+            format!("#{}", self.index)
+        }
+    }
+    /// The ledger line, whole MiB rounded down:
+    /// `RESERVED HW #k: commit X MiB · argue Y MiB · open Z MiB · budget B MiB`,
+    /// stamped `⛔OVERLAPPED` as the split line is when another prove ran.
+    pub fn reserved_line(&self) -> String {
+        format!(
+            "RESERVED HW {who}{tainted}: commit {commit} MiB · argue {argue} MiB · \
+             open {open} MiB · budget {budget} MiB",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            commit = self.reserved_commit >> 20,
+            argue = self.reserved_argue >> 20,
+            open = self.reserved_open >> 20,
+            budget = self.reserve_budget >> 20,
+        )
+    }
 }
 
 static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
@@ -655,12 +741,12 @@ pub fn push_prover(mut rec: ProverSplit) {
             (name, secs)
         });
     rec.overlapped = OVERLAPPED.load(Ordering::Relaxed) != 0;
+    rec.reserved_commit = RESERVED_COMMIT.take();
+    rec.reserved_argue = RESERVED_ARGUE.take();
+    rec.reserved_open = RESERVED_OPEN.take();
+    rec.reserve_budget = crate::gpu::reserve_budget();
 
-    let who = if rec.is_global() {
-        "GLOBAL (in base)".to_string()
-    } else {
-        format!("#{}", rec.index)
-    };
+    let who = rec.who();
     let (max_name, max_secs) = rec
         .max_table
         .clone()
@@ -712,6 +798,7 @@ pub fn push_prover(mut rec: ProverSplit) {
         rebuilds = rec.rebuild_calls,
         rderiv = rec.derived_rebuild_calls(),
     );
+    println!("{}", rec.reserved_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1027,6 +1114,44 @@ mod tests {
         assert!(
             producer.is_empty() && prover.is_empty(),
             "disabled records nothing"
+        );
+        // A ledger window is inert too: nothing opened, nothing stored.
+        let opened = open_reserved();
+        assert!(!opened, "a disabled window must not open");
+        close_reserved(&RESERVED_ARGUE, opened);
+        assert_eq!(
+            RESERVED_ARGUE.take(),
+            0,
+            "a disabled window must not move a peak"
+        );
+    }
+
+    /// ★ The ledger line's shape is what the probe's readout parses: the same
+    /// `who` as the split line, whole MiB, the budget last, and the overlap
+    /// stamp where the split line puts it.
+    #[test]
+    fn the_ledger_line_names_its_prove_and_reads_whole_mib() {
+        let epoch = ProverSplit {
+            index: 3,
+            reserved_commit: (7 << 20) + 5,
+            reserved_argue: 22 << 30,
+            reserved_open: 1 << 20,
+            reserve_budget: 26_086 << 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.reserved_line(),
+            "RESERVED HW #3: commit 7 MiB · argue 22528 MiB · open 1 MiB · budget 26086 MiB"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.reserved_line(),
+            "RESERVED HW GLOBAL (in base) ⛔OVERLAPPED: commit 0 MiB · argue 0 MiB · \
+             open 0 MiB · budget 0 MiB"
         );
     }
 
