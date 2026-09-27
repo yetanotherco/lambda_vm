@@ -8459,6 +8459,13 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
     );
+    // A THIRD surface, the opening: a chain over a device codeword whose factors
+    // the device did not build from its shares had them built on the host,
+    // stack-sized. Named for the same reason as the two above.
+    println!(
+        "   open host fallbacks {}",
+        multilinear::gpu::open_host_fallbacks()
+    );
     // ★ ROUND-3 ARGUE DISCRIMINATOR (diagnostic): per-surface DEVICE-path reserved
     // bytes + op counts, whole-run. Divided by the `argue` wall time printed
     // above, the total bytes give an achieved HBM bandwidth — near the ~1.7 TB/s

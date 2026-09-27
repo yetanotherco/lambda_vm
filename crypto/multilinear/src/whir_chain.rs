@@ -851,13 +851,21 @@ where
     /// The same from a weight given as shares: on a device they are written
     /// straight into its buffer, and the host builds the table only if none
     /// takes them.
+    ///
+    /// `on_device` says whether the codeword being opened is on one. When it
+    /// is, the host building the tables is a fallback and is counted
+    /// ([`crate::gpu::open_host_fallbacks`]); when it is not, it is the path.
     fn from_shares(
         f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
         n_stack: usize,
+        on_device: bool,
     ) -> Result<Self, Error> {
         if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
             return Ok(Self::Device(device));
+        }
+        if on_device {
+            crate::gpu::note_open_host_fallback(n_stack);
         }
         // Only here does a stacked polynomial have to exist on the host.
         Self::new(
@@ -983,7 +991,8 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
-    let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
+    let factors =
+        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().device().is_some())?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
