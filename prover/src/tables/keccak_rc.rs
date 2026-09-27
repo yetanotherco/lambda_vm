@@ -121,8 +121,18 @@ fn static_commitment(blowup_factor: u8) -> Option<Commitment> {
 /// `compute_static_commitments --layout row` and pinned by the one-row drift
 /// test. The same regeneration rules as [`static_commitment`]. A blowup with no arm here
 /// is a hard miss under one row: no recompute.
+///
+/// The blowup-2 arm is outside that list: it is the one static root the PROTO
+/// lane's `LAMBDA_VM_GAP_P1_STARK` arm needs (`one_row = auto` resolves this
+/// 32-row table to one row at blowup 2, and every other static-root table to
+/// row pairs), pinned against its recompute by `tests::gap_proto_tests`.
 pub(crate) fn static_commitment_one_row(blowup_factor: u8) -> Option<Commitment> {
     match blowup_factor {
+        2 => Some([
+            0x3e, 0xb6, 0x00, 0x05, 0x3d, 0x84, 0xfe, 0x1a, 0x03, 0xc9, 0xda, 0x25, 0x4e, 0x3e,
+            0xb7, 0xe1, 0xce, 0x89, 0x09, 0x31, 0x2e, 0x72, 0xc1, 0xbb, 0xe5, 0xae, 0x94, 0x17,
+            0xc8, 0xf0, 0x65, 0xfa,
+        ]),
         4 => Some([
             0xe6, 0x9e, 0xfc, 0xec, 0x0d, 0x6f, 0x04, 0x22, 0xfc, 0xfe, 0x7c, 0x8b, 0x44, 0xcd,
             0x6d, 0x60, 0x27, 0x6f, 0x3b, 0x9a, 0x78, 0xf6, 0x89, 0x7b, 0x26, 0x40, 0x4b, 0x2a,

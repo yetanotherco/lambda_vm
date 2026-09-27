@@ -396,9 +396,15 @@ fn a_missing_one_row_twin_is_a_hard_miss() {
             bitwise::preprocessed_commitment_for(&options, LeafLayout::Row),
             None
         );
+        // KECCAK_RC ships one twin outside the list, at blowup 2 (the PROTO
+        // lane's P1 arm, `keccak_rc::static_commitment_one_row`): there it is
+        // pinned to its recompute instead.
         assert_eq!(
             keccak_rc::preprocessed_commitment_for(&options, LeafLayout::Row),
-            None
+            (blowup == 2).then(|| keccak_rc::compute_preprocessed_commitment_with(
+                &options,
+                LeafLayout::Row
+            ))
         );
         assert_eq!(
             page::zero_init_preprocessed_commitment_for(&options, LeafLayout::Row),

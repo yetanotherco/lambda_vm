@@ -53,6 +53,8 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod gap_proto_tests;
+#[cfg(test)]
 pub mod hash_pin_enumeration;
 #[cfg(test)]
 pub mod hint_tests;
