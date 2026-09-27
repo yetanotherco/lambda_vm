@@ -1081,6 +1081,9 @@ fn mobius(
         }
         let rows = 1u32 << k;
         let pitch = MOBIUS_TILE_COLS + 1;
+        // Past 2^15 blocks in y the excess goes to grid.z (`ntt::split_grid_y`):
+        // the first tile needs `len >> 13`, 65,536 at 2^29 evaluations.
+        let (grid_y, grid_z) = crate::ntt::split_grid_y(len as u64 / (low << k));
         unsafe {
             stream
                 .launch_builder(&be.mobius_tile)
@@ -1088,11 +1091,7 @@ fn mobius(
                 .arg(&level)
                 .arg(&k)
                 .launch(LaunchConfig {
-                    grid_dim: (
-                        (low / MOBIUS_TILE_COLS as u64) as u32,
-                        (len as u64 / (low << k)) as u32,
-                        1,
-                    ),
+                    grid_dim: ((low / MOBIUS_TILE_COLS as u64) as u32, grid_y, grid_z),
                     block_dim: (MOBIUS_TILE_COLS, rows, 1),
                     shared_mem_bytes: rows * pitch * 8,
                 })?;
