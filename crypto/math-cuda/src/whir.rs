@@ -137,15 +137,31 @@ struct RetainedLeaves {
     hash: crate::DeviceHash,
     num_leaves: usize,
     bytes: u64,
+    /// The reservation `bytes` were promised under — the room of the codeword
+    /// that captured the layer, which a fold SHARES with the codeword it came
+    /// from. `Weak`: a layer never keeps a room alive.
+    room: Weak<DeviceReservation>,
 }
 
 impl Drop for RetainedLeaves {
-    /// The other half of the live-footprint accounting: whatever admitted the
-    /// layer added to [`RETAIN_BYTES_LIVE`] is given back when the layer drops —
-    /// with its codeword, or when an eviction sets the slot to `None`. `nodes`
+    /// The other half of both accountings: whatever admitted the layer added to
+    /// [`RETAIN_BYTES_LIVE`] and to its room is given back when the layer drops
+    /// — with its codeword, or when an eviction sets the slot to `None`. `nodes`
     /// (a `CudaSlice`) frees its device bytes on the line after this returns.
+    ///
+    /// ⛔ THE ROOM IS SHRUNK HERE, not by whoever dropped the layer. A fold
+    /// lives inside its source codeword's room and captures its own layer
+    /// against it, and a fold drops at the end of its round while the source
+    /// lives on to the end of the proof: shrunk only by the evictor, a fold's
+    /// layer stayed promised until the source dropped — every opened chain
+    /// leaving its folds' layers in the budget for the rest of the group, and
+    /// a commitment held across epochs gaining a set per epoch. When the room
+    /// is already gone, its drop took these bytes with the rest.
     fn drop(&mut self) {
         RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Some(room) = self.room.upgrade() {
+            room.shrink(self.bytes);
+        }
     }
 }
 
@@ -177,15 +193,14 @@ fn retention_enabled() -> bool {
 }
 
 /// A handle the allocator can walk to reclaim a codeword's retained layer under
-/// pressure. Both are `Weak`, so the registry never keeps a codeword alive:
-/// `leaves` points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the
-/// MUTEX outlives any single layer, so this entry SURVIVES an eviction and a
-/// later re-capture refills the same `Option` — and `room` at its reservation, so
-/// the freed bytes can be `shrink`-ed back into the budget. A dead `leaves`
-/// upgrade means the codeword is gone and the eviction walk prunes the entry.
+/// pressure. `Weak`, so the registry never keeps a codeword alive: `leaves`
+/// points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the MUTEX
+/// outlives any single layer, so this entry SURVIVES an eviction and a later
+/// re-capture refills the same `Option`. The layer knows its own room and gives
+/// the budget back when it drops. A dead `leaves` upgrade means the codeword is
+/// gone and the eviction walk prunes the entry.
 struct RetentionHandle {
     leaves: Weak<Mutex<Option<RetainedLeaves>>>,
-    room: Weak<DeviceReservation>,
 }
 
 /// Every retaining codeword's handle, registered once at its first capture and
@@ -198,13 +213,12 @@ fn ensure_evictor_installed() {
     INSTALLED.call_once(|| crate::device::set_retention_evictor(evict_retained_layers));
 }
 
-/// Register a codeword's layer slot + reservation for eviction. Called OUTSIDE
-/// the layer lock (it takes only the registry lock), so the one lock nesting in
-/// the system is the evictor's registry→layer and there is no cycle.
-fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>, room: &Arc<DeviceReservation>) {
+/// Register a codeword's layer slot for eviction. Called OUTSIDE the layer lock
+/// (it takes only the registry lock), so the one lock nesting in the system is
+/// the evictor's registry→layer and there is no cycle.
+fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
     let handle = RetentionHandle {
         leaves: Arc::downgrade(leaves),
-        room: Arc::downgrade(room),
     };
     if let Ok(mut reg) = RETENTION_REGISTRY.lock() {
         reg.push(handle);
@@ -217,10 +231,10 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>, room: &Arc<Dev
 /// goes; returns the bytes freed.
 ///
 /// SAFETY, the load-bearing facts:
-/// - NO REENTRANCY. It calls only `room.shrink` (a lock-free `be.reserved`
-///   subtract) and drops `RetainedLeaves` (a counter subtract + a stream-ordered
-///   free). It NEVER calls `reserve`/`grow`, so it cannot re-enter the allocator
-///   that called it.
+/// - NO REENTRANCY. It drops `RetainedLeaves` — two counter subtracts, one of
+///   them `room.shrink` (a lock-free `be.reserved` subtract), and a
+///   stream-ordered free. It NEVER calls `reserve`/`grow`, so it cannot re-enter
+///   the allocator that called it.
 /// - NO UAF. It takes the layer out UNDER the codeword's own `leaves` mutex, so a
 ///   concurrent [`serve_retained_leaves`] either ran first (its `memcpy_dtod` is
 ///   already enqueued on the codeword's stream) or sees `None` and rebuilds. The
@@ -258,10 +272,9 @@ fn evict_retained_layers(target: u64) -> u64 {
         };
         if let Some(layer) = taken {
             let bytes = layer.bytes;
-            drop(layer); // RetainedLeaves::drop: live -= bytes; nodes freed (stream-ordered)
-            if let Some(room) = handle.room.upgrade() {
-                room.shrink(bytes); // give the BUDGET back to argue
-            }
+            // RetainedLeaves::drop: live -= bytes, the BUDGET goes back to its
+            // room (for argue), nodes freed (stream-ordered).
+            drop(layer);
             freed += bytes;
             RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
             RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
@@ -320,6 +333,55 @@ mod leaf_key_tests {
     }
 }
 
+#[cfg(test)]
+mod fold_transient_tests {
+    use super::fold_transient_bytes;
+
+    /// ★ The round-0 fold's transient, in numbers: level by level the first
+    /// two levels' outputs are live together — 2.25× the committed base
+    /// codeword `C` — while fused it is only the output, `3C/64` at six levels
+    /// (extension values, a 64th as many). At the fat stack's 2^28 variables
+    /// (a 2^30 codeword, `C` = 8 GiB) that is 18 GiB against 384 MiB.
+    #[test]
+    fn a_fused_fold_holds_only_its_output() {
+        for n in [25usize, 27, 28] {
+            let log_elements = n + 2;
+            let codeword = 8u64 << log_elements;
+            let stepped = fold_transient_bytes(log_elements, 6, false);
+            let fused = fold_transient_bytes(log_elements, 6, true);
+            println!(
+                "2^{n}: level by level {:.2} C, fused {:.4} C",
+                stepped as f64 / codeword as f64,
+                fused as f64 / codeword as f64
+            );
+            assert_eq!(stepped * 4, codeword * 9);
+            assert_eq!(fused * 64, codeword * 3);
+            assert!(fused * 48 == stepped);
+        }
+        assert_eq!(
+            fold_transient_bytes(20, 1, false),
+            fold_transient_bytes(20, 1, true)
+        );
+    }
+
+    /// ★ A commit holds its coefficients or its tree, never both — and at the
+    /// production first fold of six the coefficients are the larger, a quarter
+    /// of the codeword `C`. Under a uniform fold of four the tree is (half of
+    /// `C`, less a node), and two of those in flight are, to 64 bytes, the one
+    /// codeword a group's room always promised: that room was a commit turn.
+    #[test]
+    fn a_commit_holds_its_coefficients_or_its_tree_never_both() {
+        use super::commit_transient_bytes;
+        for n in [16usize, 25, 27, 28] {
+            let codeword = 8u64 << (n + 2);
+            assert_eq!(commit_transient_bytes(n, 2, 6) * 4, codeword);
+            let uniform = commit_transient_bytes(n, 2, 4);
+            assert_eq!(uniform, codeword / 2 - 32);
+            assert_eq!(codeword - 2 * uniform, 64);
+        }
+    }
+}
+
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -364,6 +426,14 @@ impl DeviceCodeword {
 
     pub fn is_base(&self) -> bool {
         self.base
+    }
+
+    /// Every limb, read back — one per value for a base codeword, three for an
+    /// extension one. For the parity tests; a chain only ever gathers cosets.
+    pub fn to_host(&self) -> Result<Vec<u64>> {
+        let values = self.stream.clone_dtoh(self.buffer.as_ref())?;
+        self.stream.synchronize()?;
+        Ok(values)
     }
 
     /// The first value, which is what the last fold leaves behind.
@@ -552,6 +622,7 @@ impl DeviceCodeword {
             hash,
             num_leaves,
             bytes,
+            room: Arc::downgrade(&self.room),
         });
         // Release the layer lock BEFORE touching the registry, so the only lock
         // nesting anywhere is the evictor's registry→layer — acyclic. Register
@@ -559,7 +630,7 @@ impl DeviceCodeword {
         // re-capture refills the same slot, so a second push would only duplicate.
         drop(held);
         if !self.registered.swap(true, Ordering::Relaxed) {
-            register_retained(&self.leaves, &self.room);
+            register_retained(&self.leaves);
         }
     }
 
@@ -1268,6 +1339,132 @@ pub fn fold_resident(
         room: codeword.room.clone(),
         // A fold is its own codeword for retention too: its own slot, its own
         // registry entry once it captures.
+        registered: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// The widest fold [`fold_resident_fused`] takes in one launch
+/// (`WHIR_MAX_FOLD` in `whir_fold.cu`): the chain's `MAX_FOLD`.
+pub const FUSED_MAX_FOLD: usize = 6;
+
+/// The most a `levels`-level fold of a `2^log_elements` codeword holds beside
+/// its input: level by level, the first level's output and the second's live
+/// together (`3·8·(2^(N−1) + 2^(N−2))` bytes; one level holds just its own);
+/// fused, only the output (`3·8·2^(N−levels)`).
+pub const fn fold_transient_bytes(log_elements: usize, levels: usize, fused: bool) -> u64 {
+    if fused || levels == 1 {
+        24u64 << (log_elements - levels)
+    } else {
+        (24u64 << (log_elements - 1)) + (24u64 << (log_elements - 2))
+    }
+}
+
+/// Bytes a Merkle tree over `2^log_leaves` leaves holds while it is built:
+/// `2·2^log_leaves − 1` nodes of 32 bytes, the host's layout.
+pub const fn tree_bytes(log_leaves: usize) -> u64 {
+    32 * ((2u64 << log_leaves) - 1)
+}
+
+/// ★ The most one commit of a `2^log_evals` polynomial holds on the card beside
+/// the codeword it leaves there.
+///
+/// Two buffers, and they take turns rather than stack: the coefficients
+/// (`2^log_evals` base values), which the spread reads into the codeword and
+/// which are freed before the transform runs; and the tree over the codeword's
+/// `2^log_folding`-value blocks, built after it. So the peak is the larger of
+/// the two, not their sum. The transform runs in place, and its twiddles are
+/// cached for the process outside every promise. The leaf layer a tree offers
+/// for retention is not in this number either: the codeword's own room grows
+/// by it when it is kept.
+pub const fn commit_transient_bytes(
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+) -> u64 {
+    let coefficients = 8u64 << log_evals;
+    let tree = tree_bytes(log_evals + log_blowup - log_folding);
+    if coefficients > tree {
+        coefficients
+    } else {
+        tree
+    }
+}
+
+/// [`fold_resident`]'s result in ONE launch, with nothing but the output
+/// allocated.
+///
+/// Level by level, the first fold of a committed codeword writes `2^(n+1)`
+/// extension values — 1.5× the codeword — and holds them beside the second
+/// level's while the codeword is still resident: a 2.25× transient that grows
+/// with the stack. Here each output folds its own strided coset in registers
+/// (`whir_fold_k_*` in `whir_fold.cu`), so the transient is the output alone,
+/// `3·2^(n+2−levels)` limbs.
+///
+/// ★ Raw-identical to [`fold_resident`], not merely equal: every pair runs
+/// that kernel's operation sequence on the same raw inputs, `pow_base`'s
+/// squares and multiplication order included (`tests/whir_fold.rs`).
+pub fn fold_resident_fused(
+    codeword: &DeviceCodeword,
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<DeviceCodeword> {
+    let levels = g_invs.len();
+    assert!(
+        (1..=FUSED_MAX_FOLD).contains(&levels),
+        "a fused fold takes 1..={FUSED_MAX_FOLD} levels, not {levels}"
+    );
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.elements >> levels >= 1,
+        "{levels} folds do not fit"
+    );
+
+    let be = backend()?;
+    let stream = codeword.stream.clone();
+    let g_dev = crate::device::htod_or_trim(&stream, g_invs)?;
+    let alpha = crate::device::htod_or_trim(&stream, alphas)?;
+    let n_out = codeword.elements >> levels;
+    // SAFETY: the kernel writes every output element.
+    let mut out = unsafe { alloc_or_trim::<u64>(&stream, n_out * 3) }?;
+    let n_out_arg = n_out as u64;
+    let levels_arg = levels as u32;
+    let kernel = if codeword.base {
+        &be.whir_fold_k_base_ext3
+    } else {
+        &be.whir_fold_k_ext3
+    };
+    // 256 threads: a thread carries a pending value per level, and a 1024-wide
+    // block would cap its registers below what that needs.
+    let block = 256u32;
+    let grid = (n_out as u64).div_ceil(block as u64) as u32;
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(codeword.buffer.as_ref())
+            .arg(&n_out_arg)
+            .arg(&levels_arg)
+            .arg(&two_inv)
+            .arg(&g_dev)
+            .arg(&alpha)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (grid.max(1), 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+
+    Ok(DeviceCodeword {
+        buffer: Arc::new(out),
+        stream,
+        elements: n_out,
+        base: false,
+        // A fold is its own codeword, as `fold_resident`'s is.
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: codeword.room.clone(),
         registered: Arc::new(AtomicBool::new(false)),
     })
 }

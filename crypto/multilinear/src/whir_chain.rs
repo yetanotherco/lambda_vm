@@ -674,6 +674,16 @@ where
     Ok((commitment, domain))
 }
 
+/// The product of a chain's two tables, which is what its rounds evaluate —
+/// and what sizes a device session's slot file.
+pub(crate) fn opening_program<E: IsField + 'static>() -> Result<crate::program::Program<E>, Error> {
+    let mut builder = crate::program::Builder::<E>::new();
+    let weight = builder.var(0);
+    let message = builder.var(1);
+    let root = builder.mul(weight, message);
+    builder.finish(root)
+}
+
 /// The two tables a chain's rounds fold: the weight it carries and the message
 /// it is opening.
 ///
@@ -696,13 +706,8 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: Send + Sync,
 {
-    /// The product of the two, which is what a round evaluates.
     fn program() -> Result<crate::program::Program<E>, Error> {
-        let mut builder = crate::program::Builder::<E>::new();
-        let weight = builder.var(0);
-        let message = builder.var(1);
-        let root = builder.mul(weight, message);
-        builder.finish(root)
+        opening_program::<E>()
     }
 
     fn new(f: &Mle<F>, weight: Mle<E>) -> Result<Self, Error> {
@@ -727,13 +732,21 @@ where
     /// The same from a weight given as shares: on a device they are written
     /// straight into its buffer, and the host builds the table only if none
     /// takes them.
+    ///
+    /// `on_device` says whether the codeword being opened is on one. When it
+    /// is, the host building the tables is a fallback and is counted
+    /// ([`crate::gpu::open_host_fallbacks`]); when it is not, it is the path.
     fn from_shares(
         f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
         n_stack: usize,
+        on_device: bool,
     ) -> Result<Self, Error> {
         if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
             return Ok(Self::Device(device));
+        }
+        if on_device {
+            crate::gpu::note_open_host_fallback(n_stack);
         }
         // Only here does a stacked polynomial have to exist on the host.
         Self::new(
@@ -782,7 +795,7 @@ where
         }
     }
 
-    fn evaluate_message(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
+    fn evaluate_message(&mut self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
         match self {
             Self::Host { message, .. } => message.evaluate(point),
             Self::Device(device) => device.evaluate_message(point),
@@ -859,7 +872,8 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
-    let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
+    let factors =
+        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().device().is_some())?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,

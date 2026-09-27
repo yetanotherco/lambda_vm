@@ -454,6 +454,9 @@ where
                 got: sizes.iter().sum(),
             });
         }
+        // The device ledger's peak over the whole commit, under
+        // `LAMBDA_VM_BASE_SPLIT=1` — `RESERVED HW`'s `commit`.
+        let __rw_commit = multilinear::whir_split::open_reserved();
         // The epoch's columns, on the card once. Four things read them — the
         // commitment, the sumcheck's factors, the evaluation at the reduction
         // point and the opening's message — and each used to upload its own
@@ -499,6 +502,10 @@ where
                 table.trace.set_resident(store.clone(), *first);
             }
         }
+        multilinear::whir_split::close_reserved(
+            &multilinear::whir_split::RESERVED_COMMIT,
+            __rw_commit,
+        );
         Ok(Self {
             tables,
             store,
@@ -1317,6 +1324,11 @@ where
     // gated behind LFM_WHIR_PREFETCH for a one-binary A/B — off is byte-exact.
     let prefetch = prefetch_enabled();
     let mut held: Option<logup::PrefetchedTree<E>> = None;
+    // The device ledger's peak over the argument alone — `RESERVED HW`'s
+    // `argue`. It opens on what the commits left promised (the codewords, the
+    // layers they kept, and whatever room a group still holds) and rises by
+    // what the tables reserve.
+    let __rw_argue = multilinear::whir_split::open_reserved();
     for (__sp_at, table) in committed.tables().iter().enumerate() {
         table_starts.push(points.len());
         // ⛔ SERIAL, and the instrument says so rather than a reader inferring
@@ -1344,12 +1356,16 @@ where
         values.extend(proof.constraint.reduce.column_values.iter().cloned());
         tables.push(proof);
     }
+    multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_ARGUE, __rw_argue);
 
     // One opening per group, over that group's columns. The points and values
     // are in the global column order, so a group takes the slice its tables
     // span.
     let mut columns = Vec::with_capacity(committed.groups().len());
     multilinear::whir_split::note_groups(committed.groups().len());
+    // The ledger's peak over every opening — the groups' and the prepared
+    // one — as `RESERVED HW`'s `open`.
+    let __rw_open = multilinear::whir_split::open_reserved();
     // ⛔ CLEARED AT THE OPENING OF THE WINDOW, not merely read at its close.
     // The six are process-global accumulators, so whatever ran the chain
     // earlier in this process is still sitting in them; reading at the end
@@ -1437,6 +1453,7 @@ where
         None => None,
     };
     multilinear::whir_split::add(&multilinear::whir_split::OPEN_PREPARED, __sp_prepared);
+    multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_OPEN, __rw_open);
 
     Ok(MultiProof {
         roots: committed.roots().to_vec(),

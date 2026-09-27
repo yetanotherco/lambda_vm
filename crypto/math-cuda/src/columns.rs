@@ -51,7 +51,9 @@ impl Columns<'_> {
 /// The columns themselves, laid end to end in one allocation.
 pub struct DeviceColumns {
     stream: Arc<CudaStream>,
-    buffer: CudaSlice<u64>,
+    /// Shared so a reader that outlives a borrow of the store — a WHIR opening's
+    /// first rounds read the message where it lies — keeps it alive.
+    buffer: Arc<CudaSlice<u64>>,
     /// `(offset, len)` in elements, per column, in the order uploaded.
     spans: Vec<(usize, usize)>,
     _room: DeviceReservation,
@@ -85,7 +87,7 @@ impl DeviceColumns {
         stream.synchronize().ok()?;
         Some(Self {
             stream,
-            buffer,
+            buffer: Arc::new(buffer),
             spans,
             _room: room,
         })
@@ -103,6 +105,16 @@ impl DeviceColumns {
         }
         let (start, rows) = self.spans[first];
         (0..width).all(|k| self.spans[first + k] == (start + k * rows, rows))
+    }
+
+    /// The one allocation every column lives in, shared.
+    pub fn buffer(&self) -> Arc<CudaSlice<u64>> {
+        self.buffer.clone()
+    }
+
+    /// Column `k`'s `(offset, len)` in elements, within [`buffer`](Self::buffer).
+    pub fn span(&self, k: usize) -> (usize, usize) {
+        self.spans[k]
     }
 
     /// The device address of column `k` and its length in elements.

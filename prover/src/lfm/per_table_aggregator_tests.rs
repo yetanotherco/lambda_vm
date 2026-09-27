@@ -8473,6 +8473,41 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
     );
+    // A THIRD surface, the opening: a chain over a device codeword whose factors
+    // the device did not build from its shares had them built on the host,
+    // stack-sized. Named for the same reason as the two above.
+    println!(
+        "   open host fallbacks {}",
+        multilinear::gpu::open_host_fallbacks()
+    );
+    // The stacked groups' room: given back after the commits, taken back for
+    // the openings, and — the number that must read zero — refused.
+    println!(
+        "   room turns: {} parked, {} taken back, {} refused",
+        multilinear::gpu::room_parks(),
+        multilinear::gpu::room_turns(),
+        multilinear::gpu::room_turn_refusals()
+    );
+    // Which WHIR kernels ran, read off the counters of the paths themselves, so
+    // the log shows the path taken rather than the switches' spelling. At the
+    // defaults: `fused folds F of F`, `lean opens L of O (6 rounds)` with L = O
+    // unless a stack is one the lean path cannot read, `turn-sized rooms S of S`.
+    // Each opt-out zeroes its own share and leaves the total standing:
+    // `LAMBDA_VM_NO_WHIR_FUSED_FOLD=1` reads `fused folds 0 of F`,
+    // `LAMBDA_VM_WHIR_LEAN_ROUNDS=0` reads `lean opens 0 of O (0 rounds)`,
+    // `LAMBDA_VM_NO_WHIR_ROOM_RESIZE=1` reads `turn-sized rooms 0 of S`, and
+    // `LAMBDA_VM_NO_WHIR_ROOM_PARK=1` reads `0 parked, 0 taken back` above.
+    println!(
+        "   whir kernels: fused folds {} of {} · lean opens {} of {} ({} rounds) · \
+         turn-sized rooms {} of {}",
+        multilinear::gpu::fused_fold_calls(),
+        multilinear::gpu::resident_fold_calls(),
+        multilinear::gpu::lean_open_calls(),
+        multilinear::gpu::open_calls(),
+        multilinear::gpu::lean_rounds_in_effect(),
+        multilinear::gpu::rooms_turn_sized(),
+        multilinear::gpu::room_sizings()
+    );
     // ★ ROUND-3 ARGUE DISCRIMINATOR (diagnostic): per-surface DEVICE-path reserved
     // bytes + op counts, whole-run. Divided by the `argue` wall time printed
     // above, the total bytes give an achieved HBM bandwidth — near the ~1.7 TB/s
