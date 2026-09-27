@@ -973,7 +973,11 @@ fn expand_row_major_on_stream(
     match input {
         InnerInput::Host(h) if h.len() >= PINNED_H2D_MIN_U64 => {
             let mut dst = buf.slice_mut(0..n * total_cols);
-            crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut dst)?;
+            if crate::device::staging_pairs_enabled() {
+                crate::device::htod_staged(stream, h, &mut dst)?;
+            } else {
+                crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut dst)?;
+            }
         }
         InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
         InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
@@ -1063,7 +1067,9 @@ fn expand_col_major_on_stream(
     const PINNED_H2D_MIN_U64: usize = 1 << 20;
     if let InnerInput::Host(h) = input {
         let mut staged = buf.slice_mut(tail..total);
-        if h.len() >= PINNED_H2D_MIN_U64 {
+        if h.len() >= PINNED_H2D_MIN_U64 && crate::device::staging_pairs_enabled() {
+            crate::device::htod_staged(stream, h, &mut staged)?;
+        } else if h.len() >= PINNED_H2D_MIN_U64 {
             crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut staged)?;
         } else {
             stream.memcpy_htod(h, &mut staged)?;
@@ -1557,38 +1563,61 @@ fn coset_lde_row_major_inner(
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
 
+    // Transpose row-major buf into column-major for the handle, in place.
+    // Downstream kernels (DEEP, barycentric) expect buf[c * lde_size + r].
+    // No host synchronize after it: the handle carries a `ready` event instead,
+    // and consumers on other streams wait on it device-side
+    // (`wait_ready_on`). On the device-only path this makes the whole
+    // commit's tail (transpose) run behind the host's next work.
+    let transpose = |buf: CudaSlice<u64>| -> Result<(CudaSlice<u64>, crate::device::PooledEvent)> {
+        let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, total_cols)?;
+        let ready = be.take_event()?;
+        ready.event().record(&stream)?;
+        Ok((col_major_dev, ready))
+    };
     // D2H the row-major LDE (skipped when `retain_host_lde` is false — the
     // full-residency path keeps the LDE device-only; that skip is the big
-    // transfer/alloc win, and we return an empty host Vec).
-    let lde_pending = if retain_host_lde {
-        Some(crate::device::async_dtoh_via(
+    // transfer/alloc win, and we return an empty host Vec). The transpose is
+    // queued behind the D2H either way, so the host copy sees the row-major
+    // bytes.
+    let (col_major_dev, ready, lde_out) = if retain_host_lde
+        && crate::device::staging_pairs_enabled()
+    {
+        // A staging pair of this call's own: the host copies one chunk out
+        // while the next lands, and the transpose is queued the moment the last
+        // chunk's read is.
+        let src = {
+            let (ptr, _record) = buf.device_ptr(&stream);
+            ptr
+        };
+        let mut out = Vec::new();
+        // SAFETY: `src` is `buf`, whose writers (the LDE and leaf kernels) are
+        // queued on `stream` above; its next writer is the transpose, which the
+        // closure queues on `stream` behind the last read, and `buf` lives on as
+        // the transposed handle.
+        let (col_major_dev, ready) = unsafe {
+            crate::device::dtoh_staged_into(&stream, src, lde_size * total_cols, &mut out, || {
+                transpose(buf)
+            })
+        }?;
+        (col_major_dev, ready, out)
+    } else if retain_host_lde {
+        let started = std::time::Instant::now();
+        let pending = crate::device::async_dtoh_via(
             &stream,
             be.pinned_staging(),
             &be.ctx,
             &buf,
             lde_size * total_cols,
-        )?)
+        )?;
+        let (col_major_dev, ready) = transpose(buf)?;
+        let mut out = vec![0u64; lde_size * total_cols];
+        pending.wait_into_u64(&mut out)?;
+        crate::device::note_shared_slab_download(out.len() * 8, started.elapsed());
+        (col_major_dev, ready, out)
     } else {
-        None
-    };
-
-    // Transpose row-major buf into column-major for the handle, in place —
-    // queued behind the D2H above, so the host copy sees the row-major bytes.
-    // Downstream kernels (DEEP, barycentric) expect buf[c * lde_size + r].
-    let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, total_cols)?;
-    // No host synchronize here: the handle carries a `ready` event instead,
-    // and consumers on other streams wait on it device-side
-    // (`wait_ready_on`). On the device-only path this makes the whole
-    // commit's tail (transpose) run behind the host's next work.
-    let ready = be.take_event()?;
-    ready.event().record(&stream)?;
-    let lde_out = match lde_pending {
-        Some(p) => {
-            let mut out = vec![0u64; lde_size * total_cols];
-            p.wait_into_u64(&mut out)?;
-            out
-        }
-        None => Vec::new(),
+        let (col_major_dev, ready) = transpose(buf)?;
+        (col_major_dev, ready, Vec::new())
     };
 
     let tree = GpuMerkleTree {
@@ -1876,27 +1905,49 @@ pub fn coset_lde_row_major_split_trees_rpl(
         }
     };
 
+    // Column-major handle for downstream GPU rounds (DEEP, barycentric,
+    // constraint composition): transposed in place, behind the D2H below.
+    let transpose = |buf: CudaSlice<u64>| -> Result<(CudaSlice<u64>, crate::device::PooledEvent)> {
+        let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, m)?;
+        let ready = be.take_event()?;
+        ready.event().record(&stream)?;
+        Ok((col_major_dev, ready))
+    };
     // D2H the row-major LDE only when the caller keeps a host copy; under
     // device-only every downstream consumer reads the handle.
-    let lde_pending = retain_host_lde
-        .then(|| {
-            crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &buf, lde_size * m)
-        })
-        .transpose()?;
-
-    // Column-major handle for downstream GPU rounds (DEEP, barycentric,
-    // constraint composition): transposed in place, behind the D2H above.
-    let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, m)?;
-    let ready = be.take_event()?;
-    ready.event().record(&stream)?;
-
-    let lde_out = match lde_pending {
-        Some(pending) => {
-            let mut out = vec![0u64; lde_size * m];
-            pending.wait_into_u64(&mut out)?;
-            out
-        }
-        None => Vec::new(),
+    let (col_major_dev, ready, lde_out) = if retain_host_lde
+        && crate::device::staging_pairs_enabled()
+    {
+        // A staging pair of this call's own, as in `coset_lde_row_major_inner`.
+        let src = {
+            let (ptr, _record) = buf.device_ptr(&stream);
+            ptr
+        };
+        let mut out = Vec::new();
+        // SAFETY: `src` is `buf`, whose writers are queued on `stream` above;
+        // its next writer is the transpose, which the closure queues on
+        // `stream` behind the last read, and `buf` lives on as the handle.
+        let (col_major_dev, ready) = unsafe {
+            crate::device::dtoh_staged_into(&stream, src, lde_size * m, &mut out, || transpose(buf))
+        }?;
+        (col_major_dev, ready, out)
+    } else if retain_host_lde {
+        let started = std::time::Instant::now();
+        let pending = crate::device::async_dtoh_via(
+            &stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &buf,
+            lde_size * m,
+        )?;
+        let (col_major_dev, ready) = transpose(buf)?;
+        let mut out = vec![0u64; lde_size * m];
+        pending.wait_into_u64(&mut out)?;
+        crate::device::note_shared_slab_download(out.len() * 8, started.elapsed());
+        (col_major_dev, ready, out)
+    } else {
+        let (col_major_dev, ready) = transpose(buf)?;
+        (col_major_dev, ready, Vec::new())
     };
 
     let handle = GpuLdeBase {

@@ -160,6 +160,9 @@ pub struct Backend {
     /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
+    /// Fixed-size double-buffered pinned pairs, one per concurrent
+    /// staged transfer. See [`htod_staged`].
+    staging_pairs: StagingPool,
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     next: AtomicUsize,
@@ -1123,6 +1126,7 @@ impl Backend {
             streams,
             pinned_staging,
             pinned_hashes,
+            staging_pairs: StagingPool::default(),
             event_pool,
             util_stream,
             next: AtomicUsize::new(0),
@@ -1477,7 +1481,9 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
         // synced below before this memcpy overwrites the slab, so the slab is
         // never read (by an in-flight DMA) and written at the same time.
         unsafe {
+            let copy_t0 = std::time::Instant::now();
             std::ptr::copy_nonoverlapping(src.add(byte_off), staging.ptr as *mut u8, this_bytes);
+            STAGING_STATS.note_in(false, this_bytes, copy_t0.elapsed());
             let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst_base + byte_off as u64,
                 staging.ptr as *const core::ffi::c_void,
@@ -1569,6 +1575,479 @@ impl Drop for DrainOnErr<'_> {
             let _ = self.stream.synchronize();
         }
     }
+}
+
+// ── Per-transfer, double-buffered pinned staging ─────────────────────────────
+
+/// The opt-out from per-transfer staging. `1` sends the row-major commit's trace
+/// upload and its retained-LDE download through the shared per-worker slab of
+/// [`htod_via`] / [`async_dtoh_via`]; anything else (the default) gives each of
+/// those transfers a staging pair of its own ([`htod_staged`],
+/// [`dtoh_staged_into`]).
+///
+/// ⛔ WHY PAIRS. The per-table scheduler's driver threads are not rayon workers,
+/// so [`Backend::worker_slot`] sends every one of them to slot 0. Through the
+/// shared slab every driver stages through ONE slab, one single-buffered chunk at
+/// a time, and a driver copying a retained LDE out holds that slab's mutex for
+/// the whole host copy while the others queue with the card idle. The slab also
+/// grows to the largest retained LDE's next power of two and never shrinks, which
+/// is pinned host memory for the rest of the process.
+pub const STAGING_SHARED_SLAB_ENV: &str = "LAMBDA_VM_STAGING_SHARED_SLAB";
+
+thread_local! {
+    /// The calling thread's override of [`staging_pairs_enabled`], so one test
+    /// process can run both paths. `None` reads the environment.
+    static STAGING_PAIRS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the calling thread stages the row-major commit's transfers through
+/// pairs: its override if set, else unless [`STAGING_SHARED_SLAB_ENV`] is `1`.
+/// The environment is read once per process and named once on stderr, so every
+/// log states which staging it ran.
+pub fn staging_pairs_enabled() -> bool {
+    if let Some(on) = STAGING_PAIRS_OVERRIDE.with(|o| o.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let shared = std::env::var(STAGING_SHARED_SLAB_ENV).is_ok_and(|v| v == "1");
+        eprintln!(
+            "[gpu] transfer staging: {}",
+            if shared {
+                "the shared per-worker slab (LAMBDA_VM_STAGING_SHARED_SLAB=1)"
+            } else {
+                "per-transfer pinned pairs"
+            }
+        );
+        !shared
+    })
+}
+
+/// Force [`staging_pairs_enabled`] on the calling thread; `None` restores the
+/// environment's answer.
+pub fn set_staging_pairs_override(on: Option<bool>) {
+    STAGING_PAIRS_OVERRIDE.with(|o| o.set(on));
+}
+
+/// Bytes in one staging buffer. A pair holds two.
+pub const STAGED_CHUNK_BYTES: usize = 32 << 20;
+
+/// The most pairs a process ever allocates, which bounds the pairs' pinned
+/// footprint at `MAX_STAGING_PAIRS × 2 × STAGED_CHUNK_BYTES` = 512 MiB and the
+/// number of pinned allocations at sixteen. Pairs are made on demand, lent to
+/// one transfer at a time and never freed or grown — the bound whose absence
+/// made pre-sized per-worker slabs a measured regression (see the note on
+/// pinned-staging size hints in `stark::prover::multi_prove`).
+pub const MAX_STAGING_PAIRS: usize = 8;
+
+/// Two fixed-size pinned buffers, each carrying the event of the last DMA that
+/// read or wrote it.
+struct StagingPair {
+    bufs: [PinnedStaging; 2],
+}
+
+impl StagingPair {
+    fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        let mut bufs = [PinnedStaging::empty(), PinnedStaging::empty()];
+        for buf in &mut bufs {
+            buf.ensure_capacity(STAGED_CHUNK_BYTES / 8, ctx)?;
+            buf.event = Some(ctx.new_event(None)?);
+        }
+        Ok(Self { bufs })
+    }
+}
+
+/// The pairs not on loan, and how many exist.
+#[derive(Default)]
+struct StagingPool {
+    free: Mutex<Vec<StagingPair>>,
+    returned: std::sync::Condvar,
+    created: AtomicUsize,
+}
+
+impl StagingPool {
+    /// A pair for one transfer: a free one, else a new one while fewer than
+    /// [`MAX_STAGING_PAIRS`] exist, else the next one handed back. Never nested
+    /// (a transfer holds one pair and asks for nothing else while it does), so
+    /// the wait cannot deadlock.
+    fn lend(&self, ctx: &Arc<CudaContext>) -> Result<PairLoan<'_>> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(pair) = free.pop() {
+                return Ok(PairLoan {
+                    pool: self,
+                    pair: Some(pair),
+                });
+            }
+            if self.created.load(Ordering::Relaxed) < MAX_STAGING_PAIRS {
+                // Counted under the lock, so the cap cannot be overshot.
+                self.created.fetch_add(1, Ordering::Relaxed);
+                drop(free);
+                return match StagingPair::new(ctx) {
+                    Ok(pair) => Ok(PairLoan {
+                        pool: self,
+                        pair: Some(pair),
+                    }),
+                    Err(e) => {
+                        self.created.fetch_sub(1, Ordering::Relaxed);
+                        Err(e)
+                    }
+                };
+            }
+            STAGING_STATS.pair_waits.fetch_add(1, Ordering::Relaxed);
+            free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A pair on loan to one transfer, handed back when dropped. Every exit path of
+/// a transfer leaves no DMA in flight on a buffer without that buffer's event
+/// recorded after it, so the next borrower's event waits are enough.
+struct PairLoan<'a> {
+    pool: &'a StagingPool,
+    pair: Option<StagingPair>,
+}
+
+impl PairLoan<'_> {
+    fn buf(&mut self, k: usize) -> &mut PinnedStaging {
+        &mut self.pair.as_mut().expect("present until drop").bufs[k & 1]
+    }
+}
+
+impl Drop for PairLoan<'_> {
+    fn drop(&mut self) {
+        if let Some(pair) = self.pair.take() {
+            self.pool
+                .free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pair);
+            self.pool.returned.notify_one();
+        }
+    }
+}
+
+/// What the staging surface moved and what its host copies cost, by path —
+/// counted on BOTH arms so an A/B reads the same quantities on each. `in` is the
+/// commit's trace upload (host memcpy into pinned memory); `out` is the retained
+/// LDE's download, timed from the DMA's enqueue to the host holding every value.
+struct StagingStats {
+    /// `[shared slab, staged]`.
+    in_bytes: [AtomicU64; 2],
+    in_nanos: [AtomicU64; 2],
+    out_bytes: [AtomicU64; 2],
+    out_nanos: [AtomicU64; 2],
+    pair_waits: AtomicU64,
+}
+
+static STAGING_STATS: StagingStats = StagingStats {
+    in_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
+    in_nanos: [AtomicU64::new(0), AtomicU64::new(0)],
+    out_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
+    out_nanos: [AtomicU64::new(0), AtomicU64::new(0)],
+    pair_waits: AtomicU64::new(0),
+};
+
+impl StagingStats {
+    fn note_in(&self, staged: bool, bytes: usize, took: std::time::Duration) {
+        let i = usize::from(staged);
+        self.in_bytes[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        self.in_nanos[i].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn note_out(&self, staged: bool, bytes: usize, took: std::time::Duration) {
+        let i = usize::from(staged);
+        self.out_bytes[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        self.out_nanos[i].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Record one retained-LDE download taken through the shared slab: `bytes`
+/// landed in a host `Vec` `took` after the DMA was queued.
+pub fn note_shared_slab_download(bytes: usize, took: std::time::Duration) {
+    STAGING_STATS.note_out(false, bytes, took);
+}
+
+/// The staging counters as numbers, for a test that asserts a path was taken.
+#[derive(Clone, Copy, Debug)]
+pub struct StagingTotals {
+    pub shared_in_bytes: u64,
+    pub staged_in_bytes: u64,
+    pub shared_out_bytes: u64,
+    pub staged_out_bytes: u64,
+    /// Staging pairs allocated so far.
+    pub pairs: usize,
+    /// Times a transfer waited because every pair was on loan.
+    pub pair_waits: u64,
+}
+
+/// The staging counters since the process started.
+pub fn staging_totals() -> StagingTotals {
+    let s = &STAGING_STATS;
+    StagingTotals {
+        shared_in_bytes: s.in_bytes[0].load(Ordering::Relaxed),
+        staged_in_bytes: s.in_bytes[1].load(Ordering::Relaxed),
+        shared_out_bytes: s.out_bytes[0].load(Ordering::Relaxed),
+        staged_out_bytes: s.out_bytes[1].load(Ordering::Relaxed),
+        pairs: backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed)),
+        pair_waits: s.pair_waits.load(Ordering::Relaxed),
+    }
+}
+
+/// The shared slabs' pinned footprint, LDE staging and Merkle hashes together:
+/// `(bytes, slots allocated, slots busy)`. A slab grows to a power of two and
+/// never shrinks, so this is its high-water so far. A slot another thread holds
+/// right now is counted as busy, not waited for.
+fn shared_slab_footprint(be: &Backend) -> (u64, usize, usize) {
+    slab_footprint(be.pinned_staging.iter().chain(&be.pinned_hashes))
+}
+
+/// [`shared_slab_footprint`] over any set of slots.
+fn slab_footprint<'a>(
+    slots: impl Iterator<Item = &'a Mutex<PinnedStaging>>,
+) -> (u64, usize, usize) {
+    let (mut bytes, mut allocated, mut busy) = (0u64, 0usize, 0usize);
+    for slot in slots {
+        let elems = match slot.try_lock() {
+            Ok(s) => s.capacity_elems,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().capacity_elems,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                busy += 1;
+                continue;
+            }
+        };
+        if elems > 0 {
+            allocated += 1;
+            bytes += (elems * std::mem::size_of::<u64>()) as u64;
+        }
+    }
+    (bytes, allocated, busy)
+}
+
+/// One line for the log: the staging surface's traffic and host-copy seconds per
+/// path since the process started, the staging pairs' pool size and waits, and the
+/// shared slabs' pinned footprint (what the retained-LDE downloads grow while
+/// the shared-slab path is taken).
+pub fn staging_report() -> String {
+    staging_line(
+        backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed)),
+        backend().map_or((0, 0, 0), shared_slab_footprint),
+    )
+}
+
+/// [`staging_report`]'s line from the counters, the pairs allocated and the
+/// shared slabs' `(bytes, slots allocated, slots busy)`.
+fn staging_line(pairs: usize, (slab_bytes, slabs, busy): (u64, usize, usize)) -> String {
+    let s = &STAGING_STATS;
+    let gb = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+    let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+    let rate = |b: &AtomicU64, t: &AtomicU64| {
+        let t = secs(t);
+        if t > 0.0 { gb(b) / t } else { 0.0 }
+    };
+    format!(
+        "staging: upload shared-slab {:.2} GB in {:.2} s memcpy ({:.1} GB/s) · staged {:.2} GB in \
+         {:.2} s ({:.1} GB/s) | retained-LDE download shared-slab {:.2} GB in {:.2} s ({:.1} GB/s) · \
+         staged {:.2} GB in {:.2} s ({:.1} GB/s) | staging pairs {} of {MAX_STAGING_PAIRS} · waits {} \
+         | shared slabs pinned {:.2} GiB in {} slot(s), {} busy",
+        gb(&s.in_bytes[0]),
+        secs(&s.in_nanos[0]),
+        rate(&s.in_bytes[0], &s.in_nanos[0]),
+        gb(&s.in_bytes[1]),
+        secs(&s.in_nanos[1]),
+        rate(&s.in_bytes[1], &s.in_nanos[1]),
+        gb(&s.out_bytes[0]),
+        secs(&s.out_nanos[0]),
+        rate(&s.out_bytes[0], &s.out_nanos[0]),
+        gb(&s.out_bytes[1]),
+        secs(&s.out_nanos[1]),
+        rate(&s.out_bytes[1], &s.out_nanos[1]),
+        pairs,
+        s.pair_waits.load(Ordering::Relaxed),
+        slab_bytes as f64 / (1u64 << 30) as f64,
+        slabs,
+        busy,
+    )
+}
+
+/// Host→device copy through a staging pair of its own, double-buffered: the
+/// host fills one buffer while the previous chunk's DMA drains the other.
+///
+/// Returns once the LAST chunk is queued, without waiting for it: every host
+/// read of `src_host` is done by then, so it is reusable on return, and work
+/// the caller queues on `stream` next is ordered behind the copy. The buffers
+/// stay safe because each carries the event of the DMA that last read it, and
+/// whoever refills one — this call two chunks on, or the pair's next borrower on
+/// any stream — waits on that event first.
+///
+/// Under [`STAGING_SHARED_SLAB_ENV`] the upload takes [`htod_via`] instead.
+pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    src_host: &[T],
+    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+) -> Result<()> {
+    use cudarc::driver::DevicePtrMut;
+    assert!(
+        dst.len() >= src_host.len(),
+        "htod_staged: destination shorter than source"
+    );
+    let elem_size = std::mem::size_of::<T>();
+    assert!(
+        elem_size <= STAGED_CHUNK_BYTES,
+        "htod_staged: an element larger than a staging buffer"
+    );
+    let n_elems = src_host.len();
+    if std::mem::size_of_val(src_host) == 0 {
+        return Ok(());
+    }
+    // Whole elements per chunk, so a `T` never straddles two buffers.
+    let chunk_elems = STAGED_CHUNK_BYTES / elem_size.max(1);
+
+    let be = backend()?;
+    let mut loan = be.staging_pairs.lend(&be.ctx)?;
+    be.ctx.bind_to_thread()?;
+    // SAFETY: `device_ptr_mut` yields the destination's base address and orders
+    // the writes on `stream`; `dst.len() >= src_host.len()` (asserted), so every
+    // chunk's range lies inside `dst`.
+    let (dst_base, _record) = dst.device_ptr_mut(stream);
+    // Declared after `loan`, so it drops FIRST: a DMA queued but not yet covered
+    // by its buffer's event is drained before the pair can be lent again.
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
+    let src = src_host.as_ptr() as *const u8;
+    let (mut elem_off, mut k) = (0usize, 0usize);
+    while elem_off < n_elems {
+        let this_elems = (n_elems - elem_off).min(chunk_elems);
+        let this_bytes = this_elems * elem_size;
+        let byte_off = elem_off * elem_size;
+        let buf = loan.buf(k);
+        // The DMA that last read this buffer — two chunks back, or the previous
+        // borrower's — lands before the host overwrites it.
+        buf.sync_event()?;
+        // SAFETY: the buffer holds `STAGED_CHUNK_BYTES >= this_bytes`, and its
+        // last reader has landed (above), so nothing reads it while it is filled.
+        unsafe {
+            let copy_t0 = std::time::Instant::now();
+            std::ptr::copy_nonoverlapping(src.add(byte_off), buf.ptr as *mut u8, this_bytes);
+            STAGING_STATS.note_in(true, this_bytes, copy_t0.elapsed());
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_base + byte_off as u64,
+                buf.ptr as *const core::ffi::c_void,
+                this_bytes,
+                stream.cu_stream(),
+            )
+            .result();
+            // Armed even on failure: the driver may have queued the copy before
+            // reporting the error.
+            drain.armed = true;
+            r?;
+        }
+        buf.record_event(stream)?;
+        // The buffer's event now covers the DMA, for whoever refills it next.
+        drain.armed = false;
+        elem_off += this_elems;
+        k += 1;
+    }
+    Ok(())
+}
+
+/// Device→host copy of `n` `u64`s from device address `src` into `dst`, through
+/// a staging pair of its own: two chunks in flight while the host copies each
+/// landed one straight into `dst`'s spare capacity, with no zero-fill pass. `dst`
+/// must be empty; on `Ok` it holds exactly the `n` values, and every DMA of this
+/// call has landed.
+///
+/// `after_last_enqueue` runs exactly once, as soon as the LAST chunk's DMA is
+/// queued on `stream` — the first moment the caller may queue work that
+/// overwrites the source, such as the retained LDE's in-place transpose — and
+/// its value is returned. It does not run if an earlier step fails.
+///
+/// # Safety
+/// `src` must address at least `n` `u64`s of one live device allocation whose
+/// writers are all ordered before this call on `stream`. Nothing may write them
+/// before `after_last_enqueue` runs; work queued on `stream` from then on is
+/// ordered behind the reads, and the allocation must outlive them (a
+/// stream-ordered free on `stream` does).
+pub unsafe fn dtoh_staged_into<R>(
+    stream: &Arc<CudaStream>,
+    src: cudarc::driver::sys::CUdeviceptr,
+    n: usize,
+    dst: &mut Vec<u64>,
+    after_last_enqueue: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    assert!(dst.is_empty(), "dtoh_staged_into: dst must start empty");
+    if n == 0 {
+        return after_last_enqueue();
+    }
+    let started = std::time::Instant::now();
+    dst.reserve_exact(n);
+    let chunk = STAGED_CHUNK_BYTES / 8;
+    let n_chunks = n.div_ceil(chunk);
+    let chunk_len = |k: usize| (n - k * chunk).min(chunk);
+
+    let be = backend()?;
+    let mut loan = be.staging_pairs.lend(&be.ctx)?;
+    be.ctx.bind_to_thread()?;
+    // ⛔ Declared after `loan`, so it drops FIRST, and armed from the first
+    // enqueue to the last landing: a DMA WRITES the pinned buffer, and a pair
+    // handed back with one in flight would let it land in the next borrower's
+    // data. Every early return drains the stream before the pair is lent again.
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
+    let mut after = Some(after_last_enqueue);
+    let mut result = None;
+    let mut next = 0usize;
+    for k in 0..n_chunks {
+        // Keep two chunks in flight: queue up to chunk `k + 1`.
+        while next < n_chunks && next < k + 2 {
+            let buf = loan.buf(next);
+            // Whatever last touched this buffer — this call's chunk `next - 2`,
+            // already copied out, or the previous borrower's DMA — is done.
+            buf.sync_event()?;
+            // SAFETY: the buffer holds `STAGED_CHUNK_BYTES >= chunk_len(next) *
+            // 8`, nothing reads or writes it (above), and the source range lies
+            // inside the caller's `n` values.
+            unsafe {
+                let r = cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    buf.ptr as *mut core::ffi::c_void,
+                    src + (next * chunk * 8) as u64,
+                    chunk_len(next) * 8,
+                    stream.cu_stream(),
+                )
+                .result();
+                drain.armed = true;
+                r?;
+            }
+            buf.record_event(stream)?;
+            next += 1;
+            if next == n_chunks {
+                let queue_behind = after.take().expect("the last chunk is queued once");
+                result = Some(queue_behind()?);
+            }
+        }
+        let buf = loan.buf(k);
+        buf.sync_event()?;
+        // SAFETY: the event orders this chunk's DMA before the read; `dst` has
+        // capacity for `n` values (reserved above) and chunk `k` covers
+        // `[k * chunk, k * chunk + chunk_len(k))`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.ptr as *const u64,
+                dst.as_mut_ptr().add(k * chunk),
+                chunk_len(k),
+            );
+        }
+    }
+    // Every chunk landed and was copied: nothing of this call is in flight.
+    drain.armed = false;
+    // SAFETY: the loop wrote all `n` values.
+    unsafe { dst.set_len(n) };
+    STAGING_STATS.note_out(true, n * 8, started.elapsed());
+    Ok(result.expect("the closure ran at the last enqueue"))
 }
 
 impl PendingD2H<'_> {
@@ -1729,5 +2208,66 @@ mod device_fallback_counter_tests {
         assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
         reset_reserved_high_water();
         assert_eq!(reserved_high_water(), 0, "reset must zero it again");
+    }
+}
+
+#[cfg(test)]
+mod staging_report_tests {
+    use super::{PinnedStaging, slab_footprint, staging_line};
+    use std::sync::Mutex;
+
+    /// A slot claiming `elems` of capacity with no allocation behind it: the
+    /// null pointer keeps `Drop` from freeing anything.
+    fn slot(elems: usize) -> Mutex<PinnedStaging> {
+        let mut s = PinnedStaging::empty();
+        s.capacity_elems = elems;
+        Mutex::new(s)
+    }
+
+    /// Card-free: the footprint sums the allocated slots' bytes and skips empty
+    /// ones, counts a slot someone holds as busy instead of waiting for it, and
+    /// still reads a poisoned one.
+    #[test]
+    fn the_slab_footprint_counts_allocated_busy_and_poisoned_slots() {
+        let slots = [
+            slot(0),
+            slot(1 << 20),
+            slot(1 << 29),
+            slot(1 << 20),
+            slot(1 << 22),
+        ];
+        assert_eq!(slab_footprint(slots[..1].iter()), (0, 0, 0));
+        assert_eq!(
+            slab_footprint(slots[..3].iter()),
+            (((1 << 20) + (1 << 29)) * 8, 2, 0)
+        );
+        let _held = slots[3].lock().unwrap();
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _g = slots[4].lock().unwrap();
+                    panic!("poisoning the slot on purpose");
+                })
+                .join();
+        });
+        assert!(slots[4].is_poisoned());
+        assert_eq!(
+            slab_footprint(slots.iter()),
+            (((1 << 20) + (1 << 29) + (1 << 22)) * 8, 3, 1)
+        );
+    }
+
+    /// The line's shape is a contract with the IDLE-B box script's parsers: four
+    /// `<x> GB in` figures (upload shared, staged; download shared, staged), then
+    /// the slab segment last, in GiB.
+    #[test]
+    fn the_staging_line_ends_with_the_shared_slab_footprint() {
+        let line = staging_line(6, (4 << 30, 2, 1));
+        assert_eq!(line.matches(" GB in ").count(), 4, "{line}");
+        assert!(line.contains("| staging pairs 6 of 8 · waits "), "{line}");
+        assert!(
+            line.ends_with(" | shared slabs pinned 4.00 GiB in 2 slot(s), 1 busy"),
+            "{line}"
+        );
     }
 }
