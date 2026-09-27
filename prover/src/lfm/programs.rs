@@ -1174,6 +1174,80 @@ pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {
     compile(program_id_program_source(shape))
 }
 
+/// ★ GAP R1b, a TEMPORARY knob: `LAMBDA_VM_GAP_R1B=1` moves the STARK wrap's
+/// attestation fold from the machine to the host.
+///
+/// Unset (or `0`) the wrap folds `program_id` in-guest with [`emit_program_id`]
+/// — one `KeccakF` permutation, which is what puts the whole keccak family (and,
+/// through its byte lookups, `BITWISE`) into every STARK wrap and makes every
+/// level-1 node re-verify those tables. Set, the wrap computes the id at EMIT
+/// time with `recursion::program_id_from_digest` (still keccak, as the §6.7
+/// carve-out requires), publishes it as program text in the same eight-halves
+/// layout, and BINDS every input the fold consumed — the ELF digest halves the
+/// statement absorbs, the DECODE root Phase A absorbs, `pc_start` and the page
+/// roots — to the values it folded, by equality asserts on the very cells the
+/// proof's verification reads. This is the WHIR wrap's posture
+/// (`whir_epoch::epoch_program_id`), and it makes the STARK wrap an ELF-SPECIFIC
+/// program: the entry-7 ruling kept it ELF-agnostic by folding in-guest, and
+/// adopting this knob reverses that ruling (a recursion-statement change,
+/// thoughts/zf/gap/fix/REC.md §10). Read once per process at emission, with a
+/// thread-local override for tests ([`with_gap_r1b`]).
+pub const GAP_R1B_ENV: &str = "LAMBDA_VM_GAP_R1B";
+
+std::thread_local! {
+    static R1B_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the host-computed attestation (R1b) is in force on this thread.
+pub fn gap_r1b_in_force() -> bool {
+    static PROCESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    R1B_OVERRIDE.with(|o| o.get()).unwrap_or_else(|| {
+        *PROCESS.get_or_init(|| {
+            let on = super::airs::gap_knob_value(
+                GAP_R1B_ENV,
+                std::env::var(GAP_R1B_ENV).ok().as_deref(),
+            );
+            if on {
+                println!(
+                    "GAP R1B: {GAP_R1B_ENV}=1 — STARK wraps publish a host-computed program_id \
+                     and bind its inputs; no in-guest keccak"
+                );
+            }
+            on
+        })
+    })
+}
+
+/// Run `f` with R1b set to `on` on this thread. Restored on return and unwind.
+pub fn with_gap_r1b<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            R1B_OVERRIDE.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(R1B_OVERRIDE.with(|o| o.replace(Some(on))));
+    f()
+}
+
+/// The eight published halves of a host-computed `program_id`, four to a word —
+/// the layout [`emit_program_id`]'s two digest cells publish (half `h` is bytes
+/// `4h..4h+4` little-endian), so a node or a consumer reads either the same way.
+pub fn program_id_words(id: &[u8; 32]) -> [super::word::LfmWord; 2] {
+    let halves: Vec<FE> = id
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w.copy_from_slice(c);
+            FE::from(u64::from(u32::from_le_bytes(w)))
+        })
+        .collect();
+    [
+        [halves[0], halves[1], halves[2], halves[3]],
+        [halves[4], halves[5], halves[6], halves[7]],
+    ]
+}
+
 // ======== R1g(i): the next epoch's REGISTER preprocessed commitment ========
 
 /// Everything about a REGISTER-derivation program that is compile-time.

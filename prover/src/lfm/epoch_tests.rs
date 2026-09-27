@@ -1763,6 +1763,112 @@ pub(super) fn epoch_program_publishing(
     epoch_program_with(e, with_legs, false, publishes)
 }
 
+/// ★ GAP R1b: the attestation, host-side — [`super::programs::GAP_R1B_ENV`].
+///
+/// The in-guest fold consumed five inputs and published their keccak. This
+/// publishes the SAME id, computed at emit time by
+/// `recursion::program_id_from_digest` over the epoch's own inputs, and binds
+/// each input to the value folded, on the cells the verification reads:
+///
+/// - `elf_digest` — the eight halves `absorb_epoch_statement` absorbed, so the
+///   statement the challenges were drawn against is the attested one;
+/// - the DECODE root — the cells Phase A absorbed and the DECODE leg compares
+///   (the split control's second copy when that control is on, as before);
+/// - `pc_start` and the page roots — consumed by nothing else in a wrap, exactly
+///   as with the fold: they are attested, and now fixed by program text.
+///
+/// Each binding is an equality assert against a program constant, so a proof
+/// over any other value has no execution — where the fold instead published a
+/// different id for a consumer's compare to reject. The constants make this
+/// program ELF-specific (`RootCells::constant`'s doc names why that was avoided;
+/// R1b is the deliberate exception, as the WHIR wrap already is).
+fn emit_host_attestation(
+    b: &mut LfmBuilder,
+    e: &RealEpoch,
+    elf_digest: &[super::builder::Felt],
+    pc_start: &[super::builder::Felt],
+    pages: &[(Vec<super::builder::Felt>, RootCells)],
+    decode: &RootCells,
+) {
+    use super::builder::Felt;
+    let assert_all = |b: &mut LfmBuilder, cells: &[Felt], values: &[FE], what: &str| {
+        assert_eq!(cells.len(), values.len(), "{what}: one constant per cell");
+        for (cell, value) in cells.iter().zip(values) {
+            let want = b.felt_const(*value);
+            b.assert_eq(*cell, want);
+        }
+    };
+    let le_halves = |bytes: &[u8]| -> Vec<FE> {
+        bytes
+            .chunks(4)
+            .map(|c| {
+                let mut w = [0u8; 4];
+                w[..c.len()].copy_from_slice(c);
+                FE::from(u64::from(u32::from_le_bytes(w)))
+            })
+            .collect()
+    };
+    let root_lanes = |b: &mut LfmBuilder, root: &Commitment| -> Vec<Felt> {
+        RootCells::constant(b, root).lanes_flat()
+    };
+    let assert_root = |b: &mut LfmBuilder, cells: &RootCells, root: &Commitment, what: &str| {
+        let want = root_lanes(b, root);
+        let got = cells.lanes_flat();
+        assert_eq!(got.len(), want.len(), "{what}: one lane per lane");
+        for (g, w) in got.iter().zip(&want) {
+            b.assert_eq(*g, *w);
+        }
+    };
+
+    let decode_commitment = e
+        .phase_a
+        .iter()
+        .find_map(|(p, _)| match p {
+            Some(PrepSource::ElfDependent(c)) => Some(*c),
+            _ => None,
+        })
+        .expect("a continuation epoch has one ELF-dependent root, DECODE's");
+
+    assert_all(b, elf_digest, &le_halves(&e.elf_digest), "the ELF digest");
+    assert_all(
+        b,
+        pc_start,
+        &super::keccak_host::pack_stream(&e.pc_start.to_le_bytes()),
+        "pc_start",
+    );
+    assert_root(b, decode, &decode_commitment, "the DECODE root");
+    assert_eq!(
+        pages.len(),
+        e.page_commitments.len(),
+        "one page cell per root"
+    );
+    for ((base, root), (page_base, commitment)) in pages.iter().zip(&e.page_commitments) {
+        let page_base: u64 = *page_base;
+        assert_all(
+            b,
+            base,
+            &super::keccak_host::pack_stream(&page_base.to_le_bytes()),
+            "a page base",
+        );
+        assert_root(b, root, commitment, "a page root");
+    }
+
+    let id = crate::recursion::program_id_from_digest(
+        &e.elf_digest,
+        e.pc_start,
+        &decode_commitment,
+        &e.page_commitments,
+    );
+    assert_eq!(
+        id, e.expected_program_id,
+        "the host id must be the oracle's: the same inputs, the same fold"
+    );
+    for word in super::programs::program_id_words(&id) {
+        let cell = b.digest_const(word).as_cell();
+        b.public(cell);
+    }
+}
+
 /// The epoch program, optionally with the DECODE cell SPLIT — a deliberately
 /// broken control, and the falsification the entry-7 ruling asked for.
 ///
@@ -2002,35 +2108,39 @@ fn epoch_program_with(
                 (base_halves, RootCells::from_halves(&mut b, &root_halves))
             })
             .collect();
-        let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
-            .iter()
-            .map(|(base, root)| (base.clone(), root.byte_halves(&mut b)))
-            .collect();
-        let page_refs: Vec<(&[_], &[_])> = page_halves
-            .iter()
-            .map(|(base, root)| (&base[..], &root[..]))
-            .collect();
-        let decode = match a_split_decode {
-            // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
-            // root. The fold now attests to a value Phase A never absorbed.
-            Some(arena) => RootCells::hint(&mut b, arena, 0).byte_halves(&mut b),
+        // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE root.
+        // The attestation then covers a value Phase A never absorbed.
+        let decode_root = match a_split_decode {
+            Some(arena) => RootCells::hint(&mut b, arena, 0),
             None => decode_cells
-                .as_ref()
-                .expect("a continuation epoch has a DECODE sub-proof")
-                .byte_halves(&mut b),
+                .clone()
+                .expect("a continuation epoch has a DECODE sub-proof"),
         };
-        let id = super::programs::emit_program_id(
-            &mut b,
-            super::programs::ProgramIdShape {
-                num_pages: e.page_commitments.len(),
-            },
-            elf_digest,
-            &pc_start,
-            &decode,
-            &page_refs,
-        );
-        b.public(id[0]);
-        b.public(id[1]);
+        if super::programs::gap_r1b_in_force() {
+            emit_host_attestation(&mut b, e, elf_digest, &pc_start, &page_cells, &decode_root);
+        } else {
+            let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
+                .iter()
+                .map(|(base, root)| (base.clone(), root.byte_halves(&mut b)))
+                .collect();
+            let page_refs: Vec<(&[_], &[_])> = page_halves
+                .iter()
+                .map(|(base, root)| (&base[..], &root[..]))
+                .collect();
+            let decode = decode_root.byte_halves(&mut b);
+            let id = super::programs::emit_program_id(
+                &mut b,
+                super::programs::ProgramIdShape {
+                    num_pages: e.page_commitments.len(),
+                },
+                elf_digest,
+                &pc_start,
+                &decode,
+                &page_refs,
+            );
+            b.public(id[0]);
+            b.public(id[1]);
+        }
     }
 
     // ---- ★ THE BLOCK-BINDING SCHEMA, published right after the attestation id
@@ -2347,6 +2457,58 @@ fn published_digest(public: &[(u32, LfmWord)], at: usize) -> [u8; 32] {
         out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
     }
     out
+}
+
+/// ★ GAP R1b on the real epoch: the host attestation publishes EXACTLY the words
+/// the in-guest fold publishes (every public, in order), the wrap carries no
+/// keccak, and each attested input is BOUND — a forged arena word for the ELF
+/// digest, the DECODE root or `pc_start` has no execution under R1b. Where the
+/// fold would instead execute and publish a different id (shown for `pc_start`,
+/// which feeds nothing else), R1b refuses in the program itself.
+#[test]
+fn the_host_attestation_binds_what_the_fold_attested() {
+    use super::instr::Instr;
+    let e = real_epoch();
+    let classic = epoch_program(&e, false);
+    let host = super::programs::with_gap_r1b(true, || epoch_program(&e, false));
+    let keccak = |p: &LfmProgram| p.instrs.iter().any(|i| matches!(i, Instr::KeccakF(_)));
+    assert!(
+        keccak(&classic),
+        "the in-guest fold is one keccak permutation"
+    );
+    assert!(!keccak(&host), "R1b emits no keccak");
+
+    let arenas = epoch_arenas(&e);
+    let run = |p: &LfmProgram, a: &[Vec<LfmWord>]| {
+        execute(p, a, &crate::hash_pin::BLOCK_HASHER).map(|x| x.public_words)
+    };
+    let classic_words = run(&classic, &arenas).expect("the fold executes");
+    let host_words = run(&host, &arenas).expect("R1b executes on the honest epoch");
+    assert_eq!(published_digest(&host_words, 2), e.expected_program_id);
+    assert_eq!(host_words, classic_words, "every published word, in order");
+
+    // Arena order (`epoch_arena_words`): statement (the ELF digest first), the
+    // ELF-dependent roots (DECODE), main roots, INIT, FINI, pc_start, ...
+    for (arena, what) in [
+        (0usize, "an ELF digest half"),
+        (1, "the DECODE root"),
+        (5, "pc_start"),
+    ] {
+        let mut forged = arenas.clone();
+        forged[arena][0][0] += FE::one();
+        assert!(
+            run(&host, &forged).is_err(),
+            "{what}: a forged value must have no execution under R1b"
+        );
+    }
+    let mut forged = arenas.clone();
+    forged[5][0][0] += FE::one();
+    let words = run(&classic, &forged).expect("the fold attests to whatever pc_start it is handed");
+    assert_ne!(
+        published_digest(&words, 2),
+        e.expected_program_id,
+        "the fold publishes a different id, for a consumer to reject"
+    );
 }
 
 /// ★ THE RUN: the assembled verifier's Fiat-Shamir spine, executed against a

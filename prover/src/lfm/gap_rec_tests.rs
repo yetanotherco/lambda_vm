@@ -568,3 +568,61 @@ fn an_emitted_leg_verifies_a_split_child_without_bitwise() {
         "a leg bound to the wrong chunk root must reject the proof"
     );
 }
+
+// ================================= R1b =====================================
+//
+// The STARK wrap's attestation, host-side (`programs::GAP_R1B_ENV`).
+
+/// ★ R1b publishes the words the in-guest fold publishes: the standalone fold,
+/// EXECUTED over synthetic inputs (no pages and two), against
+/// `program_id_words` of the host's `program_id_from_digest`.
+#[test]
+fn the_host_attestation_words_are_the_folds_words() {
+    use super::keccak_host::pack_stream;
+    use super::programs::{ProgramIdShape, program_id_program, program_id_words};
+    for num_pages in [0usize, 2] {
+        let elf_digest: [u8; 32] = core::array::from_fn(|i| (i * 7 + 3) as u8);
+        let pc_start = 0x0000_0001_0000_0f00u64;
+        let decode: Commitment = core::array::from_fn(|i| (255 - i) as u8);
+        let pages: Vec<(u64, Commitment)> = (0..num_pages)
+            .map(|k| {
+                (
+                    0x1000 * (k as u64 + 1),
+                    core::array::from_fn(|i| (i as u8) ^ (31 * k as u8 + 1)),
+                )
+            })
+            .collect();
+        let mut halves = pack_stream(&elf_digest);
+        halves.extend(pack_stream(&pc_start.to_le_bytes()));
+        halves.extend(pack_stream(&decode));
+        for (base, c) in &pages {
+            halves.extend(pack_stream(&base.to_le_bytes()));
+            halves.extend(pack_stream(c));
+        }
+        let arena: Vec<LfmWord> = halves.into_iter().map(super::word::base_word).collect();
+        let program = program_id_program(ProgramIdShape { num_pages });
+        let exec = super::executor::execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+            .expect("the fold executes");
+        let host = crate::recursion::program_id_from_digest(&elf_digest, pc_start, &decode, &pages);
+        let words = program_id_words(&host);
+        assert_eq!(exec.public_words.len(), 2, "the fold publishes two words");
+        assert_eq!(
+            exec.public_words[0].1, words[0],
+            "{num_pages} pages: word 0"
+        );
+        assert_eq!(
+            exec.public_words[1].1, words[1],
+            "{num_pages} pages: word 1"
+        );
+    }
+}
+
+/// The R1b knob's thread-local override is scoped: on inside, restored after.
+#[test]
+fn the_r1b_override_is_scoped() {
+    use super::programs::{gap_r1b_in_force, with_gap_r1b};
+    let outside = gap_r1b_in_force();
+    assert!(with_gap_r1b(true, gap_r1b_in_force));
+    assert!(!with_gap_r1b(false, gap_r1b_in_force));
+    assert_eq!(gap_r1b_in_force(), outside);
+}
