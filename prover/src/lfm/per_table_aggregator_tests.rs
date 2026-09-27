@@ -1089,19 +1089,11 @@ pub(super) fn real_child_timed(
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    let mut airs = super::airs::LfmAirs::new_chunked(
-        &artifacts.roots,
-        &artifacts.blake3_chunk_roots,
-        &opts,
-        artifacts.keccak_rnd_chunks,
-        artifacts.hasher,
-        artifacts.chip_set,
-    );
-    // S2: the one-row preprocessed roots, exactly as `verify_against_artifacts`
-    // attaches them — a one-row chip's Phase A root and leg compare use them.
-    if let Some(one_row) = &artifacts.one_row_roots {
-        airs = airs.with_one_row_roots(one_row);
-    }
+    // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, GAP
+    // R2's `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
+    // as `verify_against_artifacts` builds it: a one-row chip's Phase A root and
+    // leg compare use them.
+    let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts);
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&proved.proof);
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");

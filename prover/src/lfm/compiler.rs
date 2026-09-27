@@ -17,7 +17,7 @@
 use crate::tables::types::FE;
 
 use super::builder::{ArenaSchema, LfmProgramSource};
-use super::chunking::{Blake3Chunking, KeccakChunking};
+use super::chunking::{Blake3Chunking, HashChunking, KeccakChunking};
 use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::layout::{self, padded_rows};
 
@@ -143,6 +143,11 @@ pub struct LfmProgram {
     /// Defaults to a single table, which is the machine as it stood before
     /// chunking existed.
     pub blake3_chunking: Blake3Chunking,
+    /// How this program's hash rows are spread over `LFM_HASH` instances — one
+    /// table unless GAP R2 splits it ([`HashChunking`]). Program shape on
+    /// [`Self::blake3_chunking`]'s terms: each chunk commits its own
+    /// instruction group, and the split is bound into `program_id`.
+    pub hash_chunking: HashChunking,
 }
 
 impl LfmProgram {
@@ -176,6 +181,55 @@ impl LfmProgram {
     pub fn blake3_chunk_count(&self) -> usize {
         self.blake3_chunking
             .chunk_count(self.groups.blake3.real_rows)
+    }
+
+    /// Replaces the `LFM_HASH` chunking policy — on
+    /// [`Self::with_blake3_chunking`]'s terms, fresh artifacts included.
+    pub fn with_hash_chunking(mut self, chunking: HashChunking) -> Self {
+        self.hash_chunking = chunking;
+        self
+    }
+
+    /// `LFM_HASH` instances this program's policy asks for — one or two.
+    pub fn hash_chunk_count(&self) -> usize {
+        self.hash_chunking.chunk_count(self.groups.hash.real_rows)
+    }
+
+    /// Hash rows in each `LFM_HASH` chunk, in chunk order.
+    pub fn hash_chunk_real_rows(&self) -> Vec<usize> {
+        let total = self.groups.hash.real_rows;
+        (0..self.hash_chunk_count())
+            .map(|c| self.hash_chunking.chunk_range(total, c).len())
+            .collect()
+    }
+
+    /// One `LFM_HASH` chunk's instruction column group, re-padded to its own
+    /// power-of-two height — [`Self::blake3_chunk_group`] for the hash chip.
+    ///
+    /// # Panics
+    ///
+    /// On a chunk index at or past [`Self::hash_chunk_count`].
+    pub fn hash_chunk_group(&self, chunk: usize) -> ColumnGroup {
+        let count = self.hash_chunk_count();
+        assert!(
+            chunk < count,
+            "LFM_HASH chunk {chunk} requested of a {count}-chunk program"
+        );
+        let group = &self.groups.hash;
+        if count == 1 {
+            return group.clone();
+        }
+        let rows = self.hash_chunking.chunk_range(group.real_rows, chunk);
+        let real_rows = rows.len();
+        let padded_rows = padded_rows(real_rows);
+        let mut data = group.data[rows.start * group.width..rows.end * group.width].to_vec();
+        data.resize(padded_rows * group.width, FE::zero());
+        ColumnGroup {
+            width: group.width,
+            real_rows,
+            padded_rows,
+            data,
+        }
     }
 
     /// Compressions in each `LFM_BLAKE3` chunk, in chunk order.
@@ -359,9 +413,12 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         num_addrs,
         arena_schema,
         public_len,
-        groups,
         chunking: KeccakChunking::default(),
         blake3_chunking: Blake3Chunking::default(),
+        // GAP R2: the one knob read at compile time, so every program this
+        // process compiles carries the same policy.
+        hash_chunking: HashChunking::for_process(groups.hash.real_rows),
+        groups,
     }
 }
 
