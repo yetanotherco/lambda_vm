@@ -80,7 +80,7 @@ use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 use super::algebraic_commit::commitment_to_digest;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
-use super::whir_fold::{emit_fold_coset, fold_coset_rows};
+use super::whir_fold::{FoldEmission, RoundFold, fold_rows_for, lean_prepare_rows};
 use super::whir_open::{
     BlockValues, CapCells, TreeAuth, cap_check_perms, cap_check_rows, verify_opening_perms_capped,
     verify_opening_rows_capped,
@@ -274,7 +274,7 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
         // The index draw, the current opening, and the fold.
         let mut q = 1
             + verify_opening_rows_capped(felts, unpacks, depth, shape.caps[r])
-            + fold_coset_rows(1usize << shape.schedule[r], depth);
+            + fold_rows_for(1usize << shape.schedule[r], depth);
         match shape.next_depth(r) {
             Some(next_depth) => {
                 let next_block = 1usize << shape.schedule[r + 1];
@@ -291,6 +291,10 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             None => q += 2,
         }
         per_round += shape.num_queries * q;
+        // GAP R4: the lean fold's once-a-round `½·α`.
+        if FoldEmission::current() == FoldEmission::Lean {
+            per_round += lean_prepare_rows(shape.schedule[r]);
+        }
     }
     per_round
 }
@@ -490,7 +494,7 @@ pub fn chain_fold_constants(
     let mut words: Vec<super::word::LfmWord> = Vec::new();
     let mut current = domain.clone();
     for r in 0..shape.rounds() {
-        for word in super::whir_fold::fold_coset_constants(
+        for word in super::whir_fold::fold_constants_for(
             &current,
             shape.schedule[r],
             shape.current_depth(r),
@@ -733,6 +737,9 @@ fn emit_query_phase(
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
+    // GAP R4: the lean fold halves the round's challenges once, here, rather
+    // than once per query; the classic fold prepares nothing.
+    let fold = RoundFold::prepare(b, alphas);
 
     match (next_tree, shape.next_depth(r)) {
         (Some(next_tree), Some(next_depth)) => {
@@ -748,8 +755,7 @@ fn emit_query_phase(
                 let (leaf_bits, slot_bits) = bits.split_at(next_depth);
                 next_tree.verify_opening(b, next.values, leaf_bits, next.siblings);
 
-                let folded =
-                    emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
+                let folded = fold.fold(b, &block_ext(current.values), current_domain, bits);
                 let claimed = emit_slot_mux(b, &block_ext(next.values), slot_bits);
                 b.assert_eq_ext(folded, claimed);
                 debug_assert_eq!(1usize << slot_bits.len(), next_block);
@@ -759,8 +765,7 @@ fn emit_query_phase(
             for (q, bits) in queries.iter().enumerate() {
                 let current = &round.current[q];
                 current_tree.verify_opening(b, current.values, bits, current.siblings);
-                let folded =
-                    emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
+                let folded = fold.fold(b, &block_ext(current.values), current_domain, bits);
                 b.assert_eq_ext(folded, final_value);
             }
         }
