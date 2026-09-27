@@ -275,6 +275,42 @@ pub fn commit_group_device_or_host_with(
     commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
 }
 
+/// Whether [`commit_group_device_or_host_with`] might take the device for
+/// `group` (gap fix I3): device artifacts on, a non-empty group, and an LDE
+/// that clears the dispatch floor on a process with a card. `false` means the
+/// commit is a host pass whatever the card is doing, so it needs no card
+/// permit.
+pub fn may_take_device(group: &ColumnGroup, options: &ProofOptions) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        device_artifacts()
+            && group.padded_rows > 0
+            && group.width > 0
+            && stark::gpu_lde::commit_clears_floor(
+                group
+                    .padded_rows
+                    .saturating_mul(options.blowup_factor as usize),
+            )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (group, options);
+        false
+    }
+}
+
+/// [`commit_group_device_or_host_with`]'s host pass, for a group
+/// [`may_take_device`] ruled out (gap fix I3): the same root, and it never
+/// touches the card, so it runs outside the card permit.
+pub fn commit_group_host_with(
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
+}
+
 /// Commits one instruction column group.
 pub fn commit_group(group: &ColumnGroup, options: &ProofOptions) -> Commitment {
     commit_columns(&group_columns(group), options)

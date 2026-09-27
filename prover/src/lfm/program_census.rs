@@ -211,7 +211,16 @@ pub fn build_artifacts_counted(
     // includes what it waited for the card, and a figure that excluded the wait
     // would make a device-bound level look host-bound.
     let t = Instant::now();
-    let artifacts = {
+    let artifacts = if crate::gap_knobs::i3_narrow_artifact_permit() {
+        // Gap fix I3: the build takes the card itself, around its device
+        // commits only, under the same label so the holds read alike.
+        super::registry::build_artifacts_with_hasher_narrow_permit(
+            program,
+            options,
+            hasher,
+            "build_artifacts",
+        )
+    } else {
         let _card = super::device_permit::hold_labeled("build_artifacts");
         build_artifacts_with_hasher(program, options, hasher)
     };
@@ -351,6 +360,40 @@ mod tests {
             "LFM_BLAKE3 chunk roots"
         );
         assert_eq!(raw.program_id, counted.program_id, "program_id");
+    }
+
+    /// Gap fix I3: the build that takes the card permit only around its device
+    /// commits builds exactly the default build's artifacts — every root in
+    /// its slot, the chunk roots, the program id — in both leaf modes, the
+    /// one-row twins included.
+    #[test]
+    fn the_narrow_permit_build_is_byte_identical_to_the_default_build() {
+        let _guard = WINDOW.lock().expect("the window guard is never poisoned");
+        for program in [trivial_program(), fri_toy_program()] {
+            for one_row in [
+                stark::proof::options::OneRowMode::Off,
+                stark::proof::options::OneRowMode::On,
+            ] {
+                let mut options = opts();
+                options.format.one_row = one_row;
+                let default = build_artifacts_with_hasher(&program, &options, HasherKind::Test);
+                let narrow = super::super::registry::build_artifacts_with_hasher_narrow_permit(
+                    &program,
+                    &options,
+                    HasherKind::Test,
+                    "build_artifacts",
+                );
+                assert_eq!(
+                    default.one_row_roots.is_some(),
+                    one_row != stark::proof::options::OneRowMode::Off,
+                    "{one_row:?}: the one-row twins are built exactly in one-row mode"
+                );
+                assert_eq!(
+                    narrow, default,
+                    "{one_row:?}: the narrow-permit build drifted from the default one"
+                );
+            }
+        }
     }
 
     /// ★ THE PREMISE THE CENSUS EXISTS TO CHECK, at the smallest scale that has

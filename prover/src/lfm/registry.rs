@@ -600,6 +600,184 @@ pub fn build_artifacts_with_hasher(
     }
 }
 
+/// [`build_artifacts_with_hasher`] for a driver whose sibling proofs share the
+/// card (gap fix I3): the build takes the card permit itself, ONCE, around the
+/// commits that may reach the device ([`super::commit::may_take_device`]),
+/// instead of its caller holding it across the whole build. The commits that
+/// cannot reach the card, materializing the `LFM_BLAKE3` chunks, the static
+/// roots and the program id all run with the card free for another proof.
+///
+/// ⛔ The permit stays mutual exclusion: every commit that can touch the card
+/// runs inside the one hold, and the host phase calls the host pass directly,
+/// so a misjudged group costs time, never a second holder.
+///
+/// The artifacts are [`build_artifacts_with_hasher`]'s: each root is the same
+/// function of its group on either path (the device/host parity gate), lands
+/// in the same slot, and the passes keep that build's windows (row pairs
+/// `groups_in_flight` at a time, the one-row twins all at once).
+pub(crate) fn build_artifacts_with_hasher_narrow_permit(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+    card_label: &'static str,
+) -> LfmArtifacts {
+    use super::commit::{
+        commit_group_device_or_host_with, commit_group_host_with, may_take_device,
+    };
+    use stark::leaf_layout::LeafLayout;
+
+    let range = range_group();
+    let program_slots = program_groups(program);
+    let groups: [&ColumnGroup; 11] = std::array::from_fn(|i| {
+        if i < PROGRAM_GROUP_SLOTS {
+            program_slots[i]
+        } else {
+            &range
+        }
+    });
+    let mut log_heights = [0u8; NUM_LFM_CHIPS];
+    for (i, g) in groups.iter().enumerate() {
+        log_heights[i] = g.padded_rows.trailing_zeros() as u8;
+    }
+    let blake3_chunk_log_heights: Vec<u8> = blake3_chunk_rows(program)
+        .into_iter()
+        .map(|rows| rows.trailing_zeros() as u8)
+        .collect();
+    log_heights[BLAKE3_SLOT] = blake3_chunk_log_heights[0];
+    // Materialized before the card is taken: host work, and the device phase
+    // needs every chunk that may reach the card at once.
+    let chunk_groups: Vec<ColumnGroup> = (0..blake3_chunk_log_heights.len())
+        .map(|c| program.blake3_chunk_group(c))
+        .collect();
+    let one_row = options.format.one_row != stark::proof::options::OneRowMode::Off;
+
+    // Every commit, in four passes with the default build's windows: slot
+    // groups then chunks as row pairs, then (one-row mode) both again.
+    struct Job<'g> {
+        group: &'g ColumnGroup,
+        layout: LeafLayout,
+        label: &'static str,
+        pass: usize,
+    }
+    let in_flight = groups_in_flight();
+    let mut windows = vec![in_flight, in_flight];
+    let mut layouts = vec![LeafLayout::RowPair];
+    if one_row {
+        windows.push(groups.len());
+        windows.push(chunk_groups.len().max(1));
+        layouts.push(LeafLayout::Row);
+    }
+    let mut jobs = Vec::new();
+    for (k, &layout) in layouts.iter().enumerate() {
+        for &group in &groups {
+            jobs.push(Job {
+                group,
+                layout,
+                label: PREP_GROUP_LABEL,
+                pass: 2 * k,
+            });
+        }
+        for group in &chunk_groups {
+            jobs.push(Job {
+                group,
+                layout,
+                label: BLAKE3_CHUNK_LABEL,
+                pass: 2 * k + 1,
+            });
+        }
+    }
+
+    let on_device: Vec<bool> = jobs
+        .iter()
+        .map(|j| may_take_device(j.group, options))
+        .collect();
+    let mut committed: Vec<Option<Commitment>> = vec![None; jobs.len()];
+    let mut run_phase = |device: bool| {
+        for (pass, &window) in windows.iter().enumerate() {
+            let idx: Vec<usize> = (0..jobs.len())
+                .filter(|&i| jobs[i].pass == pass && on_device[i] == device)
+                .collect();
+            for chunk in idx.chunks(window.max(1)) {
+                let roots = map_maybe_parallel(chunk, |&i| {
+                    let j = &jobs[i];
+                    if device {
+                        commit_group_device_or_host_with(j.label, j.group, options, j.layout)
+                    } else {
+                        commit_group_host_with(j.group, options, j.layout)
+                    }
+                });
+                for (&i, root) in chunk.iter().zip(roots) {
+                    committed[i] = Some(root);
+                }
+            }
+        }
+    };
+    // The host phase first, with the card free; then the device phase under
+    // one hold, and only if some commit may reach the card at all.
+    run_phase(false);
+    if on_device.iter().any(|&d| d) {
+        let _card = super::device_permit::hold_labeled(card_label);
+        run_phase(true);
+    }
+    let mut committed = committed
+        .into_iter()
+        .map(|root| root.expect("every commit of the build ran in one of its two phases"));
+    let mut take = || committed.next().expect("one root per commit");
+
+    let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
+    for root in roots.iter_mut().take(groups.len()) {
+        *root = take();
+    }
+    let blake3_chunk_roots: Vec<Commitment> = chunk_groups.iter().map(|_| take()).collect();
+    roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
+    // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
+    roots[13] = keccak_rc::preprocessed_commitment(options);
+    log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
+    roots[14] = bitwise::preprocessed_commitment(options);
+    log_heights[14] = bitwise::NUM_ROWS.trailing_zeros() as u8;
+
+    let chip_set = ChipSet::for_program(program);
+    let keccak_rnd_chunks = chip_set.keccak_rnd_chunks(
+        program
+            .chunking
+            .chunk_count(program.groups.keccak.real_rows),
+    );
+    let program_id = lfm_program_id(
+        &roots,
+        &log_heights,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+        &blake3_chunk_roots,
+        &blake3_chunk_log_heights,
+    );
+    let one_row_roots = one_row.then(|| {
+        let mut one: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
+        for root in one.iter_mut().take(groups.len()) {
+            *root = Some(take());
+        }
+        let blake3_chunk_roots: Vec<Commitment> = chunk_groups.iter().map(|_| take()).collect();
+        one[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
+        one[13] = keccak_rc::preprocessed_commitment_for(options, LeafLayout::Row);
+        one[14] = bitwise::preprocessed_commitment_for(options, LeafLayout::Row);
+        LfmOneRowRoots {
+            roots: one,
+            blake3_chunk_roots,
+        }
+    });
+    LfmArtifacts {
+        roots,
+        log_heights,
+        keccak_rnd_chunks,
+        blake3_chunk_roots,
+        blake3_chunk_log_heights,
+        hasher,
+        chip_set,
+        program_id,
+        one_row_roots,
+    }
+}
+
 /// The one-row roots of every committed group (host pass: the device commit
 /// builds row-pair leaves only), plus the static tables' one-row twins.
 fn build_one_row_roots(

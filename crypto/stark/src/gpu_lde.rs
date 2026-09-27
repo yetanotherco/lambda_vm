@@ -2739,6 +2739,14 @@ pub fn device_vram_budget_bytes() -> Option<u64> {
         .map(|be| be.vram_budget_bytes())
 }
 
+/// Whether a commit of `lde_size` rows clears the dispatch layer's row floor
+/// on a process with a device — the first two tests [`admit`] makes. A
+/// `false` is a commit the device path would decline; a `true` may still be
+/// declined on bytes.
+pub fn commit_clears_floor(lde_size: usize) -> bool {
+    device_vram_budget_bytes().is_some() && lde_size >= gpu_lde_threshold()
+}
+
 /// Parts counterpart of [`materialize_lde_trace_host`]: download the resident
 /// composition-poly parts (de-interleaved ext3 slabs, natural evaluation
 /// order) into per-part host Vecs. Serves the host consumers of the part
