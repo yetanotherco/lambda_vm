@@ -583,6 +583,56 @@ fn a_continuation_proves_and_verifies() {
     );
 }
 
+/// Preparing ahead of the prover moves each epoch's host preparation, and the
+/// cross-epoch proof's, onto the producer thread. That changes who does the work
+/// and when, never what is proved: the bookend's and the cross-epoch proof's
+/// roots equal those of the schedule that prepares on the prover thread, the
+/// shapes, statement values and DECODE derivation are the same, and the bundle
+/// verifies.
+///
+/// ⚠ An epoch's FIRST group root is not compared: it stacks BRANCH, DVRM,
+/// BYTEWISE, EQ, LT and MUL, whose rows follow `HashMap` iteration order, so it
+/// differs between two proves of one run under the same schedule.
+#[test]
+fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (on_prover, decode_on_prover) =
+        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, false)
+            .expect("prove");
+    let (ahead, decode_ahead) =
+        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, true)
+            .expect("prove");
+    assert!(
+        ahead.num_epochs() >= 2,
+        "a one-epoch run hands nothing over, so the schedule is not exercised"
+    );
+    assert_eq!(decode_ahead.commitment, decode_on_prover.commitment);
+    assert_eq!(ahead.num_epochs(), on_prover.num_epochs());
+    for (k, (a, d)) in ahead.epochs.iter().zip(&on_prover.epochs).enumerate() {
+        assert_eq!(
+            a.proof.roots.len(),
+            d.proof.roots.len(),
+            "epoch {k}: groups"
+        );
+        assert_eq!(
+            a.proof.roots.last(),
+            d.proof.roots.last(),
+            "epoch {k}: the bookend group's root"
+        );
+        assert_eq!(a.table_num_vars, d.table_num_vars, "epoch {k}: shapes");
+        assert_eq!(a.public_output, d.public_output, "epoch {k}: output");
+        assert_eq!(a.reg_fini, d.reg_fini, "epoch {k}: register fini");
+    }
+    assert_eq!(ahead.global.proof.roots, on_prover.global.proof.roots);
+    assert_eq!(ahead.global.table_num_vars, on_prover.global.table_num_vars);
+    assert_eq!(ahead.touched_page_bases, on_prover.touched_page_bases);
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &ahead, &opts).expect("verify"),
+        "the prepared-ahead continuation does not verify"
+    );
+}
+
 /// ★ THE PROPERTY EVERY OTHER EPOCH TEST IN THIS FILE IS BLIND TO.
 ///
 /// `verify_epoch_bookend` forks the transcript and replays the roots block to
@@ -1555,10 +1605,10 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
 
     let commit_independently = |columns: &[multilinear::mle::Mle<crate::test_utils::F>]| {
         multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
-            stark::multilinear_table::global_layout(&[(
-                columns.len(),
-                crate::continuation::PAGE_NUM_VARS,
-            )])
+            stark::multilinear_table::global_layout(
+                &[(columns.len(), crate::continuation::PAGE_NUM_VARS)],
+                config.format.stack,
+            )
             .expect("layout"),
             &multilinear::stacking::borrow(columns),
             None,

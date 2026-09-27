@@ -114,7 +114,10 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
 
     uint64_t low = (uint64_t)1 << base;
     uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
-    uint64_t i = (uint64_t)blockIdx.y * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+    // The block's `q`: grid.z carries the multiples of grid.y that grid.y's
+    // 65,535 cannot (see `ntt::split_grid_y`).
+    uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    uint64_t i = q * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
 
     tile[threadIdx.y * pitch + threadIdx.x] = x[i];
     __syncthreads();
@@ -363,7 +366,10 @@ extern "C" __global__ void ntt_dit_tile(uint64_t *x,
 
     uint64_t low = (uint64_t)1 << base;
     uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
-    uint64_t i = (uint64_t)blockIdx.y * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+    // The block's `q`: grid.z carries the multiples of grid.y that grid.y's
+    // 65,535 cannot (see `ntt::split_grid_y`).
+    uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    uint64_t i = q * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
 
     tile[threadIdx.y * pitch + threadIdx.x] = x[i];
     __syncthreads();

@@ -1089,19 +1089,11 @@ pub(super) fn real_child_timed(
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    let mut airs = super::airs::LfmAirs::new_chunked(
-        &artifacts.roots,
-        &artifacts.blake3_chunk_roots,
-        &opts,
-        artifacts.keccak_rnd_chunks,
-        artifacts.hasher,
-        artifacts.chip_set,
-    );
-    // S2: the one-row preprocessed roots, exactly as `verify_against_artifacts`
-    // attaches them — a one-row chip's Phase A root and leg compare use them.
-    if let Some(one_row) = &artifacts.one_row_roots {
-        airs = airs.with_one_row_roots(one_row);
-    }
+    // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
+    // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
+    // as `verify_against_artifacts` builds it: a one-row chip's Phase A root and
+    // leg compare use them.
+    let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts);
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&proved.proof);
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
@@ -3635,6 +3627,27 @@ fn tree_top_overlap(default: bool) -> bool {
     }
 }
 
+/// `LFM_TREE_REDERIVE_DECODE=1`: level 0's lead-in derives DECODE's
+/// commitment (and, on WHIR, its prepared opening) from the ELF again instead of
+/// taking the ones the base derived. Unset or `0`: take the base's. They are the
+/// same function of the same ELF and options, so no program identity moves
+/// either way; a base loaded from a cache has none to hand over, and the lead-in
+/// derives them regardless. Read once, and named on stderr.
+fn l0_takes_base_decode() -> bool {
+    const ENV: &str = "LFM_TREE_REDERIVE_DECODE";
+    static TAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TAKE.get_or_init(|| {
+        let rederive =
+            super::airs::env_switch(ENV, std::env::var(ENV).ok().as_deref()).unwrap_or(false);
+        super::airs::announce(if rederive {
+            "L0 DECODE: re-derived from the ELF (LFM_TREE_REDERIVE_DECODE=1)"
+        } else {
+            "L0 DECODE: taken from the base (the default)"
+        });
+        !rederive
+    })
+}
+
 fn tree_siblings_l0() -> usize {
     let k = std::env::var("LFM_TREE_K_L0").ok();
     let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
@@ -3705,34 +3718,16 @@ fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
 }
 
 fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
-    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
     let (main, aux) =
         super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
     let cells = main + 3 * aux;
-    println!(
-        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
-        program.instrs.len(),
-        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
-    );
     let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
-    let step = (fan_in + 1) as f64 / fan_in as f64;
-    for c in &panel {
-        println!(
-            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
-            c.name,
-            c.real_rows,
-            c.rows,
-            100.0 * c.headroom(),
-            if c.at_risk() { "AT RISK" } else { "fixed  " },
-            c.cliff_cost(),
-        );
-    }
-    let stepping: Vec<&str> = panel
-        .iter()
-        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
-        .map(|c| c.name)
-        .collect();
-    println!("     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}");
+    // ONE `print!` for the whole panel, never a `println!` per line: see
+    // `census_panel_text`.
+    print!(
+        "{}",
+        census_panel_text(label, cells, program.instrs.len(), &panel, fan_in)
+    );
     // ★ Lane E's dependency measurement, on the SAME production programs the
     // panel above describes — folded in here rather than given its own fixture
     // because this is the one call site every shape already passes through
@@ -3749,6 +3744,272 @@ fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, u
         println!("     (profile took {:.1}s)", t.elapsed().as_secs_f64());
     }
     (cells, program.instrs.len())
+}
+
+/// A program's census line, its chip panel and its step line, as the ONE string
+/// [`census_and_panel`] prints.
+///
+/// One `print!` holds the stdout lock for the whole panel. Printed a line at a
+/// time, the panels of proofs census'd at once (level 0's wraps in flight,
+/// sibling nodes, the level pool) interleaved LINE BY LINE with each other and
+/// with any other thread's output, and a chip line carries no label: a reader
+/// of the log could only tell whose line it was from the numbers on it. The
+/// bytes are exactly what the per-line `println!`s wrote
+/// ([`the_census_panel_is_the_per_line_bytes`]), so every reader of the panel
+/// parses it unchanged.
+fn census_panel_text(
+    label: &str,
+    cells: u64,
+    instrs: usize,
+    panel: &[super::airs::LfmChipCells],
+    fan_in: usize,
+) -> String {
+    use std::fmt::Write as _;
+    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
+        instrs,
+        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+    );
+    let step = (fan_in + 1) as f64 / fan_in as f64;
+    // A split `LFM_HASH` is two census entries, printed as ONE panel line —
+    // real and committed rows summed, the chunk heights in a trailing
+    // `[split a+b]` — so a panel never repeats a chip name (the box reader treats a
+    // repeat as two interleaved panels) and `LFM_HASH` real rows stay the
+    // permutation count. Unsplit programs print exactly as before.
+    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+    let hash_chunks: Vec<&super::airs::LfmChipCells> =
+        panel.iter().filter(|c| c.name == hash).collect();
+    for c in panel {
+        if c.name == hash && hash_chunks.len() > 1 {
+            if !std::ptr::eq(c, hash_chunks[0]) {
+                continue;
+            }
+            let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
+            let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
+            let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
+            let _ = writeln!(
+                out,
+                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
+                c.name,
+                real,
+                rows,
+                100.0 * (rows - real) as f64 / rows as f64,
+                hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
+                heights.join("+"),
+            );
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+            c.name,
+            c.real_rows,
+            c.rows,
+            100.0 * c.headroom(),
+            if c.at_risk() { "AT RISK" } else { "fixed  " },
+            c.cliff_cost(),
+        );
+    }
+    let stepping: Vec<&str> = panel
+        .iter()
+        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+        .map(|c| c.name)
+        .collect();
+    let _ = writeln!(
+        out,
+        "     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}"
+    );
+    out
+}
+
+/// ★ [`census_panel_text`] is byte for byte what the per-line `println!`s of the
+/// census panel wrote: one `print!` changes when the panel reaches the log, and
+/// nothing about what reaches it.
+///
+/// Two references. Panels the per-line code printed on the box, copied from the
+/// log byte for byte — L1N0 of a WHIR tree over block 25368371, eleven chips at
+/// fan-in 3, and wrap 2 of a STARK tree with a split `LFM_HASH` printed as its
+/// one merged line. And the per-line code itself, kept below with each `println!(f, ..)`
+/// written as `format!(f, ..)` plus the `\n` that `println!` appends, over chips
+/// under all three height rules, a zero-row chip, an empty step list and fan-ins
+/// 1 to 3. Only a chip's `main_cols + 3 · aux_cols` reaches the text (as its
+/// cliff), so each chip below carries its logged cliff over its rows as columns.
+#[test]
+fn the_census_panel_is_the_per_line_bytes() {
+    use super::airs::{HeightRule, LfmChipCells};
+
+    fn per_line(
+        label: &str,
+        cells: u64,
+        instrs: usize,
+        panel: &[LfmChipCells],
+        fan_in: usize,
+    ) -> String {
+        const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+        let mut out = String::new();
+        let mut println = |line: String| {
+            out.push_str(&line);
+            out.push('\n');
+        };
+        println(format!(
+            "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
+            instrs,
+            100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+        ));
+        let step = (fan_in + 1) as f64 / fan_in as f64;
+        let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+        let hash_chunks: Vec<&LfmChipCells> = panel.iter().filter(|c| c.name == hash).collect();
+        for c in panel {
+            if c.name == hash && hash_chunks.len() > 1 {
+                if !std::ptr::eq(c, hash_chunks[0]) {
+                    continue;
+                }
+                let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
+                let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
+                let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
+                println(format!(
+                    "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
+                    c.name,
+                    real,
+                    rows,
+                    100.0 * (rows - real) as f64 / rows as f64,
+                    hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
+                    heights.join("+"),
+                ));
+                continue;
+            }
+            println(format!(
+                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+                c.name,
+                c.real_rows,
+                c.rows,
+                100.0 * c.headroom(),
+                if c.at_risk() { "AT RISK" } else { "fixed  " },
+                c.cliff_cost(),
+            ));
+        }
+        let stepping: Vec<&str> = panel
+            .iter()
+            .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+            .map(|c| c.name)
+            .collect();
+        println(format!(
+            "     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}"
+        ));
+        out
+    }
+
+    let chip = |name, real_rows, rows, height_rule, main_cols| LfmChipCells {
+        name,
+        rows,
+        real_rows,
+        height_rule,
+        main_cols,
+        aux_cols: 0,
+    };
+    let (w, f, c) = (HeightRule::Workload, HeightRule::Fixed, HeightRule::Chunked);
+    let l1n0 = [
+        chip("LFM_CONST", 656, 1_024, w, 4),
+        chip("LFM_BALU", 473_628, 524_288, w, 10),
+        chip("LFM_XALU", 2_073_486, 2_097_152, w, 18),
+        chip("LFM_SELECT", 622_710, 1_048_576, w, 26),
+        chip("LFM_BITDEC", 7_143, 8_192, w, 168),
+        chip("LFM_HASH", 438_983, 524_288, w, 325),
+        chip("LFM_LANES", 408_681, 524_288, w, 19),
+        chip("LFM_HINT", 871_809, 1_048_576, w, 7),
+        chip("LFM_PUBLIC", 144, 256, w, 7),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    let logged = r#"   ★ CENSUS L1N0 (arity 3): 285808384 cells (4897240 instructions), floor 9.3%
+     LFM_CONST             656/      1024  headroom  35.9%  AT RISK  cliff +4096 cells
+     LFM_BALU           473628/    524288  headroom   9.7%  AT RISK  cliff +5242880 cells
+     LFM_XALU          2073486/   2097152  headroom   1.1%  AT RISK  cliff +37748736 cells
+     LFM_SELECT         622710/   1048576  headroom  40.6%  AT RISK  cliff +27262976 cells
+     LFM_BITDEC           7143/      8192  headroom  12.8%  AT RISK  cliff +1376256 cells
+     LFM_HASH           438983/    524288  headroom  16.3%  AT RISK  cliff +170393600 cells
+     LFM_LANES          408681/    524288  headroom  22.1%  AT RISK  cliff +9961472 cells
+     LFM_HINT           871809/   1048576  headroom  16.9%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            144/       256  headroom  43.8%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     BITWISE           1048576/   1048576  headroom   0.0%  fixed    cliff +26214400 cells
+     ⇒ at 1.333× the workload these would STEP: ["LFM_BALU", "LFM_XALU", "LFM_BITDEC", "LFM_HASH", "LFM_LANES", "LFM_HINT"]
+"#;
+    assert_eq!(
+        census_panel_text("L1N0 (arity 3)", 285_808_384, 4_897_240, &l1n0, 3),
+        logged,
+        "the panel as the box logged it"
+    );
+
+    // A split `LFM_HASH` — two census entries, one panel line — as the box logged
+    // it: wrap 2 of a STARK tree over block 25368371 with the split on.
+    let wrap2 = [
+        chip("LFM_CONST", 1_411, 2_048, w, 4),
+        chip("LFM_BALU", 257_780, 262_144, w, 10),
+        chip("LFM_XALU", 1_011_252, 1_048_576, w, 18),
+        chip("LFM_SELECT", 399_850, 524_288, w, 26),
+        chip("LFM_BITDEC", 2_608, 4_096, w, 168),
+        chip("LFM_HASH", 262_144, 262_144, c, 325),
+        chip("LFM_HASH", 31_634, 32_768, w, 325),
+        chip("LFM_KECCAK", 1, 4, w, 1_000),
+        chip("LFM_LANES", 372_395, 524_288, w, 19),
+        chip("LFM_HINT", 619_003, 1_048_576, w, 7),
+        chip("LFM_PUBLIC", 145, 256, w, 7),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("KECCAK_RND", 24, 32, c, 3_028),
+        chip("KECCAK_RC", 32, 32, f, 4),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    let logged_split = r#"   ★ CENSUS wrap 2: 175550880 cells (2958223 instructions), floor 15.1%
+     LFM_CONST            1411/      2048  headroom  31.1%  AT RISK  cliff +8192 cells
+     LFM_BALU           257780/    262144  headroom   1.7%  AT RISK  cliff +2621440 cells
+     LFM_XALU          1011252/   1048576  headroom   3.6%  AT RISK  cliff +18874368 cells
+     LFM_SELECT         399850/    524288  headroom  23.7%  AT RISK  cliff +13631488 cells
+     LFM_BITDEC           2608/      4096  headroom  36.3%  AT RISK  cliff +688128 cells
+     LFM_HASH           293778/    294912  headroom   0.4%  AT RISK  cliff +95846400 cells  [split 262144+32768]
+     LFM_KECCAK              1/         4  headroom  75.0%  AT RISK  cliff +4000 cells
+     LFM_LANES          372395/    524288  headroom  29.0%  AT RISK  cliff +9961472 cells
+     LFM_HINT           619003/   1048576  headroom  41.0%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            145/       256  headroom  43.4%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     KECCAK_RND             24/        32  headroom  25.0%  fixed    cliff +96896 cells
+     KECCAK_RC              32/        32  headroom   0.0%  fixed    cliff +128 cells
+     BITWISE           1048576/   1048576  headroom   0.0%  fixed    cliff +26214400 cells
+     ⇒ at 2.000× the workload these would STEP: ["LFM_CONST", "LFM_BALU", "LFM_XALU", "LFM_SELECT", "LFM_BITDEC", "LFM_HASH", "LFM_LANES", "LFM_HINT", "LFM_PUBLIC"]
+"#;
+    assert_eq!(
+        census_panel_text("wrap 2", 175_550_880, 2_958_223, &wrap2, 1),
+        logged_split,
+        "a split LFM_HASH as the box logged it"
+    );
+
+    // Every height rule, a zero-row chip (headroom 0, cliff 0), and a panel whose
+    // step list is empty.
+    let shapes = [
+        chip("LFM_CONST", 121, 128, w, 4),
+        chip("LFM_KECCAK", 0, 0, w, 900),
+        chip("LFM_RANGE", 65_536, 65_536, f, 4),
+        chip("LFM_BLAKE3", 3, 4, c, 300),
+        chip("KECCAK_RND", 524_280, 524_288, c, 60),
+        chip("BITWISE", 1_048_576, 1_048_576, f, 25),
+    ];
+    for fan_in in 1..=3 {
+        for (label, cells, instrs, panel) in [
+            ("L1N0 (arity 3)", 285_808_384, 4_897_240, &l1n0[..]),
+            ("wrap 2", 175_550_880, 2_958_223, &wrap2[..]),
+            ("wrap 7", 459_288_992, 4_237_668, &shapes[..]),
+            ("the BLOCK-ARTIFACT ROOT", 285_808_384, 0, &shapes[2..]),
+        ] {
+            assert_eq!(
+                census_panel_text(label, cells, instrs, panel, fan_in),
+                per_line(label, cells, instrs, panel, fan_in),
+                "{label} at fan-in {fan_in}"
+            );
+        }
+    }
 }
 
 /// The measured host cost of one RPX permutation, so the reach ladder reads in
@@ -6018,6 +6279,10 @@ fn the_production_tree_composes_to_a_root() {
     // 100 Hz for 67 s, which is what every other stage already pays.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
+    // The DECODE commitment the base derived, kept for level 0's lead-in.
+    // `None` under `LFM_TREE_REDERIVE_DECODE=1` or when the base was loaded
+    // rather than proved, and the lead-in then derives it from the ELF.
+    let mut base_decode: Option<stark::config::Commitment> = None;
     let bundle = cached_bundle(
         if lo == 0 {
             stage_mode(0)
@@ -6026,13 +6291,25 @@ fn the_production_tree_composes_to_a_root() {
         },
         stage_path(cache_dir.as_deref(), "bundle"),
         || {
-            crate::continuation::prove_continuation(
-                &inputs.elf_bytes,
-                &inputs.private_input,
-                inputs.epoch_log2,
-                &inner,
-            )
-            .expect("the block must prove")
+            if l0_takes_base_decode() {
+                let (bundle, decode) = crate::continuation::prove_continuation_keeping_decode(
+                    &inputs.elf_bytes,
+                    &inputs.private_input,
+                    inputs.epoch_log2,
+                    &inner,
+                )
+                .expect("the block must prove");
+                base_decode = Some(decode);
+                bundle
+            } else {
+                crate::continuation::prove_continuation(
+                    &inputs.elf_bytes,
+                    &inputs.private_input,
+                    inputs.epoch_log2,
+                    &inner,
+                )
+                .expect("the block must prove")
+            }
         },
     );
     let base_secs = t.elapsed().as_secs_f64();
@@ -6114,10 +6391,17 @@ fn the_production_tree_composes_to_a_root() {
     // does — this loop parsed 3.4 MB of ELF nineteen times and built the same
     // commitment thirty-eight. `prove_continuation` hoists exactly this pair and
     // says so; the driver did not inherit it.
-    let epoch_konsts = stamped("EpochConstants::load (ELF + DECODE commitment)", || {
-        super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
-            .expect("the inner ELF and its DECODE commitment must build once")
-    });
+    let epoch_konsts = stamped(
+        if base_decode.is_some() {
+            "EpochConstants::load (ELF; DECODE commitment from the base)"
+        } else {
+            "EpochConstants::load (ELF + DECODE commitment)"
+        },
+        || {
+            super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, base_decode)
+                .expect("the inner ELF and its DECODE commitment must build once")
+        },
+    );
     // ★★★ LEVEL-0 CONCURRENCY. Armed with its OWN count and disarmed straight
     // after, so the interior's knob and this one never reach across.
     //
@@ -6843,6 +7127,7 @@ fn whir_level_zero<H>(
     siblings: usize,
     fan_in: usize,
     top_overlap: bool,
+    base_decode: Option<&crate::multilinear_continuation::BaseDecode>,
 ) -> (
     Vec<RealChild>,
     Vec<super::per_table_aggregator::SchemaLayout>,
@@ -6850,7 +7135,7 @@ fn whir_level_zero<H>(
     Option<WhirGlobalChild>,
 )
 where
-    H: multilinear::whir_hash::WhirHash,
+    H: multilinear::whir_hash::WhirHash + 'static,
 {
     use super::per_table_aggregator::SchemaLayout;
     use super::program_census::build_artifacts_counted;
@@ -6892,14 +7177,37 @@ where
     // level. The driver's block walk makes the same ordering choice.
     crate::multilinear_continuation::reset_decode_derivations();
     let t = Instant::now();
-    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
-        .expect("DECODE's prepared opening, once per bundle");
-    let decode_root = crate::tables::decode::commitment_from_elf(elf, inner)
-        .expect("DECODE's univariate commitment, once per bundle");
+    // The base's own two derivations when it handed them over, else both from
+    // the ELF here.
+    let derived_prepared;
+    let (prepared, decode_root) = match base_decode {
+        Some(base) => (
+            base.prepared::<H>().expect(
+                "the base's DECODE prepared opening is for the hash this process \
+                 dispatches on; one process picks one hash",
+            ),
+            base.commitment,
+        ),
+        None => {
+            derived_prepared =
+                crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
+                    .expect("DECODE's prepared opening, once per bundle");
+            (
+                &derived_prepared,
+                crate::tables::decode::commitment_from_elf(elf, inner)
+                    .expect("DECODE's univariate commitment, once per bundle"),
+            )
+        }
+    };
     println!(
-        "   ★ WHIR LEVEL 0: both DECODE derivations hoisted in {:.2}s \
+        "   ★ WHIR LEVEL 0: both DECODE derivations {} in {:.2}s \
          (the prepared opening and the univariate root — different objects, \
          one each per bundle rather than one each per epoch)",
+        if base_decode.is_some() {
+            "taken from the base"
+        } else {
+            "hoisted"
+        },
         t.elapsed().as_secs_f64()
     );
     // ⛔⛔ THE COUNTER IS A THREAD-LOCAL `Cell`, AND THAT DECIDES WHERE THESE
@@ -6917,10 +7225,11 @@ where
     // preparing that wrap derived NOTHING. The second is the one that catches a
     // regression, and it fires on whichever worker regressed.
     let hoisted = crate::multilinear_continuation::decode_derivations();
+    let expected = if base_decode.is_some() { 0 } else { 1 };
     assert_eq!(
-        hoisted, 1,
-        "the hoist must derive the prepared opening exactly once on this thread, \
-         and it derived {hoisted} times"
+        hoisted, expected,
+        "the hoist must derive the prepared opening exactly {expected} time(s) on \
+         this thread (none when the base handed it over), and it derived {hoisted} times"
     );
 
     type WhirWrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
@@ -6948,7 +7257,7 @@ where
             bundle,
             k,
             Some(decode_root),
-            Some(&prepared),
+            Some(prepared),
         )
         .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
         let t_harvest_epoch = t.elapsed().as_secs_f64();
@@ -7919,13 +8228,27 @@ fn the_whir_production_tree_composes_to_a_root() {
     // bundle's, which is a second reason `cached_bundle` does not apply here.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
-    .expect("the WHIR block must prove");
+    // The base hands its DECODE derivations to level 0's lead-in, which under
+    // `LFM_TREE_REDERIVE_DECODE=1` derives both from the ELF again.
+    let (bundle, base_decode) = if l0_takes_base_decode() {
+        let (bundle, decode) = crate::multilinear_continuation::prove_continuation_keeping_decode(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the WHIR block must prove");
+        (bundle, Some(decode))
+    } else {
+        let bundle = crate::multilinear_continuation::prove_continuation(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the WHIR block must prove");
+        (bundle, None)
+    };
     let base_secs = t.elapsed().as_secs_f64();
     let (base_peak, base_at) = base_sampler.stop();
     println!(
@@ -8050,8 +8373,11 @@ fn the_whir_production_tree_composes_to_a_root() {
             l0_siblings,
             fan_in,
             top_overlap,
+            base_decode.as_ref(),
         )
     });
+    // Level 0 was their last reader.
+    drop(base_decode);
 
     super::device_permit::arm(1);
     let level0_wall = t_level.elapsed().as_secs_f64();
@@ -8455,9 +8781,58 @@ fn the_whir_production_tree_composes_to_a_root() {
     // uncounted. Printed here, whole-run, so the launcher can refuse a block
     // number unless BOTH read zero.
     println!("   commit fallbacks {}", multilinear::gpu::host_fallbacks());
+    // Of which the device was asked and answered with an error (each is also
+    // logged with its error as it happens): a failed launch, copy or allocation,
+    // or a refused reservation — never a policy decline.
+    println!(
+        "   commit device errors {}",
+        multilinear::gpu::commit_errors()
+    );
+    // Merkle trees over a HOST codeword (the folds of a chain the host holds)
+    // that the device was asked for and answered with an error; the host hashed
+    // them instead. Not commit fallbacks, so counted apart from the line above.
+    println!(
+        "   tree commit device errors {}",
+        multilinear::gpu::tree_commit_errors()
+    );
     println!(
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
+    );
+    // A THIRD surface, the opening: a chain over a device codeword whose factors
+    // the device did not build from its shares had them built on the host,
+    // stack-sized. Named for the same reason as the two above.
+    println!(
+        "   open host fallbacks {}",
+        multilinear::gpu::open_host_fallbacks()
+    );
+    // The stacked groups' room: given back after the commits, taken back for
+    // the openings, and — the number that must read zero — refused.
+    println!(
+        "   room turns: {} parked, {} taken back, {} refused",
+        multilinear::gpu::room_parks(),
+        multilinear::gpu::room_turns(),
+        multilinear::gpu::room_turn_refusals()
+    );
+    // Which WHIR kernels ran, read off the counters of the paths themselves, so
+    // the log shows the path taken rather than the switches' spelling. At the
+    // defaults: `fused folds F of F`, `lean opens L of O (6 rounds)` with L = O
+    // unless a stack is one the lean path cannot read, `turn-sized rooms S of S`.
+    // Each opt-out zeroes its own share and leaves the total standing:
+    // `LAMBDA_VM_NO_WHIR_FUSED_FOLD=1` reads `fused folds 0 of F`,
+    // `LAMBDA_VM_WHIR_LEAN_ROUNDS=0` reads `lean opens 0 of O (0 rounds)`,
+    // `LAMBDA_VM_NO_WHIR_ROOM_RESIZE=1` reads `turn-sized rooms 0 of S`, and
+    // `LAMBDA_VM_NO_WHIR_ROOM_PARK=1` reads `0 parked, 0 taken back` above.
+    println!(
+        "   whir kernels: fused folds {} of {} · lean opens {} of {} ({} rounds) · \
+         turn-sized rooms {} of {}",
+        multilinear::gpu::fused_fold_calls(),
+        multilinear::gpu::resident_fold_calls(),
+        multilinear::gpu::lean_open_calls(),
+        multilinear::gpu::open_calls(),
+        multilinear::gpu::lean_rounds_in_effect(),
+        multilinear::gpu::rooms_turn_sized(),
+        multilinear::gpu::room_sizings()
     );
     // ★ ROUND-3 ARGUE DISCRIMINATOR (diagnostic): per-surface DEVICE-path reserved
     // bytes + op counts, whole-run. Divided by the `argue` wall time printed
@@ -8571,8 +8946,21 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     let fan_in = 2;
 
     let t_all = Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
+    // As the production driver runs it: level 0 takes the base's DECODE
+    // derivations instead of deriving them again (unless
+    // `LFM_TREE_REDERIVE_DECODE=1`).
+    let (bundle, base_decode) = if l0_takes_base_decode() {
+        let (bundle, decode) = crate::multilinear_continuation::prove_continuation_keeping_decode(
+            &elf_bytes, &input, 2, &inner,
+        )
         .expect("the fixture continuation must prove under WHIR");
+        (bundle, Some(decode))
+    } else {
+        let bundle =
+            crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
+                .expect("the fixture continuation must prove under WHIR");
+        (bundle, None)
+    };
     // ⛔ THE BASE WALL IS TAKEN HERE, NOT RECOMPUTED BELOW. `t_all` keeps
     // running for the whole tree, so a second `elapsed()` further down would
     // hand the split a denominator that includes level 0 and the interior, and
@@ -8610,9 +8998,19 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     super::device_permit::arm(1);
     let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
         whir_level_zero::<H>(
-            &bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1, fan_in, false,
+            &bundle,
+            &elf_bytes,
+            &elf,
+            &inner,
+            &wrap_opts,
+            &ceiling,
+            1,
+            fan_in,
+            false,
+            base_decode.as_ref(),
         )
     });
+    drop(base_decode);
     assert!(
         no_overlapped_global.is_none(),
         "the overlap is off on this arm, so level 0 must not have produced a global child"

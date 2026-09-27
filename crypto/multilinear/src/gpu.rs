@@ -21,6 +21,22 @@ static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// fills near the end of an epoch turns into gigabytes of host memory and a
 /// utilisation figure that looks like a scheduling problem.
 static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// ★ Commits the device was ASKED for and answered with an error — the part of
+/// [`host_fallbacks`] that is not a policy decline (the size threshold, the
+/// kill switch): a refused reservation (`CUDA_ERROR_OUT_OF_MEMORY`), a failed
+/// allocation, launch or copy. Each one is also logged with its error. The
+/// launch that can never succeed is why this exists: a WHIR base commit at
+/// stack 27 launched a tile past CUDA's grid limit, every such commit fell back
+/// to the host, and the error — the one thing that named the cause — was
+/// dropped (`thoughts/zf/gap/fix/STRUCT.md` §9.2).
+static COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// ★ Merkle trees the device was ASKED to build over a HOST codeword (an
+/// extension-field fold of a chain whose codeword is on the host, through
+/// [`commit_tree_ext3`]) and answered with an error. The host builds that tree
+/// instead. Kept apart from [`COMMIT_ERRORS`], which stays the part of
+/// [`host_fallbacks`] that failed: such a tree is not a commit fallback. Each
+/// one is also logged with its error.
+static TREE_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Sumchecks whose rounds ran on device.
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
@@ -33,6 +49,38 @@ static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FACTOR_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Openings whose two factors stayed on device across their groups.
 static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones that began in share form.
+static LEAN_OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Device folds that ran every level in one launch.
+static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Folds of a codeword the device holds, in one launch or one per level: what
+/// [`FUSED_FOLD_CALLS`] is a share of.
+static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// ★ Stacked openings whose codeword the device holds but whose factors the
+/// device did not build from the shares.
+///
+/// The opening's twin of [`HOST_FALLBACKS`], and until this counter it had no
+/// name either: `open_shared` declining sends the chain to `Factors::new`,
+/// which assembles the stacked polynomial and its weight table on the host — a
+/// base copy of the stack and an extension table three times its size — before
+/// trying the device once more with the tables built. Nothing else rises or
+/// falls when that happens: [`OPEN_CALLS`] only fails to rise, and an expected
+/// count is itself derived. It matters most where the card is fullest, which
+/// is where an opening runs without the turn its group asked for (see
+/// `stacked_eval::StackedCommitment`).
+static OPEN_HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Groups that gave their room back when their commits ended.
+static ROOM_PARKS: AtomicU64 = AtomicU64::new(0);
+/// Group openings that took their room back.
+static ROOM_TURNS: AtomicU64 = AtomicU64::new(0);
+/// ★ Group openings whose room the card would not give back — see
+/// [`take_turn`] for what the opening does then.
+static ROOM_TURN_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Rooms a group sized, for its commits or its openings' turn.
+static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones sized to the turn they cover rather than to a whole
+/// base codeword (`LAMBDA_VM_NO_WHIR_ROOM_RESIZE`).
+static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -40,6 +88,60 @@ pub fn commit_calls() -> u64 {
 
 pub fn host_fallbacks() -> u64 {
     HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+pub fn commit_errors() -> u64 {
+    COMMIT_ERRORS.load(Ordering::Relaxed)
+}
+
+pub fn tree_commit_errors() -> u64 {
+    TREE_COMMIT_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Device errors printed per counter per process; past it only the counter
+/// moves.
+const DEVICE_ERRORS_LOGGED: u64 = 16;
+
+/// Count one device error in `counter` and print the first
+/// [`DEVICE_ERRORS_LOGGED`] of them. `describe` says what failed and where the
+/// work goes instead; `kind` names the errors in the note on the last line
+/// printed.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_device_error(counter: &AtomicU64, kind: &str, describe: impl FnOnce() -> String) {
+    let seen = counter.fetch_add(1, Ordering::Relaxed);
+    if seen < DEVICE_ERRORS_LOGGED {
+        let last = if seen + 1 == DEVICE_ERRORS_LOGGED {
+            format!(" (further {kind} are counted, not printed)")
+        } else {
+            String::new()
+        };
+        eprintln!("[whir] {}{last}", describe());
+    }
+}
+
+/// Count and log a device commit that returned an error, before its caller
+/// declines and the chain encodes on the host (where [`note_host_fallback`]
+/// counts it too).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_commit_error(what: &str, log_evals: usize, log_blowup: usize, err: &dyn core::fmt::Debug) {
+    note_device_error(&COMMIT_ERRORS, "commit errors", || {
+        format!(
+            "device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
+             failed: {err:?}; encoding on the host"
+        )
+    });
+}
+
+/// Count and log a device tree over a host codeword that returned an error,
+/// before its caller hashes the tree on the host.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_tree_commit_error(log_len: u32, log_folding: usize, err: &dyn core::fmt::Debug) {
+    note_device_error(&TREE_COMMIT_ERRORS, "tree commit errors", || {
+        format!(
+            "device commit (ext3 tree) of 2^{log_len} values in blocks of 2^{log_folding} \
+             failed: {err:?}; hashing on the host"
+        )
+    });
 }
 
 /// Called where a commit gives up on the device. Counts in non-cuda builds
@@ -68,19 +170,111 @@ pub fn factor_calls() -> u64 {
     FACTOR_CALLS.load(Ordering::Relaxed)
 }
 
+/// Stacked openings that ran their first rounds over the shares
+/// ([`math_cuda::whir_open::LeanRound0`]) rather than materialising up front.
+pub fn lean_open_calls() -> u64 {
+    LEAN_OPEN_CALLS.load(Ordering::Relaxed)
+}
+
+/// Device folds that ran every level in one launch.
+pub fn fused_fold_calls() -> u64 {
+    FUSED_FOLD_CALLS.load(Ordering::Relaxed)
+}
+
+/// Folds of a codeword the device holds, fused or level by level.
+pub fn resident_fold_calls() -> u64 {
+    RESIDENT_FOLD_CALLS.load(Ordering::Relaxed)
+}
+
+/// The rounds a stacked opening runs over its shares, as this process reads
+/// `LAMBDA_VM_WHIR_LEAN_ROUNDS` (or a test's override). `0` in a build without
+/// a device, where no opening runs there.
+pub fn lean_rounds_in_effect() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        lean_rounds()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// Stacked openings over a device codeword whose factors were built on the
+/// host — see [`OPEN_HOST_FALLBACKS`]. Zero in a build without a device, where
+/// no codeword is on one.
+pub fn open_host_fallbacks() -> u64 {
+    OPEN_HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Called where a stacked opening over a device codeword builds its factors on
+/// the host: counted, and said, because nothing else would show it.
+pub(crate) fn note_open_host_fallback(n_stack: usize) {
+    let count = OPEN_HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] opening factors built on the HOST over a device codeword (stack 2^{n_stack}); \
+         open host fallbacks {count}"
+    );
+}
+
 pub fn open_calls() -> u64 {
     OPEN_CALLS.load(Ordering::Relaxed)
+}
+
+/// Groups that gave their room back when their commits ended.
+pub fn room_parks() -> u64 {
+    ROOM_PARKS.load(Ordering::Relaxed)
+}
+
+/// Group openings that took their room back.
+pub fn room_turns() -> u64 {
+    ROOM_TURNS.load(Ordering::Relaxed)
+}
+
+/// Group openings whose room the card would not give back.
+pub fn room_turn_refusals() -> u64 {
+    ROOM_TURN_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Rooms a group sized, for its commits or its openings' turn.
+pub fn room_sizings() -> u64 {
+    ROOM_SIZINGS.load(Ordering::Relaxed)
+}
+
+/// Rooms sized to the turn they cover rather than to a whole base codeword.
+pub fn rooms_turn_sized() -> u64 {
+    ROOMS_TURN_SIZED.load(Ordering::Relaxed)
+}
+
+/// Called where a group sizes a room: `turn_sized` unless
+/// `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` has it promise a whole codeword.
+pub(crate) fn note_room_sized(turn_sized: bool) {
+    ROOM_SIZINGS.fetch_add(1, Ordering::Relaxed);
+    if turn_sized {
+        ROOMS_TURN_SIZED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    COMMIT_ERRORS.store(0, Ordering::Relaxed);
+    TREE_COMMIT_ERRORS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
+    LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
+    FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
+    RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
+    OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    ROOM_PARKS.store(0, Ordering::Relaxed);
+    ROOM_TURNS.store(0, Ordering::Relaxed);
+    ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
+    ROOM_SIZINGS.store(0, Ordering::Relaxed);
+    ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -185,6 +379,241 @@ pub fn reserve_room(_bytes: u64) -> Option<DeviceRoom> {
     None
 }
 
+/// Whether a group gives its room back between its last commit and its first
+/// opening, and takes it again for the openings ([`take_turn`]). `true` unless
+/// `LAMBDA_VM_NO_WHIR_ROOM_PARK` is set, which holds it from the commit to the
+/// last opening as before — the A/B's control, off the same binary.
+///
+/// Between the two runs the whole per-table argument, which reserves against
+/// the same budget and never touches the room: the room is a promise for the
+/// turns the commits and the openings take, and the argument takes none. Held
+/// across it, it is a codeword's worth of budget the argument is refused.
+pub(crate) fn room_park() -> bool {
+    match ROOM_PARK_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_PARK").is_some())
+        }
+    }
+}
+
+static ROOM_PARK_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_PARK` for the whole process — for a test
+/// that commits and opens both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_room_park(on: Option<bool>) {
+    ROOM_PARK_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Called where a group gives its room back after its commits.
+pub(crate) fn note_room_parked() {
+    ROOM_PARKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Takes a parked group's room back for its openings: `bytes` promised until
+/// the returned handle drops, or `None`, counted and said.
+///
+/// ⛔ WHY IT CAN BE REFUSED. Anything that reserves between the group's last
+/// commit and this call can have taken the bytes. In the production drivers
+/// that is the argument of the same proof, whose reservations are all released
+/// by the time its last table is argued — and the leaf layers the commits
+/// retained, which `reserve` evicts on a miss, so a retained layer never
+/// outranks a turn. A second proof on the same card in the same process is the
+/// case that can hold the bytes past this point, and a test binary running in
+/// parallel is one.
+///
+/// ⛔ WHAT A REFUSAL DOES: the opening runs on the device anyway, UNPROMISED.
+/// Its codewords are on the card with no host copy (`fold_held` has nowhere to
+/// fold a device codeword the device declines) and the transcript has absorbed
+/// their roots, so there is no host path to fall back to — declining here would
+/// be failing the proof. What runs unpromised is one opening's working set:
+/// with the lean opening and the fused fold, about a quarter of a codeword —
+/// where before them every opening ran nearly three codewords past the room it
+/// had. If the card then really is full, the factors fall to the host and
+/// [`open_host_fallbacks`] counts them, or a fold fails with
+/// [`crate::Error::DeviceFailed`] — both loud, neither silent.
+pub(crate) fn take_turn(bytes: u64, polys: usize, n_stack: usize) -> Option<DeviceRoom> {
+    if let Some(room) = reserve_room(bytes) {
+        ROOM_TURNS.fetch_add(1, Ordering::Relaxed);
+        return Some(room);
+    }
+    let count = ROOM_TURN_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] opening turn REFUSED: {} MiB for a group of {polys} at 2^{n_stack}, {} — \
+         opening on the device UNPROMISED; room turn refusals {count}",
+        bytes >> 20,
+        budget_headroom(),
+    );
+    None
+}
+
+/// The budget left to promise, for a refusal's line.
+#[cfg(feature = "cuda")]
+fn budget_headroom() -> String {
+    match math_cuda::device::backend() {
+        Ok(be) => format!(
+            "budget headroom {} MiB",
+            be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) >> 20
+        ),
+        Err(_) => "no device".to_string(),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn budget_headroom() -> String {
+    "no device".to_string()
+}
+
+/// Opens a window over the device ledger's peak
+/// ([`math_cuda::device::reset_window_high_water`]); nothing without a device.
+#[cfg(feature = "cuda")]
+pub fn reset_reserved_window() {
+    math_cuda::device::reset_window_high_water();
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reset_reserved_window() {}
+
+/// The ledger's peak since [`reset_reserved_window`]; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn reserved_window_peak() -> u64 {
+    math_cuda::device::window_high_water()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reserved_window_peak() -> u64 {
+    0
+}
+
+/// What the ledger may promise in all; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn reserve_budget() -> u64 {
+    math_cuda::device::backend()
+        .map(|be| be.vram_budget_bytes())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reserve_budget() -> u64 {
+    0
+}
+
+/// Whether a group's room is sized to the turns it covers — its commits', two
+/// in flight, and one chain's opening, as the kernels that run them allocate —
+/// rather than one base codeword. `true` unless `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`
+/// is set, which promises the codeword as before.
+///
+/// One codeword was the right number once: two commits in flight at a fold of
+/// four hold (half a codeword, less a node) each. At the production first fold
+/// of six a commit holds a quarter, and an opening under the lean rounds and
+/// the fused fold about a fifth — where before them an opening held nearly
+/// four codewords against the one it had promised.
+pub(crate) fn room_resize() -> bool {
+    match ROOM_RESIZE_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_RESIZE").is_some())
+        }
+    }
+}
+
+static ROOM_RESIZE_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` for the whole process. `None`
+/// restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_room_resize(on: Option<bool>) {
+    ROOM_RESIZE_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The two turns a stacked group's room covers, in bytes beside the codewords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomTurns {
+    /// The commits', two in flight ([`math_cuda::whir::commit_transient_bytes`]).
+    pub commit: u64,
+    /// One chain's opening at a time, from the kernels that will run it
+    /// ([`math_cuda::whir_open::opening_transient_bytes`]).
+    pub open: u64,
+}
+
+/// [`RoomTurns`] for a group laid out as `layout`, opened from resident
+/// columns or not. Every stacked polynomial of a group has the same variable
+/// count, so the widest share list and the most `eq` values over them bound
+/// every chain's opening.
+#[cfg(feature = "cuda")]
+pub fn room_turns_for(
+    layout: &crate::stacking::StackedLayout,
+    config: &crate::whir_chain::ChainConfig,
+    staged: bool,
+) -> RoomTurns {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    let n = layout.n_stack();
+    let schedule = config.schedule(n);
+    let first_fold = schedule.first().copied().unwrap_or(0);
+    let next_fold = schedule.get(1).copied().unwrap_or(0);
+    let in_flight = layout.num_polys().min(2) as u64;
+    let commit =
+        in_flight * math_cuda::whir::commit_transient_bytes(n, config.log_blowup, first_fold);
+    // A share's `eq` halves are its point's high and low coordinates' tables,
+    // the low half `num_vars / 2` wide — counted per share, with no credit for
+    // the neighbours that share a point.
+    let mut shares = vec![0usize; layout.num_polys()];
+    let mut eq_values = vec![0usize; layout.num_polys()];
+    for place in layout.placements() {
+        shares[place.poly] += 1;
+        let lo_bits = place.num_vars / 2;
+        eq_values[place.poly] += (1usize << (place.num_vars - lo_bits)) + (1usize << lo_bits);
+    }
+    let slots = crate::whir_chain::opening_program::<Ext3>()
+        .ok()
+        .and_then(|program| lower(&program))
+        .map_or(0, |lowered| lowered.num_slots);
+    let open = math_cuda::whir_open::opening_transient_bytes(&math_cuda::whir_open::OpeningShape {
+        num_vars: n,
+        log_blowup: config.log_blowup,
+        first_fold,
+        next_fold,
+        lean_rounds: lean_rounds(),
+        fused: fused_fold(),
+        staged,
+        shares: shares.iter().copied().max().unwrap_or(0),
+        eq_values: eq_values.iter().copied().max().unwrap_or(0),
+        slots,
+    });
+    RoomTurns { commit, open }
+}
+
+/// No device: nothing is ever promised, so nothing is sized.
+#[cfg(not(feature = "cuda"))]
+pub fn room_turns_for(
+    _layout: &crate::stacking::StackedLayout,
+    _config: &crate::whir_chain::ChainConfig,
+    _staged: bool,
+) -> RoomTurns {
+    RoomTurns { commit: 0, open: 0 }
+}
+
 /// What a device sumcheck that runs to the end hands back: the round proofs,
 /// and the challenges the rounds were bound at.
 ///
@@ -211,6 +640,11 @@ pub struct DeviceRoom(#[allow(dead_code)] math_cuda::device::DeviceReservation);
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug)]
 pub struct DeviceRoom(std::convert::Infallible);
+
+impl DeviceRoom {
+    /// Gives the promise back now, rather than when its holder drops.
+    pub(crate) fn give_back(self) {}
+}
 
 /// How much room handing the input layer back has to save before it is worth
 /// doing.
@@ -795,7 +1229,8 @@ where
 }
 
 /// Merkle-commits an ext3 codeword's fold blocks on device, returning the tree
-/// in the host node layout.
+/// in the host node layout. A device error is logged and counted in
+/// [`tree_commit_errors`] before the `None` that sends the caller to the host.
 #[cfg(feature = "cuda")]
 pub(crate) fn commit_tree_ext3<F>(
     codeword: &[math::field::element::FieldElement<F>],
@@ -817,11 +1252,19 @@ where
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
         return None;
     }
+    // No device is a decline, not an error (see `commit_parts`).
+    math_cuda::device::backend().ok()?;
     // SAFETY: `F == Ext3`, three transparent `u64` limbs per element.
     let raw =
         unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
-    let nodes =
-        math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda()).ok()?;
+    let nodes = match math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda())
+    {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            note_tree_commit_error(codeword.len().trailing_zeros(), log_folding, &err);
+            return None;
+        }
+    };
     let nodes = nodes_in_place(nodes)?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(nodes)
@@ -1722,8 +2165,111 @@ where
 /// message it is opening, resident across groups of rounds.
 #[cfg(feature = "cuda")]
 pub struct OpeningFactors {
-    session: math_cuda::whir_open::OpeningSession,
+    state: OpeningState,
     lowered: Lowered,
+}
+
+/// Where the factors are: still in share form for the first rounds, or
+/// materialised.
+#[cfg(feature = "cuda")]
+enum OpeningState {
+    /// The first `rounds` rounds run over the shares
+    /// ([`math_cuda::whir_open::LeanRound0`]); the tables are written only
+    /// once they are bound.
+    Lean {
+        lean: Box<math_cuda::whir_open::LeanRound0>,
+        rounds: usize,
+    },
+    Session(math_cuda::whir_open::OpeningSession),
+    /// A materialisation failed, after the transcript had moved.
+    Gone,
+}
+
+/// Rounds a stacked opening runs over its shares before materialising its
+/// factors (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, `0..=6`; default 6, a first6 chain's
+/// whole first group). `0` materialises at full width up front, which is the
+/// path before this existed; every setting proves the same values.
+///
+/// The factors at full width are the weight and the lifted message, `2·2^n`
+/// extension values — 1.5× the committed base codeword, plus the base staging
+/// while they are built — and they grow with the stack. Bound first, they are
+/// `2^(n − rounds)` wide.
+#[cfg(feature = "cuda")]
+pub const LEAN_ROUNDS_DEFAULT: usize = 6;
+
+#[cfg(feature = "cuda")]
+static LEAN_ROUNDS_FORCED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(feature = "cuda")]
+fn lean_rounds() -> usize {
+    let forced = LEAN_ROUNDS_FORCED.load(Ordering::Relaxed);
+    if forced != usize::MAX {
+        return forced;
+    }
+    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.min(math_cuda::whir::FUSED_MAX_FOLD))
+            .unwrap_or(LEAN_ROUNDS_DEFAULT)
+    })
+}
+
+/// Overrides [`LEAN_ROUNDS_DEFAULT`] / `LAMBDA_VM_WHIR_LEAN_ROUNDS` for the
+/// whole process — for a parity test that proves both ways in one binary.
+/// `None` restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_lean_rounds(rounds: Option<usize>) {
+    LEAN_ROUNDS_FORCED.store(rounds.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+/// Whether a device fold runs every level in one launch
+/// ([`math_cuda::whir::fold_resident_fused`]) or one launch per level. `true`
+/// unless `LAMBDA_VM_NO_WHIR_FUSED_FOLD` is set; the two are raw-identical.
+#[cfg(feature = "cuda")]
+static FUSED_FOLD_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn fused_fold() -> bool {
+    match FUSED_FOLD_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_FUSED_FOLD").is_some())
+        }
+    }
+}
+
+/// The same override for the fused fold. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_fused_fold(on: Option<bool>) {
+    FUSED_FOLD_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether [`open_shared`] declines as a full card would make it, so a test can
+/// reach the path [`note_open_host_fallback`] counts without filling one.
+#[cfg(feature = "cuda")]
+static SHARED_OPEN_DECLINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every stacked opening's device factors decline while `on` — for the
+/// test that the host path they fall to is counted. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_shared_open_declined(on: bool) {
+    SHARED_OPEN_DECLINED.store(on, Ordering::Relaxed);
 }
 
 /// Factors a build declined to upload. Never constructed.
@@ -1770,7 +2316,10 @@ where
     };
     let session = math_cuda::whir_open::OpeningSession::new(raw_weight, raw_message).ok()?;
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(OpeningFactors { session, lowered })
+    Some(OpeningFactors {
+        state: OpeningState::Session(session),
+        lowered,
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1789,45 +2338,93 @@ where
 #[cfg(feature = "cuda")]
 impl OpeningFactors {
     pub(crate) fn num_vars(&self) -> usize {
-        self.session.num_vars()
+        match &self.state {
+            OpeningState::Lean { lean, .. } => lean.num_vars(),
+            OpeningState::Session(session) => session.num_vars(),
+            OpeningState::Gone => 0,
+        }
+    }
+
+    /// Writes the lean factors out, if they are still in share form.
+    fn materialize(&mut self) -> Result<&mut math_cuda::whir_open::OpeningSession, crate::Error> {
+        materialize_state(&mut self.state)
     }
 
     /// One group of rounds, with the host drawing each challenge.
     ///
     /// The factors are folded in place and stay for the next group, which is
-    /// the whole point: they are the width of a stacked polynomial.
+    /// the whole point: they are the width of a stacked polynomial. A lean
+    /// opening runs its first rounds over the shares and materialises when
+    /// they are spent or the group ends — whichever comes first, since what
+    /// follows a group (the out-of-domain answer, the weight's update) reads
+    /// the tables.
     pub(crate) fn rounds<E>(
         &mut self,
         group: usize,
         degree: usize,
-        challenge: impl FnMut(
+        mut challenge: impl FnMut(
             &[math::field::element::FieldElement<E>],
         ) -> math::field::element::FieldElement<E>,
     ) -> Result<SumcheckRounds<E>, crate::Error>
     where
         E: math::field::traits::IsField + 'static,
     {
+        use math::field::element::FieldElement;
+
         let failed = |stage| crate::Error::DeviceFailed { stage };
-        let mut session = self
-            .session
-            .sumcheck(
-                &self.lowered.nodes,
-                &self.lowered.consts,
-                self.lowered.num_slots,
-                self.lowered.root_slot,
-            )
-            .map_err(|_| failed("opening session"))?;
-        let (rounds, challenges) = run_rounds(&mut session, degree, group, challenge, |_| None)?;
-        self.session.bound(group);
+        let mut proofs = Vec::with_capacity(group);
+        let mut challenges = Vec::with_capacity(group);
+        if let OpeningState::Lean { lean, rounds } = &mut self.state {
+            // The opening's rule is `w·f`, so its rounds are degree two: the
+            // lean kernel evaluates that product and nothing else.
+            if degree != 2 {
+                return Err(failed("lean opening degree"));
+            }
+            let mut t = Vec::with_capacity(degree * 3);
+            for node in 1..=degree {
+                t.extend_from_slice(
+                    &ext3_raw(&FieldElement::<E>::from(node as u64))
+                        .ok_or_else(|| failed("interpolation node"))?,
+                );
+            }
+            while proofs.len() < group && lean.bound() < *rounds && lean.num_vars() > 0 {
+                let sums = lean.round(&t).map_err(|_| failed("lean round"))?;
+                let evaluations: Vec<FieldElement<E>> =
+                    sums.chunks_exact(3).map(ext3_from_raw::<E>).collect();
+                let r = challenge(&evaluations);
+                let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
+                lean.bind(&raw);
+                proofs.push(crate::sumcheck::RoundProof { evaluations });
+                challenges.push(r);
+                SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let left = group - proofs.len();
+        let session = materialize_state(&mut self.state)?;
+        let lowered = &self.lowered;
+        if left > 0 {
+            let mut rounds = session
+                .sumcheck(
+                    &lowered.nodes,
+                    &lowered.consts,
+                    lowered.num_slots,
+                    lowered.root_slot,
+                )
+                .map_err(|_| failed("opening session"))?;
+            let (more, points) = run_rounds(&mut rounds, degree, left, challenge, |_| None)?;
+            session.bound(left);
+            proofs.extend(more);
+            challenges.extend(points);
+        }
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         // The factors stay on device; the caller reads them through this
         // handle, not through the tables it no longer has.
-        Ok((rounds, challenges, Vec::new()))
+        Ok((proofs, challenges, Vec::new()))
     }
 
     /// The message's value at `point`, which the out-of-domain answer needs.
     pub(crate) fn evaluate_message<E>(
-        &self,
+        &mut self,
         point: &[math::field::element::FieldElement<E>],
     ) -> Result<math::field::element::FieldElement<E>, crate::Error>
     where
@@ -1835,7 +2432,7 @@ impl OpeningFactors {
     {
         let raw = raw_point(point).ok_or(crate::Error::DeviceFailed { stage: "ood point" })?;
         let value = self
-            .session
+            .materialize()?
             .evaluate_message(&raw)
             .map_err(|_| crate::Error::DeviceFailed { stage: "ood value" })?;
         Ok(ext3_from_raw::<E>(&value))
@@ -1853,9 +2450,24 @@ impl OpeningFactors {
         let failed = |stage| crate::Error::DeviceFailed { stage };
         let raw = raw_point(point).ok_or_else(|| failed("weight point"))?;
         let scale = ext3_raw(gamma).ok_or_else(|| failed("weight scale"))?;
-        self.session
+        self.materialize()?
             .add_scaled_eq(&raw, &scale)
             .map_err(|_| failed("weight"))
+    }
+
+    /// Device bytes the factors hold right now — the share-form working set
+    /// before the lean rounds are spent, the tables after.
+    pub fn device_bytes(&self) -> u64 {
+        match &self.state {
+            OpeningState::Lean { lean, .. } => lean.device_bytes(),
+            OpeningState::Session(session) => session.device_bytes(),
+            OpeningState::Gone => 0,
+        }
+    }
+
+    /// Whether the factors are still in share form.
+    pub fn is_lean(&self) -> bool {
+        matches!(self.state, OpeningState::Lean { .. })
     }
 }
 
@@ -1893,7 +2505,7 @@ impl OpeningFactors {
     }
 
     pub(crate) fn evaluate_message<E>(
-        &self,
+        &mut self,
         _point: &[math::field::element::FieldElement<E>],
     ) -> Result<math::field::element::FieldElement<E>, crate::Error>
     where
@@ -1940,7 +2552,9 @@ where
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some()) {
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some())
+        || SHARED_OPEN_DECLINED.load(Ordering::Relaxed)
+    {
         return None;
     }
     let lowered = lower(program)?;
@@ -1968,22 +2582,136 @@ where
     {
         return None;
     }
+    let host_parts: Vec<(&[u64], usize)> = message
+        .parts
+        .iter()
+        .map(|(column, offset)| (raw(column), *offset))
+        .collect();
+    // ★ The first rounds over the shares, when the device takes them: the
+    // factors are then written at `2^(n − rounds)` instead of `2^n`. The same
+    // values either way; a stack the lean path cannot read materialises as
+    // before, before any challenge is drawn.
+    let rounds = lean_rounds().min(n_stack);
+    if rounds > 0
+        && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts)
+    {
+        OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        LEAN_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Some(OpeningFactors {
+            state: OpeningState::Lean {
+                lean: Box::new(lean),
+                rounds,
+            },
+            lowered,
+        });
+    }
     let session = match &message.resident {
         Some((store, parts)) => math_cuda::whir_open::OpeningSession::from_shares_and_resident(
             &shares, len, &store.0, parts,
         ),
         None => {
-            let parts: Vec<(&[u64], usize)> = message
-                .parts
-                .iter()
-                .map(|(column, offset)| (raw(column), *offset))
-                .collect();
-            math_cuda::whir_open::OpeningSession::from_shares_and_parts(&shares, len, &parts)
+            math_cuda::whir_open::OpeningSession::from_shares_and_parts(&shares, len, &host_parts)
         }
     }
     .ok()?;
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(OpeningFactors { session, lowered })
+    Some(OpeningFactors {
+        state: OpeningState::Session(session),
+        lowered,
+    })
+}
+
+/// The factors as tables: written out of share form if they still are. Past
+/// the first round the transcript has moved, so a failure here is final.
+#[cfg(feature = "cuda")]
+fn materialize_state(
+    state: &mut OpeningState,
+) -> Result<&mut math_cuda::whir_open::OpeningSession, crate::Error> {
+    if let OpeningState::Lean { .. } = state {
+        let OpeningState::Lean { lean, .. } = core::mem::replace(state, OpeningState::Gone) else {
+            unreachable!("matched above")
+        };
+        let session = (*lean)
+            .materialize()
+            .map_err(|_| crate::Error::DeviceFailed {
+                stage: "lean materialize",
+            })?;
+        *state = OpeningState::Session(session);
+    }
+    match state {
+        OpeningState::Session(session) => Ok(session),
+        _ => Err(crate::Error::DeviceFailed {
+            stage: "opening factors",
+        }),
+    }
+}
+
+/// The lean opening of a stacked polynomial: its shares with their points'
+/// `eq` tables in halves (computed here, a few kilobytes each), and the
+/// message where it already is. `None` when the stack is not one it can read.
+#[cfg(feature = "cuda")]
+fn lean_opening<F>(
+    shares: &[(usize, Vec<u64>, [u64; 3])],
+    n_stack: usize,
+    message: &crate::whir_chain::Stacked<'_, F>,
+    host_parts: &[(&[u64], usize)],
+) -> Option<math_cuda::whir_open::LeanRound0>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    // Sorted by offset: the map from a stack position to its column is a
+    // binary search over them.
+    let mut order: Vec<usize> = (0..shares.len()).collect();
+    order.sort_by_key(|i| shares[*i].0);
+    let mut lean_shares = Vec::with_capacity(shares.len());
+    let mut eq: Vec<u64> = Vec::new();
+    // A table's columns share its point and sit next to each other: one pair
+    // of half tables per run of equal points.
+    let mut last: Option<(&[u64], usize, usize, usize)> = None;
+    for &i in &order {
+        let (offset, point, scale) = &shares[i];
+        let num_vars = point.len() / 3;
+        let lo_bits = num_vars / 2;
+        let (hi_at, lo_at) = match last {
+            Some((p, lo, hi_at, lo_at)) if p == point.as_slice() && lo == lo_bits => (hi_at, lo_at),
+            _ => {
+                let coordinates: Vec<FieldElement<Ext3>> =
+                    point.chunks_exact(3).map(ext3_from_raw::<Ext3>).collect();
+                let (hi, lo) = coordinates.split_at(num_vars - lo_bits);
+                let hi_at = eq.len() / 3;
+                for value in crate::eq::eq_evals(hi) {
+                    eq.extend_from_slice(&ext3_raw(&value)?);
+                }
+                let lo_at = eq.len() / 3;
+                for value in crate::eq::eq_evals(lo) {
+                    eq.extend_from_slice(&ext3_raw(&value)?);
+                }
+                (hi_at, lo_at)
+            }
+        };
+        last = Some((point.as_slice(), lo_bits, hi_at, lo_at));
+        lean_shares.push(math_cuda::whir_open::LeanShare {
+            stack_offset: *offset,
+            num_vars,
+            lo_bits,
+            hi_at,
+            lo_at,
+            scale: *scale,
+        });
+    }
+    let source = match &message.resident {
+        Some((store, parts)) => math_cuda::whir_open::LeanMessage::Resident {
+            store: &store.0,
+            parts,
+        },
+        None => math_cuda::whir_open::LeanMessage::Parts(host_parts),
+    };
+    math_cuda::whir_open::LeanRound0::new(&lean_shares, &eq, n_stack, source)
+        .ok()
+        .flatten()
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -2072,15 +2800,23 @@ where
             )
         })
         .collect();
-    let (codeword, root) = math_cuda::whir::commit_codeword_parts(
+    // No device is a decline, not an error: the device is asked only once one
+    // exists (a GPU-less `cuda` build fails here on every commit).
+    math_cuda::device::backend().ok()?;
+    let (codeword, root) = match math_cuda::whir::commit_codeword_parts(
         &raw,
         log_evals,
         log_blowup,
         log_folding,
         transient,
         hash.into_math_cuda(),
-    )
-    .ok()?;
+    ) {
+        Ok(committed) => committed,
+        Err(err) => {
+            note_commit_error("parts", log_evals, log_blowup, &err);
+            return None;
+        }
+    };
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -2103,7 +2839,9 @@ pub(crate) fn commit_resident(
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
         return None;
     }
-    let (codeword, root) = math_cuda::whir::commit_codeword_resident(
+    // No device is a decline, not an error (see `commit_parts`).
+    math_cuda::device::backend().ok()?;
+    let (codeword, root) = match math_cuda::whir::commit_codeword_resident(
         &store.0,
         parts,
         log_evals,
@@ -2111,8 +2849,13 @@ pub(crate) fn commit_resident(
         log_folding,
         transient,
         hash.into_math_cuda(),
-    )
-    .ok()?;
+    ) {
+        Ok(committed) => committed,
+        Err(err) => {
+            note_commit_error("resident", log_evals, log_blowup, &err);
+            return None;
+        }
+    };
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -2162,7 +2905,19 @@ impl DeviceCodeword {
         N: math::field::traits::IsField + 'static,
     {
         let (two_inv, g_invs, raw_alphas) = fold_scalars(generator, alphas)?;
-        let folded = math_cuda::whir::fold_resident(&self.0, two_inv, &g_invs, &raw_alphas).ok()?;
+        // ★ Every level in one launch when it fits: the level-by-level fold
+        // holds a 2.25× codeword transient beside the committed codeword, the
+        // fused one only its output. Raw-identical either way.
+        let folded = if fused_fold() && g_invs.len() <= math_cuda::whir::FUSED_MAX_FOLD {
+            let folded =
+                math_cuda::whir::fold_resident_fused(&self.0, two_inv, &g_invs, &raw_alphas)
+                    .ok()?;
+            FUSED_FOLD_CALLS.fetch_add(1, Ordering::Relaxed);
+            folded
+        } else {
+            math_cuda::whir::fold_resident(&self.0, two_inv, &g_invs, &raw_alphas).ok()?
+        };
+        RESIDENT_FOLD_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Self(folded))
     }
 

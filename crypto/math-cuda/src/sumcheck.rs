@@ -284,6 +284,19 @@ impl SumcheckSession {
         factors as u64 * cube as u64 * 24 + threads * per_thread
     }
 
+    /// Bytes a session over factors that are already on the card allocates
+    /// for its rounds ([`from_device`](Self::from_device)): the slot file, the
+    /// per-block partials of its widest round, and the node, challenge and sum
+    /// scratch.
+    pub fn scratch_bytes(cube: usize, num_slots: usize) -> u64 {
+        let ceiling = thread_ceiling(num_slots);
+        let (grid, block) = launch_shape(ceiling, (cube / 2) as u64);
+        let threads = grid as u64 * block as u64;
+        let widest = widest_grid(ceiling, (cube / 2) as u64) as u64;
+        let nodes = MAX_NODES as u64;
+        threads * num_slots as u64 * 24 + (nodes * widest + 2 * nodes + 1) * 24
+    }
+
     /// Cube indices left to bind.
     pub fn len(&self) -> usize {
         self.len

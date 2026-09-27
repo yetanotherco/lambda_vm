@@ -25,7 +25,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ChainConfig, WhirFolds};
+use multilinear::whir_chain::{ChainConfig, StackVars, WhirFolds};
 use stark::config::Commitment;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -106,8 +106,8 @@ pub fn l2g_commitment(
         columns.len(),
         trace.main_table.height.trailing_zeros() as usize,
     )];
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let roots = crate::with_whir_hash!(|H| {
         multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
             layout,
@@ -174,6 +174,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The stack cap (S2) its layout was built under.
+    stack: StackVars,
 }
 
 impl<H> DecodePrepared<H>
@@ -233,7 +235,7 @@ where
         committed_under(
             "the pinned DECODE commitment was built",
             "this epoch argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
@@ -310,6 +312,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The stack cap (S2) its layout was built under.
+    stack: StackVars,
 }
 
 impl<H> GenesisPrepared<H>
@@ -366,7 +370,7 @@ where
         committed_under(
             "the genesis stack was committed",
             "this cross-epoch proof argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
@@ -391,6 +395,7 @@ where
             log_blowup: self.log_blowup,
             log_folding: self.log_folding,
             folds: self.folds,
+            stack: self.stack,
         }
     }
 }
@@ -432,6 +437,8 @@ pub struct GlobalPrepared {
     pub log_folding: usize,
     /// The fold schedule it was committed under (W2).
     pub folds: WhirFolds,
+    /// The stack cap its layout was built under (S2).
+    pub stack: StackVars,
 }
 
 impl GlobalPrepared {
@@ -452,29 +459,38 @@ impl GlobalPrepared {
         committed_under(
             "the genesis stack was committed",
             "this program is emitted against",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
 }
 
 /// The one comparison every `agrees_with` makes: a commitment built once and
-/// reused must have been built under the blowup, the fold width AND the fold
-/// schedule the proof argues at — the three things `StackedCommitment::commit`
-/// reads (it never reads `num_queries`).
+/// reused must have been built under the blowup, the fold width, the fold
+/// schedule AND the stack cap the proof argues at — the three things
+/// `StackedCommitment::commit` reads (it never reads `num_queries`), and the
+/// cap that decided the layout it was handed.
 fn committed_under(
     built: &str,
     argues: &str,
-    (log_blowup, log_folding, folds): (usize, usize, WhirFolds),
+    (log_blowup, log_folding, folds, stack): (usize, usize, WhirFolds, StackVars),
     config: &ChainConfig,
 ) -> Result<(), Error> {
-    if (config.log_blowup, config.log_folding, config.format.folds)
-        != (log_blowup, log_folding, folds)
+    if (
+        config.log_blowup,
+        config.log_folding,
+        config.format.folds,
+        config.format.stack,
+    ) != (log_blowup, log_folding, folds, stack)
     {
         return Err(Error::Prover(format!(
-            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?}, and \
-             {argues} at blowup {} / folding {} / folds {:?}",
-            config.log_blowup, config.log_folding, config.format.folds,
+            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?} / stack {}, \
+             and {argues} at blowup {} / folding {} / folds {:?} / stack {}",
+            stack.get(),
+            config.log_blowup,
+            config.log_folding,
+            config.format.folds,
+            config.format.stack.get(),
         )));
     }
     Ok(())
@@ -559,8 +575,8 @@ where
             )));
         }
     }
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
@@ -582,6 +598,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        stack: config.format.stack,
     }))
 }
 
@@ -654,8 +671,8 @@ where
         )));
     }
     let shape = [(columns.len(), rows.trailing_zeros() as usize)];
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
@@ -677,6 +694,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        stack: config.format.stack,
     })
 }
 
@@ -1160,6 +1178,220 @@ where
     let genesis_plan = crate::continuation::genesis_stack_plan(
         &gm_configs,
         boundaries.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    let genesis = genesis_prepared_for::<H>(&gm_configs, genesis_plan, &config)?;
+    if let Some(genesis) = genesis.as_ref() {
+        genesis.agrees_with(&config)?;
+    }
+    let borrowed = genesis
+        .as_ref()
+        .map(|g| multilinear::stacking::borrow(&g.columns))
+        .unwrap_or_default();
+    let __ws_prove = multilinear::whir_split::mark();
+    let proof = multilinear_table::multi_prove(
+        &committed,
+        &config,
+        &mut transcript,
+        genesis.as_ref().map(|g| g.opening(&borrowed)),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_global", __ws_wall);
+    multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
+        index: __ws_index,
+        prep: __ws_prep_s,
+        absorb: __ws_absorb_s,
+        commit: __ws_commit_s,
+        prove: __ws_prove_s,
+        wall: __ws_wall_s,
+        airs: __ws_airs,
+        ..Default::default()
+    });
+
+    Ok(GlobalProof {
+        proof,
+        table_num_vars,
+    })
+}
+
+/// The cross-epoch proof's host preparation, done ahead of its prove
+/// ([`crate::continuation::base_prep_ahead`]): every table of [`prove_global`]
+/// with its main columns materialized and checked, and the page layout it was
+/// built from. Owns everything, so the producer thread builds it from the
+/// boundaries while the last epoch proves.
+pub(crate) struct GlobalPrepped {
+    num_epochs: usize,
+    num_private_input_pages: usize,
+    page_bases: Vec<u64>,
+    gm_configs: Vec<crate::tables::page::PageConfig>,
+    airs: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
+    columns: Vec<Vec<Vec<FieldElement<F>>>>,
+    shapes: Vec<(usize, usize)>,
+    names: Vec<String>,
+}
+
+/// The host work [`prove_global`]'s `prep` stage does before its layouts, from
+/// the boundaries, the ELF and the private input — everything the prover-thread
+/// schedule derives after the epochs. Prints one `BASE PREP global` line under
+/// `LAMBDA_VM_BASE_SPLIT=1`.
+pub(crate) fn prep_global_ahead(
+    boundaries: &[std::sync::Arc<Vec<CellBoundary>>],
+    elf: &Elf,
+    private_inputs: &[u8],
+    opts: &ProofOptions,
+) -> Result<GlobalPrepped, Error> {
+    let t = std::time::Instant::now();
+    let t0 = stark::prove_split::epoch_secs();
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(elf, private_inputs),
+    );
+    let num_private_input_pages = crate::tables::page::private_input_page_count(private_inputs);
+    let page_bases = crate::continuation::touched_page_bases(boundaries);
+    // Each cell's final state; the boundaries are in epoch order, so the last
+    // fini wins.
+    let mut final_state: crate::tables::global_memory::FiniStateMap =
+        std::collections::HashMap::new();
+    for epoch in boundaries {
+        for b in epoch.iter() {
+            final_state.insert(
+                b.address,
+                crate::tables::global_memory::FiniState {
+                    value: (b.fini.value & 0xFF) as u8,
+                    epoch: b.fini.epoch,
+                },
+            );
+        }
+    }
+    let gm_configs = crate::continuation::global_memory_configs_from_init_page_data(
+        &page_bases,
+        &init_page_data,
+        num_private_input_pages,
+        true,
+    );
+    let mut airs: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>> =
+        Vec::with_capacity(boundaries.len() + gm_configs.len());
+    let mut traces = Vec::with_capacity(boundaries.len() + gm_configs.len());
+    for (i, epoch) in boundaries.iter().enumerate() {
+        airs.push(Box::new(crate::continuation::l2g_global_air(
+            opts,
+            local_to_global::epoch_label(i as u64),
+        )));
+        traces.push(local_to_global::generate_local_to_global_trace(
+            epoch.as_slice(),
+        ));
+    }
+    for config in &gm_configs {
+        airs.push(Box::new(crate::continuation::global_memory_air(
+            opts, config, None,
+        )));
+        traces.push(crate::tables::global_memory::generate_global_trace(
+            config,
+            &final_state,
+        ));
+    }
+    let shapes: Vec<(usize, usize)> = traces
+        .iter()
+        .map(|trace| {
+            (
+                trace.main_table.width,
+                trace.main_table.height.trailing_zeros() as usize,
+            )
+        })
+        .collect();
+    let names: Vec<String> = airs.iter().map(|air| air.name().to_string()).collect();
+    let mut columns = Vec::with_capacity(traces.len());
+    for (air, trace) in airs.iter().zip(traces.iter()) {
+        let main = trace.columns_main();
+        for (col, expected) in air.precomputed_columns().iter().enumerate() {
+            if main.get(col) != Some(expected) {
+                return Err(Error::Prover(format!(
+                    "{}: preprocessed column {col} is not what the run implies",
+                    air.name(),
+                )));
+            }
+        }
+        columns.push(main);
+    }
+    if crate::continuation::base_split_enabled() {
+        println!(
+            "BASE PREP global: prep@producer {:.2}s t=[{t0:.3},{:.3}]",
+            t.elapsed().as_secs_f64(),
+            stark::prove_split::epoch_secs(),
+        );
+    }
+    Ok(GlobalPrepped {
+        num_epochs: boundaries.len(),
+        num_private_input_pages,
+        page_bases,
+        gm_configs,
+        airs,
+        columns,
+        shapes,
+        names,
+    })
+}
+
+/// [`prove_global`] over tables prepared by [`prep_global_ahead`]: the same
+/// layouts, commitment, genesis opening and argument.
+pub(crate) fn prove_prepped_global<H>(
+    global: GlobalPrepped,
+    elf_bytes: &[u8],
+) -> Result<GlobalProof, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    let GlobalPrepped {
+        num_epochs,
+        num_private_input_pages,
+        page_bases,
+        gm_configs,
+        airs,
+        mut columns,
+        shapes,
+        names,
+    } = global;
+    let __ws_wall = multilinear::whir_split::mark();
+    let __ws_prep = multilinear::whir_split::mark();
+    let __ws_index = multilinear::whir_split::GLOBAL_INDEX;
+    let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
+    let config = chain_config(&shapes);
+    multilinear::whir_split::set_table_names(names);
+    let mut committed = Vec::with_capacity(airs.len());
+    for ((air, main), &(width, num_vars)) in airs.iter().zip(columns.iter_mut()).zip(&shapes) {
+        let layout = layout_of(air.as_ref(), width, num_vars)
+            .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+        committed.push(
+            CommittedTable::from_layout(layout, |col| core::mem::take(&mut main[col as usize]))
+                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
+        );
+    }
+    drop(columns);
+    let sizes = global_groups(num_epochs, gm_configs.len());
+    let __ws_airs = committed.len();
+    let __ws_prep_s = multilinear::whir_split::stage_done(__ws_index, "prep", __ws_prep);
+
+    let __ws_absorb = multilinear::whir_split::mark();
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_global(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        num_epochs,
+        num_private_input_pages,
+        &page_bases,
+        &table_num_vars,
+        &config,
+    );
+    let __ws_absorb_s = multilinear::whir_split::stage_done(__ws_index, "absorb", __ws_absorb);
+
+    let __ws_commit = multilinear::whir_split::mark();
+    let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
+    let genesis_plan = crate::continuation::genesis_stack_plan(
+        &gm_configs,
+        num_epochs,
         crate::continuation::PAGE_NUM_VARS,
     );
     let genesis = genesis_prepared_for::<H>(&gm_configs, genesis_plan, &config)?;
@@ -1743,6 +1975,237 @@ where
     })
 }
 
+/// One epoch's host preparation, done ahead of its prove
+/// ([`crate::continuation::base_prep_ahead`]): the AIRs, and every table's main
+/// columns already materialized and checked
+/// against its preprocessed columns. Owns everything, so the producer thread
+/// can build it while the prover proves the previous epoch;
+/// [`prove_prepped_epoch`] lays the tables out over these columns and proves.
+pub(crate) struct EpochPrepped {
+    index: u64,
+    label: u64,
+    airs: crate::VmAirs,
+    l2g_air: Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+    /// Per table in proof order, its main columns.
+    columns: Vec<Vec<Vec<FieldElement<F>>>>,
+    /// Per table, `(width, num_vars)`.
+    shapes: Vec<(usize, usize)>,
+    names: Vec<String>,
+    reg_fini: Vec<u32>,
+    table_counts: TableCounts,
+    public_output: Vec<u8>,
+}
+
+/// The same host work [`prove_epoch`]'s `prep` stage does before its layouts,
+/// on whichever thread calls it. Prints one `BASE PREP <index>` line under
+/// `LAMBDA_VM_BASE_SPLIT=1`.
+pub(crate) fn prep_epoch_ahead(
+    elf: &Elf,
+    epoch: crate::continuation::PreparedEpoch,
+    opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+) -> Result<EpochPrepped, Error> {
+    let t = std::time::Instant::now();
+    let t0 = stark::prove_split::epoch_secs();
+    let crate::continuation::PreparedEpoch {
+        index,
+        register_init,
+        label,
+        mut traces,
+        boundary,
+        is_final,
+    } = epoch;
+    // The bookend's range checks are lookups into BITWISE, so its
+    // multiplicities have to carry them.
+    crate::tables::bitwise::update_multiplicities(
+        &mut traces.bitwise,
+        &local_to_global::collect_bitwise_from_l2g(&boundary),
+    );
+    if !traces.page_configs.is_empty() {
+        return Err(Error::ContinuationInvariant(
+            "continuation epoch must have no PAGE configs (L2G bookend replaces PAGE)".to_string(),
+        ));
+    }
+
+    let reg_fini = register::fini_from_trace(&traces.register);
+    let table_counts = traces.table_counts();
+    let public_output = traces.public_output_bytes.clone();
+
+    let airs = crate::continuation::build_epoch_airs(
+        elf,
+        opts,
+        &[],
+        &table_counts,
+        &register_init,
+        &reg_fini,
+        is_final,
+        decode_commitment,
+    );
+    let l2g_air: Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        Box::new(crate::continuation::l2g_memory_air(opts, label));
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
+
+    let (columns, shapes, names) = {
+        let mut pairs = airs.air_trace_pairs(&mut traces);
+        pairs.push((&*l2g_air, &mut l2g_trace, &()));
+        let shapes: Vec<(usize, usize)> = pairs
+            .iter()
+            .map(|(_, trace, _)| {
+                (
+                    trace.main_table.width,
+                    trace.main_table.height.trailing_zeros() as usize,
+                )
+            })
+            .collect();
+        let names: Vec<String> = pairs
+            .iter()
+            .map(|(air, _, _)| air.name().to_string())
+            .collect();
+        let mut columns = Vec::with_capacity(pairs.len());
+        for (air, trace, _) in pairs.iter_mut() {
+            let main = trace.columns_main();
+            // The verifier rebuilds these and demands the proof open to them, so a
+            // trace that disagrees produces a proof nobody can verify.
+            for (col, expected) in air.precomputed_columns().iter().enumerate() {
+                if main.get(col) != Some(expected) {
+                    return Err(Error::Prover(format!(
+                        "{}: preprocessed column {col} is not what the program implies",
+                        air.name(),
+                    )));
+                }
+            }
+            columns.push(main);
+        }
+        (columns, shapes, names)
+    };
+    if crate::continuation::base_split_enabled() {
+        println!(
+            "BASE PREP {index}: prep@producer {:.2}s t=[{t0:.3},{:.3}]",
+            t.elapsed().as_secs_f64(),
+            stark::prove_split::epoch_secs(),
+        );
+    }
+    Ok(EpochPrepped {
+        index,
+        label,
+        airs,
+        l2g_air,
+        columns,
+        shapes,
+        names,
+        reg_fini,
+        table_counts,
+        public_output,
+    })
+}
+
+/// [`prove_epoch`] over an epoch prepared by [`prep_epoch_ahead`]: the same
+/// layouts, commitment and argument, with the prover thread's `prep`
+/// stage reduced to laying the tables out over columns already in hand.
+pub(crate) fn prove_prepped_epoch<H>(
+    epoch: EpochPrepped,
+    elf_bytes: &[u8],
+    prepared: &DecodePrepared<H>,
+) -> Result<EpochProof, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    let EpochPrepped {
+        index,
+        label,
+        airs,
+        l2g_air,
+        mut columns,
+        shapes,
+        names,
+        reg_fini,
+        table_counts,
+        public_output,
+    } = epoch;
+    let __ws_index = index;
+    let __ws_wall = multilinear::whir_split::mark();
+    let __ws_prep = multilinear::whir_split::mark();
+    let mut refs = airs.air_refs();
+    refs.push(&*l2g_air);
+    // The AIR set is rebuilt in the order `air_trace_pairs` walked; a set that
+    // disagreed would lay one table's columns out under another's AIR.
+    let walked: Vec<&str> = refs.iter().map(|air| air.name()).collect();
+    if walked != names.iter().map(String::as_str).collect::<Vec<_>>() {
+        return Err(Error::ContinuationInvariant(format!(
+            "epoch {index}: the AIR order {walked:?} is not the prepared order {names:?}"
+        )));
+    }
+    let decode_at = decode_table_index(&refs)?;
+    let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
+    let config = chain_config(&shapes);
+    multilinear::whir_split::set_table_names(names);
+
+    let mut committed = Vec::with_capacity(refs.len());
+    for ((air, main), &(width, num_vars)) in refs.iter().zip(columns.iter_mut()).zip(&shapes) {
+        let layout = layout_of(*air, width, num_vars)
+            .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+        committed.push(
+            CommittedTable::from_layout(layout, |col| core::mem::take(&mut main[col as usize]))
+                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
+        );
+    }
+    drop(columns);
+    let sizes = epoch_groups(committed.len());
+    prepared.agrees_with(&config)?;
+    let __ws_airs = committed.len();
+    let __ws_prep_s = multilinear::whir_split::stage_done(__ws_index, "prep", __ws_prep);
+
+    let __ws_absorb = multilinear::whir_split::mark();
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_epoch(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        &public_output,
+        &table_counts,
+        label,
+        &table_num_vars,
+        &config,
+    );
+    let __ws_absorb_s = multilinear::whir_split::stage_done(__ws_index, "absorb", __ws_absorb);
+
+    let __ws_commit = multilinear::whir_split::mark();
+    let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
+
+    let borrowed = multilinear::stacking::borrow(&prepared.columns);
+    let decode_columns = prepared.settled_at(decode_at);
+    let __ws_prove = multilinear::whir_split::mark();
+    let proof = multilinear_table::multi_prove(
+        &committed,
+        &config,
+        &mut transcript,
+        Some(prepared.opening(&borrowed, &decode_columns)),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_epoch", __ws_wall);
+    multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
+        index: __ws_index,
+        prep: __ws_prep_s,
+        absorb: __ws_absorb_s,
+        commit: __ws_commit_s,
+        prove: __ws_prove_s,
+        wall: __ws_wall_s,
+        airs: __ws_airs,
+        ..Default::default()
+    });
+
+    Ok(EpochProof {
+        proof,
+        table_num_vars,
+        table_counts,
+        public_output,
+        reg_fini,
+    })
+}
+
 /// A self-contained multilinear continuation proof.
 ///
 /// Mirrors [`crate::continuation::ContinuationProof`]: the per-epoch proofs in
@@ -1784,6 +2247,63 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_keeping_decode(elf_bytes, private_inputs, epoch_size_log2, opts)
+        .map(|(bundle, _)| bundle)
+}
+
+/// The two DECODE derivations a base run makes from the ELF, kept for a caller
+/// that reconstructs every epoch afterwards (the recursion tree's level 0), so
+/// it takes them instead of deriving both a second time.
+pub struct BaseDecode {
+    /// The univariate DECODE commitment, `commitment_from_elf(elf, opts)`.
+    pub commitment: Commitment,
+    /// The [`DecodePrepared<H>`] the base proved under, for the `H` the
+    /// process's hash dispatch chose. Type-erased because `H` is chosen inside
+    /// that dispatch; [`BaseDecode::prepared`] recovers it.
+    prepared: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl BaseDecode {
+    /// The prepared opening, if the base ran under `H`. A process picks one
+    /// hash once, so a caller inside the same dispatch always gets `Some`.
+    pub fn prepared<H>(&self) -> Option<&DecodePrepared<H>>
+    where
+        H: multilinear::whir_hash::WhirHash + 'static,
+    {
+        self.prepared.downcast_ref::<DecodePrepared<H>>()
+    }
+}
+
+/// [`prove_continuation`], also handing back its DECODE derivations
+/// ([`BaseDecode`]).
+pub fn prove_continuation_keeping_decode(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<(ContinuationProof, BaseDecode), Error> {
+    prove_continuation_scheduled(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        crate::continuation::base_prep_ahead(),
+    )
+}
+
+/// [`prove_continuation_keeping_decode`] with the preparation's schedule named
+/// by the caller rather than read from
+/// [`crate::continuation::BASE_PREP_ON_PROVER_ENV`], so one process can run
+/// both: `prep_ahead` moves each epoch's host preparation onto the producer thread,
+/// ahead of its prove, and the global proof's there too once the last epoch is
+/// handed over. The proofs are the same either way.
+pub(crate) fn prove_continuation_scheduled(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    prep_ahead: bool,
+) -> Result<(ContinuationProof, BaseDecode), Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
@@ -1793,36 +2313,56 @@ pub fn prove_continuation(
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
     // commitment — whose type names the hash — is built ONCE and held across
     // every epoch. Inside `prove_epoch` it could not outlive one call.
-    let boundaries = crate::with_whir_hash!(|H| {
+    // `prep_ahead` (the default): each epoch's host preparation runs on the
+    // producer thread, ahead of its prove, and the global proof's once the last
+    // epoch is out.
+    let (boundaries, prepared, global_prepped) = crate::with_whir_hash!(|H| {
         let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
-        crate::continuation::for_each_epoch_overlapped(
-            &elf,
-            private_inputs,
-            epoch_size_log2,
-            &artifacts,
-            |p| {
-                epochs.push(prove_epoch::<H>(
-                    &elf,
-                    elf_bytes,
-                    &p.register_init,
-                    p.label,
-                    p.traces,
-                    p.is_final,
-                    &p.boundary,
-                    opts,
-                    Some(decode_commitment),
-                    &prepared,
-                )?);
-                Ok(())
-            },
-        )?
+        let (boundaries, global_prepped) = if prep_ahead {
+            let (boundaries, global) = crate::continuation::for_each_epoch_overlapped_prepped(
+                &elf,
+                private_inputs,
+                epoch_size_log2,
+                &artifacts,
+                |p| prep_epoch_ahead(&elf, p, opts, Some(decode_commitment)),
+                |boundaries| prep_global_ahead(boundaries, &elf, private_inputs, opts),
+                |p| {
+                    epochs.push(prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?);
+                    Ok(())
+                },
+            )?;
+            (boundaries, Some(global))
+        } else {
+            let boundaries = crate::continuation::for_each_epoch_overlapped(
+                &elf,
+                private_inputs,
+                epoch_size_log2,
+                &artifacts,
+                |p| {
+                    epochs.push(prove_epoch::<H>(
+                        &elf,
+                        elf_bytes,
+                        &p.register_init,
+                        p.label,
+                        p.traces,
+                        p.is_final,
+                        &p.boundary,
+                        opts,
+                        Some(decode_commitment),
+                        &prepared,
+                    )?);
+                    Ok(())
+                },
+            )?;
+            (boundaries, None)
+        };
+        (
+            boundaries,
+            Box::new(prepared) as Box<dyn std::any::Any + Send + Sync>,
+            global_prepped,
+        )
     });
 
-    // The genesis image, which is the one the run started from — rebuilt here
-    // rather than carried, because `for_each_epoch` advances its copy.
-    let init_page_data = crate::tables::trace_builder::build_init_page_data(
-        &crate::tables::trace_builder::build_initial_image_paged(&elf, private_inputs),
-    );
     let num_private_input_pages = crate::tables::page::private_input_page_count(private_inputs);
     // One source of truth: the same list drives the committed tables and
     // travels in the bundle, so the two cannot diverge.
@@ -1832,23 +2372,44 @@ pub fn prove_continuation(
     // to agree. A hash a caller could choose for the epochs and not for the
     // cross-epoch proof would be a bundle whose two halves were argued under
     // different sponges.
-    let global = crate::with_whir_hash!(|H| {
-        prove_global::<H>(
-            &boundaries,
-            elf_bytes,
-            &init_page_data,
-            &touched_page_bases,
-            num_private_input_pages,
-            opts,
-        )
-    })?;
+    let global = match global_prepped {
+        // `prep_ahead`: prepared on the producer from the same boundaries, ELF
+        // and private input.
+        Some(global) => {
+            crate::with_whir_hash!(|H| { prove_prepped_global::<H>(global, elf_bytes) })?
+        }
+        None => {
+            // The genesis image, which is the one the run started from — rebuilt
+            // here rather than carried, because `for_each_epoch` advances its
+            // copy.
+            let init_page_data = crate::tables::trace_builder::build_init_page_data(
+                &crate::tables::trace_builder::build_initial_image_paged(&elf, private_inputs),
+            );
+            crate::with_whir_hash!(|H| {
+                prove_global::<H>(
+                    &boundaries,
+                    elf_bytes,
+                    &init_page_data,
+                    &touched_page_bases,
+                    num_private_input_pages,
+                    opts,
+                )
+            })?
+        }
+    };
 
-    Ok(ContinuationProof {
-        epochs,
-        global,
-        num_private_input_pages,
-        touched_page_bases,
-    })
+    Ok((
+        ContinuationProof {
+            epochs,
+            global,
+            num_private_input_pages,
+            touched_page_bases,
+        },
+        BaseDecode {
+            commitment: decode_commitment,
+            prepared,
+        },
+    ))
 }
 
 /// Verifies a whole run from the bundle and the ELF alone.

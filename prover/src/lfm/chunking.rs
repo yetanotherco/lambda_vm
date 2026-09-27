@@ -483,6 +483,173 @@ impl Default for BaluChunking {
     }
 }
 
+/// ★ Whether `LFM_HASH` splits into two power-of-two instances where one table
+/// would be mostly padding ([`HashChunking::for_rows`]): a PER-PIPELINE default,
+/// each pipeline's measured best — off on the WHIR pipeline
+/// (`whir/recursion-rpx`), on for the STARK pipeline (`per-table-gpu`).
+/// [`HASH_SPLIT_ENV`] overrides it either way.
+///
+/// Why the two differ, measured on block 25368371 (one RTX 5090, ABBA, on top of
+/// the `BITWISE` drop): the STARK wraps carry 276–299k hash rows in a `2^19`
+/// table and split to `2^18 + 2^15`, removing 74.5 M census cells each, and the
+/// STARK block ran 1.90 s faster (level 0 −1.80 s). The WHIR wraps carry
+/// 172–195k rows in `2^18` and a split removes only `2^16` rows, 21.3 M cells —
+/// less than the extra sub-proof costs the wrap, and each split child also
+/// costs its parent one more sub-proof to re-verify, which took four of the
+/// five fan-in-3 level-1 nodes across a power of two in `LFM_XALU`: the WHIR
+/// block ran 2.80 s slower.
+///
+/// Read once per process by [`super::compiler::compile`], so every program the
+/// process compiles carries the same policy, and the split it produces is
+/// program shape: committed per chunk, bound into `program_id`, never read off
+/// a proof. Off, every program is one table — the machine before the split
+/// existed, byte for byte.
+pub const HASH_SPLIT_DEFAULT: bool = false;
+
+/// `LAMBDA_VM_LFM_HASH_SPLIT`: `0` keeps one table, `1` splits by the rule,
+/// unset is [`HASH_SPLIT_DEFAULT`]. Anything else stops the run.
+pub const HASH_SPLIT_ENV: &str = "LAMBDA_VM_LFM_HASH_SPLIT";
+
+/// [`HASH_SPLIT_ENV`]'s reading of a raw value.
+pub fn hash_split_setting(raw: Option<&str>) -> bool {
+    super::airs::env_switch(HASH_SPLIT_ENV, raw).unwrap_or(HASH_SPLIT_DEFAULT)
+}
+
+/// Whether this process splits `LFM_HASH` by the rule. Read once; the setting is
+/// named on stderr either way, so a log states which programs it proved.
+pub fn hash_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let raw = std::env::var(HASH_SPLIT_ENV).ok();
+        let on = hash_split_setting(raw.as_deref());
+        let source = match raw.as_deref().map(str::trim) {
+            Some(v) if !v.is_empty() => HASH_SPLIT_ENV,
+            _ => "the pipeline default",
+        };
+        super::airs::announce(&format!(
+            "LFM HASH SPLIT: {} ({source})",
+            if on { "on" } else { "off" }
+        ));
+        on
+    })
+}
+
+/// The smallest padding (as a power of two of rows) a split must remove to be
+/// taken: `2^15` rows, about ten million committed cells at `LFM_HASH`'s width.
+///
+/// The counter-pressure is the instance itself and the level above: every extra
+/// instance is one more sub-proof to prove and one more for its parent to
+/// re-verify — on the block, about 15–20k more hash rows and 185–271k more
+/// instructions in the parent per split child, enough to take a parent across a
+/// power of two (the WHIR level-1 nodes' `LFM_XALU`). Below this floor the split
+/// moves cells up a level instead of removing them; above it the pipeline's
+/// measurement decides ([`HASH_SPLIT_DEFAULT`]).
+pub const HASH_SPLIT_MIN_SAVING_LOG2: u32 = 15;
+
+/// How a program's hash rows are spread over `LFM_HASH` instances — at most
+/// two, split at a power of two.
+///
+/// # Why this chip, and why this rule
+///
+/// `LFM_HASH` is the widest chip every recursion proof carries (329 value
+/// columns under RPX) and its height is a power of two like every other, so a
+/// program with `R` hash rows pays for `R.next_power_of_two()` of them. On the
+/// block that is 56 % fill in the typical STARK wrap — 293,778 rows committed as
+/// 524,288, 75.8 M cells of padding. Two
+/// instances of `2^a` and `(R − 2^a).next_power_of_two()` rows, `2^a` the largest
+/// power of two below `R`, commit 294,912 rows for the same program.
+///
+/// The split is taken only when it removes at least
+/// `2^`[`HASH_SPLIT_MIN_SAVING_LOG2`] rows, so a table that is already mostly
+/// full (`R` above three quarters of its padded height) stays one instance.
+///
+/// # Why splitting the rows is free
+///
+/// The property [`Blake3Chunking`] rests on, checked on this chip: every
+/// constraint `HashConstraints` emits reads the current row only — one
+/// permutation (or leaf absorb) per row, no row-to-row coupling — and every bus
+/// interaction is a within-row `LfmMem` token gated by the row's own mode and
+/// multiplicity columns, whose addresses are PREPROCESSED program data. Which
+/// instance a row lives in is invisible to the balance.
+///
+/// # What it costs
+///
+/// Like `LFM_BLAKE3`, the chip carries a preprocessed instruction group, so each
+/// chunk is its own committed matrix with its own root and height: chunk 0 is
+/// slot 5's entry, chunk 1 rides the artifacts and folds into `program_id` as a
+/// tail. A split program is a different program identity by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashChunking {
+    /// Rows of chunk 0 — the split point — or `None` for one table.
+    split: Option<usize>,
+}
+
+impl HashChunking {
+    /// One table, whatever the row count — **the default**.
+    pub const fn unbounded() -> Self {
+        Self { split: None }
+    }
+
+    /// Chunk 0 holds exactly `rows` rows and chunk 1 the rest. The constructor
+    /// tests use to force a split of a tiny program.
+    pub const fn split_at(rows: usize) -> Self {
+        assert!(rows > 0, "an LFM_HASH chunk must hold at least one row");
+        Self { split: Some(rows) }
+    }
+
+    /// The split rule for a program with `real_rows` hash rows: split at the
+    /// largest power of two below `real_rows` when that removes at least
+    /// `2^HASH_SPLIT_MIN_SAVING_LOG2` padded rows, else one table.
+    pub fn for_rows(real_rows: usize) -> Self {
+        if real_rows <= 1 || real_rows.is_power_of_two() {
+            return Self::unbounded();
+        }
+        let first = 1usize << (usize::BITS - 1 - real_rows.leading_zeros());
+        let one_table = super::layout::padded_rows(real_rows);
+        let split = first + super::layout::padded_rows(real_rows - first);
+        if one_table.saturating_sub(split) >= 1usize << HASH_SPLIT_MIN_SAVING_LOG2 {
+            Self::split_at(first)
+        } else {
+            Self::unbounded()
+        }
+    }
+
+    /// The policy this process compiles under: [`Self::for_rows`] when it splits
+    /// ([`hash_split_enabled`]), one table otherwise.
+    pub fn for_process(real_rows: usize) -> Self {
+        if hash_split_enabled() {
+            Self::for_rows(real_rows)
+        } else {
+            Self::unbounded()
+        }
+    }
+
+    /// `LFM_HASH` instances for `num_rows` hash rows — one or two, never zero.
+    pub fn chunk_count(self, num_rows: usize) -> usize {
+        match self.split {
+            Some(first) if num_rows > first => 2,
+            _ => 1,
+        }
+    }
+
+    /// The half-open row range chunk `chunk` covers, clamped to `num_rows` — the
+    /// single rule the group split, the record split and the census read.
+    pub fn chunk_range(self, num_rows: usize, chunk: usize) -> core::ops::Range<usize> {
+        match (self.split, chunk) {
+            (Some(first), 0) => 0..first.min(num_rows),
+            (Some(first), 1) => first.min(num_rows)..num_rows,
+            (None, 0) => 0..num_rows,
+            _ => num_rows..num_rows,
+        }
+    }
+}
+
+impl Default for HashChunking {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

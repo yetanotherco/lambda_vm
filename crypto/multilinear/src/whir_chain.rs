@@ -209,6 +209,9 @@ pub struct ChainFormat {
     /// Per-round fold schedule (W2). `Uniform` = today (`log_folding` every
     /// round, the remainder last).
     pub folds: WhirFolds,
+    /// How wide a stacked polynomial may get (S2). [`StackVars::LEGACY`] =
+    /// today (25).
+    pub stack: StackVars,
 }
 
 impl ChainFormat {
@@ -216,13 +219,71 @@ impl ChainFormat {
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Off,
         folds: WhirFolds::Uniform,
+        stack: StackVars::LEGACY,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
     pub fn is_default(&self) -> bool {
-        self.cap.is_off() && self.folds == WhirFolds::Uniform
+        self.cap.is_off() && self.folds == WhirFolds::Uniform && self.stack == StackVars::LEGACY
     }
 }
+
+/// How wide one stacked polynomial may get, in variables: the stack cap (S2).
+///
+/// The knob between proof size and peak memory, a resource tradeoff rather
+/// than an optimization. Every extra variable halves the number of stacked
+/// polynomials — and so the number of chains, which is most of a WHIR proof
+/// and of the work of verifying one in-guest — and doubles the biggest single
+/// allocation: a polynomial of `n` variables is encoded over
+/// `2^(n + log_blowup)` field elements, 1 GiB in the base field at 25 and
+/// blowup 4, 4 GiB at 27.
+///
+/// ★ A FORMAT VALUE, NOT A HINT. A group's layout is a function of its shapes
+/// and this cap, so the prover, the host verifier and the in-guest emitters
+/// all build it from the config they are given, and a proof stacked under one
+/// cap does not verify under another. Nothing reads it from a proof.
+///
+/// Constructed only through [`StackVars::new`], so a cap of 0 or wider than
+/// [`StackVars::WIDEST`] is not a value a config can hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StackVars(u8);
+
+impl StackVars {
+    /// Today's cap: one 1 GiB base codeword.
+    pub const LEGACY: Self = Self(25);
+
+    /// The widest cap a format may ask for. 27 is the widest measured to fit
+    /// a 32 GiB card (block 25368371, three runs: the argument's reserved peak
+    /// 24,218 MiB of a 25,688 MiB budget, the device peak at most 30,736 MiB);
+    /// at 28 the argument's reservations land 2–2.6 GiB over the budget in the
+    /// heaviest epochs. The device commit needs the NTT's grid split past 26.
+    pub const WIDEST: usize = 27;
+
+    /// `None` outside `1..=WIDEST`.
+    pub const fn new(n: usize) -> Option<Self> {
+        if n >= 1 && n <= Self::WIDEST {
+            Some(Self(n as u8))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Default for StackVars {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
+/// See [`WHIR_CAP_IMPLEMENTED`]. S2's stack is in: the layouts the prover, the
+/// host verifier and the in-guest emitters build, the device commit of a
+/// 2^29-point codeword (the NTT and Möbius grid split) and the argument's
+/// ledger (the rooms given back across it).
+pub const WHIR_STACK_IMPLEMENTED: bool = true;
 
 /// Which WHIR format levers THIS build implements. A lever that is only
 /// parsed must not be selectable (see `stark::proof::options::
@@ -674,6 +735,16 @@ where
     Ok((commitment, domain))
 }
 
+/// The product of a chain's two tables, which is what its rounds evaluate —
+/// and what sizes a device session's slot file.
+pub(crate) fn opening_program<E: IsField + 'static>() -> Result<crate::program::Program<E>, Error> {
+    let mut builder = crate::program::Builder::<E>::new();
+    let weight = builder.var(0);
+    let message = builder.var(1);
+    let root = builder.mul(weight, message);
+    builder.finish(root)
+}
+
 /// The two tables a chain's rounds fold: the weight it carries and the message
 /// it is opening.
 ///
@@ -696,13 +767,8 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: Send + Sync,
 {
-    /// The product of the two, which is what a round evaluates.
     fn program() -> Result<crate::program::Program<E>, Error> {
-        let mut builder = crate::program::Builder::<E>::new();
-        let weight = builder.var(0);
-        let message = builder.var(1);
-        let root = builder.mul(weight, message);
-        builder.finish(root)
+        opening_program::<E>()
     }
 
     fn new(f: &Mle<F>, weight: Mle<E>) -> Result<Self, Error> {
@@ -727,13 +793,21 @@ where
     /// The same from a weight given as shares: on a device they are written
     /// straight into its buffer, and the host builds the table only if none
     /// takes them.
+    ///
+    /// `on_device` says whether the codeword being opened is on one. When it
+    /// is, the host building the tables is a fallback and is counted
+    /// ([`crate::gpu::open_host_fallbacks`]); when it is not, it is the path.
     fn from_shares(
         f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
         n_stack: usize,
+        on_device: bool,
     ) -> Result<Self, Error> {
         if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
             return Ok(Self::Device(device));
+        }
+        if on_device {
+            crate::gpu::note_open_host_fallback(n_stack);
         }
         // Only here does a stacked polynomial have to exist on the host.
         Self::new(
@@ -782,7 +856,7 @@ where
         }
     }
 
-    fn evaluate_message(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
+    fn evaluate_message(&mut self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
         match self {
             Self::Host { message, .. } => message.evaluate(point),
             Self::Device(device) => device.evaluate_message(point),
@@ -859,7 +933,8 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
-    let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
+    let factors =
+        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().device().is_some())?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
@@ -1702,6 +1777,29 @@ mod tests {
         for k in 1..=MAX_FOLD {
             assert_eq!(FirstFold::new(k).unwrap().get(), k);
         }
+    }
+
+    /// S2: a stack cap of 0 or past the widest one measured to fit is not a
+    /// value a config can hold, and today's 25 is the default everywhere one is
+    /// spelled.
+    #[test]
+    fn a_stack_cap_outside_the_measured_range_is_unconstructible() {
+        assert!(StackVars::new(0).is_none());
+        assert!(StackVars::new(StackVars::WIDEST + 1).is_none());
+        assert!(StackVars::new(64).is_none());
+        for n in 1..=StackVars::WIDEST {
+            assert_eq!(StackVars::new(n).unwrap().get(), n);
+        }
+        assert_eq!(StackVars::LEGACY.get(), 25);
+        assert_eq!(StackVars::default(), StackVars::LEGACY);
+        assert_eq!(ChainFormat::DEFAULT.stack, StackVars::LEGACY);
+        assert_eq!(ChainFormat::default(), ChainFormat::DEFAULT);
+        assert!(ChainFormat::DEFAULT.is_default());
+        let wide = ChainFormat {
+            stack: StackVars::new(27).unwrap(),
+            ..ChainFormat::DEFAULT
+        };
+        assert!(!wide.is_default(), "a wider stack is not today's format");
     }
 
     #[test]

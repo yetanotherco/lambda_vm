@@ -93,9 +93,15 @@ pub const KECCAK_RND_SLOT: usize = 12;
 /// chip has preprocessed columns, so chunk 0's root is the roots array's slot-11
 /// entry and the rest ride
 /// [`LfmArtifacts`](super::registry::LfmArtifacts::blake3_chunk_roots).
+/// Slot of `LFM_HASH`, the class the hash split may divide in two
+/// ([`super::chunking::HashChunking`]): chunk 0 is this slot's AIR, root and
+/// height, and chunk 1 follows it in the AIR order.
+pub const HASH_SLOT: usize = 5;
 pub const KECCAK_SLOT: usize = 6;
 pub const BLAKE3_SLOT: usize = 11;
 pub const KECCAK_RC_SLOT: usize = 13;
+/// Slot of `BITWISE`, the one class [`ChipSet::bitwise`] gates.
+pub const BITWISE_SLOT: usize = 14;
 
 /// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
 /// `keccak_rnd_chunks` instances and whose `LFM_BLAKE3` is split into
@@ -144,12 +150,103 @@ pub const fn num_lfm_airs(keccak_rnd_chunks: usize, blake3_chunks: usize) -> usi
 /// that are ABOUT a hash (`KeccakChainV0`, `KeccakSpongeV0`) name keccak
 /// directly and keep the keccak family no matter what the production hash is.
 /// Keying off the global would have silently broken exactly those.
+///
+/// ## `BITWISE`
+///
+/// [`Self::bitwise`] is the third bit, and it is NOT a family: it is on exactly
+/// when some chip this mask instantiates has an interaction on a bus `BITWISE`
+/// receives ([`Self::bitwise_required`]), or for every program under
+/// [`KEEP_BITWISE_ENV`]. Derived from the chips' own interaction lists rather
+/// than from the two family bits, because the hash chip is a `BITWISE` sender
+/// under one hasher (`HasherKind::Blake3`) and not under the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChipSet {
     /// `LFM_KECCAK`, every `KECCAK_RND` chunk, and `KECCAK_RC`.
     pub keccak: bool,
     /// `LFM_BLAKE3`.
     pub blake3: bool,
+    /// `BITWISE`, the fixed `2^20`-row byte-lookup table. Off for a program
+    /// whose chips send it nothing, unless [`KEEP_BITWISE_ENV`] keeps it.
+    pub bitwise: bool,
+}
+
+/// ★ `LAMBDA_VM_LFM_KEEP_BITWISE=1` keeps `BITWISE` in every program this
+/// process builds: the machine as it was before the table became conditional,
+/// every tag, AIR list, trace and `program_id` byte for byte — the A/B arm and
+/// the rollback switch.
+///
+/// By default a program carries `BITWISE` only when one of its instantiated
+/// chips sends it a lookup ([`ChipSet::bitwise_required`]). Every recursion
+/// program of the WHIR pipeline sends none, and so do the nodes, the global
+/// parent and the root of the STARK pipeline (its wraps keep the table: their
+/// `program_id` fold is a keccak permutation). Each of those proves one
+/// sub-proof fewer and its parent re-verifies one fewer — a `2^20`-row table,
+/// 26.2 M census cells a proof. Measured on block 25368371 (one RTX 5090,
+/// ABBA): WHIR −4.70 s, STARK −5.30 s.
+///
+/// Read ONCE per process, at program-emission time, like the chunking
+/// policies: the mask is stored in the artifacts and folded into `program_id`,
+/// and every verifier takes it from there, never from a proof. Registry rows
+/// carry the mask they were blessed with (the default), whatever this process
+/// reads. Proving does not depend on the setting either: a trace set whose
+/// builder dropped the table gets it back, all zero, when the artifacts keep
+/// it ([`LfmAirs::air_trace_pairs`]).
+///
+/// Why dropping is sound: `BITWISE` only RECEIVES, with prover-chosen
+/// multiplicity columns. With no sender in the proof, the honest multiplicities
+/// are all zero and the table contributes nothing to the LogUp sum, so its
+/// presence constrains nothing its absence leaves open. What must never happen
+/// is the other direction — a sender left without its receiver — and
+/// [`ChipSet::bitwise_required`] is the predicate that keeps it unreachable: it
+/// reads every instantiated chip's interactions, and the verifier re-checks it
+/// against the mask it was handed (`proof::verify_against_chunked_with`).
+pub const KEEP_BITWISE_ENV: &str = "LAMBDA_VM_LFM_KEEP_BITWISE";
+
+/// [`KEEP_BITWISE_ENV`]'s reading of a raw value: unset keeps the default
+/// (drop the table where nothing sends to it).
+pub fn keep_bitwise_setting(raw: Option<&str>) -> bool {
+    env_switch(KEEP_BITWISE_ENV, raw).unwrap_or(false)
+}
+
+/// Whether this process keeps `BITWISE` in every program it builds
+/// ([`KEEP_BITWISE_ENV`]). Read once; prints the setting either way — to stderr,
+/// so a generator's stdout stays its output — and a log states which programs
+/// it proved.
+pub fn keep_bitwise() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let keep = keep_bitwise_setting(std::env::var(KEEP_BITWISE_ENV).ok().as_deref());
+        announce(&if keep {
+            format!("LFM BITWISE: kept in every program ({KEEP_BITWISE_ENV}=1)")
+        } else {
+            "LFM BITWISE: only where a chip sends it a lookup (the default)".to_string()
+        });
+        keep
+    })
+}
+
+/// Writes a setting's one-line banner to stderr in ONE write.
+///
+/// `eprintln!` writes each piece of its format separately to the unbuffered
+/// stderr, so in a log that merges stdout and stderr a whole stdout line can
+/// land between two pieces and gain the banner's first half as a prefix. A log
+/// reader that finds a census line by its start would miss it. One write of the
+/// finished line cannot be split.
+pub fn announce(line: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+}
+
+/// A `LAMBDA_VM_*` on/off switch's value: unset or empty is `None` (the
+/// switch's default), `0` is off, `1` is on, and anything else stops the run —
+/// a typo read as the default would prove one arm under the other's name.
+pub fn env_switch(name: &str, raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim) {
+        None | Some("") => None,
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        Some(other) => panic!("{name} must be 0 or 1, got {other:?}"),
+    }
 }
 
 impl ChipSet {
@@ -157,27 +254,100 @@ impl ChipSet {
     pub const FULL: Self = Self {
         keccak: true,
         blake3: true,
+        bitwise: true,
     };
 
-    /// The families a compiled program actually uses.
+    /// The families a compiled program actually uses, for a program proved
+    /// under the default hasher. See [`Self::for_program_with_hasher`].
     pub fn for_program(program: &super::compiler::LfmProgram) -> Self {
-        Self {
+        Self::for_program_with_hasher(program, HasherKind::default())
+    }
+
+    /// The mask a compiled program proved under `hasher` gets: the families it
+    /// uses and whether it keeps `BITWISE` (see [`KEEP_BITWISE_ENV`]).
+    pub fn for_program_with_hasher(
+        program: &super::compiler::LfmProgram,
+        hasher: HasherKind,
+    ) -> Self {
+        Self::for_program_under(program, hasher, !keep_bitwise())
+    }
+
+    /// [`Self::for_program_with_hasher`] with the `BITWISE` setting supplied
+    /// rather than read from the environment, so a test can build both masks in
+    /// one process.
+    pub fn for_program_under(
+        program: &super::compiler::LfmProgram,
+        hasher: HasherKind,
+        drop_unused_bitwise: bool,
+    ) -> Self {
+        let families = Self {
             keccak: program.groups.keccak.real_rows > 0,
             blake3: program.groups.blake3.real_rows > 0,
+            bitwise: true,
+        };
+        Self {
+            bitwise: !drop_unused_bitwise || families.bitwise_required(hasher),
+            ..families
         }
+    }
+
+    /// Whether a chip this mask instantiates, other than `BITWISE` itself, has
+    /// an interaction on a bus `BITWISE` receives — i.e. whether a proof
+    /// without `BITWISE` would leave a lookup with no receiver.
+    ///
+    /// Read off the interaction lists, not off the family bits: a chip that
+    /// gains a byte lookup tomorrow makes this true without anyone editing it.
+    pub fn bitwise_required(self, hasher: HasherKind) -> bool {
+        let received: Vec<u64> = bitwise::bus_interactions()
+            .iter()
+            .map(|i| i.bus_id)
+            .collect();
+        self.instantiated_interactions(hasher)
+            .iter()
+            .any(|i| received.contains(&i.bus_id))
+    }
+
+    /// Every interaction of every chip class this mask instantiates, `BITWISE`
+    /// excluded. One `KECCAK_RND` instance stands for all its chunks: they are
+    /// the identical AIR.
+    fn instantiated_interactions(self, hasher: HasherKind) -> Vec<BusInteraction> {
+        let mut all = Vec::new();
+        all.extend(const_::bus_interactions());
+        all.extend(balu::bus_interactions());
+        all.extend(xalu::bus_interactions());
+        all.extend(select::bus_interactions());
+        all.extend(bitdec::bus_interactions());
+        all.extend(hash::bus_interactions(hasher));
+        all.extend(lanes::bus_interactions());
+        all.extend(hint::bus_interactions());
+        all.extend(public::bus_interactions());
+        all.extend(range::bus_interactions());
+        if self.keccak {
+            all.extend(keccak::bus_interactions());
+            all.extend(keccak_rnd::bus_interactions());
+            all.extend(keccak_rc::bus_interactions());
+        }
+        if self.blake3 {
+            all.extend(blake3_chip::bus_interactions());
+        }
+        all
     }
 
     /// Sub-proofs a proof under this mask carries.
     pub const fn num_airs(self, keccak_rnd_chunks: usize, blake3_chunks: usize) -> usize {
         // The classes no family owns: all 15 less KECCAK_RND (counted per
         // chunk below), less LFM_KECCAK and KECCAK_RC (keccak's), less
-        // LFM_BLAKE3 (blake3's, counted per chunk below).
+        // LFM_BLAKE3 (blake3's, counted per chunk below). BITWISE is among
+        // them and leaves when no instantiated chip sends it a lookup.
         let mut n = NUM_LFM_CHIPS - 4;
         if self.keccak {
             n += 2 + keccak_rnd_chunks;
         }
         if self.blake3 {
             n += blake3_chunks;
+        }
+        if !self.bitwise {
+            n -= 1;
         }
         n
     }
@@ -197,8 +367,13 @@ impl ChipSet {
     /// One byte, folded into `program_id`. The mask is program shape, so a
     /// build under a different mask is a different program identity by name —
     /// not merely by a root that happens to differ.
+    ///
+    /// `BITWISE` rides bit 2 INVERTED — set when the table is dropped — so every
+    /// mask that keeps it has the tag it had before the table became
+    /// conditional: a program that sends `BITWISE` lookups, and every program
+    /// under [`KEEP_BITWISE_ENV`], keeps its digest.
     pub const fn as_tag(self) -> u8 {
-        (self.keccak as u8) | ((self.blake3 as u8) << 1)
+        (self.keccak as u8) | ((self.blake3 as u8) << 1) | ((!self.bitwise as u8) << 2)
     }
 }
 
@@ -363,6 +538,20 @@ pub fn lfm_chip_census_with_hasher(
     program: &super::compiler::LfmProgram,
     hasher: HasherKind,
 ) -> Vec<LfmChipCells> {
+    lfm_chip_census_masked(
+        program,
+        hasher,
+        ChipSet::for_program_with_hasher(program, hasher),
+    )
+}
+
+/// [`lfm_chip_census_with_hasher`] under a supplied mask rather than the one
+/// the process derives, so a test can take the census of both masks at once.
+pub fn lfm_chip_census_masked(
+    program: &super::compiler::LfmProgram,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> Vec<LfmChipCells> {
     let g = &program.groups;
     // A workload-sized chip: the compiler already computed both heights, and
     // `padded_rows` is `real_rows.next_power_of_two()`, so the gap between them
@@ -485,7 +674,6 @@ pub fn lfm_chip_census_with_hasher(
     // gates on the same mask `air_refs` does — a census that counted an absent
     // family would describe a different machine than the one being proved,
     // which is precisely what this function's doc promises it cannot.
-    let chip_set = ChipSet::for_program(program);
     let mut census = Vec::with_capacity(
         per_chip.len()
             + program.chunking.chunk_count(g.keccak.real_rows)
@@ -520,6 +708,7 @@ pub fn lfm_chip_census_with_hasher(
         let present = match class {
             KECCAK_SLOT | KECCAK_RC_SLOT => chip_set.keccak,
             BLAKE3_SLOT => chip_set.blake3,
+            BITWISE_SLOT => chip_set.bitwise,
             _ => true,
         };
         if !present {
@@ -551,6 +740,27 @@ pub fn lfm_chip_census_with_hasher(
                     rows: super::layout::padded_rows(real) as u64,
                     real_rows: real as u64,
                     height_rule: rule,
+                    main_cols: num_cols - prep,
+                    aux_cols: interactions.div_ceil(2),
+                });
+            }
+            continue;
+        }
+        // A split `LFM_HASH` is two entries, each at its own height. An
+        // unsplit one is the single workload-sized entry below, unchanged.
+        // Chunk 0 is exactly full by construction (`Chunked`); chunk 1 holds the
+        // remainder and its headroom is a real cliff (`Workload`).
+        if class == HASH_SLOT && program.hash_chunk_count() > 1 {
+            for (i, real) in program.hash_chunk_real_rows().into_iter().enumerate() {
+                census.push(LfmChipCells {
+                    name: LFM_CHIP_NAMES[HASH_SLOT],
+                    rows: super::layout::padded_rows(real) as u64,
+                    real_rows: real as u64,
+                    height_rule: if i == 0 {
+                        HeightRule::Chunked
+                    } else {
+                        HeightRule::Workload
+                    },
                     main_cols: num_cols - prep,
                     aux_cols: interactions.div_ceil(2),
                 });
@@ -599,6 +809,10 @@ pub struct LfmAirs {
     select: LfmAir<select::SelectConstraints>,
     bitdec: LfmAir<bitdec::BitDecConstraints>,
     hash: LfmAir<hash::HashConstraints>,
+    /// `LFM_HASH` chunks 1.., each with its own preprocessed root — empty
+    /// for an unsplit program. Placed right after [`Self::hash`] in the frozen
+    /// order, as the `LFM_BLAKE3` chunks are expanded in place.
+    hash_tail: Vec<LfmAir<hash::HashConstraints>>,
     keccak: LfmAir<keccak::KeccakAdapterConstraints>,
     lanes: LfmAir<EmptyConstraints>,
     hint: LfmAir<EmptyConstraints>,
@@ -802,6 +1016,7 @@ impl LfmAirs {
                 roots[5],
                 layout::hash::PREP_WIDTH,
             ),
+            hash_tail: Vec::new(),
             keccak: build_air(
                 keccak::cols::NUM_COLUMNS,
                 keccak::bus_interactions(),
@@ -912,6 +1127,13 @@ impl LfmAirs {
         self.select = self.select.with_one_row_commitment(r[3]);
         self.bitdec = self.bitdec.with_one_row_commitment(r[4]);
         self.hash = self.hash.with_one_row_commitment(r[5]);
+        self.hash_tail = std::mem::take(&mut self.hash_tail)
+            .into_iter()
+            .enumerate()
+            .map(|(i, air)| {
+                air.with_one_row_commitment(one_row.hash_chunk_roots.get(i + 1).copied())
+            })
+            .collect();
         self.keccak = self.keccak.with_one_row_commitment(r[6]);
         self.lanes = self.lanes.with_one_row_commitment(r[7]);
         self.hint = self.hint.with_one_row_commitment(r[8]);
@@ -937,6 +1159,66 @@ impl LfmAirs {
         self.blake3.len()
     }
 
+    /// This set with `LFM_HASH` split over `hash_roots`: chunk 0 stays
+    /// the slot-5 AIR, and chunks 1.. are built from `hash_roots[1..]` under the
+    /// same hasher. A one-element slice adds nothing.
+    ///
+    /// Call before [`Self::with_one_row_roots`], which attaches each chunk's
+    /// one-row root to the instances present.
+    pub fn with_hash_tail(
+        mut self,
+        hash_roots: &[Commitment],
+        options: &ProofOptions,
+        hasher: HasherKind,
+    ) -> Self {
+        self.hash_tail = hash_roots
+            .iter()
+            .skip(1)
+            .map(|root| {
+                build_air(
+                    hash::num_columns(hasher),
+                    hash::bus_interactions(hasher),
+                    options,
+                    hash::HashConstraints { kind: hasher },
+                    LFM_CHIP_NAMES[HASH_SLOT],
+                    *root,
+                    layout::hash::PREP_WIDTH,
+                )
+            })
+            .collect();
+        self
+    }
+
+    /// The AIR set a program's artifacts describe: roots, `KECCAK_RND` and
+    /// `LFM_BLAKE3` chunks, the `LFM_HASH` chunks, the hasher, the mask and
+    /// the one-row roots — every piece from the artifacts, none from a proof.
+    /// The same set `proof::verify_against_artifacts` builds piece by piece; a
+    /// caller holding artifacts (the node's child harvest) builds it here.
+    pub fn for_artifacts(
+        artifacts: &super::registry::LfmArtifacts,
+        options: &ProofOptions,
+    ) -> Self {
+        let mut airs = Self::new_chunked(
+            &artifacts.roots,
+            &artifacts.blake3_chunk_roots,
+            options,
+            artifacts.keccak_rnd_chunks,
+            artifacts.hasher,
+            artifacts.chip_set,
+        )
+        .with_hash_tail(&artifacts.hash_chunk_roots, options, artifacts.hasher);
+        if let Some(one_row) = &artifacts.one_row_roots {
+            airs = airs.with_one_row_roots(one_row);
+        }
+        airs
+    }
+
+    /// Number of `LFM_HASH` instances this set was built with — one unless the
+    /// hash split divided the table.
+    pub fn hash_chunks(&self) -> usize {
+        1 + self.hash_tail.len()
+    }
+
     /// Verify-side projection, frozen order (must match `air_trace_pairs`).
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
         let mut refs: Vec<DynLfmAir<'_>> = vec![
@@ -947,6 +1229,7 @@ impl LfmAirs {
             &self.bitdec,
             &self.hash,
         ];
+        refs.extend(self.hash_tail.iter().map(|a| a as DynLfmAir<'_>));
         // The frozen order is unchanged; an absent family leaves a hole in it
         // rather than moving anything after it.
         if self.chip_set.keccak {
@@ -963,7 +1246,9 @@ impl LfmAirs {
             refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
             refs.push(&self.keccak_rc);
         }
-        refs.push(&self.bitwise);
+        if self.chip_set.bitwise {
+            refs.push(&self.bitwise);
+        }
         refs
     }
 
@@ -996,6 +1281,16 @@ impl LfmAirs {
             "LFM_BLAKE3 chunk count differs between the AIR set and the traces \
              — artifacts and traces were built from different chunking policies"
         );
+        // The trace builder skips BITWISE's `2^20`-row fill when the mask IT
+        // derives drops the table, and it drops the table only for a program
+        // whose chips send it nothing — so every multiplicity would be zero. A
+        // set whose artifacts keep BITWISE for such a program (built under
+        // `KEEP_BITWISE_ENV`, or under a different setting than this process)
+        // gets exactly that all-zero table here: which programs keep BITWISE is
+        // the artifacts' decision, and no proof depends on the process setting.
+        if self.chip_set.bitwise && traces.bitwise.num_rows() == 0 {
+            traces.bitwise = crate::tables::bitwise::generate_bitwise_trace();
+        }
         let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> = vec![
             (&self.const_, &mut traces.const_, &()),
             (&self.balu, &mut traces.balu, &()),
@@ -1004,6 +1299,18 @@ impl LfmAirs {
             (&self.bitdec, &mut traces.bitdec, &()),
             (&self.hash, &mut traces.hash, &()),
         ];
+        assert_eq!(
+            self.hash_tail.len(),
+            traces.hash_tail.len(),
+            "LFM_HASH chunk count differs between the AIR set and the traces \
+             — artifacts and traces were built from different hash-split policies"
+        );
+        pairs.extend(
+            self.hash_tail
+                .iter()
+                .zip(traces.hash_tail.iter_mut())
+                .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
+        );
         // Same gating as `air_refs`, in the same order — these two ARE the
         // proof's layout and must move together.
         if self.chip_set.keccak {
@@ -1030,7 +1337,9 @@ impl LfmAirs {
             );
             pairs.push((&self.keccak_rc, &mut traces.keccak_rc, &()));
         }
-        pairs.push((&self.bitwise, &mut traces.bitwise, &()));
+        if self.chip_set.bitwise {
+            pairs.push((&self.bitwise, &mut traces.bitwise, &()));
+        }
         pairs
     }
 }
