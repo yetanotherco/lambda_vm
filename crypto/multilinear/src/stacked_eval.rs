@@ -42,7 +42,8 @@ use crate::{
     mle::Mle,
     stacking::{Placement, StackedLayout},
     whir::Domain,
-    whir_chain::{self, ChainConfig, ChainProof},
+    whir_batch::{self, WideCommitment},
+    whir_chain::{self, ChainConfig, ChainProof, WhirBatch},
     whir_commit::{CodewordCommitment, Commitment},
     whir_hash::WhirHash,
 };
@@ -53,12 +54,61 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     layout: StackedLayout,
-    commitments: Vec<CodewordCommitment<F, H>>,
+    commitments: Commitments<F, H>,
     domain: Domain<F>,
     /// The room the commits and the openings take turns with, promised once
-    /// for the whole group. Lives as long as the commitments do, because the
-    /// openings are the last thing that uses it.
-    _room: Option<crate::gpu::DeviceRoom>,
+    /// for the whole group.
+    room: Room,
+}
+
+/// What a group has promised the card for the working set its commits and its
+/// openings take turns with.
+enum Room {
+    /// Nothing to take back: each codeword promised its own working set,
+    /// because the card would not promise the group's when it committed — or
+    /// there is no card.
+    Own,
+    /// The group's room, held from its first commit to its last opening, across
+    /// the argument between them (`LAMBDA_VM_NO_WHIR_ROOM_PARK`). Never read:
+    /// holding it is the promise.
+    Held(#[allow(dead_code)] crate::gpu::DeviceRoom),
+    /// Given back when the commits ended; the openings take it again
+    /// ([`crate::gpu::take_turn`]).
+    Parked,
+}
+
+/// Which of a group's turns a room is promised for.
+#[derive(Clone, Copy)]
+enum Turn {
+    Commit,
+    Open,
+    /// Held from the first commit to the last opening: the larger of the two.
+    Both,
+}
+
+/// What a group's room promises for `turn`: the working set the kernels that
+/// run it allocate beside the codewords ([`crate::gpu::room_turns_for`]), or
+/// one base codeword whatever the turn under `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`.
+fn room_bytes(layout: &StackedLayout, config: &ChainConfig, staged: bool, turn: Turn) -> u64 {
+    if !crate::gpu::room_resize() {
+        return (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
+    }
+    let turns = crate::gpu::room_turns_for(layout, config, staged);
+    match turn {
+        Turn::Commit => turns.commit,
+        Turn::Open => turns.open,
+        Turn::Both => turns.commit.max(turns.open),
+    }
+}
+
+/// A group's commitments: one per stacked polynomial (today), or one per
+/// batch of them when the format opens them together (S1).
+enum Commitments<F: IsField + 'static, H: WhirHash>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    Chains(Vec<CodewordCommitment<F, H>>),
+    Batches(Vec<WideCommitment<F, H>>),
 }
 
 impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> StackedCommitment<F, H>
@@ -100,6 +150,9 @@ where
                 num_vars: layout.n_stack(),
             })
             .collect();
+        if config.format.batch != WhirBatch::Off {
+            return Self::commit_batched(layout, &sources, config);
+        }
         // The commits and the openings take turns with the same working set —
         // two commits in flight, then one opening at a time — so the group
         // promises one turn's worth rather than every polynomial promising its
@@ -123,10 +176,17 @@ where
         // whole node array — twice these bytes — and the card reached 96%, after
         // which commits fell back to the host at ~1.5 GiB each. The layer is
         // half of what that held and two thirds of what it saved.
-        let room = sources.first().and_then(|poly| {
-            let codeword_bytes = (1u64 << (poly.num_vars() + config.log_blowup)) * 8;
-            crate::gpu::reserve_room(codeword_bytes)
-        });
+        //
+        // ★ HOW MUCH: the turn it is held for (`room_bytes`) — the commits'
+        // when it is given back before the openings, which then take their
+        // own, and the larger of the two when it is held throughout.
+        let park = crate::gpu::room_park();
+        let room = if sources.is_empty() {
+            None
+        } else {
+            let turn = if park { Turn::Commit } else { Turn::Both };
+            crate::gpu::reserve_room(room_bytes(&layout, config, resident.is_none(), turn))
+        };
         let transient = room.is_none();
         // A commit spends most of its wall time waiting on a device — the tree
         // coming back — with the next polynomial's transform not yet launched.
@@ -152,16 +212,59 @@ where
                 domain = Some(d);
             }
         }
+        // ★ THE COMMITS ARE OVER, SO IS THEIR TURN. What runs next is the
+        // per-table argument — the whole of it, every table — and only then
+        // the openings; the argument reserves against the same budget and
+        // takes no turn of the group's. The codewords stay promised: they are
+        // what the openings open. The room goes back, and each opening takes
+        // it again (`prove`).
+        let room = match room {
+            None => Room::Own,
+            Some(room) if park => {
+                room.give_back();
+                crate::gpu::note_room_parked();
+                Room::Parked
+            }
+            Some(room) => Room::Held(room),
+        };
         Ok(Self {
             layout,
-            commitments,
+            commitments: Commitments::Chains(commitments),
             domain: domain.ok_or(Error::EmptyPolynomial)?,
-            _room: room,
+            room,
         })
     }
 
+    /// S1: one wide commitment per batch of the group's polynomials, the
+    /// batches being [`WhirBatch::split`] of the group — a function of the
+    /// format and the layout, so the verifier derives the same ones.
+    fn commit_batched(
+        layout: StackedLayout,
+        sources: &[whir_chain::Stacked<'_, F>],
+        config: &ChainConfig,
+    ) -> Result<Self, Error> {
+        let mut batches = Vec::new();
+        let mut domain = None;
+        for range in config.format.batch.split(sources.len()) {
+            let (commitment, d) = whir_batch::commit::<F, H>(&sources[range], config)?;
+            batches.push(commitment);
+            domain = Some(d);
+        }
+        Ok(Self {
+            layout,
+            commitments: Commitments::Batches(batches),
+            domain: domain.ok_or(Error::EmptyPolynomial)?,
+            room: Room::Own,
+        })
+    }
+
+    /// One root per commitment: per stacked polynomial, or per batch under S1
+    /// ([`ChainConfig::commitments_for`]).
     pub fn roots(&self) -> Vec<Commitment> {
-        self.commitments.iter().map(|c| c.root()).collect()
+        match &self.commitments {
+            Commitments::Chains(commitments) => commitments.iter().map(|c| c.root()).collect(),
+            Commitments::Batches(batches) => batches.iter().map(|b| b.root()).collect(),
+        }
     }
 
     pub fn domain(&self) -> &Domain<F> {
@@ -221,6 +324,34 @@ impl<E: IsField> Claimed<'_, E> {
                     })
             }
         }
+    }
+}
+
+/// Polynomial `poly` of the stack as the parts it is written from, never
+/// assembled here — see [`StackedCommitment::commit`].
+fn source<'a, F: IsField>(
+    layout: &StackedLayout,
+    columns: &[&'a Mle<F>],
+    resident: Option<(&'a crate::gpu::ResidentColumns, usize)>,
+    poly: usize,
+) -> whir_chain::Stacked<'a, F> {
+    whir_chain::Stacked {
+        parts: layout
+            .parts_of(poly)
+            .into_iter()
+            .map(|(column, offset)| (columns[column], offset))
+            .collect(),
+        resident: resident.map(|(store, first)| {
+            (
+                store,
+                layout
+                    .parts_of(poly)
+                    .into_iter()
+                    .map(|(column, offset)| (first + column, offset))
+                    .collect(),
+            )
+        }),
+        num_vars: layout.n_stack(),
     }
 }
 
@@ -379,8 +510,36 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
 
-    let mut polys = Vec::with_capacity(stacked.commitments.len());
-    for (i, commitment) in stacked.commitments.iter().enumerate() {
+    // The opening mode is the format's, and the commitment was built in one:
+    // the two must be the same, or the roots already absorbed describe trees
+    // this opening does not walk.
+    let commitments = match &stacked.commitments {
+        Commitments::Chains(commitments) if config.format.batch == WhirBatch::Off => commitments,
+        Commitments::Batches(batches) if config.format.batch != WhirBatch::Off => {
+            return prove_batched(
+                stacked, batches, columns, resident, point, &weights, config, transcript,
+            );
+        }
+        _ => {
+            return Err(Error::BatchShape {
+                what: "opening mode (the commitment was built in the other one)",
+            });
+        }
+    };
+    // ★ THE GROUP'S TURN, TAKEN BACK for as long as its openings run — one at a
+    // time, so one turn covers them all — and given back when they end. A
+    // refusal is counted and said, and the openings run anyway: see
+    // `take_turn` for why there is no other path.
+    let _turn = match &stacked.room {
+        Room::Parked => crate::gpu::take_turn(
+            room_bytes(layout, config, resident.is_none(), Turn::Open),
+            commitments.len(),
+            layout.n_stack(),
+        ),
+        Room::Own | Room::Held(_) => None,
+    };
+    let mut polys = Vec::with_capacity(commitments.len());
+    for (i, commitment) in commitments.iter().enumerate() {
         // The polynomial is its columns at their offsets, handed over as they
         // are — see `StackedCommitment::commit`.
         let poly = whir_chain::Stacked {
@@ -417,6 +576,57 @@ where
     Ok(StackedProof { polys })
 }
 
+/// [`prove`] under S1: each batch of the group's polynomials is one
+/// [`whir_batch`] opening, and its chain proofs land where the per-chain
+/// proofs would have, in polynomial order.
+#[allow(clippy::too_many_arguments)]
+fn prove_batched<F, E, T, H>(
+    stacked: &StackedCommitment<F, H>,
+    batches: &[WideCommitment<F, H>],
+    columns: &[&Mle<F>],
+    resident: Option<(&crate::gpu::ResidentColumns, usize)>,
+    point: &Claimed<'_, E>,
+    weights: &[FieldElement<E>],
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<StackedProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let layout = &stacked.layout;
+    let ranges = config.format.batch.split(layout.num_polys());
+    if ranges.len() != batches.len() {
+        return Err(Error::BatchShape {
+            what: "batch count",
+        });
+    }
+    let mut polys = Vec::with_capacity(layout.num_polys());
+    for (range, commitment) in ranges.into_iter().zip(batches) {
+        let sources: Vec<whir_chain::Stacked<'_, F>> = range
+            .clone()
+            .map(|i| source(layout, columns, resident, i))
+            .collect();
+        let shares: Vec<Vec<WeightShare<'_, E>>> = range
+            .map(|i| weight_shares(layout, i, point, weights))
+            .collect::<Result<_, _>>()?;
+        polys.extend(whir_batch::prove::<F, E, T, H>(
+            &sources,
+            &shares,
+            layout.n_stack(),
+            commitment,
+            &stacked.domain,
+            config,
+            transcript,
+        )?);
+    }
+    Ok(StackedProof { polys })
+}
+
 /// Verifies the column claims against the stacked commitments.
 ///
 /// The layout is public and derived from the column heights, so it is not part
@@ -446,7 +656,11 @@ where
             got: values.len(),
         });
     }
-    if proof.polys.len() != layout.num_polys() || roots.len() != layout.num_polys() {
+    // One root per polynomial, or per batch under S1: the count is the
+    // format's and the layout's, never the proof's.
+    if proof.polys.len() != layout.num_polys()
+        || roots.len() != config.commitments_for(layout.num_polys())
+    {
         return Err(Error::QueryCountMismatch {
             expected: layout.num_polys(),
             got: proof.polys.len().min(roots.len()),
@@ -457,6 +671,11 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
 
+    if config.format.batch != WhirBatch::Off {
+        return verify_batched::<F, E, T, H>(
+            proof, layout, roots, point, values, &weights, domain, config, transcript,
+        );
+    }
     for (i, (eval_proof, root)) in proof.polys.iter().zip(roots).enumerate() {
         whir_chain::verify_weighted::<F, E, T, _, H>(
             eval_proof,
@@ -471,6 +690,56 @@ where
         .map_err(|_| Error::ColumnOpeningRejected { column: i })?;
     }
 
+    Ok(())
+}
+
+/// [`verify`] under S1: each batch settles the SUM of its polynomials' claims
+/// against its one root. Every column keeps its own power of the batching
+/// challenge, so the sum still pins each column's value.
+#[allow(clippy::too_many_arguments)]
+fn verify_batched<F, E, T, H>(
+    proof: &StackedProof<F, E>,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    weights: &[FieldElement<E>],
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    for (range, root) in config
+        .format
+        .batch
+        .split(layout.num_polys())
+        .into_iter()
+        .zip(roots)
+    {
+        let first = range.start;
+        let mut claim = FieldElement::<E>::zero();
+        for i in range.clone() {
+            claim += claimed(layout, i, values, weights)?;
+        }
+        whir_batch::verify::<F, E, T, _, H>(
+            &proof.polys[range],
+            root,
+            |j: usize, at: &[FieldElement<E>]| weight_at(layout, first + j, point, weights, at),
+            claim,
+            layout.n_stack(),
+            domain,
+            config,
+            transcript,
+        )
+        .map_err(|_| Error::ColumnOpeningRejected { column: first })?;
+    }
     Ok(())
 }
 

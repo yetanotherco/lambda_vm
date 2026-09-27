@@ -50,7 +50,9 @@
 
 use std::sync::OnceLock;
 
-use multilinear::whir_chain::{ChainConfig, ChainFormat, FirstFold, WhirFolds};
+use multilinear::whir_chain::{
+    BatchCap, ChainConfig, ChainFormat, FirstFold, WhirBatch, WhirFolds,
+};
 use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 /// The knob names, in banner order.
@@ -59,6 +61,21 @@ pub const ENV_WHIR_CAP: &str = "LAMBDA_VM_ZF_WHIR_CAP";
 pub const ENV_FRI: &str = "LAMBDA_VM_ZF_FRI";
 pub const ENV_ONE_ROW: &str = "LAMBDA_VM_ZF_ONE_ROW";
 pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
+
+/// ★ S1, the gap-fix knob (temporary; removed with the fix defaulted on):
+/// `LAMBDA_VM_GAP_S1=1` opens each WHIR commitment group's stacked polynomials
+/// in batches, `LAMBDA_VM_GAP_S1_CAP` (default [`GAP_S1_DEFAULT_CAP`]) at most
+/// that many to a batch. Unset or `0` is today's format. The banner names it
+/// only when it is on, so the default banner is unchanged.
+pub const ENV_GAP_S1: &str = "LAMBDA_VM_GAP_S1";
+pub const ENV_GAP_S1_CAP: &str = "LAMBDA_VM_GAP_S1_CAP";
+
+/// The batch cap `LAMBDA_VM_GAP_S1=1` means when `LAMBDA_VM_GAP_S1_CAP` is
+/// unset. The device holds an opening session per polynomial of a batch
+/// (weight and message in the extension, 1.5 GiB at 2^25) and the base window
+/// measured about 6.6 GiB for them (wt89: 27,472 of 32,607 MiB with one
+/// session live), so four.
+pub const GAP_S1_DEFAULT_CAP: usize = 4;
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
@@ -79,6 +96,8 @@ pub struct ZfFormat {
     pub one_row: OneRowMode,
     /// W2: the WHIR per-round fold schedule.
     pub whir_folds: WhirFolds,
+    /// S1: how a WHIR commitment group's stacked polynomials are opened.
+    pub whir_batch: WhirBatch,
 }
 
 /// The first-round WHIR fold of the default format (`whir_folds=first6`).
@@ -110,6 +129,7 @@ impl ZfFormat {
         fri: FriMode::Dp,
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
+        whir_batch: WhirBatch::Off,
     };
 
     /// The legacy format: every lever off. What all five knobs at their
@@ -121,6 +141,7 @@ impl ZfFormat {
         fri: FriMode::Pair,
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::Uniform,
+        whir_batch: WhirBatch::Off,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -131,6 +152,7 @@ impl ZfFormat {
             && self.fri == FriMode::Pair
             && self.one_row == OneRowMode::Off
             && self.whir_folds == WhirFolds::Uniform
+            && self.whir_batch == WhirBatch::Off
     }
 
     /// Parse the five knobs through `lookup` (the process environment in
@@ -159,6 +181,7 @@ impl ZfFormat {
         if let Some(v) = get(ENV_WHIR_FOLDS) {
             format.whir_folds = parse_whir_folds(&v)?;
         }
+        format.whir_batch = parse_gap_s1(get(ENV_GAP_S1), get(ENV_GAP_S1_CAP))?;
         Ok(format)
     }
 
@@ -200,6 +223,9 @@ impl ZfFormat {
         {
             out.push(ENV_WHIR_FOLDS);
         }
+        if self.whir_batch != WhirBatch::Off && !multilinear::whir_chain::WHIR_BATCH_IMPLEMENTED {
+            out.push(ENV_GAP_S1);
+        }
         out
     }
 
@@ -236,9 +262,16 @@ impl ZfFormat {
 
     /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=…`, each value
     /// in the spelling its knob accepts.
+    ///
+    /// S1 appends ` gap_s1=cap<c>` when it is on and nothing when it is off,
+    /// so the default banner is the one every earlier log carries.
     pub fn banner(&self) -> String {
+        let batch = match self.whir_batch {
+            WhirBatch::Off => String::new(),
+            WhirBatch::Cap(cap) => format!(" gap_s1=cap{}", cap.get()),
+        };
         format!(
-            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={}",
+            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={}{batch}",
             self.cap,
             self.whir_cap,
             self.fri,
@@ -280,6 +313,7 @@ impl ZfFormat {
         ChainFormat {
             cap: self.whir_cap,
             folds: self.whir_folds,
+            batch: self.whir_batch,
         }
     }
 
@@ -340,6 +374,35 @@ fn parse_whir_folds(v: &str) -> Result<WhirFolds, String> {
         })
 }
 
+/// `LAMBDA_VM_GAP_S1` (`0` | `1`) and its cap (`1..=MAX_BATCH`). A cap with
+/// the knob off is refused rather than ignored: it would label a per-chain run
+/// as a batched one.
+fn parse_gap_s1(on: Option<String>, cap: Option<String>) -> Result<WhirBatch, String> {
+    match on.as_deref() {
+        None | Some("0") => match cap {
+            None => Ok(WhirBatch::Off),
+            Some(c) => Err(format!(
+                "{ENV_GAP_S1_CAP}={c:?} is set, but {ENV_GAP_S1} is not `1`"
+            )),
+        },
+        Some("1") => {
+            let c = match cap {
+                None => GAP_S1_DEFAULT_CAP,
+                Some(c) => c
+                    .parse::<usize>()
+                    .map_err(|_| format!("{ENV_GAP_S1_CAP}={c:?}: expected a batch size"))?,
+            };
+            BatchCap::new(c).map(WhirBatch::Cap).ok_or_else(|| {
+                format!(
+                    "{ENV_GAP_S1_CAP}={c}: expected 1..={}",
+                    multilinear::whir_chain::MAX_BATCH
+                )
+            })
+        }
+        Some(v) => Err(format!("{ENV_GAP_S1}={v:?}: expected `0` or `1`")),
+    }
+}
+
 fn whir_folds_name(folds: &WhirFolds) -> String {
     match folds {
         WhirFolds::Uniform => format!("uniform{PRODUCTION_WHIR_LOG_FOLDING}"),
@@ -375,6 +438,7 @@ mod tests {
                 fri: FriMode::Dp,
                 one_row: OneRowMode::Off,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+                whir_batch: WhirBatch::Off,
             }
         );
         assert_eq!(
@@ -529,6 +593,7 @@ mod tests {
             fri: FriMode::Dp,
             one_row: OneRowMode::Auto,
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            whir_batch: WhirBatch::Off,
         };
         assert_eq!(
             f.banner(),
@@ -907,5 +972,49 @@ mod tests {
         assert!(!ja.contains("merkle_cap") && !ja.contains("fri_mode") && !ja.contains("one_row"));
         let back: ProofOptions = serde_json::from_str(&jb).unwrap();
         assert!(back.has_default_format());
+    }
+
+    /// S1's knob: off unset and at `0`; `1` is a cap of
+    /// [`GAP_S1_DEFAULT_CAP`]; a cap needs the knob; the banner names it only
+    /// when it is on, and the statement word moves with it and only with it.
+    #[test]
+    fn the_gap_s1_knob_selects_batched_openings() {
+        let off = parse(&[(ENV_GAP_S1, "0")]).unwrap();
+        assert_eq!(off, ZfFormat::DEFAULT);
+        let on = parse(&[(ENV_GAP_S1, "1")]).unwrap();
+        assert_eq!(
+            on.whir_batch,
+            WhirBatch::Cap(BatchCap::new(GAP_S1_DEFAULT_CAP).unwrap())
+        );
+        assert_eq!(
+            on.banner(),
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 gap_s1=cap4"
+        );
+        assert_eq!(on.chain_format().batch, on.whir_batch);
+        assert!(!on.is_legacy());
+        let six = parse(&[(ENV_GAP_S1, "1"), (ENV_GAP_S1_CAP, "6")]).unwrap();
+        assert_eq!(six.whir_batch, WhirBatch::Cap(BatchCap::new(6).unwrap()));
+        for bad in [
+            &[(ENV_GAP_S1_CAP, "6")][..],
+            &[(ENV_GAP_S1, "2")][..],
+            &[(ENV_GAP_S1, "1"), (ENV_GAP_S1_CAP, "0")][..],
+            &[(ENV_GAP_S1, "1"), (ENV_GAP_S1_CAP, "33")][..],
+            &[(ENV_GAP_S1, "1"), (ENV_GAP_S1_CAP, "four")][..],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        // Selectable only once every half of the lever is in.
+        let expected: Vec<&str> = if multilinear::whir_chain::WHIR_BATCH_IMPLEMENTED {
+            Vec::new()
+        } else {
+            vec![ENV_GAP_S1]
+        };
+        assert_eq!(on.unimplemented_levers(), expected);
+        let shapes = [(1usize, 25usize)];
+        let today = crate::multilinear_prove::chain_config_under(&off, &shapes);
+        let batched = crate::multilinear_prove::chain_config_under(&on, &shapes);
+        assert_eq!(today.num_queries, batched.num_queries);
+        assert_eq!(today.fold_word(), 0x8041_0000_0000_0006);
+        assert_ne!(today.fold_word(), batched.fold_word());
     }
 }

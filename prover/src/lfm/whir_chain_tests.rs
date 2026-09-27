@@ -1897,6 +1897,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
         format: ChainFormat {
             cap: CapPolicy::Auto,
             folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+            ..ChainFormat::DEFAULT
         },
         ..config(112, 20)
     };

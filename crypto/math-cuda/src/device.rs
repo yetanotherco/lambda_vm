@@ -348,6 +348,11 @@ pub struct Backend {
     pub whir_fold_base_ext3: CudaFunction,
     pub whir_fold_ext3: CudaFunction,
     pub gather_cosets: CudaFunction,
+    pub whir_fold_k_base_ext3: CudaFunction,
+    pub whir_fold_k_ext3: CudaFunction,
+    pub whir_lean_colmap: CudaFunction,
+    pub whir_lean_round: CudaFunction,
+    pub whir_lean_materialize: CudaFunction,
 
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
@@ -569,6 +574,65 @@ pub fn drain_and_trim() -> Result<()> {
     Ok(())
 }
 
+/// ★ Bytes the default memory pool has handed out and not taken back: `(now,
+/// the most at any instant since the last [`reset_pool_high_water`])`.
+///
+/// Every allocation this crate makes is stream-ordered and comes from that
+/// pool — cudarc allocates with `cuMemAllocAsync` whenever the device has
+/// pools, which every card this runs on does — so the second number is the
+/// PEAK of what the process held. That is what a working-set claim is tested
+/// against: a reservation says what was promised, and `cuMemGetInfo` only what
+/// is free at the instant it is asked. Drain first ([`drain_and_trim`]): a free
+/// counts when its stream reaches it.
+pub fn pool_used_bytes() -> Result<(u64, u64)> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let read = |attribute| -> Result<u64> {
+        let mut value = 0u64;
+        // SAFETY: raw driver calls on the backend's own device; the value is a
+        // u64 stack slot, the type both attributes are documented to write.
+        unsafe {
+            let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+                sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+            ))?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                attribute,
+                &mut value as *mut u64 as *mut core::ffi::c_void,
+            )
+            .result()?;
+        }
+        Ok(value)
+    };
+    Ok((
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+    ))
+}
+
+/// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
+/// to zero, and the next allocation raises it to what is then in use — so a
+/// reader takes the larger of it and the `now` it read before the reset.
+pub fn reset_pool_high_water() -> Result<()> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let zero = 0u64;
+    // SAFETY: as in `pool_used_bytes`; zero is the one value the driver takes
+    // for this attribute.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            &zero as *const u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Promises `bytes` against the budget for a caller whose structure outlives
 /// the type that spends them.
 pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
@@ -634,9 +698,19 @@ pub(crate) fn note_device_fallback() {
 /// stays below the budget by construction.
 static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
-/// Note that `be.reserved` just rose to `now`, keeping the peak.
+/// ★ The same peak over a WINDOW a caller opens and closes — one phase of one
+/// proof — beside the whole-run one, which it never touches.
+///
+/// The whole-run number says how close the process came to the budget; it
+/// cannot say WHEN. A change that moves one phase's reservations — giving a
+/// group's room back across the argument, say — is tested by that phase's peak,
+/// epoch by epoch, and a run's single maximum hides every epoch but one.
+static WINDOW_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `be.reserved` just rose to `now`, keeping both peaks.
 fn note_reserved(now: u64) {
     RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+    WINDOW_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
 }
 
 /// The peak simultaneous device reservation this process reached — see
@@ -648,6 +722,24 @@ pub fn reserved_high_water() -> u64 {
 /// Zero the reservation high-water. For a test asserting a delta.
 pub fn reset_reserved_high_water() {
     RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
+}
+
+/// Opens a window ([`WINDOW_HIGH_WATER`]): its peak starts at what is promised
+/// NOW, not at zero, because the total only reports when it RISES — a phase
+/// that reserved nothing peaked at whatever it inherited, and a window started
+/// at zero would read that as nothing held at all.
+///
+/// Process-wide, like the whole-run peak: a window is one phase's only while
+/// nothing else in the process reserves during it. The WHIR base proves one
+/// epoch at a time; a caller that cannot say the same must mark what it reads.
+pub fn reset_window_high_water() {
+    let now = backend().map(|be| be.reserved_bytes()).unwrap_or(0);
+    WINDOW_HIGH_WATER.store(now, Ordering::Relaxed);
+}
+
+/// The peak promised since the last [`reset_window_high_water`].
+pub fn window_high_water() -> u64 {
+    WINDOW_HIGH_WATER.load(Ordering::Relaxed)
 }
 
 /// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs
@@ -999,6 +1091,11 @@ impl Backend {
             whir_fold_base_ext3: whir_fold.load_function("whir_fold_base_ext3")?,
             whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
             gather_cosets: whir_fold.load_function("gather_cosets")?,
+            whir_fold_k_base_ext3: whir_fold.load_function("whir_fold_k_base_ext3")?,
+            whir_fold_k_ext3: whir_fold.load_function("whir_fold_k_ext3")?,
+            whir_lean_colmap: whir_fold.load_function("whir_lean_colmap")?,
+            whir_lean_round: whir_fold.load_function("whir_lean_round")?,
+            whir_lean_materialize: whir_fold.load_function("whir_lean_materialize")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
             sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,

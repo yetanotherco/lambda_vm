@@ -224,6 +224,9 @@ jobs:
       - name: Column-major LDE engine host-KAT (NTT passes, coset LDE)
         run: make test-ntt-cm-host-kat
 
+      - name: WHIR host-KAT (fused round fold, lean first rounds)
+        run: make test-whir-host-kat
+
       # Second source for the TABLES the BLAKE3 host-KAT trusts: upstream
       # BLAKE3's portable C with its round loop parameterised, against the
       # committed 6-round vectors and the Python oracle. A ~1 s C compile plus a

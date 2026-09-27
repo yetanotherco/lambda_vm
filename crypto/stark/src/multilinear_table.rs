@@ -518,6 +518,9 @@ where
                 got: sizes.iter().sum(),
             });
         }
+        // The device ledger's peak over the whole commit, under
+        // `LAMBDA_VM_BASE_SPLIT=1` — `RESERVED HW`'s `commit`.
+        let __rw_commit = multilinear::whir_split::open_reserved();
         // The epoch's columns, on the card once. Four things read them — the
         // commitment, the sumcheck's factors, the evaluation at the reduction
         // point and the opening's message — and each used to upload its own
@@ -563,6 +566,10 @@ where
                 table.trace.set_resident(store.clone(), *first);
             }
         }
+        multilinear::whir_split::close_reserved(
+            &multilinear::whir_split::RESERVED_COMMIT,
+            __rw_commit,
+        );
         Ok(Self {
             tables,
             store,
@@ -1381,6 +1388,11 @@ where
     // gated behind LFM_WHIR_PREFETCH for a one-binary A/B — off is byte-exact.
     let prefetch = prefetch_enabled();
     let mut held: Option<logup::PrefetchedTree<E>> = None;
+    // The device ledger's peak over the argument alone — `RESERVED HW`'s
+    // `argue`. It opens on what the commits left promised (the codewords, the
+    // layers they kept, and whatever room a group still holds) and rises by
+    // what the tables reserve.
+    let __rw_argue = multilinear::whir_split::open_reserved();
     for (__sp_at, table) in committed.tables().iter().enumerate() {
         table_starts.push(points.len());
         // ⛔ SERIAL, and the instrument says so rather than a reader inferring
@@ -1408,12 +1420,16 @@ where
         values.extend(proof.constraint.reduce.column_values.iter().cloned());
         tables.push(proof);
     }
+    multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_ARGUE, __rw_argue);
 
     // One opening per group, over that group's columns. The points and values
     // are in the global column order, so a group takes the slice its tables
     // span.
     let mut columns = Vec::with_capacity(committed.groups().len());
     multilinear::whir_split::note_groups(committed.groups().len());
+    // The ledger's peak over every opening — the groups' and the prepared
+    // one — as `RESERVED HW`'s `open`.
+    let __rw_open = multilinear::whir_split::open_reserved();
     // ⛔ CLEARED AT THE OPENING OF THE WINDOW, not merely read at its close.
     // The six are process-global accumulators, so whatever ran the chain
     // earlier in this process is still sitting in them; reading at the end
@@ -1501,6 +1517,7 @@ where
         None => None,
     };
     multilinear::whir_split::add(&multilinear::whir_split::OPEN_PREPARED, __sp_prepared);
+    multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_OPEN, __rw_open);
 
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
@@ -1628,13 +1645,18 @@ where
             .iter()
             .map(|s| s.slot_of.len())
             .sum();
-        let roots = proof
-            .roots
-            .get(root_at..root_at + layout.num_polys())
-            .ok_or(MlError::QueryCountMismatch {
-                expected: root_at + layout.num_polys(),
-                got: proof.roots.len(),
-            })?;
+        // One root per polynomial, or one per batch when the format opens a
+        // group's polynomials together (S1) — the config's count, not the
+        // proof's.
+        let group_roots = config.commitments_for(layout.num_polys());
+        let roots =
+            proof
+                .roots
+                .get(root_at..root_at + group_roots)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: root_at + group_roots,
+                    got: proof.roots.len(),
+                })?;
         stacked_eval::verify::<F, E, T, H>(
             opening,
             layout,
@@ -1647,7 +1669,7 @@ where
         )?;
         statement_at += size;
         column_at += width;
-        root_at += layout.num_polys();
+        root_at += group_roots;
     }
 
     // ★★★ THE PREPARED OPENING, and check (d) with it.
@@ -1947,6 +1969,15 @@ mod tests {
         add_cols: Vec<Vec<FE>>,
         mul_cols: Vec<Vec<FE>>,
     ) -> Result<(), MlError> {
+        argue_under(&config(), cpu_cols, add_cols, mul_cols)
+    }
+
+    fn argue_under(
+        config: &ChainConfig,
+        cpu_cols: Vec<Vec<FE>>,
+        add_cols: Vec<Vec<FE>>,
+        mul_cols: Vec<Vec<FE>>,
+    ) -> Result<(), MlError> {
         let (cpu_air, add_air, mul_air) = airs();
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
@@ -1954,11 +1985,11 @@ mod tests {
                 table(&add_air, &add_cols)?,
                 table(&mul_air, &mul_cols)?,
             ],
-            &config(),
+            config,
         )?;
 
         let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        let proof = multi_prove(&committed, &config(), &mut prover, None)?;
+        let proof = multi_prove(&committed, config, &mut prover, None)?;
 
         // Three tables of different heights, and **one** commitment with one
         // opening for all of them.
@@ -1985,7 +2016,7 @@ mod tests {
             std::slice::from_ref(committed.groups()[0].domain()),
             committed.sizes(),
             &ExtE::zero(),
-            &config(),
+            config,
             &mut verifier,
             None,
         )
@@ -2063,6 +2094,23 @@ mod tests {
     #[test]
     fn three_tables_argue_and_their_buses_balance() {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();
+    }
+
+    /// S1: the same tables with the group's polynomials opened in batches. One
+    /// stacked polynomial, so one batch of one — the per-chain proof — and the
+    /// verifier takes one root for it.
+    #[test]
+    fn three_tables_argue_under_batched_openings() {
+        let config = ChainConfig {
+            format: multilinear::whir_chain::ChainFormat {
+                batch: multilinear::whir_chain::WhirBatch::Cap(
+                    multilinear::whir_chain::BatchCap::new(4).unwrap(),
+                ),
+                ..multilinear::whir_chain::ChainFormat::DEFAULT
+            },
+            ..config()
+        };
+        argue_under(&config, cpu_columns(), add_columns(), mul_columns()).unwrap();
     }
 
     #[test]
