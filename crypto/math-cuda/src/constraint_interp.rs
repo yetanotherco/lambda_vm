@@ -33,6 +33,66 @@ const BLOCK_DIM: u32 = 256;
 /// remaining rows. 65536 mirrors OpenVM's quotient `TASK_SIZE`.
 const MAX_THREADS: u32 = 1 << 16;
 
+/// The grid every launch here takes by default: a block per 256 rows, capped at
+/// [`MAX_THREADS`] (256 blocks — 0.30 waves of the composition kernel on a
+/// 170-multiprocessor card).
+fn legacy_grid(num_rows: usize) -> u32 {
+    (num_rows as u32)
+        .div_ceil(BLOCK_DIM)
+        .clamp(1, MAX_THREADS / BLOCK_DIM)
+}
+
+/// Blocks of [`BLOCK_DIM`] the composition kernel can hold resident on the
+/// whole card, as the driver reports it: multiprocessors × blocks per
+/// multiprocessor at the kernel's register count. `None` without a device.
+fn composition_fill_blocks() -> Option<u32> {
+    use cudarc::driver::sys::CUdevice_attribute;
+    static FILL: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FILL.get_or_init(|| {
+        let be = backend().ok()?;
+        let sms = be
+            .ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .ok()?;
+        let per_sm = be
+            .constraint_composition_kernel
+            .occupancy_max_active_blocks_per_multiprocessor(BLOCK_DIM, 0, None)
+            .ok()?;
+        Some((sms.max(0) as u32).saturating_mul(per_sm))
+    })
+}
+
+/// Gap fix K2: the composition grid that fills the card — one resident wave,
+/// no more blocks than rows need, and no more value scratch than
+/// [`crate::gap_kern::k2_scratch_cap_bytes`] — or `None` where that is no wider
+/// than [`legacy_grid`]. The kernel grid-strides over rows and each row's walk
+/// is independent of which thread runs it, so the output is the same bits at
+/// any grid.
+fn filled_grid(num_rows: usize, per_thread_bytes: u64) -> Option<u32> {
+    let legacy = legacy_grid(num_rows) as u64;
+    let rows = (num_rows as u64).div_ceil(BLOCK_DIM as u64).max(1);
+    let fill = composition_fill_blocks()? as u64;
+    let by_scratch =
+        crate::gap_kern::k2_scratch_cap_bytes() / per_thread_bytes.max(1) / BLOCK_DIM as u64;
+    let grid = rows.min(fill.min(by_scratch).max(legacy));
+    (grid > legacy).then_some(grid as u32)
+}
+
+/// The per-thread value scratch of a `grid`-block launch: `num_base_slots` u64
+/// and `num_ext_slots` ext3 per thread, uninitialized (the walk writes every
+/// slot before reading it).
+fn alloc_scratch(
+    stream: &Arc<CudaStream>,
+    grid: u32,
+    num_base_slots: usize,
+    num_ext_slots: usize,
+) -> Result<(CudaSlice<u64>, CudaSlice<u64>)> {
+    let num_threads = grid as usize * BLOCK_DIM as usize;
+    let base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
+    let ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    Ok((base, ext))
+}
+
 /// Evaluate every constraint of a lowered program over the device-resident LDE.
 ///
 /// Returns the per-constraint eval matrix as raw ext3 limbs, constraint-major:
@@ -223,6 +283,7 @@ fn eval_composition_launch(
     next_step: usize,
     num_rows: usize,
     accum: &CompositionAccum,
+    grid_override: Option<u32>,
 ) -> Result<(CudaSlice<u64>, Arc<CudaStream>)> {
     let num_roots = roots.len();
     assert!(num_rows > 0, "callers gate empty domains");
@@ -283,13 +344,36 @@ fn eval_composition_launch(
         stream.memcpy_dtod(&src.buf, &mut dst)?;
     }
 
-    let max_grid = MAX_THREADS / BLOCK_DIM;
-    let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
-    let num_threads = (grid as usize) * (BLOCK_DIM as usize);
-
-    // Per-thread slot scratch, uninitialized (the walk writes before reading).
-    let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
-    let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    let mut grid = grid_override.unwrap_or_else(|| legacy_grid(num_rows));
+    let mut widened = None;
+    if grid_override.is_none() && crate::gap_kern::k2() {
+        let per_thread_bytes = ((num_base_slots + 3 * num_ext_slots) * 8) as u64;
+        match filled_grid(num_rows, per_thread_bytes) {
+            Some(wide) => match alloc_scratch(&stream, wide, num_base_slots, num_ext_slots) {
+                Ok(scratch) => {
+                    grid = wide;
+                    widened = Some(scratch);
+                    crate::gap_kern::bump(&crate::gap_kern::K2_WIDENED);
+                }
+                // The legacy grid's smaller scratch below: a widening the card
+                // cannot hold costs nothing but the attempt.
+                Err(_) => crate::gap_kern::bump(&crate::gap_kern::K2_ALLOC_RETRIES),
+            },
+            None => crate::gap_kern::bump(&crate::gap_kern::K2_LEGACY),
+        }
+        crate::gap_kern::note_k2_shape(
+            num_nodes,
+            num_base_slots,
+            num_ext_slots,
+            num_rows,
+            legacy_grid(num_rows),
+            grid,
+        );
+    }
+    let (mut d_vals_base, mut d_vals_ext) = match widened {
+        Some(scratch) => scratch,
+        None => alloc_scratch(&stream, grid, num_base_slots, num_ext_slots)?,
+    };
     // Output: every row is written by the grid-stride loop.
     let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
 
@@ -386,6 +470,7 @@ pub fn eval_composition_on_device(
         next_step,
         num_rows,
         accum,
+        None,
     )?;
     let be = backend()?;
     let pending =
@@ -393,6 +478,58 @@ pub fn eval_composition_on_device(
     let mut out = vec![0u64; d_h.len()];
     pending.wait_into_u64(&mut out)?;
     Ok(out)
+}
+
+/// [`eval_composition_on_device`] at an explicit grid of `grid` blocks, for the
+/// parity test that pins gap fix K2: `H` must be the same bits at any grid.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_composition_on_device_with_grid(
+    nodes: &[u64],
+    num_nodes: usize,
+    num_base_slots: usize,
+    num_ext_slots: usize,
+    base_consts: &[u64],
+    ext_consts: &[u64],
+    roots: &[u64],
+    rap_challenges: &[u64],
+    alpha_powers: &[u64],
+    table_offset: &[u64],
+    main: &GpuLdeBase,
+    aux: &GpuLdeExt3,
+    next_step: usize,
+    num_rows: usize,
+    accum: &CompositionAccum,
+    grid: u32,
+) -> Result<Vec<u64>> {
+    assert!(num_rows > 0 && grid > 0);
+    let (d_h, stream) = eval_composition_launch(
+        nodes,
+        num_nodes,
+        num_base_slots,
+        num_ext_slots,
+        base_consts,
+        ext_consts,
+        roots,
+        rap_challenges,
+        alpha_powers,
+        table_offset,
+        main,
+        aux,
+        next_step,
+        num_rows,
+        accum,
+        Some(grid),
+    )?;
+    let out = stream.clone_dtoh(&d_h)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// The grid K2 would launch the composition kernel at for `num_rows` rows and
+/// a program of `per_thread_bytes` scratch, or `None` where it keeps the legacy
+/// grid — the parity test reads it to pick its shapes.
+pub fn k2_filled_grid(num_rows: usize, per_thread_bytes: u64) -> Option<u32> {
+    filled_grid(num_rows, per_thread_bytes)
 }
 
 /// The composition evals `H` resident on device (interleaved ext3,
@@ -439,6 +576,7 @@ pub fn eval_composition_on_device_keep(
         next_step,
         num_rows,
         accum,
+        None,
     )?;
     Ok(GpuCompH {
         buf,

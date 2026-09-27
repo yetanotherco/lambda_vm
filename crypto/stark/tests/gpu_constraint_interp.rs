@@ -592,3 +592,148 @@ fn gpu_composition_matches_cpu_oracle_decode_shaped() {
         check_composition(&decode_shaped_program(), "DECODE_SHAPED_COMP", seed);
     }
 }
+
+// ------------------------------------------------------------------------
+// Gap fix K2: the composition kernel's grid is not observable. The kernel
+// grid-strides over rows and each row's walk uses only its own slot scratch,
+// so `H` must be the same BITS at the legacy 256-block grid, at a card-filling
+// grid, and at one block striding over everything.
+// ------------------------------------------------------------------------
+
+fn composition_at_grids(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
+    // More rows than the legacy grid's 65,536 threads, so the legacy launch
+    // strides and a wider one does not.
+    const NUM_ROWS: usize = 1 << 17;
+    const NEXT_STEP: usize = 2;
+    let lde_size = NUM_ROWS;
+
+    let dev = DeviceProgram::lower(prog);
+    let (main_cols, aux_cols, rap_len, alpha_len, _max_off) = program_footprint(&dev);
+    let mut rng = SplitMix64(seed);
+
+    let base_flat: Vec<u64> = (0..main_cols.max(1) * lde_size)
+        .map(|_| rng.next_u64())
+        .collect();
+    let aux_flat: Vec<u64> = (0..aux_cols.max(1) * 3 * lde_size)
+        .map(|_| rng.next_u64())
+        .collect();
+    let rap: Vec<u64> = (0..rap_len.max(1)).flat_map(|_| enc(&rng.fp3())).collect();
+    let alpha: Vec<u64> = (0..alpha_len.max(1))
+        .flat_map(|_| enc(&rng.fp3()))
+        .collect();
+    let offset = enc(&rng.fp3()).to_vec();
+    let n = dev.roots.len();
+    let beta_trans: Vec<u64> = (0..n).flat_map(|_| enc(&rng.fp3())).collect();
+    let z_inv: Vec<u64> = (0..4).map(|_| rng.next_u64()).collect();
+    let b_col = vec![0u64];
+    let b_is_aux = vec![0u64];
+    let b_value = enc(&rng.fp3()).to_vec();
+    let b_beta = enc(&rng.fp3()).to_vec();
+    let b_z_inv_host: Vec<u64> = (0..NUM_ROWS).map(|_| rng.next_u64()).collect();
+    let b_z_inv =
+        math_cuda::constraint_interp::upload_base_vec(&b_z_inv_host).expect("upload b_z_inv");
+
+    let be = backend().expect("cuda backend");
+    let stream = be.next_stream();
+    let main = GpuLdeBase {
+        ready: None,
+        buf: Arc::new(stream.clone_htod(&base_flat).expect("upload base")),
+        m: main_cols,
+        lde_size,
+        tree: None,
+        trace_dev: None,
+        trace_rows: 0,
+    };
+    let aux = GpuLdeExt3 {
+        ready: None,
+        buf: Arc::new(stream.clone_htod(&aux_flat).expect("upload aux")),
+        m: aux_cols,
+        lde_size,
+        tree: None,
+    };
+    stream.synchronize().expect("sync");
+
+    let nodes: Vec<u64> = dev
+        .nodes
+        .iter()
+        .flat_map(|n| {
+            [
+                n.op as u64 | ((n.a as u64) << 32),
+                n.b as u64 | ((n.res as u64) << 32),
+            ]
+        })
+        .collect();
+    let ext_consts: Vec<u64> = dev.ext_consts.iter().flatten().copied().collect();
+    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+    let accum = math_cuda::constraint_interp::CompositionAccum {
+        beta_trans: &beta_trans,
+        z_inv: &z_inv,
+        b_col: &b_col,
+        b_is_aux: &b_is_aux,
+        b_value: &b_value,
+        b_beta: &b_beta,
+        b_z_inv: &[&b_z_inv],
+    };
+    let at_grid = |grid: u32| {
+        math_cuda::constraint_interp::eval_composition_on_device_with_grid(
+            &nodes,
+            dev.nodes.len(),
+            dev.num_base_slots as usize,
+            dev.num_ext_slots as usize,
+            &dev.base_consts,
+            &ext_consts,
+            &roots,
+            &rap,
+            &alpha,
+            &offset,
+            &main,
+            &aux,
+            NEXT_STEP,
+            NUM_ROWS,
+            &accum,
+            grid,
+        )
+        .unwrap_or_else(|e| panic!("[{label}] composition at grid {grid}: {e:?}"))
+    };
+    let legacy = at_grid(256);
+    assert_eq!(legacy.len(), NUM_ROWS * 3);
+    // What the prover launches with K2 off (this process never sets it).
+    let auto = math_cuda::constraint_interp::eval_composition_on_device(
+        &nodes,
+        dev.nodes.len(),
+        dev.num_base_slots as usize,
+        dev.num_ext_slots as usize,
+        &dev.base_consts,
+        &ext_consts,
+        &roots,
+        &rap,
+        &alpha,
+        &offset,
+        &main,
+        &aux,
+        NEXT_STEP,
+        NUM_ROWS,
+        &accum,
+    )
+    .expect("default composition");
+    assert_eq!(
+        auto, legacy,
+        "[{label}] the default launch is the legacy grid"
+    );
+    let per_thread = ((dev.num_base_slots + 3 * dev.num_ext_slots) * 8) as u64;
+    let filled = math_cuda::constraint_interp::k2_filled_grid(NUM_ROWS, per_thread)
+        .expect("a 2^17-row composition fills more than the legacy grid");
+    for grid in [1u32, 170, 512, filled, (NUM_ROWS / 256) as u32] {
+        assert_eq!(
+            at_grid(grid),
+            legacy,
+            "[{label}] H differs between grid {grid} and the legacy grid, seed {seed:#x}"
+        );
+    }
+}
+
+#[test]
+fn k2_composition_is_the_same_bits_at_any_grid() {
+    composition_at_grids(&all_ops_program(), "ALL_OPS_K2", 0x4B32_0001);
+    composition_at_grids(&decode_shaped_program(), "DECODE_SHAPED_K2", 0x4B32_0002);
+}
