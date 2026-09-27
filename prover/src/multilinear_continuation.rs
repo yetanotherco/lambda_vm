@@ -1784,6 +1784,41 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_keeping_decode(elf_bytes, private_inputs, epoch_size_log2, opts)
+        .map(|(bundle, _)| bundle)
+}
+
+/// The two DECODE derivations a base run makes from the ELF, kept for a caller
+/// that reconstructs every epoch afterwards (the recursion tree's level 0), so
+/// it takes them instead of deriving both a second time (gap fix I2).
+pub struct BaseDecode {
+    /// The univariate DECODE commitment, `commitment_from_elf(elf, opts)`.
+    pub commitment: Commitment,
+    /// The [`DecodePrepared<H>`] the base proved under, for the `H` the
+    /// process's hash dispatch chose. Type-erased because `H` is chosen inside
+    /// that dispatch; [`BaseDecode::prepared`] recovers it.
+    prepared: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl BaseDecode {
+    /// The prepared opening, if the base ran under `H`. A process picks one
+    /// hash once, so a caller inside the same dispatch always gets `Some`.
+    pub fn prepared<H>(&self) -> Option<&DecodePrepared<H>>
+    where
+        H: multilinear::whir_hash::WhirHash + 'static,
+    {
+        self.prepared.downcast_ref::<DecodePrepared<H>>()
+    }
+}
+
+/// [`prove_continuation`], also handing back its DECODE derivations
+/// ([`BaseDecode`]).
+pub fn prove_continuation_keeping_decode(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<(ContinuationProof, BaseDecode), Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
@@ -1793,9 +1828,9 @@ pub fn prove_continuation(
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
     // commitment — whose type names the hash — is built ONCE and held across
     // every epoch. Inside `prove_epoch` it could not outlive one call.
-    let boundaries = crate::with_whir_hash!(|H| {
+    let (boundaries, prepared) = crate::with_whir_hash!(|H| {
         let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
-        crate::continuation::for_each_epoch_overlapped(
+        let boundaries = crate::continuation::for_each_epoch_overlapped(
             &elf,
             private_inputs,
             epoch_size_log2,
@@ -1815,7 +1850,11 @@ pub fn prove_continuation(
                 )?);
                 Ok(())
             },
-        )?
+        )?;
+        (
+            boundaries,
+            Box::new(prepared) as Box<dyn std::any::Any + Send + Sync>,
+        )
     });
 
     // The genesis image, which is the one the run started from — rebuilt here
@@ -1843,12 +1882,18 @@ pub fn prove_continuation(
         )
     })?;
 
-    Ok(ContinuationProof {
-        epochs,
-        global,
-        num_private_input_pages,
-        touched_page_bases,
-    })
+    Ok((
+        ContinuationProof {
+            epochs,
+            global,
+            num_private_input_pages,
+            touched_page_bases,
+        },
+        BaseDecode {
+            commitment: decode_commitment,
+            prepared,
+        },
+    ))
 }
 
 /// Verifies a whole run from the bundle and the ELF alone.

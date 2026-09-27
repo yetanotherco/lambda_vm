@@ -2275,6 +2275,21 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_keeping_decode(elf_bytes, private_inputs, epoch_size_log2, opts)
+        .map(|(bundle, _)| bundle)
+}
+
+/// [`prove_continuation`], also handing back the DECODE commitment it derived
+/// from the ELF, so a caller that goes on to reconstruct every epoch (the
+/// recursion tree's level 0) takes it instead of deriving it a second time
+/// (gap fix I2). The commitment is a pure function of `(ELF, opts)`: the value
+/// is the one `commitment_from_elf(&Elf::load(elf_bytes), opts)` returns.
+pub fn prove_continuation_keeping_decode(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<(ContinuationProof, Commitment), Error> {
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -2769,12 +2784,15 @@ pub fn prove_continuation(
         }
     }
 
-    Ok(ContinuationProof {
-        epochs,
-        global,
-        num_private_input_pages,
-        touched_page_bases,
-    })
+    Ok((
+        ContinuationProof {
+            epochs,
+            global,
+            num_private_input_pages,
+            touched_page_bases,
+        },
+        decode_commitment,
+    ))
 }
 
 /// Verify a [`ContinuationProof`] using ONLY the bundle and the ELF — nothing from
