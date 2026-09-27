@@ -253,9 +253,9 @@ impl StackVars {
     pub const LEGACY: Self = Self(25);
 
     /// The widest cap a format may ask for. 27 is the widest measured to fit
-    /// a 32 GiB card (block 25368371: the argument's reserved peak
-    /// 24,218 MiB of a 25,688 MiB budget, the device peak 30,512 MiB); at 28
-    /// the argument's reservations land 2–2.6 GiB over the budget in the
+    /// a 32 GiB card (block 25368371, three runs: the argument's reserved peak
+    /// 24,218 MiB of a 25,688 MiB budget, the device peak at most 30,736 MiB);
+    /// at 28 the argument's reservations land 2–2.6 GiB over the budget in the
     /// heaviest epochs. The device commit needs the NTT's grid split past 26.
     pub const WIDEST: usize = 27;
 

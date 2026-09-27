@@ -89,7 +89,7 @@ pub struct MultilinearVmProof {
 /// [`ZfFormat`](crate::zf_format::ZfFormat) WHIR fields (`LAMBDA_VM_ZF_WHIR_CAP`,
 /// `_WHIR_FOLDS`, `_WHIR_STACK`) are stamped on here. Unset knobs give
 /// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
-/// (`whir_cap=auto`, `whir_folds=first6`, `whir_stack=25`); the three knobs at
+/// (`whir_cap=auto`, `whir_folds=first6`, `whir_stack=27`); the three knobs at
 /// their off spellings give the legacy config. The stack reaches every layout
 /// through this config ([`stacks`], `CommittedTables::commit_grouped`), on the
 /// prover's side and the verifier's alike.

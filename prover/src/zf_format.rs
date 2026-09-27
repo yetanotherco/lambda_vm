@@ -10,7 +10,7 @@
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=25`.
+//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
 //! Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`), so setting all six to off
@@ -46,7 +46,7 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=25`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -91,6 +91,12 @@ const DEFAULT_WHIR_FIRST_FOLD: FirstFold = match FirstFold::new(6) {
     None => panic!("6 is a legal first fold"),
 };
 
+/// The WHIR stack cap of the default format (`whir_stack=27`).
+const DEFAULT_WHIR_STACK: StackVars = match StackVars::new(27) {
+    Some(n) => n,
+    None => panic!("27 is a legal stack cap"),
+};
+
 impl Default for ZfFormat {
     fn default() -> Self {
         Self::DEFAULT
@@ -101,21 +107,23 @@ impl ZfFormat {
     /// ★ The production format when no knob is set: the MEASURED
     /// configuration. S1 `cap=auto` (STARK block −15.35 s),
     /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
-    /// (WHIR block −9.10 s together), each measured net positive in an ABBA
-    /// block run. `one_row` stays off: in ABBA block runs it costs +3.2 s on
+    /// (WHIR block −9.10 s together), S2 `whir_stack=27` (WHIR block −13.80 s
+    /// against 25, 50 base chains instead of 145), each measured net positive
+    /// in an ABBA block run. S2 changes no STARK proof: only the WHIR layouts
+    /// read the stack. `one_row` stays off: in ABBA block runs it costs +3.2 s on
     /// the WHIR pipeline (the prover-side cost of one-row LFM proofs) and saves
     /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
     /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
     /// Security parameters (queries, grinding, blowup) are the
-    /// legacy ones: no lever touches them. S2's stack stays at 25 until its
-    /// ABBA is read (`LAMBDA_VM_ZF_WHIR_STACK=27` selects it).
+    /// legacy ones: no lever touches them. `LAMBDA_VM_ZF_WHIR_STACK=25` is the
+    /// stack's rollback.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
         fri: FriMode::Dp,
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
-        whir_stack: StackVars::LEGACY,
+        whir_stack: DEFAULT_WHIR_STACK,
     };
 
     /// The legacy format: every lever off. What all six knobs at their
@@ -418,12 +426,12 @@ mod tests {
                 fri: FriMode::Dp,
                 one_row: OneRowMode::Off,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
-                whir_stack: StackVars::LEGACY,
+                whir_stack: StackVars::new(27).unwrap(),
             }
         );
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=25"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
@@ -488,6 +496,14 @@ mod tests {
                 "uniform4",
                 ZfFormat {
                     whir_folds: WhirFolds::Uniform,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_WHIR_STACK,
+                "25",
+                ZfFormat {
+                    whir_stack: StackVars::LEGACY,
                     ..ZfFormat::DEFAULT
                 },
             ),
@@ -659,7 +675,7 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
                 .unwrap()
                 .banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=25"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27"
         );
     }
 
@@ -862,10 +878,14 @@ mod tests {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             ..ZfFormat::LEGACY
         };
-        // The production default runs the first6 schedules.
+        // The production default runs the first6 schedules, to its stack.
         assert_eq!(
             ZfFormat::DEFAULT.whir_schedule_line(),
-            first6.whir_schedule_line()
+            ZfFormat {
+                whir_stack: ZfFormat::DEFAULT.whir_stack,
+                ..first6
+            }
+            .whir_schedule_line()
         );
         assert_eq!(
             first6.whir_schedule_line(),
