@@ -583,6 +583,55 @@ fn a_continuation_proves_and_verifies() {
     );
 }
 
+/// Gap fix I4 moves each epoch's host preparation, and the cross-epoch
+/// proof's, onto the producer thread. That changes who does the work and when,
+/// never what is proved: the bookend's and the cross-epoch proof's roots equal
+/// the default schedule's, the shapes, statement values and DECODE derivation
+/// are the same, and the bundle verifies.
+///
+/// ⚠ An epoch's FIRST group root is not compared: it stacks BRANCH, DVRM,
+/// BYTEWISE, EQ, LT and MUL, whose rows follow `HashMap` iteration order, so it
+/// differs between two proves of one run under the same schedule.
+#[test]
+fn gap_i4_prep_ahead_proves_what_the_default_schedule_proves() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (default, decode_default) =
+        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, false)
+            .expect("prove");
+    let (ahead, decode_ahead) =
+        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, true)
+            .expect("prove");
+    assert!(
+        ahead.num_epochs() >= 2,
+        "a one-epoch run hands nothing over, so the schedule is not exercised"
+    );
+    assert_eq!(decode_ahead.commitment, decode_default.commitment);
+    assert_eq!(ahead.num_epochs(), default.num_epochs());
+    for (k, (a, d)) in ahead.epochs.iter().zip(&default.epochs).enumerate() {
+        assert_eq!(
+            a.proof.roots.len(),
+            d.proof.roots.len(),
+            "epoch {k}: groups"
+        );
+        assert_eq!(
+            a.proof.roots.last(),
+            d.proof.roots.last(),
+            "epoch {k}: the bookend group's root"
+        );
+        assert_eq!(a.table_num_vars, d.table_num_vars, "epoch {k}: shapes");
+        assert_eq!(a.public_output, d.public_output, "epoch {k}: output");
+        assert_eq!(a.reg_fini, d.reg_fini, "epoch {k}: register fini");
+    }
+    assert_eq!(ahead.global.proof.roots, default.global.proof.roots);
+    assert_eq!(ahead.global.table_num_vars, default.global.table_num_vars);
+    assert_eq!(ahead.touched_page_bases, default.touched_page_bases);
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &ahead, &opts).expect("verify"),
+        "the prepared-ahead continuation does not verify"
+    );
+}
+
 /// ★ THE PROPERTY EVERY OTHER EPOCH TEST IN THIS FILE IS BLIND TO.
 ///
 /// `verify_epoch_bookend` forks the transcript and replays the roots block to
