@@ -2026,3 +2026,132 @@ fn the_genesis_threshold_budget_still_covers_the_stack_under_each_first_fold() {
         );
     }
 }
+
+// ============================================================================
+// GAP R4 — the chain with the lean fold
+// ============================================================================
+
+use super::whir_fold::{FoldEmission, with_fold_emission};
+
+/// ★ The lean chain executes on the same accepted proofs as the classic one.
+#[test]
+fn the_lean_chain_executes_on_a_proof_the_host_accepts() {
+    for (num_vars, num_queries) in [(6usize, 3usize), (6, 5), (5, 3), (9, 3)] {
+        let f = fixture(num_vars, num_queries, 0);
+        let (lean, classic) = (
+            with_fold_emission(FoldEmission::Lean, || chain_program(&f.shape)),
+            chain_program(&f.shape),
+        );
+        assert!(
+            lean.instrs.len() < classic.instrs.len(),
+            "S={num_vars} Q={num_queries}: the lean chain must be the smaller program"
+        );
+        let arena = chain_arena(&f, &f.proof);
+        execute(&lean, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            panic!("S={num_vars} Q={num_queries}: the lean chain refused an accepted proof: {e:?}")
+        });
+    }
+}
+
+/// ★ The lean chain refuses what the classic one refuses: the five tamper
+/// sites of [`a_tampered_chain_cannot_execute`], at a real grind width.
+#[test]
+fn a_tampered_chain_cannot_execute_under_the_lean_fold() {
+    let grind = 8u8;
+    let f = fixture(6, 3, grind);
+    let program = with_fold_emission(FoldEmission::Lean, || chain_program(&f.shape));
+    assert!(
+        execute(
+            &program,
+            &[chain_arena(&f, &f.proof)],
+            &crate::hash_pin::BLOCK_HASHER
+        )
+        .is_ok(),
+        "the untouched proof must execute under the lean fold"
+    );
+    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+    let mut forged = f.proof.clone();
+    forged.final_value += FEE::one();
+    sites.push(("the final value", forged));
+    let mut forged = f.proof.clone();
+    forged.rounds[0].sumcheck[0].evaluations[0] += FEE::one();
+    sites.push(("a sumcheck evaluation", forged));
+    let mut forged = f.proof.clone();
+    if let Some(v) = forged.rounds[0].ood_value.as_mut() {
+        *v += FEE::one();
+    }
+    sites.push(("an out-of-domain value", forged));
+    let mut forged = f.proof.clone();
+    forged.rounds[0].nonces.query ^= 1;
+    sites.push(("a grind nonce", forged));
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+    }
+    sites.push(("a Merkle sibling", forged));
+    for (name, forged) in &sites {
+        assert!(
+            execute(
+                &program,
+                &[chain_arena(&f, forged)],
+                &crate::hash_pin::BLOCK_HASHER
+            )
+            .is_err(),
+            "{name}: the lean chain must refuse the forgery"
+        );
+    }
+}
+
+/// ★ The lean chain's F1: the closed forms follow the emission in force.
+#[test]
+fn the_lean_chain_emits_its_closed_form() {
+    with_fold_emission(FoldEmission::Lean, || {
+        for (cfg, num_vars) in cost_configs() {
+            let f = fixture_with(&cfg, num_vars);
+            let program = chain_program(&f.shape);
+            let entry = SpongeEntry::fresh();
+            let measured = program.instrs.len() - const_rows(&program) - chain_plumbing(&f.shape);
+            assert_eq!(
+                measured,
+                chain_rows(&f.shape, entry),
+                "S={num_vars} Q={}: lean rows",
+                cfg.num_queries
+            );
+            assert_eq!(
+                perm_rows(&program),
+                chain_perms(&f.shape, entry),
+                "the fold hashes nothing"
+            );
+        }
+    });
+}
+
+/// The production default chain (S = 25, first6, cap auto, Q = 112, grind 20)
+/// under the lean fold: its closed form, and the rows it saves against
+/// [`DEFAULT_CHAIN_ROWS`]. `#[ignore]`d like the classic one (a production-shape
+/// program).
+#[test]
+#[ignore = "builds a production-shape chain program; run with -- --ignored"]
+fn the_lean_production_default_chain_emits_its_closed_form() {
+    let production = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    let shape = ChainShape::new(&production, 25);
+    let entry = SpongeEntry::fresh();
+    let (measured, predicted) = with_fold_emission(FoldEmission::Lean, || {
+        let program = chain_program(&shape);
+        (
+            program.instrs.len() - const_rows(&program) - chain_plumbing(&shape),
+            chain_rows(&shape, entry),
+        )
+    });
+    println!(
+        "LEAN PRODUCTION chain S=25 first6: {measured} rows (classic {DEFAULT_CHAIN_ROWS}, \
+         saved {})",
+        DEFAULT_CHAIN_ROWS - measured
+    );
+    assert_eq!(measured, predicted, "lean rows");
+    assert!(measured < DEFAULT_CHAIN_ROWS);
+}

@@ -322,3 +322,302 @@ pub fn emit_fold_coset(
 
     current[0]
 }
+
+// ============================================================================
+// GAP R4 — the lean fold
+// ============================================================================
+
+/// ★ GAP R4, a TEMPORARY knob: `LAMBDA_VM_GAP_R4=1` emits every WHIR coset fold
+/// through [`emit_fold_coset_lean`] — about three rows a folded value where
+/// [`emit_fold_coset`] spends seven.
+///
+/// The folds are 57 % of a WHIR wrap's chain rows and 46 % of all its rows
+/// (`thoughts/zf/gap/fix/REC.md` R0, wt400). Unset (or `0`) is today's
+/// emission, instruction for instruction. Read once per process, at program
+/// EMISSION: the fold is verifier arithmetic inside the emitted program, so the
+/// setting moves the WHIR wrap programs (and their ids) and no proof format —
+/// the base proof a wrap verifies is the same either way, and both emissions
+/// compute the same field value (`the_lean_fold_*` tests). Removed (lean the
+/// only emission) when the fix is integrated.
+pub const GAP_R4_ENV: &str = "LAMBDA_VM_GAP_R4";
+
+/// Which fold sequence the emitter writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldEmission {
+    /// [`emit_fold_coset`]: `7·(block − 1)` rows a block plus the point chain.
+    Classic,
+    /// [`emit_fold_coset_lean`]: `3·(block − 1)` rows a block plus the point
+    /// chain and two a level.
+    Lean,
+}
+
+std::thread_local! {
+    static FOLD_OVERRIDE: std::cell::Cell<Option<FoldEmission>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl FoldEmission {
+    /// The emission in force on this thread: a [`with_fold_emission`] override
+    /// if one is open, else the process's [`GAP_R4_ENV`] setting.
+    pub fn current() -> Self {
+        FOLD_OVERRIDE
+            .with(|o| o.get())
+            .unwrap_or_else(Self::for_process)
+    }
+
+    fn for_process() -> Self {
+        static PROCESS: std::sync::OnceLock<FoldEmission> = std::sync::OnceLock::new();
+        *PROCESS.get_or_init(|| {
+            let lean =
+                super::airs::gap_knob_value(GAP_R4_ENV, std::env::var(GAP_R4_ENV).ok().as_deref());
+            if lean {
+                println!("GAP R4: {GAP_R4_ENV}=1 — WHIR coset folds emitted lean");
+                FoldEmission::Lean
+            } else {
+                FoldEmission::Classic
+            }
+        })
+    }
+}
+
+/// Run `f` with `emission` in force on this thread — how a test builds a lean
+/// chain in a process whose knob is off. Restored on return and on unwind.
+pub fn with_fold_emission<R>(emission: FoldEmission, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<FoldEmission>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FOLD_OVERRIDE.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(FOLD_OVERRIDE.with(|o| o.replace(Some(emission))));
+    f()
+}
+
+/// A round's folding challenges as the lean fold consumes them: `½·α` per level,
+/// computed ONCE per round rather than once per query, plus the half itself.
+pub struct LeanAlphas {
+    half_alphas: Vec<Ext>,
+    half: super::builder::Felt,
+}
+
+/// [`LeanAlphas`] for one round: one `MulBase` a level.
+pub fn prepare_lean_alphas(b: &mut LfmBuilder, alphas: &[Ext]) -> LeanAlphas {
+    let half = b.felt_const(two_inv());
+    LeanAlphas {
+        half_alphas: alphas.iter().map(|a| b.emul_base(*a, half)).collect(),
+        half,
+    }
+}
+
+fn two_inv() -> FE {
+    (FE::one() + FE::one())
+        .inv()
+        .expect("2 is invertible in Goldilocks")
+}
+
+/// ★ `whir_commit::fold_coset`, emitted lean — the same value as
+/// [`emit_fold_coset`], in three extension rows a folded value and none in the
+/// base field.
+///
+/// Each level's output is rewritten around the SECOND value of its pair:
+///
+/// ```text
+///     ½·(a + c) + ½·α·x⁻¹·(a − c)  =  (a − c)·w + c,    w = ½ + ½·α·x⁻¹
+/// ```
+///
+/// and along a level `x_t = x_0·η^t`, so `½·α·x_t⁻¹ = u·η^(−t)` with
+/// `u = ½·α·x_0⁻¹` — ONE extension product a level. Per slot that leaves
+/// `w = u·η^(−t) + ½` (a `MulAdd` against the program constant `η^(−t)`),
+/// `a − c`, and the `MulAdd` that joins them: three `LFM_XALU` rows, where the
+/// classic sequence pays five plus a base `Div` for `½·x⁻¹` and a base `Mul` to
+/// step `x`. No reciprocal is taken at all: `x_0⁻¹ = g^(−p)` comes straight out
+/// of [`pow_bits`] over the INVERSE factors `g^(−2^i)`, and each level after the
+/// first squares it (`(x²)⁻¹ = (x⁻¹)²`, the classic identity inverted).
+///
+/// Rows: `2·index_bits` (the point) + `levels − 1` (squarings) + `levels` (the
+/// `u` of each level) + `3·(block − 1)`; see [`fold_coset_rows_lean`]. The
+/// `½·α` of [`prepare_lean_alphas`] are per ROUND and not counted here.
+pub fn emit_fold_coset_lean(
+    b: &mut LfmBuilder,
+    values: &[Ext],
+    domain: &Domain<GoldilocksField>,
+    index_bits: &[Bit],
+    prepared: &LeanAlphas,
+) -> Ext {
+    let levels = prepared.half_alphas.len();
+    assert_eq!(
+        values.len(),
+        1usize << levels,
+        "a block holds one value per folded variable"
+    );
+    if levels == 0 {
+        return values[0];
+    }
+
+    // `x_0⁻¹ = g^(−p)`, from the index's bits against the inverse factors.
+    let generator_inv = domain
+        .generator()
+        .inv()
+        .expect("a domain generator is nonzero");
+    let factors: Vec<FE> = (0..index_bits.len())
+        .map(|i| generator_inv.pow(1u64 << i))
+        .collect();
+    let mut x_inv = pow_bits(b, index_bits, &factors, FE::one());
+    let half = prepared.half.as_ext();
+
+    let mut current: Vec<Ext> = values.to_vec();
+    let mut current_domain = domain.clone();
+    for (level, half_alpha) in prepared.half_alphas.iter().enumerate() {
+        if level > 0 {
+            x_inv = b.mul(x_inv, x_inv);
+        }
+        let pairs = current.len() / 2;
+        // This level's stride `η`, inverted: `η^(−t)` is a program constant per
+        // slot, so the point never steps at run time.
+        let eta_inv = current_domain
+            .generator()
+            .pow((current_domain.size() / current.len()) as u64)
+            .inv()
+            .expect("a coset stride is nonzero");
+        let u = b.emul_base(*half_alpha, x_inv);
+
+        let mut next = Vec::with_capacity(pairs);
+        for t in 0..pairs {
+            let (a, c) = (current[t], current[t + pairs]);
+            let w = if t == 0 {
+                b.eadd(u, half)
+            } else {
+                let step = b.felt_const(eta_inv.pow(t as u64));
+                b.emul_add(u, step.as_ext(), half)
+            };
+            let difference = b.esub(a, c);
+            next.push(b.emul_add(difference, w, c));
+        }
+        current = next;
+        current_domain = current_domain
+            .squared()
+            .expect("a domain of at least two points squares");
+    }
+
+    current[0]
+}
+
+/// INSTRUCTIONS [`emit_fold_coset_lean`] emits for a block of `block` values
+/// with a query index of `index_bits` bits:
+///
+/// ```text
+///     2·index_bits + 3·(block − 1) + 2·levels − 1
+/// ```
+///
+/// `2·index_bits` for the point, three rows an output slot (`block − 1` of them
+/// across the levels), one `u` a level and one squaring a level after the first.
+pub const fn fold_coset_rows_lean(block: usize, index_bits: usize) -> usize {
+    if block <= 1 {
+        return 0;
+    }
+    let levels = block.trailing_zeros() as usize;
+    2 * index_bits + 3 * (block - 1) + 2 * levels - 1
+}
+
+/// Rows [`prepare_lean_alphas`] emits for a round of `levels` levels: one
+/// `MulBase` each.
+pub const fn lean_prepare_rows(levels: usize) -> usize {
+    levels
+}
+
+/// [`fold_coset_rows`] or [`fold_coset_rows_lean`], per [`FoldEmission::current`].
+pub fn fold_rows_for(block: usize, index_bits: usize) -> usize {
+    match FoldEmission::current() {
+        FoldEmission::Classic => fold_coset_rows(block, index_bits),
+        FoldEmission::Lean => fold_coset_rows_lean(block, index_bits),
+    }
+}
+
+/// ★ THE VALUES ONE LEAN FOLD INTERNS, deduplicated by value —
+/// [`fold_coset_constants`]' twin: `g^(−e)` for `e` in `{0} ∪ {2^i : i < index_bits}`
+/// (the scale and the inverse factors of the point) and `{s·N/block : 1 ≤ s < block/2}`
+/// (every `η_l^(−t)` of every level is one of level 0's `η_0^(−s)`, since
+/// `η_l = η_0^(2^l)`), plus the half.
+pub fn fold_coset_constants_lean(
+    domain: &Domain<GoldilocksField>,
+    levels: usize,
+    index_bits: usize,
+) -> Vec<LfmWord> {
+    if levels == 0 {
+        return Vec::new();
+    }
+    let n = domain.size() as u128;
+    let block = 1u128 << levels;
+    let generator_inv = domain
+        .generator()
+        .inv()
+        .expect("a domain generator is nonzero");
+    let mut exponents = vec![0u128];
+    for i in 0..index_bits {
+        exponents.push((1u128 << i) % n);
+    }
+    for s in 1..block / 2 {
+        exponents.push((s * (n / block)) % n);
+    }
+    let mut words: Vec<LfmWord> = Vec::new();
+    for e in exponents {
+        let word = base_word(generator_inv.pow(e as u64));
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    let half = base_word(two_inv());
+    if !words.contains(&half) {
+        words.push(half);
+    }
+    words
+}
+
+/// [`fold_coset_constants`] or [`fold_coset_constants_lean`], per
+/// [`FoldEmission::current`].
+pub fn fold_constants_for(
+    domain: &Domain<GoldilocksField>,
+    levels: usize,
+    index_bits: usize,
+) -> Vec<LfmWord> {
+    match FoldEmission::current() {
+        FoldEmission::Classic => fold_coset_constants(domain, levels, index_bits),
+        FoldEmission::Lean => fold_coset_constants_lean(domain, levels, index_bits),
+    }
+}
+
+/// A round's fold, prepared once per round and applied once per query — the one
+/// call site the chain emitter needs whichever [`FoldEmission`] is in force.
+pub enum RoundFold {
+    /// The classic fold takes the round's challenges as they are.
+    Classic(Vec<Ext>),
+    /// The lean fold takes them halved, once.
+    Lean(LeanAlphas),
+}
+
+impl RoundFold {
+    /// Prepare the round's challenges for the emission in force. The classic
+    /// arm emits nothing.
+    pub fn prepare(b: &mut LfmBuilder, alphas: &[Ext]) -> Self {
+        match FoldEmission::current() {
+            FoldEmission::Classic => RoundFold::Classic(alphas.to_vec()),
+            FoldEmission::Lean => RoundFold::Lean(prepare_lean_alphas(b, alphas)),
+        }
+    }
+
+    /// Fold one opened block at one query.
+    pub fn fold(
+        &self,
+        b: &mut LfmBuilder,
+        values: &[Ext],
+        domain: &Domain<GoldilocksField>,
+        index_bits: &[Bit],
+    ) -> Ext {
+        match self {
+            RoundFold::Classic(alphas) => emit_fold_coset(b, values, domain, index_bits, alphas),
+            RoundFold::Lean(prepared) => {
+                emit_fold_coset_lean(b, values, domain, index_bits, prepared)
+            }
+        }
+    }
+}
