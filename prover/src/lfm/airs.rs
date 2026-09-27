@@ -93,6 +93,10 @@ pub const KECCAK_RND_SLOT: usize = 12;
 /// chip has preprocessed columns, so chunk 0's root is the roots array's slot-11
 /// entry and the rest ride
 /// [`LfmArtifacts`](super::registry::LfmArtifacts::blake3_chunk_roots).
+/// Slot of `LFM_HASH`, the class GAP R2 may split in two
+/// ([`super::chunking::HashChunking`]): chunk 0 is this slot's AIR, root and
+/// height, and chunk 1 follows it in the AIR order.
+pub const HASH_SLOT: usize = 5;
 pub const KECCAK_SLOT: usize = 6;
 pub const BLAKE3_SLOT: usize = 11;
 pub const KECCAK_RC_SLOT: usize = 13;
@@ -706,6 +710,27 @@ pub fn lfm_chip_census_masked(
             }
             continue;
         }
+        // GAP R2: a split `LFM_HASH` is two entries, each at its own height. An
+        // unsplit one is the single workload-sized entry below, unchanged.
+        // Chunk 0 is exactly full by construction (`Chunked`); chunk 1 holds the
+        // remainder and its headroom is a real cliff (`Workload`).
+        if class == HASH_SLOT && program.hash_chunk_count() > 1 {
+            for (i, real) in program.hash_chunk_real_rows().into_iter().enumerate() {
+                census.push(LfmChipCells {
+                    name: LFM_CHIP_NAMES[HASH_SLOT],
+                    rows: super::layout::padded_rows(real) as u64,
+                    real_rows: real as u64,
+                    height_rule: if i == 0 {
+                        HeightRule::Chunked
+                    } else {
+                        HeightRule::Workload
+                    },
+                    main_cols: num_cols - prep,
+                    aux_cols: interactions.div_ceil(2),
+                });
+            }
+            continue;
+        }
         census.push(LfmChipCells {
             name: LFM_CHIP_NAMES[class],
             rows: padded_rows,
@@ -748,6 +773,10 @@ pub struct LfmAirs {
     select: LfmAir<select::SelectConstraints>,
     bitdec: LfmAir<bitdec::BitDecConstraints>,
     hash: LfmAir<hash::HashConstraints>,
+    /// GAP R2: `LFM_HASH` chunks 1.., each with its own preprocessed root — empty
+    /// for an unsplit program. Placed right after [`Self::hash`] in the frozen
+    /// order, as the `LFM_BLAKE3` chunks are expanded in place.
+    hash_tail: Vec<LfmAir<hash::HashConstraints>>,
     keccak: LfmAir<keccak::KeccakAdapterConstraints>,
     lanes: LfmAir<EmptyConstraints>,
     hint: LfmAir<EmptyConstraints>,
@@ -951,6 +980,7 @@ impl LfmAirs {
                 roots[5],
                 layout::hash::PREP_WIDTH,
             ),
+            hash_tail: Vec::new(),
             keccak: build_air(
                 keccak::cols::NUM_COLUMNS,
                 keccak::bus_interactions(),
@@ -1061,6 +1091,13 @@ impl LfmAirs {
         self.select = self.select.with_one_row_commitment(r[3]);
         self.bitdec = self.bitdec.with_one_row_commitment(r[4]);
         self.hash = self.hash.with_one_row_commitment(r[5]);
+        self.hash_tail = std::mem::take(&mut self.hash_tail)
+            .into_iter()
+            .enumerate()
+            .map(|(i, air)| {
+                air.with_one_row_commitment(one_row.hash_chunk_roots.get(i + 1).copied())
+            })
+            .collect();
         self.keccak = self.keccak.with_one_row_commitment(r[6]);
         self.lanes = self.lanes.with_one_row_commitment(r[7]);
         self.hint = self.hint.with_one_row_commitment(r[8]);
@@ -1086,6 +1123,65 @@ impl LfmAirs {
         self.blake3.len()
     }
 
+    /// This set with `LFM_HASH` split over `hash_roots` (GAP R2): chunk 0 stays
+    /// the slot-5 AIR, and chunks 1.. are built from `hash_roots[1..]` under the
+    /// same hasher. A one-element slice adds nothing.
+    ///
+    /// Call before [`Self::with_one_row_roots`], which attaches each chunk's
+    /// one-row root to the instances present.
+    pub fn with_hash_tail(
+        mut self,
+        hash_roots: &[Commitment],
+        options: &ProofOptions,
+        hasher: HasherKind,
+    ) -> Self {
+        self.hash_tail = hash_roots
+            .iter()
+            .skip(1)
+            .map(|root| {
+                build_air(
+                    hash::num_columns(hasher),
+                    hash::bus_interactions(hasher),
+                    options,
+                    hash::HashConstraints { kind: hasher },
+                    LFM_CHIP_NAMES[HASH_SLOT],
+                    *root,
+                    layout::hash::PREP_WIDTH,
+                )
+            })
+            .collect();
+        self
+    }
+
+    /// The AIR set a program's artifacts describe: roots, `KECCAK_RND` and
+    /// `LFM_BLAKE3` chunks, GAP R2's `LFM_HASH` chunks, the hasher, the mask and
+    /// the one-row roots — every piece from the artifacts, none from a proof.
+    /// The one constructor the prove and verify paths share.
+    pub fn for_artifacts(
+        artifacts: &super::registry::LfmArtifacts,
+        options: &ProofOptions,
+    ) -> Self {
+        let mut airs = Self::new_chunked(
+            &artifacts.roots,
+            &artifacts.blake3_chunk_roots,
+            options,
+            artifacts.keccak_rnd_chunks,
+            artifacts.hasher,
+            artifacts.chip_set,
+        )
+        .with_hash_tail(&artifacts.hash_chunk_roots, options, artifacts.hasher);
+        if let Some(one_row) = &artifacts.one_row_roots {
+            airs = airs.with_one_row_roots(one_row);
+        }
+        airs
+    }
+
+    /// Number of `LFM_HASH` instances this set was built with — one unless GAP
+    /// R2 split the table.
+    pub fn hash_chunks(&self) -> usize {
+        1 + self.hash_tail.len()
+    }
+
     /// Verify-side projection, frozen order (must match `air_trace_pairs`).
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
         let mut refs: Vec<DynLfmAir<'_>> = vec![
@@ -1096,6 +1192,7 @@ impl LfmAirs {
             &self.bitdec,
             &self.hash,
         ];
+        refs.extend(self.hash_tail.iter().map(|a| a as DynLfmAir<'_>));
         // The frozen order is unchanged; an absent family leaves a hole in it
         // rather than moving anything after it.
         if self.chip_set.keccak {
@@ -1164,6 +1261,18 @@ impl LfmAirs {
             (&self.bitdec, &mut traces.bitdec, &()),
             (&self.hash, &mut traces.hash, &()),
         ];
+        assert_eq!(
+            self.hash_tail.len(),
+            traces.hash_tail.len(),
+            "LFM_HASH chunk count differs between the AIR set and the traces \
+             — artifacts and traces were built from different GAP R2 policies"
+        );
+        pairs.extend(
+            self.hash_tail
+                .iter()
+                .zip(traces.hash_tail.iter_mut())
+                .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
+        );
         // Same gating as `air_refs`, in the same order — these two ARE the
         // proof's layout and must move together.
         if self.chip_set.keccak {

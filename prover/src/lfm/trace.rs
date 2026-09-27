@@ -29,6 +29,9 @@ pub struct LfmTraces {
     pub select: TraceTable<F, E>,
     pub bitdec: TraceTable<F, E>,
     pub hash: TraceTable<F, E>,
+    /// GAP R2: `LFM_HASH` chunks 1.. — empty unless the program's policy split
+    /// the table (`chunking::HashChunking`); [`Self::hash`] is then chunk 0.
+    pub hash_tail: Vec<TraceTable<F, E>>,
     pub keccak: TraceTable<F, E>,
     /// One trace per `LFM_BLAKE3` chunk (see [`super::chunking::Blake3Chunking`]).
     /// A `Vec` even when the policy is the default single table, so the prove and
@@ -513,6 +516,28 @@ pub(super) fn build_traces_walked(
         TraceTable::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1)
     };
 
+    // GAP R2: `LFM_HASH` is filled per chunk, each from its own slice of the
+    // group and of the records. An unsplit program fills the whole group in
+    // place, as before; a split one materializes one chunk group at a time.
+    let hash_count = program.hash_chunk_count();
+    let hash_trace = |c: usize| {
+        let chunk = (hash_count > 1).then(|| program.hash_chunk_group(c));
+        let base = program.hash_chunking.chunk_range(g.hash.real_rows, c).start;
+        chip_trace(
+            walk,
+            chunk.as_ref().unwrap_or(&g.hash),
+            hash::num_columns(hasher),
+            |row, out| {
+                fill_hash_row(
+                    hasher,
+                    &records.hash[base + row],
+                    hash_modes[base + row],
+                    out,
+                )
+            },
+        )
+    };
+
     LfmTraces {
         const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
         balu: chip_trace(walk, &g.balu, balu::cols::NUM_COLUMNS, |row, out| {
@@ -543,9 +568,8 @@ pub(super) fn build_traces_walked(
             out[bitdec::cols::Z] = r.z;
             out[bitdec::cols::GINV] = r.ginv;
         }),
-        hash: chip_trace(walk, &g.hash, hash::num_columns(hasher), |row, out| {
-            fill_hash_row(hasher, &records.hash[row], hash_modes[row], out)
-        }),
+        hash: hash_trace(0),
+        hash_tail: (1..hash_count).map(hash_trace).collect(),
         keccak: chip_trace(walk, &g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
             let r = &records.keccak[row];
             for lane in 0..25 {

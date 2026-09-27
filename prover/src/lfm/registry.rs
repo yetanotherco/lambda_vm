@@ -17,12 +17,12 @@ use stark::proof::options::ProofOptions;
 
 use crate::tables::{bitwise, keccak_rc};
 
-use super::airs::{BLAKE3_SLOT, ChipSet, NUM_LFM_CHIPS, blake3_chunk_rows};
+use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS, blake3_chunk_rows};
 
 use super::commit::commit_group_device_or_host;
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
-use super::statement::lfm_program_id;
+use super::statement::lfm_program_id_chunked;
 use super::trace::range_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +156,10 @@ impl LfmRegistryEntry {
             keccak_rnd_chunks: self.keccak_rnd_chunks,
             blake3_chunk_roots: vec![self.roots[BLAKE3_SLOT]],
             blake3_chunk_log_heights: vec![self.log_heights[BLAKE3_SLOT]],
+            // One `LFM_HASH` table, like one `LFM_BLAKE3` table: GAP R2 splits
+            // nothing a registry entry names.
+            hash_chunk_roots: vec![self.roots[HASH_SLOT]],
+            hash_chunk_log_heights: vec![self.log_heights[HASH_SLOT]],
             hasher: self.hasher,
             chip_set: self.chip_set,
             program_id: self.program_id,
@@ -193,6 +197,14 @@ pub struct LfmArtifacts {
     pub blake3_chunk_roots: Vec<Commitment>,
     /// Trace log-height of each `LFM_BLAKE3` chunk, in chunk order.
     pub blake3_chunk_log_heights: Vec<u8>,
+    /// One preprocessed root per `LFM_HASH` chunk, in chunk order — one entry
+    /// unless GAP R2 split the table (`chunking::HashChunking`).
+    /// `hash_chunk_roots[0]` IS `roots[HASH_SLOT]`, so an unsplit program is
+    /// bit-identical to the machine before the split existed; chunk 1 is folded
+    /// into `program_id` as a tail, like the `LFM_BLAKE3` chunks.
+    pub hash_chunk_roots: Vec<Commitment>,
+    /// Trace log-height of each `LFM_HASH` chunk, in chunk order.
+    pub hash_chunk_log_heights: Vec<u8>,
     /// The hasher `program_id` was derived under; the prove and verify paths
     /// both take it from here rather than defaulting.
     pub hasher: HasherKind,
@@ -221,6 +233,8 @@ pub struct LfmOneRowRoots {
     pub roots: [Option<Commitment>; NUM_LFM_CHIPS],
     /// One per `LFM_BLAKE3` chunk, as `LfmArtifacts::blake3_chunk_roots`.
     pub blake3_chunk_roots: Vec<Commitment>,
+    /// One per `LFM_HASH` chunk, as `LfmArtifacts::hash_chunk_roots`.
+    pub hash_chunk_roots: Vec<Commitment>,
 }
 
 impl LfmArtifacts {
@@ -396,6 +410,9 @@ const PREP_GROUP_LABEL: &str = "LFM_PREP_GROUP";
 /// which of the two walks it came from.
 const BLAKE3_CHUNK_LABEL: &str = "LFM_PREP_BLAKE3_CHUNK";
 
+/// The same, for GAP R2's `LFM_HASH` tail chunk.
+const HASH_CHUNK_LABEL: &str = "LFM_PREP_HASH_CHUNK";
+
 /// Slots 0..=9 — the instruction column groups that belong to the PROGRAM.
 ///
 /// Slot 10 (`LFM_RANGE`) is committed with them and is not one of them: its
@@ -441,7 +458,8 @@ pub fn program_groups(program: &LfmProgram) -> [&ColumnGroup; PROGRAM_GROUP_SLOT
 /// this branch, keccak on a `cuda` build, an algebraic hash on a branch that
 /// pins one.
 ///
-/// Both are folded into `program_id` (see [`lfm_program_id`]), which is what
+/// Both are folded into `program_id` (see
+/// [`lfm_program_id`](super::statement::lfm_program_id)), which is what
 /// discharges the compile-time guard this function used to carry. That guard
 /// refused to compile once `stark` gained a second commitment hash, on the
 /// grounds that artifacts naming one hash over roots built with another is a
@@ -473,8 +491,20 @@ pub fn build_artifacts_with_hasher(
     // one: it contributes one committed matrix per chunk, built and absorbed
     // after this list, which is where slot order puts it anyway.
     let program_slots = program_groups(program);
+    // GAP R2: a split `LFM_HASH` commits chunk 0 at slot 5 and chunk 1 as a
+    // tail below. An unsplit program materializes nothing here — slot 5 is the
+    // compiled group itself, exactly as before the split existed.
+    let hash_chunks: Vec<ColumnGroup> = if program.hash_chunk_count() > 1 {
+        (0..program.hash_chunk_count())
+            .map(|c| program.hash_chunk_group(c))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let groups: [&ColumnGroup; 11] = std::array::from_fn(|i| {
-        if i < PROGRAM_GROUP_SLOTS {
+        if i == HASH_SLOT && !hash_chunks.is_empty() {
+            &hash_chunks[0]
+        } else if i < PROGRAM_GROUP_SLOTS {
             program_slots[i]
         } else {
             &range
@@ -551,6 +581,17 @@ pub fn build_artifacts_with_hasher(
         }));
     }
     roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
+    // GAP R2's tail: `LFM_HASH` chunks 1.., committed like the BLAKE3 chunks.
+    // Chunk 0 is slot 5's root, committed in the window above.
+    let mut hash_chunk_roots: Vec<Commitment> = vec![roots[HASH_SLOT]];
+    let mut hash_chunk_log_heights: Vec<u8> = vec![log_heights[HASH_SLOT]];
+    let tail: Vec<&ColumnGroup> = hash_chunks.iter().skip(1).collect();
+    for window in tail.chunks(in_flight) {
+        hash_chunk_roots.extend(map_maybe_parallel(window, |g| {
+            commit_group_device_or_host(HASH_CHUNK_LABEL, g, options)
+        }));
+    }
+    hash_chunk_log_heights.extend(tail.iter().map(|g| g.padded_rows.trailing_zeros() as u8));
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
     roots[13] = keccak_rc::preprocessed_commitment(options);
     log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
@@ -576,7 +617,7 @@ pub fn build_artifacts_with_hasher(
     // and the mask decides what a proof carries, exactly where it always did:
     // `ChipSet::num_airs` and `LfmAirs::air_refs`.
 
-    let program_id = lfm_program_id(
+    let program_id = lfm_program_id_chunked(
         &roots,
         &log_heights,
         keccak_rnd_chunks,
@@ -584,15 +625,19 @@ pub fn build_artifacts_with_hasher(
         chip_set,
         &blake3_chunk_roots,
         &blake3_chunk_log_heights,
+        &hash_chunk_roots,
+        &hash_chunk_log_heights,
     );
     let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
-        .then(|| build_one_row_roots(program, options, &groups));
+        .then(|| build_one_row_roots(program, options, &groups, &tail));
     LfmArtifacts {
         roots,
         log_heights,
         keccak_rnd_chunks,
         blake3_chunk_roots,
         blake3_chunk_log_heights,
+        hash_chunk_roots,
+        hash_chunk_log_heights,
         hasher,
         chip_set,
         program_id,
@@ -606,6 +651,7 @@ fn build_one_row_roots(
     program: &LfmProgram,
     options: &ProofOptions,
     groups: &[&ColumnGroup; 11],
+    hash_tail: &[&ColumnGroup],
 ) -> LfmOneRowRoots {
     use stark::leaf_layout::LeafLayout::Row;
     let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
@@ -623,9 +669,15 @@ fn build_one_row_roots(
     roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
     roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
     roots[14] = bitwise::preprocessed_commitment_for(options, Row);
+    // Chunk 0 is slot 5's one-row root; the GAP R2 tail follows.
+    let mut hash_chunk_roots: Vec<Commitment> = roots[HASH_SLOT].into_iter().collect();
+    hash_chunk_roots.extend(map_maybe_parallel(hash_tail, |g| {
+        super::commit::commit_group_device_or_host_with(HASH_CHUNK_LABEL, g, options, Row)
+    }));
     LfmOneRowRoots {
         roots,
         blake3_chunk_roots,
+        hash_chunk_roots,
     }
 }
 

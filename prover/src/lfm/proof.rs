@@ -22,7 +22,7 @@ use stark::verifier::IsStarkVerifier;
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
-use super::airs::{BLAKE3_SLOT, ChipSet, LfmAirs, NUM_LFM_CHIPS};
+use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, LfmAirs, NUM_LFM_CHIPS};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, LfmExecution, execute};
 use super::hash::HasherKind;
@@ -292,7 +292,8 @@ pub(crate) fn prove_traces_with_hasher(
         artifacts.keccak_rnd_chunks,
         hasher,
         artifacts.chip_set,
-    );
+    )
+    .with_hash_tail(&artifacts.hash_chunk_roots, options, hasher);
     // One-row chips (S2) take their roots from the artifacts; without them a
     // chip resolved to one row is refused by `multi_prove`, never recomputed.
     if let Some(one_row) = &artifacts.one_row_roots {
@@ -372,6 +373,7 @@ pub fn verify_against_artifacts(
         artifacts.one_row_roots.as_ref(),
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
+        &artifacts.hash_chunk_roots,
         &artifacts.program_id,
         artifacts.keccak_rnd_chunks,
         proof,
@@ -455,6 +457,10 @@ pub fn verify_against_chunked(
         None,
         roots,
         blake3_roots,
+        // One `LFM_HASH` table: GAP R2's split rides the artifacts, so a split
+        // program comes through `verify_against_artifacts`, and this door
+        // rejects its proof on the AIR count.
+        &roots[HASH_SLOT..=HASH_SLOT],
         program_id,
         keccak_rnd_chunks,
         proof,
@@ -473,6 +479,7 @@ fn verify_against_chunked_with(
     one_row_roots: Option<&super::registry::LfmOneRowRoots>,
     roots: &[Commitment; NUM_LFM_CHIPS],
     blake3_roots: &[Commitment],
+    hash_roots: &[Commitment],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,
     proof: &MultiProof<F, E, ()>,
@@ -500,8 +507,14 @@ fn verify_against_chunked_with(
     if !chip_set.bitwise && chip_set.bitwise_required(hasher) {
         return false;
     }
+    // GAP R2: chunk 0 of `LFM_HASH` is slot 5's root, so the list is never
+    // empty, and every chunk past it is one more sub-proof.
+    if hash_roots.first() != Some(&roots[HASH_SLOT]) {
+        return false;
+    }
     let view = MultiProofView::Owned(proof);
-    if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) {
+    if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) + hash_roots.len() - 1
+    {
         return false;
     }
 
@@ -512,7 +525,8 @@ fn verify_against_chunked_with(
         keccak_rnd_chunks,
         hasher,
         chip_set,
-    );
+    )
+    .with_hash_tail(hash_roots, options, hasher);
     if let Some(one_row) = one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
