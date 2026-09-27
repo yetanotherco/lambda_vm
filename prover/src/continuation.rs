@@ -1379,7 +1379,6 @@ where
 }
 
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
-/// builder pool./// A collected-but-not-yet-built epoch, handed from the producer to the trace
 /// builder pool. Everything sequential (execution, op collection over the
 /// advancing memory image, boundary + register-fini derivation) already
 /// happened on the producer; a builder turns `collected` into full trace
@@ -2506,7 +2505,7 @@ pub fn prove_continuation_keeping_decode(
 /// [`prove_continuation_keeping_decode`] with gap fix I4's schedule named by
 /// the caller rather than read from the knob, so one process can run both:
 /// `prep_ahead` moves each epoch's host preparation onto the trace builders
-/// and the global proof's onto a helper, ahead of the prover thread. The
+/// and the global proof's onto the producer, ahead of the prover thread. The
 /// proofs are the same either way; only who does the host work, and when,
 /// changes.
 pub(crate) fn prove_continuation_scheduled(
@@ -2566,6 +2565,8 @@ pub(crate) fn prove_continuation_scheduled(
     // own bounded channels stay the only backpressure; it is drained once, after
     // the epoch scope joins, and the global proof is proven from it THERE — see
     // the ★ note at the drain site for why that is deliberately not overlapped.
+    // (Under gap fix I4 the producer prepares the global proof from its own
+    // shares instead, and only the PROVE waits for the drain site.)
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
     // Three-stage epoch pipeline: a producer thread runs the
@@ -2584,8 +2585,9 @@ pub(crate) fn prove_continuation_scheduled(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ReadyEpoch, Error>>(1);
     let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
     // Gap fix I4 (`prep_ahead`): the builders also run each epoch's host
-    // preparation, and a helper prepares the global proof once the last
-    // boundary is out, both ahead of the prover thread instead of on it.
+    // preparation, and the producer prepares the global proof once it has
+    // handed over the last epoch, both ahead of the prover thread instead of
+    // on it.
     // Trace builders: each turns one collected epoch into full trace tables
     // (the bulk of the old per-epoch producer latency). 2 is enough to keep
     // the prove pipeline fed on the measured workloads; builds compete with
@@ -2823,14 +2825,18 @@ pub(crate) fn prove_continuation_scheduled(
         }
     };
 
-    // Gap fix I4: the helper below takes the boundary receiver, so the drain
-    // after the scope finds it gone.
-    let mut boundary_rx = Some(boundary_rx);
-    type GlobalAhead = Result<(EpochBoundaries, GlobalPrep), Error>;
+    // Gap fix I4: once it has handed over the last epoch, the PRODUCER prepares
+    // the global proof, from its own shares of the boundaries, while the last
+    // epochs still build and prove. The preparation is host work only; the
+    // global PROVE stays after this scope (the ★ note below), so the scope
+    // still spawns exactly the producer, the builders and the prover.
+    type GlobalAhead = (EpochBoundaries, GlobalPrep);
     type ScopeOut = Result<(Vec<EpochResult>, Option<GlobalAhead>), Error>;
+    let init_page_data_ref = &init_page_data;
     let (mut results, global_ahead) = std::thread::scope(|scope| -> ScopeOut {
         let elf_ref = &elf;
-        let producer = scope.spawn(move || {
+        let producer = scope.spawn(move || -> Option<GlobalAhead> {
+            let mut kept: EpochBoundaries = Vec::new();
             let mut prepare_all = || -> Result<(), Error> {
                 let mut prev_fini: Option<Vec<u32>> = None;
                 let mut index: u64 = 0;
@@ -2920,6 +2926,9 @@ pub(crate) fn prove_continuation_scheduled(
                     // Publish this epoch's boundary for the global prove (in
                     // epoch order; the channel closes when the producer ends).
                     let _ = boundary_tx.send(Arc::clone(&boundary));
+                    if prep_ahead {
+                        kept.push(Arc::clone(&boundary));
+                    }
 
                     // R_{i+1} from the collected register end state — the exact
                     // value the generated REGISTER trace binds (`fini_from_trace`
@@ -2963,7 +2972,29 @@ pub(crate) fn prove_continuation_scheduled(
                 // builder forwards them to the prover); if the downstream side
                 // is already gone the error there wins.
                 let _ = build_tx.send(Err(e));
+                return None;
             }
+            // Gap fix I4, and only once every epoch was produced: a downstream
+            // failure stops the producer early, and its error is the answer.
+            if !prep_ahead || first_err_ref.lock().unwrap().is_some() {
+                return None;
+            }
+            let open = base_stage();
+            let prep = prep_global(
+                &kept,
+                init_page_data_ref,
+                &touched_page_bases(&kept),
+                page::private_input_page_count(private_inputs),
+                opts,
+            );
+            if let Some((start, t0)) = open {
+                println!(
+                    "BASE EPOCH global: prep {:.2}s t=[{t0:.3},{:.3}]",
+                    start.elapsed().as_secs_f64(),
+                    stark::prove_split::epoch_secs()
+                );
+            }
+            Some((kept, prep))
         });
 
         // Trace-builder pool: collected epochs → trace tables → prove channel.
@@ -2976,38 +3007,6 @@ pub(crate) fn prove_continuation_scheduled(
         }
         drop(tx);
 
-        // Gap fix I4: the global proof's host preparation starts once the
-        // producer has published the last boundary (the channel closes when it
-        // ends) and runs while the last epochs prove. Its PROVE stays after
-        // this scope, for the reason the ★ note below gives.
-        let global_helper = if prep_ahead {
-            let rx = boundary_rx
-                .take()
-                .expect("the boundary receiver is taken once");
-            let init_page_data = &init_page_data;
-            Some(scope.spawn(move || -> GlobalAhead {
-                let all: Vec<Arc<Vec<CellBoundary>>> = rx.iter().collect();
-                let open = base_stage();
-                let prep = prep_global(
-                    &all,
-                    init_page_data,
-                    &touched_page_bases(&all),
-                    page::private_input_page_count(private_inputs),
-                    opts,
-                );
-                if let Some((start, t0)) = open {
-                    println!(
-                        "BASE EPOCH global: prep {:.2}s t=[{t0:.3},{:.3}]",
-                        start.elapsed().as_secs_f64(),
-                        stark::prove_split::epoch_secs()
-                    );
-                }
-                Ok((all, prep))
-            }))
-        } else {
-            None
-        };
-
         // Prove epochs as the builders hand them over. Builders can finish
         // out of index order, so results are re-ordered by epoch index before
         // the bundle is assembled — proof bytes are identical to the
@@ -3018,15 +3017,9 @@ pub(crate) fn prove_continuation_scheduled(
         let proved = prover.join().map_err(|_| {
             Error::ContinuationInvariant("epoch prover thread panicked".to_string())
         })?;
-        producer.join().map_err(|_| {
+        let global_ahead = producer.join().map_err(|_| {
             Error::ContinuationInvariant("epoch preparation thread panicked".to_string())
         })?;
-        let global_ahead = match global_helper {
-            Some(helper) => Some(helper.join().map_err(|_| {
-                Error::ContinuationInvariant("global preparation thread panicked".to_string())
-            })?),
-            None => None,
-        };
         Ok((proved, global_ahead))
     })?;
     if let Some(e) = first_err.into_inner().unwrap() {
@@ -3058,18 +3051,8 @@ pub(crate) fn prove_continuation_scheduled(
     // proof consumes only execution artifacts (boundaries, ELF, genesis pages),
     // never an epoch proof, so the schedule was always free to choose.
     let (all, global_prep) = match global_ahead {
-        Some(ahead) => {
-            let (all, prep) = ahead?;
-            (all, Some(prep))
-        }
-        None => (
-            boundary_rx
-                .take()
-                .expect("the boundary receiver is only taken under gap fix I4")
-                .try_iter()
-                .collect::<Vec<Arc<Vec<CellBoundary>>>>(),
-            None,
-        ),
+        Some((all, prep)) => (all, Some(prep)),
+        None => (boundary_rx.try_iter().collect::<EpochBoundaries>(), None),
     };
     let num_private_input_pages = page::private_input_page_count(private_inputs);
     // SINGLE source of truth: the same page-base list drives the committed
@@ -3957,7 +3940,7 @@ mod tests {
     // ---- Standalone (split) prover/verifier ----
 
     /// Gap fix I4 moves each epoch's host preparation onto the trace builders
-    /// and the global proof's onto a helper. That changes who does the work and
+    /// and the global proof's onto the producer. That changes who does the work and
     /// when, never what is proved: the committed roots, the L2G roots and the
     /// statement values equal the default schedule's, the DECODE commitment is
     /// the same, and the bundle verifies to the same output.
