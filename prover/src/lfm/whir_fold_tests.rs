@@ -298,7 +298,7 @@ fn the_point_chain_holds_at_the_widest_indices() {
 }
 
 // ============================================================================
-// GAP R4 — the lean fold, against the same host and the same shapes
+// The lean fold, against the same host and the same shapes
 // ============================================================================
 
 use super::whir_fold::{
@@ -494,4 +494,28 @@ fn the_lean_fold_moves_with_every_input() {
             "alpha {level} must reach the output"
         );
     }
+}
+
+/// The lean fold is the default; `LAMBDA_VM_WHIR_FOLD_CLASSIC=1` selects the
+/// classic one, and a test's override is scoped to its closure.
+#[test]
+fn the_fold_default_is_lean_and_the_opt_out_is_classic() {
+    use super::whir_fold::{CLASSIC_FOLD_ENV, FoldEmission, with_fold_emission};
+    assert_eq!(CLASSIC_FOLD_ENV, "LAMBDA_VM_WHIR_FOLD_CLASSIC");
+    assert_eq!(FoldEmission::from_setting(None), FoldEmission::Lean);
+    assert_eq!(FoldEmission::from_setting(Some("0")), FoldEmission::Lean);
+    assert_eq!(FoldEmission::from_setting(Some("1")), FoldEmission::Classic);
+    let outside = FoldEmission::current();
+    for fold in [FoldEmission::Lean, FoldEmission::Classic] {
+        assert_eq!(with_fold_emission(fold, FoldEmission::current), fold);
+    }
+    assert_eq!(FoldEmission::current(), outside, "the override is scoped");
+}
+
+/// A typo stops the run rather than emitting the default under the other
+/// fold's name.
+#[test]
+#[should_panic(expected = "must be 0 or 1")]
+fn a_malformed_fold_setting_stops_the_run() {
+    let _ = super::whir_fold::FoldEmission::from_setting(Some("lean"));
 }

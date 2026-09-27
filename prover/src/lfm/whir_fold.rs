@@ -324,22 +324,25 @@ pub fn emit_fold_coset(
 }
 
 // ============================================================================
-// GAP R4 — the lean fold
+// The lean fold (the default) and the classic one (the opt-out)
 // ============================================================================
 
-/// ★ GAP R4, a TEMPORARY knob: `LAMBDA_VM_GAP_R4=1` emits every WHIR coset fold
-/// through [`emit_fold_coset_lean`] — about three rows a folded value where
-/// [`emit_fold_coset`] spends seven.
+/// ★ `LAMBDA_VM_WHIR_FOLD_CLASSIC=1` emits every WHIR coset fold through
+/// [`emit_fold_coset`], seven rows a folded value: the emission before the lean
+/// fold became the default, instruction for instruction — the A/B arm and the
+/// rollback switch.
 ///
-/// The folds are 57 % of a WHIR wrap's chain rows and 46 % of all its rows
-/// (`thoughts/zf/gap/fix/REC.md` R0, wt400). Unset (or `0`) is today's
-/// emission, instruction for instruction. Read once per process, at program
-/// EMISSION: the fold is verifier arithmetic inside the emitted program, so the
-/// setting moves the WHIR wrap programs (and their ids) and no proof format —
-/// the base proof a wrap verifies is the same either way, and both emissions
-/// compute the same field value (`the_lean_fold_*` tests). Removed (lean the
-/// only emission) when the fix is integrated.
-pub const GAP_R4_ENV: &str = "LAMBDA_VM_GAP_R4";
+/// By default every fold goes through [`emit_fold_coset_lean`], about three rows
+/// a folded value. The folds were 57 % of a WHIR wrap's chain rows and 46 % of
+/// all its rows; measured on block 25368371 (one RTX 5090, ABBA): WHIR −2.85 s,
+/// level-0 instructions −20 %, census −154.7 M cells, hash rows unchanged.
+///
+/// Read once per process, at program EMISSION: the fold is verifier arithmetic
+/// inside the emitted program, so the setting moves the WHIR wrap programs (and
+/// their ids) and no proof format — the base proof a wrap verifies is the same
+/// either way, and both emissions compute the same field value
+/// (`the_lean_fold_*` tests). A test picks either with [`with_fold_emission`].
+pub const CLASSIC_FOLD_ENV: &str = "LAMBDA_VM_WHIR_FOLD_CLASSIC";
 
 /// Which fold sequence the emitter writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,31 +361,39 @@ std::thread_local! {
 
 impl FoldEmission {
     /// The emission in force on this thread: a [`with_fold_emission`] override
-    /// if one is open, else the process's [`GAP_R4_ENV`] setting.
+    /// if one is open, else the process's [`CLASSIC_FOLD_ENV`] setting.
     pub fn current() -> Self {
         FOLD_OVERRIDE
             .with(|o| o.get())
             .unwrap_or_else(Self::for_process)
     }
 
+    /// [`CLASSIC_FOLD_ENV`]'s reading of a raw value: unset is the lean fold.
+    pub fn from_setting(raw: Option<&str>) -> Self {
+        if super::airs::env_switch(CLASSIC_FOLD_ENV, raw).unwrap_or(false) {
+            FoldEmission::Classic
+        } else {
+            FoldEmission::Lean
+        }
+    }
+
+    /// The process's setting, read once; the emission is named on stderr either
+    /// way, so a log states which programs it proved.
     fn for_process() -> Self {
         static PROCESS: std::sync::OnceLock<FoldEmission> = std::sync::OnceLock::new();
         *PROCESS.get_or_init(|| {
-            let lean =
-                super::airs::env_switch(GAP_R4_ENV, std::env::var(GAP_R4_ENV).ok().as_deref())
-                    .unwrap_or(false);
-            if lean {
-                println!("GAP R4: {GAP_R4_ENV}=1 — WHIR coset folds emitted lean");
-                FoldEmission::Lean
-            } else {
-                FoldEmission::Classic
+            let emission = Self::from_setting(std::env::var(CLASSIC_FOLD_ENV).ok().as_deref());
+            match emission {
+                FoldEmission::Classic => eprintln!("WHIR FOLD: classic ({CLASSIC_FOLD_ENV}=1)"),
+                FoldEmission::Lean => eprintln!("WHIR FOLD: lean (the default)"),
             }
+            emission
         })
     }
 }
 
-/// Run `f` with `emission` in force on this thread — how a test builds a lean
-/// chain in a process whose knob is off. Restored on return and on unwind.
+/// Run `f` with `emission` in force on this thread — how a test builds either
+/// chain whatever the process setting. Restored on return and on unwind.
 pub fn with_fold_emission<R>(emission: FoldEmission, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<FoldEmission>);
     impl Drop for Restore {

@@ -291,7 +291,7 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             None => q += 2,
         }
         per_round += shape.num_queries * q;
-        // GAP R4: the lean fold's once-a-round `½·α`.
+        // The lean fold's once-a-round `½·α`.
         if FoldEmission::current() == FoldEmission::Lean {
             per_round += lean_prepare_rows(shape.schedule[r]);
         }
@@ -737,7 +737,7 @@ fn emit_query_phase(
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
-    // GAP R4: the lean fold halves the round's challenges once, here, rather
+    // The lean fold halves the round's challenges once, here, rather
     // than once per query; the classic fold prepares nothing.
     let fold = RoundFold::prepare(b, alphas);
 
