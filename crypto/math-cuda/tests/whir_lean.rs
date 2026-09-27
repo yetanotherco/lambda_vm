@@ -10,6 +10,12 @@
 //! path computes the same field elements by a different sequence of
 //! operations. `tests/host_kat/whir_host_kat.cpp` pins the same arithmetic on
 //! the host.
+//!
+//! The two working-set tests (the lean opening's, and the fused fold's) are
+//! here too, and every test in this binary takes [`DEVICE`]: they read the
+//! driver's free memory before and after, and a neighbour allocating in the
+//! same process at the same time would be counted as theirs. The parity tests
+//! elsewhere run in parallel as usual; this binary does not.
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
@@ -18,6 +24,16 @@ use math_cuda::whir_open::{LeanMessage, LeanRound0, LeanShare, OpeningSession};
 
 type FE = FieldElement<Gl>;
 type FE3 = FieldElement<Ext3>;
+
+/// Held by every test here, so a driver measurement never overlaps another
+/// test's allocations.
+static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn device() -> std::sync::MutexGuard<'static, ()> {
+    DEVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 
@@ -233,11 +249,13 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
 
 #[test]
 fn the_lean_rounds_match_the_materialised_session_from_host_parts() {
+    let _device = device();
     lean_matches_materialised(&stack(14, 0x51), false);
 }
 
 #[test]
 fn the_lean_rounds_match_the_materialised_session_from_resident_columns() {
+    let _device = device();
     lean_matches_materialised(&stack(15, 0x77), true);
 }
 
@@ -249,6 +267,7 @@ fn the_lean_rounds_match_the_materialised_session_from_resident_columns() {
 /// with the pool drained, and by the structures' own accounting.
 #[test]
 fn the_lean_opening_holds_a_fraction_of_the_materialised_one() {
+    let _device = device();
     let s = stack(22, 0x99);
     let store = math_cuda::columns::DeviceColumns::upload(
         &s.columns
@@ -307,5 +326,76 @@ fn the_lean_opening_holds_a_fraction_of_the_materialised_one() {
     assert!(
         lean_taken * 4 < materialised,
         "lean took {lean_taken} B from the card against {materialised} B"
+    );
+}
+
+/// Two-inverse and the inverse generator of each of `levels` levels from a
+/// domain with generator `g`: what `multilinear::gpu` passes a fold.
+fn fold_scalars(g: FE, levels: usize) -> (u64, Vec<u64>) {
+    let two_inv = *FE::from(2u64).inv().expect("2 is invertible").value();
+    let mut g_inv = g.inv().expect("a generator is invertible");
+    let mut g_invs = Vec::with_capacity(levels);
+    for _ in 0..levels {
+        g_invs.push(*g_inv.value());
+        g_inv = g_inv.square();
+    }
+    (two_inv, g_invs)
+}
+
+fn raw_challenges(from: u64, count: usize) -> Vec<u64> {
+    (from..from + count as u64)
+        .flat_map(|seed| [seed * 31 + 7, seed * 17 + 5, seed + 3])
+        .collect()
+}
+
+/// The fused fold's working set is its output: folding a committed codeword
+/// six levels takes `2^(n+2−6)` extension values from the card, where the
+/// level-by-level fold's first two levels alone take `2^(n+1) + 2^n` of them
+/// while the codeword is resident. Measured through the driver, pool drained.
+#[test]
+fn the_fused_fold_takes_only_its_output_from_the_card() {
+    use multilinear::whir::Domain;
+    let _device = device();
+    let (num_vars, log_blowup) = (20usize, 2usize);
+    let evals: Vec<u64> = (0..(1u64 << num_vars)).map(|i| i * 7 + 3).collect();
+    let (committed, _root) = math_cuda::whir::commit_codeword(
+        &evals,
+        log_blowup,
+        1,
+        false,
+        math_cuda::DeviceHash::Keccak256,
+    )
+    .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+    let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+    let (two_inv, g_invs) = fold_scalars(*domain.generator(), 6);
+    let alphas = raw_challenges(1, 6);
+    let be = math_cuda::device::backend().expect("a device");
+
+    let taken = |fused: bool| -> u64 {
+        math_cuda::device::drain_and_trim().expect("drain");
+        let before = be.free_vram_bytes().expect("free");
+        let folded = if fused {
+            math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &alphas)
+        } else {
+            math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &alphas)
+        }
+        .expect("fold");
+        be.ctx.synchronize().expect("sync");
+        let after = be.free_vram_bytes().expect("free");
+        drop(folded);
+        before.saturating_sub(after)
+    };
+    let stepped = taken(false);
+    let fused = taken(true);
+    let codeword = (1u64 << (num_vars + log_blowup)) * 8;
+    println!(
+        "fold working set at 2^{}: level by level {stepped} B ({:.2}× the codeword), fused {fused} B ({:.3}×)",
+        num_vars + log_blowup,
+        stepped as f64 / codeword as f64,
+        fused as f64 / codeword as f64,
+    );
+    assert!(
+        fused * 8 < stepped,
+        "the fused fold took {fused} B against the level-by-level {stepped} B"
     );
 }
