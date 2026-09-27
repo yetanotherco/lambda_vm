@@ -602,8 +602,9 @@ fn gpu_composition_matches_cpu_oracle_decode_shaped() {
 
 fn composition_at_grids(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
     // More rows than the legacy grid's 65,536 threads, so the legacy launch
-    // strides and a wider one does not.
-    const NUM_ROWS: usize = 1 << 17;
+    // strides; and more than one card wave's, so the filled grid (one wave)
+    // strides too and differs from a block per 256 rows.
+    const NUM_ROWS: usize = 1 << 18;
     const NEXT_STEP: usize = 2;
     let lde_size = NUM_ROWS;
 
@@ -722,7 +723,7 @@ fn composition_at_grids(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u6
     );
     let per_thread = ((dev.num_base_slots + 3 * dev.num_ext_slots) * 8) as u64;
     let filled = math_cuda::constraint_interp::k2_filled_grid(NUM_ROWS, per_thread)
-        .expect("a 2^17-row composition fills more than the legacy grid");
+        .expect("a 2^18-row composition fills more than the legacy grid");
     for grid in [1u32, 170, 512, filled, (NUM_ROWS / 256) as u32] {
         assert_eq!(
             at_grid(grid),
