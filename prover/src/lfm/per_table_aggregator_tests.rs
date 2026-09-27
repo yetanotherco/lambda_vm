@@ -5817,9 +5817,8 @@ struct LeadIn<P, C, T> {
 /// How a lead-in derives its context, handed a wait for what the base shares.
 type MakeContext<C> = Box<dyn Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync>;
 
-/// What a base shares with its lead-in instead of the lead-in deriving it: the
-/// WHIR base's DECODE prepared commitment ([`crate::continuation::EpochObserver::
-/// on_decode_prepared`]).
+/// What a base shares with its lead-in instead of the lead-in deriving it again:
+/// its DECODE work ([`crate::continuation::EpochObserver::on_base_shared`]).
 type BaseShared = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
 struct LeadState<P, T> {
@@ -5884,8 +5883,10 @@ where
             std::thread::Builder::new()
                 .name(format!("gap-i7-lead-{i}"))
                 .spawn(move || {
-                    let context = lead.context();
                     while let Some((k, prefix, n)) = lead.claim() {
+                        // ⓘ Taken on the first claim, not at spawn: a helper does
+                        // nothing at all until the base's tail.
+                        let context = lead.context();
                         // A panicking prologue gives its slot back to level 0,
                         // which builds it and reports the failure where it lands.
                         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6036,9 +6037,9 @@ where
         self.changed.notify_all();
     }
 
-    fn on_decode_prepared(&self, prepared: BaseShared) {
+    fn on_base_shared(&self, shared: BaseShared) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.shared = Some(prepared);
+        st.shared = Some(shared);
         self.changed.notify_all();
     }
 }
@@ -6071,17 +6072,16 @@ fn start_stark_lead_in(
         EpochConstants, Publishes, epoch_arena_words, epoch_program_publishing,
         real_epoch_from_epochs,
     };
-    let (ctx_bytes, ctx_inner) = (elf_bytes.to_vec(), inner.clone());
     let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
     LeadIn::start(
         want,
         helpers,
-        // ⓘ The STARK base shares nothing: its DECODE commitment is host work,
-        // so the lead-in derives its own, off the card.
-        move |_base: &dyn Fn() -> BaseShared| {
-            let elf = executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load");
-            crate::tables::decode::commitment_from_elf(&elf, &ctx_inner)
-                .expect("the inner ELF's DECODE commitment must build")
+        // ⓘ The base's own DECODE commitment, shared: deriving a second one here
+        // would be a second second of host work beside the base's.
+        move |base: &dyn Fn() -> BaseShared| {
+            *base()
+                .downcast::<stark::config::Commitment>()
+                .unwrap_or_else(|_| panic!("the STARK base shares its DECODE commitment"))
         },
         move |decode: &stark::config::Commitment,
               epochs: &[crate::continuation::EpochProof],
@@ -6272,12 +6272,12 @@ fn gap_i7_lead_in_context_waits_for_what_the_base_shares() {
         },
         |_: &usize, _: &[u64], _, _| (),
     );
-    lead.on_decode_prepared(std::sync::Arc::new(42usize));
+    lead.on_base_shared(std::sync::Arc::new(42usize));
     assert_eq!(*lead.context(), 42);
 }
 
-/// The WHIR lead-in's shared context: the ELF and both DECODE derivations,
-/// taken once — what WHIR level 0 hoists at its start.
+/// The WHIR lead-in's context: the ELF and both DECODE derivations, the base's
+/// own — what WHIR level 0 hoists at its start.
 struct WhirLeadContext<H: multilinear::whir_hash::WhirHash> {
     elf: executor::elf::Elf,
     /// The base's own, shared: deriving it is a device commit.
@@ -6319,28 +6319,24 @@ where
     H: multilinear::whir_hash::WhirHash + 'static,
 {
     use crate::multilinear_continuation::{decode_derivations, reset_decode_derivations};
-    let (ctx_bytes, ctx_inner) = (elf_bytes.to_vec(), inner.clone());
+    let ctx_bytes = elf_bytes.to_vec();
     let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
     let lead: std::sync::Arc<WhirLeadIn<H>> = LeadIn::start(
         want,
         helpers,
-        // ⛔ THE PREPARED OPENING IS THE BASE'S, NOT DERIVED HERE: deriving it is
-        // a device commit, and nothing in the lead-in may reach the card. The base
-        // derives it once before its first epoch and shares it; the univariate
-        // root is host work and is taken here, off the card.
+        // ⛔ BOTH DECODE DERIVATIONS ARE THE BASE'S, NOT MADE HERE: the prepared
+        // commitment is a device commit, and nothing in the lead-in may reach the
+        // card; the base derives both once before its first epoch and shares them.
         move |base: &dyn Fn() -> BaseShared| {
-            let elf = executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load");
-            let decode_root = crate::tables::decode::commitment_from_elf(&elf, &ctx_inner)
-                .expect("DECODE's univariate commitment, once per bundle");
-            let prepared = base()
-                .downcast::<crate::multilinear_continuation::DecodePrepared<H>>()
+            let shared = base()
+                .downcast::<crate::multilinear_continuation::SharedDecode<H>>()
                 .unwrap_or_else(|_| {
-                    panic!("the WHIR base shared a DECODE commitment under another hash")
+                    panic!("the WHIR base shared its DECODE work under another hash")
                 });
             WhirLeadContext {
-                elf,
-                prepared,
-                decode_root,
+                elf: executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load"),
+                prepared: std::sync::Arc::clone(&shared.prepared),
+                decode_root: shared.root,
             }
         },
         move |ctx: &WhirLeadContext<H>,

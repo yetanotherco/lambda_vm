@@ -1776,6 +1776,19 @@ impl ContinuationProof {
     }
 }
 
+/// What the WHIR base shares with its observer (gap fix I7): DECODE's
+/// univariate root and its prepared commitment, both derived once above the
+/// epoch loop — the second by a device commit, which the lead-in must not make.
+/// Read only by the tree drivers, which are tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SharedDecode<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    pub(crate) root: Commitment,
+    pub(crate) prepared: std::sync::Arc<DecodePrepared<H>>,
+}
+
 /// An [`crate::continuation::EpochObserver`] for the WHIR base, as the
 /// thread-local holds it.
 pub(crate) type SharedEpochObserver =
@@ -1833,7 +1846,10 @@ pub fn prove_continuation(
     let boundaries = crate::with_whir_hash!(|H| {
         let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
         if let Some(observer) = observer {
-            observer.on_decode_prepared(prepared.clone());
+            observer.on_base_shared(std::sync::Arc::new(SharedDecode {
+                root: decode_commitment,
+                prepared: prepared.clone(),
+            }));
         }
         crate::continuation::for_each_epoch_overlapped_counted(
             &elf,

@@ -866,14 +866,19 @@ mod tests {
             );
         }
         let shared = std::mem::take(&mut *recorder.shared.lock().unwrap());
-        assert_eq!(shared.len(), 1, "the DECODE commitment is shared once");
+        assert_eq!(shared.len(), 1, "the DECODE work is shared once");
         let elf = Elf::load(&elf_bytes).expect("load");
         let root = crate::tables::decode::commitment_from_elf(&elf, &opts).expect("root");
         crate::with_whir_hash!(|H| {
-            let prepared = shared[0]
+            let shared = shared[0]
                 .clone()
-                .downcast::<multilinear_continuation::DecodePrepared<H>>()
-                .unwrap_or_else(|_| panic!("the base shares its DECODE commitment under its hash"));
+                .downcast::<multilinear_continuation::SharedDecode<H>>()
+                .unwrap_or_else(|_| panic!("the base shares its DECODE work under its hash"));
+            assert_eq!(
+                shared.root, root,
+                "the shared root is the ELF's DECODE root"
+            );
+            let prepared = std::sync::Arc::clone(&shared.prepared);
             let fresh = multilinear_continuation::decode_prepared_for::<H>(&elf, &elf_bytes)
                 .expect("a fresh derivation");
             assert_eq!(

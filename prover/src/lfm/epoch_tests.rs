@@ -1524,6 +1524,18 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
         vec![n],
         "the epoch count, exactly once"
     );
+    let shared = std::mem::take(&mut *recorder.shared.lock().unwrap());
+    assert_eq!(shared.len(), 1, "the DECODE commitment is shared once");
+    let shared = *shared[0]
+        .clone()
+        .downcast::<Commitment>()
+        .unwrap_or_else(|_| panic!("the STARK base shares its DECODE commitment"));
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture ELF");
+    assert_eq!(
+        shared,
+        crate::tables::decode::commitment_from_elf(&elf, &opts).expect("the DECODE commitment"),
+        "the shared commitment is the ELF's"
+    );
     let copies = recorder.epochs_in_order(n);
     for (i, (copy, kept)) in copies.iter().zip(bundle.epochs()).enumerate() {
         assert_eq!(
@@ -1537,11 +1549,14 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
         );
     }
 
+    // The lead-in's constants take the shared commitment; the pool's derive it.
     let konsts = EpochConstants::load(&elf_bytes, &opts, None).expect("the fixture ELF");
+    let lead_konsts =
+        EpochConstants::load(&elf_bytes, &opts, Some(shared)).expect("the fixture ELF");
     for k in 0..n {
         let from_bundle = real_epoch_from_constants(&opts, &konsts, &bundle, k)
             .unwrap_or_else(|e| panic!("epoch {k} from the bundle: {e}"));
-        let from_lead = real_epoch_from_epochs(&opts, &konsts, &copies[..=k], n, k)
+        let from_lead = real_epoch_from_epochs(&opts, &lead_konsts, &copies[..=k], n, k)
             .unwrap_or_else(|e| panic!("epoch {k} from its leading epochs: {e}"));
         assert_eq!(
             format!(
@@ -1563,7 +1578,7 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
     // ⛔ And the leading epochs must reach the one asked for: a list that stops
     // short is refused, never read as a shorter run.
     assert!(
-        real_epoch_from_epochs(&opts, &konsts, &copies[..1], n, 1).is_err(),
+        real_epoch_from_epochs(&opts, &lead_konsts, &copies[..1], n, 1).is_err(),
         "epoch 1 cannot be built from epoch 0 alone"
     );
 }

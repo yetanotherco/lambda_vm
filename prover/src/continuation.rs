@@ -2303,11 +2303,13 @@ pub(crate) trait EpochObserver<P>: Sync {
     /// Epoch `index` is proved. Once per epoch, in completion order, which can
     /// differ from index order.
     fn on_epoch_proved(&self, index: usize, proof: &P);
-    /// The WHIR base's DECODE prepared commitment (a
-    /// `multilinear_continuation::DecodePrepared<H>` under the base's hash),
-    /// shared rather than derived a second time: deriving it is a device commit,
-    /// and the lead-in must not reach the card. Called once, before any epoch.
-    fn on_decode_prepared(&self, _prepared: Arc<dyn std::any::Any + Send + Sync>) {}
+    /// What the base derived once and an observer would otherwise derive again,
+    /// shared: the STARK base's DECODE commitment (a `Commitment`), the WHIR
+    /// base's DECODE root and prepared commitment (a
+    /// `multilinear_continuation::SharedDecode<H>` under the base's hash — whose
+    /// derivation is a device commit, which the lead-in must not make). Called
+    /// once, before any epoch.
+    fn on_base_shared(&self, _shared: Arc<dyn std::any::Any + Send + Sync>) {}
 }
 
 /// Test-only: an [`EpochObserver`] that records what it is told, for a test
@@ -2355,8 +2357,8 @@ impl<P: Clone + Send + Sync> EpochObserver<P> for RecordingObserver<P> {
         self.epochs.lock().unwrap().push((index, proof.clone()));
     }
 
-    fn on_decode_prepared(&self, prepared: Arc<dyn std::any::Any + Send + Sync>) {
-        self.shared.lock().unwrap().push(prepared);
+    fn on_base_shared(&self, shared: Arc<dyn std::any::Any + Send + Sync>) {
+        self.shared.lock().unwrap().push(shared);
     }
 }
 
@@ -2428,6 +2430,9 @@ pub fn prove_continuation(
     // it once here instead of once per epoch inside `build_epoch_airs`.
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    if let Some(observer) = observer {
+        observer.on_base_shared(Arc::new(decode_commitment));
+    }
     // Same for the DECODE trace artifacts (instruction map + pristine trace):
     // a pure function of the ELF, built once and shared by every epoch's trace
     // build instead of re-parsed/regenerated inside the serial producer chain.
