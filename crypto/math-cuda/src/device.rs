@@ -387,12 +387,23 @@ pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
 pub fn mempool_release_threshold_bytes() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var(MEMPOOL_RELEASE_ENV)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES)
+        release_threshold_from(
+            std::env::var(MEMPOOL_RELEASE_ENV).ok().as_deref(),
+            crate::gap::i1_retain_mempool(),
+        )
     })
+}
+
+/// [`mempool_release_threshold_bytes`]'s decision: `keep_default` (gap fix I1,
+/// [`crate::gap::i1_retain_mempool`]) ignores the knob's value.
+fn release_threshold_from(knob_mb: Option<&str>, keep_default: bool) -> u64 {
+    if keep_default {
+        return DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES;
+    }
+    knob_mb
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES)
 }
 
 /// The device default memory pool, or `None` on a device/driver without
@@ -437,10 +448,16 @@ fn retain_default_mempool(ctx: &CudaContext) {
     };
     // One line per process, so the box log states the posture the run had.
     eprintln!(
-        "[gpu] mempool release threshold: {}{}",
+        "[gpu] mempool release threshold: {}{}{}",
         match threshold {
             u64::MAX => "retain all freed blocks".to_string(),
             t => format!("{} MiB", t >> 20),
+        },
+        match std::env::var(MEMPOOL_RELEASE_ENV) {
+            Ok(v) if crate::gap::i1_retain_mempool() => {
+                format!(" ({MEMPOOL_RELEASE_ENV}={v} ignored under gap fix I1)")
+            }
+            _ => String::new(),
         },
         if set {
             ""
@@ -1611,5 +1628,30 @@ mod device_fallback_counter_tests {
         assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
         reset_reserved_high_water();
         assert_eq!(reserved_high_water(), 0, "reset must zero it again");
+    }
+}
+
+#[cfg(test)]
+mod mempool_threshold_tests {
+    use super::{DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES, release_threshold_from};
+
+    /// Gap fix I1: under the knob the env value is ignored and the retain-all
+    /// default stands; off, the env value decides exactly as before.
+    #[test]
+    fn gap_i1_keeps_the_retain_all_default() {
+        assert_eq!(release_threshold_from(Some("0"), false), 0);
+        assert_eq!(release_threshold_from(Some("3"), false), 3 << 20);
+        assert_eq!(
+            release_threshold_from(None, false),
+            DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            release_threshold_from(Some("0"), true),
+            DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            release_threshold_from(None, true),
+            DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
+        );
     }
 }
