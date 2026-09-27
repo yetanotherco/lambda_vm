@@ -207,6 +207,14 @@ fn the_room_is_given_back_between_the_commits_and_the_openings(c: &Case, room: u
             before,
             "park {park}: the group gave back less than it promised"
         );
+        // The openings leave nothing promised behind them: every chain's
+        // folds, and the leaf layers those kept, went back with the chain.
+        assert_eq!(
+            opened,
+            committed,
+            "park {park}: the openings left {} B promised past their end",
+            opened.saturating_sub(committed)
+        );
         (bytes(&proof), committed, opened, counts)
     };
     let (held, held_committed, held_opened, held_counts) = arm(false);
