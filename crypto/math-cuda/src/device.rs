@@ -326,6 +326,10 @@ pub struct Backend {
     // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
     pub bit_reverse_ext3_kernel: CudaFunction,
+    /// `deep_composition_ext3_fused_m{M}` at index `M - 1`, the
+    /// DEEP row with its own `M = 1 + num_eval_points` denominators inverted in
+    /// registers.
+    pub deep_composition_ext3_fused: [CudaFunction; 4],
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
@@ -340,6 +344,8 @@ pub struct Backend {
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
     pub invert_total_ext3: CudaFunction,
+    /// `invert_denoms_rowwise_ext3_k{K}` at index `K - 1`.
+    pub invert_denoms_rowwise_ext3: [CudaFunction; 8],
     pub logup_fingerprint_ext3: CudaFunction,
     pub logup_term_ext3: CudaFunction,
     pub logup_row_sum_ext3: CudaFunction,
@@ -1110,6 +1116,12 @@ impl Backend {
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
+            deep_composition_ext3_fused: [
+                deep.load_function("deep_composition_ext3_fused_m1")?,
+                deep.load_function("deep_composition_ext3_fused_m2")?,
+                deep.load_function("deep_composition_ext3_fused_m3")?,
+                deep.load_function("deep_composition_ext3_fused_m4")?,
+            ],
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             gather_ext3_at: fri.load_function("gather_ext3_at")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
@@ -1122,6 +1134,16 @@ impl Backend {
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
             invert_total_ext3: inverse.load_function("invert_total_ext3")?,
+            invert_denoms_rowwise_ext3: [
+                inverse.load_function("invert_denoms_rowwise_ext3_k1")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k2")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k3")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k4")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k5")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k6")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k7")?,
+                inverse.load_function("invert_denoms_rowwise_ext3_k8")?,
+            ],
             logup_fingerprint_ext3: logup.load_function("logup_fingerprint_ext3")?,
             logup_term_ext3: logup.load_function("logup_term_ext3")?,
             logup_row_sum_ext3: logup.load_function("logup_row_sum_ext3")?,
