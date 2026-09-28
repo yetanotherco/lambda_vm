@@ -15,15 +15,11 @@
 use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 
-use crate::tables::{bitwise, keccak_rc};
+use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS};
 
-use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS, blake3_chunk_rows};
-
-use super::commit::commit_group_device_or_host;
+use super::artifact_walk::{BuildPlan, Pass};
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
-use super::statement::lfm_program_id_chunked;
-use super::trace::range_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LfmProgramKind {
@@ -387,7 +383,7 @@ pub fn groups_in_flight() -> usize {
 /// preserves position, so slot `k` of a window is slot `k` of the result and the
 /// roots land where the serial walk put them. A `for_each` writing through a
 /// shared handle would not have that property for free.
-fn map_maybe_parallel<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R>
+pub(super) fn map_maybe_parallel<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R>
 where
     T: Sync,
     R: Send,
@@ -404,19 +400,19 @@ where
 /// diagnostics. It names the PHASE rather than a chip, because the abort a
 /// reader would be holding says "which commit was this" and every group in this
 /// walk answers that the same way; the group's own shape is in the same message.
-const PREP_GROUP_LABEL: &str = "LFM_PREP_GROUP";
+pub(super) const PREP_GROUP_LABEL: &str = "LFM_PREP_GROUP";
 
 /// The same, for the chunked `LFM_BLAKE3` groups — held apart so an abort says
 /// which of the two walks it came from.
-const BLAKE3_CHUNK_LABEL: &str = "LFM_PREP_BLAKE3_CHUNK";
+pub(super) const BLAKE3_CHUNK_LABEL: &str = "LFM_PREP_BLAKE3_CHUNK";
 
 /// The same, for the `LFM_HASH` tail chunk.
-const HASH_CHUNK_LABEL: &str = "LFM_PREP_HASH_CHUNK";
+pub(super) const HASH_CHUNK_LABEL: &str = "LFM_PREP_HASH_CHUNK";
 
 /// Slots 0..=9 — the instruction column groups that belong to the PROGRAM.
 ///
 /// Slot 10 (`LFM_RANGE`) is committed with them and is not one of them: its
-/// group comes from [`range_group`], which takes no arguments and so cannot
+/// group comes from [`range_group`](super::trace::range_group), which takes no arguments and so cannot
 /// vary with the program.
 pub const PROGRAM_GROUP_SLOTS: usize = 10;
 
@@ -485,200 +481,90 @@ pub fn build_artifacts_with_hasher(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
-    let range = range_group();
-    // Slots 0..=10 in slot order: the program's own nine groups, then
-    // `LFM_RANGE`. Slot 11 (`LFM_BLAKE3`) is not here because it is the CHUNKED
-    // one: it contributes one committed matrix per chunk, built and absorbed
-    // after this list, which is where slot order puts it anyway.
-    let program_slots = program_groups(program);
-    // A split `LFM_HASH` commits chunk 0 at slot 5 and chunk 1 as a
-    // tail below. An unsplit program materializes nothing here — slot 5 is the
-    // compiled group itself, exactly as before the split existed.
-    let hash_chunks: Vec<ColumnGroup> = if program.hash_chunk_count() > 1 {
-        (0..program.hash_chunk_count())
-            .map(|c| program.hash_chunk_group(c))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let groups: [&ColumnGroup; 11] = std::array::from_fn(|i| {
-        if i == HASH_SLOT && !hash_chunks.is_empty() {
-            &hash_chunks[0]
-        } else if i < PROGRAM_GROUP_SLOTS {
-            program_slots[i]
-        } else {
-            &range
-        }
-    });
-    let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
-    let mut log_heights = [0u8; NUM_LFM_CHIPS];
-
-    // Heights first, from the compiled groups: the LDE walk below commits them
-    // and the digest binds them, so both read one derivation.
-    for (i, g) in groups.iter().enumerate() {
-        log_heights[i] = g.padded_rows.trailing_zeros() as u8;
-    }
-    // The chunk heights are arithmetic (`blake3_chunk_rows`), so they are known
-    // without materializing a single chunk group. Slot 11's own entry is chunk
-    // 0's — the array stays the shape a single-table program has.
-    let blake3_chunk_log_heights: Vec<u8> = blake3_chunk_rows(program)
-        .into_iter()
-        .map(|rows| rows.trailing_zeros() as u8)
-        .collect();
-    log_heights[BLAKE3_SLOT] = blake3_chunk_log_heights[0];
-
-    // ★ N GROUPS IN FLIGHT, NOT ONE AND NOT ELEVEN. Each pass is an independent
-    // expand-and-commit of its own matrix, so the loop parallelizes on its face;
-    // what stopped it was the residency trade the old comment named — "peak
-    // residency is one group's LDE" — taken when host memory was the binding
-    // constraint on this path. It is not any more: lane P measured a production
-    // L1 node's host peak at 14.4 GiB of 57.53.
-    //
-    // ⚠ So the trade is RE-PRICED, not discarded. Running all eleven at once
-    // would multiply the peak by the group count for a program whose group sizes
-    // we do not control; a fixed window multiplies it by at most
-    // `groups_in_flight()` and says so.
-    //
-    // ⛔ AND THE WINDOW IS THE SECOND-ORDER HALF. `lde_columns` → `dispatch_fft`
-    // already sends any buffer of 2^14 elements or more to the parallel Bowers
-    // FFT, so the work inside this loop was never strictly serial — but its
-    // per-layer block threshold leaves the early layers sequential, and lane P
-    // measures the result at 445% CPU (4.5 of 30.7 cores) on a production node
-    // against `emit_merkle`'s 2,652%. The COLUMN-level `par_iter` is what closes
-    // that gap; this window covers only the short groups, where each column's
-    // FFT stays sequential.
-    //
-    // ⚠ My own laptop A/B read both as a wash (serial 1.547 s, windowed 1.447 s
-    // on a 27 MiB program). That fixture concentrates its felts in ONE NARROW
-    // group, which is close to the worst case for a per-column spread — it is a
-    // statement about the fixture, not about the change. Lane P's production
-    // split is the number to plan against.
-    //
-    // ⓘ ON A CUDA BUILD THE WINDOW IS A HOST-FALLBACK BOUND, not the live one.
-    // `commit_group_device_or_host` sends each group to the card, where the
-    // residency that matters is `stark::device_set`'s and admission enforces it
-    // per call. The window still bounds the host path exactly as before, which
-    // is the path a machine with no card takes.
-    let in_flight = groups_in_flight();
-    for (base, window) in groups.chunks(in_flight).enumerate() {
-        let commits = map_maybe_parallel(window, |g| {
-            commit_group_device_or_host(PREP_GROUP_LABEL, g, options)
-        });
-        for (k, root) in commits.into_iter().enumerate() {
-            roots[base * in_flight + k] = root;
-        }
-    }
-    // Then `LFM_BLAKE3`, one window of chunks at a time: materialize each
-    // chunk's group, expand it, commit it, drop both. Peak residency is the
-    // window's chunks — which is still the point of chunking this chip, at a
-    // bound that names itself.
-    let chunks: Vec<usize> = (0..blake3_chunk_log_heights.len()).collect();
-    let mut blake3_chunk_roots: Vec<Commitment> = Vec::with_capacity(chunks.len());
-    for window in chunks.chunks(in_flight) {
-        blake3_chunk_roots.extend(map_maybe_parallel(window, |c| {
-            let group = program.blake3_chunk_group(*c);
-            commit_group_device_or_host(BLAKE3_CHUNK_LABEL, &group, options)
-        }));
-    }
-    roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
-    // The hash tail: `LFM_HASH` chunks 1.., committed like the BLAKE3 chunks.
-    // Chunk 0 is slot 5's root, committed in the window above.
-    let mut hash_chunk_roots: Vec<Commitment> = vec![roots[HASH_SLOT]];
-    let mut hash_chunk_log_heights: Vec<u8> = vec![log_heights[HASH_SLOT]];
-    let tail: Vec<&ColumnGroup> = hash_chunks.iter().skip(1).collect();
-    for window in tail.chunks(in_flight) {
-        hash_chunk_roots.extend(map_maybe_parallel(window, |g| {
-            commit_group_device_or_host(HASH_CHUNK_LABEL, g, options)
-        }));
-    }
-    hash_chunk_log_heights.extend(tail.iter().map(|g| g.padded_rows.trailing_zeros() as u8));
-    // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
-    roots[13] = keccak_rc::preprocessed_commitment(options);
-    log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
-    roots[14] = bitwise::preprocessed_commitment(options);
-    log_heights[14] = bitwise::NUM_ROWS.trailing_zeros() as u8;
-
-    // The families this program uses, and the chunk count that follows from
-    // them: zero KECCAK_RND instances when the keccak family is absent, since
-    // the chunking policy's floor of one exists only to keep an unused chip
-    // present.
-    let chip_set = ChipSet::for_program_with_hasher(program, hasher);
-    let keccak_rnd_chunks = chip_set.keccak_rnd_chunks(
-        program
-            .chunking
-            .chunk_count(program.groups.keccak.real_rows),
-    );
-    // ★ `blake3_chunk_roots` is NOT mask-gated the way `keccak_rnd_chunks` is,
-    // and the asymmetry is real: `KECCAK_RND` commits nothing, so an absent
-    // family can drop to zero instances for free, while `LFM_BLAKE3`'s
-    // instruction group is COMMITTED whether the family is used or not — slot 11
-    // has always carried a root and a height for a program that never
-    // compresses. So the chunk lists describe what was committed (never empty)
-    // and the mask decides what a proof carries, exactly where it always did:
-    // `ChipSet::num_airs` and `LfmAirs::air_refs`.
-
-    let program_id = lfm_program_id_chunked(
-        &roots,
-        &log_heights,
-        keccak_rnd_chunks,
-        hasher,
-        chip_set,
-        &blake3_chunk_roots,
-        &blake3_chunk_log_heights,
-        &hash_chunk_roots,
-        &hash_chunk_log_heights,
-    );
-    let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
-        .then(|| build_one_row_roots(program, options, &groups, &tail));
-    LfmArtifacts {
-        roots,
-        log_heights,
-        keccak_rnd_chunks,
-        blake3_chunk_roots,
-        blake3_chunk_log_heights,
-        hash_chunk_roots,
-        hash_chunk_log_heights,
-        hasher,
-        chip_set,
-        program_id,
-        one_row_roots,
-    }
+    let plan = BuildPlan::new(program, options);
+    let committed = plan.walk(options, Pass::All);
+    plan.assemble(options, hasher, committed)
 }
 
-/// The one-row roots of every committed group (host pass: the device commit
-/// builds row-pair leaves only), plus the static tables' one-row twins.
-fn build_one_row_roots(
+/// [`build_artifacts_with_hasher`] with its DEVICE commits inside a section:
+/// `enter_device` is called once, before the first device commit, and what it
+/// returns is held until the last one is made.
+///
+/// # Why
+///
+/// The card permit ([`super::device_permit`]) is taken around a proof's two
+/// device phases, and this build is the first of them. Held around the whole
+/// build, it covers host work too: every group below the device floor is
+/// committed on the host, and on a production wrap that is four groups per leaf
+/// layout. Here those commits run FIRST, outside the section, and the section
+/// covers the device commits alone.
+///
+/// # What does not change
+///
+/// - The roots. Each group's root is a pure function of the group, and a group
+///   committed on the host has the root the device would have produced — the
+///   gate `device_parity` in `commit.rs` holds the two paths together.
+/// - The device working set. The device commits run in exactly the windows the
+///   whole build puts them in, minus the host groups, so no dispatch runs beside
+///   more device work than it ever did.
+/// - Where a group goes. Both halves route on one predicate
+///   ([`super::commit::commit_reaches_device`], the device layer's own
+///   admission); the host half commits through a function that cannot reach the
+///   card, so a group misrouted there costs time and never an uncovered device
+///   dispatch; and the merge refuses a slot committed on both sides or on
+///   neither.
+///
+/// A build with no device commit at all (no card, or every group below the
+/// floor) never calls `enter_device`.
+pub fn build_artifacts_with_device_section<G>(
     program: &LfmProgram,
     options: &ProofOptions,
-    groups: &[&ColumnGroup; 11],
-    hash_tail: &[&ColumnGroup],
-) -> LfmOneRowRoots {
-    use stark::leaf_layout::LeafLayout::Row;
-    let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
-    let commits = map_maybe_parallel(groups, |g| {
-        super::commit::commit_group_device_or_host_with(PREP_GROUP_LABEL, g, options, Row)
+    hasher: HasherKind,
+    enter_device: impl FnOnce() -> G,
+) -> LfmArtifacts {
+    build_artifacts_sectioned(program, options, hasher, enter_device).0
+}
+
+/// What [`build_artifacts_with_device_section`] did on each side of its
+/// section, for the line a traced run prints.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SectionSplit {
+    /// Commits made outside the section, all on the host.
+    pub host_commits: usize,
+    /// Seconds the outside half took.
+    pub host_secs: f64,
+    /// Commits made inside the section, routed to the device.
+    pub device_commits: usize,
+    /// Seconds inside the section, from `enter_device` returning to the last
+    /// device commit — NET of whatever `enter_device` waited for.
+    pub device_secs: f64,
+}
+
+/// [`build_artifacts_with_device_section`], with the split it made.
+pub fn build_artifacts_sectioned<G>(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+    enter_device: impl FnOnce() -> G,
+) -> (LfmArtifacts, SectionSplit) {
+    let plan = BuildPlan::new(program, options);
+    let t = std::time::Instant::now();
+    let host = plan.walk(options, Pass::Host);
+    let mut split = SectionSplit {
+        host_commits: host.made(),
+        host_secs: t.elapsed().as_secs_f64(),
+        device_commits: host.left(),
+        device_secs: 0.0,
+    };
+    let device = (split.device_commits > 0).then(|| {
+        let _section = enter_device();
+        let t = std::time::Instant::now();
+        let device = plan.walk(options, Pass::Device);
+        split.device_secs = t.elapsed().as_secs_f64();
+        device
     });
-    for (slot, root) in commits.into_iter().enumerate() {
-        roots[slot] = Some(root);
-    }
-    let chunks: Vec<usize> = (0..blake3_chunk_rows(program).len()).collect();
-    let blake3_chunk_roots = map_maybe_parallel(&chunks, |c| {
-        let group = program.blake3_chunk_group(*c);
-        super::commit::commit_group_device_or_host_with(BLAKE3_CHUNK_LABEL, &group, options, Row)
-    });
-    roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
-    roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
-    roots[14] = bitwise::preprocessed_commitment_for(options, Row);
-    // Chunk 0 is slot 5's one-row root; the hash tail follows.
-    let mut hash_chunk_roots: Vec<Commitment> = roots[HASH_SLOT].into_iter().collect();
-    hash_chunk_roots.extend(map_maybe_parallel(hash_tail, |g| {
-        super::commit::commit_group_device_or_host_with(HASH_CHUNK_LABEL, g, options, Row)
-    }));
-    LfmOneRowRoots {
-        roots,
-        blake3_chunk_roots,
-        hash_chunk_roots,
-    }
+    let committed = host.merge(device);
+    (plan.assemble(options, hasher, committed), split)
 }
 
 /// Resolves a registry entry or fails hard. No fallback path exists or may

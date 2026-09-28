@@ -271,8 +271,52 @@ pub fn commit_group_device_or_host_with(
         }
     }
     let _ = label;
+    commit_group_host_with(group, options, layout)
+}
+
+/// The host arm of [`commit_group_device_or_host_with`], and nothing else: it
+/// cannot reach the card, whatever the group's shape.
+///
+/// That is what lets a build commit groups OUTSIDE its card hold
+/// (`registry::build_artifacts_with_device_section`): a group routed here by
+/// mistake costs a slower commit of the same root, never a device dispatch
+/// the permit does not cover.
+pub fn commit_group_host_with(
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
+}
+
+/// Whether [`commit_group_device_or_host_with`] would send a `rows × width`
+/// group to the card: the device-artifacts knob, a non-empty shape, and the
+/// device layer's own admission (`gpu_lde::commit_reaches_device`). Always
+/// `false` on a build without `cuda`.
+pub fn commit_reaches_device(
+    rows: usize,
+    width: usize,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        device_artifacts()
+            && rows > 0
+            && width > 0
+            && stark::gpu_lde::commit_reaches_device(
+                rows,
+                width,
+                options.blowup_factor as usize,
+                layout.rows_per_leaf(),
+            )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (rows, width, options, layout);
+        false
+    }
 }
 
 /// Commits one instruction column group.

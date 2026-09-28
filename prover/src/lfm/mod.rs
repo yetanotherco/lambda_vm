@@ -18,6 +18,7 @@
 pub mod airs;
 pub mod algebraic_commit;
 pub mod algebraic_transcript;
+mod artifact_walk;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
