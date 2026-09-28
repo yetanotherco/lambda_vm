@@ -1256,7 +1256,7 @@ void limb_primitives_match_schoolbook_arithmetic() {
         }
         ++checked;
     }
-    printf("K5 limb mul/sqr vs schoolbook __int128: %d cases (edges, forced carries, 200k raw words)\n",
+    printf("limb mul/sqr vs schoolbook __int128: %d cases (edges, forced carries, 200k raw words)\n",
            checked);
 }
 
@@ -1315,7 +1315,7 @@ void every_permutation_variant_reproduces_the_oracle() {
     for (int i = 0; i < 12; ++i) s[i] = 5;
     for (int j = 0; j < 3; ++j) rpx::permute_v<0>(s);
     check(memcmp(out.data(), s, sizeof(s)) != 0, "the chain-probe comparison must be able to fail");
-    printf("K5 permutation variants 0/1/3/4/5/7/9: oracle table raw + chain probes (k=3) + a failing control\n");
+    printf("permutation variants 0/1/3/4/5/7/9: oracle table raw + chain probes (k=3) + a failing control\n");
 }
 
 }  // namespace

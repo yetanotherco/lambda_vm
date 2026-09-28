@@ -48,7 +48,7 @@ uint64_t sample(uint64_t &seed, uint64_t i) {
 }
 
 // ---------------------------------------------------------------------------
-// K3 — the half-warp permutation against `permute`, raw.
+// The half-warp permutation against `permute`, raw.
 // ---------------------------------------------------------------------------
 void warp_permutation_matches_the_shipped_permutation() {
     // An odd count, so the last warp has a dead half.
@@ -74,7 +74,7 @@ void warp_permutation_matches_the_shipped_permutation() {
             ++failures;
         }
     }
-    printf("K3 half-warp permutation vs rpx::permute, raw: %d/%llu states (odd count, edges, raw words)\n",
+    printf("half-warp permutation vs rpx::permute, raw: %d/%llu states (odd count, edges, raw words)\n",
            matched, (unsigned long long)n);
 }
 
@@ -153,12 +153,12 @@ void warp_merkle_kernels_match_the_shipped_tree() {
     simt_launch(1, 64, [&] { rpx_merkle_tail_warp(a.data(), 7); });
     simt_launch(1, 64, [&] { rpx_merkle_tail_warp(b.data(), 7); });
     check(memcmp(a.data(), b.data(), 32) != 0, "a flipped leaf byte must move the warp tail's root");
-    printf("K3 warp level + warp tail + mixed walk vs the shipped level walk: %d trees (2..128 leaves) + a failing control\n",
+    printf("warp level + warp tail + mixed walk vs the per-parent level walk: %d trees (2..128 leaves) + a failing control\n",
            trees);
 }
 
 // ---------------------------------------------------------------------------
-// K4 — the work-queue grind against the shipped grind.
+// The work-queue grind against the stride grind.
 // ---------------------------------------------------------------------------
 
 // The shipped kernel as ONE thread: stride 1, so it scans `[base, base+count)`
@@ -231,7 +231,7 @@ void queue_grind_returns_the_shipped_nonce() {
     const uint64_t limit = 1ull << (64 - 7);
     check(queue_grind(a, limit, 0, 4096, 2, 64).nonce != queue_grind(b, limit, 0, 4096, 2, 64).nonce,
           "different inner hashes must (here) give different nonces");
-    printf("K4 queue grind vs the shipped grind: %d runs (%d with a nonce), misses hash the range once, a failing control\n",
+    printf("queue grind vs the stride grind: %d runs (%d with a nonce), misses hash the range once, a failing control\n",
            runs, found);
     printf("   (informational: %.1f nonces hashed past the answer's chunk on average, 4 host warps)\n",
            found ? past_answer / found : 0.0);
