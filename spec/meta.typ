@@ -36,7 +36,8 @@
       ("mul", [`MUL` chip], <mul>),
       ("dvrm", [`DVRM` chip], <dvrm>),
       ("bitwise", [`BITWISE` chips], <bitwise>),
-      ("bytewise", [`BYTEWISE` chip], <bytewise>)
+      ("bytewise", [`BYTEWISE` chip], <bytewise>),
+      ("is_wh", [`IS_WH`], <is-wh>),
     )),
     ("MEMORY", (
       ("memw", [`MEMW` chip], <memw>),
@@ -45,7 +46,6 @@
     )),
     ("ECALLS", (
       ("about_ecalls", [About `ECALL`], <ecall>),
-      ("is_b48", [`IS_B48`], <is-b48>),
       ("halt", [`HALT` chip], <halt>),
       ("commit", [`COMMIT` chip], <commit>),
       ("sha256", [`SHA256` accelerator], <sha256>),

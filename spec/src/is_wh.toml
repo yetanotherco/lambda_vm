@@ -1,9 +1,9 @@
-name = "IS_B48"
+name = "IS_WH"
 
 [[variables.input]]
 name = "value"
 type = ["Half", 3]
-desc = "`B48` being range checked"
+desc = "`Word`-`Half` pair being range checked"
 pad = 0
 
 [[variables.multiplicity]]
@@ -21,11 +21,11 @@ tag = "IS_HALF"
 input = [["idx", "value", "i"]]
 iter = ["i", 0, 2]
 multiplicity = "μ"
-ref = "b48:c:range_value"
+ref = "is_wh:c:range_value"
 
 [[constraints.all]]
 kind = "interaction"
-tag = "IS_B48"
+tag = "IS_WH"
 input = [["+", ["idx", "value", 1], ["*", ["^", 2, 16], ["idx", "value", 2]]], ["idx", "value", 0]]
 multiplicity = ["-", "μ"]
-ref = "b48:c:b48"
+ref = "is_wh:c:is_wh"

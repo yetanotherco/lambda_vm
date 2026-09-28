@@ -274,7 +274,7 @@ ref = "ec:c:range_addr_xG_lo"
 
 [[constraints.read_xG]]
 kind = "interaction"
-tag = "IS_B48"
+tag = "IS_WH"
 input = [["idx", ["idx", "addr_xG", "i"], 2], ["idx", ["idx", "addr_xG", "i"], 1]]
 iters = [["i", 0, 3]]
 multiplicity = "μ"
@@ -503,7 +503,7 @@ ref = "ec:c:range_addr_k_lo"
 
 [[constraints.verify_k]]
 kind = "interaction"
-tag = "IS_B48"
+tag = "IS_WH"
 input = [["idx", ["idx", "addr_k", "i"], 2], ["idx", ["idx", "addr_k", "i"], 1]]
 iters = [["i", 0, 3]]
 multiplicity = "μ"
@@ -672,7 +672,7 @@ ref = "ec:c:range_addr_xR_lo"
 
 [[constraints.write_xR]]
 kind = "interaction"
-tag = "IS_B48"
+tag = "IS_WH"
 input = [["idx", ["idx", "addr_xR", "i"], 2], ["idx", ["idx", "addr_xR", "i"], 1]]
 iters = [["i", 0, 3]]
 multiplicity = "μ"

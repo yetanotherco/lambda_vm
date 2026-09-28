@@ -104,7 +104,7 @@ Lastly, the round chip contributes the following interactions to the lookup:
 == Notes/potential optimizations
 - one does not have to range check `state_ptr[0][0]` since it is read from memory.
   Moreover, it could be represented as a `DWordWL`. 
-  This would save one column, one `IS_HALF` check and one `IS_B48` check.
+  This would save one column, one `IS_HALF` check and one `IS_WH` check.
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
 - when the output of `HWSL` are `Byte`s mapped as `Half`s, we find that out of every four output bytes, at least one is zero. 
   Since `rnc` is constant, @keccak:c:rho_rotation makes those zero-bytes show up in `rot_left` and `rot_right` at constant locations.

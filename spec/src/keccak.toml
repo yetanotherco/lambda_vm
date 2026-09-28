@@ -76,7 +76,7 @@ ref = "keccak:c:range_state_ptr_lo"
 
 [[constraints.mem]]
 kind = "interaction"
-tag = "IS_B48"
+tag = "IS_WH"
 input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 2], ["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 1]]
 iters = [["x", 0, 4], ["y", 0, 4]]
 multiplicity = "μ"
