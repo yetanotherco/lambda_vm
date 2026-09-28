@@ -169,10 +169,21 @@ const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
 fn gpu_device_only_threshold() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD")
+        let set = std::env::var("LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_DEVICE_ONLY_MIN_LDE)
+            .and_then(|s| s.parse().ok());
+        let threshold = set.unwrap_or(DEFAULT_DEVICE_ONLY_MIN_LDE);
+        // Named once: the envelope decides which tables download their LDEs,
+        // so a log has to say which one its run had.
+        eprintln!(
+            "[gpu] device-only envelope: LDE >= {threshold} rows ({})",
+            if set.is_some() {
+                "LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD"
+            } else {
+                "the default"
+            }
+        );
+        threshold
     })
 }
 
