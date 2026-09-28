@@ -407,6 +407,24 @@ impl<F: IsField> Table<F> {
         return (0..self.width).map(column).collect();
     }
 
+    /// [`Self::columns`] on the calling thread: the same columns, in the same
+    /// order, built by the same per-column read.
+    ///
+    /// For tables a few rows high, such as a proof's out-of-domain evaluations,
+    /// where the rayon pool costs more than the transpose. From a thread that
+    /// is not a rayon worker, a parallel iterator is injected into the global
+    /// pool and the caller blocks until a worker takes it, however busy the
+    /// pool is with other work.
+    pub fn columns_serial(&self) -> Vec<Vec<FieldElement<F>>> {
+        (0..self.width)
+            .map(|col_idx| {
+                (0..self.height)
+                    .map(|row_idx| self.get(row_idx, col_idx).clone())
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Extract columns as owned vectors, with each allocated at `capacity`.
     ///
     /// `capacity` is a hint sized for downstream LDE expansion so the FFT grows
