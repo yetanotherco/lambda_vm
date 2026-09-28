@@ -25,6 +25,7 @@ pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
 pub mod rpx;
+pub mod rpx_paths;
 pub mod sumcheck;
 pub mod whir;
 pub mod whir_open;

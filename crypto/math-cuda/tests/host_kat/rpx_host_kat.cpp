@@ -1208,6 +1208,116 @@ void grind_kernel_finds_the_nonce_the_host_predicate_accepts() {
            NUM_RPX_GRIND_VECTORS);
 }
 
+// ---------------------------------------------------------------------------
+// Layer 9 — the limb multiply and every permutation variant.
+//
+// `mul_limb` / `sqr_limb` return a word congruent to the product and below
+// 2^64, not `goldilocks::mul`'s word, so they are checked against the
+// schoolbook value after canonicalising. The permutation variants must then
+// reproduce the oracle table RAW, which is the property the kernels rely on:
+// intermediates may differ in representation, the canonical output may not.
+// On the host the limb primitives run their portable-C twin of the device PTX;
+// the PTX itself is pinned on the GPU (`rpx_limb_probe`).
+// ---------------------------------------------------------------------------
+void limb_primitives_match_schoolbook_arithmetic() {
+    int checked = 0;
+    for (int i = 0; i < NUM_EDGES; ++i) {
+        for (int j = 0; j < NUM_EDGES; ++j) {
+            const uint64_t a = EDGES[i], b = EDGES[j];
+            check(canon(rpx::mul_limb(a, b)) == ref_mul(a, b), "mul_limb at an edge");
+            ++checked;
+        }
+        check(canon(rpx::sqr_limb(EDGES[i])) == ref_mul(EDGES[i], EDGES[i]), "sqr_limb at an edge");
+    }
+    // Operands that drive the fold through each carry case: a carry out of
+    // step 1, a borrow from t3 in step 2, and both.
+    const uint64_t forced[][2] = {
+        {~0ull, ~0ull},
+        {P - 1, P - 1},
+        {0xFFFFFFFF00000000ull, ~0ull},
+        {0x00000000FFFFFFFFull, ~0ull},
+        {1ull << 63, 1ull << 63},
+        {(1ull << 63) + 1, ~0ull - 1},
+        {0xFFFFFFFF00000001ull, 0xFFFFFFFF00000001ull},
+    };
+    for (const auto &f : forced) {
+        check(canon(rpx::mul_limb(f[0], f[1])) == ref_mul(f[0], f[1]), "mul_limb at a forced carry");
+        check(canon(rpx::sqr_limb(f[0])) == ref_mul(f[0], f[0]), "sqr_limb at a forced carry");
+        ++checked;
+    }
+    uint64_t seed = 0x11B;
+    for (int k = 0; k < 200000; ++k) {
+        const uint64_t a = splitmix(seed), b = splitmix(seed);
+        if (canon(rpx::mul_limb(a, b)) != ref_mul(a, b) || canon(rpx::sqr_limb(a)) != ref_mul(a, a)) {
+            printf("FAIL limb primitive at a = %llu, b = %llu\n", (unsigned long long)a,
+                   (unsigned long long)b);
+            ++failures;
+            break;
+        }
+        ++checked;
+    }
+    printf("limb mul/sqr vs schoolbook __int128: %d cases (edges, forced carries, 200k raw words)\n",
+           checked);
+}
+
+template <int V>
+bool variant_reproduces_the_oracle_table() {
+    bool ok = true;
+    for (int n = 0; n < NUM_RPX_PERMUTATION_VECTORS; ++n) {
+        uint64_t s[12];
+        for (int i = 0; i < 12; ++i) s[i] = RPX_PERMUTATION_VECTORS[n].input[i];
+        rpx::permute_v<V>(s);
+        for (int i = 0; i < 12; ++i) ok = ok && s[i] == RPX_PERMUTATION_VECTORS[n].output[i];
+    }
+    return ok;
+}
+
+// The chained probe replayed thread by thread: `k` permutations per state at
+// variant V must equal `k` applications of the shipped permutation, raw.
+template <typename Kernel>
+bool chain_probe_matches_the_shipped_permutation(Kernel kernel, uint64_t k) {
+    const unsigned n = 24;
+    std::vector<uint64_t> in(n * 12), out(n * 12, 0);
+    uint64_t seed = 0xC4A1;
+    for (unsigned t = 0; t < n * 12; ++t) in[t] = sample(seed, t);
+    CUDA_HOST_FOR_EACH_THREAD(t, n) { kernel(in.data(), (uint64_t)n, k, out.data()); }
+    for (unsigned t = 0; t < n; ++t) {
+        uint64_t s[12];
+        for (int i = 0; i < 12; ++i) s[i] = in[t * 12 + i];
+        for (uint64_t j = 0; j < k; ++j) rpx::permute_v<0>(s);
+        for (int i = 0; i < 12; ++i) {
+            if (out[t * 12 + i] != s[i]) return false;
+        }
+    }
+    return true;
+}
+
+void every_permutation_variant_reproduces_the_oracle() {
+    check(variant_reproduces_the_oracle_table<0>(), "variant 0 must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<1>(), "variant 1 (limb mul) must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<3>(), "variant 3 (limb mul+sqr) must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<4>(), "variant 4 (unrolled sqn) must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<5>(), "variant 5 must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<7>(), "variant 7 must reproduce the oracle table raw");
+    check(variant_reproduces_the_oracle_table<9>(), "variant 9 (limb mul, lanes unrolled) must reproduce the oracle table raw");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v0, 3), "chain probe v0");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v1, 3), "chain probe v1");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v3, 3), "chain probe v3");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v4, 3), "chain probe v4");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v5, 3), "chain probe v5");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v7, 3), "chain probe v7");
+    check(chain_probe_matches_the_shipped_permutation(rpx_permute_chain_probe_v9, 3), "chain probe v9");
+    // A control that can fail: a chain of 2 is not a chain of 3.
+    const unsigned n = 4;
+    std::vector<uint64_t> in(n * 12, 5), out(n * 12, 0);
+    CUDA_HOST_FOR_EACH_THREAD(t, n) { rpx_permute_chain_probe_v1(in.data(), (uint64_t)n, 2, out.data()); }
+    uint64_t s[12];
+    for (int i = 0; i < 12; ++i) s[i] = 5;
+    for (int j = 0; j < 3; ++j) rpx::permute_v<0>(s);
+    check(memcmp(out.data(), s, sizeof(s)) != 0, "the chain-probe comparison must be able to fail");
+    printf("permutation variants 0/1/3/4/5/7/9: oracle table raw + chain probes (k=3) + a failing control\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1241,6 +1351,9 @@ int main() {
     permute_probe_matches_the_oracle_table();
     printf("\n-- layer 8: the proof-of-work grind kernel against the host predicate --\n");
     grind_kernel_finds_the_nonce_the_host_predicate_accepts();
+    printf("\n-- layer 9: limb arithmetic and the permutation variants --\n");
+    limb_primitives_match_schoolbook_arithmetic();
+    every_permutation_variant_reproduces_the_oracle();
     if (failures != 0) {
         printf("\n*** %d FAILURE(S) ***\n", failures);
         return 1;

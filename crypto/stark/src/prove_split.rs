@@ -146,9 +146,25 @@ pub static R4_GRIND: Slot = Slot::new();
 /// Round 4: query sampling, the FRI query phase and the DEEP openings.
 pub static R4_QUERIES: Slot = Slot::new();
 
-/// `gpu_lde::GPU_GRIND_CALLS` as of the last report, so each line carries the
-/// device grinds of ITS OWN call rather than the process total.
+/// [`device_grinds_now`] as of the last report, so each line carries the device
+/// grinds of ITS OWN call rather than the process total.
 static GRIND_GPU_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Device grinds so far on EITHER arm — the process total a line takes its
+/// `on device` delta of.
+///
+/// ⛔ It read the keccak arm's counter alone, which an RPX configuration never
+/// moves: RPX device grinds count in `gpu_grind_calls_rpx`. So under RPX every
+/// line read `0/airs on device` while every table ground on the card — the
+/// WHIR block's root printed `0/11` beside the harness's own count of 11 RPX
+/// device grinds (job 160). `prover/tests/rpx_grind_device.rs` reads this
+/// around one RPX device grind.
+pub fn device_grinds_now() -> u64 {
+    #[cfg(feature = "cuda")]
+    return crate::gpu_lde::gpu_grind_calls() + crate::gpu_lde::gpu_grind_calls_rpx();
+    #[cfg(not(feature = "cuda"))]
+    return 0;
+}
 
 /// This call's share of a monotone process-wide counter: read the previous mark
 /// and replace it in ONE swap, then subtract.
@@ -234,19 +250,15 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
     let r4_deep_fri = R4_DEEP_FRI.take();
     let r4_grind = R4_GRIND.take();
     let r4_queries = R4_QUERIES.take();
-    // ★ THE GRIND'S ARM, COUNTED RATHER THAN INFERRED. `GPU_GRIND_CALLS` counts
-    // one per table whose round-4 nonce search ran on device AND passed the host
-    // validity check — a device miss falls back to the CPU search and is NOT
-    // counted. So `n/airs on device` reading n = airs is the device arm firing
-    // on every table, and anything less names exactly how many fell back.
-    // ONE path, so the helper and its mark are live on every build: a non-cuda
-    // build simply never grinds on device, and `0/airs` is the true reading
-    // there rather than a cfg-ed-out field.
-    #[cfg(feature = "cuda")]
-    let grind_now = crate::gpu_lde::gpu_grind_calls();
-    #[cfg(not(feature = "cuda"))]
-    let grind_now = 0u64;
-    let grind_gpu = grind_delta(&GRIND_GPU_SEEN, grind_now);
+    // ★ THE GRIND'S ARM, COUNTED RATHER THAN INFERRED. The two device counters
+    // count one per table whose round-4 nonce search ran on device AND passed
+    // the host validity check — a device miss falls back to the CPU search and
+    // is NOT counted. So `n/airs on device` reading n = airs is the device arm
+    // firing on every table, and anything less names exactly how many fell
+    // back. ONE path, so the helper and its mark are live on every build: a
+    // non-cuda build simply never grinds on device, and `0/airs` is the true
+    // reading there rather than a cfg-ed-out field.
+    let grind_gpu = grind_delta(&GRIND_GPU_SEEN, device_grinds_now());
 
     let table_sum = aux_build
         + aux_commit

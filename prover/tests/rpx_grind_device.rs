@@ -46,6 +46,24 @@ fn seed_of(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
+/// Every test here resets and then reads the PROCESS-GLOBAL grind counters,
+/// and libtest runs tests on parallel threads by default. Unserialised, one
+/// test's grind or reset lands between another's reset and read: the keccak
+/// test's grind is counted under the RPX test, or a reset shrinks the counter
+/// test's three grinds to one — failures of the harness, with the dispatch
+/// correct. The Makefile runs its GPU counter suites with `--test-threads=1`
+/// for the same reason; this lock makes the file correct under the default
+/// too. Each test takes it for its whole body.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    // A test that failed while holding the lock poisons it. The next test
+    // resets the counters before reading them, so the poison carries nothing.
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// ★★ An RPX grind runs on the RPX kernel, and the nonce it returns is one the
 /// host accepts.
 ///
@@ -54,6 +72,7 @@ fn seed_of(byte: u8) -> [u8; 32] {
 /// which is the whole point.
 #[test]
 fn an_rpx_grind_runs_on_the_rpx_kernel() {
+    let _serial = serial();
     let seed = seed_of(0xA7);
     reset_gpu_grind_calls();
 
@@ -84,6 +103,7 @@ fn an_rpx_grind_runs_on_the_rpx_kernel() {
 /// dispatch rather than replacing one.
 #[test]
 fn a_keccak_grind_still_runs_on_the_keccak_kernel() {
+    let _serial = serial();
     let seed = seed_of(0x5C);
     reset_gpu_grind_calls();
 
@@ -115,6 +135,7 @@ fn a_keccak_grind_still_runs_on_the_keccak_kernel() {
 /// kernel ran, this says it computed the right hash.
 #[test]
 fn the_device_reproduces_the_oracle_grind_vectors() {
+    let _serial = serial();
     for (byte, factor, want) in [(90u8, 12u8, 1342u64), (17, 13, 300), (32, 14, 705)] {
         let seed = seed_of(byte);
         reset_gpu_grind_calls();
@@ -139,6 +160,7 @@ fn the_device_reproduces_the_oracle_grind_vectors() {
 /// counter and the search to agree about whether a device was used.
 #[test]
 fn a_device_grind_is_exactly_what_the_counter_reports() {
+    let _serial = serial();
     let seed = seed_of(0x11);
     reset_gpu_grind_calls();
     assert_eq!(gpu_grind_calls_rpx(), 0, "reset must zero the counter");
@@ -154,5 +176,30 @@ fn a_device_grind_is_exactly_what_the_counter_reports() {
         gpu_grind_calls_rpx(),
         n,
         "the counter must be one per successful device grind, not a flag"
+    );
+}
+
+/// ★ The prove split's `n/airs on device` counts RPX device grinds.
+///
+/// Each `PROVE SPLIT` line takes its device grinds as a delta of
+/// `stark::prove_split::device_grinds_now`. That read the keccak counter alone,
+/// so under RPX every line said `0/airs on device` while every table ground on
+/// the card. This reads the same function around one RPX device grind; the
+/// keccak-only count reads 0 here and fails.
+#[test]
+fn the_prove_split_counts_an_rpx_device_grind() {
+    let _serial = serial();
+    let seed = seed_of(0x3D);
+    reset_gpu_grind_calls();
+    let before = stark::prove_split::device_grinds_now();
+
+    let nonce = generate_nonce_maybe_gpu::<Rpx>(&seed, FACTOR).expect("a nonce exists");
+
+    assert!(is_valid_nonce::<Rpx>(&seed, nonce, FACTOR));
+    assert_eq!(gpu_grind_calls_rpx(), 1, "the grind ran on the RPX kernel");
+    assert_eq!(
+        stark::prove_split::device_grinds_now() - before,
+        1,
+        "the prove split must count the RPX device grind"
     );
 }
