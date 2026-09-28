@@ -1,10 +1,12 @@
 use super::field::element::FieldElement;
-use crate::fft::bit_reversing::in_place_bit_reverse_permute;
+use crate::fft::bit_reversing::{bit_reverse_rows_into, in_place_bit_reverse_permute};
 use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt};
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
-use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
+use crate::fft::two_half_fft::{
+    TwoHalfTwiddles, fft_batch_two_half, fft_batch_two_half_bit_reversed, fft_batch_two_half_expand,
+};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -518,8 +520,8 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///   1. batched iFFT (DIT) over rows[..n]
     ///   2. scale rows[..n] by coset weights (one weight per row, applied to
     ///      all M elements of that row)
-    ///   3. zero-pad rows to `n * blowup_factor`
-    ///   4. batched forward FFT (DIF)
+    ///   3. batched forward FFT of rows[..n] zero-padded to `n * blowup_factor`
+    ///      rows, without materializing (or permuting) the zero padding
     ///
     /// `weights` must be `n` base-field elements in natural row order.
     /// `inv_twiddles` are the size-`n` inverse two-half twiddles; `fwd_twiddles`
@@ -538,27 +540,61 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         if num_cols == 0 || buffer.is_empty() {
             return Ok(());
         }
-        let total = buffer.len();
-        if !total.is_multiple_of(num_cols) {
-            return Err(FFTError::InputError(total));
-        }
-        let n = total / num_cols;
-        if !n.is_power_of_two() {
-            return Err(FFTError::InputError(n));
-        }
-        let lde_n = n * blowup_factor;
-        if (lde_n.trailing_zeros() as u64) > F::TWO_ADICITY {
-            return Err(FFTError::DomainSizeError(lde_n.trailing_zeros() as usize));
-        }
-        if weights.len() < n {
-            return Err(FFTError::InputError(weights.len()));
-        }
+        let n = row_major_lde_rows::<F>(buffer.len(), num_cols, blowup_factor, weights)?;
 
         // 1. iFFT on rows[..n] (cache-blocked two-half; natural→natural, no 1/n
         //    — the 1/n is folded into the coset-weight pass below). Replaces the
         //    flat-Bowers iFFT, which cache-thrashes at large n.
+        fft_batch_two_half::<F, E>(&mut buffer[..n * num_cols], num_cols, inv_twiddles)?;
+
+        Self::scale_and_expand_row_major(buffer, num_cols, n * blowup_factor, weights, fwd_twiddles)
+    }
+
+    /// [`coset_lde_full_expand_row_major`] reading the `n * num_cols` row-major
+    /// input from `src` and returning the expansion in a new `Vec` (allocated
+    /// once at the full LDE size). Same output; instead of copying `src` into
+    /// the buffer and bit-reversing it in place (the iFFT's first step), its
+    /// rows are written into the buffer already bit-reversed.
+    pub fn coset_lde_full_expand_row_major_from<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        src: &[FieldElement<E>],
+        num_cols: usize,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        if num_cols == 0 || src.is_empty() {
+            return Ok(src.to_vec());
+        }
+        let n = row_major_lde_rows::<F>(src.len(), num_cols, blowup_factor, weights)?;
+        let lde_n = n * blowup_factor;
+
+        let mut buffer = Vec::with_capacity(lde_n * num_cols);
+        bit_reverse_rows_into(src, &mut buffer, num_cols);
+        fft_batch_two_half_bit_reversed::<F, E>(&mut buffer, num_cols, inv_twiddles)?;
+
+        Self::scale_and_expand_row_major(&mut buffer, num_cols, lde_n, weights, fwd_twiddles)?;
+        Ok(buffer)
+    }
+
+    /// Steps 2–3 of [`coset_lde_full_expand_row_major`]: scale the `n` iFFT'd
+    /// rows by the coset weights, then the zero-padded forward FFT to `lde_n`
+    /// rows (growing `buffer`).
+    fn scale_and_expand_row_major<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        num_cols: usize,
+        lde_n: usize,
+        weights: &[FieldElement<F>],
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = buffer.len() / num_cols;
         let prefix_len = n * num_cols;
-        fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
 
         // 2. Scale by coset weights — one weight per row, multiply M elements
         //    of that row by it. Each row is independent → parallelizable.
@@ -586,15 +622,36 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             }
         }
 
-        // 3. Zero-pad rows to lde_n.
-        buffer.resize(lde_n * num_cols, FieldElement::zero());
-
-        // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
-        //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
-        fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
-
-        Ok(())
+        // 3. Forward FFT of the zero-padded rows (cache-blocked two-half;
+        //    natural-order output). The padding is loaded as zeros inside the
+        //    FFT's first half instead of being written and bit-reversed.
+        fft_batch_two_half_expand::<F, E>(buffer, num_cols, lde_n, fwd_twiddles)
     }
+}
+
+/// Shape checks shared by the row-major coset LDE entry points: returns the
+/// row count `n` of a `total`-element, `num_cols`-wide row-major input.
+fn row_major_lde_rows<F: IsFFTField>(
+    total: usize,
+    num_cols: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Result<usize, FFTError> {
+    if !total.is_multiple_of(num_cols) {
+        return Err(FFTError::InputError(total));
+    }
+    let n = total / num_cols;
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let lde_n = n * blowup_factor;
+    if (lde_n.trailing_zeros() as u64) > F::TWO_ADICITY {
+        return Err(FFTError::DomainSizeError(lde_n.trailing_zeros() as usize));
+    }
+    if weights.len() < n {
+        return Err(FFTError::InputError(weights.len()));
+    }
+    Ok(n)
 }
 
 fn evaluate_fft_cpu_raw<F, E>(

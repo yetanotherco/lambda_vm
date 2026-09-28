@@ -108,3 +108,51 @@ pub(crate) fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(
         }
     }
 }
+
+/// Out-of-place row-major bit-reverse: appends the rows of `src` (`n` rows of
+/// `num_cols` elements, `n` a power of two) to the EMPTY `dst` in bit-reversed
+/// order — `dst` row `i` = `src` row `reverse_index(i, n)`. One read and one
+/// write per element, where copying `src` in and then running
+/// [`in_place_bit_reverse_permute_row_major`] costs a full extra pass. `dst`
+/// keeps (and grows to at least) the capacity it was given.
+#[cfg(feature = "alloc")]
+pub(crate) fn bit_reverse_rows_into<E: Clone + Send + Sync>(
+    src: &[E],
+    dst: &mut alloc::vec::Vec<E>,
+    num_cols: usize,
+) {
+    assert!(dst.is_empty(), "dst must start empty");
+    if num_cols == 0 || src.is_empty() {
+        return;
+    }
+    assert!(
+        src.len().is_multiple_of(num_cols),
+        "src.len() must be a multiple of num_cols"
+    );
+    let n = src.len() / num_cols;
+    assert!(n.is_power_of_two(), "row count must be a power of two");
+    dst.reserve(src.len());
+    let rows = &mut dst.spare_capacity_mut()[..src.len()];
+    let copy_row = |(i, row): (usize, &mut [core::mem::MaybeUninit<E>])| {
+        let j = reverse_index(i, n as u64) * num_cols;
+        for (d, s) in row.iter_mut().zip(&src[j..j + num_cols]) {
+            d.write(s.clone());
+        }
+    };
+    #[cfg(feature = "parallel")]
+    if n >= 2048 {
+        rows.par_chunks_exact_mut(num_cols)
+            .enumerate()
+            .for_each(copy_row);
+    } else {
+        rows.chunks_exact_mut(num_cols)
+            .enumerate()
+            .for_each(copy_row);
+    }
+    #[cfg(not(feature = "parallel"))]
+    rows.chunks_exact_mut(num_cols)
+        .enumerate()
+        .for_each(copy_row);
+    // SAFETY: every one of the first `src.len()` spare slots was written above.
+    unsafe { dst.set_len(src.len()) };
+}

@@ -1279,32 +1279,32 @@ pub trait IsStarkProver<
             // GPU split path declined (size threshold / tower) → CPU path below.
         }
 
-        // CPU path: the trace `Table` is already row-major, so copy it directly
-        // (one memcpy — no transpose) and expand in place with the cache-blocked
-        // batched two-half FFT. Row-major end-to-end: no LDE-size transpose,
-        // contiguous Merkle leaves.
+        // CPU path: the trace `Table` is already row-major, so it is read
+        // straight into the LDE buffer (bit-reversed on the way in — no copy,
+        // no transpose) and expanded with the cache-blocked batched two-half
+        // FFT. Row-major end-to-end: no LDE-size transpose, contiguous Merkle
+        // leaves.
         let (trace_data, total_cols) = trace.main_data_row_major();
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
 
-        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
-        main_data.extend_from_slice(trace_data);
+        let main_data =
+            Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major_from::<Field>(
+                trace_data,
+                total_cols,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.two_half_inv,
+                &twiddles.two_half_fwd,
+            )
+            .expect("row-major coset LDE expansion");
+        debug_assert_eq!(main_data.len(), lde_size * total_cols);
 
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             trace.main_table.advise_drop_cache();
         }
-
-        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
-            &mut main_data,
-            total_cols,
-            domain.blowup_factor,
-            &twiddles.coset_weights,
-            &twiddles.two_half_inv,
-            &twiddles.two_half_fwd,
-        )
-        .expect("row-major coset LDE expansion");
 
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
@@ -3808,25 +3808,17 @@ pub trait IsStarkProver<
                             }
                         }
 
-                        // CPU path: copy the already-row-major aux trace directly
-                        // (one memcpy — no transpose) and expand with the
+                        // CPU path: read the already-row-major aux trace
+                        // straight into the LDE buffer (bit-reversed on the
+                        // way in — no copy, no transpose) and expand with the
                         // cache-blocked batched two-half FFT.
                         let (trace_data, total_cols) = trace.aux_data_row_major();
 
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
 
-                        let mut aux_data: Vec<FieldElement<FieldExtension>> =
-                            Vec::with_capacity(lde_size * total_cols);
-                        aux_data.extend_from_slice(trace_data);
-
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            trace.aux_table.advise_drop_cache();
-                        }
-
-                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
-                            &mut aux_data,
+                        let aux_data = Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major_from::<Field>(
+                            trace_data,
                             total_cols,
                             domain.blowup_factor,
                             &twiddles.coset_weights,
@@ -3834,6 +3826,12 @@ pub trait IsStarkProver<
                             &twiddles.two_half_fwd,
                         )
                         .expect("row-major aux coset LDE expansion");
+                        debug_assert_eq!(aux_data.len(), lde_size * total_cols);
+
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            trace.aux_table.advise_drop_cache();
+                        }
 
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
