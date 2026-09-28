@@ -549,7 +549,9 @@ pub fn build_artifacts_sectioned<G>(
 ) -> (LfmArtifacts, SectionSplit) {
     let plan = BuildPlan::new(program, options);
     let t = std::time::Instant::now();
-    let host = plan.walk(options, Pass::Host);
+    // A host phase, so under `LAMBDA_VM_GAP_PREP_NICE` it yields the CPU to
+    // whichever proof holds the card.
+    let host = super::card_schedule::host_phase(|| plan.walk(options, Pass::Host));
     let mut split = SectionSplit {
         host_commits: host.made(),
         host_secs: t.elapsed().as_secs_f64(),

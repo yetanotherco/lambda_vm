@@ -1915,6 +1915,120 @@ fn cached_stage(
     }
 }
 
+/// `LAMBDA_VM_GAP_PREP_AHEAD`: build a proof's artifacts on a helper thread
+/// while this thread executes and fills it, then prove. Returns the artifacts,
+/// the proof, and the seconds of each: the build's on its own thread, and the
+/// whole prove on this one — execute, fill, the wait for the build, and
+/// `multi_prove`.
+///
+/// # Why the order can change
+///
+/// Nothing before `multi_prove` reads the artifacts: `lfm_prepare` takes the
+/// program, the arenas and the hasher. So a wrap no longer walks the host for
+/// its execute and fill AFTER its build has waited for the card and held it;
+/// the two run side by side and the wrap reaches `multi_prove` sooner.
+///
+/// # What it costs, and what it does not
+///
+/// - ⚠ HOST MEMORY: the traces now exist while the build may still be queued
+///   for the card, where before a queued build had not filled any. A level's
+///   peak can step by a wrap's traces.
+/// - The card: nothing. The build takes the permit on its own thread and the
+///   prove takes it after joining the build, so the two device phases of one
+///   proof are still ordered, and the permit still admits one holder.
+/// - The bytes: the artifacts are the same function of the program, and the
+///   traces of the same execution.
+///
+/// ⛔ Not for a `Load` arm: it proves nothing, so `cached_stage` never runs the
+/// closure that joins the build.
+fn build_beside_prepare(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+    mode: CacheMode,
+    path: Option<std::path::PathBuf>,
+    label: &str,
+) -> (
+    super::registry::LfmArtifacts,
+    super::proof::LfmProof,
+    f64,
+    f64,
+) {
+    assert_ne!(
+        mode,
+        CacheMode::Load,
+        "{label}: a load arm proves nothing, so it cannot build beside a prove"
+    );
+    let built: std::sync::Mutex<Option<(super::registry::LfmArtifacts, f64)>> =
+        std::sync::Mutex::new(None);
+    let t = std::time::Instant::now();
+    let proved = std::thread::scope(|s| {
+        let build = s.spawn(|| {
+            // This thread builds for the level: an un-enrolled build is not counted.
+            let _enrolled = super::program_census::enrol();
+            let t = std::time::Instant::now();
+            let artifacts = super::program_census::build_artifacts_counted(
+                program,
+                opts,
+                crate::hash_pin::BLOCK_HASHER,
+            );
+            (artifacts, t.elapsed().as_secs_f64())
+        });
+        cached_stage(mode, path, label, || {
+            let prepared =
+                super::proof::lfm_prepare(program, arenas, crate::hash_pin::BLOCK_HASHER)
+                    .expect("the epoch wrap must execute");
+            let (artifacts, t_artifacts) = build
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            let proved = super::proof::lfm_prove_prepared(&artifacts, prepared, opts)
+                .expect("the epoch wrap must prove");
+            *built.lock().expect("the build slot is never poisoned") =
+                Some((artifacts, t_artifacts));
+            proved
+        })
+    });
+    let t_prove = t.elapsed().as_secs_f64();
+    let (artifacts, t_artifacts) = built
+        .into_inner()
+        .expect("the build slot is never poisoned")
+        .expect("every mode but Load runs the prove, and the prove joins the build");
+    (artifacts, proved, t_artifacts, t_prove)
+}
+
+/// ★ AHEAD at the driver: [`build_beside_prepare`] hands back the artifacts a
+/// plain build makes and a proof that verifies against them — the build on its
+/// helper thread and the prove on this one are the plain order's two calls.
+///
+/// ⚠ A PROVE: box-scale (every LFM proof carries the fixed 2^20-row BITWISE).
+#[test]
+fn building_beside_the_prepare_is_a_build_then_a_prove() {
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+    let program = super::programs::trivial_program();
+    let arenas: Vec<Vec<LfmWord>> = vec![
+        (0..4u64)
+            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
+            .collect(),
+    ];
+    let plain = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
+    let (artifacts, proved, _, _) =
+        build_beside_prepare(&program, &arenas, &opts, CacheMode::Off, None, "beside");
+    assert_eq!(artifacts, plain, "the helper thread built other artifacts");
+    assert!(
+        super::proof::verify_against_artifacts(
+            &artifacts,
+            &proved.proof,
+            &proved.public_words,
+            &opts
+        ),
+        "the proof made beside the build must verify against it"
+    );
+}
+
 /// [`cached_stage`] for the base continuation, which is not an `LfmProof`.
 ///
 /// ★ The pair of numbers a bundle cache buys is the measurement, not a
@@ -4958,7 +5072,7 @@ fn prove_global_child(
     // ⚠ But the global wrap PROOF is new work: `the_global_verifier_leg_runs_and_
     // rejects_tampers` only EXECUTES this program, it has never proved it.
     let t = Instant::now();
-    let g = real_global(elf_bytes, bundle, inner);
+    let g = super::card_schedule::host_phase(|| real_global(elf_bytes, bundle, inner));
 
     // ★★ THE GO/NO-GO ON SLICING, and it proves NOTHING so it cannot abort.
     //
@@ -5165,7 +5279,7 @@ fn prove_global_child(
         // ⚠ AT k = 1 THIS *IS* `global_verifier_program`, which is defined as
         // exactly this call — so the default path emits the program it always
         // emitted rather than a second spelling of it.
-        let program = global_slice_program(&g, &partition, i);
+        let program = super::card_schedule::host_phase(|| global_slice_program(&g, &partition, i));
         let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
         // ⛔ ONE CACHE NAME PER SHAPE, for the same reason there is one layout per
         // shape. The k = 1 wrap closes its bus against zero and a slice does not,
@@ -5226,13 +5340,16 @@ fn prove_global_child(
         //   make is one somebody can delete without noticing. This one is the
         //   stage's own.
         let t_verify = Instant::now();
-        assert!(
+        let verified = super::card_schedule::host_phase(|| {
             super::proof::verify_against_artifacts(
                 &artifacts,
                 &proved.proof,
                 &proved.public_words,
-                wrap_opts
-            ),
+                wrap_opts,
+            )
+        });
+        assert!(
+            verified,
             "{label}: ITS PROOF DOES NOT VERIFY. Nothing may be cached, reported \
              or handed onward from a proof production would reject"
         );
@@ -5312,14 +5429,18 @@ fn prove_global_child(
             .as_slice()
             .expect("k > 1 IS the slice shape, chosen by this same partition");
         let t_harvest = Instant::now();
-        let slices: Vec<RealChild> = global_stages
-            .into_iter()
-            .map(|(a, p)| real_child(a, wrap_opts.clone(), &p))
-            .collect();
+        let slices: Vec<RealChild> = super::card_schedule::host_phase(|| {
+            global_stages
+                .into_iter()
+                .map(|(a, p)| real_child(a, wrap_opts.clone(), &p))
+                .collect()
+        });
         let harvest_secs = t_harvest.elapsed().as_secs_f64();
         let t_emit = Instant::now();
         // ⛔ THE SAME `partition`, not a second one built from the same numbers.
-        let program = global_parent_program(&slices, &partition, slice_layout);
+        let program = super::card_schedule::host_phase(|| {
+            global_parent_program(&slices, &partition, slice_layout)
+        });
         println!(
             "   the GLOBAL PARENT: harvest {harvest_secs:.1}s · emitted in {:.1}s",
             t_emit.elapsed().as_secs_f64()
@@ -5372,13 +5493,16 @@ fn prove_global_child(
         // a call this stage merely happens to make is one somebody can delete
         // without noticing.
         let t_verify = Instant::now();
-        assert!(
+        let verified = super::card_schedule::host_phase(|| {
             super::proof::verify_against_artifacts(
                 &artifacts,
                 &proved.proof,
                 &proved.public_words,
-                wrap_opts
-            ),
+                wrap_opts,
+            )
+        });
+        assert!(
+            verified,
             "the GLOBAL PARENT's proof DOES NOT VERIFY. Nothing may be cached, \
              reported or handed onward from a proof production would reject"
         );
@@ -7137,6 +7261,9 @@ fn the_production_tree_composes_to_a_root() {
         "   ★ LEVEL-0 CONCURRENCY: {l0_siblings} wrap(s) at once \
          (LFM_TREE_SIBLINGS_L0 or LFM_TREE_K_L0; 1 = the serial control)"
     );
+    if let Some(schedule) = super::card_schedule::banner() {
+        println!("   ★ {schedule}");
+    }
     super::device_permit::arm(l0_siblings);
     let level0_sampler = HostSampler::start();
 
@@ -7168,12 +7295,9 @@ fn the_production_tree_composes_to_a_root() {
             ),
             None => {
                 let t = Instant::now();
-                let e = super::epoch_tests::real_epoch_from_constants(
-                    &inner,
-                    &epoch_konsts,
-                    &bundle,
-                    k,
-                )
+                let e = super::card_schedule::host_phase(|| {
+                    super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+                })
                 .expect("every epoch must reconstruct from proofs alone");
                 (e, t.elapsed().as_secs_f64(), None)
             }
@@ -7202,9 +7326,16 @@ fn the_production_tree_composes_to_a_root() {
             Some(done) => done,
             None => {
                 let t = Instant::now();
-                let program =
-                    super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
-                let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+                let (program, arenas) = super::card_schedule::host_phase(|| {
+                    (
+                        super::epoch_tests::epoch_program_publishing(
+                            &e,
+                            true,
+                            Publishes::Aggregation,
+                        ),
+                        super::epoch_tests::epoch_arena_words(&e, true),
+                    )
+                });
                 let t_emit = t.elapsed().as_secs_f64();
                 (
                     program,
@@ -7239,27 +7370,44 @@ fn the_production_tree_composes_to_a_root() {
         // census is outside its TIMING line, so the fields stay comparable to
         // the arm that measured them. Its cost lands in `wall` instead, and it
         // is now the one named term in that residual.
-        let (cells, instrs) = census_and_panel(&program, &format!("wrap {k}"), 1);
+        let (cells, instrs) = super::card_schedule::host_phase(|| {
+            census_and_panel(&program, &format!("wrap {k}"), 1)
+        });
         let wrap_sampler = HostSampler::start();
-        let t = Instant::now();
-        let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-        let t_artifacts = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        let proved = cached_stage(
-            stage_mode(0),
-            stage_path(cache_dir.as_deref(), &format!("wrap-{k}")),
-            &format!("wrap {k}"),
-            || {
+        let wrap_mode = stage_mode(0);
+        let wrap_path = stage_path(cache_dir.as_deref(), &format!("wrap-{k}"));
+        let wrap_label = format!("wrap {k}");
+        // `LAMBDA_VM_GAP_PREP_AHEAD`: the artifacts are built beside the execute
+        // and fill rather than before them. A load arm proves nothing, so it
+        // keeps the plain order.
+        let ahead = super::card_schedule::ahead() && wrap_mode != CacheMode::Load;
+        let (artifacts, proved, t_artifacts, t_prove) = if ahead {
+            build_beside_prepare(
+                &program,
+                &arenas,
+                &wrap_opts,
+                wrap_mode,
+                wrap_path,
+                &wrap_label,
+            )
+        } else {
+            let t = Instant::now();
+            let artifacts =
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            let t_artifacts = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let proved = cached_stage(wrap_mode, wrap_path, &wrap_label, || {
                 lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
                     .expect("the epoch wrap must prove")
-            },
-        );
-        let t_prove = t.elapsed().as_secs_f64();
+            });
+            (artifacts, proved, t_artifacts, t.elapsed().as_secs_f64())
+        };
         let layout = SchemaLayout::wrap(out_halves);
         layout.assert_covers(proved.public_words.len());
         let t = Instant::now();
-        let (child, t_verify) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+        let (child, t_verify) = super::card_schedule::host_phase(|| {
+            real_child_timed(artifacts, wrap_opts.clone(), &proved)
+        });
         let t_harvest = t.elapsed().as_secs_f64();
         let (peak, at) = wrap_sampler.stop();
         // ⓘ `wall` is printed so the five fields read as a CLOSED account:
@@ -7278,6 +7426,12 @@ fn the_production_tree_composes_to_a_root() {
                 ""
             },
         );
+        if ahead {
+            println!(
+                "   wrap {k} ⓘ AHEAD: artifacts {t_artifacts:.2}s ran beside execute + fill, \
+                 inside prove's {t_prove:.2}s"
+            );
+        }
         // ★★ THE NUMBER THE LEVEL-0 COUNT IS CHOSEN ON, and nothing measured it
         // before. The interior prints a per-node peak and that is how its
         // retention-per-node was read; level 0 printed none, so what a SECOND
