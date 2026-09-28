@@ -69,10 +69,34 @@
 // matters to the code-size probe, which asks for it explicitly.
 #if defined(__CUDACC__)
 #define RPX_NOINLINE __noinline__
+#define RPX_LAUNCH_BOUNDS(n) __launch_bounds__(n)
 #elif defined(RPX_HOST_NOINLINE)
 #define RPX_NOINLINE __attribute__((noinline))
+#define RPX_LAUNCH_BOUNDS(n)
 #else
 #define RPX_NOINLINE
+#define RPX_LAUNCH_BOUNDS(n)
+#endif
+
+// ★ RPX_PERMUTE_VARIANT — which field multiply the permutation runs, as a
+// compile-time bit set. 0 is `goldilocks::mul` for every product and square,
+// and every kernel in a cubin uses `RPX_PERMUTE_VARIANT`. build.rs compiles this
+// file twice: `rpx_v0.cubin` at 0 and `rpx_v5.cubin` at 5 (limb multiply,
+// `square_n` unrolled), the default; `LAMBDA_VM_RPX_LIMB_PERMUTE=0` loads the
+// former (math-cuda `rpx_paths`). The bits:
+//   RPX_V_LIMB_MUL     products through `mul_limb` (32-bit limbs, carry chains);
+//   RPX_V_LIMB_SQR     squarings through `sqr_limb` (three limb products);
+//   RPX_V_UNROLL_SQN   `square_n` unrolled by four;
+//   RPX_V_UNROLL_LANES the FB round's twelve lane loops unrolled.
+// ⚠ Every variant computes the same FIELD values; only the raw representation
+// of intermediates may differ, and `permute` canonicalises its output, so
+// digests, nodes and grind heads are bit-identical across variants.
+#define RPX_V_LIMB_MUL 1
+#define RPX_V_LIMB_SQR 2
+#define RPX_V_UNROLL_SQN 4
+#define RPX_V_UNROLL_LANES 8
+#ifndef RPX_PERMUTE_VARIANT
+#define RPX_PERMUTE_VARIANT 0
 #endif
 
 namespace rpx {
@@ -177,9 +201,126 @@ static OpCount g_ops = {0, 0, 0};
 #define RPX_COUNT(field) ((void)0)
 #endif
 
-__device__ __forceinline__ uint64_t fmul(uint64_t a, uint64_t b) {
+// ---------------------------------------------------------------------------
+// The 32-bit-limb multiply. The 128-bit product is built from four
+// 32×32 partial products with the carries in the add chain, then folded to
+// `[0, 2^64)` in three steps (the reduction sppark's `gl64_t` ships, Apache-2.0,
+// which pil2-stark uses): `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`.
+//
+// The result is congruent to `a·b` and below 2^64, NOT canonical, and may differ
+// in representation from `goldilocks::mul`'s — which is why only this file uses
+// it: `permute` canonicalises its output, whereas the NTT/LDE parity tests
+// compare `goldilocks::mul`'s raw words.
+//
+// Why the steps cannot wrap (inputs anywhere in `[0, 2^64)`): limbs t0..t3 of
+// the product; step 1 forms `c·2^64 + s1 = (t1:t0) + t2·(2^32 − 1)` with
+// `c ∈ {0, 1}`, and `c = 1` forces `s1 < 2^64 − 2^33 + 1`; step 2 subtracts t3
+// with the borrow going into `c`, leaving `c ∈ {−1, 0, 1}`; step 3 subtracts
+// `c·p` as ONE 64-bit subtraction: `c = 1` subtracts p (≡ adding 2^32 − 1 mod
+// 2^64, and s2 ≤ s1 < 2^64 − 2^33 + 1 leaves room), `c = −1` subtracts
+// 2^32 − 1 (s2 = s1 − t3 + 2^64 > 2^64 − 2^32 there, so no borrow).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint64_t reduce_limbs(uint32_t t0, uint32_t t1, uint32_t t2,
+                                                 uint32_t t3) {
+#if defined(__CUDA_ARCH__)
+    const uint32_t w = 0xFFFFFFFFu;
+    // Step 1: (t1:t0) += t2·(2^32 − 1); the carry out replaces t2.
+    asm("mad.lo.cc.u32 %0, %2, %3, %0; madc.hi.cc.u32 %1, %2, %3, %1; addc.u32 %2, 0, 0;"
+        : "+r"(t0), "+r"(t1), "+r"(t2)
+        : "r"(w));
+    // Step 2: − t3, the borrow running into t2.
+    asm("sub.cc.u32 %0, %0, %3; subc.cc.u32 %1, %1, 0; subc.u32 %2, %2, 0;"
+        : "+r"(t0), "+r"(t1), "+r"(t2)
+        : "r"(t3));
+    // Step 3: − c·p with c = t2 ∈ {0, 1, 0xFFFFFFFF}: (c, 0xFFFFFFFF) for c = 1,
+    // (0xFFFFFFFF, 0) for c = −1, nothing for c = 0.
+    const uint32_t hi_sub = (t2 == 1u) ? 0xFFFFFFFFu : 0u;
+    asm("sub.cc.u32 %0, %0, %2; subc.u32 %1, %1, %3;" : "+r"(t0), "+r"(t1) : "r"(t2), "r"(hi_sub));
+    return ((uint64_t)t1 << 32) | t0;
+#else
+    // The same three steps in portable C, for the host KAT.
+    const uint64_t s = ((uint64_t)t1 << 32) | t0;
+    const uint64_t s1 = s + (uint64_t)t2 * 0xFFFFFFFFull;
+    int c = (s1 < s) ? 1 : 0;
+    const uint64_t s2 = s1 - t3;
+    c -= (s1 < t3) ? 1 : 0;
+    if (c == 1) return s2 + 0xFFFFFFFFull;
+    if (c == -1) return s2 - 0xFFFFFFFFull;
+    return s2;
+#endif
+}
+
+__device__ __forceinline__ uint64_t mul_limb(uint64_t a, uint64_t b) {
+    const uint32_t a0 = (uint32_t)a, a1 = (uint32_t)(a >> 32);
+    const uint32_t b0 = (uint32_t)b, b1 = (uint32_t)(b >> 32);
+#if defined(__CUDA_ARCH__)
+    uint32_t t0, t1, t2, t3, c;
+    asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;" : "=r"(t0), "=r"(t1) : "r"(a0), "r"(b0));
+    asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;" : "=r"(t2), "=r"(t3) : "r"(a1), "r"(b1));
+    asm("mad.lo.cc.u32 %0, %3, %4, %0; madc.hi.cc.u32 %1, %3, %4, %1; addc.u32 %2, 0, 0;"
+        : "+r"(t1), "+r"(t2), "=r"(c)
+        : "r"(a0), "r"(b1));
+    asm("mad.lo.cc.u32 %0, %3, %4, %0; madc.hi.cc.u32 %1, %3, %4, %1; addc.u32 %2, %2, %5;"
+        : "+r"(t1), "+r"(t2), "+r"(t3)
+        : "r"(a1), "r"(b0), "r"(c));
+    return reduce_limbs(t0, t1, t2, t3);
+#else
+    const uint64_t p00 = (uint64_t)a0 * b0, p01 = (uint64_t)a0 * b1;
+    const uint64_t p10 = (uint64_t)a1 * b0, p11 = (uint64_t)a1 * b1;
+    const uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
+    const uint64_t top = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    return reduce_limbs((uint32_t)p00, (uint32_t)mid, (uint32_t)top, (uint32_t)(top >> 32));
+#endif
+}
+
+// `a²` with the cross product `a0·a1` formed once and added twice: three limb
+// products where `mul_limb` needs four, paid for in adds.
+__device__ __forceinline__ uint64_t sqr_limb(uint64_t a) {
+    const uint32_t a0 = (uint32_t)a, a1 = (uint32_t)(a >> 32);
+#if defined(__CUDA_ARCH__)
+    uint32_t t0, t1, t2, t3, x0, x1;
+    asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;" : "=r"(t0), "=r"(t1) : "r"(a0), "r"(a0));
+    asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;" : "=r"(t2), "=r"(t3) : "r"(a1), "r"(a1));
+    asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;" : "=r"(x0), "=r"(x1) : "r"(a0), "r"(a1));
+    asm("add.cc.u32 %0, %0, %3; addc.cc.u32 %1, %1, %4; addc.u32 %2, %2, 0;"
+        : "+r"(t1), "+r"(t2), "+r"(t3)
+        : "r"(x0), "r"(x1));
+    asm("add.cc.u32 %0, %0, %3; addc.cc.u32 %1, %1, %4; addc.u32 %2, %2, 0;"
+        : "+r"(t1), "+r"(t2), "+r"(t3)
+        : "r"(x0), "r"(x1));
+    return reduce_limbs(t0, t1, t2, t3);
+#else
+    const uint64_t p00 = (uint64_t)a0 * a0, x = (uint64_t)a0 * a1, p11 = (uint64_t)a1 * a1;
+    const uint64_t mid = (p00 >> 32) + 2 * (uint64_t)(uint32_t)x;
+    const uint64_t top = p11 + 2 * (x >> 32) + (mid >> 32);
+    return reduce_limbs((uint32_t)p00, (uint32_t)mid, (uint32_t)top, (uint32_t)(top >> 32));
+#endif
+}
+
+// The multiply and the square as the variant `V` spells them. Both count as
+// one multiplication for the host cost model.
+template <int V>
+__device__ __forceinline__ uint64_t fmul_v(uint64_t a, uint64_t b) {
     RPX_COUNT(mul);
-    return goldilocks::mul(a, b);
+    if constexpr ((V & RPX_V_LIMB_MUL) != 0) {
+        return mul_limb(a, b);
+    } else {
+        return goldilocks::mul(a, b);
+    }
+}
+
+template <int V>
+__device__ __forceinline__ uint64_t fsqr_v(uint64_t a) {
+    if constexpr ((V & RPX_V_LIMB_SQR) != 0) {
+        RPX_COUNT(mul);
+        return sqr_limb(a);
+    } else {
+        return fmul_v<V>(a, a);
+    }
+}
+
+__device__ __forceinline__ uint64_t fmul(uint64_t a, uint64_t b) {
+    return fmul_v<RPX_PERMUTE_VARIANT>(a, b);
 }
 
 __device__ __forceinline__ uint64_t fadd(uint64_t a, uint64_t b) {
@@ -252,26 +393,33 @@ __device__ __forceinline__ void mds(uint64_t s[STATE_FELTS]) {
 
 // `x^7` in the association the AIR's degree-3 lowering uses (rpo.rs:455-460):
 // `x², x³ = x²·x, x^7 = (x³)²·x`. Two squarings, two products.
-__device__ __forceinline__ uint64_t sbox(uint64_t x) {
-    const uint64_t x2 = fmul(x, x);
-    const uint64_t x3 = fmul(x2, x);
-    const uint64_t x6 = fmul(x3, x3);
-    return fmul(x6, x);
+template <int V>
+__device__ __forceinline__ uint64_t sbox_v(uint64_t x) {
+    const uint64_t x2 = fsqr_v<V>(x);
+    const uint64_t x3 = fmul_v<V>(x2, x);
+    const uint64_t x6 = fsqr_v<V>(x3);
+    return fmul_v<V>(x6, x);
 }
 
-template <int N>
-__device__ __forceinline__ uint64_t square_n(uint64_t x) {
+template <int V, int N>
+__device__ __forceinline__ uint64_t square_n_v(uint64_t x) {
     // Rolled: the chain is serial anyway, and unrolled it is what made one
-    // permutation ~49k lines of PTX. The unroll factor here is a tuning knob.
+    // permutation ~49k lines of PTX. The unroll factor here is a tuning knob
+    // (RPX_V_UNROLL_SQN).
+    if constexpr ((V & RPX_V_UNROLL_SQN) != 0) {
+#pragma unroll 4
+        for (int i = 0; i < N; ++i) x = fsqr_v<V>(x);
+    } else {
 #pragma unroll 1
-    for (int i = 0; i < N; ++i) x = fmul(x, x);
+        for (int i = 0; i < N; ++i) x = fsqr_v<V>(x);
+    }
     return x;
 }
 
 // `base^(2^M) · tail` — the inverse chain's one building block (rpo.rs:483-495).
-template <int M>
-__device__ __forceinline__ uint64_t exp_acc(uint64_t base, uint64_t tail) {
-    return fmul(square_n<M>(base), tail);
+template <int V, int M>
+__device__ __forceinline__ uint64_t exp_acc_v(uint64_t base, uint64_t tail) {
+    return fmul_v<V>(square_n_v<V, M>(base), tail);
 }
 
 // `x^{1/7} = x^10540996611094048183` by miden-crypto's addition chain, as
@@ -279,18 +427,36 @@ __device__ __forceinline__ uint64_t exp_acc(uint64_t base, uint64_t tail) {
 // multiplications against ~93 for square-and-multiply. Per lane rather than
 // whole-state: on a GPU the twelve lanes' independence is the compiler's to
 // interleave, and a lane-wise body keeps only six values live.
-__device__ __forceinline__ uint64_t inv_sbox(uint64_t x) {
-    const uint64_t t1 = fmul(x, x);            // x^2
-    const uint64_t t2 = fmul(t1, t1);          // x^4
-    const uint64_t t3 = exp_acc<3>(t2, t2);    // x^36
-    const uint64_t t4 = exp_acc<6>(t3, t3);    // x^(36·65)
-    const uint64_t t5 = exp_acc<12>(t4, t4);   // x^(36·65·4097)
-    const uint64_t t6 = exp_acc<6>(t5, t3);    // x^0x24924924
-    const uint64_t t7 = exp_acc<31>(t6, t6);   // x^0x1249249224924924
+template <int V>
+__device__ __forceinline__ uint64_t inv_sbox_v(uint64_t x) {
+    const uint64_t t1 = fsqr_v<V>(x);                 // x^2
+    const uint64_t t2 = fsqr_v<V>(t1);                // x^4
+    const uint64_t t3 = exp_acc_v<V, 3>(t2, t2);      // x^36
+    const uint64_t t4 = exp_acc_v<V, 6>(t3, t3);      // x^(36·65)
+    const uint64_t t5 = exp_acc_v<V, 12>(t4, t4);     // x^(36·65·4097)
+    const uint64_t t6 = exp_acc_v<V, 6>(t5, t3);      // x^0x24924924
+    const uint64_t t7 = exp_acc_v<V, 31>(t6, t6);     // x^0x1249249224924924
     // ((t7² · t6)²)² · ((t1 · t2) · x)  — rpo.rs:504-508.
-    const uint64_t a = square_n<2>(fmul(fmul(t7, t7), t6));
-    const uint64_t b = fmul(fmul(t1, t2), x);
-    return fmul(a, b);
+    const uint64_t a = square_n_v<V, 2>(fmul_v<V>(fsqr_v<V>(t7), t6));
+    const uint64_t b = fmul_v<V>(fmul_v<V>(t1, t2), x);
+    return fmul_v<V>(a, b);
+}
+
+// The names every kernel calls, at this cubin's variant (the host KAT calls these).
+__device__ __forceinline__ uint64_t sbox(uint64_t x) { return sbox_v<RPX_PERMUTE_VARIANT>(x); }
+
+template <int N>
+__device__ __forceinline__ uint64_t square_n(uint64_t x) {
+    return square_n_v<RPX_PERMUTE_VARIANT, N>(x);
+}
+
+template <int M>
+__device__ __forceinline__ uint64_t exp_acc(uint64_t base, uint64_t tail) {
+    return exp_acc_v<RPX_PERMUTE_VARIANT, M>(base, tail);
+}
+
+__device__ __forceinline__ uint64_t inv_sbox(uint64_t x) {
+    return inv_sbox_v<RPX_PERMUTE_VARIANT>(x);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,19 +504,33 @@ __device__ __forceinline__ CubicExt ext_power7(const CubicExt &a) {
 
 // FB: `MDS → +ARK1 → x^7 → MDS → +ARK2 → x^{1/7}` — RPO's round exactly
 // (rpo.rs:561-582, rpx.rs:283-295). RPX runs it at R = 0, 2, 4; RPO at 0..7.
+template <int V>
+__device__ __forceinline__ void fb_round_v(uint64_t s[STATE_FELTS], int r) {
+    mds(s);
+    if constexpr ((V & RPX_V_UNROLL_LANES) != 0) {
+#pragma unroll
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = sbox_v<V>(fadd(s[i], ARK1[r][i]));
+        mds(s);
+#pragma unroll
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = inv_sbox_v<V>(fadd(s[i], ARK2[r][i]));
+    } else {
+#pragma unroll 1
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
+#pragma unroll 1
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = sbox_v<V>(s[i]);
+        mds(s);
+#pragma unroll 1
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[r][i]);
+        // The twelve chains are independent; a GPU hides their latency with
+        // other warps, not by unrolling one thread's twelve chains into
+        // straight line.
+#pragma unroll 1
+        for (int i = 0; i < STATE_FELTS; ++i) s[i] = inv_sbox_v<V>(s[i]);
+    }
+}
+
 __device__ __forceinline__ void fb_round(uint64_t s[STATE_FELTS], int r) {
-    mds(s);
-#pragma unroll 1
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
-#pragma unroll 1
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = sbox(s[i]);
-    mds(s);
-#pragma unroll 1
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[r][i]);
-    // The twelve chains are independent; a GPU hides their latency with other
-    // warps, not by unrolling one thread's twelve chains into straight line.
-#pragma unroll 1
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = inv_sbox(s[i]);
+    fb_round_v<RPX_PERMUTE_VARIANT>(s, r);
 }
 
 // E: `+ARK1 → x^7` in the cubic extension on four lane-triples, NO linear
@@ -391,15 +571,24 @@ __device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS], int r) {
 // the permutation's instructions and the state living in local memory across
 // the call; the `-Xptxas -v` report and the unroll factors of `square_n` and
 // the lane loops are the tuning knobs, in that order.
-RPX_NOINLINE __device__ void permute(uint64_t s[STATE_FELTS]) {
+//
+// `permute_v<V>` is the permutation at variant V; every instantiation
+// is its own called body. `permute` — what every kernel calls — is this
+// cubin's variant.
+template <int V>
+RPX_NOINLINE __device__ void permute_v(uint64_t s[STATE_FELTS]) {
 #pragma unroll 1
     for (int r = 0; r + 1 < NUM_ROUNDS; r += 2) {
-        fb_round(s, r);
+        fb_round_v<V>(s, r);
         ext_round(s, r + 1);
     }
     final_round(s, NUM_ROUNDS - 1);
 #pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = goldilocks::canonical(s[i]);
+}
+
+__device__ __forceinline__ void permute(uint64_t s[STATE_FELTS]) {
+    permute_v<RPX_PERMUTE_VARIANT>(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,3 +1337,363 @@ extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
 }
 
 #endif  // __CUDACC__
+
+// ===========================================================================
+// ★ The half-warp Merkle kernels and the work-queue grind (the defaults, which
+// math-cuda `rpx_paths` switches back to `rpx_merkle_level`/`rpx_merkle_tail`
+// and `rpx_grind_search`), and the probes the parity tests and benches use.
+// Every kernel here produces the same bytes (nodes, nonces, digests) as the
+// kernel it stands in for.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// K5 probes. `rpx_permute_chain_probe_v<V>` permutes each thread's state `k`
+// times at variant V — chained, so a launch is compute rather than memory and
+// a wrong step anywhere reaches the output. `rpx_limb_probe` returns the two
+// limb primitives and `goldilocks::mul` side by side on raw pairs, so the PTX
+// is checked against 128-bit arithmetic on the device itself. V is a template
+// argument, so probe v0 is the 64-bit multiply in every cubin.
+// ---------------------------------------------------------------------------
+template <int V>
+__device__ __forceinline__ void permute_chain_probe(const uint64_t *states, uint64_t n,
+                                                    uint64_t k, uint64_t *out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint64_t s[rpx::STATE_FELTS];
+#pragma unroll
+    for (int i = 0; i < rpx::STATE_FELTS; ++i) s[i] = states[tid * rpx::STATE_FELTS + i];
+    for (uint64_t j = 0; j < k; ++j) rpx::permute_v<V>(s);
+#pragma unroll
+    for (int i = 0; i < rpx::STATE_FELTS; ++i) out[tid * rpx::STATE_FELTS + i] = s[i];
+}
+
+#define RPX_CHAIN_PROBE(V)                                                                   \
+    extern "C" __global__ void rpx_permute_chain_probe_v##V(const uint64_t *states, uint64_t n, \
+                                                            uint64_t k, uint64_t *out) {       \
+        permute_chain_probe<V>(states, n, k, out);                                           \
+    }
+RPX_CHAIN_PROBE(0)
+RPX_CHAIN_PROBE(1)
+RPX_CHAIN_PROBE(3)
+RPX_CHAIN_PROBE(4)
+RPX_CHAIN_PROBE(5)
+RPX_CHAIN_PROBE(7)
+RPX_CHAIN_PROBE(9)
+#undef RPX_CHAIN_PROBE
+
+extern "C" __global__ void rpx_limb_probe(const uint64_t *a, const uint64_t *b, uint64_t n,
+                                          uint64_t *out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[3 * tid] = rpx::mul_limb(a[tid], b[tid]);
+    out[3 * tid + 1] = rpx::sqr_limb(a[tid]);
+    out[3 * tid + 2] = goldilocks::mul(a[tid], b[tid]);
+}
+
+// The poll of a word other threads update with atomics: a volatile load on the
+// device (the stride grind's `LDG.E.64.STRONG.SYS`), an atomic load under the
+// host SIMT shim, whose lanes are real threads.
+__device__ __forceinline__ unsigned long long rpx_poll_u64(unsigned long long *p) {
+#if defined(__CUDA_ARCH__)
+    return *(volatile unsigned long long *)p;
+#else
+    return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+#endif
+}
+
+#if defined(__CUDACC__) || defined(RPX_HOST_SIMT)
+
+// ---------------------------------------------------------------------------
+// K4 — the grind with nonces claimed from a WORK QUEUE, in increasing order.
+//
+// The stride kernel gives thread `t` the fixed nonces `t, t + stride, …`, so a
+// warp that runs ahead scans nonces far above the answer while a slow warp is
+// still below it; the search cannot stop until the slowest owner of a nonce
+// below the answer gets there. The counted twin measured the cost: 3.30 strides
+// of over-scan past `nonce + stride` at the record posture, with a ZERO
+// contention component (the O6 poll k-sweep), i.e. skew, not stale polls.
+//
+// Here a warp claims the next 32 unclaimed nonces (one per lane) with ONE
+// `atomicAdd` on a queue head, so the nonces are processed in (nearly)
+// increasing order whatever the warps' speeds, and the waste is bounded by the
+// work in flight when the answer lands — at most one permutation per lane.
+//
+// ★ THE ANSWER IS UNCHANGED: the smallest valid nonce in `[base, base+count)`,
+// or the sentinel. The head only grows and the result only shrinks, to valid
+// nonces. A warp stops when its claimed chunk starts at or above the result
+// (every later chunk starts higher still) or past `count`. A chunk holding a
+// nonce below the final result is therefore always claimed — the head passed
+// it before any warp could stop above it — and a claimed chunk that starts
+// below the result is hashed in full. So the launch returns what
+// `rpx_grind_search` returns, which the parity test pins seed by seed.
+//
+// `state[0]` = the result (U64_MAX sentinel), `state[1]` = the queue head (an
+// offset into `[0, count)`); the launcher resets both before each launch.
+// `blockDim.x` must be a multiple of 32 (the claim is per warp).
+// ---------------------------------------------------------------------------
+__device__ constexpr int GRIND_Q_RESULT = 0;
+__device__ constexpr int GRIND_Q_HEAD = 1;
+__device__ constexpr unsigned long long GRIND_Q_CHUNK = 32;
+
+__device__ __forceinline__ unsigned long long shfl_u64(unsigned long long v, int src) {
+    return __shfl_sync(0xffffffffu, v, src);
+}
+
+// Warp butterfly for the counted twin: sum, max and the ran-to-end count, left
+// on every lane. `__shfl_sync` only, so the host SIMT shim runs it too.
+__device__ __forceinline__ void warp_sum_max(unsigned long long &sum, unsigned long long &max_v,
+                                             unsigned long long &ends) {
+    const int lane = (int)(threadIdx.x & 31u);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += shfl_u64(sum, lane ^ off);
+        ends += shfl_u64(ends, lane ^ off);
+        const unsigned long long other = shfl_u64(max_v, lane ^ off);
+        if (other > max_v) max_v = other;
+    }
+}
+
+template <bool COUNTED>
+__device__ __forceinline__ void grind_queue(const uint64_t *inner_felts, uint64_t limit,
+                                            uint64_t base, uint64_t count,
+                                            unsigned long long *state,
+                                            unsigned long long *counts) {
+    const unsigned lane = threadIdx.x & 31u;
+    const uint64_t f0 = inner_felts[0], f1 = inner_felts[1], f2 = inner_felts[2],
+                   f3 = inner_felts[3];
+    unsigned long long iters = 0, to_end = 0;
+    for (;;) {
+        unsigned long long off = 0, best = 0;
+        if (lane == 0) {
+            off = atomicAdd(&state[GRIND_Q_HEAD], GRIND_Q_CHUNK);
+            best = rpx_poll_u64(&state[GRIND_Q_RESULT]);
+        }
+        off = shfl_u64(off, 0);
+        best = shfl_u64(best, 0);
+        if (off >= count) {
+            to_end = iters > 0 ? 1 : 0;
+            break;
+        }
+        const uint64_t first = base + off;
+        // `first < base`: the u64 wrap on the final block, unreachable in
+        // practice (the launcher bails first), as in the stride kernel.
+        if (first < base || first >= best) break;
+        const uint64_t i = off + lane;
+        if (i < count) {
+            const uint64_t nonce = base + i;
+            rpx::Sponge sp;
+            sp.init(GRIND_FELTS);
+            sp.absorb(f0);
+            sp.absorb(f1);
+            sp.absorb(f2);
+            sp.absorb(f3);
+            sp.absorb(goldilocks::canonical(nonce));
+            uint64_t digest[rpx::DIGEST_FELTS];
+            sp.finalize(digest);
+            if (digest[0] < limit) {
+                atomicMin(&state[GRIND_Q_RESULT], (unsigned long long)nonce);
+            }
+            if constexpr (COUNTED) ++iters;
+        }
+    }
+    if constexpr (COUNTED) {
+        unsigned long long sum = iters, max_v = iters, ends = to_end;
+        warp_sum_max(sum, max_v, ends);
+        if (lane == 0) {
+            atomicAdd(&counts[0], sum);
+            atomicMax(&counts[1], max_v);
+            atomicAdd(&counts[2], ends);
+        }
+    }
+}
+
+extern "C" __global__ void rpx_grind_search_queue(const uint64_t *inner_felts, uint64_t limit,
+                                                  uint64_t base, uint64_t count,
+                                                  unsigned long long *state) {
+    grind_queue<false>(inner_felts, limit, base, count, state, nullptr);
+}
+
+// ⛔ DIAGNOSTIC twin: the same search plus the counters `rpx_grind_search_counted`
+// keeps, in the same slots (executed, max iterations, ran to end).
+extern "C" __global__ void rpx_grind_search_queue_counted(const uint64_t *inner_felts,
+                                                          uint64_t limit, uint64_t base,
+                                                          uint64_t count,
+                                                          unsigned long long *state,
+                                                          unsigned long long *counts) {
+    grind_queue<true>(inner_felts, limit, base, count, state, counts);
+}
+
+// ---------------------------------------------------------------------------
+// K3 — one permutation across the lanes of a HALF-WARP.
+//
+// Narrow Merkle levels and the tail are latency-bound: one thread runs one
+// permutation as a single dependent chain (~119 µs at the block's clock),
+// whatever the width. Here lane `e` of a 16-lane half holds state element `e`,
+// so the twelve inverse S-box chains — 95% of the multiplications — run side by
+// side, and the MDS and the cubic-extension rounds read the other elements by
+// `__shfl_sync`. Lanes 12-15 mirror elements 0-3 (they compute the same values
+// and never store), so every shuffle has its whole warp and nothing diverges.
+//
+// ★ SAME WORDS as `permute`: every element sees the same field operations in
+// the same order — `mds` per output lane is the same twelve exact integer terms
+// (summed in another order; each half-sum is < 2^40, so no reduction happens
+// before the end), and the E round's triple is gathered and raised by the same
+// `ext_power7`, each of its three lanes keeping its own coefficient.
+// ---------------------------------------------------------------------------
+namespace rpx {
+
+struct WarpLane {
+    int e;      // this lane's state element, 0..11 (idle lanes mirror 0..3)
+    int group;  // the half-warp's first lane: 0 or 16
+    int tri;    // the first lane of this element's cubic-extension triple
+    int k;      // e mod 3: which coefficient of the triple this lane keeps
+    bool idle;  // lanes 12..15 of a half
+};
+
+__device__ __forceinline__ WarpLane warp_lane() {
+    const int lane = (int)(threadIdx.x & 31u);
+    const int l16 = lane & 15;
+    WarpLane w;
+    w.idle = l16 >= STATE_FELTS;
+    w.e = w.idle ? l16 - STATE_FELTS : l16;
+    w.group = lane & 16;
+    w.tri = w.group + EXT_DEGREE * (w.e / EXT_DEGREE);
+    w.k = w.e % EXT_DEGREE;
+    return w;
+}
+
+// `mds` for this lane's element. `out_i = Σ_j ROW[(j − i) mod 12]·s_j` with
+// `j = (e + k) mod 12` is `Σ_k ROW[k]·s_{(e+k) mod 12}`: the coefficient is
+// warp-uniform (a compile-time index) and the source lane varies instead.
+__device__ __forceinline__ uint64_t mds_lane(uint64_t v, const WarpLane &w) {
+    uint64_t acc_lo = 0, acc_hi = 0;  // Σ c·l_j and Σ c·h_j, each < 2^40
+#pragma unroll
+    for (int k = 0; k < STATE_FELTS; ++k) {
+        int j = w.e + k;
+        if (j >= STATE_FELTS) j -= STATE_FELTS;
+        const uint64_t sj = shfl_u64(v, w.group + j);
+        const uint64_t c = MDS_CIRC_ROW2[k];
+        acc_lo += c * (uint64_t)(uint32_t)sj;
+        acc_hi += c * (uint64_t)(uint32_t)(sj >> 32);
+    }
+    const uint64_t lo = (acc_hi << 32) + acc_lo;
+    const uint64_t carry = (lo < acc_lo) ? 1ull : 0ull;
+    const uint64_t hi = (acc_hi >> 32) + carry;
+    return fadd(lo, hi * goldilocks::EPSILON);
+}
+
+template <int V>
+__device__ __forceinline__ uint64_t fb_round_lane(uint64_t v, int r, const WarpLane &w) {
+    v = mds_lane(v, w);
+    v = sbox_v<V>(fadd(v, ARK1[r][w.e]));
+    v = mds_lane(v, w);
+    return inv_sbox_v<V>(fadd(v, ARK2[r][w.e]));
+}
+
+__device__ __forceinline__ uint64_t ext_round_lane(uint64_t v, int r, const WarpLane &w) {
+    v = fadd(v, ARK1[r][w.e]);
+    CubicExt x;
+    x.c0 = shfl_u64(v, w.tri);
+    x.c1 = shfl_u64(v, w.tri + 1);
+    x.c2 = shfl_u64(v, w.tri + 2);
+    const CubicExt y = ext_power7(x);
+    return w.k == 0 ? y.c0 : (w.k == 1 ? y.c1 : y.c2);
+}
+
+// `permute_v<V>` with the state spread over a half-warp: this lane's element
+// in, this lane's element out, canonical.
+template <int V>
+__device__ __forceinline__ uint64_t permute_warp_v(uint64_t v, const WarpLane &w) {
+#pragma unroll 1
+    for (int r = 0; r + 1 < NUM_ROUNDS; r += 2) {
+        v = fb_round_lane<V>(v, r, w);
+        v = ext_round_lane(v, r + 1, w);
+    }
+    v = mds_lane(v, w);
+    v = fadd(v, ARK1[NUM_ROUNDS - 1][w.e]);
+    return goldilocks::canonical(v);
+}
+
+// This lane's element of `compress`'s state `[left ‖ right ‖ capacity]`. The
+// two children are adjacent nodes, so elements 0..7 are the eight big-endian
+// felts of the 64 bytes at `left_node`; the capacity is zero but for the
+// compress domain (itself zero).
+__device__ __forceinline__ uint64_t load_compress_lane(const uint8_t *nodes, uint64_t left_node,
+                                                       int e) {
+    if (e == CAPACITY_DOMAIN_LANE) return DOMAIN_COMPRESS;
+    if (e >= 2 * DIGEST_FELTS) return 0;
+    const uint64_t *src = reinterpret_cast<const uint64_t *>(nodes + left_node * 32);
+    return bswap64(src[e]);
+}
+
+// One parent from the lanes holding its digest: `store_digest_be`, a felt per lane.
+__device__ __forceinline__ void store_parent_lane(uint8_t *nodes, uint64_t parent, uint64_t v,
+                                                  const WarpLane &w, bool live) {
+    if (live && !w.idle && w.e < DIGEST_FELTS) {
+        uint64_t *dst = reinterpret_cast<uint64_t *>(nodes + parent * 32);
+        dst[w.e] = bswap64(v);
+    }
+}
+
+}  // namespace rpx
+
+// One inner level, two parents per warp (one per half). The node layout is
+// `rpx_merkle_level`'s: children at `parent_begin + n_pairs + 2p` and `+ 1`,
+// parent `p` at `parent_begin + p`.
+extern "C" __global__ void rpx_merkle_level_warp(uint8_t *nodes, uint64_t parent_begin,
+                                                 uint64_t n_pairs) {
+    const rpx::WarpLane w = rpx::warp_lane();
+    const uint64_t first = (((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 2;
+    if (first >= n_pairs) return;  // warp-uniform
+    const uint64_t pair = first + (uint64_t)(w.group >> 4);
+    const bool live = pair < n_pairs;
+    // A dead half (odd n_pairs) recomputes its neighbour's pair and stores nothing.
+    const uint64_t p = live ? pair : first;
+    uint64_t v = rpx::load_compress_lane(nodes, parent_begin + n_pairs + 2 * p, w.e);
+    v = rpx::permute_warp_v<RPX_PERMUTE_VARIANT>(v, w);
+    rpx::store_parent_lane(nodes, parent_begin + p, v, w, live);
+}
+
+// Every remaining level from `level_begin` up to the root, in ONE block, with a
+// barrier between levels — `rpx_merkle_tail`'s job with a warp per two parents,
+// so a level of up to `blockDim.x / 16` pairs is one permutation latency.
+extern "C" __global__ void RPX_LAUNCH_BOUNDS(1024)
+    rpx_merkle_tail_warp(uint8_t *nodes, uint64_t level_begin) {
+    const rpx::WarpLane w = rpx::warp_lane();
+    const uint64_t first_of_warp = (uint64_t)(threadIdx.x >> 5) * 2;
+    const uint64_t pairs_per_pass = (uint64_t)(blockDim.x >> 5) * 2;
+    const uint64_t half = (uint64_t)(w.group >> 4);
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        const uint64_t nb = lb / 2;
+        const uint64_t n_pairs = lb - nb;
+        // Warp-uniform bounds: both halves run every pass together.
+        for (uint64_t first = first_of_warp; first < n_pairs; first += pairs_per_pass) {
+            const uint64_t pair = first + half;
+            const bool live = pair < n_pairs;
+            const uint64_t p = live ? pair : first;
+            uint64_t v = rpx::load_compress_lane(nodes, nb + n_pairs + 2 * p, w.e);
+            v = rpx::permute_warp_v<RPX_PERMUTE_VARIANT>(v, w);
+            rpx::store_parent_lane(nodes, nb + p, v, w, live);
+        }
+        __syncthreads();
+        lb = nb;
+    }
+}
+
+// Parity probe for the half-warp permutation: state `i` is permuted by half
+// `i mod 2` of warp `i / 2`; all twelve lanes are written back, raw.
+extern "C" __global__ void rpx_permute_warp_probe(const uint64_t *states, uint64_t n,
+                                                  uint64_t *out) {
+    const rpx::WarpLane w = rpx::warp_lane();
+    const uint64_t first = (((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 2;
+    if (first >= n) return;
+    const uint64_t idx = first + (uint64_t)(w.group >> 4);
+    const bool live = idx < n;
+    const uint64_t p = live ? idx : first;
+    uint64_t v = states[p * rpx::STATE_FELTS + w.e];
+    v = rpx::permute_warp_v<RPX_PERMUTE_VARIANT>(v, w);
+    if (live && !w.idle) out[p * rpx::STATE_FELTS + w.e] = v;
+}
+
+#endif  // __CUDACC__ || RPX_HOST_SIMT

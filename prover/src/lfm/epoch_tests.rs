@@ -1410,11 +1410,31 @@ pub(super) fn real_epoch_from_constants(
     bundle: &crate::continuation::ContinuationProof,
     epoch_index: usize,
 ) -> Result<RealEpoch, String> {
+    real_epoch_from_epochs(
+        opts,
+        konsts,
+        bundle.epochs(),
+        bundle.num_epochs(),
+        epoch_index,
+    )
+}
+
+/// [`real_epoch_from_constants`] from the leading epochs of a run of
+/// `num_epochs`, before its bundle exists — the same function over the same
+/// proofs, which is what lets the level-0 lead-in build a wrap's prologue in the base's
+/// tail. `epochs` must hold at least epochs `0..=epoch_index`.
+pub(super) fn real_epoch_from_epochs(
+    opts: &crate::ProofOptions,
+    konsts: &EpochConstants<'_>,
+    epochs: &[crate::continuation::EpochProof],
+    num_epochs: usize,
+    epoch_index: usize,
+) -> Result<RealEpoch, String> {
     let elf = &konsts.elf;
-    let position = crate::continuation::epoch_chain_position(bundle, elf, epoch_index)
+    let position = crate::continuation::epoch_chain_position(epochs, num_epochs, elf, epoch_index)
         .map_err(|e| format!("chain position for epoch {epoch_index}: {e:?}"))?
         .ok_or_else(|| format!("epoch {epoch_index} is out of range or the bundle is malformed"))?;
-    let view = bundle.epoch_view(epoch_index);
+    let view = crate::continuation::EpochProofView::Owned(&epochs[epoch_index]);
     let recon = crate::continuation::reconstruct_epoch_airs(
         elf,
         view,
@@ -1474,6 +1494,95 @@ pub(super) fn from_proof_gate_options() -> crate::ProofOptions {
 /// has and the session harness cannot build (it wants an intermediate
 /// epoch) — must also reconstruct, pass production's verifier inside the
 /// constructor, and emit a program.
+/// ★ THE LEAD-IN'S IDENTITY, at fixture scale. The base's observer is told the
+/// epoch count exactly once and handed every epoch the bundle carries, byte for
+/// byte; and a wrap prologue built from those copies — before any bundle
+/// existed, from the leading epochs alone — is the one built from the bundle:
+/// the same program and the same arenas. That is what lets level 0 take a
+/// lead-in's prologue in place of its own (the block run's IDENTITY lines are
+/// the same gate at scale).
+#[test]
+fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let opts = from_proof_gate_options();
+    let recorder = std::sync::Arc::new(crate::continuation::RecordingObserver::<
+        crate::continuation::EpochProof,
+    >::default());
+    let bundle = crate::continuation::with_epoch_observer(recorder.clone(), || {
+        crate::continuation::prove_continuation(
+            &elf_bytes,
+            &[],
+            super::proof_fixture::FIXTURE_EPOCH_LOG2,
+            &opts,
+        )
+    })
+    .expect("the fixture continuation must prove");
+    let n = bundle.num_epochs();
+    assert!(n >= 2, "the fixture continuation must have a final epoch");
+    assert_eq!(
+        *recorder.counts.lock().unwrap(),
+        vec![n],
+        "the epoch count, exactly once"
+    );
+    let shared = std::mem::take(&mut *recorder.shared.lock().unwrap());
+    assert_eq!(shared.len(), 1, "the DECODE commitment is shared once");
+    let shared = *shared[0]
+        .clone()
+        .downcast::<Commitment>()
+        .unwrap_or_else(|_| panic!("the STARK base shares its DECODE commitment"));
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture ELF");
+    assert_eq!(
+        shared,
+        crate::tables::decode::commitment_from_elf(&elf, &opts).expect("the DECODE commitment"),
+        "the shared commitment is the ELF's"
+    );
+    let copies = recorder.epochs_in_order(n);
+    for (i, (copy, kept)) in copies.iter().zip(bundle.epochs()).enumerate() {
+        assert_eq!(
+            rkyv::to_bytes::<rkyv::rancor::Error>(copy)
+                .expect("serialize")
+                .as_slice(),
+            rkyv::to_bytes::<rkyv::rancor::Error>(kept)
+                .expect("serialize")
+                .as_slice(),
+            "the observer's copy of epoch {i} is the bundle's"
+        );
+    }
+
+    // The lead-in's constants take the shared commitment; the pool's derive it.
+    let konsts = EpochConstants::load(&elf_bytes, &opts, None).expect("the fixture ELF");
+    let lead_konsts =
+        EpochConstants::load(&elf_bytes, &opts, Some(shared)).expect("the fixture ELF");
+    for k in 0..n {
+        let from_bundle = real_epoch_from_constants(&opts, &konsts, &bundle, k)
+            .unwrap_or_else(|e| panic!("epoch {k} from the bundle: {e}"));
+        let from_lead = real_epoch_from_epochs(&opts, &lead_konsts, &copies[..=k], n, k)
+            .unwrap_or_else(|e| panic!("epoch {k} from its leading epochs: {e}"));
+        assert_eq!(
+            format!(
+                "{:?}",
+                epoch_program_publishing(&from_bundle, true, Publishes::Aggregation)
+            ),
+            format!(
+                "{:?}",
+                epoch_program_publishing(&from_lead, true, Publishes::Aggregation)
+            ),
+            "wrap {k}'s program"
+        );
+        assert_eq!(
+            epoch_arena_words(&from_bundle, true),
+            epoch_arena_words(&from_lead, true),
+            "wrap {k}'s arenas"
+        );
+    }
+    // ⛔ And the leading epochs must reach the one asked for: a list that stops
+    // short is refused, never read as a shorter run.
+    assert!(
+        real_epoch_from_epochs(&opts, &lead_konsts, &copies[..1], n, 1).is_err(),
+        "epoch 1 cannot be built from epoch 0 alone"
+    );
+}
+
 #[test]
 fn the_from_proof_constructor_matches_the_session_harness() {
     let elf_bytes = super::proof_fixture::read_inner_elf();

@@ -662,11 +662,18 @@ test-blake3-host-kat:
 # ★ It also covers the two WHIR COSET kernels, which exist nowhere else and
 # which GPU CI would not see until merge_group. That is why this target is a
 # per-PR gate and not a GPU one.
+#
+# The second binary replays the kernels whose lanes cooperate (the half-warp
+# permutation and Merkle kernels, the work-queue grind) with every lane a real
+# thread (`cuda_host_simt_shim.h`), against the shipped kernels.
 test-rpx-host-kat:
 	@mkdir -p target/host_kat
 	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
 	./target/host_kat/rpx_host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/rpx_simt_host_kat $(HOST_KAT_DIR)/rpx_simt_host_kat.cpp
+	./target/host_kat/rpx_simt_host_kat
 
 # Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`), run
 # on the HOST through the same shim: every pass shape against the
