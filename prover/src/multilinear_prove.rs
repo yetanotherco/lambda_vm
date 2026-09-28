@@ -43,7 +43,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ChainConfig, GrindBits};
+use multilinear::whir_chain::ChainConfig;
 use stark::multilinear_air::Uniforms;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -87,10 +87,10 @@ pub struct MultilinearVmProof {
 ///
 /// ★ A PRODUCTION FORMAT SITE: the process's
 /// [`ZfFormat`](crate::zf_format::ZfFormat) WHIR fields (`LAMBDA_VM_ZF_WHIR_CAP`,
-/// `_WHIR_FOLDS`, `_WHIR_STACK`) are stamped on here. Unset knobs give
-/// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
-/// (`whir_cap=auto`, `whir_folds=first6`, `whir_stack=27`); the three knobs at
-/// their off spellings give the legacy config. The stack reaches every layout
+/// `_WHIR_FOLDS`, `_WHIR_STACK`, `_WHIR_GRIND`) are stamped on here. Unset knobs
+/// give [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
+/// (`whir_cap=auto`, `whir_folds=first6`, `whir_stack=27`, `whir_grind=query`);
+/// the four knobs at their off spellings give the legacy config. The stack reaches every layout
 /// through this config ([`stacks`], `CommittedTables::commit_grouped`), on the
 /// prover's side and the verifier's alike.
 pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
@@ -122,13 +122,16 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
         .max()
         .unwrap_or(1);
     let tallest = widest_table.max(multilinear_table::stack_height(shapes, format.whir_stack));
+    // The grind's bits come from the format with its nonce layout: P2's query
+    // grind alone by default, all three under `LAMBDA_VM_ZF_WHIR_GRIND=all`. Q
+    // reads the query grind only, so it is the same under both.
     let config = ChainConfig::with_security_folds(
         2,
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
         format.whir_folds,
         tallest,
         128,
-        GrindBits::uniform(20),
+        format.whir_grind.bits(),
     );
     format.chain(config)
 }

@@ -1933,18 +1933,66 @@ fn the_first_fold_production_chains_cost_what_the_design_derived() {
     });
 }
 
-/// ★ THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with
-/// no knob set — is `first6` under the `Auto` cap, at the legacy security
-/// parameters (blowup 2^2, Q = 112, 20-bit grinds). The legacy chain keeps its
-/// own pins above (`the_production_chain_costs…`, 185,509 / 22,828); these are
-/// the default's, the two levers measured together on the WHIR pipeline's
-/// block (−9.10 s, ABBA): W2's six rounds and W1's cap. Its rows are pinned
-/// under both fold emissions: the lean fold (the default) and the classic one
-/// (the opt-out); its permutations do not depend on the fold.
+/// One production chain's pinned costs at `S = 25`: the grinds' permutations,
+/// every permutation, the arena's words, and the shape rows and rows under the
+/// lean fold (the default) and the classic one (the opt-out). The permutations
+/// do not depend on the fold.
+struct ChainPins {
+    grind_perms: usize,
+    perms: usize,
+    words: u32,
+    lean: (usize, usize),
+    classic: (usize, usize),
+}
+
+/// ★ THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with no knob
+/// set — is `first6` under the `Auto` cap, at blowup 2^2 and Q = 112, grinding
+/// before its queries alone: P2's `whir_grind=query`, one 20-bit grind and one
+/// nonce word a round. The legacy chain keeps its own pins above
+/// (`the_production_chain_costs…`, 185,509 / 22,828), and the opt-out
+/// (`whir_grind=all`) keeps the pins this chain had before P2
+/// ([`the_grind_opt_out_chain_keeps_the_pins_from_before_p2`]).
 #[test]
 fn the_production_default_chain_is_first6_under_the_auto_cap() {
     let production = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    let want = ChainConfig {
+        grind: GrindBits::query_only(20),
+        format: ChainFormat {
+            cap: CapPolicy::Auto,
+            folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+            stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
+            nonces: NonceLayout::Spent,
+        },
+        ..config(112, 0)
+    };
+    assert_eq!(production, want, "the production default's chain config");
+    let shape = ChainShape::new(&production, 25);
+    for r in 0..shape.rounds() {
+        assert_eq!(shape.carries(r), [false, false, true], "round {r}");
+    }
+    check_production_chain("DEFAULT", &shape, &DEFAULT_CHAIN_PINS);
+    // Both levers pay: fewer permutations than either alone, and fewer than
+    // the same chain grinding all three.
+    const {
+        assert!(DEFAULT_CHAIN_PINS.perms < 18_729 && DEFAULT_CHAIN_PINS.perms < 19_877);
+        assert!(DEFAULT_CHAIN_PINS.perms < GRIND_ALL_CHAIN_PINS.perms);
+    };
+}
+
+/// ★ THE OPT-OUT'S CHAIN IS TODAY'S. `LAMBDA_VM_ZF_WHIR_GRIND=all` builds the
+/// production default's chain exactly as it was before P2, 20-bit grinds before
+/// all three challenges and three nonce words a round, and every cost it had
+/// then: these pins are the pre-P2 default's, unmoved.
+#[test]
+fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
+    let opt_out = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat {
+            whir_grind: crate::zf_format::WhirGrind::All,
+            ..crate::zf_format::ZfFormat::DEFAULT
+        },
         &[(1, 25)],
     );
     let want = ChainConfig {
@@ -1956,101 +2004,165 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
         },
         ..config(112, 20)
     };
-    assert_eq!(production, want, "the production default's chain config");
-    let shape = ChainShape::new(&production, 25);
-    assert_eq!(shape.schedule, vec![6, 4, 4, 4, 4, 3], "first6 at 25");
+    assert_eq!(opt_out, want, "the opt-out's chain config");
+    let shape = ChainShape::new(&opt_out, 25);
+    check_production_chain("GRIND-ALL", &shape, &GRIND_ALL_CHAIN_PINS);
+}
+
+/// The closed forms of one production chain against its pins.
+fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
+    assert_eq!(
+        shape.schedule,
+        vec![6, 4, 4, 4, 4, 3],
+        "{label}: first6 at 25"
+    );
     let entry = SpongeEntry::fresh();
     println!(
-        "production DEFAULT chain S=25 first6 cap=auto Q=112 grind=20: caps {:?}, {} opening \
-         permutations, {} cap permutations, {} grind permutations, {} permutations, {} rows \
-         ({} shape rows)",
+        "production {label} chain S=25 first6 cap=auto Q=112 grind={:?}: caps {:?}, {} opening \
+         permutations, {} cap permutations, {} grind permutations, {} permutations, {} words, \
+         {} rows ({} shape rows)",
+        shape.grind,
         shape.caps,
-        chain_opening_perms(&shape),
-        chain_cap_perms(&shape),
-        chain_grind_perms(&shape),
-        chain_perms(&shape, entry),
-        chain_rows(&shape, entry),
-        chain_shape_rows(&shape),
+        chain_opening_perms(shape),
+        chain_cap_perms(shape),
+        chain_grind_perms(shape),
+        chain_perms(shape, entry),
+        RoundStorage::words(shape),
+        chain_rows(shape, entry),
+        chain_shape_rows(shape),
     );
-    assert_eq!(chain_grind_perms(&shape), 34, "17 grinds");
-    assert_eq!(chain_opening_perms(&shape), 16_166, "opening permutations");
-    assert_eq!(chain_cap_perms(&shape), 38, "cap permutations");
-    assert_eq!(shape.caps, DEFAULT_CHAIN_CAPS, "the auto caps per tree");
-    for (fold, shape_rows, rows) in [
-        (FoldEmission::Lean, 150_075, DEFAULT_CHAIN_ROWS),
-        (FoldEmission::Classic, 202_690, CLASSIC_DEFAULT_CHAIN_ROWS),
+    assert_eq!(
+        chain_grind_perms(shape),
+        pins.grind_perms,
+        "{label}: grind permutations"
+    );
+    assert_eq!(
+        chain_opening_perms(shape),
+        16_166,
+        "{label}: opening permutations"
+    );
+    assert_eq!(chain_cap_perms(shape), 38, "{label}: cap permutations");
+    assert_eq!(
+        shape.caps, DEFAULT_CHAIN_CAPS,
+        "{label}: the auto caps per tree"
+    );
+    assert_eq!(
+        RoundStorage::words(shape),
+        pins.words,
+        "{label}: arena words"
+    );
+    for (fold, (shape_rows, rows)) in [
+        (FoldEmission::Lean, pins.lean),
+        (FoldEmission::Classic, pins.classic),
     ] {
         with_fold_emission(fold, || {
-            assert_eq!(chain_shape_rows(&shape), shape_rows, "{fold:?}: shape rows");
-            assert_eq!(chain_rows(&shape, entry), rows, "{fold:?}: rows a chain");
             assert_eq!(
-                chain_perms(&shape, entry),
-                DEFAULT_CHAIN_PERMS,
-                "{fold:?}: permutations a chain"
+                chain_shape_rows(shape),
+                shape_rows,
+                "{label}, {fold:?}: shape rows"
+            );
+            assert_eq!(
+                chain_rows(shape, entry),
+                rows,
+                "{label}, {fold:?}: rows a chain"
+            );
+            assert_eq!(
+                chain_perms(shape, entry),
+                pins.perms,
+                "{label}, {fold:?}: permutations a chain"
             );
         });
     }
-    // Both levers pay: fewer permutations than either alone.
-    const { assert!(DEFAULT_CHAIN_PERMS < 18_729 && DEFAULT_CHAIN_PERMS < 19_877) };
 }
 
-/// The production default chain's pins, derived by the closed
-/// forms and checked against the EMITTED program by
-/// [`the_production_default_chain_emits_its_closed_form`]. The rows are the
-/// lean fold's (the default); the classic fold's (the opt-out) sit beside them.
+/// The production default chain's pins, derived by the closed forms and
+/// checked against the EMITTED program by
+/// [`the_production_chains_emit_their_closed_forms`]. P2's: one grind a round
+/// (6 × 2 permutations), one nonce word a round.
 const DEFAULT_CHAIN_CAPS: &[usize] = &[3, 3, 3, 3, 3, 2];
-const DEFAULT_CHAIN_PERMS: usize = 16_443;
-const DEFAULT_CHAIN_ROWS: usize = 150_811;
-const CLASSIC_DEFAULT_CHAIN_ROWS: usize = 203_426;
+const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
+    grind_perms: 12,
+    perms: 16_411,
+    words: 32_590,
+    lean: (149_547, 150_258),
+    classic: (202_162, 202_873),
+};
 
-/// ★ The production default chain, EMITTED (the F1 of the test above), under
-/// both fold emissions. `#[ignore]`d like its siblings: production-shape
-/// programs; laptop-safe.
+/// The opt-out's pins, which are the production default's from before P2:
+/// `3R − 1 = 17` grinds (34 permutations), three nonce words a round.
+const GRIND_ALL_CHAIN_PINS: ChainPins = ChainPins {
+    grind_perms: 34,
+    perms: 16_443,
+    words: 32_602,
+    lean: (150_075, 150_811),
+    classic: (202_690, 203_426),
+};
+
+/// ★ The production chains, EMITTED (the F1 of the two tests above), the
+/// default and the opt-out, under both fold emissions. `#[ignore]`d like its
+/// siblings: production-shape programs; laptop-safe.
 #[test]
-#[ignore = "builds a production-shape chain program; run with -- --ignored"]
-fn the_production_default_chain_emits_its_closed_form() {
-    let production = crate::multilinear_prove::chain_config_under(
-        &crate::zf_format::ZfFormat::DEFAULT,
-        &[(1, 25)],
-    );
-    let shape = ChainShape::new(&production, 25);
-    let entry = SpongeEntry::fresh();
-    for (fold, rows) in [
-        (FoldEmission::Lean, DEFAULT_CHAIN_ROWS),
-        (FoldEmission::Classic, CLASSIC_DEFAULT_CHAIN_ROWS),
+#[ignore = "builds production-shape chain programs; run with -- --ignored"]
+fn the_production_chains_emit_their_closed_forms() {
+    for (label, whir_grind, pins) in [
+        (
+            "DEFAULT",
+            crate::zf_format::WhirGrind::Query,
+            &DEFAULT_CHAIN_PINS,
+        ),
+        (
+            "GRIND-ALL",
+            crate::zf_format::WhirGrind::All,
+            &GRIND_ALL_CHAIN_PINS,
+        ),
     ] {
-        let (measured, perms, consts, hints, instructions) = with_fold_emission(fold, || {
-            let program = chain_program(&shape);
-            let consts = const_rows(&program);
-            (
-                program.instrs.len() - consts - chain_plumbing(&shape),
-                perm_rows(&program),
-                consts,
-                hint_rows(&program),
-                program.instrs.len(),
-            )
-        });
-        let (predicted, predicted_perms) = with_fold_emission(fold, || {
-            (chain_rows(&shape, entry), chain_perms(&shape, entry))
-        });
-        assert_eq!(
-            hints,
-            Layout::new(&shape).total as usize,
-            "{fold:?}: every arena word hinted once"
+        let production = crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat {
+                whir_grind,
+                ..crate::zf_format::ZfFormat::DEFAULT
+            },
+            &[(1, 25)],
         );
-        println!(
-            "PRODUCTION DEFAULT chain S=25 first6 cap=auto Q=112 grind=20, {fold:?} fold: \
-             {measured} rows against {predicted} predicted; {perms} permutations against \
-             {predicted_perms} predicted; {consts} constants, {hints} hints, {instructions} \
-             instructions"
-        );
-        assert_eq!(measured, predicted, "{fold:?}: rows");
-        assert_eq!(perms, predicted_perms, "{fold:?}: permutations");
-        assert_eq!(measured, rows, "{fold:?}: the pinned rows");
-        assert_eq!(
-            perms, DEFAULT_CHAIN_PERMS,
-            "{fold:?}: the pinned permutations"
-        );
+        let shape = ChainShape::new(&production, 25);
+        let entry = SpongeEntry::fresh();
+        for (fold, (_, rows)) in [
+            (FoldEmission::Lean, pins.lean),
+            (FoldEmission::Classic, pins.classic),
+        ] {
+            let (measured, perms, consts, hints, instructions) = with_fold_emission(fold, || {
+                let program = chain_program(&shape);
+                let consts = const_rows(&program);
+                (
+                    program.instrs.len() - consts - chain_plumbing(&shape),
+                    perm_rows(&program),
+                    consts,
+                    hint_rows(&program),
+                    program.instrs.len(),
+                )
+            });
+            let (predicted, predicted_perms) = with_fold_emission(fold, || {
+                (chain_rows(&shape, entry), chain_perms(&shape, entry))
+            });
+            assert_eq!(
+                hints,
+                Layout::new(&shape).total as usize,
+                "{label}, {fold:?}: every arena word hinted once"
+            );
+            println!(
+                "PRODUCTION {label} chain S=25 first6 cap=auto Q=112 grind={:?}, {fold:?} fold: \
+                 {measured} rows against {predicted} predicted; {perms} permutations against \
+                 {predicted_perms} predicted; {consts} constants, {hints} hints, {instructions} \
+                 instructions",
+                shape.grind
+            );
+            assert_eq!(measured, predicted, "{label}, {fold:?}: rows");
+            assert_eq!(perms, predicted_perms, "{label}, {fold:?}: permutations");
+            assert_eq!(measured, rows, "{label}, {fold:?}: the pinned rows");
+            assert_eq!(
+                perms, pins.perms,
+                "{label}, {fold:?}: the pinned permutations"
+            );
+        }
     }
 }
 
@@ -2475,7 +2587,8 @@ fn proof_digest(proof: &ChainProof<F, E>) -> (usize, String) {
 /// programs (instructions, a digest of all of them, arena words), the arenas and
 /// the host proofs' rkyv bytes at zero bits (the only width where two proves
 /// agree: a search returns any valid nonce), under `Three` with uniform grinds.
-/// Also the production chain, at the stacks the block reaches (25 and 27).
+/// Also the production chain under the opt-out, `whir_grind=all`, at the stacks
+/// the block reaches (25 and 27): the program the pre-P2 default emitted.
 #[test]
 fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
     const PROGRAMS: [(usize, u8, usize, u32, &str); 4] = [
@@ -2555,7 +2668,10 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
         }
     }
 
-    let format = crate::zf_format::ZfFormat::DEFAULT;
+    let opt_out = crate::zf_format::ZfFormat {
+        whir_grind: crate::zf_format::WhirGrind::All,
+        ..crate::zf_format::ZfFormat::DEFAULT
+    };
     for (num_vars, instrs, words, digest) in [
         (
             25usize,
@@ -2570,18 +2686,18 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
             "ceccaf1e696c0a71e199f4b1a726bd113b77c9fc4037cf3eea05c7561e1a0eee",
         ),
     ] {
-        let config = crate::multilinear_prove::chain_config_under(&format, &[(1, num_vars)]);
+        let config = crate::multilinear_prove::chain_config_under(&opt_out, &[(1, num_vars)]);
         let shape = ChainShape::new(&config, num_vars);
         let program = chain_program(&shape);
         assert_eq!(
             (program.instrs.len(), RoundStorage::words(&shape)),
             (instrs, words),
-            "production S={num_vars}"
+            "production S={num_vars} under whir_grind=all"
         );
         assert_eq!(
             program_digest(&program),
             digest,
-            "production S={num_vars}: the program"
+            "production S={num_vars} under whir_grind=all: the program"
         );
     }
 }

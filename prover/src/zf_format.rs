@@ -7,15 +7,16 @@
 //! LAMBDA_VM_ZF_ONE_ROW     0 | 1 | auto           one-row trace openings (S2)
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! LAMBDA_VM_ZF_WHIR_STACK  25 | 26 | 27                   WHIR stack cap, in variables (S2)
+//! LAMBDA_VM_ZF_WHIR_GRIND  query | all                    WHIR proof of work: before the queries only, or all three (P2)
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
+//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query`.
 //! Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
-//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`), so setting all six to off
-//! reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for byte —
-//! for rollback and for A/B arms. The crypto crates' own defaults
+//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`), so setting
+//! all seven to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
+//! byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
 //! library value built without a format is the legacy one, and the production
@@ -46,13 +47,13 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
 
 use multilinear::whir_chain::{
-    ChainConfig, ChainFormat, FirstFold, NonceLayout, StackVars, WhirFolds,
+    ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
 };
 use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
 
@@ -63,11 +64,17 @@ pub const ENV_FRI: &str = "LAMBDA_VM_ZF_FRI";
 pub const ENV_ONE_ROW: &str = "LAMBDA_VM_ZF_ONE_ROW";
 pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
+pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
 /// `uniform4` after it.
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
+
+/// The WHIR base chains' proof-of-work bits, wherever [`WhirGrind`] places
+/// them. The query count subtracts the query grind's bits from what the
+/// queries must buy (`multilinear::query_count::num_queries`).
+pub const PRODUCTION_WHIR_GRIND_BITS: u8 = 20;
 
 /// One process's proof format. [`ZfFormat::default`] is [`ZfFormat::DEFAULT`],
 /// the measured configuration; [`ZfFormat::LEGACY`] is every lever off.
@@ -85,6 +92,69 @@ pub struct ZfFormat {
     pub whir_folds: WhirFolds,
     /// S2: how wide a WHIR stacked polynomial may get.
     pub whir_stack: StackVars,
+    /// P2: where the WHIR base chains grind.
+    pub whir_grind: WhirGrind,
+}
+
+/// Where the WHIR base chains grind (P2), and so which nonces their rounds
+/// carry.
+///
+/// Of a round's three grinds only the query one buys proven bits as placed:
+/// the folding grind sits before the round's first sumcheck message, so the
+/// first folding challenge is redrawn by varying that message without grinding
+/// again, and the out-of-domain grind follows the out-of-domain point
+/// (`multilinear::whir_chain`'s module header). So `query` drops the other two
+/// and loses no proven bits, and the query count, which reads the query grind
+/// alone, does not move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhirGrind {
+    /// Before each round's query positions only ([`GrindBits::query_only`]),
+    /// one nonce a round ([`NonceLayout::Spent`]). The default.
+    Query,
+    /// Before all three redrawable challenges ([`GrindBits::uniform`]), three
+    /// nonces a round ([`NonceLayout::Three`]). The legacy format, byte for
+    /// byte, and the rollback.
+    All,
+}
+
+impl WhirGrind {
+    /// The grind bits this placement puts in a chain config.
+    pub const fn bits(self) -> GrindBits {
+        match self {
+            Self::Query => GrindBits::query_only(PRODUCTION_WHIR_GRIND_BITS),
+            Self::All => GrindBits::uniform(PRODUCTION_WHIR_GRIND_BITS),
+        }
+    }
+
+    /// The nonce layout that goes with it: a round carries the nonces it
+    /// spends, except the legacy format, which keeps its three.
+    pub const fn nonces(self) -> NonceLayout {
+        match self {
+            Self::Query => NonceLayout::Spent,
+            Self::All => NonceLayout::Three,
+        }
+    }
+}
+
+impl std::fmt::Display for WhirGrind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Query => "query",
+            Self::All => "all",
+        })
+    }
+}
+
+impl std::str::FromStr for WhirGrind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "query" => Ok(Self::Query),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
 }
 
 /// The first-round WHIR fold of the default format (`whir_folds=first6`).
@@ -116,9 +186,14 @@ impl ZfFormat {
     /// the WHIR pipeline (the prover-side cost of one-row LFM proofs) and saves
     /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
     /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
-    /// Security parameters (queries, grinding, blowup) are the
-    /// legacy ones: no lever touches them. `LAMBDA_VM_ZF_WHIR_STACK=25` is the
-    /// stack's rollback.
+    /// P2 `whir_grind=query` grinds the WHIR base chains before their queries
+    /// only (WHIR block −9.65 s in PROTO's ABBA at stack 25, before the RPX
+    /// grind kernels got cheaper); it changes no STARK proof.
+    /// The query counts, the query grinds and the blowups are the legacy ones:
+    /// `whir_grind=query` drops only the WHIR folding and out-of-domain grinds,
+    /// which buy no proven bits as placed ([`WhirGrind`]).
+    /// `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
+    /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -126,9 +201,10 @@ impl ZfFormat {
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
         whir_stack: DEFAULT_WHIR_STACK,
+        whir_grind: WhirGrind::Query,
     };
 
-    /// The legacy format: every lever off. What all six knobs at their
+    /// The legacy format: every lever off. What all seven knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -138,6 +214,7 @@ impl ZfFormat {
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::Uniform,
         whir_stack: StackVars::LEGACY,
+        whir_grind: WhirGrind::All,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -149,9 +226,10 @@ impl ZfFormat {
             && self.one_row == OneRowMode::Off
             && self.whir_folds == WhirFolds::Uniform
             && self.whir_stack == StackVars::LEGACY
+            && self.whir_grind == WhirGrind::All
     }
 
-    /// Parse the six knobs through `lookup` (the process environment in
+    /// Parse the seven knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
@@ -179,6 +257,11 @@ impl ZfFormat {
         }
         if let Some(v) = get(ENV_WHIR_STACK) {
             format.whir_stack = parse_whir_stack(&v)?;
+        }
+        if let Some(v) = get(ENV_WHIR_GRIND) {
+            format.whir_grind = v
+                .parse()
+                .map_err(|()| format!("{ENV_WHIR_GRIND}={v:?}: expected `query` or `all`"))?;
         }
         Ok(format)
     }
@@ -259,17 +342,19 @@ impl ZfFormat {
         })
     }
 
-    /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…`,
-    /// each value in the spelling its knob accepts.
+    /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…
+    /// whir_grind=…`, each value in the spelling its knob accepts.
     pub fn banner(&self) -> String {
         format!(
-            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={} whir_stack={}",
+            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={} whir_stack={} \
+             whir_grind={}",
             self.cap,
             self.whir_cap,
             self.fri,
             self.one_row,
             whir_folds_name(&self.whir_folds),
-            self.whir_stack.get()
+            self.whir_stack.get(),
+            self.whir_grind
         )
     }
 
@@ -302,14 +387,15 @@ impl ZfFormat {
         }
     }
 
-    /// The WHIR part: what `multilinear::ChainConfig` carries.
+    /// The WHIR part: what `multilinear::ChainConfig` carries. `whir_grind`'s
+    /// other half, its bits, is a security parameter and goes in where the
+    /// config is built ([`crate::multilinear_prove::chain_config_under`]).
     pub fn chain_format(&self) -> ChainFormat {
         ChainFormat {
             cap: self.whir_cap,
             folds: self.whir_folds,
             stack: self.whir_stack,
-            // Three nonces a round, whatever the bits: today's layout.
-            nonces: NonceLayout::Three,
+            nonces: self.whir_grind.nonces(),
         }
     }
 
@@ -431,17 +517,19 @@ mod tests {
                 one_row: OneRowMode::Off,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
                 whir_stack: StackVars::new(27).unwrap(),
+                whir_grind: WhirGrind::Query,
             }
         );
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 \
+             whir_grind=query"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
     }
 
-    /// Every knob keeps its OFF spelling, and all six at off are the legacy
+    /// Every knob keeps its OFF spelling, and all seven at off are the legacy
     /// format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
@@ -452,13 +540,15 @@ mod tests {
             (ENV_ONE_ROW, "0"),
             (ENV_WHIR_FOLDS, "uniform4"),
             (ENV_WHIR_STACK, "25"),
+            (ENV_WHIR_GRIND, "all"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
         assert!(f.is_legacy());
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25"
+            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
+             whir_grind=all"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -508,6 +598,14 @@ mod tests {
                 "25",
                 ZfFormat {
                     whir_stack: StackVars::LEGACY,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_WHIR_GRIND,
+                "all",
+                ZfFormat {
+                    whir_grind: WhirGrind::All,
                     ..ZfFormat::DEFAULT
                 },
             ),
@@ -564,6 +662,17 @@ mod tests {
             parse(&[(ENV_WHIR_STACK, " 27 ")]).unwrap().whir_stack,
             StackVars::new(27).unwrap()
         );
+        for (v, want) in [
+            ("query", WhirGrind::Query),
+            ("all", WhirGrind::All),
+            (" ALL ", WhirGrind::All),
+        ] {
+            assert_eq!(
+                parse(&[(ENV_WHIR_GRIND, v)]).unwrap().whir_grind,
+                want,
+                "{v:?}"
+            );
+        }
     }
 
     #[test]
@@ -600,6 +709,13 @@ mod tests {
             (ENV_WHIR_STACK, "27.0"),
             (ENV_WHIR_STACK, "auto"),
             (ENV_WHIR_STACK, "off"),
+            (ENV_WHIR_GRIND, ""),
+            (ENV_WHIR_GRIND, "uniform"),
+            (ENV_WHIR_GRIND, "0"),
+            (ENV_WHIR_GRIND, "1"),
+            (ENV_WHIR_GRIND, "off"),
+            (ENV_WHIR_GRIND, "query-only"),
+            (ENV_WHIR_GRIND, "20"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
@@ -615,10 +731,12 @@ mod tests {
             one_row: OneRowMode::Auto,
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             whir_stack: StackVars::new(26).unwrap(),
+            whir_grind: WhirGrind::All,
         };
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26"
+            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
+             whir_grind=all"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -635,6 +753,7 @@ mod tests {
             (ENV_ONE_ROW, fields["one_row"]),
             (ENV_WHIR_FOLDS, fields["whir_folds"]),
             (ENV_WHIR_STACK, fields["whir_stack"]),
+            (ENV_WHIR_GRIND, fields["whir_grind"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -679,7 +798,8 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
                 .unwrap()
                 .banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
+             whir_grind=query"
         );
     }
 
@@ -737,7 +857,9 @@ mod tests {
             let c = crate::multilinear_prove::chain_config_under(&f, &[(1, 25)]);
             assert_eq!(c.format.stack.get(), n, "the config carries the stack");
             assert!(
-                f.banner().ends_with(&format!(" whir_stack={n}")),
+                f.banner()
+                    .split(' ')
+                    .any(|kv| kv == format!("whir_stack={n}")),
                 "{}",
                 f.banner()
             );
@@ -934,11 +1056,15 @@ mod tests {
             (
                 production.log_blowup,
                 production.log_folding,
-                production.grind
+                production.grind.query
             ),
-            (today.log_blowup, today.log_folding, today.grind),
-            "no security parameter moves with the format"
+            (today.log_blowup, today.log_folding, today.grind.query),
+            "the blowup and the query grind do not move with the format"
         );
+        // P2: the default grinds before the queries alone, the legacy format
+        // before all three challenges.
+        assert_eq!(production.grind, GrindBits::query_only(20));
+        assert_eq!(today.grind, GrindBits::uniform(20));
         for (name, rounds25) in [("first5", 6), ("first6", 6)] {
             let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
             let c = chain_config_under(&f, &[(1, 25)]);
@@ -946,7 +1072,7 @@ mod tests {
             assert_eq!((c.rounds(25), c.num_queries), (rounds25, 112), "{name}");
             assert_eq!(
                 (c.log_blowup, c.log_folding, c.grind),
-                (today.log_blowup, today.log_folding, today.grind)
+                (today.log_blowup, today.log_folding, f.whir_grind.bits())
             );
             assert_ne!(c.fold_word(), today.fold_word());
         }
@@ -1090,5 +1216,122 @@ mod tests {
         assert!(!ja.contains("merkle_cap") && !ja.contains("fri_mode") && !ja.contains("one_row"));
         let back: ProofOptions = serde_json::from_str(&jb).unwrap();
         assert!(back.has_default_format());
+    }
+
+    /// P2: each spelling reaches the chain config the prover, the host verifier
+    /// and the in-guest emitters build from, as its bits and its nonce layout
+    /// together, at every accepted stack; Q does not move, and the knob moves
+    /// nothing else.
+    #[test]
+    fn the_whir_grind_lever_is_selectable_and_carried() {
+        for (v, bits, nonces) in [
+            ("query", GrindBits::query_only(20), NonceLayout::Spent),
+            ("all", GrindBits::uniform(20), NonceLayout::Three),
+        ] {
+            let f = parse(&[(ENV_WHIR_GRIND, v)]).unwrap();
+            assert!(f.unimplemented_levers().is_empty(), "{v}");
+            assert!(
+                f.banner().ends_with(&format!(" whir_grind={v}")),
+                "{}",
+                f.banner()
+            );
+            for n in WHIR_STACKS {
+                let at = ZfFormat {
+                    whir_stack: StackVars::new(n).unwrap(),
+                    ..f
+                };
+                let c = crate::multilinear_prove::chain_config_under(&at, &[(1, n)]);
+                assert_eq!((c.grind, c.format.nonces), (bits, nonces), "{v} at {n}");
+                assert_eq!(
+                    c.num_queries, 112,
+                    "{v} at {n}: Q reads the query grind alone"
+                );
+            }
+            assert_eq!(
+                ZfFormat {
+                    whir_grind: ZfFormat::DEFAULT.whir_grind,
+                    ..f
+                },
+                ZfFormat::DEFAULT,
+                "the knob moves the grind and nothing else"
+            );
+        }
+        assert_eq!(ZfFormat::LEGACY.whir_grind, WhirGrind::All);
+        assert_eq!(ChainFormat::DEFAULT.nonces, NonceLayout::Three);
+    }
+
+    /// ★ THE OPT-OUT IS TODAY'S CONFIG. `LAMBDA_VM_ZF_WHIR_GRIND=all`, alone,
+    /// builds the production WHIR config exactly as it was before P2, spelled
+    /// out here as a literal rather than derived through the code under test:
+    /// blowup 2^2, fold 4 under first6, Q 112, 20-bit grinds before all three
+    /// challenges, the auto cap, stack 27, three nonces a round. The default
+    /// differs from it in the grind and the nonce layout, and in nothing else.
+    #[test]
+    fn the_grind_opt_out_is_the_production_config_before_p2() {
+        let before_p2 = ChainConfig {
+            log_blowup: 2,
+            log_folding: 4,
+            num_queries: 112,
+            grind: GrindBits {
+                folding: 20,
+                ood: 20,
+                query: 20,
+            },
+            format: ChainFormat {
+                cap: CapPolicy::Auto,
+                folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+                stack: StackVars::new(27).unwrap(),
+                nonces: NonceLayout::Three,
+            },
+        };
+        let opt_out = parse(&[(ENV_WHIR_GRIND, "all")]).unwrap();
+        for shapes in [
+            &[(1usize, 25usize)][..],
+            &[(1, 27)][..],
+            &[(64, 21), (1480, 16), (8, 20)][..],
+        ] {
+            assert_eq!(
+                crate::multilinear_prove::chain_config_under(&opt_out, shapes),
+                before_p2,
+                "{shapes:?}"
+            );
+            assert_eq!(
+                crate::multilinear_prove::chain_config_under(&ZfFormat::DEFAULT, shapes),
+                ChainConfig {
+                    grind: GrindBits {
+                        folding: 0,
+                        ood: 0,
+                        query: 20,
+                    },
+                    format: ChainFormat {
+                        nonces: NonceLayout::Spent,
+                        ..before_p2.format
+                    },
+                    ..before_p2
+                },
+                "{shapes:?}"
+            );
+        }
+    }
+
+    /// The STARK pipeline has nothing to adopt: it grinds only before its
+    /// queries already. The lever reaches no univariate option, so no STARK
+    /// proof, wrap program or id moves with it.
+    #[test]
+    fn the_grind_lever_moves_no_stark_option() {
+        let all = ZfFormat {
+            whir_grind: WhirGrind::All,
+            ..ZfFormat::DEFAULT
+        };
+        assert_eq!(all.proof_format(), ZfFormat::DEFAULT.proof_format());
+        for preset in crate::recursion::Preset::ALL {
+            let o = preset.options();
+            assert_eq!(
+                format!("{:?}", all.options(o.clone())),
+                format!("{:?}", ZfFormat::DEFAULT.options(o)),
+                "{}",
+                preset.name()
+            );
+        }
     }
 }

@@ -743,8 +743,9 @@ fn whir_transcript_counts_for_the_block() {
 }
 
 /// A grind with bits reads the transcript's state once (`check_grind`); one of
-/// zero bits reads nothing. So a chain reads it `R` times under a query-only
-/// grind (P2) and `3R − 1` times under a uniform one.
+/// zero bits reads nothing. So a production chain reads it `R` times under the
+/// default (`whir_grind=query`: the query grind alone) and `3R − 1` times under
+/// the opt-out (`whir_grind=all`).
 #[test]
 fn a_chain_reads_the_state_once_a_spent_grind() {
     let sch = [6, 4, 4, 4, 4, 3];
@@ -756,6 +757,20 @@ fn a_chain_reads_the_state_once_a_spent_grind() {
     assert_eq!(states(GrindBits::query_only(20)), 6);
     assert_eq!(states(GrindBits::uniform(20)), 17);
     assert_eq!(states(GrindBits::default()), 0);
+    for (whir_grind, want) in [
+        (crate::zf_format::WhirGrind::Query, 6),
+        (crate::zf_format::WhirGrind::All, 17),
+    ] {
+        let config = crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat {
+                whir_grind,
+                ..crate::zf_format::ZfFormat::DEFAULT
+            },
+            &[(1, 25)],
+        );
+        assert_eq!(config.schedule(25), sch);
+        assert_eq!(states(config.grind), want, "{whir_grind}");
+    }
 }
 
 /// The closed form drives `ChainConfig::schedule`; at the LEGACY format that
