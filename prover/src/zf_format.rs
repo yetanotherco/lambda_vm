@@ -51,7 +51,9 @@
 
 use std::sync::OnceLock;
 
-use multilinear::whir_chain::{ChainConfig, ChainFormat, FirstFold, StackVars, WhirFolds};
+use multilinear::whir_chain::{
+    ChainConfig, ChainFormat, FirstFold, NonceLayout, StackVars, WhirFolds,
+};
 use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 /// The knob names, in banner order.
@@ -306,6 +308,8 @@ impl ZfFormat {
             cap: self.whir_cap,
             folds: self.whir_folds,
             stack: self.whir_stack,
+            // Three nonces a round, whatever the bits: today's layout.
+            nonces: NonceLayout::Three,
         }
     }
 

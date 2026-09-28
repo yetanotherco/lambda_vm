@@ -32,8 +32,8 @@ use math::traits::AsBytes;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainFormat, ChainProof, FirstFold, GrindBits, RoundOpenings,
-    WhirFolds, commit, prove, verify,
+    CapPolicy, ChainConfig, ChainFormat, ChainProof, FirstFold, GrindBits, NonceLayout,
+    RoundOpenings, WhirFolds, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
 
@@ -449,7 +449,12 @@ impl Layout {
 
 /// The arena in the order [`chain_program`] hints it.
 fn chain_arena(fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
-    let shape = &fixture.shape;
+    chain_arena_as(&fixture.shape, fixture, proof)
+}
+
+/// [`chain_arena`] under another shape of the same chain: the same proof
+/// written in another nonce layout.
+fn chain_arena_as(shape: &ChainShape, fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
     let mut words: Vec<LfmWord> = fixture.z.iter().map(ext_word).collect();
     words.push(ext_word(&fixture.y));
     words.push(fixture.root);
@@ -1947,6 +1952,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             cap: CapPolicy::Auto,
             folds: WhirFolds::First(FirstFold::new(6).expect("6")),
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
+            nonces: NonceLayout::Three,
         },
         ..config(112, 20)
     };
@@ -2216,5 +2222,366 @@ fn each_fold_emission_emits_its_closed_form() {
                 );
             }
         });
+    }
+}
+
+// ================ P2: a grind before the queries alone (`whir_grind=query`) ================
+//
+// The production default grinds before each round's queries only, under
+// `NonceLayout::Spent`: one grind and one nonce word a round. The machine sees
+// the config only through `ChainShape::new(config, …)`, so the gates below
+// prove, verify, execute and tamper it at a laptop's width.
+
+/// P2's grind and layout at a test width.
+fn query_only_config(num_queries: usize, bits: u8) -> ChainConfig {
+    ChainConfig {
+        grind: GrindBits::query_only(bits),
+        format: ChainFormat {
+            nonces: NonceLayout::Spent,
+            ..ChainFormat::DEFAULT
+        },
+        ..config(num_queries, 0)
+    }
+}
+
+fn host_accepts(f: &Fixture, cfg: &ChainConfig, proof: &ChainProof<F, E>) -> bool {
+    let mut t = Recording::new();
+    verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, cfg, &mut t).is_ok()
+}
+
+fn machine_accepts(program: &LfmProgram, arena: Vec<LfmWord>) -> bool {
+    execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_ok()
+}
+
+/// ★ A query-only chain executes on a proof the host accepts, and a wrong query
+/// nonce is refused in every round on BOTH sides: over four forgeries a round
+/// the machine agrees with the host on each, and at least one is refused (a
+/// forgery passes the PoW with probability `2^-8`, so all four do with
+/// `2^-32`). Its only grinds are the `R` query checks, and the uniform verifier
+/// refuses its proofs: the grind bits are a verifier constant.
+#[test]
+fn a_query_only_chain_checks_its_query_nonce_in_every_round_on_both_sides() {
+    let bits = 8u8;
+    for num_vars in [6usize, 9] {
+        let cfg = query_only_config(3, bits);
+        let f = fixture_with(&cfg, num_vars);
+        assert_eq!(f.shape.grind, (0, 0, bits as usize));
+        let program = chain_program(&f.shape);
+        assert!(
+            machine_accepts(&program, chain_arena(&f, &f.proof)),
+            "S={num_vars}: the honest proof must execute"
+        );
+
+        let rounds = f.shape.rounds();
+        for r in 0..rounds {
+            assert_eq!(
+                f.shape.carries(r),
+                [false, false, true],
+                "S={num_vars}, round {r}: one nonce word, the query's"
+            );
+            let mut refused = 0;
+            for flip in [1u64, 2, 4, 8] {
+                let mut forged = f.proof.clone();
+                forged.rounds[r].nonces.query ^= flip;
+                let host = host_accepts(&f, &cfg, &forged);
+                assert_eq!(
+                    machine_accepts(&program, chain_arena(&f, &forged)),
+                    host,
+                    "S={num_vars}, round {r}, nonce ^ {flip}: the machine and the host disagree"
+                );
+                refused += usize::from(!host);
+            }
+            assert!(
+                refused > 0,
+                "S={num_vars}, round {r}: no wrong query nonce was refused"
+            );
+        }
+        assert_eq!(
+            chain_grind_perms(&f.shape),
+            2 * rounds,
+            "two permutations a query check, none anywhere else"
+        );
+        assert!(
+            !host_accepts(&f, &config(3, bits), &f.proof),
+            "the uniform verifier must refuse a query-only proof"
+        );
+    }
+}
+
+/// ★ An unspent nonce has no word in the arena. Under `Spent`, a set folding or
+/// out-of-domain nonce, in any round and the last round's out-of-domain slot
+/// included, is refused by the host and cannot reach the machine: the arena
+/// built from the forgery IS the honest one. Under `Three`, the same bits in
+/// the legacy layout, the field has a word and neither side reads it: the
+/// unbound field `Spent` removes, two of them a round.
+#[test]
+fn an_unspent_nonce_has_no_word_in_the_arena() {
+    let cfg = query_only_config(3, 8);
+    let f = fixture_with(&cfg, 9);
+    let rounds = f.shape.rounds();
+    let honest = chain_arena(&f, &f.proof);
+    let three_cfg = ChainConfig {
+        format: ChainFormat::DEFAULT,
+        ..cfg
+    };
+    let three = ChainShape::new(&three_cfg, 9);
+    let three_program = chain_program(&three);
+    assert_eq!(
+        RoundStorage::words(&three) - RoundStorage::words(&f.shape),
+        2 * rounds as u32,
+        "two nonce words fewer a round"
+    );
+    assert_eq!(
+        honest.len() + 2 * rounds,
+        chain_arena_as(&three, &f, &f.proof).len()
+    );
+
+    let mut refused = 0;
+    for r in 0..rounds {
+        for slot in ["folding", "ood"] {
+            let mut forged = f.proof.clone();
+            match slot {
+                "folding" => forged.rounds[r].nonces.folding = 1,
+                _ => forged.rounds[r].nonces.ood = 1,
+            }
+            assert!(
+                !host_accepts(&f, &cfg, &forged),
+                "round {r}, the {slot} slot: the host must refuse a set unspent nonce"
+            );
+            assert_eq!(
+                chain_arena(&f, &forged),
+                honest,
+                "round {r}, the {slot} slot: the forgery reached the arena"
+            );
+            refused += 1;
+
+            // The legacy layout carries it, unread on both sides.
+            assert!(
+                host_accepts(&f, &three_cfg, &forged),
+                "round {r}, {slot}: Three reads it"
+            );
+            let arena = chain_arena_as(&three, &f, &forged);
+            assert_ne!(arena, chain_arena_as(&three, &f, &f.proof));
+            assert!(
+                machine_accepts(&three_program, arena),
+                "round {r}, {slot}: the Three machine reads it"
+            );
+        }
+    }
+    assert_eq!(refused, 2 * rounds, "two unspent slots a round");
+}
+
+/// ★ Gates one and two under P2: the emitter's hash schedule is the host's,
+/// event for event; a state read happens exactly where a grind is spent (the
+/// `R` query checks); every arena word is hinted once; and the rows and
+/// permutations are the closed form's, which the census and the wrap sizing
+/// read. Under the production format's cap and first fold as well.
+#[test]
+fn the_query_only_chains_are_the_host_transcripts_and_emit_their_closed_forms() {
+    let entry = SpongeEntry::fresh();
+    let production_like = |num_queries| ChainConfig {
+        format: ChainFormat {
+            cap: CapPolicy::Auto,
+            folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+            ..query_only_config(num_queries, 8).format
+        },
+        ..query_only_config(num_queries, 8)
+    };
+    for (cfg, num_vars) in [
+        (query_only_config(3, 8), 6),
+        (query_only_config(5, 8), 9),
+        (production_like(3), 9),
+        (production_like(4), 13),
+    ] {
+        let f = fixture_with(&cfg, num_vars);
+        let host = f.recorded.duplex.borrow().hashes.clone();
+        let mine = chain_hash_schedule(&f.shape, entry);
+        assert_eq!(
+            mine, host,
+            "{cfg:?} S={num_vars}: the form's hash schedule is not the host's"
+        );
+        let states = mine
+            .iter()
+            .filter(|h| !matches!(h, SpongeHash::Squeeze(_)))
+            .count();
+        assert_eq!(
+            states,
+            f.shape.rounds(),
+            "{cfg:?} S={num_vars}: one state read a round, the query grind's"
+        );
+
+        let program = chain_program(&f.shape);
+        assert_eq!(
+            hint_rows(&program),
+            Layout::new(&f.shape).total as usize,
+            "{cfg:?} S={num_vars}: every arena word hinted once"
+        );
+        let measured = program.instrs.len() - const_rows(&program) - chain_plumbing(&f.shape);
+        assert_eq!(
+            measured,
+            chain_rows(&f.shape, entry),
+            "{cfg:?} S={num_vars}: rows"
+        );
+        assert_eq!(
+            perm_rows(&program),
+            chain_perms(&f.shape, entry),
+            "{cfg:?} S={num_vars}: permutations"
+        );
+        assert!(
+            machine_accepts(&program, chain_arena(&f, &f.proof)),
+            "{cfg:?} S={num_vars}: the honest proof must execute"
+        );
+    }
+}
+
+// ================ the opt-out reproduces the bytes from before P2 ================
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Keccak over every instruction and the arena schema, as `Debug` prints them.
+fn program_digest(program: &LfmProgram) -> String {
+    use digest::Digest;
+    let mut h = crypto::hash::platform_keccak::PlatformKeccak256::new();
+    for instr in &program.instrs {
+        h.update(format!("{instr:?}\n").as_bytes());
+    }
+    h.update(format!("{:?}", program.arena_schema).as_bytes());
+    hex(&h.finalize())
+}
+
+fn arena_digest(words: &[LfmWord]) -> String {
+    use digest::Digest;
+    hex(&crypto::hash::platform_keccak::PlatformKeccak256::digest(
+        format!("{words:?}").as_bytes(),
+    ))
+}
+
+/// The proof's rkyv length and keccak.
+fn proof_digest(proof: &ChainProof<F, E>) -> (usize, String) {
+    use digest::Digest;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("the proof serializes");
+    (
+        bytes.len(),
+        hex(&crypto::hash::platform_keccak::PlatformKeccak256::digest(
+            bytes.as_ref(),
+        )),
+    )
+}
+
+/// ★ THE LEGACY NONCE LAYOUT IS BYTE FOR BYTE THE ONE BEFORE P2. Every value
+/// below was printed by the code at 0428c393b, before P2 existed: the chain
+/// programs (instructions, a digest of all of them, arena words), the arenas and
+/// the host proofs' rkyv bytes at zero bits (the only width where two proves
+/// agree: a search returns any valid nonce), under `Three` with uniform grinds.
+/// Also the production chain, at the stacks the block reaches (25 and 27).
+#[test]
+fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
+    const PROGRAMS: [(usize, u8, usize, u32, &str); 4] = [
+        (
+            6,
+            0,
+            772,
+            116,
+            "d99454d21b008a7cf6ac3d633b97b38176ea77a8c1c7dd08e85d49c7aa807341",
+        ),
+        (
+            9,
+            0,
+            1514,
+            238,
+            "2435342f0fee1d177a5327440488045f3313f0f121cb3174a9fd52dec8545fd9",
+        ),
+        (
+            6,
+            8,
+            907,
+            116,
+            "99c2d0b71e767efc63e71d942519910bd77e257f82248faa1d3bfea12ac5bf4b",
+        ),
+        (
+            9,
+            8,
+            1729,
+            238,
+            "4a4d35af69c1997306486762356ce33007200fa366bfce66f8065d2218bb021f",
+        ),
+    ];
+    const ARENAS: [(usize, &str, usize, &str); 2] = [
+        (
+            6,
+            "223a11955672049c529f2d8c467bc7f3789f961d7516c2323a9a2459c745369a",
+            2744,
+            "1226279cd1a1019770c62e5357174c6ae8b153d2ba5150b2a33d46d9a179f5bb",
+        ),
+        (
+            9,
+            "5f52e35dff3e56d4da419c89a52afa25a4783daaec7d29c62047e7c5762db98e",
+            6160,
+            "6616efadcac28bc004aae828c38495ba866775d4288eaa2f6f05e338c13d4a9d",
+        ),
+    ];
+    for (num_vars, grind, instrs, words, digest) in PROGRAMS {
+        let f = fixture(num_vars, 3, grind);
+        assert_eq!(f.shape.nonces, NonceLayout::Three);
+        let program = chain_program(&f.shape);
+        assert_eq!(
+            (program.instrs.len(), RoundStorage::words(&f.shape)),
+            (instrs, words),
+            "S={num_vars} grind {grind}"
+        );
+        assert_eq!(
+            program_digest(&program),
+            digest,
+            "S={num_vars} grind {grind}: the program"
+        );
+        if grind == 0 {
+            let (_, arena, len, proof) = ARENAS
+                .iter()
+                .find(|a| a.0 == num_vars)
+                .copied()
+                .expect("an arena golden");
+            assert_eq!(
+                arena_digest(&chain_arena(&f, &f.proof)),
+                arena,
+                "S={num_vars}: the arena"
+            );
+            assert_eq!(
+                proof_digest(&f.proof),
+                (len, proof.to_string()),
+                "S={num_vars}: the proof"
+            );
+        }
+    }
+
+    let format = crate::zf_format::ZfFormat::DEFAULT;
+    for (num_vars, instrs, words, digest) in [
+        (
+            25usize,
+            183_631usize,
+            32_602u32,
+            "97b10ca20df8a7e4b4da359220786ce2fe70004af519a532c8c696119ab4d601",
+        ),
+        (
+            27,
+            208_671,
+            36_875,
+            "ceccaf1e696c0a71e199f4b1a726bd113b77c9fc4037cf3eea05c7561e1a0eee",
+        ),
+    ] {
+        let config = crate::multilinear_prove::chain_config_under(&format, &[(1, num_vars)]);
+        let shape = ChainShape::new(&config, num_vars);
+        let program = chain_program(&shape);
+        assert_eq!(
+            (program.instrs.len(), RoundStorage::words(&shape)),
+            (instrs, words),
+            "production S={num_vars}"
+        );
+        assert_eq!(
+            program_digest(&program),
+            digest,
+            "production S={num_vars}: the program"
+        );
     }
 }

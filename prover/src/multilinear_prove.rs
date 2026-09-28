@@ -200,7 +200,8 @@ pub(crate) fn absorb(
         grind,
         // ⚠ Format, NOT absorbed except the fold schedule, through the word
         // above: verifier-side constants (see `lfm::whir_statement::push_config`,
-        // the emitter's twin of this).
+        // the emitter's twin of this). The nonce layout among them; the grind
+        // bits it follows from are the trailer below.
         format: _,
     } = config;
     for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
