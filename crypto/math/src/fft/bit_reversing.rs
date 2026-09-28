@@ -2,7 +2,17 @@
 use rayon::prelude::*;
 
 /// In-place bit-reverse permutation algorithm. Requires input length to be a power of two.
-pub fn in_place_bit_reverse_permute<E>(input: &mut [E]) {
+///
+/// A power-of-two length is the whole of what the row-major variant needs to go
+/// parallel, so it takes that path — one element per row. A length that is not
+/// one keeps the serial loop rather than tripping the assert there, so a caller
+/// outside the documented contract behaves exactly as it did.
+pub fn in_place_bit_reverse_permute<E: Send + Sync>(input: &mut [E]) {
+    #[cfg(feature = "alloc")]
+    if input.len().is_power_of_two() {
+        in_place_bit_reverse_permute_row_major(input, 1);
+        return;
+    }
     for i in 0..input.len() {
         let bit_reversed_index = reverse_index(i, input.len() as u64);
         if bit_reversed_index > i {
