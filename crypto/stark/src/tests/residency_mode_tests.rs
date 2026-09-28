@@ -93,9 +93,23 @@ pub(super) fn traces() -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>)
     (cpu, add, mul)
 }
 
+/// The test options with grinding off. Under `parallel` the nonce search is
+/// rayon's `find_any`, so two proves of the same instance can return different
+/// valid nonces, and the nonce is absorbed before the queries are drawn: a
+/// ground proof is not byte-reproducible, whatever the residency mode (the
+/// reason `zf_golden_tests` proves at `grinding_factor = 0` too). The mode acts
+/// on the main LDE, which the grind never reads, so nothing it could move is
+/// lost.
+fn test_options() -> ProofOptions {
+    ProofOptions {
+        grinding_factor: 0,
+        ..ProofOptions::default_test_options()
+    }
+}
+
 fn prove_under(residency: ResidencyMode) -> MultiProof<F, E, ()> {
     let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = test_options();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -121,7 +135,7 @@ fn prove_under(residency: ResidencyMode) -> MultiProof<F, E, ()> {
 }
 
 fn verifies(proof: &MultiProof<F, E, ()>) -> bool {
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = test_options();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -174,8 +188,8 @@ fn recompute_lde_preserves_every_commitment_root() {
     }
 }
 
-/// The whole proof, byte for byte — openings, FRI decommitments, grinding nonce
-/// and all.
+/// The whole proof, byte for byte — openings, FRI decommitments and all
+/// (proved without grinding: see [`test_options`]).
 #[test_log::test]
 fn recompute_lde_produces_byte_identical_proofs() {
     let retained = bincode::serialize(&prove_under(ResidencyMode::Retain)).unwrap();
