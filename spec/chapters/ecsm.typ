@@ -367,9 +367,9 @@ $
     - it would be possible to perform a 24-bit range-check lookup,
     - one could set up a 24-bit range-check table. This could be as narrow as two columns.
     - have some hybrid version, where there is a native lookup table for x-bits, and a dynamic table for outliers (high carries are not encountered frequently).
-- `addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than `HL`s.
-  We use `HL`s as conventient notation.
-  This modification saves 6 columns.
+- `addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than `WHH`s.
+  We use `WHH`s as conventient notation.
+  This modification saves 3 columns.
 - the design of these chip is generic, and makes no assumptions on the parameters $a$, $b$, $p$ and $N$.
   It might be possible to arrive at more compact design by making some assumptions on these values.
 - Constraints @ec:c:c1_0 and @ec:c:c1_i can be simplified to degree-2 constraints by padding `q1` to `p` rather than `0`. 
