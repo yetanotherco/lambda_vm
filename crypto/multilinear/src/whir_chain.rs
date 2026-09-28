@@ -33,14 +33,15 @@
 //! Three challenges per round are worth redrawing for a cheating prover — the
 //! folding randomness, the out-of-domain batching challenge and the query
 //! positions — and [`GrindBits`] can put a [proof of work](crypto::grinding)
-//! before each: retrying one costs `2^bits` hashes. Only the query grind buys
-//! soundness as placed. It sits right before the positions, which is what lets
-//! a query count buy more soundness than its own bits. The folding grind sits
-//! before the round's FIRST sumcheck message, so the first folding challenge is
-//! redrawn by varying that message without grinding again; the out-of-domain
-//! one follows the out-of-domain point. So [`GrindBits::query_only`] loses no
-//! proven bits, and with [`NonceLayout::Spent`] the proof carries one nonce a
-//! round.
+//! before each: retrying one costs `2^bits` hashes. Only the query grind raises
+//! the proven minimum as placed. It sits right before the positions, which is
+//! what lets a query count buy more soundness than its own bits. The folding
+//! grind sits before the round's FIRST sumcheck message, so the first folding
+//! challenge is redrawn by varying that message without grinding again. The
+//! out-of-domain grind comes after the out-of-domain point, so the only
+//! challenge it guards is the batching one, which has far more bits than the
+//! target without any grind. So [`GrindBits::query_only`] loses no proven
+//! bits, and with [`NonceLayout::Spent`] the proof carries one nonce a round.
 //!
 //! The claim is the weighted one, `Σ_x w(x)·f(x) = y`, so a stacked multi-point
 //! claim chains just as an evaluation does.
@@ -211,9 +212,9 @@ impl GrindBits {
         }
     }
 
-    /// Bits before the query positions only: the one grind that buys proven
-    /// bits as placed (module header). The query count reads `query` alone, so
-    /// it equals [`uniform`](Self::uniform)'s at the same bits.
+    /// Bits before the query positions only: the one grind that raises the
+    /// proven minimum as placed (module header). The query count reads `query`
+    /// alone, so it equals [`uniform`](Self::uniform)'s at the same bits.
     pub const fn query_only(bits: u8) -> Self {
         Self {
             folding: 0,

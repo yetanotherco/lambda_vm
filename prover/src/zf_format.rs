@@ -99,13 +99,14 @@ pub struct ZfFormat {
 /// Where the WHIR base chains grind (P2), and so which nonces their rounds
 /// carry.
 ///
-/// Of a round's three grinds only the query one buys proven bits as placed:
-/// the folding grind sits before the round's first sumcheck message, so the
-/// first folding challenge is redrawn by varying that message without grinding
-/// again, and the out-of-domain grind follows the out-of-domain point
-/// (`multilinear::whir_chain`'s module header). So `query` drops the other two
-/// and loses no proven bits, and the query count, which reads the query grind
-/// alone, does not move.
+/// Of a round's three grinds only the query one raises the proven minimum as
+/// placed. The folding grind sits before the round's first sumcheck message,
+/// so the first folding challenge is redrawn by varying that message without
+/// grinding again. The out-of-domain grind comes after the out-of-domain
+/// point, so the only challenge it guards is the batching one, which has far
+/// more bits than the target without any grind (`multilinear::whir_chain`'s
+/// module header). So `query` drops the other two and loses no proven bits,
+/// and the query count, which reads the query grind alone, does not move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhirGrind {
     /// Before each round's query positions only ([`GrindBits::query_only`]),
@@ -187,12 +188,10 @@ impl ZfFormat {
     /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
     /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
     /// P2 `whir_grind=query` grinds the WHIR base chains before their queries
-    /// only (WHIR block −9.65 s in PROTO's ABBA at stack 25, before the RPX
-    /// grind kernels got cheaper); it changes no STARK proof.
-    /// The query counts, the query grinds and the blowups are the legacy ones:
-    /// `whir_grind=query` drops only the WHIR folding and out-of-domain grinds,
-    /// which buy no proven bits as placed ([`WhirGrind`]).
-    /// `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
+    /// only. It costs no proven bits: of a round's three grinds only the query
+    /// one raises the proven minimum ([`WhirGrind`]), and the query counts, the
+    /// query grinds and the blowups are the legacy ones. It changes no STARK
+    /// proof. `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
     /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
