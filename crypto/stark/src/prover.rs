@@ -28,6 +28,7 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::leaf_layout::LeafLayout;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
+use crate::proof::options::ProofOptions;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::residency_mode::ResidencyMode;
 #[cfg(feature = "disk-spill")]
@@ -793,12 +794,38 @@ where
     FieldElement<F>: Send + Sync,
     A: AIR<Field = F> + ?Sized,
 {
+    domain_and_twiddles_for_options(air.options(), trace_length)
+}
+
+/// Fill the process-wide domain and twiddle cache for `trace_length` under
+/// `options`, ahead of the first prove that needs it.
+///
+/// The entry is the one [`domain_and_twiddles`] would build on its first miss —
+/// the same function builds it — so a prove that finds it warm commits and
+/// opens exactly what it would have after building it itself. What moves is
+/// only where the time is spent: off the first prove's prepass.
+pub fn warm_domain_and_twiddles<F>(options: &ProofOptions, trace_length: usize)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let _ = domain_and_twiddles_for_options::<F>(options, trace_length);
+}
+
+pub(crate) fn domain_and_twiddles_for_options<F>(
+    options: &ProofOptions,
+    trace_length: usize,
+) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
     type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
     let key = (
         std::any::TypeId::of::<F>(),
         trace_length,
-        air.options().blowup_factor as usize,
-        air.options().coset_offset,
+        options.blowup_factor as usize,
+        options.coset_offset,
     );
     {
         let cache = domain_twiddle_cache().lock().unwrap();
@@ -810,7 +837,7 @@ where
     }
     #[cfg(test)]
     crate::tests::domain_cache_stats::record(false);
-    let d = Arc::new(Domain::new(air, trace_length));
+    let d = Arc::new(Domain::from_options(options, trace_length));
     let t = Arc::new(LdeTwiddles::new(&d));
     // Pre-fill every lazy domain-derived cache from this setup thread, so no
     // rayon worker ever runs — or blocks waiting on — an initializer

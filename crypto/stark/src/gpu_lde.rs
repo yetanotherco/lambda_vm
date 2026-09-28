@@ -2722,6 +2722,18 @@ pub fn device_vram_budget_bytes() -> Option<u64> {
         .map(|be| be.vram_budget_bytes())
 }
 
+/// Build now the device state a prove otherwise builds at first use, between
+/// two of its kernels: the backend itself, the NTT twiddles of every size up to
+/// `2^max_log_n` (both directions, as the legacy NTT and the composition-parts
+/// LDE ask for them) and `staging_pairs` transfer staging pairs. The state is
+/// the same the prove would build, by the same functions; nothing a prove
+/// commits or reads changes. Returns whether the device took all of it.
+pub fn prewarm_device(max_log_n: u64, staging_pairs: usize) -> bool {
+    math_cuda::device::backend().is_ok()
+        && math_cuda::device::prewarm_twiddles(max_log_n).is_ok()
+        && math_cuda::device::prewarm_staging_pairs(staging_pairs).is_ok()
+}
+
 /// Parts counterpart of [`materialize_lde_trace_host`]: download the resident
 /// composition-poly parts (de-interleaved ext3 slabs, natural evaluation
 /// order) into per-part host Vecs. Serves the host consumers of the part

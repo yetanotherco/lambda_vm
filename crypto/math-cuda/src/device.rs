@@ -1854,6 +1854,36 @@ pub fn staging_totals() -> StagingTotals {
     }
 }
 
+/// Make up to `n` staging pairs now (never more than [`MAX_STAGING_PAIRS`]
+/// exist), so a prove's first transfers find them made instead of paying
+/// their `cuMemHostAlloc` between two kernels. Returns how many pairs exist.
+///
+/// The pairs are the ones a transfer would have made on demand: same size,
+/// same pool, lent and returned the same way.
+pub fn prewarm_staging_pairs(n: usize) -> Result<usize> {
+    let be = backend()?;
+    // Held together, so each `lend` past the free list makes a new pair.
+    let mut loans = Vec::with_capacity(n.min(MAX_STAGING_PAIRS));
+    for _ in 0..n.min(MAX_STAGING_PAIRS) {
+        loans.push(be.staging_pairs.lend(&be.ctx)?);
+    }
+    drop(loans);
+    Ok(be.staging_pairs.created.load(Ordering::Relaxed))
+}
+
+/// Build the NTT twiddles of every size `2^1 ..= 2^max_log_n`, forward and
+/// inverse, now instead of at each size's first use. The cached entries are
+/// the ones [`Backend::fwd_twiddles_for`] and [`Backend::inv_twiddles_for`]
+/// would build, by the same code.
+pub fn prewarm_twiddles(max_log_n: u64) -> Result<()> {
+    let be = backend()?;
+    for log_n in (1..=max_log_n.min(GoldilocksField::TWO_ADICITY)).rev() {
+        be.fwd_twiddles_for(log_n)?;
+        be.inv_twiddles_for(log_n)?;
+    }
+    Ok(())
+}
+
 /// The shared slabs' pinned footprint, LDE staging and Merkle hashes together:
 /// `(bytes, slots allocated, slots busy)`. A slab grows to a power of two and
 /// never shrinks, so this is its high-water so far. A slot another thread holds
