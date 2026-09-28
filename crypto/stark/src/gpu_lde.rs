@@ -530,6 +530,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_BARY_CALLS.store(0, Ordering::Relaxed);
     GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
+    GPU_FUSED_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
@@ -2407,6 +2408,15 @@ pub fn gpu_deep_calls() -> u64 {
     GPU_DEEP_CALLS.load(Ordering::Relaxed)
 }
 
+/// The share of [`gpu_deep_calls`] that took the fused kernel, which inverts
+/// each row's denominators itself ([`try_deep_composition_gpu_fused_keep`]).
+/// Zero under `LAMBDA_VM_DEEP_INV_LEGACY=1`; at the default a resident table
+/// that stays at zero fell back to the buffered kernel and its inverse buffer.
+pub(crate) static GPU_FUSED_DEEP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_fused_deep_calls() -> u64 {
+    GPU_FUSED_DEEP_CALLS.load(Ordering::Relaxed)
+}
+
 /// FRI commit-phase dispatch counter (one per successful commit, not per
 /// layer). Counts BOTH entry points, so a table whose device-resident attempt
 /// ([`try_fri_commit_gpu_from_dev`]) fails and then commits from host evals
@@ -3427,6 +3437,121 @@ where
     )
     .ok()?;
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(dw)
+}
+
+/// [`try_deep_composition_gpu_keep`] with no inverted-denominators buffer, the
+/// fully resident R4 DEEP's default path (see `math_cuda::deep_inv`): each row
+/// inverts its own `1 + num_eval_points` denominators `x - z` in registers
+/// ([`math_cuda::deep::deep_composition_ext3_fused_keep`]).
+/// `coset_base` is the LDE coset and `z_scalars` the poles `[z^K, z·w^0, …]`,
+/// the two inputs the buffered path hands `try_inv_denoms_dev_with_stream`; the
+/// codeword is the buffered path's as field elements. `None` (→ the buffered
+/// path) on any precondition miss, more points than the fused kernels take, or
+/// a cudarc error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_deep_composition_gpu_fused_keep<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    parts_dev: &math_cuda::lde::GpuLdeExt3,
+    h_ood: &[FieldElement<E>],
+    trace_ood_columns: &[Vec<FieldElement<E>>],
+    composition_poly_gammas: &[FieldElement<E>],
+    trace_terms_gammas: &[Vec<FieldElement<E>>],
+    coset_base: &[FieldElement<F>],
+    z_scalars: &[FieldElement<E>],
+    num_eval_points: usize,
+) -> Option<math_cuda::deep::GpuDeepCodeword>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
+    if num_eval_points > math_cuda::deep::FUSED_MAX_EVAL_POINTS
+        || z_scalars.len() != 1 + num_eval_points
+    {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let lde_size = main.lde_size;
+    if !lde_size.is_power_of_two() || coset_base.len() != lde_size {
+        return None;
+    }
+    // The codeword and the coset points; there is no inverse buffer.
+    let bytes = ext3_bytes(lde_size as u64, 1).saturating_add((lde_size as u64) * BASE_BYTES);
+    if !admit_transient(lde_size, bytes, "R4 DEEP (fused)") {
+        return None;
+    }
+    let num_main = main.m;
+    let aux_handle = lde_trace.gpu_aux();
+    let num_aux = aux_handle.map(|a| a.m).unwrap_or(0);
+    let num_total_cols = num_main + num_aux;
+    let num_parts = composition_poly_gammas.len();
+    if h_ood.len() != num_parts {
+        return None;
+    }
+    if trace_ood_columns.len() != num_total_cols
+        || trace_ood_columns.iter().any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    if trace_terms_gammas.len() != num_total_cols
+        || trace_terms_gammas
+            .iter()
+            .any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    if parts_dev.m != num_parts || parts_dev.lde_size != lde_size {
+        return None;
+    }
+
+    // Pack the small host scalars. SAFETY for ext3 transmutes: E == Ext3.
+    let h_ood_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(h_ood) };
+    let mut trace_ood_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_ood_columns {
+        trace_ood_raw.extend_from_slice(unsafe { ext3_slice_to_u64::<E>(col) });
+    }
+    let gammas_h_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(composition_poly_gammas) };
+    let mut gammas_tr_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_terms_gammas {
+        gammas_tr_raw.extend_from_slice(unsafe { ext3_slice_to_u64::<E>(col) });
+    }
+    let z_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
+
+    // The table's session stream when it has one — the queue R3 and the
+    // buffered R4 path use — else a pool stream.
+    let stream = match lde_trace.bound_stream() {
+        Some(s) => s,
+        None => math_cuda::device::backend().ok()?.next_stream(),
+    };
+    // SAFETY: F == Goldilocks per the tower check; FieldElement<F> is
+    // #[repr(transparent)] over u64.
+    let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, lde_size) };
+    let coset_dev = coset_points_device_handle(coset_u64, &stream)?;
+
+    let dw = math_cuda::deep::deep_composition_ext3_fused_keep(
+        &stream,
+        main,
+        aux_handle,
+        parts_dev,
+        &coset_dev,
+        z_raw,
+        h_ood_raw,
+        &trace_ood_raw,
+        gammas_h_raw,
+        &gammas_tr_raw,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        1,
+        lde_size,
+    )
+    .ok()?;
+    GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_FUSED_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(dw)
 }
 

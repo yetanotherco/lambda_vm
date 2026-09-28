@@ -11,6 +11,7 @@ pub mod blake3;
 pub mod columns;
 pub mod constraint_interp;
 pub mod deep;
+pub mod deep_inv;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;

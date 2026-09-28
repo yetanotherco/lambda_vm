@@ -1,7 +1,9 @@
 //! R4 DEEP inverse-denominator parity: GPU `compute_and_invert_denoms_ext3_dev`
-//! (with `DenomSign::XMinusZ`, the convention used by the prover's R4 DEEP
-//! fast path) must match the CPU helper `build_r4_inv_denoms_cpu` that the
-//! prover's CPU fallback also calls into.
+//! (with `DenomSign::XMinusZ`, the convention of the prover's buffered R4 DEEP
+//! path) must match the CPU helper `build_r4_inv_denoms_cpu` that the prover's
+//! CPU fallback also calls into. By default the call takes the row-wise kernel,
+//! under `LAMBDA_VM_DEEP_INV_LEGACY=1` the scan (`math_cuda::deep_inv`); run
+//! it under both.
 //!
 //! Pins the three-copy fragility flagged in PR review: kernel construction,
 //! CPU fallback in prover.rs, and any test references must all be the same.
