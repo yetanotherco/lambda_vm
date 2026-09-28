@@ -1100,6 +1100,9 @@ pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
 /// (`recursion::check_attestation`), which has zero production call sites. Folding
 /// the roots does not bind them by itself; it makes a substitution DETECTABLE by a
 /// consumer who performs the ritual.
+///
+/// The STARK wrap folds only under [`STARK_WRAP_FOLD_ENV`]; by default it binds
+/// the same cells by assertion instead ([`emit_host_attestation`]).
 pub fn emit_program_id(
     b: &mut LfmBuilder,
     shape: ProgramIdShape,
@@ -1172,6 +1175,219 @@ pub fn emit_program_id(
 
 pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {
     compile(program_id_program_source(shape))
+}
+
+// ============ the STARK wrap's attestation, host-side ============
+
+/// ★ `LAMBDA_VM_STARK_WRAP_FOLD=1` makes every STARK wrap fold its `program_id`
+/// in-guest with [`emit_program_id`]: ELF-agnostic wraps, with every wrap, node
+/// and root program — and so every LFM `program_id` — the fold's, byte for byte.
+/// The A/B arm and the rollback switch.
+///
+/// By default a STARK wrap attests host-side ([`emit_host_attestation`]): the
+/// id is computed at EMIT time by `recursion::program_id_from_digest` over the
+/// values the verifier derives from the ELF it trusts ([`AttestedInputs`]),
+/// published as program text in the fold's layout, and every input the fold
+/// would consume is bound by an equality assert against its value, on the very
+/// cell the verification reads. No keccak runs in the wrap, so its chip mask
+/// drops the keccak family (`LFM_KECCAK`, `KECCAK_RND`, `KECCAK_RC`) and, with
+/// no byte-lookup sender left, `BITWISE`; every level-1 node then re-verifies
+/// four sub-proofs fewer per child. On block 25368371 that is 1.05 G census
+/// cells fewer over the STARK tree (15 wraps −26.3 M each, level 1 −783 M,
+/// levels 2–4 +127 M), with the `LFM_HASH` split on.
+///
+/// The price is ELF-agnosticism. The wrap's constants are functions of the ELF,
+/// so its LFM `program_id` — and, through `ChildShape::program_id`, every node's
+/// and the root's above it — is a function of the ELF as well as of the block
+/// shape, as the WHIR wrap's already is (`whir_epoch`: the derived DECODE root is
+/// program text). A verifier rebuilds the wraps from the ELF it trusts;
+/// `SOUNDNESS.md` §6.9 has the argument.
+///
+/// Read ONCE per process, at program-emission time, like the other recursion
+/// program settings; a test overrides it on its own thread with
+/// [`with_stark_wrap_fold`].
+pub const STARK_WRAP_FOLD_ENV: &str = "LAMBDA_VM_STARK_WRAP_FOLD";
+
+/// [`STARK_WRAP_FOLD_ENV`]'s reading of a raw value: unset keeps the default,
+/// the host attestation.
+pub fn stark_wrap_fold_setting(raw: Option<&str>) -> bool {
+    super::airs::env_switch(STARK_WRAP_FOLD_ENV, raw).unwrap_or(false)
+}
+
+std::thread_local! {
+    static WRAP_FOLD_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether the STARK wraps this thread emits fold `program_id` in-guest
+/// ([`STARK_WRAP_FOLD_ENV`]): a test's [`with_stark_wrap_fold`] if one is in
+/// force, else the process setting — read once, and named on stderr either way
+/// so a log states which programs it proved.
+pub fn stark_wrap_folds_in_guest() -> bool {
+    static PROCESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    WRAP_FOLD_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            *PROCESS.get_or_init(|| {
+                let fold =
+                    stark_wrap_fold_setting(std::env::var(STARK_WRAP_FOLD_ENV).ok().as_deref());
+                super::airs::announce(&if fold {
+                    format!("LFM STARK WRAP: program_id folded in-guest ({STARK_WRAP_FOLD_ENV}=1)")
+                } else {
+                    "LFM STARK WRAP: program_id attested host-side, its inputs asserted \
+                     (the default)"
+                        .to_string()
+                });
+                fold
+            })
+        })
+}
+
+/// Run `f` with the STARK wraps this thread emits folding (`true`) or attesting
+/// host-side (`false`). Restored on return and on unwind.
+pub fn with_stark_wrap_fold<R>(fold: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRAP_FOLD_OVERRIDE.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(WRAP_FOLD_OVERRIDE.with(|o| o.replace(Some(fold))));
+    f()
+}
+
+/// What an attestation covers — [`emit_program_id`]'s four inputs — as VALUES
+/// the verifier derives from the ELF it trusts, never from a proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestedInputs {
+    /// `statement::elf_digest` of the ELF: the digest every epoch statement
+    /// absorbs.
+    pub elf_digest: [u8; 32],
+    /// The ELF's entry point.
+    pub pc_start: u64,
+    /// DECODE's preprocessed commitment: the ELF's instructions committed under
+    /// the proof options at the DECODE table's leaf layout — the root
+    /// production's verifier takes from the AIR and absorbs.
+    pub decode: stark::config::Commitment,
+    /// Page genesis commitments `(base, root)`, in the order the page arena
+    /// holds them. Empty for every continuation epoch.
+    pub pages: Vec<(u64, stark::config::Commitment)>,
+}
+
+impl AttestedInputs {
+    /// The id the fold computes over these inputs, and the one a consumer
+    /// recomputes: `recursion::program_id_from_digest` (keccak, §6.7's carve-out).
+    pub fn program_id(&self) -> [u8; 32] {
+        crate::recursion::program_id_from_digest(
+            &self.elf_digest,
+            self.pc_start,
+            &self.decode,
+            &self.pages,
+        )
+    }
+}
+
+/// The cells a wrap's verification READ for each attested input — what
+/// [`emit_host_attestation`] binds.
+pub struct AttestedCells<'a> {
+    /// The statement's first eight halves, absorbed before every challenge.
+    pub elf_digest: &'a [super::builder::Felt],
+    /// The entry point's two halves.
+    pub pc_start: &'a [super::builder::Felt],
+    /// The DECODE root Phase A absorbs and the DECODE leg compares.
+    pub decode: &'a super::epoch::RootCells,
+    /// Per page, its base's two halves and its root's eight halves.
+    pub pages: &'a [(Vec<super::builder::Felt>, Vec<super::builder::Felt>)],
+}
+
+/// ★ The attestation, host-side — the STARK wrap's default
+/// ([`STARK_WRAP_FOLD_ENV`]).
+///
+/// Publishes `inputs.program_id()` as two constant words in the fold's layout
+/// ([`program_id_words`]), and BINDS every input the fold would consume to its
+/// value by an equality assert against a program constant, on the cell the
+/// verification read:
+///
+/// - the ELF digest — the eight halves the statement absorbs, so the statement
+///   every challenge was drawn against is the attested one;
+/// - `pc_start` and the page roots — consumed by nothing else in a wrap: they
+///   are attested, fixed by program text;
+/// - the DECODE root — the cells Phase A absorbs and the DECODE leg compares,
+///   lane for lane at the builder's root width.
+///
+/// So a proof over any other value has NO EXECUTION, where the fold instead
+/// publishes a different id for a consumer's compare to reject. What makes the
+/// constants trustworthy is program identity: they are `LFM_CONST` rows, so they
+/// are in this program's `program_id`, which its parent interns. Returns the
+/// published id.
+pub fn emit_host_attestation(
+    b: &mut LfmBuilder,
+    inputs: &AttestedInputs,
+    cells: &AttestedCells<'_>,
+) -> [u8; 32] {
+    use super::builder::Felt;
+    use super::keccak_host::pack_stream;
+
+    let assert_all = |b: &mut LfmBuilder, cells: &[Felt], values: &[FE], what: &str| {
+        assert_eq!(cells.len(), values.len(), "{what}: one constant per cell");
+        for (cell, value) in cells.iter().zip(values) {
+            let want = b.felt_const(*value);
+            b.assert_eq(*cell, want);
+        }
+    };
+    assert_all(
+        b,
+        cells.elf_digest,
+        &pack_stream(&inputs.elf_digest),
+        "the ELF digest",
+    );
+    assert_all(
+        b,
+        cells.pc_start,
+        &pack_stream(&inputs.pc_start.to_le_bytes()),
+        "pc_start",
+    );
+    // Lane for lane at the builder's root width: eight `u32` halves on a byte
+    // hash, four canonical felts on an algebraic one — `RootCells::constant`
+    // renders the value the way `RootCells::hint` reads the arena.
+    let want = super::epoch::RootCells::constant(b, &inputs.decode).lanes_flat();
+    let got = cells.decode.lanes_flat();
+    assert_eq!(got.len(), want.len(), "the DECODE root: one lane per lane");
+    for (g, w) in got.iter().zip(&want) {
+        b.assert_eq(*g, *w);
+    }
+    assert_eq!(
+        cells.pages.len(),
+        inputs.pages.len(),
+        "one set of page cells per page root"
+    );
+    for ((base, root), (page_base, commitment)) in cells.pages.iter().zip(&inputs.pages) {
+        assert_all(
+            b,
+            base,
+            &pack_stream(&page_base.to_le_bytes()),
+            "a page base",
+        );
+        assert_all(b, root, &pack_stream(commitment), "a page root");
+    }
+
+    let id = inputs.program_id();
+    for word in program_id_words(&id) {
+        let cell = b.digest_const(word).as_cell();
+        b.public(cell);
+    }
+    id
+}
+
+/// The two published words of a `program_id`: its eight little-endian `u32`
+/// halves, four to a word — the layout [`emit_program_id`]'s two digest cells
+/// publish, so a node or a consumer reads either posture's id the same way.
+pub fn program_id_words(id: &[u8; 32]) -> [super::word::LfmWord; 2] {
+    let halves = super::keccak_host::pack_stream(id);
+    [
+        [halves[0], halves[1], halves[2], halves[3]],
+        [halves[4], halves[5], halves[6], halves[7]],
+    ]
 }
 
 // ======== R1g(i): the next epoch's REGISTER preprocessed commitment ========

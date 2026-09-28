@@ -505,10 +505,10 @@ fn the_assembled_epoch_verifier_runs() {
     assert_eq!(pub_ext(0), e.z_alpha.0, "the shared LogUp challenge z");
     assert_eq!(pub_ext(1), e.z_alpha.1, "the shared LogUp challenge alpha");
 
-    // The attestation fold is published right after Phase A (two digest words),
-    // and its DECODE input is the cell Phase A absorbed — the join ledger entry 7
-    // rests on. Its value is differentialled in the spine test; here it only has to
-    // be skipped, and skipped by NAME rather than by a literal.
+    // The attestation id is published right after Phase A (two words), and its
+    // DECODE input is the cell Phase A absorbed — the join ledger entry 7 rests
+    // on. Its value is differentialled in the spine test; here it only has to be
+    // skipped, and skipped by NAME rather than by a literal.
     let program_id_words = 2usize;
     // ★ Then the BLOCK-BINDING SCHEMA — the register boundary vectors, the epoch
     // label, the public-output halves and the L2G re-commit root. Skipped by NAME
@@ -1347,7 +1347,7 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     assert_eq!(
         sources.2, 1,
         "exactly one ELF-dependent root in a continuation epoch — DECODE. A second \
-         would mean the attestation fold's input is ambiguous"
+         would mean the attestation's input is ambiguous"
     );
 
     // ★ AND THE PAGE HALF OF ENTRY 7 IS NOT A FIXTURE ARTEFACT. `prove_epoch`
@@ -1355,7 +1355,7 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     // PAGE configs (L2G bookend replaces PAGE)", `continuation.rs:695-702`) and both
     // `build_epoch_airs` call sites pass `&[]`. So no continuation epoch of any
     // guest has a PAGE sub-proof, and the ELF-data page genesis roots the
-    // attestation folds are the GLOBAL proof's GlobalMemory AIRs' preprocessed
+    // attestation covers are the GLOBAL proof's GlobalMemory AIRs' preprocessed
     // commitments (`continuation.rs:997-1010`) — a different proof, out of an epoch
     // verifier's scope.
     //

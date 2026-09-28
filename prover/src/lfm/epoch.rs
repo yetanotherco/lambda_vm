@@ -206,14 +206,18 @@ impl RootCells {
 
     /// A root that is PROGRAM TEXT — its eight halves interned as constants.
     ///
-    /// Admissible only for a commitment that is a function of the proof OPTIONS
-    /// and nothing else, because a program constant is part of program identity:
-    /// interning a root derived from per-proof data (an ELF, a register file)
-    /// would give the machine one program per proof instead of one per epoch
-    /// SHAPE. The two that qualify are BITWISE and KECCAK_RC
+    /// A program constant is part of program identity, so a root interned here
+    /// makes the program a function of whatever the root is a function of. As a
+    /// root Phase A absorbs, that admits the commitments of the proof OPTIONS and
+    /// nothing else — BITWISE and KECCAK_RC
     /// (`bitwise::preprocessed_commitment(options)`,
     /// `tables::keccak_rc::preprocessed_commitment(options)`), plus PAGE's
-    /// zero-init root, which every zero-initialised page shares.
+    /// zero-init root, which every zero-initialised page shares — while a root
+    /// derived from per-proof data (a register file) would give the machine one
+    /// program per proof instead of one per epoch SHAPE. The one ELF-dependent
+    /// root with a constant is DECODE's in the STARK wrap's host attestation
+    /// (`programs::emit_host_attestation`), which asserts the hinted root Phase A
+    /// absorbed equal to it and makes that wrap a function of the ELF by design.
     ///
     /// Half `h` is bytes `4h..4h+4` little-endian —
     /// `proof_arena::commitment_words`' layout, which is how a keccak digest

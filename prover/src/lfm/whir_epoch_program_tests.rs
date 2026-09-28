@@ -1808,6 +1808,41 @@ fn the_epoch_programs_newton_pool_is_measured() {
     }
 }
 
+/// The WHIR wrap does not read the STARK wrap's attestation setting
+/// (`programs::STARK_WRAP_FOLD_ENV`): it attests host-side by construction, so
+/// its program — and with it its `program_id`, and every WHIR node's and root's
+/// above it — is the same whichever posture the STARK wraps emit.
+#[test]
+fn the_whir_wrap_ignores_the_stark_wrap_attestation_setting() {
+    let (elf_bytes, opts, bundle) = driver_bundle();
+    let index = bundle.epochs.len() - 1;
+    let epoch = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
+        multilinear::whir_hash::RpxWhir,
+    >(&opts, &elf_bytes, &bundle, index, None, None)
+    .expect("the last epoch harvests");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+    let airs = crate::multilinear_continuation::epoch_airs_for(
+        &elf,
+        &opts,
+        &bundle.epochs[index],
+        &epoch.position.register_init,
+        epoch.position.is_final,
+        epoch.position.label,
+        Some(epoch.decode_commitment),
+    );
+    let refs = airs.refs();
+    let [fold, host] = [true, false].map(|fold| {
+        crate::lfm::programs::with_stark_wrap_fold(fold, || {
+            format!("{:?}", super::whir_epoch::whir_epoch_program(&epoch, &refs))
+        })
+    });
+    assert!(
+        fold == host,
+        "the WHIR wrap's program must not depend on the STARK wrap's attestation \
+         setting"
+    );
+}
+
 fn driver_bundle() -> (
     Vec<u8>,
     crate::ProofOptions,

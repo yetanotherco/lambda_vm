@@ -177,9 +177,11 @@ pub struct ChipSet {
 ///
 /// By default a program carries `BITWISE` only when one of its instantiated
 /// chips sends it a lookup ([`ChipSet::bitwise_required`]). Every recursion
-/// program of the WHIR pipeline sends none, and so do the nodes, the global
-/// parent and the root of the STARK pipeline (its wraps keep the table: their
-/// `program_id` fold is a keccak permutation). Each of those proves one
+/// program of the WHIR pipeline sends none, and so does every recursion program
+/// of the STARK pipeline, its wraps included: their attestation runs no keccak
+/// (a wrap that folds its `program_id` in-guest,
+/// `programs::STARK_WRAP_FOLD_ENV`, keeps the table for that one keccak
+/// permutation). Each of those proves one
 /// sub-proof fewer and its parent re-verifies one fewer — a `2^20`-row table,
 /// 26.2 M census cells a proof. Measured on block 25368371 (one RTX 5090,
 /// ABBA): WHIR −4.70 s, STARK −5.30 s.
