@@ -2695,11 +2695,18 @@ impl BaseHeadAhead {
                 {
                     let open = base_stage();
                     let log_blowup = u64::from(device_opts.blowup_factor.trailing_zeros());
-                    stark::gpu_lde::prewarm_device(
+                    let warmed = stark::gpu_lde::prewarm_device(
                         u64::from(epoch_size_log2) + log_blowup,
                         BASE_HEAD_STAGING_PAIRS,
                     );
-                    base_head_done("device warm-up", open);
+                    // A decline costs the prove only its head start: it builds
+                    // the same state on demand.
+                    let step = if warmed {
+                        "device warm-up"
+                    } else {
+                        "device warm-up declined"
+                    };
+                    base_head_done(step, open);
                 }
             })
             .expect("a base head helper must spawn");

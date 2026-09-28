@@ -520,3 +520,33 @@ fn the_device_or_host_decode_root_from_an_elf_is_the_host_root() {
         commitment_from_elf(&elf, &options).expect("host"),
     );
 }
+
+/// ★ On a device build the base head's DECODE root for a map above the floor
+/// comes from the DEVICE: the device group counter moves, and the root is the
+/// host's. Without the counter a declined device commit would compare the host
+/// with the host and pass.
+///
+/// ⚠ The counter is process-wide: run this test on its own
+/// (`--test-threads=1`), or another test's device commit could move it.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_head_decode_root_is_committed_on_the_device() {
+    use crate::lfm::commit::device_host_group_counts;
+    use crate::tables::decode::{
+        compute_precomputed_commitment_device_or_host, compute_precomputed_commitment_with,
+    };
+    use stark::leaf_layout::LeafLayout;
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let (map, _) = two_maps_of(4097);
+    let (device_before, _) = device_host_group_counts();
+    let root = compute_precomputed_commitment_device_or_host(&map, &options, LeafLayout::RowPair);
+    let (device_after, _) = device_host_group_counts();
+    assert!(
+        device_after > device_before,
+        "the 8,192-row DECODE group was not committed on the device (host fallback)"
+    );
+    assert_eq!(
+        root,
+        compute_precomputed_commitment_with(&map, &options, LeafLayout::RowPair)
+    );
+}
