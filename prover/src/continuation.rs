@@ -2542,6 +2542,189 @@ pub(crate) fn base_prep_ahead() -> bool {
     })
 }
 
+/// The switch that takes the STARK base's head work off its critical path:
+/// `1` on, unset or `0` the serial head (today's), anything else stops the run.
+///
+/// ⛔ WHY. Before the card has anything to do, the serial head commits DECODE's
+/// precomputed columns on the host (RPX over a 2^22-row LDE, about a second on
+/// the block ELF) before epoch 0 even executes; epoch 0's builder then
+/// initialises the device; and the first prove's prepass builds every domain
+/// and twiddle set the epoch needs. On the base's traced run (G1, ds801) that
+/// is 2.44 s from run start to the first prove and 0.38 s of prepass in it,
+/// all with the card idle.
+///
+/// With the switch, two helpers start beside the producer: one initialises the
+/// device, commits DECODE there
+/// ([`crate::tables::decode::compute_precomputed_commitment_device_or_host`],
+/// the same root) and then builds the device's per-size state; the other
+/// builds the host domains and twiddles of every trace size up to the epoch's.
+/// The epochs wait for the commitment where they first use it. Only where the
+/// host work runs changes; every committed and absorbed value is the same.
+pub const BASE_HEAD_AHEAD_ENV: &str = "LAMBDA_VM_BASE_HEAD_AHEAD";
+
+/// Whether the head runs ahead, for a raw value of [`BASE_HEAD_AHEAD_ENV`]:
+/// unset, empty or `0` is serial, `1` is ahead, and anything else panics — a
+/// typo read as the default would measure one schedule under the other's name.
+pub fn base_head_ahead_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{BASE_HEAD_AHEAD_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// Whether this process runs the STARK base's head ahead. Read once, and named
+/// on stderr in one write either way, so a log states the head its base ran.
+pub(crate) fn base_head_ahead() -> bool {
+    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        let ahead = base_head_ahead_setting(std::env::var(BASE_HEAD_AHEAD_ENV).ok().as_deref());
+        let line = if ahead {
+            format!(
+                "BASE HEAD: ahead — DECODE committed on the device and the first prove's state \
+                 built by helpers beside epoch 0 ({BASE_HEAD_AHEAD_ENV}=1)\n"
+            )
+        } else {
+            "BASE HEAD: serial (the default)\n".to_string()
+        };
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        ahead
+    })
+}
+
+/// The smallest trace the head helper builds a domain for: below it a
+/// domain costs the prepass nothing worth moving.
+const BASE_HEAD_MIN_LOG_N: u32 = 4;
+
+/// Staging pairs the head helper makes: what the base's traced run made
+/// (G1, ds801: "staging pairs 4 of 8" after the base).
+#[cfg(feature = "cuda")]
+const BASE_HEAD_STAGING_PAIRS: usize = 4;
+
+/// Print a head helper's step, like [`base_stage_done`]'s epoch stages.
+fn base_head_done(step: &str, open: Option<(std::time::Instant, f64)>) {
+    if let Some((start, t0)) = open {
+        println!(
+            "BASE HEAD: {step} {:.2}s t=[{t0:.3},{:.3}]",
+            start.elapsed().as_secs_f64(),
+            stark::prove_split::epoch_secs()
+        );
+    }
+}
+
+/// Where the base's DECODE commitment comes from.
+enum DecodeSource {
+    /// Computed before the pipeline started: the serial head.
+    Ready(Commitment),
+    /// Arriving from the head helper ([`base_head_ahead`]).
+    Ahead(BaseHeadAhead),
+}
+
+/// The head helpers of [`base_head_ahead`], and the commitment one of them
+/// sends.
+struct BaseHeadAhead {
+    decode_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Result<Commitment, String>>>>,
+    decode: std::sync::OnceLock<Result<Commitment, String>>,
+    helpers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl DecodeSource {
+    /// The commitment. The first caller waits for the head helper; the rest
+    /// read what it received.
+    fn get(&self) -> Result<Commitment, Error> {
+        let got = match self {
+            Self::Ready(c) => return Ok(*c),
+            Self::Ahead(head) => head.decode.get_or_init(|| {
+                let rx = head
+                    .decode_rx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                rx.and_then(|rx| rx.recv().ok()).unwrap_or_else(|| {
+                    Err("the base head helper ended without a DECODE commitment".to_string())
+                })
+            }),
+        };
+        got.clone()
+            .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
+    }
+
+    /// Wait for the head helpers. Their work only fills caches, so a helper
+    /// that panicked cost the prove its head start and nothing else.
+    fn finish(self) {
+        if let Self::Ahead(head) = self {
+            for helper in head.helpers {
+                let _ = helper.join();
+            }
+        }
+    }
+}
+
+impl BaseHeadAhead {
+    /// Start the head helpers for a base proving `elf_bytes` under `opts` with
+    /// epochs of `2^epoch_size_log2` cycles. `observer` hears the commitment the
+    /// moment it exists.
+    fn start(
+        elf_bytes: &[u8],
+        opts: &ProofOptions,
+        epoch_size_log2: u32,
+        observer: Option<SharedEpochObserver>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (bytes, device_opts) = (elf_bytes.to_vec(), opts.clone());
+        let device = std::thread::Builder::new()
+            .name("base-head-device".to_string())
+            .spawn(move || {
+                let open = base_stage();
+                let decode = Elf::load(&bytes)
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|elf| {
+                        crate::tables::decode::commitment_from_elf_device_or_host(
+                            &elf,
+                            &device_opts,
+                        )
+                        .map_err(|e| format!("{e}"))
+                    });
+                base_head_done("DECODE commitment", open);
+                if let (Ok(c), Some(observer)) = (&decode, &observer) {
+                    observer.on_base_shared(Arc::new(*c));
+                }
+                let _ = tx.send(decode);
+                #[cfg(feature = "cuda")]
+                {
+                    let open = base_stage();
+                    let log_blowup = u64::from(device_opts.blowup_factor.trailing_zeros());
+                    stark::gpu_lde::prewarm_device(
+                        u64::from(epoch_size_log2) + log_blowup,
+                        BASE_HEAD_STAGING_PAIRS,
+                    );
+                    base_head_done("device warm-up", open);
+                }
+            })
+            .expect("a base head helper must spawn");
+        let host_opts = opts.clone();
+        let host = std::thread::Builder::new()
+            .name("base-head-host".to_string())
+            .spawn(move || {
+                let open = base_stage();
+                for log_n in (BASE_HEAD_MIN_LOG_N..=epoch_size_log2).rev() {
+                    stark::prover::warm_domain_and_twiddles::<GoldilocksField>(
+                        &host_opts,
+                        1 << log_n,
+                    );
+                }
+                base_head_done("domain warm-up", open);
+            })
+            .expect("a base head helper must spawn");
+        Self {
+            decode_rx: std::sync::Mutex::new(Some(rx)),
+            decode: std::sync::OnceLock::new(),
+            helpers: vec![device, host],
+        }
+    }
+}
+
 /// Hooks on a base's epoch pipeline, for a caller that starts host-only work on
 /// the epoch proofs before the bundle exists: the recursion tree's level-0
 /// lead-in, which builds the first wrap prologues in the base's tail.
@@ -2560,7 +2743,9 @@ pub(crate) trait EpochObserver<P>: Sync {
     /// base's DECODE root and prepared commitment (a
     /// `multilinear_continuation::SharedDecode<H>` under the base's hash — whose
     /// derivation is a device commit, which the lead-in must not make). Called
-    /// once, before any epoch.
+    /// once, before any epoch is prepared or proved: before the pipeline starts,
+    /// or from the STARK base's head helper ([`base_head_ahead`]), whose epochs
+    /// wait for the same commitment.
     fn on_base_shared(&self, _shared: Arc<dyn std::any::Any + Send + Sync>) {}
 }
 
@@ -2670,6 +2855,7 @@ pub fn prove_continuation_keeping_decode(
         epoch_size_log2,
         opts,
         base_prep_ahead(),
+        base_head_ahead(),
     )
 }
 
@@ -2677,14 +2863,16 @@ pub fn prove_continuation_keeping_decode(
 /// by the caller rather than read from [`BASE_PREP_ON_PROVER_ENV`], so one
 /// process can run both: `prep_ahead` moves each epoch's host preparation onto
 /// the trace builders and the global proof's onto the producer, ahead of the
-/// prover thread. The proofs are the same either way; only who does the host
-/// work, and when, changes.
+/// prover thread. `head_ahead` does the same for the head, as
+/// [`BASE_HEAD_AHEAD_ENV`] would. The proofs are the same either way; only who
+/// does the host work, and when, changes.
 pub(crate) fn prove_continuation_scheduled(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size_log2: u32,
     opts: &ProofOptions,
     prep_ahead: bool,
+    head_ahead: bool,
 ) -> Result<(ContinuationProof, Commitment), Error> {
     // The observer a caller installed for this thread, if any. It sees the
     // pipeline and changes nothing in it.
@@ -2712,15 +2900,25 @@ pub(crate) fn prove_continuation_scheduled(
     let __root = stark::instruments::span("prove_continuation_total");
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    // Ahead of the executor, so the helpers run beside everything after this.
+    let head_helpers = head_ahead
+        .then(|| BaseHeadAhead::start(elf_bytes, opts, epoch_size_log2, installed.clone()));
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
     // The DECODE precomputed commitment depends only on (ELF, opts): compute
-    // it once here instead of once per epoch inside `build_epoch_airs`.
-    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
-        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
-    if let Some(observer) = observer {
-        observer.on_base_shared(Arc::new(decode_commitment));
-    }
+    // it once here instead of once per epoch inside `build_epoch_airs` — or
+    // take it from the head helper, which computes it beside epoch 0.
+    let decode_source = match head_helpers {
+        Some(head) => DecodeSource::Ahead(head),
+        None => {
+            let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+                .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+            if let Some(observer) = observer {
+                observer.on_base_shared(Arc::new(decode_commitment));
+            }
+            DecodeSource::Ready(decode_commitment)
+        }
+    };
     // Same for the DECODE trace artifacts (instruction map + pristine trace):
     // a pure function of the ELF, built once and shared by every epoch's trace
     // build instead of re-parsed/regenerated inside the serial producer chain.
@@ -2828,19 +3026,23 @@ pub(crate) fn prove_continuation_scheduled(
                     panic!("injected prover panic (test)");
                 }
                 match ready {
-                    ReadyEpoch::Built(prepared) => prove_epoch(
-                        &elf,
-                        elf_bytes,
-                        &EpochStart {
-                            register_init: &prepared.register_init,
-                            label: prepared.label,
-                        },
-                        prepared.traces,
-                        prepared.is_final,
-                        &prepared.boundary,
-                        opts,
-                        decode_commitment,
-                    ),
+                    ReadyEpoch::Built(prepared) => {
+                        decode_source.get().and_then(|decode_commitment| {
+                            prove_epoch(
+                                &elf,
+                                elf_bytes,
+                                &EpochStart {
+                                    register_init: &prepared.register_init,
+                                    label: prepared.label,
+                                },
+                                prepared.traces,
+                                prepared.is_final,
+                                &prepared.boundary,
+                                opts,
+                                decode_commitment,
+                            )
+                        })
+                    }
                     ReadyEpoch::Prepped { prep, .. } => prove_prepped_epoch(*prep, elf_bytes, opts),
                 }
             }));
@@ -2960,16 +3162,18 @@ pub(crate) fn prove_continuation_scheduled(
                         // the build.
                         let __bs_prep = base_stage();
                         let prep = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            prep_epoch(
-                                &elf,
-                                &job.register_init,
-                                job.label,
-                                traces,
-                                job.is_final,
-                                &job.boundary,
-                                opts,
-                                decode_commitment,
-                            )
+                            decode_source.get().and_then(|decode_commitment| {
+                                prep_epoch(
+                                    &elf,
+                                    &job.register_init,
+                                    job.label,
+                                    traces,
+                                    job.is_final,
+                                    &job.boundary,
+                                    opts,
+                                    decode_commitment,
+                                )
+                            })
                         }));
                         base_stage_done(job.index, "prep", __bs_prep);
                         match prep {
@@ -3286,6 +3490,8 @@ pub(crate) fn prove_continuation_scheduled(
         }
     }
 
+    let decode_commitment = decode_source.get()?;
+    decode_source.finish();
     Ok((
         ContinuationProof {
             epochs,
@@ -4129,33 +4335,27 @@ mod tests {
 
     // ---- Standalone (split) prover/verifier ----
 
-    /// Preparing ahead of the prover moves each epoch's host preparation onto
-    /// the trace builders and the global proof's onto the producer. That changes
-    /// who does the work and when, never what is proved: the committed roots, the
-    /// L2G roots and the statement values equal those of the schedule that
-    /// prepares on the prover thread, the DECODE commitment is the same, and the
-    /// bundle verifies to the same output.
+    /// Two proves of one run under two base schedules proved the same thing:
+    /// the committed roots, the L2G roots and the statement values are equal,
+    /// the DECODE commitment is the same, and `x` verifies to the run's output.
     ///
     /// ⚠ Six tables are compared by everything BUT their root: BRANCH, DVRM,
     /// BYTEWISE, EQ, LT and MUL lay their rows out in `HashMap` iteration
     /// order (`op_map.into_iter()`), so their roots differ between two proves
     /// of the same run under the SAME schedule (measured: LT[0] in two of three
     /// epochs of this program, one schedule twice in one process).
-    #[test]
-    fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_commit_split");
-        let opts = ProofOptions::default_test_options();
-        let (on_prover, decode_on_prover) =
-            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, false).unwrap();
-        let (ahead, decode_ahead) =
-            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true).unwrap();
+    fn assert_same_proved(
+        elf_bytes: &[u8],
+        opts: &ProofOptions,
+        (x, decode_x): (&ContinuationProof, Commitment),
+        (y, decode_y): (&ContinuationProof, Commitment),
+    ) {
         assert!(
-            ahead.num_epochs() > 1,
+            x.num_epochs() > 1,
             "16-cycle epochs must split the run, or the pipeline is not exercised"
         );
-        assert_eq!(decode_ahead, decode_on_prover, "the DECODE commitment");
-        assert_eq!(ahead.num_epochs(), on_prover.num_epochs());
+        assert_eq!(decode_x, decode_y, "the DECODE commitment");
+        assert_eq!(x.num_epochs(), y.num_epochs());
         let roots = |p: &MultiProof<F, E, ()>| -> Vec<Commitment> {
             p.proofs
                 .iter()
@@ -4167,9 +4367,9 @@ mod tests {
                 .iter()
                 .any(|t| name.starts_with(&format!("{t}[")) || name == *t)
         };
-        let elf = Elf::load(&elf_bytes).unwrap();
-        for (k, (a, d)) in ahead.epochs.iter().zip(&on_prover.epochs).enumerate() {
-            let position = epoch_chain_position(&on_prover.epochs, on_prover.num_epochs(), &elf, k)
+        let elf = Elf::load(elf_bytes).unwrap();
+        for (k, (a, d)) in x.epochs.iter().zip(&y.epochs).enumerate() {
+            let position = epoch_chain_position(&y.epochs, y.num_epochs(), &elf, k)
                 .unwrap()
                 .unwrap();
             let recon = reconstruct_epoch_airs(
@@ -4178,7 +4378,7 @@ mod tests {
                 &position.register_init,
                 position.is_final,
                 position.label,
-                &opts,
+                opts,
                 None,
             )
             .unwrap()
@@ -4199,14 +4399,81 @@ mod tests {
             assert_eq!(a.public_output, d.public_output, "epoch {k}: output");
             assert_eq!(a.reg_fini, d.reg_fini, "epoch {k}: register fini");
         }
-        assert_eq!(
-            roots(&ahead.global),
-            roots(&on_prover.global),
-            "global trace roots"
-        );
-        assert_eq!(ahead.touched_page_bases, on_prover.touched_page_bases);
-        let out = verify_continuation(&elf_bytes, &ahead, &opts).unwrap();
+        assert_eq!(roots(&x.global), roots(&y.global), "global trace roots");
+        assert_eq!(x.touched_page_bases, y.touched_page_bases);
+        let out = verify_continuation(elf_bytes, x, opts).unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    /// Preparing ahead of the prover moves each epoch's host preparation onto
+    /// the trace builders and the global proof's onto the producer. That changes
+    /// who does the work and when, never what is proved
+    /// ([`assert_same_proved`]).
+    #[test]
+    fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
+        let (on_prover, decode_on_prover) =
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, false, false).unwrap();
+        let (ahead, decode_ahead) =
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true, false).unwrap();
+        assert_same_proved(
+            &elf_bytes,
+            &opts,
+            (&ahead, decode_ahead),
+            (&on_prover, decode_on_prover),
+        );
+    }
+
+    /// ★ The head run ahead ([`base_head_ahead`]) proves what the serial head
+    /// proves ([`assert_same_proved`]): its DECODE commitment comes from the
+    /// device-or-host commit on a helper, the first prove finds the domains the
+    /// other helper built, and none of it moves a value. The observer hears the
+    /// commitment exactly once, from the helper, and it is the serial head's.
+    #[test]
+    fn the_head_ahead_proves_what_the_serial_head_proves() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
+        let (serial, decode_serial) =
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true, false).unwrap();
+        let observer = Arc::new(RecordingObserver::<EpochProof>::default());
+        let (ahead, decode_ahead) = with_epoch_observer(observer.clone(), || {
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true, true)
+        })
+        .unwrap();
+        assert_same_proved(
+            &elf_bytes,
+            &opts,
+            (&ahead, decode_ahead),
+            (&serial, decode_serial),
+        );
+        let shared = observer.shared.lock().unwrap();
+        assert_eq!(shared.len(), 1, "the base shares its DECODE work once");
+        assert_eq!(
+            shared[0].downcast_ref::<Commitment>(),
+            Some(&decode_serial),
+            "and it is the serial head's commitment"
+        );
+    }
+
+    /// The head switch: unset, empty or `0` is the serial head, `1` ahead.
+    #[test]
+    fn the_base_head_switch_is_serial_unless_exactly_one() {
+        assert!(!base_head_ahead_setting(None));
+        assert!(!base_head_ahead_setting(Some("")));
+        assert!(!base_head_ahead_setting(Some("0")));
+        assert!(base_head_ahead_setting(Some("1")));
+        assert!(base_head_ahead_setting(Some(" 1 ")));
+    }
+
+    /// Anything else stops the run rather than measuring the default under the
+    /// switch's name.
+    #[test]
+    #[should_panic(expected = "LAMBDA_VM_BASE_HEAD_AHEAD must be 0 or 1")]
+    fn the_base_head_switch_refuses_anything_else() {
+        base_head_ahead_setting(Some("yes"));
     }
 
     /// The schedule switch: unset, empty or `0` prepares ahead of the prover

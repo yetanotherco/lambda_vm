@@ -478,3 +478,45 @@ fn print_decode_shape_for_the_bench_elfs() {
         );
     }
 }
+
+// =========================================================================
+// The device-or-host DECODE commitment (the base's head, run ahead)
+// =========================================================================
+
+/// ★ The device-or-host DECODE root is the host root, in both leaf layouts.
+///
+/// On a CPU build both sides are the host, and this pins the row-major group
+/// the device arm is handed: a transposed, truncated or widened group changes
+/// the root. On a device build the 8,192-row map crosses the device's commit
+/// floor (8,192 × blowup ≥ 2^14 LDE rows), so there the device commits it and
+/// this is the device-against-host gate the base's head relies on.
+#[test]
+fn the_device_or_host_decode_root_is_the_host_root() {
+    use crate::tables::decode::{
+        compute_precomputed_commitment_device_or_host, compute_precomputed_commitment_with,
+    };
+    use stark::leaf_layout::LeafLayout;
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    for n in [13u64, 4097] {
+        let (map, _) = two_maps_of(n);
+        for layout in [LeafLayout::RowPair, LeafLayout::Row] {
+            assert_eq!(
+                compute_precomputed_commitment_device_or_host(&map, &options, layout),
+                compute_precomputed_commitment_with(&map, &options, layout),
+                "{n} instructions, {layout:?}"
+            );
+        }
+    }
+}
+
+/// The same from an ELF, as the base's head calls it.
+#[test]
+fn the_device_or_host_decode_root_from_an_elf_is_the_host_root() {
+    use crate::tables::decode::commitment_from_elf_device_or_host;
+    let elf = Elf::load(&asm_elf_bytes("test_commit_split")).expect("ELF load");
+    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    assert_eq!(
+        commitment_from_elf_device_or_host(&elf, &options).expect("device-or-host"),
+        commitment_from_elf(&elf, &options).expect("host"),
+    );
+}
