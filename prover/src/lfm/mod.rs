@@ -140,6 +140,8 @@ mod c5_probe;
 #[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]
+mod dwhir_sizing_tests;
+#[cfg(test)]
 mod epoch_tests;
 #[cfg(test)]
 mod epoch_verify_tests;
