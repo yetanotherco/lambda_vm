@@ -6049,6 +6049,129 @@ fn lead_in_count(var: &str, default: usize) -> usize {
     }
 }
 
+/// The opt-in that runs the lead-in's prologues in a rayon pool of their own,
+/// of this many threads: unset, empty or `0` is the global pool (today's).
+///
+/// ⛔ WHY. A prologue verifies its base epoch, fanning out over every thread of
+/// the pool it runs in, while the base is still proving its last epochs. The
+/// base's per-table drivers are plain OS threads: each parallel iterator they
+/// start is injected into the GLOBAL pool and waits until a worker takes it. On
+/// the base's traced run (G1, ds801) the prologues' spans hold 4.83 s of the
+/// base's 10.88 s of card idle, and the base's host-only OOD absorb, which is
+/// such an injection, summed 5.16 s over split 9's tables against 0.02 s in a
+/// quiet split. In a pool of their own the prologues use at most that many
+/// threads and never queue in front of the base's work.
+const TAIL_THREADS_ENV: &str = "LFM_TREE_TAIL_THREADS";
+
+/// [`TAIL_THREADS_ENV`] for a raw value: `None` (the global pool) for unset,
+/// empty or `0`, else the pool's size. Anything but a count panics.
+fn tail_threads_setting(raw: Option<&str>) -> Option<usize> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => None,
+        Some(v) => Some(
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("{TAIL_THREADS_ENV} must be a thread count, got `{v}`")),
+        ),
+    }
+}
+
+/// The lead-in's own pool, built on first use and named on stdout then, or
+/// `None` for the global pool.
+#[cfg(feature = "parallel")]
+fn tail_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = tail_threads_setting(std::env::var(TAIL_THREADS_ENV).ok().as_deref())?;
+        println!(
+            "   ★ L0 PROLOGUES: in a rayon pool of their own, {threads} thread(s) \
+             ({TAIL_THREADS_ENV})"
+        );
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("l0-tail-pool-{i}"))
+                .build()
+                .expect("the lead-in's pool must build"),
+        )
+    })
+    .as_ref()
+}
+
+/// Run `f` in the lead-in's pool when [`TAIL_THREADS_ENV`] asks for one, on
+/// the calling thread otherwise.
+fn in_tail_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    #[cfg(feature = "parallel")]
+    return in_pool(tail_pool(), f);
+    #[cfg(not(feature = "parallel"))]
+    return f();
+}
+
+/// Run `f` inside `pool`, so every parallel iterator it starts runs on that
+/// pool's threads, or on the calling thread when there is none.
+#[cfg(feature = "parallel")]
+fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+/// The pool switch: unset, empty or `0` is the global pool, a count is a pool
+/// of its own.
+#[test]
+fn the_tail_pool_switch_is_the_global_pool_unless_a_count() {
+    assert_eq!(tail_threads_setting(None), None);
+    assert_eq!(tail_threads_setting(Some("")), None);
+    assert_eq!(tail_threads_setting(Some("0")), None);
+    assert_eq!(tail_threads_setting(Some("8")), Some(8));
+    assert_eq!(tail_threads_setting(Some(" 4 ")), Some(4));
+}
+
+/// Anything but a count stops the run rather than measuring the default under
+/// the switch's name.
+#[test]
+#[should_panic(expected = "LFM_TREE_TAIL_THREADS must be a thread count")]
+fn the_tail_pool_switch_refuses_anything_else() {
+    tail_threads_setting(Some("many"));
+}
+
+/// ★ Work run in a pool of its own fans out over THAT pool's threads — not the
+/// global pool's, which is the whole point — and returns what it computed.
+#[cfg(feature = "parallel")]
+#[test]
+fn work_in_a_pool_of_its_own_runs_on_its_threads() {
+    use rayon::prelude::*;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .thread_name(|i| format!("tail-pool-test-{i}"))
+        .build()
+        .expect("a 3-thread pool");
+    let (threads, names, sum) = in_pool(Some(&pool), || {
+        let names: std::collections::BTreeSet<String> = (0..64u64)
+            .into_par_iter()
+            .map(|_| {
+                std::thread::current()
+                    .name()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let sum: u64 = (1..=1000u64).into_par_iter().sum();
+        (rayon::current_num_threads(), names, sum)
+    });
+    assert_eq!(threads, 3, "the work sees the pool's width");
+    assert!(
+        names.iter().all(|n| n.starts_with("tail-pool-test-")),
+        "every task ran on the pool's threads: {names:?}"
+    );
+    assert_eq!(sum, 500_500);
+    assert_eq!(
+        in_pool(None, || 7),
+        7,
+        "no pool: the calling thread runs it"
+    );
+}
+
 /// ★ THE LEVEL-0 LEAD-IN, in the base's tail.
 ///
 /// ⛔ WHAT IT REMOVES. Without it level 0 opens with host work alone: every
@@ -6150,9 +6273,12 @@ where
                         // level 0, which builds it and reports the failure where it
                         // lands; a slot left `Building` would park level 0's `take`.
                         // ⓘ The context is taken on the first claim, not at spawn: a
-                        // helper does nothing at all until the base's tail.
+                        // helper does nothing at all until the base's tail. It is
+                        // taken outside the tail pool, so no pool thread waits on
+                        // the base for it.
                         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            build(lead.context(), &prefix, n, k)
+                            let context = lead.context();
+                            in_tail_pool(|| build(context, &prefix, n, k))
                         }));
                         if built.is_err() {
                             println!(
