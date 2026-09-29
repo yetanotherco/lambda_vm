@@ -49,6 +49,30 @@ fn epoch_field_vm_vs_lfm() {
         program.instrs.len(),
         t.elapsed().as_secs_f64()
     );
+    // Per-chip census: value columns (no preprocessed prefix) plus LogUp aux
+    // columns. The field part is what the Field VM translation covers.
+    const FIELD: [&str; 6] = [
+        "LFM_CONST",
+        "LFM_BALU",
+        "LFM_XALU",
+        "LFM_SELECT",
+        "LFM_HINT",
+        "LFM_PUBLIC",
+    ];
+    let (mut field, mut rest) = (0u64, 0u64);
+    for c in super::airs::lfm_chip_census(&program) {
+        let cells = c.main_cells() + c.aux_cells();
+        eprintln!(
+            "  chip {:<12} rows={:>8} real={:>8} main={:>4} aux={:>3} cells={:>10}",
+            c.name, c.rows, c.real_rows, c.main_cols, c.aux_cols, cells
+        );
+        if FIELD.contains(&c.name) {
+            field += cells;
+        } else {
+            rest += cells;
+        }
+    }
+    eprintln!("  lfm census: field part {field} cells, hash/bit part {rest} cells");
     let hasher = crate::hash_pin::BLOCK_HASHER;
     let exec =
         super::executor::execute(&program, &arenas, &hasher).expect("the epoch verifier executes");
