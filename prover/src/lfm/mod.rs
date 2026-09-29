@@ -77,6 +77,9 @@ pub mod whir_global;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
+/// The W-LFM proof: an LFM program proved by the stacked-WHIR prover (pure
+/// WHIR, D-WHIR §2), selected by `LAMBDA_VM_LFM_PROVER=whir`.
+pub mod whir_proof;
 /// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
 ///
 /// ⚠ NOT `#[cfg(test)]`: `WhirRealEpoch` is the input type of V1's level-0
@@ -201,6 +204,8 @@ mod whir_open_tests;
 mod whir_poly_tests;
 #[cfg(test)]
 mod whir_program_tests;
+#[cfg(test)]
+mod whir_proof_tests;
 /// The cross-epoch driver's tests, beside the level-0 driver's.
 #[cfg(test)]
 mod whir_real_global_tests;
