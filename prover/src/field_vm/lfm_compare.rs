@@ -11,7 +11,7 @@ use stark::proof::stark::MultiProof;
 use super::asm::Asm;
 use super::executor::{Memory, NoHints, execute};
 use super::isa::{Arg, Program, gpr};
-use super::prove::{generate_traces, program_id, prove_traces, verify};
+use super::prove::{generate_traces, program_id, prove_traces, public_cells, verify};
 use crate::lfm::builder::LfmBuilder;
 use crate::lfm::compiler::compile;
 use crate::lfm::edsl::horner_ext;
@@ -86,14 +86,17 @@ fn report_fvm(label: &str, program: &Program, len: usize) {
     )
     .unwrap();
     let id = program_id(program, &opts);
+    // Only the result is public, as `LFM` publishes only its `public` word.
+    let public = [len as u64 + 1];
+    let cells = public_cells(&exec, &public);
     let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
     for _ in 0..RUNS {
-        let mut traces = generate_traces(program, &exec);
+        let mut traces = generate_traces(program, &exec, &public);
         let t = Instant::now();
-        let proof = prove_traces(&id, &mut traces, &opts).unwrap();
+        let proof = prove_traces(&id, &cells, &mut traces, &opts).unwrap();
         prove_ms.push(t.elapsed().as_secs_f64() * 1e3);
         let t = Instant::now();
-        assert!(verify(&id, &proof, &opts));
+        assert!(verify(&id, &cells, &proof, &opts));
         verify_ms.push(t.elapsed().as_secs_f64() * 1e3);
         shape = census(&proof);
     }
