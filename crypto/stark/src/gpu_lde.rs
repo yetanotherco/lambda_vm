@@ -148,13 +148,24 @@ fn gpu_lde_threshold() -> usize {
 /// from small sizes (it kills the per-round re-uploads); dropping the HOST
 /// copy is a much stronger contract — every downstream dispatch must take its
 /// GPU path or the prove hard-aborts, and the gate cannot mirror kernel-side
-/// eligibility (the LOCKSTEP note below). Keep device-only to the large-table
-/// envelope where those paths are exercised; mid tables keep a host copy so a
-/// dispatch decline degrades to CPU instead of aborting.
+/// eligibility (the LOCKSTEP note below).
 ///
-/// That degradation covers the sites that READ the LDE — they all gate on
-/// `host_trace_empty()` and take their host arm. It does NOT cover the R4
-/// Merkle-proof gather: the host tree is root-only for every GPU-committed
+/// ★ 2^16, because of what a host copy costs. A table outside the envelope
+/// downloads its whole main and aux LDE inside its commit, on the driver that
+/// would otherwise submit its next table. With the envelope at 2^19 the STARK
+/// block's base downloaded 39.74 GB that way (8.08 s of driver time), most of it
+/// KECCAK_RND and ECDAS tables of 1,480 and 521 columns that sat below 2^19 by
+/// row count alone. At 2^16 (with the barycentric floor, `n >= 2^14`, below it:
+/// at blowup 4 every table the R3 device path serves) the base downloads 7.27 GB
+/// and the block proves 1.40 s faster (FAST job 206, ds850–861, two arms each:
+/// wall −1.40 s, base −1.10 s; program ids unchanged, the root verified).
+/// `LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD=524288` restores the 2^19 envelope.
+///
+/// Tables outside the envelope keep a host copy, so a dispatch decline there
+/// degrades to CPU instead of aborting. That degradation covers the sites that
+/// READ the LDE — they all gate on `host_trace_empty()` and take their host
+/// arm. It does NOT cover the R4 Merkle-proof gather: the host tree is
+/// root-only for every GPU-committed
 /// table (the tree stays resident from [`DEFAULT_GPU_LDE_THRESHOLD`] upward,
 /// whatever `retain_host_lde` says), so a declined `gather_proofs_dev` has
 /// nothing to fall back to and aborts regardless of the host LDE. Lowering
@@ -164,7 +175,7 @@ fn gpu_lde_threshold() -> usize {
 /// Inside the envelope the contract is stricter still: a device-only table's
 /// host recovery is refused in production ([`refuse_host_recovery`]), so a
 /// runtime decline there is an abort with a diagnostic, never a slow prove.
-const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
+const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 16;
 
 fn gpu_device_only_threshold() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
