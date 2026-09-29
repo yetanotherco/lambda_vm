@@ -74,6 +74,9 @@ pub mod whir_fold;
 pub mod whir_gkr;
 /// The CROSS-EPOCH program builder, beside `whir_epoch`'s level-0 one.
 pub mod whir_global;
+/// The W-leg: a node's in-guest verifier of one W-LFM child, and the node
+/// over W-LFM children.
+pub mod whir_leg;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
@@ -198,6 +201,8 @@ mod whir_gkr_tests;
 /// The cross-epoch program builder's tests.
 #[cfg(test)]
 mod whir_global_tests;
+#[cfg(test)]
+mod whir_leg_tests;
 #[cfg(test)]
 mod whir_open_tests;
 #[cfg(test)]
