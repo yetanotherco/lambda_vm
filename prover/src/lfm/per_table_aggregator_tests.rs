@@ -10191,6 +10191,34 @@ fn w1_prove_whir(
         build.artifacts.table_num_vars,
         w1_id(&build.artifacts.program_id),
     );
+    // ★ The security gate's input: one `GAPB CHAIN` line per chain this proof
+    // opens — every main polynomial, then every prepared one — in the form
+    // `proto_bits.py` parses (a9ffbf48a's line, which is not on this branch).
+    let config = &build.artifacts.config;
+    let chains = std::iter::repeat_n(
+        plan.group_layouts[0].n_stack(),
+        plan.group_layouts[0].num_polys(),
+    )
+    .chain(std::iter::repeat_n(
+        build.artifacts.prepared_layout.n_stack(),
+        build.artifacts.prepared_layout.num_polys(),
+    ));
+    for num_vars in chains {
+        println!(
+            "GAPB CHAIN num_vars={num_vars} log_domain={} blowup_log={} schedule={:?} caps={:?} \
+             queries={} grind={}/{}/{} who=w-lfm:{}:{}",
+            num_vars + config.log_blowup,
+            config.log_blowup,
+            config.schedule(num_vars),
+            config.tree_caps(num_vars),
+            config.num_queries,
+            config.grind.folding,
+            config.grind.ood,
+            config.grind.query,
+            label.replace(' ', "_"),
+            policy.name(),
+        );
+    }
     // The verifier's half: the prover's prepared stack (its codewords stay on
     // the card) is dropped here, since a parent needs only the artifacts.
     (build.artifacts, proved)
