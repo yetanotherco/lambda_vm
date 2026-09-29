@@ -162,3 +162,116 @@ fn epoch_field_vm_vs_lfm() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn epoch_op_profile() {
+    use super::instr::{BaseOp, ExtOp, Instr};
+    use std::collections::{BTreeMap, HashMap};
+    let e = super::epoch_tests::real_epoch_from(
+        super::proof_fixture::fixture_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let op = |i: &Instr| -> String {
+        match i {
+            Instr::BaseAlu { op, .. } => format!("b{op:?}"),
+            Instr::ExtAlu { op, .. } => format!("e{op:?}"),
+            other => {
+                format!("{:?}", std::mem::discriminant(other))
+                    .chars()
+                    .take(0)
+                    .collect::<String>()
+                    + match other {
+                        Instr::Const { .. } => "Const",
+                        Instr::Select { .. } => "Select",
+                        Instr::BitDec { .. } => "BitDec",
+                        Instr::Hash { .. } => "Hash",
+                        Instr::Hint { .. } => "Hint",
+                        Instr::Pack { .. } => "Pack",
+                        Instr::Unpack { .. } => "Unpack",
+                        Instr::Public { .. } => "Public",
+                        _ => "Other",
+                    }
+            }
+        }
+    };
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut producer: HashMap<u64, (usize, u64)> = HashMap::new();
+    for (idx, i) in program.instrs.iter().enumerate() {
+        *kinds.entry(op(i)).or_insert(0) += 1;
+        match i {
+            Instr::BaseAlu { out, mult, .. }
+            | Instr::ExtAlu { out, mult, .. }
+            | Instr::Const { out, mult, .. } => {
+                producer.insert(out.0, (idx, *mult));
+            }
+            _ => {}
+        }
+    }
+    let mut pairs: BTreeMap<String, usize> = BTreeMap::new();
+    for i in &program.instrs {
+        let (kind, ins): (String, Vec<u64>) = match i {
+            Instr::BaseAlu { a, b, c, op, .. } => (
+                format!("b{op:?}"),
+                if matches!(op, BaseOp::MulAdd) {
+                    vec![a.0, b.0, c.0]
+                } else {
+                    vec![a.0, b.0]
+                },
+            ),
+            Instr::ExtAlu { a, b, c, op, .. } => (
+                format!("e{op:?}"),
+                if matches!(op, ExtOp::MulAdd) {
+                    vec![a.0, b.0, c.0]
+                } else {
+                    vec![a.0, b.0]
+                },
+            ),
+            _ => continue,
+        };
+        for (pos, a) in ins.iter().enumerate() {
+            if let Some(&(p, 1)) = producer.get(a) {
+                *pairs
+                    .entry(format!("{} -> {kind}[{pos}]", op(&program.instrs[p])))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    eprintln!("kinds: {kinds:?}");
+    let mut v: Vec<_> = pairs.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    for (k, n) in v.iter().take(25) {
+        eprintln!("  single-use {k}: {n}");
+    }
+}
+
+/// The translation with `FVM_TRANSLATE_OPT` / `FVM_MEM_COMPACT` executes on the
+/// real epoch: every fused or chained row is an assertion the executor checks.
+#[test]
+#[ignore]
+fn epoch_translation_shapes() {
+    let e = super::epoch_tests::real_epoch_from(
+        super::proof_fixture::fixture_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap();
+    let tr = translate(&program, &exec, false);
+    let run = execute(
+        &tr.program,
+        Memory::with_init(tr.mem.len(), &tr.mem),
+        &mut NoHints,
+        1 << 26,
+    )
+    .expect("the translation executes");
+    eprintln!(
+        "program={} steps={} mem={} public={} skipped={:?}",
+        tr.program.len(),
+        run.steps.len(),
+        tr.mem.len(),
+        tr.public.len(),
+        tr.skipped
+    );
+}

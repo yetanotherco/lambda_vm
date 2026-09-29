@@ -34,8 +34,138 @@ fn word_to_ext(w: [FE; 4]) -> FEE {
     FEE::new([w[0], w[1], w[2]])
 }
 
+/// An ALU instruction as `(is_ext, op, out, a, b, c)`.
+fn alu(i: &Instr) -> Option<(bool, AluOp, u64, u64, u64, u64)> {
+    match i {
+        Instr::BaseAlu {
+            op, out, a, b, c, ..
+        } => Some((false, AluOp::from_base(*op), out.0, a.0, b.0, c.0)),
+        Instr::ExtAlu {
+            op, out, a, b, c, ..
+        } => Some((true, AluOp::from_ext(*op), out.0, a.0, b.0, c.0)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AluOp {
+    Add,
+    Sub,
+    Mul,
+    MulAdd,
+    Div,
+}
+
+impl AluOp {
+    fn from_base(op: BaseOp) -> Self {
+        match op {
+            BaseOp::Add => Self::Add,
+            BaseOp::Sub => Self::Sub,
+            BaseOp::Mul => Self::Mul,
+            BaseOp::MulAdd => Self::MulAdd,
+            BaseOp::Div => Self::Div,
+        }
+    }
+
+    fn from_ext(op: ExtOp) -> Self {
+        match op {
+            ExtOp::Add => Self::Add,
+            ExtOp::Sub => Self::Sub,
+            ExtOp::Mul | ExtOp::MulBase => Self::Mul,
+            ExtOp::MulAdd => Self::MulAdd,
+            ExtOp::Div => Self::Div,
+        }
+    }
+}
+
+/// How an ALU instruction's result is produced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    Plain,
+    /// Folded into its single consumer's row.
+    Fused,
+    /// Written to the accumulator register for the next instruction.
+    Chained,
+}
+
+/// Single-use results that fold into their consumer's FMA, or stay in a
+/// register when the consumer comes right after.
+fn plan(program: &LfmProgram) -> Vec<Plan> {
+    let mut produced: std::collections::HashMap<u64, (usize, u64)> =
+        std::collections::HashMap::new();
+    for (i, instr) in program.instrs.iter().enumerate() {
+        match instr {
+            Instr::BaseAlu { out, mult, .. } | Instr::ExtAlu { out, mult, .. } => {
+                produced.insert(out.0, (i, *mult));
+            }
+            _ => {}
+        }
+    }
+    let single = |addr: u64| {
+        produced
+            .get(&addr)
+            .filter(|(_, m)| *m == 1)
+            .map(|(i, _)| *i)
+    };
+    let mut plan = vec![Plan::Plain; program.instrs.len()];
+    // Rows whose result lands outside the `d` slot (a Div, a fused Sub).
+    let mut out_not_d = vec![false; program.instrs.len()];
+    for (j, instr) in program.instrs.iter().enumerate() {
+        let Some((ext, op, _, a, b, _)) = alu(instr) else {
+            continue;
+        };
+        let is = |p: usize, want: AluOp| {
+            alu(&program.instrs[p]).is_some_and(|(pe, pop, ..)| pe == ext && pop == want)
+        };
+        match op {
+            // (x − y) / c  ⇒  [x] == [c]·[q] + [y]
+            AluOp::Div => {
+                out_not_d[j] = true;
+                if let Some(p) = single(a).filter(|&p| is(p, AluOp::Sub)) {
+                    plan[p] = Plan::Fused;
+                }
+            }
+            // z − x·y  ⇒  [z] == [x]·[y] + [q]
+            AluOp::Sub => {
+                if let Some(p) = single(b).filter(|&p| is(p, AluOp::Mul)) {
+                    plan[p] = Plan::Fused;
+                    out_not_d[j] = true;
+                }
+            }
+            // x·y + z  ⇒  [q] == [x]·[y] + [z]
+            AluOp::Add => {
+                if let Some(p) = single(a).filter(|&p| is(p, AluOp::Mul)) {
+                    plan[p] = Plan::Fused;
+                } else if let Some(p) = single(b).filter(|&p| is(p, AluOp::Mul)) {
+                    plan[p] = Plan::Fused;
+                }
+            }
+            _ => {}
+        }
+    }
+    for c in 1..program.instrs.len() {
+        let p = c - 1;
+        let (Some((_, _, out, ..)), Some((_, cop, _, a, b, cc))) =
+            (alu(&program.instrs[p]), alu(&program.instrs[c]))
+        else {
+            continue;
+        };
+        let reads = a == out || b == out || (cop == AluOp::MulAdd && cc == out);
+        if plan[p] == Plan::Plain
+            && plan[c] != Plan::Fused
+            && !out_not_d[p]
+            && reads
+            && single(out) == Some(p)
+        {
+            plan[p] = Plan::Chained;
+        }
+    }
+    plan
+}
+
 /// `bit_dec` decomposes with FMA rows (a bit check and an accumulation per
-/// bit); otherwise it is skipped as RISC-V-half work.
+/// bit); otherwise it is skipped as RISC-V-half work. `FVM_TRANSLATE_OPT`
+/// turns on the planner above and moves base constants to public cells.
 pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Translation {
     let n = program.num_addrs;
     let mut mem: Vec<FEE> = (0..n)
@@ -51,12 +181,40 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         mem.len() as u64 - 1
     };
     let (acc, tmp) = (gpr(0), gpr(1));
+    let opt = std::env::var_os("FVM_TRANSLATE_OPT").is_some();
+    let plan = if opt {
+        plan(program)
+    } else {
+        vec![Plan::Plain; program.instrs.len()]
+    };
+    let producer: std::collections::HashMap<u64, usize> = program
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, instr)| alu(instr).map(|(_, _, out, ..)| (out, i)))
+        .collect();
+    let fused = |x: u64| {
+        producer
+            .get(&x)
+            .filter(|&&p| plan[p] == Plan::Fused)
+            .and_then(|&p| alu(&program.instrs[p]))
+    };
+    // The address the accumulator holds for the current instruction.
+    let mut in_acc: Option<u64> = None;
     let mut asm = Asm::new();
     let mut public = Vec::new();
     let mut lfm_counts = BTreeMap::new();
     let mut skipped = BTreeMap::new();
 
-    for instr in &program.instrs {
+    for (idx, instr) in program.instrs.iter().enumerate() {
+        let held = in_acc.take();
+        let arg = |x: u64| {
+            if held == Some(x) {
+                Arg::reg(acc)
+            } else {
+                Arg::mem_abs(x)
+            }
+        };
         let kind = match instr {
             Instr::Const { .. } => "const",
             Instr::BaseAlu { .. } => "base_alu",
@@ -74,37 +232,46 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         *lfm_counts.entry(kind).or_insert(0) += 1;
         match instr {
             Instr::Const { out, value, .. } => {
-                if value[1] == FE::zero() && value[2] == FE::zero() {
+                if value[1] == FE::zero() && value[2] == FE::zero() && !opt {
                     asm.store(cell(out), Arg::imm_fe(value[0]));
                 } else {
                     public.push(out.0);
                 }
             }
-            Instr::BaseAlu {
-                op, out, a, b, c, ..
-            } => {
-                let one = Arg::imm(1);
-                match op {
-                    BaseOp::Add => asm.fma(cell(out), one, cell(a), cell(b)),
-                    BaseOp::Sub => asm.fma(cell(out), Arg::imm(-1), cell(b), cell(a)),
-                    BaseOp::Mul => asm.fma(cell(out), cell(a), cell(b), Arg::imm(0)),
-                    BaseOp::MulAdd => asm.fma(cell(out), cell(a), cell(b), cell(c)),
-                    BaseOp::Div => asm.fma(cell(a), cell(b), cell(out), Arg::imm(0)),
+            Instr::BaseAlu { .. } | Instr::ExtAlu { .. } => {
+                let (_, op, out, a, b, c) = alu(instr).expect("an ALU instruction");
+                if plan[idx] == Plan::Fused {
+                    *skipped.entry("fused").or_insert(0) += 1;
+                    continue;
+                }
+                let (d, hint) = if plan[idx] == Plan::Chained {
+                    in_acc = Some(out);
+                    (Arg::reg(acc), true)
+                } else {
+                    (Arg::mem_abs(out), false)
                 };
-            }
-            Instr::ExtAlu {
-                op, out, a, b, c, ..
-            } => {
-                let one = Arg::imm(1);
-                match op {
-                    ExtOp::Add => asm.fma(cell(out), one, cell(a), cell(b)),
-                    ExtOp::Sub => asm.fma(cell(out), Arg::imm(-1), cell(b), cell(a)),
-                    ExtOp::Mul | ExtOp::MulBase => {
-                        asm.fma(cell(out), cell(a), cell(b), Arg::imm(0))
-                    }
-                    ExtOp::MulAdd => asm.fma(cell(out), cell(a), cell(b), cell(c)),
-                    ExtOp::Div => asm.fma(cell(a), cell(b), cell(out), Arg::imm(0)),
+                let (fd, fa, fb, fc) = match op {
+                    AluOp::Add => match (fused(a), fused(b)) {
+                        (Some((.., x, y, _)), _) => (d, arg(x), arg(y), arg(b)),
+                        (_, Some((.., x, y, _))) => (d, arg(x), arg(y), arg(a)),
+                        _ => (d, Arg::imm(1), arg(a), arg(b)),
+                    },
+                    AluOp::Sub => match fused(b) {
+                        Some((.., x, y, _)) => (arg(a), arg(x), arg(y), Arg::mem_abs(out)),
+                        None => (d, Arg::imm(-1), arg(b), arg(a)),
+                    },
+                    AluOp::Mul => (d, arg(a), arg(b), Arg::imm(0)),
+                    AluOp::MulAdd => (d, arg(a), arg(b), arg(c)),
+                    AluOp::Div => match fused(a) {
+                        Some((.., x, y, _)) => (arg(x), arg(b), Arg::mem_abs(out), arg(y)),
+                        None => (arg(a), arg(b), Arg::mem_abs(out), Arg::imm(0)),
+                    },
                 };
+                if hint {
+                    asm.fma_out(fd, fa, fb, fc);
+                } else {
+                    asm.fma(fd, fa, fb, fc);
+                }
             }
             Instr::Select {
                 bit,
