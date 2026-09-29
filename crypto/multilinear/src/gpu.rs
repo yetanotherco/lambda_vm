@@ -1648,15 +1648,20 @@ fn not_off(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
-/// Whether the argument's challenge tables are built on the card —
-/// `LAMBDA_VM_ARGUE_DEVICE_TABLES=1` (any non-empty value other than `0`): the
+/// Whether the argument's challenge tables are built on the card: the
 /// zerocheck's weights `eq(r)` and `eq(row)` from their points, and the claim
 /// reduce's shift tables and batched columns from `alpha` and the resident
-/// columns. Off by default until its A/B; off is today's path.
+/// columns. On by default; `LAMBDA_VM_ARGUE_DEVICE_TABLES=0` is the opt-out, and
+/// it is the old path exactly.
+///
+/// The default was turned on by its A/B on the block (FAST, 2026-09-29): the
+/// whole run 5.20 s faster, the argue 19.7 → 14.7 s, 1,364 tables built on the
+/// card a run, every arm proved and verified on the record's identities, and
+/// the cross-check arm — every card table compared with the host's — clean.
 ///
 /// # Why
 ///
-/// Today both are host tables. They are built on the pool, and the ARGUE thread
+/// Off, both are host tables. They are built on the pool, and the ARGUE thread
 /// waits in the join — 3.56 s of it on the head's trace, where the producer's
 /// prep holds the pool at the same time — and then they cross as pageable
 /// uploads, 20 GB a block (`thoughts/zf/gap2/fix2/I-GFS.md` §6). On the card
@@ -1668,7 +1673,7 @@ pub fn argue_device_tables() -> bool {
         2 => false,
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_DEVICE_TABLES"))
+            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_DEVICE_TABLES"))
         }
     }
 }
@@ -3784,14 +3789,24 @@ mod tests {
         b.finish(root).unwrap()
     }
 
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` is on by default: unset, empty or any
-    /// value reads on, and only `0` — the opt-out — reads off.
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` and `LAMBDA_VM_ARGUE_DEVICE_TABLES` are on
+    /// by default: unset, empty or any value reads on, and only `0` — the
+    /// opt-out — reads off.
     #[test]
     fn only_zero_turns_a_default_on_knob_off() {
         assert!(not_off(None), "unset is the default, on");
         assert!(not_off(Some("")), "empty is not the opt-out");
         assert!(not_off(Some("1")));
         assert!(!not_off(Some("0")), "`0` is the opt-out");
+    }
+
+    /// The tables knob reads its variable the default-on way, whatever the
+    /// environment sets. ⚠ No test in this binary forces the knob, which is
+    /// what makes the reading the environment's.
+    #[test]
+    fn the_tables_knob_is_on_unless_its_variable_is_zero() {
+        let variable = std::env::var("LAMBDA_VM_ARGUE_DEVICE_TABLES").ok();
+        assert_eq!(argue_device_tables(), not_off(variable.as_deref()));
     }
 
     #[test]
