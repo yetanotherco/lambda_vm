@@ -28,6 +28,7 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::leaf_layout::LeafLayout;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
+use crate::proof::options::ProofOptions;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::residency_mode::ResidencyMode;
 #[cfg(feature = "disk-spill")]
@@ -793,12 +794,38 @@ where
     FieldElement<F>: Send + Sync,
     A: AIR<Field = F> + ?Sized,
 {
+    domain_and_twiddles_for_options(air.options(), trace_length)
+}
+
+/// Fill the process-wide domain and twiddle cache for `trace_length` under
+/// `options`, ahead of the first prove that needs it.
+///
+/// The entry is the one [`domain_and_twiddles`] would build on its first miss —
+/// the same function builds it — so a prove that finds it warm commits and
+/// opens exactly what it would have after building it itself. What moves is
+/// only where the time is spent: off the first prove's prepass.
+pub fn warm_domain_and_twiddles<F>(options: &ProofOptions, trace_length: usize)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let _ = domain_and_twiddles_for_options::<F>(options, trace_length);
+}
+
+pub(crate) fn domain_and_twiddles_for_options<F>(
+    options: &ProofOptions,
+    trace_length: usize,
+) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
     type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
     let key = (
         std::any::TypeId::of::<F>(),
         trace_length,
-        air.options().blowup_factor as usize,
-        air.options().coset_offset,
+        options.blowup_factor as usize,
+        options.coset_offset,
     );
     {
         let cache = domain_twiddle_cache().lock().unwrap();
@@ -810,7 +837,7 @@ where
     }
     #[cfg(test)]
     crate::tests::domain_cache_stats::record(false);
-    let d = Arc::new(Domain::new(air, trace_length));
+    let d = Arc::new(Domain::from_options(options, trace_length));
     let t = Arc::new(LdeTwiddles::new(&d));
     // Pre-fill every lazy domain-derived cache from this setup thread, so no
     // rayon worker ever runs — or blocks waiting on — an initializer
@@ -1187,6 +1214,99 @@ fn describe_walk(order: &[usize], weights: &[u64], names: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The opt-in that builds the out-of-domain tables' columns on the calling
+/// thread instead of through the rayon pool: `1` on, unset or `0` the pool
+/// (today's), anything else stops the run.
+///
+/// ⛔ WHY IT EXISTS. A round-3 OOD table is one or two rows high and one
+/// column per trace column, and [`Table::columns`] transposes it with a rayon
+/// parallel iterator. The per-table drivers of `multi_prove` are plain OS
+/// threads, so every such call is injected into the global pool and the driver
+/// waits until a worker takes it. When the pool is busy with someone else's
+/// work, that microsecond transpose waits behind it with the table's next
+/// device work unsubmitted. On the base's traced run (G1, ds801) the host-only
+/// OOD absorb, which does nothing else host-heavy, summed 5.16 s over split 9's
+/// tables and 2.73 s over split 11's (the level-0 lead-in was verifying base
+/// epochs then), against about 0.02 s in a quiet split.
+///
+/// The values and their order are those of [`Table::columns`], so the
+/// transcript and the proof are the same bytes either way.
+pub const OOD_COLUMNS_ON_CALLER_ENV: &str = "LAMBDA_VM_OOD_COLUMNS_ON_CALLER";
+
+/// [`OOD_COLUMNS_ON_CALLER_ENV`] for a raw value: unset, empty or `0` is the
+/// pool, `1` the calling thread, and anything else panics — a typo read as the
+/// default would measure one schedule under the other's name.
+pub fn ood_columns_on_caller_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{OOD_COLUMNS_ON_CALLER_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// Test-only pin of [`ood_columns_on_caller`]'s answer: 0 reads the
+/// environment, 1 is the pool, 2 the calling thread. Process-wide because the
+/// per-table drivers are threads of their own; safe beside other tests because
+/// both arms prove the same bytes.
+#[cfg(test)]
+static OOD_COLUMNS_ON_CALLER_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: pin the OOD columns' schedule for this process (`None` returns
+/// it to the environment's).
+#[cfg(test)]
+pub(crate) fn pin_ood_columns_on_caller(on: Option<bool>) {
+    OOD_COLUMNS_ON_CALLER_PIN.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// Test-only: how many OOD tables were read on the calling thread, so a test
+/// can show that the arm it named is the arm that ran.
+#[cfg(test)]
+pub(crate) static OOD_COLUMNS_ON_CALLER_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this process builds OOD columns on the calling thread. Read once
+/// and named on stderr, so a log states which schedule its proves ran.
+fn ood_columns_on_caller() -> bool {
+    #[cfg(test)]
+    match OOD_COLUMNS_ON_CALLER_PIN.load(Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on =
+            ood_columns_on_caller_setting(std::env::var(OOD_COLUMNS_ON_CALLER_ENV).ok().as_deref());
+        eprintln!(
+            "[prover] OOD columns: {}",
+            if on {
+                "on the calling thread (LAMBDA_VM_OOD_COLUMNS_ON_CALLER=1)"
+            } else {
+                "through the rayon pool (the default)"
+            }
+        );
+        on
+    })
+}
+
+/// The columns of an out-of-domain table, by [`ood_columns_on_caller`]'s
+/// schedule. Both arms return the same values in the same order.
+fn ood_columns<E: IsField>(table: &Table<E>) -> Vec<Vec<FieldElement<E>>> {
+    if ood_columns_on_caller() {
+        #[cfg(test)]
+        OOD_COLUMNS_ON_CALLER_READS.fetch_add(1, Ordering::Relaxed);
+        table.columns_serial()
+    } else {
+        table.columns()
+    }
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -3378,7 +3498,7 @@ pub trait IsStarkProver<
                     lde_trace,
                     parts_dev,
                     &round_3_result.composition_poly_parts_ood_evaluation,
-                    &round_3_result.trace_ood_evaluations.columns(),
+                    &ood_columns(&round_3_result.trace_ood_evaluations),
                     composition_poly_gammas,
                     trace_terms_gammas,
                     &domain.lde_roots_of_unity_coset,
@@ -3399,7 +3519,7 @@ pub trait IsStarkProver<
             lde_trace,
             parts_dev,
             &round_3_result.composition_poly_parts_ood_evaluation,
-            &round_3_result.trace_ood_evaluations.columns(),
+            &ood_columns(&round_3_result.trace_ood_evaluations),
             composition_poly_gammas,
             trace_terms_gammas,
             (&inv_dev, &stream),
@@ -3450,7 +3570,7 @@ pub trait IsStarkProver<
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
-        let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+        let trace_ood_columns = ood_columns(&round_3_result.trace_ood_evaluations);
         let num_total_cols = num_main_cols + num_aux_cols;
 
         // Fully device-resident GPU fast path: build inv_denoms on device
@@ -5757,7 +5877,7 @@ pub trait IsStarkProver<
         let (ood_block0, ood_block1) =
             Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
         for block in [&ood_block0, &ood_block1] {
-            for col in block.columns().iter() {
+            for col in ood_columns(block).iter() {
                 for elem in col.iter() {
                     transcript.append_field_element(elem);
                 }

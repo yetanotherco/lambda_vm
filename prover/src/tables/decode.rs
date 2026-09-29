@@ -419,6 +419,56 @@ pub fn commitment_from_elf(
     Ok(compute_precomputed_commitment(&instructions, options))
 }
 
+/// [`compute_precomputed_commitment_with`], committed on the device when one
+/// admits the shape and on the host otherwise.
+///
+/// The host commit hashes DECODE's LDE with RPX on the CPU, about a second for
+/// the block's 2^20-row program, and the base cannot prove its first epoch
+/// until it has this root. The device builds the same tree from the same five
+/// columns in milliseconds. It is one root either way: the device arm is
+/// [`crate::lfm::commit::commit_group_device_or_host_with`], whose device root
+/// its own device tests pin to the host's, and `multi_prove` rebuilds DECODE's
+/// precomputed tree on the device at the first epoch and refuses the proof if
+/// its root differs from this one. The host arm interpolates, coset-evaluates
+/// and commits each column with the functions [`compute_precomputed_commitment_with`]
+/// uses, in the same order.
+pub fn compute_precomputed_commitment_device_or_host(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    // MU=0, as in `preprocessed_columns`; row-major here, the device's layout.
+    let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let rows = trace.num_rows();
+    let mut data = Vec::with_capacity(rows * NUM_PRECOMPUTED_COLS);
+    for row in 0..rows {
+        for col in 0..NUM_PRECOMPUTED_COLS {
+            data.push(*trace.main_table.get(row, col));
+        }
+    }
+    let group = crate::lfm::compiler::ColumnGroup {
+        width: NUM_PRECOMPUTED_COLS,
+        real_rows: rows,
+        padded_rows: rows,
+        data,
+    };
+    crate::lfm::commit::commit_group_device_or_host_with("DECODE", &group, options, layout)
+}
+
+/// [`commitment_from_elf`] through [`compute_precomputed_commitment_device_or_host`]:
+/// the same row-pair root, on the device when one admits it.
+pub fn commitment_from_elf_device_or_host(
+    elf: &Elf,
+    options: &ProofOptions,
+) -> Result<Commitment, InstructionError> {
+    let instructions = instructions_from_elf(elf)?;
+    Ok(compute_precomputed_commitment_device_or_host(
+        &instructions,
+        options,
+        LeafLayout::RowPair,
+    ))
+}
+
 // =========================================================================
 // Combined ELF processing (DECODE only)
 // =========================================================================
