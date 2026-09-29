@@ -147,30 +147,105 @@ fn fill_row(t: &mut stark::table::Table<F>, row: usize, program: &Program, step:
     set_ext(t, row, cols::OUT_INV, &inv);
 }
 
-/// The FIELD_VM trace, padded to a power of two with halt steps, and the
-/// DECODE multiplicities including the padding.
-pub fn generate_trace(
+/// At most this many FIELD_VM segments when no cap forces more.
+pub const MAX_SEGMENTS: usize = 4;
+
+/// `(real steps, rows)` per segment. A segment that is not the last holds
+/// `rows − 1` steps and repeats the next segment's first row as its last, so
+/// the transition out of its last step is checked inside it. A single
+/// power-of-two table is used when it wastes at most a quarter of its rows.
+/// `max_rows` caps every segment (tests use it to force long chains).
+pub fn segment_plan(steps: usize, min_rows: usize, max_rows: Option<usize>) -> Vec<(usize, usize)> {
+    let cap = max_rows.unwrap_or(usize::MAX);
+    let mut plan = Vec::new();
+    let mut left = steps;
+    loop {
+        let full = left.next_power_of_two().max(min_rows);
+        let rows = (full / 2).min(cap).max(min_rows);
+        let fits = full <= cap;
+        let last_allowed = max_rows.is_none() && plan.len() + 1 == MAX_SEGMENTS;
+        if fits && ((full - left) * 4 <= full || last_allowed || rows > left) {
+            plan.push((left, full));
+            return plan;
+        }
+        plan.push((rows - 1, rows));
+        left -= rows - 1;
+    }
+}
+
+pub struct Segments {
+    pub traces: Vec<TraceTable<F, E>>,
+    pub public: Vec<FvmPublicInputs>,
+    /// DECODE multiplicities, padding and repeated rows included.
+    pub decode_mult: Vec<u64>,
+    /// MEM multiplicities, repeated rows included.
+    pub mem_mult: Vec<u64>,
+}
+
+/// The FIELD_VM segments of `exec`, the last padded with halt steps.
+pub fn generate_segments(
     program: &Program,
     exec: &Execution,
     min_rows: usize,
-) -> (TraceTable<F, E>, Vec<u64>) {
-    let num_rows = exec.steps.len().next_power_of_two().max(min_rows);
+    max_rows: Option<usize>,
+) -> Segments {
     let halt = *exec
         .steps
         .last()
         .expect("an execution ends with a halt step");
-    let mut trace = TraceTable::new_main(
-        zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    for row in 0..num_rows {
-        let step = exec.steps.get(row).unwrap_or(&halt);
-        fill_row(&mut trace.main_table, row, program, step);
-    }
+    let plan = segment_plan(exec.steps.len(), min_rows, max_rows);
     let mut decode_mult = exec.decode_mult.clone();
-    decode_mult[halt.state.pc as usize] += (num_rows - exec.steps.len()) as u64;
-    (trace, decode_mult)
+    let mut mem_mult = exec.mem_mult.clone();
+    let (mut traces, mut public) = (Vec::new(), Vec::new());
+    let mut start = 0;
+    for (k, &(real, rows)) in plan.iter().enumerate() {
+        let last = k + 1 == plan.len();
+        let mut trace = TraceTable::new_main(
+            zeroed_fe_vec(rows * cols::NUM_COLUMNS),
+            cols::NUM_COLUMNS,
+            1,
+        );
+        for row in 0..rows {
+            let step = if row < real {
+                &exec.steps[start + row]
+            } else if last {
+                &halt
+            } else {
+                &exec.steps[start + real]
+            };
+            fill_row(&mut trace.main_table, row, program, step);
+        }
+        if last {
+            decode_mult[halt.state.pc as usize] += (rows - real) as u64;
+        } else {
+            // The repeated row looks up the program and memory once more.
+            let repeat = &exec.steps[start + real];
+            decode_mult[repeat.state.pc as usize] += 1;
+            let instr = &program.instrs[repeat.state.pc as usize];
+            for (i, a) in instr.args().iter().enumerate() {
+                if a.mem {
+                    mem_mult[repeat.args_premem[i].value()[0].canonical() as usize] += 1;
+                }
+            }
+        }
+        public.push(FvmPublicInputs {
+            last_row: rows - 1,
+            first: state_words(&exec.steps[start].state),
+            last: if last {
+                halt_words()
+            } else {
+                state_words(&exec.steps[start + real].state)
+            },
+        });
+        traces.push(trace);
+        start += real;
+    }
+    Segments {
+        traces,
+        public,
+        decode_mult,
+        mem_mult,
+    }
 }
 
 // =========================================================================
@@ -480,29 +555,56 @@ impl ConstraintSet<F, E> for FieldVmConstraints {
 // Boundary constraints
 // =========================================================================
 
+/// The state a boundary row pins: `pc`, `ZERO`, then every register
+/// component, as canonical words.
+pub const STATE_WORDS: usize = 2 + 3 * N;
+
+pub fn state_words(state: &State) -> Vec<u64> {
+    let mut w = Vec::with_capacity(STATE_WORDS);
+    w.push(state.pc);
+    w.push(state.zero as u64);
+    for r in &state.regs {
+        w.extend(r.value().iter().map(|c| c.canonical()));
+    }
+    w
+}
+
+/// The start state: `PC = 1`, `ZERO = 0`, registers `0`.
+pub fn start_words() -> Vec<u64> {
+    state_words(&State::initial())
+}
+
+/// The halt state: `PC = 0`, `ZERO = 1`, registers `0`.
+pub fn halt_words() -> Vec<u64> {
+    let mut w = vec![0; STATE_WORDS];
+    w[1] = 1;
+    w
+}
+
 #[derive(
     Clone, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct FvmPublicInputs {
     /// Index of the last FIELD_VM row; checked against the proof's trace length.
     pub last_row: usize,
+    /// The segment's first-row state ([`state_words`]).
+    pub first: Vec<u64>,
+    /// The segment's last-row state: the next segment's first, or the halt.
+    pub last: Vec<u64>,
 }
 
-/// First row: `PC = 1`, `ZERO = 0`, registers `0`. Last row: the halt state.
+/// First and last rows pinned to the segment's boundary states.
 pub struct FieldVmBoundary;
 
 impl BoundaryConstraintBuilder<F, E, FvmPublicInputs> for FieldVmBoundary {
     fn boundary_constraints(pi: &FvmPublicInputs, _: &[FEE]) -> Vec<BoundaryConstraint<E>> {
-        let mut out = Vec::with_capacity(2 * (2 + 3 * N));
-        for (step, pc, zero) in [(0, 1u64, 0u64), (pi.last_row, 0, 1)] {
-            out.push(BoundaryConstraint::new_main(cols::PC, step, FEE::from(pc)));
-            out.push(BoundaryConstraint::new_main(
-                cols::ZERO,
-                step,
-                FEE::from(zero),
-            ));
-            for c in cols::REGS..cols::REGS + 3 * N {
-                out.push(BoundaryConstraint::new_main(c, step, FEE::zero()));
+        let columns = [cols::PC, cols::ZERO]
+            .into_iter()
+            .chain(cols::REGS..cols::REGS + 3 * N);
+        let mut out = Vec::with_capacity(2 * STATE_WORDS);
+        for (step, words) in [(0, &pi.first), (pi.last_row, &pi.last)] {
+            for (c, w) in columns.clone().zip(words) {
+                out.push(BoundaryConstraint::new_main(c, step, FEE::from(*w)));
             }
         }
         out

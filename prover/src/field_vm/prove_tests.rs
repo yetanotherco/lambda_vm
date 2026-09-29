@@ -5,8 +5,8 @@ use super::executor::{Execution, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, Program, gpr};
 use super::mem::cols as mem_cols;
 use super::prove::{
-    FvmTraces, PublicCell, default_options, generate_traces, program_id, prove, prove_traces,
-    public_cells, verify,
+    FvmTraces, PublicCell, default_options, generate_traces, generate_traces_with, program_id,
+    prove, prove_traces, public_cells, verify,
 };
 use crate::tables::types::{FE, FEE};
 
@@ -166,7 +166,7 @@ fn register_changed_without_a_hint_is_rejected() {
     let (program, exec) = power_exec();
     // General-purpose register 4 is never hinted by this program.
     assert!(!verifies_after(&program, &exec, |t| bump(
-        &mut t.fvm.main_table,
+        &mut t.fvm[0].main_table,
         3,
         cols::reg(4)
     )));
@@ -176,7 +176,7 @@ fn register_changed_without_a_hint_is_rejected() {
 fn pc_skipping_without_a_hint_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| bump(
-        &mut t.fvm.main_table,
+        &mut t.fvm[0].main_table,
         2,
         cols::PC
     )));
@@ -186,8 +186,8 @@ fn pc_skipping_without_a_hint_is_rejected() {
 fn lying_zero_flag_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| {
-        let z = *t.fvm.main_table.get(4, cols::ZERO);
-        t.fvm.main_table.set(4, cols::ZERO, FE::one() - z);
+        let z = *t.fvm[0].main_table.get(4, cols::ZERO);
+        t.fvm[0].main_table.set(4, cols::ZERO, FE::one() - z);
     }));
 }
 
@@ -195,7 +195,7 @@ fn lying_zero_flag_is_rejected() {
 fn wrong_fma_output_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| bump(
-        &mut t.fvm.main_table,
+        &mut t.fvm[0].main_table,
         1,
         cols::arg(0)
     )));
@@ -205,7 +205,7 @@ fn wrong_fma_output_is_rejected() {
 fn out_of_range_register_index_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| {
-        t.fvm
+        t.fvm[0]
             .main_table
             .set(1, cols::ARG_REG + 1, FE::from(super::isa::NUM_REGS as u64));
     }));
@@ -380,7 +380,7 @@ fn report_horner() {
         let cells_pub = public_cells(&exec, &public);
         let traces = generate_traces(&program, &exec, &public);
         let rows = [
-            traces.fvm.num_rows(),
+            traces.fvm.iter().map(|t| t.num_rows()).sum::<usize>(),
             traces.decode.num_rows(),
             traces.mem.num_rows(),
         ];
@@ -415,4 +415,114 @@ fn report_horner() {
             verify_ms[2]
         );
     }
+}
+
+/// The power program at `n = 13`: long enough for an 8-row cap to split it
+/// into many segments.
+fn long_power_exec() -> (Program, Execution) {
+    let program = power_program(13);
+    let exec = execute(
+        &program,
+        Memory::with_init(2, &[fee(2, 1, 9)]),
+        &mut NoHints,
+        1 << 12,
+    )
+    .unwrap();
+    (program, exec)
+}
+
+/// Proves `exec` with FIELD_VM split into segments of at most `max_rows`.
+fn segmented_proof(
+    program: &Program,
+    exec: &Execution,
+    max_rows: usize,
+) -> (super::prove::FvmProof, Vec<PublicCell>) {
+    let options = default_options();
+    let cells = public_cells(exec, &POWER_PUBLIC);
+    let mut traces = generate_traces_with(program, exec, &POWER_PUBLIC, Some(max_rows));
+    assert!(traces.fvm.len() > 2, "the cap must force several segments");
+    let proof = prove_traces(
+        &program_id(program, &options),
+        &cells,
+        &mut traces,
+        &options,
+    )
+    .unwrap();
+    (proof, cells)
+}
+
+#[test]
+fn segmented_execution_proves_and_verifies() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    assert!(verify(
+        &program_id(&program, &options),
+        &cells,
+        &proof,
+        &options
+    ));
+}
+
+#[test]
+fn dropped_or_reordered_segments_are_rejected() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    let mut dropped = proof.clone();
+    dropped.proofs.remove(1);
+    assert!(!verify(&id, &cells, &dropped, &options));
+    let mut swapped = proof.clone();
+    swapped.proofs.swap(0, 1);
+    assert!(!verify(&id, &cells, &swapped, &options));
+}
+
+#[test]
+fn forged_segment_boundary_is_rejected() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    // Consistent on both sides of the boundary, so only the traces can object.
+    let mut forged = proof.clone();
+    forged.proofs[0].public_inputs.last[2] += 1;
+    forged.proofs[1].public_inputs.first[2] += 1;
+    assert!(!verify(&id, &cells, &forged, &options));
+    // Inconsistent across the boundary.
+    let mut broken = proof;
+    broken.proofs[1].public_inputs.first[0] += 1;
+    assert!(!verify(&id, &cells, &broken, &options));
+}
+
+#[test]
+fn segment_plan_covers_every_step() {
+    for steps in [1usize, 7, 8, 9, 100, 4851, 19_320, 21_234, 538_706] {
+        for cap in [None, Some(8), Some(64)] {
+            let plan = super::air::segment_plan(steps, 8, cap);
+            assert_eq!(
+                plan.iter().map(|(real, _)| real).sum::<usize>(),
+                steps,
+                "{steps} {cap:?}"
+            );
+            for (k, &(real, rows)) in plan.iter().enumerate() {
+                assert!(rows.is_power_of_two() && rows >= 8);
+                if k + 1 < plan.len() {
+                    assert_eq!(real + 1, rows);
+                } else {
+                    assert!(real <= rows);
+                }
+                if let Some(c) = cap {
+                    assert!(rows <= c.max(8));
+                }
+            }
+            if cap.is_none() {
+                assert!(plan.len() <= super::air::MAX_SEGMENTS);
+            }
+        }
+    }
+    assert_eq!(
+        super::air::segment_plan(538_706, 8, None),
+        vec![(524_287, 524_288), (14_419, 16_384)]
+    );
 }
