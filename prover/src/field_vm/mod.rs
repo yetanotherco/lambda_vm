@@ -4,9 +4,16 @@
 //! Spec: `spec/chapters/field_vm.typ`, `spec/src/field_vm.toml` and
 //! `spec/src/field_vm_decode.toml` (#971).
 
+pub mod air;
 pub mod asm;
+pub mod decode;
 pub mod executor;
 pub mod isa;
+pub mod mem;
+pub mod mux;
+pub mod prove;
 
+#[cfg(test)]
+mod prove_tests;
 #[cfg(test)]
 mod tests;

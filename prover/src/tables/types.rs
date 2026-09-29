@@ -359,6 +359,14 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Field VM (`crate::field_vm`)
+    // =========================================================================
+    /// `FIELD_VM_DECODE[pc, imm..., flags, registers]`: the program lookup.
+    FieldVmDecode = 40,
+    /// `FIELD_VM_MEM[addr] -> value`: the read-only memory lookup.
+    FieldVmMem = 41,
 }
 
 impl BusId {
@@ -388,6 +396,8 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::FieldVmDecode => "FieldVmDecode",
+            BusId::FieldVmMem => "FieldVmMem",
         }
     }
 }
@@ -420,6 +430,8 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            40 => Ok(BusId::FieldVmDecode),
+            41 => Ok(BusId::FieldVmMem),
             other => Err(other),
         }
     }
