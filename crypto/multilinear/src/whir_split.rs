@@ -367,6 +367,14 @@ pub static TABLES_ON_CARD: Counter = Counter::new();
 /// host's, cell for cell, and found equal.
 pub static TABLES_XCHECKED: Counter = Counter::new();
 
+/// Device sumchecks whose end was read back in one gathered copy
+/// (`LAMBDA_VM_ARGUE_LEAN_READS`), beside [`READS_PER_FACTOR`], the factors
+/// read one synchronous copy at a time — the mechanism line of that knob: it
+/// moves reads from the second to the first.
+pub static READS_GATHERED: Counter = Counter::new();
+/// See [`READS_GATHERED`].
+pub static READS_PER_FACTOR: Counter = Counter::new();
+
 /// Everything the chain parked at the group-loop boundary, awaiting the record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChainSlots {
@@ -611,6 +619,12 @@ pub struct ProverSplit {
     pub tables_on_card: u64,
     pub tables_xchecked: u64,
     pub device_tables: bool,
+    /// Sessions read back in one copy and factors read one at a time —
+    /// [`READS_GATHERED`], [`READS_PER_FACTOR`] — and the knob they were read
+    /// under.
+    pub reads_gathered: u64,
+    pub reads_per_factor: u64,
+    pub lean_reads: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -768,6 +782,24 @@ impl ProverSplit {
             xcheck = on_off(self.xcheck),
         )
     }
+    /// The sessions' reads-back line, stamped the same way:
+    /// `ARGUE READS #k: sessions read in one copy G · factors read one at a
+    /// time F || lean reads on|off`.
+    pub fn reads_line(&self) -> String {
+        format!(
+            "ARGUE READS {who}{tainted}: sessions read in one copy {gathered} · factors read one \
+             at a time {single} || lean reads {knob}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            gathered = self.reads_gathered,
+            single = self.reads_per_factor,
+            knob = if self.lean_reads { "on" } else { "off" },
+        )
+    }
 }
 
 static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
@@ -841,6 +873,9 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.tables_on_card = TABLES_ON_CARD.take();
     rec.tables_xchecked = TABLES_XCHECKED.take();
     rec.device_tables = crate::gpu::argue_device_tables();
+    rec.reads_gathered = READS_GATHERED.take();
+    rec.reads_per_factor = READS_PER_FACTOR.take();
+    rec.lean_reads = crate::gpu::argue_lean_reads();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -897,6 +932,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.reserved_line());
     println!("{}", rec.columns_line());
     println!("{}", rec.tables_line());
+    println!("{}", rec.reads_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1199,15 +1235,19 @@ mod tests {
         bump_by(&COLUMNS_XCHECKED, 11);
         bump_by(&TABLES_ON_CARD, 13);
         bump_by(&TABLES_XCHECKED, 17);
+        bump(&READS_GATHERED);
+        bump_by(&READS_PER_FACTOR, 19);
         assert_eq!(
             (
                 COLUMNS_ON_CARD.take(),
                 COLUMNS_ON_HOST.take(),
                 COLUMNS_XCHECKED.take(),
                 TABLES_ON_CARD.take(),
-                TABLES_XCHECKED.take()
+                TABLES_XCHECKED.take(),
+                READS_GATHERED.take(),
+                READS_PER_FACTOR.take()
             ),
-            (0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0),
             "a disabled bump_by must not move a counter"
         );
         assert_eq!(stage_done(0, "execute", mark()), 0.0);
@@ -1297,6 +1337,34 @@ mod tests {
             global.columns_line(),
             "ARGUE COLUMNS GLOBAL (in base) ⛔OVERLAPPED: on the card 0 · on the host 9 · \
              xchecked 0 || device columns off · xcheck off"
+        );
+    }
+
+    /// The reads line: both counts and the knob, stamped like the split line.
+    #[test]
+    fn the_reads_line_names_its_prove_and_its_knob() {
+        let epoch = ProverSplit {
+            index: 7,
+            reads_gathered: 245,
+            reads_per_factor: 0,
+            lean_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.reads_line(),
+            "ARGUE READS #7: sessions read in one copy 245 · factors read one at a time 0 || \
+             lean reads on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            reads_per_factor: 3301,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.reads_line(),
+            "ARGUE READS GLOBAL (in base) ⛔OVERLAPPED: sessions read in one copy 0 · factors \
+             read one at a time 3301 || lean reads off"
         );
     }
 

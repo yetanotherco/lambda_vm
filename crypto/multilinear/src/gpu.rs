@@ -60,6 +60,12 @@ static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 static ARGUE_TABLES_ON_CARD: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the host's.
 static ARGUE_TABLE_XCHECKS: AtomicU64 = AtomicU64::new(0);
+/// Device sumchecks whose end was read back in one gathered copy
+/// (`LAMBDA_VM_ARGUE_LEAN_READS`).
+static READS_GATHERED: AtomicU64 = AtomicU64::new(0);
+/// Factors read back one synchronous copy at a time — what the gathered read
+/// replaces.
+static READS_PER_FACTOR: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
@@ -195,6 +201,14 @@ pub fn argue_table_xchecks() -> u64 {
     ARGUE_TABLE_XCHECKS.load(Ordering::Relaxed)
 }
 
+pub fn reads_gathered() -> u64 {
+    READS_GATHERED.load(Ordering::Relaxed)
+}
+
+pub fn reads_per_factor() -> u64 {
+    READS_PER_FACTOR.load(Ordering::Relaxed)
+}
+
 pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
@@ -300,6 +314,8 @@ pub fn reset_call_counters() {
     ARGUE_XCHECKS.store(0, Ordering::Relaxed);
     ARGUE_TABLES_ON_CARD.store(0, Ordering::Relaxed);
     ARGUE_TABLE_XCHECKS.store(0, Ordering::Relaxed);
+    READS_GATHERED.store(0, Ordering::Relaxed);
+    READS_PER_FACTOR.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -958,7 +974,7 @@ where
     };
     // Each factor as the last fold left it, read where it lies — which is the
     // only thing a session over factors it does not own can say.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -1178,7 +1194,7 @@ where
     // The rounds folded every factor where it lies, so reading them back is
     // what spares the caller a pass over the trace to compute what the device
     // already has — the values at the point, when the cube ran out here.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed {
             stage: "factor values",
         }));
@@ -1352,7 +1368,7 @@ where
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -1675,6 +1691,79 @@ pub fn force_argue_device_tables(on: Option<bool>) {
         },
         Ordering::Relaxed,
     );
+}
+
+/// Whether a device sumcheck's end is read back in one gathered copy —
+/// `LAMBDA_VM_ARGUE_LEAN_READS=1` (any non-empty value other than `0`) —
+/// rather than one synchronous copy per factor. The same bytes either way; off
+/// by default until its A/B, and off is today's path.
+///
+/// Every session the argument runs ends by reading its factors back: the
+/// zerocheck's hundreds or thousands (the widest precompile has 1,482), each
+/// GKR layer's five, each reduce's pairs. One copy each is a round trip each,
+/// ~6 µs: about 0.3 s a block on the head's trace, 49 thousand copies of a few
+/// hundred bytes (`thoughts/zf/gap2/fix2/I-GFS.md` §8).
+pub fn argue_lean_reads() -> bool {
+    match ARGUE_LEAN_READS_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_READS"))
+        }
+    }
+}
+
+static ARGUE_LEAN_READS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_READS` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_reads(on: Option<bool>) {
+    ARGUE_LEAN_READS_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// ⛔ A FAULT: while armed, a gathered read hands back its first factor's first
+/// word plus one — what a gather that read one wrong word would do — so the
+/// checks on a session's end can be shown to see one. Never armed outside a
+/// test. Not for production callers.
+static READ_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_read_fault(on: bool) {
+    READ_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// A device sumcheck's factors as its last fold left them: one gathered copy
+/// under `LAMBDA_VM_ARGUE_LEAN_READS`, a copy per factor otherwise — the same
+/// bytes, counted both ways so an arm's log says which it took.
+#[cfg(feature = "cuda")]
+fn session_values(
+    session: &math_cuda::sumcheck::SumcheckSession,
+) -> math_cuda::Result<Vec<Vec<u64>>> {
+    if !argue_lean_reads() {
+        let values = session.values()?;
+        READS_PER_FACTOR.fetch_add(values.len() as u64, Ordering::Relaxed);
+        crate::whir_split::bump_by(&crate::whir_split::READS_PER_FACTOR, values.len() as u64);
+        return Ok(values);
+    }
+    let mut values = session.values_gathered()?;
+    READS_GATHERED.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::READS_GATHERED);
+    if READ_FAULT.load(Ordering::Relaxed)
+        && let Some(word) = values.first_mut().and_then(|factor| factor.first_mut())
+    {
+        *word = word.wrapping_add(1);
+    }
+    Ok(values)
 }
 
 /// Which table the card built a fault corrupts ([`force_table_fault`]).
@@ -2272,7 +2361,7 @@ impl DeviceTree {
             Ok(rounds) => rounds,
             Err(error) => return Some(Err(error)),
         };
-        let Ok(values) = session.values() else {
+        let Ok(values) = session_values(&session) else {
             return Some(Err(failed("layer values")));
         };
         // Factor 0 is the weight; the four the layer reduces to follow.
