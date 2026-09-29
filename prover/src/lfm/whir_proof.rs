@@ -122,6 +122,45 @@ fn shape_error(message: impl Into<String>) -> WhirLfmError {
     WhirLfmError::Shape(message.into())
 }
 
+/// ★ Where a W-LFM proof commits each table's preprocessed prefix (D-WHIR §2.4).
+///
+/// Either way the prefix's claims are settled by the prepared opening against
+/// the program's own stack, which is what binds the program. The policies
+/// differ in whether the main stack ALSO carries the prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrepPolicy {
+    /// Policy A: in the main stack and in the prepared stack (DECODE's shape in
+    /// the base). No layout change anywhere; the prefix is committed twice.
+    Both,
+    /// Policy B: in the prepared stack ONLY. The main stack holds each table's
+    /// value columns, so it is smaller — a wrap's goes from a half-empty 2^27
+    /// to a full 2^26 — and its claims on the prefix are the opening's alone.
+    PreparedOnly,
+}
+
+impl PrepPolicy {
+    /// The name the banner prints and the knob spells.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::PreparedOnly => "prepared",
+        }
+    }
+
+    /// The byte `program_id_w` folds.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Both => 0,
+            Self::PreparedOnly => 1,
+        }
+    }
+
+    /// Whether the main stack leaves the prefix out.
+    pub const fn excludes_prefix(self) -> bool {
+        matches!(self, Self::PreparedOnly)
+    }
+}
+
 /// A W-LFM program's verifier-side artifacts: everything a verifier needs about
 /// the program, derived from the program, and never read from a proof.
 ///
@@ -146,6 +185,9 @@ pub struct WhirLfmArtifacts {
     /// The chain config the program proves under — its shapes and the process
     /// format, through `multilinear_prove::chain_config`.
     pub config: ChainConfig,
+    /// Where the preprocessed prefix is committed: a FORMAT choice, folded into
+    /// the identity.
+    pub policy: PrepPolicy,
     /// The prepared stack's roots: derived from the program, never read from a
     /// proof.
     pub prepared_roots: Vec<Commitment>,
@@ -301,7 +343,8 @@ fn expected_plan(counts: &[usize]) -> Vec<PreparedColumn> {
         .collect()
 }
 
-/// ★ Builds a program's W-LFM artifacts and the prover's prepared stack.
+/// ★ Builds a program's W-LFM artifacts and the prover's prepared stack, under
+/// the process's prefix policy (`LAMBDA_VM_LFM_WHIR_PREP`).
 ///
 /// ONE derivation for both sides: the prover and every verifier of this program
 /// take the stack's roots, layout and domain from here, and the stack is a
@@ -310,6 +353,22 @@ pub fn build_whir_artifacts(
     program: &LfmProgram,
     options: &ProofOptions,
     hasher: HasherKind,
+) -> Result<WhirLfmBuild, WhirLfmError> {
+    build_whir_artifacts_under(
+        program,
+        options,
+        hasher,
+        crate::lfm_prover_knob::prep_policy(),
+    )
+}
+
+/// [`build_whir_artifacts`] under an explicit prefix policy, so one process can
+/// build the same program both ways (W1's A/B on one binary).
+pub fn build_whir_artifacts_under(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+    policy: PrepPolicy,
 ) -> Result<WhirLfmBuild, WhirLfmError> {
     let chip_set = ChipSet::for_program_with_hasher(program, hasher);
     check_chip_set(chip_set)?;
@@ -387,6 +446,7 @@ pub fn build_whir_artifacts(
         &counts,
         &prepared_roots,
         &config,
+        policy,
     );
     Ok(WhirLfmBuild {
         artifacts: WhirLfmArtifacts {
@@ -395,6 +455,7 @@ pub fn build_whir_artifacts(
             hash_chunks,
             table_num_vars,
             config,
+            policy,
             prepared_roots,
             prepared_at,
             prepared_layout: commitment.layout().clone(),
@@ -416,7 +477,7 @@ pub fn build_whir_artifacts(
 /// and preprocessed count, the prepared roots (which bind the instruction
 /// groups themselves), and the WHIR format the proof runs under (the absorbed
 /// config words plus the stack cap and the Merkle cap policy, which the
-/// statement does not absorb) and the WHIR hash's name.
+/// statement does not absorb), the prefix policy and the WHIR hash's name.
 pub fn lfm_program_id_w(
     hasher: HasherKind,
     chip_set: ChipSet,
@@ -424,6 +485,7 @@ pub fn lfm_program_id_w(
     counts: &[usize],
     prepared_roots: &[Commitment],
     config: &ChainConfig,
+    policy: PrepPolicy,
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_WHIR_PROGRAM_TAG);
@@ -443,6 +505,7 @@ pub fn lfm_program_id_w(
     h.update(config_bytes(config));
     h.update([config.format.stack.get() as u8]);
     h.update(cap_policy_bytes(config.format.cap));
+    h.update([policy.tag()]);
     h.finalize().into()
 }
 
@@ -551,14 +614,19 @@ pub fn absorb_whir_lfm_statement(
 /// does not settle exactly `0..count` of every table (D-WHIR §2.4).
 pub struct WhirLfmPlan<'a> {
     pub config: ChainConfig,
+    /// The artifacts' prefix policy.
+    pub policy: PrepPolicy,
     /// `(main width, height in variables)` per table.
     pub shapes: Vec<(usize, usize)>,
+    /// `(columns in the main stack, height)` per table: [`Self::shapes`] under
+    /// policy A, the value columns alone under policy B.
+    pub main_shapes: Vec<(usize, usize)>,
     pub layouts: Vec<TableLayout<'a, F, E>>,
     /// Each table's preprocessed count, from its AIR.
     pub counts: Vec<usize>,
     /// Each table's name, for messages.
     pub names: Vec<String>,
-    /// The main group's stack and domain — one group under policy A.
+    /// The main group's stack and domain — one group, over `main_shapes`.
     pub group_layouts: Vec<StackedLayout>,
     pub group_domains: Vec<Domain<F>>,
 }
@@ -635,13 +703,26 @@ impl<'a> WhirLfmPlan<'a> {
             )));
         }
 
+        let main_shapes: Vec<(usize, usize)> = shapes
+            .iter()
+            .zip(&counts)
+            .map(|(&(width, num_vars), &count)| {
+                if artifacts.policy.excludes_prefix() {
+                    (width - count, num_vars)
+                } else {
+                    (width, num_vars)
+                }
+            })
+            .collect();
         let sizes = [airs.len()];
         let (group_layouts, group_domains) =
-            crate::multilinear_prove::stacks(&shapes, &sizes, &config)
+            crate::multilinear_prove::stacks(&main_shapes, &sizes, &config)
                 .map_err(|e| shape_error(format!("{e:?}")))?;
         Ok(Self {
             config,
+            policy: artifacts.policy,
             shapes,
+            main_shapes,
             layouts,
             counts,
             names,
@@ -653,6 +734,17 @@ impl<'a> WhirLfmPlan<'a> {
     /// Tables per commitment group: every table in one.
     pub fn sizes(&self) -> Vec<usize> {
         vec![self.layouts.len()]
+    }
+
+    /// Per table, the leading columns the main stack leaves out: every
+    /// prefix under policy B, none (an empty list) under policy A — the form
+    /// `CommittedTables::commit_grouped_settled` takes.
+    pub fn settled_out_of_main(&self) -> Vec<usize> {
+        if self.policy.excludes_prefix() {
+            self.counts.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Each table's statement, at its AIR's preprocessed count.
@@ -756,13 +848,17 @@ pub(crate) fn prove_traces_whir_opening(
     let refs = airs.air_refs();
     // The layouts the committed tables are built against are the PLAN's — the
     // same derivation the verifier makes — moved out rather than rebuilt.
+    let plan = WhirLfmPlan::build(artifacts, &refs)?;
+    // Under policy B the main stack leaves every prefix out; the prepared
+    // opening, which `multi_prove` refuses to omit then, is its only binding.
+    let settled = plan.settled_out_of_main();
     let WhirLfmPlan {
         config,
         shapes,
         layouts,
         counts,
         ..
-    } = WhirLfmPlan::build(artifacts, &refs)?;
+    } = plan;
     let pairs = airs.air_trace_pairs(traces);
     if pairs.len() != layouts.len() {
         return Err(shape_error(format!(
@@ -814,7 +910,12 @@ pub(crate) fn prove_traces_whir_opening(
         &artifacts.table_num_vars,
         &config,
     );
-    let committed = CommittedTables::<F, E, WhirLfmHash>::commit(tables, &config)?;
+    let committed = CommittedTables::<F, E, WhirLfmHash>::commit_grouped_settled(
+        tables,
+        &[counts.len()],
+        &config,
+        &settled,
+    )?;
     let borrowed = multilinear::stacking::borrow(&build.prepared.columns);
     let prepared = Prepared {
         commitment: &build.prepared.commitment,
@@ -875,7 +976,7 @@ pub fn verify_whir_checked(
     let expected = super::proof::expected_public_balance(claimed_public, &z, &alpha)
         .ok_or(WhirLfmError::Argument(multilinear::Error::BusImbalance))?;
 
-    multilinear_table::multi_verify::<F, E, _, WhirLfmHash>(
+    multilinear_table::multi_verify_settled::<F, E, _, WhirLfmHash>(
         proof,
         &statements,
         &plan.group_layouts,
@@ -885,6 +986,7 @@ pub fn verify_whir_checked(
         &plan.config,
         &mut transcript,
         Some(prepared_check(artifacts)),
+        plan.policy.excludes_prefix(),
     )?;
     Ok(())
 }

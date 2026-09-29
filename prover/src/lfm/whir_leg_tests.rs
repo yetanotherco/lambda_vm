@@ -24,8 +24,8 @@ use super::whir_leg::{
     shape_only_artifacts, table_proof_words, whir_leg_arena_words, whir_leg_cost,
 };
 use super::whir_proof::{
-    WhirLfmBuild, WhirLfmProof, build_whir_artifacts, lfm_prove_whir, prove_traces_whir_opening,
-    test_grind,
+    PrepPolicy, WhirLfmBuild, WhirLfmProof, build_whir_artifacts, build_whir_artifacts_under,
+    lfm_prove_whir, prove_traces_whir_opening, test_grind,
 };
 use super::word::LfmWord;
 
@@ -43,8 +43,13 @@ fn arenas() -> Vec<Vec<LfmWord>> {
 
 /// The child: `TrivialV0`, built and proved as a W-LFM proof.
 fn child() -> (WhirLfmBuild, WhirLfmProof) {
+    child_under(PrepPolicy::Both)
+}
+
+/// [`child`] under an explicit prefix policy.
+fn child_under(policy: PrepPolicy) -> (WhirLfmBuild, WhirLfmProof) {
     let program = trivial_program();
-    let build = build_whir_artifacts(&program, &options(), REGISTRY_HASHER)
+    let build = build_whir_artifacts_under(&program, &options(), REGISTRY_HASHER, policy)
         .unwrap_or_else(|e| panic!("the child's artifacts build: {e:?}"));
     let proof = lfm_prove_whir(&program, &build, &arenas(), &options())
         .unwrap_or_else(|e| panic!("the child proves: {e:?}"));
@@ -252,8 +257,28 @@ fn forged_trivial_program() -> LfmProgram {
 /// against the honest program's prepared stack.
 #[test]
 fn the_w_leg_refuses_a_forged_program() {
+    refuses_a_forged_program(PrepPolicy::Both);
+}
+
+/// ★ Under policy B the leg executes an honest child, and refuses the forged
+/// program — the prepared opening being the prefix's only binding there.
+#[test]
+fn the_w_leg_executes_and_refuses_a_forgery_under_policy_b() {
     let _ungrinded = test_grind::off();
-    let (build, honest) = child();
+    let (build, honest) = child_under(PrepPolicy::PreparedOnly);
+    let opts = options();
+    let child = WhirChild {
+        artifacts: &build.artifacts,
+        proof: &honest,
+        options: &opts,
+    };
+    run_or_locate(&leg_program(&child), &whir_leg_arena_words(&child));
+    refuses_a_forged_program(PrepPolicy::PreparedOnly);
+}
+
+fn refuses_a_forged_program(policy: PrepPolicy) {
+    let _ungrinded = test_grind::off();
+    let (build, honest) = child_under(policy);
     let forged_program = forged_trivial_program();
     let exec = execute(&forged_program, &arenas(), &REGISTRY_HASHER).expect("executes");
     let mut traces =
@@ -325,8 +350,19 @@ fn a_leg_for_an_unsettled_prefix_is_refused_at_emit_time() {
 /// shape-derived table word count is each table's real arena length.
 #[test]
 fn the_w_legs_instruction_count_is_its_form() {
+    f1_holds(PrepPolicy::Both);
+}
+
+/// The same F1 under policy B, where the main group opens each table's
+/// columns past its prefix and the prepared opening is the prefix's only one.
+#[test]
+fn the_w_legs_instruction_count_is_its_form_under_policy_b() {
+    f1_holds(PrepPolicy::PreparedOnly);
+}
+
+fn f1_holds(policy: PrepPolicy) {
     let _ungrinded = test_grind::off();
-    let (build, proof) = child();
+    let (build, proof) = child_under(policy);
     let opts = options();
     let child = WhirChild {
         artifacts: &build.artifacts,
@@ -353,7 +389,7 @@ fn the_w_legs_instruction_count_is_its_form() {
         options: &opts,
     });
     println!(
-        "W-LEG F1: instrs {} = ops {ops} + consts {consts} + hints {hints}; perms {perms}; \
+        "W-LEG F1 [{policy:?}]: instrs {} = ops {ops} + consts {consts} + hints {hints}; perms {perms}; \
          form ops {} (spine {} tables {} closure {} groups {} prepared {}), consts {}, hints {}, \
          perms {}",
         program.instrs.len(),
@@ -532,7 +568,7 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
     let publics = super::per_table_aggregator::SchemaLayout::node(0).total();
     let mut rows = Vec::new();
     for (label, logs) in SIZING_PROFILES {
-        let artifacts = shape_only_artifacts(logs, &opts);
+        let artifacts = shape_only_artifacts(logs, &opts, PrepPolicy::Both);
         let cost = whir_leg_cost(&WhirLegShape {
             artifacts: &artifacts,
             num_public_words: publics,
@@ -555,6 +591,64 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
         );
         rows.push((*label, cost.perms, cost.operations(), cost.hints));
     }
+    // Policy B at the same shapes: the main stack holds the value columns only.
+    let mut rows_b = Vec::new();
+    for (label, logs) in SIZING_PROFILES {
+        let artifacts = shape_only_artifacts(logs, &opts, PrepPolicy::PreparedOnly);
+        let cost = whir_leg_cost(&WhirLegShape {
+            artifacts: &artifacts,
+            num_public_words: publics,
+            options: &opts,
+        });
+        let airs = super::whir_proof::airs_for(&artifacts, &opts);
+        let plan =
+            super::whir_proof::WhirLfmPlan::build(&artifacts, &airs.air_refs()).expect("plan");
+        println!(
+            "W-LEG SIZING B {label}: perms {} · ops {} · hints {} · main n{} x{} · prepared n{} x{}",
+            cost.perms,
+            cost.operations(),
+            cost.hints,
+            plan.group_layouts[0].n_stack(),
+            plan.group_layouts[0].num_polys(),
+            artifacts.prepared_layout.n_stack(),
+            artifacts.prepared_layout.num_polys(),
+        );
+        rows_b.push((*label, cost.perms, cost.operations(), cost.hints));
+    }
+    // ★ The policy-B pins, same format.
+    let pins_b: [(&str, usize, usize, usize); 5] = [
+        ("wrap 0", 38_440, 384_825, 73_961),
+        ("global wrap", 62_576, 591_284, 117_796),
+        ("L1N0", 62_621, 592_012, 117_853),
+        ("L2N0", 62_673, 592_698, 117_928),
+        ("node -1", 41_191, 405_242, 77_677),
+    ];
+    for (label, perms, ops, hints) in pins_b {
+        let row = rows_b
+            .iter()
+            .find(|(l, ..)| *l == label)
+            .expect("the profile is in the table");
+        assert_eq!(
+            (row.1, row.2, row.3),
+            (perms, ops, hints),
+            "{label} (B): (perms, ops, hints) moved off the pin"
+        );
+    }
+    // The design's policy-B instrument: wrap 0 38,441 permutations, L2N0
+    // 62,673 — the same 0.5 % band as policy A's.
+    for (label, want) in [("wrap 0", 38_441usize), ("L2N0", 62_673)] {
+        let (_, perms, _, _) = rows_b
+            .iter()
+            .find(|(l, ..)| *l == label)
+            .expect("the profile is in the table");
+        let off = (*perms as f64 - want as f64).abs() / want as f64;
+        assert!(
+            off < 0.005,
+            "{label} (B): the form's {perms} permutations are {:.2} % from the design's {want}",
+            100.0 * off
+        );
+    }
+
     // ★ THE PINS, at the default format (stack 27, first6, cap auto, grind 20):
     // `(label, permutations, operations, hints)`, the exact form's values.
     let pins: [(&str, usize, usize, usize); 5] = [

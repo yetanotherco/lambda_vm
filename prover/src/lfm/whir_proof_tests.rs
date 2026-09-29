@@ -24,9 +24,10 @@ use super::registry::{LfmProgramKind, REGISTRY_HASHER};
 use super::trace::build_traces_with_hasher;
 use super::whir_proof::test_grind;
 use super::whir_proof::{
-    WhirLfmBuild, WhirLfmError, WhirLfmPlan, WhirLfmTranscript, absorb_whir_lfm_statement,
-    airs_for, build_whir_artifacts, check_chip_set, lfm_prove_whir, lfm_verify_whir,
-    prove_traces_whir_opening, verify_whir_checked,
+    PrepPolicy, WhirLfmBuild, WhirLfmError, WhirLfmPlan, WhirLfmTranscript,
+    absorb_whir_lfm_statement, airs_for, build_whir_artifacts, build_whir_artifacts_under,
+    check_chip_set, lfm_prove_whir, lfm_verify_whir, prove_traces_whir_opening,
+    verify_whir_checked,
 };
 use super::word::LfmWord;
 
@@ -122,6 +123,77 @@ fn the_trivial_program_round_trips_at_the_production_config() {
         &options(),
     )
     .unwrap_or_else(|e| panic!("the honest W-LFM proof must verify: {e:?}"));
+}
+
+/// ★ Policy B round-trips: the prefix out of the main stack, settled by the
+/// prepared opening alone — and a policy-B proof read under policy A is
+/// refused, the main stack being another stack there.
+#[test]
+fn policy_b_round_trips_and_is_not_read_as_policy_a() {
+    let _ungrinded = test_grind::off();
+    let program = trivial_program();
+    let b = build_whir_artifacts_under(
+        &program,
+        &options(),
+        REGISTRY_HASHER,
+        PrepPolicy::PreparedOnly,
+    )
+    .expect("builds under policy B");
+    let a = build(&program, REGISTRY_HASHER);
+    assert_eq!(
+        a.artifacts.policy,
+        PrepPolicy::Both,
+        "the default is policy A"
+    );
+    assert_eq!(
+        a.artifacts.prepared_roots, b.artifacts.prepared_roots,
+        "the prepared stack does not depend on the policy"
+    );
+    assert_ne!(
+        a.artifacts.program_id, b.artifacts.program_id,
+        "the policy is part of the identity"
+    );
+    let proved = lfm_prove_whir(&program, &b, &arenas(), &options()).expect("proves under B");
+    verify_whir_checked(
+        &b.artifacts,
+        &proved.proof,
+        &proved.public_words,
+        &options(),
+    )
+    .unwrap_or_else(|e| panic!("the honest policy-B proof must verify: {e:?}"));
+    let mut as_a = b.artifacts.clone();
+    as_a.policy = PrepPolicy::Both;
+    assert!(
+        !lfm_verify_whir(&as_a, &proved.proof, &proved.public_words, &options()),
+        "a policy-B proof must not verify as policy A"
+    );
+    // And a policy-A proof must not verify as policy B.
+    let proved_a = lfm_prove_whir(&program, &a, &arenas(), &options()).expect("proves under A");
+    let mut as_b = a.artifacts.clone();
+    as_b.policy = PrepPolicy::PreparedOnly;
+    assert!(
+        !lfm_verify_whir(&as_b, &proved_a.proof, &proved_a.public_words, &options()),
+        "a policy-A proof must not verify as policy B"
+    );
+}
+
+/// Under policy B the prepared opening is the prefix's ONLY binding: the
+/// forged program's proof is refused.
+#[test]
+fn policy_b_refuses_a_forged_instruction_column() {
+    let _ungrinded = test_grind::off();
+    let honest = build_whir_artifacts_under(
+        &trivial_program(),
+        &options(),
+        REGISTRY_HASHER,
+        PrepPolicy::PreparedOnly,
+    )
+    .expect("builds under policy B");
+    let (proof, words) = forge(&forged_trivial_program(), &honest, true);
+    assert!(
+        !lfm_verify_whir(&honest.artifacts, &proof, &words, &options()),
+        "under policy B the forged prefix must not open the program's stack"
+    );
 }
 
 /// The same under the registry's hasher, ungrinded.

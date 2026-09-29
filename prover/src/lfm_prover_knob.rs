@@ -83,6 +83,43 @@ pub fn selected() -> Setting {
     })
 }
 
+/// `LAMBDA_VM_LFM_WHIR_PREP` — where a W-LFM proof commits each table's
+/// preprocessed prefix (D-WHIR §2.4): `both` (policy A, the default) in the main
+/// stack AND the prepared stack, `prepared` (policy B) in the prepared stack
+/// only. A W-LFM FORMAT choice, stamped on the program's artifacts at build time
+/// and folded into its `program_id_w`, so a verifier takes it from the
+/// artifacts and never from a proof.
+pub const PREP_ENV: &str = "LAMBDA_VM_LFM_WHIR_PREP";
+
+/// The W-LFM prefix policy for this process, read once and bannered on every
+/// setting; an unknown value aborts.
+pub fn prep_policy() -> crate::lfm::whir_proof::PrepPolicy {
+    use crate::lfm::whir_proof::PrepPolicy;
+    static POLICY: OnceLock<PrepPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let raw = std::env::var(PREP_ENV).ok();
+        let policy = prep_policy_of(raw.as_deref()).unwrap_or_else(|| {
+            eprintln!(
+                "{PREP_ENV}={:?} is not a prefix policy. Accepted: both, prepared.",
+                raw.unwrap_or_default()
+            );
+            std::process::abort()
+        });
+        println!("★ LFM WHIR PREP: {}", policy.name());
+        policy
+    })
+}
+
+/// [`PREP_ENV`]'s reading: unset or empty is policy A (`both`).
+fn prep_policy_of(raw: Option<&str>) -> Option<crate::lfm::whir_proof::PrepPolicy> {
+    use crate::lfm::whir_proof::PrepPolicy;
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("both") => Some(PrepPolicy::Both),
+        Some("prepared") => Some(PrepPolicy::PreparedOnly),
+        Some(_) => None,
+    }
+}
+
 /// [`ENV`]'s reading of a raw value: unset or empty is [`DEFAULT`], an accepted
 /// spelling (case-insensitive) its setting, anything else `None`.
 fn setting_of(raw: Option<&str>) -> Option<Setting> {
@@ -124,6 +161,23 @@ mod tests {
     fn a_near_miss_is_not_silently_accepted() {
         for raw in ["wir", "whir2", "multilinear", "fri", "1", "0", "starks"] {
             assert_eq!(setting_of(Some(raw)), None, "{raw:?} must not parse");
+        }
+    }
+
+    /// The prefix policy: unset, empty and `both` are A; `prepared` is B;
+    /// anything else does not parse.
+    #[test]
+    fn the_prep_policy_parses_its_two_spellings_only() {
+        use crate::lfm::whir_proof::PrepPolicy;
+        assert_eq!(prep_policy_of(None), Some(PrepPolicy::Both));
+        assert_eq!(prep_policy_of(Some("")), Some(PrepPolicy::Both));
+        assert_eq!(prep_policy_of(Some("both")), Some(PrepPolicy::Both));
+        assert_eq!(
+            prep_policy_of(Some("Prepared")),
+            Some(PrepPolicy::PreparedOnly)
+        );
+        for raw in ["a", "b", "B", "prep", "main", "1"] {
+            assert_eq!(prep_policy_of(Some(raw)), None, "{raw:?} must not parse");
         }
     }
 }

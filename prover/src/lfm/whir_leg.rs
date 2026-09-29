@@ -54,7 +54,9 @@ use super::whir_epoch::{
     GroupWires, PreprocessedPlan, PreprocessedRoute, TableWalk, TableWires, emit_group_walk,
     emit_roots_block, emit_table_walk, hint_group_chains, hint_table_wires, push_table_words,
 };
-use super::whir_proof::{WhirLfmArtifacts, WhirLfmPlan, WhirLfmProof, airs_for, statement_runs};
+use super::whir_proof::{
+    PrepPolicy, WhirLfmArtifacts, WhirLfmPlan, WhirLfmProof, airs_for, statement_runs,
+};
 use super::whir_stacked::{StackedPolyWires, emit_stacked_verify};
 use super::whir_table::{TableProofWires, TableShape};
 use super::whir_transcript::{CANDIDATES_PER_SQUEEZE, SpongeEntry, WhirTranscript};
@@ -296,6 +298,32 @@ fn emit_whir_lfm_statement(
     transcript.absorb_const_bytes(&runs.tail);
 }
 
+/// The walk the main group opens under policy B: every table's columns past
+/// its preprocessed prefix — `None` under policy A, where the main stack holds
+/// every column and the walk is used as it is.
+fn main_stack_walk(walk: &TableWalk, plan: &WhirLfmPlan<'_>) -> Option<TableWalk> {
+    if !plan.policy.excludes_prefix() {
+        return None;
+    }
+    let mut values = Vec::with_capacity(walk.values.len());
+    let mut start = 0usize;
+    for (&width, &count) in walk.widths.iter().zip(&plan.counts) {
+        values.extend_from_slice(&walk.values[start + count..start + width]);
+        start += width;
+    }
+    Some(TableWalk {
+        outputs: walk.outputs.clone(),
+        points: walk.points.clone(),
+        widths: walk
+            .widths
+            .iter()
+            .zip(&plan.counts)
+            .map(|(&width, &count)| width - count)
+            .collect(),
+        values,
+    })
+}
+
 /// The leg's closure: `Σ_t p_t / q_t == Σ_i 1/(z − fingerprint_i)`, the
 /// `LfmPublic` balance of the hinted words. A `Div` refuses a vanished `q`,
 /// which is the host's `BusImbalance` on `contribution`'s `None`.
@@ -444,7 +472,17 @@ pub fn emit_whir_leg(b: &mut LfmBuilder, child: &WhirChild<'_>, a: &WhirLegArena
             domain: &plan.plan.group_domains[group],
         })
         .collect();
-    emit_group_walk(b, &mut transcript, &groups, &plan.plan.sizes(), &walk);
+    // ★ Under policy B the main stack holds each table's columns PAST its
+    // prefix, so the group walk sees those claims only; the prefix's are the
+    // prepared opening's below, against the full walk.
+    let main_walk = main_stack_walk(&walk, &plan.plan);
+    emit_group_walk(
+        b,
+        &mut transcript,
+        &groups,
+        &plan.plan.sizes(),
+        main_walk.as_ref().unwrap_or(&walk),
+    );
 
     // 6. ★★ The prepared opening, last: every table's prefix at that table's
     //    own reduced point, against the INTERNED roots the roots block absorbed
@@ -744,7 +782,7 @@ pub fn whir_leg_cost(shape: &WhirLegShape<'_>) -> WhirLegCost {
 
     // The main group, threaded from where the tables left the sponge.
     let groups = super::whir_epoch::epoch_group_costs(
-        &plan.plan.shapes,
+        &plan.plan.main_shapes,
         &plan.plan.sizes(),
         &plan.plan.group_layouts,
         config,
@@ -863,7 +901,11 @@ pub const RECURSION_HASHER: HasherKind = HasherKind::Rpx;
 /// reads the roots' and the identity's VALUES. A verifier handed these would
 /// refuse every proof, which is the right failure for an object that describes
 /// no commitment.
-pub fn shape_only_artifacts(table_num_vars: &[u8], options: &ProofOptions) -> WhirLfmArtifacts {
+pub fn shape_only_artifacts(
+    table_num_vars: &[u8],
+    options: &ProofOptions,
+    policy: PrepPolicy,
+) -> WhirLfmArtifacts {
     let airs = super::whir_proof::whir_lfm_airs(RECURSION_HASHER, RECURSION_CHIP_SET, 1, options);
     let refs = airs.air_refs();
     assert_eq!(
@@ -900,6 +942,7 @@ pub fn shape_only_artifacts(table_num_vars: &[u8], options: &ProofOptions) -> Wh
         hash_chunks: 1,
         table_num_vars: table_num_vars.to_vec(),
         config,
+        policy,
         prepared_roots: vec![zero; prepared_layout.num_polys()],
         prepared_at,
         prepared_layout,
