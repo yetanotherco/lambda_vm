@@ -2589,6 +2589,109 @@ mod tests {
         )
     }
 
+    /// Grind checks in the verifier's order: `(the state the check read, the
+    /// nonce)`.
+    type GrindChecks = Vec<([u8; 32], u64)>;
+
+    /// The verifier's transcript, logging every proof-of-work check it passes:
+    /// the state the check read and the nonce it absorbed right after.
+    /// `check_grind` is the verifier's only reader of `state()`, and it absorbs
+    /// the nonce next.
+    struct GrindLog {
+        inner: DefaultTranscript<F>,
+        read: core::cell::Cell<Option<[u8; 32]>>,
+        checks: GrindChecks,
+    }
+
+    impl IsTranscript<F> for GrindLog {
+        fn append_field_element(&mut self, element: &FE) {
+            self.inner.append_field_element(element);
+        }
+
+        fn append_bytes(&mut self, new_bytes: &[u8]) {
+            if let Some(state) = self.read.take() {
+                let nonce = new_bytes
+                    .try_into()
+                    .map(u64::from_be_bytes)
+                    .expect("a passed grind check absorbs its eight-byte nonce next");
+                self.checks.push((state, nonce));
+            }
+            self.inner.append_bytes(new_bytes);
+        }
+
+        fn state(&self) -> [u8; 32] {
+            let state = self.inner.state();
+            self.read.set(Some(state));
+            state
+        }
+
+        fn sample_field_element(&mut self) -> FE {
+            self.inner.sample_field_element()
+        }
+
+        fn sample_u64(&mut self, upper_bound: u64) -> u64 {
+            self.inner.sample_u64(upper_bound)
+        }
+    }
+
+    /// [`verify_ground`], with every grind check the verifier passed on the way.
+    fn verify_logged(
+        proof: &ChainProof<F, F>,
+        root: &Commitment,
+        domain: &Domain<F>,
+        y: FE,
+        cfg: &ChainConfig,
+        num_vars: usize,
+    ) -> (Result<(), Error>, GrindChecks) {
+        let mut log = GrindLog {
+            inner: transcript(),
+            read: Default::default(),
+            checks: Vec::new(),
+        };
+        let verdict =
+            verify::<F, F, _, KeccakWhir>(proof, root, &point(num_vars), y, domain, cfg, &mut log);
+        (verdict, log.checks)
+    }
+
+    fn passes(state: &[u8; 32], nonce: u64, bits: u8) -> bool {
+        crypto::grinding::is_valid_nonce::<GrindingDigest<KeccakWhir>>(state, nonce, bits)
+    }
+
+    /// A forgery the check at `state` must refuse, whichever valid nonce the
+    /// search returned: the first of `nonce + 1, nonce + 2, …` that fails the
+    /// PoW there. `nonce + 1` alone passes with probability `2^-bits`, and a
+    /// forgery that passes is absorbed and moves the transcript, failing later
+    /// and elsewhere instead of at the check.
+    fn failing(state: &[u8; 32], nonce: u64, bits: u8) -> u64 {
+        (1..)
+            .map(|d| nonce.wrapping_add(d))
+            .find(|&n| !passes(state, n, bits))
+            .expect("a nonce that fails the PoW")
+    }
+
+    /// Proves a uniformly ground chain, replaces the spent nonce of `slot` in
+    /// `round` with a forgery its check must refuse, and verifies. The log
+    /// holds three checks a round (folding, out-of-domain, query), so `round`
+    /// must not be the last, which has no out-of-domain check.
+    fn forge_uniform(round: usize, slot: &str) -> Result<(), Error> {
+        let num_vars = 6;
+        let cfg = ground(2);
+        let (mut proof, root, domain, y) = prove_ground(num_vars, &cfg);
+        let (verdict, checks) = verify_logged(&proof, &root, &domain, y, &cfg, num_vars);
+        verdict.expect("the honest proof must verify");
+        assert!(round + 1 < proof.rounds.len(), "not the last round");
+        let nonces = &mut proof.rounds[round].nonces;
+        let (at, field) = match slot {
+            "folding" => (0, &mut nonces.folding),
+            "ood" => (1, &mut nonces.ood),
+            _ => (2, &mut nonces.query),
+        };
+        let (state, nonce) = checks[3 * round + at];
+        assert_eq!(*field, nonce, "the logged check is round {round}'s {slot}");
+        *field = failing(&state, nonce, 8);
+        verify_ground(&proof, &root, &domain, y, &cfg, num_vars)
+    }
+
     #[test]
     fn a_ground_proof_verifies() {
         let num_vars = 6;
@@ -2596,15 +2699,39 @@ mod tests {
         let (proof, root, domain, y) = prove_ground(num_vars, &cfg);
 
         // Every round grinds before its folding challenges and its queries, and
-        // before the out-of-domain challenge where there is one.
-        for round in &proof.rounds {
-            assert_ne!(round.nonces.folding, 0);
-            assert_ne!(round.nonces.query, 0);
+        // before the out-of-domain challenge where there is one: the verifier
+        // checks exactly those nonces, in that order, and each passes the PoW
+        // at the state its check read. Not "non-zero": the search may return
+        // any valid nonce, 0 included (`find_any` under `parallel`).
+        let (verdict, checks) = verify_logged(&proof, &root, &domain, y, &cfg, num_vars);
+        verdict.unwrap();
+        let last = proof.rounds.len() - 1;
+        let spent: Vec<u64> = proof
+            .rounds
+            .iter()
+            .enumerate()
+            .flat_map(|(r, round)| {
+                let n = round.nonces;
+                if r == last {
+                    vec![n.folding, n.query]
+                } else {
+                    vec![n.folding, n.ood, n.query]
+                }
+            })
+            .collect();
+        assert_eq!(checks.len(), 3 * proof.rounds.len() - 1);
+        assert_eq!(
+            checks.iter().map(|&(_, nonce)| nonce).collect::<Vec<_>>(),
+            spent,
+            "one check a spent slot, in slot order"
+        );
+        for (state, nonce) in &checks {
+            assert!(passes(state, *nonce, 8));
         }
-        assert_ne!(proof.rounds[0].nonces.ood, 0);
-        assert_eq!(proof.rounds.last().unwrap().nonces.ood, 0);
-
-        verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap();
+        assert_eq!(
+            proof.rounds[last].nonces.ood, 0,
+            "the last round has no out-of-domain grind"
+        );
     }
 
     #[test]
@@ -2617,40 +2744,25 @@ mod tests {
 
     #[test]
     fn a_forged_folding_nonce_is_rejected() {
-        let num_vars = 6;
-        let cfg = ground(2);
-        let (mut proof, root, domain, y) = prove_ground(num_vars, &cfg);
-        proof.rounds[1].nonces.folding += 1;
-
         assert_eq!(
-            verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap_err(),
-            Error::GrindingRejected { bits: 8 }
+            forge_uniform(1, "folding"),
+            Err(Error::GrindingRejected { bits: 8 })
         );
     }
 
     #[test]
     fn a_forged_out_of_domain_nonce_is_rejected() {
-        let num_vars = 6;
-        let cfg = ground(2);
-        let (mut proof, root, domain, y) = prove_ground(num_vars, &cfg);
-        proof.rounds[0].nonces.ood += 1;
-
         assert_eq!(
-            verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap_err(),
-            Error::GrindingRejected { bits: 8 }
+            forge_uniform(0, "ood"),
+            Err(Error::GrindingRejected { bits: 8 })
         );
     }
 
     #[test]
     fn a_forged_query_nonce_is_rejected() {
-        let num_vars = 6;
-        let cfg = ground(2);
-        let (mut proof, root, domain, y) = prove_ground(num_vars, &cfg);
-        proof.rounds[0].nonces.query += 1;
-
         assert_eq!(
-            verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap_err(),
-            Error::GrindingRejected { bits: 8 }
+            forge_uniform(0, "query"),
+            Err(Error::GrindingRejected { bits: 8 })
         );
     }
 
@@ -2721,26 +2833,6 @@ mod tests {
         }
     }
 
-    /// The verdicts on four forgeries of one nonce slot: `^ 1`, `^ 2`, `^ 4`,
-    /// `^ 8`. Each passes the PoW with probability `2^-bits`, so a verifier that
-    /// checks the slot refuses at least one of the four (all four pass with
-    /// probability `2^-32` at 8 bits), and one that does not check it refuses
-    /// none.
-    fn flips(
-        proof: &ChainProof<F, F>,
-        slot: impl Fn(&mut ChainProof<F, F>) -> &mut u64,
-        verify: impl Fn(&ChainProof<F, F>) -> Result<(), Error>,
-    ) -> Vec<Result<(), Error>> {
-        [1u64, 2, 4, 8]
-            .into_iter()
-            .map(|flip| {
-                let mut forged = proof.clone();
-                *slot(&mut forged) ^= flip;
-                verify(&forged)
-            })
-            .collect()
-    }
-
     /// ★ Under either layout a query-only chain grinds once a round, before its
     /// queries: the other two nonces stay zero, and a wrong query nonce is
     /// refused in every round.
@@ -2757,24 +2849,30 @@ mod tests {
             for round in &proof.rounds {
                 assert_eq!((round.nonces.folding, round.nonces.ood), (0, 0));
             }
-            verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap();
-
-            for r in 0..proof.rounds.len() {
-                let verdicts = flips(
-                    &proof,
-                    |p| &mut p.rounds[r].nonces.query,
-                    |p| verify_ground(p, &root, &domain, y, &cfg, num_vars),
+            // One check a round, the query's, each passing the PoW at the state
+            // it read.
+            let (verdict, checks) = verify_logged(&proof, &root, &domain, y, &cfg, num_vars);
+            verdict.unwrap();
+            assert_eq!(
+                checks.iter().map(|&(_, nonce)| nonce).collect::<Vec<_>>(),
+                proof
+                    .rounds
+                    .iter()
+                    .map(|round| round.nonces.query)
+                    .collect::<Vec<_>>(),
+                "{layout:?}: one grind check a round, the query's"
+            );
+            for (r, (state, nonce)) in checks.iter().enumerate() {
+                assert!(passes(state, *nonce, 8), "{layout:?}, round {r}");
+                // A wrong query nonce, one that fails the PoW there, is refused
+                // by that round's check.
+                let mut forged = proof.clone();
+                forged.rounds[r].nonces.query = failing(state, *nonce, 8);
+                assert_eq!(
+                    verify_ground(&forged, &root, &domain, y, &cfg, num_vars),
+                    Err(Error::GrindingRejected { bits: 8 }),
+                    "{layout:?}, round {r}"
                 );
-                assert!(
-                    verdicts.contains(&Err(Error::GrindingRejected { bits: 8 })),
-                    "{layout:?}, round {r}: the query nonce is not checked ({verdicts:?})"
-                );
-                for v in verdicts {
-                    assert!(
-                        matches!(v, Ok(()) | Err(Error::GrindingRejected { bits: 8 })),
-                        "{layout:?}, round {r}: {v:?}"
-                    );
-                }
             }
         }
     }
