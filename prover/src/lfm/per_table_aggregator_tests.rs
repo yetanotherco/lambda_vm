@@ -6589,6 +6589,9 @@ fn lead_in_count(var: &str, default: usize) -> usize {
 /// epochs, and `want` products are held from there to level 0's start.
 struct LeadIn<P, C, T> {
     want: usize,
+    /// Epochs per slot: 1 for a wrap, the fan-in for a wide level-1 node, whose
+    /// prologue needs its group's epochs and every one before them.
+    span: usize,
     context: std::sync::OnceLock<C>,
     make_context: MakeContext<C>,
     state: std::sync::Mutex<LeadState<P, T>>,
@@ -6641,12 +6644,27 @@ where
         make_context: impl Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync + 'static,
         build: impl Fn(&C, &[P], usize, usize) -> T + Send + Sync + 'static,
     ) -> std::sync::Arc<Self> {
+        Self::start_spanning(want, 1, helpers, make_context, build)
+    }
+
+    /// [`Self::start`] over slots of `span` epochs: slot `k` is built once epochs
+    /// `0..(k + 1)·span` (capped at the epoch count) exist, and its builder is
+    /// handed that prefix. `span` 1 is [`Self::start`] exactly.
+    fn start_spanning(
+        want: usize,
+        span: usize,
+        helpers: usize,
+        make_context: impl Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync + 'static,
+        build: impl Fn(&C, &[P], usize, usize) -> T + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        assert!(span >= 1, "a lead-in slot covers at least one epoch");
         let lead = std::sync::Arc::new(Self {
             want,
+            span,
             context: std::sync::OnceLock::new(),
             make_context: Box::new(make_context),
             state: std::sync::Mutex::new(LeadState {
-                epochs: (0..want).map(|_| None).collect(),
+                epochs: (0..want * span).map(|_| None).collect(),
                 num_epochs: None,
                 shared: None,
                 slots: (0..want).map(|_| LeadSlot::Waiting).collect(),
@@ -6675,8 +6693,9 @@ where
                         }));
                         if built.is_err() {
                             println!(
-                                "   ⚠ L0 PROLOGUES: the lead-in prologue of wrap {k} panicked; \
-                                 level 0 builds it instead"
+                                "   ⚠ L0 PROLOGUES: the lead-in prologue of {} {k} panicked; \
+                                 level 0 builds it instead",
+                                if lead.span == 1 { "wrap" } else { "wide node" }
                             );
                         }
                         lead.finish(k, built.ok());
@@ -6704,7 +6723,7 @@ where
         }
     }
 
-    /// The next wrap to build: the lowest `Waiting` one below the epoch count
+    /// The next slot to build: the lowest `Waiting` one below the slot count
     /// whose epochs are all here. `None` once level 0 has started or nothing is
     /// left.
     #[allow(clippy::type_complexity)]
@@ -6715,17 +6734,18 @@ where
                 return None;
             }
             if let Some(n) = st.num_epochs {
-                let upto = self.want.min(n);
+                let upto = self.want.min(n.div_ceil(self.span));
                 let mut left = false;
                 for k in 0..upto {
                     if !matches!(st.slots[k], LeadSlot::Waiting) {
                         continue;
                     }
                     left = true;
-                    if st.epochs[..=k].iter().all(Option::is_some) {
+                    let end = ((k + 1) * self.span).min(n);
+                    if st.epochs[..end].iter().all(Option::is_some) {
                         st.slots[k] = LeadSlot::Building;
                         let prefix: Vec<std::sync::Arc<P>> =
-                            st.epochs[..=k].iter().flatten().cloned().collect();
+                            st.epochs[..end].iter().flatten().cloned().collect();
                         drop(st);
                         // The deep copies are made outside the lock: the base's
                         // prover thread takes it to hand over its next epoch.
@@ -6809,7 +6829,7 @@ where
     }
 
     fn on_epoch_proved(&self, index: usize, proof: &P) {
-        if index >= self.want {
+        if index >= self.want * self.span {
             return;
         }
         // Copied before the lock: this is the base's prover thread.
@@ -6966,6 +6986,44 @@ fn l0_lead_in_setting_reads_the_environment() {
             "at level 0 (LFM_TREE_PROLOGUES_AT_LEVEL0=1)"
         }
     );
+}
+
+/// ★ THE WIDE LEAD-IN'S SLOTS: slot `k` of span 2 waits for epochs
+/// `0..2(k + 1)` — its group and every epoch before it — and the last slot of an
+/// odd count for the epochs that exist. Its builder is handed exactly that
+/// prefix.
+#[test]
+fn l0_lead_in_spanning_builds_each_slot_from_its_group_prefix() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<TestLeadIn> = LeadIn::start_spanning(
+        3,
+        2,
+        2,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        |_ctx: &usize, epochs: &[u64], n, k| (k, epochs.to_vec(), n),
+    );
+    lead.on_epoch_count(5);
+    for (i, e) in [10u64, 11, 12].into_iter().enumerate() {
+        lead.on_epoch_proved(i, &e);
+    }
+    lead.until("slot 0 built", |k| k[0] == "built");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        lead.slot_kinds()[1],
+        "waiting",
+        "slot 1 needs epochs 0..4, and epoch 3 is not here"
+    );
+    lead.on_epoch_proved(3, &13);
+    lead.on_epoch_proved(4, &14);
+    lead.until("every slot built", |k| k.iter().all(|s| *s == "built"));
+    assert_eq!(lead.take(0), Some((0, vec![10, 11], 5)));
+    assert_eq!(lead.take(1), Some((1, vec![10, 11, 12, 13], 5)));
+    assert_eq!(
+        lead.take(2),
+        Some((2, vec![10, 11, 12, 13, 14], 5)),
+        "the last slot of an odd count covers the one epoch left"
+    );
+    assert_eq!(lead.take(3), None, "past `want` the pool builds");
 }
 
 #[test]
@@ -7133,6 +7191,155 @@ struct WhirWrapPrologue {
 
 type WhirLeadIn<H> =
     LeadIn<crate::multilinear_continuation::EpochProof, WhirLeadContext<H>, WhirWrapPrologue>;
+
+/// One wide level-1 node's host-only prologue: what `whir_level_zero`'s
+/// `prove_one_wide` builds before it reaches the card — its harvested epochs
+/// (the schema checks read the ends), its program and its arenas.
+struct WhirWidePrologue {
+    epochs: Vec<crate::lfm::whir_real_epoch::WhirRealEpoch>,
+    program: LfmProgram,
+    arenas: Vec<Vec<LfmWord>>,
+    t_harvest: f64,
+    t_emit: f64,
+    /// The prologue's window on the prove-split clock.
+    t0: f64,
+    t1: f64,
+}
+
+type WhirWideLeadIn<H> =
+    LeadIn<crate::multilinear_continuation::EpochProof, WhirLeadContext<H>, WhirWidePrologue>;
+
+/// A wide node's program and arenas over its harvested epochs, pinned at the
+/// tree positions of `range` — the ONE emission the pool and the lead-in share,
+/// so a prologue a helper built is the pool's own program.
+fn wide_prologue_emit(
+    held: &[(
+        crate::lfm::whir_real_epoch::WhirRealEpoch,
+        crate::multilinear_continuation::WhirEpochAirs,
+    )],
+    range: std::ops::Range<usize>,
+) -> (LfmProgram, Vec<Vec<LfmWord>>) {
+    let refs: Vec<Vec<_>> = held.iter().map(|(_, airs)| airs.refs()).collect();
+    let wide_epochs: Vec<super::whir_wide::WideEpoch<'_>> = held
+        .iter()
+        .zip(&refs)
+        .map(|((epoch, _), refs)| super::whir_wide::WideEpoch {
+            epoch,
+            airs: &refs[..],
+        })
+        .collect();
+    // ⛔ THE POSITIONS ARE THE TREE'S: the labels the wraps' parent would have
+    // pinned, never the epochs' own (see `whir_wide`'s header).
+    let positions: Vec<u64> = range
+        .map(|k| crate::tables::local_to_global::epoch_label(k as u64))
+        .collect();
+    let program = super::whir_wide::wide_node_program(
+        &wide_epochs,
+        &positions,
+        super::per_table_aggregator::NodePublishSet::Aggregation,
+    );
+    let arenas = super::whir_wide::wide_node_arena(&wide_epochs);
+    (program, arenas)
+}
+
+/// The wide tree's lead-in: [`start_whir_lead_in`] over slots of `span` epochs.
+/// A helper harvests slot `j`'s epochs from the base's proofs as the base
+/// hands them over, and emits the wide node with [`wide_prologue_emit`] — the
+/// pool's own emission, so the IDENTITY lines are the gate again.
+#[allow(clippy::type_complexity)]
+fn start_whir_wide_lead_in<H>(
+    elf_bytes: &[u8],
+    inner: &crate::ProofOptions,
+    want: usize,
+    span: usize,
+    helpers: usize,
+) -> (
+    crate::multilinear_continuation::SharedEpochObserver,
+    std::sync::Arc<dyn std::any::Any + Send + Sync>,
+)
+where
+    H: multilinear::whir_hash::WhirHash + 'static,
+{
+    use crate::multilinear_continuation::{decode_derivations, reset_decode_derivations};
+    let ctx_bytes = elf_bytes.to_vec();
+    let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
+    let lead: std::sync::Arc<WhirWideLeadIn<H>> = LeadIn::start_spanning(
+        want,
+        span,
+        helpers,
+        // ⛔ BOTH DECODE DERIVATIONS ARE THE BASE'S, as for the wrap lead-in.
+        move |base: &dyn Fn() -> BaseShared| {
+            let shared = base()
+                .downcast::<crate::multilinear_continuation::SharedDecode<H>>()
+                .unwrap_or_else(|_| {
+                    panic!("the WHIR base shared its DECODE work under another hash")
+                });
+            WhirLeadContext {
+                elf: executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load"),
+                prepared: std::sync::Arc::clone(&shared.prepared),
+                decode_root: shared.root,
+            }
+        },
+        move |ctx: &WhirLeadContext<H>,
+              epochs: &[crate::multilinear_continuation::EpochProof],
+              n,
+              j| {
+            reset_decode_derivations();
+            let t0 = stark::prove_split::epoch_secs();
+            let range = j * span..((j + 1) * span).min(n);
+            let t = std::time::Instant::now();
+            let held: Vec<_> = range
+                .clone()
+                .map(|k| {
+                    let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_epochs_under::<H>(
+                        &inner,
+                        &bytes,
+                        epochs,
+                        n,
+                        k,
+                        Some(ctx.decode_root),
+                        Some(&*ctx.prepared),
+                    )
+                    .unwrap_or_else(|why| {
+                        panic!("epoch {k} must harvest from proofs alone: {why}")
+                    });
+                    let air_set = crate::multilinear_continuation::epoch_airs_for(
+                        &ctx.elf,
+                        &inner,
+                        &epochs[k],
+                        &e.position.register_init,
+                        e.position.is_final,
+                        e.position.label,
+                        Some(ctx.decode_root),
+                    );
+                    (e, air_set)
+                })
+                .collect();
+            let t_harvest = t.elapsed().as_secs_f64();
+            // The per-node assert level 1 makes, on the thread that prepared it.
+            let derived_here = decode_derivations();
+            assert_eq!(
+                derived_here, 0,
+                "wide node {j} derived DECODE {derived_here} time(s) in the lead-in; both \
+                 hoists are handed in, so a non-zero count means one did not reach it"
+            );
+            let t = std::time::Instant::now();
+            let (program, arenas) = wide_prologue_emit(&held, range);
+            let t_emit = t.elapsed().as_secs_f64();
+            WhirWidePrologue {
+                epochs: held.into_iter().map(|(e, _)| e).collect(),
+                program,
+                arenas,
+                t_harvest,
+                t_emit,
+                t0,
+                t1: stark::prove_split::epoch_secs(),
+            }
+        },
+    );
+    let observer: crate::multilinear_continuation::SharedEpochObserver = lead.clone();
+    (observer, lead)
+}
 
 /// The WHIR tree's lead-in, under the hash `H` level 0 will prove its
 /// epochs under. Returns the base's observer and the handle `whir_level_zero`
@@ -8462,17 +8669,17 @@ where
         );
     }
 
-    // ⛔ THE LEAD-IN BUILDS WRAP PROLOGUES, and a wide level has no wraps: the
-    // caller starts none under `LAMBDA_VM_LFM_WIDE=on`, and a lead-in handed in
-    // anyway would have spent the base's tail on programs nothing proves.
-    assert!(
-        !(wide && lead_in.is_some()),
-        "a wide level 1 takes no lead-in: its prologues are wrap programs"
-    );
-    // ★ The lead-in the base fed, under this level's own `H`.
-    let lead = lead_in.map(|any| {
+    // ★ The lead-in the base fed, under this level's own `H`: wrap prologues,
+    // or under a wide level 1 the wide nodes' (`start_whir_wide_lead_in`).
+    let lead = lead_in.filter(|_| !wide).map(|any| {
         any.downcast_ref::<WhirLeadIn<H>>()
             .expect("the lead-in was started under a different WHIR hash than level 0's")
+    });
+    let wide_lead = lead_in.filter(|_| wide).map(|any| {
+        any.downcast_ref::<WhirWideLeadIn<H>>().expect(
+            "a wide level 1 takes the WIDE lead-in, under level 1's WHIR hash; this one \
+             is a wrap lead-in or another hash's",
+        )
     });
 
     // ⚠ AFTER the prove, not before: `prove_continuation` derives its own, and
@@ -8536,6 +8743,9 @@ where
     );
     // ★ The lead-in: from here level 0 builds whatever it has not started.
     if let Some(l) = lead {
+        println!("   {}", l.close());
+    }
+    if let Some(l) = wide_lead {
         println!("   {}", l.close());
     }
 
@@ -8786,66 +8996,78 @@ where
         // where the level above reads it: as level 1's node `j`.
         let label = format!("L1N{j} (arity {})", epochs.len());
         crate::multilinear_continuation::reset_decode_derivations();
-        let t = Instant::now();
-        let held: Vec<(
-            crate::lfm::whir_real_epoch::WhirRealEpoch,
-            crate::multilinear_continuation::WhirEpochAirs,
-        )> = epochs
-            .clone()
-            .map(|k| {
-                let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
-                    inner,
-                    elf_bytes,
-                    bundle,
-                    k,
-                    Some(decode_root),
-                    Some(prepared),
-                )
-                .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
-                let air_set = crate::multilinear_continuation::epoch_airs_for(
-                    elf,
-                    inner,
-                    &bundle.epochs[k],
-                    &e.position.register_init,
-                    e.position.is_final,
-                    e.position.label,
-                    Some(decode_root),
+        // ★ The prologue a lead-in helper built in the base's tail, if any — the
+        // same harvest, program and arenas the arm below builds, with both
+        // asserts made on the helper's thread.
+        let lead_prologue = wide_lead.and_then(|l| l.take(j));
+        let from_lead = lead_prologue.is_some();
+        let (held, program, arenas, t_harvest_epochs, t_emit) = match lead_prologue {
+            Some(p) => {
+                if super::device_permit::trace_enabled() {
+                    println!(
+                        "STAGE {label} prologue (harvest+emit, pre-device, lead-in, in the \
+                         base's tail): {:.2}s t=[{:.3},{:.3}]",
+                        p.t_harvest + p.t_emit,
+                        p.t0,
+                        p.t1,
+                    );
+                }
+                (p.epochs, p.program, p.arenas, p.t_harvest, p.t_emit)
+            }
+            None => {
+                let t = Instant::now();
+                let held: Vec<(
+                    crate::lfm::whir_real_epoch::WhirRealEpoch,
+                    crate::multilinear_continuation::WhirEpochAirs,
+                )> = epochs
+                    .clone()
+                    .map(|k| {
+                        let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
+                            inner,
+                            elf_bytes,
+                            bundle,
+                            k,
+                            Some(decode_root),
+                            Some(prepared),
+                        )
+                        .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+                        let air_set = crate::multilinear_continuation::epoch_airs_for(
+                            elf,
+                            inner,
+                            &bundle.epochs[k],
+                            &e.position.register_init,
+                            e.position.is_final,
+                            e.position.label,
+                            Some(decode_root),
+                        );
+                        (e, air_set)
+                    })
+                    .collect();
+                let t_harvest_epochs = t.elapsed().as_secs_f64();
+                let derived_here = crate::multilinear_continuation::decode_derivations();
+                assert_eq!(
+                    derived_here, 0,
+                    "{label} derived DECODE {derived_here} time(s) while preparing its epochs; \
+                     both hoists are handed in, so a non-zero count means one is not reaching the \
+                     harvest"
                 );
-                (e, air_set)
-            })
-            .collect();
-        let t_harvest_epochs = t.elapsed().as_secs_f64();
-        let derived_here = crate::multilinear_continuation::decode_derivations();
-        assert_eq!(
-            derived_here, 0,
-            "{label} derived DECODE {derived_here} time(s) while preparing its epochs; \
-             both hoists are handed in, so a non-zero count means one is not reaching the \
-             harvest"
-        );
-        let refs: Vec<Vec<_>> = held.iter().map(|(_, airs)| airs.refs()).collect();
-        let wide_epochs: Vec<super::whir_wide::WideEpoch<'_>> = held
-            .iter()
-            .zip(&refs)
-            .map(|((epoch, _), refs)| super::whir_wide::WideEpoch {
-                epoch,
-                airs: &refs[..],
-            })
-            .collect();
-        // ⛔ THE POSITIONS ARE THE TREE'S: the labels the wraps' parent would
-        // have pinned, never the epochs' own (see `whir_wide`'s header).
+                let t = Instant::now();
+                let (program, arenas) = wide_prologue_emit(&held, epochs.clone());
+                let t_emit = t.elapsed().as_secs_f64();
+                (
+                    held.into_iter().map(|(e, _)| e).collect::<Vec<_>>(),
+                    program,
+                    arenas,
+                    t_harvest_epochs,
+                    t_emit,
+                )
+            }
+        };
         let positions: Vec<u64> = epochs
             .clone()
             .map(|k| crate::tables::local_to_global::epoch_label(k as u64))
             .collect();
-        let t = Instant::now();
-        let program = super::whir_wide::wide_node_program(
-            &wide_epochs,
-            &positions,
-            super::per_table_aggregator::NodePublishSet::Aggregation,
-        );
-        let arenas = super::whir_wide::wide_node_arena(&wide_epochs);
-        let t_emit = t.elapsed().as_secs_f64();
-        let (first, last) = (&held[0].0, &held[held.len() - 1].0);
+        let (first, last) = (&held[0], &held[held.len() - 1]);
         let out_halves = last.public_output().len().div_ceil(4);
 
         let (cells, instrs) = census_and_panel(&program, &label, epochs.len());
@@ -8905,10 +9127,15 @@ where
         println!(
             "   {label} TIMING: wide, epochs {}..={} · harvest-epochs {t_harvest_epochs:.2}s · \
              emit+arenas {t_emit:.2}s · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · \
-             harvest {t_child:.2}s (verify {t_verify:.2}) · wall {:.2}s",
+             harvest {t_child:.2}s (verify {t_verify:.2}) · wall {:.2}s{}",
             epochs.start,
             epochs.end - 1,
             t_wide.elapsed().as_secs_f64(),
+            if from_lead {
+                " ⓘ lead-in: harvest-epochs + emit ran in the base's tail, outside this wall"
+            } else {
+                ""
+            },
         );
         println!(
             "   {label}: host peak {peak:.3} GiB at t={at:.1}{}{}",
@@ -9728,17 +9955,10 @@ fn whir_production_tree<C: TreeChild>() {
     // ★ THE LEAD-IN: level 0's first-round wrap prologues, built by helpers in
     // the base's tail — see [`LeadIn`]. Started under the hash level 0
     // dispatches on, and handed to the base as a hash-free observer.
-    // ★ `LAMBDA_VM_LFM_WIDE`, read before the lead-in: a wide level 1 has no
-    // wrap prologues for the base's tail to build.
+    // ★ `LAMBDA_VM_LFM_WIDE`, read before the lead-in: a wide level 1's lead-in
+    // builds wide nodes of `fan_in` epochs, where the wrap tree's builds wraps.
     let wide = crate::lfm_prover_knob::wide_selected();
-    if wide && lead_in_enabled() {
-        println!(
-            "   ★ LEAD-IN OFF: level 1 is wide (LAMBDA_VM_LFM_WIDE=on), and the lead-in \
-             builds wrap prologues; the wide nodes harvest their epochs as their own \
-             first work"
-        );
-    }
-    let whir_lead = (lead_in_enabled() && !wide).then(|| {
+    let whir_lead = lead_in_enabled().then(|| {
         let want = lead_in_count(
             "LFM_TREE_TAIL_PROLOGUES",
             tree_siblings_l0()
@@ -9746,13 +9966,24 @@ fn whir_production_tree<C: TreeChild>() {
                 .max(1),
         );
         let helpers = lead_in_count("LFM_TREE_TAIL_HELPERS", 2);
-        println!(
-            "   ★ L0 PROLOGUES: in the base's tail (the default): {helpers} helper(s) build \
-             WHIR wraps 0..{want} (LFM_TREE_TAIL_PROLOGUES / LFM_TREE_TAIL_HELPERS)"
-        );
-        crate::with_whir_hash!(|H| {
-            start_whir_lead_in::<H>(&inputs.elf_bytes, &inner, want, helpers)
-        })
+        if wide {
+            println!(
+                "   ★ L1 WIDE PROLOGUES: in the base's tail (the default): {helpers} helper(s) \
+                 build wide nodes 0..{want}, {fan_in} epochs each (LFM_TREE_TAIL_PROLOGUES / \
+                 LFM_TREE_TAIL_HELPERS)"
+            );
+            crate::with_whir_hash!(|H| {
+                start_whir_wide_lead_in::<H>(&inputs.elf_bytes, &inner, want, fan_in, helpers)
+            })
+        } else {
+            println!(
+                "   ★ L0 PROLOGUES: in the base's tail (the default): {helpers} helper(s) build \
+                 WHIR wraps 0..{want} (LFM_TREE_TAIL_PROLOGUES / LFM_TREE_TAIL_HELPERS)"
+            );
+            crate::with_whir_hash!(|H| {
+                start_whir_lead_in::<H>(&inputs.elf_bytes, &inner, want, helpers)
+            })
+        }
     });
     if whir_lead.is_none() {
         println!("   L0 PROLOGUES: at level 0 (LFM_TREE_PROLOGUES_AT_LEVEL0=1)");
@@ -9875,6 +10106,14 @@ fn whir_production_tree<C: TreeChild>() {
 
     // ---- level 0: one WHIR wrap per epoch.
     let t_level = Instant::now();
+    // ⓘ Under a wide level 1, its start on the prove-split clock: what the gap
+    // to the first `CARD HOLD` is measured from.
+    if wide {
+        println!(
+            "   ★ LEVEL 1 (wide) START t={:.3} (prove-split clock)",
+            stark::prove_split::epoch_secs()
+        );
+    }
     super::program_census::begin_level();
     let l0_siblings = tree_siblings_l0().min(bundle.num_epochs().max(1));
     println!(
