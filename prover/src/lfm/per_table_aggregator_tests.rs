@@ -2379,9 +2379,17 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     // ---- the composition property, asserted rather than implied: an inner
     // node's published schema has the SAME shape as its children's, which is
     // what lets the level above it use the identical emitter.
+    //
+    // Measured against the LAST leaf, in the words each proof published. A node
+    // carries its last child's output halves (`emit_node_publishes`), so the
+    // length of that run belongs to whichever epoch committed, not to the level,
+    // and only the last leaf carries what the inner node carries. The first leaf
+    // matches it only while neither leaf's last epoch commits: at 8-cycle epochs
+    // the fixture commits in epoch 1, the first leaf's last, and the first leaf
+    // publishes two output halves the inner node does not carry.
     assert_eq!(
-        inner_layout.total(),
-        leaf_layouts[0].total(),
+        inner_node.public_words.len(),
+        leaves[FAN_IN - 1].public_words.len(),
         "a node's published schema must not change with its level — that is what \
          makes the same emitter serve the level above"
     );
