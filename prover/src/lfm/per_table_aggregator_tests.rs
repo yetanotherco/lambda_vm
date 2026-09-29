@@ -1252,8 +1252,8 @@ pub(super) fn node_program(
 /// parallel vectors because `node_program` and `prove_node_program_as_child` take
 /// `&[RealChild]` and `&[SchemaLayout]`, so a node's child group is a subslice of
 /// each rather than a clone of every child's harvest.
-pub(super) type TreeLevel = (
-    Vec<RealChild>,
+pub(super) type TreeLevel<C = RealChild> = (
+    Vec<C>,
     Vec<super::per_table_aggregator::SchemaLayout>,
     Vec<Vec<u64>>,
 );
@@ -1318,6 +1318,525 @@ pub(super) fn root_program(
         },
     );
     compile(b.finish())
+}
+
+// ======================= pure WHIR: the tree's child, generic =======================
+
+/// ★ A proof one level of the production tree hands the next — the harvest of a
+/// STARK-proved LFM proof ([`RealChild`], today's tree) or a W-LFM proof
+/// ([`WhirTreeChild`], pure WHIR, D-WHIR §6.3).
+///
+/// Level 0, the global stage, the interior and the root are generic over it, so
+/// both provers run THE SAME DRIVER — the same pools, siblings, permits and stage
+/// order — and an A/B of `LAMBDA_VM_LFM_PROVER` compares provers, not drivers.
+/// ⛔ The STARK instance is today's code, call for call: every method below
+/// forwards to the function the driver called before it was generic, and the
+/// phases keep their order (build, prove, the schema checks on the proof, the
+/// harvest), so a STARK arm's timings and lines are the ones it always printed.
+pub(super) trait TreeChild: Sized + Send + Sync {
+    /// What a build leaves the prover: STARK artifacts, or a W-LFM build.
+    type Built: Send;
+    /// A proof before its harvest.
+    type Proved: Send;
+
+    /// Build the program's artifacts — the first device phase, under the permit.
+    fn build(program: &LfmProgram, opts: &crate::ProofOptions) -> Self::Built;
+
+    /// Prove the program over its arenas — the second device phase. `Err` names
+    /// the reason, with a refused equality located in the program.
+    fn prove(
+        label: &str,
+        program: &LfmProgram,
+        built: &Self::Built,
+        arenas: &[Vec<LfmWord>],
+        opts: &crate::ProofOptions,
+    ) -> Result<Self::Proved, String>;
+
+    /// What the proof published — the schema checks read it before the harvest.
+    fn proved_words(proved: &Self::Proved) -> &[(u32, LfmWord)];
+
+    /// Verify on the host and keep what a parent needs: the child, and the
+    /// verify's own seconds.
+    fn harvest(
+        label: &str,
+        built: Self::Built,
+        opts: &crate::ProofOptions,
+        proved: Self::Proved,
+    ) -> (Self, f64);
+
+    /// What the child published.
+    fn public_words(&self) -> &[(u32, LfmWord)];
+
+    /// The IDENTITY line's fields: the program id's first eight bytes in hex,
+    /// the heights and the chunk heights, each as the line prints it.
+    fn identity(&self) -> (String, String, String);
+
+    /// Sub-proofs (tables) the child's proof carries.
+    fn num_tables(&self) -> usize;
+
+    /// The child's arenas, as its parent's leg reads them.
+    fn arena_words(&self) -> Vec<Vec<LfmWord>>;
+
+    /// The aggregation node over `kids`.
+    fn node_program(
+        kids: &[Self],
+        layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        publishes: super::per_table_aggregator::NodePublishSet,
+    ) -> LfmProgram;
+
+    /// A node program, proved and harvested as the next level's child.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_node_program_as_child(
+        label: &str,
+        program: &LfmProgram,
+        children: &[Self],
+        out_halves: usize,
+        opts: &crate::ProofOptions,
+        mode: CacheMode,
+        cache: Option<std::path::PathBuf>,
+    ) -> (Self, super::per_table_aggregator::SchemaLayout);
+
+    /// The block-artifact root program over the interior and the global child.
+    #[allow(clippy::too_many_arguments)]
+    fn root_program(
+        interior: &[Self],
+        interior_layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        global: &Self,
+        global_child_layout: &super::block_root::GlobalLayout,
+        fold_shape: &super::block_root::FoldShape,
+        publishes: super::block_root::RootPublishSet,
+    ) -> LfmProgram;
+
+    /// Open a stage whose device use is asserted: what `assert_device_window`
+    /// compares against.
+    fn begin_device_window() -> u64;
+
+    /// The stage reached the device, or the run refuses to quote it.
+    fn assert_device_window(stage: &str, since: u64);
+}
+
+/// The first eight bytes of a program id, as every IDENTITY line prints them.
+fn id_hex(id: &stark::config::Commitment) -> String {
+    id.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+impl TreeChild for RealChild {
+    type Built = super::registry::LfmArtifacts;
+    type Proved = super::proof::LfmProof;
+
+    fn build(program: &LfmProgram, opts: &crate::ProofOptions) -> Self::Built {
+        super::program_census::build_artifacts_counted(program, opts, crate::hash_pin::BLOCK_HASHER)
+    }
+
+    fn prove(
+        label: &str,
+        program: &LfmProgram,
+        built: &Self::Built,
+        arenas: &[Vec<LfmWord>],
+        opts: &crate::ProofOptions,
+    ) -> Result<Self::Proved, String> {
+        // ⛔ WHEN IT DOES NOT PROVE, SAY WHICH ASSERT FAILED — `assert_eq` lowers
+        // to `diff / ZERO` and the executor names the `diff` cell, which
+        // `locate_addr` turns into the instruction and its neighbours.
+        super::proof::lfm_prove(program, built, arenas, opts).map_err(|e| match e {
+            super::proof::LfmProveError::Exec(super::executor::LfmExecError::DivByZero {
+                addr,
+            }) => format!(
+                "{label}: the emitted verifier REFUSED its arena — a failing equality \
+                 assert, not a machine fault.\n{}",
+                super::executor::locate_addr(program, addr)
+            ),
+            why => format!("{label}: the program must prove: {why:?}"),
+        })
+    }
+
+    fn proved_words(proved: &Self::Proved) -> &[(u32, LfmWord)] {
+        &proved.public_words
+    }
+
+    fn harvest(
+        _label: &str,
+        built: Self::Built,
+        opts: &crate::ProofOptions,
+        proved: Self::Proved,
+    ) -> (Self, f64) {
+        real_child_timed(built, opts.clone(), &proved)
+    }
+
+    fn public_words(&self) -> &[(u32, LfmWord)] {
+        &self.public_words
+    }
+
+    fn identity(&self) -> (String, String, String) {
+        (
+            id_hex(&self.artifacts.program_id),
+            format!("{:?}", self.artifacts.log_heights),
+            format!("{:?}", self.artifacts.blake3_chunk_log_heights),
+        )
+    }
+
+    fn num_tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    fn arena_words(&self) -> Vec<Vec<LfmWord>> {
+        child_arena_words(self)
+    }
+
+    fn node_program(
+        kids: &[Self],
+        layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        publishes: super::per_table_aggregator::NodePublishSet,
+    ) -> LfmProgram {
+        node_program(kids, layouts, labels, label_range, publishes)
+    }
+
+    fn prove_node_program_as_child(
+        label: &str,
+        program: &LfmProgram,
+        children: &[Self],
+        out_halves: usize,
+        opts: &crate::ProofOptions,
+        mode: CacheMode,
+        cache: Option<std::path::PathBuf>,
+    ) -> (Self, super::per_table_aggregator::SchemaLayout) {
+        prove_node_program_as_child(label, program, children, out_halves, opts, mode, cache)
+    }
+
+    fn root_program(
+        interior: &[Self],
+        interior_layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        global: &Self,
+        global_child_layout: &super::block_root::GlobalLayout,
+        fold_shape: &super::block_root::FoldShape,
+        publishes: super::block_root::RootPublishSet,
+    ) -> LfmProgram {
+        root_program(
+            interior,
+            interior_layouts,
+            labels,
+            label_range,
+            global,
+            global_child_layout,
+            fold_shape,
+            publishes,
+        )
+    }
+
+    fn begin_device_window() -> u64 {
+        #[cfg(feature = "cuda")]
+        stark::gpu_lde::reset_all_gpu_call_counters();
+        0
+    }
+
+    fn assert_device_window(stage: &str, _since: u64) {
+        #[cfg(feature = "cuda")]
+        {
+            let calls = stark::gpu_lde::gpu_lde_calls()
+                + stark::gpu_lde::gpu_merkle_tree_calls()
+                + stark::gpu_lde::gpu_fri_calls();
+            assert!(
+                calls > 0,
+                "the {stage} reached the device ZERO times — it proved on the HOST with \
+                 cuda compiled in, so its peak is not a production figure"
+            );
+            println!("     GPU dispatches during the {stage}: {calls}");
+            assert_the_rpx_grind_reached_the_device(stage);
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = stage;
+    }
+}
+
+/// ★ A W-LFM proof as the tree carries it: the verifier's artifacts (what a
+/// parent interns), the proof and its published words, and the options its
+/// AIR set is built under. The prover's prepared stack is NOT here — a parent
+/// needs only the artifacts, so a harvest drops it with its device codewords.
+pub(super) struct WhirTreeChild {
+    pub(super) artifacts: super::whir_proof::WhirLfmArtifacts,
+    pub(super) proof: super::whir_proof::WhirLfmProof,
+    pub(super) opts: crate::ProofOptions,
+}
+
+impl WhirTreeChild {
+    /// The child as a W-leg's input.
+    pub(super) fn as_child(&self) -> super::whir_leg::WhirChild<'_> {
+        super::whir_leg::WhirChild {
+            artifacts: &self.artifacts,
+            proof: &self.proof,
+            options: &self.opts,
+        }
+    }
+}
+
+/// One `GAPB CHAIN` line per chain a W-LFM proof opens — every main polynomial,
+/// then every prepared one — in the form `proto_bits.py` parses: the security
+/// gate's input, printed where each W-LFM proof is harvested.
+fn print_whir_gapb_chains(label: &str, artifacts: &super::whir_proof::WhirLfmArtifacts) {
+    let airs = super::whir_proof::airs_for(artifacts, &crate::ProofOptions::default_test_options());
+    let refs = airs.air_refs();
+    let Ok(plan) = super::whir_proof::WhirLfmPlan::build(artifacts, &refs) else {
+        return;
+    };
+    let config = &artifacts.config;
+    let chains = std::iter::repeat_n(
+        plan.group_layouts[0].n_stack(),
+        plan.group_layouts[0].num_polys(),
+    )
+    .chain(std::iter::repeat_n(
+        artifacts.prepared_layout.n_stack(),
+        artifacts.prepared_layout.num_polys(),
+    ));
+    for num_vars in chains {
+        println!(
+            "GAPB CHAIN num_vars={num_vars} log_domain={} blowup_log={} schedule={:?} caps={:?} \
+             queries={} grind={}/{}/{} who=w-lfm:{}:{}",
+            num_vars + config.log_blowup,
+            config.log_blowup,
+            config.schedule(num_vars),
+            config.tree_caps(num_vars),
+            config.num_queries,
+            config.grind.folding,
+            config.grind.ood,
+            config.grind.query,
+            label.replace(' ', "_"),
+            artifacts.policy.name(),
+        );
+    }
+}
+
+impl TreeChild for WhirTreeChild {
+    type Built = super::whir_proof::WhirLfmBuild;
+    type Proved = super::whir_proof::WhirLfmProof;
+
+    fn build(program: &LfmProgram, opts: &crate::ProofOptions) -> Self::Built {
+        let t = std::time::Instant::now();
+        let build =
+            super::whir_proof::build_whir_artifacts(program, opts, crate::hash_pin::BLOCK_HASHER)
+                .unwrap_or_else(|e| panic!("a W-LFM program's artifacts must build: {e:?}"));
+        super::program_census::record_built(build.artifacts.program_id, t.elapsed().as_nanos());
+        build
+    }
+
+    fn prove(
+        label: &str,
+        program: &LfmProgram,
+        built: &Self::Built,
+        arenas: &[Vec<LfmWord>],
+        opts: &crate::ProofOptions,
+    ) -> Result<Self::Proved, String> {
+        super::whir_proof::lfm_prove_whir(program, built, arenas, opts).map_err(|e| match e {
+            super::whir_proof::WhirLfmError::Exec(super::executor::LfmExecError::DivByZero {
+                addr,
+            }) => format!(
+                "{label}: the emitted verifier REFUSED its arena under the W-LFM prover — \
+                 a failing equality assert, not a machine fault.\n{}",
+                super::executor::locate_addr(program, addr)
+            ),
+            why => format!("{label}: the W-LFM program must prove: {why:?}"),
+        })
+    }
+
+    fn proved_words(proved: &Self::Proved) -> &[(u32, LfmWord)] {
+        &proved.public_words
+    }
+
+    fn harvest(
+        label: &str,
+        built: Self::Built,
+        opts: &crate::ProofOptions,
+        proved: Self::Proved,
+    ) -> (Self, f64) {
+        // ⛔ THE HARNESS READS ONLY PROOFS THE VERIFIER ACCEPTS — the STARK
+        // harvest's rule, with the W-LFM verifier.
+        let t = std::time::Instant::now();
+        super::whir_proof::verify_whir_checked(
+            &built.artifacts,
+            &proved.proof,
+            &proved.public_words,
+            opts,
+        )
+        .unwrap_or_else(|e| {
+            panic!("{label}: the harness only reads children the verifier accepts: {e:?}")
+        });
+        let verify = t.elapsed().as_secs_f64();
+        print_whir_gapb_chains(label, &built.artifacts);
+        (
+            WhirTreeChild {
+                artifacts: built.artifacts,
+                proof: proved,
+                opts: opts.clone(),
+            },
+            verify,
+        )
+    }
+
+    fn public_words(&self) -> &[(u32, LfmWord)] {
+        &self.proof.public_words
+    }
+
+    fn identity(&self) -> (String, String, String) {
+        (
+            id_hex(&self.artifacts.program_id),
+            format!("{:?}", self.artifacts.table_num_vars),
+            "[]".to_string(),
+        )
+    }
+
+    fn num_tables(&self) -> usize {
+        self.proof.proof.tables.len()
+    }
+
+    fn arena_words(&self) -> Vec<Vec<LfmWord>> {
+        super::whir_leg::whir_leg_arena_words(&self.as_child())
+    }
+
+    fn node_program(
+        kids: &[Self],
+        layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        publishes: super::per_table_aggregator::NodePublishSet,
+    ) -> LfmProgram {
+        let children: Vec<super::whir_leg::WhirChild<'_>> =
+            kids.iter().map(WhirTreeChild::as_child).collect();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        super::whir_leg::emit_whir_node(
+            &mut b,
+            &super::whir_leg::WhirNodeInputs {
+                children: &children,
+                layouts,
+                labels,
+                label_range,
+                publishes,
+            },
+        );
+        compile(b.finish())
+    }
+
+    fn prove_node_program_as_child(
+        label: &str,
+        program: &LfmProgram,
+        children: &[Self],
+        out_halves: usize,
+        opts: &crate::ProofOptions,
+        _mode: CacheMode,
+        _cache: Option<std::path::PathBuf>,
+    ) -> (Self, super::per_table_aggregator::SchemaLayout) {
+        prove_whir_node_program_as_child(label, program, children, out_halves, opts)
+    }
+
+    fn root_program(
+        interior: &[Self],
+        interior_layouts: &[super::per_table_aggregator::SchemaLayout],
+        labels: &[&[u64]],
+        label_range: (u64, u64),
+        global: &Self,
+        global_child_layout: &super::block_root::GlobalLayout,
+        fold_shape: &super::block_root::FoldShape,
+        publishes: super::block_root::RootPublishSet,
+    ) -> LfmProgram {
+        let interior: Vec<super::whir_leg::WhirChild<'_>> =
+            interior.iter().map(WhirTreeChild::as_child).collect();
+        let global = global.as_child();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        super::whir_leg::emit_whir_block_root(
+            &mut b,
+            &super::whir_leg::WhirRootInputs {
+                interior: &interior,
+                interior_layouts,
+                labels,
+                label_range,
+                global: &global,
+                global_child_layout,
+                fold_shape,
+                publishes,
+            },
+        );
+        compile(b.finish())
+    }
+
+    fn begin_device_window() -> u64 {
+        multilinear::gpu::commit_calls() + multilinear::gpu::sumcheck_calls()
+    }
+
+    fn assert_device_window(stage: &str, since: u64) {
+        #[cfg(feature = "cuda")]
+        {
+            let calls =
+                multilinear::gpu::commit_calls() + multilinear::gpu::sumcheck_calls() - since;
+            assert!(
+                calls > 0,
+                "the {stage} reached the device ZERO times under the W-LFM prover — it \
+                 proved on the HOST with cuda compiled in, so its time is not a production \
+                 figure"
+            );
+            println!("     W-LFM device commits + sumchecks during the {stage}: {calls}");
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (stage, since);
+    }
+}
+
+/// [`prove_node_program_as_child`] under the W-LFM prover: the children's arenas,
+/// the build (the prepared commit), the prove and the harvest, with the same
+/// TIMING line — `replay` is zero, a W-LFM harvest being the verify alone.
+fn prove_whir_node_program_as_child(
+    label: &str,
+    program: &LfmProgram,
+    children: &[WhirTreeChild],
+    out_halves: usize,
+    opts: &crate::ProofOptions,
+) -> (WhirTreeChild, super::per_table_aggregator::SchemaLayout) {
+    use super::per_table_aggregator::SchemaLayout;
+    use std::time::Instant;
+
+    let wait_before = super::device_permit::waited_secs();
+    let t = Instant::now();
+    let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(TreeChild::arena_words).collect();
+    let t_arenas = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let built = <WhirTreeChild as TreeChild>::build(program, opts);
+    let t_artifacts = t.elapsed().as_secs_f64();
+    let wait_artifacts = (super::device_permit::waited_secs() - wait_before).max(0.0);
+    let wait_before = super::device_permit::waited_secs();
+    let t = Instant::now();
+    println!("   {label}: PROVED in-process, NOT cached");
+    let proved = <WhirTreeChild as TreeChild>::prove(label, program, &built, &arenas, opts)
+        .unwrap_or_else(|why| panic!("an aggregation node must prove: {why}"));
+    print_prove_split(label);
+    let t_prove = t.elapsed().as_secs_f64();
+    println!("   {label}: {} instructions", program.instrs.len());
+    mark(&format!("AFTER {label}"));
+    let layout = SchemaLayout::node(out_halves);
+    layout.assert_covers(proved.public_words.len());
+    let t = Instant::now();
+    let (child, t_verify) = <WhirTreeChild as TreeChild>::harvest(label, built, opts, proved);
+    let t_harvest = t.elapsed().as_secs_f64();
+    let wait_prove = (super::device_permit::waited_secs() - wait_before).max(0.0);
+    let wait_total = wait_artifacts + wait_prove;
+    println!(
+        "   {label} TIMING: arenas {t_arenas:.1}s · build_artifacts {t_artifacts:.1}s \
+         · prove {t_prove:.1}s · harvest {t_harvest:.1}s (verify {t_verify:.2} + replay {:.2}){}",
+        t_harvest - t_verify,
+        if wait_total > 0.0 {
+            format!(
+                " · permit wait {wait_total:.2}s (inside build_artifacts {wait_artifacts:.2} \
+                 + prove {wait_prove:.2})"
+            )
+        } else {
+            String::new()
+        },
+    );
+    (child, layout)
 }
 
 /// Name any sub-proof whose query sampler would be handed a zero bit width,
@@ -5484,12 +6003,12 @@ pub(super) struct InteriorInputs<'a> {
 /// handed in, advanced to level `hi`; `report` is the per-node table the caller
 /// prints; `top_level` is `Some` only under the sizing arm, which needs two
 /// levels live at once.
-pub(super) struct InteriorOutcome {
-    pub(super) children: Vec<RealChild>,
+pub(super) struct InteriorOutcome<C = RealChild> {
+    pub(super) children: Vec<C>,
     pub(super) layouts: Vec<super::per_table_aggregator::SchemaLayout>,
     pub(super) labels: Vec<Vec<u64>>,
     pub(super) report: Vec<(usize, usize, u64, usize, f64, f64, f64)>,
-    pub(super) top_level: Option<TreeLevel>,
+    pub(super) top_level: Option<TreeLevel<C>>,
 }
 
 /// Levels 1..=`hi` of a production tree, over whatever level 0 produced.
@@ -5513,12 +6032,12 @@ pub(super) struct InteriorOutcome {
 /// ⓘ The device permit is ARMED here and disarmed by the caller, exactly as it
 /// was when this was inline — the interior's sibling count must not reach level
 /// 0 or the stages after it.
-pub(super) fn compose_interior_levels(
+pub(super) fn compose_interior_levels<C: TreeChild>(
     ctx: InteriorInputs<'_>,
-    mut children: Vec<RealChild>,
+    mut children: Vec<C>,
     mut layouts: Vec<super::per_table_aggregator::SchemaLayout>,
     mut labels: Vec<Vec<u64>>,
-) -> InteriorOutcome {
+) -> InteriorOutcome<C> {
     use super::per_table_aggregator::SchemaLayout;
     use std::time::Instant;
 
@@ -5566,9 +6085,9 @@ pub(super) fn compose_interior_levels(
     // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
     // the loop. `None` on every other arm, where one level's output is all the
     // run needs.
-    let mut top_level: Option<TreeLevel> = None;
-    type NodeSlot = (
-        RealChild,
+    let mut top_level: Option<TreeLevel<C>> = None;
+    type NodeSlot<C> = (
+        C,
         super::per_table_aggregator::SchemaLayout,
         Vec<u64>,
         (usize, usize, u64, usize, f64, f64, f64),
@@ -5589,10 +6108,10 @@ pub(super) fn compose_interior_levels(
     let prove_one_node = |level_no: usize,
                           j: usize,
                           siblings: usize,
-                          kids: &[RealChild],
+                          kids: &[C],
                           kid_layouts: &[super::per_table_aggregator::SchemaLayout],
                           kid_labels: &[Vec<u64>]|
-     -> NodeSlot {
+     -> NodeSlot<C> {
         let arity = &kids.len();
         let label = format!("L{level_no}N{j} (arity {arity})");
 
@@ -5604,7 +6123,7 @@ pub(super) fn compose_interior_levels(
         let out_halves = kid_layouts[arity - 1].out_halves;
 
         let t_emit = Instant::now();
-        let program = node_program(
+        let program = C::node_program(
             kids,
             kid_layouts,
             &label_refs,
@@ -5621,7 +6140,7 @@ pub(super) fn compose_interior_levels(
         let t_node = Instant::now();
         // ⛔ The program the census was taken on, NOT a second emission of
         // the same thing. See `prove_node_program_as_child`.
-        let (child, layout) = prove_node_program_as_child(
+        let (child, layout) = C::prove_node_program_as_child(
             &label,
             &program,
             kids,
@@ -5738,7 +6257,7 @@ pub(super) fn compose_interior_levels(
         let siblings = super::device_permit::workers().min(groups.len().max(1));
         let level_sampler = HostSampler::start();
 
-        let prove_one = |j: usize| -> NodeSlot {
+        let prove_one = |j: usize| -> NodeSlot<C> {
             let g = &groups[j];
             prove_one_node(
                 level_no,
@@ -5775,20 +6294,12 @@ pub(super) fn compose_interior_levels(
             .enumerate()
         {
             let (_, arity, cells, instrs, ..) = row;
+            let (id, heights, chunk_heights) = child.identity();
             println!(
-                "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights {:?} \
-                 · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {id} · heights {heights} \
+                 · blake3 chunk heights {chunk_heights} · published {} words · {cells} cells \
                  ({instrs} instructions)",
-                child
-                    .artifacts
-                    .program_id
-                    .iter()
-                    .take(8)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-                child.artifacts.log_heights,
-                child.artifacts.blake3_chunk_log_heights,
-                child.public_words.len(),
+                child.public_words().len(),
             );
             report.push(row);
             next.push(child);
@@ -5899,7 +6410,7 @@ pub(super) fn compose_interior_levels(
         let span_sampler = HostSampler::start();
         let t_span = Instant::now();
         super::program_census::begin_level();
-        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
+        let seed: Vec<(C, SchemaLayout, Vec<u64>)> = children
             .into_iter()
             .zip(layouts)
             .zip(labels)
@@ -5941,20 +6452,12 @@ pub(super) fn compose_interior_levels(
                 // completion order, which is the thing the gate is not allowed to
                 // depend on.
                 let (_, arity, cells, instrs, ..) = row;
+                let (id, heights, chunk_heights) = child.identity();
                 let line = format!(
-                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
-                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
-                     ({instrs} instructions)",
-                    child
-                        .artifacts
-                        .program_id
-                        .iter()
-                        .take(8)
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
-                    child.artifacts.log_heights,
-                    child.artifacts.blake3_chunk_log_heights,
-                    child.public_words.len(),
+                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {id} · heights \
+                     {heights} · blake3 chunk heights {chunk_heights} · published {} words · \
+                     {cells} cells ({instrs} instructions)",
+                    child.public_words().len(),
                 );
                 ((child, layout, lbl), (line, row))
             },
@@ -7847,6 +8350,15 @@ fn the_production_tree_composes_to_a_root() {
 // line was the whole of the merge step.
 use super::whir_epoch::{whir_epoch_arena, whir_epoch_program};
 
+/// What level 0 hands the interior: the wraps, their layouts and label runs, and
+/// the global child when the level's pool ran it (`LFM_TREE_TOP_OVERLAP`).
+type LevelZero<C> = (
+    Vec<C>,
+    Vec<super::per_table_aggregator::SchemaLayout>,
+    Vec<Vec<u64>>,
+    Option<WhirGlobalChild<C>>,
+);
+
 /// One WHIR epoch's level-0 wrap, and the whole level of them.
 ///
 /// ★★★ WHY THIS IS A GENERIC FUNCTION AND NOT A BLOCK INSIDE `with_whir_hash!`.
@@ -7882,7 +8394,7 @@ use super::whir_epoch::{whir_epoch_arena, whir_epoch_program};
 /// its type and could not leave `with_whir_hash!`. ✓ The return type still names
 /// no `H`: [`WhirGlobalChild`] is a `RealChild` plus a `GlobalLayout`.
 #[allow(clippy::too_many_arguments)]
-fn whir_level_zero<H>(
+fn whir_level_zero<H, C>(
     bundle: &crate::multilinear_continuation::ContinuationProof,
     elf_bytes: &[u8],
     elf: &executor::elf::Elf,
@@ -7894,18 +8406,12 @@ fn whir_level_zero<H>(
     top_overlap: bool,
     base_decode: Option<&crate::multilinear_continuation::BaseDecode>,
     lead_in: Option<&(dyn std::any::Any + Send + Sync)>,
-) -> (
-    Vec<RealChild>,
-    Vec<super::per_table_aggregator::SchemaLayout>,
-    Vec<Vec<u64>>,
-    Option<WhirGlobalChild>,
-)
+) -> LevelZero<C>
 where
     H: multilinear::whir_hash::WhirHash + 'static,
+    C: TreeChild,
 {
     use super::per_table_aggregator::SchemaLayout;
-    use super::program_census::build_artifacts_counted;
-    use super::proof::lfm_prove;
     use std::time::Instant;
 
     // ⛔ THE PROCESS HASH IS REFUSED HERE, NOT REPORTED — and this is the one
@@ -8008,9 +8514,9 @@ where
         println!("   {}", l.close());
     }
 
-    type WhirWrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
+    type WhirWrapSlot<C> = (C, SchemaLayout, Vec<u64>, u64, usize);
 
-    let prove_one_wrap = |k: usize| -> WhirWrapSlot {
+    let prove_one_wrap = |k: usize| -> WhirWrapSlot<C> {
         let t_wrap = Instant::now();
         // ⓘ ON THIS WORKER'S OWN COUNTER. Zeroed here rather than once per level
         // because a pool reuses its threads, so a second wrap on the same worker
@@ -8111,7 +8617,7 @@ where
         let wrap_sampler = HostSampler::start();
 
         let t = Instant::now();
-        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let artifacts = C::build(&program, wrap_opts);
         let t_artifacts = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
@@ -8124,20 +8630,16 @@ where
         // `locate_addr` turns it into the instruction that wrote the cell and its
         // neighbours, which identifies the assert without bisecting the emitter.
         // Costs nothing on the success path and is the difference between "the
-        // WHIR wrap did not prove" and a report V1 can act on.
-        let proved = match lfm_prove(&program, &artifacts, &arenas, wrap_opts) {
-            Ok(p) => p,
-            Err(super::proof::LfmProveError::Exec(super::executor::LfmExecError::DivByZero {
-                addr,
-            })) => {
-                panic!(
-                    "wrap {k}: the emitted WHIR verifier REFUSED this epoch — a \
-                     failing equality assert, not a machine fault.\n{}",
-                    super::executor::locate_addr(&program, addr)
-                );
-            }
-            Err(why) => panic!("wrap {k}: the WHIR wrap must prove: {why:?}"),
-        };
+        // WHIR wrap did not prove" and a report V1 can act on. (`TreeChild::prove`
+        // locates it, under either prover.)
+        let proved = C::prove(
+            &format!("wrap {k}"),
+            &program,
+            &artifacts,
+            &arenas,
+            wrap_opts,
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
         let t_prove = t.elapsed().as_secs_f64();
 
         // ★★ THE SEAM'S OWN CHECK, and the cheapest assertion in this file.
@@ -8154,7 +8656,7 @@ where
         // assumed structural — and this assert is what catches a block where it
         // stops being true.
         let layout = SchemaLayout::wrap(out_halves);
-        layout.assert_covers(proved.public_words.len());
+        layout.assert_covers(C::proved_words(&proved).len());
 
         // ⛔⛔ AND THE COUNT ALONE STOPPED BEING A CHECK THAT CAN FAIL.
         //
@@ -8172,8 +8674,7 @@ where
         // the wrong epoch would compose a tree over the wrong block with every
         // count above it still adding up.
         let word_at = |i: usize| -> LfmWord {
-            proved
-                .public_words
+            C::proved_words(&proved)
                 .iter()
                 .find(|(at, _)| *at as usize == i)
                 .unwrap_or_else(|| panic!("wrap {k} published no word at schema index {i}"))
@@ -8209,7 +8710,7 @@ where
         }
 
         let t = Instant::now();
-        let (child, t_verify) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+        let (child, t_verify) = C::harvest(&format!("wrap {k}"), artifacts, wrap_opts, proved);
         let t_child = t.elapsed().as_secs_f64();
         let (peak, at) = wrap_sampler.stop();
 
@@ -8296,21 +8797,23 @@ where
     }
     // ⓘ Boxed for the same reason the STARK level boxes its slots: the two
     // variants are very different sizes and the pool holds one slot per task.
-    type L0Out = PoolOut<Box<WhirWrapSlot>, Box<WhirGlobalChild>>;
-    let l0_out = in_index_order(bundle.num_epochs() + l0_offset, siblings, |j| -> L0Out {
+    type L0Out<C> = PoolOut<Box<WhirWrapSlot<C>>, Box<WhirGlobalChild<C>>>;
+    let l0_out = in_index_order(bundle.num_epochs() + l0_offset, siblings, |j| -> L0Out<C> {
         if top_overlap && j == 0 {
             // ⛔ A REFUSAL, NEVER A `None` THE CALLER TURNS INTO A `return` —
             // the property the serial call site was written to have, kept here.
             // `in_index_order` re-raises the FIRST worker panic with its payload
             // intact, so the stage's own reason still travels.
             PoolOut::Global(Box::new(
-                prove_whir_global_child::<H>(bundle, elf_bytes, inner, wrap_opts, ceiling, fan_in)
-                    .unwrap_or_else(|why| {
-                        panic!(
-                            "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no \
+                prove_whir_global_child::<H, C>(
+                    bundle, elf_bytes, inner, wrap_opts, ceiling, fan_in,
+                )
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no \
                          extra child for a root and no block artifact to compose: {why}"
-                        )
-                    }),
+                    )
+                }),
             ))
         } else {
             PoolOut::Wrap(Box::new(prove_one_wrap(j - l0_offset)))
@@ -8330,19 +8833,11 @@ where
         "level 0's pool must yield one slot per epoch; the global task is not a wrap"
     );
     for (k, (child, layout, lbl, cells, instrs)) in l0_wraps.into_iter().map(|w| *w).enumerate() {
+        let (id, heights, chunk_heights) = child.identity();
         println!(
-            "   whir wrap {k} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights \
-             {:?} · published {} words · {cells} cells ({instrs} instructions)",
-            child
-                .artifacts
-                .program_id
-                .iter()
-                .take(8)
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-            child.artifacts.log_heights,
-            child.artifacts.blake3_chunk_log_heights,
-            child.public_words.len(),
+            "   whir wrap {k} IDENTITY: program_id {id} · heights {heights} · blake3 chunk \
+             heights {chunk_heights} · published {} words · {cells} cells ({instrs} instructions)",
+            child.public_words().len(),
         );
         children.push(child);
         layouts.push(layout);
@@ -8374,9 +8869,9 @@ where
 /// the block — and holding that across every interior level would put it in the
 /// host peak of stages that cannot read it. ⇒ it is dropped inside the stage and
 /// what survives is the child plus two `usize`s.
-pub(super) struct WhirGlobalChild {
+pub(super) struct WhirGlobalChild<C = RealChild> {
     /// The child the root takes, in the same shape every other child arrives in.
-    pub(super) child: RealChild,
+    pub(super) child: C,
     /// What that child published.
     ///
     /// ⛔ COPIED OFF THE DRIVER'S OWN `WhirRealGlobal::published`, never rebuilt
@@ -8442,19 +8937,18 @@ pub(super) struct WhirGlobalChild {
 /// labels are bound between siblings by `emit_chain_bindings`, and the memory
 /// chain closes at the ROOT, where `emit_l2g_compare` refolds the interior's
 /// published digests against this child's flat root list.
-fn prove_whir_global_child<H>(
+fn prove_whir_global_child<H, C>(
     bundle: &crate::multilinear_continuation::ContinuationProof,
     elf_bytes: &[u8],
     inner: &crate::ProofOptions,
     wrap_opts: &crate::ProofOptions,
     ceiling: &Result<f64, String>,
     fan_in: usize,
-) -> Result<WhirGlobalChild, String>
+) -> Result<WhirGlobalChild<C>, String>
 where
     H: multilinear::whir_hash::WhirHash,
+    C: TreeChild,
 {
-    use super::program_census::build_artifacts_counted;
-    use super::proof::lfm_prove;
     use std::time::Instant;
 
     // ⛔ THE HARVEST VERIFIES BEFORE IT HANDS ANYTHING BACK, and `?` is what
@@ -8494,13 +8988,18 @@ where
     // this panel and never inferred from a ratio.
     let (cells, instrs) = census_and_panel(&program, "the WHIR GLOBAL wrap", fan_in);
 
-    let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
-    #[cfg(feature = "cuda")]
-    stark::gpu_lde::reset_all_gpu_call_counters();
+    let artifacts = C::build(&program, wrap_opts);
+    let device_since = C::begin_device_window();
     let sampler = HostSampler::start();
     let t_prove = Instant::now();
-    let proved = lfm_prove(&program, &artifacts, &arenas, wrap_opts)
-        .map_err(|e| format!("the WHIR GLOBAL wrap did not prove: {e:?}"))?;
+    let proved = C::prove(
+        "the WHIR GLOBAL wrap",
+        &program,
+        &artifacts,
+        &arenas,
+        wrap_opts,
+    )
+    .map_err(|e| format!("the WHIR GLOBAL wrap did not prove: {e}"))?;
     let prove_secs = t_prove.elapsed().as_secs_f64();
     let (peak, at) = sampler.stop();
 
@@ -8508,13 +9007,13 @@ where
     // compare reads is measured from `GlobalLayout`, so a published set of
     // another width shifts all of them at once — silently, and a whole root
     // emission downstream.
-    if proved.public_words.len() != published_words {
+    if C::proved_words(&proved).len() != published_words {
         return Err(format!(
             "the WHIR GLOBAL wrap published {} words and its layout says {published_words} \
              (z, alpha, then {num_epochs} bookend roots at {} lanes each). Every index \
              the root's L2G compare reads is shifted by this, so it must refuse here \
              rather than compare the wrong words",
-            proved.public_words.len(),
+            C::proved_words(&proved).len(),
             published.lanes_per_root,
         ));
     }
@@ -8522,19 +9021,7 @@ where
     // ⚠ THE DEVICE, ASSERTED WHERE THIS PROCESS ACTUALLY PROVED. There is no
     // cache on this path and no `load` mode, so unlike the STARK stage there is
     // no arm on which a zero count is the correct observation.
-    #[cfg(feature = "cuda")]
-    {
-        let calls = stark::gpu_lde::gpu_lde_calls()
-            + stark::gpu_lde::gpu_merkle_tree_calls()
-            + stark::gpu_lde::gpu_fri_calls();
-        assert!(
-            calls > 0,
-            "the WHIR GLOBAL wrap reached the device ZERO times — it proved on the \
-             HOST with cuda compiled in, so its peak is not a production figure"
-        );
-        println!("     GPU dispatches during the WHIR GLOBAL wrap: {calls}");
-        assert_the_rpx_grind_reached_the_device("WHIR GLOBAL wrap");
-    }
+    C::assert_device_window("WHIR GLOBAL wrap", device_since);
 
     // ⛔ ONE HOST VERIFY, AND IT IS THIS ONE.
     //
@@ -8546,26 +9033,18 @@ where
     // somebody can delete without noticing" — is answered by taking the verify
     // through `real_child_timed`, which RETURNS its seconds so the stage PRINTS
     // them. A number a stage prints is not an invariant hidden inside a harvest.
-    let (child, verify_secs) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+    let (child, verify_secs) = C::harvest("the WHIR GLOBAL wrap", artifacts, wrap_opts, proved);
+    let (id, heights, chunk_heights) = child.identity();
     println!(
-        "   whir global IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
-         · published {} words · {cells} cells ({instrs} instructions)",
-        child
-            .artifacts
-            .program_id
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-        child.artifacts.log_heights,
-        child.artifacts.blake3_chunk_log_heights,
-        child.public_words.len(),
+        "   whir global IDENTITY: program_id {id} · heights {heights} · blake3 chunk heights \
+         {chunk_heights} · published {} words · {cells} cells ({instrs} instructions)",
+        child.public_words().len(),
     );
     println!(
         "     the WHIR GLOBAL wrap: prove {prove_secs:.1}s · verify {verify_secs:.1}s · \
          {} published words ({num_epochs} bookend roots) · host peak {peak:.3} GiB at \
          t={at:.1}{}",
-        child.public_words.len(),
+        child.public_words().len(),
         match ceiling {
             Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
             Err(_) => String::new(),
@@ -8817,6 +9296,20 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
 #[test]
 #[ignore = "box tier, production scale: the WHIR base, its level 0 and the interior"]
 fn the_whir_production_tree_composes_to_a_root() {
+    // ★ THE PROVER OF THE TREE'S LFM PROOFS, one knob read once and bannered
+    // (`lfm_prover_knob`): `stark` (unset) is today's tree, call for call;
+    // `whir` proves every wrap, the global wrap and every node as a W-LFM proof
+    // (pure WHIR, D-WHIR §6.3) through the SAME driver below, so an A/B of the
+    // knob compares provers and not drivers.
+    match crate::lfm_prover_knob::selected() {
+        crate::lfm_prover_knob::Setting::Stark => whir_production_tree::<RealChild>(),
+        crate::lfm_prover_knob::Setting::Whir => whir_production_tree::<WhirTreeChild>(),
+    }
+}
+
+/// [`the_whir_production_tree_composes_to_a_root`]'s body, over the tree's
+/// child type.
+fn whir_production_tree<C: TreeChild>() {
     use super::epoch_tests::EpochInputs;
     use super::per_table_aggregator::{WHIR_FAN_IN, tree_node_count, tree_shape};
     use super::program_census::build_artifacts_counted;
@@ -9205,7 +9698,7 @@ fn the_whir_production_tree_composes_to_a_root() {
     // ⓘ ONE LINE PER ARM, which is the whole reason level 0 is a function: the
     // macro duplicates whatever is written here.
     let (mut children, mut layouts, mut labels, overlapped_global) = crate::with_whir_hash!(|H| {
-        whir_level_zero::<H>(
+        whir_level_zero::<H, C>(
             &bundle,
             &inputs.elf_bytes,
             &elf,
@@ -9278,7 +9771,7 @@ fn the_whir_production_tree_composes_to_a_root() {
     let global = match overlapped_global {
         Some(done) => done,
         None => crate::with_whir_hash!(|H| {
-            prove_whir_global_child::<H>(
+            prove_whir_global_child::<H, C>(
                 &bundle,
                 &inputs.elf_bytes,
                 &inner,
@@ -9440,7 +9933,7 @@ fn the_whir_production_tree_composes_to_a_root() {
             // honest provers at different postures emit different artifact bytes.
             let publishes = super::block_root::RootPublishSet::AssertOnly;
             let t_emit = Instant::now();
-            let program = root_program(
+            let program = C::root_program(
                 &children,
                 &layouts,
                 &refs,
@@ -9450,15 +9943,15 @@ fn the_whir_production_tree_composes_to_a_root() {
                 &fold_shape,
                 publishes,
             );
-            let sub_proofs: usize =
-                children.iter().map(|c| c.tables.len()).sum::<usize>() + global.child.tables.len();
+            let sub_proofs: usize = children.iter().map(TreeChild::num_tables).sum::<usize>()
+                + global.child.num_tables();
             println!(
                 "\n★★★ THE WHIR BLOCK-ARTIFACT ROOT — option {}\n   {closed} interior \
                  children + the global child = {} children, {sub_proofs} sub-proofs \
                  ({} of them the global child's) · emitted in {:.1}s",
                 option.describe(),
                 closed + 1,
-                global.child.tables.len(),
+                global.child.num_tables(),
                 t_emit.elapsed().as_secs_f64(),
             );
             // ★ THE PANEL BEFORE THE PROVE, as every other stage takes it.
@@ -9471,78 +9964,145 @@ fn the_whir_production_tree_composes_to_a_root() {
             let arenas: Vec<Vec<LfmWord>> = children
                 .iter()
                 .chain(std::iter::once(&global.child))
-                .flat_map(child_arena_words)
+                .flat_map(TreeChild::arena_words)
                 .collect();
-            let artifacts =
-                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-            #[cfg(feature = "cuda")]
-            stark::gpu_lde::reset_all_gpu_call_counters();
-            let sampler = HostSampler::start();
-            let t_stage = Instant::now();
-            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-                .unwrap_or_else(|e| panic!("★ THE WHIR BLOCK-ARTIFACT ROOT MUST PROVE: {e:?}"));
-            let stage_secs = t_stage.elapsed().as_secs_f64();
-            let (peak, at) = sampler.stop();
-
-            // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER. `root_schema_words`
-            // takes no epoch count and no arity, so a mismatch means the artifact
-            // acquired a dependence on HOW WE PROVED IT. ⛔ Do not widen this
-            // assert: a tolerance here would hide exactly that.
             let out_halves = layouts.last().expect("nonempty").out_halves;
             let num_reg = layouts[0].num_reg;
             let want_words = super::block_root::root_schema_words(num_reg, out_halves, publishes);
-            assert_eq!(
-                proved.public_words.len(),
-                want_words,
-                "★ THE ARTIFACT IS THE WRONG WIDTH: the root published {} words and \
-                 root_schema_words({num_reg} registers, {out_halves} output halves, \
-                 AssertOnly) is {want_words}. That signature takes NO epoch count and \
-                 NO arity, so this is the artifact acquiring a dependence on the \
-                 proving strategy",
-                proved.public_words.len(),
-            );
-            // ⛔ VERIFIED HERE, and by this stage. A root that PROVES and does not
-            // VERIFY is the failure that reads as success.
-            let t_verify = Instant::now();
-            assert!(
-                super::proof::verify_against_artifacts(
-                    &artifacts,
-                    &proved.proof,
-                    &proved.public_words,
-                    &wrap_opts
-                ),
-                "★ THE WHIR BLOCK-ARTIFACT ROOT DOES NOT VERIFY. Nothing may be \
-                 reported or claimed from a proof production would reject"
-            );
-            let verify_secs = t_verify.elapsed().as_secs_f64();
-            #[cfg(feature = "cuda")]
-            {
-                let calls = stark::gpu_lde::gpu_lde_calls()
-                    + stark::gpu_lde::gpu_merkle_tree_calls()
-                    + stark::gpu_lde::gpu_fri_calls();
-                assert!(
-                    calls > 0,
-                    "the WHIR BLOCK-ARTIFACT ROOT reached the device ZERO times — it \
-                     proved on the HOST with cuda compiled in, so its peak is not a \
-                     production figure"
-                );
-                println!("     GPU dispatches during the WHIR BLOCK-ARTIFACT ROOT: {calls}");
-                assert_the_rpx_grind_reached_the_device("WHIR BLOCK-ARTIFACT ROOT");
-            }
-            println!(
-                "   whir root IDENTITY: program_id {} · heights {:?} · blake3 chunk \
-                 heights {:?} · published {} words · {root_cells} cells \
-                 ({root_instrs} instructions)",
-                artifacts
-                    .program_id
-                    .iter()
-                    .take(8)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-                artifacts.log_heights,
-                artifacts.blake3_chunk_log_heights,
-                proved.public_words.len(),
-            );
+            // ★ THE ROOT'S PROVER: STARK today, and at D-WHIR W2 over a W-LFM tree
+            // (`LAMBDA_VM_LFM_ROOT_PROVER=stark`, so the artifact's format does not
+            // move while the interior's is measured); W-LFM at W3. Each arm proves,
+            // pins the artifact's width, VERIFIES and prints its IDENTITY; what
+            // follows reads only the published words and the times.
+            let (root_words, stage_secs, verify_secs, peak, at) =
+                match crate::lfm_prover_knob::root_selected() {
+                    crate::lfm_prover_knob::Setting::Stark => {
+                        let artifacts = build_artifacts_counted(
+                            &program,
+                            &wrap_opts,
+                            crate::hash_pin::BLOCK_HASHER,
+                        );
+                        #[cfg(feature = "cuda")]
+                        stark::gpu_lde::reset_all_gpu_call_counters();
+                        let sampler = HostSampler::start();
+                        let t_stage = Instant::now();
+                        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                            .unwrap_or_else(|e| {
+                                panic!("★ THE WHIR BLOCK-ARTIFACT ROOT MUST PROVE: {e:?}")
+                            });
+                        let stage_secs = t_stage.elapsed().as_secs_f64();
+                        let (peak, at) = sampler.stop();
+
+                        // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER. `root_schema_words`
+                        // takes no epoch count and no arity, so a mismatch means the artifact
+                        // acquired a dependence on HOW WE PROVED IT. ⛔ Do not widen this
+                        // assert: a tolerance here would hide exactly that.
+                        assert_eq!(
+                            proved.public_words.len(),
+                            want_words,
+                            "★ THE ARTIFACT IS THE WRONG WIDTH: the root published {} words and \
+                         root_schema_words({num_reg} registers, {out_halves} output halves, \
+                         AssertOnly) is {want_words}. That signature takes NO epoch count and \
+                         NO arity, so this is the artifact acquiring a dependence on the \
+                         proving strategy",
+                            proved.public_words.len(),
+                        );
+                        // ⛔ VERIFIED HERE, and by this stage. A root that PROVES and does not
+                        // VERIFY is the failure that reads as success.
+                        let t_verify = Instant::now();
+                        assert!(
+                            super::proof::verify_against_artifacts(
+                                &artifacts,
+                                &proved.proof,
+                                &proved.public_words,
+                                &wrap_opts
+                            ),
+                            "★ THE WHIR BLOCK-ARTIFACT ROOT DOES NOT VERIFY. Nothing may be \
+                         reported or claimed from a proof production would reject"
+                        );
+                        let verify_secs = t_verify.elapsed().as_secs_f64();
+                        #[cfg(feature = "cuda")]
+                        {
+                            let calls = stark::gpu_lde::gpu_lde_calls()
+                                + stark::gpu_lde::gpu_merkle_tree_calls()
+                                + stark::gpu_lde::gpu_fri_calls();
+                            assert!(
+                                calls > 0,
+                                "the WHIR BLOCK-ARTIFACT ROOT reached the device ZERO times — it \
+                             proved on the HOST with cuda compiled in, so its peak is not a \
+                             production figure"
+                            );
+                            println!(
+                                "     GPU dispatches during the WHIR BLOCK-ARTIFACT ROOT: {calls}"
+                            );
+                            assert_the_rpx_grind_reached_the_device("WHIR BLOCK-ARTIFACT ROOT");
+                        }
+                        println!(
+                            "   whir root IDENTITY: program_id {} · heights {:?} · blake3 chunk \
+                         heights {:?} · published {} words · {root_cells} cells \
+                         ({root_instrs} instructions)",
+                            artifacts
+                                .program_id
+                                .iter()
+                                .take(8)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>(),
+                            artifacts.log_heights,
+                            artifacts.blake3_chunk_log_heights,
+                            proved.public_words.len(),
+                        );
+                        (proved.public_words, stage_secs, verify_secs, peak, at)
+                    }
+                    crate::lfm_prover_knob::Setting::Whir => {
+                        let built = <WhirTreeChild as TreeChild>::build(&program, &wrap_opts);
+                        let device_since = <WhirTreeChild as TreeChild>::begin_device_window();
+                        let sampler = HostSampler::start();
+                        let t_stage = Instant::now();
+                        let proved = <WhirTreeChild as TreeChild>::prove(
+                            "the WHIR BLOCK-ARTIFACT ROOT",
+                            &program,
+                            &built,
+                            &arenas,
+                            &wrap_opts,
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("★ THE WHIR BLOCK-ARTIFACT ROOT MUST PROVE: {e}")
+                        });
+                        let stage_secs = t_stage.elapsed().as_secs_f64();
+                        let (peak, at) = sampler.stop();
+                        // ⛔ THE ARTIFACT'S WIDTH, the STARK arm's pin, unchanged.
+                        assert_eq!(
+                            proved.public_words.len(),
+                            want_words,
+                            "★ THE ARTIFACT IS THE WRONG WIDTH: the W-LFM root published {} \
+                             words and root_schema_words({num_reg}, {out_halves}, AssertOnly) \
+                             is {want_words}",
+                            proved.public_words.len(),
+                        );
+                        // ⛔ VERIFIED HERE: the harvest is `lfm_verify_whir`, the host's
+                        // final check on a W-LFM artifact, and it panics on a refusal.
+                        let t_verify = Instant::now();
+                        let (root, _) = <WhirTreeChild as TreeChild>::harvest(
+                            "the WHIR BLOCK-ARTIFACT ROOT",
+                            built,
+                            &wrap_opts,
+                            proved,
+                        );
+                        let verify_secs = t_verify.elapsed().as_secs_f64();
+                        <WhirTreeChild as TreeChild>::assert_device_window(
+                            "WHIR BLOCK-ARTIFACT ROOT",
+                            device_since,
+                        );
+                        let (id, heights, chunk_heights) = root.identity();
+                        println!(
+                            "   whir root IDENTITY: program_id {id} · heights {heights} · blake3 \
+                             chunk heights {chunk_heights} · published {} words · {root_cells} \
+                             cells ({root_instrs} instructions) · W-LFM",
+                            root.public_words().len(),
+                        );
+                        (root.proof.public_words, stage_secs, verify_secs, peak, at)
+                    }
+                };
             println!(
                 "\n★★★ THE BLOCK IS COMPRESSED UNDER WHIR — the block-artifact ROOT \
                  PROVED AND VERIFIED\n   option {}\n   stage {stage_secs:.1}s · verify \
@@ -9552,7 +10112,7 @@ fn the_whir_production_tree_composes_to_a_root() {
                  VRAM accounting above, not a harness sample — this harness counts \
                  dispatches, it does not size the card",
                 option.describe(),
-                proved.public_words.len(),
+                root_words.len(),
                 match &ceiling {
                     Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
                     Err(_) => String::new(),
@@ -9584,7 +10144,7 @@ fn the_whir_production_tree_composes_to_a_root() {
                     inputs.epoch_log2,
                     if option.replaces_top() { "A" } else { "B" },
                 ),
-                words: proved.public_words.clone(),
+                words: root_words.clone(),
             }];
             match super::block_root::why_posture_identity_cannot_run(&runs) {
                 Some(why) => println!("\n   ⚠ {why}"),
@@ -9774,6 +10334,16 @@ fn the_whir_production_tree_composes_to_a_root() {
 #[test]
 #[ignore = "fixture scale, card-free, but many minutes long: run it with --ignored"]
 fn the_whir_fixture_tree_composes_to_a_block_artifact() {
+    // The production tree's knob, so the W-LFM tree runs at fixture scale too.
+    match crate::lfm_prover_knob::selected() {
+        crate::lfm_prover_knob::Setting::Stark => whir_fixture_tree::<RealChild>(),
+        crate::lfm_prover_knob::Setting::Whir => whir_fixture_tree::<WhirTreeChild>(),
+    }
+}
+
+/// [`the_whir_fixture_tree_composes_to_a_block_artifact`]'s body, over the
+/// tree's child type.
+fn whir_fixture_tree<C: TreeChild>() {
     use super::per_table_aggregator::{tree_node_count, tree_shape};
     use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
@@ -9843,7 +10413,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     // change what the card-free test covers depending on the caller's shell.
     super::device_permit::arm(1);
     let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
-        whir_level_zero::<H>(
+        whir_level_zero::<H, C>(
             &bundle,
             &elf_bytes,
             &elf,
@@ -9871,7 +10441,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     // ---- the GLOBAL stage, where the production driver runs it: between level
     // 0 and level 1. ⛔ A REFUSAL, NEVER A `return` — see the stage's own doc.
     let global = crate::with_whir_hash!(|H| {
-        prove_whir_global_child::<H>(&bundle, &elf_bytes, &inner, &wrap_opts, &ceiling, fan_in)
+        prove_whir_global_child::<H, C>(&bundle, &elf_bytes, &inner, &wrap_opts, &ceiling, fan_in)
     })
     .unwrap_or_else(|why| panic!("★ THE FIXTURE WHIR GLOBAL WRAP COULD NOT BE BUILT: {why}"));
     // ⛔ ONE BOOKEND ROOT PER EPOCH, checked against the BUNDLE rather than
@@ -9995,7 +10565,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     );
     let refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
     let publishes = super::block_root::RootPublishSet::AssertOnly;
-    let program = root_program(
+    let program = C::root_program(
         &children,
         &layouts,
         &refs,
@@ -10006,7 +10576,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
         publishes,
     );
     let sub_proofs: usize =
-        children.iter().map(|c| c.tables.len()).sum::<usize>() + global.child.tables.len();
+        children.iter().map(TreeChild::num_tables).sum::<usize>() + global.child.num_tables();
     println!(
         "   FIXTURE ROOT — option {}: {} interior children + the global child = \
          {} children, {sub_proofs} sub-proofs",
@@ -10019,42 +10589,73 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     let arenas: Vec<Vec<LfmWord>> = children
         .iter()
         .chain(std::iter::once(&global.child))
-        .flat_map(child_arena_words)
+        .flat_map(TreeChild::arena_words)
         .collect();
-    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-    let t_root = Instant::now();
-    let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-        .unwrap_or_else(|e| panic!("★ THE FIXTURE WHIR ROOT MUST PROVE: {e:?}"));
-    let root_secs = t_root.elapsed().as_secs_f64();
-    // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER — `root_schema_words` takes no
-    // epoch count and no arity, so a mismatch means the artifact acquired a
-    // dependence on how we proved it.
     let out_halves = layouts.last().expect("nonempty").out_halves;
     let num_reg = layouts[0].num_reg;
     let want_words = super::block_root::root_schema_words(num_reg, out_halves, publishes);
-    assert_eq!(
-        proved.public_words.len(),
-        want_words,
-        "the fixture artifact is the wrong width: the root published {} words and \
-         root_schema_words({num_reg}, {out_halves}, AssertOnly) is {want_words}",
-        proved.public_words.len(),
-    );
-    assert!(
-        super::proof::verify_against_artifacts(
-            &artifacts,
-            &proved.proof,
-            &proved.public_words,
-            &wrap_opts
-        ),
-        "the fixture WHIR block-artifact root must verify"
-    );
+    let (root_words, root_secs) = match crate::lfm_prover_knob::root_selected() {
+        crate::lfm_prover_knob::Setting::Stark => {
+            let artifacts =
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            let t_root = Instant::now();
+            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                .unwrap_or_else(|e| panic!("★ THE FIXTURE WHIR ROOT MUST PROVE: {e:?}"));
+            let root_secs = t_root.elapsed().as_secs_f64();
+            // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER — `root_schema_words` takes no
+            // epoch count and no arity, so a mismatch means the artifact acquired a
+            // dependence on how we proved it.
+            assert_eq!(
+                proved.public_words.len(),
+                want_words,
+                "the fixture artifact is the wrong width: the root published {} words and \
+                 root_schema_words({num_reg}, {out_halves}, AssertOnly) is {want_words}",
+                proved.public_words.len(),
+            );
+            assert!(
+                super::proof::verify_against_artifacts(
+                    &artifacts,
+                    &proved.proof,
+                    &proved.public_words,
+                    &wrap_opts
+                ),
+                "the fixture WHIR block-artifact root must verify"
+            );
+            (proved.public_words, root_secs)
+        }
+        crate::lfm_prover_knob::Setting::Whir => {
+            let built = <WhirTreeChild as TreeChild>::build(&program, &wrap_opts);
+            let t_root = Instant::now();
+            let proved = <WhirTreeChild as TreeChild>::prove(
+                "the FIXTURE WHIR ROOT",
+                &program,
+                &built,
+                &arenas,
+                &wrap_opts,
+            )
+            .unwrap_or_else(|e| panic!("★ THE FIXTURE WHIR ROOT MUST PROVE: {e}"));
+            let root_secs = t_root.elapsed().as_secs_f64();
+            assert_eq!(
+                proved.public_words.len(),
+                want_words,
+                "the fixture W-LFM artifact is the wrong width"
+            );
+            let (root, _) = <WhirTreeChild as TreeChild>::harvest(
+                "the FIXTURE WHIR ROOT",
+                built,
+                &wrap_opts,
+                proved,
+            );
+            (root.proof.public_words, root_secs)
+        }
+    };
     println!(
         "   ★ FIXTURE WHIR BLOCK ARTIFACT: the root PROVED AND VERIFIED over {} \
          children in {root_secs:.1}s · {} published words · {root_cells} cells \
          ({root_instrs} instructions)\n   ★ whole arm {:.1}s over {} epochs — NOT \
          a measurement (CPU, blowup {}, {} queries)",
         children.len() + 1,
-        proved.public_words.len(),
+        root_words.len(),
         t_all.elapsed().as_secs_f64(),
         bundle.num_epochs(),
         inner.blowup_factor,
