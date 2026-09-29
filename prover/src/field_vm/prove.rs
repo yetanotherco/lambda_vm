@@ -49,12 +49,14 @@ pub fn default_options() -> ProofOptions {
 struct Airs {
     /// One per FIELD_VM segment.
     fvm: Vec<AirWithBuses<F, E, FieldVmBoundary, FvmPublicInputs, FieldVmConstraints>>,
-    decode: AirWithBuses<F, E, NullBoundaryConstraintBuilder, FvmPublicInputs, EmptyConstraints>,
+    /// One per DECODE chunk, each preprocessed under its program-id root.
+    decode:
+        Vec<AirWithBuses<F, E, NullBoundaryConstraintBuilder, FvmPublicInputs, EmptyConstraints>>,
     mem: AirWithBuses<F, E, MemBoundary, FvmPublicInputs, MemConstraints>,
 }
 
 impl Airs {
-    fn new(program_id: Commitment, options: &ProofOptions, segments: usize) -> Self {
+    fn new(program_id: &[Commitment], options: &ProofOptions, segments: usize) -> Self {
         let aux = |interactions| AuxiliaryTraceBuildData { interactions };
         let fvm = AirWithBuses::new(
             air::cols::NUM_COLUMNS,
@@ -67,15 +69,21 @@ impl Airs {
             fvm: (0..segments)
                 .map(|k| fvm.clone().with_name(&format!("FIELD_VM[{k}]")))
                 .collect(),
-            decode: AirWithBuses::new(
-                decode::NUM_COLUMNS,
-                aux(decode::bus_interactions()),
-                options,
-                1,
-                EmptyConstraints,
-            )
-            .with_name("FIELD_VM_DECODE")
-            .with_preprocessed(program_id, decode::NUM_PRECOMPUTED_COLS),
+            decode: program_id
+                .iter()
+                .enumerate()
+                .map(|(k, root)| {
+                    AirWithBuses::new(
+                        decode::NUM_COLUMNS,
+                        aux(decode::bus_interactions()),
+                        options,
+                        1,
+                        EmptyConstraints,
+                    )
+                    .with_name(&format!("FIELD_VM_DECODE[{k}]"))
+                    .with_preprocessed(*root, decode::NUM_PRECOMPUTED_COLS)
+                })
+                .collect(),
             mem: AirWithBuses::new(
                 mem::cols::NUM_COLUMNS,
                 aux(mem::bus_interactions()),
@@ -87,11 +95,15 @@ impl Airs {
         }
     }
 
-    /// The segments, then DECODE, then MEM.
+    /// The segments, then the DECODE chunks, then MEM.
     fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>> =
             self.fvm.iter().map(|a| a as _).collect();
-        refs.push(&self.decode);
+        refs.extend(
+            self.decode.iter().map(|a| {
+                a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>
+            }),
+        );
         refs.push(&self.mem);
         refs
     }
@@ -99,12 +111,15 @@ impl Airs {
 
 /// The statement: program id, public cells and every segment boundary state.
 fn transcript(
-    program_id: &Commitment,
+    program_id: &[Commitment],
     public: &[PublicCell],
     segments: &[FvmPublicInputs],
 ) -> crate::hash_pin::BlockTranscript {
     let mut t = crate::hash_pin::block_transcript(DOMAIN_TAG);
-    t.append_bytes(program_id);
+    t.append_bytes(&(program_id.len() as u64).to_le_bytes());
+    for root in program_id {
+        t.append_bytes(root);
+    }
     t.append_bytes(&(public.len() as u64).to_le_bytes());
     for (addr, value) in public {
         t.append_bytes(&addr.to_le_bytes());
@@ -165,7 +180,10 @@ fn logup_challenges(
     )
 }
 
-pub fn program_id(program: &Program, options: &ProofOptions) -> Commitment {
+/// One Merkle root per DECODE chunk.
+pub type ProgramId = Vec<Commitment>;
+
+pub fn program_id(program: &Program, options: &ProofOptions) -> ProgramId {
     decode::program_commitment(program, options, MIN_ROWS)
 }
 
@@ -173,7 +191,7 @@ pub fn program_id(program: &Program, options: &ProofOptions) -> Commitment {
 pub struct FvmTraces {
     pub fvm: Vec<TraceTable<F, E>>,
     pub segments: Vec<FvmPublicInputs>,
-    pub decode: TraceTable<F, E>,
+    pub decode: Vec<TraceTable<F, E>>,
     pub mem: TraceTable<F, E>,
 }
 
@@ -193,20 +211,20 @@ pub fn generate_traces_with(
     FvmTraces {
         fvm: seg.traces,
         segments: seg.public,
-        decode: decode::generate_trace(program, &seg.decode_mult, MIN_ROWS),
+        decode: decode::generate_traces(program, &seg.decode_mult, MIN_ROWS),
         mem: mem::generate_trace(&exec.mem, &seg.mem_mult, public, MIN_ROWS),
     }
 }
 
 pub fn prove_traces(
-    program_id: &Commitment,
+    program_id: &[Commitment],
     public: &[PublicCell],
     traces: &mut FvmTraces,
     options: &ProofOptions,
 ) -> Result<FvmProof, ProvingError> {
     let none = FvmPublicInputs::default();
     let n = traces.fvm.len();
-    let airs = Airs::new(*program_id, options, n);
+    let airs = Airs::new(program_id, options, n);
     let refs = airs.refs();
     let mut pairs: Vec<_> = refs
         .iter()
@@ -214,8 +232,11 @@ pub fn prove_traces(
         .zip(&traces.segments)
         .map(|((air, trace), pi)| (*air, trace, pi))
         .collect();
-    pairs.push((refs[n], &mut traces.decode, &none));
-    pairs.push((refs[n + 1], &mut traces.mem, &none));
+    let chunks = traces.decode.len();
+    for (air, trace) in refs[n..n + chunks].iter().zip(traces.decode.iter_mut()) {
+        pairs.push((*air, trace, &none));
+    }
+    pairs.push((refs[n + chunks], &mut traces.mem, &none));
     crate::hash_pin::BlockProver::<F, E, FvmPublicInputs>::multi_prove(
         pairs,
         &mut transcript(program_id, public, &traces.segments),
@@ -243,7 +264,7 @@ pub fn prove(
 /// Verifies that `program_id` halts with memory holding `public`, whose
 /// addresses must be strictly increasing.
 pub fn verify(
-    program_id: &Commitment,
+    program_id: &[Commitment],
     public: &[PublicCell],
     proof: &FvmProof,
     options: &ProofOptions,
@@ -251,7 +272,12 @@ pub fn verify(
     if !public.windows(2).all(|w| w[0].0 < w[1].0) {
         return false;
     }
-    let Some(n) = proof.proofs.len().checked_sub(2).filter(|&n| n >= 1) else {
+    let Some(n) = proof
+        .proofs
+        .len()
+        .checked_sub(program_id.len() + 1)
+        .filter(|&n| n >= 1)
+    else {
         return false;
     };
     let (fvm, rest) = proof.proofs.split_at(n);
@@ -277,7 +303,7 @@ pub fn verify(
     {
         return false;
     }
-    let airs = Airs::new(*program_id, options, n);
+    let airs = Airs::new(program_id, options, n);
     let mut t = transcript(program_id, public, &segments);
     let (z, alpha) = logup_challenges(&airs, proof, &mut t.clone());
     let Some(expected) = expected_public_balance(public, &z, &alpha) else {

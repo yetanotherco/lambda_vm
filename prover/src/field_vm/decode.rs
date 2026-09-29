@@ -20,31 +20,62 @@ pub const NUM_PRECOMPUTED_COLS: usize = 11;
 pub const MU: usize = NUM_PRECOMPUTED_COLS;
 pub const NUM_COLUMNS: usize = NUM_PRECOMPUTED_COLS + 1;
 
-pub fn num_rows(program: &Program, min_rows: usize) -> usize {
-    program.len().next_power_of_two().max(min_rows)
+/// At most this many DECODE tables.
+pub const MAX_CHUNKS: usize = 4;
+
+/// `(first pc, instructions, rows)` per DECODE table. One power-of-two table
+/// when it wastes at most a quarter of its rows, otherwise the largest power of
+/// two that fits and the rest.
+pub fn chunks(program: &Program, min_rows: usize) -> Vec<(usize, usize, usize)> {
+    let mut plan = Vec::new();
+    let (mut start, mut left) = (0, program.len());
+    loop {
+        let full = left.next_power_of_two().max(min_rows);
+        let half = full / 2;
+        if (full - left) * 4 <= full
+            || plan.len() + 1 == MAX_CHUNKS
+            || half < min_rows
+            || half >= left
+        {
+            plan.push((start, left, full));
+            return plan;
+        }
+        plan.push((start, half, half));
+        start += half;
+        left -= half;
+    }
 }
 
-/// `mult[pc]` executions of each address; padding rows get zero.
-pub fn generate_trace(
+/// One trace per chunk; `mult[pc]` executions of each address. Padding rows
+/// repeat the halt entry, with zero multiplicity.
+pub fn generate_traces(
     program: &Program,
     mult: &[u64],
     min_rows: usize,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let rows = num_rows(program, min_rows);
-    let mut trace = TraceTable::new_main(zeroed_fe_vec(rows * NUM_COLUMNS), NUM_COLUMNS, 1);
-    let t = &mut trace.main_table;
+) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
     let halt = decode_tuple(HALT_PC, &program.instrs[HALT_PC as usize]);
-    for row in 0..rows {
-        let tuple = match program.instrs.get(row) {
-            Some(instr) => decode_tuple(row as u64, instr),
-            None => halt,
-        };
-        for (c, v) in tuple.into_iter().enumerate() {
-            t.set(row, c, v);
-        }
-        t.set(row, MU, FE::from(mult.get(row).copied().unwrap_or(0)));
-    }
-    trace
+    chunks(program, min_rows)
+        .into_iter()
+        .map(|(start, len, rows)| {
+            let mut trace = TraceTable::new_main(zeroed_fe_vec(rows * NUM_COLUMNS), NUM_COLUMNS, 1);
+            let t = &mut trace.main_table;
+            for row in 0..rows {
+                let pc = start + row;
+                let tuple = if row < len {
+                    decode_tuple(pc as u64, &program.instrs[pc])
+                } else {
+                    halt
+                };
+                for (c, v) in tuple.into_iter().enumerate() {
+                    t.set(row, c, v);
+                }
+                if row < len {
+                    t.set(row, MU, FE::from(mult.get(pc).copied().unwrap_or(0)));
+                }
+            }
+            trace
+        })
+        .collect()
 }
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -60,17 +91,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     )]
 }
 
-/// The program id: the Merkle root over the LDE of the preprocessed columns,
-/// committed the same way the prover commits the trace.
+/// The program id: per DECODE table, the Merkle root over the LDE of its
+/// preprocessed columns, committed the way the prover commits the trace.
 pub fn program_commitment(
     program: &Program,
     options: &ProofOptions,
     min_rows: usize,
-) -> Commitment {
-    let trace = generate_trace(program, &[], min_rows);
-    let rows = trace.num_rows();
-    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|c| (0..rows).map(|r| *trace.main_table.get(r, c)).collect())
-        .collect();
-    crate::lfm::commit::commit_columns(&columns, options)
+) -> Vec<Commitment> {
+    generate_traces(program, &[], min_rows)
+        .iter()
+        .map(|trace| {
+            let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+                .map(|c| {
+                    (0..trace.num_rows())
+                        .map(|r| *trace.main_table.get(r, c))
+                        .collect()
+                })
+                .collect();
+            crate::lfm::commit::commit_columns(&columns, options)
+        })
+        .collect()
 }

@@ -235,7 +235,7 @@ fn duplicate_memory_address_is_rejected() {
 fn tampered_program_column_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| bump(
-        &mut t.decode.main_table,
+        &mut t.decode[0].main_table,
         5,
         1
     )));
@@ -381,7 +381,7 @@ fn report_horner() {
         let traces = generate_traces(&program, &exec, &public);
         let rows = [
             traces.fvm.iter().map(|t| t.num_rows()).sum::<usize>(),
-            traces.decode.num_rows(),
+            traces.decode.iter().map(|t| t.num_rows()).sum::<usize>(),
             traces.mem.num_rows(),
         ];
         // Main width + 3 base columns per LogUp aux column (⌈interactions / 2⌉).
@@ -525,4 +525,20 @@ fn segment_plan_covers_every_step() {
         super::air::segment_plan(538_706, 8, None),
         vec![(524_287, 524_288), (14_419, 16_384)]
     );
+}
+
+#[test]
+fn decode_chunks_cover_the_program() {
+    for len in [2usize, 9, 100, 5000, 16_385, 538_706] {
+        let program = super::isa::Program::new(vec![super::isa::Instr::nop(); len - 2]).unwrap();
+        let plan = super::decode::chunks(&program, 8);
+        assert!(plan.len() <= super::decode::MAX_CHUNKS);
+        let mut next = 0;
+        for &(start, n, rows) in &plan {
+            assert_eq!(start, next);
+            assert!(rows.is_power_of_two() && n <= rows && rows >= 8);
+            next += n;
+        }
+        assert_eq!(next, len);
+    }
 }
