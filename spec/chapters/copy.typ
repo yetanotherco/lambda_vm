@@ -1,4 +1,4 @@
-#import "/meta.typ": aside
+#import "/meta.typ": aside, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -14,20 +14,14 @@
 #let chip = load_chip("src/copy.toml", config)
 #let copy = raw(chip.name)
 
-The #copy chip moves a range of bytes from one location to another, eight bytes per row.
-It is the only copying primitive of this VM: one chip serves `memcpy`, `memmove`, `memset` and the byte loop of a commitment.
-#footnote([Linux man-page on `memmove`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man3/memmove.3.html")[[src]]])
-The three functionalities differ only in where the bytes go and in which of the two accesses happens first:
+The #copy chip moves a range of bytes from one location to another.
+This single chip serves the standard `C` memory functions `memcpy`, `memmove` and (a variation to) `memset`, as well as the `write` sycall.
 
-#align(center)[#table(
-  columns: (auto, auto, auto, auto),
-  table.header("functionality", "entered from", "read at", "write at"),
-  [`memcpy`/`memmove`], `ECALL`,  $#`timestamp` + 1$, $#`timestamp` + 2$,
-  `memset`,           `ECALL`,  $#`timestamp` + 2$, $#`timestamp` + 1$,
-  `commit`,           `COMMIT`, $#`timestamp` + 1$, "the commitment domain",
-)]
+*Note.* Each of these four operations modifies a _variable_ number of bytes.
+To accomodate this behaviour, this chip was given an atypical design:
+it performs the first small "chunk" of the requested work in each row and 
+recursively "calls itself" on the remaining work.
 
-Neither the destination domain nor the order of the two accesses is chosen by the caller; both follow from `is_set` and `is_commit`, which are decoded from the way the sequence was entered.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -40,136 +34,173 @@ The #copy chip is comprised of #nr_variables variables that are expressed using 
 = Assumptions
 #render_chip_assumptions(chip, config)
 
-These concern the _first_ row of a sequence, where the values come from the register file or from `COMMIT`; every later row receives them over `MEMMOVE_NEXT`, where @copy:c:range_src_incr, @copy:c:range_dst_incr, @copy:c:range_src_incr_top, @copy:c:range_dst_incr_top and @copy:c:range_count_decr range-check three of the four on the sending side.
-Nothing range-checks `timestamp` on either side; it stays a `Word` only because it travels unchanged from the `ECALL` at the root of the sequence.
-On a commitment sequence nothing guarantees @copy:a:dst at all (@copy:aside:index).
-
 = Constraints
-In this VM, we assign syscall number -30 to the copy functionality of the #copy accelerator, and -32 to `memset`.
-Since the number of bytes is not known in advance, this chip is recursive: each row moves one chunk and "calls" itself to move the remainder, so only the `first` row of a sequence accepts an entry.
-There are two entries --- an `ECALL` from the `CPU`, or the byte loop `COMMIT` defers (@commit) --- and `first_ecall` and `first_commit` split `first` between them.
-#render_constraint_table(chip, config, groups: "incoming")
+The behaviour of this chip is slightly different, depending on the exact 
+function it is expected to perform.
+The only exception here are `memcpy` and `memmove`: the definition of `memmove`
+subsumes that of `memcpy`, meaning that we can perform both operation in the same way. 
+As such, this chip need only distinguish three states.
+This is achieved by means of the `is_write` and `is_set` flags,
+which are to be set according to the below table.
+Importantly, the `is_write` and `is_set` flags are not to be set simultaneously,
+as enforced by @copy:c:one_hot.
 
-== Selecting the functionality
-@copy:c:receive_ecall receives the system call number as $2^32 - 30 - 2 dot #`is_set`$, so `is_set` is decoded from the `ECALL` the guest executed rather than chosen.
-That number is a linear function of `is_set`, and the tuple's high limb is the constant $2^32 - 1$, so as `is_set` ranges over the whole field the pair reproduces _every_ system call number in the negative range.
-What rules those out is @copy:c:range_is_set, which restricts `is_set` to $0$ and $1$ and so leaves only $-30$ and $-32$; it carries the whole decoding argument.
-`is_commit` is decoded instead from _which_ bus the first row accepted from, `COMMIT_DEFER` having exactly one sender.
-Both selectors ride inside the `MEMMOVE_NEXT` tuple in either direction, so a sequence cannot change functionality half way through it.
-#render_constraint_table(chip, config, groups: "functionality")
+#figure(
+  table(
+    stroke: none,
+    columns: (auto, auto, auto),
+    align: (right, center, center),
+    table.header(
+      [], [`is_write`], [`is_set`],
+    ),
+    table.hline(),
+    table.vline(x: 1),
+    [`memmove`/`memcpy`], [0], [0],
+    [`memset`], [0], [1],
+    [`write`], [1], [0],
+    [-], [1], [1],
+  )
+)
 
-The last three define nothing new --- they are a selector combined with `first`, with $#`μ` - #`end`$ and with `single` --- and exist as columns only because a multiplicity must be linear in the columns of the chip (@logup).
+#render_constraint_table(chip, config, groups: "flags")
 
-== Reading the operands
-The guest-side `memcpy` this chip accelerates has the following signature:
+== Chip state assignment
 
-```c
-void *memcpy(size_t count; void dest[restrict count], const void src[restrict count], size_t count);
+Each of the three chip states corresponds to a syscall number: $-30$ for `memmove`/`memcpy`, $-32$ for `memset`, and $64$ to `write`.#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
+The chip is to accept `ECALL`s with all three of these numbers.
+Rather than having a separate interactions for each, this chip leverages the 
+prover-hinted `is_commit` and `is_set` flags to extract the correct syscall number from the bus:
+
+#render_constraint_table(chip, config, groups: "ecall")
+
+Note that this step is performed only when the prover-hinted `first` flag is set,
+ensuring this flag is only set on the first row of a copy sequence.
+
+== Reading parameters <reading-parameters>
+
+Each of the four operations accepts three input parameters, and produces one return value.
+The `mem*` operations, have the following interfaces:
+```cpp
+void* memcpy(  void* dest, const void* src, std::size_t count );
+void* memmove( void* dest, const void* src, std::size_t count );		
+void* memset(  void* dest,          int ch, std::size_t count );
 ```
+Rather that supporting `memset` directly, this accelerator instead enables _repeating_ a selection of eight bytes over a desired length `count`. 
+A `memset(dest, ch, count)`-function call with  $#`count` > 8$ can then be compiled as 
+```c
+SD dst, ch; // store `ch` at `dst`
+memcpy(dest + 8, dest, count - 8)
+```
+#et[technically, you'd have to duplicate the `ch`.... Also, hte ref to memcpy is confusing...]
+where we expect the `memcpy` function to perform the copy one byte at a time, incrementing the address at is goes along.
+This leads to eight copies of `ch` being repeated across the entire address interval $[#`dest`, #`dest` + #`count`)$, which is equivalent to setting the values held by all these addresses to `ch`.
+We will later show how this chip achieves this when $#`is_set` = 1$.
+Lastly, note that `memset` calls with $#`count` <= 8$ should be mapped to a `STORE` operation directly, which is more efficient anyway.
 
-That is to say, `A0` contains the address of the first byte to write, `A1` the address of the first byte to read, and `A2` the number of bytes to move; `memset` uses the same three registers for the same three roles.
-Each read writes back the value it read, so the operation leaves the registers untouched and the guest produces the return value.
-These are conditioned on `first_ecall`, since a deferred commitment sequence takes its operands from `COMMIT_DEFER`.
+With the `mem*` operations now aligned, we turn our attention the `write` syscall, which has the following interface#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]]):
+```c
+ssize_t write(size_t count; int fd, const void buf[count], size_t count);
+```
+To invoke the `write` syscall, one should call `ECALL` with the appropriate syscall number after writing the file descriptor `fd` to `A0` (= `x10`), filling `A1` (= `x11`) with the address of `buf`'s first byte, and making `A2` (= `x12`) contain `count`.
+Once the syscall returns, `A0` stores the number of bytes that was _actually_ written to the `fd` during the syscall.
+
+Given that this syscall already exists, its interface is fixed and should not be modified: the other operations have to be mapped onto it.
+To this end, we require the parameters of the function to be stored in order in `A0`-`A2` before requesting the `ECALL`; this chip ensures the return value is stored in `A0` before handing control back to the `CPU`.
+
+With all four operations now supplying a `src` and `count` in the same parameter position, reading them from `x11` and `x12` is easily achieved by means of @copy:c:read_src and @copy:c:read_count.
+The destination address is found in `x10` for the `mem*` operations; for `write` it is not provided. 
+To ensure `write` does not overwrite previously written values, register `x254` (initialized at 0),
+it used to keep track of the number of bytes previously written.
+The value in this register can thus act as the starting point for the `write`-sequence, 
+as long as it is appropriately updated with each `write` syscall.
+Hence, @copy:c:read_dst reads `dst` from either `x10` or `x254` depending on `is_write`,
+and overwrites this with the `dst_res`, which is $#`dst` + #`count`$ for `write`-calls (@copy:c:dst_res_is_write)
+and just `dst` otherwise (@copy:c:dst_res_non_write).
+
+What remains is reading `fd` and returning `count` when $#`is_write`=1$,
+which is enforced by @copy:c:read_fd.
+Since we only support writing to `stdout` (which corresponds to $#`fd` = 1$ #footnote([The Open Group Standard for Information Technology --- Portable Operating System Interface (POSIX) Base Specifications, `unistd.h`; The Open Group, issue 8, #link("https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/unistd.h.html")[[src]]])),
+this constraint enforces that a $1$ is read from `x10`.
+Since this chip will always perfectly execute a `write`, this constraint moreover writes `count` as the return value to this register in the same interaction.
+
 #render_constraint_table(chip, config, groups: "read_input")
 
-== Chunk width
-A row moves eight bytes, or a single byte when `single` is set.
-The width itself is left free --- the prover may cut any row to a single byte at any count --- but a wide row must have the bytes to fill it, and @copy:c:wide_needs_eight is what asks for them: it puts $#`count` < 8$ to `LT` (@lt) and pins the answer to "no", at multiplicity $#`μ` - #`single`$.
-A wide row therefore fires the lookup and must have at least eight bytes left, while a narrow row does not fire it at all.
-Note that this obligation is carried by a lookup rather than by a polynomial, so there is no constraint in the table below that enforces it.
-That freedom decides which memory chip a row reaches: `MEMW_A` (@memw) admits an access that does not cross a $2^16$ limb boundary and whose bytes share one old timestamp, and a buffer last written in eight-byte groups has one timestamp per group, so a schedule can spend narrow rows to land its wide rows on those groups.
-@copy:c:bound proves $#`count` < 257$ on the first row of every `ECALL`-entered sequence, capping it at $257$ rows; the guest stubs chunk larger operations.
-#render_constraint_table(chip, config, groups: "width")
+Note: constraints @copy:c:range_dst_res is included to satisfy assumptions made 
+by the `ADD` template.
 
-Note that @copy:c:bound carries `first_ecall`, so a commitment sequence proves no byte bound, and `COMMIT` range-checks none either.
-No prover gain follows --- the commitment bus must balance against the committed output, which the verifier knows in full --- but the verifier contributes a token pair per committed byte, so an excessive `count` is unverifiable as well as unprovable.
+
+== Chaining
+
+Rather than performing the full copy in a single row, this chip splits each operation
+in "chunks", with each row in the table representing one such chunk.
+Each row copies `step` bytes (which is either $1$ or $8$) from the source to
+the destination.
+Note that by this model, a copy operation on $x$ bytes can represented using 
+$floor.l x / 8 floor.r + x mod 8$ rows.
+#footnote[
+  The prover is free to select the `step` of each row; an $x$-byte copy could
+  thus be spread over as many as $x$ rows.
+  This freedom allows the prover to align the `MEMW` requests, such that they 
+  can be handled by the `MEMW_A` chip, rather than the less efficient `MEMW` chip.
+]
+
+As long as $#`count` > #`step`$, the copy is not done yet, and an extra row
+must be introduced.
+As such, each row computes an updated `count`, as well as the updated `src` and
+`dst` addresses for the bytes that remain to be copied, and forwards this
+to the next row using the `COPY_NEXT` interaction @copy:c:send_next_chunk.
+The next row then receives this information through @copy:c:receive_next_chunk,
+instead of reading this information from the registers as is done on `first`-rows (@reading-parameters).
+
+#render_constraint_table(chip, config, groups: "forward")
+
+Note: constraints @copy:c:range_src_incr, @copy:c:range_dst_incr and @copy:c:range_count_decr
+are included to satisfy assumptions made by the `ADD` and `SUB` templates.
+
+== Terminating the recursion
+
+Observe from @copy:c:send_next_chunk that raising the prover-hinted flag `end`
+stops the recursive behaviour.
+Without constraining this flag, the prover has two possibilities to cheat: set the 
+flag early, or set the flag late.
+Premature raising is prevented by asserting that the flag is only set when either 
+$#`count` = #`step`$, or $(#`count`, #`first`) = (0,1)$.
+#footnote[This second case is required to allow a zero-length copy.]
+With the second case indicated by prover-hinted flag `zc` (short for "zero-copy"), 
+this constraint can now be captured by @copy:c:end_implies_count_is_step_or_zc_upper and @copy:c:end_implies_count_is_step_or_zc_lower.
+While raising the flag too late is possible, doing so results in `count` wrapping
+around to $2^64-1$, requiring a virtually impossible $2^61$ more rows before the next exit attempt.
+Moreover, the copy would now overwrite the values on the `PAGE` with index 0, 
+which is caught during verification. #et[link source]
+
+#render_constraint_table(chip, config, groups: "restrict_end")
 
 == Performing the move
-The bytes are read at $#`timestamp` + 1 + #`is_set`$ and written at $#`timestamp` + 2 - #`is_set`$, one timestamp apart, with `is_set` deciding which comes first.
-The `CPU`'s preprocessed timestamp column holds $4 dot (i + 1)$ at row $i$ (@vars), so neither expression leaves the `Word` range.
-Both interactions are expressed over the _same_ `value` variable, which is what makes the moved bytes equal, and the read carries `value` as input and output, pinning it to whatever the memory argument (@memory) holds at `src`.
-@copy:c:single_lanes canonicalises a narrow row, whose seven unused lanes `MEMW` gates out of the memory argument but not out of its own tuple.
+Constraints @copy:c:read_value and @copy:c:write_value respectively read and write
+`value` from/to memory.
+Whether eight or just 8 byte is copied, is determined by the prover-hinted `single` flag.
+When set, the top seven bytes in `value` are fixed at zero (@copy:c:single_lanes).
+
+For most copy operations, the value is read at $#`timestamp` + 1$ and written at $#`timestamp` + 2$.
+The exception to this rule, are `memset` operations, performing the write before the read instead.
+While this behaviour may seem counterintuitive, this inverse timing technique
+ensures the same eight bytes are repeated across the requested memory domain.
+
+One more requirement for a proper replication, is that $#`dst` = #`src` + 8$,
+which is enforced by @copy:c:set_gap.
+
 #render_constraint_table(chip, config, groups: "copy")
 
-Every row of a sequence carries the same `timestamp`, so an entire sequence reads at one instant and writes at another.
-Under the normal order every read therefore observes memory as it was before the sequence started, which is `memmove`'s guarantee for an overlapping range; under the inverted order every read observes memory after all of the sequence's writes, and the sequence propagates rather than copies.
-That is `memset`: the guest seeds eight bytes with ordinary stores and calls with `src` the start of the seed and `dst` its end, and each row forces $"mem"[#`src` + k + 8] = "mem"[#`src` + k]$, replicating the seed across the range.
-
-@copy:c:set_gap_lo and @copy:c:set_gap_hi pin that gap, which is necessary: at $#`dst` = #`src`$ the read and the write address one cell at adjacent timestamps, the memory argument closes on $#`value` = #`value`$, and all eight lanes --- pinned by the read alone --- become free field elements.
-Only $#`dst` = #`src`$ frees them; the gap is $8$ because that is the widest row, so a wide row's read and write ranges stay disjoint.
-The gate is `is_set` alone rather than a product, which would cost a degree.
-Being limb-wise, the pair admits no carry out of the low limb, so a `memset` whose range crosses the $2^32$ boundary has no satisfying assignment at all --- a precondition on the caller, which the executor enforces.
-
-== Writing to the commitment domain
-The destination domain is the one thing `commit` changes about the write, and @copy:c:write_value takes it straight from the selector: the domain it passes to `MEMW` is $2 dot #`is_commit`$, so a copy writes to RAM and a commitment writes to the domain-separated part of memory reserved for committed values (@memory).
-Nothing else differs --- same `value` lanes, same width flag, same multiplicity --- which is what lets one interaction serve both.
-
-The committed bytes therefore reach the memory argument as ordinary `MEMW` accesses, one token per byte at $#`dst` + i$, on `MEMW`'s rows rather than on this chip's.
-That the tokens are per byte is what decouples the verifier from the prover's row schedule: the verifier rebuilds this side of the bus from the committed output alone, where it sees only the concatenation of every commitment the program made, and the schedule restarts at every system call.
-`MEMW`'s width flags do the rest, so a narrow committing row writes the one byte it read and no more.
-
-The verifier initializes and finalizes this domain as it does any other (@memory, @streaming).#footnote[
-  In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward" all commitments from earlier epochs, similar to padded values, in the `L2G` table.
-  Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
-]
-
-#aside(ref: <copy:aside:index>)[Note on the commitment index][
-  Nothing here guarantees @copy:a:dst, and the reconstruction of `dst_incr_top` relies on it, so a denormalized index weakens the no-wraparound argument below to a field statement.
-  This is not a prover gain, since such a token has no receiver, but range-checking `index` where it enters `COMMIT` would settle it --- and would also stop @commit:c:read_index writing past the `Word` range into `x254`.
-]
-
-== Advancing to the next chunk
-In parallel, we compute $#`src_incr` = #`src` + #`step`$ and $#`dst_incr` = #`dst` + #`step`$ as the positions at which the next chunk starts, and $#`count_decr` = #`count` - #`step`$ as the number of bytes still to move.
-Only the low three halfwords of each position are stored: the fourth is reconstructed as `src_incr_top` and `dst_incr_top` from the carry out of the low limb, which is what @copy:c:src_incr and @copy:c:dst_incr pin to a bit.
-@copy:c:range_count_decr is included to satisfy @sub:a:diff.
-#render_constraint_table(chip, config, groups: "incr_decr")
-
-The positions must not wrap modulo $2^64$, or a sequence could walk `src` past the end of the address space, or close into a ring that balances every bus while moving nothing that was asked for.
-No constraint says so. With the top halfword reconstructed, the relation it used to be pinned by holds by construction and would prove nothing; what carries the property instead are the range checks @copy:c:range_src_incr_top and @copy:c:range_dst_incr_top, together with the third halfword's.
-Both below $2^16$ is exactly $#`src`_1 + #`src_carry` < 2^32$, which is the no-wraparound statement.
-They are therefore load-bearing rather than bookkeeping.
-The count uses plain `SUB`, which permits it, because the terminal row holds $#`count` = 0$ and hence $#`count_decr` = 2^64 - 1$.
-That is safe because $#`step` <= #`count`$ on every active row with $#`count` >= 1$: a wide row is checked by @copy:c:wide_needs_eight and hence has $#`count` >= 8 = #`step`$, and a narrow row has $#`step` = 1$.
-
-== Terminating the sequence
-When `count` hits $0$ we stop recursing, which the `end` bit indicates.
-#render_constraint_table(chip, config, groups: "end")
-
-*Note*:
-+ We set $#`end` = 1$ when $#`count_decr` = -1$ rather than when $#`count` = 0$, which allows `count` to be stored in a `DWordWL` rather than a `DWordHL`.
-+ $forall i in [0, 3]: 65535 - #`count_decr`_i >= 0$ as a result of @copy:c:range_count_decr, hence $sum_(i=0)^3 65535 - #`count_decr`_i = 0 arrow.l.r.double.long forall i: #`count_decr`_i = 65535$.
-  Without those range checks one limb could compensate another and `end` would be claimable at a nonzero count --- a silently truncated operation with every bus balanced, since every memory interaction vanishes with `end`.
-+ $#`end` = 1$ still forces $#`count` = 0$ even though the prover picks the width: the other candidate, $#`count` = 7$ with a wide row, is rejected by @copy:c:wide_needs_eight.
-+ An operation on zero bytes is a single row with $#`first` = #`end` = 1$.
-
-== Chaining the rows
-When this was not the last chunk, we recursively move the next one over `MEMMOVE_NEXT`, carrying the timestamp, the three updated values and the functionality.
-Both tuples carry the `timestamp`, which is what separates one sequence from another; since the CPU's timestamps strictly increase per instruction, no two sequences share one.
-This chip contributes the following to the lookup argument.
-#render_constraint_table(chip, config, groups: "lookups")
-
-Note that the two positions are sent as written-out expressions rather than as a packing of their columns, since their top halfword is not a column: the low element is $#`src_incr`_0 + 2^16 dot #`src_incr`_1$ and the high one is $#`src`_1 + #`src_carry`$, in which $#`src_incr`_2$ cancels. That halfword survives only to carry its range check.
-
-#aside("Why no termination constraint is needed")[
-  Fix a timestamp. Balancing `MEMMOVE_NEXT` forces the number of rows claiming `end` to equal the number claiming `first`, and $#`first` = #`first_ecall` + #`first_commit`$ caps that at one, since the `CPU` sends one `ECALL` per timestamp and that `ECALL` cannot be both a copy and a `write`.
-  That rules out an _open_ sequence and nothing more: a ring of rows with neither `first` nor `end` set sends and receives one tuple each, so it balances while consuming no entry.
-  What forbids the ring is @copy:c:range_src_incr_top: with no wraparound, $#`src_incr` = #`src` + #`step`$ holds over the integers with $#`step` >= 1$, so `src` strictly increases and can never return to a value it held.
-]
 
 == Bits
-Lastly, the six independent bits must be bits, and each of `first`, `end` and `single` must imply $#`μ` = 1$, to keep the multiplicities $-(#`μ` - #`first`)$, $#`μ` - #`end`$ and $#`μ` - #`single`$ binary.
-`first_ecall` needs no range check, being already equated to a product of bits.
-@copy:c:single_implies_mu is worth singling out, since it looks like bookkeeping for the padding row and is not: at $#`μ` = 0$ with $#`single` = 1$ the width lookup would carry multiplicity $-1$, which would make this chip a _provider_ on the `ALU` bus and let any consumer take an unwitnessed $#`count` >= 8$ from it.
+Lastly, both `first` and `end` must be bits, and both must imply $#`μ` = 1$ to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
+Note that $#`μ` - #`zc`$ is always binary, since $#`zc` => #`μ` = 1$ indirectly holds
+via @copy:c:zc_implies_first.
 #render_constraint_table(chip, config, groups: "bits")
 
 = Padding
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
-
-This padding row is not all-zero.
-@copy:c:single_implies_mu forces $#`single` = 0$ here, so $#`step` = 8$; @copy:c:count_decr is unconditional, which $#`count` = 8$ and $#`count_decr` = 0$ then satisfy.
-The low-limb carry of the two position updates is constrained on every row (@copy:c:src_incr, @copy:c:dst_incr), which $#`src_incr` = #`dst_incr` = 8$ satisfies with a zero carry.
-@copy:c:wide_needs_eight is inert, its multiplicity being $0 - 0$.
 
 = The Accelerated Memory Operations standard
 The Ethereum Foundation's Accelerated Memory Operations standard fixes what an accelerated `memcpy`, `memmove` and `memset` must provide.
@@ -179,9 +210,5 @@ The one restriction this chip does impose is not an alignment --- a `memset` may
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
 
 = Notes/optimizations
-- `count` need not be a full `DWordWL` on the `ECALL` path, where @copy:c:bound already proves $#`count` < 257$; the commitment path has no such bound, so this costs a range check where the value enters from `COMMIT`.
-- The eight `IS_HALF` checks on the two positions carry multiplicity $#`μ`$ while `src_incr` and `dst_incr` are consumed only at $#`μ` - #`end`$. Lowering them would drop eight lookups per terminal row, though not shrink the proof, that table being preprocessed at a fixed height. They cannot be dropped altogether: two of the eight are the no-wraparound argument.
-- Selecting between exactly two widths keeps `single` a single bit, so $#`step` = 8 - 7 dot #`single`$ stays linear and, more to the point, so does @copy:c:wide_needs_eight's multiplicity $#`μ` - #`single`$. With a two-bit selector the corresponding "fire only on the widest row" multiplicity is a product, and would need a gate column and a degree-2 constraint of its own, as `first_ecall` does. Four-, two- and one-byte chunks would save at most eight rows per sequence.
-- A row could move sixteen or thirty-two bytes, at the cost of a wider `MEMW` signature, but `MEMW_A` needs every byte of an access to share one old timestamp, which a wider row only manages where the buffer was written in groups at least that wide.
-- `COMMIT` could send its deferral on `MEMMOVE_NEXT` directly, retiring the `COMMIT_DEFER` bus and the `first_ecall` column, at the cost of `first` no longer meaning "head of the sequence" and of an added $#`first` dot #`is_commit` = 0$.
-- The `memmove` property belongs to one `ECALL`: past 256 bytes the stub splits into several at distinct timestamps, and chunk $k+1$ reads what chunk $k$ wrote. That is in-contract for `memcpy`, whose buffers may not overlap.
+- One could refactor the chip to move sixteen or thirty-two bytes per row instead of eight.
+  It is suspected that this could be achieved using a 41c/18i and 57c/22i configuration, respectively.
