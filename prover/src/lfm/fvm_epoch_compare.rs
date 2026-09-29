@@ -23,7 +23,9 @@ fn runs() -> usize {
 }
 
 fn blowup(b: u8) -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(b).expect("valid blowup")
+    crate::field_vm::prove::production_format(
+        GoldilocksCubicProofOptions::with_blowup(b).expect("valid blowup"),
+    )
 }
 
 /// The inner epoch's options: `FVM_EPOCH_PRESET` = `blowup2` | `blowup4` |

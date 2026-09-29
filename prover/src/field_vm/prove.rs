@@ -43,7 +43,18 @@ pub type PublicCell = (u64, FEE);
 /// The smallest blowup the constraint degree allows: 4 at the spec's degree 5.
 pub fn default_options() -> ProofOptions {
     let blowup = (super::mux::D - 1).next_power_of_two().max(2) as u8;
-    GoldilocksCubicProofOptions::with_blowup(blowup).expect("valid blowup")
+    production_format(GoldilocksCubicProofOptions::with_blowup(blowup).expect("valid blowup"))
+}
+
+/// With `FVM_ZF_FORMAT` set, the recursion pipeline's proof format: its
+/// Merkle caps and FRI fold schedule, and the terminal at degree 2^8, as the
+/// LFM wraps are proved (`lfm::proof::aggregation_wrap_options`).
+pub fn production_format(mut options: ProofOptions) -> ProofOptions {
+    if std::env::var_os("FVM_ZF_FORMAT").is_some() {
+        options.fri_final_poly_log_degree = 8;
+        options = crate::zf_format::ZfFormat::global().options(options);
+    }
+    options
 }
 
 struct Airs {
