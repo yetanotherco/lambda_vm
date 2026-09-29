@@ -141,6 +141,9 @@ where
 
     /// The same, with the table's preprocessed columns for the verifier to
     /// check the claimed openings against — see [`TableStatement::preprocessed`].
+    ///
+    /// The table's preprocessed count is the number of columns handed in: the
+    /// verifier holds a copy of every one of them.
     pub fn statement_with_preprocessed<'s>(
         &'s self,
         preprocessed: &'s [Mle<F>],
@@ -150,6 +153,30 @@ where
             interactions: self.interactions,
             slot_of: &self.slot_of,
             preprocessed,
+            num_preprocessed: preprocessed.len(),
+            kinds: &self.kinds,
+            num_vars: self.num_vars,
+        }
+    }
+
+    /// The statement of a table whose leading `count` columns are preprocessed
+    /// and of which the verifier holds NO copy: a prepared opening must settle
+    /// all `count` of them, and [`multi_verify`] refuses the table otherwise.
+    ///
+    /// ⛔ `count` IS THE AIR'S, never the length of a column list. An AIR that
+    /// declares its preprocessed columns by count alone (`with_preprocessed`)
+    /// has no column builder, so its `precomputed_columns()` is empty; a
+    /// statement built from that list would say "nothing to check" about a
+    /// table whose program columns are exactly what binds the proof to its
+    /// program. Taking the count from the AIR is what makes an unsettled prefix
+    /// a refusal instead of an unchecked column.
+    pub fn statement_with_prepared_prefix(&self, count: usize) -> TableStatement<'_, F, E> {
+        TableStatement {
+            shape: &self.shape,
+            interactions: self.interactions,
+            slot_of: &self.slot_of,
+            preprocessed: &[],
+            num_preprocessed: count,
             kinds: &self.kinds,
             num_vars: self.num_vars,
         }
@@ -556,6 +583,15 @@ pub struct TableStatement<'a, F: IsFFTField + IsPrimeField, E: IsField> {
     /// commitment only says the prover stayed consistent with what it
     /// committed; these are what say it committed the right thing.
     pub preprocessed: &'a [Mle<F>],
+    /// How many of the table's leading main columns ARE preprocessed.
+    ///
+    /// Equal to `preprocessed.len()` whenever the verifier holds the columns
+    /// ([`TableLayout::statement_with_preprocessed`]). Larger when it holds none
+    /// of them ([`TableLayout::statement_with_prepared_prefix`]), and then a
+    /// prepared opening must settle exactly this many, or the table is refused:
+    /// every preprocessed column is either opened out of band or recomputed
+    /// here, never neither.
+    pub num_preprocessed: usize,
     pub kinds: &'a [FactorKind],
     pub num_vars: usize,
 }
@@ -1129,10 +1165,22 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
-    if settled_out_of_band > statement.preprocessed.len() {
+    let count = statement.num_preprocessed;
+    if settled_out_of_band > count {
         return Err(MlError::QueryCountMismatch {
-            expected: statement.preprocessed.len(),
+            expected: count,
             got: settled_out_of_band,
+        });
+    }
+    // ⛔ THE COUNT TRAP, CLOSED. Columns `settled_out_of_band..count` are
+    // preprocessed and the opening did not settle them, so this function must
+    // recompute every one; a verifier holding fewer copies than that would skip
+    // them in the loop below and leave the program's own columns bound by
+    // NOTHING. That is a refusal, never a pass.
+    if settled_out_of_band < count && statement.preprocessed.len() < count {
+        return Err(MlError::QueryCountMismatch {
+            expected: count,
+            got: settled_out_of_band.max(statement.preprocessed.len()),
         });
     }
     for (col, column) in statement
@@ -1560,9 +1608,15 @@ where
         // ⚠ THE ASSERT THAT MATTERS. The opening covers `settled` of this
         // table's columns; skipping more than that would drop a preprocessed
         // check nothing replaced.
-        if settled > statement.preprocessed.len() {
+        //
+        // ★ Against the table's preprocessed COUNT, not the length of the
+        // column copies the verifier holds: a statement built with
+        // `statement_with_prepared_prefix` holds none, and an honest proof
+        // whose opening settles its whole prefix must pass here. The other
+        // half — a prefix nothing settles — is `check_preprocessed`'s refusal.
+        if settled > statement.num_preprocessed {
             return Err(MlError::QueryCountMismatch {
-                expected: statement.preprocessed.len(),
+                expected: statement.num_preprocessed,
                 got: settled,
             });
         }
@@ -1938,6 +1992,233 @@ mod tests {
     #[test]
     fn three_tables_argue_and_their_buses_balance() {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();
+    }
+
+    /// The CPU table's leading columns a count-only AIR would declare
+    /// preprocessed in the tests below: the two selectors and the first
+    /// operand, which together say WHICH operations the program runs in which
+    /// order.
+    const CPU_PREFIX: usize = 3;
+
+    /// The CPU trace with its rows reversed — a DIFFERENT program (its leading
+    /// columns are not the pinned ones) that still proves: the bus is a
+    /// multiset, so the lookups balance in any row order. It is exactly the
+    /// forgery a preprocessed commitment exists to refuse.
+    fn reversed_cpu_columns() -> Vec<Vec<FE>> {
+        cpu_columns()
+            .into_iter()
+            .map(|mut column| {
+                column.reverse();
+                column
+            })
+            .collect()
+    }
+
+    /// How the verifier describes the CPU table's preprocessed prefix.
+    #[derive(Clone, Copy)]
+    enum PrefixStatement {
+        /// Today's `statement()`: no copies, so a count of zero.
+        CountZero,
+        /// `statement_with_prepared_prefix(count)`: the AIR's count, no copies.
+        PreparedPrefix(usize),
+    }
+
+    /// The three tables argued with `cpu_cols` committed, the prepared stack
+    /// built over the PINNED program columns (`cpu_columns()`'s first
+    /// `opened` columns), and the verifier describing the CPU prefix as
+    /// `statement`.
+    ///
+    /// `prove_opening` says whether the prover carries the prepared opening;
+    /// `verify_check` whether the verifier settles one.
+    fn argue_prepared(
+        cpu_cols: Vec<Vec<FE>>,
+        opened: usize,
+        prove_opening: bool,
+        statement: PrefixStatement,
+        verify_check: bool,
+    ) -> Result<(), MlError> {
+        let (cpu_air, add_air, mul_air) = airs();
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit(
+            vec![
+                table(&cpu_air, &cpu_cols)?,
+                table(&add_air, &add_columns())?,
+                table(&mul_air, &mul_columns())?,
+            ],
+            &config(),
+        )?;
+
+        // The program's columns, committed outside the proof: the ones the
+        // verifier trusts, whatever the prover put in its trace.
+        let pinned: Vec<Mle<Fp>> = cpu_columns()[..opened]
+            .iter()
+            .map(|column| Mle::new(column.clone()))
+            .collect::<Result<_, _>>()?;
+        let num_vars = pinned[0].num_vars();
+        let layout = global_layout(&[(pinned.len(), num_vars)], config().format.stack)?;
+        let borrowed = multilinear::stacking::borrow(&pinned);
+        let prepared_commitment =
+            StackedCommitment::<Fp, KeccakWhir>::commit(layout, &borrowed, None, &config())?;
+        let at = leading_columns(0, opened);
+
+        let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        let proof = multi_prove(
+            &committed,
+            &config(),
+            &mut prover,
+            prove_opening.then_some(Prepared {
+                commitment: &prepared_commitment,
+                columns: &borrowed,
+                at: &at,
+            }),
+        )?;
+
+        let layouts: Vec<&TableLayout<'_, Fp, Ext>> =
+            committed.tables().iter().map(|t| t.layout()).collect();
+        let statements: Vec<TableStatement<'_, Fp, Ext>> = layouts
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| match (index, statement) {
+                (0, PrefixStatement::PreparedPrefix(count)) => {
+                    layout.statement_with_prepared_prefix(count)
+                }
+                _ => layout.statement(),
+            })
+            .collect();
+        let roots = prepared_commitment.roots();
+        let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        multi_verify::<_, _, _, KeccakWhir>(
+            &proof,
+            &statements,
+            std::slice::from_ref(committed.groups()[0].layout()),
+            std::slice::from_ref(committed.groups()[0].domain()),
+            committed.sizes(),
+            &ExtE::zero(),
+            &config(),
+            &mut verifier,
+            verify_check.then_some(PreparedCheck {
+                roots: &roots,
+                layout: prepared_commitment.layout(),
+                domain: prepared_commitment.domain(),
+                at: &at,
+            }),
+        )
+    }
+
+    /// ⛔ THE TRAP, SHOWN RATHER THAN DESCRIBED: a table whose preprocessed
+    /// columns the statement counts as ZERO binds nothing. The reversed CPU
+    /// trace is a different program and it VERIFIES — which is what an LFM
+    /// table (count-only `with_preprocessed`, so `precomputed_columns()` is
+    /// empty) pushed through `statement()` would do for any forged program.
+    ///
+    /// This is the control for the two refusals below: it proves the forgery is
+    /// a valid proof in every respect but the program, so their failures are
+    /// the count's doing and nothing else's.
+    #[test]
+    fn a_prefix_counted_as_zero_binds_no_program() {
+        argue_prepared(
+            reversed_cpu_columns(),
+            CPU_PREFIX,
+            false,
+            PrefixStatement::CountZero,
+            false,
+        )
+        .expect("the forged program verifies when its prefix is counted as zero — the trap");
+    }
+
+    /// The trap closed, first direction: the AIR's count with NO prepared
+    /// opening to settle it is refused, the forged program with it.
+    #[test]
+    fn a_counted_prefix_nothing_settles_is_refused() {
+        assert!(
+            argue_prepared(
+                reversed_cpu_columns(),
+                CPU_PREFIX,
+                false,
+                PrefixStatement::PreparedPrefix(CPU_PREFIX),
+                false,
+            )
+            .is_err(),
+            "a preprocessed prefix neither opened nor recomputed must be refused"
+        );
+        // …and the honest program too: without an opening nothing binds it
+        // either, so a verifier that accepted this would accept the forgery.
+        assert!(
+            argue_prepared(
+                cpu_columns(),
+                CPU_PREFIX,
+                false,
+                PrefixStatement::PreparedPrefix(CPU_PREFIX),
+                false,
+            )
+            .is_err(),
+            "an unsettled prefix is refused whatever the trace holds"
+        );
+    }
+
+    /// The trap closed, second direction: an HONEST proof whose prepared opening
+    /// settles the whole counted prefix is accepted. Under the old bound
+    /// (`settled > preprocessed.len()`, the copies' length) this proof was
+    /// rejected for carrying the opening that binds it.
+    #[test]
+    fn an_honest_prefix_settled_by_its_opening_is_accepted() {
+        argue_prepared(
+            cpu_columns(),
+            CPU_PREFIX,
+            true,
+            PrefixStatement::PreparedPrefix(CPU_PREFIX),
+            true,
+        )
+        .expect("an honest proof whose opening settles the counted prefix verifies");
+        // The old statement shape, count zero, against the same honest proof:
+        // the settled count exceeds it and the proof is refused. Kept as the
+        // record of why the count had to move off the copies' length.
+        assert!(
+            argue_prepared(
+                cpu_columns(),
+                CPU_PREFIX,
+                true,
+                PrefixStatement::CountZero,
+                true,
+            )
+            .is_err(),
+            "a statement counting zero preprocessed columns cannot take a settled prefix"
+        );
+    }
+
+    /// The opening is what binds the program: the forged trace with the
+    /// prepared opening over the PINNED columns is refused, because the values
+    /// the forged table settled on are not what the pinned commitment takes at
+    /// that point.
+    #[test]
+    fn a_forged_prefix_is_refused_by_the_prepared_opening() {
+        let refused = argue_prepared(
+            reversed_cpu_columns(),
+            CPU_PREFIX,
+            true,
+            PrefixStatement::PreparedPrefix(CPU_PREFIX),
+            true,
+        );
+        assert!(
+            refused.is_err(),
+            "the forged program must not open the pinned commitment"
+        );
+    }
+
+    /// An opening that settles only part of the counted prefix leaves the rest
+    /// bound by nothing, and is refused like no opening at all.
+    #[test]
+    fn a_prefix_settled_only_in_part_is_refused() {
+        assert!(
+            argue_prepared(
+                cpu_columns(),
+                CPU_PREFIX - 1,
+                true,
+                PrefixStatement::PreparedPrefix(CPU_PREFIX),
+                true,
+            )
+            .is_err(),
+            "a column past the settled run, with no copy to recompute, must be refused"
+        );
     }
 
     /// [`config`] with its stack cap at `cap`.
