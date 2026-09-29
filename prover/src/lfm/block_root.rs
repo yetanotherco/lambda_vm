@@ -224,6 +224,26 @@ impl RootOption {
         }
     }
 
+    /// ★ THE OPTION A TREE RUNS AS: itself, except `A` on a wide tree whose only
+    /// node level is level 1, which runs as `B`.
+    ///
+    /// ⛔ **A WIDE LEVEL 1 VERIFIES EPOCHS, NOT PROOFS.** `A` takes level
+    /// `top - 1`'s output. On a wrap tree that is always a level of proofs, down
+    /// to the epoch wraps at `top == 1`. On a wide tree with `top == 1` (two to
+    /// `fan_in` epochs, one wide node) there are no proofs below the node.
+    /// The driver would hand the root that one node, against a fold shape that
+    /// expects one digest per epoch: an honest block could not be composed. So
+    /// the root sits above the node, which is `B`'s children and fold shape.
+    ///
+    /// ⓘ One epoch (`top == 0`) needs no mapping: `A` and `B` both take level 0's
+    /// output, the one wide node, and its fold of one root is that root.
+    pub fn for_tree(self, top: usize, wide: bool) -> Self {
+        match self {
+            Self::A if wide && top == 1 => Self::B,
+            other => other,
+        }
+    }
+
     /// The option spelled out for a log line.
     pub fn describe(self) -> &'static str {
         match self {
@@ -852,6 +872,74 @@ mod tests {
         }
     }
 
+    /// ★ EVERY EPOCH COUNT COMPOSES ON A WIDE TREE: the children the driver hands
+    /// the root equal the digests the option's fold shape refolds to, for 1..=40
+    /// epochs at fan-in 2..=4, with the option run through
+    /// [`RootOption::for_tree`].
+    ///
+    /// On a wide tree level 0 builds no wraps: its stage produces level 1's
+    /// output, one node per `fan_in` epochs, even for one epoch. So a root taking
+    /// level 0's or level 1's output holds those nodes.
+    ///
+    /// ⛔ The mapping is load-bearing: run as named, `A` fails exactly at two to
+    /// `fan_in` epochs and nowhere else, and a wrap tree needs no mapping.
+    #[test]
+    fn a_wide_tree_composes_at_every_epoch_count() {
+        use super::super::builder::LfmBuilder;
+        use super::super::edsl::WrapHash;
+
+        let refolded = |epochs: usize, fan_in: usize, option: RootOption| -> usize {
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let lanes = super::super::proof_arena::lanes_per_root();
+            let digests: Vec<_> = (0..epochs)
+                .map(|k| {
+                    let cells: Vec<_> = (0..lanes)
+                        .map(|w| b.felt_const(FE::from((17 * k + w) as u64)))
+                        .collect();
+                    digest_from_lanes(&mut b, &cells)
+                })
+                .collect();
+            option
+                .fold_shape(epochs, fan_in)
+                .refold(&mut b, &digests)
+                .len()
+        };
+        let handed = |epochs: usize, fan_in: usize, option: RootOption| -> usize {
+            let shape = tree_shape(epochs, fan_in);
+            match option.child_level(shape.len()) {
+                0 | 1 => epochs.div_ceil(fan_in),
+                level => shape[level - 1].nodes(),
+            }
+        };
+        for fan_in in [2usize, 3, 4] {
+            for epochs in 1usize..=40 {
+                let top = tree_shape(epochs, fan_in).len();
+                for named in [RootOption::A, RootOption::B] {
+                    let option = named.for_tree(top, true);
+                    assert_eq!(
+                        handed(epochs, fan_in, option),
+                        refolded(epochs, fan_in, option),
+                        "{epochs} epochs at fan-in {fan_in}, {named:?} run as {option:?}: the \
+                         root would be handed a different number of children than its fold \
+                         shape refolds to"
+                    );
+                    assert_eq!(
+                        named.for_tree(top, false),
+                        named,
+                        "a wrap tree maps nothing"
+                    );
+                }
+                assert_eq!(
+                    handed(epochs, fan_in, RootOption::A)
+                        == refolded(epochs, fan_in, RootOption::A),
+                    !(2..=fan_in).contains(&epochs),
+                    "{epochs} epochs at fan-in {fan_in}: `A` as named must fail exactly at \
+                     2..={fan_in} epochs, where `for_tree` maps it"
+                );
+            }
+        }
+    }
+
     /// ★ THE ROOT OPTION IS A NAMED INPUT: `A` or `B`, and nothing else parses.
     ///
     /// ⛔ Including the empty string, which is what `export LFM_TREE_ROOT_OPTION=`
@@ -1265,6 +1353,34 @@ mod tests {
         }
     }
 
+    /// ★ THE ROOT OVER EVERY SMALL WIDE TREE EXECUTES, HONEST: one to six epochs
+    /// at fan-in 4, root option A run through [`RootOption::for_tree`] — one
+    /// interior child up to four epochs (`B`'s shape from two), two at five and
+    /// six — and the artifact keeps its fixed width.
+    #[test]
+    fn the_root_over_every_small_wide_tree_executes() {
+        for epochs in 1usize..=6 {
+            let option = RootOption::A.for_tree(tree_shape(epochs, 4).len(), true);
+            let (plan, exec) = run_root_fixture(epochs, 4, option.replaces_top(), 0, |_| {});
+            let exec = exec.unwrap_or_else(|e| {
+                panic!(
+                    "{epochs} epochs at fan-in 4, run as {option:?}: the HONEST root must \
+                     execute: {e:?}"
+                )
+            });
+            assert_eq!(
+                plan.interior_layouts.len(),
+                epochs.div_ceil(4),
+                "{epochs}@4: one interior child per wide level-1 node"
+            );
+            assert_eq!(
+                exec.public_words.len(),
+                root_schema_words(fixture_num_reg(), 0, plan.publishes),
+                "{epochs}@4: the artifact's width"
+            );
+        }
+    }
+
     /// ⛔ A MOVED L2G ROOT is rejected — at every epoch and every lane.
     ///
     /// One lane of one epoch's root in the GLOBAL child, moved by one. The
@@ -1275,8 +1391,16 @@ mod tests {
     #[test]
     fn the_root_rejects_a_moved_l2g_root() {
         let lanes = super::super::proof_arena::lanes_per_root();
-        // `(15, 4, true)`: pure WHIR's default root.
-        let shapes = [(2usize, 2usize, true), (4, 2, true), (15, 4, true)];
+        // `(15, 4, true)`: pure WHIR's default root. `(1, 4, true)` and
+        // `(3, 4, false)`: small wide blocks, one epoch and one node of three
+        // (`RootOption::for_tree`).
+        let shapes = [
+            (2usize, 2usize, true),
+            (4, 2, true),
+            (15, 4, true),
+            (1, 4, true),
+            (3, 4, false),
+        ];
         for (epochs, fan_in, replaces_top) in shapes {
             let (_, honest) = run_root_fixture(epochs, fan_in, replaces_top, 0, |_| {});
             assert!(
