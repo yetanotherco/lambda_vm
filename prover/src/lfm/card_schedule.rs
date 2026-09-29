@@ -1,5 +1,6 @@
-//! How a level's proofs share the card and the host: three knobs, all OFF by
-//! default, none of which changes a byte any proof commits to.
+//! How a level's proofs share the card and the host: three knobs, none of which
+//! changes a byte any proof commits to. NICE is ON by default; SCOPE and AHEAD
+//! are off.
 //!
 //! # The term they attack
 //!
@@ -17,11 +18,12 @@
 //! - `LAMBDA_VM_GAP_PREP_SCOPE=1` — [`device_scope`]: an artifact build holds
 //!   the card only around its DEVICE commits. The groups below the device
 //!   floor are committed on the host first, outside the hold.
-//! - `LAMBDA_VM_GAP_PREP_NICE=<1..19>` — [`host_nice`]: the host-only phases of
-//!   a recursion proof (execute, fill, the build's host pass, and the tree
-//!   driver's reconstruct, emit and harvest) run at that nice value on a pool
-//!   of the CALLING thread's own ([`host_phase`]), so the proof holding the card
-//!   keeps the CPU and the global rayon pool.
+//! - `LAMBDA_VM_GAP_PREP_NICE=<0..19>` — [`host_nice`], ON by default at
+//!   [`DEFAULT_NICE`]: the host-only phases of a recursion proof (execute, fill,
+//!   the build's host pass, and the tree driver's reconstruct, emit and
+//!   harvest) run at that nice value on a pool of the CALLING thread's own
+//!   ([`host_phase`]), so the proof holding the card keeps the CPU and the
+//!   global rayon pool. `0` turns it off: host phases run where they are called.
 //! - `LAMBDA_VM_GAP_PREP_AHEAD=1` — [`ahead`]: a level-0 wrap builds its
 //!   artifacts on a helper thread while it executes and fills, instead of
 //!   before.
@@ -53,9 +55,14 @@ pub fn ahead() -> bool {
     *ON.get_or_init(|| flag("LAMBDA_VM_GAP_PREP_AHEAD"))
 }
 
-/// `LAMBDA_VM_GAP_PREP_NICE=<1..19>`: the nice value the host-phase pool runs
-/// at. `None` (unset, empty or `0`) = no pool, host phases run where they are
-/// called.
+/// The nice value the host-phase pools run at when `LAMBDA_VM_GAP_PREP_NICE` is
+/// unset. At 10 the STARK tree took 1.55 s less on FAST (level-0 holds −4.15 s,
+/// against +2.49 s of card waiting for the next wrap's host work).
+pub const DEFAULT_NICE: i32 = 10;
+
+/// `LAMBDA_VM_GAP_PREP_NICE=<0..19>`: the nice value the host-phase pools run
+/// at. Unset or empty = [`DEFAULT_NICE`]; `0` = `None`, no pool: host phases run
+/// where they are called, the schedule before the knob.
 pub fn host_nice() -> Option<i32> {
     static NICE: OnceLock<Option<i32>> = OnceLock::new();
     *NICE.get_or_init(|| parse_nice(std::env::var("LAMBDA_VM_GAP_PREP_NICE").ok().as_deref()))
@@ -73,13 +80,16 @@ fn flag(name: &str) -> bool {
 
 fn parse_nice(value: Option<&str>) -> Option<i32> {
     match value {
-        None | Some("") | Some("0") => None,
+        None | Some("") => Some(DEFAULT_NICE),
+        Some("0") => None,
         Some(v) => Some(
             v.parse::<i32>()
                 .ok()
                 .filter(|n| (1..=19).contains(n))
                 .unwrap_or_else(|| {
-                    panic!("LAMBDA_VM_GAP_PREP_NICE must be an integer in 1..=19, got `{v}`")
+                    panic!(
+                        "LAMBDA_VM_GAP_PREP_NICE must be an integer in 0..=19 (0 = off), got `{v}`"
+                    )
                 }),
         ),
     }
@@ -232,7 +242,8 @@ fn lower_this_thread(_nice: i32) -> bool {
 }
 
 /// The line a driver prints once, so an arm's log names its schedule. `None`
-/// when every knob is off, so a default run prints exactly what it always did.
+/// only when every knob is off, NICE included (`LAMBDA_VM_GAP_PREP_NICE=0`):
+/// then a run prints exactly what it did before the knobs.
 pub fn banner() -> Option<String> {
     if !device_scope() && !ahead() && host_nice().is_none() {
         return None;
@@ -246,7 +257,8 @@ pub fn banner() -> Option<String> {
     };
     Some(format!(
         "CARD SCHEDULE (F-PREP): artifact hold {} · {} · level-0 artifacts {} \
-         (LAMBDA_VM_GAP_PREP_SCOPE / _NICE / _AHEAD; all unset = the record schedule)",
+         (LAMBDA_VM_GAP_PREP_SCOPE / _NICE / _AHEAD; NICE defaults to {DEFAULT_NICE}, _NICE=0 \
+         turns it off)",
         if device_scope() {
             "around the device commits only"
         } else {
@@ -265,23 +277,26 @@ pub fn banner() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// ★ On by default at the measured value; `0` is the one way off.
     #[test]
-    fn the_nice_knob_reads_off_for_unset_empty_and_zero() {
-        assert_eq!(parse_nice(None), None);
-        assert_eq!(parse_nice(Some("")), None);
+    fn the_nice_knob_defaults_to_ten_and_zero_turns_it_off() {
+        assert_eq!(DEFAULT_NICE, 10);
+        assert_eq!(parse_nice(None), Some(DEFAULT_NICE));
+        assert_eq!(parse_nice(Some("")), Some(DEFAULT_NICE));
         assert_eq!(parse_nice(Some("0")), None);
+        assert_eq!(parse_nice(Some("1")), Some(1));
         assert_eq!(parse_nice(Some("10")), Some(10));
         assert_eq!(parse_nice(Some("19")), Some(19));
     }
 
     #[test]
-    #[should_panic(expected = "must be an integer in 1..=19")]
+    #[should_panic(expected = "must be an integer in 0..=19 (0 = off)")]
     fn a_nice_value_outside_the_range_stops_the_run() {
         let _ = parse_nice(Some("20"));
     }
 
     #[test]
-    #[should_panic(expected = "must be an integer in 1..=19")]
+    #[should_panic(expected = "must be an integer in 0..=19 (0 = off)")]
     fn a_negative_nice_value_stops_the_run() {
         // A negative value would ask for MORE priority than the card holder,
         // which is the opposite of the knob, and needs a privilege besides.
@@ -418,9 +433,10 @@ mod tests {
         assert_eq!(outer, inner, "a worker's host phase left its thread");
     }
 
-    /// Unset, a host phase runs on the caller, exactly as the code before the knob.
+    /// Off (`LAMBDA_VM_GAP_PREP_NICE=0`), a host phase runs on the caller, exactly
+    /// as the code before the knob.
     #[test]
-    fn with_the_knob_unset_a_host_phase_runs_on_the_caller() {
+    fn with_the_knob_off_a_host_phase_runs_on_the_caller() {
         let here = std::thread::current().id();
         assert_eq!(host_phase_at(None, || std::thread::current().id()), here);
     }

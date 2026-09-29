@@ -184,8 +184,8 @@ pub struct LfmPrepared {
 /// (`LAMBDA_VM_GAP_PREP_AHEAD`) and hand both to [`lfm_prove_prepared`].
 ///
 /// Both halves run as [`super::card_schedule::host_phase`]s: under
-/// `LAMBDA_VM_GAP_PREP_NICE` they yield the CPU to whichever proof holds the
-/// card, and inline, exactly as before, when it is unset.
+/// `LAMBDA_VM_GAP_PREP_NICE` (on by default) they yield the CPU to whichever
+/// proof holds the card, and inline, exactly as before, at `0`.
 pub fn lfm_prepare(
     program: &LfmProgram,
     arenas: &[Vec<LfmWord>],
