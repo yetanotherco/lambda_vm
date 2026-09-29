@@ -2011,16 +2011,36 @@ mod tests {
         on_card: u64,
         on_host: u64,
         tables_on_card: u64,
+        /// Session ends read in one copy, and factors read one at a time.
+        reads_gathered: u64,
+        reads_per_factor: u64,
+        /// Device GKR layers whose host tail ran lean.
+        lean_tails: u64,
     }
 
-    /// Commits the tall tables afresh and proves them with
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` and `LAMBDA_VM_ARGUE_DEVICE_TABLES` as
-    /// asked.
+    /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
+    /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`, `LAMBDA_VM_ARGUE_LEAN_READS`,
+    /// `LAMBDA_VM_ARGUE_LEAN_TAIL`.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Knobs {
+        columns: bool,
+        tables: bool,
+        reads: bool,
+        tail: bool,
+    }
+
+    const TODAY: Knobs = Knobs {
+        columns: false,
+        tables: false,
+        reads: false,
+        tail: false,
+    };
+
+    /// Commits the tall tables afresh and proves them under `knobs`.
     fn prove_tall<'a>(
         airs: &'a ThreeAirs,
         columns: &[Vec<Vec<FE>>; 3],
-        on: bool,
-        tables: bool,
+        knobs: Knobs,
     ) -> TallArm<'a> {
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
@@ -2031,30 +2051,36 @@ mod tests {
             &config(),
         )
         .unwrap();
-        multilinear::gpu::force_argue_device_columns(Some(on));
-        multilinear::gpu::force_argue_device_tables(Some(tables));
-        let (card, host, built) = (
+        multilinear::gpu::force_argue_device_columns(Some(knobs.columns));
+        multilinear::gpu::force_argue_device_tables(Some(knobs.tables));
+        multilinear::gpu::force_argue_lean_reads(Some(knobs.reads));
+        multilinear::gpu::force_argue_lean_tail(Some(knobs.tail));
+        let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
             multilinear::gpu::argue_tables_on_card(),
+            multilinear::gpu::reads_gathered(),
+            multilinear::gpu::reads_per_factor(),
+            multilinear::gpu::lean_tails(),
         );
         let mut transcript = DefaultTranscript::<Ext>::new(b"multilinear-table");
         let proof = multi_prove(&committed, &config(), &mut transcript, None);
-        let (on_card, on_host, tables_on_card) = (
-            multilinear::gpu::evaluate_calls() - card,
-            multilinear::gpu::host_evaluate_calls() - host,
-            multilinear::gpu::argue_tables_on_card() - built,
-        );
+        let arm = TallArm {
+            committed,
+            proof: proof.unwrap_or_else(|e| panic!("{knobs:?}: {e:?}")),
+            transcript,
+            on_card: multilinear::gpu::evaluate_calls() - card,
+            on_host: multilinear::gpu::host_evaluate_calls() - host,
+            tables_on_card: multilinear::gpu::argue_tables_on_card() - built,
+            reads_gathered: multilinear::gpu::reads_gathered() - gathered,
+            reads_per_factor: multilinear::gpu::reads_per_factor() - single,
+            lean_tails: multilinear::gpu::lean_tails() - lean,
+        };
         multilinear::gpu::force_argue_device_columns(None);
         multilinear::gpu::force_argue_device_tables(None);
-        TallArm {
-            committed,
-            proof: proof.unwrap_or_else(|e| panic!("columns {on}, tables {tables}: {e:?}")),
-            transcript,
-            on_card,
-            on_host,
-            tables_on_card,
-        }
+        multilinear::gpu::force_argue_lean_reads(None);
+        multilinear::gpu::force_argue_lean_tail(None);
+        arm
     }
 
     fn verify_tall(
@@ -2114,8 +2140,15 @@ mod tests {
         let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
         let airs = airs();
         let columns = tall_columns();
-        let mut off = prove_tall(&airs, &columns, false, false);
-        let mut on = prove_tall(&airs, &columns, true, false);
+        let mut off = prove_tall(&airs, &columns, TODAY);
+        let mut on = prove_tall(
+            &airs,
+            &columns,
+            Knobs {
+                columns: true,
+                ..TODAY
+            },
+        );
 
         if a_device() {
             assert_eq!(
@@ -2178,10 +2211,17 @@ mod tests {
             eprintln!("argue device columns: SKIPPED, no device to corrupt a value on");
             return;
         }
-        let off = prove_tall(&airs, &columns, false, false);
+        let off = prove_tall(&airs, &columns, TODAY);
         multilinear::gpu::force_column_value_fault(true);
         let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove_tall(&airs, &columns, true, false)
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    columns: true,
+                    ..TODAY
+                },
+            )
         }));
         multilinear::gpu::force_column_value_fault(false);
         let faulted = faulted.expect("the faulted arm proves");
@@ -2215,14 +2255,23 @@ mod tests {
         let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
         let airs = airs();
         let columns = tall_columns();
-        let mut today = prove_tall(&airs, &columns, false, false);
+        let mut today = prove_tall(&airs, &columns, TODAY);
         verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
         let today_state = today.transcript.state();
         let today_next = today.transcript.sample_field_element();
         let device = a_device();
         for (on, tables) in [(false, true), (true, true)] {
             let what = format!("columns {on}, tables {tables}");
-            let mut arm = prove_tall(&airs, &columns, on, tables);
+            let mut arm = prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    columns: on,
+                    tables,
+                    reads: false,
+                    tail: false,
+                },
+            );
             if device {
                 assert_eq!(
                     (today.tables_on_card, arm.tables_on_card),
@@ -2299,7 +2348,7 @@ mod tests {
             eprintln!("argue device tables: SKIPPED, no device to corrupt a table on");
             return;
         }
-        let today = prove_tall(&airs, &columns, false, false);
+        let today = prove_tall(&airs, &columns, TODAY);
         // CPU's argument, part by part: what precedes its reduce, and the reduce.
         let cpu = |arm: &TallArm<'_>| {
             let table = &arm.proof.tables[0];
@@ -2315,7 +2364,14 @@ mod tests {
         };
         let (today_before, today_reduce) = cpu(&today);
 
-        let clean = prove_tall(&airs, &columns, false, true);
+        let clean = prove_tall(
+            &airs,
+            &columns,
+            Knobs {
+                tables: true,
+                ..TODAY
+            },
+        );
         assert_eq!(
             clean.tables_on_card, 12,
             "the control is on the card's path"
@@ -2330,7 +2386,14 @@ mod tests {
         for fault in [TableFault::Eq, TableFault::Batched] {
             multilinear::gpu::force_table_fault(Some(fault));
             let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_tall(&airs, &columns, false, true)
+                prove_tall(
+                    &airs,
+                    &columns,
+                    Knobs {
+                        tables: true,
+                        ..TODAY
+                    },
+                )
             }));
             multilinear::gpu::force_table_fault(None);
             let faulted = faulted.unwrap_or_else(|_| panic!("{fault:?}: the faulted arm proves"));
@@ -2362,6 +2425,247 @@ mod tests {
         eprintln!(
             "argue device tables: both faults refused by the reduce, CPU's zerocheck untouched"
         );
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_LEAN_READS` moves no byte of the proof, alone or with
+    /// both other argue knobs: the same canonical bytes, transcript and next
+    /// challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, every
+    /// session's end is read a factor at a time and none in one copy; on, the
+    /// reverse. ⚠ Run it alone (`--exact`): the counters are process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_its_reads_gathered() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut today = prove_tall(&airs, &columns, TODAY);
+        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+        let today_state = today.transcript.state();
+        let today_next = today.transcript.sample_field_element();
+        let device = a_device();
+        if device {
+            assert!(
+                today.reads_gathered == 0 && today.reads_per_factor > 0,
+                "today reads a factor at a time: gathered {}, per factor {}",
+                today.reads_gathered,
+                today.reads_per_factor
+            );
+        }
+        let all = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            tail: false,
+        };
+        for knobs in [
+            Knobs {
+                reads: true,
+                ..TODAY
+            },
+            all,
+        ] {
+            let mut arm = prove_tall(&airs, &columns, knobs);
+            if device {
+                assert!(
+                    arm.reads_per_factor == 0 && arm.reads_gathered > 0,
+                    "{knobs:?}: every session's end in one copy: gathered {}, per factor {}",
+                    arm.reads_gathered,
+                    arm.reads_per_factor
+                );
+                eprintln!(
+                    "argue lean reads: {knobs:?}: {} sessions read in one copy",
+                    arm.reads_gathered
+                );
+            } else {
+                assert_eq!(
+                    (arm.reads_gathered, arm.reads_per_factor),
+                    (0, 0),
+                    "{knobs:?}: no device read a session back"
+                );
+                eprintln!("argue lean reads: no device; no session to read back");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &arm.proof),
+                None,
+                "{knobs:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&arm.proof).unwrap(),
+                "{knobs:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                arm.transcript.state(),
+                "{knobs:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                arm.transcript.sample_field_element(),
+                "{knobs:?}: the next challenge moved"
+            );
+            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail. With the fault armed, every gathered
+    /// read hands back its first word plus one; the proof must then differ from
+    /// today's at CPU, the first table argued, and must not verify. Needs a
+    /// device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_read_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue lean reads: SKIPPED, no device to corrupt a read on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, TODAY);
+        multilinear::gpu::force_read_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    reads: true,
+                    ..TODAY
+                },
+            )
+        }));
+        multilinear::gpu::force_read_fault(false);
+        let faulted = faulted.expect("the faulted arm proves");
+        assert!(
+            faulted.reads_gathered > 0,
+            "the fault is on the gathered path"
+        );
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        let verdict = verify_tall(&faulted.committed, &faulted.proof);
+        assert!(
+            verdict.is_err(),
+            "a proof over a wrong read must not verify, got {verdict:?}"
+        );
+        eprintln!("argue lean reads: the wrong read was refused: {verdict:?}");
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_LEAN_TAIL` moves no byte of the proof, alone or with
+    /// every other argue knob: the same canonical bytes, transcript and next
+    /// challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, no device
+    /// GKR layer's tail runs lean; on, some do — CPU's tree and ADD's are built
+    /// on the card. ⚠ Run it alone (`--exact`): the counters are process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_its_tail_lean() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut today = prove_tall(&airs, &columns, TODAY);
+        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+        let today_state = today.transcript.state();
+        let today_next = today.transcript.sample_field_element();
+        let device = a_device();
+        assert_eq!(today.lean_tails, 0, "today no tail runs lean");
+        let every = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            tail: true,
+        };
+        for knobs in [
+            Knobs {
+                tail: true,
+                ..TODAY
+            },
+            every,
+        ] {
+            let mut arm = prove_tall(&airs, &columns, knobs);
+            if device {
+                assert!(
+                    arm.lean_tails > 0,
+                    "{knobs:?}: the device layers' tails run lean"
+                );
+                eprintln!(
+                    "argue lean tail: {knobs:?}: {} device layers finished lean",
+                    arm.lean_tails
+                );
+            } else {
+                assert_eq!(arm.lean_tails, 0, "{knobs:?}: no device, no lean tail");
+                eprintln!("argue lean tail: no device; no layer to finish lean");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &arm.proof),
+                None,
+                "{knobs:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&arm.proof).unwrap(),
+                "{knobs:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                arm.transcript.state(),
+                "{knobs:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                arm.transcript.sample_field_element(),
+                "{knobs:?}: the next challenge moved"
+            );
+            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail. With the fault armed, every lean tail adds
+    /// one to its first round's `s(1)`. The proof must then differ from today's
+    /// at CPU, the first table argued, and be refused by GKR's layer check —
+    /// the first check a verifier runs on a table, before its zerocheck. Needs
+    /// a device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_lean_tail_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue lean tail: SKIPPED, no device to corrupt a tail on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, TODAY);
+        multilinear::gkr::force_lean_tail_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    tail: true,
+                    ..TODAY
+                },
+            )
+        }));
+        multilinear::gkr::force_lean_tail_fault(false);
+        let faulted = faulted.expect("the faulted arm proves");
+        assert!(faulted.lean_tails > 0, "the fault is on the lean path");
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        let verdict = verify_tall(&faulted.committed, &faulted.proof);
+        assert!(
+            matches!(verdict, Err(MlError::LayerRelationMismatch { .. })),
+            "GKR's layer check must refuse it, got {verdict:?}"
+        );
+        eprintln!("argue lean tail: the wrong tail was refused: {verdict:?}");
     }
 
     /// [`config`] with its stack cap at `cap`.

@@ -60,6 +60,17 @@ static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 static ARGUE_TABLES_ON_CARD: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the host's.
 static ARGUE_TABLE_XCHECKS: AtomicU64 = AtomicU64::new(0);
+/// Device sumchecks whose end was read back in one gathered copy
+/// (`LAMBDA_VM_ARGUE_LEAN_READS`).
+static READS_GATHERED: AtomicU64 = AtomicU64::new(0);
+/// Factors read back one synchronous copy at a time — what the gathered read
+/// replaces.
+static READS_PER_FACTOR: AtomicU64 = AtomicU64::new(0);
+/// Device GKR layers whose host tail ran lean (`LAMBDA_VM_ARGUE_LEAN_TAIL`).
+static LEAN_TAILS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round against
+/// the generic rounds.
+static LEAN_TAIL_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
@@ -195,6 +206,32 @@ pub fn argue_table_xchecks() -> u64 {
     ARGUE_TABLE_XCHECKS.load(Ordering::Relaxed)
 }
 
+pub fn reads_gathered() -> u64 {
+    READS_GATHERED.load(Ordering::Relaxed)
+}
+
+pub fn reads_per_factor() -> u64 {
+    READS_PER_FACTOR.load(Ordering::Relaxed)
+}
+
+pub fn lean_tails() -> u64 {
+    LEAN_TAILS.load(Ordering::Relaxed)
+}
+
+pub fn lean_tail_xchecks() -> u64 {
+    LEAN_TAIL_XCHECKS.load(Ordering::Relaxed)
+}
+
+/// Counts a layer the lean tail finished, and whether the cross-check ran on it.
+pub(crate) fn note_lean_tail(xchecked: bool) {
+    LEAN_TAILS.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::TAILS_LEAN);
+    if xchecked {
+        LEAN_TAIL_XCHECKS.fetch_add(1, Ordering::Relaxed);
+        crate::whir_split::bump(&crate::whir_split::TAILS_XCHECKED);
+    }
+}
+
 pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
@@ -300,6 +337,10 @@ pub fn reset_call_counters() {
     ARGUE_XCHECKS.store(0, Ordering::Relaxed);
     ARGUE_TABLES_ON_CARD.store(0, Ordering::Relaxed);
     ARGUE_TABLE_XCHECKS.store(0, Ordering::Relaxed);
+    READS_GATHERED.store(0, Ordering::Relaxed);
+    READS_PER_FACTOR.store(0, Ordering::Relaxed);
+    LEAN_TAILS.store(0, Ordering::Relaxed);
+    LEAN_TAIL_XCHECKS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -958,7 +999,7 @@ where
     };
     // Each factor as the last fold left it, read where it lies — which is the
     // only thing a session over factors it does not own can say.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -1178,7 +1219,7 @@ where
     // The rounds folded every factor where it lies, so reading them back is
     // what spares the caller a pass over the trace to compute what the device
     // already has — the values at the point, when the cube ran out here.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed {
             stage: "factor values",
         }));
@@ -1352,7 +1393,7 @@ where
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -1694,6 +1735,116 @@ pub fn force_argue_device_tables(on: Option<bool>) {
         },
         Ordering::Relaxed,
     );
+}
+
+/// Whether a device sumcheck's end is read back in one gathered copy —
+/// `LAMBDA_VM_ARGUE_LEAN_READS=1` (any non-empty value other than `0`) —
+/// rather than one synchronous copy per factor. The same bytes either way; off
+/// by default until its A/B, and off is today's path.
+///
+/// Every session the argument runs ends by reading its factors back: the
+/// zerocheck's hundreds or thousands (the widest precompile has 1,482), each
+/// GKR layer's five, each reduce's pairs. One copy each is a round trip each,
+/// ~6 µs: about 0.3 s a block on the head's trace, 49 thousand copies of a few
+/// hundred bytes (`thoughts/zf/gap2/fix2/I-GFS.md` §8).
+pub fn argue_lean_reads() -> bool {
+    match ARGUE_LEAN_READS_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_READS"))
+        }
+    }
+}
+
+static ARGUE_LEAN_READS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_READS` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_reads(on: Option<bool>) {
+    ARGUE_LEAN_READS_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// ⛔ A FAULT: while armed, a gathered read hands back its first factor's first
+/// word plus one — what a gather that read one wrong word would do — so the
+/// checks on a session's end can be shown to see one. Never armed outside a
+/// test. Not for production callers.
+static READ_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_read_fault(on: bool) {
+    READ_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// Whether a device GKR layer's host tail runs lean — `LAMBDA_VM_ARGUE_LEAN_TAIL=1`
+/// (any non-empty value other than `0`): the layer's `eq` weight pulled out of
+/// the round polynomial and its factors extended by addition
+/// ([`gkr`](crate::gkr)'s `lean_tail`). The same round values either way; off by
+/// default until its A/B, and off is today's path.
+///
+/// Every device layer hands its last nine rounds to the host, over a cube of
+/// 512: on the head's split that tail's arithmetic is 52 % of the 264 µs the
+/// host spends between two device layers (`thoughts/zf/gap2/fix2/I-GFS.md` §9).
+pub fn argue_lean_tail() -> bool {
+    match ARGUE_LEAN_TAIL_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_TAIL"))
+        }
+    }
+}
+
+static ARGUE_LEAN_TAIL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_TAIL` for the whole process — for a test that
+/// proves both ways in one binary. `None` restores the environment's setting.
+/// Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_tail(on: Option<bool>) {
+    ARGUE_LEAN_TAIL_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// A device sumcheck's factors as its last fold left them: one gathered copy
+/// under `LAMBDA_VM_ARGUE_LEAN_READS`, a copy per factor otherwise — the same
+/// bytes, counted both ways so an arm's log says which it took.
+#[cfg(feature = "cuda")]
+fn session_values(
+    session: &math_cuda::sumcheck::SumcheckSession,
+) -> math_cuda::Result<Vec<Vec<u64>>> {
+    if !argue_lean_reads() {
+        let values = session.values()?;
+        READS_PER_FACTOR.fetch_add(values.len() as u64, Ordering::Relaxed);
+        crate::whir_split::bump_by(&crate::whir_split::READS_PER_FACTOR, values.len() as u64);
+        return Ok(values);
+    }
+    let mut values = session.values_gathered()?;
+    READS_GATHERED.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::READS_GATHERED);
+    if READ_FAULT.load(Ordering::Relaxed)
+        && let Some(word) = values.first_mut().and_then(|factor| factor.first_mut())
+    {
+        *word = word.wrapping_add(1);
+    }
+    Ok(values)
 }
 
 /// Which table the card built a fault corrupts ([`force_table_fault`]).
@@ -2230,13 +2381,19 @@ impl DeviceTree {
     where
         E: math::field::traits::IsField + 'static,
     {
+        use crate::whir_split::{self, add_tick, tick};
+
+        let t = tick();
         let lowered = lower(program)?;
         let mut raw_point = Vec::with_capacity(point.len() * 3);
         for coordinate in point {
             raw_point.extend_from_slice(&ext3_raw(coordinate)?);
         }
+        add_tick(&whir_split::GKR_LOWER, t);
         let input_layer = layer + 1 == self.num_layers;
-        let session = if input_layer && self.rebuild.is_some() {
+        let rebuilds = input_layer && self.rebuild.is_some();
+        let t = tick();
+        let session = if rebuilds {
             // The one the tree gave back. Everything above it has been proved,
             // so the levels go first and the layer is written where they were.
             let num_vars = self.input_num_vars.checked_sub(1)?;
@@ -2267,6 +2424,12 @@ impl DeviceTree {
                 lowered.root_slot,
             )
         };
+        if rebuilds {
+            add_tick(&whir_split::GKR_REBUILD, t);
+            whir_split::bump(&whir_split::GKR_REBUILDS);
+        } else {
+            add_tick(&whir_split::GKR_SESSION, t);
+        }
         let num_vars = if input_layer {
             self.input_num_vars.checked_sub(1)?
         } else {
@@ -2286,18 +2449,23 @@ impl DeviceTree {
 
         // Past here the transcript moves: the host path is no longer an option.
         let failed = |stage| crate::Error::DeviceFailed { stage };
+        let t = tick();
         let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
+        add_tick(&whir_split::GKR_ROUNDS, t);
         let (rounds, challenges) = match outcome {
             Ok(rounds) => rounds,
             Err(error) => return Some(Err(error)),
         };
-        let Ok(values) = session.values() else {
+        let t = tick();
+        let Ok(values) = session_values(&session) else {
             return Some(Err(failed("layer values")));
         };
+        add_tick(&whir_split::GKR_VALUES, t);
         // Factor 0 is the weight; the four the layer reduces to follow.
         if values.len() != 5 {
             return Some(Err(failed("layer factors")));
         }
+        let t = tick();
         let factors: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
             .iter()
             .map(|factor| {
@@ -2307,6 +2475,8 @@ impl DeviceTree {
         let Ok(factors) = factors else {
             return Some(Err(failed("layer factors")));
         };
+        add_tick(&whir_split::GKR_FACTORS, t);
+        whir_split::bump(&whir_split::GKR_LAYERS);
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Ok((rounds, challenges, factors)))
     }

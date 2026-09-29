@@ -474,6 +474,42 @@ impl SumcheckSession {
         Ok(out)
     }
 
+    /// [`values`](Self::values) — the same bytes — gathered into one buffer on
+    /// the card and read back in one copy, where `values` makes a synchronous
+    /// copy per factor: a table of fourteen hundred factors is fourteen hundred
+    /// round trips at every session's end, for a few kilobytes each.
+    ///
+    /// Pageable, not pinned: what this saves is the count of copies, and a
+    /// session's end is at most a megabyte or so.
+    pub fn values_gathered(&self) -> Result<Vec<Vec<u64>>> {
+        let be = backend()?;
+        let span = self.len * 3;
+        let total = self.width * span;
+        // SAFETY: the kernel writes every word of it, one thread per word.
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, total) }?;
+        let width = self.width as u64;
+        let cells = self.len as u64;
+        let grid = (total as u64)
+            .div_ceil(BLOCK_DIM as u64)
+            .clamp(1, MAX_GRID as u64) as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&be.gather_factor_heads_ext3)
+                .arg(&self.factor_ptrs)
+                .arg(&width)
+                .arg(&cells)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let flat = self.stream.clone_dtoh(&out)?;
+        self.stream.synchronize()?;
+        Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
+    }
+
     /// Factor `k`'s remaining values, read where it lies: one factor, where
     /// [`values`](Self::values) reads every one — so a check of a table the
     /// card built reads that table and not the trace beside it.
