@@ -502,6 +502,36 @@ extern "C" __global__ void mle_fold_base_ext3_many(const uint64_t *__restrict__ 
     }
 }
 
+// The claim reduce's batched column for one offset, out of the epoch's resident
+// columns: `out[row] = Σ_m weight[m]·column[member[m]][row]`. The columns are
+// base-field and laid end to end, `rows` each, from the start of the table's run;
+// `members` is each term's column in that run and `weights` its ext3 weight.
+//
+// One thread per row, looping over the members: the threads of a warp read one
+// column's consecutive rows, and every thread reads the same weight. The sum is
+// the host's (`claim_reduce::batched_column`) term for term — base × ext3 is the
+// componentwise product either way — in a different order, which a field does
+// not see.
+extern "C" __global__ void batched_column_ext3(const uint64_t *__restrict__ columns,
+                                               uint64_t rows,
+                                               const uint64_t *__restrict__ members,
+                                               const uint64_t *__restrict__ weights,
+                                               uint64_t num_members,
+                                               uint64_t *__restrict__ out) {
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+         row += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 acc = ext3::zero();
+        for (uint64_t m = 0; m < num_members; ++m) {
+            uint64_t value = columns[members[m] * rows + row];
+            acc = ext3::add(acc, ext3::mul_base(load_ext(weights + m * 3), value));
+        }
+        uint64_t *at = out + row * 3;
+        at[0] = acc.a;
+        at[1] = acc.b;
+        at[2] = acc.c;
+    }
+}
+
 // Binds the round's variable: `f(j) <- f(j) + r·(f(j + half) − f(j))` for every
 // factor, halving the cube. One thread per (factor, index) pair.
 extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_factors,

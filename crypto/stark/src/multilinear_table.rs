@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use multilinear::{
     Error as MlError,
-    batch::Rule,
+    batch::{Rule, Weight},
     claim_reduce,
     constraint_argument::{self, ConstraintCore, FactorKind, TraceData},
     eq::{eq_eval, eq_mle},
@@ -946,9 +946,20 @@ where
     let betas = multilinear_air::beta_powers(beta, shape.num_roots());
     let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
 
+    // Under `LAMBDA_VM_ARGUE_DEVICE_TABLES` the weights go as their points and
+    // the card builds them where the zerocheck folds them; the host builds them
+    // only if the card turns the rounds down.
+    let weights = if multilinear::gpu::argue_device_tables() {
+        vec![Weight::Eq(r), Weight::Eq(bus.row_point.clone())]
+    } else {
+        vec![
+            Weight::Table(eq_mle(&r)?),
+            Weight::Table(eq_mle(&bus.row_point)?),
+        ]
+    };
     let (constraint, point) = constraint_argument::prove_core::<F, E, T>(
         &table.trace,
-        vec![eq_mle(&r)?, eq_mle(&bus.row_point)?],
+        weights,
         vec![zerocheck, bus.numerator, bus.denominator],
         &[
             FieldElement::zero(),
@@ -1978,8 +1989,8 @@ mod tests {
         [cpu, add, mul]
     }
 
-    /// The two tests below switch process-wide overrides — one of them arms a
-    /// fault — so they never run at the same time.
+    /// The tests below switch process-wide overrides — some arm a fault — so
+    /// they never run at the same time.
     static ARGUE_OVERRIDES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The three AIRs [`airs`] builds, borrowed as one.
@@ -1989,20 +2000,28 @@ mod tests {
         Air<MulConstraints>,
     );
 
-    /// One arm of the knob's A/B: the commitment it proved against, the proof,
-    /// the transcript after it, and how many columns the card and the host
-    /// valued at the reduction points while it ran.
+    /// One arm of a knob's A/B: the commitment it proved against, the proof,
+    /// the transcript after it, how many columns the card and the host valued
+    /// at the reduction points, and how many challenge tables the card built,
+    /// while it ran.
     struct TallArm<'a> {
         committed: CommittedTables<'a, Fp, Ext, KeccakWhir>,
         proof: MultiProof<Fp, Ext>,
         transcript: DefaultTranscript<Ext>,
         on_card: u64,
         on_host: u64,
+        tables_on_card: u64,
     }
 
     /// Commits the tall tables afresh and proves them with
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` as asked.
-    fn prove_tall<'a>(airs: &'a ThreeAirs, columns: &[Vec<Vec<FE>>; 3], on: bool) -> TallArm<'a> {
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` and `LAMBDA_VM_ARGUE_DEVICE_TABLES` as
+    /// asked.
+    fn prove_tall<'a>(
+        airs: &'a ThreeAirs,
+        columns: &[Vec<Vec<FE>>; 3],
+        on: bool,
+        tables: bool,
+    ) -> TallArm<'a> {
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
                 table(&airs.0, &columns[0]).unwrap(),
@@ -2013,23 +2032,28 @@ mod tests {
         )
         .unwrap();
         multilinear::gpu::force_argue_device_columns(Some(on));
-        let (card, host) = (
+        multilinear::gpu::force_argue_device_tables(Some(tables));
+        let (card, host, built) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
+            multilinear::gpu::argue_tables_on_card(),
         );
         let mut transcript = DefaultTranscript::<Ext>::new(b"multilinear-table");
         let proof = multi_prove(&committed, &config(), &mut transcript, None);
-        let (on_card, on_host) = (
+        let (on_card, on_host, tables_on_card) = (
             multilinear::gpu::evaluate_calls() - card,
             multilinear::gpu::host_evaluate_calls() - host,
+            multilinear::gpu::argue_tables_on_card() - built,
         );
         multilinear::gpu::force_argue_device_columns(None);
+        multilinear::gpu::force_argue_device_tables(None);
         TallArm {
             committed,
-            proof: proof.unwrap_or_else(|e| panic!("knob {on}: {e:?}")),
+            proof: proof.unwrap_or_else(|e| panic!("columns {on}, tables {tables}: {e:?}")),
             transcript,
             on_card,
             on_host,
+            tables_on_card,
         }
     }
 
@@ -2090,8 +2114,8 @@ mod tests {
         let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
         let airs = airs();
         let columns = tall_columns();
-        let mut off = prove_tall(&airs, &columns, false);
-        let mut on = prove_tall(&airs, &columns, true);
+        let mut off = prove_tall(&airs, &columns, false, false);
+        let mut on = prove_tall(&airs, &columns, true, false);
 
         if a_device() {
             assert_eq!(
@@ -2154,10 +2178,10 @@ mod tests {
             eprintln!("argue device columns: SKIPPED, no device to corrupt a value on");
             return;
         }
-        let off = prove_tall(&airs, &columns, false);
+        let off = prove_tall(&airs, &columns, false, false);
         multilinear::gpu::force_column_value_fault(true);
         let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove_tall(&airs, &columns, true)
+            prove_tall(&airs, &columns, true, false)
         }));
         multilinear::gpu::force_column_value_fault(false);
         let faulted = faulted.expect("the faulted arm proves");
@@ -2171,6 +2195,172 @@ mod tests {
             verify_tall(&faulted.committed, &faulted.proof),
             Err(MlError::ShiftedReadMismatch),
             "a corrupted column value must fail the claim reduce's check"
+        );
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_DEVICE_TABLES` moves no byte of the proof, alone or
+    /// with `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`: the same canonical bytes table by
+    /// table and whole, the same transcript and next challenge, and each proof
+    /// verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: the card builds
+    /// 12 tables with the knob on — per table, the zerocheck's two `eq` weights
+    /// and the reduce's shift table and batched column at the one offset these
+    /// AIRs read — and none with it off. ⚠ Run it alone (`--exact`): the
+    /// counters are process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_its_tables_on_the_card() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut today = prove_tall(&airs, &columns, false, false);
+        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+        let today_state = today.transcript.state();
+        let today_next = today.transcript.sample_field_element();
+        let device = a_device();
+        for (on, tables) in [(false, true), (true, true)] {
+            let what = format!("columns {on}, tables {tables}");
+            let mut arm = prove_tall(&airs, &columns, on, tables);
+            if device {
+                assert_eq!(
+                    (today.tables_on_card, arm.tables_on_card),
+                    (0, 12),
+                    "{what}: the tables the card built (today, this arm)"
+                );
+                let columns_moved = if on { (9, 4) } else { (0, 13) };
+                assert_eq!(
+                    (arm.on_card, arm.on_host),
+                    columns_moved,
+                    "{what}: the column values (card, host)"
+                );
+                eprintln!(
+                    "argue device tables: {what}: the card built {} tables",
+                    arm.tables_on_card
+                );
+            } else {
+                assert_eq!(arm.tables_on_card, 0, "{what}: no device built a table");
+                eprintln!(
+                    "argue device tables: no device; the host's tables compared with themselves"
+                );
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &arm.proof),
+                None,
+                "{what}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&arm.proof).unwrap(),
+                "{what}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                arm.transcript.state(),
+                "{what}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                arm.transcript.sample_field_element(),
+                "{what}: the next challenge moved"
+            );
+            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail. With a fault armed, the first cell of
+    /// tables the card builds is overwritten: under `Eq`, the zerocheck's `eq(r)`
+    /// weight and the reduce's offset-0 `eq(α)` table; under `Batched`, the
+    /// reduce's offset-0 batched column. The proof must then differ from
+    /// today's at CPU, the first table argued, and must not verify.
+    ///
+    /// ★ Here both faults are refused by the reduce (`ShiftedReadMismatch`), and
+    /// the test pins why. CPU has no constraints of its own
+    /// (`EmptyConstraints`), so its zerocheck rule is `eq(r)` times an empty sum,
+    /// which the program builder makes the constant zero: a wrong `eq(r)` moves
+    /// no round. CPU's GKR, zerocheck and factor values stay today's; its reduce
+    /// is what the fault reaches, and the reduce's final check is the first to
+    /// see it. A zerocheck weight fault under a table with constraints is
+    /// refused as `BatchMismatch`, which multilinear's `argue_device_tables`
+    /// matrix pins.
+    ///
+    /// The control comes first: the same arm without a fault is today's proof,
+    /// and it verifies. So what the faulted arms show is the fault's doing.
+    /// Needs a device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_table_on_the_card_changes_the_argument_and_fails_it() {
+        use multilinear::gpu::TableFault;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue device tables: SKIPPED, no device to corrupt a table on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, false, false);
+        // CPU's argument, part by part: what precedes its reduce, and the reduce.
+        let cpu = |arm: &TallArm<'_>| {
+            let table = &arm.proof.tables[0];
+            let before = [
+                bincode::serialize(&table.gkr).unwrap(),
+                bincode::serialize(&table.constraint.sumcheck).unwrap(),
+                bincode::serialize(&table.constraint.factor_values).unwrap(),
+            ];
+            (
+                before,
+                bincode::serialize(&table.constraint.reduce).unwrap(),
+            )
+        };
+        let (today_before, today_reduce) = cpu(&today);
+
+        let clean = prove_tall(&airs, &columns, false, true);
+        assert_eq!(
+            clean.tables_on_card, 12,
+            "the control is on the card's path"
+        );
+        assert_eq!(
+            first_table_that_differs(&today.proof, &clean.proof),
+            None,
+            "without a fault the card's tables are the host's"
+        );
+        verify_tall(&clean.committed, &clean.proof).expect("without a fault the proof verifies");
+
+        for fault in [TableFault::Eq, TableFault::Batched] {
+            multilinear::gpu::force_table_fault(Some(fault));
+            let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prove_tall(&airs, &columns, false, true)
+            }));
+            multilinear::gpu::force_table_fault(None);
+            let faulted = faulted.unwrap_or_else(|_| panic!("{fault:?}: the faulted arm proves"));
+            assert_eq!(
+                faulted.tables_on_card, 12,
+                "{fault:?}: the fault is on the card's path"
+            );
+            assert_eq!(
+                first_table_that_differs(&today.proof, &faulted.proof),
+                Some(0),
+                "{fault:?}: the identity must name CPU, the first table argued"
+            );
+            let (before, reduce) = cpu(&faulted);
+            assert_eq!(
+                before, today_before,
+                "{fault:?}: CPU's GKR, zerocheck and factor values are today's (its zerocheck is \
+                 eq(r) times an empty sum)"
+            );
+            assert_ne!(
+                reduce, today_reduce,
+                "{fault:?}: the fault reaches CPU's reduce"
+            );
+            assert_eq!(
+                verify_tall(&faulted.committed, &faulted.proof),
+                Err(MlError::ShiftedReadMismatch),
+                "{fault:?}: the reduce's final check refuses the corrupted table"
+            );
+        }
+        eprintln!(
+            "argue device tables: both faults refused by the reduce, CPU's zerocheck untouched"
         );
     }
 

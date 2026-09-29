@@ -53,6 +53,13 @@ static HOST_EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// and found equal — so a gate run can show the check ran, not only that
 /// nothing failed.
 static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
+/// Challenge tables the card built for the argument
+/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): the zerocheck's `eq` weights and the claim
+/// reduce's shift tables and batched columns, each of which the host would
+/// otherwise have built and uploaded.
+static ARGUE_TABLES_ON_CARD: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the host's.
+static ARGUE_TABLE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
@@ -180,6 +187,14 @@ pub fn argue_xchecks() -> u64 {
     ARGUE_XCHECKS.load(Ordering::Relaxed)
 }
 
+pub fn argue_tables_on_card() -> u64 {
+    ARGUE_TABLES_ON_CARD.load(Ordering::Relaxed)
+}
+
+pub fn argue_table_xchecks() -> u64 {
+    ARGUE_TABLE_XCHECKS.load(Ordering::Relaxed)
+}
+
 pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
@@ -283,6 +298,8 @@ pub fn reset_call_counters() {
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
     HOST_EVALUATE_CALLS.store(0, Ordering::Relaxed);
     ARGUE_XCHECKS.store(0, Ordering::Relaxed);
+    ARGUE_TABLES_ON_CARD.store(0, Ordering::Relaxed);
+    ARGUE_TABLE_XCHECKS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -1044,7 +1061,7 @@ where
 #[cfg(feature = "cuda")]
 pub(crate) fn prove_sumcheck_resident<E>(
     resident: &DeviceFactors,
-    extra: &[crate::mle::Mle<E>],
+    extra: &[WeightView<'_, E>],
     program: &crate::program::Program<E>,
     degree: usize,
     challenge: impl FnMut(
@@ -1067,7 +1084,7 @@ where
     if degree == 0 || degree > math_cuda::sumcheck::MAX_NODES {
         return None;
     }
-    if extra.iter().any(|table| table.len() != len) {
+    if extra.iter().any(|weight| weight.cells() != len) {
         return None;
     }
     // A slot past the factor list would be an out-of-bounds device read, which
@@ -1085,17 +1102,31 @@ where
     }
     let lowered = lower(program)?;
 
-    // SAFETY: `E == Ext3` is established above, and its `FieldElement` is a
-    // transparent wrapper over three `u64` limbs — the layout the kernel reads.
-    let raw: Vec<&[u64]> = extra
+    // A table goes up as it is; an `eq` weight goes up as its point, and the
+    // card builds it (`LAMBDA_VM_ARGUE_DEVICE_TABLES`).
+    let mut points = Vec::with_capacity(extra.len());
+    for weight in extra {
+        points.push(match weight {
+            WeightView::Eq(point) => raw_point(point)?,
+            WeightView::Table(_) => Vec::new(),
+        });
+    }
+    let raw: Vec<math_cuda::sumcheck::Extra<'_>> = extra
         .iter()
-        .map(|table| unsafe {
-            core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
+        .zip(&points)
+        .map(|(weight, point)| match weight {
+            // SAFETY: `E == Ext3` is established above, and its `FieldElement`
+            // is a transparent wrapper over three `u64` limbs — the layout the
+            // kernel reads.
+            WeightView::Table(table) => math_cuda::sumcheck::Extra::Table(unsafe {
+                core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
+            }),
+            WeightView::Eq(_) => math_cuda::sumcheck::Extra::Eq(point),
         })
         .collect();
     let mut session = resident
         .0
-        .session(
+        .session_with(
             &raw,
             &lowered.nodes,
             &lowered.consts,
@@ -1103,6 +1134,37 @@ where
             lowered.root_slot,
         )
         .ok()?;
+
+    // The weights the card built, by their slot in the session.
+    let built: Vec<(usize, &[math::field::element::FieldElement<E>])> = extra
+        .iter()
+        .enumerate()
+        .filter_map(|(k, weight)| match weight {
+            WeightView::Eq(point) => Some((resident.0.width() + k, *point)),
+            WeightView::Table(_) => None,
+        })
+        .collect();
+    if let Some(&(slot, _)) = built.first() {
+        note_tables_on_card(built.len());
+        if table_fault() == Some(TableFault::Eq) {
+            session.set_cell(slot, 0, &FAULT_CELL).ok()?;
+        }
+    }
+    // Nothing is absorbed until the first round, so a check that cannot read
+    // the card still declines; one that reads a wrong table fails the proof.
+    if argue_xcheck() {
+        for &(slot, point) in &built {
+            let card = session.factor(slot).ok()?;
+            if let Some(cell) = first_difference(&card, &crate::eq::eq_evals(point)) {
+                eprintln!(
+                    "[argue] XCHECK: the card's eq weight in slot {slot} (2^{num_vars} cells) is not \
+                     the host's at cell {cell}"
+                );
+                return Some(Err(crate::Error::DeviceFailed { stage: "eq weight" }));
+            }
+            note_tables_xchecked(1);
+        }
+    }
 
     // The rounds stop where the cube reaches the crossover: past it a round is
     // one thread walking the whole program, and a core here walks it far
@@ -1139,7 +1201,7 @@ where
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn prove_sumcheck_resident<E>(
     _resident: &DeviceFactors,
-    _extra: &[crate::mle::Mle<E>],
+    _extra: &[WeightView<'_, E>],
     _program: &crate::program::Program<E>,
     _degree: usize,
     _challenge: impl FnMut(
@@ -1147,6 +1209,181 @@ pub(crate) fn prove_sumcheck_resident<E>(
     ) -> math::field::element::FieldElement<E>,
 ) -> Option<Result<ResidentRounds<E>, crate::Error>>
 where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// The claim reduce's sumcheck with its tables built on the card
+/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): `eq(alpha)` once, each offset's shift
+/// table a rotated copy of it, each offset's batched column out of the
+/// epoch's resident columns (`math_cuda::sumcheck::reduce_session`).
+///
+/// The gates are [`prove_sumcheck`]'s over the same `2 · offsets` tables, so the
+/// card takes exactly the reductions it took with the tables uploaded, when
+/// the table's columns are a resident run. The rounds are [`prove_sumcheck`]'s
+/// too, down to the same crossover, and the tables come back folded to it for
+/// the caller to finish.
+///
+/// `None` is a decline before the transcript moved: the caller builds the
+/// tables on the host, as before.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_reduce_resident<F, E>(
+    columns: &[crate::mle::Mle<F>],
+    sources: &[crate::claim_reduce::FactorSource],
+    weights: &[math::field::element::FieldElement<E>],
+    offsets: &[usize],
+    alpha: &[math::field::element::FieldElement<E>],
+    resident: Option<(&ResidentColumns, usize)>,
+    program: &crate::program::Program<E>,
+    challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+) -> Option<Result<SumcheckRounds<E>, crate::Error>>
+where
+    F: math::field::traits::IsField + math::field::traits::IsSubFieldOf<E> + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let (store, first) = resident?;
+    if !store.0.is_run(first, columns.len()) {
+        return None;
+    }
+    let num_vars = alpha.len();
+    if num_vars == 0 || num_vars >= usize::BITS as usize {
+        return None;
+    }
+    let len = 1usize << num_vars;
+    if columns.iter().any(|column| column.len() != len) {
+        return None;
+    }
+    // The reduce's rule is a sum of kernel-times-column pairs: degree two.
+    let degree = 2;
+    let width = 2 * offsets.len();
+    if offsets.is_empty() || !worth_the_device(width, len) {
+        return None;
+    }
+    if program
+        .max_slot()
+        .is_some_and(|slot| slot as usize >= width)
+    {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_SUMCHECK").is_some()) {
+        return None;
+    }
+    let lowered = lower(program)?;
+    let raw_alpha = raw_point(alpha)?;
+    // Per offset, every source reading at it: its column in the table's run
+    // and its batching weight — `claim_reduce::batched_column`'s terms.
+    let mut groups = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        let mut members = Vec::new();
+        let mut member_weights = Vec::new();
+        for (source, weight) in sources.iter().zip(weights) {
+            if source.offset == offset {
+                members.push(source.column as u64);
+                member_weights.extend_from_slice(&ext3_raw(weight)?);
+            }
+        }
+        groups.push((offset, members, member_weights));
+    }
+    let mut session = math_cuda::sumcheck::reduce_session(
+        &store.0,
+        first,
+        columns.len(),
+        &raw_alpha,
+        &groups,
+        &lowered.nodes,
+        &lowered.consts,
+        lowered.num_slots,
+        lowered.root_slot,
+    )
+    .ok()?;
+    note_tables_on_card(width);
+    match table_fault() {
+        Some(TableFault::Eq) => session.set_cell(0, 0, &FAULT_CELL).ok()?,
+        Some(TableFault::Batched) => session.set_cell(1, 0, &FAULT_CELL).ok()?,
+        None => {}
+    }
+    // Nothing is absorbed until the first round, so a check that cannot read
+    // the card still declines; one that reads a wrong table fails the proof.
+    if argue_xcheck() {
+        for (i, &offset) in offsets.iter().enumerate() {
+            let shift = crate::eq::shift_evals(alpha, offset);
+            let batched = match crate::claim_reduce::batched_column(
+                columns, sources, weights, offset, num_vars,
+            ) {
+                Ok(batched) => batched,
+                Err(error) => return Some(Err(error)),
+            };
+            for (slot, host, what) in [
+                (2 * i, &shift[..], "shift table"),
+                (2 * i + 1, batched.evals(), "batched column"),
+            ] {
+                let card = session.factor(slot).ok()?;
+                if let Some(cell) = first_difference(&card, host) {
+                    eprintln!(
+                        "[argue] XCHECK: the card's {what} for offset {offset} (2^{num_vars} cells) \
+                         is not the host's at cell {cell}"
+                    );
+                    return Some(Err(crate::Error::DeviceFailed {
+                        stage: "reduce tables",
+                    }));
+                }
+                note_tables_xchecked(1);
+            }
+        }
+    }
+
+    // The same crossover `prove_sumcheck` stops at for the reduce's
+    // polynomial, whose rule the host walks through the program interpreter.
+    let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
+    let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
+    let (rounds, challenges) = match outcome {
+        Ok(rounds) => rounds,
+        Err(error) => return Some(Err(error)),
+    };
+    let Ok(values) = session.values() else {
+        return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
+    };
+    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
+        .iter()
+        .map(|table| crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect()))
+        .collect();
+    let Ok(folded) = folded else {
+        return Some(Err(crate::Error::DeviceFailed {
+            stage: "folded tables",
+        }));
+    };
+    SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(Ok((rounds, challenges, folded)))
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_reduce_resident<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _sources: &[crate::claim_reduce::FactorSource],
+    _weights: &[math::field::element::FieldElement<E>],
+    _offsets: &[usize],
+    _alpha: &[math::field::element::FieldElement<E>],
+    _resident: Option<(&ResidentColumns, usize)>,
+    _program: &crate::program::Program<E>,
+    _challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+) -> Option<Result<SumcheckRounds<E>, crate::Error>>
+where
+    F: math::field::traits::IsField + math::field::traits::IsSubFieldOf<E> + 'static,
     E: math::field::traits::IsField + 'static,
 {
     None
@@ -1409,6 +1646,143 @@ fn env_not_off(name: &str) -> bool {
 /// A default-on knob's reading of its variable: only `0` turns it off.
 fn not_off(value: Option<&str>) -> bool {
     value != Some("0")
+}
+
+/// Whether the argument's challenge tables are built on the card —
+/// `LAMBDA_VM_ARGUE_DEVICE_TABLES=1` (any non-empty value other than `0`): the
+/// zerocheck's weights `eq(r)` and `eq(row)` from their points, and the claim
+/// reduce's shift tables and batched columns from `alpha` and the resident
+/// columns. Off by default until its A/B; off is today's path.
+///
+/// # Why
+///
+/// Today both are host tables. They are built on the pool, and the ARGUE thread
+/// waits in the join — 3.56 s of it on the head's trace, where the producer's
+/// prep holds the pool at the same time — and then they cross as pageable
+/// uploads, 20 GB a block (`thoughts/zf/gap2/fix2/I-GFS.md` §6). On the card
+/// they are the same values, made from a few kilobytes: the points, the columns
+/// each offset reads, and their weights.
+pub fn argue_device_tables() -> bool {
+    match ARGUE_DEVICE_TABLES_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_DEVICE_TABLES"))
+        }
+    }
+}
+
+static ARGUE_DEVICE_TABLES_FORCED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_DEVICE_TABLES` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_device_tables(on: Option<bool>) {
+    ARGUE_DEVICE_TABLES_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Which table the card built a fault corrupts ([`force_table_fault`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFault {
+    /// The first table built from `eq`: the zerocheck's `eq(r)`, or the claim
+    /// reduce's first shift table.
+    Eq,
+    /// The claim reduce's first batched column.
+    Batched,
+}
+
+/// ⛔ A FAULT: while armed, the first cell of the chosen table the card builds
+/// is overwritten before the rounds read it — what a kernel that wrote one
+/// wrong cell would leave. So the checks on the tables can be shown to fail.
+/// Never armed outside a test.
+static TABLE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What [`TABLE_FAULT`] writes: a value no table here holds in its first cell
+/// but by a coincidence of one in 2^64.
+#[cfg(feature = "cuda")]
+const FAULT_CELL: [u64; 3] = [12345, 0, 0];
+
+#[doc(hidden)]
+pub fn force_table_fault(fault: Option<TableFault>) {
+    TABLE_FAULT.store(
+        match fault {
+            None => 0,
+            Some(TableFault::Eq) => 1,
+            Some(TableFault::Batched) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn table_fault() -> Option<TableFault> {
+    match TABLE_FAULT.load(Ordering::Relaxed) {
+        1 => Some(TableFault::Eq),
+        2 => Some(TableFault::Batched),
+        _ => None,
+    }
+}
+
+/// Called where the card built `tables` of the argument's challenge tables.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_tables_on_card(tables: usize) {
+    ARGUE_TABLES_ON_CARD.fetch_add(tables as u64, Ordering::Relaxed);
+    crate::whir_split::bump_by(&crate::whir_split::TABLES_ON_CARD, tables as u64);
+}
+
+/// Called where `LAMBDA_VM_ARGUE_XCHECK` found `tables` the card built equal to
+/// the host's, cell for cell.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_tables_xchecked(tables: usize) {
+    ARGUE_TABLE_XCHECKS.fetch_add(tables as u64, Ordering::Relaxed);
+    crate::whir_split::bump_by(&crate::whir_split::TABLES_XCHECKED, tables as u64);
+}
+
+/// A batch weight as the device is handed it: a table the host built, or the
+/// point of an `eq` table the card builds (`LAMBDA_VM_ARGUE_DEVICE_TABLES`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WeightView<'a, E: math::field::traits::IsField> {
+    Table(&'a crate::mle::Mle<E>),
+    Eq(&'a [math::field::element::FieldElement<E>]),
+}
+
+impl<E: math::field::traits::IsField + 'static> WeightView<'_, E> {
+    /// Cells the weight spans.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn cells(&self) -> usize {
+        match self {
+            Self::Table(table) => table.len(),
+            Self::Eq(point) => 1usize << point.len(),
+        }
+    }
+}
+
+/// The first cell at which a table the card built is not the host's.
+#[cfg(feature = "cuda")]
+fn first_difference<E>(
+    card: &[u64],
+    host: &[math::field::element::FieldElement<E>],
+) -> Option<usize>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    if card.len() != host.len() * 3 {
+        return Some(card.len().min(host.len() * 3) / 3);
+    }
+    card.chunks_exact(3)
+        .zip(host)
+        .position(|(cell, value)| ext3_from_raw::<E>(cell) != *value)
 }
 
 /// ⛔ A FAULT: while armed, the batched device evaluation hands back its first

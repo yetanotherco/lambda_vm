@@ -357,6 +357,16 @@ pub static COLUMNS_ON_HOST: Counter = Counter::new();
 /// gate run's silence was a comparison rather than an absence of one.
 pub static COLUMNS_XCHECKED: Counter = Counter::new();
 
+/// Challenge tables the card built for the argument
+/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): the zerocheck's `eq` weights and the claim
+/// reduce's shift tables and batched columns — each one the host would have
+/// built on the pool and uploaded. Zero with the knob off: the mechanism line
+/// of that knob's A/B.
+pub static TABLES_ON_CARD: Counter = Counter::new();
+/// Of [`TABLES_ON_CARD`], the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the
+/// host's, cell for cell, and found equal.
+pub static TABLES_XCHECKED: Counter = Counter::new();
+
 /// Everything the chain parked at the group-loop boundary, awaiting the record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChainSlots {
@@ -595,6 +605,12 @@ pub struct ProverSplit {
     pub columns_xchecked: u64,
     pub device_columns: bool,
     pub xcheck: bool,
+    /// Challenge tables the card built, and checked against the host —
+    /// [`TABLES_ON_CARD`], [`TABLES_XCHECKED`] — and the knob they were built
+    /// under.
+    pub tables_on_card: u64,
+    pub tables_xchecked: u64,
+    pub device_tables: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -732,6 +748,26 @@ impl ProverSplit {
             xcheck = on_off(self.xcheck),
         )
     }
+    /// The challenge tables' line, stamped the same way:
+    /// `ARGUE TABLES #k: built on the card N · xchecked X || device tables
+    /// on|off · xcheck on|off`.
+    pub fn tables_line(&self) -> String {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE TABLES {who}{tainted}: built on the card {card} · xchecked {checked} || \
+             device tables {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            card = self.tables_on_card,
+            checked = self.tables_xchecked,
+            knob = on_off(self.device_tables),
+            xcheck = on_off(self.xcheck),
+        )
+    }
 }
 
 static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
@@ -802,6 +838,9 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.columns_xchecked = COLUMNS_XCHECKED.take();
     rec.device_columns = crate::gpu::argue_device_columns();
     rec.xcheck = crate::gpu::argue_xcheck();
+    rec.tables_on_card = TABLES_ON_CARD.take();
+    rec.tables_xchecked = TABLES_XCHECKED.take();
+    rec.device_tables = crate::gpu::argue_device_tables();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -857,6 +896,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     );
     println!("{}", rec.reserved_line());
     println!("{}", rec.columns_line());
+    println!("{}", rec.tables_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1157,13 +1197,17 @@ mod tests {
         bump_by(&COLUMNS_ON_CARD, 5);
         bump_by(&COLUMNS_ON_HOST, 7);
         bump_by(&COLUMNS_XCHECKED, 11);
+        bump_by(&TABLES_ON_CARD, 13);
+        bump_by(&TABLES_XCHECKED, 17);
         assert_eq!(
             (
                 COLUMNS_ON_CARD.take(),
                 COLUMNS_ON_HOST.take(),
-                COLUMNS_XCHECKED.take()
+                COLUMNS_XCHECKED.take(),
+                TABLES_ON_CARD.take(),
+                TABLES_XCHECKED.take()
             ),
-            (0, 0, 0),
+            (0, 0, 0, 0, 0),
             "a disabled bump_by must not move a counter"
         );
         assert_eq!(stage_done(0, "execute", mark()), 0.0);
@@ -1253,6 +1297,34 @@ mod tests {
             global.columns_line(),
             "ARGUE COLUMNS GLOBAL (in base) ⛔OVERLAPPED: on the card 0 · on the host 9 · \
              xchecked 0 || device columns off · xcheck off"
+        );
+    }
+
+    /// The tables line: its count, its checked count and its knob, stamped
+    /// like the split line.
+    #[test]
+    fn the_tables_line_names_its_prove_and_its_knob() {
+        let epoch = ProverSplit {
+            index: 2,
+            tables_on_card: 84,
+            tables_xchecked: 84,
+            device_tables: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.tables_line(),
+            "ARGUE TABLES #2: built on the card 84 · xchecked 84 || device tables on · xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.tables_line(),
+            "ARGUE TABLES GLOBAL (in base) ⛔OVERLAPPED: built on the card 0 · xchecked 0 || \
+             device tables off · xcheck off"
         );
     }
 

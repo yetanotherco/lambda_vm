@@ -39,7 +39,7 @@ use rayon::prelude::*;
 
 use crate::{
     Error,
-    batch::{self, Rule},
+    batch::{self, Rule, Weight},
     claim_reduce::{self, FactorSource, ReduceProof},
     eq::{eq_eval, eq_mle},
     mle::Mle,
@@ -550,6 +550,7 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    let weights = weights.into_iter().map(Weight::Table).collect();
     let (core, reduced_point) =
         prove_core::<F, E, T>(&trace.data, weights, rules, claims, transcript)?;
 
@@ -575,7 +576,7 @@ where
 /// once.
 pub fn prove_core<F, E, T>(
     trace: &TraceData<F, E>,
-    weights: Vec<Mle<E>>,
+    weights: Vec<Weight<E>>,
     rules: Vec<Rule<'_, E>>,
     claims: &[FieldElement<E>],
     transcript: &mut T,
