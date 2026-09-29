@@ -858,6 +858,30 @@ fn the_mds_row_sum_cannot_overflow_a_u128() {
     assert!(bound < u128::MAX);
 }
 
+/// [`mds`] reads a precomputed matrix; this pins it to the definition it
+/// replaces, `out_i = Σ_j MDS_CIRC_ROW[(j − i) mod 12]·s_j` in field arithmetic,
+/// on states that reach the top of the field.
+#[test]
+fn the_mds_is_the_circulant_of_its_first_row() {
+    for seed in 0..64u64 {
+        let state: [Fp; STATE_FELTS] = core::array::from_fn(|j| {
+            let x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (j as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+            if seed % 4 == 0 {
+                fe(P - 1 - j as u64)
+            } else {
+                fe(x)
+            }
+        });
+        let want: [Fp; STATE_FELTS] = core::array::from_fn(|i| {
+            (0..STATE_FELTS).fold(Fp::zero(), |acc, j| {
+                acc + fe(MDS_CIRC_ROW[(j + STATE_FELTS - i) % STATE_FELTS]) * state[j]
+            })
+        });
+        assert_eq!(mds(&state), want, "seed {seed}");
+    }
+}
+
 /// The forward and inverse S-boxes invert each other — the property that
 /// actually matters, checked on values neither chain was tuned for.
 #[test]

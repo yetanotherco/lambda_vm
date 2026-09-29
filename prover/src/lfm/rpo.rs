@@ -113,6 +113,23 @@ pub const HALVES_PER_ROUND: usize = 2;
 /// property Poseidon2 lacked.
 pub const MDS_CIRC_ROW: [u64; HASH_STATE_FELTS] = [7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8];
 
+/// [`MDS_CIRC_ROW`] expanded to the whole circulant at compile time,
+/// `MDS_MATRIX[i][j] = MDS_CIRC_ROW[(j − i) mod 12]`, so [`Rpo256::mds`] reads
+/// every row as constants instead of rotating an index at run time.
+const MDS_MATRIX: [[u64; HASH_STATE_FELTS]; HASH_STATE_FELTS] = {
+    let mut m = [[0; HASH_STATE_FELTS]; HASH_STATE_FELTS];
+    let mut i = 0;
+    while i < HASH_STATE_FELTS {
+        let mut j = 0;
+        while j < HASH_STATE_FELTS {
+            m[i][j] = MDS_CIRC_ROW[(j + HASH_STATE_FELTS - i) % HASH_STATE_FELTS];
+            j += 1;
+        }
+        i += 1;
+    }
+    m
+};
+
 /// Round constants for the FIRST half of each round — added after the first MDS
 /// and before the forward `x^7` layer. See the module header for the two-source
 /// provenance.
@@ -536,24 +553,33 @@ impl Rpo256 {
     /// This matters because the MDS runs FOURTEEN times per permutation and,
     /// once the inverse S-box layer stops dominating, it is the largest
     /// remaining share of the host's commitment cost.
+    ///
+    /// ⚠ **Plain loops over [`MDS_MATRIX`], not a `core::array::from_fn`
+    /// closure.** The closure's `from_fn` wrapper is a generic instance that
+    /// rustc places in a codegen unit of its own choosing, and it is inlined here
+    /// only when that unit happens to be this function's. When it is not, every
+    /// lane becomes an out-of-line call that re-derives `(j − i) mod 12` with a
+    /// 64-bit multiply per term — about a fifth more instructions per RPX
+    /// permutation, decided by unrelated edits elsewhere in the crate. Loops over
+    /// a compile-time matrix compile the same way in every build.
     pub(crate) fn mds(state: &[FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
         /// `2^32 − 1`, and `2^64 ≡ EPSILON (mod p)` for the Goldilocks prime.
         /// Written here rather than imported because the field crate keeps its
         /// own copy private; [`tests::the_epsilon_identity_holds`] re-derives it.
         const EPSILON: u64 = 0xFFFF_FFFF;
 
-        let raw: [u64; HASH_STATE_FELTS] = core::array::from_fn(|j| *state[j].value());
-        core::array::from_fn(|i| {
+        let mut out = [FE::zero(); HASH_STATE_FELTS];
+        for (row, o) in MDS_MATRIX.iter().zip(out.iter_mut()) {
             let mut acc: u128 = 0;
-            for (j, s) in raw.iter().enumerate() {
-                let c = MDS_CIRC_ROW[(j + HASH_STATE_FELTS - i) % HASH_STATE_FELTS];
-                acc += (*s as u128) * (c as u128);
+            for (c, s) in row.iter().zip(state) {
+                acc += (*s.value() as u128) * (*c as u128);
             }
             let lo = acc as u64;
             let hi = (acc >> 64) as u64;
             // hi < 2^9, so hi·EPSILON < 2^41 and neither `from` reduces twice.
-            FE::from(lo) + FE::from(hi * EPSILON)
-        })
+            *o = FE::from(lo) + FE::from(hi * EPSILON);
+        }
+        out
     }
 }
 
@@ -863,6 +889,31 @@ mod tests {
             max_hi * 0xFFFF_FFFF < (1u128 << 64),
             "hi·EPSILON must fit a u64 without its own reduction"
         );
+    }
+
+    /// [`Rpo256::mds`] reads a precomputed matrix; this pins it to the
+    /// definition it replaces, `out_i = Σ_j MDS_CIRC_ROW[(j − i) mod 12]·s_j` in
+    /// field arithmetic, on states that reach the top of the field.
+    #[test]
+    fn the_mds_is_the_circulant_of_its_first_row() {
+        for seed in 0..64u64 {
+            let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|j| {
+                let x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (j as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                if seed % 4 == 0 {
+                    FE::from(u64::MAX - j as u64)
+                } else {
+                    FE::from(x)
+                }
+            });
+            let want: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
+                (0..HASH_STATE_FELTS).fold(FE::zero(), |acc, j| {
+                    acc + FE::from(MDS_CIRC_ROW[(j + HASH_STATE_FELTS - i) % HASH_STATE_FELTS])
+                        * state[j]
+                })
+            });
+            assert_eq!(Rpo256::mds(&state), want, "seed {seed}");
+        }
     }
 
     /// `2^64 ≡ EPSILON (mod p)` — the identity [`Rpo256::mds`]'s single
