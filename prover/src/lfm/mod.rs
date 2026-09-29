@@ -180,6 +180,9 @@ mod one_row_tests;
 mod per_table_aggregator_tests;
 #[cfg(test)]
 mod per_table_census_tests;
+/// The card permit's order moves no proof byte (box tier).
+#[cfg(test)]
+mod permit_order_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
 #[cfg(test)]
