@@ -264,25 +264,51 @@ pub fn inv_sbox(x: &Fp) -> Fp {
 /// using `2^64 ≡ EPSILON (mod p)`: `hi·2^64 + lo ≡ lo + hi·EPSILON`, and with
 /// `hi < 2^9` the correction `hi·EPSILON < 2^41` needs no reduction of its own.
 /// `tests::the_mds_row_sum_cannot_overflow_a_u128` asserts the bound.
+///
+/// ⚠ **Plain loops over [`MDS_MATRIX`], not a `core::array::from_fn` closure.**
+/// The closure's `from_fn` wrapper is a generic instance that rustc places in a
+/// codegen unit of its own choosing, and it is inlined here only when that unit
+/// happens to be this function's. When it is not, every lane becomes an
+/// out-of-line call that re-derives `(j − i) mod 12` with a 64-bit multiply per
+/// term — about a fifth more instructions per permutation, decided by unrelated
+/// edits elsewhere in the crate. Loops over a compile-time matrix compile the
+/// same way in every build.
 pub fn mds(state: &[Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
     /// `2^32 − 1`, and `2^64 ≡ EPSILON (mod p)` for the Goldilocks prime.
     /// Written here rather than imported because the field crate keeps its own
     /// copy private; `tests::the_epsilon_identity_holds` re-derives it.
     const EPSILON: u64 = 0xFFFF_FFFF;
 
-    let raw: [u64; STATE_FELTS] = core::array::from_fn(|j| *state[j].value());
-    core::array::from_fn(|i| {
+    let mut out = [Fp::zero(); STATE_FELTS];
+    for (row, o) in MDS_MATRIX.iter().zip(out.iter_mut()) {
         let mut acc: u128 = 0;
-        for (j, s) in raw.iter().enumerate() {
-            let c = MDS_CIRC_ROW[(j + STATE_FELTS - i) % STATE_FELTS];
-            acc += (*s as u128) * (c as u128);
+        for (c, s) in row.iter().zip(state) {
+            acc += (*s.value() as u128) * (*c as u128);
         }
         let lo = acc as u64;
         let hi = (acc >> 64) as u64;
         // hi < 2^9, so hi·EPSILON < 2^41 and neither `from` reduces twice.
-        Fp::from(lo) + Fp::from(hi * EPSILON)
-    })
+        *o = Fp::from(lo) + Fp::from(hi * EPSILON);
+    }
+    out
 }
+
+/// [`MDS_CIRC_ROW`] expanded to the whole circulant at compile time,
+/// `MDS_MATRIX[i][j] = MDS_CIRC_ROW[(j − i) mod 12]`, so [`mds`] reads every row
+/// as constants instead of rotating an index at run time.
+const MDS_MATRIX: [[u64; STATE_FELTS]; STATE_FELTS] = {
+    let mut m = [[0; STATE_FELTS]; STATE_FELTS];
+    let mut i = 0;
+    while i < STATE_FELTS {
+        let mut j = 0;
+        while j < STATE_FELTS {
+            m[i][j] = MDS_CIRC_ROW[(j + STATE_FELTS - i) % STATE_FELTS];
+            j += 1;
+        }
+        i += 1;
+    }
+    m
+};
 
 /// ★ The RPX permutation: `FB E FB E FB E M`.
 pub fn permute(state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
