@@ -26,6 +26,18 @@ fn blowup(b: u8) -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(b).expect("valid blowup")
 }
 
+/// The inner epoch's options: `FVM_EPOCH_PRESET` = `blowup2` | `blowup4` |
+/// `blowup8` picks a production preset; unset is the min-preset fixture.
+fn inner_options() -> ProofOptions {
+    use crate::recursion::Preset;
+    match std::env::var("FVM_EPOCH_PRESET").as_deref() {
+        Ok("blowup2") => Preset::Blowup2.options(),
+        Ok("blowup4") => Preset::Blowup4.options(),
+        Ok("blowup8") => Preset::Blowup8.options(),
+        _ => super::proof_fixture::fixture_options(),
+    }
+}
+
 fn census<PI>(proof: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> (usize, usize) {
     proof.proofs.iter().fold((0, 0), |(r, c), p| {
         (
@@ -54,7 +66,7 @@ fn stats(mut v: Vec<f64>) -> String {
 fn epoch_field_vm_vs_lfm() {
     let t = Instant::now();
     let e = super::epoch_tests::real_epoch_from(
-        super::proof_fixture::fixture_options(),
+        inner_options(),
         super::epoch_tests::EpochInputs::fixture(),
     );
     let program = super::epoch_tests::epoch_program(&e, true);
@@ -169,7 +181,7 @@ fn epoch_op_profile() {
     use super::instr::{BaseOp, ExtOp, Instr};
     use std::collections::{BTreeMap, HashMap};
     let e = super::epoch_tests::real_epoch_from(
-        super::proof_fixture::fixture_options(),
+        inner_options(),
         super::epoch_tests::EpochInputs::fixture(),
     );
     let program = super::epoch_tests::epoch_program(&e, true);
@@ -252,7 +264,7 @@ fn epoch_op_profile() {
 #[ignore]
 fn epoch_translation_shapes() {
     let e = super::epoch_tests::real_epoch_from(
-        super::proof_fixture::fixture_options(),
+        inner_options(),
         super::epoch_tests::EpochInputs::fixture(),
     );
     let program = super::epoch_tests::epoch_program(&e, true);
