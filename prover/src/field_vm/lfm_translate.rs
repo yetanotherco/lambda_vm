@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use super::asm::Asm;
-use super::isa::{Arg, Program, gpr};
+use super::isa::{Arg, Program, REG_ZERO, gpr};
 use crate::lfm::compiler::LfmProgram;
 use crate::lfm::executor::LfmExecution;
 use crate::lfm::instr::{Addr, BaseOp, ExtOp, Instr};
@@ -174,11 +174,43 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
     asm.halt();
     public.sort_unstable();
     public.dedup();
+    let mut program = asm.finish().expect("translated program");
+    if std::env::var_os("FVM_MEM_COMPACT").is_some() {
+        (mem, public) = compact(&mut program, &mem, &public);
+    }
     Translation {
-        program: asm.finish().expect("translated program"),
+        program,
         mem,
         public,
         lfm_counts,
         skipped,
     }
+}
+
+/// Keeps only the cells the program reads or publishes, renumbered densely in
+/// first-use order. Every memory argument of a translation is an absolute
+/// address, so renumbering is rewriting offsets.
+fn compact(program: &mut Program, mem: &[FEE], public: &[u64]) -> (Vec<FEE>, Vec<u64>) {
+    let mut remap: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut dense = Vec::new();
+    let mut slot = |old: u64, dense: &mut Vec<FEE>| {
+        *remap.entry(old).or_insert_with(|| {
+            dense.push(mem[old as usize]);
+            dense.len() as u64 - 1
+        })
+    };
+    for instr in program.instrs.iter_mut() {
+        for arg in [&mut instr.d, &mut instr.a, &mut instr.b, &mut instr.c] {
+            if arg.mem {
+                assert!(
+                    arg.reg == REG_ZERO && arg.scale == FE::zero(),
+                    "translations address memory absolutely"
+                );
+                arg.offset = FE::from(slot(arg.offset.canonical(), &mut dense));
+            }
+        }
+    }
+    let mut public: Vec<u64> = public.iter().map(|&a| slot(a, &mut dense)).collect();
+    public.sort_unstable();
+    (dense, public)
 }
