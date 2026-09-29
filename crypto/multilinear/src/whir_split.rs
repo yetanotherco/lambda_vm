@@ -424,6 +424,12 @@ pub static GKR_LAYERS: Counter = Counter::new();
 pub static GKR_REBUILDS: Counter = Counter::new();
 /// Rounds the host finished after them.
 pub static GKR_TAIL_ROUNDS: Counter = Counter::new();
+/// Of [`GKR_LAYERS`], the ones whose host tail ran lean
+/// (`LAMBDA_VM_ARGUE_LEAN_TAIL`) — the mechanism line of that knob.
+pub static TAILS_LEAN: Counter = Counter::new();
+/// Of [`TAILS_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
+/// against the generic rounds and found equal.
+pub static TAILS_XCHECKED: Counter = Counter::new();
 
 /// A prove's device GKR layers, split: seconds per region, in the order a
 /// layer runs them, and the counts they are over.
@@ -802,6 +808,12 @@ pub struct ProverSplit {
     pub lean_reads: bool,
     /// The device GKR layers, split — [`GkrSplit`].
     pub gkr: GkrSplit,
+    /// Device GKR layers whose host tail ran lean, and checked against the
+    /// generic rounds — [`TAILS_LEAN`], [`TAILS_XCHECKED`] — and the knob they
+    /// ran under.
+    pub tails_lean: u64,
+    pub tails_xchecked: u64,
+    pub lean_tail: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -977,6 +989,27 @@ impl ProverSplit {
             knob = if self.lean_reads { "on" } else { "off" },
         )
     }
+    /// The host tails' line, stamped as the split line is:
+    /// `ARGUE TAIL #k: lean L of device layers D · xchecked X || lean tail
+    /// on|off · xcheck on|off`.
+    pub fn tail_line(&self) -> String {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE TAIL {who}{tainted}: lean {lean} of device layers {layers} · xchecked {checked} \
+             || lean tail {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            lean = self.tails_lean,
+            layers = self.gkr.layers,
+            checked = self.tails_xchecked,
+            knob = on_off(self.lean_tail),
+            xcheck = on_off(self.xcheck),
+        )
+    }
     /// The GKR line, milliseconds, stamped as the split line is:
     /// `ARGUE GKR #k: layers on the card N (rebuilt R) · host tail rounds T ||
     /// between layers B ms, M µs a layer: lambda · program · lower · session ·
@@ -1095,6 +1128,9 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.reads_per_factor = READS_PER_FACTOR.take();
     rec.lean_reads = crate::gpu::argue_lean_reads();
     rec.gkr = GkrSplit::take();
+    rec.tails_lean = TAILS_LEAN.take();
+    rec.tails_xchecked = TAILS_XCHECKED.take();
+    rec.lean_tail = crate::gpu::argue_lean_tail();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -1153,6 +1189,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.tables_line());
     println!("{}", rec.reads_line());
     println!("{}", rec.gkr_line());
+    println!("{}", rec.tail_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1460,6 +1497,8 @@ mod tests {
         bump(&GKR_LAYERS);
         bump(&GKR_REBUILDS);
         bump_by(&GKR_TAIL_ROUNDS, 9);
+        bump(&TAILS_LEAN);
+        bump(&TAILS_XCHECKED);
         assert_eq!(
             (
                 COLUMNS_ON_CARD.take(),
@@ -1471,9 +1510,11 @@ mod tests {
                 READS_PER_FACTOR.take(),
                 GKR_LAYERS.take(),
                 GKR_REBUILDS.take(),
-                GKR_TAIL_ROUNDS.take()
+                GKR_TAIL_ROUNDS.take(),
+                TAILS_LEAN.take(),
+                TAILS_XCHECKED.take()
             ),
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
             "a disabled bump_by must not move a counter"
         );
         // The GKR regions' one-read clock is inert the same way.
@@ -1674,6 +1715,39 @@ mod tests {
              rounds 0 || between layers 0.00 ms, 0.0 µs a layer: lambda 0.00 · program 0.00 · \
              lower 0.00 · session 0.00 · factors 0.00 · tail 0.00 (transcript 0.00) · close 0.00 \
              || rebuild 0.00 · rounds 0.00 · values 0.00 (ms)"
+        );
+    }
+
+    /// The tails line: the lean count against the record's device layers, and
+    /// both knobs it was taken under, stamped like the split line.
+    #[test]
+    fn the_tail_line_names_its_prove_and_its_knobs() {
+        let epoch = ProverSplit {
+            index: 6,
+            gkr: GkrSplit {
+                layers: 240,
+                ..Default::default()
+            },
+            tails_lean: 240,
+            tails_xchecked: 240,
+            lean_tail: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.tail_line(),
+            "ARGUE TAIL #6: lean 240 of device layers 240 · xchecked 240 || lean tail on · \
+             xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.tail_line(),
+            "ARGUE TAIL GLOBAL (in base) ⛔OVERLAPPED: lean 0 of device layers 0 · xchecked 0 || \
+             lean tail off · xcheck off"
         );
     }
 
