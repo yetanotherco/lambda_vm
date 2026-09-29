@@ -50,7 +50,7 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         mem.push(v);
         mem.len() as u64 - 1
     };
-    let (acc_lo, acc_hi, tmp) = (gpr(0), gpr(1), gpr(2));
+    let (acc, tmp) = (gpr(0), gpr(1));
     let mut asm = Asm::new();
     let mut public = Vec::new();
     let mut lfm_counts = BTreeMap::new();
@@ -129,36 +129,36 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
                     continue;
                 }
                 let x = mem[input.0 as usize].value()[0].canonical();
-                asm.mov(Arg::reg(acc_lo), Arg::imm(0))
-                    .mov(Arg::reg(acc_hi), Arg::imm(0));
-                for i in 0..64 {
-                    let b = match bits.get(i) {
-                        Some((a, _)) => a.0,
-                        None => scratch(&mut mem, FEE::from((x >> i) & 1)),
-                    };
-                    let (acc, shift) = if i < 32 {
-                        (acc_lo, i)
-                    } else {
-                        (acc_hi, i - 32)
-                    };
-                    asm.fma(
-                        Arg::mem_abs(b),
-                        Arg::mem_abs(b),
-                        Arg::mem_abs(b),
-                        Arg::imm(0),
-                    )
-                    .fma_out(
-                        Arg::reg(acc),
-                        Arg::imm_fe(FE::from(1u64 << shift)),
-                        Arg::mem_abs(b),
-                        Arg::reg(acc),
-                    );
+                let lo_cell = scratch(&mut mem, FEE::from(x & 0xFFFF_FFFF));
+                for half in 0..2 {
+                    asm.mov(Arg::reg(acc), Arg::imm(0));
+                    for i in 32 * half..32 * (half + 1) {
+                        let b = match bits.get(i) {
+                            Some((a, _)) => a.0,
+                            None => scratch(&mut mem, FEE::from((x >> i) & 1)),
+                        };
+                        asm.fma(
+                            Arg::mem_abs(b),
+                            Arg::mem_abs(b),
+                            Arg::mem_abs(b),
+                            Arg::imm(0),
+                        )
+                        .fma_out(
+                            Arg::reg(acc),
+                            Arg::imm_fe(FE::from(1u64 << (i - 32 * half))),
+                            Arg::mem_abs(b),
+                            Arg::reg(acc),
+                        );
+                    }
+                    if half == 0 {
+                        asm.store(Arg::mem_abs(lo_cell), Arg::reg(acc));
+                    }
                 }
                 asm.fma(
                     cell(input),
                     Arg::imm_fe(FE::from(1u64 << 32)),
-                    Arg::reg(acc_hi),
-                    Arg::reg(acc_lo),
+                    Arg::reg(acc),
+                    Arg::mem_abs(lo_cell),
                 );
                 // The halves are byte-swapped `u32`s for the transcript: byte
                 // glue, which the 3MI split leaves to the RISC-V half.

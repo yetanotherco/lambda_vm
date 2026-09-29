@@ -16,12 +16,11 @@ pub const D: usize = 5;
 #[cfg(feature = "fvm-d3")]
 pub const D: usize = 3;
 /// Number of split polynomials after the first.
-#[cfg(not(feature = "fvm-d3"))]
-pub const T: usize = 1;
-#[cfg(feature = "fvm-d3")]
-pub const T: usize = 5;
+/// The fewest splits that fit the Lagrange basis on `NUM_REGS` points:
+/// `NUM_REGS ≤ (T + 1)(D − 2) + 1`.
+pub const T: usize = (NUM_REGS - 1).div_ceil(D - 2) - 1;
 
-const _: () = assert!(D >= 3 && T >= 1);
+const _: () = assert!(D >= 3);
 const _: () = assert!(
     NUM_REGS <= (D - 1) + T * (D - 2),
     "too many registers for (D, T)"
@@ -44,16 +43,23 @@ pub type Split = [[FE; D]; T + 1];
 fn split(coeffs: &[FE]) -> Split {
     let mut out = [[FE::zero(); D]; T + 1];
     for (e, c) in coeffs.iter().enumerate() {
-        let (k, l) = if e <= D - 2 {
+        // The range polynomial's one extra coefficient goes on top of the
+        // last split polynomial.
+        let extra = if T == 0 {
+            D - 1
+        } else {
+            split_exponent(T) + (D - 2)
+        };
+        let (k, l) = if e == extra {
+            (T, if T == 0 { D - 1 } else { D - 2 })
+        } else if e <= D - 2 {
             (0, e)
-        } else if e == split_exponent(T) + (D - 2) {
-            (T, D - 2)
         } else {
             let r = e - (D - 1);
             (1 + r / (D - 2), r % (D - 2))
         };
         assert!(
-            k <= T,
+            k < out.len(),
             "polynomial of degree {} does not fit the split",
             coeffs.len() - 1
         );
@@ -155,11 +161,14 @@ mod tests {
                 assert!(split[D - 2] == FE::zero() && split[D - 1] == FE::zero());
             }
         }
-        assert!(t.range[0][D - 1] == FE::zero());
-        for split in &t.range[1..T] {
-            assert!(split[D - 2] == FE::zero() && split[D - 1] == FE::zero());
+        // With t = 0 the range polynomial's extra coefficient is x^{D-1}.
+        if T != 0 {
+            assert!(t.range[0][D - 1] == FE::zero());
+            for split in t.range.iter().take(T).skip(1) {
+                assert!(split[D - 2] == FE::zero() && split[D - 1] == FE::zero());
+            }
+            assert!(t.range[T][D - 1] == FE::zero());
         }
-        assert!(t.range[T][D - 1] == FE::zero());
     }
 
     #[test]

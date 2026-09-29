@@ -378,7 +378,7 @@ impl ConstraintSet<F, E> for FieldVmConstraints {
         for i in 0..4 {
             let x = b.main(0, cols::ARG_REG + i);
             let mut prev: Option<B::Expr> = None;
-            for k in 1..=T {
+            for k in (1..).take(T) {
                 let step = if k == 1 { D - 1 } else { D - 2 };
                 let mut p = prev.clone().unwrap_or_else(|| b.one());
                 for _ in 0..step {

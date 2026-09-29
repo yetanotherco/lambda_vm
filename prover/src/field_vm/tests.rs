@@ -1,4 +1,5 @@
 use super::asm::{Asm, AsmError};
+#[cfg_attr(feature = "fvm-narrow", allow(unused_imports))]
 use super::executor::{ExecError, Execution, HintKind, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, HALT_PC, Instr, N, Program, REG_PC, REG_ZERO, gpr};
 use crate::tables::types::{FE, FEE};
@@ -56,6 +57,7 @@ fn straight_line_fma_matches_native() {
     assert_bookkeeping(&program, &exec);
 }
 
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 fn loop_computes_power() {
     let (acc, cnt, x) = (gpr(0), gpr(1), gpr(2));
@@ -96,6 +98,7 @@ fn jump_zero_takes_and_skips() {
     }
 }
 
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 fn horner_over_indexed_memory() {
     let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
@@ -154,6 +157,7 @@ fn inv_of_zero_is_unresolved() {
 }
 
 /// Recursive factorial through `CALL`/`RET`, with fresh frames from the oracle.
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 fn call_ret_recursive_factorial() {
     let (fp, n, t, res) = (gpr(0), gpr(1), gpr(2), gpr(3));

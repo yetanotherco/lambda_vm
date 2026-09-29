@@ -57,29 +57,37 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn fvm_loop(len: usize) -> Program {
-    let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
+    let (acc, i) = (gpr(0), gpr(1));
     let mut asm = Asm::new();
-    asm.mov(Arg::reg(x), Arg::mem_abs(0))
-        .mov(Arg::reg(acc), Arg::imm(0))
+    asm.mov(Arg::reg(acc), Arg::imm(0))
         .mov(Arg::reg(i), Arg::imm(len as i64));
     let top = asm.label();
     asm.bind(top);
-    asm.fma_out(Arg::reg(acc), Arg::reg(acc), Arg::reg(x), Arg::mem(i, 0))
-        .sub(Arg::reg(i), Arg::reg(i), Arg::imm(1))
-        .jump_not_zero(top)
-        .store(Arg::mem_abs(len as u64 + 1), Arg::reg(acc))
-        .halt();
+    asm.fma_out(
+        Arg::reg(acc),
+        Arg::reg(acc),
+        Arg::mem_abs(0),
+        Arg::mem(i, 0),
+    )
+    .sub(Arg::reg(i), Arg::reg(i), Arg::imm(1))
+    .jump_not_zero(top)
+    .store(Arg::mem_abs(len as u64 + 1), Arg::reg(acc))
+    .halt();
     asm.finish().unwrap()
 }
 
 /// Straight-line, one row per coefficient, like the LFM's `horner_ext`.
 fn fvm_unrolled(len: usize) -> Program {
-    let (acc, x) = (gpr(0), gpr(2));
+    let acc = gpr(0);
     let mut asm = Asm::new();
-    asm.mov(Arg::reg(x), Arg::mem_abs(0))
-        .mov(Arg::reg(acc), Arg::mem_abs(len as u64));
+    asm.mov(Arg::reg(acc), Arg::mem_abs(len as u64));
     for k in (1..len as u64).rev() {
-        asm.fma_out(Arg::reg(acc), Arg::reg(acc), Arg::reg(x), Arg::mem_abs(k));
+        asm.fma_out(
+            Arg::reg(acc),
+            Arg::reg(acc),
+            Arg::mem_abs(0),
+            Arg::mem_abs(k),
+        );
     }
     asm.store(Arg::mem_abs(len as u64 + 1), Arg::reg(acc))
         .halt();

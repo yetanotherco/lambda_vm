@@ -1,5 +1,6 @@
 use super::air::cols;
 use super::asm::Asm;
+#[cfg_attr(feature = "fvm-narrow", allow(unused_imports))]
 use super::executor::{Execution, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, Program, gpr};
 use super::mem::cols as mem_cols;
@@ -14,14 +15,13 @@ fn fee(a: u64, b: u64, c: u64) -> FEE {
 }
 
 fn power_program(n: i64) -> Program {
-    let (acc, cnt, x) = (gpr(0), gpr(1), gpr(2));
+    let (acc, cnt) = (gpr(0), gpr(1));
     let mut asm = Asm::new();
     asm.mov(Arg::reg(acc), Arg::imm(1))
-        .mov(Arg::reg(x), Arg::mem_abs(0))
         .mov(Arg::reg(cnt), Arg::imm(n));
     let top = asm.label();
     asm.bind(top);
-    asm.mul(Arg::reg(acc), Arg::reg(acc), Arg::reg(x))
+    asm.mul(Arg::reg(acc), Arg::reg(acc), Arg::mem_abs(0))
         .sub(Arg::reg(cnt), Arg::reg(cnt), Arg::imm(1))
         .jump_not_zero(top)
         .store(Arg::mem_abs(1), Arg::reg(acc))
@@ -72,6 +72,7 @@ fn inv_and_straight_line_prove_and_verify() {
     assert!(prove_and_verify(&program, &exec, &[0, 1]));
 }
 
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 fn recursive_calls_prove_and_verify() {
     let (fp, n, t, res) = (gpr(0), gpr(1), gpr(2), gpr(3));
@@ -159,6 +160,7 @@ fn untampered_traces_verify() {
     assert!(verifies_after(&program, &exec, |_| {}));
 }
 
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 fn register_changed_without_a_hint_is_rejected() {
     let (program, exec) = power_exec();
@@ -336,6 +338,7 @@ fn non_bit_public_flag_is_rejected() {
     }));
 }
 
+#[cfg(not(feature = "fvm-narrow"))]
 fn horner_program(len: usize) -> Program {
     let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
     let mut asm = Asm::new();
@@ -354,6 +357,7 @@ fn horner_program(len: usize) -> Program {
 
 /// Sizes and timings of a Horner evaluation (3 rows per coefficient).
 /// `cargo test --release -p lambda-vm-prover --lib field_vm::prove_tests::report_horner -- --ignored --nocapture`
+#[cfg(not(feature = "fvm-narrow"))]
 #[test]
 #[ignore]
 fn report_horner() {
