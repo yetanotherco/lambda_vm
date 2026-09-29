@@ -18,6 +18,7 @@ use crate::{
     poly::SumcheckPolynomial,
     program::{Builder, Program},
     sumcheck::{self, SumcheckProof},
+    whir_split,
 };
 
 /// One level of the tree: numerators and denominators over the same cube.
@@ -405,7 +406,14 @@ where
     let prefix = tree.host_prefix();
 
     for i in 0..tree.num_layers() - 1 {
+        // A layer the device runs, whose host work the instrument splits
+        // (`whir_split`, under `LAMBDA_VM_BASE_SPLIT` only).
+        let on_card = prefix.get(i + 1).is_none() && tree.device().is_some();
+        let clock = || if on_card { whir_split::tick() } else { None };
+
+        let t = clock();
         let lambda: FieldElement<F> = transcript.sample_field_element();
+        whir_split::add_tick(&whir_split::GKR_LAMBDA, t);
 
         // What the device ran of this layer, and the relation it left behind.
         // A tree the device holds proves its layer where it lies — the halves
@@ -419,7 +427,9 @@ where
             ),
             None => match tree.device() {
                 Some(device) => {
+                    let t = clock();
                     let program = LayerRelation::program_for(&lambda)?;
+                    whir_split::add_tick(&whir_split::GKR_PROGRAM, t);
                     let attempt = device.prove_layer(
                         i + 1,
                         &point,
@@ -452,7 +462,19 @@ where
         // The tail, however much of it is left: all of it for a level that came
         // here whole, none for one the device ran out.
         let left = relation.num_vars();
-        let (tail, tail_z) = sumcheck::prove_rounds(&mut relation, left, transcript)?;
+        let t = clock();
+        let (tail, tail_z) = if t.is_some() {
+            // The same calls on the same transcript, with its share timed.
+            let mut timed =
+                whir_split::Timed::new(&mut *transcript, &whir_split::GKR_TAIL_TRANSCRIPT);
+            sumcheck::prove_rounds(&mut relation, left, &mut timed)?
+        } else {
+            sumcheck::prove_rounds(&mut relation, left, transcript)?
+        };
+        whir_split::add_tick(&whir_split::GKR_TAIL, t);
+        if on_card {
+            whir_split::bump_by(&whir_split::GKR_TAIL_ROUNDS, left as u64);
+        }
         rounds.extend(tail);
         z.extend(tail_z);
         let sumcheck = SumcheckProof { rounds };
@@ -462,6 +484,7 @@ where
         // to `z` is the evaluation at `z`. Evaluating the halves again would be
         // a second pass over the layer, and the layers are the biggest thing
         // the fraction tree holds.
+        let t = clock();
         let bound = |slot: usize| -> Result<FieldElement<F>, Error> {
             relation.polys()[slot]
                 .as_constant()
@@ -490,6 +513,7 @@ where
             q_lo,
             q_hi,
         });
+        whir_split::add_tick(&whir_split::GKR_CLOSE, t);
     }
 
     Ok(GkrOutput {

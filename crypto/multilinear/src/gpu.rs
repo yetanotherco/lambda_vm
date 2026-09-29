@@ -2300,13 +2300,19 @@ impl DeviceTree {
     where
         E: math::field::traits::IsField + 'static,
     {
+        use crate::whir_split::{self, add_tick, tick};
+
+        let t = tick();
         let lowered = lower(program)?;
         let mut raw_point = Vec::with_capacity(point.len() * 3);
         for coordinate in point {
             raw_point.extend_from_slice(&ext3_raw(coordinate)?);
         }
+        add_tick(&whir_split::GKR_LOWER, t);
         let input_layer = layer + 1 == self.num_layers;
-        let session = if input_layer && self.rebuild.is_some() {
+        let rebuilds = input_layer && self.rebuild.is_some();
+        let t = tick();
+        let session = if rebuilds {
             // The one the tree gave back. Everything above it has been proved,
             // so the levels go first and the layer is written where they were.
             let num_vars = self.input_num_vars.checked_sub(1)?;
@@ -2337,6 +2343,12 @@ impl DeviceTree {
                 lowered.root_slot,
             )
         };
+        if rebuilds {
+            add_tick(&whir_split::GKR_REBUILD, t);
+            whir_split::bump(&whir_split::GKR_REBUILDS);
+        } else {
+            add_tick(&whir_split::GKR_SESSION, t);
+        }
         let num_vars = if input_layer {
             self.input_num_vars.checked_sub(1)?
         } else {
@@ -2356,18 +2368,23 @@ impl DeviceTree {
 
         // Past here the transcript moves: the host path is no longer an option.
         let failed = |stage| crate::Error::DeviceFailed { stage };
+        let t = tick();
         let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
+        add_tick(&whir_split::GKR_ROUNDS, t);
         let (rounds, challenges) = match outcome {
             Ok(rounds) => rounds,
             Err(error) => return Some(Err(error)),
         };
+        let t = tick();
         let Ok(values) = session_values(&session) else {
             return Some(Err(failed("layer values")));
         };
+        add_tick(&whir_split::GKR_VALUES, t);
         // Factor 0 is the weight; the four the layer reduces to follow.
         if values.len() != 5 {
             return Some(Err(failed("layer factors")));
         }
+        let t = tick();
         let factors: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
             .iter()
             .map(|factor| {
@@ -2377,6 +2394,8 @@ impl DeviceTree {
         let Ok(factors) = factors else {
             return Some(Err(failed("layer factors")));
         };
+        add_tick(&whir_split::GKR_FACTORS, t);
+        whir_split::bump(&whir_split::GKR_LAYERS);
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Ok((rounds, challenges, factors)))
     }
