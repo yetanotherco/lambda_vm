@@ -246,3 +246,78 @@ fn lying_last_row_is_rejected() {
     proof.proofs[0].public_inputs.last_row -= 1;
     assert!(!verify(&program_id(&program, &options), &proof, &options));
 }
+
+fn horner_program(len: usize) -> Program {
+    let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
+    let mut asm = Asm::new();
+    asm.mov(Arg::reg(x), Arg::mem_abs(0))
+        .mov(Arg::reg(acc), Arg::imm(0))
+        .mov(Arg::reg(i), Arg::imm(len as i64));
+    let top = asm.label();
+    asm.bind(top);
+    asm.fma_out(Arg::reg(acc), Arg::reg(acc), Arg::reg(x), Arg::mem(i, 0))
+        .sub(Arg::reg(i), Arg::reg(i), Arg::imm(1))
+        .jump_not_zero(top)
+        .store(Arg::mem_abs(len as u64 + 1), Arg::reg(acc))
+        .halt();
+    asm.finish().unwrap()
+}
+
+/// Sizes and timings of a Horner evaluation (3 rows per coefficient).
+/// `cargo test --release -p lambda-vm-prover --lib field_vm::prove_tests::report_horner -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn report_horner() {
+    use std::time::Instant;
+    let options = default_options();
+    for len in [1usize << 10, 1 << 14, 1 << 16] {
+        let program = horner_program(len);
+        let init: Vec<FEE> = (0..=len as u64)
+            .map(|k| fee(k + 3, 2 * k + 1, k * k + 7))
+            .collect();
+        let exec = execute(
+            &program,
+            Memory::with_init(len + 2, &init),
+            &mut NoHints,
+            1 << 22,
+        )
+        .unwrap();
+        let id = program_id(&program, &options);
+        let traces = generate_traces(&program, &exec);
+        let rows = [
+            traces.fvm.num_rows(),
+            traces.decode.num_rows(),
+            traces.mem.num_rows(),
+        ];
+        // Main width + 3 base columns per LogUp aux column (⌈interactions / 2⌉).
+        let widths = [
+            cols::NUM_COLUMNS + 3 * 3,
+            super::decode::NUM_COLUMNS + 3,
+            mem_cols::NUM_COLUMNS + 3,
+        ];
+        let cells: usize = rows.iter().zip(widths).map(|(r, w)| r * w).sum();
+        let mut prove_ms = Vec::new();
+        let mut verify_ms = Vec::new();
+        let mut size = 0;
+        for _ in 0..5 {
+            let mut t = generate_traces(&program, &exec);
+            let start = Instant::now();
+            let proof = prove_traces(&id, &mut t, &options).unwrap();
+            prove_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            let start = Instant::now();
+            assert!(verify(&id, &proof, &options));
+            verify_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            size = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap().len();
+        }
+        prove_ms.sort_by(f64::total_cmp);
+        verify_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "len={len} steps={} rows(fvm,dec,mem)={rows:?} cells={cells} prove_ms(min/med/max)={:.1}/{:.1}/{:.1} verify_ms(med)={:.1} proof_bytes={size}",
+            exec.steps.len(),
+            prove_ms[0],
+            prove_ms[2],
+            prove_ms[4],
+            verify_ms[2]
+        );
+    }
+}
