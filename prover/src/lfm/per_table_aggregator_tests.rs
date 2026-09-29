@@ -10660,11 +10660,21 @@ fn whir_fixture_tree<C: TreeChild>() {
         no_overlapped_global.is_none(),
         "the overlap is off on this arm, so level 0 must not have produced a global child"
     );
-    assert_eq!(
-        children.len(),
-        bundle.num_epochs(),
-        "one level-0 wrap per epoch"
-    );
+    // One wrap per epoch; under a wide level 1, one node per `fan_in` epochs —
+    // level 1's own count, since the level-0 stage produced level 1's output.
+    if wide {
+        assert_eq!(
+            children.len(),
+            shape[0].arities.len(),
+            "one wide level-1 node per {fan_in} epochs"
+        );
+    } else {
+        assert_eq!(
+            children.len(),
+            bundle.num_epochs(),
+            "one level-0 wrap per epoch"
+        );
+    }
 
     // ---- the GLOBAL stage, where the production driver runs it: between level
     // 0 and level 1. ⛔ A REFUSAL, NEVER A `return` — see the stage's own doc.
@@ -10772,13 +10782,21 @@ fn whir_fixture_tree<C: TreeChild>() {
         "the root's last child must end at the last epoch"
     );
     // ⓘ Only levels 1..=`child_level` ran, so the report is short of
-    // `tree_node_count` by exactly the levels the root replaces.
+    // `tree_node_count` by exactly the levels the root replaces. Under a wide
+    // level 1 the level-0 stage proved level 1, so the interior's report
+    // covers levels 2..=`child_level` only.
     let interior_nodes: usize = shape[..child_level].iter().map(|l| l.arities.len()).sum();
+    let first_interior = usize::from(wide).min(child_level);
+    let reported: usize = shape[first_interior..child_level]
+        .iter()
+        .map(|l| l.arities.len())
+        .sum();
     assert_eq!(
         interior.report.len(),
-        interior_nodes,
-        "one report row per interior node PROVED — levels 1..={child_level} of \
+        reported,
+        "one report row per interior node PROVED — levels {}..={child_level} of \
          {top}, since option {} replaces the rest",
+        first_interior + 1,
         option.describe(),
     );
     assert!(
