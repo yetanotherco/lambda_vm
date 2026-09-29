@@ -313,4 +313,16 @@ fn epoch_translation_shapes() {
         }
     }
     eprintln!("row classes: plain+base={p_base} plain+ext={p_ext} registers/hints={other}");
+    // How many arguments of each row read memory, and which positions.
+    let mut by_count = [0usize; 5];
+    let mut by_pos = [0usize; 4];
+    for step in &run.steps {
+        let instr = &tr.program.instrs[step.state.pc as usize];
+        let args = instr.args();
+        by_count[args.iter().filter(|a| a.mem).count()] += 1;
+        for (i, a) in args.iter().enumerate() {
+            by_pos[i] += a.mem as usize;
+        }
+    }
+    eprintln!("memory args per row: {by_count:?}; per position d,a,b,c: {by_pos:?}");
 }
