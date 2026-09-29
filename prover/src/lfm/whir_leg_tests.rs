@@ -616,12 +616,20 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
         rows_b.push((*label, cost.perms, cost.operations(), cost.hints));
     }
     // ★ The policy-B pins, same format.
+    //
+    // Re-blessed under P2 (the chains grind before their queries only, with
+    // one spent nonce a round): each chain round drops its folding and OOD
+    // grinds and their two nonce words, e.g. wrap 0 −66 perms, −1,110 ops,
+    // −24 hints over its 12 rounds. Before P2: wrap 0 38,440 / 384,825 /
+    // 73,961 · global 62,576 / 591,284 / 117,796 · L1N0 62,621 / 592,012 /
+    // 117,853 · L2N0 62,673 / 592,698 / 117,928 · node −1 41,191 / 405,242 /
+    // 77,677.
     let pins_b: [(&str, usize, usize, usize); 5] = [
-        ("wrap 0", 38_440, 384_825, 73_961),
-        ("global wrap", 62_576, 591_284, 117_796),
-        ("L1N0", 62_621, 592_012, 117_853),
-        ("L2N0", 62_673, 592_698, 117_928),
-        ("node -1", 41_191, 405_242, 77_677),
+        ("wrap 0", 38_374, 383_715, 73_937),
+        ("global wrap", 62_465, 589_417, 117_756),
+        ("L1N0", 62_510, 590_145, 117_813),
+        ("L2N0", 62_562, 590_831, 117_888),
+        ("node -1", 41_119, 404_031, 77_651),
     ];
     for (label, perms, ops, hints) in pins_b {
         let row = rows_b
@@ -649,14 +657,18 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
         );
     }
 
-    // ★ THE PINS, at the default format (stack 27, first6, cap auto, grind 20):
-    // `(label, permutations, operations, hints)`, the exact form's values.
+    // ★ THE PINS, at the default format (stack 27, first6, cap auto, grind 20
+    // before the queries only — P2): `(label, permutations, operations,
+    // hints)`, the exact form's values. Re-blessed under P2 as the B pins
+    // above; before it: wrap 0 39,795 / 398,742 / 75,432 · global 62,651 /
+    // 594,462 / 117,796 · L1N0 62,696 / 595,307 / 117,853 · L2N0 82,155 /
+    // 767,664 / 154,805 · node −1 41,266 / 408,727 / 77,677.
     let pins: [(&str, usize, usize, usize); 5] = [
-        ("wrap 0", 39_795, 398_742, 75_432),
-        ("global wrap", 62_651, 594_462, 117_796),
-        ("L1N0", 62_696, 595_307, 117_853),
-        ("L2N0", 82_155, 767_664, 154_805),
-        ("node -1", 41_266, 408_727, 77_677),
+        ("wrap 0", 39_723, 397_531, 75_406),
+        ("global wrap", 62_540, 592_595, 117_756),
+        ("L1N0", 62_585, 593_440, 117_813),
+        ("L2N0", 82_005, 765_141, 154_751),
+        ("node -1", 41_194, 407_516, 77_651),
     ];
     for (label, perms, ops, hints) in pins {
         let row = rows

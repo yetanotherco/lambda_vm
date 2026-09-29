@@ -105,9 +105,10 @@ fn forge(
 fn the_trivial_program_round_trips_at_the_production_config() {
     let program = trivial_program();
     let build = build(&program, HasherKind::Rpx);
+    // The production grind is P2's: 20 bits before each round's queries only.
     assert_eq!(
         build.artifacts.config.grind,
-        multilinear::whir_chain::GrindBits::uniform(20),
+        multilinear::whir_chain::GrindBits::query_only(20),
         "the anchor must run the production grind"
     );
     let proved = lfm_prove_whir(&program, &build, &arenas(), &options())
