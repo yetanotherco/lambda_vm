@@ -150,6 +150,58 @@ pub fn root_selected() -> Setting {
     })
 }
 
+/// `LAMBDA_VM_LFM_WIDE=off|on` — whether a W-LFM tree's level 1 verifies its
+/// epochs DIRECTLY (wide nodes, `lfm::whir_wide`, D-WHIR §7 L1) instead of over
+/// one wrap proof per epoch. `on` puts `k` = the tree's fan-in epochs in each
+/// node, so level 1's grouping, the root's fold shape and every level above are
+/// the wrap tree's. Unset or empty is `off`: today's wraps.
+pub const WIDE_ENV: &str = "LAMBDA_VM_LFM_WIDE";
+
+/// Whether this process's WHIR tree builds wide level-1 nodes, read once and
+/// bannered on every setting; an unknown value aborts.
+///
+/// ⛔ `on` UNDER `LAMBDA_VM_LFM_PROVER=stark` IS REFUSED: the wide node is a
+/// pure-WHIR lever, measured against the W-LFM tree, and a STARK-proved wide
+/// tree would be an arm nobody pre-registered.
+pub fn wide_selected() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let raw = std::env::var(WIDE_ENV).ok();
+        let on = wide_of(raw.as_deref()).unwrap_or_else(|| {
+            eprintln!(
+                "{WIDE_ENV}={:?} is not a setting. Accepted: off, on.",
+                raw.clone().unwrap_or_default()
+            );
+            std::process::abort()
+        });
+        if on && selected() == Setting::Stark {
+            eprintln!(
+                "{WIDE_ENV}=on under {ENV}=stark: wide level-1 nodes are a W-LFM lever. \
+                 Refused."
+            );
+            std::process::abort()
+        }
+        println!(
+            "★ LFM WIDE: {}",
+            if on {
+                "on (level 1 verifies its epochs directly, k = the tree's fan-in)"
+            } else {
+                "off"
+            }
+        );
+        on
+    })
+}
+
+/// [`WIDE_ENV`]'s reading: unset, empty and `off` are off; `on` is on.
+fn wide_of(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("off") => Some(false),
+        Some("on") => Some(true),
+        Some(_) => None,
+    }
+}
+
 /// [`PREP_ENV`]'s reading: unset or empty is policy A (`both`).
 fn prep_policy_of(raw: Option<&str>) -> Option<crate::lfm::whir_proof::PrepPolicy> {
     use crate::lfm::whir_proof::PrepPolicy;
@@ -218,6 +270,20 @@ mod tests {
         );
         for raw in ["a", "b", "B", "prep", "main", "1"] {
             assert_eq!(prep_policy_of(Some(raw)), None, "{raw:?} must not parse");
+        }
+    }
+
+    /// The wide switch: unset, empty and `off` are off; `on` is on, in any
+    /// case; a number or a near miss does not parse (`k` is the tree's fan-in,
+    /// never a value of its own).
+    #[test]
+    fn the_wide_switch_parses_off_and_on_only() {
+        assert_eq!(wide_of(None), Some(false));
+        assert_eq!(wide_of(Some("")), Some(false));
+        assert_eq!(wide_of(Some("off")), Some(false));
+        assert_eq!(wide_of(Some(" ON ")), Some(true));
+        for raw in ["1", "0", "3", "yes", "true", "wide", "onn"] {
+            assert_eq!(wide_of(Some(raw)), None, "{raw:?} must not parse");
         }
     }
 }
