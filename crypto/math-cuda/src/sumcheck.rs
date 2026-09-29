@@ -686,39 +686,43 @@ pub fn evaluate_many_base(
                 })?;
         }
         // From here every table is ext3 and they all fold together: one launch
-        // per level, over the list of addresses.
-        let addresses: Vec<u64> = {
-            let (at, _guard) = values.device_ptr(&stream);
-            (0..group_len)
-                .map(|k| at + (k * half * 3 * 8) as u64)
-                .collect()
-        };
-        let mut factors = crate::device::htod_or_trim(&stream, &addresses)?;
-        let mut span = half;
-        let mut r_dev = crate::device::htod_or_trim(&stream, &point[3..6.min(point.len())])?;
-        for coordinate in point[3..].chunks_exact(3) {
-            let fold_half = (span / 2) as u64;
-            if fold_half == 0 {
-                break;
+        // per level, over the list of addresses. A table of one variable has
+        // no level left — the launch above bound it — and uploading its empty
+        // rest of the point would ask the driver for a zero-byte allocation.
+        if vars > 1 {
+            let addresses: Vec<u64> = {
+                let (at, _guard) = values.device_ptr(&stream);
+                (0..group_len)
+                    .map(|k| at + (k * half * 3 * 8) as u64)
+                    .collect()
+            };
+            let mut factors = crate::device::htod_or_trim(&stream, &addresses)?;
+            let mut span = half;
+            let mut r_dev = crate::device::htod_or_trim(&stream, &point[3..6])?;
+            for coordinate in point[3..].chunks_exact(3) {
+                let fold_half = (span / 2) as u64;
+                if fold_half == 0 {
+                    break;
+                }
+                stream.memcpy_htod(coordinate, &mut r_dev)?;
+                let width = group_len as u64;
+                let total = width * fold_half;
+                let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+                unsafe {
+                    stream
+                        .launch_builder(&be.sumcheck_fold_ext3)
+                        .arg(&mut factors)
+                        .arg(&fold_half)
+                        .arg(&width)
+                        .arg(&r_dev)
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (BLOCK_DIM, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                span /= 2;
             }
-            stream.memcpy_htod(coordinate, &mut r_dev)?;
-            let width = group_len as u64;
-            let total = width * fold_half;
-            let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
-            unsafe {
-                stream
-                    .launch_builder(&be.sumcheck_fold_ext3)
-                    .arg(&mut factors)
-                    .arg(&fold_half)
-                    .arg(&width)
-                    .arg(&r_dev)
-                    .launch(LaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (BLOCK_DIM, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-            span /= 2;
         }
 
         // Three u64 per column, where each one's fold left it — not the

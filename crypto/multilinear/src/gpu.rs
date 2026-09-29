@@ -43,6 +43,16 @@ static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 static SUMCHECK_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// Multilinear evaluations bound on device.
 static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Columns the claim reduce evaluated on the HOST, one at a time: the tables
+/// the batched device evaluation did not take, at a height where a single
+/// column stays here too ([`evaluates_on_device`]). The count
+/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` exists to move: at the default every table
+/// under 2^16 rows lands here, however wide.
+static HOST_EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Columns whose device value `LAMBDA_VM_ARGUE_XCHECK` recomputed on the host
+/// and found equal — so a gate run can show the check ran, not only that
+/// nothing failed.
+static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
@@ -162,6 +172,14 @@ pub fn evaluate_calls() -> u64 {
     EVALUATE_CALLS.load(Ordering::Relaxed)
 }
 
+pub fn host_evaluate_calls() -> u64 {
+    HOST_EVALUATE_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn argue_xchecks() -> u64 {
+    ARGUE_XCHECKS.load(Ordering::Relaxed)
+}
+
 pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
@@ -263,6 +281,8 @@ pub fn reset_call_counters() {
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
+    HOST_EVALUATE_CALLS.store(0, Ordering::Relaxed);
+    ARGUE_XCHECKS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -1287,6 +1307,138 @@ where
 #[cfg(feature = "cuda")]
 const EVALUATE_THRESHOLD: usize = 1 << 16;
 
+/// Whether the claim reduce evaluates a resident table's columns on the card
+/// once the TABLE holds [`EVALUATE_THRESHOLD`] cells, rather than only once
+/// each column is that tall — `LAMBDA_VM_ARGUE_DEVICE_COLUMNS=1` (any non-empty
+/// value other than `0`). Off by default until its A/B; off is today's path.
+///
+/// # Why the height is the wrong measure for a resident table
+///
+/// The threshold was set for columns that had to be uploaded first, where a
+/// short column's upload costs more than the host loop it replaces. Columns
+/// the epoch already put on the card cost no upload, and the launches are one
+/// per variable for the whole table, so what the host would spend is the
+/// table's CELLS: the widest precompile — 1,480 columns of 2^15 rows — is a
+/// 48-million-cell walk the host did one column after another, 263–303 ms of a
+/// single thread per table, while the card reads it in well under a
+/// millisecond (`thoughts/zf/gap2/fix2/D-GFS-NOTE.md` §1.2, G2).
+///
+/// The values are the same either way — each is the column's multilinear
+/// extension at the point, in exact arithmetic — so the proof is too.
+pub fn argue_device_columns() -> bool {
+    match ARGUE_DEVICE_COLUMNS_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_DEVICE_COLUMNS"))
+        }
+    }
+}
+
+static ARGUE_DEVICE_COLUMNS_FORCED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` for the whole process — for a
+/// test that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_device_columns(on: Option<bool>) {
+    ARGUE_DEVICE_COLUMNS_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether every column value the card computes for the claim reduce is
+/// recomputed on the host and compared — `LAMBDA_VM_ARGUE_XCHECK=1`. A
+/// diagnostic for an UNTIMED gate run: it puts the host walk back.
+///
+/// ⛔ It is the block's identity gate, because proof bytes are not one. Two
+/// proves of the same block never share their bytes: six table builders lay
+/// their rows out in `HashMap` order (`prover/src/tables/eq.rs` and five
+/// others), so every root and every challenge after it differs between two
+/// processes whatever this file does. What can be compared is each value the
+/// card produced against the host's, in the same process, at the moment it is
+/// produced — which is this.
+pub fn argue_xcheck() -> bool {
+    match ARGUE_XCHECK_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_XCHECK"))
+        }
+    }
+}
+
+static ARGUE_XCHECK_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_XCHECK` for the whole process. `None` restores
+/// the environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_xcheck(on: Option<bool>) {
+    ARGUE_XCHECK_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `name` set to anything but empty or `0`.
+fn env_on(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// ⛔ A FAULT: while armed, the batched device evaluation hands back its first
+/// column's value plus one — what a kernel that read one wrong cell would do.
+///
+/// It exists so the checks that compare the card against the host can be shown
+/// to fail: an identity test that passes whatever the card returns certifies
+/// nothing. Never armed outside a test. Not for production callers.
+static COLUMN_VALUE_FAULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_column_value_fault(on: bool) {
+    COLUMN_VALUE_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`evaluate_mle`] sends a table of `len` evaluations to the device —
+/// so a caller evaluating many one at a time can tell a host loop, which it may
+/// spread over the pool, from device calls, which it must not.
+#[cfg(feature = "cuda")]
+pub(crate) fn evaluates_on_device(len: usize) -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    len >= EVALUATE_THRESHOLD
+        && !*DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn evaluates_on_device(_len: usize) -> bool {
+    false
+}
+
+/// Called where the claim reduce walks `columns` on the host, one at a time.
+pub(crate) fn note_host_evaluations(columns: usize) {
+    HOST_EVALUATE_CALLS.fetch_add(columns as u64, Ordering::Relaxed);
+    crate::whir_split::bump_by(&crate::whir_split::COLUMNS_ON_HOST, columns as u64);
+}
+
+/// Called where `LAMBDA_VM_ARGUE_XCHECK` found `columns` device values equal to
+/// the host's.
+pub(crate) fn note_xchecked(columns: usize) {
+    ARGUE_XCHECKS.fetch_add(columns as u64, Ordering::Relaxed);
+    crate::whir_split::bump_by(&crate::whir_split::COLUMNS_XCHECKED, columns as u64);
+}
+
 /// Every base-field column's value at one point, folded together.
 ///
 /// The columns of a table are evaluated at the same point and one at a time
@@ -1310,7 +1462,20 @@ where
         return None;
     }
     let rows = columns.first()?.len();
-    if point.is_empty() || rows < EVALUATE_THRESHOLD || rows != 1 << point.len() {
+    if point.is_empty() || rows != 1 << point.len() {
+        return None;
+    }
+    // Columns already on the card cost no upload, so under the knob a resident
+    // table is worth the launches once it has the cells; any other table still
+    // has to pay its upload, and is worth it only once each column is tall.
+    let resident_run = argue_device_columns()
+        && resident.is_some_and(|(store, first)| store.0.is_run(first, columns.len()));
+    let size = if resident_run {
+        rows.saturating_mul(columns.len())
+    } else {
+        rows
+    };
+    if size < EVALUATE_THRESHOLD {
         return None;
     }
     if columns.iter().any(|column| column.len() != rows) {
@@ -1335,7 +1500,15 @@ where
     let values =
         math_cuda::sumcheck::evaluate_many_base(columns_at(resident, &raw), &raw_point).ok()?;
     EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
-    Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
+    crate::whir_split::bump_by(&crate::whir_split::COLUMNS_ON_CARD, values.len() as u64);
+    let mut values: Vec<math::field::element::FieldElement<E>> =
+        values.iter().map(|v| ext3_from_raw::<E>(v)).collect();
+    if COLUMN_VALUE_FAULT.load(Ordering::Relaxed)
+        && let Some(first) = values.first_mut()
+    {
+        *first += math::field::element::FieldElement::<E>::one();
+    }
+    Some(values)
 }
 
 #[cfg(not(feature = "cuda"))]

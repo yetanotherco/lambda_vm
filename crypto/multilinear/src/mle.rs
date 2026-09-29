@@ -212,6 +212,25 @@ impl<F: IsField + 'static> Mle<F> {
         if let Some(value) = crate::gpu::evaluate_mle(&self.evals, point) {
             return Ok(value);
         }
+        self.evaluate_in_on_host(point)
+    }
+
+    /// [`evaluate_in`](Self::evaluate_in) with the device never asked: the
+    /// oracle a device value is checked against, whatever the table's size.
+    pub(crate) fn evaluate_in_on_host<E>(
+        &self,
+        point: &[FieldElement<E>],
+    ) -> Result<FieldElement<E>, Error>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField + 'static,
+    {
+        if point.len() != self.num_vars {
+            return Err(Error::VariableCountMismatch {
+                expected: self.num_vars,
+                got: point.len(),
+            });
+        }
         let Some((first, rest)) = point.split_first() else {
             return Ok(self.evals[0].clone().to_extension::<E>());
         };

@@ -181,6 +181,74 @@ where
     Mle::new(acc)
 }
 
+/// Every column at `point`, one at a time: what runs when the card does not
+/// take the table whole.
+///
+/// Under `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` the walk is spread over the pool when
+/// each column is a host loop — the values are the same either way, every
+/// column's fold being its own. Columns tall enough that `evaluate_in` sends
+/// each to the device stay in order: they only get here when the card turned
+/// the table down, and a pool of them would each ask it for a slab it has not
+/// promised.
+fn evaluate_each<F, E>(
+    columns: &[Mle<F>],
+    point: &[FieldElement<E>],
+) -> Result<Vec<FieldElement<E>>, Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    let on_host = !crate::gpu::evaluates_on_device(columns.first().map_or(0, Mle::len));
+    if on_host {
+        crate::gpu::note_host_evaluations(columns.len());
+    }
+    let one = |column: &Mle<F>| column.evaluate_in(point);
+    #[cfg(feature = "parallel")]
+    if on_host && crate::gpu::argue_device_columns() {
+        return columns.par_iter().map(one).collect();
+    }
+    columns.iter().map(one).collect()
+}
+
+/// `LAMBDA_VM_ARGUE_XCHECK`: every value the card handed back, recomputed here
+/// and compared. A mismatch fails the proof and names the column, where a
+/// verifier would only say that the proof does not verify.
+fn check_against_the_host<F, E>(
+    columns: &[Mle<F>],
+    point: &[FieldElement<E>],
+    device: &[FieldElement<E>],
+) -> Result<(), Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    let one = |column: &Mle<F>| column.evaluate_in_on_host(point);
+    #[cfg(feature = "parallel")]
+    let host: Vec<FieldElement<E>> = columns.par_iter().map(one).collect::<Result<_, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let host: Vec<FieldElement<E>> = columns.iter().map(one).collect::<Result<_, _>>()?;
+    let differs = if host.len() != device.len() {
+        Some(host.len().min(device.len()))
+    } else {
+        (0..host.len()).find(|&k| host[k] != device[k])
+    };
+    if let Some(k) = differs {
+        eprintln!(
+            "[argue] XCHECK: the card's value of column {k} of {} (2^{} rows) is not the \
+             host's: card {:?}, host {:?}",
+            columns.len(),
+            point.len(),
+            device.get(k),
+            host.get(k),
+        );
+        return Err(Error::DeviceFailed {
+            stage: "column evaluation",
+        });
+    }
+    crate::gpu::note_xchecked(columns.len());
+    Ok(())
+}
+
 /// Reduces every factor's claimed value at `alpha` to one claim per column.
 ///
 /// Returns the proof and the reduced point. `factor_values[i]` must be the
@@ -238,11 +306,13 @@ where
     // All at the same point, so they fold together: one upload and one launch
     // per level for the table instead of per column.
     let column_values = match crate::gpu::evaluate_many_base(columns, &point, resident) {
-        Some(values) => values,
-        None => columns
-            .iter()
-            .map(|c| c.evaluate_in(&point))
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(values) => {
+            if crate::gpu::argue_xcheck() {
+                check_against_the_host(columns, &point, &values)?;
+            }
+            values
+        }
+        None => evaluate_each(columns, &point)?,
     };
     for value in &column_values {
         transcript.append_field_element(value);
@@ -624,6 +694,63 @@ mod tests {
                 got: 1
             }
         );
+    }
+
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` spreads the host walk over the pool, and
+    /// the proof must not notice: the same rounds, the same column values, the
+    /// same transcript after them.
+    ///
+    /// The knob is process-wide, so this is the only test here that sets it.
+    #[test]
+    fn the_device_columns_knob_moves_no_value_of_the_host_walk() {
+        let num_vars = 6;
+        let columns: Vec<Mle<F>> = (0..9).map(|k| column(num_vars, 3 + 2 * k)).collect();
+        let sources: Vec<FactorSource> = (0..9)
+            .flat_map(|c| [FactorSource::direct(c), FactorSource::shifted(c, 1 + c % 3)])
+            .collect();
+        let alpha = point(num_vars);
+        let values = honest_values(&columns, &sources, &alpha);
+
+        let run = |on: bool| {
+            crate::gpu::force_argue_device_columns(Some(on));
+            let walked = crate::gpu::host_evaluate_calls();
+            let mut t = transcript();
+            let (proof, reduced) = prove(&columns, &sources, &values, &alpha, None, &mut t)
+                .unwrap_or_else(|e| panic!("knob {on}: {e:?}"));
+            (
+                proof,
+                reduced,
+                t,
+                crate::gpu::host_evaluate_calls() - walked,
+            )
+        };
+        let (off, off_point, mut off_t, off_walked) = run(false);
+        let (on, on_point, mut on_t, on_walked) = run(true);
+        crate::gpu::force_argue_device_columns(None);
+
+        assert_eq!(off.sumcheck, on.sumcheck, "the rounds moved");
+        assert_eq!(off.column_values, on.column_values, "a column value moved");
+        assert_eq!(off_point, on_point, "the reduced point moved");
+        assert_eq!(off_t.state(), on_t.state(), "the transcripts parted");
+        assert_eq!(
+            off_t.sample_field_element(),
+            on_t.sample_field_element(),
+            "the next challenge moved"
+        );
+        // No card takes a base-field reduce, so both walked every column here.
+        assert!(
+            off_walked >= 9 && on_walked >= 9,
+            "the host walk went uncounted: {off_walked} and {on_walked} of 9"
+        );
+        verify(
+            &on,
+            &sources,
+            &values,
+            &alpha,
+            columns.len(),
+            &mut transcript(),
+        )
+        .expect("the proof with the knob on verifies");
     }
 
     #[test]

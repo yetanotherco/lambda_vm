@@ -286,13 +286,27 @@ fn a_weight_built_all_at_once_matches_one_share_at_a_time() {
 
 /// Columns evaluated together against the same columns evaluated one at a
 /// time, which is what the batched fold replaces.
+///
+/// The short shapes are the ones `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` sends here:
+/// under 2^16 rows, from a handful of columns to past the widest precompile's
+/// 1,480, and two chunks of `CHUNK_BUDGET_BYTES` at the tallest (102 columns
+/// of 2^15 rows fill one).
 #[test]
 fn columns_folded_together_match_one_at_a_time() {
     let Ok(_) = math_cuda::device::backend() else {
         eprintln!("no device; skipping");
         return;
     };
-    for (vars, width) in [(16usize, 5usize), (17, 12), (16, 1)] {
+    let shapes = [
+        (16usize, 5usize),
+        (17, 12),
+        (16, 1),
+        (2, 7),
+        (5, 2000),
+        (10, 64),
+        (15, 200),
+    ];
+    for (vars, width) in shapes {
         let rows = 1usize << vars;
         let columns: Vec<Vec<u64>> = (0..width)
             .map(|k| {

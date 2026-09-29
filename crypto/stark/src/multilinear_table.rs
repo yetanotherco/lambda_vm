@@ -1940,6 +1940,240 @@ mod tests {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();
     }
 
+    /// The same three tables at a height where the claim reduce's
+    /// columns-on-the-card knob (`LAMBDA_VM_ARGUE_DEVICE_COLUMNS`) has work to
+    /// move: CPU is 2^14 rows of 5 columns and ADD 2^14 of 4 — exactly 2^16
+    /// cells, the threshold — so a card values both once they are resident,
+    /// while MUL, 2^13 of 4, stays on the host either way. Every column is
+    /// under 2^16 rows, so at the default the host walks all thirteen.
+    ///
+    /// Half the CPU's rows add and half multiply, each met by one receive; ADD
+    /// is padded with rows that add up (0 + 0 = 0) and receive nothing.
+    fn tall_columns() -> [Vec<Vec<FE>>; 3] {
+        let (adds, muls) = (1u64 << 13, 1u64 << 13);
+        let mut cpu = vec![Vec::new(); 5];
+        let mut add = vec![Vec::new(); 4];
+        let mut mul = vec![Vec::new(); 4];
+        let push = |table: &mut Vec<Vec<FE>>, row: &[FE]| {
+            assert_eq!(table.len(), row.len(), "a row of the table's width");
+            for (column, value) in table.iter_mut().zip(row) {
+                column.push(*value);
+            }
+        };
+        for i in 0..adds {
+            let (a, b) = (FE::from(i + 1), FE::from(3 * i + 7));
+            let c = a + b;
+            push(&mut cpu, &[FE::one(), FE::zero(), a, b, c]);
+            push(&mut add, &[a, b, c, FE::one()]);
+        }
+        for _ in 0..adds {
+            push(&mut add, &[FE::zero(); 4]);
+        }
+        for i in 0..muls {
+            let (a, b) = (FE::from(i + 2), FE::from(5 * i + 3));
+            let c = a * b;
+            push(&mut cpu, &[FE::zero(), FE::one(), a, b, c]);
+            push(&mut mul, &[a, b, c, FE::one()]);
+        }
+        [cpu, add, mul]
+    }
+
+    /// The two tests below switch process-wide overrides — one of them arms a
+    /// fault — so they never run at the same time.
+    static ARGUE_OVERRIDES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The three AIRs [`airs`] builds, borrowed as one.
+    type ThreeAirs = (
+        Air<EmptyConstraints>,
+        Air<AddConstraints>,
+        Air<MulConstraints>,
+    );
+
+    /// One arm of the knob's A/B: the commitment it proved against, the proof,
+    /// the transcript after it, and how many columns the card and the host
+    /// valued at the reduction points while it ran.
+    struct TallArm<'a> {
+        committed: CommittedTables<'a, Fp, Ext, KeccakWhir>,
+        proof: MultiProof<Fp, Ext>,
+        transcript: DefaultTranscript<Ext>,
+        on_card: u64,
+        on_host: u64,
+    }
+
+    /// Commits the tall tables afresh and proves them with
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` as asked.
+    fn prove_tall<'a>(airs: &'a ThreeAirs, columns: &[Vec<Vec<FE>>; 3], on: bool) -> TallArm<'a> {
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit(
+            vec![
+                table(&airs.0, &columns[0]).unwrap(),
+                table(&airs.1, &columns[1]).unwrap(),
+                table(&airs.2, &columns[2]).unwrap(),
+            ],
+            &config(),
+        )
+        .unwrap();
+        multilinear::gpu::force_argue_device_columns(Some(on));
+        let (card, host) = (
+            multilinear::gpu::evaluate_calls(),
+            multilinear::gpu::host_evaluate_calls(),
+        );
+        let mut transcript = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        let proof = multi_prove(&committed, &config(), &mut transcript, None);
+        let (on_card, on_host) = (
+            multilinear::gpu::evaluate_calls() - card,
+            multilinear::gpu::host_evaluate_calls() - host,
+        );
+        multilinear::gpu::force_argue_device_columns(None);
+        TallArm {
+            committed,
+            proof: proof.unwrap_or_else(|e| panic!("knob {on}: {e:?}")),
+            transcript,
+            on_card,
+            on_host,
+        }
+    }
+
+    fn verify_tall(
+        committed: &CommittedTables<'_, Fp, Ext, KeccakWhir>,
+        proof: &MultiProof<Fp, Ext>,
+    ) -> Result<(), MlError> {
+        let statements: Vec<TableStatement<'_, Fp, Ext>> =
+            committed.tables().iter().map(|t| t.statement()).collect();
+        let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        multi_verify::<_, _, _, KeccakWhir>(
+            proof,
+            &statements,
+            std::slice::from_ref(committed.groups()[0].layout()),
+            std::slice::from_ref(committed.groups()[0].domain()),
+            committed.sizes(),
+            &ExtE::zero(),
+            &config(),
+            &mut verifier,
+            None,
+        )
+    }
+
+    /// The first table whose argument's canonical bytes differ between two
+    /// proofs — the name a failed identity gives — or `None`.
+    fn first_table_that_differs(a: &MultiProof<Fp, Ext>, b: &MultiProof<Fp, Ext>) -> Option<usize> {
+        let bytes = |p: &MultiProof<Fp, Ext>, k: usize| {
+            p.tables.get(k).map(|t| bincode::serialize(t).unwrap())
+        };
+        (0..a.tables.len().max(b.tables.len())).find(|&k| bytes(a, k) != bytes(b, k))
+    }
+
+    /// Whether a device took this process's columns: `false` in a build or on
+    /// a machine without one.
+    fn a_device() -> bool {
+        multilinear::gpu::reserve_budget() > 0
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` moves no byte of the proof. The tall
+    /// tables proved with the knob off and on give the same canonical bytes,
+    /// table by table and whole, the same transcript after them and the same
+    /// next challenge, and both verify.
+    ///
+    /// On a device the arms are also shown to have taken different paths —
+    /// the card valued 9 columns with the knob on and none with it off — so the
+    /// comparison is not of a path with itself. Without one, what is compared
+    /// is the host walk against the same walk spread over the pool (under
+    /// `parallel`). ⚠ Run it alone (`--exact`): the counters are process-wide.
+    ///
+    /// ```text
+    /// cargo test --release -p stark --features cuda,parallel,multilinear/cuda,multilinear/parallel \
+    ///     --lib -- multilinear_table::tests::the_argument_proves_the_same_bytes_with_its_columns_on_the_card --exact
+    /// ```
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_its_columns_on_the_card() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut off = prove_tall(&airs, &columns, false);
+        let mut on = prove_tall(&airs, &columns, true);
+
+        if a_device() {
+            assert_eq!(
+                (off.on_card, off.on_host),
+                (0, 13),
+                "knob off: the host must value all 13 columns (card, host)"
+            );
+            assert_eq!(
+                (on.on_card, on.on_host),
+                (9, 4),
+                "knob on: the card must value CPU's 5 and ADD's 4 (card, host)"
+            );
+            eprintln!(
+                "argue device columns: the card valued {} columns",
+                on.on_card
+            );
+        } else {
+            assert_eq!(
+                (off.on_card, on.on_card),
+                (0, 0),
+                "no device valued a column"
+            );
+            eprintln!("argue device columns: no device; the host walk compared with itself");
+        }
+        assert_eq!(
+            first_table_that_differs(&off.proof, &on.proof),
+            None,
+            "a table's argument changed with its columns on the card"
+        );
+        assert_eq!(
+            bincode::serialize(&off.proof).unwrap(),
+            bincode::serialize(&on.proof).unwrap(),
+            "the proofs' canonical bytes differ"
+        );
+        assert_eq!(
+            off.transcript.state(),
+            on.transcript.state(),
+            "the transcripts parted"
+        );
+        assert_eq!(
+            off.transcript.sample_field_element(),
+            on.transcript.sample_field_element(),
+            "the next challenge moved"
+        );
+        verify_tall(&off.committed, &off.proof).expect("the knob-off proof verifies");
+        verify_tall(&on.committed, &on.proof).expect("the knob-on proof verifies");
+    }
+
+    /// ⛔ The identity above can fail. With the fault armed the card hands back
+    /// its first column's value plus one; the knob-on proof must then differ
+    /// from the knob-off one at CPU — the first table the card values — and
+    /// must not verify. Needs a device: there is no card value to corrupt
+    /// without one, and it says so rather than passing.
+    #[test]
+    fn a_wrong_card_value_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue device columns: SKIPPED, no device to corrupt a value on");
+            return;
+        }
+        let off = prove_tall(&airs, &columns, false);
+        multilinear::gpu::force_column_value_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(&airs, &columns, true)
+        }));
+        multilinear::gpu::force_column_value_fault(false);
+        let faulted = faulted.expect("the faulted arm proves");
+        assert_eq!(faulted.on_card, 9, "the fault is on the card's path");
+        assert_eq!(
+            first_table_that_differs(&off.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table the card valued"
+        );
+        assert_eq!(
+            verify_tall(&faulted.committed, &faulted.proof),
+            Err(MlError::ShiftedReadMismatch),
+            "a corrupted column value must fail the claim reduce's check"
+        );
+    }
+
     /// [`config`] with its stack cap at `cap`.
     fn config_at(cap: usize) -> ChainConfig {
         ChainConfig {
