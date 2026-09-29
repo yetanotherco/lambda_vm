@@ -18,11 +18,13 @@
 pub mod airs;
 pub mod algebraic_commit;
 pub mod algebraic_transcript;
+mod artifact_walk;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
 pub mod block_root;
 pub mod builder;
+pub mod card_schedule;
 pub mod chips;
 pub mod chunking;
 pub mod commit;
@@ -137,6 +139,8 @@ mod blake3_socket_kats;
 mod blake3_socket_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod c5_probe;
+#[cfg(test)]
+mod card_schedule_tests;
 #[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]

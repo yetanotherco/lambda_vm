@@ -211,7 +211,23 @@ pub fn build_artifacts_counted(
     // includes what it waited for the card, and a figure that excluded the wait
     // would make a device-bound level look host-bound.
     let t = Instant::now();
-    let artifacts = {
+    let artifacts = if super::card_schedule::device_scope() {
+        // `LAMBDA_VM_GAP_PREP_SCOPE=1`: the card is held around the device
+        // commits only; the groups below the device floor are committed first,
+        // on the host, while another proof may hold the card.
+        let (artifacts, split) =
+            super::registry::build_artifacts_sectioned(program, options, hasher, || {
+                super::device_permit::hold_labeled("build_artifacts")
+            });
+        if super::device_permit::trace_enabled() {
+            println!(
+                "ARTIFACTS SECTION: host {} commits {:.3}s outside the hold · device {} \
+                 commits {:.3}s inside it",
+                split.host_commits, split.host_secs, split.device_commits, split.device_secs,
+            );
+        }
+        artifacts
+    } else {
         let _card = super::device_permit::hold_labeled("build_artifacts");
         build_artifacts_with_hasher(program, options, hasher)
     };

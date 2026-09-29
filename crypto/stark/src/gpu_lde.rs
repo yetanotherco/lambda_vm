@@ -1398,6 +1398,31 @@ where
     Some(tree.root)
 }
 
+/// Whether [`try_commit_row_major_with`] would dispatch a `rows × cols` commit
+/// to the device, rather than decline before touching it.
+///
+/// The same decision `admit_commit` makes on that path — no device, or an LDE
+/// below the row floor, declines; anything else reaches the card — computed
+/// from the same process constants, so a caller can route a commit before
+/// making it. ⛔ `OverBudget` counts as reaching the device: the dispatch
+/// aborts there, as it always has, and a caller that routes on this must never
+/// turn that abort into a quiet host commit.
+pub fn commit_reaches_device(
+    rows: usize,
+    cols: usize,
+    blowup_factor: usize,
+    rows_per_leaf: usize,
+) -> bool {
+    if rows == 0 || cols == 0 {
+        return false;
+    }
+    let set = commit_device_set_rpl(rows, cols, blowup_factor, true, rows_per_leaf);
+    !matches!(
+        admit(rows.saturating_mul(blowup_factor), set.total()),
+        Admission::NoDevice | Admission::BelowFloor { .. }
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     table: &str,

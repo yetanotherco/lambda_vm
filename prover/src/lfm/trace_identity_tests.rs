@@ -203,8 +203,7 @@ fn assert_identical(case: &str, a: &LfmTraces, b: &LfmTraces) {
             .position(|(p, q)| p != q)
             .expect("the slices differ, so some index differs");
         panic!(
-            "{case}/{name}: the parallel walk and the serial reference disagree \
-             at row {}, column {} — {:?} vs {:?}",
+            "{case}/{name}: the two sides disagree at row {}, column {} — {:?} vs {:?}",
             at / width,
             at % width,
             dx[at],
@@ -285,6 +284,36 @@ fn the_parallel_row_walk_is_byte_identical_to_the_serial_reference() {
              on either walk — the gate is vacuous on it. Add a case that \
              exercises it rather than dropping it from this list."
         );
+    }
+}
+
+/// ★ `LAMBDA_VM_GAP_PREP_NICE`'s gate: execute and fill on the host-phase pool
+/// (`card_schedule` — its own rayon pool, its threads at a lower priority)
+/// publish the words and fill the traces they do inline, every case, cell for
+/// cell. The pool changes which threads run the walk and nothing the walk
+/// writes.
+#[cfg(feature = "parallel")]
+#[test]
+fn execute_and_fill_on_the_host_phase_pool_are_byte_identical() {
+    use super::card_schedule::{build_host_pool, host_phase_in};
+    use super::trace::build_traces_with_hasher;
+
+    let pool = build_host_pool(10);
+    for case in cases() {
+        let run = || {
+            let exec = execute(&case.program, &case.arenas, &case.hasher)
+                .unwrap_or_else(|e| panic!("{}: the case must execute: {e:?}", case.name));
+            let traces = build_traces_with_hasher(&case.program, &exec.records, case.hasher);
+            (exec.public_words, traces)
+        };
+        let (inline_words, inline) = run();
+        let (pooled_words, pooled) = host_phase_in(Some(&pool), run);
+        assert_eq!(
+            pooled_words, inline_words,
+            "{}: the pool moved the published words",
+            case.name
+        );
+        assert_identical(&format!("{} (pool vs inline)", case.name), &pooled, &inline);
     }
 }
 

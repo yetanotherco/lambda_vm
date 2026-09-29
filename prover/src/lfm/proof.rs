@@ -164,6 +164,33 @@ pub(crate) fn lfm_prove_with_residency(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<LfmProof, LfmProveError> {
+    let prepared = lfm_prepare(program, arenas, hasher)?;
+    prove_prepared(artifacts, prepared, options, residency)
+}
+
+/// A program executed and its traces filled: everything a prove needs except
+/// the artifacts, which nothing before `multi_prove` reads.
+pub struct LfmPrepared {
+    traces: LfmTraces,
+    public_words: Vec<(u32, LfmWord)>,
+    hasher: HasherKind,
+    execute_secs: f64,
+    fill_secs: f64,
+    exec_split: super::executor::ExecSplit,
+}
+
+/// The host half of a prove: execute `program` under `hasher` and fill its
+/// traces. It reads no artifact, so a caller may build the artifacts beside it
+/// (`LAMBDA_VM_GAP_PREP_AHEAD`) and hand both to [`lfm_prove_prepared`].
+///
+/// Both halves run as [`super::card_schedule::host_phase`]s: under
+/// `LAMBDA_VM_GAP_PREP_NICE` they yield the CPU to whichever proof holds the
+/// card, and inline, exactly as before, when it is unset.
+pub fn lfm_prepare(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    hasher: HasherKind,
+) -> Result<LfmPrepared, LfmProveError> {
     // ★ THE SPLIT OF THE `prove` FIELD. The driver's per-node TIMING line prints
     // this whole function as one number, and the three statements below are
     // three different machines: `execute` is a single-threaded interpreter,
@@ -187,7 +214,8 @@ pub(crate) fn lfm_prove_with_residency(
         public_words,
         memory,
         split: exec_split,
-    } = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    } = super::card_schedule::host_phase(|| execute(program, arenas, &hasher))
+        .map_err(LfmProveError::Exec)?;
     let execute_secs = t.elapsed().as_secs_f64();
     // The final write-once array: 32 bytes per address, a few hundred MB for a
     // wrap. It is a diagnostic surface for tests — nothing on the proving path
@@ -196,14 +224,60 @@ pub(crate) fn lfm_prove_with_residency(
     drop(memory);
 
     let t = Instant::now();
-    let mut traces = build_traces_with_hasher(program, &records, hasher);
+    let traces =
+        super::card_schedule::host_phase(|| build_traces_with_hasher(program, &records, hasher));
     let fill_secs = t.elapsed().as_secs_f64();
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
     // here on; holding the records as well doubles the values through the card
     // phase.
     drop(records);
+    Ok(LfmPrepared {
+        traces,
+        public_words,
+        hasher,
+        execute_secs,
+        fill_secs,
+        exec_split,
+    })
+}
 
+/// The device half of a prove: [`prove_traces_with_hasher`] over a prepared
+/// execution, with the residency mode read from the environment as
+/// [`lfm_prove`] reads it.
+///
+/// # Panics
+///
+/// If `prepared` was executed under a hasher other than the one `artifacts`
+/// was built for — the check [`lfm_prove_with_hasher`] makes, for its reason.
+pub fn lfm_prove_prepared(
+    artifacts: &LfmArtifacts,
+    prepared: LfmPrepared,
+    options: &ProofOptions,
+) -> Result<LfmProof, LfmProveError> {
+    assert_eq!(
+        artifacts.hasher, prepared.hasher,
+        "artifacts were built for {:?} but the program was executed under {:?}; \
+         program_id binds the hasher, so the two must agree",
+        artifacts.hasher, prepared.hasher
+    );
+    prove_prepared(artifacts, prepared, options, decide_lfm_residency())
+}
+
+fn prove_prepared(
+    artifacts: &LfmArtifacts,
+    prepared: LfmPrepared,
+    options: &ProofOptions,
+    residency: ResidencyMode,
+) -> Result<LfmProof, LfmProveError> {
+    let LfmPrepared {
+        mut traces,
+        public_words,
+        hasher,
+        execute_secs,
+        fill_secs,
+        exec_split,
+    } = prepared;
     let t = Instant::now();
     let waited_before = super::device_permit::waited_secs();
     let proof = prove_traces_with_hasher(
