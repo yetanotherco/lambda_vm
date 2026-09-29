@@ -3529,6 +3529,7 @@ fn the_tree_shape_matches_the_epoch_count() {
         (15, 2, 4, 15),                   // 2^21: 15 -> 8 -> 4 -> 2 -> 1
         (15, 3, 3, 8),                    // 2^21: 15 -> 5 -> 2 -> 1
         (15, 4, 2, 5),                    // 2^21, pure WHIR's default: 15 -> 4 -> 1
+        (15, 5, 2, 4),                    // 2^21, fan-in 5 (the WHIR tree only): 15 -> 3 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -9858,9 +9859,11 @@ fn whir_production_tree<C: TreeChild>() {
     // `device fallbacks 0` and `commit fallbacks 0` on every arm — worth −8.05 s
     // of interior card time (wt29-32).
     //
-    // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the same parse and the same
-    // 2..=4 bound as the STARK driver. What changed is which value an unset
-    // variable selects, and nothing else.
+    // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the STARK driver's parse. Its
+    // bound is this tree's own: 2..=5, because five is being costed here (F5).
+    // The STARK drivers keep 2..=4 — nothing above four has been costed on
+    // them, and their arity-3 node did not fit the card. Only the ARITY bound
+    // differs; which value an unset variable selects is `whir_default_fan_in`.
     let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
         Ok(v) => v
             .parse()
@@ -9868,8 +9871,9 @@ fn whir_production_tree<C: TreeChild>() {
         Err(_) => whir_default_fan_in(wide),
     };
     assert!(
-        (2..=4).contains(&fan_in),
-        "LFM_CENSUS_FAN_IN must be in 2..=4, got {fan_in}"
+        (2..=5).contains(&fan_in),
+        "LFM_CENSUS_FAN_IN must be in 2..=5 on the WHIR tree, got {fan_in}: one child is \
+         not an aggregation, and nothing above five has been costed"
     );
     // ⛔ THE ROOT IS NAMED, AND ITS OPTION CARRIES NO DEFAULT — the STARK
     // driver's rule, verbatim, because it is a rule about the ARTIFACT and not
