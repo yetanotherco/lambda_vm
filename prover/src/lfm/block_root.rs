@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn the_fold_shape_is_the_interior_minus_the_root_level() {
         for epochs in [2usize, 3, 4, 5, 10, 19, 36] {
-            for fan_in in [2usize, 3] {
+            for fan_in in [2usize, 3, 4] {
                 let full = tree_shape(epochs, fan_in);
                 let shape = FoldShape::interior(epochs, fan_in);
                 assert_eq!(
@@ -835,7 +835,7 @@ mod tests {
 
         // ---- and the rule generally: the level an option names carries exactly
         // as many children as that option's fold shape refolds to.
-        for fan_in in [2usize, 3] {
+        for fan_in in [2usize, 3, 4] {
             for epochs in [2usize, 3, 4, 5, 7, 10, 19, 36] {
                 let out = outputs(epochs, fan_in);
                 let top = out.len() - 1;
@@ -1222,8 +1222,16 @@ mod tests {
     /// it is the one shape in which an indexing error cannot hide behind a hash,
     /// and dropped shapes above it would leave the tree-shaped fold untested —
     /// which is why the four-epoch shapes are here too.
-    const ROOT_SHAPES: [(usize, usize, bool); 4] =
-        [(2, 2, true), (4, 2, true), (5, 2, true), (4, 2, false)];
+    ///
+    /// ★ `(15, 4, true)` is pure WHIR's default root: four level-1 nodes of
+    /// 4 / 4 / 4 / 3 epochs beside the global child, one fold level of arity four.
+    const ROOT_SHAPES: [(usize, usize, bool); 5] = [
+        (2, 2, true),
+        (4, 2, true),
+        (5, 2, true),
+        (4, 2, false),
+        (15, 4, true),
+    ];
 
     /// ★ THE HONEST CONTROL: the root verifies its children, binds them, and the
     /// L2G compare passes when the global child's roots refold to what the
@@ -1267,7 +1275,9 @@ mod tests {
     #[test]
     fn the_root_rejects_a_moved_l2g_root() {
         let lanes = super::super::proof_arena::lanes_per_root();
-        for (epochs, fan_in, replaces_top) in [(2usize, 2usize, true), (4, 2, true)] {
+        // `(15, 4, true)`: pure WHIR's default root.
+        let shapes = [(2usize, 2usize, true), (4, 2, true), (15, 4, true)];
+        for (epochs, fan_in, replaces_top) in shapes {
             let (_, honest) = run_root_fixture(epochs, fan_in, replaces_top, 0, |_| {});
             assert!(
                 honest.is_ok(),
@@ -1308,25 +1318,30 @@ mod tests {
     #[test]
     fn the_root_rejects_a_reordered_l2g_fold() {
         let lanes = super::super::proof_arena::lanes_per_root();
-        for (epochs, replaces_top, a, c) in [
-            (4usize, true, 0usize, 1usize),
-            (4, true, 1, 2),
-            (4, true, 0, 3),
-            (4, false, 0, 1),
-            (5, true, 2, 4),
+        // The last two rows are pure WHIR's default root (15 epochs at fan-in 4,
+        // groups of 4 / 4 / 4 / 3): a swap inside group 0, then one across groups
+        // 0 and 1.
+        for (epochs, fan_in, replaces_top, a, c) in [
+            (4usize, 2usize, true, 0usize, 1usize),
+            (4, 2, true, 1, 2),
+            (4, 2, true, 0, 3),
+            (4, 2, false, 0, 1),
+            (5, 2, true, 2, 4),
+            (15, 4, true, 0, 3),
+            (15, 4, true, 3, 4),
         ] {
-            let (_, honest) = run_root_fixture(epochs, 2, replaces_top, 0, |_| {});
+            let (_, honest) = run_root_fixture(epochs, fan_in, replaces_top, 0, |_| {});
             assert!(honest.is_ok(), "the honest control must execute");
-            let (_, tampered) = run_root_fixture(epochs, 2, replaces_top, 0, |f| {
+            let (_, tampered) = run_root_fixture(epochs, fan_in, replaces_top, 0, |f| {
                 for lane in 0..lanes {
                     f.global.swap(2 + a * lanes + lane, 2 + c * lanes + lane);
                 }
             });
             assert!(
                 tampered.is_err(),
-                "{epochs} epochs (replaces_top={replaces_top}): epochs {a} and {c} were \
-                 swapped in the GLOBAL child and the root refolded them to the same \
-                 digest — the fold is behaving as if it were order-free"
+                "{epochs} epochs at fan-in {fan_in} (replaces_top={replaces_top}): epochs \
+                 {a} and {c} were swapped in the GLOBAL child and the root refolded them \
+                 to the same digest — the fold is behaving as if it were order-free"
             );
         }
     }

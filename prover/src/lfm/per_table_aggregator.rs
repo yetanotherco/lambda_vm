@@ -675,7 +675,9 @@ pub fn emit_chain_bindings(
 /// at two, and this constant is what keeps them comparable.
 pub const FAN_IN: usize = 2;
 
-/// Children per node on the WHIR tree — that tree's arity, and THREE.
+/// Children per node on a WHIR tree without a wide level 1 — the `stark`
+/// opt-out and `LAMBDA_VM_LFM_WIDE=off` — and THREE. The wide pure-WHIR tree
+/// takes [`WHIR_WIDE_FAN_IN`].
 ///
 /// ★ **THE MEASUREMENT [`FAN_IN`]'s doc was waiting for, on the tree that has
 /// it.** "The measured host peak decides; until it has, the conservative value
@@ -692,6 +694,33 @@ pub const FAN_IN: usize = 2;
 /// the benefit is that a WHIR posture cannot move a STARK measurement, which is
 /// the property the campaign's comparisons rest on.
 pub const WHIR_FAN_IN: usize = 3;
+
+/// Children per node on the pure-WHIR tree with a wide level 1 — the WHIR
+/// tree's default — and FOUR.
+///
+/// ★ Measured on block 25368371 (FAST, A B B A): 15 epochs at four make four
+/// wide level-1 nodes (4 / 4 / 4 / 3 epochs), which the root takes directly
+/// beside the global wrap, so the interior level is gone. −0.70 s alone (job
+/// 235) and −0.90 s with the card permit after the host prep (job 236). In job
+/// 235 the W-LFM argue's reservation peaked at 21.8 GiB of 25.7, with no
+/// fallbacks and every chain in the 130.393-bit family.
+///
+/// ⚠ **A THIRD CONSTANT, for the reason [`WHIR_FAN_IN`] is a second one.** The
+/// WHIR trees without a wide level 1 — the `stark` opt-out and
+/// `LAMBDA_VM_LFM_WIDE=off` — keep [`WHIR_FAN_IN`], so their shapes and program
+/// ids stay the ones on record. [`whir_default_fan_in`] is the one place that
+/// picks between the two.
+pub const WHIR_WIDE_FAN_IN: usize = 4;
+
+/// The WHIR tree's arity when `LFM_CENSUS_FAN_IN` is unset: [`WHIR_WIDE_FAN_IN`]
+/// under a wide level 1, [`WHIR_FAN_IN`] otherwise.
+///
+/// A wide level 1 exists only under the W-LFM prover
+/// (`lfm_prover_knob::wide_selected` refuses it under `stark`), so the four is
+/// pure WHIR's and nothing else's.
+pub fn whir_default_fan_in(wide: bool) -> usize {
+    if wide { WHIR_WIDE_FAN_IN } else { WHIR_FAN_IN }
+}
 
 /// A digest rebuilt from the lanes a child PUBLISHED for it.
 ///

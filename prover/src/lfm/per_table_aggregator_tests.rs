@@ -3528,6 +3528,7 @@ fn the_tree_shape_matches_the_epoch_count() {
         (8, 3, 2, 4),                     // 2^22: 8 -> 3 -> 1
         (15, 2, 4, 15),                   // 2^21: 15 -> 8 -> 4 -> 2 -> 1
         (15, 3, 3, 8),                    // 2^21: 15 -> 5 -> 2 -> 1
+        (15, 4, 2, 5),                    // 2^21, pure WHIR's default: 15 -> 4 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -3604,6 +3605,28 @@ fn the_tree_shape_matches_the_epoch_count() {
         "fan-in 3 at the shipped epoch count must leave a short node on at \
          least two levels"
     );
+    assert_eq!(
+        short_levels(15, 4),
+        1,
+        "pure WHIR's default leaves its one short node at level 1 (4 / 4 / 4 / 3)"
+    );
+}
+
+/// ★ THE WHIR TREE'S DEFAULT ARITY: four under a wide level 1 (pure WHIR's
+/// default), three on the WHIR trees without one (the `stark` opt-out and
+/// `LAMBDA_VM_LFM_WIDE=off`), and the STARK tree's two untouched. A change to
+/// any of them re-bases that tree's numbers on record, so it is an edit here.
+#[test]
+fn the_whir_tree_defaults_to_four_only_under_a_wide_level_one() {
+    use super::per_table_aggregator::{FAN_IN, WHIR_FAN_IN, WHIR_WIDE_FAN_IN, whir_default_fan_in};
+    assert_eq!(whir_default_fan_in(true), WHIR_WIDE_FAN_IN);
+    assert_eq!(whir_default_fan_in(false), WHIR_FAN_IN);
+    assert_eq!(
+        WHIR_WIDE_FAN_IN, 4,
+        "the wide pure-WHIR tree (jobs 235, 236)"
+    );
+    assert_eq!(WHIR_FAN_IN, 3, "the stark opt-out and the wrap tree");
+    assert_eq!(FAN_IN, 2, "the STARK tree");
 }
 
 /// ★ THE GRIND FALSIFIER — the one observation that separates a block proved on
@@ -9736,7 +9759,7 @@ fn the_whir_production_tree_composes_to_a_root() {
 /// child type.
 fn whir_production_tree<C: TreeChild>() {
     use super::epoch_tests::EpochInputs;
-    use super::per_table_aggregator::{WHIR_FAN_IN, tree_node_count, tree_shape};
+    use super::per_table_aggregator::{tree_node_count, tree_shape, whir_default_fan_in};
     use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
     use std::time::Instant;
@@ -9820,12 +9843,20 @@ fn whir_production_tree<C: TreeChild>() {
          — no WHIR tree has been proved. Unset it"
     );
 
-    // ★ THREE UNSET, AND FROM THIS TREE'S OWN CONSTANT. `WHIR_FAN_IN` is not
-    // `FAN_IN`: the STARK tree keeps two because its arity-3 node does not fit
-    // the card (ds15/ds16), and this tree takes three because the host peak the
-    // shared constant's doc was waiting on now exists — 31.1-31.5 GiB of a 33.5
-    // gate, `device fallbacks 0` and `commit fallbacks 0` on every arm — and it
-    // is worth −8.05 s of interior card time (wt29-32).
+    // ★ `LAMBDA_VM_LFM_WIDE`, READ FIRST: the arity an unset `LFM_CENSUS_FAN_IN`
+    // selects depends on it, and a wide level 1's lead-in builds wide nodes of
+    // `fan_in` epochs where the wrap tree's builds wraps.
+    let wide = crate::lfm_prover_knob::wide_selected();
+    // ★ UNSET, FROM THIS TREE'S OWN CONSTANTS (`whir_default_fan_in`): FOUR under
+    // a wide level 1, the pure-WHIR default — the root takes the four wide nodes
+    // and the interior level is gone (jobs 235 and 236) — and THREE on the WHIR
+    // trees without one, the `stark` opt-out and `LAMBDA_VM_LFM_WIDE=off`, whose
+    // shapes and program ids stay the ones on record. Neither is `FAN_IN`: the
+    // STARK tree keeps two because its arity-3 node does not fit the card
+    // (ds15/ds16), and this tree took three because the host peak the shared
+    // constant's doc was waiting on exists — 31.1-31.5 GiB of a 33.5 gate,
+    // `device fallbacks 0` and `commit fallbacks 0` on every arm — worth −8.05 s
+    // of interior card time (wt29-32).
     //
     // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the same parse and the same
     // 2..=4 bound as the STARK driver. What changed is which value an unset
@@ -9834,7 +9865,7 @@ fn whir_production_tree<C: TreeChild>() {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
-        Err(_) => WHIR_FAN_IN,
+        Err(_) => whir_default_fan_in(wide),
     };
     assert!(
         (2..=4).contains(&fan_in),
@@ -9954,10 +9985,8 @@ fn whir_production_tree<C: TreeChild>() {
     let base_sampler = HostSampler::start();
     // ★ THE LEAD-IN: level 0's first-round wrap prologues, built by helpers in
     // the base's tail — see [`LeadIn`]. Started under the hash level 0
-    // dispatches on, and handed to the base as a hash-free observer.
-    // ★ `LAMBDA_VM_LFM_WIDE`, read before the lead-in: a wide level 1's lead-in
-    // builds wide nodes of `fan_in` epochs, where the wrap tree's builds wraps.
-    let wide = crate::lfm_prover_knob::wide_selected();
+    // dispatches on, and handed to the base as a hash-free observer. Under a
+    // wide level 1 (`wide`, read with the arity above) it builds wide nodes.
     let whir_lead = lead_in_enabled().then(|| {
         let want = lead_in_count(
             "LFM_TREE_TAIL_PROLOGUES",
