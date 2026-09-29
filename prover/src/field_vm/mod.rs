@@ -16,6 +16,8 @@ pub mod prove;
 #[cfg(test)]
 mod lfm_compare;
 #[cfg(test)]
+mod lfm_translate;
+#[cfg(test)]
 mod prove_tests;
 #[cfg(test)]
 mod tests;

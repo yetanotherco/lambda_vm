@@ -204,3 +204,96 @@ fn horner_field_vm_vs_lfm() {
         report_lfm(len);
     }
 }
+
+fn fri_toy() -> (
+    crate::lfm::compiler::LfmProgram,
+    Vec<Vec<crate::lfm::word::LfmWord>>,
+    crate::lfm::executor::LfmExecution,
+) {
+    let program = crate::lfm::programs::fri_toy_program();
+    let inner = crate::lfm::fixture::fixture_prove();
+    let arenas = vec![inner.commitments.clone(), inner.openings.clone()];
+    let exec =
+        crate::lfm::executor::execute(&program, &arenas, &crate::lfm::hash::HasherKind::Test)
+            .expect("fri_toy executes");
+    (program, arenas, exec)
+}
+
+/// Every translated instruction is an assertion over the LFM's own memory, so
+/// executing the translation checks it.
+#[test]
+fn fri_toy_translation_executes() {
+    let (program, _, exec) = fri_toy();
+    for bit_dec in [false, true] {
+        let t = super::lfm_translate::translate(&program, &exec, bit_dec);
+        let run = execute(
+            &t.program,
+            Memory::with_init(t.mem.len(), &t.mem),
+            &mut NoHints,
+            1 << 24,
+        );
+        assert!(run.is_ok(), "bit_dec={bit_dec}: {:?}", run.err());
+    }
+}
+
+/// `fri_toy` (Milestone C: transcript replay, two Merkle-authenticated opening
+/// sets, Horner, two folds, terminal check) on both machines.
+#[test]
+#[ignore]
+fn fri_toy_field_vm_vs_lfm() {
+    let opts = options();
+    let (program, arenas, exec) = fri_toy();
+    for bit_dec in [false, true] {
+        let t = super::lfm_translate::translate(&program, &exec, bit_dec);
+        eprintln!(
+            "bit_dec={bit_dec} lfm instrs={:?} skipped={:?} public={}",
+            t.lfm_counts,
+            t.skipped,
+            t.public.len()
+        );
+        let run = execute(
+            &t.program,
+            Memory::with_init(t.mem.len(), &t.mem),
+            &mut NoHints,
+            1 << 24,
+        )
+        .unwrap();
+        let id = program_id(&t.program, &opts);
+        let cells = public_cells(&run, &t.public);
+        let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
+        for _ in 0..RUNS {
+            let mut traces = generate_traces(&t.program, &run, &t.public);
+            let s = Instant::now();
+            let proof = prove_traces(&id, &cells, &mut traces, &opts).unwrap();
+            prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            let s = Instant::now();
+            assert!(verify(&id, &cells, &proof, &opts));
+            verify_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            shape = census(&proof);
+        }
+        eprintln!(
+            "  fvm bit_dec={bit_dec} program={} steps={} rows={} cells={} prove_ms={:.1} verify_ms={:.1}",
+            t.program.len(),
+            run.steps.len(),
+            shape.0,
+            shape.1,
+            median(prove_ms),
+            median(verify_ms)
+        );
+    }
+    let artifacts = build_artifacts(&program, &opts);
+    let (mut prove_ms, mut shape) = (Vec::new(), (0, 0));
+    for _ in 0..RUNS {
+        let s = Instant::now();
+        let proof = lfm_prove(&program, &artifacts, &arenas, &opts).unwrap();
+        prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
+        shape = census(&proof.proof);
+    }
+    eprintln!(
+        "  lfm program={} rows={} cells={} prove_ms={:.1}",
+        program.instrs.len(),
+        shape.0,
+        shape.1,
+        median(prove_ms)
+    );
+}
