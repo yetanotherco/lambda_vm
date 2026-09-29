@@ -10127,7 +10127,7 @@ fn w1_prove_whir(
     opts: &crate::ProofOptions,
     policy: super::whir_proof::PrepPolicy,
 ) -> (
-    super::whir_proof::WhirLfmBuild,
+    super::whir_proof::WhirLfmArtifacts,
     super::whir_proof::WhirLfmProof,
 ) {
     use std::time::Instant;
@@ -10191,7 +10191,9 @@ fn w1_prove_whir(
         build.artifacts.table_num_vars,
         w1_id(&build.artifacts.program_id),
     );
-    (build, proved)
+    // The verifier's half: the prover's prepared stack (its codewords stay on
+    // the card) is dropped here, since a parent needs only the artifacts.
+    (build.artifacts, proved)
 }
 
 /// ★★ D-WHIR §6.2, W1: one wrap and one node, proved BOTH WAYS on one binary,
@@ -10340,8 +10342,8 @@ fn w1_one_wrap_and_one_node_proved_both_ways() {
     // ---- W1c: the pure-WHIR L1 node over the policy-B WHIR wraps.
     let whir_children: Vec<WhirChild<'_>> = whir_wraps
         .iter()
-        .map(|(build, proof)| WhirChild {
-            artifacts: &build.artifacts,
+        .map(|(artifacts, proof)| WhirChild {
+            artifacts,
             proof,
             options: &wrap_opts,
         })
@@ -10384,7 +10386,7 @@ fn w1_one_wrap_and_one_node_proved_both_ways() {
             w1c_b = Some(built);
         }
     }
-    let (w1c_build, w1c_proof) = w1c_b.expect("the policy-B W1c node proved");
+    let (w1c_artifacts, w1c_proof) = w1c_b.expect("the policy-B W1c node proved");
 
     // ---- W1d: the census of an L2-shaped parent over each child kind.
     let node_layouts: Vec<SchemaLayout> = (0..fan_in)
@@ -10405,7 +10407,7 @@ fn w1_one_wrap_and_one_node_proved_both_ways() {
     census_and_panel(&parent_stark, "w1 L2 parent over 3 STARK L1N0", fan_in);
     let w_children: Vec<WhirChild<'_>> = (0..fan_in)
         .map(|_| WhirChild {
-            artifacts: &w1c_build.artifacts,
+            artifacts: &w1c_artifacts,
             proof: &w1c_proof,
             options: &wrap_opts,
         })
@@ -10424,7 +10426,7 @@ fn w1_one_wrap_and_one_node_proved_both_ways() {
     let parent_whir = compile(b.finish());
     census_and_panel(&parent_whir, "w1 L2 parent over 3 W1c nodes", fan_in);
     let cost = whir_leg_cost(&WhirLegShape {
-        artifacts: &w1c_build.artifacts,
+        artifacts: &w1c_artifacts,
         num_public_words: w1c_proof.public_words.len(),
         options: &wrap_opts,
     });
@@ -10433,7 +10435,7 @@ fn w1_one_wrap_and_one_node_proved_both_ways() {
         cost.perms,
         cost.operations(),
         cost.hints,
-        w1c_build.artifacts.table_num_vars,
+        w1c_artifacts.table_num_vars,
     );
     println!("W1 DONE in {:.1}s", t_all.elapsed().as_secs_f64());
 }
