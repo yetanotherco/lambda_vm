@@ -68,6 +68,15 @@ fn build(program: &LfmProgram, hasher: HasherKind) -> WhirLfmBuild {
         .unwrap_or_else(|e| panic!("the W-LFM artifacts build: {e:?}"))
 }
 
+/// [`build`] under policy A, where a proof WITHOUT its prepared opening is still
+/// well-formed (the prefix is in the main stack too) — the only policy under
+/// which the §2.4 trap can be shown. Under policy B, the default, the prover
+/// refuses to leave a prefix out that no opening settles.
+fn build_a(program: &LfmProgram, hasher: HasherKind) -> WhirLfmBuild {
+    build_whir_artifacts_under(program, &options(), hasher, PrepPolicy::Both)
+        .unwrap_or_else(|e| panic!("the W-LFM artifacts build under policy A: {e:?}"))
+}
+
 /// Proves `program`'s execution against `build`, WITHOUT the prover's prefix
 /// check — the forger's prover.
 fn forge(
@@ -140,12 +149,12 @@ fn policy_b_round_trips_and_is_not_read_as_policy_a() {
         PrepPolicy::PreparedOnly,
     )
     .expect("builds under policy B");
-    let a = build(&program, REGISTRY_HASHER);
     assert_eq!(
-        a.artifacts.policy,
-        PrepPolicy::Both,
-        "the default is policy A"
+        build(&program, REGISTRY_HASHER).artifacts.policy,
+        PrepPolicy::PreparedOnly,
+        "the default is policy B"
     );
+    let a = build_a(&program, REGISTRY_HASHER);
     assert_eq!(
         a.artifacts.prepared_roots, b.artifacts.prepared_roots,
         "the prepared stack does not depend on the policy"
@@ -288,7 +297,7 @@ fn the_registry_programs_round_trip_or_are_refused_by_chip_set() {
 #[test]
 fn a_count_zero_statement_accepts_a_forged_lfm_program() {
     let _ungrinded = test_grind::off();
-    let honest = build(&trivial_program(), REGISTRY_HASHER);
+    let honest = build_a(&trivial_program(), REGISTRY_HASHER);
     let (proof, words) = forge(&forged_trivial_program(), &honest, false);
 
     let airs = airs_for(&honest.artifacts, &options());
@@ -340,7 +349,7 @@ fn a_count_zero_statement_accepts_a_forged_lfm_program() {
 #[test]
 fn a_forged_program_without_a_prepared_opening_is_refused() {
     let _ungrinded = test_grind::off();
-    let honest = build(&trivial_program(), REGISTRY_HASHER);
+    let honest = build_a(&trivial_program(), REGISTRY_HASHER);
     let (proof, words) = forge(&forged_trivial_program(), &honest, false);
     assert!(
         !lfm_verify_whir(&honest.artifacts, &proof, &words, &options()),

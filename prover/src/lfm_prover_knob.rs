@@ -2,10 +2,16 @@
 //! nodes, the root) are proved with.
 //!
 //! ```text
-//! LAMBDA_VM_LFM_PROVER=stark   (default) one STARK per table, today's proofs
-//! LAMBDA_VM_LFM_PROVER=whir    the base's stacked-WHIR prover
+//! LAMBDA_VM_LFM_PROVER=whir    (default) the base's stacked-WHIR prover
 //!                              (`lfm::whir_proof`), verified in-guest by W-legs
+//! LAMBDA_VM_LFM_PROVER=stark   one STARK per table: the opt-out, the recursion
+//!                              as it was before pure WHIR
 //! ```
+//!
+//! The default is pure WHIR (D-WHIR W4, an ABBA at 4150afab6: the block's whole
+//! run 56.65 s against 60.70 s). Its two companions default with it: the prefix
+//! in the prepared stack only ([`PREP_ENV`] = `prepared`) and the wide level 1
+//! ([`WIDE_ENV`] on under `whir`).
 //!
 //! Read ONCE per process and cached, so a tree cannot switch provers halfway
 //! and produce a parent emitted for one kind of child over a proof of the other.
@@ -32,9 +38,10 @@ use std::sync::OnceLock;
 /// Which prover this process's LFM proofs are proved with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
-    /// One STARK per table (`lfm::proof::lfm_prove`), the default.
+    /// One STARK per table (`lfm::proof::lfm_prove`), the opt-out.
     Stark,
-    /// The stacked-WHIR multilinear prover (`lfm::whir_proof::lfm_prove_whir`).
+    /// The stacked-WHIR multilinear prover (`lfm::whir_proof::lfm_prove_whir`),
+    /// the default.
     Whir,
 }
 
@@ -51,8 +58,8 @@ impl Setting {
 /// The environment variable that selects it.
 pub const ENV: &str = "LAMBDA_VM_LFM_PROVER";
 
-/// The default when [`ENV`] is unset or empty: today's proofs.
-pub const DEFAULT: Setting = Setting::Stark;
+/// The default when [`ENV`] is unset or empty: pure WHIR.
+pub const DEFAULT: Setting = Setting::Whir;
 
 /// What [`ENV`] accepts, and what an error message lists.
 const ACCEPTED: &[(&str, Setting)] = &[("stark", Setting::Stark), ("whir", Setting::Whir)];
@@ -84,9 +91,9 @@ pub fn selected() -> Setting {
 }
 
 /// `LAMBDA_VM_LFM_WHIR_PREP` — where a W-LFM proof commits each table's
-/// preprocessed prefix (D-WHIR §2.4): `both` (policy A, the default) in the main
-/// stack AND the prepared stack, `prepared` (policy B) in the prepared stack
-/// only. A W-LFM FORMAT choice, stamped on the program's artifacts at build time
+/// preprocessed prefix (D-WHIR §2.4): `prepared` (policy B, the default) in the
+/// prepared stack only, `both` (policy A) in the main stack AND the prepared
+/// stack. A W-LFM FORMAT choice, stamped on the program's artifacts at build time
 /// and folded into its `program_id_w`, so a verifier takes it from the
 /// artifacts and never from a proof.
 pub const PREP_ENV: &str = "LAMBDA_VM_LFM_WHIR_PREP";
@@ -154,7 +161,8 @@ pub fn root_selected() -> Setting {
 /// epochs DIRECTLY (wide nodes, `lfm::whir_wide`, D-WHIR §7 L1) instead of over
 /// one wrap proof per epoch. `on` puts `k` = the tree's fan-in epochs in each
 /// node, so level 1's grouping, the root's fold shape and every level above are
-/// the wrap tree's. Unset or empty is `off`: today's wraps.
+/// the wrap tree's. Unset or empty FOLLOWS THE TREE'S PROVER: on under `whir`
+/// (the default), off under `stark`, whose tree has wraps.
 pub const WIDE_ENV: &str = "LAMBDA_VM_LFM_WIDE";
 
 /// Whether this process's WHIR tree builds wide level-1 nodes, read once and
@@ -167,13 +175,15 @@ pub fn wide_selected() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let raw = std::env::var(WIDE_ENV).ok();
-        let on = wide_of(raw.as_deref()).unwrap_or_else(|| {
-            eprintln!(
-                "{WIDE_ENV}={:?} is not a setting. Accepted: off, on.",
-                raw.clone().unwrap_or_default()
-            );
-            std::process::abort()
-        });
+        let on = wide_of(raw.as_deref())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "{WIDE_ENV}={:?} is not a setting. Accepted: off, on.",
+                    raw.clone().unwrap_or_default()
+                );
+                std::process::abort()
+            })
+            .unwrap_or(selected() == Setting::Whir);
         if on && selected() == Setting::Stark {
             eprintln!(
                 "{WIDE_ENV}=on under {ENV}=stark: wide level-1 nodes are a W-LFM lever. \
@@ -193,21 +203,23 @@ pub fn wide_selected() -> bool {
     })
 }
 
-/// [`WIDE_ENV`]'s reading: unset, empty and `off` are off; `on` is on.
-fn wide_of(raw: Option<&str>) -> Option<bool> {
+/// [`WIDE_ENV`]'s reading: `off` and `on` are themselves; unset and empty are
+/// `Some(None)`, the tree prover's default; anything else does not parse.
+fn wide_of(raw: Option<&str>) -> Option<Option<bool>> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        None | Some("") | Some("off") => Some(false),
-        Some("on") => Some(true),
+        None | Some("") => Some(None),
+        Some("off") => Some(Some(false)),
+        Some("on") => Some(Some(true)),
         Some(_) => None,
     }
 }
 
-/// [`PREP_ENV`]'s reading: unset or empty is policy A (`both`).
+/// [`PREP_ENV`]'s reading: unset or empty is policy B (`prepared`).
 fn prep_policy_of(raw: Option<&str>) -> Option<crate::lfm::whir_proof::PrepPolicy> {
     use crate::lfm::whir_proof::PrepPolicy;
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        None | Some("") | Some("both") => Some(PrepPolicy::Both),
-        Some("prepared") => Some(PrepPolicy::PreparedOnly),
+        None | Some("") | Some("prepared") => Some(PrepPolicy::PreparedOnly),
+        Some("both") => Some(PrepPolicy::Both),
         Some(_) => None,
     }
 }
@@ -231,16 +243,16 @@ fn setting_of(raw: Option<&str>) -> Option<Setting> {
 mod tests {
     use super::*;
 
-    /// Unset and empty are today's prover; the two spellings map where they
-    /// say, case-insensitively.
+    /// Unset and empty are the default, pure WHIR; the two spellings map where
+    /// they say, case-insensitively.
     ///
     /// Tested through [`setting_of`] rather than [`selected`], which caches in
     /// a process-global `OnceLock` and aborts on a bad value.
     #[test]
-    fn the_default_is_stark_and_each_spelling_maps() {
-        assert_eq!(setting_of(None), Some(Setting::Stark));
-        assert_eq!(setting_of(Some("")), Some(Setting::Stark));
-        assert_eq!(setting_of(Some("  ")), Some(Setting::Stark));
+    fn the_default_is_whir_and_each_spelling_maps() {
+        assert_eq!(setting_of(None), Some(Setting::Whir));
+        assert_eq!(setting_of(Some("")), Some(Setting::Whir));
+        assert_eq!(setting_of(Some("  ")), Some(Setting::Whir));
         assert_eq!(setting_of(Some("stark")), Some(Setting::Stark));
         assert_eq!(setting_of(Some("whir")), Some(Setting::Whir));
         assert_eq!(setting_of(Some("WHIR")), Some(Setting::Whir));
@@ -256,13 +268,13 @@ mod tests {
         }
     }
 
-    /// The prefix policy: unset, empty and `both` are A; `prepared` is B;
-    /// anything else does not parse.
+    /// The prefix policy: unset, empty and `prepared` are B, the default;
+    /// `both` is A; anything else does not parse.
     #[test]
     fn the_prep_policy_parses_its_two_spellings_only() {
         use crate::lfm::whir_proof::PrepPolicy;
-        assert_eq!(prep_policy_of(None), Some(PrepPolicy::Both));
-        assert_eq!(prep_policy_of(Some("")), Some(PrepPolicy::Both));
+        assert_eq!(prep_policy_of(None), Some(PrepPolicy::PreparedOnly));
+        assert_eq!(prep_policy_of(Some("")), Some(PrepPolicy::PreparedOnly));
         assert_eq!(prep_policy_of(Some("both")), Some(PrepPolicy::Both));
         assert_eq!(
             prep_policy_of(Some("Prepared")),
@@ -273,15 +285,15 @@ mod tests {
         }
     }
 
-    /// The wide switch: unset, empty and `off` are off; `on` is on, in any
-    /// case; a number or a near miss does not parse (`k` is the tree's fan-in,
-    /// never a value of its own).
+    /// The wide switch: unset and empty defer to the tree's prover; `off` and
+    /// `on` are themselves, in any case; a number or a near miss does not parse
+    /// (`k` is the tree's fan-in, never a value of its own).
     #[test]
     fn the_wide_switch_parses_off_and_on_only() {
-        assert_eq!(wide_of(None), Some(false));
-        assert_eq!(wide_of(Some("")), Some(false));
-        assert_eq!(wide_of(Some("off")), Some(false));
-        assert_eq!(wide_of(Some(" ON ")), Some(true));
+        assert_eq!(wide_of(None), Some(None));
+        assert_eq!(wide_of(Some("")), Some(None));
+        assert_eq!(wide_of(Some("off")), Some(Some(false)));
+        assert_eq!(wide_of(Some(" ON ")), Some(Some(true)));
         for raw in ["1", "0", "3", "yes", "true", "wide", "onn"] {
             assert_eq!(wide_of(Some(raw)), None, "{raw:?} must not parse");
         }
