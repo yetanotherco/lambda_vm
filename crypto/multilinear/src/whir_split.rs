@@ -170,8 +170,14 @@ impl Counter {
 /// Count one occurrence. Inert when the instrument is off, like [`mark`].
 #[inline]
 pub fn bump(counter: &Counter) {
+    bump_by(counter, 1);
+}
+
+/// Count `n` occurrences at once. Inert when the instrument is off.
+#[inline]
+pub fn bump_by(counter: &Counter, n: u64) {
     if enabled() {
-        counter.0.fetch_add(1, Ordering::Relaxed);
+        counter.0.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -335,6 +341,21 @@ pub static CHAIN_COUNT: Counter = Counter::new();
 /// final one, so `2R − 1`. Summed over `g` chains that is
 /// `2·Σ R − g = 2·round_count − groups`, which is [`check_closure`]'s arm F.
 pub static REBUILD_CALLS: Counter = Counter::new();
+
+/// Columns the argument's claim reduces valued on the CARD, in one batched
+/// evaluation per table — beside [`COLUMNS_ON_HOST`], the ones walked on the
+/// host one at a time. The pair is the mechanism line of
+/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`: the knob moves columns from the second to
+/// the first, and their sum is the prove's committed width either way — short
+/// of it only by a tall table the card refused, whose columns then go to the
+/// device one at a time and count in neither.
+pub static COLUMNS_ON_CARD: Counter = Counter::new();
+/// See [`COLUMNS_ON_CARD`].
+pub static COLUMNS_ON_HOST: Counter = Counter::new();
+/// Of [`COLUMNS_ON_CARD`], the ones `LAMBDA_VM_ARGUE_XCHECK` recomputed on the
+/// host and found equal. Zero on a run without the check, which is what says a
+/// gate run's silence was a comparison rather than an absence of one.
+pub static COLUMNS_XCHECKED: Counter = Counter::new();
 
 /// Everything the chain parked at the group-loop boundary, awaiting the record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -566,6 +587,14 @@ pub struct ProverSplit {
     pub reserved_argue: u64,
     pub reserved_open: u64,
     pub reserve_budget: u64,
+    /// Columns the claim reduces valued on the card, on the host, and checked
+    /// against the host — [`COLUMNS_ON_CARD`], [`COLUMNS_ON_HOST`],
+    /// [`COLUMNS_XCHECKED`] — and the two knobs they were valued under.
+    pub columns_on_card: u64,
+    pub columns_on_host: u64,
+    pub columns_xchecked: u64,
+    pub device_columns: bool,
+    pub xcheck: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -680,6 +709,29 @@ impl ProverSplit {
             budget = self.reserve_budget >> 20,
         )
     }
+    /// The claim reduces' line, stamped as the split line is:
+    /// `ARGUE COLUMNS #k: on the card C · on the host H · xchecked X ||
+    /// device columns on|off · xcheck on|off`. The knobs ride on the line
+    /// because the counts mean nothing without the setting they were taken
+    /// under.
+    pub fn columns_line(&self) -> String {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE COLUMNS {who}{tainted}: on the card {card} · on the host {host} · \
+             xchecked {checked} || device columns {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            card = self.columns_on_card,
+            host = self.columns_on_host,
+            checked = self.columns_xchecked,
+            knob = on_off(self.device_columns),
+            xcheck = on_off(self.xcheck),
+        )
+    }
 }
 
 static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
@@ -745,6 +797,11 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.reserved_argue = RESERVED_ARGUE.take();
     rec.reserved_open = RESERVED_OPEN.take();
     rec.reserve_budget = crate::gpu::reserve_budget();
+    rec.columns_on_card = COLUMNS_ON_CARD.take();
+    rec.columns_on_host = COLUMNS_ON_HOST.take();
+    rec.columns_xchecked = COLUMNS_XCHECKED.take();
+    rec.device_columns = crate::gpu::argue_device_columns();
+    rec.xcheck = crate::gpu::argue_xcheck();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -799,6 +856,7 @@ pub fn push_prover(mut rec: ProverSplit) {
         rderiv = rec.derived_rebuild_calls(),
     );
     println!("{}", rec.reserved_line());
+    println!("{}", rec.columns_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1096,6 +1154,18 @@ mod tests {
             (0, 0, 0),
             "a disabled bump must not move a counter"
         );
+        bump_by(&COLUMNS_ON_CARD, 5);
+        bump_by(&COLUMNS_ON_HOST, 7);
+        bump_by(&COLUMNS_XCHECKED, 11);
+        assert_eq!(
+            (
+                COLUMNS_ON_CARD.take(),
+                COLUMNS_ON_HOST.take(),
+                COLUMNS_XCHECKED.take()
+            ),
+            (0, 0, 0),
+            "a disabled bump_by must not move a counter"
+        );
         assert_eq!(stage_done(0, "execute", mark()), 0.0);
         note_table(3, 9.0);
         set_table_names(vec!["KECCAK".to_string()]);
@@ -1152,6 +1222,37 @@ mod tests {
             global.reserved_line(),
             "RESERVED HW GLOBAL (in base) ⛔OVERLAPPED: commit 0 MiB · argue 0 MiB · \
              open 0 MiB · budget 0 MiB"
+        );
+    }
+
+    /// The columns line carries its counts in a fixed order and the two knobs
+    /// they were taken under, with the split line's `who` and overlap stamp.
+    #[test]
+    fn the_columns_line_names_its_prove_and_its_knobs() {
+        let epoch = ProverSplit {
+            index: 4,
+            columns_on_card: 1480,
+            columns_on_host: 38,
+            columns_xchecked: 1480,
+            device_columns: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.columns_line(),
+            "ARGUE COLUMNS #4: on the card 1480 · on the host 38 · xchecked 1480 || \
+             device columns on · xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            columns_on_host: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.columns_line(),
+            "ARGUE COLUMNS GLOBAL (in base) ⛔OVERLAPPED: on the card 0 · on the host 9 · \
+             xchecked 0 || device columns off · xcheck off"
         );
     }
 
