@@ -151,7 +151,8 @@ fn epoch_field_vm_vs_lfm() {
         let id = program_id(&tr.program, &opts);
         let build_ms = s.elapsed().as_secs_f64() * 1e3;
         let cells = public_cells(&run, &tr.public);
-        let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
+        let (mut prove_ms, mut verify_ms, mut shape, mut bytes) =
+            (Vec::new(), Vec::new(), (0, 0), 0);
         for _ in 0..runs() {
             let mut traces = generate_traces(&tr.program, &run, &tr.public);
             let s = Instant::now();
@@ -161,9 +162,12 @@ fn epoch_field_vm_vs_lfm() {
             assert!(verify(&id, &cells, &proof, &opts));
             verify_ms.push(s.elapsed().as_secs_f64() * 1e3);
             shape = census(&proof);
+            bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .map(|b| b.len())
+                .unwrap_or(0);
         }
         eprintln!(
-            "  fvm blowup={} bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={} verify_ms={}",
+            "  fvm blowup={} bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={} verify_ms={} proof_bytes={bytes}",
             opts.blowup_factor,
             tr.program.len(),
             tr.mem.len(),
