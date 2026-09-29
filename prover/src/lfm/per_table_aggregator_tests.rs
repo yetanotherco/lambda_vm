@@ -3528,8 +3528,8 @@ fn the_tree_shape_matches_the_epoch_count() {
         (8, 3, 2, 4),                     // 2^22: 8 -> 3 -> 1
         (15, 2, 4, 15),                   // 2^21: 15 -> 8 -> 4 -> 2 -> 1
         (15, 3, 3, 8),                    // 2^21: 15 -> 5 -> 2 -> 1
-        (15, 4, 2, 5),                    // 2^21, pure WHIR's default: 15 -> 4 -> 1
-        (15, 5, 2, 4),                    // 2^21, fan-in 5 (the WHIR tree only): 15 -> 3 -> 1
+        (15, 4, 2, 5),                    // 2^21, fan-in 4 (the WHIR tree's opt-out): 15 -> 4 -> 1
+        (15, 5, 2, 4), // 2^21, pure WHIR's default (the WHIR tree only): 15 -> 3 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -3609,23 +3609,25 @@ fn the_tree_shape_matches_the_epoch_count() {
     assert_eq!(
         short_levels(15, 4),
         1,
-        "pure WHIR's default leaves its one short node at level 1 (4 / 4 / 4 / 3)"
+        "fan-in 4 leaves its one short node at level 1 (4 / 4 / 4 / 3)"
+    );
+    assert_eq!(
+        short_levels(15, 5),
+        1,
+        "pure WHIR's default fills level 1 (5 / 5 / 5); its short node is the root's level"
     );
 }
 
-/// ★ THE WHIR TREE'S DEFAULT ARITY: four under a wide level 1 (pure WHIR's
+/// ★ THE WHIR TREE'S DEFAULT ARITY: five under a wide level 1 (pure WHIR's
 /// default), three on the WHIR trees without one (the `stark` opt-out and
 /// `LAMBDA_VM_LFM_WIDE=off`), and the STARK tree's two untouched. A change to
 /// any of them re-bases that tree's numbers on record, so it is an edit here.
 #[test]
-fn the_whir_tree_defaults_to_four_only_under_a_wide_level_one() {
+fn the_whir_tree_defaults_to_five_only_under_a_wide_level_one() {
     use super::per_table_aggregator::{FAN_IN, WHIR_FAN_IN, WHIR_WIDE_FAN_IN, whir_default_fan_in};
     assert_eq!(whir_default_fan_in(true), WHIR_WIDE_FAN_IN);
     assert_eq!(whir_default_fan_in(false), WHIR_FAN_IN);
-    assert_eq!(
-        WHIR_WIDE_FAN_IN, 4,
-        "the wide pure-WHIR tree (jobs 235, 236)"
-    );
+    assert_eq!(WHIR_WIDE_FAN_IN, 5, "the wide pure-WHIR tree (job 238)");
     assert_eq!(WHIR_FAN_IN, 3, "the stark opt-out and the wrap tree");
     assert_eq!(FAN_IN, 2, "the STARK tree");
 }
@@ -9848,9 +9850,9 @@ fn whir_production_tree<C: TreeChild>() {
     // selects depends on it, and a wide level 1's lead-in builds wide nodes of
     // `fan_in` epochs where the wrap tree's builds wraps.
     let wide = crate::lfm_prover_knob::wide_selected();
-    // ★ UNSET, FROM THIS TREE'S OWN CONSTANTS (`whir_default_fan_in`): FOUR under
-    // a wide level 1, the pure-WHIR default — the root takes the four wide nodes
-    // and the interior level is gone (jobs 235 and 236) — and THREE on the WHIR
+    // ★ UNSET, FROM THIS TREE'S OWN CONSTANTS (`whir_default_fan_in`): FIVE under
+    // a wide level 1, the pure-WHIR default — the root takes the three wide nodes
+    // and there is no interior level (jobs 235, 236 and 238) — and THREE on the WHIR
     // trees without one, the `stark` opt-out and `LAMBDA_VM_LFM_WIDE=off`, whose
     // shapes and program ids stay the ones on record. Neither is `FAN_IN`: the
     // STARK tree keeps two because its arity-3 node does not fit the card
@@ -9860,7 +9862,8 @@ fn whir_production_tree<C: TreeChild>() {
     // of interior card time (wt29-32).
     //
     // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the STARK driver's parse. Its
-    // bound is this tree's own: 2..=5, because five is being costed here (F5).
+    // bound is this tree's own: 2..=5, because five is this tree's default (job
+    // 238).
     // The STARK drivers keep 2..=4 — nothing above four has been costed on
     // them, and their arity-3 node did not fit the card. Only the ARITY bound
     // differs; which value an unset variable selects is `whir_default_fan_in`.
@@ -11300,14 +11303,14 @@ fn the_spin_guest_lands_every_small_epoch_count() {
 
 /// ★★ EVERY SMALL BLOCK COMPOSES: one to six epochs, each proved on the fixture
 /// to a root PROVED AND VERIFIED, at the tree's default arity
-/// (`whir_default_fan_in`: four under the default wide level 1).
+/// (`whir_default_fan_in`: five under the default wide level 1).
 ///
-/// ⛔ The shapes at fan-in 4:
+/// ⛔ The shapes at fan-in 5:
 /// - one epoch: one wide node over one epoch, whose fold of one root is that root;
-/// - two to four: one wide node, which the root takes (`RootOption::for_tree`);
-/// - five and six: two wide nodes, and root option A as named.
+/// - two to five: one wide node, which the root takes (`RootOption::for_tree`);
+/// - six: two wide nodes, and root option A as named.
 ///
-/// Before `for_tree` a wide tree failed the root's child count at two to four
+/// Before `for_tree` a wide tree failed the root's child count at two to fan-in
 /// epochs. Under `LAMBDA_VM_LFM_PROVER=stark` or `LAMBDA_VM_LFM_WIDE=off` the
 /// same blocks run the wrap tree at fan-in 3.
 ///

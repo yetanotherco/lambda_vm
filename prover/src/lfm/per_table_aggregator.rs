@@ -696,27 +696,34 @@ pub const FAN_IN: usize = 2;
 pub const WHIR_FAN_IN: usize = 3;
 
 /// Children per node on the pure-WHIR tree with a wide level 1 — the WHIR
-/// tree's default — and FOUR.
+/// tree's default — and FIVE.
 ///
-/// ★ Measured on block 25368371 (FAST, A B B A): 15 epochs at four make four
-/// wide level-1 nodes (4 / 4 / 4 / 3 epochs), which the root takes directly
-/// beside the global wrap, so the interior level is gone. −0.70 s alone (job
-/// 235) and −0.90 s with the card permit after the host prep (job 236). In job
-/// 235 the W-LFM argue's reservation peaked at 21.8 GiB of 25.7, with no
-/// fallbacks and every chain in the 130.393-bit family.
+/// ★ Measured on block 25368371 (FAST, A B B A): 15 epochs at five make three
+/// wide level-1 nodes (5 / 5 / 5 epochs), which the root takes directly beside
+/// the global wrap. Against fan-in 4 (job 238): −1.55 s, level 1 −0.76 and the
+/// root −0.70; level 1's census falls from 1,052.8 M to 852.6 M cells, because
+/// every table but LANES stays inside its power of two, and the root's LFM_HASH
+/// (253,082 rows) stays under 2^18, so the root falls from 270.9 M to 149.6 M.
+/// Fan-in 4 had already removed the interior level (−0.70 s alone, job 235).
+///
+/// ⚠ **THE CARD'S MARGIN IS 1.4 GiB.** The W-LFM argue's reservation peaked at
+/// 24.3 GiB of the 25.7 GiB budget at five (21.9 at four). A block with heavier
+/// epochs would push it over, and the refused work falls back to the host:
+/// slower, never wrong. Measure a heavier block before relying on five;
+/// `LFM_CENSUS_FAN_IN=4` is the opt-out.
 ///
 /// ⚠ **A THIRD CONSTANT, for the reason [`WHIR_FAN_IN`] is a second one.** The
 /// WHIR trees without a wide level 1 — the `stark` opt-out and
 /// `LAMBDA_VM_LFM_WIDE=off` — keep [`WHIR_FAN_IN`], so their shapes and program
 /// ids stay the ones on record. [`whir_default_fan_in`] is the one place that
 /// picks between the two.
-pub const WHIR_WIDE_FAN_IN: usize = 4;
+pub const WHIR_WIDE_FAN_IN: usize = 5;
 
 /// The WHIR tree's arity when `LFM_CENSUS_FAN_IN` is unset: [`WHIR_WIDE_FAN_IN`]
 /// under a wide level 1, [`WHIR_FAN_IN`] otherwise.
 ///
 /// A wide level 1 exists only under the W-LFM prover
-/// (`lfm_prover_knob::wide_selected` refuses it under `stark`), so the four is
+/// (`lfm_prover_knob::wide_selected` refuses it under `stark`), so the five is
 /// pure WHIR's and nothing else's.
 pub fn whir_default_fan_in(wide: bool) -> usize {
     if wide { WHIR_WIDE_FAN_IN } else { WHIR_FAN_IN }

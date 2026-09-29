@@ -911,7 +911,7 @@ mod tests {
                 level => shape[level - 1].nodes(),
             }
         };
-        for fan_in in [2usize, 3, 4] {
+        for fan_in in [2usize, 3, 4, 5] {
             for epochs in 1usize..=40 {
                 let top = tree_shape(epochs, fan_in).len();
                 for named in [RootOption::A, RootOption::B] {
@@ -1311,9 +1311,9 @@ mod tests {
     /// and dropped shapes above it would leave the tree-shaped fold untested —
     /// which is why the four-epoch shapes are here too.
     ///
-    /// ★ `(15, 4, true)` is pure WHIR's default root: four level-1 nodes of
-    /// 4 / 4 / 4 / 3 epochs beside the global child, one fold level of arity four.
-    /// `(15, 5, true)` is fan-in 5's (the WHIR tree only): three nodes of five.
+    /// ★ `(15, 5, true)` is pure WHIR's default root: three level-1 nodes of five
+    /// epochs beside the global child, one fold level of arity five. `(15, 4,
+    /// true)` is fan-in 4's (`LFM_CENSUS_FAN_IN=4`): four nodes of 4 / 4 / 4 / 3.
     const ROOT_SHAPES: [(usize, usize, bool); 6] = [
         (2, 2, true),
         (4, 2, true),
@@ -1356,30 +1356,33 @@ mod tests {
     }
 
     /// ★ THE ROOT OVER EVERY SMALL WIDE TREE EXECUTES, HONEST: one to six epochs
-    /// at fan-in 4, root option A run through [`RootOption::for_tree`] — one
-    /// interior child up to four epochs (`B`'s shape from two), two at five and
-    /// six — and the artifact keeps its fixed width.
+    /// at fan-in 4 and 5, root option A run through [`RootOption::for_tree`] —
+    /// one interior child up to `fan_in` epochs (`B`'s shape from two), two
+    /// above — and the artifact keeps its fixed width.
     #[test]
     fn the_root_over_every_small_wide_tree_executes() {
-        for epochs in 1usize..=6 {
-            let option = RootOption::A.for_tree(tree_shape(epochs, 4).len(), true);
-            let (plan, exec) = run_root_fixture(epochs, 4, option.replaces_top(), 0, |_| {});
-            let exec = exec.unwrap_or_else(|e| {
-                panic!(
-                    "{epochs} epochs at fan-in 4, run as {option:?}: the HONEST root must \
-                     execute: {e:?}"
-                )
-            });
-            assert_eq!(
-                plan.interior_layouts.len(),
-                epochs.div_ceil(4),
-                "{epochs}@4: one interior child per wide level-1 node"
-            );
-            assert_eq!(
-                exec.public_words.len(),
-                root_schema_words(fixture_num_reg(), 0, plan.publishes),
-                "{epochs}@4: the artifact's width"
-            );
+        for fan_in in [4usize, 5] {
+            for epochs in 1usize..=6 {
+                let option = RootOption::A.for_tree(tree_shape(epochs, fan_in).len(), true);
+                let (plan, exec) =
+                    run_root_fixture(epochs, fan_in, option.replaces_top(), 0, |_| {});
+                let exec = exec.unwrap_or_else(|e| {
+                    panic!(
+                        "{epochs} epochs at fan-in {fan_in}, run as {option:?}: the HONEST \
+                         root must execute: {e:?}"
+                    )
+                });
+                assert_eq!(
+                    plan.interior_layouts.len(),
+                    epochs.div_ceil(fan_in),
+                    "{epochs}@{fan_in}: one interior child per wide level-1 node"
+                );
+                assert_eq!(
+                    exec.public_words.len(),
+                    root_schema_words(fixture_num_reg(), 0, plan.publishes),
+                    "{epochs}@{fan_in}: the artifact's width"
+                );
+            }
         }
     }
 
@@ -1393,13 +1396,14 @@ mod tests {
     #[test]
     fn the_root_rejects_a_moved_l2g_root() {
         let lanes = super::super::proof_arena::lanes_per_root();
-        // `(15, 4, true)`: pure WHIR's default root. `(1, 4, true)` and
-        // `(3, 4, false)`: small wide blocks, one epoch and one node of three
-        // (`RootOption::for_tree`).
+        // `(15, 5, true)`: pure WHIR's default root, and `(15, 4, true)` fan-in
+        // 4's. `(1, 4, true)` and `(3, 4, false)`: small wide blocks, one epoch
+        // and one node of three (`RootOption::for_tree`).
         let shapes = [
             (2usize, 2usize, true),
             (4, 2, true),
             (15, 4, true),
+            (15, 5, true),
             (1, 4, true),
             (3, 4, false),
         ];
@@ -1444,9 +1448,9 @@ mod tests {
     #[test]
     fn the_root_rejects_a_reordered_l2g_fold() {
         let lanes = super::super::proof_arena::lanes_per_root();
-        // The last two rows are pure WHIR's default root (15 epochs at fan-in 4,
-        // groups of 4 / 4 / 4 / 3): a swap inside group 0, then one across groups
-        // 0 and 1.
+        // The last four rows are the fan-in-4 root (groups of 4 / 4 / 4 / 3) and
+        // pure WHIR's default root (15 epochs at fan-in 5, groups of five): each a
+        // swap inside group 0, then one across groups 0 and 1.
         for (epochs, fan_in, replaces_top, a, c) in [
             (4usize, 2usize, true, 0usize, 1usize),
             (4, 2, true, 1, 2),
@@ -1455,6 +1459,8 @@ mod tests {
             (5, 2, true, 2, 4),
             (15, 4, true, 0, 3),
             (15, 4, true, 3, 4),
+            (15, 5, true, 0, 4),
+            (15, 5, true, 4, 5),
         ] {
             let (_, honest) = run_root_fixture(epochs, fan_in, replaces_top, 0, |_| {});
             assert!(honest.is_ok(), "the honest control must execute");
