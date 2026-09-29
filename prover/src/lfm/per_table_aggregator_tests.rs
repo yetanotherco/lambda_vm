@@ -5970,6 +5970,9 @@ fn prove_global_child(
 pub(super) struct InteriorInputs<'a> {
     /// The tree's per-level arities, as [`tree_shape`] built them.
     pub(super) shape: &'a [super::per_table_aggregator::Level],
+    /// The first level this run proves: 1, or 2 when a wide level 1
+    /// (`LAMBDA_VM_LFM_WIDE=on`) already produced level 1's output.
+    pub(super) start_level: usize,
     /// The highest level this run proves.
     pub(super) hi: usize,
     /// The tree's TOP level, which is not always `hi` — a root arm stops the
@@ -6047,6 +6050,7 @@ pub(super) fn compose_interior_levels<C: TreeChild>(
     // strings, and a format string cannot capture a field access.
     let InteriorInputs {
         shape,
+        start_level,
         hi,
         top,
         size_root,
@@ -6215,15 +6219,27 @@ pub(super) fn compose_interior_levels<C: TreeChild>(
          arm needs two levels' outputs held by index, and the pool consumes a \
          level into its parent. Run them as separate arms"
     );
+    assert!(
+        start_level >= 1,
+        "level 0 is the base's children, never the interior's"
+    );
     let barrier_levels = if pool_on { (pool_from - 1).min(hi) } else { hi };
+    // ⓘ Levels below `start_level` were proved before this call; `pooled_from`
+    // is where the pool takes over, and at `start_level` 1 it is `barrier_levels`.
+    let pooled_from = barrier_levels.max(start_level - 1);
     if pool_on {
         println!(
             "   ★ LEVEL POOL: levels {}..={hi} run in dependency order, {levels_in_flight} \
              level(s) in flight (LFM_TREE_LEVEL_POOL=1; unset = the per-level barrier)",
-            barrier_levels + 1
+            pooled_from + 1
         );
     }
-    for (li, level) in shape.iter().enumerate().take(barrier_levels) {
+    for (li, level) in shape
+        .iter()
+        .enumerate()
+        .take(barrier_levels)
+        .skip(start_level - 1)
+    {
         let level_no = li + 1;
         let t_level = Instant::now();
         // ★ HOW MANY DISTINCT PROGRAMS THIS LEVEL ACTUALLY HAS. The artifact
@@ -6399,11 +6415,11 @@ pub(super) fn compose_interior_levels<C: TreeChild>(
     // window and the per-NODE peaks the nodes print themselves. The stop
     // condition therefore reads off the node lines and this span line, not off a
     // per-level maximum that no longer exists.
-    if pool_on && barrier_levels < hi {
+    if pool_on && pooled_from < hi {
         let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
             .iter()
             .take(hi)
-            .skip(barrier_levels)
+            .skip(pooled_from)
             .map(|level| level_groups(&level.arities))
             .collect();
         let workers = super::device_permit::workers().max(1);
@@ -6416,7 +6432,7 @@ pub(super) fn compose_interior_levels<C: TreeChild>(
             .zip(labels)
             .map(|((c, l), b)| (c, l, b))
             .collect();
-        let first_level = barrier_levels + 1;
+        let first_level = pooled_from + 1;
         let (top, summaries) = prove_in_dependency_order(
             &pool_groups,
             seed,
@@ -7987,6 +8003,7 @@ fn the_production_tree_composes_to_a_root() {
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
+            start_level: 1,
             hi,
             top,
             size_root,
@@ -8406,6 +8423,7 @@ fn whir_level_zero<H, C>(
     top_overlap: bool,
     base_decode: Option<&crate::multilinear_continuation::BaseDecode>,
     lead_in: Option<&(dyn std::any::Any + Send + Sync)>,
+    wide: bool,
 ) -> LevelZero<C>
 where
     H: multilinear::whir_hash::WhirHash + 'static,
@@ -8444,6 +8462,13 @@ where
         );
     }
 
+    // ⛔ THE LEAD-IN BUILDS WRAP PROLOGUES, and a wide level has no wraps: the
+    // caller starts none under `LAMBDA_VM_LFM_WIDE=on`, and a lead-in handed in
+    // anyway would have spent the base's tail on programs nothing proves.
+    assert!(
+        !(wide && lead_in.is_some()),
+        "a wide level 1 takes no lead-in: its prologues are wrap programs"
+    );
     // ★ The lead-in the base fed, under this level's own `H`.
     let lead = lead_in.map(|any| {
         any.downcast_ref::<WhirLeadIn<H>>()
@@ -8748,6 +8773,170 @@ where
         )
     };
 
+    // ★★ THE WIDE LEVEL 1 (`LAMBDA_VM_LFM_WIDE=on`): one task per `fan_in`
+    // consecutive epochs, each ONE program that verifies its epochs directly
+    // (`whir_wide`) and publishes the node schema — what an L1 node over those
+    // epochs' wraps publishes, so every level above reads it as that node. The
+    // harvest, the AIR sets and the DECODE hoist assert are the wrap task's, per
+    // epoch; the schema checks read the node layout's two ENDS.
+    let prove_one_wide = |j: usize, epochs: std::ops::Range<usize>| -> WhirWrapSlot<C> {
+        let t_wide = Instant::now();
+        crate::multilinear_continuation::reset_decode_derivations();
+        let t = Instant::now();
+        let held: Vec<(
+            crate::lfm::whir_real_epoch::WhirRealEpoch,
+            crate::multilinear_continuation::WhirEpochAirs,
+        )> = epochs
+            .clone()
+            .map(|k| {
+                let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
+                    inner,
+                    elf_bytes,
+                    bundle,
+                    k,
+                    Some(decode_root),
+                    Some(prepared),
+                )
+                .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+                let air_set = crate::multilinear_continuation::epoch_airs_for(
+                    elf,
+                    inner,
+                    &bundle.epochs[k],
+                    &e.position.register_init,
+                    e.position.is_final,
+                    e.position.label,
+                    Some(decode_root),
+                );
+                (e, air_set)
+            })
+            .collect();
+        let t_harvest_epochs = t.elapsed().as_secs_f64();
+        let derived_here = crate::multilinear_continuation::decode_derivations();
+        assert_eq!(
+            derived_here, 0,
+            "wide node {j} derived DECODE {derived_here} time(s) while preparing its epochs; \
+             both hoists are handed in, so a non-zero count means one is not reaching the \
+             harvest"
+        );
+        let refs: Vec<Vec<_>> = held.iter().map(|(_, airs)| airs.refs()).collect();
+        let wide_epochs: Vec<super::whir_wide::WideEpoch<'_>> = held
+            .iter()
+            .zip(&refs)
+            .map(|((epoch, _), refs)| super::whir_wide::WideEpoch {
+                epoch,
+                airs: &refs[..],
+            })
+            .collect();
+        // ⛔ THE POSITIONS ARE THE TREE'S: the labels the wraps' parent would
+        // have pinned, never the epochs' own (see `whir_wide`'s header).
+        let positions: Vec<u64> = epochs
+            .clone()
+            .map(|k| crate::tables::local_to_global::epoch_label(k as u64))
+            .collect();
+        let t = Instant::now();
+        let program = super::whir_wide::wide_node_program(
+            &wide_epochs,
+            &positions,
+            super::per_table_aggregator::NodePublishSet::Aggregation,
+        );
+        let arenas = super::whir_wide::wide_node_arena(&wide_epochs);
+        let t_emit = t.elapsed().as_secs_f64();
+        let (first, last) = (&held[0].0, &held[held.len() - 1].0);
+        let out_halves = last.public_output().len().div_ceil(4);
+
+        let (cells, instrs) = census_and_panel(&program, &format!("whir wide {j}"), epochs.len());
+        let wide_sampler = HostSampler::start();
+        let t = Instant::now();
+        let artifacts = C::build(&program, wrap_opts);
+        let t_artifacts = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let proved = C::prove(
+            &format!("wide {j}"),
+            &program,
+            &artifacts,
+            &arenas,
+            wrap_opts,
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
+        let t_prove = t.elapsed().as_secs_f64();
+
+        // ★★ THE SEAM'S OWN CHECK, at the node schema: the level above reads
+        // this proof as a node, so its published words must be the FIRST
+        // epoch's INIT, the LAST epoch's FINI and the position range's ends.
+        let layout = SchemaLayout::node(out_halves);
+        layout.assert_covers(C::proved_words(&proved).len());
+        let word_at = |i: usize| -> LfmWord {
+            C::proved_words(&proved)
+                .iter()
+                .find(|(at, _)| *at as usize == i)
+                .unwrap_or_else(|| panic!("wide node {j} published no word at schema index {i}"))
+                .1
+        };
+        for (r, value) in first.position.register_init.iter().enumerate() {
+            assert_eq!(
+                word_at(layout.reg_init(r)),
+                base_word(FE::from(u64::from(*value))),
+                "wide node {j}: published reg_init[{r}] is not its first epoch's"
+            );
+        }
+        for (r, value) in last.proof.reg_fini.iter().enumerate() {
+            assert_eq!(
+                word_at(layout.reg_fini(r)),
+                base_word(FE::from(u64::from(*value))),
+                "wide node {j}: published reg_fini[{r}] is not its last epoch's"
+            );
+        }
+        let ends = [positions[0], positions[positions.len() - 1]];
+        for (i, label) in ends.iter().enumerate() {
+            assert_eq!(
+                word_at(layout.label(2 * i)),
+                base_word(FE::from(label & 0xFFFF_FFFF)),
+                "wide node {j}: label range end {i} (low half)"
+            );
+            assert_eq!(
+                word_at(layout.label(2 * i + 1)),
+                base_word(FE::from(label >> 32)),
+                "wide node {j}: label range end {i} (high half)"
+            );
+        }
+
+        let t = Instant::now();
+        let (child, t_verify) = C::harvest(&format!("wide {j}"), artifacts, wrap_opts, proved);
+        let t_child = t.elapsed().as_secs_f64();
+        let (peak, at) = wide_sampler.stop();
+        println!(
+            "   whir wide {j} TIMING: epochs {}..={} · harvest-epochs {t_harvest_epochs:.2}s · \
+             emit+arenas {t_emit:.2}s · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · \
+             harvest {t_child:.2}s (verify {t_verify:.2}) · wall {:.2}s",
+            epochs.start,
+            epochs.end - 1,
+            t_wide.elapsed().as_secs_f64(),
+        );
+        println!(
+            "   whir wide {j}: host peak {peak:.3} GiB at t={at:.1}{}{}",
+            match ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                Err(_) => String::new(),
+            },
+            if siblings > 1 {
+                format!(" ⓘ PROCESS-WIDE, {siblings} tasks in flight")
+            } else {
+                String::new()
+            },
+        );
+        (child, layout, ends.to_vec(), cells, instrs)
+    };
+
+    // One task per wrap, or per wide node's epochs.
+    let groups: Vec<std::ops::Range<usize>> = if wide {
+        (0..bundle.num_epochs())
+            .step_by(fan_in)
+            .map(|start| start..(start + fan_in).min(bundle.num_epochs()))
+            .collect()
+    } else {
+        (0..bundle.num_epochs()).map(|k| k..k + 1).collect()
+    };
+
     let mut children = Vec::with_capacity(bundle.num_epochs());
     let mut layouts = Vec::with_capacity(bundle.num_epochs());
     let mut labels = Vec::with_capacity(bundle.num_epochs());
@@ -8798,7 +8987,7 @@ where
     // ⓘ Boxed for the same reason the STARK level boxes its slots: the two
     // variants are very different sizes and the pool holds one slot per task.
     type L0Out<C> = PoolOut<Box<WhirWrapSlot<C>>, Box<WhirGlobalChild<C>>>;
-    let l0_out = in_index_order(bundle.num_epochs() + l0_offset, siblings, |j| -> L0Out<C> {
+    let l0_out = in_index_order(groups.len() + l0_offset, siblings, |j| -> L0Out<C> {
         if top_overlap && j == 0 {
             // ⛔ A REFUSAL, NEVER A `None` THE CALLER TURNS INTO A `return` —
             // the property the serial call site was written to have, kept here.
@@ -8815,6 +9004,11 @@ where
                     )
                 }),
             ))
+        } else if wide {
+            PoolOut::Wrap(Box::new(prove_one_wide(
+                j - l0_offset,
+                groups[j - l0_offset].clone(),
+            )))
         } else {
             PoolOut::Wrap(Box::new(prove_one_wrap(j - l0_offset)))
         }
@@ -8829,13 +9023,14 @@ where
     let (l0_wraps, overlapped_global) = split_pool_out(l0_out, top_overlap);
     assert_eq!(
         l0_wraps.len(),
-        bundle.num_epochs(),
-        "level 0's pool must yield one slot per epoch; the global task is not a wrap"
+        groups.len(),
+        "level 0's pool must yield one slot per task; the global task is not a wrap"
     );
+    let kind = if wide { "wide" } else { "wrap" };
     for (k, (child, layout, lbl, cells, instrs)) in l0_wraps.into_iter().map(|w| *w).enumerate() {
         let (id, heights, chunk_heights) = child.identity();
         println!(
-            "   whir wrap {k} IDENTITY: program_id {id} · heights {heights} · blake3 chunk \
+            "   whir {kind} {k} IDENTITY: program_id {id} · heights {heights} · blake3 chunk \
              heights {chunk_heights} · published {} words · {cells} cells ({instrs} instructions)",
             child.public_words().len(),
         );
@@ -9530,7 +9725,17 @@ fn whir_production_tree<C: TreeChild>() {
     // ★ THE LEAD-IN: level 0's first-round wrap prologues, built by helpers in
     // the base's tail — see [`LeadIn`]. Started under the hash level 0
     // dispatches on, and handed to the base as a hash-free observer.
-    let whir_lead = lead_in_enabled().then(|| {
+    // ★ `LAMBDA_VM_LFM_WIDE`, read before the lead-in: a wide level 1 has no
+    // wrap prologues for the base's tail to build.
+    let wide = crate::lfm_prover_knob::wide_selected();
+    if wide && lead_in_enabled() {
+        println!(
+            "   ★ LEAD-IN OFF: level 1 is wide (LAMBDA_VM_LFM_WIDE=on), and the lead-in \
+             builds wrap prologues; the wide nodes harvest their epochs as their own \
+             first work"
+        );
+    }
+    let whir_lead = (lead_in_enabled() && !wide).then(|| {
         let want = lead_in_count(
             "LFM_TREE_TAIL_PROLOGUES",
             tree_siblings_l0()
@@ -9710,6 +9915,7 @@ fn whir_production_tree<C: TreeChild>() {
             top_overlap,
             base_decode.as_ref(),
             whir_lead.as_ref().map(|(_, lead)| &**lead),
+            wide,
         )
     });
     // Level 0 was their last reader: the base's DECODE derivations, and the
@@ -9720,10 +9926,18 @@ fn whir_production_tree<C: TreeChild>() {
     super::device_permit::arm(1);
     let level0_wall = t_level.elapsed().as_secs_f64();
     let (l0_peak, l0_at) = level0_sampler.stop();
-    println!(
-        "   level 0: {} WHIR wraps in {level0_wall:.1}s",
-        children.len()
-    );
+    if wide {
+        println!(
+            "   level 1 (wide): {} wide nodes over {} epochs in {level0_wall:.1}s",
+            children.len(),
+            bundle.num_epochs()
+        );
+    } else {
+        println!(
+            "   level 0: {} WHIR wraps in {level0_wall:.1}s",
+            children.len()
+        );
+    }
     println!("{}", jemalloc_line("level 0"));
     println!(
         "   level 0: host peak {l0_peak:.3} GiB at t={l0_at:.1}{}, {l0_siblings} wrap(s) in flight",
@@ -9812,6 +10026,8 @@ fn whir_production_tree<C: TreeChild>() {
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
+            // ⓘ Under a wide level 1 its output is already in `children`.
+            start_level: if wide { 2 } else { 1 },
             hi,
             top,
             // ⓘ No sizing arm here: it needs two levels held at once for two root
@@ -10365,6 +10581,9 @@ fn whir_fixture_tree<C: TreeChild>() {
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     let fan_in = 2;
+    // ★ `LAMBDA_VM_LFM_WIDE=on`: level 1 verifies its epochs directly, `fan_in`
+    // to a node, so the fixture's two nodes cover epochs 0–1 and 2.
+    let wide = crate::lfm_prover_knob::wide_selected();
 
     let t_all = Instant::now();
     // As the production driver runs it: level 0 takes the base's DECODE
@@ -10430,6 +10649,7 @@ fn whir_fixture_tree<C: TreeChild>() {
             false,
             base_decode.as_ref(),
             None,
+            wide,
         )
     });
     drop(base_decode);
@@ -10470,6 +10690,8 @@ fn whir_fixture_tree<C: TreeChild>() {
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
+            // ⓘ Under a wide level 1 its output is already in `children`.
+            start_level: if wide { 2 } else { 1 },
             // ★ THE INTERIOR STOPS WHERE THE ROOT'S CHILDREN COME FROM. Under A
             // that is `top - 1`, so the level-`top` node is never proved — it is
             // not a child of anything.
