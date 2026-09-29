@@ -6049,23 +6049,35 @@ fn lead_in_count(var: &str, default: usize) -> usize {
     }
 }
 
-/// The lead-in's prologues run in a rayon pool of their own, of this many
-/// threads: unset or empty is the pipeline's default (a pool of
-/// [`STARK_TAIL_THREADS`] for the STARK tree, the global pool for the WHIR
-/// tree), `0` the global pool (the named opt-out, which reproduces the tail as
-/// it ran before), a count a pool of that size. Anything else stops the run.
+/// Where the lead-in's prologues run: unset or empty is the pipeline's default
+/// (one pool of [`STARK_TAIL_THREADS`] shared by the helpers for the STARK tree,
+/// the global pool for the WHIR tree); `0` the global pool (the named opt-out,
+/// which reproduces the tail as it ran before); `<n>` one pool of n threads
+/// shared by the helpers; `per-helper:<n>` one pool of n threads per helper.
+/// Anything else stops the run.
 ///
-/// ⛔ WHY. The prologues run while the base still proves its last epochs, and
-/// they put parallel work on whatever pool they run in. The base's per-table
-/// drivers are plain OS threads: each parallel iterator they start is injected
-/// into the GLOBAL pool and waits until a worker takes it. On the STARK base's
-/// traced run (G1, ds801) the prologues' spans held 4.83 s of the base's 10.88 s
-/// of card idle, and the host-only OOD absorb, one such injection, summed
-/// 5.2–5.3 s over split 9's tables in all three G1 arms against 0.02 s in a
-/// quiet split. In a pool of their own the prologues never queue in front of the
-/// base's work: FAST job 206 (ds850–861, two arms each, a pool of 16 against the
-/// global pool) measured the base's worst split absorb at 0.04 s, the base
-/// −2.35 s, level 0 +0.05 s and the block −2.20 s; program ids unchanged.
+/// ⛔ WHY A POOL OF THEIR OWN. The prologues run while the base still proves its
+/// last epochs, and they put parallel work on whatever pool they run in. The
+/// base's per-table drivers are plain OS threads: each parallel iterator they
+/// start is injected into the GLOBAL pool and waits until a worker takes it. On
+/// the STARK base's traced run (G1, ds801) the prologues' spans held 4.83 s of
+/// the base's 10.88 s of card idle, and the host-only OOD absorb, one such
+/// injection, summed 5.2–5.3 s over split 9's tables in all three G1 arms
+/// against 0.02 s in a quiet split. In a pool of their own the prologues never
+/// queue in front of the base's work: FAST job 206 (ds850–861, two arms each, a
+/// pool of 16 against the global pool) measured the base's worst split absorb
+/// at 0.04 s, the base −2.35 s, level 0 +0.05 s and the block −2.20 s; program
+/// ids unchanged.
+///
+/// ⛔ WHY PER HELPER. Each helper `install`s a whole prologue (3–5 s, with joins
+/// inside) into its pool. A pool thread waiting in a join takes the next job it
+/// finds — its own deque, then a steal, then an INJECTED job (rayon-core
+/// `wait_until_cold`) — so in a pool shared by two helpers it can run the other
+/// helper's whole prologue nested on its stack and finish its own only after
+/// that one. F-PREP measured that inversion on level 0 (reconstructs 2 → 22 s).
+/// Job 206 did not show it here (the tail prologues' maximum 4.90 s against the
+/// global pool's 4.44 s), but only a pool per helper, each with one caller,
+/// rules it out.
 const TAIL_THREADS_ENV: &str = "LFM_TREE_TAIL_THREADS";
 
 /// The STARK tree's default pool for the lead-in's prologues: large enough that
@@ -6073,37 +6085,61 @@ const TAIL_THREADS_ENV: &str = "LFM_TREE_TAIL_THREADS";
 /// at the global pool's width), small enough to leave the base the rest.
 const STARK_TAIL_THREADS: usize = 16;
 
-/// [`TAIL_THREADS_ENV`] for a raw value over a pipeline's `default`: unset or
-/// empty is `default`, `0` the global pool (`None`), a count a pool of that
-/// size. Anything else panics.
-fn tail_threads_setting(raw: Option<&str>, default: Option<usize>) -> Option<usize> {
-    match raw.map(str::trim) {
-        None | Some("") => default,
-        Some("0") => None,
-        Some(v) => Some(
-            v.parse::<usize>()
-                .unwrap_or_else(|_| panic!("{TAIL_THREADS_ENV} must be a thread count, got `{v}`")),
-        ),
+/// Where the lead-in's prologues run ([`TAIL_THREADS_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailPools {
+    /// The global rayon pool, beside the base's own parallel work.
+    Global,
+    /// One pool of this many threads, shared by every helper.
+    Shared(usize),
+    /// One pool of this many threads per helper.
+    PerHelper(usize),
+}
+
+/// [`TAIL_THREADS_ENV`] for a raw value over a pipeline's `default`. Anything
+/// but `0`, a count or `per-helper:<count>` (a count of at least one) panics.
+fn tail_pools_setting(raw: Option<&str>, default: TailPools) -> TailPools {
+    let v = match raw.map(str::trim) {
+        None | Some("") => return default,
+        Some(v) => v,
+    };
+    let bad = || -> ! {
+        panic!("{TAIL_THREADS_ENV} must be 0, a thread count or per-helper:<count>, got `{v}`")
+    };
+    match v.strip_prefix("per-helper:") {
+        Some(n) => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => TailPools::PerHelper(n),
+            _ => bad(),
+        },
+        None => match v.parse::<usize>() {
+            Ok(0) => TailPools::Global,
+            Ok(n) => TailPools::Shared(n),
+            Err(_) => bad(),
+        },
     }
 }
 
 /// This process's [`TAIL_THREADS_ENV`] over a pipeline's `default`, named on
 /// stdout, so a log states where its prologues ran.
-fn tail_threads(default: Option<usize>) -> Option<usize> {
-    let threads = tail_threads_setting(std::env::var(TAIL_THREADS_ENV).ok().as_deref(), default);
+fn tail_pools(default: TailPools) -> TailPools {
+    let pools = tail_pools_setting(std::env::var(TAIL_THREADS_ENV).ok().as_deref(), default);
     let source = if std::env::var(TAIL_THREADS_ENV).is_ok_and(|v| !v.trim().is_empty()) {
         TAIL_THREADS_ENV
     } else {
         "the default"
     };
-    match threads {
-        Some(n) => println!(
+    match pools {
+        TailPools::Shared(n) => println!(
             "   ★ L0 PROLOGUES: in a rayon pool of their own, {n} thread(s) ({source}; \
              {TAIL_THREADS_ENV}=0 is the global pool)"
         ),
-        None => println!("   L0 PROLOGUES: in the global rayon pool ({source})"),
+        TailPools::PerHelper(n) => println!(
+            "   ★ L0 PROLOGUES: in a rayon pool of their own per helper, {n} thread(s) each \
+             ({source}; {TAIL_THREADS_ENV}=0 is the global pool)"
+        ),
+        TailPools::Global => println!("   L0 PROLOGUES: in the global rayon pool ({source})"),
     }
-    threads
+    pools
 }
 
 /// Run `f` inside `pool`, so every parallel iterator it starts runs on that
@@ -6117,25 +6153,119 @@ fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Se
 }
 
 /// The pool switch over each pipeline's default: unset or empty keeps the
-/// default, `0` is the global pool, a count is a pool of its own.
+/// default, `0` is the global pool, a count one shared pool, `per-helper:<n>`
+/// one pool per helper.
 #[test]
 fn the_tail_pool_switch_keeps_the_default_unless_set() {
-    let stark = Some(STARK_TAIL_THREADS);
-    assert_eq!(tail_threads_setting(None, stark), stark);
-    assert_eq!(tail_threads_setting(Some(""), stark), stark);
-    assert_eq!(tail_threads_setting(Some("0"), stark), None);
-    assert_eq!(tail_threads_setting(Some(" 0 "), stark), None);
-    assert_eq!(tail_threads_setting(Some("8"), stark), Some(8));
-    assert_eq!(tail_threads_setting(None, None), None, "the WHIR default");
-    assert_eq!(tail_threads_setting(Some("4"), None), Some(4));
+    let stark = TailPools::Shared(STARK_TAIL_THREADS);
+    assert_eq!(tail_pools_setting(None, stark), stark);
+    assert_eq!(tail_pools_setting(Some(""), stark), stark);
+    assert_eq!(tail_pools_setting(Some("0"), stark), TailPools::Global);
+    assert_eq!(tail_pools_setting(Some(" 0 "), stark), TailPools::Global);
+    assert_eq!(tail_pools_setting(Some("00"), stark), TailPools::Global);
+    assert_eq!(tail_pools_setting(Some("8"), stark), TailPools::Shared(8));
+    assert_eq!(
+        tail_pools_setting(Some("per-helper:8"), stark),
+        TailPools::PerHelper(8)
+    );
+    assert_eq!(
+        tail_pools_setting(Some(" per-helper:4 "), stark),
+        TailPools::PerHelper(4)
+    );
+    assert_eq!(
+        tail_pools_setting(None, TailPools::Global),
+        TailPools::Global,
+        "the WHIR default"
+    );
+    assert_eq!(
+        tail_pools_setting(Some("4"), TailPools::Global),
+        TailPools::Shared(4)
+    );
 }
 
-/// Anything but a count stops the run rather than measuring the default under
-/// the switch's name.
+/// Anything else stops the run rather than measuring the default under the
+/// switch's name — including a per-helper pool of no threads, which rayon would
+/// read as "every core".
 #[test]
-#[should_panic(expected = "LFM_TREE_TAIL_THREADS must be a thread count")]
 fn the_tail_pool_switch_refuses_anything_else() {
-    tail_threads_setting(Some("many"), Some(STARK_TAIL_THREADS));
+    for bad in [
+        "many",
+        "per-helper:0",
+        "per-helper:x",
+        "per-helper:",
+        "per_helper:8",
+    ] {
+        let refused = std::panic::catch_unwind(|| {
+            tail_pools_setting(Some(bad), TailPools::Shared(STARK_TAIL_THREADS))
+        });
+        assert!(refused.is_err(), "`{bad}` was accepted");
+    }
+}
+
+/// A lead-in's prologue, reporting the width of the pool it ran in and the
+/// thread names its parallel work ran on.
+#[cfg(feature = "parallel")]
+type PoolProbe = (usize, Vec<String>);
+
+/// Start a lead-in of `want` wraps and `helpers` helpers under `pools`, prove
+/// every epoch, and return each wrap's [`PoolProbe`] once all are built. The
+/// first `gather` prologues wait for each other (up to 5 s) before their work;
+/// a helper builds one prologue at a time, so they are `gather` different
+/// helpers' prologues.
+#[cfg(feature = "parallel")]
+fn probe_lead_in(want: usize, helpers: usize, pools: TailPools, gather: usize) -> Vec<PoolProbe> {
+    use crate::continuation::EpochObserver;
+    use rayon::prelude::*;
+    let started = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+    let lead: std::sync::Arc<LeadIn<u64, usize, PoolProbe>> = LeadIn::start(
+        want,
+        helpers,
+        pools,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        move |_: &usize, _: &[u64], _, _| {
+            let (count, arrived) = &*started;
+            let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            arrived.notify_all();
+            drop(
+                arrived
+                    .wait_timeout_while(n, std::time::Duration::from_secs(5), |n| *n < gather)
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            let names: Vec<String> = (0..32u32)
+                .into_par_iter()
+                .map(|_| {
+                    std::thread::current()
+                        .name()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            (rayon::current_num_threads(), names)
+        },
+    );
+    for k in 0..want {
+        lead.on_epoch_proved(k, &(10 + k as u64));
+    }
+    lead.on_epoch_count(want);
+    let start = std::time::Instant::now();
+    loop {
+        let built = {
+            let st = lead.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.slots.iter().all(|s| matches!(s, LeadSlot::Built(_)))
+        };
+        if built {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the prologues were never built ({pools:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    (0..want)
+        .map(|k| lead.take(k).expect("a built prologue"))
+        .collect()
 }
 
 /// ★ A lead-in with a pool of its own builds its prologues THERE: their
@@ -6144,57 +6274,41 @@ fn the_tail_pool_switch_refuses_anything_else() {
 #[cfg(feature = "parallel")]
 #[test]
 fn l0_lead_in_builds_its_prologues_in_its_own_pool() {
-    use crate::continuation::EpochObserver;
-    use rayon::prelude::*;
-    for (threads, own) in [(Some(3usize), true), (None, false)] {
-        let lead: std::sync::Arc<LeadIn<u64, usize, (usize, Vec<String>)>> = LeadIn::start(
-            1,
-            1,
-            threads,
-            |_base: &dyn Fn() -> BaseShared| 7usize,
-            |_: &usize, _: &[u64], _, _| {
-                let names: Vec<String> = (0..32u32)
-                    .into_par_iter()
-                    .map(|_| {
-                        std::thread::current()
-                            .name()
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                    .collect();
-                (rayon::current_num_threads(), names)
-            },
-        );
-        lead.on_epoch_proved(0, &10);
-        lead.on_epoch_count(1);
-        let start = std::time::Instant::now();
-        let (width, names) = loop {
-            let built = {
-                let st = lead.state.lock().unwrap_or_else(|e| e.into_inner());
-                matches!(st.slots[0], LeadSlot::Built(_))
-            };
-            if built {
-                break lead.take(0).expect("the built prologue");
-            }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(10),
-                "the prologue was never built ({threads:?})"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        if own {
-            assert_eq!(width, 3, "the prologue sees its pool's width");
-            assert!(
-                names.iter().all(|n| n.starts_with("l0-tail-pool-")),
-                "every task ran on the lead-in's pool: {names:?}"
-            );
-        } else {
-            assert!(
-                names.iter().all(|n| !n.starts_with("l0-tail-pool-")),
-                "no pool of its own, no task on one: {names:?}"
-            );
-        }
+    let (width, names) = probe_lead_in(1, 1, TailPools::Shared(3), 1).remove(0);
+    assert_eq!(width, 3, "the prologue sees its pool's width");
+    assert!(
+        names.iter().all(|n| n.starts_with("l0-tail-pool-")),
+        "every task ran on the lead-in's pool: {names:?}"
+    );
+    let (_, names) = probe_lead_in(1, 1, TailPools::Global, 1).remove(0);
+    assert!(
+        names.iter().all(|n| !n.starts_with("l0-tail-pool-")),
+        "no pool of its own, no task on one: {names:?}"
+    );
+}
+
+/// ★ Per helper, each helper's prologue runs on ITS pool alone: every task of
+/// one prologue on one helper's pool, of that pool's width, and the two helpers
+/// (both building at once) on two pools. Pools with one caller each are what
+/// makes the nested-prologue inversion unreachable.
+#[cfg(feature = "parallel")]
+#[test]
+fn l0_lead_in_gives_each_helper_its_own_pool() {
+    let mut used = std::collections::BTreeSet::new();
+    for (width, names) in probe_lead_in(4, 2, TailPools::PerHelper(2), 2) {
+        assert_eq!(width, 2, "a helper's pool has the per-helper width");
+        let pools: std::collections::BTreeSet<String> = names
+            .iter()
+            .map(|n| n.rsplit_once('-').map_or("", |(pool, _)| pool).to_string())
+            .collect();
+        assert_eq!(pools.len(), 1, "one prologue, one pool: {names:?}");
+        used.extend(pools);
     }
+    assert_eq!(
+        used.into_iter().collect::<Vec<_>>(),
+        ["l0-tail-pool-0", "l0-tail-pool-1"],
+        "two helpers, two pools"
+    );
 }
 
 /// ★ Work run in a pool of its own fans out over THAT pool's threads — not the
@@ -6259,10 +6373,10 @@ struct LeadIn<P, C, T> {
     make_context: MakeContext<C>,
     state: std::sync::Mutex<LeadState<P, T>>,
     changed: std::sync::Condvar,
-    /// The prologues' own rayon pool ([`TAIL_THREADS_ENV`]); `None` runs them
-    /// in the global pool.
+    /// The prologues' own rayon pools ([`TAIL_THREADS_ENV`]): none (the global
+    /// pool), one shared by every helper, or one per helper.
     #[cfg(feature = "parallel")]
-    pool: Option<rayon::ThreadPool>,
+    pools: Vec<rayon::ThreadPool>,
 }
 
 /// How a lead-in derives its context, handed a wait for what the base shares.
@@ -6304,17 +6418,34 @@ where
     /// Start `helpers` threads that derive the context, then build the prologues
     /// of wraps `0..want` once the epoch count is known and their epochs exist.
     /// `make_context` is handed a wait for what the base shares, for a context
-    /// that is taken from the base rather than derived. `tail_threads` sizes the
-    /// prologues' own pool ([`tail_threads`]); `None` is the global pool.
+    /// that is taken from the base rather than derived. `pools` says where the
+    /// prologues run ([`tail_pools`]).
     fn start(
         want: usize,
         helpers: usize,
-        tail_threads: Option<usize>,
+        pools: TailPools,
         make_context: impl Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync + 'static,
         build: impl Fn(&C, &[P], usize, usize) -> T + Send + Sync + 'static,
     ) -> std::sync::Arc<Self> {
         #[cfg(not(feature = "parallel"))]
-        let _ = tail_threads;
+        let _ = pools;
+        #[cfg(feature = "parallel")]
+        let pools = {
+            let pool = |prefix: String, threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(move |j| format!("{prefix}{j}"))
+                    .build()
+                    .expect("the lead-in's pool must build")
+            };
+            match pools {
+                TailPools::Global => Vec::new(),
+                TailPools::Shared(n) => vec![pool("l0-tail-pool-".to_string(), n)],
+                TailPools::PerHelper(n) => (0..helpers)
+                    .map(|i| pool(format!("l0-tail-pool-{i}-"), n))
+                    .collect(),
+            }
+        };
         let lead = std::sync::Arc::new(Self {
             want,
             context: std::sync::OnceLock::new(),
@@ -6330,13 +6461,7 @@ where
             }),
             changed: std::sync::Condvar::new(),
             #[cfg(feature = "parallel")]
-            pool: tail_threads.map(|n| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .thread_name(|i| format!("l0-tail-pool-{i}"))
-                    .build()
-                    .expect("the lead-in's pool must build")
-            }),
+            pools,
         });
         let build = std::sync::Arc::new(build);
         for i in 0..helpers {
@@ -6356,7 +6481,7 @@ where
                         // the base for it.
                         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let context = lead.context();
-                            lead.in_own_pool(|| build(context, &prefix, n, k))
+                            lead.in_own_pool(i, || build(context, &prefix, n, k))
                         }));
                         if built.is_err() {
                             println!(
@@ -6372,13 +6497,21 @@ where
         lead
     }
 
-    /// Run `f` in the prologues' own pool, or on the calling thread when there
-    /// is none (the global pool's work then lands there).
-    fn in_own_pool<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+    /// Run helper `helper`'s `f` in its pool — the shared one, or its own — or
+    /// on the calling thread when there is none (the global pool's work then
+    /// lands there).
+    fn in_own_pool<R: Send>(&self, helper: usize, f: impl FnOnce() -> R + Send) -> R {
         #[cfg(feature = "parallel")]
-        return in_pool(self.pool.as_ref(), f);
+        return in_pool(
+            self.pools
+                .get(helper.min(self.pools.len().saturating_sub(1))),
+            f,
+        );
         #[cfg(not(feature = "parallel"))]
-        return f();
+        return {
+            let _ = helper;
+            f()
+        };
     }
 
     /// The shared context, derived once by whoever asks first.
@@ -6552,7 +6685,7 @@ fn start_stark_lead_in(
     LeadIn::start(
         want,
         helpers,
-        tail_threads(Some(STARK_TAIL_THREADS)),
+        tail_pools(TailPools::Shared(STARK_TAIL_THREADS)),
         // ⓘ The base's own DECODE commitment, shared: deriving a second one here
         // would be a second second of host work beside the base's.
         move |base: &dyn Fn() -> BaseShared| {
@@ -6602,7 +6735,7 @@ fn test_lead_in(
     LeadIn::start(
         want,
         helpers,
-        None,
+        TailPools::Global,
         |_base: &dyn Fn() -> BaseShared| 7usize,
         move |ctx: &usize, epochs: &[u64], n, k| {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -6762,7 +6895,7 @@ fn l0_lead_in_hands_back_a_slot_whose_context_failed() {
     let lead: std::sync::Arc<LeadIn<u64, usize, usize>> = LeadIn::start(
         2,
         1,
-        None,
+        TailPools::Global,
         |_base: &dyn Fn() -> BaseShared| -> usize { panic!("the context fails (injected)") },
         |_: &usize, _: &[u64], _, k| k,
     );
@@ -6795,7 +6928,7 @@ fn l0_lead_in_context_waits_for_what_the_base_shares() {
     let lead: std::sync::Arc<LeadIn<u64, usize, ()>> = LeadIn::start(
         1,
         1,
-        None,
+        TailPools::Global,
         |base: &dyn Fn() -> BaseShared| {
             *base()
                 .downcast::<usize>()
@@ -6857,7 +6990,7 @@ where
         helpers,
         // The WHIR tree keeps the global pool unless asked: its tail was not
         // measured in a pool of its own.
-        tail_threads(None),
+        tail_pools(TailPools::Global),
         // ⛔ BOTH DECODE DERIVATIONS ARE THE BASE'S, NOT MADE HERE: the prepared
         // commitment is a device commit, and nothing in the lead-in may reach the
         // card; the base derives both once before its first epoch and shares them.
