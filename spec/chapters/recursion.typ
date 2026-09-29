@@ -264,12 +264,15 @@ which is equivalent to addition in $BB$.
 Hence, $verify^*$ and $verify'$ are effectively equivalent, except that $verify^*$
 has the proof include a bit $b$ indicating whether it is verifying a base proof or recursion proof.
 
-We now observe that, for a valid split $(verify_0, verify_1)$ of $verify$,
+We now observe that, for a valid split $(verify_0, verify_1)$ of $verify$ and
+record generator $d_verify$,
 $
 	verify^*_0([comm(x), comm(y)], [[proof, b], r]) 
 	&:= verify_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
 	verify^*_1([comm(x), comm(y)], [[proof, b], r]) 
-	&:= verify_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
+	&:= verify_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+  d_(verify^*)([comm(x), comm(y)], [proof, b])
+  &:= d_verify (Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)
 $
 jointly form a valid split of $verify^*$, since
 $
@@ -279,7 +282,7 @@ $
 	&= product(verify^*_0, verify^*_1)([comm(x), comm(y)], [[proof, b], r]),\
 $
 when
-$r = d_(verify^*) ([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
+$r = d_(verify^*) ([comm(x), comm(y)], [proof, b])$.
 By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(verify^*_0, verify^*_1)))$, 
 we now obtain
 $
@@ -300,9 +303,8 @@ $
   &&#h(8em)text(italic("etc."))
 $
 with
-$
-	r_i :&= d_(verify^*)(comm(product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], dot)), [proof_i, 1-delta_(i,0)]).
-$
+$r_i := d_(verify^*)([comm(instance), comm(product(verify^*_0, verify^*_1))], [proof_i, 1-delta_(i,0)])$,
+where $delta_(i,j)$ denotes the Kronecker delta function.
 
 = The theory applied
 We now discuss how the split-recursion system is integrated in practice.
