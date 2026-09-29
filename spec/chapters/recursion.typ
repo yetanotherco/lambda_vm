@@ -208,7 +208,7 @@ More formally, we define
 $verify_0, verify_1: commitmentSpace times proofSpace times recordSpace to BB$ as a valid _split_ of 
 verifier $verify in verifierSpace$ if
 $
-  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff exists record in recordSpace text("s.t.") verify_0(comm(instance), [proof, record]) and verify_1(comm(instance), [proof, record]) = 1,
+  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff exists record in recordSpace text("s.t.") verify_0(comm(instance), [proof, record]) = 1 and verify_1(comm(instance), [proof, record]) = 1,
 $
 where $recordSpace$ denotes the _communication record space_.
 One can now express 
@@ -264,7 +264,7 @@ which is equivalent to addition in $BB$.
 Hence, $verify^*$ and $verify'$ are effectively equivalent, except that $verify^*$
 has the proof include a bit $b$ indicating whether it is verifying a base proof or recursion proof.
 
-We now observe that
+We now observe that, for a valid split $(verify_0, verify_1)$ of $verify$,
 $
 	verify^*_0([comm(x), comm(y)], [[proof, b], r]) 
 	&:= verify_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
