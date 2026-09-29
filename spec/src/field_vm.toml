@@ -138,8 +138,8 @@ input = ["hint_output"]
 
 [[constraints.decode]]
 kind = "arith"
-# PARAM: $limits(sum)_(j = 0)^T #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^(d - 1) #`argument_registers`_i^k dot #`RANGE`_(j,k)$
-constraint = "$limits(sum)_(j = 0)^1 #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^4 #`argument_registers`_i^k dot #`RANGE`_(j,k)$"
+# PARAM: $limits(sum)_(j = 0)^T #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^(d - 1) #`argument_registers`_i^k dot #`RANGE`_(j,k) = 0$
+constraint = "$limits(sum)_(j = 0)^1 #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^4 #`argument_registers`_i^k dot #`RANGE`_(j,k) = 0$"
 # PARAM: ["sum", ["=", "j", 0], T, ["*", ["idx", ["idx", "arg_register_powers", "i"], "j"], ["sum", ["=", "k", 0], ["-", "d", 1], ["*", ["^", ["idx", "argument_registers", "i"], "k"], ["idx", ["idx", "RANGE", "j"], "k"]]]]]
 poly = ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", "i"], "j"], ["sum", ["=", "k", 0], 4, ["*", ["^", ["idx", "argument_registers", "i"], "k"], ["idx", ["idx", "RANGE", "j"], "k"]]]]]
 iter = ["i", 0, 3]

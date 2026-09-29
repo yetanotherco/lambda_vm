@@ -23,7 +23,7 @@ The central instruction of the ISA is a constraint for a fused multiply-add over
 Here all of `d`, `a`, `b` and `c` are arguments following the addressing scheme described below.
 
 This constraint-based view generally goes well with a read-only memory.
-The memory system gives us that guarantee that whenever we access `MEM` at the same index,
+The memory system gives us the guarantee that whenever we access `MEM` at the same index,
 we get the same value back, and the constraint allows us to enforce that these
 values in memory are consistent with the structure we want it to have.#footnote[
   In the most central application of the VM, we check that the memory consists of a correct proof
@@ -41,7 +41,7 @@ The execution of a guest program can be seen as a succession of _states_ of the 
 A state is then the tuple of all values the registers have at a given point in time during the execution.#footnote[
   If we consider states across different executions, the contents of `MEM` should also be considered part of the state.
 ]
-Each instruction acts upon _current state_ to produce the _future state_.#footnote[
+Each instruction acts upon the _current state_ to produce the _future state_.#footnote[
   And since the program counter is part of the current state,
   each possible state has at most one associated instruction.
 ]
@@ -58,9 +58,9 @@ We index the registers from $0$ to $N + 1$ in the order above, so `ZERO` gets in
 
 The `ZERO` register indicates whether the previous instruction had a zero result,
 i.e. $next("ZERO") <=> #`d` = 0$.
-The `PC` register stores the program counter: the address of the current instruction,
-and --- except when branches are taken, through register hinting --- is incremented by $1$
-for every consecutive state.
+The `PC` register stores the program counter: the address of the current instruction.
+It is generally incremented by $1$ for every consecutive state,
+except for when handling a branching instruction (that output-hints the `PC` register).
 As the name implies, the general purpose registers are available for arbitrary usage.
 
 Each argument to the `FMA` constraint has either of the two following forms:
@@ -71,15 +71,15 @@ The `d` argument to the instruction obtains its register value from the future s
 
 == Register hinting
 
-By default, a general-purpose register will have the same value the future state
-as it does in the current state.
+By default, a general-purpose register will have the same value across two consecutive states.
 To change register values, each general-purpose register in the current state
 can be marked as _hinted_ by the acting instruction.
-This means that from the current state onwards,#footnote[Until it is hinted again.]
-the register can take a value that is independent from the previous value,
+This means that the register receives a new value in the current state, which it will keep
+until the register is hinted again.
+The new value is independent from the previous value or state,
 except as constrained by the instruction.
 Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument
-will change from the future state onwards, and as such in the `d` argument too.
+will change in the future state, as such impacting the value of the `d` argument.
 This applies to the _register_ of the `d` argument, regardless of the additional immediates and `MEM[]`
 access that may happen in the instruction.
 We distinguish between these two types by naming them respectively _input hinting_ and _output hinting_.
@@ -101,7 +101,7 @@ This can, e.g., be used to compute field inverses and square roots, which have a
 on the result.
 There may even be situations where hinting multiple values can be chosen simultaneously, such as a decomposition
 $a = b + c$ in a divide-and-conquer algorithm.
-Even hinting registers that are not used in the current instruction may provide useful in limited situations.
+Even hinting registers that are not used in the current instruction may prove useful in limited situations.
 Though we approach it differently in @field-VM:sec:calling, one can imagine a calling convention
 where the frame pointer is updated directly during the jump instruction, without being further involved
 in the computation of the next `PC`.
@@ -277,7 +277,7 @@ We must ensure the consistency between consecutive rows of the table, and allow 
 We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
 - $!next("hint_input")_r and !#`hint_output` => next("registers")_r = #`registers`_r$,\ `r` could not have been hinted,
-  since it was not input-hinted in the next row, and there was no output hint, so the next `r` should remain the same.
+  since it was not input-hinted in the next row, and there was no output hint, so $next("r")$ should remain the same.
 - $!next("hint_input")_r and f_(r)(#`argument_registers`_0) = 0 => next("registers")_r = #`registers`_r$,\
   `r` was not input-hinted in the next row, and it was not the output register, so it once again stays the same.
 
