@@ -160,9 +160,10 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
                     Arg::reg(acc_hi),
                     Arg::reg(acc_lo),
                 );
-                if let Some([(hi, _), (lo, _)]) = halves {
-                    asm.store(Arg::mem_abs(hi.0), Arg::reg(acc_hi))
-                        .store(Arg::mem_abs(lo.0), Arg::reg(acc_lo));
+                // The halves are byte-swapped `u32`s for the transcript: byte
+                // glue, which the 3MI split leaves to the RISC-V half.
+                if halves.is_some() {
+                    *skipped.entry("bit_dec_halves").or_insert(0) += 1;
                 }
             }
             Instr::Public { addr, .. } => public.push(addr.0),
