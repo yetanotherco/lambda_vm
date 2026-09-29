@@ -371,6 +371,11 @@ where
     /// How many tables each group holds, in order.
     sizes: Vec<usize>,
     roots: Vec<Commitment>,
+    /// Per table, how many LEADING columns the group stacks leave out — the
+    /// prefix a prepared opening settles instead (policy B). Empty when every
+    /// column is in its group's stack, which is every proof but a W-LFM one
+    /// under policy B.
+    settled: Vec<usize>,
 }
 
 /// Where each table's columns start in the global column order.
@@ -430,6 +435,57 @@ pub fn stack_height(shapes: &[(usize, usize)], cap: StackVars) -> usize {
     want.min(cap.get()).max(tallest)
 }
 
+/// The store column of every column a group stacks when each table's leading
+/// `settled[k]` columns are left out: table `k`'s columns `settled[k]..width`,
+/// which sit at `firsts[k] + settled[k]..firsts[k] + width` in a store that
+/// keeps every table's columns contiguous.
+fn settled_column_map(widths: &[usize], firsts: &[usize], settled: &[usize]) -> Vec<usize> {
+    widths
+        .iter()
+        .zip(firsts)
+        .zip(settled)
+        .flat_map(|((&width, &first), &skip)| (first + skip)..(first + width))
+        .collect()
+}
+
+/// A group's claims with each table's leading `settled[k]` columns left out,
+/// gathered from the global per-column lists: the points and values the group's
+/// stack opens under policy B. `starts[k]` is table `k`'s first global column.
+fn unsettled_claims<E: IsField>(
+    widths: &[usize],
+    starts: &[usize],
+    settled: &[usize],
+    points: &[Vec<FieldElement<E>>],
+    values: &[FieldElement<E>],
+) -> Result<PreparedClaims<E>, MlError> {
+    let mut at_points = Vec::new();
+    let mut at_values = Vec::new();
+    for ((&width, &start), &skip) in widths.iter().zip(starts).zip(settled) {
+        let range = start + skip..start + width;
+        at_points.extend(
+            points
+                .get(range.clone())
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: start + width,
+                    got: points.len(),
+                })?
+                .iter()
+                .cloned(),
+        );
+        at_values.extend(
+            values
+                .get(range)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: start + width,
+                    got: values.len(),
+                })?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok((at_points, at_values))
+}
+
 /// One layout per group, from the shapes, how the tables are split and the
 /// stack cap.
 pub fn global_layouts(
@@ -479,9 +535,31 @@ where
     /// Everything else is unchanged — the tables are argued in one transcript
     /// against one set of roots, and each group is opened once.
     pub fn commit_grouped(
+        tables: Vec<CommittedTable<'a, F, E>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+    ) -> Result<Self, MlError> {
+        Self::commit_grouped_settled(tables, sizes, config, &[])
+    }
+
+    /// [`Self::commit_grouped`] with each table's leading `settled[t]` columns
+    /// LEFT OUT of its group's stack — policy B of a W-LFM proof, where a
+    /// table's preprocessed prefix is committed only in the prepared stack and
+    /// its claims are settled only by the prepared opening.
+    ///
+    /// ★ The argument still reads every column: the tables' factors, their GKR
+    /// input and their reduction are over the whole trace, so the resident
+    /// store keeps each table's columns contiguous as before, and a group's
+    /// stack reads its own columns out of it through a column map.
+    ///
+    /// `settled` empty is [`Self::commit_grouped`] exactly. [`multi_prove`]
+    /// refuses a proof whose prepared opening does not settle exactly these
+    /// prefixes, since a column in neither stack would be bound by nothing.
+    pub fn commit_grouped_settled(
         mut tables: Vec<CommittedTable<'a, F, E>>,
         sizes: &[usize],
         config: &ChainConfig,
+        settled: &[usize],
     ) -> Result<Self, MlError> {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -489,6 +567,23 @@ where
                 got: sizes.iter().sum(),
             });
         }
+        if !settled.is_empty() {
+            if settled.len() != tables.len() {
+                return Err(MlError::QueryCountMismatch {
+                    expected: tables.len(),
+                    got: settled.len(),
+                });
+            }
+            for (table, &count) in tables.iter().zip(settled) {
+                if count >= table.num_committed_columns() {
+                    return Err(MlError::QueryCountMismatch {
+                        expected: table.num_committed_columns(),
+                        got: count,
+                    });
+                }
+            }
+        }
+        let settled_of = |table: usize| settled.get(table).copied().unwrap_or(0);
         // The device ledger's peak over the whole commit, under
         // `LAMBDA_VM_BASE_SPLIT=1` — `RESERVED HW`'s `commit`.
         let __rw_commit = multilinear::whir_split::open_reserved();
@@ -514,18 +609,37 @@ where
             let group = &tables[at..at + size];
             let shapes: Vec<(usize, usize)> = group
                 .iter()
-                .map(|t| (t.num_committed_columns(), t.num_vars()))
+                .enumerate()
+                .map(|(k, t)| (t.num_committed_columns() - settled_of(at + k), t.num_vars()))
                 .collect();
             let layout = global_layout(&shapes, config.format.stack)?;
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
-            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            let stacked = StackedCommitment::<F, H>::commit(
-                layout,
-                &columns,
-                store.as_ref().map(|store| (&**store, firsts[at])),
-                config,
-            )?;
+            let columns: Vec<&Mle<F>> = group
+                .iter()
+                .enumerate()
+                .flat_map(|(k, t)| &t.columns()[settled_of(at + k)..])
+                .collect();
+            let stacked = if settled.is_empty() {
+                StackedCommitment::<F, H>::commit(
+                    layout,
+                    &columns,
+                    store.as_ref().map(|store| (&**store, firsts[at])),
+                    config,
+                )?
+            } else {
+                let widths: Vec<usize> = group.iter().map(|t| t.num_committed_columns()).collect();
+                let map =
+                    settled_column_map(&widths, &firsts[at..at + size], &settled[at..at + size]);
+                StackedCommitment::<F, H>::commit_mapped(
+                    layout,
+                    &columns,
+                    store
+                        .as_ref()
+                        .map(|store| (&**store, stacked_eval::ColumnsAt::Map(&map))),
+                    config,
+                )?
+            };
             roots.extend(stacked.roots());
             groups.push(stacked);
             at += size;
@@ -547,11 +661,18 @@ where
             groups,
             sizes: sizes.to_vec(),
             roots,
+            settled: settled.to_vec(),
         })
     }
 
     pub fn tables(&self) -> &[CommittedTable<'a, F, E>] {
         &self.tables
+    }
+
+    /// Per table, the leading columns the group stacks leave out — empty when
+    /// every column is in its stack.
+    pub fn settled(&self) -> &[usize] {
+        &self.settled
     }
 
     /// Every group's roots, in order — what the transcript absorbs.
@@ -1356,6 +1477,28 @@ where
     // says so; it releases on DROP, which is what the `?`s below need.
     let _split = multilinear::whir_split::begin_prove();
 
+    // ⛔ A PREFIX LEFT OUT OF THE STACKS MUST BE SETTLED BY THE OPENING, table
+    // for table and count for count: a column in neither stack is bound by
+    // nothing, and a prover must never hand out the proof that says so.
+    if !committed.settled.is_empty() {
+        let at = prepared
+            .as_ref()
+            .map(|p| p.at)
+            .ok_or(MlError::QueryCountMismatch {
+                expected: 1,
+                got: 0,
+            })?;
+        for (table, &count) in committed.settled.iter().enumerate() {
+            let opened = prefix_at(at, table)?.map(|(_, n)| n).unwrap_or(0);
+            if opened != count {
+                return Err(MlError::QueryCountMismatch {
+                    expected: count,
+                    got: opened,
+                });
+            }
+        }
+    }
+
     let prepared_roots: Vec<Commitment> = prepared
         .as_ref()
         .map(|p| p.commitment.roots())
@@ -1439,20 +1582,49 @@ where
             .iter()
             .map(|t| t.num_committed_columns())
             .sum();
-        // The same columns, in the same order, the group was committed over.
-        let group_columns: Vec<&Mle<F>> = committed.tables()[table_at..table_at + size]
-            .iter()
-            .flat_map(|t| t.trace.columns())
-            .collect();
-        columns.push(stacked_eval::prove::<F, E, T, H>(
-            group,
-            &group_columns,
-            committed.store.as_ref().map(|store| (&**store, column_at)),
-            &Claimed::PerColumn(&points[column_at..column_at + width]),
-            &values[column_at..column_at + width],
-            config,
-            transcript,
-        )?);
+        if committed.settled.is_empty() {
+            // The same columns, in the same order, the group was committed over.
+            let group_columns: Vec<&Mle<F>> = committed.tables()[table_at..table_at + size]
+                .iter()
+                .flat_map(|t| t.trace.columns())
+                .collect();
+            columns.push(stacked_eval::prove::<F, E, T, H>(
+                group,
+                &group_columns,
+                committed.store.as_ref().map(|store| (&**store, column_at)),
+                &Claimed::PerColumn(&points[column_at..column_at + width]),
+                &values[column_at..column_at + width],
+                config,
+                transcript,
+            )?);
+        } else {
+            // Policy B: the group's stack holds each table's columns past its
+            // settled prefix, and opens exactly those claims; the prefix's are
+            // the prepared opening's.
+            let tables = &committed.tables()[table_at..table_at + size];
+            let skip = &committed.settled[table_at..table_at + size];
+            let starts = &table_starts[table_at..table_at + size];
+            let widths: Vec<usize> = tables.iter().map(|t| t.num_committed_columns()).collect();
+            let group_columns: Vec<&Mle<F>> = tables
+                .iter()
+                .zip(skip)
+                .flat_map(|(t, &s)| &t.trace.columns()[s..])
+                .collect();
+            let (at_points, at_values) = unsettled_claims(&widths, starts, skip, &points, &values)?;
+            let map = settled_column_map(&widths, starts, skip);
+            columns.push(stacked_eval::prove_mapped::<F, E, T, H>(
+                group,
+                &group_columns,
+                committed
+                    .store
+                    .as_ref()
+                    .map(|store| (&**store, stacked_eval::ColumnsAt::Map(&map))),
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                config,
+                transcript,
+            )?);
+        }
         table_at += size;
         column_at += width;
     }
@@ -1545,6 +1717,43 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    multi_verify_settled::<F, E, T, H>(
+        proof, statements, layouts, domains, sizes, expected, config, transcript, prepared, false,
+    )
+}
+
+/// [`multi_verify`], with `exclude_settled` saying whether the group stacks
+/// LEAVE OUT each table's prefix the prepared check settles (policy B, the
+/// proofs of [`CommittedTables::commit_grouped_settled`]).
+///
+/// The exclusion is the verifier's own FORMAT decision, never a proof's: the
+/// caller builds `layouts` from the value-only shapes under it. It turns no
+/// check off — a prefix left out of the stacks is settled by the prepared
+/// opening, which is then its only binding, exactly as it is DECODE's — and a
+/// proof made under the other policy fails the group openings, whose layouts
+/// then describe different stacks.
+#[allow(clippy::too_many_arguments)]
+pub fn multi_verify_settled<F, E, T, H>(
+    proof: &MultiProof<F, E>,
+    statements: &[TableStatement<'_, F, E>],
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    sizes: &[usize],
+    expected: &FieldElement<E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: Option<PreparedCheck<'_, F>>,
+    exclude_settled: bool,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
     // ★★ The transcript's hash must BE the configuration's. Not "should": a
     // caller that passes a keccak transcript under an RPX `H` does not compile.
     //
@@ -1590,6 +1799,8 @@ where
     // Where each table's columns start in the global column order. A prepared
     // commitment may span several tables, so every start is kept.
     let mut table_starts = Vec::with_capacity(statements.len());
+    // How many of each table's leading columns the prepared opening settles.
+    let mut settled_counts = Vec::with_capacity(statements.len());
     for (index, (table, statement)) in proof.tables.iter().zip(statements).enumerate() {
         table_starts.push(points.len());
         // ★ ONE VALUE drives both halves: the count the opening settles is the
@@ -1620,6 +1831,7 @@ where
                 got: settled,
             });
         }
+        settled_counts.push(settled);
         let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript, settled)?;
         balance += contribution(&output).ok_or(MlError::BusImbalance)?;
         for _ in 0..statement.slot_of.len() {
@@ -1650,16 +1862,42 @@ where
                 expected: root_at + layout.num_polys(),
                 got: proof.roots.len(),
             })?;
-        stacked_eval::verify::<F, E, T, H>(
-            opening,
-            layout,
-            roots,
-            &Claimed::PerColumn(&points[column_at..column_at + width]),
-            &values[column_at..column_at + width],
-            domain,
-            config,
-            transcript,
-        )?;
+        if exclude_settled {
+            // Policy B: the group's stack holds each table's columns past the
+            // prefix the prepared opening settles, and these are its claims.
+            let widths: Vec<usize> = statements[statement_at..statement_at + size]
+                .iter()
+                .map(|s| s.slot_of.len())
+                .collect();
+            let (at_points, at_values) = unsettled_claims(
+                &widths,
+                &table_starts[statement_at..statement_at + size],
+                &settled_counts[statement_at..statement_at + size],
+                &points,
+                &values,
+            )?;
+            stacked_eval::verify::<F, E, T, H>(
+                opening,
+                layout,
+                roots,
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                domain,
+                config,
+                transcript,
+            )?;
+        } else {
+            stacked_eval::verify::<F, E, T, H>(
+                opening,
+                layout,
+                roots,
+                &Claimed::PerColumn(&points[column_at..column_at + width]),
+                &values[column_at..column_at + width],
+                domain,
+                config,
+                transcript,
+            )?;
+        }
         statement_at += size;
         column_at += width;
         root_at += layout.num_polys();
@@ -2201,6 +2439,151 @@ mod tests {
         assert!(
             refused.is_err(),
             "the forged program must not open the pinned commitment"
+        );
+    }
+
+    /// Policy B: the three tables proved with the CPU's prefix LEFT OUT of the
+    /// main stack (`commit_grouped_settled`), its claims settled only by the
+    /// prepared opening over the pinned columns. `prove_b` / `verify_b` say
+    /// which policy each side runs; the verifier rebuilds its layout from the
+    /// shapes under its own policy, never from the prover's commitment.
+    fn argue_policy(
+        cpu_cols: Vec<Vec<FE>>,
+        prove_b: bool,
+        verify_b: bool,
+        settled_by_prover: usize,
+    ) -> Result<(), MlError> {
+        let (cpu_air, add_air, mul_air) = airs();
+        let tables = vec![
+            table(&cpu_air, &cpu_cols)?,
+            table(&add_air, &add_columns())?,
+            table(&mul_air, &mul_columns())?,
+        ];
+        let sizes = [3usize];
+        let settled = if prove_b {
+            vec![settled_by_prover, 0, 0]
+        } else {
+            Vec::new()
+        };
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit_grouped_settled(
+            tables,
+            &sizes,
+            &config(),
+            &settled,
+        )?;
+        let pinned: Vec<Mle<Fp>> = cpu_columns()[..CPU_PREFIX]
+            .iter()
+            .map(|column| Mle::new(column.clone()))
+            .collect::<Result<_, _>>()?;
+        let num_vars = pinned[0].num_vars();
+        let layout = global_layout(&[(pinned.len(), num_vars)], config().format.stack)?;
+        let borrowed = multilinear::stacking::borrow(&pinned);
+        let prepared_commitment =
+            StackedCommitment::<Fp, KeccakWhir>::commit(layout, &borrowed, None, &config())?;
+        let at = leading_columns(0, CPU_PREFIX);
+
+        let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        let proof = multi_prove(
+            &committed,
+            &config(),
+            &mut prover,
+            Some(Prepared {
+                commitment: &prepared_commitment,
+                columns: &borrowed,
+                at: &at,
+            }),
+        )?;
+
+        let statements: Vec<TableStatement<'_, Fp, Ext>> = committed
+            .tables()
+            .iter()
+            .enumerate()
+            .map(|(index, t)| {
+                if index == 0 {
+                    t.layout().statement_with_prepared_prefix(CPU_PREFIX)
+                } else {
+                    t.layout().statement()
+                }
+            })
+            .collect();
+        // The verifier's own stack, from the shapes under ITS policy.
+        let shapes: Vec<(usize, usize)> = three_shapes()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (width, n))| {
+                if verify_b && index == 0 {
+                    (width - CPU_PREFIX, n)
+                } else {
+                    (width, n)
+                }
+            })
+            .collect();
+        let group_layout = global_layout(&shapes, config().format.stack)?;
+        let domain = Domain::<Fp>::new(group_layout.n_stack() + config().log_blowup)?;
+        let roots = prepared_commitment.roots();
+        let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        multi_verify_settled::<_, _, _, KeccakWhir>(
+            &proof,
+            &statements,
+            std::slice::from_ref(&group_layout),
+            std::slice::from_ref(&domain),
+            &sizes,
+            &ExtE::zero(),
+            &config(),
+            &mut verifier,
+            Some(PreparedCheck {
+                roots: &roots,
+                layout: prepared_commitment.layout(),
+                domain: prepared_commitment.domain(),
+                at: &at,
+            }),
+            verify_b,
+        )
+    }
+
+    /// ★ Policy B round-trips: the prefix out of the main stack, settled by the
+    /// prepared opening alone — and the main stack is narrower for it.
+    #[test]
+    fn policy_b_settles_the_prefix_only_in_the_prepared_stack() {
+        argue_policy(cpu_columns(), true, true, CPU_PREFIX)
+            .expect("an honest policy-B proof verifies under policy B");
+        // Policy A still round-trips through the same entry points.
+        argue_policy(cpu_columns(), false, false, 0)
+            .expect("an honest policy-A proof verifies under policy A");
+    }
+
+    /// Under policy B the prepared opening is the prefix's ONLY binding, and it
+    /// refuses the forged program.
+    #[test]
+    fn policy_b_refuses_a_forged_prefix() {
+        assert!(
+            argue_policy(reversed_cpu_columns(), true, true, CPU_PREFIX).is_err(),
+            "the forged prefix must not open the pinned stack under policy B"
+        );
+    }
+
+    /// The policy is the verifier's: a B proof read as A, and an A proof read
+    /// as B, are both refused — their group openings describe other stacks.
+    #[test]
+    fn a_proof_read_under_the_other_policy_is_refused() {
+        assert!(
+            argue_policy(cpu_columns(), true, false, CPU_PREFIX).is_err(),
+            "a policy-B proof must not verify under policy A"
+        );
+        assert!(
+            argue_policy(cpu_columns(), false, true, 0).is_err(),
+            "a policy-A proof must not verify under policy B"
+        );
+    }
+
+    /// ⛔ A prover whose prepared opening does not settle exactly the prefix it
+    /// left out of the stacks is refused before it hands anything out: a column
+    /// in neither stack would be bound by nothing.
+    #[test]
+    fn a_left_out_prefix_the_opening_does_not_settle_is_refused_by_the_prover() {
+        assert!(
+            argue_policy(cpu_columns(), true, true, CPU_PREFIX - 1).is_err(),
+            "the prover must refuse a stack exclusion its opening does not match"
         );
     }
 
