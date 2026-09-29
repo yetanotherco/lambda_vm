@@ -65,14 +65,14 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "m_addr", "i"], 0]]
 multiplicity = "μ"
-iters = [["i", 0, 7]]
+iter = ["i", 0, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "IS_WH"
 input = [["idx", ["idx", "m_addr", "i"], 2], ["idx", ["idx", "m_addr", "i"], 1]]
 multiplicity = "μ"
-iters = [["i", 0, 7]]
+iter = ["i", 0, 7]
 
 [[constraints.memory]]
 kind = "template"
@@ -119,14 +119,14 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "h_addr", "i"], 0]]
 multiplicity = "μ"
-iters = [["i", 0, 3]]
+iter = ["i", 0, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "IS_WH"
 input = [["idx", ["idx", "h_addr", "i"], 2], ["idx", ["idx", "h_addr", "i"], 1]]
 multiplicity = "μ"
-iters = [["i", 0, 3]]
+iter = ["i", 0, 3]
 
 [[constraints.memory]]
 kind = "template"
