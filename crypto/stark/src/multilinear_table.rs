@@ -1945,7 +1945,7 @@ mod tests {
     /// move: CPU is 2^14 rows of 5 columns and ADD 2^14 of 4 — exactly 2^16
     /// cells, the threshold — so a card values both once they are resident,
     /// while MUL, 2^13 of 4, stays on the host either way. Every column is
-    /// under 2^16 rows, so at the default the host walks all thirteen.
+    /// under 2^16 rows, so with the knob off the host walks all thirteen.
     ///
     /// Half the CPU's rows add and half multiply, each met by one receive; ADD
     /// is padded with rows that add up (0 + 0 = 0) and receive nothing.

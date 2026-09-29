@@ -46,8 +46,8 @@ static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Columns the claim reduce evaluated on the HOST, one at a time: the tables
 /// the batched device evaluation did not take, at a height where a single
 /// column stays here too ([`evaluates_on_device`]). The count
-/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` exists to move: at the default every table
-/// under 2^16 rows lands here, however wide.
+/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` exists to move: with it off (`=0`) every
+/// table under 2^16 rows lands here, however wide.
 static HOST_EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Columns whose device value `LAMBDA_VM_ARGUE_XCHECK` recomputed on the host
 /// and found equal — so a gate run can show the check ran, not only that
@@ -1309,8 +1309,12 @@ const EVALUATE_THRESHOLD: usize = 1 << 16;
 
 /// Whether the claim reduce evaluates a resident table's columns on the card
 /// once the TABLE holds [`EVALUATE_THRESHOLD`] cells, rather than only once
-/// each column is that tall — `LAMBDA_VM_ARGUE_DEVICE_COLUMNS=1` (any non-empty
-/// value other than `0`). Off by default until its A/B; off is today's path.
+/// each column is that tall. On by default; `LAMBDA_VM_ARGUE_DEVICE_COLUMNS=0`
+/// is the opt-out, and it is the old path exactly.
+///
+/// The default was turned on by its A/B on the block (FAST, 2026-09-28): the
+/// whole run 1.05 s faster, the columns the host walked 24,195 → 3,478, every
+/// arm proved and verified on the record's identities.
 ///
 /// # Why the height is the wrong measure for a resident table
 ///
@@ -1331,7 +1335,7 @@ pub fn argue_device_columns() -> bool {
         2 => false,
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_DEVICE_COLUMNS"))
+            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_DEVICE_COLUMNS"))
         }
     }
 }
@@ -1395,6 +1399,16 @@ pub fn force_argue_xcheck(on: Option<bool>) {
 /// `name` set to anything but empty or `0`.
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `name` unset or set to anything but `0`: a knob that is on by default.
+fn env_not_off(name: &str) -> bool {
+    not_off(std::env::var(name).ok().as_deref())
+}
+
+/// A default-on knob's reading of its variable: only `0` turns it off.
+fn not_off(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 /// ⛔ A FAULT: while armed, the batched device evaluation hands back its first
@@ -3394,6 +3408,16 @@ mod tests {
         let seven = b.fixed(FE::from(7u64));
         let root = b.add(acc, seven);
         b.finish(root).unwrap()
+    }
+
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` is on by default: unset, empty or any
+    /// value reads on, and only `0` — the opt-out — reads off.
+    #[test]
+    fn only_zero_turns_a_default_on_knob_off() {
+        assert!(not_off(None), "unset is the default, on");
+        assert!(not_off(Some("")), "empty is not the opt-out");
+        assert!(not_off(Some("1")));
+        assert!(!not_off(Some("0")), "`0` is the opt-out");
     }
 
     #[test]
