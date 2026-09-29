@@ -32,7 +32,7 @@ pub fn chunks(program: &Program, min_rows: usize) -> Vec<(usize, usize, usize)> 
     loop {
         let full = left.next_power_of_two().max(min_rows);
         let half = full / 2;
-        if (full - left) * 4 <= full
+        if super::air::within_waste(left, full)
             || plan.len() + 1 == MAX_CHUNKS
             || half < min_rows
             || half >= left

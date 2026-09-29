@@ -147,6 +147,20 @@ fn fill_row(t: &mut stark::table::Table<F>, row: usize, program: &Program, step:
     set_ext(t, row, cols::OUT_INV, &inv);
 }
 
+/// The padding share (in percent) a single power-of-two table may waste
+/// before it is split: `FVM_SEGMENT_WASTE`, default 25. Shared with DECODE.
+pub fn max_waste_percent() -> usize {
+    std::env::var("FVM_SEGMENT_WASTE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25)
+}
+
+/// Whether `rows` padded rows over `used` real ones stay within the waste bound.
+pub fn within_waste(used: usize, rows: usize) -> bool {
+    (rows - used) * 100 <= rows * max_waste_percent()
+}
+
 /// At most this many FIELD_VM segments when no cap forces more.
 pub const MAX_SEGMENTS: usize = 4;
 
@@ -164,7 +178,7 @@ pub fn segment_plan(steps: usize, min_rows: usize, max_rows: Option<usize>) -> V
         let rows = (full / 2).min(cap).max(min_rows);
         let fits = full <= cap;
         let last_allowed = max_rows.is_none() && plan.len() + 1 == MAX_SEGMENTS;
-        if fits && ((full - left) * 4 <= full || last_allowed || rows > left) {
+        if fits && (within_waste(left, full) || last_allowed || rows > left) {
             plan.push((left, full));
             return plan;
         }
