@@ -21,6 +21,37 @@ use crate::{
     sumcheck::{self, SumcheckProof},
 };
 
+/// A weight table the batch multiplies its statements by, as the caller has it:
+/// built, or as the point of an `eq` table.
+///
+/// The second is what lets a device build the table where it is folded —
+/// `2^n` cells from `n` coordinates — instead of the host building it and
+/// sending it across (`LAMBDA_VM_ARGUE_DEVICE_TABLES`). Whoever runs the rounds
+/// on the host builds it here, the same table either way.
+#[derive(Clone, Debug)]
+pub enum Weight<F: IsField> {
+    Table(Mle<F>),
+    /// `eq(point, ·)`.
+    Eq(Vec<FieldElement<F>>),
+}
+
+impl<F: IsField + 'static> Weight<F> {
+    /// The table, built here if it came as a point.
+    pub fn materialize(self) -> Result<Mle<F>, Error> {
+        match self {
+            Self::Table(table) => Ok(table),
+            Self::Eq(point) => crate::eq::eq_mle(&point),
+        }
+    }
+
+    fn view(&self) -> crate::gpu::WeightView<'_, F> {
+        match self {
+            Self::Table(table) => crate::gpu::WeightView::Table(table),
+            Self::Eq(point) => crate::gpu::WeightView::Eq(point),
+        }
+    }
+}
+
 /// One statement's rule: what it makes of the batch's factors.
 ///
 /// Reads the **whole** factor list, so a sub-argument that already combines a
@@ -317,8 +348,11 @@ type ResidentProof<F> = (SumcheckProof<F>, Vec<FieldElement<F>>, Vec<FieldElemen
 /// about the factors to the transcript by then — only the claims and the
 /// batching challenge, which are the same either way — so the host path
 /// continues from where the device left off and produces the same proof.
+///
+/// A weight given as a point ([`Weight::Eq`]) stays one until then: the device
+/// builds it with the rounds, or the host does when they are turned down.
 pub fn prove_resident<F, T, B>(
-    extra: Vec<Mle<F>>,
+    extra: Vec<Weight<F>>,
     device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
     absent: B,
     rules: Vec<Rule<'_, F>>,
@@ -338,7 +372,9 @@ where
     }
     let Some(device) = device else {
         let mut polys = absent()?;
-        polys.extend(extra);
+        for weight in extra {
+            polys.push(weight.materialize()?);
+        }
         let (proof, point) = prove(polys, rules, claims, transcript)?;
         return Ok((proof, point, Vec::new()));
     };
@@ -347,21 +383,38 @@ where
         transcript.append_field_element(claim);
     }
     let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
-    let mut batched = Batched::new(extra, rules, lambdas)?;
+    // Built weights go in the batch now, as they always did. When any came as a
+    // point, the batch starts empty and the weights wait: for the device to
+    // build them with its rounds, or for the host to, if it turns them down.
+    let pending = extra.iter().any(|weight| matches!(weight, Weight::Eq(_)));
+    let (built, waiting) = if pending {
+        (Vec::new(), extra)
+    } else {
+        let tables = extra
+            .into_iter()
+            .map(Weight::materialize)
+            .collect::<Result<Vec<_>, _>>()?;
+        (tables, Vec::new())
+    };
+    let mut batched = Batched::new(built, rules, lambdas)?;
     let degree = batched.degree().max(1);
     if let Some(program) = batched.program() {
-        let attempt = crate::gpu::prove_sumcheck_resident(
-            &device,
-            batched.polys(),
-            program,
-            degree,
-            |evaluations| {
+        let views: Vec<crate::gpu::WeightView<'_, F>> = if pending {
+            waiting.iter().map(Weight::view).collect()
+        } else {
+            batched
+                .polys()
+                .iter()
+                .map(crate::gpu::WeightView::Table)
+                .collect()
+        };
+        let attempt =
+            crate::gpu::prove_sumcheck_resident(&device, &views, program, degree, |evaluations| {
                 for e in evaluations {
                     transcript.append_field_element(e);
                 }
                 transcript.sample_field_element()
-            },
-        );
+            });
         if let Some(outcome) = attempt {
             let (mut rounds, mut point, factors) = outcome?;
             // The device stopped where the cube stopped being worth sending;
@@ -383,7 +436,14 @@ where
         }
     }
     // Declined before the first round: the host runs them, and for that the
-    // factors have to be here after all.
+    // factors have to be here after all — and any weight that waited as a point.
+    if pending {
+        let weights = waiting
+            .into_iter()
+            .map(Weight::materialize)
+            .collect::<Result<Vec<_>, _>>()?;
+        batched.prepend(weights)?;
+    }
     batched.prepend(absent()?)?;
     let (proof, point) = sumcheck::prove(batched, transcript)?;
     Ok((proof, point, Vec::new()))
@@ -640,6 +700,44 @@ mod tests {
             &mut transcript(),
         )
         .map(|_| ())
+    }
+
+    /// A weight given as its point proves exactly what its table proves. With
+    /// no device the host builds the point into the same table before the
+    /// rounds, so the proof, the point, the transcript after them — everything
+    /// — is the table's.
+    #[test]
+    fn a_weight_given_as_its_point_proves_what_its_table_proves() {
+        let r = [FE::from(11), FE::from(13)];
+        let (polys, _, claims) = two_evaluation_claims(&r);
+        let run = |weight: Weight<F>| {
+            let (_, rules, _) = two_evaluation_claims(&r);
+            let mut t = transcript();
+            let (proof, point, bound) = prove_resident(
+                vec![weight],
+                None,
+                || Ok(polys[..2].to_vec()),
+                rules,
+                &claims,
+                &mut t,
+            )
+            .unwrap();
+            (proof, point, bound, t.state())
+        };
+        let from_table = run(Weight::Table(eq_mle(&r).unwrap()));
+        let from_point = run(Weight::Eq(r.to_vec()));
+        assert_eq!(from_table, from_point);
+
+        let (_, rules, _) = two_evaluation_claims(&r);
+        verify(
+            &from_point.0,
+            &rules,
+            &claims,
+            |at: &[FE]| polys.iter().map(|p| p.evaluate(at)).collect(),
+            r.len(),
+            &mut transcript(),
+        )
+        .expect("the proof from a point verifies");
     }
 
     #[test]

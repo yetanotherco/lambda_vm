@@ -32,7 +32,7 @@ use crate::{
     Error, challenge_powers,
     eq::{shift_eval, shift_mle},
     mle::Mle,
-    poly::Composed,
+    poly::{Composed, SumcheckPolynomial},
     program::{Builder, Program},
     sumcheck::{self, SumcheckProof},
 };
@@ -139,7 +139,7 @@ const ACCUMULATOR_CHUNK: usize = 1 << 12;
 
 /// `Σ_{i reads at `offset`} gamma^i · column_i`, the one polynomial that offset's
 /// kernel multiplies.
-fn batched_column<F, E>(
+pub(crate) fn batched_column<F, E>(
     columns: &[Mle<F>],
     sources: &[FactorSource],
     weights: &[FieldElement<E>],
@@ -284,24 +284,65 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), sources.len());
 
-    let mut polys = Vec::with_capacity(2 * offsets(sources).len());
-    for offset in offsets(sources) {
-        polys.push(shift_mle(alpha, offset)?);
-        polys.push(batched_column::<F, E>(
+    // Under `LAMBDA_VM_ARGUE_DEVICE_TABLES` the tables are built where they are
+    // folded: the card takes the point, the columns each offset reads and their
+    // weights, and hands back the tables folded to the crossover.
+    let on_card = if crate::gpu::argue_device_tables() {
+        let offsets = offsets(sources);
+        crate::gpu::prove_reduce_resident(
             columns,
             sources,
             &weights,
-            offset,
-            alpha.len(),
-        )?);
-    }
+            &offsets,
+            alpha,
+            resident,
+            &pair_products_program::<E>(offsets.len())?,
+            |evaluations| {
+                for e in evaluations {
+                    transcript.append_field_element(e);
+                }
+                transcript.sample_field_element()
+            },
+        )
+    } else {
+        None
+    };
+    let (sumcheck, point) = match on_card {
+        Some(outcome) => {
+            let (mut rounds, mut point, folded) = outcome?;
+            // The rounds past the crossover run here, over the tables the card
+            // folded — as they do after an upload, and through the same loop:
+            // a cube at the crossover is one no device takes.
+            let pairs = folded.len() / 2;
+            let mut rest = Composed::new(folded, pair_products::<E>, 2)?
+                .with_program(pair_products_program::<E>(pairs)?);
+            let left = rest.num_vars();
+            let (tail, tail_point) = sumcheck::prove_rounds(&mut rest, left, transcript)?;
+            rounds.extend(tail);
+            point.extend(tail_point);
+            (SumcheckProof { rounds }, point)
+        }
+        None => {
+            let mut polys = Vec::with_capacity(2 * offsets(sources).len());
+            for offset in offsets(sources) {
+                polys.push(shift_mle(alpha, offset)?);
+                polys.push(batched_column::<F, E>(
+                    columns,
+                    sources,
+                    &weights,
+                    offset,
+                    alpha.len(),
+                )?);
+            }
 
-    let pairs = polys.len() / 2;
-    let (sumcheck, point) = sumcheck::prove(
-        Composed::new(polys, pair_products::<E>, 2)?
-            .with_program(pair_products_program::<E>(pairs)?),
-        transcript,
-    )?;
+            let pairs = polys.len() / 2;
+            sumcheck::prove(
+                Composed::new(polys, pair_products::<E>, 2)?
+                    .with_program(pair_products_program::<E>(pairs)?),
+                transcript,
+            )?
+        }
+    };
 
     // All at the same point, so they fold together: one upload and one launch
     // per level for the table instead of per column.
