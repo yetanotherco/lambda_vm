@@ -3883,19 +3883,22 @@ mod tests {
     ///   again): nothing is counted.
     /// - The consume path refused: one GKR tree refusal, one argue-side device
     ///   fallback, and the host's tree has the card's output fraction.
+    ///
+    /// ⚠ Run it with `--features cuda,multilinear/cuda`: this crate's `cuda` does
+    /// not turn on multilinear's, and without it the factors never go to the card.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "the card, run alone: the budget and the counts are process-wide"]
+    #[ignore = "the card, run alone, with multilinear/cuda: the budget and the counts are process-wide"]
     fn a_refused_gkr_tree_is_counted_and_the_host_builds_the_same_tree() {
         use math_cuda::device::{backend, device_fallbacks, reserve};
         use multilinear::gpu::{gkr_tree_refusals, set_hand_back_threshold_for_tests};
 
         let (_, add_air, _) = airs();
         let (t, interactions) = resident_add_table(&add_air);
-        let resident = t
-            .trace
-            .reside_from_columns()
-            .expect("an ADD table of 2^12 rows goes to the card");
+        let resident = t.trace.reside_from_columns().expect(
+            "an ADD table of 2^12 rows goes to the card — only with multilinear's `cuda` \
+                 feature on (`--features cuda,multilinear/cuda`)",
+        );
         let counts = || (gkr_tree_refusals(), device_fallbacks());
         let at_start = counts();
 
