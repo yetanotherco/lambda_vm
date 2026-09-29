@@ -843,6 +843,10 @@ pub(crate) fn prove_traces_whir_opening(
     // `multi_prove`, so a tree driver serializes W-LFM proves exactly as it
     // serializes today's.
     let _card = super::device_permit::hold_labeled("multi_prove");
+    // The prove's own split, recorded as a `WHIR PROVE SPLIT W-LFM` line under
+    // `LAMBDA_VM_BASE_SPLIT=1` (the base's instrument, with the base's stages:
+    // prep = the tables built, absorb = the statement, commit, prove).
+    let t_wall = Instant::now();
     let artifacts = &build.artifacts;
     let airs = airs_for(artifacts, options);
     let refs = airs.air_refs();
@@ -902,6 +906,9 @@ pub(crate) fn prove_traces_whir_opening(
         })?);
     }
 
+    let prep_secs = t_wall.elapsed().as_secs_f64();
+
+    let t = Instant::now();
     let mut transcript = WhirLfmTranscript::new(&[]);
     absorb_whir_lfm_statement(
         &mut transcript,
@@ -910,24 +917,41 @@ pub(crate) fn prove_traces_whir_opening(
         &artifacts.table_num_vars,
         &config,
     );
+    let absorb_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
     let committed = CommittedTables::<F, E, WhirLfmHash>::commit_grouped_settled(
         tables,
         &[counts.len()],
         &config,
         &settled,
     )?;
+    let commit_secs = t.elapsed().as_secs_f64();
     let borrowed = multilinear::stacking::borrow(&build.prepared.columns);
     let prepared = Prepared {
         commitment: &build.prepared.commitment,
         columns: &borrowed,
         at: &artifacts.prepared_at,
     };
-    Ok(multilinear_table::multi_prove(
+    let t = Instant::now();
+    let proof = multilinear_table::multi_prove(
         &committed,
         &config,
         &mut transcript,
         open_prepared.then_some(prepared),
-    )?)
+    )?;
+    if multilinear::whir_split::enabled() {
+        multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
+            index: multilinear::whir_split::LFM_INDEX,
+            prep: prep_secs,
+            absorb: absorb_secs,
+            commit: commit_secs,
+            prove: t.elapsed().as_secs_f64(),
+            wall: t_wall.elapsed().as_secs_f64(),
+            airs: counts.len(),
+            ..Default::default()
+        });
+    }
+    Ok(proof)
 }
 
 /// ★ Verifies a W-LFM proof against the program's artifacts and the CLAIMED
