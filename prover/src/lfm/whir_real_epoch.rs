@@ -188,13 +188,33 @@ pub(crate) fn whir_epoch_chain_position_in(
     elf: &Elf,
     index: usize,
 ) -> Option<WhirChainPosition> {
-    if index >= num_epochs || index >= epochs.len() {
+    if index >= epochs.len() {
         return None;
     }
-    let register_init = if index == 0 {
-        register::register_init_from_entry_point(elf.entry_point)
-    } else {
-        epochs[index - 1].reg_fini.clone()
+    whir_epoch_chain_position_after(
+        index.checked_sub(1).map(|prev| &epochs[prev]),
+        num_epochs,
+        elf,
+        index,
+    )
+}
+
+/// [`whir_epoch_chain_position_in`] from the one proof it reads: epoch
+/// `index − 1`'s (`prev`, `None` for epoch 0). `None` when the index is out of
+/// range, or `prev` is missing for a later epoch.
+pub(crate) fn whir_epoch_chain_position_after(
+    prev: Option<&EpochProof>,
+    num_epochs: usize,
+    elf: &Elf,
+    index: usize,
+) -> Option<WhirChainPosition> {
+    if index >= num_epochs {
+        return None;
+    }
+    let register_init = match (index, prev) {
+        (0, _) => register::register_init_from_entry_point(elf.entry_point),
+        (_, Some(prev)) => prev.reg_fini.clone(),
+        (_, None) => return None,
     };
     Some(WhirChainPosition {
         register_init,
@@ -322,12 +342,7 @@ where
     H: WhirHash,
 {
     let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
-    let decode_commitment = match decode_commitment {
-        Some(c) => c,
-        None => crate::tables::decode::commitment_from_elf(&elf, opts)
-            .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
-    };
-
+    let decode_commitment = decode_commitment_or_derive(&elf, opts, decode_commitment)?;
     let position =
         whir_epoch_chain_position_in(epochs, num_epochs, &elf, epoch_index).ok_or_else(|| {
             format!(
@@ -337,7 +352,87 @@ where
             )
         })?;
     let proof = epochs[epoch_index].clone();
+    harvest_at_position::<H>(
+        opts,
+        elf_bytes,
+        &elf,
+        decode_commitment,
+        position,
+        proof,
+        epoch_index,
+        prepared,
+    )
+}
 
+/// [`real_epoch_from_whir_epochs_under`] from the two proofs it reads: epoch
+/// `epoch_index`'s own and its predecessor's (`prev`, `None` for epoch 0), for a
+/// caller that holds a run's epochs one at a time rather than as a prefix — the
+/// tree's early harvest. The same verification, AIR set and config, so the same
+/// epoch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn real_epoch_after_under<H>(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    prev: Option<&EpochProof>,
+    proof: &EpochProof,
+    num_epochs: usize,
+    epoch_index: usize,
+    decode_commitment: Option<Commitment>,
+    prepared: Option<&crate::multilinear_continuation::DecodePrepared<H>>,
+) -> Result<WhirRealEpoch, String>
+where
+    H: WhirHash,
+{
+    let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
+    let decode_commitment = decode_commitment_or_derive(&elf, opts, decode_commitment)?;
+    let position = whir_epoch_chain_position_after(prev, num_epochs, &elf, epoch_index)
+        .ok_or_else(|| {
+            format!(
+                "epoch {epoch_index} is out of range, or its predecessor is missing: the run \
+                 has {num_epochs} epochs"
+            )
+        })?;
+    harvest_at_position::<H>(
+        opts,
+        elf_bytes,
+        &elf,
+        decode_commitment,
+        position,
+        proof.clone(),
+        epoch_index,
+        prepared,
+    )
+}
+
+/// The DECODE commitment handed in, or derived from the ELF.
+fn decode_commitment_or_derive(
+    elf: &Elf,
+    opts: &crate::ProofOptions,
+    given: Option<Commitment>,
+) -> Result<Commitment, String> {
+    match given {
+        Some(c) => Ok(c),
+        None => crate::tables::decode::commitment_from_elf(elf, opts)
+            .map_err(|e| format!("DECODE commitment from ELF: {e}")),
+    }
+}
+
+/// The harvest once the epoch's chain position is known: verify the epoch under
+/// `H`, rebuild its AIR set, derive its config.
+#[allow(clippy::too_many_arguments)]
+fn harvest_at_position<H>(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    elf: &Elf,
+    decode_commitment: Commitment,
+    position: WhirChainPosition,
+    proof: EpochProof,
+    epoch_index: usize,
+    prepared: Option<&crate::multilinear_continuation::DecodePrepared<H>>,
+) -> Result<WhirRealEpoch, String>
+where
+    H: WhirHash,
+{
     // ★ The acceptance check, and the hash agreement with it. Both are the
     // same call: `H` configures the transcript's sponge, so verifying here IS
     // asking whether this bundle was proven under `H`.
@@ -348,7 +443,7 @@ where
     let prepared = match prepared {
         Some(p) => p,
         None => {
-            derived = crate::multilinear_continuation::decode_prepared_for::<H>(&elf, elf_bytes)
+            derived = crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
                 .map_err(|e| {
                     format!(
                         "DECODE's prepared commitment under {}: {e:?}",
@@ -359,7 +454,7 @@ where
         }
     };
     let verified = crate::multilinear_continuation::verify_epoch_bookend::<H>(
-        &elf,
+        elf,
         elf_bytes,
         &proof,
         &position.register_init,
@@ -400,7 +495,7 @@ where
     // this side's answer for DECODE's preprocessed commitment — see
     // `epoch_airs_for` on why that is the only thing the two callers differ on.
     let air_set = crate::multilinear_continuation::epoch_airs_for(
-        &elf,
+        elf,
         opts,
         &proof,
         &position.register_init,
