@@ -706,11 +706,11 @@ pub const WHIR_FAN_IN: usize = 3;
 /// (253,082 rows) stays under 2^18, so the root falls from 270.9 M to 149.6 M.
 /// Fan-in 4 had already removed the interior level (−0.70 s alone, job 235).
 ///
-/// ⚠ **THE CARD'S MARGIN IS 1.4 GiB.** The W-LFM argue's reservation peaked at
-/// 24.3 GiB of the 25.7 GiB budget at five (21.9 at four). A block with heavier
-/// epochs would push it over, and the refused work falls back to the host:
-/// slower, never wrong. Measure a heavier block before relying on five;
-/// `LFM_CENSUS_FAN_IN=4` is the opt-out.
+/// ⚠ **THE CARD'S MARGIN IS 1,346 MiB.** The W-LFM argue's reservation peaked
+/// at 24,342 MiB of the 25,688 MiB budget at five (21,754 MiB at four; job 238,
+/// the log's `RESERVED HW` MiB). A block with heavier epochs would push it over,
+/// and the refused work falls back to the host: slower, never wrong. Measure a
+/// heavier block before relying on five; `LFM_CENSUS_FAN_IN=4` is the opt-out.
 ///
 /// ⚠ **A THIRD CONSTANT, for the reason [`WHIR_FAN_IN`] is a second one.** The
 /// WHIR trees without a wide level 1 — the `stark` opt-out and
