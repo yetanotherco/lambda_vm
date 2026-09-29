@@ -8781,6 +8781,10 @@ where
     // epoch; the schema checks read the node layout's two ENDS.
     let prove_one_wide = |j: usize, epochs: std::ops::Range<usize>| -> WhirWrapSlot<C> {
         let t_wide = Instant::now();
+        // ⓘ THE INTERIOR'S LABEL AT LEVEL 1, so every reader of a tree log
+        // (`zf_summary.py`'s `L{level}N{j}` rule among them) files this proof
+        // where the level above reads it: as level 1's node `j`.
+        let label = format!("L1N{j} (arity {})", epochs.len());
         crate::multilinear_continuation::reset_decode_derivations();
         let t = Instant::now();
         let held: Vec<(
@@ -8814,7 +8818,7 @@ where
         let derived_here = crate::multilinear_continuation::decode_derivations();
         assert_eq!(
             derived_here, 0,
-            "wide node {j} derived DECODE {derived_here} time(s) while preparing its epochs; \
+            "{label} derived DECODE {derived_here} time(s) while preparing its epochs; \
              both hoists are handed in, so a non-zero count means one is not reaching the \
              harvest"
         );
@@ -8844,20 +8848,14 @@ where
         let (first, last) = (&held[0].0, &held[held.len() - 1].0);
         let out_halves = last.public_output().len().div_ceil(4);
 
-        let (cells, instrs) = census_and_panel(&program, &format!("whir wide {j}"), epochs.len());
+        let (cells, instrs) = census_and_panel(&program, &label, epochs.len());
         let wide_sampler = HostSampler::start();
         let t = Instant::now();
         let artifacts = C::build(&program, wrap_opts);
         let t_artifacts = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let proved = C::prove(
-            &format!("wide {j}"),
-            &program,
-            &artifacts,
-            &arenas,
-            wrap_opts,
-        )
-        .unwrap_or_else(|why| panic!("{why}"));
+        let proved = C::prove(&label, &program, &artifacts, &arenas, wrap_opts)
+            .unwrap_or_else(|why| panic!("{why}"));
         let t_prove = t.elapsed().as_secs_f64();
 
         // ★★ THE SEAM'S OWN CHECK, at the node schema: the level above reads
@@ -8869,21 +8867,21 @@ where
             C::proved_words(&proved)
                 .iter()
                 .find(|(at, _)| *at as usize == i)
-                .unwrap_or_else(|| panic!("wide node {j} published no word at schema index {i}"))
+                .unwrap_or_else(|| panic!("{label} published no word at schema index {i}"))
                 .1
         };
         for (r, value) in first.position.register_init.iter().enumerate() {
             assert_eq!(
                 word_at(layout.reg_init(r)),
                 base_word(FE::from(u64::from(*value))),
-                "wide node {j}: published reg_init[{r}] is not its first epoch's"
+                "{label}: published reg_init[{r}] is not its first epoch's"
             );
         }
         for (r, value) in last.proof.reg_fini.iter().enumerate() {
             assert_eq!(
                 word_at(layout.reg_fini(r)),
                 base_word(FE::from(u64::from(*value))),
-                "wide node {j}: published reg_fini[{r}] is not its last epoch's"
+                "{label}: published reg_fini[{r}] is not its last epoch's"
             );
         }
         let ends = [positions[0], positions[positions.len() - 1]];
@@ -8891,21 +8889,21 @@ where
             assert_eq!(
                 word_at(layout.label(2 * i)),
                 base_word(FE::from(label & 0xFFFF_FFFF)),
-                "wide node {j}: label range end {i} (low half)"
+                "{label}: label range end {i} (low half)"
             );
             assert_eq!(
                 word_at(layout.label(2 * i + 1)),
                 base_word(FE::from(label >> 32)),
-                "wide node {j}: label range end {i} (high half)"
+                "{label}: label range end {i} (high half)"
             );
         }
 
         let t = Instant::now();
-        let (child, t_verify) = C::harvest(&format!("wide {j}"), artifacts, wrap_opts, proved);
+        let (child, t_verify) = C::harvest(&label, artifacts, wrap_opts, proved);
         let t_child = t.elapsed().as_secs_f64();
         let (peak, at) = wide_sampler.stop();
         println!(
-            "   whir wide {j} TIMING: epochs {}..={} · harvest-epochs {t_harvest_epochs:.2}s · \
+            "   {label} TIMING: wide, epochs {}..={} · harvest-epochs {t_harvest_epochs:.2}s · \
              emit+arenas {t_emit:.2}s · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · \
              harvest {t_child:.2}s (verify {t_verify:.2}) · wall {:.2}s",
             epochs.start,
@@ -8913,7 +8911,7 @@ where
             t_wide.elapsed().as_secs_f64(),
         );
         println!(
-            "   whir wide {j}: host peak {peak:.3} GiB at t={at:.1}{}{}",
+            "   {label}: host peak {peak:.3} GiB at t={at:.1}{}{}",
             match ceiling {
                 Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
                 Err(_) => String::new(),
@@ -9026,11 +9024,16 @@ where
         groups.len(),
         "level 0's pool must yield one slot per task; the global task is not a wrap"
     );
-    let kind = if wide { "wide" } else { "wrap" };
     for (k, (child, layout, lbl, cells, instrs)) in l0_wraps.into_iter().map(|w| *w).enumerate() {
         let (id, heights, chunk_heights) = child.identity();
+        // A wide node carries level 1's node label; a wrap, today's.
+        let label = if wide {
+            format!("L1N{k} (arity {})", groups[k].len())
+        } else {
+            format!("whir wrap {k}")
+        };
         println!(
-            "   whir {kind} {k} IDENTITY: program_id {id} · heights {heights} · blake3 chunk \
+            "   {label} IDENTITY: program_id {id} · heights {heights} · blake3 chunk \
              heights {chunk_heights} · published {} words · {cells} cells ({instrs} instructions)",
             child.public_words().len(),
         );
