@@ -6050,11 +6050,12 @@ fn lead_in_count(var: &str, default: usize) -> usize {
 }
 
 /// Where the lead-in's prologues run: unset or empty is the pipeline's default
-/// (one pool of [`STARK_TAIL_THREADS`] shared by the helpers for the STARK tree,
-/// the global pool for the WHIR tree); `0` the global pool (the named opt-out,
-/// which reproduces the tail as it ran before); `<n>` one pool of n threads
-/// shared by the helpers; `per-helper:<n>` one pool of n threads per helper.
-/// Anything else stops the run.
+/// (a pool of [`STARK_TAIL_THREADS`] per helper for the STARK tree, the global
+/// pool for the WHIR tree); `0` the global pool (the named opt-out, which
+/// reproduces the tail as it ran before); `<n>` one pool of n threads shared by
+/// the helpers (`16` is the shared pool the STARK tree ran before a pool per
+/// helper); `per-helper:<n>` one pool of n threads per helper. Anything else
+/// stops the run.
 ///
 /// ⛔ WHY A POOL OF THEIR OWN. The prologues run while the base still proves its
 /// last epochs, and they put parallel work on whatever pool they run in. The
@@ -6075,15 +6076,21 @@ fn lead_in_count(var: &str, default: usize) -> usize {
 /// `wait_until_cold`) — so in a pool shared by two helpers it can run the other
 /// helper's whole prologue nested on its stack and finish its own only after
 /// that one. F-PREP measured that inversion on level 0 (reconstructs 2 → 22 s).
-/// Job 206 did not show it here (the tail prologues' maximum 4.90 s against the
-/// global pool's 4.44 s), but only a pool per helper, each with one caller,
-/// rules it out.
+/// Jobs 206 and 211 did not show it here (the shared pool's tail prologues at
+/// most 4.90 s against the global pool's 4.44 s), but only a pool per helper,
+/// each with one caller, rules it out. FAST job 2115 (ds884–887, a pool of 8
+/// per helper against one shared pool of 16, two arms each) measured the wall
+/// +0.30 s, the base −0.20 s and level 0 +0.70 s, all inside the noise; program
+/// ids unchanged. The one prologue it slows is the lead-in's last, which runs
+/// alone: 5.4–5.5 s on its helper's 8 threads against 3.9–4.1 s on the shared
+/// 16.
 const TAIL_THREADS_ENV: &str = "LFM_TREE_TAIL_THREADS";
 
-/// The STARK tree's default pool for the lead-in's prologues: large enough that
-/// they finish before level 0 starts (G1: the last one finished 3.7 s before it
-/// at the global pool's width), small enough to leave the base the rest.
-const STARK_TAIL_THREADS: usize = 16;
+/// The STARK tree's default pool per helper for the lead-in's prologues: the 16
+/// threads of the shared pool it replaced, split between the default two
+/// helpers — enough that all but the last prologue are ready when level 0
+/// starts, few enough to leave the base the rest.
+const STARK_TAIL_THREADS: usize = 8;
 
 /// Where the lead-in's prologues run ([`TAIL_THREADS_ENV`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6157,13 +6164,13 @@ fn in_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Se
 /// one pool per helper.
 #[test]
 fn the_tail_pool_switch_keeps_the_default_unless_set() {
-    let stark = TailPools::Shared(STARK_TAIL_THREADS);
+    let stark = TailPools::PerHelper(STARK_TAIL_THREADS);
     assert_eq!(tail_pools_setting(None, stark), stark);
     assert_eq!(tail_pools_setting(Some(""), stark), stark);
     assert_eq!(tail_pools_setting(Some("0"), stark), TailPools::Global);
     assert_eq!(tail_pools_setting(Some(" 0 "), stark), TailPools::Global);
     assert_eq!(tail_pools_setting(Some("00"), stark), TailPools::Global);
-    assert_eq!(tail_pools_setting(Some("8"), stark), TailPools::Shared(8));
+    assert_eq!(tail_pools_setting(Some("16"), stark), TailPools::Shared(16));
     assert_eq!(
         tail_pools_setting(Some("per-helper:8"), stark),
         TailPools::PerHelper(8)
@@ -6196,7 +6203,7 @@ fn the_tail_pool_switch_refuses_anything_else() {
         "per_helper:8",
     ] {
         let refused = std::panic::catch_unwind(|| {
-            tail_pools_setting(Some(bad), TailPools::Shared(STARK_TAIL_THREADS))
+            tail_pools_setting(Some(bad), TailPools::PerHelper(STARK_TAIL_THREADS))
         });
         assert!(refused.is_err(), "`{bad}` was accepted");
     }
@@ -6685,7 +6692,7 @@ fn start_stark_lead_in(
     LeadIn::start(
         want,
         helpers,
-        tail_pools(TailPools::Shared(STARK_TAIL_THREADS)),
+        tail_pools(TailPools::PerHelper(STARK_TAIL_THREADS)),
         // ⓘ The base's own DECODE commitment, shared: deriving a second one here
         // would be a second second of host work beside the base's.
         move |base: &dyn Fn() -> BaseShared| {
