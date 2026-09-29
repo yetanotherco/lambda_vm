@@ -43,8 +43,10 @@ pub mod cols {
     pub const OUT_INV: usize = ZERO + 1;
     /// `arg_reg_pows_computed[4][T]`.
     pub const POWS: usize = OUT_INV + 3;
-    pub const ARGS_PREMEM: usize = POWS + 4 * T;
-    pub const ARGS: usize = ARGS_PREMEM + 12;
+    /// The base address of each argument that reads memory (the spec's
+    /// `args_premem`, kept only where it differs from `args`).
+    pub const ADDR: usize = POWS + 4 * T;
+    pub const ARGS: usize = ADDR + 4;
     pub const NUM_COLUMNS: usize = ARGS + 12;
 
     pub const fn reg(g: usize) -> usize {
@@ -54,8 +56,8 @@ pub mod cols {
     pub const fn pow(i: usize, k: usize) -> usize {
         POWS + i * T + (k - 1)
     }
-    pub const fn premem(i: usize) -> usize {
-        ARGS_PREMEM + 3 * i
+    pub const fn addr(i: usize) -> usize {
+        ADDR + i
     }
     pub const fn arg(i: usize) -> usize {
         ARGS + 3 * i
@@ -125,7 +127,9 @@ fn fill_row(t: &mut stark::table::Table<F>, row: usize, program: &Program, step:
         for (k, p) in pows.iter().enumerate().skip(1) {
             t.set(row, cols::pow(i, k), *p);
         }
-        set_ext(t, row, cols::premem(i), &step.args_premem[i]);
+        if a.mem {
+            t.set(row, cols::addr(i), step.args_premem[i].value()[0]);
+        }
         set_ext(t, row, cols::arg(i), &step.args[i]);
     }
     for (g, r) in regs.iter().enumerate() {
@@ -181,7 +185,7 @@ fn direct(c: usize) -> BusValue {
 }
 
 /// - **Sends** `FIELD_VM_DECODE[decode_tuple]` once per row.
-/// - **Sends** `FIELD_VM_MEM[args_premem[i]] -> args[i]` when `mem_flags[i]`.
+/// - **Sends** `FIELD_VM_MEM[addr[i], 0, 0] -> args[i]` when `mem_flags[i]`.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut flags: Vec<LinearTerm> = (0..4)
         .map(|i| LinearTerm::Column {
@@ -221,7 +225,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     )];
     for i in 0..4 {
         let values = (0..3)
-            .map(|k| direct(cols::premem(i) + k))
+            .map(|k| {
+                if k == 0 {
+                    direct(cols::addr(i))
+                } else {
+                    BusValue::constant(0)
+                }
+            })
             .chain((0..3).map(|k| direct(cols::arg(i) + k)))
             .collect();
         interactions.push(BusInteraction::sender(
@@ -403,29 +413,25 @@ impl ConstraintSet<F, E> for FieldVmConstraints {
                 scaled[2].clone(),
             ]
         };
+        // memory: before the lookup an argument is its base address when it
+        // reads memory, and its value otherwise.
+        let before_lookup = |b: &B, i: usize| -> Ext3<B::Expr> {
+            let mem = b.main(0, cols::MEM_FLAG + i);
+            let not_mem = b.one() - mem.clone();
+            let arg = ext_col(b, 0, cols::arg(i));
+            [
+                mem * b.main(0, cols::addr(i)) + not_mem.clone() * arg[0].clone(),
+                not_mem.clone() * arg[1].clone(),
+                not_mem * arg[2].clone(),
+            ]
+        };
         for i in 1..4 {
-            let expected = premem(b, i, 0);
-            let diff = ext_sub(&ext_col(b, 0, cols::premem(i)), &expected);
-            for e in diff {
+            for e in ext_sub(&before_lookup(b, i), &premem(b, i, 0)) {
                 em.all(b, e);
             }
         }
-        let expected = premem(b, 0, 1);
-        let diff = ext_sub(&ext_col(b, 0, cols::premem(0)), &expected);
-        for e in diff {
+        for e in ext_sub(&before_lookup(b, 0), &premem(b, 0, 1)) {
             em.next(b, e);
-        }
-
-        // memory
-        for i in 0..4 {
-            let not_mem = one.clone() - b.main(0, cols::MEM_FLAG + i);
-            let diff = ext_sub(
-                &ext_col(b, 0, cols::arg(i)),
-                &ext_col(b, 0, cols::premem(i)),
-            );
-            for e in diff {
-                em.all(b, not_mem.clone() * e);
-            }
         }
 
         // fma
