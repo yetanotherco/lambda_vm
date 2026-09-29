@@ -2333,21 +2333,165 @@ pub fn prove_continuation_keeping_decode(
         epoch_size_log2,
         opts,
         crate::continuation::base_prep_ahead(),
+        whir_head_ahead(),
     )
 }
 
-/// [`prove_continuation_keeping_decode`] with the preparation's schedule named
-/// by the caller rather than read from
-/// [`crate::continuation::BASE_PREP_ON_PROVER_ENV`], so one process can run
-/// both: `prep_ahead` moves each epoch's host preparation onto the producer thread,
+/// The switch that takes DECODE's root off the WHIR base's critical path: `1`
+/// on, unset, empty or `0` the serial head (today's), anything else stops the
+/// run.
+///
+/// ⛔ WHY. Before the producer starts, the serial head commits DECODE's
+/// univariate root on the host (an FFT, a 4× LDE and the leaves over DECODE's
+/// columns, about a second on the block ELF) and then its prepared commitment on
+/// the device: on FAST job 239's default arms (wt1011/wt1012) epoch 0 began
+/// executing 1.50 / 1.42 s into the base and the first card commit came at
+/// 2.62 / 2.55 s. Epoch 0's execution needs neither — its preparation reads the
+/// root, its prove the prepared commitment — so ahead, a helper computes the root
+/// beside epoch 0's execution and the preparation waits for it where it first
+/// reads it. The prepared commitment keeps its place on the calling thread.
+/// Only where the root is computed moves; every committed value is the same.
+pub const WHIR_HEAD_AHEAD_ENV: &str = "LAMBDA_VM_WHIR_HEAD_AHEAD";
+
+/// [`WHIR_HEAD_AHEAD_ENV`] for a raw value: `1` is ahead; unset, empty or `0`
+/// serial. Anything else panics rather than measuring the default under the
+/// switch's name.
+pub fn whir_head_ahead_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{WHIR_HEAD_AHEAD_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// Whether this process runs the WHIR base's head ahead. Read once, and named
+/// on stderr in one write either way, so a log states the head its base ran.
+pub(crate) fn whir_head_ahead() -> bool {
+    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        let ahead = whir_head_ahead_setting(std::env::var(WHIR_HEAD_AHEAD_ENV).ok().as_deref());
+        let line = if ahead {
+            format!(
+                "BASE HEAD (WHIR): ahead ({WHIR_HEAD_AHEAD_ENV}=1) — DECODE's root on a helper \
+                 beside epoch 0\n"
+            )
+        } else {
+            "BASE HEAD (WHIR): serial (the default)\n".to_string()
+        };
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        ahead
+    })
+}
+
+/// Print a head step under `LAMBDA_VM_BASE_SPLIT=1`, like the epochs' stages.
+fn whir_head_done(step: &str, start: std::time::Instant, t0: f64) {
+    if crate::continuation::base_split_enabled() {
+        println!(
+            "BASE HEAD (WHIR): {step} {:.2}s t=[{t0:.3},{:.3}]",
+            start.elapsed().as_secs_f64(),
+            stark::prove_split::epoch_secs()
+        );
+    }
+}
+
+/// Where the WHIR base's DECODE root comes from.
+enum DecodeRoot {
+    /// Computed before the pipeline started: the serial head.
+    Ready(Commitment),
+    /// Arriving from the head helper ([`whir_head_ahead`]), which fills the
+    /// cell with the root or with why there is none, and never leaves it empty.
+    Ahead {
+        cell: std::sync::Arc<std::sync::OnceLock<Result<Commitment, String>>>,
+        helper: std::thread::JoinHandle<()>,
+    },
+}
+
+impl DecodeRoot {
+    /// The serial head's root, computed here.
+    fn serial(elf: &Elf, opts: &ProofOptions) -> Result<Self, Error> {
+        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+        let root = crate::tables::decode::commitment_from_elf(elf, opts)
+            .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+        whir_head_done("DECODE root", start, t0);
+        Ok(Self::Ready(root))
+    }
+
+    /// The root computed by a helper thread from the same ELF and options.
+    fn ahead(elf_bytes: &[u8], opts: &ProofOptions) -> Self {
+        let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+        let (filled, bytes, opts) = (cell.clone(), elf_bytes.to_vec(), opts.clone());
+        let helper = std::thread::Builder::new()
+            .name("whir-head-root".to_string())
+            .spawn(move || {
+                let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+                let root = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let elf = Elf::load(&bytes).map_err(|e| format!("{e}"))?;
+                    crate::tables::decode::commitment_from_elf(&elf, &opts)
+                        .map_err(|e| format!("{e}"))
+                }))
+                .unwrap_or_else(|_| Err("the head helper panicked".to_string()));
+                whir_head_done("DECODE root", start, t0);
+                let _ = filled.set(root);
+            })
+            .expect("the WHIR head helper must spawn");
+        Self::Ahead { cell, helper }
+    }
+
+    /// Whether the root comes from the helper.
+    fn is_ahead(&self) -> bool {
+        matches!(self, Self::Ahead { .. })
+    }
+
+    /// The root, waiting for the helper if it has not finished.
+    fn get(&self) -> Result<Commitment, Error> {
+        match self {
+            Self::Ready(root) => Ok(*root),
+            Self::Ahead { cell, .. } => cell
+                .wait()
+                .clone()
+                .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}"))),
+        }
+    }
+
+    /// [`Self::get`] for epoch `index`'s preparation, stamping how long epoch
+    /// 0's waited: the part of the root the head did not hide.
+    fn get_for_prep(&self, index: u64) -> Result<Commitment, Error> {
+        let start = std::time::Instant::now();
+        let root = self.get()?;
+        if index == 0 && self.is_ahead() && crate::continuation::base_split_enabled() {
+            println!(
+                "BASE HEAD (WHIR): epoch 0's prep waited {:.2}s for the DECODE root",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        Ok(root)
+    }
+
+    /// The root, once the helper is done with it.
+    fn finish(self) -> Result<Commitment, Error> {
+        let root = self.get()?;
+        if let Self::Ahead { helper, .. } = self {
+            let _ = helper.join();
+        }
+        Ok(root)
+    }
+}
+
+/// [`prove_continuation_keeping_decode`] with the schedule named by the caller
+/// rather than read from [`crate::continuation::BASE_PREP_ON_PROVER_ENV`] and
+/// [`WHIR_HEAD_AHEAD_ENV`], so one process can run every combination:
+/// `prep_ahead` moves each epoch's host preparation onto the producer thread,
 /// ahead of its prove, and the global proof's there too once the last epoch is
-/// handed over. The proofs are the same either way.
+/// handed over; `head_ahead` computes DECODE's root on a helper beside epoch 0
+/// instead of before the pipeline. The proofs are the same every way.
 pub(crate) fn prove_continuation_scheduled(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size_log2: u32,
     opts: &ProofOptions,
     prep_ahead: bool,
+    head_ahead: bool,
 ) -> Result<(ContinuationProof, BaseDecode), Error> {
     // The observer a caller installed for this thread, if any (see
     // [`crate::continuation::EpochObserver`]). It sees the pipeline and changes
@@ -2356,9 +2500,18 @@ pub(crate) fn prove_continuation_scheduled(
     let observer: Option<&dyn crate::continuation::EpochObserver<EpochProof>> = installed
         .as_deref()
         .map(|o| o as &dyn crate::continuation::EpochObserver<EpochProof>);
+    if crate::continuation::base_split_enabled() {
+        println!(
+            "BASE HEAD (WHIR): start t={:.3}",
+            stark::prove_split::epoch_secs()
+        );
+    }
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
-        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    let root = if head_ahead {
+        DecodeRoot::ahead(elf_bytes, opts)
+    } else {
+        DecodeRoot::serial(&elf, opts)?
+    };
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
     let on_count = observer.map(|o| move |n: usize| o.on_epoch_count(n));
 
@@ -2369,14 +2522,25 @@ pub(crate) fn prove_continuation_scheduled(
     // `prep_ahead` (the default): each epoch's host preparation runs on the
     // producer thread, ahead of its prove, and the global proof's once the last
     // epoch is out. The prepared DECODE opening is shared (an `Arc`) with the
-    // observer, when one is installed, before any epoch.
+    // observer, when one is installed, before any epoch is proved: before the
+    // pipeline under the serial head, and ahead, once the root is in, before
+    // the first epoch the consumer proves.
     let (boundaries, prepared, global_prepped) = crate::with_whir_hash!(|H| {
+        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
         let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
-        if let Some(observer) = observer {
-            observer.on_base_shared(std::sync::Arc::new(SharedDecode {
-                root: decode_commitment,
-                prepared: prepared.clone(),
-            }));
+        whir_head_done("DECODE prepared", start, t0);
+        let share = || -> Result<(), Error> {
+            if let Some(observer) = observer {
+                observer.on_base_shared(std::sync::Arc::new(SharedDecode {
+                    root: root.get()?,
+                    prepared: prepared.clone(),
+                }));
+            }
+            Ok(())
+        };
+        let mut unshared = root.is_ahead();
+        if !unshared {
+            share()?;
         }
         let on_count = on_count.as_ref().map(|f| f as &(dyn Fn(usize) + Sync));
         let (boundaries, global_prepped) = if prep_ahead {
@@ -2386,9 +2550,15 @@ pub(crate) fn prove_continuation_scheduled(
                 epoch_size_log2,
                 &artifacts,
                 on_count,
-                |p| prep_epoch_ahead(&elf, p, opts, Some(decode_commitment)),
+                |p| {
+                    let decode_commitment = root.get_for_prep(p.index)?;
+                    prep_epoch_ahead(&elf, p, opts, Some(decode_commitment))
+                },
                 |boundaries| prep_global_ahead(boundaries, &elf, private_inputs, opts),
                 |p| {
+                    if std::mem::take(&mut unshared) {
+                        share()?;
+                    }
                     let index = p.index as usize;
                     let proof = prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?;
                     if let Some(observer) = observer {
@@ -2407,6 +2577,9 @@ pub(crate) fn prove_continuation_scheduled(
                 &artifacts,
                 on_count,
                 |p| {
+                    if std::mem::take(&mut unshared) {
+                        share()?;
+                    }
                     let index = p.index as usize;
                     let proof = prove_epoch::<H>(
                         &elf,
@@ -2417,7 +2590,7 @@ pub(crate) fn prove_continuation_scheduled(
                         p.is_final,
                         &p.boundary,
                         opts,
-                        Some(decode_commitment),
+                        Some(root.get_for_prep(p.index)?),
                         &prepared,
                     )?;
                     if let Some(observer) = observer {
@@ -2479,7 +2652,7 @@ pub(crate) fn prove_continuation_scheduled(
             touched_page_bases,
         },
         BaseDecode {
-            commitment: decode_commitment,
+            commitment: root.finish()?,
             prepared,
         },
     ))

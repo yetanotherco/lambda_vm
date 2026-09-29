@@ -597,12 +597,14 @@ fn a_continuation_proves_and_verifies() {
 fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
     let (elf_bytes, input) = a_run_that_touches_memory();
     let opts = ProofOptions::default_test_options();
-    let (on_prover, decode_on_prover) =
-        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, false)
-            .expect("prove");
-    let (ahead, decode_ahead) =
-        multilinear_continuation::prove_continuation_scheduled(&elf_bytes, &input, 2, &opts, true)
-            .expect("prove");
+    let (on_prover, decode_on_prover) = multilinear_continuation::prove_continuation_scheduled(
+        &elf_bytes, &input, 2, &opts, false, false,
+    )
+    .expect("prove");
+    let (ahead, decode_ahead) = multilinear_continuation::prove_continuation_scheduled(
+        &elf_bytes, &input, 2, &opts, true, false,
+    )
+    .expect("prove");
     assert!(
         ahead.num_epochs() >= 2,
         "a one-epoch run hands nothing over, so the schedule is not exercised"
@@ -631,6 +633,160 @@ fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
         multilinear_continuation::verify_continuation(&elf_bytes, &ahead, &opts).expect("verify"),
         "the prepared-ahead continuation does not verify"
     );
+}
+
+/// What a base told its observer, in the order it said it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Heard {
+    Count,
+    Proved,
+    Shared,
+}
+
+/// An observer that keeps the ORDER of what it hears, and what it was shared.
+#[derive(Default)]
+struct OrderObserver {
+    heard: std::sync::Mutex<Vec<Heard>>,
+    shared: std::sync::Mutex<Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
+}
+
+impl continuation::EpochObserver<multilinear_continuation::EpochProof> for OrderObserver {
+    fn on_epoch_count(&self, _num_epochs: usize) {
+        self.heard.lock().unwrap().push(Heard::Count);
+    }
+
+    fn on_epoch_proved(&self, _index: usize, _proof: &multilinear_continuation::EpochProof) {
+        self.heard.lock().unwrap().push(Heard::Proved);
+    }
+
+    fn on_base_shared(&self, shared: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.heard.lock().unwrap().push(Heard::Shared);
+        self.shared.lock().unwrap().push(shared);
+    }
+}
+
+/// The head switch: `1` is ahead; unset, empty and `0` are the serial head.
+#[test]
+fn the_whir_head_switch_is_serial_unless_exactly_one() {
+    use multilinear_continuation::whir_head_ahead_setting as ahead;
+    assert!(!ahead(None));
+    assert!(!ahead(Some("")));
+    assert!(!ahead(Some("0")));
+    assert!(!ahead(Some(" 0 ")));
+    assert!(ahead(Some("1")));
+    assert!(ahead(Some(" 1 ")));
+}
+
+/// Anything else stops the run rather than measuring the serial head under the
+/// switch's name.
+#[test]
+#[should_panic(expected = "LAMBDA_VM_WHIR_HEAD_AHEAD must be 0 or 1")]
+fn the_whir_head_switch_refuses_anything_else() {
+    multilinear_continuation::whir_head_ahead_setting(Some("yes"));
+}
+
+/// Running the head ahead computes DECODE's root on a helper beside epoch 0
+/// instead of before the pipeline. That changes where and when, never what,
+/// under either preparation schedule: the DECODE root and prepared commitment,
+/// every epoch's bookend root, shapes, output and register fini, and the
+/// cross-epoch proof's roots equal the serial head's, and the bundle verifies.
+/// The observer hears the shared DECODE work once, with the serial head's
+/// values, before any epoch is proved — which is when the lead-in may read it.
+///
+/// ⚠ An epoch's FIRST group root is not compared, for the reason
+/// [`prep_ahead_proves_what_the_prover_thread_schedule_proves`] gives.
+#[test]
+fn the_head_ahead_proves_what_the_serial_head_proves() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    for prep_ahead in [true, false] {
+        let prove = |head_ahead: bool| {
+            let observer = std::sync::Arc::new(OrderObserver::default());
+            let proved = multilinear_continuation::with_epoch_observer(observer.clone(), || {
+                multilinear_continuation::prove_continuation_scheduled(
+                    &elf_bytes, &input, 2, &opts, prep_ahead, head_ahead,
+                )
+            })
+            .expect("prove");
+            (proved, observer)
+        };
+        let ((serial, serial_decode), serial_heard) = prove(false);
+        let ((ahead, ahead_decode), ahead_heard) = prove(true);
+        let at = format!("prep ahead {prep_ahead}");
+        assert!(
+            ahead.num_epochs() >= 2,
+            "{at}: a one-epoch run hands nothing over, so the schedule is not exercised"
+        );
+        assert_eq!(
+            ahead_decode.commitment, serial_decode.commitment,
+            "{at}: root"
+        );
+        assert_eq!(ahead.num_epochs(), serial.num_epochs(), "{at}: epochs");
+        for (k, (a, s)) in ahead.epochs.iter().zip(&serial.epochs).enumerate() {
+            assert_eq!(
+                a.proof.roots.len(),
+                s.proof.roots.len(),
+                "{at}: epoch {k} groups"
+            );
+            assert_eq!(
+                a.proof.roots.last(),
+                s.proof.roots.last(),
+                "{at}: epoch {k}: the bookend group's root"
+            );
+            assert_eq!(
+                a.table_num_vars, s.table_num_vars,
+                "{at}: epoch {k}: shapes"
+            );
+            assert_eq!(a.public_output, s.public_output, "{at}: epoch {k}: output");
+            assert_eq!(a.reg_fini, s.reg_fini, "{at}: epoch {k}: register fini");
+        }
+        assert_eq!(ahead.global.proof.roots, serial.global.proof.roots, "{at}");
+        assert_eq!(
+            ahead.global.table_num_vars, serial.global.table_num_vars,
+            "{at}"
+        );
+        assert_eq!(ahead.touched_page_bases, serial.touched_page_bases, "{at}");
+        crate::with_whir_hash!(|H| {
+            assert_eq!(
+                ahead_decode.prepared::<H>().expect("prepared").roots,
+                serial_decode.prepared::<H>().expect("prepared").roots,
+                "{at}: the prepared DECODE commitment"
+            );
+            for (heard, decode) in [
+                (&serial_heard, &serial_decode),
+                (&ahead_heard, &ahead_decode),
+            ] {
+                let events = heard.heard.lock().unwrap().clone();
+                let shared_at: Vec<usize> = (0..events.len())
+                    .filter(|&i| events[i] == Heard::Shared)
+                    .collect();
+                assert_eq!(shared_at.len(), 1, "{at}: shared once, in {events:?}");
+                let first_proved = events
+                    .iter()
+                    .position(|e| *e == Heard::Proved)
+                    .expect("an epoch was proved");
+                assert!(
+                    shared_at[0] < first_proved,
+                    "{at}: shared before any epoch is proved, in {events:?}"
+                );
+                let shared = heard.shared.lock().unwrap()[0]
+                    .clone()
+                    .downcast::<multilinear_continuation::SharedDecode<H>>()
+                    .unwrap_or_else(|_| panic!("{at}: shared under the base's hash"));
+                assert_eq!(shared.root, serial_decode.commitment, "{at}: shared root");
+                assert_eq!(
+                    shared.prepared.roots,
+                    decode.prepared::<H>().expect("prepared").roots,
+                    "{at}: the shared prepared commitment is the one the base proved under"
+                );
+            }
+        });
+        assert!(
+            multilinear_continuation::verify_continuation(&elf_bytes, &ahead, &opts)
+                .expect("verify"),
+            "{at}: the head-ahead continuation does not verify"
+        );
+    }
 }
 
 /// ★ THE PROPERTY EVERY OTHER EPOCH TEST IN THIS FILE IS BLIND TO.
