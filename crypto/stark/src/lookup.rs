@@ -849,6 +849,8 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Full-width columns some transition constraint reads at the next row.
+    next_row_columns: Vec<usize>,
 }
 
 /// Cloning an `AirWithBuses` copies its derived artifacts — the MetaBuilder-run
@@ -880,6 +882,7 @@ impl<
             num_precomputed_cols: self.num_precomputed_cols,
             name: self.name.clone(),
             max_bus_elements: self.max_bus_elements,
+            next_row_columns: self.next_row_columns.clone(),
         }
     }
 }
@@ -943,6 +946,17 @@ impl<
             .max()
             .unwrap_or(0);
 
+        // The verifier opens only these columns at `g·z`: the wrapped set's
+        // next-row reads plus the LogUp accumulator.
+        let mut reads = crate::constraints::builder::NextRowReads::new();
+        constraint_set.eval(&mut reads);
+        let mut next_row_columns = reads.into_columns(trace_layout.0);
+        if num_interactions > 0 {
+            next_row_columns.push(trace_layout.0 + logup.acc_column_idx);
+        }
+        next_row_columns.sort_unstable();
+        next_row_columns.dedup();
+
         // Create context
         let context = AirContext {
             proof_options: proof_options.clone(),
@@ -966,6 +980,7 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            next_row_columns,
         }
     }
 
@@ -1040,16 +1055,11 @@ where
     }
 
     fn trace_ood_next_row_columns(&self) -> Vec<usize> {
-        // The only transition constraint that reads the next row is the circular
-        // LogUp accumulator, and after forward accumulation it reads only the
-        // accumulated column there (all committed terms and absorbed operands
-        // read the current row). Its full-width index is the main width plus the
-        // accumulated column's aux index. No interactions => no next-row reads.
-        if self.auxiliary_trace_build_data.interactions.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.trace_layout.0 + self.logup.acc_column_idx]
-        }
+        // Derived in `new` from the wrapped constraint set, plus the LogUp
+        // accumulator: after forward accumulation it is the only LogUp column
+        // read at the next row (committed terms and absorbed operands read the
+        // current row).
+        self.next_row_columns.clone()
     }
 
     fn has_trace_interaction(&self) -> bool {
