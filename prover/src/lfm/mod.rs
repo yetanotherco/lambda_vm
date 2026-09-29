@@ -146,6 +146,10 @@ mod blake3_socket_kats;
 mod blake3_socket_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod c5_probe;
+/// `LFM_CARD_AFTER_PREP`: only the lock moves, and the prep never reaches the
+/// device (box tier, but for the knob's parse).
+#[cfg(test)]
+mod card_after_prep_tests;
 #[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]

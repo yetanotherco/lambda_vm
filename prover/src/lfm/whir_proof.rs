@@ -834,28 +834,31 @@ pub(crate) fn prove_traces_whir(
     prove_traces_whir_opening(build, traces, public_words, options, check_prefix, true)
 }
 
-/// [`prove_traces_whir`] with the prepared opening optional — `false` proves as
-/// if the program had no prepared stack: no derived root absorbed, no opening.
-/// Only the tamper tests take `false`, to build the proof a count-zero verifier
-/// would accept and show this path's verifier refuses it.
-pub(crate) fn prove_traces_whir_opening(
+/// What the W-LFM prove's host prep hands the device phases: the tables,
+/// built against the plan's layouts, and what the commit needs besides them.
+pub(crate) struct WhirPrepped<'a> {
+    pub(crate) tables: Vec<CommittedTable<'a, F, E>>,
+    pub(crate) counts: Vec<usize>,
+    pub(crate) config: ChainConfig,
+    pub(crate) settled: Vec<usize>,
+}
+
+/// ★ THE W-LFM PROVE'S HOST PREP, and nothing else: the plan's layouts (the same
+/// derivation the verifier makes), each table's main columns moved into its
+/// layout, and the prefix check against the prepared stack.
+///
+/// ⛔ HOST ONLY. It takes no device handle and calls nothing that reaches the
+/// card, which is what lets `LFM_CARD_AFTER_PREP=1` run it outside the card
+/// permit ([`card_after_prep`]). `the_w_lfm_prep_never_reaches_the_card`
+/// (box, cuda) counts every entry into the device layer across it and requires
+/// none; a step that needed the card belongs after the permit, not here.
+pub(crate) fn prep_whir_tables<'a>(
     build: &WhirLfmBuild,
-    traces: &mut LfmTraces,
-    public_words: &[(u32, LfmWord)],
-    options: &ProofOptions,
+    airs: &'a LfmAirs,
+    traces: &'a mut LfmTraces,
     check_prefix: bool,
-    open_prepared: bool,
-) -> Result<MultiProof<F, E>, WhirLfmError> {
-    // ⛔ THE CARD: the same exclusive permit the STARK prover holds around
-    // `multi_prove`, so a tree driver serializes W-LFM proves exactly as it
-    // serializes today's.
-    let _card = super::device_permit::hold_labeled("multi_prove");
-    // The prove's own split, recorded as a `WHIR PROVE SPLIT W-LFM` line under
-    // `LAMBDA_VM_BASE_SPLIT=1` (the base's instrument, with the base's stages:
-    // prep = the tables built, absorb = the statement, commit, prove).
-    let t_wall = Instant::now();
+) -> Result<WhirPrepped<'a>, WhirLfmError> {
     let artifacts = &build.artifacts;
-    let airs = airs_for(artifacts, options);
     let refs = airs.air_refs();
     // The layouts the committed tables are built against are the PLAN's — the
     // same derivation the verifier makes — moved out rather than rebuilt.
@@ -912,8 +915,122 @@ pub(crate) fn prove_traces_whir_opening(
             core::mem::take(&mut columns[col as usize])
         })?);
     }
+    Ok(WhirPrepped {
+        tables,
+        counts,
+        config,
+        settled,
+    })
+}
 
+/// The environment variable that takes the W-LFM prove's card permit after its
+/// host prep ([`prep_whir_tables`]) instead of before it.
+pub const CARD_AFTER_PREP_ENV: &str = "LFM_CARD_AFTER_PREP";
+
+/// Unset, empty or `0` is today's order: the permit first, then the prep inside
+/// it. `1` takes the permit after the prep.
+///
+/// # Panics
+///
+/// On any other value: a misspelt arm must not run as the control.
+pub fn parse_card_after_prep(value: Option<&str>) -> bool {
+    match value {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{CARD_AFTER_PREP_ENV} must be `0` or `1`, got `{other}`"),
+    }
+}
+
+/// ★ WHETHER THE W-LFM PROVE TAKES THE CARD AFTER ITS HOST PREP
+/// (`LFM_CARD_AFTER_PREP`, default off).
+///
+/// Today the permit is the prove's first statement, so the card is held — idle,
+/// and closed to every other proof — while the prove builds its tables on the
+/// host: 2.05 s of the pure-WHIR recursion's 9.89 s of W-LFM holds at job 222,
+/// 1.68 s of it at level 1. Taken after the prep, the same host work runs while
+/// another proof uses the card. Only the lock moves, so the proof's bytes are
+/// the same (`card_after_prep_tests`). Read once per process, and named once
+/// on stdout so an arm's log says which order it ran.
+pub fn card_after_prep() -> bool {
+    #[cfg(test)]
+    if let Some(on) = test_card_after_prep::get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_card_after_prep(std::env::var(CARD_AFTER_PREP_ENV).ok().as_deref());
+        println!(
+            "   ★ W-LFM CARD PERMIT: {} ({CARD_AFTER_PREP_ENV}; unset = before the prep, the \
+             default)",
+            if on {
+                "after the host prep"
+            } else {
+                "before the host prep"
+            }
+        );
+        on
+    })
+}
+
+/// Tests only: the setting [`card_after_prep`] reports in place of the
+/// environment's, so one process can prove under both.
+#[cfg(test)]
+pub(crate) mod test_card_after_prep {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const UNSET: u8 = u8::MAX;
+    static SETTING: AtomicU8 = AtomicU8::new(UNSET);
+
+    pub(crate) fn get() -> Option<bool> {
+        match SETTING.load(Ordering::Relaxed) {
+            UNSET => None,
+            v => Some(v == 1),
+        }
+    }
+
+    /// `None` gives the environment back.
+    pub(crate) fn set(on: Option<bool>) {
+        SETTING.store(on.map_or(UNSET, u8::from), Ordering::Relaxed);
+    }
+}
+
+/// [`prove_traces_whir`] with the prepared opening optional — `false` proves as
+/// if the program had no prepared stack: no derived root absorbed, no opening.
+/// Only the tamper tests take `false`, to build the proof a count-zero verifier
+/// would accept and show this path's verifier refuses it.
+pub(crate) fn prove_traces_whir_opening(
+    build: &WhirLfmBuild,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    check_prefix: bool,
+    open_prepared: bool,
+) -> Result<MultiProof<F, E>, WhirLfmError> {
+    // ⛔ THE CARD: the same exclusive permit the STARK prover holds around
+    // `multi_prove`, so a tree driver serializes W-LFM proves exactly as it
+    // serializes today's. Taken HERE by default, before the host prep; under
+    // `LFM_CARD_AFTER_PREP=1` it is taken after it (see [`card_after_prep`]).
+    let early_card =
+        (!card_after_prep()).then(|| super::device_permit::hold_labeled("multi_prove"));
+    // The prove's own split, recorded as a `WHIR PROVE SPLIT W-LFM` line under
+    // `LAMBDA_VM_BASE_SPLIT=1` (the base's instrument, with the base's stages:
+    // prep = the tables built, absorb = the statement, commit, prove). Its wall
+    // is prep + the held part in both settings: the wait for the card is in
+    // neither.
+    let t_wall = Instant::now();
+    let artifacts = &build.artifacts;
+    let airs = airs_for(artifacts, options);
+    let WhirPrepped {
+        tables,
+        counts,
+        config,
+        settled,
+    } = prep_whir_tables(build, &airs, traces, check_prefix)?;
     let prep_secs = t_wall.elapsed().as_secs_f64();
+    // ★ Under `LFM_CARD_AFTER_PREP=1` the card is taken only now: everything
+    // above is host work, and from here on every step reaches the device.
+    let _card = early_card.unwrap_or_else(|| super::device_permit::hold_labeled("multi_prove"));
+    let t_held = Instant::now();
 
     let t = Instant::now();
     let mut transcript = WhirLfmTranscript::new(&[]);
@@ -953,7 +1070,7 @@ pub(crate) fn prove_traces_whir_opening(
             absorb: absorb_secs,
             commit: commit_secs,
             prove: t.elapsed().as_secs_f64(),
-            wall: t_wall.elapsed().as_secs_f64(),
+            wall: prep_secs + t_held.elapsed().as_secs_f64(),
             airs: counts.len(),
             ..Default::default()
         });
