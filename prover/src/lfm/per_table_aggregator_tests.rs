@@ -10061,3 +10061,379 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
         inner.fri_number_of_queries,
     );
 }
+
+// =============================================================================
+// D-WHIR W1 — pure WHIR: one wrap and one node, proved both ways on one binary
+// =============================================================================
+
+/// The first eight bytes of a program id, as the IDENTITY lines print it.
+fn w1_id(id: &stark::config::Commitment) -> String {
+    id.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// One STARK prove of `program` at `opts`, with its W1 line: artifacts, the
+/// prove and its split, the host verify, the proof's bytes and the host peak.
+fn w1_prove_stark(
+    label: &str,
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+) -> (RealChild, super::proof::LfmProof) {
+    use std::time::Instant;
+    let sampler = HostSampler::start();
+    let t = Instant::now();
+    let artifacts = super::program_census::build_artifacts_counted(
+        program,
+        opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
+    let build_s = t.elapsed().as_secs_f64();
+    let _ = super::proof::take_prove_split();
+    let t = Instant::now();
+    let proved = match super::proof::lfm_prove(program, &artifacts, arenas, opts) {
+        Ok(p) => p,
+        Err(super::proof::LfmProveError::Exec(super::executor::LfmExecError::DivByZero {
+            addr,
+        })) => panic!(
+            "W1 {label}: the program REFUSED its arena under the STARK prover.\n{}",
+            super::executor::locate_addr(program, addr)
+        ),
+        Err(why) => panic!("W1 {label}: the STARK prove failed: {why:?}"),
+    };
+    let prove_s = t.elapsed().as_secs_f64();
+    let split = super::proof::take_prove_split().unwrap_or_default();
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+        .expect("a proof serializes")
+        .len();
+    let id = w1_id(&artifacts.program_id);
+    let (child, verify_s) = real_child_timed(artifacts, opts.clone(), &proved);
+    let (peak, _) = sampler.stop();
+    println!(
+        "W1 PROVE {label} · stark · build {build_s:.3}s · prove {prove_s:.3}s (execute {:.3} · \
+         fill {:.3} · multi_prove {:.3} · wait {:.3}) · verify {verify_s:.3}s · proof {bytes} B · \
+         host peak {peak:.2} GiB · IDENTITY {id}",
+        split.execute, split.fill, split.multi_prove, split.permit_wait,
+    );
+    (child, proved)
+}
+
+/// One W-LFM prove of `program` at `opts` under `policy`, with its W1 line: the
+/// build (the prepared commit is inside it), the prove and its split, the host
+/// verify, the proof's bytes, the stacks and the host peak.
+fn w1_prove_whir(
+    label: &str,
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+    policy: super::whir_proof::PrepPolicy,
+) -> (
+    super::whir_proof::WhirLfmBuild,
+    super::whir_proof::WhirLfmProof,
+) {
+    use std::time::Instant;
+    let sampler = HostSampler::start();
+    let t = Instant::now();
+    let build = super::whir_proof::build_whir_artifacts_under(
+        program,
+        opts,
+        crate::hash_pin::BLOCK_HASHER,
+        policy,
+    )
+    .unwrap_or_else(|e| panic!("W1 {label}: the W-LFM artifacts build: {e:?}"));
+    let build_s = t.elapsed().as_secs_f64();
+    let _ = super::proof::take_prove_split();
+    let t = Instant::now();
+    let proved = match super::whir_proof::lfm_prove_whir(program, &build, arenas, opts) {
+        Ok(p) => p,
+        Err(super::whir_proof::WhirLfmError::Exec(super::executor::LfmExecError::DivByZero {
+            addr,
+        })) => panic!(
+            "W1 {label}: the program REFUSED its arena under the W-LFM prover.\n{}",
+            super::executor::locate_addr(program, addr)
+        ),
+        Err(why) => panic!("W1 {label}: the W-LFM prove failed: {why:?}"),
+    };
+    let prove_s = t.elapsed().as_secs_f64();
+    let split = super::proof::take_prove_split().unwrap_or_default();
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+        .expect("a proof serializes")
+        .len();
+    let t = Instant::now();
+    super::whir_proof::verify_whir_checked(
+        &build.artifacts,
+        &proved.proof,
+        &proved.public_words,
+        opts,
+    )
+    .unwrap_or_else(|e| panic!("W1 {label}: the W-LFM proof must verify: {e:?}"));
+    let verify_s = t.elapsed().as_secs_f64();
+    let (peak, _) = sampler.stop();
+    let airs = super::whir_proof::airs_for(&build.artifacts, opts);
+    let refs = airs.air_refs();
+    let plan = super::whir_proof::WhirLfmPlan::build(&build.artifacts, &refs).expect("plan");
+    let cells: usize = plan.shapes.iter().map(|&(w, n)| w << n).sum();
+    println!(
+        "W1 PROVE {label} · whir-{} · build {build_s:.3}s · prove {prove_s:.3}s (execute {:.3} \
+         · fill {:.3} · multi_prove {:.3} · wait {:.3}) · verify {verify_s:.3}s · proof {bytes} B \
+         · host peak {peak:.2} GiB · cells {cells} · main n{} x{} · prepared n{} x{} · Q {} · \
+         grind {:?} · heights {:?} · IDENTITY {}",
+        policy.name(),
+        split.execute,
+        split.fill,
+        split.multi_prove,
+        split.permit_wait,
+        plan.group_layouts[0].n_stack(),
+        plan.group_layouts[0].num_polys(),
+        build.artifacts.prepared_layout.n_stack(),
+        build.artifacts.prepared_layout.num_polys(),
+        build.artifacts.config.num_queries,
+        build.artifacts.config.grind,
+        build.artifacts.table_num_vars,
+        w1_id(&build.artifacts.program_id),
+    );
+    (build, proved)
+}
+
+/// ★★ D-WHIR §6.2, W1: one wrap and one node, proved BOTH WAYS on one binary,
+/// and a pure-WHIR node over WHIR wraps.
+///
+/// - W1a: wrap 0's program under the STARK prover and the W-LFM prover (policy
+///   A and B), plus wraps 1 and 2 under STARK and policy B (W1c's children);
+/// - W1b: L1N0's program — the arity-3 node over the three STARK wraps, the
+///   production tree's first interior node — under STARK and W-LFM (A and B);
+/// - W1c: the pure-WHIR L1 node, emitted over the three policy-B WHIR wraps with
+///   W-legs, proved as a W-LFM proof (A and B);
+/// - W1d: the census of an L2-shaped parent over three STARK L1N0 children and
+///   over three W1c children (emitted, not proved — the census is the program's).
+///
+/// ⛔ THE DEFAULT'S BYTE GATE rides along: at `LAMBDA_VM_LFM_PROVER` unset the
+/// STARK wraps and L1N0 must print the identities the tree of record printed at
+/// the base sha (wt800: wrap 0 `eb2953cc6876a84f`, L1N0 `4798f6c5efa5beae`);
+/// the box script compares them.
+#[test]
+#[ignore = "box tier, production scale: D-WHIR W1 (one wrap and one node proved both ways)"]
+fn w1_one_wrap_and_one_node_proved_both_ways() {
+    use super::epoch_tests::EpochInputs;
+    use super::per_table_aggregator::{NodePublishSet, SchemaLayout, WHIR_FAN_IN};
+    use super::whir_leg::{
+        WhirChild, WhirLegShape, WhirNodeInputs, emit_whir_node, whir_leg_cost,
+        whir_node_arena_words,
+    };
+    use super::whir_proof::PrepPolicy;
+    use multilinear::whir_hash::RpxWhir;
+    use std::time::Instant;
+
+    if !cfg!(feature = "cuda") {
+        panic!("W1 measures the device provers and requires `--features cuda`");
+    }
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: W1 proves the production block's wraps"
+        );
+    }
+    if let Some(note) = crate::lfm::whir_real_epoch::whir_process_posture_note() {
+        panic!("W1 needs the RPX base (LAMBDA_VM_WHIR_HASH=rpx): {note}");
+    }
+    println!(
+        "★ LFM PROVER (the tree's knob, not read by W1): {}",
+        crate::lfm_prover_knob::selected().name()
+    );
+
+    let inputs = EpochInputs::from_env();
+    let inner = super::proof::block_base_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let fan_in = WHIR_FAN_IN;
+    println!(
+        "★★★ D-WHIR W1 — guest {}, {} input bytes, 2^{} cycles/epoch, fan-in {fan_in}",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+    );
+    let t_all = Instant::now();
+
+    // ---- the base, under RPX.
+    let t = Instant::now();
+    let bundle = crate::multilinear_continuation::prove_continuation(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+        &inner,
+    )
+    .expect("the WHIR block must prove");
+    println!(
+        "W1 base: {} epochs in {:.1}s",
+        bundle.num_epochs(),
+        t.elapsed().as_secs_f64()
+    );
+    assert!(bundle.num_epochs() >= fan_in, "W1 needs {fan_in} epochs");
+    let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the guest ELF loads");
+    let prepared =
+        crate::multilinear_continuation::decode_prepared_for::<RpxWhir>(&elf, &inputs.elf_bytes)
+            .expect("DECODE's prepared opening");
+    let decode_root = crate::tables::decode::commitment_from_elf(&elf, &inner)
+        .expect("DECODE's univariate commitment");
+
+    // ---- W1a: the wraps.
+    let mut stark_wraps: Vec<RealChild> = Vec::with_capacity(fan_in);
+    let mut whir_wraps = Vec::with_capacity(fan_in);
+    let mut layouts: Vec<SchemaLayout> = Vec::with_capacity(fan_in);
+    let mut labels: Vec<Vec<u64>> = Vec::with_capacity(fan_in);
+    for k in 0..fan_in {
+        let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<RpxWhir>(
+            &inner,
+            &inputs.elf_bytes,
+            &bundle,
+            k,
+            Some(decode_root),
+            Some(&prepared),
+        )
+        .unwrap_or_else(|why| panic!("epoch {k} must harvest: {why}"));
+        let air_set = crate::multilinear_continuation::epoch_airs_for(
+            &elf,
+            &inner,
+            &bundle.epochs[k],
+            &e.position.register_init,
+            e.position.is_final,
+            e.position.label,
+            Some(decode_root),
+        );
+        let refs = air_set.refs();
+        let program = whir_epoch_program(&e, &refs[..]);
+        let arenas = whir_epoch_arena(&e, &refs[..]);
+        census_and_panel(&program, &format!("w1 wrap {k}"), 1);
+        layouts.push(SchemaLayout::wrap(e.public_output().len().div_ceil(4)));
+        labels.push(vec![e.position.label]);
+
+        let (child, _) = w1_prove_stark(&format!("wrap {k}"), &program, &arenas, &wrap_opts);
+        stark_wraps.push(child);
+        let policies: &[PrepPolicy] = if k == 0 {
+            &[PrepPolicy::Both, PrepPolicy::PreparedOnly]
+        } else {
+            &[PrepPolicy::PreparedOnly]
+        };
+        for &policy in policies {
+            let built = w1_prove_whir(&format!("wrap {k}"), &program, &arenas, &wrap_opts, policy);
+            if policy == PrepPolicy::PreparedOnly {
+                whir_wraps.push(built);
+            }
+        }
+    }
+    let label_refs: Vec<&[u64]> = labels.iter().map(Vec::as_slice).collect();
+    let range = (labels[0][0], labels[fan_in - 1][0]);
+
+    // ---- W1b: L1N0 over the STARK wraps, both ways.
+    let l1 = node_program(
+        &stark_wraps,
+        &layouts,
+        &label_refs,
+        range,
+        NodePublishSet::Aggregation,
+    );
+    census_and_panel(&l1, "w1 L1N0 (STARK children)", fan_in);
+    let l1_arenas: Vec<Vec<LfmWord>> = stark_wraps.iter().flat_map(child_arena_words).collect();
+    let (l1_child, l1_proved) = w1_prove_stark("L1N0", &l1, &l1_arenas, &wrap_opts);
+    for policy in [PrepPolicy::Both, PrepPolicy::PreparedOnly] {
+        let _ = w1_prove_whir("L1N0", &l1, &l1_arenas, &wrap_opts, policy);
+    }
+
+    // ---- W1c: the pure-WHIR L1 node over the policy-B WHIR wraps.
+    let whir_children: Vec<WhirChild<'_>> = whir_wraps
+        .iter()
+        .map(|(build, proof)| WhirChild {
+            artifacts: &build.artifacts,
+            proof,
+            options: &wrap_opts,
+        })
+        .collect();
+    let t = Instant::now();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    emit_whir_node(
+        &mut b,
+        &WhirNodeInputs {
+            children: &whir_children,
+            layouts: &layouts,
+            labels: &label_refs,
+            label_range: range,
+            publishes: NodePublishSet::Aggregation,
+        },
+    );
+    let w1c = compile(b.finish());
+    super::validator::validate(&w1c).expect("the pure-WHIR node must be admissible");
+    println!("W1 W1c emitted in {:.2}s", t.elapsed().as_secs_f64());
+    census_and_panel(&w1c, "w1 pure-WHIR L1 node (W-leg children)", fan_in);
+    for child in &whir_children {
+        let cost = whir_leg_cost(&WhirLegShape {
+            artifacts: child.artifacts,
+            num_public_words: child.num_public_words(),
+            options: &wrap_opts,
+        });
+        println!(
+            "W1 W-LEG FORM (wrap child, B): perms {} · ops {} · hints {} · heights {:?}",
+            cost.perms,
+            cost.operations(),
+            cost.hints,
+            child.artifacts.table_num_vars,
+        );
+    }
+    let w1c_arenas = whir_node_arena_words(&whir_children);
+    let mut w1c_b = None;
+    for policy in [PrepPolicy::Both, PrepPolicy::PreparedOnly] {
+        let built = w1_prove_whir("W1c node", &w1c, &w1c_arenas, &wrap_opts, policy);
+        if policy == PrepPolicy::PreparedOnly {
+            w1c_b = Some(built);
+        }
+    }
+    let (w1c_build, w1c_proof) = w1c_b.expect("the policy-B W1c node proved");
+
+    // ---- W1d: the census of an L2-shaped parent over each child kind.
+    let node_layouts: Vec<SchemaLayout> = (0..fan_in)
+        .map(|_| SchemaLayout::node(layouts[fan_in - 1].out_halves))
+        .collect();
+    let node_labels: Vec<Vec<u64>> = (0..fan_in).map(|_| vec![range.0, range.1]).collect();
+    let node_label_refs: Vec<&[u64]> = node_labels.iter().map(Vec::as_slice).collect();
+    let l1_children: Vec<RealChild> = (0..fan_in)
+        .map(|_| real_child(l1_child.artifacts.clone(), wrap_opts.clone(), &l1_proved))
+        .collect();
+    let parent_stark = node_program(
+        &l1_children,
+        &node_layouts,
+        &node_label_refs,
+        range,
+        NodePublishSet::Aggregation,
+    );
+    census_and_panel(&parent_stark, "w1 L2 parent over 3 STARK L1N0", fan_in);
+    let w_children: Vec<WhirChild<'_>> = (0..fan_in)
+        .map(|_| WhirChild {
+            artifacts: &w1c_build.artifacts,
+            proof: &w1c_proof,
+            options: &wrap_opts,
+        })
+        .collect();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    emit_whir_node(
+        &mut b,
+        &WhirNodeInputs {
+            children: &w_children,
+            layouts: &node_layouts,
+            labels: &node_label_refs,
+            label_range: range,
+            publishes: NodePublishSet::Aggregation,
+        },
+    );
+    let parent_whir = compile(b.finish());
+    census_and_panel(&parent_whir, "w1 L2 parent over 3 W1c nodes", fan_in);
+    let cost = whir_leg_cost(&WhirLegShape {
+        artifacts: &w1c_build.artifacts,
+        num_public_words: w1c_proof.public_words.len(),
+        options: &wrap_opts,
+    });
+    println!(
+        "W1 W-LEG FORM (W1c child, B): perms {} · ops {} · hints {} · heights {:?}",
+        cost.perms,
+        cost.operations(),
+        cost.hints,
+        w1c_build.artifacts.table_num_vars,
+    );
+    println!("W1 DONE in {:.1}s", t_all.elapsed().as_secs_f64());
+}
