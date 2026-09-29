@@ -532,6 +532,22 @@ extern "C" __global__ void batched_column_ext3(const uint64_t *__restrict__ colu
     }
 }
 
+// A session's end, read back in one copy: factor `k`'s first `cells` ext3
+// values — what the folds left of it, at its own base — gathered to
+// `out[k·cells·3 ..]`. One thread per u64, so a warp reads one factor's
+// consecutive words and writes consecutive words.
+extern "C" __global__ void gather_factor_heads_ext3(uint64_t *const *__restrict__ d_factors,
+                                                    uint64_t width, uint64_t cells,
+                                                    uint64_t *__restrict__ out) {
+    uint64_t span = cells * 3;
+    uint64_t total = width * span;
+    for (uint64_t word = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; word < total;
+         word += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t k = word / span;
+        out[word] = d_factors[k][word - k * span];
+    }
+}
+
 // Binds the round's variable: `f(j) <- f(j) + r·(f(j + half) − f(j))` for every
 // factor, halving the cube. One thread per (factor, index) pair.
 extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_factors,

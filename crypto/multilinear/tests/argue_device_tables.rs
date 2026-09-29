@@ -41,6 +41,7 @@ impl Drop for Restore {
     fn drop(&mut self) {
         gpu::force_argue_device_tables(None);
         gpu::force_argue_device_columns(None);
+        gpu::force_argue_lean_reads(None);
         gpu::force_argue_xcheck(None);
         gpu::force_table_fault(None);
     }
@@ -358,6 +359,8 @@ struct Arm {
     columns: bool,
     /// Programs, which a device runs, or closures.
     compiled: bool,
+    /// `LAMBDA_VM_ARGUE_LEAN_READS`: every session's end read in one copy.
+    reads: bool,
 }
 
 struct Argued {
@@ -368,11 +371,15 @@ struct Argued {
     /// Challenge tables and column values the card made during the arm.
     tables_on_card: u64,
     columns_on_card: u64,
+    /// Session ends read in one copy, and factors read one at a time.
+    reads_gathered: u64,
+    reads_per_factor: u64,
 }
 
 fn argue(columns: &[Mle<F>], arm: Arm) -> Result<Argued, Error> {
     gpu::force_argue_device_tables(Some(arm.tables));
     gpu::force_argue_device_columns(Some(arm.columns));
+    gpu::force_argue_lean_reads(Some(arm.reads));
     let mut trace = TraceData::new(columns.to_vec(), kinds(), Vec::new())?;
     if arm.resident {
         // A taller table first, so the run starts past column 0 of a store of
@@ -392,6 +399,7 @@ fn argue(columns: &[Mle<F>], arm: Arm) -> Result<Argued, Error> {
         vec![Weight::Table(eq_mle(&r)?), Weight::Table(eq_mle(&row)?)]
     };
     let (tables, cards) = (gpu::argue_tables_on_card(), gpu::evaluate_calls());
+    let (gathered, single) = (gpu::reads_gathered(), gpu::reads_per_factor());
     let mut t = transcript();
     let (core, point) = constraint_argument::prove_core::<F, Ext, _>(
         &trace,
@@ -407,6 +415,8 @@ fn argue(columns: &[Mle<F>], arm: Arm) -> Result<Argued, Error> {
         next: t.sample_field_element(),
         tables_on_card: gpu::argue_tables_on_card() - tables,
         columns_on_card: gpu::evaluate_calls() - cards,
+        reads_gathered: gpu::reads_gathered() - gathered,
+        reads_per_factor: gpu::reads_per_factor() - single,
     })
 }
 
@@ -458,6 +468,7 @@ const TODAY: Arm = Arm {
     tables: false,
     columns: false,
     compiled: true,
+    reads: false,
 };
 
 /// ★ The stage's identity. The same argument with its tables built on the
@@ -527,11 +538,30 @@ fn the_argument_proves_the_same_bytes_with_its_tables_on_the_card() {
             0,
             0,
         ),
+        // Every session's end in one copy: alone, and with everything else.
+        (
+            Arm {
+                reads: true,
+                ..TODAY
+            },
+            0,
+            0,
+        ),
+        (
+            Arm {
+                tables: true,
+                columns: true,
+                reads: true,
+                ..TODAY
+            },
+            8,
+            6,
+        ),
     ];
     for (arm, tables, cards) in arms {
         let what = format!(
-            "resident {} · tables {} · columns {} · compiled {}",
-            arm.resident, arm.tables, arm.columns, arm.compiled
+            "resident {} · tables {} · columns {} · compiled {} · reads {}",
+            arm.resident, arm.tables, arm.columns, arm.compiled, arm.reads
         );
         let argued = argue(&columns, arm).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(
@@ -539,6 +569,21 @@ fn the_argument_proves_the_same_bytes_with_its_tables_on_the_card() {
             (tables, cards),
             "{what}: the path taken (tables, columns on the card)"
         );
+        // Every device session's end took the arm's read: all in one copy, or
+        // all a factor at a time.
+        if arm.reads {
+            assert!(
+                argued.reads_per_factor == 0 && argued.reads_gathered > 0,
+                "{what}: gathered {} · per factor {}",
+                argued.reads_gathered,
+                argued.reads_per_factor
+            );
+        } else {
+            assert_eq!(
+                argued.reads_gathered, 0,
+                "{what}: a session was read in one copy"
+            );
+        }
         assert_eq!(
             canonical(&argued.core),
             canonical(&today.core),

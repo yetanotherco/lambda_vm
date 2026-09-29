@@ -946,6 +946,72 @@ where
         builder.finish(root)
     }
 
+    /// [`program`](Self::program) with each root folded into the running sum
+    /// as soon as its step is computed, rather than all of them at the end.
+    ///
+    /// The same polynomial, `weight · Σ β^i · sel_i · root_i`, summed in step
+    /// order rather than root order. What changes is how long a root stays
+    /// live. The sum at the end keeps every root's value until the last step,
+    /// so the program's live set — the slot file a device round keeps per
+    /// thread — is at least its number of roots, and on the widest precompile
+    /// that file is tens of kilobytes a thread: it caps a round's threads and
+    /// does not stay in cache (`thoughts/zf/gap2/fix2/I-GFS.md` §15). Folded in
+    /// early, a root dies at its term.
+    pub fn program_lean(
+        &self,
+        beta_powers: &[FieldElement<E>],
+        weight: usize,
+    ) -> Result<Program<E>, MlError> {
+        if beta_powers.len() != self.roots.len() {
+            return Err(MlError::VariableCountMismatch {
+                expected: self.roots.len(),
+                got: beta_powers.len(),
+            });
+        }
+        // The roots each step completes, so their terms follow it directly.
+        let mut completes: Vec<Vec<usize>> = vec![Vec::new(); self.steps.len()];
+        for (root, &step) in self.root_steps.iter().enumerate() {
+            completes[step as usize].push(root);
+        }
+        let mut builder = Builder::<E>::new();
+        // Where each step landed: the terms between the steps move them.
+        let mut node: Vec<u32> = Vec::with_capacity(self.steps.len());
+        let mut sum: Option<u32> = None;
+        for (index, step) in self.steps.iter().enumerate() {
+            let emitted = match *step {
+                Step::Fixed(ref c) => builder.fixed(c.clone()),
+                Step::Var(i) => builder.var(i as usize),
+                Step::Add(a, b) => builder.add(node[a as usize], node[b as usize]),
+                Step::Sub(a, b) => builder.sub(node[a as usize], node[b as usize]),
+                Step::Mul(a, b) => builder.mul(node[a as usize], node[b as usize]),
+                Step::Neg(a) => builder.neg(node[a as usize]),
+            };
+            node.push(emitted);
+            for &root in &completes[index] {
+                let mut term = emitted;
+                if let Some(slot) = self.selector_of_root[root] {
+                    let s = builder.var(slot);
+                    term = builder.mul(term, s);
+                }
+                if beta_powers[root] != FieldElement::one() {
+                    let c = builder.fixed(beta_powers[root].clone());
+                    term = builder.mul(c, term);
+                }
+                sum = Some(match sum {
+                    Some(acc) => builder.add(acc, term),
+                    None => term,
+                });
+            }
+        }
+        let sum = match sum {
+            Some(sum) => sum,
+            None => builder.fixed(FieldElement::zero()),
+        };
+        let w = builder.var(weight);
+        let root = builder.mul(w, sum);
+        builder.finish(root)
+    }
+
     pub fn combine(
         &self,
         beta_powers: &[FieldElement<E>],
@@ -1689,6 +1755,32 @@ mod tests {
             program.eval(&values, &mut scratch),
             values[width] * shape.combine(&betas, &values[..width])
         );
+    }
+
+    /// The lean program is the same polynomial, and it holds fewer values at
+    /// once: its roots die at their terms instead of at the end.
+    #[test]
+    fn the_lean_zerocheck_program_is_the_same_rule() {
+        let num_vars = 3;
+        let (prog, meta) = fib_program();
+        let columns = fib_columns(num_vars);
+        let leaves = fib_leaves(&columns, num_vars);
+        let poly =
+            IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta).unwrap();
+        let shape = poly.shape().clone();
+        let betas = beta_powers(&ExtE::from(5), shape.num_roots());
+        let width = poly.polys().len();
+        let values: Vec<ExtE> = (0..=width)
+            .map(|i| ExtE::from((i as u64).wrapping_mul(2654435761) + 11))
+            .collect();
+        let today = shape.program(&betas, width).unwrap();
+        let lean = shape.program_lean(&betas, width).unwrap();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            lean.eval(&values, &mut scratch),
+            today.eval(&values, &mut scratch)
+        );
+        assert!(shape.program_lean(&[ExtE::one()], width).is_err());
     }
 
     /// A beta power per root, or the rule would batch the wrong number of them.

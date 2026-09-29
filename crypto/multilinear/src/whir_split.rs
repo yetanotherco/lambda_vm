@@ -64,6 +64,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::field::{element::FieldElement, traits::IsField};
+
 /// `LAMBDA_VM_BASE_SPLIT=1` (any non-empty value other than `0`) turns the
 /// lines and the records on.
 ///
@@ -367,6 +370,260 @@ pub static TABLES_ON_CARD: Counter = Counter::new();
 /// host's, cell for cell, and found equal.
 pub static TABLES_XCHECKED: Counter = Counter::new();
 
+/// Device sumchecks whose end was read back in one gathered copy
+/// (`LAMBDA_VM_ARGUE_LEAN_READS`), beside [`READS_PER_FACTOR`], the factors
+/// read one synchronous copy at a time — the mechanism line of that knob: it
+/// moves reads from the second to the first.
+pub static READS_GATHERED: Counter = Counter::new();
+/// See [`READS_GATHERED`].
+pub static READS_PER_FACTOR: Counter = Counter::new();
+
+// ── inside the argue: a device GKR layer, and the host work between two ─────
+//
+// The head's trace put 0.79 s of card idle between one GKR layer's read-back
+// and the next layer's first kernel — 3,489 transitions, 227 µs each on
+// average — and could not say whose it is. These split a device layer, in the
+// order it runs, into the host's work before its rounds, the rounds, and the
+// host's work after them. Only the layers a device runs are timed: a level GKR
+// proves here from the start has no transition to split.
+//
+// ★ Timed with [`tick`], one clock read, not [`mark`]'s two: a prove opens
+// these some hundred thousand times.
+
+/// The layer's `λ`, drawn from the transcript.
+pub static GKR_LAMBDA: Slot = Slot::new();
+/// `program_for(λ)`: the layer relation written as a program.
+pub static GKR_PROGRAM: Slot = Slot::new();
+/// The program lowered to the device's nodes and constants, and the point's
+/// limbs.
+pub static GKR_LOWER: Slot = Slot::new();
+/// The session set up on the card: the `eq` table over the point, the factor
+/// pointers, the nodes and the round scratch.
+pub static GKR_SESSION: Slot = Slot::new();
+/// The input layer written again for its own sumcheck by a tree that gave it
+/// back, and that session set up — card work, once a table, kept out of
+/// [`GKR_SESSION`] so the transitions are not charged for it.
+pub static GKR_REBUILD: Slot = Slot::new();
+/// The rounds on the card, their transcript round trips included.
+pub static GKR_ROUNDS: Slot = Slot::new();
+/// The factors read back at the crossover cube.
+pub static GKR_VALUES: Slot = Slot::new();
+/// Those values made into the relation's five tables.
+pub static GKR_FACTORS: Slot = Slot::new();
+/// The rounds the host finishes over the crossover cube, their transcript
+/// included.
+pub static GKR_TAIL: Slot = Slot::new();
+/// Of [`GKR_TAIL`], the transcript's share: the round messages absorbed and
+/// the challenges drawn.
+pub static GKR_TAIL_TRANSCRIPT: Slot = Slot::new();
+/// The layer's four values absorbed, `c` drawn and the next claim made.
+pub static GKR_CLOSE: Slot = Slot::new();
+/// Layers a device ran.
+pub static GKR_LAYERS: Counter = Counter::new();
+/// Of [`GKR_LAYERS`], the input layers written again ([`GKR_REBUILD`]).
+pub static GKR_REBUILDS: Counter = Counter::new();
+/// Rounds the host finished after them.
+pub static GKR_TAIL_ROUNDS: Counter = Counter::new();
+/// Of [`GKR_LAYERS`], the ones whose host tail ran lean
+/// (`LAMBDA_VM_ARGUE_LEAN_TAIL`) — the mechanism line of that knob.
+pub static TAILS_LEAN: Counter = Counter::new();
+/// Of [`TAILS_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
+/// against the generic rounds and found equal.
+pub static TAILS_XCHECKED: Counter = Counter::new();
+
+/// A prove's device GKR layers, split: seconds per region, in the order a
+/// layer runs them, and the counts they are over.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GkrSplit {
+    pub lambda: f64,
+    pub program: f64,
+    pub lower: f64,
+    pub session: f64,
+    pub rebuild: f64,
+    pub rounds: f64,
+    pub values: f64,
+    pub factors: f64,
+    pub tail: f64,
+    pub tail_transcript: f64,
+    pub close: f64,
+    pub layers: u64,
+    pub rebuilds: u64,
+    pub tail_rounds: u64,
+}
+
+impl GkrSplit {
+    /// Read and clear every GKR slot and counter.
+    fn take() -> Self {
+        Self {
+            lambda: GKR_LAMBDA.take(),
+            program: GKR_PROGRAM.take(),
+            lower: GKR_LOWER.take(),
+            session: GKR_SESSION.take(),
+            rebuild: GKR_REBUILD.take(),
+            rounds: GKR_ROUNDS.take(),
+            values: GKR_VALUES.take(),
+            factors: GKR_FACTORS.take(),
+            tail: GKR_TAIL.take(),
+            tail_transcript: GKR_TAIL_TRANSCRIPT.take(),
+            close: GKR_CLOSE.take(),
+            layers: GKR_LAYERS.take(),
+            rebuilds: GKR_REBUILDS.take(),
+            tail_rounds: GKR_TAIL_ROUNDS.take(),
+        }
+    }
+
+    /// The host's work between two device layers: what follows one layer's
+    /// read-back — the factors, the tail, the close — and what precedes the
+    /// next one's rounds — `λ`, the program, the lowering, the session. The
+    /// rebuild, the rounds and the read-back are not in it.
+    pub fn between(&self) -> f64 {
+        self.lambda
+            + self.program
+            + self.lower
+            + self.session
+            + self.factors
+            + self.tail
+            + self.close
+    }
+}
+
+// ── inside the argue: a zerocheck's device rounds ───────────────────────────
+//
+// A big batch holds so many values a thread that its first rounds run a few
+// thousand threads (`gpu::LEAN_ABOVE_SLOTS`): the head's widest ran 8,096 at
+// 94 ms a launch. `LAMBDA_VM_ARGUE_LEAN_PROGRAM` trades held values for steps,
+// which buys threads in the early rounds and costs steps in the late ones,
+// where a round is a handful of threads walking the program. These say which
+// rounds paid. Timed with [`tick`], as the GKR regions are.
+
+/// A big batch's round is early while half its cube holds at least this many
+/// indices — the head's widest batch had room for 8,096 threads, so its rounds
+/// from here up ran short of them.
+pub const LATE_HALF: usize = 1 << 13;
+/// A big batch's early device rounds: the kernels, the read-back, the
+/// challenge drawn and the fold.
+pub static ZC_BIG_EARLY: Slot = Slot::new();
+/// A big batch's late device rounds, timed the same way.
+pub static ZC_BIG_LATE: Slot = Slot::new();
+/// Every other batch's device rounds.
+pub static ZC_OTHER: Slot = Slot::new();
+/// The rounds the host finishes over the crossover cube, every batch's, with
+/// the factors taken in and their values read out.
+pub static ZC_TAIL: Slot = Slot::new();
+/// Zerocheck sessions over a big batch.
+pub static ZC_BIG: Counter = Counter::new();
+/// Of [`ZC_BIG`], the ones whose program ran on demand — the mechanism line of
+/// `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+pub static ZC_LEAN: Counter = Counter::new();
+/// Of [`ZC_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
+/// against today's program over the same factors, and found equal.
+pub static ZC_LEAN_XCHECKED: Counter = Counter::new();
+/// The rounds in [`ZC_BIG_EARLY`].
+pub static ZC_BIG_EARLY_ROUNDS: Counter = Counter::new();
+/// The rounds in [`ZC_BIG_LATE`].
+pub static ZC_BIG_LATE_ROUNDS: Counter = Counter::new();
+
+/// A prove's zerocheck rounds, split: seconds per region and the counts they
+/// are over.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ZerocheckSplit {
+    pub big_early: f64,
+    pub big_late: f64,
+    pub other: f64,
+    pub tail: f64,
+    pub big: u64,
+    pub lean: u64,
+    pub xchecked: u64,
+    pub early_rounds: u64,
+    pub late_rounds: u64,
+}
+
+impl ZerocheckSplit {
+    /// Read and clear every zerocheck slot and counter.
+    fn take() -> Self {
+        Self {
+            big_early: ZC_BIG_EARLY.take(),
+            big_late: ZC_BIG_LATE.take(),
+            other: ZC_OTHER.take(),
+            tail: ZC_TAIL.take(),
+            big: ZC_BIG.take(),
+            lean: ZC_LEAN.take(),
+            xchecked: ZC_LEAN_XCHECKED.take(),
+            early_rounds: ZC_BIG_EARLY_ROUNDS.take(),
+            late_rounds: ZC_BIG_LATE_ROUNDS.take(),
+        }
+    }
+}
+
+/// Start a region timed many times a prove: one clock read, where [`mark`]
+/// takes two to place a stage on a sampler's timeline. `None`, and no clock
+/// read, when the knob is off.
+#[inline]
+pub fn tick() -> Option<Instant> {
+    enabled().then(Instant::now)
+}
+
+/// Close a region opened by [`tick`] into `slot`.
+#[inline]
+pub fn add_tick(slot: &Slot, start: Option<Instant>) {
+    if let Some(t) = start {
+        slot.0
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// A transcript that adds the time spent in it to a slot.
+///
+/// It makes the same calls, in the same order, on the transcript it wraps, so
+/// what it absorbs and draws is that transcript's: wrapping one changes no
+/// challenge and no proof byte.
+pub struct Timed<'a, T> {
+    inner: &'a mut T,
+    slot: &'a Slot,
+}
+
+impl<'a, T> Timed<'a, T> {
+    pub fn new(inner: &'a mut T, slot: &'a Slot) -> Self {
+        Self { inner, slot }
+    }
+}
+
+impl<F: IsField, T: IsTranscript<F>> IsTranscript<F> for Timed<'_, T> {
+    fn append_field_element(&mut self, element: &FieldElement<F>) {
+        let t = tick();
+        self.inner.append_field_element(element);
+        add_tick(self.slot, t);
+    }
+
+    fn append_bytes(&mut self, new_bytes: &[u8]) {
+        let t = tick();
+        self.inner.append_bytes(new_bytes);
+        add_tick(self.slot, t);
+    }
+
+    fn mark_statement_end(&mut self) {
+        self.inner.mark_statement_end();
+    }
+
+    fn state(&self) -> [u8; 32] {
+        self.inner.state()
+    }
+
+    fn sample_field_element(&mut self) -> FieldElement<F> {
+        let t = tick();
+        let sampled = self.inner.sample_field_element();
+        add_tick(self.slot, t);
+        sampled
+    }
+
+    fn sample_u64(&mut self, upper_bound: u64) -> u64 {
+        let t = tick();
+        let sampled = self.inner.sample_u64(upper_bound);
+        add_tick(self.slot, t);
+        sampled
+    }
+}
+
 /// Everything the chain parked at the group-loop boundary, awaiting the record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChainSlots {
@@ -611,6 +868,24 @@ pub struct ProverSplit {
     pub tables_on_card: u64,
     pub tables_xchecked: u64,
     pub device_tables: bool,
+    /// Sessions read back in one copy and factors read one at a time —
+    /// [`READS_GATHERED`], [`READS_PER_FACTOR`] — and the knob they were read
+    /// under.
+    pub reads_gathered: u64,
+    pub reads_per_factor: u64,
+    pub lean_reads: bool,
+    /// The device GKR layers, split — [`GkrSplit`].
+    pub gkr: GkrSplit,
+    /// Device GKR layers whose host tail ran lean, and checked against the
+    /// generic rounds — [`TAILS_LEAN`], [`TAILS_XCHECKED`] — and the knob they
+    /// ran under.
+    pub tails_lean: u64,
+    pub tails_xchecked: u64,
+    pub lean_tail: bool,
+    /// The zerocheck rounds, split — [`ZerocheckSplit`] — and the knob they
+    /// ran under (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
+    pub zerocheck: ZerocheckSplit,
+    pub lean_program: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -777,6 +1052,118 @@ impl ProverSplit {
             xcheck = on_off(self.xcheck),
         )
     }
+    /// The sessions' reads-back line, stamped the same way:
+    /// `ARGUE READS #k: sessions read in one copy G · factors read one at a
+    /// time F || lean reads on|off`.
+    pub fn reads_line(&self) -> String {
+        format!(
+            "ARGUE READS {who}{tainted}: sessions read in one copy {gathered} · factors read one \
+             at a time {single} || lean reads {knob}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            gathered = self.reads_gathered,
+            single = self.reads_per_factor,
+            knob = if self.lean_reads { "on" } else { "off" },
+        )
+    }
+    /// The host tails' line, stamped as the split line is:
+    /// `ARGUE TAIL #k: lean L of device layers D · xchecked X || lean tail
+    /// on|off · xcheck on|off`.
+    pub fn tail_line(&self) -> String {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE TAIL {who}{tainted}: lean {lean} of device layers {layers} · xchecked {checked} \
+             || lean tail {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            lean = self.tails_lean,
+            layers = self.gkr.layers,
+            checked = self.tails_xchecked,
+            knob = on_off(self.lean_tail),
+            xcheck = on_off(self.xcheck),
+        )
+    }
+    /// The zerocheck line, milliseconds, stamped as the split line is:
+    /// `ARGUE ZEROCHECK #k: big sessions B (lean L · xchecked X) · early rounds
+    /// E · late rounds R || big early X · big late Y · other Z · host tail T
+    /// (ms) || lean program on|off · xcheck on|off`.
+    pub fn zerocheck_line(&self) -> String {
+        let z = &self.zerocheck;
+        let ms = |secs: f64| secs * 1e3;
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE ZEROCHECK {who}{tainted}: big sessions {big} (lean {lean} · xchecked \
+             {checked}) · early rounds {early} · late rounds {late} || big early {big_early:.2} · \
+             big late {big_late:.2} · other {other:.2} · host tail {tail:.2} (ms) || lean \
+             program {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            big = z.big,
+            lean = z.lean,
+            checked = z.xchecked,
+            early = z.early_rounds,
+            late = z.late_rounds,
+            big_early = ms(z.big_early),
+            big_late = ms(z.big_late),
+            other = ms(z.other),
+            tail = ms(z.tail),
+            knob = on_off(self.lean_program),
+            xcheck = on_off(self.xcheck),
+        )
+    }
+    /// The GKR line, milliseconds, stamped as the split line is:
+    /// `ARGUE GKR #k: layers on the card N (rebuilt R) · host tail rounds T ||
+    /// between layers B ms, M µs a layer: lambda · program · lower · session ·
+    /// factors · tail (transcript) · close || rebuild · rounds · values (ms)`.
+    pub fn gkr_line(&self) -> String {
+        let g = &self.gkr;
+        let ms = |secs: f64| secs * 1e3;
+        let mean = if g.layers == 0 {
+            0.0
+        } else {
+            g.between() * 1e6 / g.layers as f64
+        };
+        format!(
+            "ARGUE GKR {who}{tainted}: layers on the card {layers} (rebuilt {rebuilt}) · host tail \
+             rounds {tail_rounds} || between layers {between:.2} ms, {mean:.1} µs a layer: lambda \
+             {lambda:.2} · program {program:.2} · lower {lower:.2} · session {session:.2} · \
+             factors {factors:.2} · tail {tail:.2} (transcript {heard:.2}) · close {close:.2} || \
+             rebuild {rebuild:.2} · rounds {rounds:.2} · values {values:.2} (ms)",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            layers = g.layers,
+            rebuilt = g.rebuilds,
+            tail_rounds = g.tail_rounds,
+            between = ms(g.between()),
+            lambda = ms(g.lambda),
+            program = ms(g.program),
+            lower = ms(g.lower),
+            session = ms(g.session),
+            factors = ms(g.factors),
+            tail = ms(g.tail),
+            heard = ms(g.tail_transcript),
+            close = ms(g.close),
+            rebuild = ms(g.rebuild),
+            rounds = ms(g.rounds),
+            values = ms(g.values),
+        )
+    }
 }
 
 static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
@@ -850,6 +1237,15 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.tables_on_card = TABLES_ON_CARD.take();
     rec.tables_xchecked = TABLES_XCHECKED.take();
     rec.device_tables = crate::gpu::argue_device_tables();
+    rec.reads_gathered = READS_GATHERED.take();
+    rec.reads_per_factor = READS_PER_FACTOR.take();
+    rec.lean_reads = crate::gpu::argue_lean_reads();
+    rec.gkr = GkrSplit::take();
+    rec.tails_lean = TAILS_LEAN.take();
+    rec.tails_xchecked = TAILS_XCHECKED.take();
+    rec.lean_tail = crate::gpu::argue_lean_tail();
+    rec.zerocheck = ZerocheckSplit::take();
+    rec.lean_program = crate::gpu::argue_lean_program();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -906,6 +1302,10 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.reserved_line());
     println!("{}", rec.columns_line());
     println!("{}", rec.tables_line());
+    println!("{}", rec.reads_line());
+    println!("{}", rec.gkr_line());
+    println!("{}", rec.tail_line());
+    println!("{}", rec.zerocheck_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1208,16 +1608,50 @@ mod tests {
         bump_by(&COLUMNS_XCHECKED, 11);
         bump_by(&TABLES_ON_CARD, 13);
         bump_by(&TABLES_XCHECKED, 17);
+        bump(&READS_GATHERED);
+        bump_by(&READS_PER_FACTOR, 19);
+        bump(&GKR_LAYERS);
+        bump(&GKR_REBUILDS);
+        bump_by(&GKR_TAIL_ROUNDS, 9);
+        bump(&TAILS_LEAN);
+        bump(&TAILS_XCHECKED);
+        bump(&ZC_BIG);
+        bump(&ZC_LEAN);
+        bump(&ZC_LEAN_XCHECKED);
+        bump(&ZC_BIG_EARLY_ROUNDS);
+        bump(&ZC_BIG_LATE_ROUNDS);
         assert_eq!(
             (
                 COLUMNS_ON_CARD.take(),
                 COLUMNS_ON_HOST.take(),
                 COLUMNS_XCHECKED.take(),
                 TABLES_ON_CARD.take(),
-                TABLES_XCHECKED.take()
+                TABLES_XCHECKED.take(),
+                READS_GATHERED.take(),
+                READS_PER_FACTOR.take(),
+                GKR_LAYERS.take(),
+                GKR_REBUILDS.take(),
+                GKR_TAIL_ROUNDS.take(),
+                TAILS_LEAN.take(),
+                TAILS_XCHECKED.take()
             ),
-            (0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
             "a disabled bump_by must not move a counter"
+        );
+        // The GKR regions' one-read clock is inert the same way.
+        assert!(tick().is_none(), "a disabled tick must read no clock");
+        add_tick(&GKR_TAIL, tick());
+        assert_eq!(
+            GkrSplit::take(),
+            GkrSplit::default(),
+            "a disabled tick must not move a slot"
+        );
+        add_tick(&ZC_BIG_EARLY, tick());
+        add_tick(&ZC_TAIL, tick());
+        assert_eq!(
+            ZerocheckSplit::take(),
+            ZerocheckSplit::default(),
+            "a disabled tick or bump must not move a zerocheck slot or counter"
         );
         assert_eq!(stage_done(0, "execute", mark()), 0.0);
         note_table(3, 9.0);
@@ -1309,6 +1743,34 @@ mod tests {
         );
     }
 
+    /// The reads line: both counts and the knob, stamped like the split line.
+    #[test]
+    fn the_reads_line_names_its_prove_and_its_knob() {
+        let epoch = ProverSplit {
+            index: 7,
+            reads_gathered: 245,
+            reads_per_factor: 0,
+            lean_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.reads_line(),
+            "ARGUE READS #7: sessions read in one copy 245 · factors read one at a time 0 || \
+             lean reads on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            reads_per_factor: 3301,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.reads_line(),
+            "ARGUE READS GLOBAL (in base) ⛔OVERLAPPED: sessions read in one copy 0 · factors \
+             read one at a time 3301 || lean reads off"
+        );
+    }
+
     /// The tables line: its count, its checked count and its knob, stamped
     /// like the split line.
     #[test]
@@ -1334,6 +1796,180 @@ mod tests {
             global.tables_line(),
             "ARGUE TABLES GLOBAL (in base) ⛔OVERLAPPED: built on the card 0 · xchecked 0 || \
              device tables off · xcheck off"
+        );
+    }
+
+    /// The GKR line: its counts, the transition's sum and its mean a layer,
+    /// then every slot in milliseconds, stamped like the split line. The rebuild,
+    /// the rounds and the read-back stay out of the transition.
+    #[test]
+    fn the_gkr_line_names_its_prove_and_splits_a_transition() {
+        let epoch = ProverSplit {
+            index: 5,
+            gkr: GkrSplit {
+                lambda: 0.002,
+                program: 0.001,
+                lower: 0.003,
+                session: 0.010,
+                rebuild: 0.050,
+                rounds: 0.200,
+                values: 0.004,
+                factors: 0.0005,
+                tail: 0.030,
+                tail_transcript: 0.020,
+                close: 0.0035,
+                layers: 200,
+                rebuilds: 12,
+                tail_rounds: 1800,
+            },
+            ..Default::default()
+        };
+        assert!((epoch.gkr.between() - 0.05).abs() < 1e-12);
+        assert_eq!(
+            epoch.gkr_line(),
+            "ARGUE GKR #5: layers on the card 200 (rebuilt 12) · host tail rounds 1800 || \
+             between layers 50.00 ms, 250.0 µs a layer: lambda 2.00 · program 1.00 · lower 3.00 · \
+             session 10.00 · factors 0.50 · tail 30.00 (transcript 20.00) · close 3.50 || \
+             rebuild 50.00 · rounds 200.00 · values 4.00 (ms)"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.gkr_line(),
+            "ARGUE GKR GLOBAL (in base) ⛔OVERLAPPED: layers on the card 0 (rebuilt 0) · host tail \
+             rounds 0 || between layers 0.00 ms, 0.0 µs a layer: lambda 0.00 · program 0.00 · \
+             lower 0.00 · session 0.00 · factors 0.00 · tail 0.00 (transcript 0.00) · close 0.00 \
+             || rebuild 0.00 · rounds 0.00 · values 0.00 (ms)"
+        );
+    }
+
+    /// The tails line: the lean count against the record's device layers, and
+    /// both knobs it was taken under, stamped like the split line.
+    #[test]
+    fn the_tail_line_names_its_prove_and_its_knobs() {
+        let epoch = ProverSplit {
+            index: 6,
+            gkr: GkrSplit {
+                layers: 240,
+                ..Default::default()
+            },
+            tails_lean: 240,
+            tails_xchecked: 240,
+            lean_tail: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.tail_line(),
+            "ARGUE TAIL #6: lean 240 of device layers 240 · xchecked 240 || lean tail on · \
+             xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.tail_line(),
+            "ARGUE TAIL GLOBAL (in base) ⛔OVERLAPPED: lean 0 of device layers 0 · xchecked 0 || \
+             lean tail off · xcheck off"
+        );
+    }
+
+    /// The zerocheck line: its session and round counts, then every slot in
+    /// milliseconds and the knob, stamped like the split line.
+    #[test]
+    fn the_zerocheck_line_names_its_prove_and_its_knob() {
+        let epoch = ProverSplit {
+            index: 3,
+            zerocheck: ZerocheckSplit {
+                big_early: 1.25,
+                big_late: 0.0405,
+                other: 0.5,
+                tail: 0.012,
+                big: 4,
+                lean: 4,
+                xchecked: 4,
+                early_rounds: 30,
+                late_rounds: 36,
+            },
+            lean_program: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.zerocheck_line(),
+            "ARGUE ZEROCHECK #3: big sessions 4 (lean 4 · xchecked 4) · early rounds 30 · late \
+             rounds 36 || big early 1250.00 · big late 40.50 · other 500.00 · host tail 12.00 \
+             (ms) || lean program on · xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.zerocheck_line(),
+            "ARGUE ZEROCHECK GLOBAL (in base) ⛔OVERLAPPED: big sessions 0 (lean 0 · xchecked \
+             0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 0.00 · \
+             host tail 0.00 (ms) || lean program off · xcheck off"
+        );
+    }
+
+    /// A region closed by `add_tick` lands in its slot in nanoseconds, and the
+    /// take reads it back in seconds and clears it.
+    #[test]
+    fn a_ticked_region_lands_in_its_slot() {
+        static PROBE: Slot = Slot::new();
+        let started = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(5))
+            .expect("the clock is past its origin");
+        add_tick(&PROBE, Some(started));
+        let secs = PROBE.take();
+        assert!(
+            (0.005..1.0).contains(&secs),
+            "five milliseconds ago, read {secs}"
+        );
+        assert_eq!(PROBE.take(), 0.0, "the take clears the slot");
+    }
+
+    /// ★ The one piece of the GKR split on the proof's path: the tail's
+    /// transcript is wrapped to time its share. The wrapper must make the same
+    /// calls on the transcript it wraps — same state, same draws — or wrapping
+    /// it would change the proof it times.
+    #[test]
+    fn a_timed_transcript_draws_what_it_wraps() {
+        use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+        use math::field::goldilocks::GoldilocksField as F;
+
+        type FE = FieldElement<F>;
+        let mut bare = DefaultTranscript::<F>::new(b"timed");
+        let mut held = DefaultTranscript::<F>::new(b"timed");
+        let drawn = |t: &mut dyn IsTranscript<F>| {
+            let mut out = Vec::new();
+            for k in 1..=5u64 {
+                t.append_field_element(&FE::from(k * 7));
+                t.append_bytes(&k.to_le_bytes());
+                t.mark_statement_end();
+                out.push(t.sample_field_element());
+                out.push(FE::from(t.sample_u64(1 << 20)));
+            }
+            out
+        };
+        let from_bare = drawn(&mut bare);
+        let from_timed = drawn(&mut Timed::new(&mut held, &GKR_TAIL_TRANSCRIPT));
+        assert_eq!(
+            from_bare, from_timed,
+            "the wrapper drew what the transcript draws"
+        );
+        assert_eq!(bare.state(), held.state(), "and left it in the same state");
+        assert_eq!(
+            GKR_TAIL_TRANSCRIPT.take(),
+            0.0,
+            "no clock is read with the knob off"
         );
     }
 

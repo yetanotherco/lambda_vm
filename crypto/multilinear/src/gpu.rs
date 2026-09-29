@@ -60,6 +60,23 @@ static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 static ARGUE_TABLES_ON_CARD: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the host's.
 static ARGUE_TABLE_XCHECKS: AtomicU64 = AtomicU64::new(0);
+/// Device sumchecks whose end was read back in one gathered copy
+/// (`LAMBDA_VM_ARGUE_LEAN_READS`).
+static READS_GATHERED: AtomicU64 = AtomicU64::new(0);
+/// Factors read back one synchronous copy at a time — what the gathered read
+/// replaces.
+static READS_PER_FACTOR: AtomicU64 = AtomicU64::new(0);
+/// Device GKR layers whose host tail ran lean (`LAMBDA_VM_ARGUE_LEAN_TAIL`).
+static LEAN_TAILS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round against
+/// the generic rounds.
+static LEAN_TAIL_XCHECKS: AtomicU64 = AtomicU64::new(0);
+/// Zerocheck sessions whose device rounds walked their program on demand
+/// (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
+static LEAN_PROGRAMS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round against
+/// today's program walking the same factors.
+static LEAN_PROGRAM_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
@@ -195,6 +212,40 @@ pub fn argue_table_xchecks() -> u64 {
     ARGUE_TABLE_XCHECKS.load(Ordering::Relaxed)
 }
 
+pub fn reads_gathered() -> u64 {
+    READS_GATHERED.load(Ordering::Relaxed)
+}
+
+pub fn reads_per_factor() -> u64 {
+    READS_PER_FACTOR.load(Ordering::Relaxed)
+}
+
+pub fn lean_tails() -> u64 {
+    LEAN_TAILS.load(Ordering::Relaxed)
+}
+
+pub fn lean_tail_xchecks() -> u64 {
+    LEAN_TAIL_XCHECKS.load(Ordering::Relaxed)
+}
+
+pub fn lean_programs() -> u64 {
+    LEAN_PROGRAMS.load(Ordering::Relaxed)
+}
+
+pub fn lean_program_xchecks() -> u64 {
+    LEAN_PROGRAM_XCHECKS.load(Ordering::Relaxed)
+}
+
+/// Counts a layer the lean tail finished, and whether the cross-check ran on it.
+pub(crate) fn note_lean_tail(xchecked: bool) {
+    LEAN_TAILS.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::TAILS_LEAN);
+    if xchecked {
+        LEAN_TAIL_XCHECKS.fetch_add(1, Ordering::Relaxed);
+        crate::whir_split::bump(&crate::whir_split::TAILS_XCHECKED);
+    }
+}
+
 pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
@@ -300,6 +351,12 @@ pub fn reset_call_counters() {
     ARGUE_XCHECKS.store(0, Ordering::Relaxed);
     ARGUE_TABLES_ON_CARD.store(0, Ordering::Relaxed);
     ARGUE_TABLE_XCHECKS.store(0, Ordering::Relaxed);
+    READS_GATHERED.store(0, Ordering::Relaxed);
+    READS_PER_FACTOR.store(0, Ordering::Relaxed);
+    LEAN_TAILS.store(0, Ordering::Relaxed);
+    LEAN_TAIL_XCHECKS.store(0, Ordering::Relaxed);
+    LEAN_PROGRAMS.store(0, Ordering::Relaxed);
+    LEAN_PROGRAM_XCHECKS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -958,7 +1015,7 @@ where
     };
     // Each factor as the last fold left it, read where it lies — which is the
     // only thing a session over factors it does not own can say.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -986,12 +1043,136 @@ fn run_rounds<E>(
     session: &mut math_cuda::sumcheck::SumcheckSession,
     degree: usize,
     num_vars: usize,
+    challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+    reference: impl FnMut(
+        &math_cuda::sumcheck::SumcheckSession,
+    ) -> Option<Vec<math::field::element::FieldElement<E>>>,
+) -> Result<ClosedRounds<E>, crate::Error>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    run_rounds_timed(session, degree, num_vars, challenge, reference, None)
+}
+
+/// Where a zerocheck's device rounds go on the base split's `ARGUE ZEROCHECK`
+/// line: a big batch's split at [`whir_split::LATE_HALF`](crate::whir_split::LATE_HALF)
+/// into early and late rounds, every other batch's together.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum ZerocheckRounds {
+    Big,
+    Other,
+}
+
+#[cfg(feature = "cuda")]
+impl ZerocheckRounds {
+    fn note(self, half: usize, start: Option<std::time::Instant>) {
+        use crate::whir_split::{self, add_tick, bump};
+        match self {
+            Self::Big if half >= whir_split::LATE_HALF => {
+                add_tick(&whir_split::ZC_BIG_EARLY, start);
+                bump(&whir_split::ZC_BIG_EARLY_ROUNDS);
+            }
+            Self::Big => {
+                add_tick(&whir_split::ZC_BIG_LATE, start);
+                bump(&whir_split::ZC_BIG_LATE_ROUNDS);
+            }
+            Self::Other => add_tick(&whir_split::ZC_OTHER, start),
+        }
+    }
+}
+
+/// Today's program walking a zerocheck's factors beside the program on demand
+/// (`LAMBDA_VM_ARGUE_XCHECK`): each round, the shadow's sums are taken before
+/// the leader's round and compared with its answer before the challenge is
+/// drawn. Inert without a shadow.
+#[cfg(feature = "cuda")]
+struct ShadowRounds {
+    shadow: std::cell::RefCell<Option<math_cuda::sumcheck::SumcheckSession>>,
+    /// The interpolation nodes, as the round loop sends them.
+    t: Vec<u64>,
+    /// The shadow's sums for the round under way; empty if its round failed.
+    expected: std::cell::RefCell<Option<Vec<u64>>>,
+    round: std::cell::Cell<usize>,
+    /// The first round the two disagreed at.
+    parted: std::cell::Cell<Option<usize>>,
+}
+
+#[cfg(feature = "cuda")]
+impl ShadowRounds {
+    fn new(shadow: Option<math_cuda::sumcheck::SumcheckSession>, degree: usize) -> Option<Self> {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        let mut t = Vec::with_capacity(degree * 3);
+        for node in 1..=degree as u64 {
+            t.extend_from_slice(&ext3_raw(
+                &math::field::element::FieldElement::<Ext3>::from(node),
+            )?);
+        }
+        Some(Self {
+            shadow: std::cell::RefCell::new(shadow),
+            t,
+            expected: std::cell::RefCell::new(None),
+            round: std::cell::Cell::new(0),
+            parted: std::cell::Cell::new(None),
+        })
+    }
+
+    /// Before the leader's round: the shadow's, over the cube the leader has
+    /// left. Never a reference for the round loop to assert on.
+    fn walk<E>(
+        &self,
+        leader: &math_cuda::sumcheck::SumcheckSession,
+    ) -> Option<Vec<math::field::element::FieldElement<E>>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        if let Some(shadow) = self.shadow.borrow_mut().as_mut() {
+            shadow.follow(leader);
+            *self.expected.borrow_mut() = Some(shadow.round(&self.t).unwrap_or_default());
+        }
+        None
+    }
+
+    /// After it: the leader's answer against the shadow's sums.
+    fn compare<E>(&self, evaluations: &[math::field::element::FieldElement<E>])
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let round = self.round.replace(self.round.get() + 1);
+        let Some(sums) = self.expected.borrow_mut().take() else {
+            return;
+        };
+        let same = sums.len() == evaluations.len() * 3
+            && sums
+                .chunks_exact(3)
+                .zip(evaluations)
+                .all(|(sum, value)| ext3_from_raw::<E>(sum) == *value);
+        if !same && self.parted.get().is_none() {
+            self.parted.set(Some(round));
+        }
+    }
+
+    fn parted(&self) -> Option<usize> {
+        self.parted.get()
+    }
+}
+
+/// [`run_rounds`], each round — its kernels, its read-back, the challenge drawn
+/// and its fold — timed onto the zerocheck's split when `zerocheck` says which.
+#[cfg(feature = "cuda")]
+fn run_rounds_timed<E>(
+    session: &mut math_cuda::sumcheck::SumcheckSession,
+    degree: usize,
+    num_vars: usize,
     mut challenge: impl FnMut(
         &[math::field::element::FieldElement<E>],
     ) -> math::field::element::FieldElement<E>,
     mut reference: impl FnMut(
         &math_cuda::sumcheck::SumcheckSession,
     ) -> Option<Vec<math::field::element::FieldElement<E>>>,
+    zerocheck: Option<ZerocheckRounds>,
 ) -> Result<ClosedRounds<E>, crate::Error>
 where
     E: math::field::traits::IsField + 'static,
@@ -1014,6 +1195,8 @@ where
     let mut challenges = Vec::with_capacity(num_vars);
     for round in 0..num_vars {
         let expected = reference(session);
+        let half = session.len() / 2;
+        let start = zerocheck.and_then(|_| crate::whir_split::tick());
         let sums = session.round(&t).map_err(|_| failed("round"))?;
         let evaluations: Vec<FieldElement<E>> =
             sums.chunks_exact(3).map(ext3_from_raw::<E>).collect();
@@ -1026,6 +1209,9 @@ where
         let r = challenge(&evaluations);
         let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
         session.fold(&raw).map_err(|_| failed("fold"))?;
+        if let Some(zerocheck) = zerocheck {
+            zerocheck.note(half, start);
+        }
         rounds.push(crate::sumcheck::RoundProof { evaluations });
         challenges.push(r);
         SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
@@ -1100,7 +1286,15 @@ where
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_SUMCHECK").is_some()) {
         return None;
     }
-    let lowered = lower(program)?;
+    // A big batch's program on demand holds few enough values that its slot
+    // file is sized for every node from the first round.
+    let ZerocheckLowering {
+        run: lowered,
+        held,
+        big,
+    } = lower_for_zerocheck(program)?;
+    let lean = held.is_some();
+    let spread = if lean { degree } else { 1 };
 
     // A table goes up as it is; an `eq` weight goes up as its point, and the
     // card builds it (`LAMBDA_VM_ARGUE_DEVICE_TABLES`).
@@ -1126,14 +1320,41 @@ where
         .collect();
     let mut session = resident
         .0
-        .session_with(
+        .session_spread(
             &raw,
             &lowered.nodes,
             &lowered.consts,
             lowered.num_slots,
             lowered.root_slot,
+            spread,
         )
         .ok()?;
+    // Under the cross-check, today's program walks the same factors beside it,
+    // a round at a time: the block's identity gate for the schedule, as proof
+    // bytes cannot be one. A shadow the card has no room for declines here,
+    // before the first round, and is counted as unchecked.
+    let shadow = match &held {
+        Some(today) if argue_xcheck() => Some(
+            session
+                .shadow(
+                    &today.nodes,
+                    &today.consts,
+                    today.num_slots,
+                    today.root_slot,
+                )
+                .ok()?,
+        ),
+        _ => None,
+    };
+    let checked = shadow.is_some();
+    let beside = ShadowRounds::new(shadow, degree)?;
+    if big {
+        crate::whir_split::bump(&crate::whir_split::ZC_BIG);
+    }
+    if lean {
+        LEAN_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+        crate::whir_split::bump(&crate::whir_split::ZC_LEAN);
+    }
 
     // The weights the card built, by their slot in the session.
     let built: Vec<(usize, &[math::field::element::FieldElement<E>])> = extra
@@ -1170,15 +1391,45 @@ where
     // one thread walking the whole program, and a core here walks it far
     // faster. The caller finishes from the factors this hands back.
     let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
-    let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
+    let mut challenge = challenge;
+    let outcome = run_rounds_timed(
+        &mut session,
+        degree,
+        there,
+        |evaluations| {
+            beside.compare(evaluations);
+            challenge(evaluations)
+        },
+        |leader| beside.walk(leader),
+        Some(if big {
+            ZerocheckRounds::Big
+        } else {
+            ZerocheckRounds::Other
+        }),
+    );
     let (rounds, challenges) = match outcome {
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
+    if let Some(round) = beside.parted() {
+        eprintln!(
+            "[argue] XCHECK: a {num_vars}-variable zerocheck's rounds on demand ({} values a \
+             thread) parted from today's program ({} values) at round {round}",
+            lowered.num_slots,
+            held.as_ref().map_or(0, |today| today.num_slots),
+        );
+        return Some(Err(crate::Error::DeviceFailed {
+            stage: "program on demand",
+        }));
+    }
+    if checked {
+        LEAN_PROGRAM_XCHECKS.fetch_add(1, Ordering::Relaxed);
+        crate::whir_split::bump(&crate::whir_split::ZC_LEAN_XCHECKED);
+    }
     // The rounds folded every factor where it lies, so reading them back is
     // what spares the caller a pass over the trace to compute what the device
     // already has — the values at the point, when the cube ran out here.
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed {
             stage: "factor values",
         }));
@@ -1352,7 +1603,7 @@ where
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    let Ok(values) = session.values() else {
+    let Ok(values) = session_values(&session) else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
     let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
@@ -1694,6 +1945,242 @@ pub fn force_argue_device_tables(on: Option<bool>) {
         },
         Ordering::Relaxed,
     );
+}
+
+/// Whether a device sumcheck's end is read back in one gathered copy —
+/// `LAMBDA_VM_ARGUE_LEAN_READS=1` (any non-empty value other than `0`) —
+/// rather than one synchronous copy per factor. The same bytes either way; off
+/// by default until its A/B, and off is today's path.
+///
+/// Every session the argument runs ends by reading its factors back: the
+/// zerocheck's hundreds or thousands (the widest precompile has 1,482), each
+/// GKR layer's five, each reduce's pairs. One copy each is a round trip each,
+/// ~6 µs: about 0.3 s a block on the head's trace, 49 thousand copies of a few
+/// hundred bytes (`thoughts/zf/gap2/fix2/I-GFS.md` §8).
+pub fn argue_lean_reads() -> bool {
+    match ARGUE_LEAN_READS_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_READS"))
+        }
+    }
+}
+
+static ARGUE_LEAN_READS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_READS` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_reads(on: Option<bool>) {
+    ARGUE_LEAN_READS_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// ⛔ A FAULT: while armed, a gathered read hands back its first factor's first
+/// word plus one — what a gather that read one wrong word would do — so the
+/// checks on a session's end can be shown to see one. Never armed outside a
+/// test. Not for production callers.
+static READ_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_read_fault(on: bool) {
+    READ_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// Whether a device GKR layer's host tail runs lean — `LAMBDA_VM_ARGUE_LEAN_TAIL=1`
+/// (any non-empty value other than `0`): the layer's `eq` weight pulled out of
+/// the round polynomial and its factors extended by addition
+/// ([`gkr`](crate::gkr)'s `lean_tail`). The same round values either way; off by
+/// default until its A/B, and off is today's path.
+///
+/// Every device layer hands its last nine rounds to the host, over a cube of
+/// 512: on the head's split that tail's arithmetic is 52 % of the 264 µs the
+/// host spends between two device layers (`thoughts/zf/gap2/fix2/I-GFS.md` §9).
+pub fn argue_lean_tail() -> bool {
+    match ARGUE_LEAN_TAIL_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_TAIL"))
+        }
+    }
+}
+
+static ARGUE_LEAN_TAIL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_TAIL` for the whole process — for a test that
+/// proves both ways in one binary. `None` restores the environment's setting.
+/// Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_tail(on: Option<bool>) {
+    ARGUE_LEAN_TAIL_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a big batch's device rounds walk its program on demand
+/// ([`Program::on_demand`](crate::program::Program::on_demand)) —
+/// `LAMBDA_VM_ARGUE_LEAN_PROGRAM=1` (any non-empty value other than `0`) — with
+/// the slot file sized for every interpolation node from the first round. The
+/// same round values either way; off by default until its A/B, and off is
+/// today's path.
+///
+/// A batch is big when the values its lowered program holds a thread, more
+/// than [`LEAN_ABOVE_SLOTS`], leave a round fewer than 64 k threads: the head's
+/// widest ran its first rounds on 8,096 threads, at 94 ms a launch. What fills
+/// that slot file is the order the batch was written in — every read held from
+/// its first use to its last, every root and every interaction's side held
+/// until the sum at the end. On demand the widest holds 207 values instead of
+/// 2,763, and the four big batches 14 to 207 (`thoughts/zf/gap2/fix2/I-GFS.md`
+/// §16).
+pub fn argue_lean_program() -> bool {
+    match ARGUE_LEAN_PROGRAM_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_PROGRAM"))
+        }
+    }
+}
+
+static ARGUE_LEAN_PROGRAM_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_LEAN_PROGRAM` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's
+/// setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_argue_lean_program(on: Option<bool>) {
+    ARGUE_LEAN_PROGRAM_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// A batch whose lowered program holds more values a thread than this is
+/// big: at 342 or more, the round kernel's slot budget leaves fewer than 64 k
+/// threads (`math_cuda::sumcheck::thread_ceiling`; pinned by a test). The VM's
+/// four big batches hold 859 to 2,763; the next widest, 117.
+pub const LEAN_ABOVE_SLOTS: usize = 341;
+
+/// A test's own gate in place of [`LEAN_ABOVE_SLOTS`] (`u64::MAX` = none),
+/// so a fixture whose batches are small can still take the lean path.
+static LEAN_GATE_FORCED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[doc(hidden)]
+pub fn force_lean_program_gate(above_slots: Option<usize>) {
+    LEAN_GATE_FORCED.store(
+        above_slots.map_or(u64::MAX, |slots| slots as u64),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a program holding `num_slots` values a thread is a big batch.
+pub fn is_big_batch(num_slots: usize) -> bool {
+    match LEAN_GATE_FORCED.load(Ordering::Relaxed) {
+        u64::MAX => num_slots > LEAN_ABOVE_SLOTS,
+        forced => num_slots as u64 > forced,
+    }
+}
+
+/// ⛔ A FAULT: while armed, every constant of a program run on demand is off by
+/// one in its first limb — what a schedule that read wrong values would do — so
+/// the checks after it can be shown to see it. Never armed outside a test.
+static LEAN_PROGRAM_FAULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_lean_program_fault(on: bool) {
+    LEAN_PROGRAM_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// What a zerocheck's device rounds walk.
+#[cfg(feature = "cuda")]
+struct ZerocheckLowering {
+    /// The program the rounds run, lowered.
+    run: Lowered,
+    /// Today's lowering, when `run` is the same program on demand in its place.
+    held: Option<Lowered>,
+    /// Whether the batch is big ([`is_big_batch`]).
+    big: bool,
+}
+
+/// `program` lowered — or, under `LAMBDA_VM_ARGUE_LEAN_PROGRAM` for a big batch,
+/// the same program on demand, when that holds fewer values.
+#[cfg(feature = "cuda")]
+fn lower_for_zerocheck<E>(program: &crate::program::Program<E>) -> Option<ZerocheckLowering>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let today = lower(program)?;
+    let big = is_big_batch(today.num_slots);
+    let as_today = |today| ZerocheckLowering {
+        run: today,
+        held: None,
+        big,
+    };
+    if !big || !argue_lean_program() {
+        return Some(as_today(today));
+    }
+    let Some(mut demand) = lower(&program.on_demand()) else {
+        return Some(as_today(today));
+    };
+    if demand.num_slots >= today.num_slots {
+        return Some(as_today(today));
+    }
+    if LEAN_PROGRAM_FAULT.load(Ordering::Relaxed) {
+        for constant in demand.consts.chunks_exact_mut(3) {
+            constant[0] = constant[0].wrapping_add(1);
+        }
+    }
+    Some(ZerocheckLowering {
+        run: demand,
+        held: Some(today),
+        big,
+    })
+}
+
+/// A device sumcheck's factors as its last fold left them: one gathered copy
+/// under `LAMBDA_VM_ARGUE_LEAN_READS`, a copy per factor otherwise — the same
+/// bytes, counted both ways so an arm's log says which it took.
+#[cfg(feature = "cuda")]
+fn session_values(
+    session: &math_cuda::sumcheck::SumcheckSession,
+) -> math_cuda::Result<Vec<Vec<u64>>> {
+    if !argue_lean_reads() {
+        let values = session.values()?;
+        READS_PER_FACTOR.fetch_add(values.len() as u64, Ordering::Relaxed);
+        crate::whir_split::bump_by(&crate::whir_split::READS_PER_FACTOR, values.len() as u64);
+        return Ok(values);
+    }
+    let mut values = session.values_gathered()?;
+    READS_GATHERED.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::READS_GATHERED);
+    if READ_FAULT.load(Ordering::Relaxed)
+        && let Some(word) = values.first_mut().and_then(|factor| factor.first_mut())
+    {
+        *word = word.wrapping_add(1);
+    }
+    Ok(values)
 }
 
 /// Which table the card built a fault corrupts ([`force_table_fault`]).
@@ -2230,13 +2717,19 @@ impl DeviceTree {
     where
         E: math::field::traits::IsField + 'static,
     {
+        use crate::whir_split::{self, add_tick, tick};
+
+        let t = tick();
         let lowered = lower(program)?;
         let mut raw_point = Vec::with_capacity(point.len() * 3);
         for coordinate in point {
             raw_point.extend_from_slice(&ext3_raw(coordinate)?);
         }
+        add_tick(&whir_split::GKR_LOWER, t);
         let input_layer = layer + 1 == self.num_layers;
-        let session = if input_layer && self.rebuild.is_some() {
+        let rebuilds = input_layer && self.rebuild.is_some();
+        let t = tick();
+        let session = if rebuilds {
             // The one the tree gave back. Everything above it has been proved,
             // so the levels go first and the layer is written where they were.
             let num_vars = self.input_num_vars.checked_sub(1)?;
@@ -2267,6 +2760,12 @@ impl DeviceTree {
                 lowered.root_slot,
             )
         };
+        if rebuilds {
+            add_tick(&whir_split::GKR_REBUILD, t);
+            whir_split::bump(&whir_split::GKR_REBUILDS);
+        } else {
+            add_tick(&whir_split::GKR_SESSION, t);
+        }
         let num_vars = if input_layer {
             self.input_num_vars.checked_sub(1)?
         } else {
@@ -2286,18 +2785,23 @@ impl DeviceTree {
 
         // Past here the transcript moves: the host path is no longer an option.
         let failed = |stage| crate::Error::DeviceFailed { stage };
+        let t = tick();
         let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
+        add_tick(&whir_split::GKR_ROUNDS, t);
         let (rounds, challenges) = match outcome {
             Ok(rounds) => rounds,
             Err(error) => return Some(Err(error)),
         };
-        let Ok(values) = session.values() else {
+        let t = tick();
+        let Ok(values) = session_values(&session) else {
             return Some(Err(failed("layer values")));
         };
+        add_tick(&whir_split::GKR_VALUES, t);
         // Factor 0 is the weight; the four the layer reduces to follow.
         if values.len() != 5 {
             return Some(Err(failed("layer factors")));
         }
+        let t = tick();
         let factors: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
             .iter()
             .map(|factor| {
@@ -2307,6 +2811,8 @@ impl DeviceTree {
         let Ok(factors) = factors else {
             return Some(Err(failed("layer factors")));
         };
+        add_tick(&whir_split::GKR_FACTORS, t);
+        whir_split::bump(&whir_split::GKR_LAYERS);
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Ok((rounds, challenges, factors)))
     }
@@ -3869,6 +4375,53 @@ mod tests {
         let root = b.sum(&terms);
         let program = b.finish(root).unwrap();
         assert!(lower(&program).is_none());
+    }
+
+    /// The lowering of a program on demand — a read a step, the same values
+    /// in fewer slots — walks to the program's value, as the kernel walks it.
+    #[test]
+    fn a_lowered_program_on_demand_computes_what_the_program_does() {
+        let mut b = Builder::<Ext3>::new();
+        let mut acc = b.var(0);
+        let mut squares = Vec::new();
+        for slot in 1..8 {
+            let v = b.var(slot);
+            let squared = b.mul(v, v);
+            let with_acc = b.add(squared, acc);
+            squares.push(with_acc);
+            acc = b.mul(with_acc, with_acc);
+        }
+        squares.push(acc);
+        let root = b.sum(&squares);
+        let v = values(8);
+        let mut scratch = Vec::new();
+        for program in [sample_program(), b.finish(root).unwrap()] {
+            let demand = lower(&program.on_demand()).expect("lowers");
+            assert_eq!(run_lowered(&demand, &v), program.eval(&v, &mut scratch));
+        }
+    }
+
+    /// A batch is big past [`LEAN_ABOVE_SLOTS`] values a thread, unless a test
+    /// sets its own gate.
+    #[test]
+    fn the_big_batch_gate_reads_its_override() {
+        assert!(!is_big_batch(LEAN_ABOVE_SLOTS));
+        assert!(is_big_batch(LEAN_ABOVE_SLOTS + 1));
+        force_lean_program_gate(Some(0));
+        let forced = (is_big_batch(0), is_big_batch(1));
+        force_lean_program_gate(None);
+        assert_eq!(forced, (false, true), "a gate of 0 makes every program big");
+        assert!(!is_big_batch(LEAN_ABOVE_SLOTS), "and `None` restores it");
+    }
+
+    /// ★ The gate is where the slot budget leaves a round fewer than 64 k
+    /// threads: 341 values a thread still run 65,600, 342 run 65,408.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_big_batch_gate_is_where_a_round_drops_below_64k_threads() {
+        use math_cuda::sumcheck::thread_ceiling;
+        assert!(thread_ceiling(LEAN_ABOVE_SLOTS) >= 1 << 16);
+        assert!(thread_ceiling(LEAN_ABOVE_SLOTS + 1) < 1 << 16);
     }
 
     #[test]
