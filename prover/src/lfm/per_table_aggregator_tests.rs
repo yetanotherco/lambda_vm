@@ -2209,12 +2209,19 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     // constant — every one of which would otherwise be re-baselined by a change
     // whose only purpose is to give THIS test more epochs.
     //
+    // TWO below the shared constant, not one, and the margin is asserted
+    // elsewhere: `proof_fixture`'s `the_fixture_guest_commits_in_an_intermediate_epoch`
+    // holds the guest to more than one shared epoch and at most two. A quarter
+    // of that epoch therefore yields at least five epochs whatever the guest's
+    // exact length, where half of it yields three or four — and the fixture's
+    // 48 cycles give three.
+    //
     // ⚠ Smaller epochs mean shallower tables, which is where the degenerate
     // shapes live. That is a feature: the one-row sub-proof and the one-leaf
     // Merkle tree were both found this way, and both are now gated in
     // milliseconds. If a third appears, it is a shape the emitter has to handle
     // and this is the cheapest place to find it.
-    let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 1;
+    let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 2;
 
     // ★★ ONE ARM PER PROCESS, which is what lets a LEVEL be priced.
     //
