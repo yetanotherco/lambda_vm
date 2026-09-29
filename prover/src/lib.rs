@@ -20,6 +20,7 @@ pub mod hash_pin;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 pub mod lfm;
+pub mod lfm_prover_knob;
 pub mod multilinear_continuation;
 pub mod multilinear_prove;
 mod paged_mem;

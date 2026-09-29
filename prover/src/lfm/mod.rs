@@ -74,9 +74,15 @@ pub mod whir_fold;
 pub mod whir_gkr;
 /// The CROSS-EPOCH program builder, beside `whir_epoch`'s level-0 one.
 pub mod whir_global;
+/// The W-leg: a node's in-guest verifier of one W-LFM child, and the node
+/// over W-LFM children.
+pub mod whir_leg;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
+/// The W-LFM proof: an LFM program proved by the stacked-WHIR prover (pure
+/// WHIR, D-WHIR §2), selected by `LAMBDA_VM_LFM_PROVER=whir`.
+pub mod whir_proof;
 /// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
 ///
 /// ⚠ NOT `#[cfg(test)]`: `WhirRealEpoch` is the input type of V1's level-0
@@ -103,6 +109,9 @@ pub mod whir_statement;
 pub mod whir_table;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
+/// The wide level-1 node: its epochs verified in-program, no wraps (D-WHIR
+/// §7 L1), selected by `LAMBDA_VM_LFM_WIDE=on`.
+pub mod whir_wide;
 pub mod word;
 
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
@@ -196,11 +205,15 @@ mod whir_gkr_tests;
 #[cfg(test)]
 mod whir_global_tests;
 #[cfg(test)]
+mod whir_leg_tests;
+#[cfg(test)]
 mod whir_open_tests;
 #[cfg(test)]
 mod whir_poly_tests;
 #[cfg(test)]
 mod whir_program_tests;
+#[cfg(test)]
+mod whir_proof_tests;
 /// The cross-epoch driver's tests, beside the level-0 driver's.
 #[cfg(test)]
 mod whir_real_global_tests;
@@ -216,6 +229,8 @@ mod whir_table_tests;
 mod whir_transcript_kat_tests;
 #[cfg(test)]
 mod whir_transcript_replay_tests;
+#[cfg(test)]
+mod whir_wide_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]

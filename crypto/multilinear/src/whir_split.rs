@@ -652,6 +652,12 @@ const QUERY_SLACK: f64 = 0.002;
 /// but it is not an epoch and must not be averaged with them.
 pub const GLOBAL_INDEX: u64 = u64::MAX;
 
+/// The index a W-LFM proof (an LFM recursion program proved by this prover,
+/// pure WHIR) records under: NOT an epoch and not the base's, so its line reads
+/// `WHIR PROVE SPLIT W-LFM` and no reader of the base's table can take it for
+/// one of the base's.
+pub const LFM_INDEX: u64 = u64::MAX - 1;
+
 impl ProverSplit {
     /// What the four stages leave over.
     pub fn other(&self) -> f64 {
@@ -698,10 +704,13 @@ impl ProverSplit {
         self.index == GLOBAL_INDEX
     }
     /// Who the record is, as both of its lines name it: `#k` for epoch `k`
-    /// (0-based), `GLOBAL (in base)` for the cross-epoch stage.
+    /// (0-based), `GLOBAL (in base)` for the cross-epoch stage, `W-LFM` for a
+    /// recursion proof proved by this prover ([`LFM_INDEX`]).
     fn who(&self) -> String {
         if self.is_global() {
             "GLOBAL (in base)".to_string()
+        } else if self.index == LFM_INDEX {
+            "W-LFM".to_string()
         } else {
             format!("#{}", self.index)
         }

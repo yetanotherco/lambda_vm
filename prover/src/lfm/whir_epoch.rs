@@ -794,6 +794,60 @@ pub fn emit_epoch_publishes(
     layout
 }
 
+/// [`emit_epoch_publishes`]' words as a PARENT reads them, published nowhere:
+/// one [`HintedPublicWord`] per `SchemaLayout::wrap` index, in the same order,
+/// each holding the lanes that published word would carry.
+///
+/// ★ For a wide level-1 node (`whir_wide`), which verifies its epochs in-program
+/// and so has no child proof whose published words it could hint. It hands
+/// these to the node's own binding and publishing code, which reads a wrap child
+/// by schema index and by nothing else.
+///
+/// The lanes: a constant word's four lanes as constants; a wire's from one
+/// `Unpack` of its cell (the pair and the balance, whose cells a wrap publishes
+/// whole); the L2G root's lanes as the base words the wrap publishes them as,
+/// `(lane, 0, 0, 0)`.
+///
+/// [`HintedPublicWord`]: super::per_table_aggregator::HintedPublicWord
+pub(crate) fn epoch_would_publish(
+    b: &mut LfmBuilder,
+    p: &EpochPublishes<'_>,
+) -> (
+    super::per_table_aggregator::SchemaLayout,
+    Vec<super::per_table_aggregator::HintedPublicWord>,
+) {
+    let out_halves = p.text.public_output.len().div_ceil(4);
+    let layout = super::per_table_aggregator::SchemaLayout::wrap(out_halves);
+    let zero = b.felt_const(FE::zero());
+    let mut lanes: Vec<[super::builder::Felt; 4]> = Vec::with_capacity(layout.total());
+    lanes.push(b.unpack(p.z.as_cell()));
+    lanes.push(b.unpack(p.alpha.as_cell()));
+    for word in publish_constant_words(&p.text) {
+        lanes.push(word.map(|lane| b.felt_const(lane)));
+    }
+    for lane in b.unpack(p.l2g_root) {
+        lanes.push([lane, zero, zero, zero]);
+    }
+    lanes.push(b.unpack(p.balance.as_cell()));
+    assert_eq!(
+        lanes.len(),
+        layout.total(),
+        "the would-be published set is the wrap schema's, word for word"
+    );
+    let words = lanes
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, lanes)| super::per_table_aggregator::HintedPublicWord {
+                index: index as u32,
+                halves: Vec::new(),
+                lanes: lanes.to_vec(),
+            },
+        )
+        .collect();
+    (layout, words)
+}
+
 // =============================================================================
 // The per-table walk
 // =============================================================================
@@ -1564,12 +1618,64 @@ pub(crate) fn push_table_words(
 /// between the two walks is a readability choice and not a soundness one. Every
 /// other step's position IS load-bearing.
 pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let leg = emit_epoch_leg(&mut b, epoch, airs);
+
+    // 7. The published aggregation set — see [`EpochPublishes`] for the order
+    //    and for which fields are wires.
+    let layout = emit_epoch_publishes(&mut b, &leg.publishes(epoch));
+
+    let program = super::compiler::compile(b.finish());
+    layout.assert_covers(program.public_len as usize);
+    super::validator::validate(&program).expect("an epoch program must be admissible");
+    program
+}
+
+/// The four WIRES one epoch's verifier leaves for its published set: the rest of
+/// [`EpochPublishes`] is the epoch's own program text.
+pub(crate) struct EpochLegWires {
+    pub(crate) z: Ext,
+    pub(crate) alpha: Ext,
+    /// The bookend group's carried root — see [`emit_epoch_leg`].
+    pub(crate) l2g_root: Cell,
+    pub(crate) balance: Ext,
+}
+
+impl EpochLegWires {
+    /// The epoch's published set: these wires and the epoch's program text.
+    pub(crate) fn publishes<'a>(&self, epoch: &'a WhirRealEpoch) -> EpochPublishes<'a> {
+        EpochPublishes {
+            z: self.z,
+            alpha: self.alpha,
+            text: PublishedText {
+                program_id: epoch_program_id(epoch),
+                register_init: &epoch.position.register_init,
+                reg_fini: &epoch.proof.reg_fini,
+                label: epoch.position.label,
+                public_output: epoch.public_output(),
+            },
+            l2g_root: self.l2g_root,
+            balance: self.balance,
+        }
+    }
+}
+
+/// Steps 1–6 of [`whir_epoch_program`]: one epoch's verifier, over the ONE arena
+/// it declares ([`whir_epoch_arena`]'s words) and on a transcript of its own.
+///
+/// What it leaves is the four wires the epoch's published set needs. The wrap
+/// publishes them; a wide level-1 node (`whir_wide`) binds several epochs' worth
+/// of them the way a node binds its wraps' published words.
+pub(crate) fn emit_epoch_leg(
+    b: &mut LfmBuilder,
+    epoch: &WhirRealEpoch,
+    airs: EpochAirs<'_>,
+) -> EpochLegWires {
     let plan = EpochPlan::build(epoch, airs);
     let proof = &epoch.proof.proof;
     let words = whir_epoch_arena(epoch, airs);
     let total = words[0].len() as u32;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(total);
     let mut at = 0u32;
 
@@ -1611,7 +1717,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .iter()
         .map(super::algebraic_commit::commitment_to_digest)
         .collect();
-    let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &derived);
+    let (z, alpha, beta) = emit_roots_block(b, &mut transcript, &carried, &derived);
 
     // The shared alpha ladder. ⚠ EPOCH-LEVEL: `emit_interaction` reads
     // `alpha_powers[i + 1]` and one ladder of the longest table's length serves
@@ -1623,12 +1729,12 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .map(|shape| super::whir_bus::alpha_powers_read(shape.bus))
         .max()
         .unwrap_or(1);
-    let ladder = super::whir_poly::emit_challenge_powers(&mut b, alpha, ladder_len);
+    let ladder = super::whir_poly::emit_challenge_powers(b, alpha, ladder_len);
 
     // 3. The per-table walk, with each table's proof wires hinted first.
     let mut store = Vec::with_capacity(proof.tables.len());
     for table in &proof.tables {
-        store.push(hint_table_wires(&mut b, arena, &mut at, table));
+        store.push(hint_table_wires(b, arena, &mut at, table));
     }
     let wires: Vec<TableProofWires<'_>> = store.iter().map(TableWires::borrow).collect();
     let views: Vec<Vec<&[FE]>> = plan
@@ -1639,7 +1745,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     let routes = plan.routes(&views);
     let slots = plan.slots();
     let walk = emit_table_walk(
-        &mut b,
+        b,
         &mut transcript,
         &wires,
         &shapes,
@@ -1655,7 +1761,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     //    back rather than being dropped.
     let start_index = u64::from(epoch.position.register_init[crate::tables::register::X254_INDEX]);
     let closure = emit_epoch_closure(
-        &mut b,
+        b,
         &walk.outputs,
         epoch.public_output(),
         start_index,
@@ -1667,7 +1773,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     let mut chains = Vec::with_capacity(proof.columns.len());
     for (group, opening) in proof.columns.iter().enumerate() {
         let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
-        chains.push(hint_group_chains(&mut b, arena, &mut at, opening, &shape));
+        chains.push(hint_group_chains(b, arena, &mut at, opening, &shape));
     }
     let group_shapes: Vec<ChainShape> = plan
         .group_layouts
@@ -1723,7 +1829,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
             domain: &plan.group_domains[group],
         })
         .collect();
-    emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);
+    emit_group_walk(b, &mut transcript, &groups, &plan.sizes, &walk);
 
     // 6. The prepared opening, last, on DECODE's own layout and domain at the
     //    EPOCH's config. Its root is the SAME interned constant the roots block
@@ -1734,7 +1840,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         .as_ref()
         .expect("an epoch carries DECODE's prepared opening");
     let prepared_shape = ChainShape::new(&plan.config, plan.decode_layout.n_stack());
-    let held = hint_group_chains(&mut b, arena, &mut at, prepared, &prepared_shape);
+    let held = hint_group_chains(b, arena, &mut at, prepared, &prepared_shape);
     let decode_roots: Vec<Cell> = derived
         .iter()
         .map(|word| b.digest_const(*word).as_cell())
@@ -1760,7 +1866,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     let column_at = walk.column_at(plan.decode_at);
     let settled = plan.preprocessed[plan.decode_at].len();
     emit_prepared_group(
-        &mut b,
+        b,
         &mut transcript,
         &plan.decode_layout,
         &prepared_polys,
@@ -1775,9 +1881,6 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         "the program must hint exactly the words the arena writes"
     );
 
-    // 7. The published aggregation set — see [`EpochPublishes`] for the order
-    //    and for which fields are wires.
-    //
     // ★ THE L2G ROOT IS THE BOOKEND GROUP'S, AND IT IS THE CARRIED WIRE. The
     // bookend is committed in the LAST group, alone, so its roots are the tail
     // of `proof.roots` — the rule `EpochProof::l2g_roots` states and the same
@@ -1797,27 +1900,12 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
          field covers one root's lanes; a bookend split into {l2g_polys} \
          publishes a set this layout does not describe"
     );
-    let layout = emit_epoch_publishes(
-        &mut b,
-        &EpochPublishes {
-            z,
-            alpha,
-            text: PublishedText {
-                program_id: epoch_program_id(epoch),
-                register_init: &epoch.position.register_init,
-                reg_fini: &epoch.proof.reg_fini,
-                label: epoch.position.label,
-                public_output: epoch.public_output(),
-            },
-            l2g_root: carried[carried.len() - l2g_polys],
-            balance: closure.balance,
-        },
-    );
-
-    let program = super::compiler::compile(b.finish());
-    layout.assert_covers(program.public_len as usize);
-    super::validator::validate(&program).expect("an epoch program must be admissible");
-    program
+    EpochLegWires {
+        z,
+        alpha,
+        l2g_root: carried[carried.len() - l2g_polys],
+        balance: closure.balance,
+    }
 }
 
 /// One table's hinted wires, OWNED, because `TableProofWires` borrows them.

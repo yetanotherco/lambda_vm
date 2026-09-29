@@ -102,6 +102,29 @@ fn room_bytes(layout: &StackedLayout, config: &ChainConfig, staged: bool, turn: 
     }
 }
 
+/// Where a group's columns sit in a resident store.
+///
+/// `From(first)` is the contiguous run every group has always been — column `c`
+/// of the group at store column `first + c`. `Map(store)` names each column's
+/// store position, for a group whose columns are NOT one run of the store: a
+/// stack that leaves each table's leading prefix out (the W-LFM's policy B),
+/// while the store keeps every table's columns contiguous for its argument.
+#[derive(Clone, Copy, Debug)]
+pub enum ColumnsAt<'a> {
+    From(usize),
+    Map(&'a [usize]),
+}
+
+impl ColumnsAt<'_> {
+    /// The store column holding the group's column `column`.
+    pub fn store_column(&self, column: usize) -> usize {
+        match self {
+            Self::From(first) => first + column,
+            Self::Map(map) => map[column],
+        }
+    }
+}
+
 impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> StackedCommitment<F, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
@@ -117,6 +140,30 @@ where
         resident: Option<(&crate::gpu::ResidentColumns, usize)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
+        Self::commit_mapped(
+            layout,
+            columns,
+            resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+            config,
+        )
+    }
+
+    /// [`Self::commit`] with the columns' store positions named by a
+    /// [`ColumnsAt`] rather than one contiguous run.
+    pub fn commit_mapped(
+        layout: StackedLayout,
+        columns: &[&Mle<F>],
+        resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+        config: &ChainConfig,
+    ) -> Result<Self, Error> {
+        if let Some((_, ColumnsAt::Map(map))) = resident
+            && map.len() != columns.len()
+        {
+            return Err(Error::QueryCountMismatch {
+                expected: columns.len(),
+                got: map.len(),
+            });
+        }
         // The stacked polynomials are not built here: each is its columns at
         // their offsets, and both the commit and the opening write those
         // straight into the device's buffer. Assembling a copy on the way is a
@@ -128,13 +175,13 @@ where
                     .into_iter()
                     .map(|(column, offset)| (columns[column], offset))
                     .collect(),
-                resident: resident.map(|(store, first)| {
+                resident: resident.map(|(store, at)| {
                     (
                         store,
                         layout
                             .parts_of(poly)
                             .into_iter()
-                            .map(|(column, offset)| (first + column, offset))
+                            .map(|(column, offset)| (at.store_column(column), offset))
                             .collect(),
                     )
                 }),
@@ -430,6 +477,44 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    prove_mapped(
+        stacked,
+        columns,
+        resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+        point,
+        values,
+        config,
+        transcript,
+    )
+}
+
+/// [`prove`] with the columns' store positions named by a [`ColumnsAt`] — the
+/// same map the group was committed with.
+pub fn prove_mapped<F, E, T, H>(
+    stacked: &StackedCommitment<F, H>,
+    columns: &[&Mle<F>],
+    resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<StackedProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if let Some((_, ColumnsAt::Map(map))) = resident
+        && map.len() != columns.len()
+    {
+        return Err(Error::QueryCountMismatch {
+            expected: columns.len(),
+            got: map.len(),
+        });
+    }
     let layout = &stacked.layout;
     if values.len() != layout.placements().len() {
         return Err(Error::QueryCountMismatch {
@@ -464,13 +549,13 @@ where
                 .into_iter()
                 .map(|(column, offset)| (columns[column], offset))
                 .collect(),
-            resident: resident.map(|(store, first)| {
+            resident: resident.map(|(store, at)| {
                 (
                     store,
                     layout
                         .parts_of(i)
                         .into_iter()
-                        .map(|(column, offset)| (first + column, offset))
+                        .map(|(column, offset)| (at.store_column(column), offset))
                         .collect(),
                 )
             }),

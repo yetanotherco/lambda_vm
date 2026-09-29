@@ -94,6 +94,13 @@ pub fn take_prove_split() -> Option<ProveSplit> {
     LAST_PROVE_SPLIT.with(|c| c.take())
 }
 
+/// Record a prove's split on this thread, for a prover other than
+/// [`lfm_prove`] — the W-LFM one (`whir_proof::lfm_prove_whir`) — so the
+/// driver's timing lines read one cell whichever prover ran.
+pub(crate) fn record_prove_split(split: ProveSplit) {
+    LAST_PROVE_SPLIT.with(|c| c.set(Some(split)));
+}
+
 #[derive(Debug)]
 pub enum LfmProveError {
     Exec(LfmExecError),
@@ -561,7 +568,11 @@ fn verify_against_chunked_with(
 
 /// `Σ_i 1/(z − (LfmPublic + index_i·α + Σ_l v_l·α^{2+l}))` — the fingerprint
 /// layout matches the `LFM_PUBLIC` sender token `(index, v0..v3)`.
-fn expected_public_balance(
+///
+/// `pub(crate)` because the W-LFM verifier (`whir_proof`) closes its bus
+/// against the same target: the `LFM_PUBLIC` chip is the same chip whichever
+/// prover proved it.
+pub(crate) fn expected_public_balance(
     words: &[(u32, LfmWord)],
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
