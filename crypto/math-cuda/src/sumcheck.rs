@@ -474,6 +474,44 @@ impl SumcheckSession {
         Ok(out)
     }
 
+    /// Factor `k`'s remaining values, read where it lies: one factor, where
+    /// [`values`](Self::values) reads every one — so a check of a table the
+    /// card built reads that table and not the trace beside it.
+    pub fn factor(&self, k: usize) -> Result<Vec<u64>> {
+        self.stream.synchronize()?;
+        let mut values = vec![0u64; self.len * 3];
+        // SAFETY: as in `values`: the address is factor `k`'s base, it spans
+        // `len` elements, and the stream is idle.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                values.as_mut_ptr() as *mut core::ffi::c_void,
+                self.addresses[k],
+                self.len * 24,
+            )
+            .result()?;
+        }
+        Ok(values)
+    }
+
+    /// Writes `value` over cell `index` of factor `k`: the way in for a fault
+    /// that corrupts a table the card built, so the checks on it can be shown
+    /// to see one.
+    pub fn set_cell(&self, k: usize, index: usize, value: &[u64; 3]) -> Result<()> {
+        assert!(index < self.len, "the cell is inside the cube");
+        self.stream.synchronize()?;
+        // SAFETY: the cell is inside factor `k`'s `len` elements, and the
+        // stream is idle, so nothing reads or writes it meanwhile.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyHtoD_v2(
+                self.addresses[k] + (index * 24) as u64,
+                value.as_ptr() as *const core::ffi::c_void,
+                24,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     /// What each factor has been bound to, once every variable is gone.
     pub fn bound_values(&self) -> Result<Vec<[u64; 3]>> {
         assert_eq!(self.len, 1, "a factor is bound once every variable is");
@@ -784,6 +822,19 @@ fn fold_to_one(
     Ok(())
 }
 
+/// A weight a sumcheck over resident factors adds on top of them.
+///
+/// A weight is `2^vars` cells; an `eq` weight is made of `vars` coordinates.
+/// Given as its point it is built where it will be folded, and what crosses the
+/// bus is the point.
+#[derive(Clone, Copy, Debug)]
+pub enum Extra<'a> {
+    /// A table the host built: `len` ext3 values, three u64 each.
+    Table(&'a [u64]),
+    /// `eq(point, ·)`, the point three u64 per coordinate.
+    Eq(&'a [u64]),
+}
+
 /// A table's factors, uploaded once and read by everything that walks them:
 /// the LogUp input layer, and then the batched sumcheck.
 pub struct DeviceFactors {
@@ -1064,19 +1115,50 @@ impl DeviceFactors {
         num_slots: usize,
         root_slot: u32,
     ) -> Result<SumcheckSession> {
+        let extra: Vec<Extra<'_>> = extra.iter().map(|table| Extra::Table(table)).collect();
+        self.session_with(&extra, nodes, consts, num_slots, root_slot)
+    }
+
+    /// The same, with each weight a table to upload or the point of an `eq`
+    /// table to build here ([`Extra`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_with(
+        &self,
+        extra: &[Extra<'_>],
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+    ) -> Result<SumcheckSession> {
         let span = self.len * 3;
         let mut addresses = self.addresses.clone();
         let mut held = vec![self.buffer.clone()];
         if !extra.is_empty() {
-            assert!(
-                extra.iter().all(|f| f.len() == span),
-                "every factor spans the same cube"
-            );
+            for weight in extra {
+                match weight {
+                    Extra::Table(table) => {
+                        assert_eq!(table.len(), span, "every factor spans the same cube")
+                    }
+                    Extra::Eq(point) => assert!(
+                        point.len().is_multiple_of(3) && 1usize << (point.len() / 3) == self.len,
+                        "an eq weight's point spans the cube"
+                    ),
+                }
+            }
+            // SAFETY: every slab is written below — a table by its copy, an
+            // `eq` table by its seed and levels, which cover all of it.
             let mut buffer = unsafe { self.stream.alloc::<u64>(extra.len() * span) }?;
-            for (k, factor) in extra.iter().enumerate() {
+            for (k, weight) in extra.iter().enumerate() {
                 let at = k * span;
-                let mut slab = buffer.slice_mut(at..at + span);
-                self.stream.memcpy_htod(*factor, &mut slab)?;
+                match weight {
+                    Extra::Table(table) => {
+                        let mut slab = buffer.slice_mut(at..at + span);
+                        self.stream.memcpy_htod(*table, &mut slab)?;
+                    }
+                    Extra::Eq(point) => {
+                        eq_expand_into(&self.stream, &mut buffer, k * self.len, point, &[1, 0, 0])?
+                    }
+                }
             }
             {
                 let (base, _record) = buffer.device_ptr(&self.stream);
@@ -1276,6 +1358,145 @@ pub fn eq_expand_shares_ext3(
         }
     }
     Ok(())
+}
+
+/// The claim reduce's session with its tables built here, out of the epoch's
+/// resident columns: per offset, in the reduce's order, the shift table and the
+/// batched column.
+///
+/// A shift table is `eq(alpha)` read `offset` rows back, cyclically — the shift
+/// kernel at a corner `y` is the equality kernel at `y − offset`, which
+/// `multilinear::eq`'s `a_shift_table_is_the_eq_table_rotated` pins — so
+/// `eq(alpha)` is built once and each offset's table is two copies of it. A
+/// batched column is `Σ weight·column` over the offset's members
+/// (`batched_column_ext3`).
+///
+/// `alpha` is three u64 per coordinate. `groups` is one `(offset, members,
+/// weights)` per offset: each member a column of the run `first..first + width`
+/// of `store`, each weight three u64. What crosses the bus is the point, the
+/// members and their weights: a few kilobytes where the tables are gigabytes.
+#[allow(clippy::too_many_arguments)]
+pub fn reduce_session(
+    store: &crate::columns::DeviceColumns,
+    first: usize,
+    width: usize,
+    alpha: &[u64],
+    groups: &[(usize, Vec<u64>, Vec<u64>)],
+    nodes: &[u64],
+    consts: &[u64],
+    num_slots: usize,
+    root_slot: u32,
+) -> Result<SumcheckSession> {
+    assert!(
+        alpha.len().is_multiple_of(3) && !alpha.is_empty(),
+        "a point of at least one coordinate, three u64 each"
+    );
+    let len = 1usize << (alpha.len() / 3);
+    assert!(
+        store.is_run(first, width) && store.span(first).1 == len,
+        "the columns are a run spanning the cube"
+    );
+    assert!(!groups.is_empty(), "a reduction reads at an offset");
+    for (_, members, weights) in groups {
+        assert!(!members.is_empty(), "an offset has a column reading at it");
+        assert_eq!(
+            weights.len(),
+            members.len() * 3,
+            "one ext3 weight per member"
+        );
+        assert!(
+            members.iter().all(|&m| (m as usize) < width),
+            "a member is a column of the run"
+        );
+    }
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let span = len * 3;
+    // SAFETY: every slab is written below — a shift slab by `eq(alpha)` or by
+    // its two copies, a batched slab by the kernel, which covers every row.
+    let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, 2 * groups.len() * span) }?;
+    // `eq(alpha)` is the first shift slab when the first offset is no shift,
+    // and a table of its own, freed once copied, otherwise.
+    let in_place = groups[0].0.is_multiple_of(len);
+    let own = if in_place {
+        eq_expand_into(&stream, &mut buffer, 0, alpha, &[1, 0, 0])?;
+        None
+    } else {
+        Some(eq_table_ext3(&stream, alpha, len)?)
+    };
+    let base = {
+        let (base, _record) = buffer.device_ptr(&stream);
+        base
+    };
+    let eq_at = match &own {
+        Some(table) => {
+            let (at, _record) = table.device_ptr(&stream);
+            at
+        }
+        None => base,
+    };
+    let copy = |dst: u64, src: u64, bytes: usize| -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        // SAFETY: both ranges lie inside allocations this call holds, they do
+        // not overlap — a shift slab is never the table it is copied from —
+        // and the copy is ordered on `stream` behind whatever wrote the source.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(dst, src, bytes, stream.cu_stream())
+                .result()?;
+        }
+        Ok(())
+    };
+    let columns = store.view(first, width);
+    let rows = len as u64;
+    let grid = rows.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+    for (i, (offset, members, weights)) in groups.iter().enumerate() {
+        if !(i == 0 && in_place) {
+            // `shift[y] = eq[(y − k) mod len]`: the table's tail lands at its
+            // head, and the rest after it.
+            let k = offset % len;
+            let shift_at = base + (2 * i * span * 8) as u64;
+            copy(shift_at + (k * 24) as u64, eq_at, (len - k) * 24)?;
+            copy(shift_at, eq_at + ((len - k) * 24) as u64, k * 24)?;
+        }
+        let members_dev = crate::device::htod_or_trim(&stream, members)?;
+        let weights_dev = crate::device::htod_or_trim(&stream, weights)?;
+        let count = members.len() as u64;
+        let at = (2 * i + 1) * span;
+        let mut out = buffer.slice_mut(at..at + span);
+        unsafe {
+            stream
+                .launch_builder(&be.batched_column_ext3)
+                .arg(&columns)
+                .arg(&rows)
+                .arg(&members_dev)
+                .arg(&weights_dev)
+                .arg(&count)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+    }
+    // Freed on `stream`, so behind the copies that read it.
+    drop(own);
+    let addresses: Vec<u64> = (0..2 * groups.len())
+        .map(|k| base + (k * span * 8) as u64)
+        .collect();
+    SumcheckSession::from_device(
+        stream,
+        &addresses,
+        len,
+        vec![Arc::new(buffer)],
+        nodes,
+        consts,
+        num_slots,
+        root_slot,
+    )
 }
 
 /// A resident table's value at `point`, binding it in place.
