@@ -624,6 +624,68 @@ pub fn whir_node_arena_words(children: &[WhirChild<'_>]) -> Vec<Vec<LfmWord>> {
 }
 
 // =============================================================================
+// The block-artifact root over W-LFM children
+// =============================================================================
+
+/// [`super::block_root::RootInputs`] over W-LFM children: the top interior
+/// level's nodes and the global child, all W-LFM proofs.
+pub struct WhirRootInputs<'a> {
+    pub interior: &'a [WhirChild<'a>],
+    pub interior_layouts: &'a [SchemaLayout],
+    /// Per interior child, the epoch labels it must carry.
+    pub labels: &'a [&'a [u64]],
+    /// The first and last epoch label of the whole block.
+    pub label_range: (u64, u64),
+    pub global: &'a WhirChild<'a>,
+    /// What the global child published.
+    pub global_child_layout: &'a super::block_root::GlobalLayout,
+    pub fold_shape: &'a super::block_root::FoldShape,
+    pub publishes: super::block_root::RootPublishSet,
+}
+
+/// ★ The block-artifact root over W-LFM children —
+/// [`super::block_root::emit_block_root`] with its legs swapped for W-legs.
+///
+/// Everything the root does besides verifying its children — the length pins,
+/// the cross-child bindings, the L2G compare against the global child's roots,
+/// the published claim — is `emit_root_checks_and_publishes`, the STARK root's
+/// own code over the legs' published lanes, which a W-leg hands over in the same
+/// shape. Declaration order is arena order and the global child goes LAST, as
+/// in the STARK root, so the arenas are [`whir_leg_arena_words`] of the interior
+/// children and then of the global child.
+pub fn emit_whir_block_root(b: &mut LfmBuilder, inputs: &WhirRootInputs<'_>) {
+    let WhirRootInputs {
+        interior,
+        interior_layouts,
+        labels,
+        label_range,
+        global,
+        global_child_layout,
+        fold_shape,
+        publishes,
+    } = *inputs;
+    let mut leg_of = |child: &WhirChild<'_>| {
+        let arenas = declare_whir_leg_arenas(b, child);
+        emit_whir_leg(b, child, &arenas)
+    };
+    let interior_legs: Vec<LegCells> = interior.iter().map(&mut leg_of).collect();
+    let global_leg = leg_of(global);
+    super::block_root::emit_root_checks_and_publishes(
+        b,
+        &super::block_root::RootLegs {
+            interior: &interior_legs,
+            interior_layouts,
+            labels,
+            label_range,
+            global: &global_leg,
+            global_child_layout,
+            fold_shape,
+            publishes,
+        },
+    );
+}
+
+// =============================================================================
 // The cost form (F1)
 // =============================================================================
 

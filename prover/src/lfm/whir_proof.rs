@@ -429,12 +429,19 @@ pub fn build_whir_artifacts_under(
         )));
     }
     let layout = multilinear_table::global_layout(&prep_shapes, config.format.stack)?;
-    let commitment = StackedCommitment::<F, WhirLfmHash>::commit(
-        layout,
-        &multilinear::stacking::borrow(&columns),
-        None,
-        &config,
-    )?;
+    // ⛔ THE CARD, FOR THE FIRST OF A W-LFM PROOF'S TWO DEVICE PHASES, as
+    // `program_census::build_artifacts_counted` holds it for a STARK build: the
+    // prepared commit runs on the device outside `multi_prove`, so concurrent
+    // siblings must serialize it too. Inert unless a driver armed the permit.
+    let commitment = {
+        let _card = super::device_permit::hold_labeled("build_artifacts");
+        StackedCommitment::<F, WhirLfmHash>::commit(
+            layout,
+            &multilinear::stacking::borrow(&columns),
+            None,
+            &config,
+        )?
+    };
     let prepared_roots = commitment.roots();
     if prepared_roots.is_empty() {
         return Err(shape_error("the prepared stack commits to nothing"));

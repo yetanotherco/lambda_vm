@@ -110,6 +110,46 @@ pub fn prep_policy() -> crate::lfm::whir_proof::PrepPolicy {
     })
 }
 
+/// `LAMBDA_VM_LFM_ROOT_PROVER=stark|whir` — which prover proves the tree's
+/// BLOCK-ARTIFACT ROOT, when it is not the rest of the tree's. Unset or empty:
+/// the root follows [`selected`]. It exists for the D-WHIR W2 stage, which runs
+/// a W-LFM tree under a STARK root so the artifact's format does not move while
+/// the interior's is measured; W3 unsets it.
+pub const ROOT_ENV: &str = "LAMBDA_VM_LFM_ROOT_PROVER";
+
+/// The root's prover for this process, read once and bannered on every
+/// setting; an unknown value aborts.
+///
+/// ⛔ A W-LFM ROOT OVER A STARK TREE IS REFUSED: its legs would be STARK legs
+/// and nothing of pure WHIR would be under measurement, so the combination is a
+/// mislabeled arm rather than an experiment.
+pub fn root_selected() -> Setting {
+    static SETTING: OnceLock<Setting> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let raw = std::env::var(ROOT_ENV).ok();
+        let tree = selected();
+        let setting = match raw.as_deref().map(str::trim) {
+            None | Some("") => tree,
+            Some(_) => setting_of(raw.as_deref()).unwrap_or_else(|| {
+                eprintln!(
+                    "{ROOT_ENV}={:?} is not a prover this path knows. Accepted: stark, whir.",
+                    raw.clone().unwrap_or_default()
+                );
+                std::process::abort()
+            }),
+        };
+        if tree == Setting::Stark && setting == Setting::Whir {
+            eprintln!(
+                "{ROOT_ENV}=whir under {ENV}=stark: a W-LFM root over STARK children has \
+                 STARK legs and measures nothing of pure WHIR. Refused."
+            );
+            std::process::abort()
+        }
+        println!("★ LFM ROOT PROVER: {}", setting.name());
+        setting
+    })
+}
+
 /// [`PREP_ENV`]'s reading: unset or empty is policy A (`both`).
 fn prep_policy_of(raw: Option<&str>) -> Option<crate::lfm::whir_proof::PrepPolicy> {
     use crate::lfm::whir_proof::PrepPolicy;

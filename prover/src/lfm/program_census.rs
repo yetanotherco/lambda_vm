@@ -220,6 +220,14 @@ pub fn build_artifacts_counted(
     artifacts
 }
 
+/// Count a build this module did not run — a W-LFM program's
+/// (`whir_proof::build_whir_artifacts`), whose identity is its `program_id_w` —
+/// in the open level window, exactly as [`build_artifacts_counted`] counts its
+/// own.
+pub fn record_built(program_id: Commitment, build_nanos: u128) {
+    lock().record(program_id, build_nanos);
+}
+
 impl Census {
     fn record(&mut self, program_id: Commitment, build_nanos: u128) {
         let Some(w) = self.window.as_mut() else {
