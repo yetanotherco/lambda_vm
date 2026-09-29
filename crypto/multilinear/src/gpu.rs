@@ -2034,11 +2034,16 @@ pub fn force_argue_lean_tail(on: Option<bool>) {
 }
 
 /// Whether a big batch's device rounds walk its program on demand
-/// ([`Program::on_demand`](crate::program::Program::on_demand)) —
-/// `LAMBDA_VM_ARGUE_LEAN_PROGRAM=1` (any non-empty value other than `0`) — with
-/// the slot file sized for every interpolation node from the first round. The
-/// same round values either way; off by default until its A/B, and off is
-/// today's path.
+/// ([`Program::on_demand`](crate::program::Program::on_demand)), with the slot
+/// file sized for every interpolation node from the first round. The same
+/// round values either way. On by default; `LAMBDA_VM_ARGUE_LEAN_PROGRAM=0` is
+/// the opt-out, and it is the old path exactly.
+///
+/// The default was turned on by its A/B on the block (FAST, 2026-09-29): the
+/// whole run 1.35 s faster, the big batches' early device rounds 1,527 → 442 ms
+/// and the argue 1.43 s faster, every arm proved and verified on the record's
+/// identities, and the cross-check arm — every big session's rounds compared,
+/// round by round, with today's program over the same factors — clean.
 ///
 /// A batch is big when the values its lowered program holds a thread, more
 /// than [`LEAN_ABOVE_SLOTS`], leave a round fewer than 64 k threads: the head's
@@ -2054,7 +2059,7 @@ pub fn argue_lean_program() -> bool {
         2 => false,
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_on("LAMBDA_VM_ARGUE_LEAN_PROGRAM"))
+            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_LEAN_PROGRAM"))
         }
     }
 }
@@ -4295,9 +4300,9 @@ mod tests {
         b.finish(root).unwrap()
     }
 
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` and `LAMBDA_VM_ARGUE_DEVICE_TABLES` are on
-    /// by default: unset, empty or any value reads on, and only `0` — the
-    /// opt-out — reads off.
+    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`, `LAMBDA_VM_ARGUE_DEVICE_TABLES` and
+    /// `LAMBDA_VM_ARGUE_LEAN_PROGRAM` are on by default: unset, empty or any value
+    /// reads on, and only `0` — the opt-out — reads off.
     #[test]
     fn only_zero_turns_a_default_on_knob_off() {
         assert!(not_off(None), "unset is the default, on");
@@ -4313,6 +4318,15 @@ mod tests {
     fn the_tables_knob_is_on_unless_its_variable_is_zero() {
         let variable = std::env::var("LAMBDA_VM_ARGUE_DEVICE_TABLES").ok();
         assert_eq!(argue_device_tables(), not_off(variable.as_deref()));
+    }
+
+    /// The lean program's knob reads its variable the default-on way, whatever
+    /// the environment sets. ⚠ No test in this binary forces the knob, which is
+    /// what makes the reading the environment's.
+    #[test]
+    fn the_lean_program_knob_is_on_unless_its_variable_is_zero() {
+        let variable = std::env::var("LAMBDA_VM_ARGUE_LEAN_PROGRAM").ok();
+        assert_eq!(argue_lean_program(), not_off(variable.as_deref()));
     }
 
     #[test]
