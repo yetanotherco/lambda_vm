@@ -6801,6 +6801,19 @@ where
         self.changed.notify_all();
     }
 
+    /// Marks slot `k` as building for a builder other than the helpers, so no
+    /// helper claims it: `false` when it is past the slots kept, already
+    /// claimed, or level 0 has started. The builder ends it with
+    /// [`Self::finish`].
+    fn reserve(&self, k: usize) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || k >= self.want || !matches!(st.slots[k], LeadSlot::Waiting) {
+            return false;
+        }
+        st.slots[k] = LeadSlot::Building;
+        true
+    }
+
     /// Wrap `k`'s prologue if a helper built it, waiting for one in progress;
     /// `None` hands it to the caller, and no helper will start it afterwards.
     fn take(&self, k: usize) -> Option<T> {
@@ -6871,24 +6884,39 @@ where
     }
 }
 
-/// `LFM_TREE_EARLY_HARVEST=1`: a wide lead-in also harvests its LAST node's epochs
-/// in the base's tail, one at a time as each lands ([`AheadHarvest`]).
+/// What a wide lead-in does with its LAST node before level 1: `1` harvests its
+/// epochs in the base's tail, one at a time as each lands ([`AheadHarvest`]);
+/// `2` builds the whole node there ([`build_last_slot`]). Unset, empty or `0`
+/// leaves it to level 1.
 const EARLY_HARVEST_ENV: &str = "LFM_TREE_EARLY_HARVEST";
 
-/// [`EARLY_HARVEST_ENV`] for a raw value: unset, empty or `0` is off, `1` is on,
-/// anything else stops the run.
-fn early_harvest_setting(raw: Option<&str>) -> bool {
+/// [`EARLY_HARVEST_ENV`]'s settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyHarvest {
+    /// Level 1 harvests and emits the last node after the base (the default).
+    Off,
+    /// `1`: the last node's epochs are harvested in the base's tail; level 1
+    /// emits the node.
+    PerEpoch,
+    /// `2`: the last node is harvested and emitted in the base's tail.
+    LastSlot,
+}
+
+/// [`EARLY_HARVEST_ENV`] for a raw value: unset, empty or `0` is off, `1` and
+/// `2` are the two early modes, anything else stops the run.
+fn early_harvest_setting(raw: Option<&str>) -> EarlyHarvest {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
-        Some(v) => panic!("{EARLY_HARVEST_ENV} must be `0` or `1`, got `{v}`"),
+        None | Some("") | Some("0") => EarlyHarvest::Off,
+        Some("1") => EarlyHarvest::PerEpoch,
+        Some("2") => EarlyHarvest::LastSlot,
+        Some(v) => panic!("{EARLY_HARVEST_ENV} must be `0`, `1` or `2`, got `{v}`"),
     }
 }
 
-/// Whether the wide lead-in harvests its last node's epochs ahead, read once.
-fn early_harvest_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| early_harvest_setting(std::env::var(EARLY_HARVEST_ENV).ok().as_deref()))
+/// The wide lead-in's early mode for its last node, read once.
+fn early_harvest_mode() -> EarlyHarvest {
+    static MODE: std::sync::OnceLock<EarlyHarvest> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| early_harvest_setting(std::env::var(EARLY_HARVEST_ENV).ok().as_deref()))
 }
 
 /// ★ THE EARLY HARVEST: the last wide node's epochs, harvested in the base's tail.
@@ -7064,6 +7092,63 @@ fn harvest_ahead<P, C, T, A>(
     }
 }
 
+/// `LFM_TREE_EARLY_HARVEST=2`'s thread: the LAST slot of `lead` — epochs
+/// `(⌈n / span⌉ − 1)·span .. n` of a run of `n` — built whole in the base's tail.
+///
+/// ⛔ WHY THE WHOLE SLOT. Harvesting its epochs ahead ([`harvest_ahead`]) leaves
+/// the emission (2.7–2.9 s at fan-in 5) after the base, so the node still asks
+/// for the card behind the first node's prove, and the card permit serves in
+/// arrival order: nothing moves. Built here, the node is ready about 1.5 s into
+/// level 1, while the card still waits for the first prove.
+///
+/// It reserves the slot as soon as the epoch count is known, so no helper claims
+/// it; harvests each of its epochs once it and its predecessor have landed; and
+/// `assemble`s the slot from them once the last is in. A slot that is past the
+/// ones kept, or that a helper claimed first, is left alone; a panic hands the
+/// slot back to level 1, which builds it as it does without the knob. Returns
+/// the slot it built.
+fn build_last_slot<P, C, T, E>(
+    lead: &LeadIn<P, C, T>,
+    harvest: impl Fn(&C, Option<&P>, &P, usize, usize) -> E,
+    assemble: impl FnOnce(&C, Vec<E>, std::ops::Range<usize>) -> T,
+) -> Option<usize>
+where
+    P: Clone + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+    T: Send + 'static,
+{
+    let n = lead.epoch_count();
+    if n == 0 {
+        return None;
+    }
+    let j = n.div_ceil(lead.span) - 1;
+    if !lead.reserve(j) {
+        return None;
+    }
+    let range = j * lead.span..n;
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let context = lead.context();
+        let held: Vec<E> = range
+            .clone()
+            .map(|k| {
+                let (prev, this) = lead
+                    .epoch_pair(k)
+                    .expect("a reserved slot's epochs are kept");
+                harvest(context, prev.as_deref(), &this, n, k)
+            })
+            .collect();
+        assemble(context, held, range.clone())
+    }));
+    if built.is_err() {
+        println!(
+            "   ⚠ L1 LAST SLOT AHEAD: building wide node {j} in the base's tail panicked; level 1 \
+             builds it instead"
+        );
+    }
+    lead.finish(j, built.ok());
+    Some(j)
+}
+
 impl<P, C, T> crate::continuation::EpochObserver<P> for LeadIn<P, C, T>
 where
     P: Clone + Send + Sync,
@@ -7188,7 +7273,7 @@ fn test_lead_in(
     )
 }
 
-impl TestLeadIn {
+impl<P, C, T> LeadIn<P, C, T> {
     fn slot_kinds(&self) -> Vec<&'static str> {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.slots
@@ -7274,15 +7359,17 @@ fn l0_lead_in_spanning_builds_each_slot_from_its_group_prefix() {
     assert_eq!(lead.take(3), None, "past `want` the pool builds");
 }
 
-/// The early harvest's switch: unset, empty or `0` is off, `1` is on.
+/// The early harvest's switch: unset, empty or `0` is off, `1` harvests the last
+/// node's epochs ahead, `2` builds the whole node ahead.
 #[test]
-fn the_early_harvest_switch_is_off_unless_one() {
-    assert!(!early_harvest_setting(None));
-    assert!(!early_harvest_setting(Some("")));
-    assert!(!early_harvest_setting(Some("0")));
-    assert!(early_harvest_setting(Some("1")));
-    assert!(early_harvest_setting(Some(" 1 ")));
-    for bad in ["on", "true", "2", "yes"] {
+fn the_early_harvest_switch_is_off_unless_one_or_two() {
+    assert_eq!(early_harvest_setting(None), EarlyHarvest::Off);
+    assert_eq!(early_harvest_setting(Some("")), EarlyHarvest::Off);
+    assert_eq!(early_harvest_setting(Some("0")), EarlyHarvest::Off);
+    assert_eq!(early_harvest_setting(Some("1")), EarlyHarvest::PerEpoch);
+    assert_eq!(early_harvest_setting(Some(" 1 ")), EarlyHarvest::PerEpoch);
+    assert_eq!(early_harvest_setting(Some("2")), EarlyHarvest::LastSlot);
+    for bad in ["on", "true", "3", "yes", "12"] {
         assert!(
             std::panic::catch_unwind(|| early_harvest_setting(Some(bad))).is_err(),
             "`{bad}` must be refused, not read as the control"
@@ -7518,6 +7605,143 @@ fn the_node_is_emitted_from_the_same_epochs_with_or_without_the_early_harvest() 
     );
 }
 
+/// ★ THE LAST SLOT IS RESERVED AT THE COUNT AND BUILT WHOLE IN THE TAIL
+/// (`LFM_TREE_EARLY_HARVEST=2`): of 5 epochs in slots of 3 with one helper, the
+/// helper builds slot 0, and slot 1 is the thread's from the moment the count is
+/// known. The thread harvests epochs 3 and 4, each once it and its predecessor
+/// have landed whatever order they came in, and builds the slot from exactly
+/// those.
+#[test]
+fn the_last_slot_is_reserved_at_the_count_and_built_whole_in_the_tail() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<TestLeadIn> = LeadIn::start_spanning(
+        2,
+        3,
+        1,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        |_ctx: &usize, epochs: &[u64], n, k| (k, epochs.to_vec(), n),
+    );
+    let thread = {
+        let lead = std::sync::Arc::clone(&lead);
+        std::thread::spawn(move || {
+            build_last_slot(
+                &lead,
+                |ctx: &usize, prev: Option<&u64>, this: &u64, n, k| -> TestHarvested {
+                    assert_eq!(*ctx, 7, "the context reaches the last slot's thread");
+                    (k, prev.copied(), *this, n)
+                },
+                // The slot, each epoch's predecessor and own proof in order, the count.
+                |_ctx: &usize, held: Vec<TestHarvested>, range: std::ops::Range<usize>| {
+                    let pairs = held
+                        .iter()
+                        .flat_map(|(_, prev, this, _)| [prev.unwrap_or(u64::MAX), *this])
+                        .collect();
+                    (range.start / 3, pairs, held[0].3)
+                },
+            )
+        })
+    };
+    for (i, e) in [10u64, 11, 12].into_iter().enumerate() {
+        lead.on_epoch_proved(i, &e);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        lead.slot_kinds(),
+        ["waiting"; 2],
+        "nothing is reserved or built before the epoch count"
+    );
+    lead.on_epoch_count(5);
+    lead.until("slot 0 built by the helper, slot 1 reserved", |k| {
+        k == ["built", "building"]
+    });
+    lead.on_epoch_proved(4, &14);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        lead.slot_kinds()[1],
+        "building",
+        "epoch 3 has not landed, so the last slot cannot be built"
+    );
+    lead.on_epoch_proved(3, &13);
+    assert_eq!(thread.join().expect("the last slot's thread"), Some(1));
+    assert_eq!(lead.take(0), Some((0, vec![10, 11, 12], 5)), "the helper's");
+    assert_eq!(
+        lead.take(1),
+        Some((1, vec![12, 13, 13, 14], 5)),
+        "the thread's: epochs 3 and 4, each with its predecessor"
+    );
+}
+
+/// A slot another builder holds is left to it, one past the slots kept is not
+/// reserved, and none is once level 0 has started.
+#[test]
+fn the_last_slot_thread_leaves_a_claimed_slot_alone() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<TestLeadIn> = LeadIn::start_spanning(
+        2,
+        3,
+        0,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        |_ctx: &usize, epochs: &[u64], n, k| (k, epochs.to_vec(), n),
+    );
+    assert!(!lead.reserve(2), "past the slots kept");
+    assert!(lead.reserve(1));
+    assert!(!lead.reserve(1), "a slot is reserved once");
+    lead.on_epoch_count(5);
+    let built = build_last_slot(
+        &lead,
+        |_: &usize, _: Option<&u64>, _: &u64, _, k| -> TestHarvested {
+            panic!("epoch {k} of a slot the thread does not hold must not be harvested")
+        },
+        |_: &usize, _: Vec<TestHarvested>, _| -> (usize, Vec<u64>, usize) {
+            panic!("a slot the thread does not hold must not be built")
+        },
+    );
+    assert_eq!(built, None);
+    assert_eq!(
+        lead.slot_kinds(),
+        ["waiting", "building"],
+        "the other builder's slot is untouched"
+    );
+    let _ = lead.close();
+    assert!(!lead.reserve(0), "level 0 has started");
+}
+
+/// ★ A PANICKING LAST SLOT IS HANDED BACK: level 1 then builds it, as it does
+/// without the knob.
+#[test]
+fn a_panicking_last_slot_is_handed_back() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<TestLeadIn> = LeadIn::start_spanning(
+        1,
+        3,
+        0,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        |_ctx: &usize, epochs: &[u64], n, k| (k, epochs.to_vec(), n),
+    );
+    let thread = {
+        let lead = std::sync::Arc::clone(&lead);
+        std::thread::spawn(move || {
+            build_last_slot(
+                &lead,
+                |_: &usize, prev: Option<&u64>, this: &u64, n, k| -> TestHarvested {
+                    assert!(k != 1, "the harvest of epoch {k} fails (injected)");
+                    (k, prev.copied(), *this, n)
+                },
+                |_: &usize, held: Vec<TestHarvested>, range: std::ops::Range<usize>| {
+                    (range.start, held.iter().map(|h| h.2).collect(), held.len())
+                },
+            )
+        })
+    };
+    lead.on_epoch_count(3);
+    for (i, e) in [10u64, 11, 12].into_iter().enumerate() {
+        lead.on_epoch_proved(i, &e);
+    }
+    assert_eq!(thread.join().expect("the last slot's thread"), Some(0));
+    assert_eq!(lead.slot_kinds(), ["gone"]);
+    assert_eq!(lead.take(0), None, "level 1 builds it");
+}
+
 #[test]
 fn l0_lead_in_builds_each_prologue_from_its_leading_epochs() {
     use crate::continuation::EpochObserver;
@@ -7748,12 +7972,54 @@ fn wide_prologue_emit(
     (program, arenas)
 }
 
+/// One epoch for the early modes ([`EARLY_HARVEST_ENV`]), harvested from its own
+/// proof and its predecessor's on the lead-in's context: the harvest and AIR set
+/// a helper or level 1 would build, with the DECODE assert made on this thread.
+fn harvest_whir_epoch<H: multilinear::whir_hash::WhirHash>(
+    ctx: &WhirLeadContext<H>,
+    inner: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    prev: Option<&crate::multilinear_continuation::EpochProof>,
+    this: &crate::multilinear_continuation::EpochProof,
+    n: usize,
+    k: usize,
+) -> HarvestedEpoch {
+    let e = crate::lfm::whir_real_epoch::real_epoch_after_under::<H>(
+        inner,
+        elf_bytes,
+        prev,
+        this,
+        n,
+        k,
+        Some(ctx.decode_root),
+        Some(&*ctx.prepared),
+    )
+    .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+    let air_set = crate::multilinear_continuation::epoch_airs_for(
+        &ctx.elf,
+        inner,
+        this,
+        &e.position.register_init,
+        e.position.is_final,
+        e.position.label,
+        Some(ctx.decode_root),
+    );
+    let derived_here = crate::multilinear_continuation::decode_derivations();
+    assert_eq!(
+        derived_here, 0,
+        "the early harvest derived DECODE {derived_here} time(s); both hoists are handed \
+         in, so a non-zero count means one did not reach it"
+    );
+    (e, air_set)
+}
+
 /// The wide tree's lead-in: [`start_whir_lead_in`] over slots of `span` epochs.
 /// A helper harvests slot `j`'s epochs from the base's proofs as the base
 /// hands them over, and emits the wide node with [`wide_prologue_emit`] — the
-/// pool's own emission, so the IDENTITY lines are the gate again. With
-/// `early_harvest` ([`EARLY_HARVEST_ENV`] in the driver) a thread of its own
-/// also harvests the last slot's epochs as they land ([`AheadHarvest`]).
+/// pool's own emission, so the IDENTITY lines are the gate again. `early`
+/// ([`EARLY_HARVEST_ENV`] in the driver) adds a thread of its own for the LAST
+/// slot: [`harvest_ahead`] harvests its epochs as they land, or
+/// [`build_last_slot`] builds the whole slot.
 #[allow(clippy::type_complexity)]
 fn start_whir_wide_lead_in<H>(
     elf_bytes: &[u8],
@@ -7761,7 +8027,7 @@ fn start_whir_wide_lead_in<H>(
     want: usize,
     span: usize,
     helpers: usize,
-    early_harvest: bool,
+    early: EarlyHarvest,
 ) -> (
     crate::multilinear_continuation::SharedEpochObserver,
     std::sync::Arc<dyn std::any::Any + Send + Sync>,
@@ -7772,9 +8038,9 @@ where
     use crate::multilinear_continuation::{decode_derivations, reset_decode_derivations};
     let ctx_bytes = elf_bytes.to_vec();
     let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
-    let ahead = early_harvest.then(AheadHarvest::<HarvestedEpoch>::new);
+    let ahead = (early == EarlyHarvest::PerEpoch).then(AheadHarvest::<HarvestedEpoch>::new);
     let helper_ahead = ahead.clone();
-    let (ahead_bytes, ahead_inner) = (bytes.clone(), inner.clone());
+    let (early_bytes, early_inner) = (bytes.clone(), inner.clone());
     let lead: std::sync::Arc<WhirWideLeadIn<H>> = LeadIn::start_spanning(
         want,
         span,
@@ -7852,52 +8118,81 @@ where
             }
         },
     );
-    if let Some(ahead) = &ahead {
-        let (lead, ahead) = (std::sync::Arc::clone(&lead), std::sync::Arc::clone(ahead));
-        let (bytes, inner) = (ahead_bytes, ahead_inner);
-        // ⓘ Detached, as the helpers are: it holds nothing a failing run must
-        // release, and one parked on the observer dies with the process.
-        std::thread::Builder::new()
-            .name("l1-harvest-ahead".to_string())
-            .spawn(move || {
-                reset_decode_derivations();
-                harvest_ahead(
-                    &lead,
-                    &ahead,
-                    |ctx: &WhirLeadContext<H>, prev, this, n, k| {
-                        let e = crate::lfm::whir_real_epoch::real_epoch_after_under::<H>(
-                            &inner,
-                            &bytes,
-                            prev,
-                            this,
-                            n,
-                            k,
-                            Some(ctx.decode_root),
-                            Some(&*ctx.prepared),
-                        )
-                        .unwrap_or_else(|why| {
-                            panic!("epoch {k} must harvest from proofs alone: {why}")
-                        });
-                        let air_set = crate::multilinear_continuation::epoch_airs_for(
-                            &ctx.elf,
-                            &inner,
-                            this,
-                            &e.position.register_init,
-                            e.position.is_final,
-                            e.position.label,
-                            Some(ctx.decode_root),
-                        );
-                        let derived_here = decode_derivations();
-                        assert_eq!(
-                            derived_here, 0,
-                            "the early harvest derived DECODE {derived_here} time(s); both \
-                             hoists are handed in, so a non-zero count means one did not reach it"
-                        );
-                        (e, air_set)
-                    },
-                );
-            })
-            .expect("the harvest-ahead thread must spawn");
+    // ⓘ Both early threads are detached, as the helpers are: they hold nothing a
+    // failing run must release, and one parked on the observer dies with the
+    // process.
+    match early {
+        EarlyHarvest::Off => {}
+        EarlyHarvest::PerEpoch => {
+            let lead = std::sync::Arc::clone(&lead);
+            let ahead = std::sync::Arc::clone(ahead.as_ref().expect("made for this mode"));
+            let (bytes, inner) = (early_bytes, early_inner);
+            std::thread::Builder::new()
+                .name("l1-harvest-ahead".to_string())
+                .spawn(move || {
+                    reset_decode_derivations();
+                    harvest_ahead(&lead, &ahead, |ctx, prev, this, n, k| {
+                        harvest_whir_epoch::<H>(ctx, &inner, &bytes, prev, this, n, k)
+                    });
+                })
+                .expect("the harvest-ahead thread must spawn");
+        }
+        EarlyHarvest::LastSlot => {
+            let lead = std::sync::Arc::clone(&lead);
+            let (bytes, inner) = (early_bytes, early_inner);
+            std::thread::Builder::new()
+                .name("l1-last-slot".to_string())
+                .spawn(move || {
+                    reset_decode_derivations();
+                    build_last_slot(
+                        &lead,
+                        // Each epoch with its start stamp and its harvest's seconds.
+                        |ctx: &WhirLeadContext<H>, prev, this, n, k| {
+                            let t0 = stark::prove_split::epoch_secs();
+                            let t = std::time::Instant::now();
+                            let held =
+                                harvest_whir_epoch::<H>(ctx, &inner, &bytes, prev, this, n, k);
+                            (held, t0, t.elapsed().as_secs_f64())
+                        },
+                        |_ctx: &WhirLeadContext<H>,
+                         harvested: Vec<(HarvestedEpoch, f64, f64)>,
+                         range: std::ops::Range<usize>| {
+                            // ⓘ The window runs from the first epoch's harvest to the
+                            // emission's end, and `t_harvest` is the harvests' own
+                            // seconds, not that window: the epochs land over it.
+                            let t_last = stark::prove_split::epoch_secs();
+                            let t0 = harvested.first().map_or(t_last, |(_, t0, _)| *t0);
+                            let t_harvest: f64 = harvested.iter().map(|(_, _, secs)| secs).sum();
+                            let held: Vec<HarvestedEpoch> =
+                                harvested.into_iter().map(|(h, _, _)| h).collect();
+                            let t = std::time::Instant::now();
+                            let (program, arenas) = wide_prologue_emit(&held, range.clone());
+                            let t_emit = t.elapsed().as_secs_f64();
+                            let t1 = stark::prove_split::epoch_secs();
+                            println!(
+                                "   ★ L1 LAST SLOT AHEAD ({EARLY_HARVEST_ENV}=2): wide node {} \
+                                 (epochs {}..={}) built in the base's tail: {} epoch(s) \
+                                 harvested in {t_harvest:.2}s, the last by t={t_last:.3}; \
+                                 emitted in {t_emit:.2}s, done at t={t1:.3}",
+                                range.start / span,
+                                range.start,
+                                range.end - 1,
+                                held.len(),
+                            );
+                            WhirWidePrologue {
+                                epochs: held.into_iter().map(|(e, _)| e).collect(),
+                                program,
+                                arenas,
+                                t_harvest,
+                                t_emit,
+                                t0,
+                                t1,
+                            }
+                        },
+                    );
+                })
+                .expect("the last-slot thread must spawn");
+        }
     }
     let observer: crate::multilinear_continuation::SharedEpochObserver = lead.clone();
     (observer, std::sync::Arc::new(WhirWideLead { lead, ahead }))
@@ -9651,9 +9946,15 @@ where
 
         let (cells, instrs) = census_and_panel(&program, &label, epochs.len());
         let wide_sampler = HostSampler::start();
+        // ⓘ When the node first asks for the card — its build, on the
+        // prove-split clock the CARD HOLD lines use — and how long this thread
+        // then waited for it.
+        let t_build_asked = stark::prove_split::epoch_secs();
+        let waited_before = super::device_permit::waited_secs();
         let t = Instant::now();
         let artifacts = C::build(&program, wrap_opts);
         let t_artifacts = t.elapsed().as_secs_f64();
+        let build_waited = super::device_permit::waited_secs() - waited_before;
         let t = Instant::now();
         let proved = C::prove(&label, &program, &artifacts, &arenas, wrap_opts)
             .unwrap_or_else(|why| panic!("{why}"));
@@ -9715,6 +10016,10 @@ where
             } else {
                 ""
             },
+        );
+        println!(
+            "   {label} CARD: the build asked for the card at t={t_build_asked:.3} and waited \
+             {build_waited:.3}s for it"
         );
         println!(
             "   {label}: host peak {peak:.3} GiB at t={at:.1}{}{}",
@@ -10561,17 +10866,20 @@ fn whir_production_tree<C: TreeChild>() {
                  build wide nodes 0..{want}, {fan_in} epochs each (LFM_TREE_TAIL_PROLOGUES / \
                  LFM_TREE_TAIL_HELPERS)"
             );
-            let early = early_harvest_enabled();
-            if early {
-                println!(
-                    "   ★ L1 HARVEST AHEAD: on ({EARLY_HARVEST_ENV}=1): the last wide node's \
-                     epochs are harvested in the base's tail, each as it lands"
-                );
-            } else {
-                println!(
+            let early = early_harvest_mode();
+            match early {
+                EarlyHarvest::Off => println!(
                     "   L1 HARVEST AHEAD: off (the default; {EARLY_HARVEST_ENV}=1 harvests the \
-                     last wide node's epochs in the base's tail)"
-                );
+                     last wide node's epochs in the base's tail, =2 builds the whole node there)"
+                ),
+                EarlyHarvest::PerEpoch => println!(
+                    "   ★ L1 HARVEST AHEAD: per epoch ({EARLY_HARVEST_ENV}=1): the last wide \
+                     node's epochs are harvested in the base's tail, each as it lands"
+                ),
+                EarlyHarvest::LastSlot => println!(
+                    "   ★ L1 HARVEST AHEAD: last slot ({EARLY_HARVEST_ENV}=2): the last wide \
+                     node is harvested and emitted in the base's tail"
+                ),
             }
             crate::with_whir_hash!(|H| {
                 start_whir_wide_lead_in::<H>(
@@ -11930,24 +12238,27 @@ type NodeBytes = (
 
 /// ★★ THE EARLY HARVEST MOVES NO NODE BYTE ([`EARLY_HARVEST_ENV`]). The
 /// continuation fixture's three epochs, from ONE set of epoch proofs, through
-/// the wide level 1 in slots of 2 (nodes over epochs 0–1 and 2: the harvest
-/// covers epoch 2, whose predecessor is the first node's) and of 3 (one node:
-/// the harvest covers every epoch, epoch 0 among them), four ways:
+/// the wide level 1 in slots of 2 (nodes over epochs 0–1 and 2: the last slot is
+/// epoch 2, whose predecessor is the first node's) and of 3 (one node: the last
+/// slot is every epoch, epoch 0 among them), six ways:
 /// - off, no helper: level 1 harvests every epoch itself — the last node's path
 ///   on the block today;
 /// - off, two helpers: the helpers build the nodes' prologues;
-/// - on, no helper, level 1 started once the harvest is done: level 1 takes
+/// - `1`, no helper, level 1 started once the harvest is done: level 1 takes
 ///   every epoch the harvest covers (all done before, all taken after);
-/// - on, two helpers: a helper and the harvest race for the last node's epochs.
+/// - `1`, two helpers: a helper and the harvest race for the last node's epochs;
+/// - `2`, no helper, level 1 started once the last slot is built: level 1 takes
+///   the node the thread built (built before, taken after);
+/// - `2`, two helpers: the helpers and the thread race for the last slot.
 ///
 /// Every node's program id, heights, published words and proof bytes are the
-/// same in all four.
+/// same in all six.
 ///
 /// ⚠ Under `LAMBDA_VM_DETERMINISTIC_GRIND=1` (two proves of one program may
 /// otherwise take different grinding nonces) and `LAMBDA_VM_WHIR_HASH=rpx`
 /// (level 1 refuses another process hash). Fixture traces: box tier.
 #[test]
-#[ignore = "fixture traces, twelve node proves, under LAMBDA_VM_DETERMINISTIC_GRIND=1 and \
+#[ignore = "fixture traces, eighteen node proves, under LAMBDA_VM_DETERMINISTIC_GRIND=1 and \
             LAMBDA_VM_WHIR_HASH=rpx: box only"]
 fn the_early_harvest_moves_no_node_byte() {
     type H = multilinear::whir_hash::RpxWhir;
@@ -11977,10 +12288,12 @@ fn the_early_harvest_moves_no_node_byte() {
         let want = n.div_ceil(span);
         let mut runs: Vec<(&str, Vec<NodeBytes>)> = Vec::new();
         for (arm, early, helpers) in [
-            ("off, no helper", false, 0usize),
-            ("off, two helpers", false, 2),
-            ("on, no helper", true, 0),
-            ("on, two helpers", true, 2),
+            ("off, no helper", EarlyHarvest::Off, 0usize),
+            ("off, two helpers", EarlyHarvest::Off, 2),
+            ("1, no helper", EarlyHarvest::PerEpoch, 0),
+            ("1, two helpers", EarlyHarvest::PerEpoch, 2),
+            ("2, no helper", EarlyHarvest::LastSlot, 0),
+            ("2, two helpers", EarlyHarvest::LastSlot, 2),
         ] {
             println!("\n★ EARLY HARVEST BYTES: slots of {span}, {arm}");
             let (observer, handle) =
@@ -11995,21 +12308,34 @@ fn the_early_harvest_moves_no_node_byte() {
             for (i, e) in bundle.epochs.iter().enumerate() {
                 observer.on_epoch_proved(i, e);
             }
-            let ahead = handle
+            let wide = handle
                 .downcast_ref::<WhirWideLead<H>>()
-                .expect("the wide lead-in")
-                .ahead
-                .clone();
+                .expect("the wide lead-in");
+            let ahead = wide.ahead.clone();
             assert_eq!(
                 ahead.is_some(),
-                early,
-                "the early harvest runs exactly when asked"
+                early == EarlyHarvest::PerEpoch,
+                "the per-epoch harvest runs exactly when asked"
             );
             let waited = ahead.as_ref().filter(|_| helpers == 0);
             if let Some(a) = waited {
                 a.until("the early harvest done", 600, |k| {
                     !k.is_empty() && k.iter().all(|s| *s == "done")
                 });
+            }
+            // Under `2` with no helper the thread alone builds the last slot:
+            // level 1 starts once it has.
+            let last_slot = (early == EarlyHarvest::LastSlot && helpers == 0).then(|| want - 1);
+            if let Some(j) = last_slot {
+                let start = std::time::Instant::now();
+                while wide.lead.slot_kinds()[j] != "built" {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(600),
+                        "timed out waiting for the last slot: {:?}",
+                        wide.lead.slot_kinds()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
             super::device_permit::arm(1);
             let (children, _, _, global) = whir_level_zero::<H, WhirTreeChild>(
@@ -12032,6 +12358,13 @@ fn the_early_harvest_moves_no_node_byte() {
                     a.kinds().iter().all(|s| *s == "gone"),
                     "level 1 must take every epoch the early harvest covers: {:?}",
                     a.kinds()
+                );
+            }
+            if let Some(j) = last_slot {
+                assert_eq!(
+                    wide.lead.slot_kinds()[j],
+                    "gone",
+                    "level 1 must take the last slot the thread built"
                 );
             }
             assert_eq!(children.len(), want, "one wide node per slot");
@@ -12069,7 +12402,7 @@ fn the_early_harvest_moves_no_node_byte() {
         }
         println!(
             "★ EARLY HARVEST BYTES: slots of {span}: {} node(s), program ids, heights, published \
-             words and proof bytes equal in all four arms",
+             words and proof bytes equal in all six arms",
             control.len()
         );
     }
