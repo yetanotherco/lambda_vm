@@ -10110,6 +10110,21 @@ fn whir_production_tree<C: TreeChild>() {
     let shape = tree_shape(bundle.num_epochs(), fan_in);
     let top = shape.len();
     let hi = hi_req.unwrap_or(top).min(top);
+    // ★ A WIDE TREE OF ONE NODE LEVEL RUNS `A` AS `B` (`RootOption::for_tree`):
+    // at most `fan_in` epochs make one wide node, with no proofs below it for
+    // `A` to take, so the root takes that node. Every other shape runs the
+    // option as named, and the line below says when it did not.
+    let root_option = root_option.map(|named| {
+        let option = named.for_tree(top, wide);
+        if option != named {
+            println!(
+                "   ★ ROOT OPTION {named:?} RUNS AS {option:?}: {} epoch(s) make one wide node \
+                 at fan-in {fan_in}, and the root takes it (RootOption::for_tree)",
+                bundle.num_epochs()
+            );
+        }
+        option
+    });
     // ★ THE LOOP STOPS AT THE LEVEL THE ROOT'S CHILDREN COME FROM, and that
     // level is `RootOption::child_level` — the one named rule the STARK driver
     // reads as well, rather than index arithmetic written out twice. Under A it
@@ -10391,10 +10406,12 @@ fn whir_production_tree<C: TreeChild>() {
             // ONLY where the two counts differ: where they happen to agree, the
             // root compares a fold of the wrong depth and an HONEST prover fails.
             let child_level = option.child_level(top);
-            let want = if child_level == 0 {
-                bundle.num_epochs()
-            } else {
-                shape[child_level - 1].arities.len()
+            // ⓘ Level 0's output is the wraps, or under a wide level 1 the wide
+            // nodes — which a one-epoch block (`top` 0) still builds, one of them.
+            let want = match child_level {
+                0 if wide => bundle.num_epochs().div_ceil(fan_in),
+                0 => bundle.num_epochs(),
+                level => shape[level - 1].arities.len(),
             };
             assert_eq!(
                 closed,
@@ -10812,10 +10829,12 @@ fn whir_production_tree<C: TreeChild>() {
 ///   30 of the block's 35 pages take has NO TABLE here and no gate here: the
 ///   block under the box is that route's only gate, which is what
 ///   `whir_global`'s own route table says per route.
-/// - ROOT OPTION A ONLY. The root REPLACES the top interior level; option B —
-///   the root sitting above a closed interior — is never emitted at fixture
-///   scale. What covers both is the child-count guard below, which reads
-///   `RootOption::child_level` rather than a hard-coded level.
+/// - ROOT OPTION A, AS NAMED. At three epochs and fan-in 2 the root REPLACES
+///   the top interior level. Option B's shape — the root above a closed
+///   interior — reaches fixture scale only through the small blocks
+///   ([`the_whir_fixture_tree_proves_every_small_block`]), where a wide tree of
+///   one node level runs `A` as `B`. What covers both is the child-count guard
+///   below, which reads `RootOption::child_level` rather than a hard-coded level.
 ///
 /// What it DOES establish is the half a byte gate cannot: that the sequence runs
 /// end to end, that the publish set and `SchemaLayout::wrap` agree, that both
@@ -10834,8 +10853,40 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
 }
 
 /// [`the_whir_fixture_tree_composes_to_a_block_artifact`]'s body, over the
-/// tree's child type.
+/// tree's child type: `test_private_input_xpage` at 2^2 cycles an epoch (three
+/// epochs) and fan-in 2.
 fn whir_fixture_tree<C: TreeChild>() {
+    let mut input: Vec<u8> = Vec::with_capacity(16);
+    input.extend_from_slice(&16u32.to_le_bytes());
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    input.extend_from_slice(&[0u8; 4]);
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    // ⛔ At least two epochs: a one-epoch run chains nothing and would make the
+    // interior vacuous, which is not what this fixture is for.
+    whir_fixture_tree_on::<C>(&FixtureBlock {
+        elf_bytes: &elf_bytes,
+        input: &input,
+        epoch_log2: 2,
+        fan_in: 2,
+        epochs: 2..=usize::MAX,
+    });
+}
+
+/// A block the fixture tree proves: its guest and private input, the epoch
+/// size, the tree's arity, and the epoch counts the run must come to.
+struct FixtureBlock<'a> {
+    elf_bytes: &'a [u8],
+    input: &'a [u8],
+    epoch_log2: u32,
+    fan_in: usize,
+    epochs: std::ops::RangeInclusive<usize>,
+}
+
+/// The fixture tree over one block, to a root PROVED AND VERIFIED: the body of
+/// [`the_whir_fixture_tree_composes_to_a_block_artifact`] and of
+/// [`the_whir_fixture_tree_proves_every_small_block`].
+fn whir_fixture_tree_on<C: TreeChild>(block: &FixtureBlock<'_>) {
+    use super::block_root::RootOption;
     use super::per_table_aggregator::{tree_node_count, tree_shape};
     use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
@@ -10843,17 +10894,19 @@ fn whir_fixture_tree<C: TreeChild>() {
 
     // ⓘ NO `cuda` ASSERT HERE, and that is the whole point of this arm — see the
     // doc above. It is also why nothing it prints may be quoted as a cost.
-    let mut input: Vec<u8> = Vec::with_capacity(16);
-    input.extend_from_slice(&16u32.to_le_bytes());
-    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-    input.extend_from_slice(&[0u8; 4]);
-    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let FixtureBlock {
+        elf_bytes,
+        input,
+        epoch_log2,
+        fan_in,
+        ref epochs,
+    } = *block;
     let inner = crate::ProofOptions::default_test_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
-    let fan_in = 2;
     // ★ `LAMBDA_VM_LFM_WIDE=on`: level 1 verifies its epochs directly, `fan_in`
-    // to a node, so the fixture's two nodes cover epochs 0–1 and 2.
+    // to a node, so at three epochs and fan-in 2 the two nodes cover epochs 0–1
+    // and 2.
     let wide = crate::lfm_prover_knob::wide_selected();
 
     let t_all = Instant::now();
@@ -10862,14 +10915,15 @@ fn whir_fixture_tree<C: TreeChild>() {
     // `LFM_TREE_REDERIVE_DECODE=1`).
     let (bundle, base_decode) = if l0_takes_base_decode() {
         let (bundle, decode) = crate::multilinear_continuation::prove_continuation_keeping_decode(
-            &elf_bytes, &input, 2, &inner,
+            elf_bytes, input, epoch_log2, &inner,
         )
         .expect("the fixture continuation must prove under WHIR");
         (bundle, Some(decode))
     } else {
-        let bundle =
-            crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
-                .expect("the fixture continuation must prove under WHIR");
+        let bundle = crate::multilinear_continuation::prove_continuation(
+            elf_bytes, input, epoch_log2, &inner,
+        )
+        .expect("the fixture continuation must prove under WHIR");
         (bundle, None)
     };
     // ⛔ THE BASE WALL IS TAKEN HERE, NOT RECOMPUTED BELOW. `t_all` keeps
@@ -10878,8 +10932,9 @@ fn whir_fixture_tree<C: TreeChild>() {
     // every stage's share would read far too small.
     let base_secs = t_all.elapsed().as_secs_f64();
     assert!(
-        bundle.num_epochs() >= 2,
-        "a one-epoch run chains nothing and would make the interior vacuous"
+        epochs.contains(&bundle.num_epochs()),
+        "the fixture block must come to {epochs:?} epochs, and it ran {}",
+        bundle.num_epochs()
     );
     println!(
         "   FIXTURE base (WHIR): {} epochs in {base_secs:.1}s",
@@ -10891,7 +10946,7 @@ fn whir_fixture_tree<C: TreeChild>() {
     // instrument nothing gates.
     whir_base_split_readback(base_secs);
 
-    let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture ELF must load");
+    let elf = executor::elf::Elf::load(elf_bytes).expect("the fixture ELF must load");
     let shape = tree_shape(bundle.num_epochs(), fan_in);
     let top = shape.len();
     println!(
@@ -10910,7 +10965,7 @@ fn whir_fixture_tree<C: TreeChild>() {
     let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
         whir_level_zero::<H, C>(
             &bundle,
-            &elf_bytes,
+            elf_bytes,
             &elf,
             &inner,
             &wrap_opts,
@@ -10930,10 +10985,12 @@ fn whir_fixture_tree<C: TreeChild>() {
     );
     // One wrap per epoch; under a wide level 1, one node per `fan_in` epochs —
     // level 1's own count, since the level-0 stage produced level 1's output.
+    // ⓘ Counted from the epochs, not from `shape[0]`: one epoch has no interior
+    // level at all, and its one wide node is still built.
     if wide {
         assert_eq!(
             children.len(),
-            shape[0].arities.len(),
+            bundle.num_epochs().div_ceil(fan_in),
             "one wide level-1 node per {fan_in} epochs"
         );
     } else {
@@ -10947,7 +11004,7 @@ fn whir_fixture_tree<C: TreeChild>() {
     // ---- the GLOBAL stage, where the production driver runs it: between level
     // 0 and level 1. ⛔ A REFUSAL, NEVER A `return` — see the stage's own doc.
     let global = crate::with_whir_hash!(|H| {
-        prove_whir_global_child::<H, C>(&bundle, &elf_bytes, &inner, &wrap_opts, &ceiling, fan_in)
+        prove_whir_global_child::<H, C>(&bundle, elf_bytes, &inner, &wrap_opts, &ceiling, fan_in)
     })
     .unwrap_or_else(|why| panic!("★ THE FIXTURE WHIR GLOBAL WRAP COULD NOT BE BUILT: {why}"));
     // ⛔ ONE BOOKEND ROOT PER EPOCH, checked against the BUNDLE rather than
@@ -10964,8 +11021,18 @@ fn whir_fixture_tree<C: TreeChild>() {
     // ⛔ THE ROOT OPTION IS A NAMED INPUT HERE TOO, and A is named because it is
     // what the box arm runs (`LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A`).
     // Everything below reads it through `RootOption`'s own accessors rather than
-    // through a level index written out again.
-    let option = super::block_root::RootOption::A;
+    // through a level index written out again. ★ It runs as the production
+    // driver runs it: a wide tree of one node level takes `B`'s shape
+    // (`RootOption::for_tree`).
+    let named = RootOption::A;
+    let option = named.for_tree(top, wide);
+    if option != named {
+        println!(
+            "   FIXTURE ROOT OPTION {named:?} RUNS AS {option:?}: {} epoch(s) make one wide node \
+             at fan-in {fan_in}, and the root takes it",
+            bundle.num_epochs()
+        );
+    }
     let child_level = option.child_level(top);
 
     let interior = compose_interior_levels(
@@ -11007,10 +11074,10 @@ fn whir_fixture_tree<C: TreeChild>() {
     // and fan-in 2 the tree is `[[2, 1], [2]]`: `top` is 2, A's children are
     // level 1's OUTPUT — 2 proofs — and the root takes those plus the global
     // child, three in all.
-    let want = if child_level == 0 {
-        bundle.num_epochs()
-    } else {
-        shape[child_level - 1].arities.len()
+    let want = match child_level {
+        0 if wide => bundle.num_epochs().div_ceil(fan_in),
+        0 => bundle.num_epochs(),
+        level => shape[level - 1].arities.len(),
     };
     assert_eq!(
         children.len(),
@@ -11067,11 +11134,15 @@ fn whir_fixture_tree<C: TreeChild>() {
         first_interior + 1,
         option.describe(),
     );
-    assert!(
-        interior_nodes < tree_node_count(&shape),
-        "option A must leave the top level unproved, or this fixture is not \
-         exercising the root-replaces-top shape at all"
-    );
+    // ⓘ Only where `A` runs over a node level: `B`'s root keeps the top node,
+    // and one epoch has no node level to leave.
+    if option == RootOption::A && top >= 1 {
+        assert!(
+            interior_nodes < tree_node_count(&shape),
+            "option A must leave the top level unproved, or this fixture is not \
+             exercising the root-replaces-top shape at all"
+        );
+    }
 
     // ---- ★★★ THE BLOCK-ARTIFACT ROOT, over `fan_in + 1` children.
     let fold_shape = option.fold_shape(bundle.num_epochs(), fan_in);
@@ -11177,6 +11248,96 @@ fn whir_fixture_tree<C: TreeChild>() {
         inner.blowup_factor,
         inner.fri_number_of_queries,
     );
+}
+
+/// The epoch size the small blocks run at: 2^4 cycles.
+const SPIN_EPOCH_LOG2: u32 = 4;
+
+/// The private input that sizes `test_private_input_spin` to `epochs` epochs at
+/// 2^[`SPIN_EPOCH_LOG2`] cycles: the spin count, then the eight bytes the guest
+/// commits (the host maps them after the input's length word). The guest runs
+/// 13 cycles with no spins and two more per spin, so no spins is one epoch and
+/// `8n − 11` spins land `n` epochs mid-epoch (16n − 9 cycles).
+fn spin_input(epochs: usize) -> Vec<u8> {
+    let spins = if epochs == 1 {
+        0u32
+    } else {
+        8 * u32::try_from(epochs).expect("a small block") - 11
+    };
+    let mut input: Vec<u8> = Vec::with_capacity(12);
+    input.extend_from_slice(&spins.to_le_bytes());
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    input
+}
+
+/// ★ THE SMALL BLOCKS' INPUTS LAND WHERE THE BOX TEST NEEDS THEM: executed, not
+/// proved, the spin guest runs exactly `n` epochs of 2^4 cycles on
+/// [`spin_input`]`(n)` for one to six. A red in
+/// [`the_whir_fixture_tree_proves_every_small_block`] is then a tree's failure,
+/// not an input that missed its epoch count.
+#[test]
+fn the_spin_guest_lands_every_small_epoch_count() {
+    use executor::vm::execution::Executor;
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("test_private_input_spin"))
+            .expect("the spin guest loads");
+    for n in 1..=6 {
+        let epochs = Executor::new(&program, spin_input(n))
+            .expect("the spin guest starts")
+            .run_epochs(1 << SPIN_EPOCH_LOG2)
+            .expect("the spin guest runs");
+        assert_eq!(
+            epochs.len(),
+            n,
+            "spin_input({n}) must run {n} epoch(s) of 2^{SPIN_EPOCH_LOG2} cycles"
+        );
+    }
+}
+
+/// ★★ EVERY SMALL BLOCK COMPOSES: one to six epochs, each proved on the fixture
+/// to a root PROVED AND VERIFIED, at the tree's default arity
+/// (`whir_default_fan_in`: four under the default wide level 1).
+///
+/// ⛔ The shapes at fan-in 4:
+/// - one epoch: one wide node over one epoch, whose fold of one root is that root;
+/// - two to four: one wide node, which the root takes (`RootOption::for_tree`);
+/// - five and six: two wide nodes, and root option A as named.
+///
+/// Before `for_tree` a wide tree failed the root's child count at two to four
+/// epochs. Under `LAMBDA_VM_LFM_PROVER=stark` or `LAMBDA_VM_LFM_WIDE=off` the
+/// same blocks run the wrap tree at fan-in 3.
+///
+/// The guest is `test_private_input_spin`, sized by [`spin_input`] and checked on
+/// the host by [`the_spin_guest_lands_every_small_epoch_count`]. The caveats of
+/// [`the_whir_fixture_tree_composes_to_a_block_artifact`] apply: CPU proves,
+/// `default_test_options`, and `LAMBDA_VM_WHIR_HASH=rpx` in the environment.
+#[test]
+#[ignore = "fixture scale, card-free, six trees: run it with --ignored"]
+fn the_whir_fixture_tree_proves_every_small_block() {
+    match crate::lfm_prover_knob::selected() {
+        crate::lfm_prover_knob::Setting::Stark => whir_small_blocks::<RealChild>(),
+        crate::lfm_prover_knob::Setting::Whir => whir_small_blocks::<WhirTreeChild>(),
+    }
+}
+
+/// [`the_whir_fixture_tree_proves_every_small_block`]'s body, over the tree's
+/// child type.
+fn whir_small_blocks<C: TreeChild>() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_spin");
+    let fan_in =
+        super::per_table_aggregator::whir_default_fan_in(crate::lfm_prover_knob::wide_selected());
+    for n in 1..=6 {
+        println!("\n★★★ SMALL BLOCK: {n} epoch(s) at fan-in {fan_in}");
+        let input = spin_input(n);
+        whir_fixture_tree_on::<C>(&FixtureBlock {
+            elf_bytes: &elf_bytes,
+            input: &input,
+            epoch_log2: SPIN_EPOCH_LOG2,
+            fan_in,
+            epochs: n..=n,
+        });
+    }
+    println!("\n★★★ SMALL BLOCKS: 1..=6 epochs at fan-in {fan_in}, every root PROVED AND VERIFIED");
 }
 
 // =============================================================================
