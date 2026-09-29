@@ -1,11 +1,11 @@
 //! `LFM_CARD_AFTER_PREP`: the W-LFM prove takes the card permit after its host
-//! prep instead of before it (`whir_proof::card_after_prep`).
+//! prep (the default), or before it under `0` (`whir_proof::card_after_prep`).
 //!
 //! Two claims carry the change, and each has its test here:
-//! - **Only the lock moves.** The same programs, proved with the setting off and
-//!   on, in one process, give the same bytes. Proved serially and then three at a
-//!   time with the permit armed, so the prep really does run while another proof
-//!   holds the card.
+//! - **Only the lock moves.** The same programs, proved with the permit before
+//!   and after the prep, in one process, give the same bytes. Proved serially
+//!   and then three at a time with the permit armed, so the prep really does run
+//!   while another proof holds the card.
 //! - **The prep never reaches the device.** Every entry into math-cuda's device
 //!   layer (`device::backend`, which every device entry point calls) is counted
 //!   across `prep_whir_tables`, and none may happen. The paired control counts
@@ -33,12 +33,13 @@ use super::word::LfmWord;
 /// A program to prove: its label, the program, and its arenas.
 type Job = (String, LfmProgram, Vec<Vec<LfmWord>>);
 
+/// Unset and empty are the default, after the prep; `0` is the opt-out.
 #[test]
 fn the_knob_parses_and_a_misspelt_arm_is_refused() {
-    assert!(!parse_card_after_prep(None));
-    assert!(!parse_card_after_prep(Some("")));
-    assert!(!parse_card_after_prep(Some("0")));
+    assert!(parse_card_after_prep(None));
+    assert!(parse_card_after_prep(Some("")));
     assert!(parse_card_after_prep(Some("1")));
+    assert!(!parse_card_after_prep(Some("0")));
     for bad in ["on", "true", "2", "yes"] {
         assert!(
             std::panic::catch_unwind(|| parse_card_after_prep(Some(bad))).is_err(),
@@ -192,8 +193,9 @@ fn prove_pool(jobs: &[Job], builds: &[WhirLfmBuild], opts: &crate::ProofOptions)
         .collect()
 }
 
-/// ★ ONLY THE LOCK MOVES: the same programs, proved with the setting off and on,
-/// serially and three at a time with the permit armed, give the same bytes.
+/// ★ ONLY THE LOCK MOVES: the same programs, proved with the permit before and
+/// after the prep, serially and three at a time with the permit armed, give the
+/// same bytes.
 #[test]
 #[ignore = "fixture traces and the card, under LAMBDA_VM_DETERMINISTIC_GRIND=1: box only"]
 fn the_card_after_prep_moves_no_proof_byte() {
@@ -207,8 +209,9 @@ fn the_card_after_prep_moves_no_proof_byte() {
     let opts = super::proof::aggregation_wrap_options();
     let builds: Vec<WhirLfmBuild> = jobs.iter().map(|j| build(j, &opts)).collect();
 
-    // The control: the default setting, serially, twice. Two proves of one
-    // program must agree, and distinct programs must differ.
+    // The control: the permit before the prep (`LFM_CARD_AFTER_PREP=0`),
+    // serially, twice. Two proves of one program must agree, and distinct
+    // programs must differ.
     let off = Setting::new(false);
     let serial: Vec<Vec<u8>> = jobs
         .iter()
@@ -246,7 +249,8 @@ fn the_card_after_prep_moves_no_proof_byte() {
         );
     }
     println!(
-        "CARD AFTER PREP: {} jobs, serial and pooled ({} proofs), equal to the default's bytes",
+        "CARD AFTER PREP: {} jobs, serial and pooled ({} proofs), equal to the bytes with the \
+         permit before the prep",
         jobs.len(),
         pooled.len()
     );

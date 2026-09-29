@@ -848,8 +848,8 @@ pub(crate) struct WhirPrepped<'a> {
 /// layout, and the prefix check against the prepared stack.
 ///
 /// ⛔ HOST ONLY. It takes no device handle and calls nothing that reaches the
-/// card, which is what lets `LFM_CARD_AFTER_PREP=1` run it outside the card
-/// permit ([`card_after_prep`]). `the_w_lfm_prep_never_reaches_the_card`
+/// card, which is what lets the prove run it outside the card permit
+/// ([`card_after_prep`]). `the_w_lfm_prep_never_reaches_the_card`
 /// (box, cuda) counts every entry into the device layer across it and requires
 /// none; a step that needed the card belongs after the permit, not here.
 pub(crate) fn prep_whir_tables<'a>(
@@ -923,34 +923,37 @@ pub(crate) fn prep_whir_tables<'a>(
     })
 }
 
-/// The environment variable that takes the W-LFM prove's card permit after its
-/// host prep ([`prep_whir_tables`]) instead of before it.
+/// The environment variable that chooses where the W-LFM prove takes its card
+/// permit: after its host prep ([`prep_whir_tables`]), the default, or before
+/// it.
 pub const CARD_AFTER_PREP_ENV: &str = "LFM_CARD_AFTER_PREP";
 
-/// Unset, empty or `0` is today's order: the permit first, then the prep inside
-/// it. `1` takes the permit after the prep.
+/// Unset, empty or `1` takes the permit after the prep, the default. `0` is the
+/// order before it: the permit first, then the prep inside it.
 ///
 /// # Panics
 ///
-/// On any other value: a misspelt arm must not run as the control.
+/// On any other value: a misspelt arm must not run as either setting.
 pub fn parse_card_after_prep(value: Option<&str>) -> bool {
     match value {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") | Some("1") => true,
+        Some("0") => false,
         Some(other) => panic!("{CARD_AFTER_PREP_ENV} must be `0` or `1`, got `{other}`"),
     }
 }
 
 /// ★ WHETHER THE W-LFM PROVE TAKES THE CARD AFTER ITS HOST PREP
-/// (`LFM_CARD_AFTER_PREP`, default off).
+/// (`LFM_CARD_AFTER_PREP`, default on; `0` opts out).
 ///
-/// Today the permit is the prove's first statement, so the card is held — idle,
-/// and closed to every other proof — while the prove builds its tables on the
-/// host: 2.05 s of the pure-WHIR recursion's 9.89 s of W-LFM holds at job 222,
-/// 1.68 s of it at level 1. Taken after the prep, the same host work runs while
-/// another proof uses the card. Only the lock moves, so the proof's bytes are
-/// the same (`card_after_prep_tests`). Read once per process, and named once
-/// on stdout so an arm's log says which order it ran.
+/// Taken before the prep, the permit is the prove's first statement, so the
+/// card is held — idle, and closed to every other proof — while the prove
+/// builds its tables on the host: 2.05 s of the pure-WHIR recursion's 9.89 s of
+/// W-LFM holds at job 222, 1.68 s of it at level 1. Taken after it, the same
+/// host work runs while another proof uses the card: −0.65 s on the block at
+/// fan-in 3 (job 234), and −0.90 s together with fan-in 4 (job 236), where
+/// fan-in 4 alone measured −0.70 s (job 235). Only the lock moves, so the
+/// proof's bytes are the same (`card_after_prep_tests`). Read once per process,
+/// and named once on stdout so an arm's log says which order it ran.
 pub fn card_after_prep() -> bool {
     #[cfg(test)]
     if let Some(on) = test_card_after_prep::get() {
@@ -960,8 +963,8 @@ pub fn card_after_prep() -> bool {
     *ON.get_or_init(|| {
         let on = parse_card_after_prep(std::env::var(CARD_AFTER_PREP_ENV).ok().as_deref());
         println!(
-            "   ★ W-LFM CARD PERMIT: {} ({CARD_AFTER_PREP_ENV}; unset = before the prep, the \
-             default)",
+            "   ★ W-LFM CARD PERMIT: {} ({CARD_AFTER_PREP_ENV}; unset = after the prep, the \
+             default; 0 = before it)",
             if on {
                 "after the host prep"
             } else {
@@ -1008,8 +1011,9 @@ pub(crate) fn prove_traces_whir_opening(
 ) -> Result<MultiProof<F, E>, WhirLfmError> {
     // ⛔ THE CARD: the same exclusive permit the STARK prover holds around
     // `multi_prove`, so a tree driver serializes W-LFM proves exactly as it
-    // serializes today's. Taken HERE by default, before the host prep; under
-    // `LFM_CARD_AFTER_PREP=1` it is taken after it (see [`card_after_prep`]).
+    // serializes the STARK ones. Taken after the host prep by default; under
+    // `LFM_CARD_AFTER_PREP=0` it is taken HERE, before it (see
+    // [`card_after_prep`]).
     let early_card =
         (!card_after_prep()).then(|| super::device_permit::hold_labeled("multi_prove"));
     // The prove's own split, recorded as a `WHIR PROVE SPLIT W-LFM` line under
@@ -1027,8 +1031,8 @@ pub(crate) fn prove_traces_whir_opening(
         settled,
     } = prep_whir_tables(build, &airs, traces, check_prefix)?;
     let prep_secs = t_wall.elapsed().as_secs_f64();
-    // ★ Under `LFM_CARD_AFTER_PREP=1` the card is taken only now: everything
-    // above is host work, and from here on every step reaches the device.
+    // ★ By default the card is taken only now: everything above is host work,
+    // and from here on every step reaches the device.
     let _card = early_card.unwrap_or_else(|| super::device_permit::hold_labeled("multi_prove"));
     let t_held = Instant::now();
 
