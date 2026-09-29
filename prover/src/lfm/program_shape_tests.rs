@@ -1,11 +1,12 @@
 //! Recursion-program shape: `BITWISE` only in the programs whose instantiated
-//! chips send it a lookup ([`ChipSet::bitwise`]), and `LFM_HASH` split into two
+//! chips send it a lookup ([`ChipSet::bitwise`]), `LFM_HASH` split into two
 //! power-of-two instances where one table would be mostly padding
-//! ([`HashChunking`]).
+//! ([`HashChunking`]), and the STARK wrap's `program_id` attested host-side
+//! ([`emit_host_attestation`]) rather than folded in-guest.
 //!
-//! The premise tests read interaction lists, split rules and digests and prove
-//! nothing; the tests that prove (`*_proves_*`, `*_refused`, `an_emitted_leg_*`)
-//! belong on the box.
+//! The premise tests read interaction lists, split rules and digests, or execute
+//! small standalone programs, and prove nothing; the tests that prove
+//! (`*_proves_*`, `*_refused`, `an_emitted_leg_*`) belong on the box.
 
 use stark::proof::options::ProofOptions;
 use stark::proof::view::MultiProofView;
@@ -20,12 +21,22 @@ use super::airs::{
     keep_bitwise, keep_bitwise_setting, lfm_chip_census_masked,
 };
 use super::chunking::HashChunking;
+use super::compiler::{LfmProgram, compile};
+use super::edsl::WrapHash;
+use super::executor::execute;
 use super::hash::HasherKind;
-use super::programs::{keccak_chain_program, trivial_program};
+use super::keccak_host::pack_stream;
+use super::programs::{
+    AttestedCells, AttestedInputs, ProgramIdShape, STARK_WRAP_FOLD_ENV, emit_host_attestation,
+    keccak_chain_program, program_id_program, program_id_words, stark_wrap_fold_setting,
+    stark_wrap_folds_in_guest, trivial_program, with_stark_wrap_fold,
+};
 use super::proof::{lfm_prove, lfm_prove_with_hasher, verify_against, verify_against_artifacts};
+use super::proof_arena::commitments_to_arena_for;
 use super::registry::{LfmArtifacts, build_artifacts, build_artifacts_with_hasher};
 use super::statement::{lfm_program_id, lfm_program_id_chunked};
-use super::word::LfmWord;
+use super::word::{LfmWord, base_word};
+use crate::hash_pin::BLOCK_HASHER;
 
 const HASHERS: [HasherKind; 5] = [
     HasherKind::Test,
@@ -710,5 +721,303 @@ fn an_emitted_leg_verifies_a_split_child_without_bitwise() {
     assert!(
         super::executor::execute(&leg_program(&forged), &words, &hasher).is_err(),
         "a leg bound to the wrong chunk root must reject the proof"
+    );
+}
+
+// ================ the STARK wrap's attestation, host-side ==================
+//
+// `programs::emit_host_attestation` over a standalone program whose arenas hold
+// the cells a wrap's verification reads, at a wrap hash's root width; the fold
+// it stands in for is `programs::program_id_program`. The real epoch's wrap is
+// `epoch_tests`' (box).
+
+/// Inputs with `num_pages` pages. Every 8-byte chunk of the DECODE root stays
+/// below `2^63`, so on the algebraic arm its four felts are canonical.
+fn attestation_inputs(num_pages: usize) -> AttestedInputs {
+    AttestedInputs {
+        elf_digest: core::array::from_fn(|i| (i * 7 + 3) as u8),
+        pc_start: 0x0000_0001_0000_0f00,
+        decode: core::array::from_fn(|i| (i as u8).wrapping_mul(37) & 0x7f),
+        pages: (0..num_pages)
+            .map(|k| {
+                (
+                    0x1000 * (k as u64 + 1),
+                    core::array::from_fn(|i| (i as u8) ^ (31 * k as u8 + 1)),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The standalone host attestation: one arena per attested input, read the way
+/// the wrap reads it at `hash`'s root width, bound to `constants`.
+fn host_attestation_program(constants: &AttestedInputs, hash: WrapHash) -> LfmProgram {
+    use super::builder::{Felt, LfmBuilder};
+    use super::epoch::RootCells;
+
+    let mut b = LfmBuilder::new().with_wrap_hash(hash);
+    let a_elf = b.declare_arena(8);
+    let a_pc = b.declare_arena(2);
+    let a_decode = b.declare_arena(RootCells::words_per_root(&b));
+    let a_pages =
+        (!constants.pages.is_empty()).then(|| b.declare_arena(10 * constants.pages.len() as u32));
+    let elf_digest: Vec<Felt> = (0..8).map(|i| b.hint_felt(a_elf, i)).collect();
+    let pc_start: Vec<Felt> = (0..2).map(|i| b.hint_felt(a_pc, i)).collect();
+    let decode = RootCells::hint(&mut b, a_decode, 0);
+    let pages: Vec<(Vec<Felt>, Vec<Felt>)> = (0..constants.pages.len())
+        .map(|k| {
+            let base = 10 * k as u32;
+            let arena = a_pages.expect("a page arena exists when pages do");
+            (
+                (0..2).map(|j| b.hint_felt(arena, base + j)).collect(),
+                (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect(),
+            )
+        })
+        .collect();
+    emit_host_attestation(
+        &mut b,
+        constants,
+        &AttestedCells {
+            elf_digest: &elf_digest,
+            pc_start: &pc_start,
+            decode: &decode,
+            pages: &pages,
+        },
+    );
+    compile(b.finish())
+}
+
+/// The arenas [`host_attestation_program`] reads, holding `values`.
+fn host_attestation_arenas(values: &AttestedInputs, hash: WrapHash) -> Vec<Vec<LfmWord>> {
+    let halves =
+        |bytes: &[u8]| -> Vec<LfmWord> { pack_stream(bytes).into_iter().map(base_word).collect() };
+    let mut out = vec![
+        halves(&values.elf_digest),
+        halves(&values.pc_start.to_le_bytes()),
+        commitments_to_arena_for(&[values.decode], hash),
+    ];
+    if !values.pages.is_empty() {
+        out.push(
+            values
+                .pages
+                .iter()
+                .flat_map(|(base, root)| {
+                    let mut page = halves(&base.to_le_bytes());
+                    page.extend(halves(root));
+                    page
+                })
+                .collect(),
+        );
+    }
+    out
+}
+
+/// The fold's one arena (`program_id_program_source`), holding `values`.
+fn fold_arena(values: &AttestedInputs) -> Vec<LfmWord> {
+    let mut halves = pack_stream(&values.elf_digest);
+    halves.extend(pack_stream(&values.pc_start.to_le_bytes()));
+    halves.extend(pack_stream(&values.decode));
+    for (base, root) in &values.pages {
+        halves.extend(pack_stream(&base.to_le_bytes()));
+        halves.extend(pack_stream(root));
+    }
+    halves.into_iter().map(base_word).collect()
+}
+
+/// Both root widths: the production wrap hash's and the byte hash's.
+const WRAP_HASHES: [WrapHash; 2] = [WrapHash::production(), WrapHash::Keccak];
+
+/// The default is the host attestation; `1` folds; anything else stops the run.
+#[test]
+fn the_stark_wrap_attestation_defaults_to_the_host_and_the_opt_out_folds() {
+    assert_eq!(STARK_WRAP_FOLD_ENV, "LAMBDA_VM_STARK_WRAP_FOLD");
+    assert!(
+        !stark_wrap_fold_setting(None),
+        "unset: the host attestation"
+    );
+    assert!(!stark_wrap_fold_setting(Some("")), "empty is unset");
+    assert!(!stark_wrap_fold_setting(Some("0")));
+    assert!(stark_wrap_fold_setting(Some("1")), "the opt-out folds");
+}
+
+#[test]
+#[should_panic(expected = "must be 0 or 1")]
+fn a_malformed_stark_wrap_attestation_setting_stops_the_run() {
+    let _ = stark_wrap_fold_setting(Some("fold"));
+}
+
+/// The thread override is scoped: in force inside, restored after — nested, and
+/// on unwind.
+#[test]
+fn the_stark_wrap_attestation_override_is_scoped() {
+    let outside = stark_wrap_folds_in_guest();
+    assert!(with_stark_wrap_fold(true, stark_wrap_folds_in_guest));
+    assert!(!with_stark_wrap_fold(false, stark_wrap_folds_in_guest));
+    assert!(with_stark_wrap_fold(true, || {
+        let inner = with_stark_wrap_fold(false, stark_wrap_folds_in_guest);
+        !inner && stark_wrap_folds_in_guest()
+    }));
+    let unwound = std::panic::catch_unwind(|| with_stark_wrap_fold(!outside, || panic!("unwind")));
+    assert!(unwound.is_err());
+    assert_eq!(stark_wrap_folds_in_guest(), outside);
+}
+
+/// ★ The host attestation publishes the fold's words: the standalone fold,
+/// EXECUTED over inputs with no pages and with two, publishes
+/// `program_id_words` of the host's id — and the standalone host attestation
+/// publishes those same words at either root width.
+#[test]
+fn the_host_attestation_publishes_the_folds_words() {
+    for num_pages in [0usize, 2] {
+        let inputs = attestation_inputs(num_pages);
+        let fold = program_id_program(ProgramIdShape { num_pages });
+        let fold_words = execute(&fold, &[fold_arena(&inputs)], &BLOCK_HASHER)
+            .expect("the fold executes")
+            .public_words;
+        let values: Vec<LfmWord> = fold_words.iter().map(|(_, w)| *w).collect();
+        assert_eq!(
+            values,
+            program_id_words(&inputs.program_id()),
+            "{num_pages} pages: the fold publishes the host id's two words"
+        );
+        for hash in WRAP_HASHES {
+            let host = host_attestation_program(&inputs, hash);
+            let words = execute(
+                &host,
+                &host_attestation_arenas(&inputs, hash),
+                &BLOCK_HASHER,
+            )
+            .expect("the host attestation executes on honest cells")
+            .public_words;
+            assert_eq!(
+                words, fold_words,
+                "{num_pages} pages, {hash:?}: the host attestation publishes the fold's words"
+            );
+        }
+    }
+}
+
+/// ★ A forged constant, one per field — the ELF digest, `pc_start`, the DECODE
+/// root, a page base, a page root — has no execution on honest cells. Nothing
+/// else in this program reads a constant, so each case is refused by its own
+/// field's asserts alone.
+#[test]
+fn a_forged_attested_constant_has_no_execution() {
+    let honest = attestation_inputs(2);
+    let mut elf_digest = honest.clone();
+    elf_digest.elf_digest[31] ^= 0x01;
+    let mut pc_start = honest.clone();
+    pc_start.pc_start += 1 << 40;
+    let mut decode = honest.clone();
+    decode.decode[8] ^= 0x01;
+    let mut page_base = honest.clone();
+    page_base.pages[1].0 += 0x1000;
+    let mut page_root = honest.clone();
+    page_root.pages[0].1[5] ^= 0x40;
+    let forgeries = [
+        ("the ELF digest", elf_digest),
+        ("pc_start", pc_start),
+        ("the DECODE root", decode),
+        ("a page base", page_base),
+        ("a page root", page_root),
+    ];
+    for hash in WRAP_HASHES {
+        let arenas = host_attestation_arenas(&honest, hash);
+        assert!(
+            execute(
+                &host_attestation_program(&honest, hash),
+                &arenas,
+                &BLOCK_HASHER
+            )
+            .is_ok(),
+            "{hash:?}: the honest constants execute"
+        );
+        for (what, forged) in &forgeries {
+            assert_ne!(*forged, honest, "{what}: the forgery must move a constant");
+            assert!(
+                execute(
+                    &host_attestation_program(forged, hash),
+                    &arenas,
+                    &BLOCK_HASHER
+                )
+                .is_err(),
+                "{hash:?}, {what}: a forged constant must have no execution on honest cells"
+            );
+        }
+    }
+}
+
+/// ★ An arena cell that differs from its constant has no execution: every
+/// word of the ELF digest, `pc_start` and page arenas, and every lane of every
+/// DECODE root word, moved one at a time.
+#[test]
+fn an_attested_cell_that_differs_from_its_constant_has_no_execution() {
+    const DECODE_ARENA: usize = 2;
+    let inputs = attestation_inputs(2);
+    for hash in WRAP_HASHES {
+        let program = host_attestation_program(&inputs, hash);
+        let arenas = host_attestation_arenas(&inputs, hash);
+        assert!(execute(&program, &arenas, &BLOCK_HASHER).is_ok());
+        let mut moved = 0;
+        for (a, arena) in arenas.iter().enumerate() {
+            let lanes = if a == DECODE_ARENA { 4 } else { 1 };
+            for w in 0..arena.len() {
+                for lane in 0..lanes {
+                    let mut tampered = arenas.clone();
+                    tampered[a][w][lane] += FE::from(1u64);
+                    assert!(
+                        execute(&program, &tampered, &BLOCK_HASHER).is_err(),
+                        "{hash:?}: arena {a} word {w} lane {lane} differs from its constant \
+                         and must have no execution"
+                    );
+                    moved += 1;
+                }
+            }
+        }
+        let decode_lanes = 4 * commitments_to_arena_for(&[inputs.decode], hash).len();
+        assert_eq!(
+            moved,
+            8 + 2 + decode_lanes + 10 * inputs.pages.len(),
+            "{hash:?}: every attested cell was moved once"
+        );
+    }
+}
+
+/// ★ The host attestation leaves no `BITWISE` sender without its receiver.
+///
+/// It emits no keccak, so under every hasher its mask instantiates no hash
+/// family, and it keeps `BITWISE` exactly when an instantiated chip sends it a
+/// lookup — only the `LFM_HASH` socket under BLAKE3. The fold's keccak keeps the
+/// family and its `BITWISE` receiver under every hasher.
+#[test]
+fn the_host_attestation_leaves_no_bitwise_sender_without_its_receiver() {
+    let host = host_attestation_program(&attestation_inputs(0), WrapHash::production());
+    let fold = program_id_program(ProgramIdShape { num_pages: 0 });
+    for hasher in HASHERS {
+        let mask = ChipSet::for_program_under(&host, hasher, true);
+        assert!(
+            !mask.keccak && !mask.blake3,
+            "{hasher:?}: no hash family, {mask:?}"
+        );
+        assert_eq!(
+            mask.bitwise,
+            mask.bitwise_required(hasher),
+            "{hasher:?}: BITWISE is kept exactly when a chip sends to it"
+        );
+        assert_eq!(
+            mask.bitwise,
+            hasher == HasherKind::Blake3,
+            "{hasher:?}: only the BLAKE3 socket sends BITWISE a lookup here"
+        );
+        let fold_mask = ChipSet::for_program_under(&fold, hasher, true);
+        assert!(
+            fold_mask.keccak && fold_mask.bitwise && fold_mask.bitwise_required(hasher),
+            "{hasher:?}: the fold keeps the keccak family and BITWISE, {fold_mask:?}"
+        );
+    }
+    let mask = ChipSet::for_program_under(&host, BLOCK_HASHER, true);
+    assert!(
+        !mask.bitwise,
+        "under the block hasher the host-attested program carries no BITWISE"
     );
 }

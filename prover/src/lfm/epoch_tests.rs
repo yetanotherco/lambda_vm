@@ -606,9 +606,12 @@ fn a_nonce_that_did_not_grind_is_rejected() {
 ///   in-machine. Interning it would pin one LFM program per register file;
 ///   hinting it would leave the boundary — the carried commit index among it — a
 ///   free arena word (ledger entry 2).
-/// - the inner ELF ⇒ [`Self::ElfDependent`], an arena cell bound one level up by
-///   the attestation's `program_id` fold. Interning it would make LFM program
-///   identity a function of the guest ELF, which is an always-stop item.
+/// - the inner ELF ⇒ [`Self::ElfDependent`], an arena cell — the cell Phase A
+///   absorbs and the DECODE leg compares — bound by the wrap's attestation
+///   ([`Attestation`]): asserted equal to the root recomputed from the ELF the
+///   verifier trusts (the default, which makes the wrap an ELF-specific
+///   program), or folded into the published `program_id` for a consumer's
+///   recompute to check (`LAMBDA_VM_STARK_WRAP_FOLD=1`, ELF-agnostic wraps).
 ///
 /// [`prep_source`] decides the variant by MATCHING the AIR's own commitment
 /// against production's candidate functions, so an epoch that grew a preprocessed
@@ -714,16 +717,16 @@ pub(super) struct RealEpoch {
     reg_fini: Vec<u32>,
     /// The inner ELF's entry point — `program_id`'s `pc_start`.
     pc_start: u64,
-    /// The ELF-data page genesis roots the attestation folds. EMPTY for a
+    /// The ELF-data page genesis roots the attestation covers. EMPTY for a
     /// continuation epoch's own verification: continuation epochs carry no PAGE
     /// sub-proof at all (`continuation.rs:695-702`), so these belong to the
-    /// GLOBAL proof and reach the fold from outside.
+    /// GLOBAL proof and reach the attestation from outside.
     page_commitments: Vec<(u64, Commitment)>,
     /// The inner proof's LDE domain, for the REGISTER derivation. Both fields are
     /// proof OPTIONS, hence program shape.
     reg_shape: super::programs::RegisterDerivationShape,
     /// `recursion::program_id_from_digest` over this epoch's own inputs — the
-    /// oracle for the attestation fold.
+    /// oracle for the attestation id, in either posture.
     pub(super) expected_program_id: [u8; 32],
     /// Per table, everything the fork absorbs plus the oracle challenges.
     pub(super) tables: Vec<HostTable>,
@@ -743,14 +746,84 @@ pub(super) struct RealEpoch {
 }
 
 impl RealEpoch {
-    /// Pages this epoch touched. The attestation fold already emitted in every
-    /// wrap hashes `TAG + 32 + 8 + 32 + 8 + 40 * num_pages` bytes, so this count
-    /// is linear in the fold's cost — and it is the main cost driver of the
-    /// block-artifact root, which does not exist yet. Exposed so a production run
-    /// can report it for free rather than a later lane guessing at it.
+    /// Pages this epoch touched. The attestation fold hashes
+    /// `TAG + 32 + 8 + 32 + 8 + 40 * num_pages` bytes (the host attestation
+    /// asserts ten halves a page), so this count is linear in the attestation's
+    /// cost — and it is the main cost driver of the block-artifact root, which
+    /// does not exist yet. Exposed so a production run can report it for free
+    /// rather than a later lane guessing at it.
     pub(super) fn num_pages(&self) -> usize {
         self.page_commitments.len()
     }
+}
+
+/// How a STARK wrap attests its `program_id`.
+///
+/// Both postures publish the same two words (`programs::program_id_words` of
+/// `recursion::program_id_from_digest` over the epoch's inputs) right after
+/// Phase A, so nodes, the root and a consumer read the same id either way. They
+/// differ in what binds the inputs the id covers.
+pub(super) enum Attestation {
+    /// The id folded in-guest ([`super::programs::emit_program_id`]) over the
+    /// cells the verification read; a consumer's recompute from a trusted ELF
+    /// is what rejects a substituted input. One keccak permutation, which keeps
+    /// the keccak family and `BITWISE` in every wrap. ELF-agnostic wraps:
+    /// [`super::programs::STARK_WRAP_FOLD_ENV`]`=1`.
+    Fold,
+    /// The id computed at emission over these inputs and each input bound by an
+    /// equality assert on the cell the verification read
+    /// ([`super::programs::emit_host_attestation`]): the default. The wrap is a
+    /// function of the ELF.
+    Host(super::programs::AttestedInputs),
+}
+
+impl Attestation {
+    /// The posture this thread emits ([`super::programs::stark_wrap_folds_in_guest`]),
+    /// over `e`'s own inputs.
+    fn for_epoch(e: &RealEpoch) -> Self {
+        if super::programs::stark_wrap_folds_in_guest() {
+            Self::Fold
+        } else {
+            Self::Host(attested_inputs(e))
+        }
+    }
+}
+
+/// The values `e`'s wrap attests, each derived from the ELF the harness trusts
+/// and none read off the proof:
+///
+/// - the ELF digest is `statement::elf_digest` of the ELF's bytes;
+/// - `pc_start` is the ELF's entry point;
+/// - the DECODE root is the one [`prep_source`] matched against the ELF's
+///   instructions committed at the table's layout — the root production's
+///   verifier takes from the AIR — so it is the ELF's value or the harvest
+///   panicked;
+/// - the page roots are none: a continuation epoch carries no PAGE sub-proof.
+///
+/// ⛔ Asserted equal to the harness oracle `expected_program_id`, which
+/// [`harvest_real_epoch`] folds from the same sources: the published id is the
+/// one a consumer recomputes, or nothing is emitted.
+pub(super) fn attested_inputs(e: &RealEpoch) -> super::programs::AttestedInputs {
+    let decode = e
+        .phase_a
+        .iter()
+        .find_map(|(p, _)| match p {
+            Some(PrepSource::ElfDependent(c)) => Some(*c),
+            _ => None,
+        })
+        .expect("a continuation epoch has one ELF-dependent root, DECODE's");
+    let inputs = super::programs::AttestedInputs {
+        elf_digest: e.elf_digest,
+        pc_start: e.pc_start,
+        decode,
+        pages: e.page_commitments.clone(),
+    };
+    assert_eq!(
+        inputs.program_id(),
+        e.expected_program_id,
+        "the attested inputs must fold to the oracle's id"
+    );
+    inputs
 }
 
 pub(super) fn real_epoch() -> RealEpoch {
@@ -900,7 +973,7 @@ pub(super) struct EpochFront {
     pub(super) runtime_page_ranges: Vec<crate::RuntimePageRange>,
     /// `epoch_label(0)`.
     pub(super) label: u64,
-    /// The attestation fold's DECODE input, from PRODUCTION's own function —
+    /// The attestation's DECODE input, from PRODUCTION's own function —
     /// the same value `VmAirs::new` puts on the DECODE AIR, and the same one
     /// `recursion::check_attestation` recomputes from a trusted ELF.
     pub(super) decode_root: Commitment,
@@ -1187,7 +1260,7 @@ fn harvest_real_epoch(
     let mut phase_a = Vec::new();
     // S2: the REGISTER table's leaf layout (the in-circuit register commitment
     // is emitted at its `rows_per_leaf`) and the DECODE root Phase A absorbs
-    // (the attestation folds that very root) — both at the table's resolved
+    // (the attestation covers that very root) — both at the table's resolved
     // layout, which is today's row pair at the default format.
     let mut register_layout = stark::leaf_layout::LeafLayout::RowPair;
     let mut absorbed_decode_root = decode_root;
@@ -1295,7 +1368,7 @@ fn harvest_real_epoch(
         // fixture: `prove_epoch` REJECTS an epoch with any PAGE config
         // ("continuation epoch must have no PAGE configs (L2G bookend replaces
         // PAGE)", `continuation.rs:695-702`) and both `build_epoch_airs` call
-        // sites pass `&[]`. The ELF-data page genesis roots the attestation folds
+        // sites pass `&[]`. The ELF-data page genesis roots the attestation covers
         // are the GLOBAL proof's GlobalMemory AIRs' preprocessed commitments
         // (`continuation.rs:997-1010`), never an epoch's.
         page_commitments: Vec::new(),
@@ -1305,7 +1378,7 @@ fn harvest_real_epoch(
             // The REGISTER table's own leaf layout: 2 at the default format.
             rows_per_leaf: register_layout.rows_per_leaf(),
         },
-        // The attestation folds the DECODE root Phase A absorbed — the
+        // The attestation covers the DECODE root Phase A absorbed — the
         // row-pair `decode_root` at the default format (asserted below), the
         // DECODE table's one-row root when S2 resolves it to one row (the
         // attestation id moves with the knob).
@@ -1875,7 +1948,7 @@ pub(super) fn epoch_program_publishing(
 /// The epoch program, optionally with the DECODE cell SPLIT — a deliberately
 /// broken control, and the falsification the entry-7 ruling asked for.
 ///
-/// `split_decode = true` gives the attestation fold its own arena copy of the
+/// `split_decode = true` gives the attestation its own arena copy of the
 /// DECODE root instead of the cell Phase A absorbed. Nothing about the program
 /// then looks wrong: every assert still passes, the challenges are still
 /// production's, and an honest host that fills both copies with the same 32 bytes
@@ -1886,11 +1959,31 @@ pub(super) fn epoch_program_publishing(
 /// [`the_assembled_verifier_declares_exactly_the_shape_words`] is what refuses it.
 ///
 /// The extra arena is declared LAST so no existing arena index moves.
+///
+/// The wrap attests in the posture this thread emits ([`Attestation::for_epoch`]).
 fn epoch_program_with(
     e: &RealEpoch,
     with_legs: bool,
     split_decode: bool,
     publishes: Publishes,
+) -> LfmProgram {
+    epoch_program_attesting(
+        e,
+        with_legs,
+        split_decode,
+        publishes,
+        &Attestation::for_epoch(e),
+    )
+}
+
+/// [`epoch_program_with`] with the attestation named — how a test emits the
+/// wrap under a FORGED constant, which the honest path never builds.
+pub(super) fn epoch_program_attesting(
+    e: &RealEpoch,
+    with_legs: bool,
+    split_decode: bool,
+    publishes: Publishes,
+    attestation: &Attestation,
 ) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
@@ -1920,10 +2013,11 @@ fn epoch_program_with(
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
     let a_reg_init = b.declare_arena(num_reg);
     let a_reg_fini = b.declare_arena(num_reg);
-    // The attestation fold's own inputs. `elf_digest` is NOT here — it is the
+    // The attestation's own inputs. `elf_digest` is NOT here — it is the
     // statement's, which is the join. `pc_start` has one consumer in an epoch
     // verifier, and the page roots have none at all (a continuation epoch carries
-    // no PAGE sub-proof), so both are plain proof data the fold hashes.
+    // no PAGE sub-proof), so both are plain proof data the attestation covers:
+    // folded, or asserted against the ELF's values.
     let a_pc_start = b.declare_arena(2);
     let a_page_roots = (!e.page_commitments.is_empty())
         .then(|| b.declare_arena(10 * e.page_commitments.len() as u32));
@@ -2017,12 +2111,12 @@ fn epoch_program_with(
                 next_arena_prep += 1;
                 // Every ELF-dependent root of a continuation EPOCH is DECODE (the
                 // page family lives in the global proof), and the attestation
-                // folds exactly one DECODE root — so a second one here would mean
-                // the fold's input is ambiguous, not that the fold needs a loop.
+                // covers exactly one DECODE root — so a second one here would
+                // mean its input is ambiguous, not that it needs a loop.
                 assert!(
                     decode_cells.is_none(),
                     "a continuation epoch has one ELF-dependent preprocessed root \
-                     (DECODE); a second one has no place in the program_id fold"
+                     (DECODE); a second one has no place in the attestation"
                 );
                 decode_cells = Some(cells.clone());
                 Some(cells)
@@ -2091,55 +2185,94 @@ fn epoch_program_with(
     b.public(z.as_cell());
     b.public(alpha.as_cell());
 
-    // ---- ★ the attestation join: the DECODE cell Phase A absorbed, folded
+    // ---- ★ the attestation join: the DECODE cell Phase A absorbed, attested
     //
     // One cell, two consumers. Without this the DECODE root would be a free arena
     // word — the machine would absorb whatever the prover offered and publish
-    // nothing that depended on it.
+    // nothing that depended on it. The host attestation asserts it (with the ELF
+    // digest halves, `pc_start` and the page roots) equal to the ELF's value; the
+    // fold hashes it into the published id for a consumer to recompute.
     {
         let pc_start: Vec<_> = (0..2).map(|i| b.hint_felt(a_pc_start, i)).collect();
-        let page_cells: Vec<(Vec<_>, RootCells)> = e
-            .page_commitments
-            .iter()
-            .enumerate()
-            .map(|(k, _)| {
-                let base = 10 * k as u32;
-                let arena = a_page_roots.expect("a page arena exists when pages do");
-                let base_halves: Vec<_> = (0..2).map(|j| b.hint_felt(arena, base + j)).collect();
-                let root_halves: Vec<_> =
-                    (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect();
-                (base_halves, RootCells::from_halves(&mut b, &root_halves))
-            })
-            .collect();
-        let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
-            .iter()
-            .map(|(base, root)| (base.clone(), root.byte_halves(&mut b)))
-            .collect();
-        let page_refs: Vec<(&[_], &[_])> = page_halves
-            .iter()
-            .map(|(base, root)| (&base[..], &root[..]))
-            .collect();
-        let decode = match a_split_decode {
-            // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
-            // root. The fold now attests to a value Phase A never absorbed.
-            Some(arena) => RootCells::hint(&mut b, arena, 0).byte_halves(&mut b),
-            None => decode_cells
-                .as_ref()
-                .expect("a continuation epoch has a DECODE sub-proof")
-                .byte_halves(&mut b),
-        };
-        let id = super::programs::emit_program_id(
-            &mut b,
-            super::programs::ProgramIdShape {
-                num_pages: e.page_commitments.len(),
-            },
-            elf_digest,
-            &pc_start,
-            &decode,
-            &page_refs,
-        );
-        b.public(id[0]);
-        b.public(id[1]);
+        match attestation {
+            Attestation::Host(inputs) => {
+                let pages: Vec<(Vec<_>, Vec<_>)> = (0..e.page_commitments.len())
+                    .map(|k| {
+                        let base = 10 * k as u32;
+                        let arena = a_page_roots.expect("a page arena exists when pages do");
+                        let base_halves = (0..2).map(|j| b.hint_felt(arena, base + j)).collect();
+                        let root_halves =
+                            (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect();
+                        (base_halves, root_halves)
+                    })
+                    .collect();
+                let decode = match a_split_decode {
+                    // ★ THE BROKEN CONTROL: a second, independent reading of the
+                    // DECODE root. The assert now binds a copy, and the cell Phase
+                    // A absorbed is bound by nothing.
+                    Some(arena) => RootCells::hint(&mut b, arena, 0),
+                    None => decode_cells
+                        .clone()
+                        .expect("a continuation epoch has a DECODE sub-proof"),
+                };
+                super::programs::emit_host_attestation(
+                    &mut b,
+                    inputs,
+                    &super::programs::AttestedCells {
+                        elf_digest,
+                        pc_start: &pc_start,
+                        decode: &decode,
+                        pages: &pages,
+                    },
+                );
+            }
+            Attestation::Fold => {
+                let page_cells: Vec<(Vec<_>, RootCells)> = e
+                    .page_commitments
+                    .iter()
+                    .enumerate()
+                    .map(|(k, _)| {
+                        let base = 10 * k as u32;
+                        let arena = a_page_roots.expect("a page arena exists when pages do");
+                        let base_halves: Vec<_> =
+                            (0..2).map(|j| b.hint_felt(arena, base + j)).collect();
+                        let root_halves: Vec<_> =
+                            (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect();
+                        (base_halves, RootCells::from_halves(&mut b, &root_halves))
+                    })
+                    .collect();
+                let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
+                    .iter()
+                    .map(|(base, root)| (base.clone(), root.byte_halves(&mut b)))
+                    .collect();
+                let page_refs: Vec<(&[_], &[_])> = page_halves
+                    .iter()
+                    .map(|(base, root)| (&base[..], &root[..]))
+                    .collect();
+                let decode = match a_split_decode {
+                    // ★ THE BROKEN CONTROL: a second, independent reading of the
+                    // DECODE root. The fold now attests to a value Phase A never
+                    // absorbed.
+                    Some(arena) => RootCells::hint(&mut b, arena, 0).byte_halves(&mut b),
+                    None => decode_cells
+                        .as_ref()
+                        .expect("a continuation epoch has a DECODE sub-proof")
+                        .byte_halves(&mut b),
+                };
+                let id = super::programs::emit_program_id(
+                    &mut b,
+                    super::programs::ProgramIdShape {
+                        num_pages: e.page_commitments.len(),
+                    },
+                    elf_digest,
+                    &pc_start,
+                    &decode,
+                    &page_refs,
+                );
+                b.public(id[0]);
+                b.public(id[1]);
+            }
+        }
     }
 
     // ---- ★ THE BLOCK-BINDING SCHEMA, published right after the attestation id
@@ -2478,12 +2611,15 @@ fn the_epoch_challenge_spine_matches_production() {
     assert_eq!(pub_ext(0), e.z_alpha.0, "the shared LogUp challenge z");
     assert_eq!(pub_ext(1), e.z_alpha.1, "the shared LogUp challenge alpha");
 
-    // ★ The attestation fold, published right after Phase A. Its DECODE input is
-    // the very cell Phase A absorbed, so this differential is simultaneously a
-    // check of the fold and of the join: had the fold read a second copy, this
-    // would still pass — which is why the split is denied STRUCTURALLY by
-    // `the_assembled_verifier_declares_exactly_the_shape_words` and demonstrated
-    // by `a_split_decode_cell_forges_the_attestation`.
+    // ★ The attestation id, published right after Phase A. In this thread's
+    // posture — the host attestation by default — it is a program constant, and
+    // what is checked here is that the constant is production's id; the fold's
+    // in-machine computation of the same words is differentialled by
+    // `the_host_attestation_binds_what_the_fold_attested`. Either way the DECODE
+    // input is the very cell Phase A absorbed: had the attestation read a second
+    // copy, this would still pass — which is why the split is denied
+    // STRUCTURALLY by `the_assembled_verifier_declares_exactly_the_shape_words`
+    // and demonstrated by `a_split_decode_cell_forges_the_attestation`.
     assert_eq!(
         published_digest(&exec.public_words, 2),
         e.expected_program_id,
@@ -2700,7 +2836,7 @@ fn expected_arena_words(e: &RealEpoch, with_legs: bool) -> usize {
     // ★ One root's width per ELF-DEPENDENT preprocessed root and NOT ONE MORE.
     // The options-only roots are program text and the REGISTER root is derived,
     // so a program that hinted any of them — or that kept a second copy of
-    // DECODE for the attestation fold — declares more words than this.
+    // DECODE for the attestation — declares more words than this.
     total += dw
         * e.phase_a
             .iter()
@@ -2741,7 +2877,9 @@ fn expected_arena_words(e: &RealEpoch, with_legs: bool) -> usize {
 /// Together the two guards are complete for this class: a second copy must either
 /// re-read an existing word (hinted-once fails) or add one (this fails). A fold
 /// that instead read some OTHER existing value would publish a `program_id` that is
-/// not production's, which the spine differential catches.
+/// not production's, which the spine differential catches; a host attestation that
+/// asserted some other existing value equal to the DECODE root would not execute
+/// on an honest epoch. The guard reads the schema, so it holds in both postures.
 #[test]
 fn the_assembled_verifier_declares_exactly_the_shape_words() {
     let e = real_epoch();
@@ -2783,10 +2921,21 @@ fn the_assembled_verifier_declares_exactly_the_shape_words() {
 /// the fold's input changes what Phase A absorbed, which moves every challenge and
 /// the run dies. Both halves are asserted, because "the joined program rejects it"
 /// alone would be satisfied by a program that rejects everything.
+///
+/// The FOLD's hazard, so both programs fold (`LAMBDA_VM_STARK_WRAP_FOLD`'s
+/// posture). Under the host attestation the split copy is what the assert binds,
+/// and the unbound cell is Phase A's; the schema guard above denies that split in
+/// both postures.
 #[test]
 fn a_split_decode_cell_forges_the_attestation() {
     let e = real_epoch();
     let honest = epoch_arena_words(&e, false);
+    let (split, joined) = super::programs::with_stark_wrap_fold(true, || {
+        (
+            epoch_program_with(&e, false, true, Publishes::Diagnostic),
+            epoch_program(&e, false),
+        )
+    });
 
     // A DECODE root for some other program. Any 32 bytes the honest arena does not
     // carry will do; what matters is the id it produces.
@@ -2809,7 +2958,6 @@ fn a_split_decode_cell_forges_the_attestation() {
     );
 
     // ---- (a) the SPLIT program: the forgery runs and publishes the forged id.
-    let split = epoch_program_with(&e, false, true, Publishes::Diagnostic);
     let mut split_arenas = honest.clone();
     split_arenas.push(super::proof_arena::commitments_to_arena(&[substituted]));
     let exec = execute(&split, &split_arenas, &crate::hash_pin::BLOCK_HASHER).expect(
@@ -2840,7 +2988,6 @@ fn a_split_decode_cell_forges_the_attestation() {
     // There is no surplus arena to put it in, so the only way to move the fold's
     // input is to move the cell Phase A absorbed — which moves every challenge
     // derived after it.
-    let joined = epoch_program(&e, false);
     let mut joined_arenas = honest.clone();
     joined_arenas[1] = super::proof_arena::commitments_to_arena(&[substituted]);
     assert!(
@@ -2848,6 +2995,175 @@ fn a_split_decode_cell_forges_the_attestation() {
         "with one cell, substituting the DECODE root must break the run: the \
          transcript absorbed it, so the challenges cannot survive it"
     );
+}
+
+/// ★ The host attestation on the real epoch, against the fold it stands in for.
+///
+/// 1. The setting picks the posture: [`super::programs::with_stark_wrap_fold`]
+///    `(false, ..)` emits [`Attestation::Host`] over [`attested_inputs`], and
+///    `(true, ..)` emits [`Attestation::Fold`].
+/// 2. The host program publishes EXACTLY the fold's words, every public in
+///    order, and the id among them is production's — so a node, the root and a
+///    consumer read what they read under the fold.
+/// 3. It emits no keccak, where the fold is one permutation, and so sends
+///    `BITWISE` nothing: its mask drops the keccak family and `BITWISE`, and no
+///    chip it instantiates has an interaction on a bus `BITWISE` receives. The
+///    fold's mask keeps both.
+/// 4. An arena cell that differs from its constant has no execution. For
+///    `pc_start`, which feeds nothing else, the assert is the only refusal — the
+///    fold runs the same tamper and publishes a different id for a consumer to
+///    reject. The ELF digest and the DECODE root are also absorbed, so a lone
+///    tampered cell there dies in the transcript too;
+///    [`a_forged_attested_constant_has_no_wrap_execution`] is what isolates
+///    their asserts.
+#[test]
+fn the_host_attestation_binds_what_the_fold_attested() {
+    use super::airs::ChipSet;
+    use super::instr::Instr;
+    use super::programs::with_stark_wrap_fold;
+
+    let e = real_epoch();
+    let fold = with_stark_wrap_fold(true, || epoch_program(&e, false));
+    let host = with_stark_wrap_fold(false, || epoch_program(&e, false));
+
+    // ---- (1) the setting and the two postures are one choice.
+    let named = |attestation: &Attestation| {
+        format!(
+            "{:?}",
+            epoch_program_attesting(&e, false, false, Publishes::Diagnostic, attestation)
+        )
+    };
+    assert_eq!(
+        format!("{fold:?}"),
+        named(&Attestation::Fold),
+        "the fold setting emits the fold"
+    );
+    assert_eq!(
+        format!("{host:?}"),
+        named(&Attestation::Host(attested_inputs(&e))),
+        "the default emits the host attestation over the epoch's own inputs"
+    );
+
+    // ---- (3) no keccak, so no BITWISE sender.
+    let keccak = |p: &LfmProgram| p.instrs.iter().any(|i| matches!(i, Instr::KeccakF(_)));
+    assert!(keccak(&fold), "the fold is one keccak permutation");
+    assert!(!keccak(&host), "the host attestation emits no keccak");
+    let hasher = crate::hash_pin::BLOCK_HASHER;
+    let host_mask = ChipSet::for_program_under(&host, hasher, true);
+    assert!(
+        !host_mask.keccak && !host_mask.blake3 && !host_mask.bitwise,
+        "the host-attested wrap instantiates no hash family and drops BITWISE: {host_mask:?}"
+    );
+    assert!(
+        !host_mask.bitwise_required(hasher),
+        "no chip the host-attested wrap instantiates sends BITWISE a lookup"
+    );
+    let fold_mask = ChipSet::for_program_under(&fold, hasher, true);
+    assert!(
+        fold_mask.keccak && fold_mask.bitwise && fold_mask.bitwise_required(hasher),
+        "the fold's permutation keeps the keccak family and its BITWISE receiver: {fold_mask:?}"
+    );
+
+    // ---- (2) the same words.
+    let arenas = epoch_arenas(&e);
+    let run = |p: &LfmProgram, a: &[Vec<LfmWord>]| {
+        execute(p, a, &crate::hash_pin::BLOCK_HASHER).map(|x| x.public_words)
+    };
+    let fold_words = run(&fold, &arenas).expect("the fold executes");
+    let host_words =
+        run(&host, &arenas).expect("the host attestation executes on the honest epoch");
+    assert_eq!(published_digest(&host_words, 2), e.expected_program_id);
+    assert_eq!(host_words, fold_words, "every published word, in order");
+
+    // ---- (4) a cell that differs from its constant. Arena order
+    // (`epoch_arena_words`): the statement (the ELF digest first), the
+    // ELF-dependent roots (DECODE), the main roots, INIT, FINI, `pc_start`.
+    const STATEMENT: usize = 0;
+    const DECODE: usize = 1;
+    const PC_START: usize = 5;
+    assert_eq!(
+        arenas[DECODE].len(),
+        super::proof_arena::words_per_root(),
+        "arena {DECODE} is the epoch's one ELF-dependent root"
+    );
+    assert_eq!(
+        arenas[PC_START].len(),
+        2,
+        "arena {PC_START} is pc_start's two halves"
+    );
+    for (arena, what) in [
+        (STATEMENT, "an ELF digest half"),
+        (DECODE, "the DECODE root"),
+        (PC_START, "pc_start"),
+    ] {
+        let mut forged = arenas.clone();
+        forged[arena][0][0] += FE::one();
+        assert!(
+            run(&host, &forged).is_err(),
+            "{what}: a cell that differs from its constant must have no execution"
+        );
+    }
+    let mut forged = arenas.clone();
+    forged[PC_START][0][0] += FE::one();
+    let words = run(&fold, &forged).expect("the fold attests to whatever pc_start it is handed");
+    assert_ne!(
+        published_digest(&words, 2),
+        e.expected_program_id,
+        "the fold publishes a different id, for a consumer to reject"
+    );
+}
+
+/// ★ Each attested constant is LOAD-BEARING on the real epoch: the wrap emitted
+/// with one forged constant — the ELF digest, `pc_start` or the DECODE root — has
+/// no execution on the honest epoch, while the honest constants execute.
+///
+/// This is the attack the asserts exist for, in the only form one honest proof
+/// can express: a proof consistent with one set of values under a wrap that
+/// asserts another. Nothing but the forged field's assert reads the constant —
+/// the transcript, the legs and the closure read the arena — so deleting that
+/// assert makes its case execute and this test fail. No continuation epoch
+/// carries a page; `program_shape_tests` forges page constants on the standalone
+/// program.
+#[test]
+fn a_forged_attested_constant_has_no_wrap_execution() {
+    let e = real_epoch();
+    let arenas = epoch_arenas(&e);
+    let honest = attested_inputs(&e);
+    let run = |inputs: &super::programs::AttestedInputs| {
+        let program = epoch_program_attesting(
+            &e,
+            false,
+            false,
+            Publishes::Diagnostic,
+            &Attestation::Host(inputs.clone()),
+        );
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).map(|x| x.public_words)
+    };
+    let words = run(&honest).expect("the honest constants execute");
+    assert_eq!(published_digest(&words, 2), e.expected_program_id);
+
+    // Another genuine root — table 0's main root — so the forged DECODE value is
+    // a commitment some hash produced, not bytes no root could have.
+    let other_root = e.phase_a[0].1;
+    assert_ne!(other_root, honest.decode, "the forged root must differ");
+    let mut elf_digest = honest.clone();
+    elf_digest.elf_digest[7] ^= 0x10;
+    let mut pc_start = honest.clone();
+    pc_start.pc_start ^= 4;
+    let mut decode = honest.clone();
+    decode.decode = other_root;
+    for (what, forged) in [
+        ("the ELF digest", elf_digest),
+        ("pc_start", pc_start),
+        ("the DECODE root", decode),
+    ] {
+        assert_ne!(forged, honest, "{what}: the forgery must move a constant");
+        assert!(
+            run(&forged).is_err(),
+            "{what}: a wrap asserting a forged constant must have no execution on \
+             the honest epoch"
+        );
+    }
 }
 
 /// ★ LEDGER ENTRY 2, closed and falsified: the whole register boundary is bound,

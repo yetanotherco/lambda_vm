@@ -2209,12 +2209,19 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     // constant — every one of which would otherwise be re-baselined by a change
     // whose only purpose is to give THIS test more epochs.
     //
+    // TWO below the shared constant, not one, and the margin is asserted
+    // elsewhere: `proof_fixture`'s `the_fixture_guest_commits_in_an_intermediate_epoch`
+    // holds the guest to more than one shared epoch and at most two. A quarter
+    // of that epoch therefore yields at least five epochs whatever the guest's
+    // exact length, where half of it yields three or four — and the fixture's
+    // 48 cycles give three.
+    //
     // ⚠ Smaller epochs mean shallower tables, which is where the degenerate
     // shapes live. That is a feature: the one-row sub-proof and the one-leaf
     // Merkle tree were both found this way, and both are now gated in
     // milliseconds. If a third appears, it is a shape the emitter has to handle
     // and this is the cheapest place to find it.
-    let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 1;
+    let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 2;
 
     // ★★ ONE ARM PER PROCESS, which is what lets a LEVEL be priced.
     //
@@ -2372,9 +2379,17 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     // ---- the composition property, asserted rather than implied: an inner
     // node's published schema has the SAME shape as its children's, which is
     // what lets the level above it use the identical emitter.
+    //
+    // Measured against the LAST leaf, in the words each proof published. A node
+    // carries its last child's output halves (`emit_node_publishes`), so the
+    // length of that run belongs to whichever epoch committed, not to the level,
+    // and only the last leaf carries what the inner node carries. The first leaf
+    // matches it only while neither leaf's last epoch commits: at 8-cycle epochs
+    // the fixture commits in epoch 1, the first leaf's last, and the first leaf
+    // publishes two output halves the inner node does not carry.
     assert_eq!(
-        inner_layout.total(),
-        leaf_layouts[0].total(),
+        inner_node.public_words.len(),
+        leaves[FAN_IN - 1].public_words.len(),
         "a node's published schema must not change with its level — that is what \
          makes the same emitter serve the level above"
     );
@@ -7180,18 +7195,26 @@ fn the_production_tree_composes_to_a_root() {
         };
         let out_halves = e.statement.public_output_len.div_ceil(4);
         if k == 0 {
-            // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation fold
-            // is already emitted inside every wrap at this page count, and the
-            // fold's hashed length is linear in it — so this one number is the
-            // main cost driver of the root that does not yet exist.
+            // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation covers
+            // this page count in every wrap, and its cost is linear in it — the
+            // fold's hashed length, or ten asserted halves a page on the host —
+            // so this one number is the main cost driver of the root that does
+            // not yet exist.
             let shape = super::programs::ProgramIdShape {
                 num_pages: e.num_pages(),
             };
             println!(
-                "   ★ BLOCK FACTS: {} touched pages ⇒ attestation fold hashes {} \
-                 bytes; epoch public output {} halves",
+                "   ★ BLOCK FACTS: {} touched pages ⇒ attestation {}; epoch public \
+                 output {} halves",
                 shape.num_pages,
-                shape.byte_len(),
+                if super::programs::stark_wrap_folds_in_guest() {
+                    format!("fold hashes {} bytes", shape.byte_len())
+                } else {
+                    format!(
+                        "asserted host-side ({} program_id bytes folded at emission)",
+                        shape.byte_len()
+                    )
+                },
                 out_halves,
             );
         }
@@ -7772,13 +7795,23 @@ fn the_production_tree_composes_to_a_root() {
             },
         );
         // ⛔ THE STANDING CAVEAT, PRINTED WITH THE CLAIM AND NOT LEFT TO A DOC.
-        println!(
-            "   ⛔ CAVEAT, unchanged by this proof and by design: the attestation \
-             is NOT self-enforcing. The guest uses supplied roots verbatim, and \
-             the binding happens OUTSIDE — `recursion::check_attestation` \
-             recomputes the id from an ELF the consumer trusts, host-side. \
-             \"One proof for this block\" terminates there"
-        );
+        if super::programs::stark_wrap_folds_in_guest() {
+            println!(
+                "   ⛔ CAVEAT, unchanged by this proof and by design: the attestation \
+                 is NOT self-enforcing. The guest uses supplied roots verbatim, and \
+                 the binding happens OUTSIDE — `recursion::check_attestation` \
+                 recomputes the id from an ELF the consumer trusts, host-side. \
+                 \"One proof for this block\" terminates there"
+            );
+        } else {
+            println!(
+                "   ⛔ CAVEAT, by design: every wrap asserts the ELF digest, entry \
+                 point and DECODE root it verified against equal to the values \
+                 derived from the ELF this run trusts, so the proof binds that ELF \
+                 for a verifier that derives the tree's program identities from it \
+                 (SOUNDNESS.md §6.9). \"One proof for this block\" terminates there"
+            );
+        }
         // ⛔ AND THE SECOND RUNG OF THE LADDER, WHICH THIS RUN DOES NOT REACH.
         // The claim ladder was fixed before the result: a root proved and
         // verified is "the block is compressed"; "PINNED" needs the tamper arms

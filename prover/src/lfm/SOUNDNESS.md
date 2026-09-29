@@ -369,7 +369,9 @@ site rather than by search; two of them were on axis 3.
   `program_id` identifies a program to CONSUMERS; it is not part of the proof system's commitment
   layer. Following the configured hash would make the attestation join disagree with every host
   consumer of a `program_id`, and the disagreement would surface as a consumer-side compare
-  failing rather than as an unprovable program. ✓ VERIFIED both name their hash explicitly.
+  failing rather than as an unprovable program. ✓ VERIFIED both name their hash explicitly. The
+  STARK wrap runs the in-machine fold only under `LAMBDA_VM_STARK_WRAP_FOLD=1`; by default it takes
+  the id from the host function at emission (§6.9), so the carve-out holds in both postures.
 - `statement::elf_digest` (`prover/src/statement.rs:30`), same class: it names `Keccak256`
   directly. ✓ VERIFIED.
 
@@ -416,6 +418,97 @@ explicit algebraic branch. `transcript_replay::sample` names the algebraic arm a
 behaviour there is a DEFINITION rather than a fidelity claim. **So the durable remedy is the same
 one the width defects want: put the distinction in a TYPE, and the doc cannot lie about it.**
 
+### 6.9 THE STARK WRAP'S ATTESTATION IS ASSERTED, NOT FOLDED — what binds each input
+
+**Setting.** A STARK wrap `W_e` verifies epoch e's base proof in-machine (call it `V`) and
+publishes an attestation id right after Phase A. Write `K` for `recursion::program_id_from_digest`
+(keccak, §6.7). `V` reads four inputs out of its arenas:
+
+- `h`, the ELF digest: the statement's first eight halves, absorbed before every challenge;
+- `pc`, the entry point: the `pc_start` arena's two halves, which nothing else in a wrap reads;
+- `D`, the DECODE root: the cells Phase A absorbs and the DECODE leg compares with its
+  precomputed root;
+- `P`, the page roots: none, since a continuation epoch carries no PAGE sub-proof.
+
+**The two postures.**
+
+- *Fold* (`LAMBDA_VM_STARK_WRAP_FOLD=1`, `programs::emit_program_id`): `W_e` computes
+  `K(h, pc, D, P)` in-machine over the cells `V` read and publishes it. It binds nothing inside the
+  program. A consumer recomputes `K(h*, pc*, D*, P*)` from the ELF it trusts and compares
+  (`recursion::check_attestation`); keccak's collision resistance then gives
+  `(h, pc, D, P) = (h*, pc*, D*, P*)`.
+- *Host attestation* (the default, `programs::emit_host_attestation`): `W_e` carries
+  `(h*, pc*, D*, P*)` as program constants, asserts every cell `V` read equal to its constant
+  (`assert_eq`, which has a witness only when the two are equal), and publishes the constant
+  `K(h*, pc*, D*, P*)`. An execution exists iff `V` accepts AND `(h, pc, D, P) = (h*, pc*, D*, P*)`.
+  Those are exactly the proofs the fold lets through the consumer's compare; a mismatch is refused
+  inside the program instead of at the consumer, and the refusal needs no collision resistance of
+  `K`. The published words are the fold's (same function, same eight-halves layout,
+  `programs::program_id_words`), so nodes, the root and a consumer read what they read under the
+  fold.
+
+**Each constant, where it comes from, and the cell it is checked against.** None is read from a
+proof (the harness: `epoch_tests::attested_inputs`).
+
+| constant | derived from | cell asserted | what else reads that cell |
+|---|---|---|---|
+| `h*` | `statement::elf_digest` of the ELF's bytes | the statement arena's first eight halves | `absorb_epoch_statement`, so every challenge |
+| `pc*` | the ELF's entry point | the `pc_start` arena's two halves | nothing: attested only |
+| `D*` | the ELF's instructions committed under the options at the DECODE table's leaf layout: the root production's verifier takes from the AIR (`prep_source` panics unless the AIR's root equals that recompute) | the DECODE root cells, lane for lane | Phase A's absorb, and the DECODE leg's precomputed-root compare |
+| `P*` | none: `page_commitments` is empty for every continuation epoch, and the page count is shape | the page arena's ten halves a page | nothing |
+
+The layout that selects `D*` is shape, resolved by `table_leaf_layout` exactly as production's
+verifier resolves it, so `D*` is a function of (ELF, options, layout) and of no proof byte. The
+harness also asserts the published id equal to the harvest's oracle `expected_program_id`, which it
+folds from the same sources.
+
+**What makes the constants trustworthy is program identity.** The constants are `LFM_CONST` rows,
+whose values are columns of the committed instruction group, so they are inside `W_e`'s LFM
+`program_id`. A parent node interns each child's `program_id` as an emit-time constant
+(`ChildShape::program_id`, absorbed by `emit_lfm_statement`) together with each child table's
+preprocessed root (`ChildTable::precomputed_root`), and every level up does the same, to the root.
+A prover who substitutes a wrap carrying other constants, or one that publishes `id*` while
+asserting other values, presents another `program_id`, and no parent accepts it — PROVIDED the
+verifier derives every program identity itself, from the ELF it trusts and the block's shape. That
+premise is not new: a verifier that took program identities from the prover would already accept a
+program publishing any id it likes, fold or no fold, and the tree's programs already depend on the
+block's shapes. The host attestation widens what the derivation reads to the ELF, as the WHIR
+wrap's already does (its DECODE root is program text, `whir_epoch`). The cost is that a STARK
+wrap, node and root are functions of the ELF: a verifier rebuilds the wraps from the ELF, and a
+tree proved for one ELF fails at the first node above the wraps when checked against programs
+rebuilt for another.
+
+**Obligations, and the tests that check them.**
+
+1. Every input the fold consumes is asserted on the cell `V` reads, not on a copy. The split-DECODE
+   control (`epoch_tests`, `split_decode`) shows the difference: its assert lands on a second copy
+   and the cell Phase A absorbed is bound by nothing. `the_assembled_verifier_declares_exactly_the_shape_words`
+   denies any surplus arena word, in both postures.
+2. Each constant is load-bearing. `epoch_tests::a_forged_attested_constant_has_no_wrap_execution`:
+   on the real epoch, a forged `h*`, `pc*` or `D*` against the honest proof has no execution, and
+   nothing but that field's assert reads the constant.
+   `program_shape_tests::a_forged_attested_constant_has_no_execution` does the same for every field,
+   pages included, at both root widths; deleting any one field's asserts makes both fail.
+3. A cell that differs from its constant has no execution: `an_attested_cell_that_differs_from_its_constant_has_no_execution`
+   (standalone, every cell) and `the_host_attestation_binds_what_the_fold_attested` (real epoch;
+   for `h` and `D` the transcript refuses a lone tampered cell as well, for `pc` only the assert).
+4. The honest wrap publishes the fold's words, every public in order:
+   `the_host_attestation_binds_what_the_fold_attested` and
+   `the_host_attestation_publishes_the_folds_words` (0 and 2 pages).
+5. No `BITWISE` sender without its receiver. With no keccak the wrap's mask drops the keccak family,
+   and `ChipSet::bitwise_required` — re-checked by `proof::verify_against_chunked_with` — decides
+   `BITWISE` from the chips that remain: under RPX, none sends to it.
+   `the_host_attestation_leaves_no_bitwise_sender_without_its_receiver` and the real-epoch masks in
+   `the_host_attestation_binds_what_the_fold_attested`; `wrap_tests::the_fixture_epoch_wraps` proves
+   and verifies the default wrap.
+
+**Unchanged.** `K` is keccak, computed on the host at emission; the published id's value and
+layout; the base proofs and their security; the consumer's compare, which stays valid and is
+redundant for a verifier that derives the wraps from the same ELF. ⚠ Unchanged and pre-existing:
+under a format that resolves DECODE to one row, both postures publish `K` over the one-row root,
+while `recursion::expected_program_id` recomputes the row-pair one — a consumer compares at the
+layout the tree used.
+
 ## 7. Reviewer checklist (reject if any fails)
 
 0. For an algebraic configuration: is grinding still a RECOMPUTE-and-compare check (§6.5)? If a
@@ -446,6 +539,10 @@ one the width defects want: put the distinction in a TYPE, and the doc cannot li
     `elf_digest` — still pinned rather than following the configuration?
 11. Does every hash-adjacent helper's doc match its body (§6.8)? A "hash-agnostic" claim on a
     function that indexes a second digest cell is a defect even when nothing reaches it.
+12. Under the STARK wrap's host attestation (§6.9): is every input the attestation covers asserted
+    equal to a constant derived from the trusted ELF, on the very cell the verification reads and
+    not on a copy? And does the verifier derive the wrap programs — hence every node's and the
+    root's `program_id` — from that ELF and the block's shape, never from the prover?
 
 ## 8. Proven bits at the aggregation-era presets (the η re-tune, applied)
 

@@ -47,6 +47,13 @@
 //! native FFT + Merkle pass done once at top level, never in-VM). "One proof for
 //! block N" therefore terminates in a host-side recompute against a trusted ELF.
 //! That is deliberate, predates this campaign, and the root does not change it.
+//!
+//! The STARK wraps' default attestation moves that binding, for the values a
+//! wrap verified against, into the wrap: it asserts the ELF digest, entry point
+//! and DECODE root it read equal to the values derived from the ELF, so "one
+//! proof for block N" terminates instead in the verifier deriving the tree's
+//! program identities from the ELF it trusts (`SOUNDNESS.md` §6.9). Under
+//! `LAMBDA_VM_STARK_WRAP_FOLD=1` the wraps fold, as above.
 
 use super::builder::LfmBuilder;
 use super::edsl::WrapDigest;
