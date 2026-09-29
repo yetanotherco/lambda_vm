@@ -10079,6 +10079,10 @@ fn whir_production_tree<C: TreeChild>() {
                              is {want_words}",
                             proved.public_words.len(),
                         );
+                        // The artifact's size, taken before the verify's clock starts.
+                        let artifact_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+                            .expect("a W-LFM proof serializes")
+                            .len();
                         // ⛔ VERIFIED HERE: the harvest is `lfm_verify_whir`, the host's
                         // final check on a W-LFM artifact, and it panics on a refusal.
                         let t_verify = Instant::now();
@@ -10100,6 +10104,7 @@ fn whir_production_tree<C: TreeChild>() {
                              cells ({root_instrs} instructions) · W-LFM",
                             root.public_words().len(),
                         );
+                        println!("   whir root W-LFM artifact: {artifact_bytes} B");
                         (root.proof.public_words, stage_secs, verify_secs, peak, at)
                     }
                 };
