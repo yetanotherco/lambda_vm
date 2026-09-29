@@ -14,6 +14,8 @@ pub mod mux;
 pub mod prove;
 
 #[cfg(test)]
+mod lfm_compare;
+#[cfg(test)]
 mod prove_tests;
 #[cfg(test)]
 mod tests;
