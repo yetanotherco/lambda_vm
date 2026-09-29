@@ -533,10 +533,13 @@ fn segment_plan_covers_every_step() {
             }
         }
     }
-    assert_eq!(
-        super::air::segment_plan(538_706, 8, None),
-        vec![(524_287, 524_288), (14_419, 16_384)]
-    );
+    // The default bound; `FVM_SEGMENT_WASTE` moves the plan.
+    if std::env::var_os("FVM_SEGMENT_WASTE").is_none() {
+        assert_eq!(
+            super::air::segment_plan(538_706, 8, None),
+            vec![(524_287, 524_288), (14_419, 16_384)]
+        );
+    }
 }
 
 #[test]
