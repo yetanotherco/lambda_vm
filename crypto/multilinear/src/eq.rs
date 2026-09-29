@@ -538,4 +538,74 @@ mod tests {
     fn shift_rejects_mismatched_arity() {
         assert!(shift_eval(&point(&[1, 2]), &point(&[1]), 1).is_err());
     }
+
+    /// `shift_evals(x, k)[y] == eq_evals(x)[(y − k) mod 2^n]` for every `y`.
+    fn shift_is_rotated_eq<E: IsField>(x: &[FieldElement<E>], offsets: &[usize])
+    where
+        FieldElement<E>: Send + Sync,
+    {
+        let eq = eq_evals(x);
+        let size = eq.len();
+        for &k in offsets {
+            let shift = shift_evals(x, k);
+            assert_eq!(shift.len(), size);
+            for (y, value) in shift.iter().enumerate() {
+                assert_eq!(
+                    value,
+                    &eq[(y + size - k % size) % size],
+                    "n={}, k={k}, y={y}",
+                    x.len()
+                );
+            }
+        }
+    }
+
+    /// ★ The identity the claim reduce's tables on the card stand on
+    /// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): a shift table is the `eq` table read
+    /// `k` rows back, cyclically, so the card builds `eq(x, ·)` once and each
+    /// offset's table is a rotated copy of it.
+    ///
+    /// For a corner `y`, `shift_k(x, y)` is the indicator of `x = y − k`
+    /// extended multilinearly in `x`, which is `eq(x, y − k)`. The carry
+    /// recursion has to give that value for value, off the cube, at every
+    /// offset — every one below the cube's size for the small cubes, and the
+    /// ones past it, which wrap — in the base field and in the extension the
+    /// prover runs in.
+    #[test]
+    fn a_shift_table_is_the_eq_table_rotated() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+
+        for n in 1..=12usize {
+            let size = 1usize << n;
+            let offsets: Vec<usize> = if n <= 6 {
+                (0..size + 3).collect()
+            } else {
+                vec![
+                    0,
+                    1,
+                    2,
+                    3,
+                    7,
+                    size / 2,
+                    size / 2 + 1,
+                    size - 1,
+                    size,
+                    size + 1,
+                    2 * size + 5,
+                ]
+            };
+            let base: Vec<FE> = (0..n as u64).map(|i| FE::from(3 * i + 5)).collect();
+            shift_is_rotated_eq(&base, &offsets);
+            let ext: Vec<FieldElement<Ext>> = (0..n as u64)
+                .map(|i| {
+                    FieldElement::<Ext>::new([
+                        FE::from(7 * i + 2),
+                        FE::from(i + 11),
+                        FE::from(5 * i * i + 3),
+                    ])
+                })
+                .collect();
+            shift_is_rotated_eq(&ext, &offsets);
+        }
+    }
 }
