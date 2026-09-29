@@ -165,6 +165,8 @@ mod fri_group_tests;
 #[cfg(test)]
 mod fri_tests;
 #[cfg(test)]
+mod fvm_epoch_compare;
+#[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
