@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn the_fold_shape_is_the_interior_minus_the_root_level() {
         for epochs in [2usize, 3, 4, 5, 10, 19, 36] {
-            for fan_in in [2usize, 3, 4] {
+            for fan_in in [2usize, 3, 4, 5] {
                 let full = tree_shape(epochs, fan_in);
                 let shape = FoldShape::interior(epochs, fan_in);
                 assert_eq!(
@@ -835,7 +835,7 @@ mod tests {
 
         // ---- and the rule generally: the level an option names carries exactly
         // as many children as that option's fold shape refolds to.
-        for fan_in in [2usize, 3, 4] {
+        for fan_in in [2usize, 3, 4, 5] {
             for epochs in [2usize, 3, 4, 5, 7, 10, 19, 36] {
                 let out = outputs(epochs, fan_in);
                 let top = out.len() - 1;
@@ -1225,12 +1225,14 @@ mod tests {
     ///
     /// ★ `(15, 4, true)` is pure WHIR's default root: four level-1 nodes of
     /// 4 / 4 / 4 / 3 epochs beside the global child, one fold level of arity four.
-    const ROOT_SHAPES: [(usize, usize, bool); 5] = [
+    /// `(15, 5, true)` is fan-in 5's (the WHIR tree only): three nodes of five.
+    const ROOT_SHAPES: [(usize, usize, bool); 6] = [
         (2, 2, true),
         (4, 2, true),
         (5, 2, true),
         (4, 2, false),
         (15, 4, true),
+        (15, 5, true),
     ];
 
     /// ★ THE HONEST CONTROL: the root verifies its children, binds them, and the
