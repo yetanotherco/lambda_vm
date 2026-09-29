@@ -4,7 +4,8 @@ use super::executor::{Execution, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, Program, gpr};
 use super::mem::cols as mem_cols;
 use super::prove::{
-    FvmTraces, default_options, generate_traces, program_id, prove, prove_traces, verify,
+    FvmTraces, PublicCell, default_options, generate_traces, program_id, prove, prove_traces,
+    public_cells, verify,
 };
 use crate::tables::types::{FE, FEE};
 
@@ -28,10 +29,15 @@ fn power_program(n: i64) -> Program {
     asm.finish().unwrap()
 }
 
-fn prove_and_verify(program: &Program, exec: &Execution) -> bool {
+fn prove_and_verify(program: &Program, exec: &Execution, public: &[u64]) -> bool {
     let options = default_options();
-    let proof = prove(program, exec, &options).expect("proving");
-    verify(&program_id(program, &options), &proof, &options)
+    let proof = prove(program, exec, public, &options).expect("proving");
+    verify(
+        &program_id(program, &options),
+        &public_cells(exec, public),
+        &proof,
+        &options,
+    )
 }
 
 #[test]
@@ -44,7 +50,7 @@ fn power_loop_proves_and_verifies() {
         1 << 12,
     )
     .unwrap();
-    assert!(prove_and_verify(&program, &exec));
+    assert!(prove_and_verify(&program, &exec, &[0, 1]));
 }
 
 #[test]
@@ -63,7 +69,7 @@ fn inv_and_straight_line_prove_and_verify() {
         64,
     )
     .unwrap();
-    assert!(prove_and_verify(&program, &exec));
+    assert!(prove_and_verify(&program, &exec, &[0, 1]));
 }
 
 #[test]
@@ -93,7 +99,7 @@ fn recursive_calls_prove_and_verify() {
     };
     let exec = execute(&program, Memory::new(128), &mut frames, 1 << 12).unwrap();
     assert_eq!(exec.mem[0], FEE::from(24u64));
-    assert!(prove_and_verify(&program, &exec));
+    assert!(prove_and_verify(&program, &exec, &[0]));
 }
 
 fn power_exec() -> (Program, Execution) {
@@ -108,20 +114,34 @@ fn power_exec() -> (Program, Execution) {
     (program, exec)
 }
 
-/// Proves `exec` after `tamper` edits its traces; `true` iff the proof verifies.
+/// The power program's input `x` and its output `x^3`.
+const POWER_PUBLIC: [u64; 2] = [0, 1];
+
+/// Proves `exec` after `tamper` edits its traces, with [`POWER_PUBLIC`]
+/// flagged; `true` iff the proof verifies against `claimed`.
+fn verifies_with(
+    program: &Program,
+    exec: &Execution,
+    claimed: &[PublicCell],
+    tamper: impl FnOnce(&mut FvmTraces),
+) -> bool {
+    let options = default_options();
+    let id = program_id(program, &options);
+    let proved = public_cells(exec, &POWER_PUBLIC);
+    let mut traces = generate_traces(program, exec, &POWER_PUBLIC);
+    tamper(&mut traces);
+    match prove_traces(&id, &proved, &mut traces, &options) {
+        Ok(proof) => verify(&id, claimed, &proof, &options),
+        Err(_) => false,
+    }
+}
+
 fn verifies_after(
     program: &Program,
     exec: &Execution,
     tamper: impl FnOnce(&mut FvmTraces),
 ) -> bool {
-    let options = default_options();
-    let id = program_id(program, &options);
-    let mut traces = generate_traces(program, exec);
-    tamper(&mut traces);
-    match prove_traces(&id, &mut traces, &options) {
-        Ok(proof) => verify(&id, &proof, &options),
-        Err(_) => false,
-    }
+    verifies_with(program, exec, &public_cells(exec, &POWER_PUBLIC), tamper)
 }
 
 fn bump(
@@ -230,9 +250,10 @@ fn execution_that_never_halts_is_rejected() {
 fn proof_does_not_verify_for_another_program() {
     let (program, exec) = power_exec();
     let options = default_options();
-    let proof = prove(&program, &exec, &options).unwrap();
+    let proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
     assert!(!verify(
         &program_id(&power_program(4), &options),
+        &public_cells(&exec, &POWER_PUBLIC),
         &proof,
         &options
     ));
@@ -242,9 +263,77 @@ fn proof_does_not_verify_for_another_program() {
 fn lying_last_row_is_rejected() {
     let (program, exec) = power_exec();
     let options = default_options();
-    let mut proof = prove(&program, &exec, &options).unwrap();
+    let mut proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
     proof.proofs[0].public_inputs.last_row -= 1;
-    assert!(!verify(&program_id(&program, &options), &proof, &options));
+    assert!(!verify(
+        &program_id(&program, &options),
+        &public_cells(&exec, &POWER_PUBLIC),
+        &proof,
+        &options
+    ));
+}
+
+fn with_value(cells: &[PublicCell], i: usize, v: FEE) -> Vec<PublicCell> {
+    let mut cells = cells.to_vec();
+    cells[i].1 = v;
+    cells
+}
+
+#[test]
+fn wrong_public_output_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let forged = with_value(&cells, 1, cells[1].1 + FEE::one());
+    assert!(!verifies_with(&program, &exec, &forged, |_| {}));
+}
+
+#[test]
+fn wrong_public_input_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let forged = with_value(&cells, 0, fee(2, 1, 8));
+    assert!(!verifies_with(&program, &exec, &forged, |_| {}));
+}
+
+#[test]
+fn missing_or_extra_public_cells_are_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    assert!(!verifies_with(&program, &exec, &cells[..1], |_| {}));
+    assert!(!verifies_with(&program, &exec, &[], |_| {}));
+    let mut extra = cells.clone();
+    extra.push((5, FEE::zero()));
+    assert!(!verifies_with(&program, &exec, &extra, |_| {}));
+}
+
+#[test]
+fn unsorted_or_repeated_public_claims_are_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let reversed: Vec<_> = cells.iter().rev().copied().collect();
+    assert!(!verifies_with(&program, &exec, &reversed, |_| {}));
+    assert!(!verifies_with(
+        &program,
+        &exec,
+        &[cells[0], cells[0]],
+        |_| {}
+    ));
+}
+
+#[test]
+fn flagging_an_unclaimed_cell_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        t.mem.main_table.set(5, mem_cols::PUB, FE::one())
+    }));
+}
+
+#[test]
+fn non_bit_public_flag_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        t.mem.main_table.set(1, mem_cols::PUB, FE::from(2u64))
+    }));
 }
 
 fn horner_program(len: usize) -> Program {
@@ -283,7 +372,9 @@ fn report_horner() {
         )
         .unwrap();
         let id = program_id(&program, &options);
-        let traces = generate_traces(&program, &exec);
+        let public: Vec<u64> = (0..=len as u64 + 1).collect();
+        let cells_pub = public_cells(&exec, &public);
+        let traces = generate_traces(&program, &exec, &public);
         let rows = [
             traces.fvm.num_rows(),
             traces.decode.num_rows(),
@@ -300,12 +391,12 @@ fn report_horner() {
         let mut verify_ms = Vec::new();
         let mut size = 0;
         for _ in 0..5 {
-            let mut t = generate_traces(&program, &exec);
+            let mut t = generate_traces(&program, &exec, &public);
             let start = Instant::now();
-            let proof = prove_traces(&id, &mut t, &options).unwrap();
+            let proof = prove_traces(&id, &cells_pub, &mut t, &options).unwrap();
             prove_ms.push(start.elapsed().as_secs_f64() * 1e3);
             let start = Instant::now();
-            assert!(verify(&id, &proof, &options));
+            assert!(verify(&id, &cells_pub, &proof, &options));
             verify_ms.push(start.elapsed().as_secs_f64() * 1e3);
             size = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap().len();
         }
