@@ -290,4 +290,27 @@ fn epoch_translation_shapes() {
         tr.public.len(),
         tr.skipped
     );
+    // Row classes for a narrow-table split: no registers and no hints (P),
+    // and whether every argument value is in the base field.
+    use crate::field_vm::isa::REG_ZERO;
+    let (mut p_base, mut p_ext, mut other) = (0usize, 0usize, 0usize);
+    for step in &run.steps {
+        let instr = &tr.program.instrs[step.state.pc as usize];
+        let plain = !instr.hint_out
+            && instr.hint_in.iter().all(|h| !h)
+            && instr
+                .args()
+                .iter()
+                .all(|a| a.reg == REG_ZERO && a.scale == crate::tables::types::FE::zero());
+        let base = step.args.iter().all(|v| {
+            let c = v.value();
+            c[1] == crate::tables::types::FE::zero() && c[2] == crate::tables::types::FE::zero()
+        });
+        match (plain, base) {
+            (true, true) => p_base += 1,
+            (true, false) => p_ext += 1,
+            _ => other += 1,
+        }
+    }
+    eprintln!("row classes: plain+base={p_base} plain+ext={p_ext} registers/hints={other}");
 }
