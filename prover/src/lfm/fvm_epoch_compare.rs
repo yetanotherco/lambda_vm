@@ -92,7 +92,13 @@ fn epoch_field_vm_vs_lfm() {
     let exec =
         super::executor::execute(&program, &arenas, &hasher).expect("the epoch verifier executes");
 
-    for b in [2u8, 4] {
+    // `FVM_COMPARE_SKIP_LFM` proves only the Field VM side.
+    let lfm_blowups: &[u8] = if std::env::var_os("FVM_COMPARE_SKIP_LFM").is_some() {
+        &[]
+    } else {
+        &[2, 4]
+    };
+    for &b in lfm_blowups {
         let opts = blowup(b);
         let s = Instant::now();
         let artifacts = super::registry::build_artifacts_with_hasher(&program, &opts, hasher);
