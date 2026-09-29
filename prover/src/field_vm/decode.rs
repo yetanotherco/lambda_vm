@@ -7,12 +7,9 @@
 //!
 //! Padding rows repeat the halt entry, so they add no instruction to the program.
 
-use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
 use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::TraceTable;
 
 use super::air::decode_tuple;
@@ -72,17 +69,8 @@ pub fn program_commitment(
 ) -> Commitment {
     let trace = generate_trace(program, &[], min_rows);
     let rows = trace.num_rows();
-    let blowup = options.blowup_factor as usize;
-    let offset = FE::from(options.coset_offset);
-    let lde: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|c| {
-            let col: Vec<FE> = (0..rows).map(|r| *trace.main_table.get(r, c)).collect();
-            let poly =
-                Polynomial::interpolate_fft::<GoldilocksField>(&col).expect("FFT interpolation");
-            evaluate_polynomial_on_lde_domain(&poly, blowup, rows, &offset).expect("LDE evaluation")
-        })
+    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .map(|c| (0..rows).map(|r| *trace.main_table.get(r, c)).collect())
         .collect();
-    commit_bit_reversed(&lde, ROWS_PER_LEAF)
-        .expect("Merkle commit")
-        .1
+    crate::lfm::commit::commit_columns(&columns, options)
 }

@@ -1,19 +1,18 @@
 //! Proving and verifying a Field VM execution: `FIELD_VM`, `FIELD_VM_DECODE`
 //! and `FIELD_VM_MEM` in one `multi_prove`, with a closed bus system.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::config::Commitment;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
-use stark::prover::{IsStarkProver, Prover, ProvingError};
+use stark::prover::{IsStarkProver, ProvingError};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use super::air::{self, FieldVmBoundary, FieldVmConstraints, FvmPublicInputs};
 use super::decode;
@@ -80,8 +79,8 @@ impl Airs {
     }
 }
 
-fn transcript(program_id: &Commitment) -> DefaultTranscript<E> {
-    let mut t = DefaultTranscript::<E>::new(DOMAIN_TAG);
+fn transcript(program_id: &Commitment) -> crate::hash_pin::BlockTranscript {
+    let mut t = crate::hash_pin::block_transcript(DOMAIN_TAG);
     t.append_bytes(program_id);
     t
 }
@@ -117,7 +116,7 @@ pub fn prove_traces(
     let none = FvmPublicInputs::default();
     let airs = Airs::new(*program_id, options);
     let [fvm, dec, mem] = airs.refs();
-    Prover::multi_prove(
+    crate::hash_pin::BlockProver::<F, E, FvmPublicInputs>::multi_prove(
         vec![
             (fvm, &mut traces.fvm, &pi),
             (dec, &mut traces.decode, &none),
@@ -126,6 +125,7 @@ pub fn prove_traces(
         &mut transcript(program_id),
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::default(),
     )
 }
 
@@ -153,7 +153,7 @@ pub fn verify(program_id: &Commitment, proof: &FvmProof, options: &ProofOptions)
         return false;
     }
     let airs = Airs::new(*program_id, options);
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::<F, E, FvmPublicInputs>::multi_verify(
         &airs.refs(),
         proof,
         &mut transcript(program_id),
