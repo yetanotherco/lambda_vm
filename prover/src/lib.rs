@@ -16,6 +16,7 @@ pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+pub mod field_vm;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
