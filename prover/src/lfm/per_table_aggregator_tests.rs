@@ -8409,6 +8409,11 @@ where
         EarlyHarvest::LastSlot | EarlyHarvest::LastSlotClaimed => {
             let lead = std::sync::Arc::clone(&lead);
             let (bytes, inner) = (early_bytes, early_inner);
+            let knob = if early == EarlyHarvest::LastSlot {
+                2
+            } else {
+                3
+            };
             std::thread::Builder::new()
                 .name("l1-last-slot".to_string())
                 .spawn(move || {
@@ -8439,7 +8444,7 @@ where
                             let t_emit = t.elapsed().as_secs_f64();
                             let t1 = stark::prove_split::epoch_secs();
                             println!(
-                                "   ★ L1 LAST SLOT AHEAD ({EARLY_HARVEST_ENV}=2): wide node {} \
+                                "   ★ L1 LAST SLOT AHEAD ({EARLY_HARVEST_ENV}={knob}): wide node {} \
                                  (epochs {}..={}) built in the base's tail: {} epoch(s) \
                                  harvested in {t_harvest:.2}s, the last by t={t_last:.3}; \
                                  emitted in {t_emit:.2}s, done at t={t1:.3}",
