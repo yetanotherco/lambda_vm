@@ -343,6 +343,78 @@ fn columns_folded_together_match_one_at_a_time() {
     }
 }
 
+/// A session's end read in one gathered copy is the per-factor read, bit for
+/// bit (`LAMBDA_VM_ARGUE_LEAN_READS`): after rounds and folds, for a session
+/// that uploaded its factors and for one over resident factors with weights
+/// added, from one factor to the widest precompile's 1,482, at cubes the
+/// sessions stop at and ones they do not.
+#[test]
+fn a_session_end_read_in_one_copy_is_the_per_factor_read() {
+    let Ok(_) = math_cuda::device::backend() else {
+        eprintln!("no device; skipping");
+        return;
+    };
+    let mut t = Vec::new();
+    for node in 1..=2u64 {
+        t.extend_from_slice(&ext3_raw(&FE::from(node)).expect("ext3"));
+    }
+    let r = ext3_raw(&FE::from(7u64)).expect("ext3");
+    for (vars, width, folds) in [
+        (6usize, 1usize, 1usize),
+        (8, 5, 3),
+        (10, 5, 1),
+        (7, 1482, 2),
+        (11, 40, 0),
+    ] {
+        let factors: Vec<Mle<Ext3>> = (0..width).map(|k| factor(vars, k as u64 + 3)).collect();
+        let raw: Vec<&[u64]> = factors
+            .iter()
+            .map(|f| unsafe {
+                core::slice::from_raw_parts(f.evals().as_ptr() as *const u64, f.len() * 3)
+            })
+            .collect();
+        let program = program(width.min(8));
+        let lowered = lower(&program).expect("ext3 lowers");
+
+        let mut uploaded = math_cuda::sumcheck::SumcheckSession::new(
+            &raw,
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+        )
+        .expect("a session (needs a GPU)");
+        let resident = math_cuda::sumcheck::DeviceFactors::upload(&raw).expect("the factors");
+        let point: Vec<u64> = (0..vars as u64)
+            .flat_map(|i| ext3_raw(&FE::from(i + 2)).expect("ext3"))
+            .collect();
+        let mut over_resident = resident
+            .session_with(
+                &[
+                    math_cuda::sumcheck::Extra::Eq(&point),
+                    math_cuda::sumcheck::Extra::Table(raw[0]),
+                ],
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+            .expect("a session over resident factors");
+        for session in [&mut uploaded, &mut over_resident] {
+            for _ in 0..folds {
+                session.round(&t).expect("a round");
+                session.fold(&r).expect("a fold");
+            }
+            let one_at_a_time = session.values().expect("the per-factor read");
+            let gathered = session.values_gathered().expect("the gathered read");
+            assert_eq!(
+                gathered, one_at_a_time,
+                "2^{vars} × {width} after {folds} folds: the gathered read differs"
+            );
+        }
+    }
+}
+
 // ⛔ ROUND-3 ARGUE DISCRIMINATOR — an ncu MICRO-BENCH, on no production path.
 //
 // The census put argue at ~2% of the HBM roofline and single-digit-% of compute
