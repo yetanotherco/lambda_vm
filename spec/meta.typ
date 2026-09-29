@@ -36,7 +36,8 @@
       ("mul", [`MUL` chip], <mul>),
       ("dvrm", [`DVRM` chip], <dvrm>),
       ("bitwise", [`BITWISE` chips], <bitwise>),
-      ("bytewise", [`BYTEWISE` chip], <bytewise>)
+      ("bytewise", [`BYTEWISE` chip], <bytewise>),
+      ("is_wh", [`IS_WH`], <is-wh>),
     )),
     ("MEMORY", (
       ("memw", [`MEMW` chip], <memw>),

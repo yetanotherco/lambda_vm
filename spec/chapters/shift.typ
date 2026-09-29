@@ -35,7 +35,7 @@ Here, $<<$ and $>>$ denote the _logical_ left and right shift operations, while 
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)
 
-The `SHIFT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #shift chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
 = Explanation
