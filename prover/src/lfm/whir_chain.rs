@@ -26,7 +26,15 @@
 //! spends the QUERY nonce, and opens `Q` queries against both trees. The last
 //! round absorbs `final_value` instead, spends only the query nonce, and opens
 //! `Q` queries against one tree — `verify_final` has no successor
-//! (`whir_chain.rs:1125-1141`). That is why a chain has `3R − 1` grinds.
+//! (`whir_chain.rs:1125-1141`). That is why a uniformly ground chain has
+//! `3R − 1` grinds.
+//!
+//! A grind of zero bits is not emitted at all. Which nonces the ARENA carries
+//! is the config's [`NonceLayout`]: three a round under `Three` (today's
+//! format, the unspent ones hinted and never read), only the spent ones under
+//! `Spent`. P2 grinds before the queries alone (`GrindBits::query_only`) under
+//! `Spent`, so a round carries ONE nonce word and an unspent nonce has no word
+//! to be set in: [`ChainShape::carries`].
 //!
 //! # ★ The out-of-domain squarings are SHARED, and exactly
 //!
@@ -73,7 +81,7 @@
 //! an assert somebody could forget.
 
 use multilinear::whir::Domain;
-use multilinear::whir_chain::{ChainConfig, ChainProof, ChainRound, RoundOpenings};
+use multilinear::whir_chain::{ChainConfig, ChainProof, ChainRound, NonceLayout, RoundOpenings};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -103,13 +111,16 @@ pub struct QueryOpening<'a> {
     pub siblings: &'a [WrapDigest],
 }
 
-/// The three nonces a round spends. The out-of-domain one is unused on the last
-/// round and is not read there.
+/// A round's nonce wires, one per slot the arena carries
+/// ([`ChainShape::carries`]). A slot is read only when its grind spends bits,
+/// and every such slot is carried, so `None` is a slot nothing reads. Under
+/// [`NonceLayout::Three`] all three are hinted and the unspent ones (zero bits,
+/// and the out-of-domain one on the last round) are not read.
 #[derive(Clone, Copy)]
 pub struct RoundNonces {
-    pub folding: Felt,
-    pub ood: Felt,
-    pub query: Felt,
+    pub folding: Option<Felt>,
+    pub ood: Option<Felt>,
+    pub query: Option<Felt>,
 }
 
 /// One round of the chain, as wires.
@@ -154,6 +165,8 @@ pub struct ChainShape {
     /// tree. From the same `ChainConfig::tree_caps` the host prover and
     /// verifier use; all zero at the default format.
     pub caps: Vec<usize>,
+    /// Which nonces a round's arena words carry (P2): the config's own.
+    pub nonces: NonceLayout,
 }
 
 impl ChainShape {
@@ -178,11 +191,31 @@ impl ChainShape {
                 config.grind.ood as usize,
                 config.grind.query as usize,
             ),
+            nonces: config.format.nonces,
         }
     }
 
     pub fn rounds(&self) -> usize {
         self.schedule.len()
+    }
+
+    /// Which of round `r`'s nonce slots (folding, out-of-domain, query) have an
+    /// arena word: all three under [`NonceLayout::Three`], the spent ones
+    /// under [`NonceLayout::Spent`], a grind of nonzero bits and the
+    /// out-of-domain one only where the round has a successor.
+    ///
+    /// ★ The one place the nonce layout is written: the arena's word count,
+    /// the hints that read it and the words that fill it all take it from here.
+    pub fn carries(&self, r: usize) -> [bool; 3] {
+        let (folding, ood, query) = self.grind;
+        match self.nonces {
+            NonceLayout::Three => [true; 3],
+            NonceLayout::Spent => [
+                folding > 0,
+                ood > 0 && self.next_depth(r).is_some(),
+                query > 0,
+            ],
+        }
     }
 
     /// The current tree's depth at round `r`: its leaves are the round's domain
@@ -556,7 +589,7 @@ pub fn emit_verify_weighted(
         let k = shape.schedule[r];
         assert_eq!(round.sumcheck.len(), k, "round {r} folds {k} variables");
 
-        emit_grind_check(b, transcript, grind_folding as u8, round.nonces.folding);
+        emit_spent_grind(b, transcript, grind_folding, round.nonces.folding);
 
         // The sumcheck, interleaved: a round's challenge is drawn only after
         // its evaluations are absorbed, which is the order `verify_rounds`
@@ -602,18 +635,18 @@ pub fn emit_verify_weighted(
                 let ood_point: Vec<Ext> = powers[..shape.num_vars - bound].to_vec();
 
                 transcript.absorb_ext(b, y0);
-                emit_grind_check(b, transcript, grind_ood as u8, round.nonces.ood);
+                emit_spent_grind(b, transcript, grind_ood, round.nonces.ood);
                 let gamma = transcript.sample_ext(b);
                 claim = b.emul_add(gamma, y0, claim);
                 ood.push((gamma, ood_point, bound));
 
-                emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
+                emit_spent_grind(b, transcript, grind_query, round.nonces.query);
                 Some(tree_auth(b, shape.caps[r + 1], round.next_cap, &lanes))
             }
             (None, None, None) => {
                 assert!(round.next_cap.is_empty(), "the last round has no successor");
                 transcript.absorb_ext(b, final_value);
-                emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
+                emit_spent_grind(b, transcript, grind_query, round.nonces.query);
                 None
             }
             _ => panic!(
@@ -651,6 +684,26 @@ pub fn emit_verify_weighted(
     }
 
     emit_final_check(b, claim, weight, final_value, one);
+}
+
+/// One grind slot, emitted: [`emit_grind_check`] where the grind spends bits,
+/// nothing where it does not (the host's `check_grind` reads nothing then).
+///
+/// A spent grind always has its nonce wire, because [`ChainShape::carries`]
+/// carries every slot of nonzero bits under either layout; a missing one is a
+/// wire walk that disagrees with the shape it was built from, refused here at
+/// emit time rather than emitted as a grind that checks nothing.
+fn emit_spent_grind(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    bits: usize,
+    nonce: Option<Felt>,
+) {
+    if bits == 0 {
+        return;
+    }
+    let nonce = nonce.expect("a grind of nonzero bits has its nonce wire under every layout");
+    emit_grind_check(b, transcript, bits as u8, nonce);
 }
 
 /// How a tree's openings are checked: against its root lanes when its cap
@@ -907,11 +960,15 @@ impl RoundStorage {
                 .map(|_| (0..2).map(|_| next_word(b, &mut at).as_ext()).collect())
                 .collect();
             // The nonces are FELTS: `append_bytes(&nonce.to_be_bytes())` is one
-            // big-endian felt, which is how the grind absorbs them.
-            let folding = b.hint_felt(arena, at);
-            let ood_nonce = b.hint_felt(arena, at + 1);
-            let query = b.hint_felt(arena, at + 2);
-            at += 3;
+            // big-endian felt, which is how the grind absorbs them. One word a
+            // slot the layout carries, in slot order.
+            let [folding, ood_nonce, query] = shape.carries(r).map(|carried| {
+                carried.then(|| {
+                    let felt = b.hint_felt(arena, at);
+                    at += 1;
+                    felt
+                })
+            });
 
             // W1: tree 0's cap, right after round 0's nonces (the words the
             // owner path carried after its siblings).
@@ -1066,9 +1123,11 @@ impl RoundStorage {
 
 pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     let k = shape.schedule[r];
-    // The sumcheck's two evaluations a round, three nonces, and per query
-    // the current block plus its path (to the cap, when the tree has one).
-    let mut n = (2 * k + 3) as u32;
+    // The sumcheck's two evaluations a round, the nonces the layout carries,
+    // and per query the current block plus its path (to the cap, when the tree
+    // has one).
+    let nonces = shape.carries(r).iter().filter(|&&carried| carried).count();
+    let mut n = (2 * k + nonces) as u32;
     let depth = shape.current_path(r);
     let block = 1usize << k;
     n += (shape.num_queries * (block + depth)) as u32;
@@ -1109,8 +1168,14 @@ pub fn push_round_words(
                 words.push(ext_word(e));
             }
         }
-        for nonce in [round.nonces.folding, round.nonces.ood, round.nonces.query] {
-            words.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
+        // The slots the layout carries. A slot it does not carry has no word,
+        // so its host field, which the host verifier requires to be 0 under
+        // `Spent`, has no way into the machine.
+        let nonces = [round.nonces.folding, round.nonces.ood, round.nonces.query];
+        for (nonce, carried) in nonces.into_iter().zip(shape.carries(r)) {
+            if carried {
+                words.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
+            }
         }
         // W1: round 0 owns tree 0, whose cap rides at the end of its first
         // current path; it goes to the arena here and the path goes without it.

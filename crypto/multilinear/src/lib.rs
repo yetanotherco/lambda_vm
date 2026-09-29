@@ -129,6 +129,8 @@ pub enum Error {
     GrindingFailed { bits: u8 },
     #[error("a proof-of-work nonce does not carry the required {bits} bits")]
     GrindingRejected { bits: u8 },
+    #[error("a nonce the proof format does not carry is set")]
+    UnspentNonce,
     #[error("the buses do not balance across the proof")]
     BusImbalance,
     #[error("the statements rebuilt from the factor values are not what the batch demands")]

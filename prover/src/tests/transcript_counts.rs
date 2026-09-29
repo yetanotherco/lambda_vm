@@ -177,12 +177,21 @@ fn schedule(num_vars: usize, k: usize) -> Vec<usize> {
 
 /// One chain's transcript over the fold schedule `sch` — the config's own
 /// (`ChainConfig::schedule`), so a non-uniform first fold (`whir_folds=first6`,
-/// the production default) is priced as it is proved.
-fn drive_chain(s: &mut Sim, sch: &[usize], queries: usize) {
+/// the production default) is priced as it is proved — and its grinds, of
+/// which only those with bits touch the transcript (P2's query-only grind
+/// spends one a round).
+fn drive_chain(s: &mut Sim, sch: &[usize], queries: usize, grind: GrindBits) {
+    // `check_grind`: at zero bits it returns before its `state()` and before
+    // absorbing the nonce.
+    let spend = |s: &mut Sim, bits: u8| {
+        if bits > 0 {
+            s.state();
+            s.absorb(8);
+        }
+    };
     let rounds = sch.len();
     for (r, &kr) in sch.iter().enumerate() {
-        s.state(); // check_grind(folding)
-        s.absorb(8);
+        spend(s, grind.folding);
         for _ in 0..kr {
             s.absorb(24);
             s.absorb(24); // degree-2 round polynomial
@@ -192,15 +201,12 @@ fn drive_chain(s: &mut Sim, sch: &[usize], queries: usize) {
             s.absorb(32); // next_root
             s.sample_ext(); // z0
             s.absorb(24); // y0
-            s.state(); // check_grind(ood)
-            s.absorb(8);
+            spend(s, grind.ood);
             s.sample_ext(); // gamma
-            s.state(); // check_grind(query)
-            s.absorb(8);
+            spend(s, grind.query);
         } else {
             s.absorb(24); // final_value
-            s.state(); // check_grind(query)
-            s.absorb(8);
+            spend(s, grind.query);
         }
         for _ in 0..queries {
             s.sample_u64();
@@ -258,7 +264,7 @@ pub fn transcript_counts(
         }
         s.sample_ext(); // the batching challenge
         for _ in 0..g.num_polys {
-            drive_chain(&mut s, &chain.schedule(g.n_stack), queries);
+            drive_chain(&mut s, &chain.schedule(g.n_stack), queries, chain.grind);
         }
     }
     s.c
@@ -272,7 +278,7 @@ use crate::multilinear_continuation::{epoch_groups, global_groups};
 use crate::multilinear_prove::{chain_config, stacks};
 use crate::tables::trace_builder::DecodeArtifacts;
 use executor::elf::Elf;
-use multilinear::whir_chain::ChainConfig;
+use multilinear::whir_chain::{ChainConfig, GrindBits};
 use stark::traits::AIR;
 
 /// The tags, copied so the byte totals are exact. A drift here fails the
@@ -734,6 +740,37 @@ fn whir_transcript_counts_for_the_block() {
         "transcript finalizes (squeezes + states) = {}",
         c.finalizes()
     );
+}
+
+/// A grind with bits reads the transcript's state once (`check_grind`); one of
+/// zero bits reads nothing. So a production chain reads it `R` times under the
+/// default (`whir_grind=query`: the query grind alone) and `3R − 1` times under
+/// the opt-out (`whir_grind=all`).
+#[test]
+fn a_chain_reads_the_state_once_a_spent_grind() {
+    let sch = [6, 4, 4, 4, 4, 3];
+    let states = |grind| {
+        let mut s = Sim::new();
+        drive_chain(&mut s, &sch, 112, grind);
+        s.c.state_finalizes
+    };
+    assert_eq!(states(GrindBits::query_only(20)), 6);
+    assert_eq!(states(GrindBits::uniform(20)), 17);
+    assert_eq!(states(GrindBits::default()), 0);
+    for (whir_grind, want) in [
+        (crate::zf_format::WhirGrind::Query, 6),
+        (crate::zf_format::WhirGrind::All, 17),
+    ] {
+        let config = crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat {
+                whir_grind,
+                ..crate::zf_format::ZfFormat::DEFAULT
+            },
+            &[(1, 25)],
+        );
+        assert_eq!(config.schedule(25), sch);
+        assert_eq!(states(config.grind), want, "{whir_grind}");
+    }
 }
 
 /// The closed form drives `ChainConfig::schedule`; at the LEGACY format that

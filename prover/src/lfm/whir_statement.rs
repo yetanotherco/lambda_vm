@@ -105,12 +105,14 @@ fn push_config(bytes: &mut Vec<u8>, config: &ChainConfig) {
         log_folding: _,
         num_queries,
         grind,
-        // ⚠ NOT absorbed: the rest of the format (the cap policy) is a set of
-        // verifier-side constants, like the STARK cap. Absorbing it would move
-        // this statement's bytes, and every WHIR transcript KAT, at the
-        // default. A change to a lever's effect on the statement
-        // decides that here, explicitly. The fold schedule is absorbed through
-        // the word above, whose default value is today's.
+        // ⚠ NOT absorbed: the rest of the format (the cap policy, the nonce
+        // layout) is a set of verifier-side constants, like the STARK cap.
+        // Absorbing it would move this statement's bytes, and every WHIR
+        // transcript KAT, at the default. A change to a lever's effect on the
+        // statement decides that here, explicitly. The fold schedule is
+        // absorbed through the word above, whose default value is today's; the
+        // grind bits, which decide which nonces a round spends, through the
+        // trailer below.
         format: _,
     } = config;
     for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {

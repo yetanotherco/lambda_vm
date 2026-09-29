@@ -32,9 +32,16 @@
 //!
 //! Three challenges per round are worth redrawing for a cheating prover — the
 //! folding randomness, the out-of-domain batching challenge and the query
-//! positions — so each is preceded by a [proof of
-//! work](crypto::grinding): retrying one costs `2^bits` hashes. That is what
-//! lets a query count buy more soundness than its own bits.
+//! positions — and [`GrindBits`] can put a [proof of work](crypto::grinding)
+//! before each: retrying one costs `2^bits` hashes. Only the query grind raises
+//! the proven minimum as placed. It sits right before the positions, which is
+//! what lets a query count buy more soundness than its own bits. The folding
+//! grind sits before the round's FIRST sumcheck message, so the first folding
+//! challenge is redrawn by varying that message without grinding again. The
+//! out-of-domain grind comes after the out-of-domain point, so the only
+//! challenge it guards is the batching one, which has far more bits than the
+//! target without any grind. So [`GrindBits::query_only`] loses no proven
+//! bits, and with [`NonceLayout::Spent`] the proof carries one nonce a round.
 //!
 //! The claim is the weighted one, `Σ_x w(x)·f(x) = y`, so a stacked multi-point
 //! claim chains just as an evaluation does.
@@ -139,6 +146,36 @@ where
     Ok(())
 }
 
+/// A nonce slot the round does not spend: a grind of zero bits, or the last
+/// round's out-of-domain slot. [`NonceLayout::Three`] carries it and never
+/// reads it; [`NonceLayout::Spent`] has no such nonce, so the field standing in
+/// for it must be 0. No transcript is touched either way.
+fn check_unspent(layout: NonceLayout, nonce: u64) -> Result<(), Error> {
+    match layout {
+        NonceLayout::Spent if nonce != 0 => Err(Error::UnspentNonce),
+        _ => Ok(()),
+    }
+}
+
+/// One nonce slot, as the layout has it: [`check_grind`] where the grind spends
+/// bits, [`check_unspent`] where it does not.
+fn check_nonce<E, T, H>(
+    transcript: &mut T,
+    bits: u8,
+    nonce: u64,
+    layout: NonceLayout,
+) -> Result<(), Error>
+where
+    E: IsField + Send + Sync + 'static,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if bits == 0 {
+        return check_unspent(layout, nonce);
+    }
+    check_grind::<E, T, H>(transcript, bits, nonce)
+}
+
 /// `w + gamma·eq`, the weight the next group carries.
 fn batch_weight<E: IsField + 'static>(
     w: &Mle<E>,
@@ -171,6 +208,17 @@ impl GrindBits {
         Self {
             folding: bits,
             ood: bits,
+            query: bits,
+        }
+    }
+
+    /// Bits before the query positions only: the one grind that raises the
+    /// proven minimum as placed (module header). The query count reads `query`
+    /// alone, so it equals [`uniform`](Self::uniform)'s at the same bits.
+    pub const fn query_only(bits: u8) -> Self {
+        Self {
+            folding: 0,
+            ood: 0,
             query: bits,
         }
     }
@@ -212,6 +260,8 @@ pub struct ChainFormat {
     /// How wide a stacked polynomial may get (S2). [`StackVars::LEGACY`] =
     /// today (25).
     pub stack: StackVars,
+    /// Which nonces a round carries (P2). [`NonceLayout::Three`] = today.
+    pub nonces: NonceLayout,
 }
 
 impl ChainFormat {
@@ -220,12 +270,46 @@ impl ChainFormat {
         cap: CapPolicy::Off,
         folds: WhirFolds::Uniform,
         stack: StackVars::LEGACY,
+        nonces: NonceLayout::Three,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
     pub fn is_default(&self) -> bool {
-        self.cap.is_off() && self.folds == WhirFolds::Uniform && self.stack == StackVars::LEGACY
+        self.cap.is_off()
+            && self.folds == WhirFolds::Uniform
+            && self.stack == StackVars::LEGACY
+            && self.nonces == NonceLayout::Three
     }
+}
+
+/// Which proof-of-work nonces a round's encoding carries (P2's format half).
+///
+/// A round has three nonce slots, folding, out-of-domain and query, and spends
+/// the ones whose grind has bits. At zero bits a grind searches, reads and
+/// absorbs nothing, and the last round's out-of-domain slot has no grind at all
+/// (there is no successor to batch).
+///
+/// ★ WHY IT IS A FORMAT FIELD. Under [`Three`](Self::Three) an unspent slot is
+/// carried and never read, so any value in it verifies: an unbound field.
+/// [`GrindBits::query_only`] leaves two of those a round. [`Spent`](Self::Spent)
+/// takes them out of the format. The in-guest encoding
+/// (`prover::lfm::whir_chain`'s arena) has no word for an unspent nonce, so
+/// there is nothing to set. The host [`RoundNonces`] keeps its three fields, so
+/// both layouts share one proof type and `Three` keeps its bytes, and the
+/// verifier refuses a nonzero value in a field the layout does not carry
+/// ([`Error::UnspentNonce`]).
+///
+/// A verifier-side constant like the rest of [`ChainFormat`], and not absorbed:
+/// the grind bits, which decide which slots are spent, are (the statement's
+/// grind trailer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NonceLayout {
+    /// Three nonces a round, whatever the bits. Today's format.
+    #[default]
+    Three,
+    /// Only the nonces the round spends: one a round under
+    /// [`GrindBits::query_only`].
+    Spent,
 }
 
 /// How wide one stacked polynomial may get, in variables: the stack cap (S2).
@@ -516,7 +600,8 @@ impl ChainConfig {
 /// A round's proof-of-work nonces.
 ///
 /// Zero where the config asks for no bits, and the out-of-domain one is unused
-/// on the last round.
+/// on the last round. Under [`NonceLayout::Spent`] those unspent fields are not
+/// part of the format and must stay zero; see there.
 #[derive(
     Clone,
     Copy,
@@ -1320,6 +1405,8 @@ where
     // carries; every later tree by the check the round that committed it
     // returned. A verifier constant per tree, derived from the config alone.
     let caps = config.tree_caps(num_vars);
+    // Which nonce slots the proof carries: a verifier constant too.
+    let layout = config.format.nonces;
     let mut current: TreeCheck<'a> = TreeCheck::Owner {
         root,
         cap_height: caps[0],
@@ -1345,7 +1432,12 @@ where
                 got: r,
             });
         }
-        check_grind::<E, T, H>(transcript, config.grind.folding, round.nonces.folding)?;
+        check_nonce::<E, T, H>(
+            transcript,
+            config.grind.folding,
+            round.nonces.folding,
+            layout,
+        )?;
         // The weight raises the degree of the plain `f` term to two.
         let group = sumcheck::verify_rounds(&round.sumcheck, claim, 2, transcript)?;
         claim = group.expected_evaluation;
@@ -1373,12 +1465,12 @@ where
                 let point = ood_point(&z0, num_vars - bound);
                 transcript.append_field_element(y0);
 
-                check_grind::<E, T, H>(transcript, config.grind.ood, round.nonces.ood)?;
+                check_nonce::<E, T, H>(transcript, config.grind.ood, round.nonces.ood, layout)?;
                 let gamma: FieldElement<E> = transcript.sample_field_element();
                 claim += &gamma * y0;
                 ood.push((gamma, point, bound));
 
-                check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
+                check_nonce::<E, T, H>(transcript, config.grind.query, round.nonces.query, layout)?;
                 let commitments = RoundCommitments {
                     current,
                     next_root,
@@ -1406,8 +1498,11 @@ where
                 current = TreeCheck::Checked(next_check);
             }
             (None, None, None) => {
+                // No successor, so no out-of-domain grind: the slot is never
+                // spent.
+                check_unspent(layout, round.nonces.ood)?;
                 transcript.append_field_element(&proof.final_value);
-                check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
+                check_nonce::<E, T, H>(transcript, config.grind.query, round.nonces.query, layout)?;
                 match &round.openings {
                     RoundOpenings::Base(openings) => verify_final::<F, F, E, T, H>(
                         openings,
@@ -2586,6 +2681,154 @@ mod tests {
         let (proof, root, domain, y) = prove_ground(num_vars, &cfg);
         assert_eq!(proof.rounds[0].nonces.ood, 0);
         verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // P2: a grind before the queries only, and the nonce layout.
+    // ---------------------------------------------------------------
+
+    /// The query count reads the query grind alone, so dropping the other two
+    /// grinds leaves it where it was.
+    #[test]
+    fn a_query_only_grind_keeps_the_query_count() {
+        assert_eq!(
+            GrindBits::query_only(20),
+            GrindBits {
+                folding: 0,
+                ood: 0,
+                query: 20
+            }
+        );
+        for num_vars in [10, 25, 27] {
+            assert_eq!(
+                ChainConfig::with_security(2, 4, num_vars, 128, GrindBits::query_only(20))
+                    .num_queries,
+                ChainConfig::with_security(2, 4, num_vars, 128, GrindBits::uniform(20)).num_queries,
+                "num_vars {num_vars}"
+            );
+        }
+    }
+
+    /// Enough query bits to be a real search, under a nonce layout.
+    fn query_only(layout: NonceLayout) -> ChainConfig {
+        ChainConfig {
+            grind: GrindBits::query_only(8),
+            format: ChainFormat {
+                nonces: layout,
+                ..ChainFormat::DEFAULT
+            },
+            ..config(2)
+        }
+    }
+
+    /// The verdicts on four forgeries of one nonce slot: `^ 1`, `^ 2`, `^ 4`,
+    /// `^ 8`. Each passes the PoW with probability `2^-bits`, so a verifier that
+    /// checks the slot refuses at least one of the four (all four pass with
+    /// probability `2^-32` at 8 bits), and one that does not check it refuses
+    /// none.
+    fn flips(
+        proof: &ChainProof<F, F>,
+        slot: impl Fn(&mut ChainProof<F, F>) -> &mut u64,
+        verify: impl Fn(&ChainProof<F, F>) -> Result<(), Error>,
+    ) -> Vec<Result<(), Error>> {
+        [1u64, 2, 4, 8]
+            .into_iter()
+            .map(|flip| {
+                let mut forged = proof.clone();
+                *slot(&mut forged) ^= flip;
+                verify(&forged)
+            })
+            .collect()
+    }
+
+    /// ★ Under either layout a query-only chain grinds once a round, before its
+    /// queries: the other two nonces stay zero, and a wrong query nonce is
+    /// refused in every round.
+    #[test]
+    fn a_query_only_chain_checks_its_query_nonce_in_every_round() {
+        let num_vars = 9;
+        for layout in [NonceLayout::Three, NonceLayout::Spent] {
+            let cfg = query_only(layout);
+            let (proof, root, domain, y) = prove_ground(num_vars, &cfg);
+            assert!(
+                proof.rounds.len() > 2,
+                "a round that is neither first nor last"
+            );
+            for round in &proof.rounds {
+                assert_eq!((round.nonces.folding, round.nonces.ood), (0, 0));
+            }
+            verify_ground(&proof, &root, &domain, y, &cfg, num_vars).unwrap();
+
+            for r in 0..proof.rounds.len() {
+                let verdicts = flips(
+                    &proof,
+                    |p| &mut p.rounds[r].nonces.query,
+                    |p| verify_ground(p, &root, &domain, y, &cfg, num_vars),
+                );
+                assert!(
+                    verdicts.contains(&Err(Error::GrindingRejected { bits: 8 })),
+                    "{layout:?}, round {r}: the query nonce is not checked ({verdicts:?})"
+                );
+                for v in verdicts {
+                    assert!(
+                        matches!(v, Ok(()) | Err(Error::GrindingRejected { bits: 8 })),
+                        "{layout:?}, round {r}: {v:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ★ A nonce the round does not spend is refused when set, under `Spent`
+    /// only. `Three` carries it unread: today's format, and the reason `Spent`
+    /// exists. Every unspent slot of a query-only chain, and the last round's
+    /// out-of-domain slot, which no config spends.
+    #[test]
+    fn an_unspent_nonce_is_refused_where_the_layout_does_not_carry_it() {
+        let num_vars = 9;
+        let (proof, root, domain, y) = prove_ground(num_vars, &query_only(NonceLayout::Spent));
+        let rounds = proof.rounds.len();
+        let mut refused = 0;
+        for r in 0..rounds {
+            for slot in ["folding", "ood"] {
+                let mut forged = proof.clone();
+                match slot {
+                    "folding" => forged.rounds[r].nonces.folding = 1,
+                    _ => forged.rounds[r].nonces.ood = 1,
+                }
+                let under = |layout| {
+                    verify_ground(&forged, &root, &domain, y, &query_only(layout), num_vars)
+                };
+                assert_eq!(
+                    under(NonceLayout::Spent),
+                    Err(Error::UnspentNonce),
+                    "round {r}, the {slot} slot"
+                );
+                assert_eq!(
+                    under(NonceLayout::Three),
+                    Ok(()),
+                    "round {r}, the {slot} slot: Three must not read it"
+                );
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 2 * rounds, "two unspent slots a round");
+
+        // With every grind spent, the one unspent slot is the last round's
+        // out-of-domain nonce: refused under `Spent`, unread under `Three`.
+        let uniform = |layout| ChainConfig {
+            format: ChainFormat {
+                nonces: layout,
+                ..ChainFormat::DEFAULT
+            },
+            ..ground(2)
+        };
+        let (proof, root, domain, y) = prove_ground(num_vars, &uniform(NonceLayout::Spent));
+        let mut forged = proof.clone();
+        forged.rounds.last_mut().expect("a round").nonces.ood = 1;
+        let under = |layout| verify_ground(&forged, &root, &domain, y, &uniform(layout), num_vars);
+        assert_eq!(under(NonceLayout::Spent), Err(Error::UnspentNonce));
+        assert_eq!(under(NonceLayout::Three), Ok(()));
     }
 
     /// The field tower: a base-field domain with extension-valued codewords.
