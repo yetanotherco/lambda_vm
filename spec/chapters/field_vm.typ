@@ -1,4 +1,4 @@
-#import "/meta.typ": aside
+#import "/meta.typ": aside, notelist
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_variable_table, total_nr_variables, total_nr_instantiated_columns, compute_nr_interactions, render_constraint_table, render_chip_padding_table
 #import "/expr.typ": expr_to_math
@@ -63,7 +63,7 @@ It is generally incremented by $1$ for every consecutive state,
 except for when handling a branching instruction (that output-hints the `PC` register).
 As the name implies, the general purpose registers are available for arbitrary usage.
 
-Each argument to the `FMA` constraint has either of the two following forms:
+Each argument to the `FMA` constraint has either of the two following composite forms, which we call addressing modes:
 - $#`imm`_0 dot #`reg` + #`imm`_1$
 - $#`MEM[`#`imm`_0 dot #`reg` + #`imm`_1#`]`$
 where each immediate is a base field element, encoded in the instruction for a specific argument.
@@ -155,17 +155,33 @@ implementers and practitioners are encouraged to discover and use their own,
 as experience may point out further useful abstractions.
 
 #table(columns: (auto, 2fr, 1fr),
-       stroke: 0pt,
-       inset: (right: .5em),
-       table.header[*Pseudoinstr.*][*Translation*][*Comment*], table.hline(stroke: 1.5pt))[
-  `ADD d, a, b`][`FMA d == (0 * X + 1) * a + b, hint out`][Addition][
-  `MUL d, a, b`][`FMA d == a * b + (0 * X), hint out`][Multiplication][
-  `INV d, a`][`FMA d == (a + 1) * d - 1, hint <register of d>`][Extension field inversion. Note: `d` and `a` cannot use the same register here, and `d` should not be input-hinted in the next instruction.][
-  `J a`][`FMA PC == a, hint out`][Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC][
-  `JZA imm`][`FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`][Jump if ZERO, absolute target address. The immediate in the translated instruction is different from, but based on, the immediate in the pseudoinstruction.][
-  `JZR a`][`FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`][Jump if ZERO, PC-relative target address][
-  `JNZA imm`][`FMA PC == ZERO * (PC + (-imm)) + (ZERO + imm), hint out`][Jump if not ZERO, absolute target address. The immediate in the translated instruction is different from, but based on, the immediate in the pseudoinstruction.][
-  `JNZR a`][`FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`][Jump if not ZERO, PC-relative target address]
+      stroke: 0pt,
+      inset: (right: .5em),
+      table.header[*Pseudoinstr.*][*Translation*][*Comment*], table.hline(stroke: 1.5pt))[
+  `ADD d, a, b`][`FMA d == (0 * X + 1) * a + b, hint out`                   ][Addition
+                                                                              @field-VM:note:fullarg][
+  `MUL d, a, b`][`FMA d == a * b + (0), hint out`                           ][Multiplication
+                                                                              @field-VM:note:fullarg][
+  `INV d, a`   ][`FMA d == (a + 1) * d + (-1), hint <register of d>`        ][Extension field inversion
+                                                                              @field-VM:note:fullarg@field-VM:note:imm_mod@field-VM:note:inv][
+  `J a`        ][`FMA PC == a, hint out`                                    ][Jump
+                                                                              @field-VM:note:fullarg@field-VM:note:pcrel][
+  `JZA imm`    ][`FMA PC == (ZERO)*(-1 * PC + (imm-1)) + (PC + 1), hint out`][Jump if ZERO, absolute target address
+                                                                              @field-VM:note:immarg][
+  `JZR a`      ][`FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`          ][Jump if ZERO, PC-relative target address
+                                                                              @field-VM:note:fullarg@field-VM:note:imm_mod][
+  `JNZA imm`   ][`FMA PC == ZERO * (PC + (-imm)) + (ZERO + imm), hint out`  ][Jump if not ZERO, absolute target address
+                                                                              @field-VM:note:immarg][
+  `JNZR a`     ][`FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out` ][Jump if not ZERO, PC-relative target address
+                                                                              @field-VM:note:fullarg@field-VM:note:imm_mod]
+
+#notelist("field-VM")[
+  / fullarg: The `a`, `b` and `d` arguments are complete arguments that can take the form of any addressing mode
+  / immarg: The `imm` argument is a single base field immediate value. If operated on in the translation (e.g. `(imm-1)`), the resulting value should instead be used for the translated version.
+  / imm_mod: For arguments with an extra immediate in the translation, the immediates of the original form should be appropriately adapted, and the argument can no longer use a memory addressing mode.
+  / inv: Since `d` gets input-hinted, `a` and `d` should use distinct registers.
+  / pcrel: The jump may be relative to `PC`, depending on the register used in the arguments.
+]
 
 Eventually, usage may inform a set of common pseudoinstructions,
 along with informing potential optimizations that remove unused capabilities
