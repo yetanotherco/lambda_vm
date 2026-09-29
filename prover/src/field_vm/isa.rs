@@ -10,10 +10,12 @@
 use crate::tables::types::{FE, FEE};
 
 /// Number of general-purpose registers.
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 pub const N: usize = 5;
-#[cfg(feature = "fvm-narrow")]
+#[cfg(all(feature = "fvm-narrow", not(feature = "fvm-n1")))]
 pub const N: usize = 2;
+#[cfg(feature = "fvm-n1")]
+pub const N: usize = 1;
 /// `ZERO`, `PC` and the `N` general-purpose registers.
 pub const NUM_REGS: usize = N + 2;
 

@@ -1,5 +1,5 @@
 use super::asm::{Asm, AsmError};
-#[cfg_attr(feature = "fvm-narrow", allow(unused_imports))]
+#[cfg_attr(any(feature = "fvm-narrow", feature = "fvm-n1"), allow(unused_imports))]
 use super::executor::{ExecError, Execution, HintKind, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, HALT_PC, Instr, N, Program, REG_PC, REG_ZERO, gpr};
 use crate::tables::types::{FE, FEE};
@@ -57,7 +57,7 @@ fn straight_line_fma_matches_native() {
     assert_bookkeeping(&program, &exec);
 }
 
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 fn loop_computes_power() {
     let (acc, cnt, x) = (gpr(0), gpr(1), gpr(2));
@@ -98,7 +98,7 @@ fn jump_zero_takes_and_skips() {
     }
 }
 
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 fn horner_over_indexed_memory() {
     let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
@@ -128,6 +128,7 @@ fn horner_over_indexed_memory() {
     assert_bookkeeping(&program, &exec);
 }
 
+#[cfg(not(feature = "fvm-n1"))]
 #[test]
 fn inv_is_solved_from_the_constraint() {
     let (r, a) = (gpr(0), gpr(1));
@@ -143,6 +144,7 @@ fn inv_is_solved_from_the_constraint() {
     assert_bookkeeping(&program, &exec);
 }
 
+#[cfg(not(feature = "fvm-n1"))]
 #[test]
 fn inv_of_zero_is_unresolved() {
     let (r, a) = (gpr(0), gpr(1));
@@ -157,7 +159,7 @@ fn inv_of_zero_is_unresolved() {
 }
 
 /// Recursive factorial through `CALL`/`RET`, with fresh frames from the oracle.
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 fn call_ret_recursive_factorial() {
     let (fp, n, t, res) = (gpr(0), gpr(1), gpr(2), gpr(3));
@@ -229,6 +231,7 @@ fn reading_a_free_cell_fails() {
     );
 }
 
+#[cfg(not(feature = "fvm-n1"))]
 #[test]
 fn bad_addresses_fail() {
     let mut asm = Asm::new();
@@ -252,6 +255,7 @@ fn bad_addresses_fail() {
     ));
 }
 
+#[cfg(not(feature = "fvm-n1"))]
 #[test]
 fn output_hint_followed_by_input_hint_is_a_collision() {
     let (r, a) = (gpr(0), gpr(1));

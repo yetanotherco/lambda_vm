@@ -10,6 +10,8 @@ default = ["parallel"]
 fvm-d3 = []
 # Field VM with 2 general-purpose registers.
 fvm-narrow = []
+# Field VM with a single general-purpose register.
+fvm-n1 = []
 parallel = [
     "stark/parallel",
     "math/parallel",

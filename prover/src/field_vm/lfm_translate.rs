@@ -180,7 +180,9 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         mem.push(v);
         mem.len() as u64 - 1
     };
-    let (acc, tmp) = (gpr(0), gpr(1));
+    // A select never meets a chain (chains feed only the next ALU
+    // instruction), so with one register it borrows the accumulator.
+    let (acc, tmp) = (gpr(0), gpr(if super::isa::N >= 2 { 1 } else { 0 }));
     let opt = std::env::var_os("FVM_TRANSLATE_OPT").is_some();
     let plan = if opt {
         plan(program)

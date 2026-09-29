@@ -1,6 +1,6 @@
 use super::air::cols;
 use super::asm::Asm;
-#[cfg_attr(feature = "fvm-narrow", allow(unused_imports))]
+#[cfg_attr(any(feature = "fvm-narrow", feature = "fvm-n1"), allow(unused_imports))]
 use super::executor::{Execution, HintRequest, Memory, NoHints, execute};
 use super::isa::{Arg, Program, gpr};
 use super::mem::cols as mem_cols;
@@ -15,6 +15,17 @@ fn fee(a: u64, b: u64, c: u64) -> FEE {
 }
 
 fn power_program(n: i64) -> Program {
+    if super::isa::N == 1 {
+        // One register: the power as a straight-line chain.
+        let acc = gpr(0);
+        let mut asm = Asm::new();
+        asm.mov(Arg::reg(acc), Arg::imm(1));
+        for _ in 0..n {
+            asm.mul(Arg::reg(acc), Arg::reg(acc), Arg::mem_abs(0));
+        }
+        asm.store(Arg::mem_abs(1), Arg::reg(acc)).halt();
+        return asm.finish().unwrap();
+    }
     let (acc, cnt) = (gpr(0), gpr(1));
     let mut asm = Asm::new();
     asm.mov(Arg::reg(acc), Arg::imm(1))
@@ -53,6 +64,7 @@ fn power_loop_proves_and_verifies() {
     assert!(prove_and_verify(&program, &exec, &[0, 1]));
 }
 
+#[cfg(not(feature = "fvm-n1"))]
 #[test]
 fn inv_and_straight_line_prove_and_verify() {
     let (r, a) = (gpr(0), gpr(1));
@@ -72,7 +84,7 @@ fn inv_and_straight_line_prove_and_verify() {
     assert!(prove_and_verify(&program, &exec, &[0, 1]));
 }
 
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 fn recursive_calls_prove_and_verify() {
     let (fp, n, t, res) = (gpr(0), gpr(1), gpr(2), gpr(3));
@@ -160,7 +172,7 @@ fn untampered_traces_verify() {
     assert!(verifies_after(&program, &exec, |_| {}));
 }
 
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 fn register_changed_without_a_hint_is_rejected() {
     let (program, exec) = power_exec();
@@ -338,7 +350,7 @@ fn non_bit_public_flag_is_rejected() {
     }));
 }
 
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 fn horner_program(len: usize) -> Program {
     let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
     let mut asm = Asm::new();
@@ -357,7 +369,7 @@ fn horner_program(len: usize) -> Program {
 
 /// Sizes and timings of a Horner evaluation (3 rows per coefficient).
 /// `cargo test --release -p lambda-vm-prover --lib field_vm::prove_tests::report_horner -- --ignored --nocapture`
-#[cfg(not(feature = "fvm-narrow"))]
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
 #[test]
 #[ignore]
 fn report_horner() {
@@ -541,4 +553,25 @@ fn decode_chunks_cover_the_program() {
         }
         assert_eq!(next, len);
     }
+}
+
+/// With a single register the translation still borrows it for selects and
+/// chains; a one-register program proves, and a forged register is rejected.
+#[test]
+fn one_register_program_proves_and_rejects_forgery() {
+    let (program, exec) = power_exec();
+    let options = default_options();
+    let proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    assert!(verify(
+        &program_id(&program, &options),
+        &cells,
+        &proof,
+        &options
+    ));
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.fvm[0].main_table,
+        2,
+        cols::reg(0)
+    )));
 }
