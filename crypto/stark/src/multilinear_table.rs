@@ -2308,11 +2308,25 @@ mod tests {
         }
     }
 
-    /// ⛔ The identity above can fail. With a fault armed, the first cell of a
-    /// table the card builds is overwritten: the zerocheck's `eq` weight, or the
-    /// reduce's batched column. The proof must then differ from today's at CPU
-    /// — the first table argued — and must not verify, each fault at its own
-    /// check. Needs a device, and says so rather than passing without one.
+    /// ⛔ The identity above can fail. With a fault armed, the first cell of
+    /// tables the card builds is overwritten: under `Eq`, the zerocheck's `eq(r)`
+    /// weight and the reduce's offset-0 `eq(α)` table; under `Batched`, the
+    /// reduce's offset-0 batched column. The proof must then differ from
+    /// today's at CPU, the first table argued, and must not verify.
+    ///
+    /// ★ Here both faults are refused by the reduce (`ShiftedReadMismatch`), and
+    /// the test pins why. CPU has no constraints of its own
+    /// (`EmptyConstraints`), so its zerocheck rule is `eq(r)` times an empty sum,
+    /// which the program builder makes the constant zero: a wrong `eq(r)` moves
+    /// no round. CPU's GKR, zerocheck and factor values stay today's; its reduce
+    /// is what the fault reaches, and the reduce's final check is the first to
+    /// see it. A zerocheck weight fault under a table with constraints is
+    /// refused as `BatchMismatch`, which multilinear's `argue_device_tables`
+    /// matrix pins.
+    ///
+    /// The control comes first: the same arm without a fault is today's proof,
+    /// and it verifies. So what the faulted arms show is the fault's doing.
+    /// Needs a device, and says so rather than passing without one.
     #[test]
     fn a_wrong_table_on_the_card_changes_the_argument_and_fails_it() {
         use multilinear::gpu::TableFault;
@@ -2325,10 +2339,41 @@ mod tests {
             return;
         }
         let today = prove_tall(&airs, &columns, TODAY);
-        for (fault, rejected) in [
-            (TableFault::Eq, MlError::BatchMismatch),
-            (TableFault::Batched, MlError::ShiftedReadMismatch),
-        ] {
+        // CPU's argument, part by part: what precedes its reduce, and the reduce.
+        let cpu = |arm: &TallArm<'_>| {
+            let table = &arm.proof.tables[0];
+            let before = [
+                bincode::serialize(&table.gkr).unwrap(),
+                bincode::serialize(&table.constraint.sumcheck).unwrap(),
+                bincode::serialize(&table.constraint.factor_values).unwrap(),
+            ];
+            (
+                before,
+                bincode::serialize(&table.constraint.reduce).unwrap(),
+            )
+        };
+        let (today_before, today_reduce) = cpu(&today);
+
+        let clean = prove_tall(
+            &airs,
+            &columns,
+            Knobs {
+                tables: true,
+                ..TODAY
+            },
+        );
+        assert_eq!(
+            clean.tables_on_card, 12,
+            "the control is on the card's path"
+        );
+        assert_eq!(
+            first_table_that_differs(&today.proof, &clean.proof),
+            None,
+            "without a fault the card's tables are the host's"
+        );
+        verify_tall(&clean.committed, &clean.proof).expect("without a fault the proof verifies");
+
+        for fault in [TableFault::Eq, TableFault::Batched] {
             multilinear::gpu::force_table_fault(Some(fault));
             let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 prove_tall(
@@ -2351,12 +2396,25 @@ mod tests {
                 Some(0),
                 "{fault:?}: the identity must name CPU, the first table argued"
             );
+            let (before, reduce) = cpu(&faulted);
+            assert_eq!(
+                before, today_before,
+                "{fault:?}: CPU's GKR, zerocheck and factor values are today's (its zerocheck is \
+                 eq(r) times an empty sum)"
+            );
+            assert_ne!(
+                reduce, today_reduce,
+                "{fault:?}: the fault reaches CPU's reduce"
+            );
             assert_eq!(
                 verify_tall(&faulted.committed, &faulted.proof),
-                Err(rejected),
-                "{fault:?}: the proof over a corrupted table must not verify"
+                Err(MlError::ShiftedReadMismatch),
+                "{fault:?}: the reduce's final check refuses the corrupted table"
             );
         }
+        eprintln!(
+            "argue device tables: both faults refused by the reduce, CPU's zerocheck untouched"
+        );
     }
 
     /// ★ `LAMBDA_VM_ARGUE_LEAN_READS` moves no byte of the proof, alone or with
