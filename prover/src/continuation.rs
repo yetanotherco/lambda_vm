@@ -2561,9 +2561,9 @@ pub(crate) trait EpochObserver<P>: Sync {
     /// `multilinear_continuation::SharedDecode<H>` under the base's hash — whose
     /// derivation is a device commit, which the lead-in must not make). Called
     /// once, before any epoch is proved: before the pipeline starts, or — with
-    /// the WHIR base's head ahead (`LAMBDA_VM_WHIR_HEAD_AHEAD`), whose DECODE root
-    /// arrives from a helper — from the consumer, before the first epoch it
-    /// proves.
+    /// the WHIR base's head ahead (the default; `LAMBDA_VM_WHIR_HEAD_AHEAD=0` is
+    /// the serial head), whose DECODE root arrives from a helper — from the
+    /// consumer, before the first epoch it proves.
     fn on_base_shared(&self, _shared: Arc<dyn std::any::Any + Send + Sync>) {}
 }
 

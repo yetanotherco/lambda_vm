@@ -665,19 +665,20 @@ impl continuation::EpochObserver<multilinear_continuation::EpochProof> for Order
     }
 }
 
-/// The head switch: `1` is ahead; unset, empty and `0` are the serial head.
+/// The head switch: unset, empty and `1` are ahead (the default); `0` is the
+/// serial head, the named opt-out.
 #[test]
-fn the_whir_head_switch_is_serial_unless_exactly_one() {
+fn the_whir_head_switch_is_ahead_unless_exactly_zero() {
     use multilinear_continuation::whir_head_ahead_setting as ahead;
-    assert!(!ahead(None));
-    assert!(!ahead(Some("")));
-    assert!(!ahead(Some("0")));
-    assert!(!ahead(Some(" 0 ")));
+    assert!(ahead(None));
+    assert!(ahead(Some("")));
     assert!(ahead(Some("1")));
     assert!(ahead(Some(" 1 ")));
+    assert!(!ahead(Some("0")));
+    assert!(!ahead(Some(" 0 ")));
 }
 
-/// Anything else stops the run rather than measuring the serial head under the
+/// Anything else stops the run rather than measuring the default under the
 /// switch's name.
 #[test]
 #[should_panic(expected = "LAMBDA_VM_WHIR_HEAD_AHEAD must be 0 or 1")]

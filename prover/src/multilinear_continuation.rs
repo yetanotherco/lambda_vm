@@ -2337,9 +2337,10 @@ pub fn prove_continuation_keeping_decode(
     )
 }
 
-/// The switch that takes DECODE's root off the WHIR base's critical path: `1`
-/// on, unset, empty or `0` the serial head (today's), anything else stops the
-/// run.
+/// The switch that takes DECODE's root off the WHIR base's critical path:
+/// unset, empty or `1` ahead (the default), `0` the serial head (the named
+/// opt-out, which reproduces the head as it ran before), anything else stops
+/// the run.
 ///
 /// ⛔ WHY. Before the producer starts, the serial head commits DECODE's
 /// univariate root on the host (an FFT, a 4× LDE and the leaves over DECODE's
@@ -2351,15 +2352,20 @@ pub fn prove_continuation_keeping_decode(
 /// beside epoch 0's execution and the preparation waits for it where it first
 /// reads it. The prepared commitment keeps its place on the calling thread.
 /// Only where the root is computed moves; every committed value is the same.
+///
+/// Measured (FAST job 241, wt1030–1033, two arms each against the serial
+/// head): epoch 0 executing 1.03 s earlier, the first card commit 0.73 s
+/// earlier, the base −0.65 s and the block −0.55 s, level 1 unchanged; the
+/// program ids unchanged. Epoch 0's preparation never waited for the root.
 pub const WHIR_HEAD_AHEAD_ENV: &str = "LAMBDA_VM_WHIR_HEAD_AHEAD";
 
-/// [`WHIR_HEAD_AHEAD_ENV`] for a raw value: `1` is ahead; unset, empty or `0`
+/// [`WHIR_HEAD_AHEAD_ENV`] for a raw value: unset, empty or `1` is ahead, `0`
 /// serial. Anything else panics rather than measuring the default under the
 /// switch's name.
 pub fn whir_head_ahead_setting(raw: Option<&str>) -> bool {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") | Some("1") => true,
+        Some("0") => false,
         Some(other) => panic!("{WHIR_HEAD_AHEAD_ENV} must be 0 or 1, got {other:?}"),
     }
 }
@@ -2371,12 +2377,10 @@ pub(crate) fn whir_head_ahead() -> bool {
     *AHEAD.get_or_init(|| {
         let ahead = whir_head_ahead_setting(std::env::var(WHIR_HEAD_AHEAD_ENV).ok().as_deref());
         let line = if ahead {
-            format!(
-                "BASE HEAD (WHIR): ahead ({WHIR_HEAD_AHEAD_ENV}=1) — DECODE's root on a helper \
-                 beside epoch 0\n"
-            )
+            "BASE HEAD (WHIR): ahead (the default) — DECODE's root on a helper beside epoch 0\n"
+                .to_string()
         } else {
-            "BASE HEAD (WHIR): serial (the default)\n".to_string()
+            format!("BASE HEAD (WHIR): serial ({WHIR_HEAD_AHEAD_ENV}=0)\n")
         };
         use std::io::Write;
         let _ = std::io::stderr().write_all(line.as_bytes());
