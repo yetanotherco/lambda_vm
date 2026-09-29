@@ -461,13 +461,14 @@ fn every_vm_batch_on_demand_is_the_same_program() {
     );
 }
 
-/// ★ Device parity, the four big batches: on the card, the program on demand
-/// — its slot file sized for every node from the first round — gives today's
-/// round sums, round by round from a 2^14 cube (whose first round is past
-/// KECCAK_RND's 8,096-thread ceiling) down to the host crossover; and a shadow
-/// session walking today's program over the lean session's own factors
-/// ([`SumcheckSession::shadow`], what `LAMBDA_VM_ARGUE_XCHECK` runs) agrees
-/// with both. Needs a device, and says so rather than passing without one.
+/// ★ Device parity, every big batch — the VM's four and the W-LFM's one, found
+/// by the gate: on the card, the program on demand — its slot file sized for
+/// every node from the first round — gives today's round sums, round by round
+/// from a 2^14 cube (whose first round is past KECCAK_RND's 8,096-thread
+/// ceiling) down to the host crossover; and a shadow session walking today's
+/// program over the lean session's own factors ([`SumcheckSession::shadow`],
+/// what `LAMBDA_VM_ARGUE_XCHECK` runs) agrees with both. Needs a device, and
+/// says so rather than passing without one.
 ///
 /// ```text
 /// cargo test --release -p lambda-vm-prover --features cuda --lib \
@@ -496,12 +497,29 @@ fn every_big_batch_rounds_the_same_on_demand_on_the_card() {
         state ^= state << 17;
         state % P
     };
-    for (air, label) in vm_airs() {
-        if !["KECCAK", "KECCAK_RND", "ECSM", "ECDAS"].contains(&label) {
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    let every: Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        String,
+    )> = vm
+        .iter()
+        .map(|(air, label)| (&**air, label.to_string()))
+        .chain(
+            lfm.air_refs()
+                .into_iter()
+                .map(|air| (air, air.name().to_string())),
+        )
+        .collect();
+    let mut big = Vec::new();
+    for (air, label) in every {
+        let label = label.as_str();
+        let batch = batch_of(air, label);
+        let today = multilinear::gpu::lower(&batch.program).expect("today's lowers");
+        if !multilinear::gpu::is_big_batch(today.num_slots) {
             continue;
         }
-        let batch = batch_of(&*air, label);
-        let today = multilinear::gpu::lower(&batch.program).expect("today's lowers");
+        big.push(label.to_string());
         let demand = multilinear::gpu::lower(&batch.program.on_demand()).expect("on demand lowers");
         let factors: Vec<Vec<u64>> = (0..batch.factors)
             .map(|_| (0..CUBE * 3).map(|_| next()).collect())
@@ -559,6 +577,106 @@ fn every_big_batch_rounds_the_same_on_demand_on_the_card() {
             demand.num_slots,
             thread_ceiling(today.num_slots),
             thread_ceiling(demand.num_slots),
+        );
+    }
+    assert_eq!(
+        big,
+        ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS", "LFM_HASH"],
+        "the big batches"
+    );
+}
+
+// ── the W-LFM batches under pure WHIR ────────────────────────────────────────
+
+/// The W-LFM chips as the pure-WHIR recursion proves them: the WHIR recursion
+/// chip set at the recursion's hasher, as `whir_proof::whir_lfm_airs` builds it.
+fn w_lfm_airs() -> crate::lfm::airs::LfmAirs {
+    use crate::lfm::whir_leg::{RECURSION_CHIP_SET, RECURSION_HASHER};
+
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    crate::lfm::whir_proof::whir_lfm_airs(RECURSION_HASHER, RECURSION_CHIP_SET, 1, &opts)
+}
+
+/// ★ Host parity, every W-LFM batch: each on demand is the same polynomial as
+/// today's at random points and holds no more values a thread. Under pure WHIR
+/// the recursion proves these with the base's argue, so the gate reaches them:
+/// `LFM_HASH` — and only it — is big, and on demand it falls under the gate.
+#[test]
+fn every_w_lfm_batch_on_demand_is_the_same_program() {
+    let airs = w_lfm_airs();
+    let mut big = Vec::new();
+    for air in airs.air_refs() {
+        let label = air.name().to_string();
+        let batch = batch_of(air, &label);
+        let demand = batch.program.on_demand();
+        let mut scratch = Vec::new();
+        for seed in [1u64, 29, 311] {
+            let values = point(batch.factors, seed);
+            assert_eq!(
+                demand.eval(&values, &mut scratch),
+                batch.program.eval(&values, &mut scratch),
+                "{label}: on demand is another polynomial (seed {seed})"
+            );
+        }
+        let today = multilinear::gpu::lower(&batch.program).expect("today's lowers");
+        let lean = multilinear::gpu::lower(&demand).expect("on demand lowers");
+        assert!(
+            lean.num_slots <= today.num_slots,
+            "{label}: on demand holds {} values a thread, today {}",
+            lean.num_slots,
+            today.num_slots
+        );
+        if multilinear::gpu::is_big_batch(today.num_slots) {
+            assert!(
+                !multilinear::gpu::is_big_batch(lean.num_slots),
+                "{label}: on demand still holds {} values a thread",
+                lean.num_slots
+            );
+            big.push(label);
+        }
+    }
+    assert_eq!(big, ["LFM_HASH"], "the big W-LFM batches");
+}
+
+/// Census (ignored by default): every W-LFM chip's zerocheck batch — today's
+/// lowering against the program on demand, whether the gate calls it big, and
+/// the thread ceilings.
+///
+/// `cargo test -p lambda-vm-prover --lib tests::lean_program_census::the_w_lfm -- --ignored --nocapture`
+#[test]
+#[ignore = "a printing census for the lean-program landing, not a gate"]
+fn the_w_lfm_zerocheck_programs_and_their_live_sets() {
+    let airs = w_lfm_airs();
+    for air in airs.air_refs() {
+        let label = air.name().to_string();
+        let batch = batch_of(air, &label);
+        let today = multilinear::gpu::lower(&batch.program).expect("today's lowers");
+        let demand_program = batch.program.on_demand();
+        let values = point(batch.factors, 5);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            demand_program.eval(&values, &mut scratch),
+            batch.program.eval(&values, &mut scratch),
+            "{label}: on demand is another polynomial"
+        );
+        let demand = multilinear::gpu::lower(&demand_program).expect("on demand lowers");
+        println!(
+            "W-LFM {label:12} width {:4} · degree {} · factors {:4} || steps {:6} → {:6} · slots {:5} → {:5} || \
+             ceiling {:8} → {:8} threads · {}",
+            air.trace_layout().0,
+            batch.degree,
+            batch.factors,
+            today.nodes.len() / 2,
+            demand.nodes.len() / 2,
+            today.num_slots,
+            demand.num_slots,
+            ceiling(today.num_slots),
+            ceiling(demand.num_slots),
+            if multilinear::gpu::is_big_batch(today.num_slots) {
+                "BIG: on demand under the knob"
+            } else {
+                "not big: today's program"
+            },
         );
     }
 }
