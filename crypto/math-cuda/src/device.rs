@@ -669,8 +669,9 @@ pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
 }
 
 /// Argue-surface device fallbacks: the reservation refusals in math-cuda's
-/// `sumcheck`, `gkr` and `columns`, counted where each one's `reserve` returns
-/// `None` and its work moves to the host.
+/// `sumcheck`, `gkr` and `columns`, and the GKR tree's whole-tree promise in
+/// `multilinear::gpu`, counted where each one's `reserve` returns `None` and its
+/// work moves to the host.
 ///
 /// ⛔ WHY THIS EXISTS. Until this counter the only fallback number the campaign
 /// read was `multilinear::gpu::host_fallbacks()`, which has ONE caller — the
@@ -682,17 +683,29 @@ pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
 /// Read beside `host_fallbacks()`, this makes "the device did the work"
 /// distinguishable from "it quietly did not" on the argue surface.
 ///
-/// SCOPE, stated precisely. The FIVE argue-side `reserve`→`None` sites in
-/// `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1), `columns.rs`
-/// (×1). This is NOT the whole device surface, and it does not claim to be:
-/// `multilinear/src/gpu.rs` holds two further argue-side sites — `:177`
-/// (`reserve_room`) and `:1572` (the GKR tree) — whose `None` still falls to
-/// the host uncounted. Those are a documented FOLLOW-UP, out of this counter's
-/// scope, because each needs its caller traced before it can honestly be
-/// labelled a fallback. A THIRD site there, `:1551`, is a SPECULATIVE reserve
-/// whose `None` selects a lazy path that is STILL on the device — NOT a
-/// fallback, and it must never be counted. Putting a wrong site into the very
-/// counter meant to end false numbers is the one thing to avoid.
+/// SCOPE, stated precisely, by function (line numbers go stale). SIX sites
+/// count here, each where its reservation is refused and its work moves to the
+/// host:
+/// - the FIVE in `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1),
+///   `columns.rs` (×1);
+/// - the GKR tree's whole-tree promise in `multilinear::gpu`'s
+///   `input_layer_tree_impl`, on the consume path only: the host then builds
+///   the table's factors and fraction tree. `multilinear::gpu::gkr_tree_refusals`
+///   counts it apart as well.
+///
+/// The other argue-side `reserve` calls in `multilinear::gpu` are NOT
+/// fallbacks, and must never be counted here:
+/// - `input_layer_tree_impl`'s carry (`reserve(eager)`) is SPECULATIVE: its
+///   `None` picks the lazy tree, still on the device;
+/// - a prefetch's (`input_layer_tree_deferred`) refusal only means no prefetch;
+/// - `reserve_room`'s two callers keep the work on the device. `take_turn` opens
+///   unpromised and counts its own refusals (`room_turn_refusals`); the group
+///   commit's retention room makes the commit transient, so its leaf pass is
+///   redone.
+///
+/// This is NOT the whole device surface: the commit path has its own counters
+/// (`multilinear::gpu::host_fallbacks`, `commit_errors`). Putting a wrong site
+/// into the very counter meant to end false numbers is the one thing to avoid.
 static DEVICE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Argue-surface device fallbacks this process has taken — see
@@ -709,9 +722,9 @@ pub fn reset_device_fallbacks() {
     DEVICE_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
-/// Record one argue-side reservation refusal — bumped at each of the five
+/// Record one argue-side reservation refusal — bumped at each of the six
 /// sites [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
-pub(crate) fn note_device_fallback() {
+pub fn note_device_fallback() {
     DEVICE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -2241,13 +2254,14 @@ mod device_fallback_counter_tests {
     /// ⛔ THE FOUR UNDRIVEN SITES' FALSIFIER. The box test drives ONE site
     /// (`DeviceColumns::upload`); this arm is what lets the other four fail
     /// without four card fixtures. `note_device_fallback` must be CALLED at
-    /// exactly the five argue-surface sites the counter's doc enumerates —
-    /// three in `sumcheck.rs`, one in `gkr.rs`, one in `columns.rs`. Removing
-    /// the call at ANY site changes the tuple and reddens this test by name,
-    /// which localises the loss to the file it happened in.
+    /// exactly the five math-cuda argue-surface sites the counter's doc
+    /// enumerates — three in `sumcheck.rs`, one in `gkr.rs`, one in
+    /// `columns.rs`. Removing the call at ANY site changes the tuple and reddens
+    /// this test by name, which localises the loss to the file it happened in.
+    /// The sixth site, `multilinear::gpu`'s GKR tree, has its own census there.
     ///
     /// The pattern carries the `crate::device::` prefix so it counts CALLS and
-    /// never the definition (`pub(crate) fn note_device_fallback`).
+    /// never the definition (`pub fn note_device_fallback`).
     #[test]
     fn note_device_fallback_is_called_at_exactly_the_five_argue_sites() {
         const PATTERN: &str = "crate::device::note_device_fallback()";

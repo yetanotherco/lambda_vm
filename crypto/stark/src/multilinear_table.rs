@@ -3838,4 +3838,113 @@ mod tests {
             Some(MlError::EmptyPolynomial)
         );
     }
+
+    /// An ADD table of `2^12` rows: wide enough that its factors go to the card
+    /// (factors × rows over the device's cell floor), with its buses' interactions
+    /// at `(z, alpha) = (7, 11)`.
+    #[cfg(feature = "cuda")]
+    fn resident_add_table<'a>(
+        air: &'a Air<AddConstraints>,
+    ) -> (
+        CommittedTable<'a, Fp, Ext>,
+        Vec<multilinear::logup::Interaction<Ext>>,
+    ) {
+        let rows = 1u64 << 12;
+        let columns = vec![
+            (0..rows).map(FE::from).collect::<Vec<_>>(),
+            (0..rows).map(|i| FE::from(2 * i)).collect(),
+            (0..rows).map(|i| FE::from(3 * i)).collect(),
+            vec![FE::one(); rows as usize],
+        ];
+        let t = table(air, &columns).expect("the ADD table builds");
+        let interactions = multilinear_logup::interactions(
+            t.layout.interactions,
+            t.slot_of().len(),
+            &ExtE::from(7u64),
+            &ExtE::from(11u64),
+            |col| slot(t.slot_of(), col),
+        )
+        .expect("the interactions build");
+        (t, interactions)
+    }
+
+    /// ★★ A REFUSED GKR TREE IS COUNTED, AND THE HOST BUILDS THE SAME TREE.
+    ///
+    /// The tree's whole-tree promise (`multilinear::gpu::input_layer_tree_impl`)
+    /// is the one argue-side refusal that moves work to the host. It is reached
+    /// only when the tree's carry is refused too and handing it back saves enough
+    /// (a gigabyte, which only the widest precompiles do), so the test hands every
+    /// carry back (`set_hand_back_threshold_for_tests(Some(0))`) and leaves the
+    /// budget nothing to promise, by holding the rest of it itself.
+    ///
+    /// - The control, at the normal budget: the card builds the tree; nothing is
+    ///   counted.
+    /// - A prefetch refused the same way is not a fallback (the consume site asks
+    ///   again): nothing is counted.
+    /// - The consume path refused: one GKR tree refusal, one argue-side device
+    ///   fallback, and the host's tree has the card's output fraction.
+    ///
+    /// ⚠ Run it with `--features cuda,multilinear/cuda`: this crate's `cuda` does
+    /// not turn on multilinear's, and without it the factors never go to the card.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "the card, run alone, with multilinear/cuda: the budget and the counts are process-wide"]
+    fn a_refused_gkr_tree_is_counted_and_the_host_builds_the_same_tree() {
+        use math_cuda::device::{backend, device_fallbacks, reserve};
+        use multilinear::gpu::{gkr_tree_refusals, set_hand_back_threshold_for_tests};
+
+        let (_, add_air, _) = airs();
+        let (t, interactions) = resident_add_table(&add_air);
+        let resident = t.trace.reside_from_columns().expect(
+            "an ADD table of 2^12 rows goes to the card — only with multilinear's `cuda` \
+                 feature on (`--features cuda,multilinear/cuda`)",
+        );
+        let counts = || (gkr_tree_refusals(), device_fallbacks());
+        let at_start = counts();
+
+        // The control: the normal budget.
+        let on_card = logup::resident_tree(&interactions, resident.clone())
+            .expect("at the normal budget the card builds the tree");
+        assert_eq!(counts(), at_start, "a tree the card built counts nothing");
+
+        // The budget left to promise, taken; every carry handed back.
+        set_hand_back_threshold_for_tests(Some(0));
+        let be = backend().expect("the card");
+        let rest = be.vram_budget_bytes().saturating_sub(be.reserved_bytes());
+        let held = reserve(rest).expect("the rest of the budget");
+
+        let prefetched = logup::resident_tree_deferred(&interactions, resident.clone());
+        let after_prefetch = counts();
+        let refused = logup::resident_tree(&interactions, resident);
+        let after_refusal = counts();
+        drop(held);
+        set_hand_back_threshold_for_tests(None);
+
+        assert!(prefetched.is_none(), "with no room a prefetch is declined");
+        assert_eq!(
+            after_prefetch, at_start,
+            "a refused prefetch is not a fallback: the consume site asks again"
+        );
+        assert!(
+            refused.is_none(),
+            "with no room the card must refuse the tree"
+        );
+        assert_eq!(
+            after_refusal,
+            (at_start.0 + 1, at_start.1 + 1),
+            "the refused tree is one GKR tree refusal and one argue-side device fallback"
+        );
+
+        // The path the refusal hands the table to: the host's own tree.
+        let factors = t.trace.factors().expect("the host builds the factors");
+        let on_host = FractionTree::build(
+            logup::input_layer(&interactions, &factors).expect("the host builds the layer"),
+        )
+        .expect("the host builds the tree");
+        assert_eq!(
+            on_host.output(),
+            on_card.output(),
+            "the host's tree has the card's output fraction"
+        );
+    }
 }

@@ -115,6 +115,11 @@ static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones sized to the turn they cover rather than to a whole
 /// base codeword (`LAMBDA_VM_NO_WHIR_ROOM_RESIZE`).
 static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
+/// ★ GKR fraction trees whose whole-tree promise the budget refused on the
+/// consume path, after refusing their carry: the host built that table's
+/// factors and tree. See [`note_gkr_tree_refusal`]; each one is also a
+/// `math_cuda::device::device_fallbacks`.
+static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -318,6 +323,11 @@ pub fn room_turns() -> u64 {
 /// Group openings whose room the card would not give back.
 pub fn room_turn_refusals() -> u64 {
     ROOM_TURN_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// GKR fraction trees the host built because the card refused their promise.
+pub fn gkr_tree_refusals() -> u64 {
+    GKR_TREE_REFUSALS.load(Ordering::Relaxed)
 }
 
 /// Rooms a group sized, for its commits or its openings' turn.
@@ -750,6 +760,28 @@ impl DeviceRoom {
 /// between a device and the host.
 #[cfg(feature = "cuda")]
 const WORTH_HANDING_BACK: u64 = 1 << 30;
+
+/// [`WORTH_HANDING_BACK`], unless a test has set its own.
+#[cfg(feature = "cuda")]
+fn worth_handing_back() -> u64 {
+    match HAND_BACK_FOR_TESTS.load(Ordering::Relaxed) {
+        u64::MAX => WORTH_HANDING_BACK,
+        bytes => bytes,
+    }
+}
+
+/// A test's hand-back threshold; `u64::MAX` is none.
+static HAND_BACK_FOR_TESTS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Tests only: the room a tree's carry must save before it is handed back,
+/// in place of [`WORTH_HANDING_BACK`]; `None` restores it. At `Some(0)` every
+/// refused carry is handed back, which is the only way a table smaller than the
+/// widest precompiles reaches the tree's whole-tree promise and its refusal.
+/// Process-wide: a test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_hand_back_threshold_for_tests(bytes: Option<u64>) {
+    HAND_BACK_FOR_TESTS.store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
 
 /// Cells — factors times rows — below which the host wins.
 ///
@@ -3129,6 +3161,21 @@ where
     input_layer_tree_impl(factors, numerators, denominators, true)
 }
 
+/// Count a GKR tree whose whole-tree promise the budget refused on the consume
+/// path — in [`GKR_TREE_REFUSALS`] and in the argue surface's
+/// `math_cuda::device::device_fallbacks` — and say so as it happens.
+#[cfg(feature = "cuda")]
+fn note_gkr_tree_refusal(bytes: u64, cells: usize) {
+    let count = GKR_TREE_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    math_cuda::device::note_device_fallback();
+    eprintln!(
+        "[gkr] tree promise REFUSED: {} MiB for {cells} cells, {} — the host builds this \
+         table's factors and tree; gkr tree refusals {count}",
+        bytes >> 20,
+        budget_headroom(),
+    );
+}
+
 /// `defer` skips the one output read (the sync), leaving it for the consume
 /// site; everything else is identical, so the eager caller is byte-for-byte the
 /// path it always was.
@@ -3157,7 +3204,7 @@ where
     let eager = (4 * full) as u64 * 24;
     let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
     let carried = math_cuda::device::reserve(eager);
-    if carried.is_some() || eager - lazy < WORTH_HANDING_BACK {
+    if carried.is_some() || eager - lazy < worth_handing_back() {
         drop(carried);
         let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
         let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
@@ -3180,7 +3227,19 @@ where
 
     // One promise for the whole tree, held past it: the layer handed back for
     // the last sumcheck is part of the same structure.
-    let room = math_cuda::device::reserve(math_cuda::gkr::padded_peak_bytes(real, full))?;
+    //
+    // ⛔ ITS REFUSAL IS A HOST FALLBACK on the consume path: `logup::resident_tree`
+    // gets `None` and the table's factors and whole tree are built on the host.
+    // So it is counted, here where it is refused, and only when `!defer`: a
+    // prefetch that is refused only means no prefetch, and the consume site asks
+    // again.
+    let promise = math_cuda::gkr::padded_peak_bytes(real, full);
+    let Some(room) = math_cuda::device::reserve(promise) else {
+        if !defer {
+            note_gkr_tree_refusal(promise, full);
+        }
+        return None;
+    };
 
     let (p, q) = write_input_layer(&factors, &numerators, &denominators, false)?;
     let num_vars = full.trailing_zeros() as usize;
@@ -4444,5 +4503,32 @@ mod tests {
         let root = b.var(0);
         let program = b.finish(root).unwrap();
         assert!(lower(&program).is_none());
+    }
+
+    /// ⛔ THE GKR TREE'S REFUSAL IS COUNTED AT ITS ONE SITE, and only there —
+    /// math-cuda's census of its own five, extended to this file. The argue
+    /// surface's device-fallback counter is bumped here once, inside
+    /// `note_gkr_tree_refusal`, which the whole-tree promise's refusal calls once.
+    /// The carry's refusal (speculative) and the prefetch's (no prefetch) must
+    /// not reach it: removing the call, or adding one, reddens this test by name.
+    /// The box test (`stark::multilinear_table`'s
+    /// `a_refused_gkr_tree_is_counted_and_the_host_builds_the_same_tree`)
+    /// drives the site.
+    #[test]
+    fn the_gkr_tree_refusal_is_counted_at_exactly_its_one_site() {
+        let source = include_str!("gpu.rs");
+        let bumps = source
+            .matches(concat!("math_cuda::device::", "note_device_fallback()"))
+            .count();
+        let notes = source
+            .matches(concat!("note_gkr_tree_refusal(", "promise, full)"))
+            .count();
+        assert_eq!(
+            (bumps, notes),
+            (1, 1),
+            "the device-fallback counter must be bumped once in this file, in \
+             `note_gkr_tree_refusal`, and that called once, at the whole-tree \
+             promise's refusal (found {bumps} bumps, {notes} calls)"
+        );
     }
 }
