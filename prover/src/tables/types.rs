@@ -367,6 +367,9 @@ pub enum BusId {
     FieldVmDecode = 40,
     /// `FIELD_VM_MEM[addr] -> value`: the read-only memory lookup.
     FieldVmMem = 41,
+    /// `FIELD_VM_PUBLIC[addr, value]`: the public memory cells, closed by a
+    /// verifier-computed balance (the COMMIT-bus pattern).
+    FieldVmPublic = 42,
 }
 
 impl BusId {
@@ -398,6 +401,7 @@ impl BusId {
             BusId::GlobalMemory => "GlobalMemory",
             BusId::FieldVmDecode => "FieldVmDecode",
             BusId::FieldVmMem => "FieldVmMem",
+            BusId::FieldVmPublic => "FieldVmPublic",
         }
     }
 }
@@ -432,6 +436,7 @@ impl TryFrom<u64> for BusId {
             31 => Ok(BusId::GlobalMemory),
             40 => Ok(BusId::FieldVmDecode),
             41 => Ok(BusId::FieldVmMem),
+            42 => Ok(BusId::FieldVmPublic),
             other => Err(other),
         }
     }
