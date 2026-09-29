@@ -10696,8 +10696,9 @@ fn whir_production_tree<C: TreeChild>() {
     // only host memory and a utilisation dip as its symptoms:
     //   · commit fallbacks — a WHIR commitment declined the device
     //     (`multilinear::gpu::host_fallbacks`, one call site, the commit path);
-    //   · device fallbacks — an argue-surface reservation was refused in
-    //     math-cuda (sumcheck/gkr/columns; `math_cuda::device::device_fallbacks`).
+    //   · device fallbacks — an argue-surface reservation was refused
+    //     (math-cuda's sumcheck/gkr/columns, and the GKR tree's whole-tree
+    //     promise in `multilinear::gpu`; `math_cuda::device::device_fallbacks`).
     // wt16 read as a slot-level win because THIS second number had no name: the
     // leaf-layer retention took the shared budget and argue fell to the host
     // uncounted. Printed here, whole-run, so the launcher can refuse a block
@@ -10720,6 +10721,12 @@ fn whir_production_tree<C: TreeChild>() {
     println!(
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
+    );
+    // Of which the GKR tree's whole-tree promise, refused on the consume path:
+    // the host built that table's factors and fraction tree.
+    println!(
+        "   gkr tree refusals {}",
+        multilinear::gpu::gkr_tree_refusals()
     );
     // A THIRD surface, the opening: a chain over a device codeword whose factors
     // the device did not build from its shares had them built on the host,
