@@ -19,7 +19,17 @@ use crate::lfm::proof::lfm_prove;
 use crate::lfm::registry::build_artifacts;
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-const RUNS: usize = 5;
+/// Repetitions: `FVM_COMPARE_RUNS`, default 5.
+fn runs() -> usize {
+    std::env::var("FVM_COMPARE_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+fn fvm_options() -> ProofOptions {
+    super::prove::default_options()
+}
 
 fn options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4 is valid")
@@ -77,7 +87,7 @@ fn fvm_unrolled(len: usize) -> Program {
 }
 
 fn report_fvm(label: &str, program: &Program, len: usize) {
-    let opts = options();
+    let opts = fvm_options();
     let exec = execute(
         program,
         Memory::with_init(len + 2, &inputs(len)),
@@ -90,7 +100,7 @@ fn report_fvm(label: &str, program: &Program, len: usize) {
     let public = [len as u64 + 1];
     let cells = public_cells(&exec, &public);
     let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let mut traces = generate_traces(program, &exec, &public);
         let t = Instant::now();
         let proof = prove_traces(&id, &cells, &mut traces, &opts).unwrap();
@@ -131,7 +141,7 @@ fn report_lfm(len: usize) {
         .collect();
     let arenas = vec![words];
     let (mut prove_ms, mut shape) = (Vec::new(), (0, 0));
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let t = Instant::now();
         let proof = lfm_prove(&program, &artifacts, &arenas, &opts).unwrap();
         prove_ms.push(t.elapsed().as_secs_f64() * 1e3);
@@ -161,13 +171,14 @@ fn report_lfm(len: usize) {
 #[ignore]
 fn program_build_times() {
     let opts = options();
+    let fvm_opts = fvm_options();
     for len in [1usize << 10, 1 << 14, 1 << 16] {
         let (loop_p, unrolled) = (fvm_loop(len), fvm_unrolled(len));
         let t = Instant::now();
-        program_id(&loop_p, &opts);
+        program_id(&loop_p, &fvm_opts);
         let fvm_loop_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
-        program_id(&unrolled, &opts);
+        program_id(&unrolled, &fvm_opts);
         let fvm_unrolled_ms = t.elapsed().as_secs_f64() * 1e3;
         let mut b = LfmBuilder::new();
         let arena = b.declare_arena(len as u32 + 1);
@@ -242,6 +253,7 @@ fn fri_toy_translation_executes() {
 #[ignore]
 fn fri_toy_field_vm_vs_lfm() {
     let opts = options();
+    let fvm_opts = fvm_options();
     let (program, arenas, exec) = fri_toy();
     for bit_dec in [false, true] {
         let t = super::lfm_translate::translate(&program, &exec, bit_dec);
@@ -258,16 +270,16 @@ fn fri_toy_field_vm_vs_lfm() {
             1 << 24,
         )
         .unwrap();
-        let id = program_id(&t.program, &opts);
+        let id = program_id(&t.program, &fvm_opts);
         let cells = public_cells(&run, &t.public);
         let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let mut traces = generate_traces(&t.program, &run, &t.public);
             let s = Instant::now();
-            let proof = prove_traces(&id, &cells, &mut traces, &opts).unwrap();
+            let proof = prove_traces(&id, &cells, &mut traces, &fvm_opts).unwrap();
             prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
             let s = Instant::now();
-            assert!(verify(&id, &cells, &proof, &opts));
+            assert!(verify(&id, &cells, &proof, &fvm_opts));
             verify_ms.push(s.elapsed().as_secs_f64() * 1e3);
             shape = census(&proof);
         }
@@ -283,7 +295,7 @@ fn fri_toy_field_vm_vs_lfm() {
     }
     let artifacts = build_artifacts(&program, &opts);
     let (mut prove_ms, mut shape) = (Vec::new(), (0, 0));
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let s = Instant::now();
         let proof = lfm_prove(&program, &artifacts, &arenas, &opts).unwrap();
         prove_ms.push(s.elapsed().as_secs_f64() * 1e3);

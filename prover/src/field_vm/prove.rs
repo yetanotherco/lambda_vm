@@ -40,9 +40,10 @@ const DOMAIN_TAG: &[u8] = b"lambda-vm/field-vm/v1";
 /// A public memory cell: an input the program reads or an output it leaves.
 pub type PublicCell = (u64, FEE);
 
-/// Blowup 4, as the spec's degree-5 constraints require.
+/// The smallest blowup the constraint degree allows: 4 at the spec's degree 5.
 pub fn default_options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4 is valid")
+    let blowup = (super::mux::D - 1).next_power_of_two().max(2) as u8;
+    GoldilocksCubicProofOptions::with_blowup(blowup).expect("valid blowup")
 }
 
 struct Airs {

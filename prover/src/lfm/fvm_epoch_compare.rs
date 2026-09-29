@@ -113,7 +113,7 @@ fn epoch_field_vm_vs_lfm() {
         );
     }
 
-    let opts = blowup(4);
+    let opts = crate::field_vm::prove::default_options();
     for bit_dec in [false, true] {
         let tr = translate(&program, &exec, bit_dec);
         eprintln!(
@@ -145,7 +145,8 @@ fn epoch_field_vm_vs_lfm() {
             shape = census(&proof);
         }
         eprintln!(
-            "  fvm blowup=4 bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={} verify_ms={}",
+            "  fvm blowup={} bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={} verify_ms={}",
+            opts.blowup_factor,
             tr.program.len(),
             tr.mem.len(),
             shape.0,

@@ -11,9 +11,15 @@ use super::isa::NUM_REGS;
 use crate::tables::types::FE;
 
 /// Maximum constraint degree.
+#[cfg(not(feature = "fvm-d3"))]
 pub const D: usize = 5;
+#[cfg(feature = "fvm-d3")]
+pub const D: usize = 3;
 /// Number of split polynomials after the first.
+#[cfg(not(feature = "fvm-d3"))]
 pub const T: usize = 1;
+#[cfg(feature = "fvm-d3")]
+pub const T: usize = 5;
 
 const _: () = assert!(D >= 3 && T >= 1);
 const _: () = assert!(
@@ -33,6 +39,8 @@ pub const fn split_exponent(k: usize) -> usize {
 /// Coefficients as `[k][l]`: the coefficient of `x^{split_exponent(k) + l}`.
 pub type Split = [[FE; D]; T + 1];
 
+// `D - 2` is 1 at degree 3, where the modulo is always zero.
+#[allow(clippy::modulo_one)]
 fn split(coeffs: &[FE]) -> Split {
     let mut out = [[FE::zero(); D]; T + 1];
     for (e, c) in coeffs.iter().enumerate() {

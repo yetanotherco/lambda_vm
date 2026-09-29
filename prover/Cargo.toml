@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 default = ["parallel"]
+# Field VM at constraint degree 3 (t = 5), proved at blowup 2.
+fvm-d3 = []
 parallel = [
     "stark/parallel",
     "math/parallel",
