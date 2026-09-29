@@ -487,6 +487,74 @@ impl GkrSplit {
     }
 }
 
+// ── inside the argue: a zerocheck's device rounds ───────────────────────────
+//
+// A big batch holds so many values a thread that its first rounds run a few
+// thousand threads (`gpu::LEAN_ABOVE_SLOTS`): the head's widest ran 8,096 at
+// 94 ms a launch. `LAMBDA_VM_ARGUE_LEAN_PROGRAM` trades held values for steps,
+// which buys threads in the early rounds and costs steps in the late ones,
+// where a round is a handful of threads walking the program. These say which
+// rounds paid. Timed with [`tick`], as the GKR regions are.
+
+/// A big batch's round is early while half its cube holds at least this many
+/// indices — the head's widest batch had room for 8,096 threads, so its rounds
+/// from here up ran short of them.
+pub const LATE_HALF: usize = 1 << 13;
+/// A big batch's early device rounds: the kernels, the read-back, the
+/// challenge drawn and the fold.
+pub static ZC_BIG_EARLY: Slot = Slot::new();
+/// A big batch's late device rounds, timed the same way.
+pub static ZC_BIG_LATE: Slot = Slot::new();
+/// Every other batch's device rounds.
+pub static ZC_OTHER: Slot = Slot::new();
+/// The rounds the host finishes over the crossover cube, every batch's, with
+/// the factors taken in and their values read out.
+pub static ZC_TAIL: Slot = Slot::new();
+/// Zerocheck sessions over a big batch.
+pub static ZC_BIG: Counter = Counter::new();
+/// Of [`ZC_BIG`], the ones whose program ran on demand — the mechanism line of
+/// `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+pub static ZC_LEAN: Counter = Counter::new();
+/// Of [`ZC_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
+/// against today's program over the same factors, and found equal.
+pub static ZC_LEAN_XCHECKED: Counter = Counter::new();
+/// The rounds in [`ZC_BIG_EARLY`].
+pub static ZC_BIG_EARLY_ROUNDS: Counter = Counter::new();
+/// The rounds in [`ZC_BIG_LATE`].
+pub static ZC_BIG_LATE_ROUNDS: Counter = Counter::new();
+
+/// A prove's zerocheck rounds, split: seconds per region and the counts they
+/// are over.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ZerocheckSplit {
+    pub big_early: f64,
+    pub big_late: f64,
+    pub other: f64,
+    pub tail: f64,
+    pub big: u64,
+    pub lean: u64,
+    pub xchecked: u64,
+    pub early_rounds: u64,
+    pub late_rounds: u64,
+}
+
+impl ZerocheckSplit {
+    /// Read and clear every zerocheck slot and counter.
+    fn take() -> Self {
+        Self {
+            big_early: ZC_BIG_EARLY.take(),
+            big_late: ZC_BIG_LATE.take(),
+            other: ZC_OTHER.take(),
+            tail: ZC_TAIL.take(),
+            big: ZC_BIG.take(),
+            lean: ZC_LEAN.take(),
+            xchecked: ZC_LEAN_XCHECKED.take(),
+            early_rounds: ZC_BIG_EARLY_ROUNDS.take(),
+            late_rounds: ZC_BIG_LATE_ROUNDS.take(),
+        }
+    }
+}
+
 /// Start a region timed many times a prove: one clock read, where [`mark`]
 /// takes two to place a stage on a sampler's timeline. `None`, and no clock
 /// read, when the knob is off.
@@ -814,6 +882,10 @@ pub struct ProverSplit {
     pub tails_lean: u64,
     pub tails_xchecked: u64,
     pub lean_tail: bool,
+    /// The zerocheck rounds, split — [`ZerocheckSplit`] — and the knob they
+    /// ran under (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
+    pub zerocheck: ZerocheckSplit,
+    pub lean_program: bool,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -1010,6 +1082,38 @@ impl ProverSplit {
             xcheck = on_off(self.xcheck),
         )
     }
+    /// The zerocheck line, milliseconds, stamped as the split line is:
+    /// `ARGUE ZEROCHECK #k: big sessions B (lean L · xchecked X) · early rounds
+    /// E · late rounds R || big early X · big late Y · other Z · host tail T
+    /// (ms) || lean program on|off · xcheck on|off`.
+    pub fn zerocheck_line(&self) -> String {
+        let z = &self.zerocheck;
+        let ms = |secs: f64| secs * 1e3;
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        format!(
+            "ARGUE ZEROCHECK {who}{tainted}: big sessions {big} (lean {lean} · xchecked \
+             {checked}) · early rounds {early} · late rounds {late} || big early {big_early:.2} · \
+             big late {big_late:.2} · other {other:.2} · host tail {tail:.2} (ms) || lean \
+             program {knob} · xcheck {xcheck}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            big = z.big,
+            lean = z.lean,
+            checked = z.xchecked,
+            early = z.early_rounds,
+            late = z.late_rounds,
+            big_early = ms(z.big_early),
+            big_late = ms(z.big_late),
+            other = ms(z.other),
+            tail = ms(z.tail),
+            knob = on_off(self.lean_program),
+            xcheck = on_off(self.xcheck),
+        )
+    }
     /// The GKR line, milliseconds, stamped as the split line is:
     /// `ARGUE GKR #k: layers on the card N (rebuilt R) · host tail rounds T ||
     /// between layers B ms, M µs a layer: lambda · program · lower · session ·
@@ -1131,6 +1235,8 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.tails_lean = TAILS_LEAN.take();
     rec.tails_xchecked = TAILS_XCHECKED.take();
     rec.lean_tail = crate::gpu::argue_lean_tail();
+    rec.zerocheck = ZerocheckSplit::take();
+    rec.lean_program = crate::gpu::argue_lean_program();
 
     let who = rec.who();
     let (max_name, max_secs) = rec
@@ -1190,6 +1296,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.reads_line());
     println!("{}", rec.gkr_line());
     println!("{}", rec.tail_line());
+    println!("{}", rec.zerocheck_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1499,6 +1606,11 @@ mod tests {
         bump_by(&GKR_TAIL_ROUNDS, 9);
         bump(&TAILS_LEAN);
         bump(&TAILS_XCHECKED);
+        bump(&ZC_BIG);
+        bump(&ZC_LEAN);
+        bump(&ZC_LEAN_XCHECKED);
+        bump(&ZC_BIG_EARLY_ROUNDS);
+        bump(&ZC_BIG_LATE_ROUNDS);
         assert_eq!(
             (
                 COLUMNS_ON_CARD.take(),
@@ -1524,6 +1636,13 @@ mod tests {
             GkrSplit::take(),
             GkrSplit::default(),
             "a disabled tick must not move a slot"
+        );
+        add_tick(&ZC_BIG_EARLY, tick());
+        add_tick(&ZC_TAIL, tick());
+        assert_eq!(
+            ZerocheckSplit::take(),
+            ZerocheckSplit::default(),
+            "a disabled tick or bump must not move a zerocheck slot or counter"
         );
         assert_eq!(stage_done(0, "execute", mark()), 0.0);
         note_table(3, 9.0);
@@ -1748,6 +1867,46 @@ mod tests {
             global.tail_line(),
             "ARGUE TAIL GLOBAL (in base) ⛔OVERLAPPED: lean 0 of device layers 0 · xchecked 0 || \
              lean tail off · xcheck off"
+        );
+    }
+
+    /// The zerocheck line: its session and round counts, then every slot in
+    /// milliseconds and the knob, stamped like the split line.
+    #[test]
+    fn the_zerocheck_line_names_its_prove_and_its_knob() {
+        let epoch = ProverSplit {
+            index: 3,
+            zerocheck: ZerocheckSplit {
+                big_early: 1.25,
+                big_late: 0.0405,
+                other: 0.5,
+                tail: 0.012,
+                big: 4,
+                lean: 4,
+                xchecked: 4,
+                early_rounds: 30,
+                late_rounds: 36,
+            },
+            lean_program: true,
+            xcheck: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.zerocheck_line(),
+            "ARGUE ZEROCHECK #3: big sessions 4 (lean 4 · xchecked 4) · early rounds 30 · late \
+             rounds 36 || big early 1250.00 · big late 40.50 · other 500.00 · host tail 12.00 \
+             (ms) || lean program on · xcheck on"
+        );
+        let global = ProverSplit {
+            index: GLOBAL_INDEX,
+            overlapped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            global.zerocheck_line(),
+            "ARGUE ZEROCHECK GLOBAL (in base) ⛔OVERLAPPED: big sessions 0 (lean 0 · xchecked \
+             0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 0.00 · \
+             host tail 0.00 (ms) || lean program off · xcheck off"
         );
     }
 

@@ -70,6 +70,118 @@ impl<E: IsField> Program<E> {
         scratch[self.root as usize].clone()
     }
 
+    /// The same program, emitted on demand: each step where the step that
+    /// uses it first needs it, the operand that holds more values evaluated
+    /// first, and every read — a factor's value or a constant — emitted again
+    /// at each use instead of once and held.
+    ///
+    /// A value lives from its step to its last use. [`simplify`](Self::simplify)
+    /// makes every read of a column or a constant one step, and a batch is
+    /// written piece by piece: every root, then their weighted sum; every
+    /// interaction's side, then theirs. So a batch holds each shared read from
+    /// its first use to its last, and each root or side until the sum at the
+    /// end. On the widest precompile's batch that is 2,763 values a thread
+    /// (`thoughts/zf/gap2/fix2/I-GFS.md` §15.5). On demand, a sum's terms are
+    /// added in as they are made, which is the running sum a lean builder
+    /// would write, and a read lives for one step.
+    ///
+    /// The order is the Sethi–Ullman one: of two operands, the one needing more
+    /// values goes first, so the other is held while less is live. A step is
+    /// the same operation on the same operands as before, so every value is
+    /// the same, to the limb. A reload costs a load, plus the extension to the
+    /// interpolation node for a factor. Nothing is simplified again, which
+    /// would merge the reads back.
+    pub fn on_demand(&self) -> Self {
+        let n = self.steps.len();
+        let reads = |op: &Op<E>| matches!(op, Op::Var(_) | Op::Fixed(_));
+        // Values each step needs to be evaluated as a tree (a read, one).
+        let mut need = vec![0u32; n];
+        for (k, op) in self.steps.iter().enumerate() {
+            need[k] = match *op {
+                Op::Var(_) | Op::Fixed(_) => 1,
+                Op::Neg(a) => need[a as usize],
+                Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
+                    let (x, y) = (need[a as usize], need[b as usize]);
+                    if x == y {
+                        x.saturating_add(1)
+                    } else {
+                        x.max(y)
+                    }
+                }
+            };
+        }
+        let mut steps: Vec<Op<E>> = Vec::with_capacity(n * 3 / 2);
+        // Where each old step landed, once it has; a read has no one place.
+        let mut at: Vec<Option<u32>> = vec![None; n];
+        let read = |steps: &mut Vec<Op<E>>, at: &[Option<u32>], k: u32| -> u32 {
+            match &self.steps[k as usize] {
+                Op::Var(i) => {
+                    steps.push(Op::Var(*i));
+                    (steps.len() - 1) as u32
+                }
+                Op::Fixed(c) => {
+                    steps.push(Op::Fixed(c.clone()));
+                    (steps.len() - 1) as u32
+                }
+                _ => at[k as usize].expect("an operand is emitted before its user"),
+            }
+        };
+        if reads(&self.steps[self.root as usize]) {
+            let root = read(&mut steps, &at, self.root);
+            return Self { steps, root };
+        }
+        // A step, and whether its operands are already under way.
+        let mut stack: Vec<(u32, bool)> = vec![(self.root, false)];
+        while let Some((k, expanded)) = stack.pop() {
+            if at[k as usize].is_some() {
+                continue;
+            }
+            let op = &self.steps[k as usize];
+            let operands = match *op {
+                Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => [Some(a), Some(b)],
+                Op::Neg(a) => [Some(a), None],
+                Op::Var(_) | Op::Fixed(_) => unreachable!("a read is emitted at its use"),
+            };
+            if !expanded {
+                stack.push((k, true));
+                let mut pending: Vec<u32> = operands
+                    .into_iter()
+                    .flatten()
+                    .filter(|&o| !reads(&self.steps[o as usize]) && at[o as usize].is_none())
+                    .collect();
+                // The one needing more goes first, so it goes on top; a tie
+                // keeps the written order.
+                if let [a, b] = pending[..]
+                    && need[b as usize] > need[a as usize]
+                {
+                    pending.swap(0, 1);
+                }
+                stack.extend(pending.into_iter().rev().map(|o| (o, false)));
+                continue;
+            }
+            let emitted = match *op {
+                Op::Add(a, b) => {
+                    let (a, b) = (read(&mut steps, &at, a), read(&mut steps, &at, b));
+                    Op::Add(a, b)
+                }
+                Op::Sub(a, b) => {
+                    let (a, b) = (read(&mut steps, &at, a), read(&mut steps, &at, b));
+                    Op::Sub(a, b)
+                }
+                Op::Mul(a, b) => {
+                    let (a, b) = (read(&mut steps, &at, a), read(&mut steps, &at, b));
+                    Op::Mul(a, b)
+                }
+                Op::Neg(a) => Op::Neg(read(&mut steps, &at, a)),
+                Op::Var(_) | Op::Fixed(_) => unreachable!("a read is emitted at its use"),
+            };
+            steps.push(emitted);
+            at[k as usize] = Some((steps.len() - 1) as u32);
+        }
+        let root = at[self.root as usize].expect("the root is emitted");
+        Self { steps, root }
+    }
+
     /// The same program with each step emitted once and nothing dead in it.
     ///
     /// Straight-line code over a field: two steps with the same operator over
@@ -405,6 +517,103 @@ mod simplify_tests {
             let after = small.eval(&values, &mut scratch);
             assert_eq!(before, after, "seed {seed}");
         }
+    }
+
+    /// A program on demand is the same program: every read becomes one step
+    /// per use, the root included when it is a read, a shared step is still
+    /// emitted once, and the value at every point is the same.
+    #[test]
+    fn a_program_on_demand_is_the_same_program() {
+        let mut b = Builder::<F>::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let seven = b.fixed(FE::from(7u64));
+        let xy = b.mul(x, y);
+        let a = b.add(xy, seven);
+        let d = b.sub(a, x);
+        let n = b.neg(d);
+        let shared = b.mul(n, seven);
+        let root = b.mul(shared, shared);
+        let program = b.finish(root).unwrap();
+        let demand = program.on_demand();
+        let count = |p: &Program<F>, read: bool| {
+            p.steps()
+                .iter()
+                .filter(|op| matches!(op, Op::Var(_) | Op::Fixed(_)) == read)
+                .count()
+        };
+        // x twice, y once, seven twice: one read per use. The six other steps
+        // are six still: `shared` is used twice and made once.
+        assert_eq!((count(&program, true), count(&demand, true)), (3, 5));
+        assert_eq!((count(&program, false), count(&demand, false)), (6, 6));
+        let mut scratch = Vec::new();
+        for seed in 0..6u64 {
+            let values: Vec<FE> = (0..2).map(|i| FE::from((seed + 1) * (i + 3) + 7)).collect();
+            assert_eq!(
+                program.eval(&values, &mut scratch),
+                demand.eval(&values, &mut scratch),
+                "seed {seed}"
+            );
+        }
+        // A program that is a single read is that read.
+        let mut b = Builder::<F>::new();
+        let only = b.var(3);
+        let read = b.finish(only).unwrap().on_demand();
+        assert_eq!(read.steps(), &[Op::Var(3)]);
+        assert_eq!(read.root(), 0);
+    }
+
+    /// ★ What the schedule is for: a weighted sum written after its terms
+    /// holds every term until the sum; on demand it holds the running sum and
+    /// the term being made. Eight products of two reads each, summed with
+    /// weights, as `weighted_sum` writes them after the terms.
+    #[test]
+    fn a_sum_on_demand_holds_one_term_at_a_time() {
+        let mut b = Builder::<F>::new();
+        let terms: Vec<(u32, FE)> = (0..8u32)
+            .map(|i| {
+                let (p, q) = (b.var(2 * i as usize), b.var(2 * i as usize + 1));
+                (b.mul(p, q), FE::from(u64::from(i) + 2))
+            })
+            .collect();
+        let root = b.weighted_sum(&terms);
+        let program = b.finish(root).unwrap();
+        let demand = program.on_demand();
+        let live = |p: &Program<F>| {
+            // A value is live from its step to its last use.
+            let mut last = vec![0usize; p.steps().len()];
+            for (k, op) in p.steps().iter().enumerate() {
+                match *op {
+                    Op::Add(a, c) | Op::Sub(a, c) | Op::Mul(a, c) => {
+                        last[a as usize] = k;
+                        last[c as usize] = k;
+                    }
+                    Op::Neg(a) => last[a as usize] = k,
+                    Op::Var(_) | Op::Fixed(_) => {}
+                }
+            }
+            last[p.root() as usize] = p.steps().len();
+            (0..p.steps().len())
+                .map(|k| (0..=k).filter(|&j| last[j] >= k).count())
+                .max()
+                .unwrap()
+        };
+        assert!(
+            live(&program) >= 8,
+            "written after its terms, the sum holds its eight terms: {}",
+            live(&program)
+        );
+        assert!(
+            live(&demand) <= 4,
+            "on demand it holds the running sum, a term and its two reads: {}",
+            live(&demand)
+        );
+        let values: Vec<FE> = (0..16u64).map(|i| FE::from(i * 5 + 1)).collect();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            program.eval(&values, &mut scratch),
+            demand.eval(&values, &mut scratch)
+        );
     }
 
     #[test]

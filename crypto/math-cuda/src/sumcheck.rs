@@ -220,6 +220,31 @@ impl SumcheckSession {
         num_slots: usize,
         root_slot: u32,
     ) -> Result<Self> {
+        Self::from_device_spread(
+            stream, addresses, len, held, nodes, consts, num_slots, root_slot, 1,
+        )
+    }
+
+    /// [`from_device`](Self::from_device) with the slot file sized for
+    /// `spread` threads per cube index, up to the slot budget.
+    ///
+    /// A round gives each index one thread and spreads the interpolation nodes
+    /// over the grid's second dimension only as far as the slot file has room
+    /// (`round`'s `nodes_wide`). Sized for one thread an index, a session's
+    /// first round walks every node in turn on one thread; sized for `spread`
+    /// — the round's degree — the nodes run side by side from the first round.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_device_spread(
+        stream: Arc<CudaStream>,
+        addresses: &[u64],
+        len: usize,
+        held: Vec<Arc<CudaSlice<u64>>>,
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+        spread: usize,
+    ) -> Result<Self> {
         assert!(!addresses.is_empty(), "a sumcheck needs a factor");
         assert!(len.is_power_of_two(), "the cube is a power of two");
         assert!(nodes.len().is_multiple_of(2), "two u64 per step");
@@ -232,7 +257,10 @@ impl SumcheckSession {
         let be = backend()?;
         let width = addresses.len();
         let ceiling = thread_ceiling(num_slots);
-        let (grid, block) = launch_shape(ceiling, (len / 2) as u64);
+        let (grid, block) = launch_shape(
+            ceiling,
+            (len / 2) as u64 * spread.clamp(1, MAX_NODES) as u64,
+        );
         let num_threads = grid as u64 * block as u64;
         let widest = widest_grid(ceiling, (len / 2) as u64);
         let factor_ptrs = crate::device::htod_or_trim(&stream, addresses)?;
@@ -295,6 +323,42 @@ impl SumcheckSession {
         let widest = widest_grid(ceiling, (cube / 2) as u64) as u64;
         let nodes = MAX_NODES as u64;
         threads * num_slots as u64 * 24 + (nodes * widest + 2 * nodes + 1) * 24
+    }
+
+    /// A second session over this one's factors, walking another program:
+    /// the same buffers, and a slot file of its own sized for one thread an
+    /// index. It never folds — [`follow`](Self::follow) takes the cube size
+    /// of the session it shadows after that one folds the buffers they share.
+    /// For checking one program's rounds against another's over the same
+    /// factors, in the same process.
+    pub fn shadow(
+        &self,
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+    ) -> Result<Self> {
+        Self::from_device(
+            self.stream.clone(),
+            &self.addresses,
+            self.len,
+            self.held.clone(),
+            nodes,
+            consts,
+            num_slots,
+            root_slot,
+        )
+    }
+
+    /// Takes `leader`'s cube size: it folded the factors this session shares
+    /// with it ([`shadow`](Self::shadow)).
+    pub fn follow(&mut self, leader: &Self) {
+        assert_eq!(
+            self.addresses, leader.addresses,
+            "a shadow follows the session whose factors it reads"
+        );
+        assert!(leader.len <= self.len, "a cube only shrinks");
+        self.len = leader.len;
     }
 
     /// Cube indices left to bind.
@@ -582,7 +646,7 @@ impl SumcheckSession {
 /// The most threads a program of `num_slots` live values may run at once: the
 /// slot file is per thread, so it is the thread count that gives way to a wider
 /// program.
-fn thread_ceiling(num_slots: usize) -> u64 {
+pub fn thread_ceiling(num_slots: usize) -> u64 {
     let per_thread = num_slots as u64 * 3 * 8;
     (SLOT_BUDGET_BYTES / per_thread.max(1))
         .min(MAX_THREADS)
@@ -1166,6 +1230,22 @@ impl DeviceFactors {
         num_slots: usize,
         root_slot: u32,
     ) -> Result<SumcheckSession> {
+        self.session_spread(extra, nodes, consts, num_slots, root_slot, 1)
+    }
+
+    /// [`session_with`](Self::session_with) with the slot file sized for
+    /// `spread` threads per cube index
+    /// ([`SumcheckSession::from_device_spread`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_spread(
+        &self,
+        extra: &[Extra<'_>],
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+        spread: usize,
+    ) -> Result<SumcheckSession> {
         let span = self.len * 3;
         let mut addresses = self.addresses.clone();
         let mut held = vec![self.buffer.clone()];
@@ -1202,7 +1282,7 @@ impl DeviceFactors {
             }
             held.push(Arc::new(buffer));
         }
-        SumcheckSession::from_device(
+        SumcheckSession::from_device_spread(
             self.stream.clone(),
             &addresses,
             self.len,
@@ -1211,6 +1291,7 @@ impl DeviceFactors {
             consts,
             num_slots,
             root_slot,
+            spread,
         )
     }
 }

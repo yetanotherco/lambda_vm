@@ -2016,17 +2016,26 @@ mod tests {
         reads_per_factor: u64,
         /// Device GKR layers whose host tail ran lean.
         lean_tails: u64,
+        /// Zerocheck sessions whose rounds walked their program on demand, and
+        /// the ones the cross-check walked today's program beside.
+        lean_programs: u64,
+        lean_program_xchecks: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
     /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`, `LAMBDA_VM_ARGUE_LEAN_READS`,
-    /// `LAMBDA_VM_ARGUE_LEAN_TAIL`.
+    /// `LAMBDA_VM_ARGUE_LEAN_TAIL`, `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+    ///
+    /// Under `program` every batch counts as big, so these small tables take
+    /// the path the VM's four big batches do
+    /// ([`the_tall_batches_hold_fewer_values_on_demand`]).
     #[derive(Clone, Copy, Debug, Default)]
     struct Knobs {
         columns: bool,
         tables: bool,
         reads: bool,
         tail: bool,
+        program: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2034,6 +2043,7 @@ mod tests {
         tables: false,
         reads: false,
         tail: false,
+        program: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2042,6 +2052,15 @@ mod tests {
         columns: &[Vec<Vec<FE>>; 3],
         knobs: Knobs,
     ) -> TallArm<'a> {
+        try_prove_tall(airs, columns, knobs).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"))
+    }
+
+    /// [`prove_tall`], a refused proof handed back rather than a panic.
+    fn try_prove_tall<'a>(
+        airs: &'a ThreeAirs,
+        columns: &[Vec<Vec<FE>>; 3],
+        knobs: Knobs,
+    ) -> Result<TallArm<'a>, MlError> {
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
                 table(&airs.0, &columns[0]).unwrap(),
@@ -2055,6 +2074,8 @@ mod tests {
         multilinear::gpu::force_argue_device_tables(Some(knobs.tables));
         multilinear::gpu::force_argue_lean_reads(Some(knobs.reads));
         multilinear::gpu::force_argue_lean_tail(Some(knobs.tail));
+        multilinear::gpu::force_argue_lean_program(Some(knobs.program));
+        multilinear::gpu::force_lean_program_gate(knobs.program.then_some(0));
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2063,11 +2084,15 @@ mod tests {
             multilinear::gpu::reads_per_factor(),
             multilinear::gpu::lean_tails(),
         );
+        let (demand, demand_checked) = (
+            multilinear::gpu::lean_programs(),
+            multilinear::gpu::lean_program_xchecks(),
+        );
         let mut transcript = DefaultTranscript::<Ext>::new(b"multilinear-table");
         let proof = multi_prove(&committed, &config(), &mut transcript, None);
-        let arm = TallArm {
+        let arm = proof.map(|proof| TallArm {
             committed,
-            proof: proof.unwrap_or_else(|e| panic!("{knobs:?}: {e:?}")),
+            proof,
             transcript,
             on_card: multilinear::gpu::evaluate_calls() - card,
             on_host: multilinear::gpu::host_evaluate_calls() - host,
@@ -2075,11 +2100,15 @@ mod tests {
             reads_gathered: multilinear::gpu::reads_gathered() - gathered,
             reads_per_factor: multilinear::gpu::reads_per_factor() - single,
             lean_tails: multilinear::gpu::lean_tails() - lean,
-        };
+            lean_programs: multilinear::gpu::lean_programs() - demand,
+            lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
+        });
         multilinear::gpu::force_argue_device_columns(None);
         multilinear::gpu::force_argue_device_tables(None);
         multilinear::gpu::force_argue_lean_reads(None);
         multilinear::gpu::force_argue_lean_tail(None);
+        multilinear::gpu::force_argue_lean_program(None);
+        multilinear::gpu::force_lean_program_gate(None);
         arm
     }
 
@@ -2268,8 +2297,7 @@ mod tests {
                 Knobs {
                     columns: on,
                     tables,
-                    reads: false,
-                    tail: false,
+                    ..TODAY
                 },
             );
             if device {
@@ -2458,7 +2486,7 @@ mod tests {
             columns: true,
             tables: true,
             reads: true,
-            tail: false,
+            ..TODAY
         };
         for knobs in [
             Knobs {
@@ -2580,6 +2608,7 @@ mod tests {
             tables: true,
             reads: true,
             tail: true,
+            ..TODAY
         };
         for knobs in [
             Knobs {
@@ -2666,6 +2695,222 @@ mod tests {
             "GKR's layer check must refuse it, got {verdict:?}"
         );
         eprintln!("argue lean tail: the wrong tail was refused: {verdict:?}");
+    }
+
+    /// A tall table's zerocheck batch as [`prove`] builds it — the constraint
+    /// rule beside the bus's two, combined — at arbitrary challenges: the
+    /// program a device's rounds walk.
+    fn tall_batch(table: &CommittedTable<'_, Fp, Ext>) -> multilinear::program::Program<Ext> {
+        let interactions = multilinear_logup::interactions(
+            table.layout.interactions,
+            table.slot_of().len(),
+            &ExtE::from(0x2a_u64),
+            &ExtE::from(0x3b_u64),
+            |col| slot(table.slot_of(), col),
+        )
+        .unwrap();
+        let num_vars = table.num_vars();
+        let claim: Vec<ExtE> = (0..logup::input_layer_vars(interactions.len(), num_vars) as u64)
+            .map(|i| ExtE::from(i * 7 + 3))
+            .collect();
+        let (weight_r, weight_z) = weight_slots(table.kinds().len());
+        let bus = logup::claim_statements(&interactions, &claim, num_vars, weight_z).unwrap();
+        let shape = table.shape();
+        let betas = multilinear_air::beta_powers(&ExtE::from(0x5eed_u64), shape.num_roots());
+        let zerocheck = shape.program(&betas, weight_r).unwrap();
+        multilinear::program::combine(
+            &[
+                &zerocheck,
+                bus.numerator.program().unwrap(),
+                bus.denominator.program().unwrap(),
+            ],
+            &[ExtE::from(1u64), ExtE::from(5u64), ExtE::from(25u64)],
+        )
+        .unwrap()
+    }
+
+    /// ★ Every tall table's zerocheck batch holds fewer values a thread on
+    /// demand, so under the knob — with every batch counted big — each takes
+    /// the path the VM's big batches take: the identity below compares two
+    /// paths, not one path with itself.
+    #[test]
+    fn the_tall_batches_hold_fewer_values_on_demand() {
+        let airs = airs();
+        let columns = tall_columns();
+        let tables = [
+            table(&airs.0, &columns[0]).unwrap(),
+            table(&airs.1, &columns[1]).unwrap(),
+            table(&airs.2, &columns[2]).unwrap(),
+        ];
+        for (k, table) in tables.iter().enumerate() {
+            let batch = tall_batch(table);
+            let today = multilinear::gpu::lower(&batch).expect("today's lowers");
+            let demand = multilinear::gpu::lower(&batch.on_demand()).expect("on demand lowers");
+            assert!(
+                demand.num_slots < today.num_slots,
+                "table {k}: on demand holds {} values a thread, today {}",
+                demand.num_slots,
+                today.num_slots
+            );
+        }
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_LEAN_PROGRAM` moves no byte of the proof, alone or with
+    /// every other argue knob: the same canonical bytes, transcript and next
+    /// challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, no
+    /// zerocheck walks its program on demand; on, all three tables' do (every
+    /// batch counted big). ⚠ Run it alone (`--exact`): the counters are
+    /// process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_its_programs_on_demand() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut today = prove_tall(&airs, &columns, TODAY);
+        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+        let today_state = today.transcript.state();
+        let today_next = today.transcript.sample_field_element();
+        let device = a_device();
+        assert_eq!(today.lean_programs, 0, "today no program runs on demand");
+        let every = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            tail: true,
+            program: true,
+        };
+        for knobs in [
+            Knobs {
+                program: true,
+                ..TODAY
+            },
+            every,
+        ] {
+            let mut arm = prove_tall(&airs, &columns, knobs);
+            if device {
+                assert_eq!(
+                    arm.lean_programs, 3,
+                    "{knobs:?}: the three zerochecks' rounds on demand"
+                );
+                eprintln!(
+                    "argue lean program: {knobs:?}: {} zerochecks on demand",
+                    arm.lean_programs
+                );
+            } else {
+                assert_eq!(
+                    arm.lean_programs, 0,
+                    "{knobs:?}: no device, no rounds on demand"
+                );
+                eprintln!("argue lean program: no device; no rounds to run on demand");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &arm.proof),
+                None,
+                "{knobs:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&arm.proof).unwrap(),
+                "{knobs:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                arm.transcript.state(),
+                "{knobs:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                arm.transcript.sample_field_element(),
+                "{knobs:?}: the next challenge moved"
+            );
+            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail, and both checks behind it see it. With
+    /// the fault armed, every constant of a program on demand is off by one.
+    ///
+    /// - The control first: the same arm without the fault, under the
+    ///   cross-check, is today's proof, verifies, and had every session checked.
+    /// - Faulted: the proof differs from today's at CPU, the first table argued,
+    ///   and the zerocheck's final check refuses it (`BatchMismatch`).
+    /// - Faulted under `LAMBDA_VM_ARGUE_XCHECK`: today's program walking the
+    ///   same factors disagrees at the first round, and the prove is refused
+    ///   there (`DeviceFailed`), before a proof exists.
+    ///
+    /// Needs a device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_program_on_demand_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue lean program: SKIPPED, no device to corrupt a program on");
+            return;
+        }
+        let lean = Knobs {
+            program: true,
+            ..TODAY
+        };
+        let today = prove_tall(&airs, &columns, TODAY);
+
+        multilinear::gpu::force_argue_xcheck(Some(true));
+        let control = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_prove_tall(&airs, &columns, lean)
+        }));
+        multilinear::gpu::force_argue_xcheck(None);
+        let control = control
+            .expect("the control proves")
+            .expect("the control is not refused");
+        assert_eq!(
+            (control.lean_programs, control.lean_program_xchecks),
+            (3, 3),
+            "the control is on the path, every session checked"
+        );
+        assert_eq!(
+            first_table_that_differs(&today.proof, &control.proof),
+            None,
+            "without the fault the rounds on demand are today's"
+        );
+        verify_tall(&control.committed, &control.proof).expect("without the fault it verifies");
+
+        multilinear::gpu::force_lean_program_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(&airs, &columns, lean)
+        }));
+        multilinear::gpu::force_argue_xcheck(Some(true));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_prove_tall(&airs, &columns, lean).map(|_| ())
+        }));
+        multilinear::gpu::force_argue_xcheck(None);
+        multilinear::gpu::force_lean_program_fault(false);
+
+        let faulted = faulted.expect("the faulted arm proves");
+        assert_eq!(faulted.lean_programs, 3, "the fault is on the path");
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        assert_eq!(
+            verify_tall(&faulted.committed, &faulted.proof),
+            Err(MlError::BatchMismatch),
+            "the zerocheck's final check must refuse it"
+        );
+        assert_eq!(
+            refused.expect("the cross-checked arm returns"),
+            Err(MlError::DeviceFailed {
+                stage: "program on demand"
+            }),
+            "the cross-check must refuse it before a proof exists"
+        );
+        eprintln!(
+            "argue lean program: the wrong program was refused, by the verifier and the xcheck"
+        );
     }
 
     /// [`config`] with its stack cap at `cap`.

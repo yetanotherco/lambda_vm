@@ -417,6 +417,7 @@ where
             });
         if let Some(outcome) = attempt {
             let (mut rounds, mut point, factors) = outcome?;
+            let host_tail = crate::whir_split::tick();
             // The device stopped where the cube stopped being worth sending;
             // the rest of the rounds run over the factors it folded.
             batched.adopt(factors)?;
@@ -432,6 +433,7 @@ where
                 .map(|factor| factor.as_constant().cloned())
                 .collect();
             let bound = bound.ok_or(Error::NoVariablesLeft)?;
+            crate::whir_split::add_tick(&crate::whir_split::ZC_TAIL, host_tail);
             return Ok((SumcheckProof { rounds }, point, bound));
         }
     }
