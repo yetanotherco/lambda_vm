@@ -14,7 +14,13 @@ use crate::field_vm::lfm_translate::translate;
 use crate::field_vm::prove::{generate_traces, program_id, prove_traces, public_cells, verify};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
-const RUNS: usize = 3;
+/// Repetitions per configuration: `FVM_COMPARE_RUNS`, default 3.
+fn runs() -> usize {
+    std::env::var("FVM_COMPARE_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
 
 fn blowup(b: u8) -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(b).expect("valid blowup")
@@ -29,9 +35,18 @@ fn census<PI>(proof: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> (
     })
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+/// `median (cv=…%, n=…)` of timings in milliseconds.
+fn stats(mut v: Vec<f64>) -> String {
     v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt();
+    format!(
+        "{:.1} (cv={:.1}%, n={})",
+        v[v.len() / 2],
+        100.0 * sd / mean,
+        v.len()
+    )
 }
 
 #[test]
@@ -83,7 +98,7 @@ fn epoch_field_vm_vs_lfm() {
         let artifacts = super::registry::build_artifacts_with_hasher(&program, &opts, hasher);
         let build_ms = s.elapsed().as_secs_f64() * 1e3;
         let (mut prove_ms, mut shape) = (Vec::new(), (0, 0));
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let s = Instant::now();
             let proof =
                 super::proof::lfm_prove(&program, &artifacts, &arenas, &opts).expect("LFM proves");
@@ -91,10 +106,10 @@ fn epoch_field_vm_vs_lfm() {
             shape = census(&proof.proof);
         }
         eprintln!(
-            "  lfm blowup={b} rows={} cells={} build_ms={build_ms:.1} prove_ms={:.1}",
+            "  lfm blowup={b} rows={} cells={} build_ms={build_ms:.1} prove_ms={}",
             shape.0,
             shape.1,
-            median(prove_ms)
+            stats(prove_ms)
         );
     }
 
@@ -119,7 +134,7 @@ fn epoch_field_vm_vs_lfm() {
         let build_ms = s.elapsed().as_secs_f64() * 1e3;
         let cells = public_cells(&run, &tr.public);
         let (mut prove_ms, mut verify_ms, mut shape) = (Vec::new(), Vec::new(), (0, 0));
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let mut traces = generate_traces(&tr.program, &run, &tr.public);
             let s = Instant::now();
             let proof = prove_traces(&id, &cells, &mut traces, &opts).expect("FVM proves");
@@ -130,13 +145,13 @@ fn epoch_field_vm_vs_lfm() {
             shape = census(&proof);
         }
         eprintln!(
-            "  fvm blowup=4 bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={:.1} verify_ms={:.1}",
+            "  fvm blowup=4 bit_dec={bit_dec} program={} mem={} rows={} cells={} build_ms={build_ms:.1} prove_ms={} verify_ms={}",
             tr.program.len(),
             tr.mem.len(),
             shape.0,
             shape.1,
-            median(prove_ms),
-            median(verify_ms)
+            stats(prove_ms),
+            stats(verify_ms)
         );
     }
 }
