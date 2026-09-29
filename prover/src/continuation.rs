@@ -2543,7 +2543,9 @@ pub(crate) fn base_prep_ahead() -> bool {
 }
 
 /// The switch that takes the STARK base's head work off its critical path:
-/// `1` on, unset or `0` the serial head (today's), anything else stops the run.
+/// unset, empty or `1` ahead (the default), `0` the serial head (the named
+/// opt-out, which reproduces the head as it ran before), anything else stops
+/// the run.
 ///
 /// ⛔ WHY. Before the card has anything to do, the serial head commits DECODE's
 /// precomputed columns on the host (RPX over a 2^22-row LDE, about a second on
@@ -2560,15 +2562,19 @@ pub(crate) fn base_prep_ahead() -> bool {
 /// builds the host domains and twiddles of every trace size up to the epoch's.
 /// The epochs wait for the commitment where they first use it. Only where the
 /// host work runs changes; every committed and absorbed value is the same.
+///
+/// Measured (FAST job 206, ds850–861, two arms each against the serial head):
+/// the head 2.4 → 1.0 s, the first prepass 0.37 → 0.00 s, the base −2.00 s and
+/// the block −1.45 s; program ids unchanged, the root verified.
 pub const BASE_HEAD_AHEAD_ENV: &str = "LAMBDA_VM_BASE_HEAD_AHEAD";
 
 /// Whether the head runs ahead, for a raw value of [`BASE_HEAD_AHEAD_ENV`]:
-/// unset, empty or `0` is serial, `1` is ahead, and anything else panics — a
+/// unset, empty or `1` is ahead, `0` is serial, and anything else panics — a
 /// typo read as the default would measure one schedule under the other's name.
 pub fn base_head_ahead_setting(raw: Option<&str>) -> bool {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") | Some("1") => true,
+        Some("0") => false,
         Some(other) => panic!("{BASE_HEAD_AHEAD_ENV} must be 0 or 1, got {other:?}"),
     }
 }
@@ -2580,12 +2586,11 @@ pub(crate) fn base_head_ahead() -> bool {
     *AHEAD.get_or_init(|| {
         let ahead = base_head_ahead_setting(std::env::var(BASE_HEAD_AHEAD_ENV).ok().as_deref());
         let line = if ahead {
-            format!(
-                "BASE HEAD: ahead — DECODE committed on the device and the first prove's state \
-                 built by helpers beside epoch 0 ({BASE_HEAD_AHEAD_ENV}=1)\n"
-            )
+            "BASE HEAD: ahead (the default) — DECODE committed on the device and the first \
+             prove's state built by helpers beside epoch 0\n"
+                .to_string()
         } else {
-            "BASE HEAD: serial (the default)\n".to_string()
+            format!("BASE HEAD: serial ({BASE_HEAD_AHEAD_ENV}=0)\n")
         };
         use std::io::Write;
         let _ = std::io::stderr().write_all(line.as_bytes());
@@ -4465,14 +4470,15 @@ mod tests {
         );
     }
 
-    /// The head switch: unset, empty or `0` is the serial head, `1` ahead.
+    /// The head switch: unset, empty or `1` runs the head ahead (the default),
+    /// `0` is the serial head (the opt-out).
     #[test]
-    fn the_base_head_switch_is_serial_unless_exactly_one() {
-        assert!(!base_head_ahead_setting(None));
-        assert!(!base_head_ahead_setting(Some("")));
-        assert!(!base_head_ahead_setting(Some("0")));
+    fn the_base_head_switch_is_ahead_unless_exactly_zero() {
+        assert!(base_head_ahead_setting(None));
+        assert!(base_head_ahead_setting(Some("")));
         assert!(base_head_ahead_setting(Some("1")));
-        assert!(base_head_ahead_setting(Some(" 1 ")));
+        assert!(!base_head_ahead_setting(Some("0")));
+        assert!(!base_head_ahead_setting(Some(" 0 ")));
     }
 
     /// Anything else stops the run rather than measuring the default under the
