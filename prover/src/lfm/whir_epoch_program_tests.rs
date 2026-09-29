@@ -1808,7 +1808,7 @@ fn the_epoch_programs_newton_pool_is_measured() {
     }
 }
 
-fn driver_bundle() -> (
+pub(super) fn driver_bundle() -> (
     Vec<u8>,
     crate::ProofOptions,
     crate::multilinear_continuation::ContinuationProof,

@@ -109,6 +109,9 @@ pub mod whir_statement;
 pub mod whir_table;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
+/// The wide level-1 node: its epochs verified in-program, no wraps (D-WHIR
+/// §7 L1), selected by `LAMBDA_VM_LFM_WIDE=on`.
+pub mod whir_wide;
 pub mod word;
 
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
@@ -226,6 +229,8 @@ mod whir_table_tests;
 mod whir_transcript_kat_tests;
 #[cfg(test)]
 mod whir_transcript_replay_tests;
+#[cfg(test)]
+mod whir_wide_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]

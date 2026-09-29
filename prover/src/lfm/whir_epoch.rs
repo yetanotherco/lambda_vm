@@ -794,6 +794,60 @@ pub fn emit_epoch_publishes(
     layout
 }
 
+/// [`emit_epoch_publishes`]' words as a PARENT reads them, published nowhere:
+/// one [`HintedPublicWord`] per `SchemaLayout::wrap` index, in the same order,
+/// each holding the lanes that published word would carry.
+///
+/// ★ For a wide level-1 node (`whir_wide`), which verifies its epochs in-program
+/// and so has no child proof whose published words it could hint. It hands
+/// these to the node's own binding and publishing code, which reads a wrap child
+/// by schema index and by nothing else.
+///
+/// The lanes: a constant word's four lanes as constants; a wire's from one
+/// `Unpack` of its cell (the pair and the balance, whose cells a wrap publishes
+/// whole); the L2G root's lanes as the base words the wrap publishes them as,
+/// `(lane, 0, 0, 0)`.
+///
+/// [`HintedPublicWord`]: super::per_table_aggregator::HintedPublicWord
+pub(crate) fn epoch_would_publish(
+    b: &mut LfmBuilder,
+    p: &EpochPublishes<'_>,
+) -> (
+    super::per_table_aggregator::SchemaLayout,
+    Vec<super::per_table_aggregator::HintedPublicWord>,
+) {
+    let out_halves = p.text.public_output.len().div_ceil(4);
+    let layout = super::per_table_aggregator::SchemaLayout::wrap(out_halves);
+    let zero = b.felt_const(FE::zero());
+    let mut lanes: Vec<[super::builder::Felt; 4]> = Vec::with_capacity(layout.total());
+    lanes.push(b.unpack(p.z.as_cell()));
+    lanes.push(b.unpack(p.alpha.as_cell()));
+    for word in publish_constant_words(&p.text) {
+        lanes.push(word.map(|lane| b.felt_const(lane)));
+    }
+    for lane in b.unpack(p.l2g_root) {
+        lanes.push([lane, zero, zero, zero]);
+    }
+    lanes.push(b.unpack(p.balance.as_cell()));
+    assert_eq!(
+        lanes.len(),
+        layout.total(),
+        "the would-be published set is the wrap schema's, word for word"
+    );
+    let words = lanes
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, lanes)| super::per_table_aggregator::HintedPublicWord {
+                index: index as u32,
+                halves: Vec::new(),
+                lanes: lanes.to_vec(),
+            },
+        )
+        .collect();
+    (layout, words)
+}
+
 // =============================================================================
 // The per-table walk
 // =============================================================================
