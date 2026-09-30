@@ -25,6 +25,7 @@ pub mod logup;
 pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
+pub mod pinned_slots;
 pub mod rpx;
 pub mod rpx_paths;
 pub mod sumcheck;

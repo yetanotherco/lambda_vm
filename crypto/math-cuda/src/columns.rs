@@ -9,8 +9,14 @@
 //! A table's columns are a contiguous run of equal height, which is the layout
 //! the factor gather and the batched evaluation already want; the commitment and
 //! the opening scatter theirs, which on the card is a copy at device bandwidth.
+//!
+//! The columns may come from page-locked memory ([`DeviceColumns::upload_parts`],
+//! D-TRACE stage 1b), whose copies return before they finish. Every upload
+//! synchronizes its stream before it returns, on every path, so no copy reads
+//! the host side after the borrow of it ends.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
@@ -56,6 +62,7 @@ pub struct DeviceColumns {
     buffer: Arc<CudaSlice<u64>>,
     /// `(offset, len)` in elements, per column, in the order uploaded.
     spans: Vec<(usize, usize)>,
+    upload: UploadRecord,
     _room: DeviceReservation,
 }
 
@@ -63,10 +70,25 @@ impl DeviceColumns {
     /// `None` when the card will not promise the room, in which case every
     /// caller uploads its own copy as before.
     pub fn upload(columns: &[&[u64]]) -> Option<Self> {
-        if columns.is_empty() {
+        let parts: Vec<(&[u64], usize)> = columns.iter().map(|c| (*c, c.len())).collect();
+        Self::upload_parts(&parts, false)
+    }
+
+    /// [`Self::upload`], sending only the first `sent` values of each
+    /// `(column, sent)` and leaving the rest zero on the card: when any column
+    /// leaves a tail, one memset over the whole buffer goes first, then one
+    /// copy per nonempty prefix, on one stream. With every `sent` the column's
+    /// length that is [`Self::upload`] exactly: no memset, the same copies.
+    ///
+    /// `pinned` says the columns are page-locked, which only labels the record:
+    /// the driver sees it from the addresses. From page-locked memory the
+    /// copies are DMA and return before they finish, so the stream is
+    /// synchronized before this returns, whatever happens.
+    pub fn upload_parts(parts: &[(&[u64], usize)], pinned: bool) -> Option<Self> {
+        if parts.is_empty() {
             return None;
         }
-        let total: usize = columns.iter().map(|c| c.len()).sum();
+        let total: usize = parts.iter().map(|(column, _)| column.len()).sum();
         let be = backend().ok()?;
         let Some(room) = be.reserve(total as u64 * 8) else {
             crate::device::note_device_fallback();
@@ -74,23 +96,53 @@ impl DeviceColumns {
         };
         crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
         let stream = be.next_stream();
-        // SAFETY: every element is written by the copies below.
+        // SAFETY: every element is written below, by a copy or by the memset.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
-        let mut spans = Vec::with_capacity(columns.len());
-        let mut at = 0usize;
-        for column in columns {
-            let mut slab = buffer.slice_mut(at..at + column.len());
-            stream.memcpy_htod(*column, &mut slab).ok()?;
-            spans.push((at, column.len()));
-            at += column.len();
-        }
-        stream.synchronize().ok()?;
+        let started = std::time::Instant::now();
+        let sent_of = |&(column, sent): &(&[u64], usize)| sent.min(column.len());
+        let mut spans = Vec::with_capacity(parts.len());
+        let mut zero_tails = 0u64;
+        let issued = (|| -> Result<()> {
+            if parts.iter().any(|part| sent_of(part) < part.0.len()) {
+                stream.memset_zeros(&mut buffer)?;
+            }
+            let mut at = 0usize;
+            for part in parts {
+                let (column, sent) = (part.0, sent_of(part));
+                if sent > 0 {
+                    let mut slab = buffer.slice_mut(at..at + sent);
+                    stream.memcpy_htod(&column[..sent], &mut slab)?;
+                }
+                zero_tails += ((column.len() - sent) * 8) as u64;
+                spans.push((at, column.len()));
+                at += column.len();
+            }
+            Ok(())
+        })();
+        // Before any return: a copy from page-locked memory may still be
+        // reading it.
+        let synced = stream.synchronize();
+        issued.ok()?;
+        synced.ok()?;
+        let upload = UploadRecord {
+            bytes: total as u64 * 8,
+            zero_tails,
+            secs: started.elapsed().as_secs_f64(),
+            pinned,
+        };
+        UPLOADS.note(&upload);
         Some(Self {
             stream,
             buffer: Arc::new(buffer),
             spans,
+            upload,
             _room: room,
         })
+    }
+
+    /// What this store's upload held, left behind and took.
+    pub fn upload_record(&self) -> UploadRecord {
+        self.upload
     }
 
     pub fn num_columns(&self) -> usize {
@@ -160,5 +212,108 @@ impl DeviceColumns {
             .result()?;
         }
         Ok(())
+    }
+}
+
+/// One column upload: the bytes the columns hold, the bytes left behind as
+/// zero tails (zeroed on the card instead of sent), the wall seconds from the
+/// first write to the stream's synchronize, and whether the host side was
+/// page-locked.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UploadRecord {
+    pub bytes: u64,
+    pub zero_tails: u64,
+    pub secs: f64,
+    pub pinned: bool,
+}
+
+impl UploadRecord {
+    /// One line for the log:
+    /// `<GB> sent · <GB> zero tails · <s> · <GB/s> (pinned|pageable)`, the rate
+    /// over the bytes sent.
+    pub fn line(&self) -> String {
+        let sent = self.bytes.saturating_sub(self.zero_tails);
+        let rate = if self.secs > 0.0 {
+            sent as f64 / 1e9 / self.secs
+        } else {
+            0.0
+        };
+        format!(
+            "{:.3} GB sent · {:.3} GB zero tails · {:.3}s · {rate:.1} GB/s ({})",
+            sent as f64 / 1e9,
+            self.zero_tails as f64 / 1e9,
+            self.secs,
+            if self.pinned { "pinned" } else { "pageable" },
+        )
+    }
+}
+
+struct UploadTotals {
+    calls: AtomicU64,
+    pinned_calls: AtomicU64,
+    bytes: AtomicU64,
+    zero_tails: AtomicU64,
+}
+
+static UPLOADS: UploadTotals = UploadTotals {
+    calls: AtomicU64::new(0),
+    pinned_calls: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    zero_tails: AtomicU64::new(0),
+};
+
+impl UploadTotals {
+    fn note(&self, record: &UploadRecord) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(record.bytes, Ordering::Relaxed);
+        self.zero_tails
+            .fetch_add(record.zero_tails, Ordering::Relaxed);
+        if record.pinned {
+            self.pinned_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Column uploads since the process started: `(uploads, of which pinned,
+/// bytes, bytes left behind as zero tails)`, for a test that asserts which
+/// path ran.
+pub fn upload_totals() -> (u64, u64, u64, u64) {
+    (
+        UPLOADS.calls.load(Ordering::Relaxed),
+        UPLOADS.pinned_calls.load(Ordering::Relaxed),
+        UPLOADS.bytes.load(Ordering::Relaxed),
+        UPLOADS.zero_tails.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_line_reads_the_record() {
+        let pinned = UploadRecord {
+            bytes: 2_500_000_000,
+            zero_tails: 500_000_000,
+            secs: 0.04,
+            pinned: true,
+        };
+        assert_eq!(
+            pinned.line(),
+            "2.000 GB sent · 0.500 GB zero tails · 0.040s · 50.0 GB/s (pinned)"
+        );
+        let pageable = UploadRecord {
+            zero_tails: 0,
+            pinned: false,
+            ..pinned
+        };
+        assert_eq!(
+            pageable.line(),
+            "2.500 GB sent · 0.000 GB zero tails · 0.040s · 62.5 GB/s (pageable)"
+        );
+        assert_eq!(
+            UploadRecord::default().line(),
+            "0.000 GB sent · 0.000 GB zero tails · 0.000s · 0.0 GB/s (pageable)"
+        );
     }
 }

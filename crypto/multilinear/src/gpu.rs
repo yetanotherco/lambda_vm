@@ -2888,14 +2888,35 @@ where
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some()) {
         return None;
     }
+    // A view into a pinned slot (`crate::pinned`) knows where its zero tail
+    // starts, and only what comes before is sent; every other column is sent
+    // whole, as before.
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
-    let raw: Vec<&[u64]> = columns
+    let parts: Vec<(&[u64], usize)> = columns
         .iter()
-        .map(|column| unsafe {
-            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+        .map(|column| {
+            let raw = unsafe {
+                core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+            };
+            (raw, column.nonzero_len().unwrap_or(column.len()))
         })
         .collect();
-    math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns)
+    let pinned = columns.iter().all(|column| column.is_pinned());
+    math_cuda::columns::DeviceColumns::upload_parts(&parts, pinned).map(ResidentColumns)
+}
+
+impl ResidentColumns {
+    /// What putting these columns on the card sent, left behind and took, as
+    /// one log line.
+    #[cfg(feature = "cuda")]
+    pub fn upload_line(&self) -> String {
+        self.0.upload_record().line()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn upload_line(&self) -> String {
+        match self.0 {}
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

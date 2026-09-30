@@ -13,6 +13,7 @@ pub mod gkr;
 pub mod gpu;
 pub mod logup;
 pub mod mle;
+pub mod pinned;
 pub mod poly;
 pub mod program;
 pub mod query_count;
