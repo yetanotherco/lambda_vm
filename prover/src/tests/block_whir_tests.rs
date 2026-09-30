@@ -310,6 +310,13 @@ fn block_whir_on_a_real_block() {
         .expect("the block proves");
     let prove_wall = wall.elapsed().as_secs_f64();
     print!("{}", stamps.report());
+    // A device that declined any of it would make the readout a host number.
+    println!(
+        "BLOCK FALLBACKS: commit/encode to the host {} · device commit errors {} · openings on the host {}",
+        multilinear::gpu::host_fallbacks(),
+        multilinear::gpu::commit_errors(),
+        multilinear::gpu::open_host_fallbacks(),
+    );
     println!(
         "BLOCK PROVE WALL: {prove_wall:.2}s · host peak {:.2} GiB",
         host_peak_gib()
@@ -325,6 +332,46 @@ fn block_whir_on_a_real_block() {
         proof.proof.roots.len(),
     );
     assert!(ok, "the block proof must verify");
+}
+
+/// The control for W1's readout (box only, `--ignored`): #1010's epoch base on
+/// the same binary and block — `prove_continuation` at 2^21 — with
+/// `LAMBDA_VM_BASE_SPLIT=1`, summing every epoch's and the cross-epoch
+/// proof's argue, openings and commit. Prints `BLOCK REFERENCE`.
+#[test]
+#[ignore = "a real block: box only"]
+fn block_whir_epoch_reference_on_a_real_block() {
+    let elf_path = std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF");
+    let input_path = std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT");
+    let elf = std::fs::read(&elf_path).expect("read the ELF");
+    let input = std::fs::read(&input_path).expect("read the input");
+    assert!(
+        multilinear::whir_split::enabled(),
+        "the reference reads the split: export LAMBDA_VM_BASE_SPLIT=1"
+    );
+    let opts = crate::lfm::proof::block_base_options();
+    let _ = multilinear::whir_split::drain();
+    let wall = std::time::Instant::now();
+    let bundle = crate::multilinear_continuation::prove_continuation(&elf, &input, 21, &opts)
+        .expect("the epochs prove");
+    let base = wall.elapsed().as_secs_f64();
+    let (_, prover) = multilinear::whir_split::drain();
+    let sum =
+        |f: fn(&multilinear::whir_split::ProverSplit) -> f64| prover.iter().map(f).sum::<f64>();
+    let (argue, groups, prepared) = (
+        sum(|r| r.argue),
+        sum(|r| r.open_groups),
+        sum(|r| r.open_prepared),
+    );
+    println!(
+        "BLOCK REFERENCE: base {base:.2}s · epochs {} · records {} · Σargue {argue:.2} · Σopen {:.2} (groups {groups:.2} + prepared {prepared:.2}) · Σcommit {:.2} · argue+open {:.2} · host peak {:.2} GiB",
+        bundle.num_epochs(),
+        prover.len(),
+        groups + prepared,
+        sum(|r| r.commit),
+        argue + groups + prepared,
+        host_peak_gib(),
+    );
 }
 
 /// The process's peak resident set (`VmHWM`), GiB; 0 where `/proc` is absent.
