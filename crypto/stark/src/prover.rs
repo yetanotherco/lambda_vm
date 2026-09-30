@@ -5582,6 +5582,12 @@ pub trait IsStarkProver<
             ) {
                 let __ps_rc = crate::prove_split::mark();
                 let tl_rc = table_timeline().then(crate::prove_split::epoch_secs);
+                // Its own label: the recommit (the full one, or the LDE alone
+                // under kept top levels) runs inside the fused task, and under
+                // `nvtx` this range is how a timeline tells its kernels from the
+                // aux and rounds 2-4 work around it.
+                #[cfg(feature = "instruments")]
+                let __sp = crate::instruments::span("r1_main_recommit_table");
                 // Kept top levels: the LDE alone, no second hash. The commit
                 // (root-only tree + top levels) stays; the openings rebuild the
                 // queried subtrees and check them against the kept nodes.
