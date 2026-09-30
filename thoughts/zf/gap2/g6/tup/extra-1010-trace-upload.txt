@@ -1,0 +1,27 @@
+# fix2/1010-trace-upload at d0bf1ad8c (#1010's keep-futile head 73342bc66 + LAMBDA_VM_TRACE_UPLOAD, default OFF): the
+# staged column upload (4 threads through staging pairs, zero tails of >= 64 KiB zeroed on the card) and DECODE's
+# prepared opening on a helper beside epoch 0. Extra box gates for zf-gates.sh; one command per line, verbatim from the
+# worktree root. zf-gates' own a1 (-p math-cuda, every non-ignored test) covers htod_staged's refactor through
+# staged_transfers and htod_via; its lib suite (e) runs the prepared-ahead proving test on the host.
+#
+# --- host logic: the knob, the thread count, the override, the tail cut, the log line
+cargo test --release -p math-cuda --lib columns::tests
+#
+# --- ★ ON THE CARD: the store read back from a dirtied pool equals the host columns and the pageable upload, value for
+#     value; the dirty-pool control; asserts the card itself (backend().expect) and the staged counters
+cargo test --release -p math-cuda --test columns_upload -- --ignored --test-threads=1
+#
+# --- ★ ON THE CARD: a multi_prove over three EQ tables serialises to the same bytes with the knob off, on, off; the
+#     control (off == off), the path (staged ran, tails skipped), the mutation (another table moves the bytes)
+cargo test --release -p lambda-vm-prover --features cuda --test trace_upload_identity -- --ignored --test-threads=1
+#
+# --- the head's part on the host: the setting, and the prepared opening ahead proves what the serial one proves
+cargo test --release -p lambda-vm-prover --lib -- --exact tests::multilinear_continuation_tests::the_prepared_opening_moves_only_when_asked tests::multilinear_continuation_tests::the_prepared_opening_ahead_proves_what_the_serial_one_proves
+#
+# --- ★ THE PRODUCTION TREE AT THE DEFAULT (knob unset): fan-in 5, the root, pageable uploads only, the serial prepared
+#     opening, and the 5 IDENTITY lines = /root/zf/bin/ids-1010-f5.txt (the ids of jobs 243/246 and of 73342bc66's gate)
+!raw set -o pipefail; unset LFM_CENSUS_FAN_IN LFM_CARD_AFTER_PREP LAMBDA_VM_LFM_PROVER LAMBDA_VM_LFM_WIDE LAMBDA_VM_LFM_WHIR_PREP LAMBDA_VM_LFM_ROOT_PROVER LAMBDA_VM_TRACE_UPLOAD LAMBDA_VM_TRACE_UPLOAD_THREADS; export LFM_CENSUS_ELF=/root/fixtures/ethrex_8f826601.elf LFM_CENSUS_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin LFM_CENSUS_EPOCH_LOG2=21 LAMBDA_VM_MAX_ROWS_LOG2=21 LAMBDA_VM_MEMPOOL_RELEASE_MB=0 LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A LFM_WHIR_RETENTION=1 LAMBDA_VM_WHIR_HASH=rpx TABLE_PARALLELISM=4 LFM_TREE_SIBLINGS_L0=6 LFM_TREE_SIBLINGS=4 LFM_TREE_LEVEL_POOL=1 LAMBDA_VM_BASE_SPLIT=1 && cargo test --release -p lambda-vm-prover --features cuda --lib -- --ignored --exact --nocapture lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root > /tmp/tup-default-tree.log 2>&1 && grep -q '★ SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes' /tmp/tup-default-tree.log && grep -q 'THE BLOCK IS COMPRESSED UNDER WHIR' /tmp/tup-default-tree.log && grep -q 'COLUMNS UPLOAD: .*(pageable)' /tmp/tup-default-tree.log && ! grep -q 'COLUMNS UPLOAD: .*(staged' /tmp/tup-default-tree.log && ! grep -q 'DECODE prepared (ahead)' /tmp/tup-default-tree.log && grep -q 'BASE HEAD (WHIR): DECODE prepared ' /tmp/tup-default-tree.log && grep 'IDENTITY: program_id' /tmp/tup-default-tree.log | sed 's/^ *//' | sort > /tmp/tup-default-ids.txt && [ "$(grep -c . /tmp/tup-default-ids.txt)" -eq 5 ] && diff /root/zf/bin/ids-1010-f5.txt /tmp/tup-default-ids.txt
+#
+# --- ★ THE PRODUCTION TREE UNDER LAMBDA_VM_TRACE_UPLOAD=1: the same root and the same 5 ids, staged x4 uploads only,
+#     a nonzero zero-tail count, the opening ahead and the first prove's wait printed
+!raw set -o pipefail; unset LFM_CENSUS_FAN_IN LFM_CARD_AFTER_PREP LAMBDA_VM_LFM_PROVER LAMBDA_VM_LFM_WIDE LAMBDA_VM_LFM_WHIR_PREP LAMBDA_VM_LFM_ROOT_PROVER LAMBDA_VM_TRACE_UPLOAD LAMBDA_VM_TRACE_UPLOAD_THREADS; export LFM_CENSUS_ELF=/root/fixtures/ethrex_8f826601.elf LFM_CENSUS_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin LFM_CENSUS_EPOCH_LOG2=21 LAMBDA_VM_MAX_ROWS_LOG2=21 LAMBDA_VM_MEMPOOL_RELEASE_MB=0 LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A LFM_WHIR_RETENTION=1 LAMBDA_VM_WHIR_HASH=rpx TABLE_PARALLELISM=4 LFM_TREE_SIBLINGS_L0=6 LFM_TREE_SIBLINGS=4 LFM_TREE_LEVEL_POOL=1 LAMBDA_VM_BASE_SPLIT=1 LAMBDA_VM_TRACE_UPLOAD=1 && cargo test --release -p lambda-vm-prover --features cuda --lib -- --ignored --exact --nocapture lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root > /tmp/tup-on-tree.log 2>&1 && grep -q '★ SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes' /tmp/tup-on-tree.log && grep -q 'THE BLOCK IS COMPRESSED UNDER WHIR' /tmp/tup-on-tree.log && grep -q 'COLUMNS UPLOAD: .*(staged x4)' /tmp/tup-on-tree.log && ! grep -q 'COLUMNS UPLOAD: .*(pageable)' /tmp/tup-on-tree.log && grep -Eq 'COLUMNS UPLOAD: .*, [0-9]*\.[0-9]*[1-9][0-9]* GB zero tails not sent' /tmp/tup-on-tree.log && grep -q 'DECODE prepared (ahead)' /tmp/tup-on-tree.log && grep -q 'the first prove waited' /tmp/tup-on-tree.log && grep 'IDENTITY: program_id' /tmp/tup-on-tree.log | sed 's/^ *//' | sort > /tmp/tup-on-ids.txt && [ "$(grep -c . /tmp/tup-on-ids.txt)" -eq 5 ] && diff /root/zf/bin/ids-1010-f5.txt /tmp/tup-on-ids.txt

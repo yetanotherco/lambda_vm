@@ -574,3 +574,78 @@ cycles [E]. That is free only where it lands in idle windows.
   - The rig found one bug, now fixed: a `$( [ … ] && echo … )` inside an assignment silently ended the real mode under
     `set -e`.
   - The rig cannot show real /proc, real nsys, the real harness, or what the census lines hold.
+
+## 7. c.3's cheap slice: `LAMBDA_VM_TRACE_UPLOAD` (pre-registered 2026-09-30 15:11Z, before any box run)
+
+The lead's go (2026-09-30): build the slice §4.7 recommends. It must stay byte-identical, sit behind a knob that is
+off by default, and live on `fix2/1010-trace-upload`, branched from 73342bc66 (keep-futile, gated).
+
+### 7.1 What was built [V: the code at `d0bf1ad8c`]
+
+| part | where | default | knob on |
+|---|---|---|---|
+| staged column upload | `math_cuda::columns::DeviceColumns::upload` (the epoch's `upload_columns`, `multilinear_table.rs:595`) | one stream of per-column pageable `memcpy_htod` | 4 threads (`LAMBDA_VM_TRACE_UPLOAD_THREADS`, at most 8), each taking the next column through a staging pair of its own (`htod_staged_raw`, the I6 pairs, now addressable by raw pointer) |
+| zero tails | the same | every byte sent | a column's all-zero tail ≥ 64 KiB (`ZERO_TAIL_MIN_BYTES`) is not sent; a `cuMemsetD8Async` zeroes it on the card |
+| DECODE's prepared opening | `prove_continuation_scheduled` (`PreparedDecode`) | `decode_prepared_for` serial before the pipeline | on a helper from the ELF bytes; the first prove, or the observer's share just before it, joins it |
+| log | `COLUMNS UPLOAD: <GB> in <s>, <GB> zero tails not sent, <GB/s> sent (pageable\|staged xN) t=` under `LAMBDA_VM_BASE_SPLIT`, on both arms; `BASE HEAD (WHIR): DECODE prepared (ahead)` and `… the first prove waited <s> for DECODE prepared` | | |
+
+- **Knob:** `LAMBDA_VM_TRACE_UPLOAD`. `1` turns on both parts. `columns` or `head` turns on one, for attribution.
+  Anything else is off.
+- **Not built, and why:**
+  - **The per-table upload overlapped with the commit's kernels.** An epoch's first stacked polynomial holds columns
+    from every table (`BASE STACK #0: tables 0..19 … polys 2 vars 27`), so its Möbius transform cannot start before
+    the last of those tables has landed. Overlap would need a different stacking, so the slice parallelizes the
+    upload instead.
+  - **Uploading epoch k+1 during epoch k's open.** It would hide the whole upload, but it adds ≈ 2.2 GB of VRAM per
+    epoch next to the open's trees. i-whir measured the argue's high-water within 7 MiB of the budget in epoch 5.
+    That is a separate lever with its own VRAM case.
+- **Prior art that sets the risk** (`crypto/math-cuda/tests/h2d_bench.rs`, measured on a box before): one thread
+  copying through a pinned pair ran at 13.9 GiB/s, slower than pageable at 18.6 GiB/s. Registering page locks on
+  the fly cost as much as it saved. The slice therefore parallelizes the host copy (4 threads) instead of relying
+  on one pinned stream. The laptop cannot measure the resulting rate [I]: it is what the A/B reads.
+
+### 7.2 Gates (FAST2, job 185)
+
+- Script: `thoughts/zf/box/extra-1010-trace-upload.txt` in `lambda_vm-tup` (md5 `a27f4da68fbba6edbbf5780ebde8f364`),
+  through `zf-gates.sh d0bf1ad8c 1010-trace-upload`.
+- Unit tests: the columns module's host tests (5). The setting and the prepared-ahead proving test (in the lib
+  suite).
+- On the card:
+  - `columns_upload`: the store is read back from a pool dirtied with `u64::MAX`. It must equal the host columns
+    and the pageable upload. A control shows the dirty pool hands back garbage.
+  - `trace_upload_identity`: a `multi_prove` over three EQ tables, with the knob off, on and off again. The bytes
+    must be identical. Controls: the two off proves agree, and the staged path ran and skipped tails. Mutation:
+    another valid table changes the bytes.
+- The production tree at the default and at `=1`: the same root, and the 5 ids = `ids-1010-f5.txt`. Each arm's
+  own path lines must appear.
+- Laptop, done: `make fmt`, `make lint` green; `cargo test -p math-cuda --lib columns::tests` 5/5; the setting
+  test 1/1.
+
+### 7.3 The A/B (FAST job 290): A = default, B = `LAMBDA_VM_TRACE_UPLOAD=1`, A B B A, wt1290–1293
+
+- Script `tup-ab.sh` (md5 `e11bf9937a9917258feae64bfcf99f06`) with `tup_readout.py` (md5
+  `1309e6265c87de78ce512e3f528066ea`), through the harness `zf-whir-arms.sh` 86951bc2.
+- Bands, B − A unless named. The readout prints one row per mechanism row:
+
+| row | what | band | why |
+|---|---|---|---|
+| M0 | each arm ran its own path; ids identical; proved; same GB uploaded | exact | the knob, and byte-identity at block level |
+| M1 | A's Σ `COLUMNS UPLOAD` seconds in the base (control) | 1.3–2.3 s | G6: H2D pageable 1.84 s of op time in the base, 1.79 exclusive |
+| M2 | B's Σ upload seconds | ≤ 1.3 s | 31–33 GB sent at ≥ 24 GB/s. Pinned DMA read 23.7 GiB/s on one stream in isolation and 39 GiB/s in a proof (`h2d_bench.rs`) [I] |
+| M3 | Δ upload (the exclusive-H2D row) | [−1.2, −0.3] s | point −0.8 |
+| M4 | B's zero tails not sent in the base (upload bytes skipped) | 3.0–4.6 GB | the census: 4.46 GB of row padding in the epochs' tables. Only tails ≥ 64 KiB are cut, and tables whose padding is not zero keep theirs |
+| M5 | A: head start → epoch 0 executes (control) | 0.40–0.70 s | G6 P2 0.543 s |
+| M6 | Δ head → epoch 0 executes (the head's critical path) | [−0.45, −0.15] s | `decode_prepared_for` 0.32–0.36 s leaves the path; the helper competes with epoch 0 for CPU |
+| M7 | Δ head → epoch 0's commit | [−0.45, −0.05] s | |
+| M8 | B's first prove waited for the opening | ≤ 0.10 s | the helper has ≈ 1.3 s before the first prove |
+| M9 | Δ base | [−1.8, −0.3] s | M3 + M7 |
+| — | **Δ whole run** | **−1.0 s [−1.8, −0.3]** | EFFECTIVE if ≤ −0.3; NO EFFECT if within ±0.3; REGRESSION if ≥ +0.3 |
+
+- **What would falsify the mechanism, not just the number:**
+  - M2 above 1.3 s means the host copy, not the bus, is the bottleneck. The next step would then be more threads,
+    not tracegen.
+  - M6 inside ±0.1 s means the head is not bound where §4.3 says.
+  - A whole-run gain with M3 and M6 both null would be noise. With the A spread at 0.6 s (job 249), a single ABBA
+    resolves only about 0.4 s.
+- **Replication:** if the verdict is promoted to a default flip, a second ABBA on new tags comes first (memory:
+  replicate an arm promoted after a run).
