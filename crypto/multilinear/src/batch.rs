@@ -460,7 +460,16 @@ where
             );
             crate::whir_split::add_tick(&crate::whir_split::ZC_OTHER, start);
             match attempt {
-                None => crate::gpu_fused::note_decline(),
+                None => {
+                    crate::gpu_fused::note_decline();
+                    if check || crate::gpu_fused::argue_fused_log() {
+                        eprintln!(
+                            "ARGUE FUSED: declined · factors {} n={} (today's rounds run)",
+                            device.width(),
+                            device.len().trailing_zeros(),
+                        );
+                    }
+                }
                 Some(Err(error)) => return Err(error),
                 Some(Ok((mut rounds, mut point, factors, times))) => {
                     if check {
@@ -469,8 +478,12 @@ where
                         )?;
                     } else if crate::gpu_fused::argue_fused_log() {
                         eprintln!(
-                            "ARGUE FUSED: factors {} n={} · fused {:.3} ms (grid {:.3} fold2 {:.3} rounds {:.3})",
+                            "ARGUE FUSED: factors {} roots {} terms {} slots {} n={} · fused {:.3} ms (grid \
+                             {:.3} fold2 {:.3} rounds {:.3})",
                             device.width(),
+                            times.roots,
+                            times.terms,
+                            times.slots,
                             device.len().trailing_zeros(),
                             times.total * 1e3,
                             times.grid * 1e3,
@@ -592,9 +605,12 @@ where
         }
     };
     eprintln!(
-        "ARGUE FUSED: factors {} n={} · fused {:.3} ms (grid {:.3} fold2 {:.3} rounds {:.3}) · today {:.3} ms · \
-         R {:.3} · xcheck {verdict}",
+        "ARGUE FUSED: factors {} roots {} terms {} slots {} n={} · fused {:.3} ms (grid {:.3} fold2 {:.3} rounds \
+         {:.3}) · today {:.3} ms · R {:.3} · xcheck {verdict}",
         device.width(),
+        times.roots,
+        times.terms,
+        times.slots,
         device.len().trailing_zeros(),
         times.total * 1e3,
         times.grid * 1e3,

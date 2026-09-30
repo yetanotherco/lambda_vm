@@ -393,6 +393,11 @@ pub struct FusedTimes {
     pub fold2: f64,
     pub rounds: f64,
     pub total: f64,
+    /// The table's signature on the log line (a committed table has no name
+    /// here): its roots, its bus column's terms, the constraint walk's slots.
+    pub roots: usize,
+    pub terms: usize,
+    pub slots: usize,
 }
 
 // ── the rounds ───────────────────────────────────────────────────────────────
@@ -698,6 +703,9 @@ where
         fold2: fold2_secs,
         rounds: rounds_secs,
         total: started.elapsed().as_secs_f64(),
+        roots: constraints.roots().len(),
+        terms: slots.len(),
+        slots: lowered.num_slots,
     };
     Some(Ok((rounds, point, factors, times)))
 }
