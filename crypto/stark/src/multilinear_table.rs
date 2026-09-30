@@ -593,6 +593,15 @@ where
         // copy.
         let all: Vec<&Mle<F>> = tables.iter().flat_map(|t| t.columns()).collect();
         let store = multilinear::gpu::upload_columns(&all).map(Arc::new);
+        if multilinear::whir_split::enabled()
+            && let Some(store) = &store
+        {
+            println!(
+                "COLUMNS UPLOAD: {} t={:.3}",
+                store.upload_line(),
+                multilinear::whir_split::epoch_secs()
+            );
+        }
         // Where each table's columns start in it.
         let mut firsts = Vec::with_capacity(tables.len());
         let mut column_at = 0usize;
