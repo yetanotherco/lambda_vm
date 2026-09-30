@@ -339,14 +339,25 @@ fn collect_cpu_ops(
     instructions: &U64HashMap<Instruction>,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
+    collect_cpu_ops_into(logs, instructions, 0, &mut cpu_ops)?;
+    Ok(cpu_ops)
+}
 
+/// [`collect_cpu_ops`] over logs that start `first_cycle` cycles into the run,
+/// appending to `cpu_ops`: a window of a run gets the run's timestamps.
+fn collect_cpu_ops_into(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    first_cycle: usize,
+    cpu_ops: &mut Vec<CpuOperation>,
+) -> Result<(), Error> {
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location. The +4 stride reserves
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = ((first_cycle + i) as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -355,7 +366,7 @@ fn collect_cpu_ops(
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
     }
-    Ok(cpu_ops)
+    Ok(())
 }
 
 // =============================================================================
@@ -555,19 +566,112 @@ fn collect_ops_from_cpu(
     Vec<ecdas::EcdasOperation>,
     Vec<hint::HintOperation>,
 ) {
-    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
-    let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
-    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
-    let mut commit_ops = Vec::new();
-    let mut keccak_ops = Vec::new();
-    let mut blake3_ops = Vec::new();
-    let mut blake3_absorb_ops = Vec::new();
-    let mut cpu32_ops = Vec::new();
-    let mut ecsm_ops = Vec::new();
-    let mut ecdas_ops = Vec::new();
-    let mut hint_ops = Vec::new();
+    let mut acc = WalkOutputs::with_capacity(cpu_ops.len());
+    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut acc);
+    acc.into_tuple()
+}
+
+/// Everything the Phase-2 walk emits, accumulated across calls: the windowed
+/// block collector ([`WindowedCollector`]) walks its run a window at a time into
+/// one of these, which is the single walk over the whole run because the walk
+/// is a left fold — each op appends to these lists in op order, reading and
+/// advancing only the memory and register state the caller carries.
+struct WalkOutputs {
+    memw: MemwBuckets,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    commit_ops: Vec<CommitOperation>,
+    keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    ecsm_ops: Vec<ecsm::EcsmOperation>,
+    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    hint_ops: Vec<hint::HintOperation>,
+}
+
+impl WalkOutputs {
+    /// The capacities the one-call walk has always reserved for `n` ops.
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            memw: MemwBuckets::with_register_capacity(n * 3),
+            load_ops: Vec::with_capacity(n / 8 + 1),
+            lt_ops: Vec::with_capacity(n / 10 + 1),
+            shift_ops: Vec::with_capacity(n / 10 + 1),
+            bitwise_ops: Vec::with_capacity(n * 4),
+            commit_ops: Vec::new(),
+            keccak_ops: Vec::new(),
+            blake3_ops: Vec::new(),
+            blake3_absorb_ops: Vec::new(),
+            cpu32_ops: Vec::new(),
+            ecsm_ops: Vec::new(),
+            ecdas_ops: Vec::new(),
+            hint_ops: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn into_tuple(
+        self,
+    ) -> (
+        MemwBuckets,
+        Vec<LoadOperation>,
+        Vec<LtOperation>,
+        Vec<ShiftOperation>,
+        Vec<BitwiseOperation>,
+        Vec<CommitOperation>,
+        Vec<KeccakOperation>,
+        Vec<Blake3Operation>,
+        Vec<blake3::Blake3AbsorbOperation>,
+        Vec<cpu32::Cpu32Operation>,
+        Vec<ecsm::EcsmOperation>,
+        Vec<ecdas::EcdasOperation>,
+        Vec<hint::HintOperation>,
+    ) {
+        (
+            self.memw,
+            self.load_ops,
+            self.lt_ops,
+            self.shift_ops,
+            self.bitwise_ops,
+            self.commit_ops,
+            self.keccak_ops,
+            self.blake3_ops,
+            self.blake3_absorb_ops,
+            self.cpu32_ops,
+            self.ecsm_ops,
+            self.ecdas_ops,
+            self.hint_ops,
+        )
+    }
+}
+
+/// [`collect_ops_from_cpu`]'s walk, appending to `acc`.
+fn collect_ops_from_cpu_into(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    acc: &mut WalkOutputs,
+) {
+    let WalkOutputs {
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    } = acc;
+    // This call's commit rows start here; the check below counts only them.
+    let commit_ops_start = commit_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -598,7 +702,7 @@ fn collect_ops_from_cpu(
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, &mut memw);
+        collect_register_ops_from_cpu(op, register_state, memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -780,26 +884,10 @@ fn collect_ops_from_cpu(
     // Each ecall generates count+1 operations (count real rows + 1 end row).
     // Count only this epoch's rows, so subtract the carried start index.
     debug_assert_eq!(
-        commit_ops.len(),
+        commit_ops.len() - commit_ops_start,
         (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
-
-    (
-        memw,
-        load_ops,
-        lt_ops,
-        shift_ops,
-        bitwise_ops,
-        commit_ops,
-        keccak_ops,
-        blake3_ops,
-        blake3_absorb_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ecdas_ops,
-        hint_ops,
-    )
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -3321,6 +3409,114 @@ impl DecodeArtifacts {
     }
 }
 
+/// Phases 1-2 of the trace build over a whole run that arrives a window of
+/// logs at a time (the no-epoch block's producer): each window's CPU ops are
+/// collected with the run's timestamps and walked into the one accumulator,
+/// carrying the memory and register state, so [`Self::finish`] returns what
+/// [`Traces::collect_epoch`] returns for the whole run's logs at once.
+pub struct WindowedCollector<'a> {
+    artifacts: &'a DecodeArtifacts,
+    memory_state: MemoryState,
+    register_state: RegisterState,
+    cpu_ops: Vec<CpuOperation>,
+    walk: WalkOutputs,
+}
+
+impl<'a> WindowedCollector<'a> {
+    /// A run starting from `initial_image` and `register_init`, sized for
+    /// about `expected_cycles` (capacity only).
+    pub fn new<I: ImageSource>(
+        artifacts: &'a DecodeArtifacts,
+        initial_image: &I,
+        register_init: &[u32],
+        expected_cycles: usize,
+    ) -> Self {
+        Self {
+            artifacts,
+            memory_state: MemoryState::from_image(initial_image),
+            register_state: RegisterState::from_init(register_init),
+            cpu_ops: Vec::with_capacity(expected_cycles),
+            walk: WalkOutputs::with_capacity(expected_cycles),
+        }
+    }
+
+    /// Cycles collected so far.
+    pub fn cycles(&self) -> usize {
+        self.cpu_ops.len()
+    }
+
+    /// Collect and walk the run's next window of logs.
+    pub fn push_window(&mut self, logs: &[Log]) -> Result<(), Error> {
+        let start = self.cpu_ops.len();
+        collect_cpu_ops_into(logs, &self.artifacts.instructions, start, &mut self.cpu_ops)?;
+        collect_ops_from_cpu_into(
+            &self.cpu_ops[start..],
+            &mut self.memory_state,
+            &mut self.register_state,
+            &mut self.walk,
+        );
+        Ok(())
+    }
+
+    /// The run's collected epoch (it is final: HALT is applied). With
+    /// `cpu_generated_outside`, the build leaves the CPU tables to the caller,
+    /// who generated each window's with [`generate_cpu_window`].
+    pub fn finish(mut self, cpu_generated_outside: bool) -> CollectedEpoch {
+        let (
+            memw,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
+            cpu32_ops,
+            ecsm_ops,
+            ecdas_ops,
+            hint_ops,
+        ) = self.walk.into_tuple();
+        let mut ops = collect_all_ops(
+            self.cpu_ops,
+            memw,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
+            cpu32_ops,
+            ecsm_ops,
+            ecdas_ops,
+            hint_ops,
+            &mut self.register_state,
+            true,
+        );
+        ops.cpu_generated_outside = cpu_generated_outside;
+        CollectedEpoch {
+            ops,
+            memory_state: self.memory_state,
+            register_state: self.register_state,
+        }
+    }
+}
+
+/// The CPU table of one window of a run: the run's `first_cycle`.. cycles, the
+/// table `Traces::cpus` holds for that chunk when the window is one CPU chunk
+/// (`max_rows.cpu` cycles, or the run's tail).
+pub fn generate_cpu_window(
+    logs: &[Log],
+    artifacts: &DecodeArtifacts,
+    first_cycle: usize,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
+    let mut ops = Vec::with_capacity(logs.len());
+    collect_cpu_ops_into(logs, &artifacts.instructions, first_cycle, &mut ops)?;
+    Ok(cpu::generate_cpu_trace(&ops))
+}
+
 /// An epoch's collected operations and end state (Phases 1-2 of the trace
 /// build), produced by [`Traces::collect_epoch`] and consumed by
 /// [`Traces::build_from_collected`]. Collection must run in epoch order (it
@@ -3502,6 +3698,10 @@ struct CollectedOps {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
+    /// The CPU tables were generated outside the build (the windowed block
+    /// collector's builders, one per window), so `build_traces` leaves
+    /// `Traces::cpus` empty for its caller to fill.
+    cpu_generated_outside: bool,
 }
 
 /// Chunk raw ops and generate one trace table per chunk, padding an empty `ops`
@@ -3772,6 +3972,7 @@ fn collect_all_ops(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        cpu_generated_outside: false,
     }
 }
 
@@ -3818,6 +4019,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        cpu_generated_outside,
     } = ops;
 
     // =====================================================================
@@ -4021,6 +4223,9 @@ fn build_traces<I: ImageSource + Sync>(
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
     let gen_cpus = || {
+        if cpu_generated_outside {
+            return Ok(Vec::new());
+        }
         chunk_and_generate(
             cpu_ops_ref,
             max_rows.cpu,

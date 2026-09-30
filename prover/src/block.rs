@@ -27,8 +27,13 @@ use stark::residency_mode::ResidencyMode;
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::register;
-use crate::tables::trace_builder::{DecodeArtifacts, Traces, build_initial_image};
+use crate::tables::trace_builder::{
+    DecodeArtifacts, Traces, WindowedCollector, build_initial_image, generate_cpu_window,
+};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::test_utils::create_cpu_air;
 use crate::{AcceleratorShape, Commitment, Error, ProofOptions, VmAirs, VmProof};
+use stark::trace::TraceTable as StarkTraceTable;
 
 /// A helper thread's result, its panic re-raised on the caller.
 fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
@@ -183,23 +188,67 @@ pub fn prove_block_with(
 ) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let (mut traces, decode_commitment, cpu_precommits) = if stream_phase_a() {
+        build_streamed(
+            &program,
+            private_input,
+            opts,
+            max_rows,
+            residency,
+            &mut times,
+        )?
+    } else {
+        let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
+        (traces, decode, Vec::new())
+    };
 
+    let proof = prove_block_traces(
+        elf_bytes,
+        &program,
+        &mut traces,
+        opts,
+        Some(decode_commitment),
+        residency,
+        cpu_precommits,
+        &mut times,
+    )?;
+    eprintln!(
+        "BLOCK PHASE total {:.2}s (execute {:.2} · build {:.2} · setup {:.2} · prove {:.2})",
+        times.total(),
+        times.execute,
+        times.build,
+        times.setup,
+        times.prove
+    );
+    Ok((proof, times))
+}
+
+/// Phase A's producer, serial: execute the whole run, then collect, then build
+/// every trace (DECODE's root, the DECODE artifacts, the initial image and the
+/// data-page roots beside the execution).
+fn build_serial(
+    program: &Elf,
+    private_input: &[u8],
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    times: &mut BlockTimes,
+) -> Result<(Traces, Commitment), Error> {
     // Beside the execution: DECODE's root (a function of the ELF and `opts`),
     // the DECODE artifacts and the initial image — none reads the execution.
     let t = Instant::now();
     let (decode_commitment, artifacts, initial_image, run) = std::thread::scope(|s| {
         let decode = s.spawn(|| {
-            crate::tables::decode::commitment_from_elf_device_or_host(&program, opts)
+            crate::tables::decode::commitment_from_elf_device_or_host(program, opts)
                 .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
         });
-        let artifacts = s.spawn(|| DecodeArtifacts::from_elf(&program));
+        let artifacts = s.spawn(|| DecodeArtifacts::from_elf(program));
         // The ELF data pages' preprocessed roots, on the card while it is
         // otherwise idle; Round 1 would otherwise derive each on the host.
         if warm_precomputed() {
-            s.spawn(|| warm_data_page_commitments(&program, opts));
+            s.spawn(|| warm_data_page_commitments(program, opts));
         }
-        let image = s.spawn(|| build_initial_image(&program, private_input));
-        let run = Executor::new(&program, private_input.to_vec())
+        let image = s.spawn(|| build_initial_image(program, private_input));
+        let run = Executor::new(program, private_input.to_vec())
             .map_err(|e| Error::Execution(format!("{e}")))
             .and_then(|executor| executor.run().map_err(|e| Error::Execution(format!("{e}"))));
         (join(decode), join(artifacts), join(image), run)
@@ -215,7 +264,7 @@ pub fn prove_block_with(
         Traces::collect_epoch(&artifacts, &initial_image, &register_init, &run.logs, true)?;
     drop(run);
     let collect = t.elapsed().as_secs_f64();
-    let mut traces = Traces::build_from_collected(
+    let traces = Traces::build_from_collected(
         &artifacts,
         collected,
         Some(&initial_image),
@@ -235,30 +284,176 @@ pub fn prove_block_with(
         times.build - collect
     );
 
-    let proof = prove_block_traces(
-        elf_bytes,
-        &program,
-        &mut traces,
-        opts,
-        Some(decode_commitment),
-        residency,
-        &mut times,
-    )?;
-    eprintln!(
-        "BLOCK PHASE total {:.2}s (execute {:.2} · build {:.2} · setup {:.2} · prove {:.2})",
-        times.total(),
-        times.execute,
-        times.build,
-        times.setup,
-        times.prove
-    );
-    Ok((proof, times))
+    Ok((traces, decode_commitment))
+}
+
+/// A CPU instance's trace and its Round-1 commit, made in phase A's stream.
+type CpuPrecommit = stark::prover::PrecommittedMain<
+    crate::tables::types::GoldilocksField,
+    crate::hash_pin::BlockStarkHash,
+>;
+
+/// A streamed CPU instance: its index, its trace and its Round-1 commit.
+type BuiltCpu = (
+    usize,
+    StarkTraceTable<GoldilocksField, GoldilocksExtension>,
+    CpuPrecommit,
+);
+
+/// `LAMBDA_VM_BLOCK_STREAM=0` builds phase A serially (the A arm of the stream
+/// A/B); unset or anything else streams it.
+fn stream_phase_a() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_STREAM").map_or(true, |v| v != "0")
+}
+
+/// Committer threads for the streamed CPU instances.
+const STREAM_BUILDERS: usize = 2;
+
+/// Phase A's producer, streamed. The executor runs in windows of one CPU
+/// instance (`max_rows.cpu` cycles) on its own thread; the collector walks
+/// each window as it arrives; and for each window a builder generates that CPU
+/// instance's trace from the window's logs and makes its Round-1 commit on the
+/// device ([`IsStarkProver::precommit_main`]) while the run is still being
+/// executed and collected. After the last window the other tables are built as
+/// before. The traces are the serial build's (the windowed walk is the one walk;
+/// each window's CPU table is `chunk_and_generate`'s chunk of the same ops).
+fn build_streamed(
+    program: &Elf,
+    private_input: &[u8],
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    residency: ResidencyMode,
+    times: &mut BlockTimes,
+) -> Result<(Traces, Commitment, Vec<CpuPrecommit>), Error> {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    let window = max_rows.cpu;
+    let t = Instant::now();
+    std::thread::scope(|outer| {
+        // The executor, window by window, a bounded two windows ahead.
+        let (log_tx, log_rx) = mpsc::sync_channel::<Arc<Vec<executor::vm::logs::Log>>>(2);
+        let exec = outer.spawn(move || -> Result<f64, Error> {
+            let t = Instant::now();
+            let mut executor = Executor::new(program, private_input.to_vec())
+                .map_err(|e| Error::Execution(format!("{e}")))?;
+            while let Some(logs) = executor
+                .resume_with_limit(window)
+                .map_err(|e| Error::Execution(format!("{e}")))?
+            {
+                if log_tx.send(Arc::new(logs.to_vec())).is_err() {
+                    break;
+                }
+            }
+            Ok(t.elapsed().as_secs_f64())
+        });
+        let decode = outer.spawn(|| {
+            crate::tables::decode::commitment_from_elf_device_or_host(program, opts)
+                .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
+        });
+        if warm_precomputed() {
+            outer.spawn(|| warm_data_page_commitments(program, opts));
+        }
+        let image = outer.spawn(|| build_initial_image(program, private_input));
+        let artifacts = DecodeArtifacts::from_elf(program)?;
+        let initial_image = join(image);
+        let register_init = register::register_init_from_entry_point(program.entry_point);
+
+        let (job_tx, job_rx) = mpsc::channel::<(usize, usize, Arc<Vec<executor::vm::logs::Log>>)>();
+        let job_rx = Mutex::new(job_rx);
+        let built: Mutex<Vec<BuiltCpu>> = Mutex::new(Vec::new());
+        let builder_secs = Mutex::new(0.0f64);
+        let (collect_secs, collected) = std::thread::scope(|inner| -> Result<_, Error> {
+            let mut builders = Vec::new();
+            for _ in 0..STREAM_BUILDERS {
+                builders.push(inner.spawn(|| -> Result<(), Error> {
+                    loop {
+                        let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((k, first_cycle, logs)) = job else {
+                            return Ok(());
+                        };
+                        let t = Instant::now();
+                        let trace = generate_cpu_window(&logs, &artifacts, first_cycle)?;
+                        drop(logs);
+                        let air = create_cpu_air(opts).with_name(&format!("CPU[{k}]"));
+                        let pre = crate::hash_pin::BlockProver::precommit_main(
+                            &air,
+                            &trace,
+                            #[cfg(feature = "disk-spill")]
+                            stark::storage_mode::StorageMode::Ram,
+                            residency,
+                        )
+                        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+                        *builder_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                            t.elapsed().as_secs_f64();
+                        built
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((k, trace, pre));
+                    }
+                }));
+            }
+            let mut collector =
+                WindowedCollector::new(&artifacts, &initial_image, &register_init, 1 << 27);
+            let mut collect_secs = 0.0;
+            for (k, logs) in log_rx.iter().enumerate() {
+                let _ = job_tx.send((k, collector.cycles(), Arc::clone(&logs)));
+                let t = Instant::now();
+                collector.push_window(&logs)?;
+                collect_secs += t.elapsed().as_secs_f64();
+            }
+            drop(job_tx);
+            let t = Instant::now();
+            let collected = collector.finish(true);
+            collect_secs += t.elapsed().as_secs_f64();
+            for b in builders {
+                join(b)?;
+            }
+            Ok((collect_secs, collected))
+        })?;
+        times.execute = join(exec)?;
+        let decode_commitment = join(decode)?;
+        let streamed = t.elapsed().as_secs_f64();
+
+        let t_build = Instant::now();
+        let mut traces = Traces::build_from_collected(
+            &artifacts,
+            collected,
+            Some(&initial_image),
+            &register_init,
+            max_rows,
+            private_input,
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )?;
+        let generate = t_build.elapsed().as_secs_f64();
+        let mut built = built.into_inner().unwrap_or_else(|e| e.into_inner());
+        built.sort_by_key(|(k, ..)| *k);
+        let mut precommits = Vec::with_capacity(built.len());
+        for (k, (i, trace, pre)) in built.into_iter().enumerate() {
+            debug_assert_eq!(i, k, "one CPU instance per window, in order");
+            traces.cpus.push(trace);
+            precommits.push(pre);
+        }
+        times.build = t.elapsed().as_secs_f64() - times.execute;
+        eprintln!(
+            "BLOCK PHASE stream {streamed:.2}s (execute {:.2} on its thread · collect {collect_secs:.2} · \
+             CPU build+commit {:.2} on {STREAM_BUILDERS} threads, {} instances) · generate {generate:.2}",
+            times.execute,
+            builder_secs.into_inner().unwrap_or_else(|e| e.into_inner()),
+            precommits.len(),
+        );
+        Ok((traces, decode_commitment, precommits))
+    })
 }
 
 /// The prove step over built traces: the AIRs [`crate::prove_with_options_and_inputs`]
 /// builds (with DECODE's commitment supplied when given), the monolithic
 /// statement in the transcript, and one `multi_prove` under `residency`.
 /// Prints the instance census before proving.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_block_traces(
     elf_bytes: &[u8],
     program: &Elf,
@@ -266,6 +461,7 @@ pub fn prove_block_traces(
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
     residency: ResidencyMode,
+    cpu_precommits: Vec<CpuPrecommit>,
     times: &mut BlockTimes,
 ) -> Result<VmProof, Error> {
     let t = Instant::now();
@@ -312,13 +508,35 @@ pub fn prove_block_traces(
         times.setup
     );
 
+    // `CPU[i]`'s precommit goes to that AIR's index; the rest commit in Round 1.
+    let n_cpu_precommits = cpu_precommits.len();
+    let mut cpu_precommits: Vec<Option<CpuPrecommit>> =
+        cpu_precommits.into_iter().map(Some).collect();
+    let precommitted: Vec<Option<CpuPrecommit>> = pairs
+        .iter()
+        .map(|(air, _, _)| {
+            air.name()
+                .strip_prefix("CPU[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .and_then(|i| i.parse::<usize>().ok())
+                .and_then(|i| cpu_precommits.get_mut(i).and_then(Option::take))
+        })
+        .collect();
+    let placed = precommitted.iter().filter(|p| p.is_some()).count();
+    if placed != n_cpu_precommits {
+        return Err(Error::Prover(format!(
+            "{n_cpu_precommits} CPU precommits for {placed} CPU tables"
+        )));
+    }
+
     let t = Instant::now();
-    let proof = crate::hash_pin::BlockProver::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove_precommitted(
         pairs,
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
         residency,
+        precommitted,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     times.prove = t.elapsed().as_secs_f64();
