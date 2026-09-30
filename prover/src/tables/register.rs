@@ -228,6 +228,7 @@ pub fn generate_register_trace(
     init: &[u32],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    multilinear::whir_split::note_rows("REGISTER", NUM_REGISTER_ADDRESSES, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

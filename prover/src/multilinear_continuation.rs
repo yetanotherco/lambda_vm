@@ -851,6 +851,91 @@ pub(crate) fn epoch_groups(num_tables: usize) -> Vec<usize> {
     vec![num_tables - 1, 1]
 }
 
+/// The padding census's host-side lines, under `LAMBDA_VM_ROW_CENSUS=1`: the
+/// real and padded rows every trace generator noted since the last call, and
+/// the shape (main width, variables) of every table this stage hands the
+/// prover. Printed on the producer thread after the stage's last generator
+/// ran, so a line holds this stage's tables and no other's.
+fn print_row_census(who: std::fmt::Arguments<'_>, names: &[String], shapes: &[(usize, usize)]) {
+    if !multilinear::whir_split::census_enabled() {
+        return;
+    }
+    let rows = multilinear::whir_split::take_rows();
+    println!(
+        "{}",
+        multilinear::whir_split::rows_line(&who.to_string(), &rows)
+    );
+    let tables: Vec<String> = names
+        .iter()
+        .zip(shapes)
+        .map(|(name, &(width, num_vars))| format!("{name} w{width} m{num_vars}"))
+        .collect();
+    println!("BASE SHAPES {who}: {}", tables.join(" · "));
+}
+
+/// The census's view of one argument's tables: their names and committed
+/// shapes (columns, variables), taken before the commitment consumes the
+/// tables. Built only when the census is on, so the default path copies
+/// nothing.
+struct ArgueCensus {
+    names: Vec<String>,
+    shapes: Vec<(usize, usize)>,
+}
+
+impl ArgueCensus {
+    fn new(names: Vec<String>, committed: &[CommittedTable<'_, F, E>]) -> Self {
+        let shapes = committed
+            .iter()
+            .map(|t| (t.num_committed_columns(), t.num_vars()))
+            .collect();
+        Self { names, shapes }
+    }
+
+    /// Each group's stack: the columns' own cells against the stacked
+    /// polynomials they occupy. The difference is the alignment padding the
+    /// stacking adds on top of the rows' own.
+    fn print_stacks(&self, who: &str, sizes: &[usize], config: &ChainConfig) {
+        let Ok(layouts) =
+            multilinear_table::global_layouts(&self.shapes, sizes, config.format.stack)
+        else {
+            println!("BASE STACK {who}: the layout was refused");
+            return;
+        };
+        let mut at = 0usize;
+        let groups: Vec<String> = sizes
+            .iter()
+            .zip(&layouts)
+            .map(|(&size, layout)| {
+                let cells: usize = self.shapes[at..at + size]
+                    .iter()
+                    .map(|&(cols, vars)| cols << vars)
+                    .sum();
+                let group = format!(
+                    "tables {at}..{} cells {cells} polys {} vars {}",
+                    at + size,
+                    layout.num_polys(),
+                    layout.n_stack()
+                );
+                at += size;
+                group
+            })
+            .collect();
+        println!("BASE STACK {who}: {}", groups.join(" · "));
+        // The argument's per-table times are read after it: clear whatever an
+        // earlier argument in this process left.
+        let _ = multilinear::whir_split::take_table_secs();
+    }
+
+    /// Every table's argue seconds, as `multi_prove` timed them.
+    fn print_argue(&self, who: &str) {
+        for (at, secs) in multilinear::whir_split::take_table_secs() {
+            let name = self.names.get(at).map(String::as_str).unwrap_or("?");
+            let (cols, vars) = self.shapes.get(at).copied().unwrap_or_default();
+            println!("ARGUE TABLE {who} {at} {name}: vars {vars} · cols {cols} · argue {secs:.4}s");
+        }
+    }
+}
+
 /// A table's layout, from the AIR and the shape the verifier states.
 fn layout_of<'a>(
     air: &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -1313,6 +1398,7 @@ pub(crate) fn prep_global_ahead(
         }
         columns.push(main);
     }
+    print_row_census(format_args!("global"), &names, &shapes);
     if crate::continuation::base_split_enabled() {
         println!(
             "BASE PREP global: prep@producer {:.2}s t=[{t0:.3},{:.3}]",
@@ -1356,6 +1442,7 @@ where
     let __ws_index = multilinear::whir_split::GLOBAL_INDEX;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
+    let census_names = multilinear::whir_split::census_enabled().then(|| names.clone());
     multilinear::whir_split::set_table_names(names);
     let mut committed = Vec::with_capacity(airs.len());
     for ((air, main), &(width, num_vars)) in airs.iter().zip(columns.iter_mut()).zip(&shapes) {
@@ -1367,6 +1454,7 @@ where
         );
     }
     drop(columns);
+    let census = census_names.map(|names| ArgueCensus::new(names, &committed));
     let sizes = global_groups(num_epochs, gm_configs.len());
     let __ws_airs = committed.len();
     let __ws_prep_s = multilinear::whir_split::stage_done(__ws_index, "prep", __ws_prep);
@@ -1389,6 +1477,9 @@ where
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
+    if let Some(census) = &census {
+        census.print_stacks("global", &sizes, &config);
+    }
     let genesis_plan = crate::continuation::genesis_stack_plan(
         &gm_configs,
         num_epochs,
@@ -1411,6 +1502,9 @@ where
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    if let Some(census) = &census {
+        census.print_argue("global");
+    }
     let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_global", __ws_wall);
     multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
         index: __ws_index,
@@ -2078,6 +2172,7 @@ pub(crate) fn prep_epoch_ahead(
         }
         (columns, shapes, names)
     };
+    print_row_census(format_args!("#{index}"), &names, &shapes);
     if crate::continuation::base_split_enabled() {
         println!(
             "BASE PREP {index}: prep@producer {:.2}s t=[{t0:.3},{:.3}]",
@@ -2138,6 +2233,7 @@ where
     let decode_at = decode_table_index(&refs)?;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
+    let census_names = multilinear::whir_split::census_enabled().then(|| names.clone());
     multilinear::whir_split::set_table_names(names);
 
     let mut committed = Vec::with_capacity(refs.len());
@@ -2150,6 +2246,7 @@ where
         );
     }
     drop(columns);
+    let census = census_names.map(|names| ArgueCensus::new(names, &committed));
     let sizes = epoch_groups(committed.len());
     prepared.agrees_with(&config)?;
     let __ws_airs = committed.len();
@@ -2173,6 +2270,9 @@ where
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
+    if let Some(census) = &census {
+        census.print_stacks(&format!("#{index}"), &sizes, &config);
+    }
 
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
     let decode_columns = prepared.settled_at(decode_at);
@@ -2185,6 +2285,9 @@ where
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    if let Some(census) = &census {
+        census.print_argue(&format!("#{index}"));
+    }
     let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_epoch", __ws_wall);
     multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
         index: __ws_index,

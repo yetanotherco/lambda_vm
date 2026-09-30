@@ -97,6 +97,7 @@ pub fn generate_keccak_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
+    multilinear::whir_split::note_rows("KECCAK", n, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

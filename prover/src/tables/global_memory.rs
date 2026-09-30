@@ -123,6 +123,8 @@ pub fn generate_global_trace(
     );
 
     let num_rows = page_size; // One row per byte in the page
+    // Every row is a cell of the page: nothing here is padding.
+    multilinear::whir_split::note_rows("GLOBAL_MEMORY", num_rows, num_rows);
     let mut data = crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS);
 
     for offset in 0..page_size {

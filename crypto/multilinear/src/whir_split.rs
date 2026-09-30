@@ -730,6 +730,88 @@ pub fn note_table(index: usize, secs: f64) {
     {
         *held = Some((index, secs));
     }
+    if census_enabled()
+        && let Ok(mut held) = TABLE_SECS.lock()
+    {
+        held.push((index, secs));
+    }
+}
+
+// ── the padding census, under `LAMBDA_VM_ROW_CENSUS=1` ─────────────────────
+//
+// Lever c.5 (commit and argue only the real rows) is sized by the share of the
+// base's committed cells and argue work that is power-of-two padding. The real
+// row counts are known only inside the trace generators, the committed shapes
+// in the epoch prover and the per-table argue times inside `multi_prove`; this
+// crate is the one all three reach (see the module note). Log lines only:
+// nothing recorded here feeds a proof.
+
+/// `LAMBDA_VM_ROW_CENSUS=1` (any non-empty value other than `0`) turns the
+/// census lines on. The per-table argue times also need [`enabled`], since they
+/// are taken where the split's own per-table maximum is.
+pub fn census_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAMBDA_VM_ROW_CENSUS") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
+/// Every table a trace generator built since the last [`take_rows`]: its name,
+/// the real rows it was handed, and the padded height it built.
+///
+/// ⓘ In no particular order: chunked tables are generated on rayon workers. A
+/// reader sums per table, which is what the census needs.
+static ROWS: Mutex<Vec<(&'static str, usize, usize)>> = Mutex::new(Vec::new());
+
+/// The per-table argue seconds of the arguments since the last
+/// [`take_table_secs`], by index into each argument's table order.
+static TABLE_SECS: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+
+/// Note one generated table's real and padded row counts. Inert when the
+/// census is off.
+#[inline]
+pub fn note_rows(table: &'static str, real: usize, padded: usize) {
+    if !census_enabled() {
+        return;
+    }
+    if let Ok(mut held) = ROWS.lock() {
+        held.push((table, real, padded));
+    }
+}
+
+/// Read and clear the row notes.
+pub fn take_rows() -> Vec<(&'static str, usize, usize)> {
+    ROWS.lock()
+        .map(|mut held| std::mem::take(&mut *held))
+        .unwrap_or_default()
+}
+
+/// Read and clear the per-table argue seconds.
+pub fn take_table_secs() -> Vec<(usize, f64)> {
+    TABLE_SECS
+        .lock()
+        .map(|mut held| std::mem::take(&mut *held))
+        .unwrap_or_default()
+}
+
+/// The census line of one epoch's (or the global stage's) generated tables:
+/// per table, `real/padded` rows summed over its instances and the instance
+/// count, sorted by name so that two runs print the same line.
+pub fn rows_line(who: &str, rows: &[(&'static str, usize, usize)]) -> String {
+    let mut by_table: std::collections::BTreeMap<&str, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
+    for &(table, real, padded) in rows {
+        let entry = by_table.entry(table).or_default();
+        entry.0 += real;
+        entry.1 += padded;
+        entry.2 += 1;
+    }
+    let tables: Vec<String> = by_table
+        .iter()
+        .map(|(table, (real, padded, n))| format!("{table} {real}/{padded} n{n}"))
+        .collect();
+    format!("BASE ROWS {who}: {}", tables.join(" · "))
 }
 
 /// Name the epoch's tables, in the order the argument walks them.
@@ -1572,6 +1654,38 @@ pub fn check_closure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The census knob is off in the test binary, as the split's is: a row note
+    /// and a table time then record nothing.
+    #[test]
+    fn census_disabled_is_inert() {
+        assert!(
+            !census_enabled(),
+            "the test binary must not set LAMBDA_VM_ROW_CENSUS"
+        );
+        note_rows("CPU", 3, 4);
+        note_table(0, 1.5);
+        assert!(
+            take_rows().is_empty(),
+            "a disabled row note must not record"
+        );
+        assert!(
+            take_table_secs().is_empty(),
+            "a disabled table time must not record"
+        );
+    }
+
+    /// The census line sums each table's instances, whatever order the
+    /// generators noted them in, and names every table once, sorted.
+    #[test]
+    fn rows_line_sums_per_table() {
+        let rows = [("MEMW", 5, 8), ("CPU", 4, 4), ("MEMW", 8, 8), ("LT", 1, 4)];
+        let mut shuffled = rows;
+        shuffled.reverse();
+        let line = rows_line("#3", &rows);
+        assert_eq!(line, "BASE ROWS #3: CPU 4/4 n1 · LT 1/4 n1 · MEMW 13/16 n2");
+        assert_eq!(line, rows_line("#3", &shuffled));
+    }
 
     /// ⛔ The disabled path must read no clock. Asserted through the only
     /// observable it has: [`mark`] returns `None`, so [`add`] cannot move a

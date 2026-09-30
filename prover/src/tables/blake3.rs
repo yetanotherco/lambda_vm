@@ -914,6 +914,7 @@ pub fn generate_blake3_trace(
         .collect();
     let n = ops.len() + absorb_rows.len();
     let num_rows = n.next_power_of_two().max(4);
+    multilinear::whir_split::note_rows("BLAKE3", n, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

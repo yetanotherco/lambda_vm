@@ -152,6 +152,7 @@ pub fn generate_decode_trace(
     // +1 for the CPU padding entry
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
+    multilinear::whir_split::note_rows("DECODE", num_entries, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
