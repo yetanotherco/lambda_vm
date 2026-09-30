@@ -1,0 +1,24 @@
+# fix2/1010-zerotail at d9aab005a (#1010's keep-futile head 73342bc66 + LAMBDA_VM_TRACE_UPLOAD=zerotail, default OFF):
+# each column's all-zero tail of >= 64 KiB left behind and zeroed on the card, the rest one stream of pageable copies,
+# two helper threads finding the tails ahead; plus an ignored pinned-vs-pageable microbench (run on FAST, not here).
+# Extra box gates for zf-gates.sh; one command per line, verbatim from the worktree root. No prover lib code changed;
+# zf-gates' own lib suite (e) still runs.
+#
+# --- host logic: the knob, the override, the tail cut, the wide scan against a plain one, the log line
+cargo test --release -p math-cuda --lib columns::tests
+#
+# --- ★ ON THE CARD: the store read back from a dirtied pool equals the host columns and the plain upload, value for
+#     value; the dirty-pool control; asserts the card itself (backend().expect) and the zero-tail counters
+cargo test --release -p math-cuda --test columns_upload -- --ignored --test-threads=1
+#
+# --- ★ ON THE CARD: a multi_prove over three EQ tables serialises to the same bytes with the knob off, on, off; the
+#     control (off == off), the path (tails left behind), the mutation (another table moves the bytes)
+cargo test --release -p lambda-vm-prover --features cuda --test trace_upload_identity -- --ignored --test-threads=1
+#
+# --- ★ THE PRODUCTION TREE AT THE DEFAULT (knob unset): fan-in 5, the root, pageable uploads only, and the 5 IDENTITY
+#     lines = /root/zf/bin/ids-1010-f5.txt (the ids of jobs 243/246/290 and of 73342bc66's gate)
+!raw set -o pipefail; unset LFM_CENSUS_FAN_IN LFM_CARD_AFTER_PREP LAMBDA_VM_LFM_PROVER LAMBDA_VM_LFM_WIDE LAMBDA_VM_LFM_WHIR_PREP LAMBDA_VM_LFM_ROOT_PROVER LAMBDA_VM_TRACE_UPLOAD; export LFM_CENSUS_ELF=/root/fixtures/ethrex_8f826601.elf LFM_CENSUS_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin LFM_CENSUS_EPOCH_LOG2=21 LAMBDA_VM_MAX_ROWS_LOG2=21 LAMBDA_VM_MEMPOOL_RELEASE_MB=0 LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A LFM_WHIR_RETENTION=1 LAMBDA_VM_WHIR_HASH=rpx TABLE_PARALLELISM=4 LFM_TREE_SIBLINGS_L0=6 LFM_TREE_SIBLINGS=4 LFM_TREE_LEVEL_POOL=1 LAMBDA_VM_BASE_SPLIT=1 && cargo test --release -p lambda-vm-prover --features cuda --lib -- --ignored --exact --nocapture lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root > /tmp/zt-default-tree.log 2>&1 && grep -q '★ SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes' /tmp/zt-default-tree.log && grep -q 'THE BLOCK IS COMPRESSED UNDER WHIR' /tmp/zt-default-tree.log && grep -q 'COLUMNS UPLOAD: .*(pageable)' /tmp/zt-default-tree.log && ! grep -q 'COLUMNS UPLOAD: .*(zerotail' /tmp/zt-default-tree.log && grep 'IDENTITY: program_id' /tmp/zt-default-tree.log | sed 's/^ *//' | sort > /tmp/zt-default-ids.txt && [ "$(grep -c . /tmp/zt-default-ids.txt)" -eq 5 ] && diff /root/zf/bin/ids-1010-f5.txt /tmp/zt-default-ids.txt
+#
+# --- ★ THE PRODUCTION TREE UNDER LAMBDA_VM_TRACE_UPLOAD=zerotail: the same root and the same 5 ids, zerotail uploads
+#     only, a nonzero count of bytes not sent
+!raw set -o pipefail; unset LFM_CENSUS_FAN_IN LFM_CARD_AFTER_PREP LAMBDA_VM_LFM_PROVER LAMBDA_VM_LFM_WIDE LAMBDA_VM_LFM_WHIR_PREP LAMBDA_VM_LFM_ROOT_PROVER LAMBDA_VM_TRACE_UPLOAD; export LFM_CENSUS_ELF=/root/fixtures/ethrex_8f826601.elf LFM_CENSUS_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin LFM_CENSUS_EPOCH_LOG2=21 LAMBDA_VM_MAX_ROWS_LOG2=21 LAMBDA_VM_MEMPOOL_RELEASE_MB=0 LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A LFM_WHIR_RETENTION=1 LAMBDA_VM_WHIR_HASH=rpx TABLE_PARALLELISM=4 LFM_TREE_SIBLINGS_L0=6 LFM_TREE_SIBLINGS=4 LFM_TREE_LEVEL_POOL=1 LAMBDA_VM_BASE_SPLIT=1 LAMBDA_VM_TRACE_UPLOAD=zerotail && cargo test --release -p lambda-vm-prover --features cuda --lib -- --ignored --exact --nocapture lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root > /tmp/zt-on-tree.log 2>&1 && grep -q '★ SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes' /tmp/zt-on-tree.log && grep -q 'THE BLOCK IS COMPRESSED UNDER WHIR' /tmp/zt-on-tree.log && grep -q 'COLUMNS UPLOAD: .*(zerotail, scan on the path' /tmp/zt-on-tree.log && ! grep -q 'COLUMNS UPLOAD: .*(pageable)' /tmp/zt-on-tree.log && grep -Eq 'COLUMNS UPLOAD: .*, [0-9]*\.[0-9]*[1-9][0-9]* GB zero tails not sent' /tmp/zt-on-tree.log && grep 'IDENTITY: program_id' /tmp/zt-on-tree.log | sed 's/^ *//' | sort > /tmp/zt-on-ids.txt && [ "$(grep -c . /tmp/zt-on-ids.txt)" -eq 5 ] && diff /root/zf/bin/ids-1010-f5.txt /tmp/zt-on-ids.txt

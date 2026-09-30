@@ -773,3 +773,90 @@ Seconds after `BASE HEAD (WHIR): start`:
 4. **The pinned part is dropped by the rule.** Only D-TRACE's stage 1b removes the prover-side copy that caps it:
    the producer writes pinned slots, and the prover copies nothing. The logs do not measure the pinned DMA ceiling
    on FAST [I].
+
+## 8. The zero-tail skip alone, and D-TRACE's pinned microbench (pre-registered 2026-09-30 16:10Z, before any box run)
+
+The lead's decisions after job 290:
+- the head-only A/B: not run;
+- pinned staging: dropped;
+- the zero-tail skip on the pageable path: GO, with the scan off the critical path, behind
+  `LAMBDA_VM_TRACE_UPLOAD=zerotail` (default off), a byte-identity gate and the mutation;
+- in the same FAST job, before the arms: D-TRACE's box request 1, a pure pinned-vs-pageable DMA microbench;
+- the device DECODE root port: parked until both read.
+
+### 8.1 What was built [V: `fix2/1010-zerotail` @ `d9aab005a`, two signed commits on 73342bc66]
+
+- **`ceea5d178`, the zero-tail upload.**
+  - Under `zerotail`, `DeviceColumns::upload` sends each column up to its last nonzero value; `memset_zeros` zeroes
+    the rest on the card. A tail shorter than 64 KiB is still sent, the same `sent_len` rule job 290 measured.
+  - The copies stay one stream of pageable `memcpy_htod`, exactly as the default.
+  - Two scanner threads find the lengths ahead, in column order. Each reads only its tail, backwards, eight values
+    at a time. A column whose length is not ready yet is scanned on the uploading thread instead of waited for, so a
+    slow scanner costs time, never a hang. That time prints as `scan on the path`.
+  - The log line is `COLUMNS UPLOAD: … (pageable)` or `(zerotail, scan on the path <s>)`.
+  - **No pinned code and no head change** remain on this branch.
+- **`d9aab005a`, the microbench** `crypto/math-cuda/tests/h2d_pinned_bench.rs` (ignored). It runs pageable
+  `memcpy_htod` from a `Vec`, a `cuMemcpyHtoDAsync` from `cuMemHostAlloc` memory, and the same over two streams:
+  - at 256 KiB, 1, 4, 16, 32 and 64 MiB per copy, over 2 GiB;
+  - over epoch 0's real 393 columns (2.06 GB, from the G6 census);
+  - with no host copy anywhere, each rate the median of five runs.
+- **Where the scan runs, and why not on the producer.** The scanned slice is the uploaded slice, borrowed immutably
+  for the whole upload, so a stale length cannot exist.
+  - The producer has ≈ 10 s of slack, but a length computed there would travel through `EpochPrepped` →
+    `CommittedTable` → the upload. The prover could not check it without re-reading the tail.
+  - The upload-side scan also covers the global stage and level 1's uploads (2.39 GB of tails after the base in job
+    290).
+- **Laptop gates:** `make fmt`, `make lint` green; `cargo test -p math-cuda --lib columns::tests` 5/5, including the
+  wide scan checked against a plain one for every length up to 40 and every position of the last nonzero value.
+
+### 8.2 Part 1, the microbench (FAST job 291, before the arms)
+
+- **Expected:**
+  - pageable over the epoch-0 mix: 17–21 GB/s. Job 290's pageable sent rate in the proof was 18.9–19.0 GB/s.
+  - pinned: h2d_bench.rs's earlier single-stream page-locked reading was 23.7 GiB/s (25.4 GB/s), 1.27–1.34× that.
+    PCIe 5 × 16 would allow ≈ 2×. Ratio band 1.2–2.3× [I].
+- **Stop rule (D-TRACE box request 1): the best pinned rate (one or two streams) ≥ 1.3× pageable over the epoch-0
+  mix ⇒ stage 1b (producer writes pinned slots) is worth designing further; < 1.3× ⇒ stage 1b is dropped.**
+- The per-size rows show whether small columns lose on either path. They inform the design; they do not gate.
+
+### 8.3 Part 2, the A/B: A = default, B = `LAMBDA_VM_TRACE_UPLOAD=zerotail`, A B B A A B B A, wt1294–1301
+
+- Harness `zf-whir-arms.sh` 86951bc2 with `ZF_ALLOW_OTHER_KNOBS=1`.
+- Scripts: `zt-ab.sh` (md5 `53c0300e3f419c3aed2ae71f5681dc9a`) and `zt_readout.py` (md5
+  `0c4755093707a6da8dad27cde247c52a`). The readout's selftest passes on job 290's real logs.
+
+| row | what | band | from |
+|---|---|---|---|
+| M0 | each arm's own path; ids identical across settings; proved; the same GB to upload | exact | the knob; byte-identity at block level |
+| M1 | A's Σ upload in the base (control) | 1.5–2.1 s | job 290 A: 1.791 / 1.781 s |
+| M2 | B's zero tails not sent in the base, **each** B arm | **7.70–7.95 GB** | job 290 B: 7.82 GB in both arms. Same rule and same data: per upload identical except epoch 0's 0.573 / 0.570 GB (the HashMap-ordered tables) |
+| M3 | Δ upload | [−0.50, −0.25] s | 7.82 GB ÷ 18.9 GB/s = −0.41 s |
+| M4 | B's sent rate | ≥ 17.0 GB/s | the copies must stay pageable-fast with the scanners reading beside them (A: 18.9) |
+| M5 | B's scan on the path, max over B arms of the base's Σ | ≤ 0.03 s | two scanners reading ≈ 0.5 GB of tails per epoch stay ahead of ≈ 0.08 s of copies |
+| M6 | Δ head → epoch 0's commit | [−0.10, +0.10] s | the head is untouched |
+| M7 | Δ base | [−0.55, −0.15] s | M3 |
+| L1N2 | arms whose level-1 last node has harvest-epochs > 2.4 s or artifacts > 0.6 s, by setting | a count, not a gate | wt1291 read 2.68 / 1.08 s; the other 7 arms of jobs 249 and 290 read 2.01–2.13 / 0.27–0.29 s |
+| — | **Δ whole, 8 arms** | **−0.3 s [−0.45, −0.1]** | the lead's band; M3 plus ≈ −0.1 s from the 2.39 GB of tails after the base, where they bind [I] |
+
+- **Verdict:** EFFECTIVE if Δ whole ≤ −0.1 s; NO EFFECT if within (−0.1, +0.3); REGRESSION if ≥ +0.3. The Δ of each
+  ABBA is printed alongside.
+- **L1N2 reading:**
+  - an anomaly in both settings is box noise;
+  - one only in B arms points at the knob [I];
+  - none is consistent with job 290's being noise.
+- **What falsifies the mechanism:**
+  - M4 under 17 GB/s means the scanners' reads slow the copies. The fix would then be the producer-side scan.
+  - M5 over 0.03 s means the scanners fall behind.
+  - A whole-run gain with M3 null would be noise.
+- **Landing:** if EFFECTIVE, with M2–M5 PASS and job 186's gates green, the lead decides whether to flip the default.
+  A flip is re-gated at the flipped sha.
+
+### 8.4 Gates (FAST2 job 186)
+
+- `extra-1010-zerotail.txt` (md5 `87ddfc86fb749d340db38ef57bfc8410`) through `zf-gates.sh d9aab005a 1010-zerotail`.
+- Checks:
+  - the columns module's unit tests;
+  - `columns_upload` (dirty pool, value for value, and its control);
+  - `trace_upload_identity` (off, on, off: identical bytes; control; mutation);
+  - the production tree at the default and at `zerotail`, each with its own path lines and the 5 ids =
+    `ids-1010-f5.txt` (md5 5cc1445a, which job 290's A arm also printed).
