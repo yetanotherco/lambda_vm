@@ -406,8 +406,19 @@ impl Layout {
 /// Builds the program for one shape, publishing every extension challenge the
 /// machine draws in the order it draws them.
 pub(super) fn chain_program(shape: &ChainShape) -> LfmProgram {
+    let program = chain_program_from(
+        shape,
+        LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production()),
+    );
+    validate(&program).expect("the chain leg must be admissible");
+    program
+}
+
+/// [`chain_program`]'s emission from a given (empty) builder, unvalidated —
+/// the D-HASH census emits it under a different geometry.
+pub(super) fn chain_program_from(shape: &ChainShape, b: LfmBuilder) -> LfmProgram {
     let layout = Layout::new(shape);
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = b;
     let arena = b.declare_arena(layout.total);
     let mut transcript = WhirTranscript::new();
 
@@ -436,9 +447,7 @@ pub(super) fn chain_program(shape: &ChainShape) -> LfmProgram {
         |b, alphas| emit_eq_eval(b, &z, alphas),
     );
 
-    let program = compile(b.finish());
-    validate(&program).expect("the chain leg must be admissible");
-    program
+    compile(b.finish())
 }
 
 impl Layout {

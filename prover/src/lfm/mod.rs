@@ -173,6 +173,8 @@ mod one_row_guest_tests;
 #[cfg(test)]
 mod one_row_tests;
 #[cfg(test)]
+mod p1w16_census_tests;
+#[cfg(test)]
 mod p1w16_chip_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;

@@ -214,9 +214,7 @@ pub fn fill_row(layout: Layout, mode: Mode, input: [FE; STATE_FELTS]) -> Vec<FE>
         Mode::Transcript | Mode::Leaf => RATE_FELTS,
     };
     row[IN0..IN0 + read_lanes].copy_from_slice(&state[..read_lanes]);
-    for k in 0..4 {
-        row[S12 + k] = state[RATE_FELTS + k];
-    }
+    row[S12..S12 + 4].copy_from_slice(&state[RATE_FELTS..]);
 
     let mut s = state;
     for r in 0..NUM_ROUNDS {

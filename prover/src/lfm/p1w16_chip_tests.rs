@@ -83,14 +83,11 @@ fn the_widths_are_the_closed_forms() {
 fn every_layout_assigns_every_column_exactly_once() {
     for layout in LAYOUTS {
         let mut seen = vec![0usize; layout.num_columns()];
-        for c in IN0..IN0 + p1::STATE_FELTS {
-            seen[c] += 1;
-        }
-        for c in S12..S12 + 4 {
-            seen[c] += 1;
-        }
-        for c in OUT0..OUT0 + p1::STATE_FELTS {
-            seen[c] += 1;
+        let prefix = [(IN0, p1::STATE_FELTS), (S12, 4), (OUT0, p1::STATE_FELTS)];
+        for (start, len) in prefix {
+            for n in &mut seen[start..start + len] {
+                *n += 1;
+            }
         }
         for r in 0..p1::NUM_ROUNDS {
             for lane in 0..sboxed_lanes(r) {
@@ -215,5 +212,49 @@ fn a_mode_swap_is_rejected() {
             violations(layout, &row).iter().any(|&i| i < 4),
             "{layout:?}"
         );
+    }
+}
+
+/// The evaluation cost the census does not see: hash-consed constraint-program
+/// nodes (and multiplications) per row, for both layouts against the RPX and
+/// W12 Poseidon chips. Informational (`--nocapture`); asserts only that the
+/// programs are non-empty.
+#[test]
+fn constraint_program_sizes() {
+    use super::chips::hash::HashConstraints;
+    use stark::constraint_ir::ir::Op;
+
+    fn size<S: ConstraintSet<Gl, Gl3>>(set: &S) -> (usize, usize) {
+        let meta = set.meta();
+        let mut cb = CaptureBuilder::<Gl, Gl3>::new();
+        set.eval(&mut cb);
+        let (prog, _) = cb.finish(num_base_from_meta(&meta));
+        let muls = prog
+            .nodes
+            .iter()
+            .filter(|o| matches!(o, Op::Mul(..)))
+            .count();
+        (prog.len(), muls)
+    }
+    for (name, (nodes, muls), cols) in [
+        (
+            "p1w16 rule",
+            size(&P1W16Constraints {
+                layout: Layout::Rule,
+            }),
+            Layout::Rule.value_columns(),
+        ),
+        (
+            "p1w16 compact",
+            size(&P1W16Constraints {
+                layout: Layout::Compact,
+            }),
+            Layout::Compact.value_columns(),
+        ),
+        ("rpx", size(&HashConstraints::RPX), 0),
+        ("poseidon w12", size(&HashConstraints::POSEIDON), 0),
+    ] {
+        assert!(nodes > 0);
+        println!("PROGRAM {name}: nodes {nodes} muls {muls} value-cols {cols}");
     }
 }
