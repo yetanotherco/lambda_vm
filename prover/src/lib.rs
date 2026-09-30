@@ -12,6 +12,7 @@
 
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
+pub mod block;
 pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]

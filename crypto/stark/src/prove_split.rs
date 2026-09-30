@@ -145,6 +145,9 @@ pub static R4_DEEP_FRI: Slot = Slot::new();
 pub static R4_GRIND: Slot = Slot::new();
 /// Round 4: query sampling, the FRI query phase and the DEEP openings.
 pub static R4_QUERIES: Slot = Slot::new();
+/// `ResidencyMode::RecomputeLdeDevice`: the second device commit of each
+/// table's main trace at the top of its fused task. Printed only when it ran.
+pub static MAIN_RECOMMIT: Slot = Slot::new();
 
 /// [`device_grinds_now`] as of the last report, so each line carries the device
 /// grinds of ITS OWN call rather than the process total.
@@ -250,6 +253,7 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
     let r4_deep_fri = R4_DEEP_FRI.take();
     let r4_grind = R4_GRIND.take();
     let r4_queries = R4_QUERIES.take();
+    let main_recommit = MAIN_RECOMMIT.take();
     // ★ THE GRIND'S ARM, COUNTED RATHER THAN INFERRED. The two device counters
     // count one per table whose round-4 nonce search ran on device AND passed
     // the host validity check — a device miss falls back to the CPU search and
@@ -287,7 +291,7 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
          r2_decompose {r2_decompose:.2} · r2_commit {r2_commit:.2} · \
          r3_ood {r3_ood:.2} · r3_absorb {r3_absorb:.3} · r4_deep_fri {r4_deep_fri:.2} · \
          r4_grind {r4_grind:.2} ({grind_gpu}/{num_airs} on device) · \
-         r4_queries {r4_queries:.2} · Σ {table_sum:.2}",
+         r4_queries {r4_queries:.2} · Σ {table_sum:.2}{recommit}",
         seq = m.seq,
         tainted = if OVERLAPPED.load(Ordering::Relaxed) == 0 {
             ""
@@ -296,6 +300,13 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
         },
         t0 = m.start_epoch,
         t1 = end_epoch,
+        // ⓘ Absent unless a recommit ran, so every line a `Retain` prove prints
+        // is byte-identical to the ones before the slot existed.
+        recommit = if main_recommit > 0.0 {
+            format!(" || recommit[Σ] {main_recommit:.2}")
+        } else {
+            String::new()
+        },
     ))
 }
 

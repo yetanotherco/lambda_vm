@@ -86,6 +86,8 @@ pub mod multilinear_prove_tests;
 #[cfg(test)]
 pub mod multilinear_table_tests;
 #[cfg(test)]
+pub mod noepoch_block_tests;
+#[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]
 pub mod page_layout_tests;

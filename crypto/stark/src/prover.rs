@@ -124,6 +124,11 @@ pub enum ProvingError {
     /// compute path, so there is no host arm to continue on; the message names
     /// the table, the shape and the live device posture.
     DevicePath(String),
+    /// `ResidencyMode::RecomputeLdeDevice` committed a table's trace a second
+    /// time in its fused task and got a different root from the one Round 1
+    /// absorbed. The openings would be answered against a tree the transcript
+    /// never saw, so the proof is refused here rather than by a verifier.
+    RecomputedCommitmentMismatch(String),
 }
 
 impl From<FFTError> for ProvingError {
@@ -502,9 +507,18 @@ struct Lde<Field: IsFFTField, FieldExtension: IsField> {
 /// empty data believing it is an LDE — it has to handle the recompute arm or
 /// fail to compile. That is the loud guard for the one real risk in dropping
 /// the buffer: a retention point the audit missed.
+///
+/// `DroppedDevice` is the `ResidencyMode::RecomputeLdeDevice` state of a table
+/// Round 1 committed on the device: its host tree is a root only, so the fused
+/// task commits the trace on the device again (the slot becomes `Retained`)
+/// before anything reads it.
 enum MainLdeSlot<Field: IsField> {
     Retained((Vec<FieldElement<Field>>, usize)),
-    Dropped { num_cols: usize },
+    Dropped {
+        num_cols: usize,
+    },
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    DroppedDevice,
 }
 
 impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
@@ -1763,9 +1777,15 @@ pub trait IsStarkProver<
         // commit is recomputed on the host, so the buffer the tree was built
         // from must be the host one. Same posture as disk-spill — the mode is
         // for CPU proving and forces the host path per table.
+        //
+        // `RecomputeLdeDevice` takes the device paths but downloads no host
+        // LDE: only the root survives this commit, and the fused task commits
+        // the trace on the device again.
         let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
-        if precomputed.is_none() && !residency.recomputes_main_lde() {
+        let retain_host_lde = !device_only && !residency.recommits_on_device();
+        #[cfg(feature = "cuda")]
+        if precomputed.is_none() && !residency.recomputes_on_host() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
                 trace_slice.len() / num_cols
@@ -1788,7 +1808,7 @@ pub trait IsStarkProver<
                     num_cols,
                     domain.blowup_factor,
                     &twiddles.coset_weights,
-                    !device_only,
+                    retain_host_lde,
                     rows_per_leaf,
                 )
             {
@@ -1800,7 +1820,7 @@ pub trait IsStarkProver<
                 // Count a device-only main commit only once the GPU keep path
                 // actually fired (handle produced + host trace intentionally
                 // empty), so the counter reflects real residency, not the gate.
-                if device_only {
+                if device_only && !residency.recommits_on_device() {
                     crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1823,7 +1843,7 @@ pub trait IsStarkProver<
         // the downstream GPU rounds.
         #[cfg(feature = "cuda")]
         if let Some((expected_precomputed_root, num_precomputed)) = precomputed
-            && !residency.recomputes_main_lde()
+            && !residency.recomputes_on_host()
         {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
@@ -1860,13 +1880,13 @@ pub trait IsStarkProver<
                     &twiddles.coset_weights,
                     num_precomputed,
                     cached_pre.is_none(),
-                    !device_only,
+                    retain_host_lde,
                     rows_per_leaf,
                 )
             {
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
-                if device_only {
+                if device_only && !residency.recommits_on_device() {
                     crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2018,6 +2038,63 @@ pub trait IsStarkProver<
         return Ok((commit, (main_data, total_cols), None));
         #[cfg(not(feature = "cuda"))]
         Ok((commit, (main_data, total_cols)))
+    }
+
+    /// `ResidencyMode::RecomputeLdeDevice`'s second commit: the table's trace
+    /// committed on the device again, exactly as `Retain`'s Round 1 commits it
+    /// (the same function, the same device-only gate), after Round 1 kept only
+    /// the root. The new root must equal `absorbed`'s, the one the transcript
+    /// holds, and the precomputed root must too; anything else is refused with
+    /// `ProvingError::RecomputedCommitmentMismatch`, because the openings would
+    /// then be answered against a tree the transcript never saw.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn recommit_main_trace_device(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        layout: LeafLayout,
+        idx: usize,
+        absorbed: &TableCommit<Field, H>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<MainCommitTuple<Field, H>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::residency_mode::test_hooks::take_perturbation(idx) {
+            let v = trace.main_table.get(0, 0).clone();
+            trace.main_table.set(0, 0, v + FieldElement::<Field>::one());
+        }
+        let precomputed = absorbed
+            .precomputed_root
+            .map(|root| (root, absorbed.num_precomputed_cols));
+        let device_only = Self::device_only_for(air, domain);
+        let recommitted = Self::commit_main_trace(
+            air.name(),
+            trace,
+            domain,
+            twiddles,
+            precomputed,
+            layout,
+            device_only,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            ResidencyMode::Retain,
+        )?;
+        if recommitted.0.root != absorbed.root
+            || recommitted.0.precomputed_root != absorbed.precomputed_root
+        {
+            return Err(ProvingError::RecomputedCommitmentMismatch(format!(
+                "table {idx} ({}): the device recommit's main root differs from the one Round 1 \
+                 absorbed",
+                air.name()
+            )));
+        }
+        crate::residency_mode::DEVICE_RECOMMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(recommitted)
     }
 
     /// Expand a table's main trace to its coset LDE, row-major, without
@@ -4706,7 +4783,8 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 let device_only = Self::device_only_for(*air, domain);
 
-                Self::commit_main_trace(
+                #[allow(unused_mut)]
+                let mut committed = Self::commit_main_trace(
                     air.name(),
                     *trace,
                     domain,
@@ -4718,17 +4796,29 @@ pub trait IsStarkProver<
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
                     residency,
-                )
+                )?;
+                // `RecomputeLdeDevice`: the root is all this phase keeps. The
+                // device LDE, tree and trace snapshot are freed here, inside
+                // the admitted region, so the next table's commit is admitted
+                // against an empty card rather than against every earlier
+                // table's buffers.
+                #[cfg(feature = "cuda")]
+                let recommit_on_device =
+                    residency.recommits_on_device() && committed.2.take().is_some();
+                #[cfg(not(feature = "cuda"))]
+                let recommit_on_device = false;
+                Ok::<_, ProvingError>((committed, recommit_on_device))
             },
         );
         crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
         let __ps_abs = crate::prove_split::mark();
         for result in main_results {
             let result = result.expect("run_admitted fills every slot");
+            let (committed, recommit_on_device) = result?;
             #[cfg(feature = "cuda")]
-            let (commit, cached_main, gpu_main) = result?;
+            let (commit, cached_main, gpu_main) = committed;
             #[cfg(not(feature = "cuda"))]
-            let (commit, cached_main) = result?;
+            let (commit, cached_main) = committed;
             if let Some(ref pre_root) = commit.precomputed_root {
                 transcript.append_bytes(pre_root);
             }
@@ -4736,12 +4826,19 @@ pub trait IsStarkProver<
             main_commits.push(commit);
             // The root is in the transcript; that is all Fiat-Shamir asks of
             // this phase. Under `RecomputeLde` the buffer it was built from
-            // dies here and the table's fused task rebuilds it from the trace.
+            // dies here and the table's fused task rebuilds it from the trace;
+            // under `RecomputeLdeDevice` a device-committed table's fused task
+            // commits it on the device again.
             main_ldes.push(match residency {
                 ResidencyMode::Retain => MainLdeSlot::Retained(cached_main),
-                ResidencyMode::RecomputeLde => MainLdeSlot::Dropped {
-                    num_cols: cached_main.1,
-                },
+                ResidencyMode::RecomputeLdeDevice if recommit_on_device => {
+                    MainLdeSlot::DroppedDevice
+                }
+                ResidencyMode::RecomputeLde | ResidencyMode::RecomputeLdeDevice => {
+                    MainLdeSlot::Dropped {
+                        num_cols: cached_main.1,
+                    }
+                }
             });
             #[cfg(feature = "cuda")]
             main_gpu_handles.push(gpu_main);
@@ -4794,7 +4891,7 @@ pub trait IsStarkProver<
         // keeping the aux build there too makes the mode wholly host-side, which
         // is what its aux release at the end of each fused task acts on.
         #[cfg(feature = "cuda")]
-        if residency.recomputes_main_lde() {
+        if residency.recomputes_on_host() {
             for (_, trace, _) in air_trace_pairs.iter_mut() {
                 trace.set_resident_aux_ok(false);
             }
@@ -4907,6 +5004,45 @@ pub trait IsStarkProver<
             let (air, trace, _) = &mut *pair;
             let domain = &domains[idx];
             let twiddles = &twiddle_caches[idx];
+
+            // `RecomputeLdeDevice`: Round 1 kept only this table's root, so
+            // commit the trace on the device again before anything reads the
+            // slot. From here the task is the `Retain` one: the commit (its
+            // root checked equal), the LDE slot and the device handle are the
+            // ones Round 1 would have left, and the trace snapshot goes to the
+            // aux build below.
+            #[cfg(feature = "cuda")]
+            if matches!(
+                main_lde_cells[idx].lock().unwrap().as_ref(),
+                Some(MainLdeSlot::DroppedDevice)
+            ) {
+                let __ps_rc = crate::prove_split::mark();
+                let (commit, cached_main, gpu_main) = {
+                    let absorbed = main_commit_cells[idx].lock().unwrap();
+                    Self::recommit_main_trace_device(
+                        *air,
+                        &mut **trace,
+                        domain,
+                        twiddles,
+                        leaf_layouts[idx],
+                        idx,
+                        absorbed
+                            .as_ref()
+                            .expect("main commit present until the table's aux stage"),
+                        #[cfg(feature = "disk-spill")]
+                        storage_mode,
+                    )?
+                };
+                if let Some(handle) = &gpu_main
+                    && let Some(td) = &handle.trace_dev
+                {
+                    trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                }
+                *main_commit_cells[idx].lock().unwrap() = Some(commit);
+                *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
+                *gpu_main_cells[idx].lock().unwrap() = gpu_main;
+                crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+            }
 
             let __ps_ab = crate::prove_split::mark();
             #[cfg(feature = "instruments")]
@@ -5160,6 +5296,15 @@ pub trait IsStarkProver<
                         "recomputed main LDE width must match the committed one"
                     );
                     recomputed
+                }
+                // Recommitted at the top of this task, which leaves the slot
+                // `Retained`; reaching here means that step was skipped, and
+                // the root-only host tree could not answer an opening.
+                MainLdeSlot::DroppedDevice => {
+                    return Err(ProvingError::DevicePath(format!(
+                        "table {idx} ({}): main LDE dropped on the device and never recommitted",
+                        air.name()
+                    )));
                 }
             };
             #[cfg(feature = "cuda")]

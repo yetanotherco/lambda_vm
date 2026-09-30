@@ -223,6 +223,7 @@ fn recompute_lde_releases_aux_columns_and_retain_keeps_them() {
     for (residency, expect_aux_rows) in [
         (ResidencyMode::Retain, true),
         (ResidencyMode::RecomputeLde, false),
+        (ResidencyMode::RecomputeLdeDevice, false),
     ] {
         let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
         let proof_options = ProofOptions::default_test_options();
@@ -262,6 +263,101 @@ fn recompute_lde_releases_aux_columns_and_retain_keeps_them() {
             );
             // The declared width survives either way — only the data is freed.
             assert!(trace.aux_table.width > 0, "{name} lost its aux width");
+        }
+    }
+}
+
+/// `RecomputeLdeDevice` is invisible to the proof too. Below the device floor
+/// (every table here, at the default `LAMBDA_VM_GPU_LDE_THRESHOLD`, and every
+/// table on a build without `cuda`) its tables take the host arm, so this pins
+/// the mode's plumbing on any build; the device recommit itself is pinned by
+/// [`recompute_lde_device_recommits_on_the_card`].
+#[test_log::test]
+fn recompute_lde_device_produces_byte_identical_proofs() {
+    let retained = bincode::serialize(&prove_under(ResidencyMode::Retain)).unwrap();
+    let recomputed = prove_under(ResidencyMode::RecomputeLdeDevice);
+    assert!(
+        verifies(&recomputed),
+        "the RecomputeLdeDevice proof must verify"
+    );
+    assert!(
+        retained == bincode::serialize(&recomputed).unwrap(),
+        "proof bytes moved between Retain and RecomputeLdeDevice"
+    );
+}
+
+/// ★ The device recommit, on the card: every table committed on the device in
+/// Round 1, freed, and committed on the device again in its fused task, with
+/// the proof byte-identical to `Retain`'s and verifying. The recommit counter
+/// must move by one per table, so a run where the tables fell to the host arm
+/// fails here instead of passing as the device path.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD=2; run with --features cuda -- --ignored"]
+fn recompute_lde_device_recommits_on_the_card() {
+    use std::sync::atomic::Ordering;
+    let retained = bincode::serialize(&prove_under(ResidencyMode::Retain)).unwrap();
+    let before = crate::residency_mode::DEVICE_RECOMMITS.load(Ordering::SeqCst);
+    let recomputed = prove_under(ResidencyMode::RecomputeLdeDevice);
+    let recommits = crate::residency_mode::DEVICE_RECOMMITS.load(Ordering::SeqCst) - before;
+    assert_eq!(
+        recommits, 3,
+        "every table must be recommitted on the device (is LAMBDA_VM_GPU_LDE_THRESHOLD=2 set?)"
+    );
+    assert!(
+        verifies(&recomputed),
+        "the RecomputeLdeDevice proof must verify"
+    );
+    assert!(
+        retained == bincode::serialize(&recomputed).unwrap(),
+        "proof bytes moved between Retain and the device recommit"
+    );
+}
+
+/// ★ The recommit's root check is load-bearing: a trace that changes between
+/// Round 1 and the table's fused task (one cell, one table) commits to a
+/// different root, and the prover refuses with `RecomputedCommitmentMismatch`
+/// instead of answering openings against a tree the transcript never saw.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD=2; run with --features cuda -- --ignored"]
+fn recompute_lde_device_refuses_a_trace_that_moved() {
+    use crate::prover::ProvingError;
+    for table in 0..3 {
+        crate::residency_mode::test_hooks::perturb_before_recommit(table);
+        let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
+        let proof_options = test_options();
+        let cpu_air = new_cpu_air_with_lookup(&proof_options);
+        let add_air = new_add_air_with_lookup(&proof_options);
+        let mul_air = new_mul_air_with_lookup(&proof_options);
+        let pairs: Vec<(
+            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+            _,
+            _,
+        )> = vec![
+            (&cpu_air, &mut cpu_trace, &()),
+            (&add_air, &mut add_trace, &()),
+            (&mul_air, &mut mul_trace, &()),
+        ];
+        let out = Prover::multi_prove(
+            pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            ResidencyMode::RecomputeLdeDevice,
+        );
+        assert!(
+            crate::residency_mode::test_hooks::PERTURB_BEFORE_RECOMMIT
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0,
+            "table {table}: the perturbation never fired (no device recommit ran)"
+        );
+        match out {
+            Err(ProvingError::RecomputedCommitmentMismatch(msg)) => {
+                assert!(msg.contains(&format!("table {table}")), "{msg}")
+            }
+            Err(e) => panic!("table {table}: wrong refusal {e:?}"),
+            Ok(_) => panic!("table {table}: a moved trace was proved"),
         }
     }
 }
