@@ -1013,6 +1013,89 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
     );
 }
 
+/// ★ The production switches (fused on, the corners skipped, no
+/// cross-check) on every table without roots: its constraint part is zero,
+/// so its grid `{0,1}²` is all corners, the corner skip is exact on random
+/// columns too, and no grid point is left to launch — the case FAST job
+/// 273's B arm crashed on (a division by the empty row count). Against
+/// today's host rounds; each run counted as a fused session.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_fused_rounds_skip_the_corners_of_every_table_without_roots() {
+    use multilinear::gpu_fused::*;
+    let _switches = CardSwitches::set(FusedFaults::default(), false);
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    let mut runs = 0;
+    for (at, (air, label)) in every_air(&vm, &lfm).into_iter().enumerate() {
+        let mut rng = Rng::new(0x5C1 + at as u64);
+        let probe = Table::from_air(air, &label, 8, &mut rng);
+        if probe.shape.num_roots() != 0 {
+            continue;
+        }
+        let n = (8..)
+            .find(|n| probe.width() << n >= 4096)
+            .expect("a height");
+        let table = Table::from_air(air, &label, n, &mut rng);
+        let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        let sessions = fused_sessions();
+        session.assert_card_is_today(&claims, session.on_the_card(&claims), "corners skipped");
+        assert_eq!(
+            fused_sessions(),
+            sessions + 1,
+            "{label} n={n}: the card ran the fused rounds"
+        );
+        runs += 1;
+    }
+    assert_eq!(runs, 12, "the twelve tables without roots");
+    eprintln!(
+        "argue Q1b: {runs} tables without roots sent today's messages with the corners skipped"
+    );
+}
+
+/// ★ A proof made with the fused rounds verifies: `test_keccak` under the
+/// production switches of the B arm (fused, integer nodes, no cross-check),
+/// then with the cross-check, each proved and verified
+/// (`multilinear_prove::verify_with_options`), each taking the card's fused
+/// rounds on the tables tall enough (n ≥ 7) — among them tables without roots.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches and proves a program: run alone, --ignored --test-threads=1"]
+fn a_proof_made_with_the_fused_rounds_verifies() {
+    use crate::tables::MaxRowsConfig;
+    use multilinear::gpu_fused::*;
+    use stark::proof::options::ProofOptions;
+    let options = ProofOptions::default_test_options();
+    let elf = crate::test_utils::asm_elf_bytes("test_keccak");
+    for xcheck in [false, true] {
+        let _switches = CardSwitches::set(FusedFaults::default(), xcheck);
+        math_cuda::sumcheck::force_int_nodes(Some(true));
+        let (sessions, checks) = (fused_sessions(), fused_xchecks());
+        let proof =
+            crate::multilinear_prove::prove_with_options(&elf, &options, &MaxRowsConfig::default())
+                .unwrap_or_else(|e| panic!("xcheck {xcheck}: test_keccak proves: {e:?}"));
+        let fused = fused_sessions() - sessions;
+        assert!(fused > 0, "xcheck {xcheck}: the fused rounds ran");
+        if xcheck {
+            assert_eq!(
+                fused_xchecks() - checks,
+                fused,
+                "every fused table confirmed"
+            );
+        }
+        assert!(
+            crate::multilinear_prove::verify_with_options(&proof, &elf, &options)
+                .unwrap_or_else(|e| panic!("xcheck {xcheck}: verify: {e:?}")),
+            "xcheck {xcheck}: the proof verifies"
+        );
+        eprintln!(
+            "argue Q1b: test_keccak proved with {fused} fused tables (xcheck {xcheck}) and verified"
+        );
+    }
+}
+
 /// ★ S1-1 on today's kernel (`LAMBDA_VM_ARGUE_INT_NODES`): the device rounds
 /// with integer nodes send today's messages (the three at 2^10, fused off).
 #[cfg(feature = "cuda")]

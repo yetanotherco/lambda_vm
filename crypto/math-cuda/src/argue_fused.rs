@@ -98,6 +98,9 @@ pub const MAX_ROWS: usize = 32;
 /// Threads a launch of `work` indices over `rows` block rows takes, a slot
 /// file of `words` u64 a thread, at most `cap_threads` in all: `(grid.x, block)`.
 fn fit(work: u64, rows: usize, words: u64, cap_threads: u64) -> Option<(u32, u32)> {
+    if rows == 0 {
+        return None;
+    }
     let per_row = (ceiling(words * 8) / rows as u64)
         .min(cap_threads / rows as u64)
         .min(MAX_LAUNCH_THREADS / rows as u64);
@@ -292,17 +295,56 @@ impl<'f> FusedZerocheck<'f> {
     /// `points` (three u64 each, in order), `U(b, c)` at `2b + c`, and the
     /// first row whose corner is not zero, if a corner was on the list and one
     /// was not. With `keep_corners` a corner is summed into `T` like any
-    /// point and checked for nothing — random columns, in a test.
+    /// point and checked for nothing — random columns, in a test. An empty
+    /// list — a table without roots, whose grid is all corners — launches no
+    /// grid pass: `T` is zero.
     #[allow(clippy::type_complexity)]
     pub fn grid(
         &mut self,
         points: &[(u32, u32)],
         keep_corners: bool,
     ) -> Result<(Vec<u64>, Vec<u64>, Option<u64>)> {
-        assert!(
-            !points.is_empty() && points.len() <= MAX_ROWS,
-            "grid points per launch"
+        assert!(points.len() <= MAX_ROWS, "grid points per launch");
+        let (t, violation) = if points.is_empty() {
+            (Vec::new(), None)
+        } else {
+            self.grid_pass(points, keep_corners)?
+        };
+        let be = backend()?;
+        let q = (self.rows / 4) as u64;
+        let (grid, block) = (
+            q.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32,
+            BLOCK_DIM,
         );
+        let factors = self.source.factor_ptrs();
+        unsafe {
+            self.stream
+                .launch_builder(&be.zc_bus_u)
+                .arg(factors)
+                .arg(&q)
+                .arg(&self.term_slots)
+                .arg(&self.term_coeffs)
+                .arg(&self.num_terms)
+                .arg(&self.constant)
+                .arg(&self.eq_rho)
+                .arg(&mut self.partials)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: block * 3 * 8,
+                })?;
+        }
+        let u = self.reduce(4, grid)?;
+        Ok((t, u, violation))
+    }
+
+    /// `zc_grid01` over a non-empty `points`: `T` at each, three u64 a point,
+    /// and the first row whose corner is not zero.
+    fn grid_pass(
+        &mut self,
+        points: &[(u32, u32)],
+        keep_corners: bool,
+    ) -> Result<(Vec<u64>, Option<u64>)> {
         let be = backend()?;
         let q = (self.rows / 4) as u64;
         let packed: Vec<u64> = points
@@ -340,30 +382,7 @@ impl<'f> FusedZerocheck<'f> {
         let t = self.reduce(points.len(), grid)?;
         let violation = self.stream.clone_dtoh(&self.violation)?;
         self.stream.synchronize()?;
-
-        let (grid, block) = (
-            q.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32,
-            BLOCK_DIM,
-        );
-        unsafe {
-            self.stream
-                .launch_builder(&be.zc_bus_u)
-                .arg(factors)
-                .arg(&q)
-                .arg(&self.term_slots)
-                .arg(&self.term_coeffs)
-                .arg(&self.num_terms)
-                .arg(&self.constant)
-                .arg(&self.eq_rho)
-                .arg(&mut self.partials)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
-        }
-        let u = self.reduce(4, grid)?;
-        Ok((t, u, (violation[0] != u64::MAX).then_some(violation[0])))
+        Ok((t, (violation[0] != u64::MAX).then_some(violation[0])))
     }
 
     /// Both folds at once (`w[2a + b] = eq₁(s₀, a)·eq₁(s₁, b)`, twelve u64), into
@@ -586,5 +605,20 @@ impl<'f> FusedZerocheck<'f> {
             .clone_dtoh(&self.folded.slice(at..at + self.len * 3))?;
         self.stream.synchronize()?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table without roots has `d_C = 0`, so its grid `{0,1}²` is all
+    /// corners and, with the corners skipped, no point is left to launch —
+    /// FAST job 273's B arm, which divided by that empty row count.
+    #[test]
+    fn a_grid_of_corners_only_sizes_no_grid_launch() {
+        let words = slot_words(1 << 20, 1, 0, 3);
+        assert!(words > 0, "the later rounds still need their slot file");
+        assert_eq!(fit(1 << 18, 0, 1, u64::MAX), None, "no rows, no launch");
     }
 }
