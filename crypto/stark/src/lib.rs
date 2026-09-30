@@ -27,6 +27,7 @@ pub mod logup_gpu;
 pub mod lookup;
 pub mod merkle_caps;
 pub mod multilinear_air;
+pub mod multilinear_block;
 pub mod multilinear_logup;
 pub mod multilinear_table;
 pub mod ood;

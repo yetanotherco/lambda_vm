@@ -334,6 +334,21 @@ where
         self.trace.columns().len()
     }
 
+    /// Points the table's columns at a device copy of them (see
+    /// [`TraceData::set_resident`]) — the block prover's per-group store.
+    pub(crate) fn set_resident(
+        &mut self,
+        store: Arc<multilinear::gpu::ResidentColumns>,
+        first: usize,
+    ) {
+        self.trace.set_resident(store, first);
+    }
+
+    /// Lets the device copy go; the host columns stay.
+    pub(crate) fn clear_resident(&mut self) {
+        self.trace.clear_resident();
+    }
+
     /// The committed columns themselves. The opening needs them: a stacked
     /// polynomial is these at their offsets, and it is never assembled.
     pub fn columns(&self) -> &[Mle<F>] {
