@@ -11,6 +11,8 @@ pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
+pub mod canonical_rows_tests;
+#[cfg(test)]
 pub mod commit_tests;
 #[cfg(test)]
 pub mod compute_commit_bus_offset_tests;

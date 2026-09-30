@@ -106,7 +106,9 @@ const MASK_254: u64 = 254;
 /// A single BRANCH operation to be added to the trace.
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Ordered by `pc`, `offset`, `register`, `jalr`: the table's row order
+/// ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BranchOperation {
     /// Current program counter (64-bit)
     pub pc: u64,
@@ -153,7 +155,8 @@ impl BranchOperation {
 /// Generates the BRANCH trace table from a list of operations.
 ///
 /// Duplicate operations (same pc, offset, register, jalr) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// with their multiplicities summed, the rows sorted by operation
+/// ([`super::row_order`]). The table is then padded to the next power of 2.
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -163,7 +166,7 @@ pub fn generate_branch_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

@@ -585,14 +585,14 @@ fn a_continuation_proves_and_verifies() {
 
 /// Preparing ahead of the prover moves each epoch's host preparation, and the
 /// cross-epoch proof's, onto the producer thread. That changes who does the work
-/// and when, never what is proved: the bookend's and the cross-epoch proof's
-/// roots equal those of the schedule that prepares on the prover thread, the
-/// shapes, statement values and DECODE derivation are the same, and the bundle
-/// verifies.
+/// and when, never what is proved: every group root of every epoch and the
+/// cross-epoch proof's roots equal those of the schedule that prepares on the
+/// prover thread, the shapes, statement values and DECODE derivation are the
+/// same, and the bundle verifies.
 ///
-/// ⚠ An epoch's FIRST group root is not compared: it stacks BRANCH, DVRM,
-/// BYTEWISE, EQ, LT and MUL, whose rows follow `HashMap` iteration order, so it
-/// differs between two proves of one run under the same schedule.
+/// The first group root is compared too: it stacks BRANCH, DVRM, BYTEWISE, EQ,
+/// LT and MUL, which sort their rows by key ([`crate::tables::row_order`]); in
+/// `HashMap` order it differed between two proves under the same schedule.
 #[test]
 fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
     let (elf_bytes, input) = a_run_that_touches_memory();
@@ -611,14 +611,8 @@ fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
     assert_eq!(ahead.num_epochs(), on_prover.num_epochs());
     for (k, (a, d)) in ahead.epochs.iter().zip(&on_prover.epochs).enumerate() {
         assert_eq!(
-            a.proof.roots.len(),
-            d.proof.roots.len(),
-            "epoch {k}: groups"
-        );
-        assert_eq!(
-            a.proof.roots.last(),
-            d.proof.roots.last(),
-            "epoch {k}: the bookend group's root"
+            a.proof.roots, d.proof.roots,
+            "epoch {k}: every group's root"
         );
         assert_eq!(a.table_num_vars, d.table_num_vars, "epoch {k}: shapes");
         assert_eq!(a.public_output, d.public_output, "epoch {k}: output");

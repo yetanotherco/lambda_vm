@@ -47,7 +47,8 @@ pub mod cols {
 // =========================================================================
 
 /// A single BYTEWISE operation. `op` is an [`alu_op`] opcode in {AND, OR, XOR}.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Ordered by `a`, `b`, `op`: the table's row order ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BytewiseOperation {
     pub a: u64,
     pub b: u64,
@@ -92,8 +93,9 @@ impl BytewiseOperation {
 
 /// Generates the BYTEWISE trace from a list of operations.
 ///
-/// Duplicate operations are merged with summed multiplicities, then padded to
-/// the next power of two (minimum 4).
+/// Duplicate operations are merged with summed multiplicities, the rows sorted
+/// by operation ([`super::row_order`]), then padded to the next power of two
+/// (minimum 4).
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -104,7 +106,7 @@ pub fn generate_bytewise_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

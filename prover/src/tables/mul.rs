@@ -144,7 +144,9 @@ const SIGN_FILL: u64 = 0xFFFF;
 /// the sender's `flags` byte at lookup time.
 ///
 /// Derives Hash and Eq for HashMap-based deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Ordered by `lhs`, `lhs_signed`, `rhs`, `rhs_signed`: the table's row order
+/// ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MulOperation {
     /// Left operand (64-bit)
     pub lhs: u64,
@@ -283,7 +285,8 @@ impl MulOperation {
 
 /// Generates the MUL trace table from a list of operations.
 ///
-/// Operations are deduplicated by (lhs, lhs_signed, rhs, rhs_signed).
+/// Operations are deduplicated by (lhs, lhs_signed, rhs, rhs_signed), and the
+/// rows sorted by that key ([`super::row_order`]).
 /// Each unique operation tracks separate multiplicities for lo and hi lookups.
 ///
 /// # Arguments
@@ -303,7 +306,7 @@ pub fn generate_mul_trace(
         }
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

@@ -103,8 +103,10 @@ pub mod cols {
 /// distinguishes plain less-than (memw/dvrm internal checks, CPU `SLT[U]`/`BLT[U]`)
 /// from the inverted form (`BGE[U]`).
 ///
-/// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Derives Hash and Eq so it can be used as a HashMap key for deduplication,
+/// and Ord (by `lhs`, `rhs`, `signed`, `invert`) for the table's row order
+/// ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LtOperation {
     /// Left operand (64-bit value)
     pub lhs: u64,
@@ -154,8 +156,9 @@ impl LtOperation {
 
 /// Generates the LT trace table from a list of operations.
 ///
-/// Duplicate operations (same lhs, rhs, signed) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// Duplicate operations (same lhs, rhs, signed, invert) are merged into a single
+/// row with their multiplicities summed, the rows sorted by operation
+/// ([`super::row_order`]). The table is then padded to the next power of 2.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -165,7 +168,7 @@ pub fn generate_lt_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

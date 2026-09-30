@@ -64,7 +64,8 @@ pub mod cols {
 // =========================================================================
 
 /// A single EQ operation.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Ordered by `a`, `b`, `invert`: the table's row order ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EqOperation {
     /// First operand (64-bit)
     pub a: u64,
@@ -114,7 +115,8 @@ impl EqOperation {
 /// Generates the EQ trace from a list of operations.
 ///
 /// Duplicate operations are merged into a single row with summed multiplicities,
-/// then padded to the next power of two (minimum 4).
+/// the rows sorted by operation ([`super::row_order`]), then padded to the next
+/// power of two (minimum 4).
 pub fn generate_eq_trace(
     operations: &[EqOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -125,7 +127,7 @@ pub fn generate_eq_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

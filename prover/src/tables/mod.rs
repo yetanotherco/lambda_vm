@@ -48,6 +48,7 @@ pub mod memw_register;
 pub mod mul;
 pub mod page;
 pub mod register;
+pub mod row_order;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;

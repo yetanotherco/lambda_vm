@@ -152,7 +152,8 @@ const SIGN_FILL: u64 = 0xFFFF;
 /// A single DVRM operation to be added to the trace.
 ///
 /// Derives Hash and Eq for HashMap-based deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// Ordered by `n`, `d`, `signed`: the table's row order ([`super::row_order`]).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DvrmOperation {
     /// Numerator (64-bit)
     pub n: u64,
@@ -275,7 +276,8 @@ impl DvrmOperation {
 
 /// Generates the DVRM trace table from a list of operations.
 ///
-/// Operations are deduplicated by (n, d, signed).
+/// Operations are deduplicated by (n, d, signed), and the rows sorted by that
+/// key ([`super::row_order`]).
 /// Each unique operation tracks separate multiplicities for quotient and remainder lookups.
 ///
 /// # Arguments
@@ -295,7 +297,7 @@ pub fn generate_dvrm_trace(
         }
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = super::row_order::unique_rows(op_map);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

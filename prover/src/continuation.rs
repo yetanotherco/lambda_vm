@@ -4348,14 +4348,14 @@ mod tests {
     // ---- Standalone (split) prover/verifier ----
 
     /// Two proves of one run under two base schedules proved the same thing:
-    /// the committed roots, the L2G roots and the statement values are equal,
-    /// the DECODE commitment is the same, and `x` verifies to the run's output.
+    /// every table's committed root, the L2G roots and the statement values
+    /// are equal, the DECODE commitment is the same, and `x` verifies to the
+    /// run's output.
     ///
-    /// ⚠ Six tables are compared by everything BUT their root: BRANCH, DVRM,
-    /// BYTEWISE, EQ, LT and MUL lay their rows out in `HashMap` iteration
-    /// order (`op_map.into_iter()`), so their roots differ between two proves
-    /// of the same run under the SAME schedule (measured: LT[0] in two of three
-    /// epochs of this program, one schedule twice in one process).
+    /// Every root includes BRANCH, DVRM, BYTEWISE, EQ, LT and MUL: they sort
+    /// their rows by key ([`crate::tables::row_order`]). In `HashMap` order
+    /// their roots differed between two proves of the same run under the SAME
+    /// schedule (LT[0] in two of three epochs of this program).
     fn assert_same_proved(
         elf_bytes: &[u8],
         opts: &ProofOptions,
@@ -4373,11 +4373,6 @@ mod tests {
                 .iter()
                 .map(|t| t.lde_trace_main_merkle_root)
                 .collect()
-        };
-        let hash_ordered = |name: &str| {
-            ["BRANCH", "DVRM", "BYTEWISE", "EQ", "LT", "MUL"]
-                .iter()
-                .any(|t| name.starts_with(&format!("{t}[")) || name == *t)
         };
         let elf = Elf::load(elf_bytes).unwrap();
         for (k, (a, d)) in x.epochs.iter().zip(&y.epochs).enumerate() {
@@ -4399,14 +4394,9 @@ mod tests {
             names.push(recon.l2g_air.name());
             let (ra, rd) = (roots(&a.proof), roots(&d.proof));
             assert_eq!(ra.len(), names.len(), "epoch {k}: one root per table");
-            let mut compared = 0;
             for ((name, x), y) in names.iter().zip(&ra).zip(&rd) {
-                if !hash_ordered(name) {
-                    assert_eq!(x, y, "epoch {k}: {name}'s trace root");
-                    compared += 1;
-                }
+                assert_eq!(x, y, "epoch {k}: {name}'s trace root");
             }
-            assert!(compared >= 5, "epoch {k}: only {compared} roots compared");
             assert_eq!(a.l2g_root, d.l2g_root, "epoch {k}: L2G root");
             assert_eq!(a.public_output, d.public_output, "epoch {k}: output");
             assert_eq!(a.reg_fini, d.reg_fini, "epoch {k}: register fini");
