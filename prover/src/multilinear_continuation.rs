@@ -2399,6 +2399,137 @@ fn whir_head_done(step: &str, start: std::time::Instant, t0: f64) {
     }
 }
 
+/// The base's trace-upload knob, read here for its head part: `1` (both parts)
+/// or `head` computes DECODE's prepared opening on a helper beside epoch 0
+/// instead of before the pipeline; unset, empty or `0` (the default) keeps it
+/// serial. `columns` is `math_cuda::columns`' part only (the staged column
+/// upload), which the head ignores. The opening is the same either way, so the
+/// proofs are identical.
+pub const TRACE_UPLOAD_ENV: &str = "LAMBDA_VM_TRACE_UPLOAD";
+
+/// Whether [`TRACE_UPLOAD_ENV`]'s raw value moves `decode_prepared_for` off the
+/// head. Anything unrecognised is off: a typo measures the default.
+pub fn prepared_ahead_setting(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "head"))
+}
+
+thread_local! {
+    static PREPARED_AHEAD_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin this thread's heads to one schedule of the prepared opening (`Some`), or
+/// back to [`TRACE_UPLOAD_ENV`]'s answer (`None`). For tests that prove both
+/// ways in one process.
+pub fn set_prepared_ahead_override(on: Option<bool>) {
+    PREPARED_AHEAD_OVERRIDE.with(|o| o.set(on));
+}
+
+/// Whether this head computes the prepared opening ahead: the thread's
+/// override, else the environment's answer, read once.
+fn prepared_ahead() -> bool {
+    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PREPARED_AHEAD_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            *AHEAD.get_or_init(|| {
+                prepared_ahead_setting(std::env::var(TRACE_UPLOAD_ENV).ok().as_deref())
+            })
+        })
+}
+
+/// DECODE's prepared opening: computed before the pipeline (the default), or
+/// on a helper beside epoch 0 and joined by whoever needs it first — the first
+/// prove, or the observer's share just before it.
+struct PreparedDecode<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    ready: std::sync::OnceLock<std::sync::Arc<DecodePrepared<H>>>,
+    helper: std::sync::Mutex<Option<PreparedHelper<H>>>,
+}
+
+/// The helper computing a [`PreparedDecode`] ahead.
+type PreparedHelper<H> = std::thread::JoinHandle<Result<DecodePrepared<H>, Error>>;
+
+impl<H> PreparedDecode<H>
+where
+    H: multilinear::whir_hash::WhirHash + 'static,
+    DecodePrepared<H>: Send + 'static,
+{
+    /// Before the pipeline, on this thread.
+    fn serial(elf: &Elf, elf_bytes: &[u8]) -> Result<Self, Error> {
+        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+        let prepared = decode_prepared_for::<H>(elf, elf_bytes)?;
+        whir_head_done("DECODE prepared", start, t0);
+        let ready = std::sync::OnceLock::new();
+        let _ = ready.set(std::sync::Arc::new(prepared));
+        Ok(Self {
+            ready,
+            helper: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// On a helper from the same ELF bytes; serial if the helper cannot spawn.
+    fn ahead(elf: &Elf, elf_bytes: &[u8]) -> Result<Self, Error> {
+        let bytes = elf_bytes.to_vec();
+        let spawned = std::thread::Builder::new()
+            .name("whir-head-prepared".to_string())
+            .spawn(move || {
+                let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+                let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let elf = Elf::load(&bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+                    decode_prepared_for::<H>(&elf, &bytes)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::Prover(
+                        "the DECODE prepared helper panicked".to_string(),
+                    ))
+                });
+                whir_head_done("DECODE prepared (ahead)", start, t0);
+                prepared
+            });
+        match spawned {
+            Ok(helper) => Ok(Self {
+                ready: std::sync::OnceLock::new(),
+                helper: std::sync::Mutex::new(Some(helper)),
+            }),
+            Err(_) => Self::serial(elf, elf_bytes),
+        }
+    }
+
+    /// The opening, joining the helper the first time.
+    fn get(&self) -> Result<std::sync::Arc<DecodePrepared<H>>, Error> {
+        if let Some(prepared) = self.ready.get() {
+            return Ok(prepared.clone());
+        }
+        let mut helper = self
+            .helper
+            .lock()
+            .map_err(|_| Error::Prover("the DECODE prepared helper's lock".to_string()))?;
+        // Another caller may have joined it while this one waited for the lock.
+        if let Some(prepared) = self.ready.get() {
+            return Ok(prepared.clone());
+        }
+        let handle = helper
+            .take()
+            .ok_or_else(|| Error::Prover("the DECODE prepared helper failed before".to_string()))?;
+        let start = std::time::Instant::now();
+        let prepared = handle
+            .join()
+            .map_err(|_| Error::Prover("the DECODE prepared helper panicked".to_string()))??;
+        if crate::continuation::base_split_enabled() {
+            println!(
+                "BASE HEAD (WHIR): the first prove waited {:.2}s for DECODE prepared",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        let prepared = std::sync::Arc::new(prepared);
+        let _ = self.ready.set(prepared.clone());
+        Ok(prepared)
+    }
+}
+
 /// Where the WHIR base's DECODE root comes from.
 enum DecodeRoot {
     /// Computed before the pipeline started: the serial head.
@@ -2530,14 +2661,16 @@ pub(crate) fn prove_continuation_scheduled(
     // pipeline under the serial head, and ahead, once the root is in, before
     // the first epoch the consumer proves.
     let (boundaries, prepared, global_prepped) = crate::with_whir_hash!(|H| {
-        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
-        let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
-        whir_head_done("DECODE prepared", start, t0);
+        let prepared_src = if prepared_ahead() {
+            PreparedDecode::<H>::ahead(&elf, elf_bytes)?
+        } else {
+            PreparedDecode::<H>::serial(&elf, elf_bytes)?
+        };
         let share = || -> Result<(), Error> {
             if let Some(observer) = observer {
                 observer.on_base_shared(std::sync::Arc::new(SharedDecode {
                     root: root.get()?,
-                    prepared: prepared.clone(),
+                    prepared: prepared_src.get()?,
                 }));
             }
             Ok(())
@@ -2564,7 +2697,7 @@ pub(crate) fn prove_continuation_scheduled(
                         share()?;
                     }
                     let index = p.index as usize;
-                    let proof = prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?;
+                    let proof = prove_prepped_epoch::<H>(p, elf_bytes, &*prepared_src.get()?)?;
                     if let Some(observer) = observer {
                         observer.on_epoch_proved(index, &proof);
                     }
@@ -2595,7 +2728,7 @@ pub(crate) fn prove_continuation_scheduled(
                         &p.boundary,
                         opts,
                         Some(root.get_for_prep(p.index)?),
-                        &prepared,
+                        &*prepared_src.get()?,
                     )?;
                     if let Some(observer) = observer {
                         observer.on_epoch_proved(index, &proof);
@@ -2608,7 +2741,7 @@ pub(crate) fn prove_continuation_scheduled(
         };
         (
             boundaries,
-            Box::new(prepared) as Box<dyn std::any::Any + Send + Sync>,
+            Box::new(prepared_src.get()?) as Box<dyn std::any::Any + Send + Sync>,
             global_prepped,
         )
     });
