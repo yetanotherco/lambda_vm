@@ -4172,6 +4172,61 @@ fn tree_top_overlap(default: bool) -> bool {
     }
 }
 
+/// `LFM_TREE_GLOBAL_AFTER_LAST=1`: in a wide level 1 whose pool runs the WHIR
+/// global child, the global's `multi_prove` waits until the last wide node has
+/// built its artifacts. Unset or `0`: the card is first come, first served.
+///
+/// ★ Why: level 1 ends when its last node proves, and that node's chain is its
+/// prologue, its artifacts, its host prep and its prove. The global's prove
+/// belongs inside that prep, where it costs nothing. On the block (34 arms,
+/// jobs 246–292) the global asked for the card BEFORE the last node's
+/// artifacts in 11 arms, and all 11 read level 1 at 8.0–8.7 s. The last node's
+/// artifacts then waited out the global's whole prove, and its prep ran with
+/// the card idle. No arm under 8.0 s had the global first. The latch keeps the
+/// global's host prep where it is and moves only its card request. Read once
+/// per level; anything but `0` or `1` stops the run.
+fn tree_global_after_last() -> bool {
+    match std::env::var("LFM_TREE_GLOBAL_AFTER_LAST").ok().as_deref() {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("LFM_TREE_GLOBAL_AFTER_LAST must be `0` or `1`, got `{other}`"),
+    }
+}
+
+/// Whether [`tree_global_after_last`] can apply: a wide level 1, the global
+/// child in the level's own pool, and a worker for every task at once.
+///
+/// ⛔ THE LAST CONDITION IS THE DEADLOCK GUARD. With fewer workers than tasks a
+/// worker could take the global and wait behind the latch while the node that
+/// opens it waits for a worker — the serial driver most of all, which runs the
+/// global first. (The permit also ignores deferrals while it is unarmed, and the
+/// wait itself is bounded; this keeps the lever from ever leaning on either.)
+fn global_after_last_active(
+    knob: bool,
+    wide: bool,
+    top_overlap: bool,
+    siblings: usize,
+    tasks: usize,
+) -> bool {
+    knob && wide && top_overlap && tasks >= 2 && siblings >= tasks
+}
+
+#[test]
+fn global_after_last_is_active_only_when_every_task_has_a_worker() {
+    // The production level: 3 wide nodes and the global, 6 workers.
+    assert!(global_after_last_active(true, true, true, 6, 4));
+    assert!(global_after_last_active(true, true, true, 4, 4));
+    // Off, or not the level it orders.
+    assert!(!global_after_last_active(false, true, true, 6, 4));
+    assert!(!global_after_last_active(true, false, true, 6, 4));
+    assert!(!global_after_last_active(true, true, false, 6, 4));
+    // Too few workers: the global could wait for a node nobody has taken.
+    assert!(!global_after_last_active(true, true, true, 3, 4));
+    assert!(!global_after_last_active(true, true, true, 1, 4));
+    // Nothing to order.
+    assert!(!global_after_last_active(true, true, true, 6, 1));
+}
+
 /// `LFM_TREE_REDERIVE_DECODE=1`: level 0's lead-in derives DECODE's
 /// commitment (and, on WHIR, its prepared opening) from the ELF again instead of
 /// taking the ones the base derived. Unset or `0`: take the base's. They are the
@@ -8775,6 +8830,43 @@ where
         println!("   {}", l.close());
     }
 
+    // One task per wrap, or per wide node's epochs.
+    let groups: Vec<std::ops::Range<usize>> = if wide {
+        (0..bundle.num_epochs())
+            .step_by(fan_in)
+            .map(|start| start..(start + fan_in).min(bundle.num_epochs()))
+            .collect()
+    } else {
+        (0..bundle.num_epochs()).map(|k| k..k + 1).collect()
+    };
+
+    // ★ `LFM_TREE_GLOBAL_AFTER_LAST`: the global child's prove waits behind a
+    // latch the LAST wide node opens once its artifacts are built. See
+    // [`global_after_last_active`] for when it can apply, and
+    // `device_permit::CardLatch` for the race it settles.
+    let tasks = groups.len() + usize::from(top_overlap);
+    let knob = tree_global_after_last();
+    let last_latch = global_after_last_active(knob, wide, top_overlap, siblings, tasks)
+        .then(super::device_permit::CardLatch::new);
+    if wide && top_overlap {
+        match (&last_latch, knob) {
+            (Some(_), _) => println!(
+                "   ★ GLOBAL AFTER LAST: the WHIR GLOBAL child's prove waits until L1N{} has built \
+                 its artifacts (LFM_TREE_GLOBAL_AFTER_LAST=1)",
+                groups.len() - 1
+            ),
+            (None, true) => println!(
+                "   ★ GLOBAL AFTER LAST requested but INACTIVE: {siblings} worker(s) for {tasks} \
+                 tasks, so the global could wait for a node no worker has taken \
+                 (LFM_TREE_GLOBAL_AFTER_LAST=1)"
+            ),
+            (None, false) => println!(
+                "   ★ GLOBAL AFTER LAST OFF: the card is first come, first served \
+                 (unset or LFM_TREE_GLOBAL_AFTER_LAST=0)"
+            ),
+        }
+    }
+
     type WhirWrapSlot<C> = (C, SchemaLayout, Vec<u64>, u64, usize);
 
     let prove_one_wrap = |k: usize| -> WhirWrapSlot<C> {
@@ -9021,6 +9113,12 @@ where
         // (`zf_summary.py`'s `L{level}N{j}` rule among them) files this proof
         // where the level above reads it: as level 1's node `j`.
         let label = format!("L1N{j} (arity {})", epochs.len());
+        // ★ The last node opens the global's latch once its artifacts are
+        // built, or as it unwinds, so a failed task never strands the global.
+        let opener = last_latch
+            .as_ref()
+            .filter(|_| j + 1 == groups.len())
+            .map(|latch| super::device_permit::OpenOnDrop::new(latch.clone()));
         crate::multilinear_continuation::reset_decode_derivations();
         // ★ The prologue a lead-in helper built in the base's tail, if any — the
         // same harvest, program and arenas the arm below builds, with both
@@ -9101,6 +9199,8 @@ where
         let t = Instant::now();
         let artifacts = C::build(&program, wrap_opts);
         let t_artifacts = t.elapsed().as_secs_f64();
+        // The artifacts are built: the global may take the card for its prove.
+        drop(opener);
         let t = Instant::now();
         let proved = C::prove(&label, &program, &artifacts, &arenas, wrap_opts)
             .unwrap_or_else(|why| panic!("{why}"));
@@ -9178,16 +9278,6 @@ where
         (child, layout, ends.to_vec(), cells, instrs)
     };
 
-    // One task per wrap, or per wide node's epochs.
-    let groups: Vec<std::ops::Range<usize>> = if wide {
-        (0..bundle.num_epochs())
-            .step_by(fan_in)
-            .map(|start| start..(start + fan_in).min(bundle.num_epochs()))
-            .collect()
-    } else {
-        (0..bundle.num_epochs()).map(|k| k..k + 1).collect()
-    };
-
     let mut children = Vec::with_capacity(bundle.num_epochs());
     let mut layouts = Vec::with_capacity(bundle.num_epochs());
     let mut labels = Vec::with_capacity(bundle.num_epochs());
@@ -9240,6 +9330,10 @@ where
     type L0Out<C> = PoolOut<Box<WhirWrapSlot<C>>, Box<WhirGlobalChild<C>>>;
     let l0_out = in_index_order(groups.len() + l0_offset, siblings, |j| -> L0Out<C> {
         if top_overlap && j == 0 {
+            // Behind the last node's artifacts, under `LFM_TREE_GLOBAL_AFTER_LAST`.
+            let _deferred = last_latch
+                .as_ref()
+                .map(|latch| super::device_permit::defer_multi_prove_until(latch.clone()));
             // ⛔ A REFUSAL, NEVER A `None` THE CALLER TURNS INTO A `return` —
             // the property the serial call site was written to have, kept here.
             // `in_index_order` re-raises the FIRST worker panic with its payload
