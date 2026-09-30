@@ -9,6 +9,7 @@ pub mod batch;
 pub mod claim_reduce;
 pub mod constraint_argument;
 pub mod eq;
+pub mod fused;
 pub mod gkr;
 pub mod gpu;
 pub mod logup;
@@ -143,4 +144,12 @@ pub enum Error {
     /// the host: the transcript has moved.
     #[error("the device failed mid-{stage}, after the transcript had moved")]
     DeviceFailed { stage: &'static str },
+    /// A constraint program's constant has an extension part, so the program
+    /// cannot run in the base field (`fused`).
+    #[error("step {step} of the constraint program is not a base-field constant")]
+    NotBaseField { step: usize },
+    /// The trace breaks its constraints at a row the stage-1 rounds would have
+    /// taken as satisfied (`fused`'s corner check).
+    #[error("the trace violates its constraints at row {row}")]
+    ConstraintViolated { row: usize },
 }
