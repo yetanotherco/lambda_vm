@@ -377,7 +377,14 @@ fn epochs_round_trip(name: &str, log: u32) -> (usize, Vec<String>) {
                     )
                 })
                 .collect();
-            names.extend(pairs.iter().map(|(air, _, _)| air.name().to_string()));
+            // The bookend by its census label: continuation AIRs carry no name
+            // of their own (they print as `unknown`), and it is pushed last.
+            names.extend(
+                pairs[..pairs.len() - 1]
+                    .iter()
+                    .map(|(air, _, _)| air.name().to_string()),
+            );
+            names.push("L2G".to_string());
             let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
             let config = batched(multilinear_prove::chain_config(&shapes));
             let mut committed = Vec::with_capacity(pairs.len());
