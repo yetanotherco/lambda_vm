@@ -4,8 +4,8 @@
 #
 # WHAT IT ANSWERS
 #   Why the no-epoch STARK base (the whole block 25368371 as ONE proof, prove_block, PR #1013) runs
-#   ~38 s where #1009's epoch base runs ~26 s on the same card, when packing admission only bought
-#   0.64 s. Both run on one binary, so every difference is the schedule and the instance sizes:
+#   ~31 s where #1009's epoch base runs ~26 s on the same card (FAST, after packing admission, KECCAK_RND
+#   chunking and device page roots). Both run on one binary, so every difference is the schedule and the instance sizes:
 #   (a) is the card saturated or idle in each stage (head, main commit, fused, the recommit)?
 #   (b) are the kernels that carry the fused and recommit time compute-, memory- or latency-bound, and
 #       do the block-wide instances run them worse than the epoch-sized ones?
@@ -18,9 +18,10 @@
 #      probe; ERR_NVGPUCTRPERM gets the fix printed); RAM (the no-epoch run peaks at 43.9 GiB on the
 #      host) and disk; the Rust toolchain.
 #   2. Clones https://github.com/yetanotherco/lambda_vm (public, HTTPS) into its own work directory and
-#      checks out PIN_SHA below: noepoch/stark @ 4ca8e6f48 (the no-epoch prover with packing admission
-#      behind a knob) plus one instruments-only commit, an NVTX range around the device recommit. That
-#      branch sits 4 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
+#      checks out PIN_SHA below: noepoch/stark @ fe3f6bf05 (the no-epoch prover: packing admission
+#      behind a knob; KECCAK_RND chunked to 2^16 and the data pages' roots derived on the device, both
+#      default-on) plus one instruments-only commit, an NVTX range around the device recommit. That
+#      branch sits 7 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
 #      as a control test, so ONE build runs both workloads:
 #        epoch    tests::noepoch_block_tests::noepoch_epoch_base_reference   (#1009's base: 15 epochs of
 #                 2^21 rows and the global proof, continuation::prove_continuation; no recursion, no verify)
@@ -118,10 +119,10 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION=iprof-2026-09-30a
+SCRIPT_VERSION=iprof-2026-09-30b
 REPO_URL_DEFAULT=https://github.com/yetanotherco/lambda_vm
-PIN_SHA=30cd83f668b883d3acdf27da998aa653cb8dcd27            # profile/noepoch-counters: noepoch/stark + the recommit span
-NOEPOCH_SHA=4ca8e6f48a0d6a4d2a5d4414db9151b86ea242c4        # noepoch/stark (PR #1013), PIN_SHA's parent
+PIN_SHA=80e6aa89f841950c46a76d66c6b87f83e44290b8            # profile/noepoch-counters: noepoch/stark + the recommit span
+NOEPOCH_SHA=fe3f6bf0538936ad8c1b4dc015d42ff383c90e2c        # noepoch/stark (PR #1013), PIN_SHA's parent
 EPOCH_SHA=cc411aa2c7a779464b577b5751eb846cf755b3d6          # stark-recursion-rpx (#1009), an ancestor of both
 ELF_COMMIT=da2a423b137b87e04213ecafbfd5d16e98a1f4a3         # whir/profile-rpx, where the record ELF is committed
 ELF_REPO_PATH=scripts/profile/fixtures/ethrex_8f826601.elf
@@ -201,7 +202,8 @@ default_plan() {
 prereg_text() {
   cat <<'PREREG'
 Pre-registered 2026-09-30 (lane I-PROF), before any run of this script. Sources: FAST 351 (ds1002, i-noepoch
-I-NOEPOCH.md §5) and FAST 352 (ds1003, packing: -0.64 s). Mauro's machine is not FAST (another CPU), so the
+I-NOEPOCH.md §5), FAST 352 (ds1003, packing: -0.64 s) and the later FAST arms at fe3f6bf05 (KECCAK_RND
+chunking -3.23 s, device page roots -1.43 s: base 30.9 s, per the lead). Mauro's machine is not FAST (another CPU), so the
 walls get wide bands; the structural checks are exact.
 
 Gates (a miss makes the VERDICT PARTIAL or FAILED):
@@ -209,12 +211,13 @@ Gates (a miss makes the VERDICT PARTIAL or FAILED):
   - the no-epoch log carries the packing banner (LAMBDA_VM_GATE_PACKING=1) and a PROVE SPLIT line with a
     recommit[Σ] field; the epoch log carries PROVE SPLIT lines (16 on FAST 351: 15 epochs and the global proof);
   - run A's stages come from NVTX ranges (needs LAMBDA_VM_NVTX_LIB), and the no-epoch trace has exactly as
-    many r1_main_recommit_table ranges as the log's `device recommits` (127 on FAST 351); the epoch trace 0;
+    many r1_main_recommit_table ranges as the log's `device recommits` (127 on FAST 351, before chunking); the epoch trace 0;
   - every run-B pass profiles at least one launch.
 Expected (reported, not gated):
-  - reference walls: epoch base 23-30 s (FAST 26.05), no-epoch base 33-42 s (FAST 38.0 with packing);
-    nsys run A within +15 % of the reference; host peak of the no-epoch run 38-48 GiB (FAST 43.9);
-  - run A, no-epoch fused stage 18-26 s (FAST 22.7 before packing) with recommit ranges covering 3-12 s of it;
+  - reference walls: epoch base 23-30 s (FAST 26.05), no-epoch base 27-36 s (FAST 30.9 at fe3f6bf05);
+    nsys run A within +15 % of the reference; host peak of the no-epoch run 35-50 GiB (FAST 43.9 at ae11e232e);
+  - run A, no-epoch fused stage 13-24 s (FAST 22.7 at ae11e232e, before packing and chunking), with recommit
+    ranges covering 3-12 s of it;
     VRAM max near the card's 32 GB in fused (FAST 32,110 MiB);
   - if the fused stage is card-bound, its SM active % is within 10 points of the epoch base's fused stage; a
     no-epoch fused SM active % 15 or more points lower, with fewer than 2.5 open tasks on average, reads as
@@ -2642,7 +2645,7 @@ run_env() { # run_env [nvtx]: the profiled process's system variables (+ the NVT
   done
   if [ "${1:-}" = nvtx ] && [ -n "$NVTX_LIB" ]; then RUN_ENV+=("LAMBDA_VM_NVTX_LIB=$NVTX_LIB"); fi
 }
-wl_env() { # wl_env epoch|noepoch record|runb: the workload's knobs, as FAST 351/352 ran it or as run B runs it
+wl_env() { # wl_env epoch|noepoch record|runb: the workload's knobs, as i-noepoch's FAST arms run it or as run B runs it
   local budget="$RUN_VRAM_MB"
   if [ "$2" = runb ]; then budget="$NP_NCU_VRAM_MB"; fi
   WL_ENV=("NOEPOCH_ELF=$W/fixtures/ethrex_8f826601.elf" "NOEPOCH_INPUT=$W/fixtures/ethrex_mainnet_25368371_573004e6.bin"
