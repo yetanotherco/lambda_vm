@@ -169,17 +169,17 @@ fn plan(program: &LfmProgram) -> Vec<Plan> {
 /// bit); otherwise it is skipped as RISC-V-half work. `FVM_TRANSLATE_OPT`
 /// turns on the planner above and moves base constants to public cells.
 pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Translation {
-    translate_keeping(program, exec, bit_dec, &[], &|_| false)
+    translate_keeping(program, exec, bit_dec, &[], &|_, _| false)
 }
 
 /// [`translate`] keeping the cells at `keep` in memory whether or not the
-/// program reads them.
+/// program reads them, and skipping the instructions `skip` names by index.
 pub fn translate_keeping(
     program: &LfmProgram,
     exec: &LfmExecution,
     bit_dec: bool,
     keep: &[u64],
-    skip: &dyn Fn(&Instr) -> bool,
+    skip: &dyn Fn(usize, &Instr) -> bool,
 ) -> Translation {
     let n = program.num_addrs;
     let mut mem: Vec<FEE> = (0..n)
@@ -247,7 +247,7 @@ pub fn translate_keeping(
             Instr::Public { .. } => "public",
         };
         *lfm_counts.entry(kind).or_insert(0) += 1;
-        if skip(instr) {
+        if skip(idx, instr) {
             *skipped.entry(kind).or_insert(0) += 1;
             continue;
         }

@@ -559,7 +559,7 @@ impl Hybrid {
             exec,
             false,
             &crossing,
-            &hash_side::is_hash_side,
+            &|_, i| hash_side::is_hash_side(i),
         );
         let faddr: std::collections::HashMap<u64, u64> =
             crossing.iter().copied().zip(tr.kept.iter().copied()).collect();
