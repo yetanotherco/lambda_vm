@@ -9,8 +9,10 @@ pub mod batch;
 pub mod claim_reduce;
 pub mod constraint_argument;
 pub mod eq;
+pub mod front_loaded;
 pub mod fused;
 pub mod gkr;
+pub mod gkr_lockstep;
 pub mod gpu;
 pub mod gpu_fused;
 pub mod logup;
@@ -153,4 +155,13 @@ pub enum Error {
     /// taken as satisfied (`fused`'s corner check).
     #[error("the trace violates its constraints at row {row}")]
     ConstraintViolated { row: usize },
+    /// A proof's argue variant is not the one the configuration names
+    /// ([`whir_chain::ArgueFormat`]): the prover and the verifier each refuse
+    /// to cross formats, since each reads the variant from its own config.
+    #[error("the proof's argue format is not the configured one")]
+    ArgueFormatMismatch,
+    /// A batched argue's shape (bins, trees, tables, reductions) is not the
+    /// one the verifier derives from the statement.
+    #[error("the batched argue's {part} does not have the shape the statement implies")]
+    ArgueShapeMismatch { part: &'static str },
 }

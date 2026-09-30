@@ -1965,6 +1965,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             folds: WhirFolds::First(FirstFold::new(6).expect("6")),
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Spent,
+            argue: multilinear::whir_chain::ArgueFormat::PerTable,
         },
         ..config(112, 0)
     };
@@ -2001,6 +2002,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             folds: WhirFolds::First(FirstFold::new(6).expect("6")),
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Three,
+            argue: multilinear::whir_chain::ArgueFormat::PerTable,
         },
         ..config(112, 20)
     };

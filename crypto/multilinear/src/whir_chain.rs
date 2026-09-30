@@ -262,6 +262,9 @@ pub struct ChainFormat {
     pub stack: StackVars,
     /// Which nonces a round carries (P2). [`NonceLayout::Three`] = today.
     pub nonces: NonceLayout,
+    /// How a proof's tables argue their constraints and buses (D-BATCH).
+    /// [`ArgueFormat::PerTable`] = today.
+    pub argue: ArgueFormat,
 }
 
 impl ChainFormat {
@@ -271,6 +274,7 @@ impl ChainFormat {
         folds: WhirFolds::Uniform,
         stack: StackVars::LEGACY,
         nonces: NonceLayout::Three,
+        argue: ArgueFormat::PerTable,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -279,7 +283,42 @@ impl ChainFormat {
             && self.folds == WhirFolds::Uniform
             && self.stack == StackVars::LEGACY
             && self.nonces == NonceLayout::Three
+            && self.argue == ArgueFormat::PerTable
     }
+}
+
+/// How a proof's tables argue their constraints and buses (D-BATCH,
+/// `thoughts/zf/gap2/fix2/D-BATCH.md` §2).
+///
+/// [`PerTable`](Self::PerTable) is today's: each table runs its own LogUp-GKR,
+/// its own constraint sumcheck and its own claim reduction.
+/// [`Batched`](Self::Batched) runs one lockstep GKR per bin of tables, one
+/// front-loaded constraint sumcheck over every table, and no claim reduction
+/// for a table without shifted reads (`stark::multilinear_table::batched`).
+///
+/// ★ A FORMAT VALUE, NOT A HINT. The two produce different proof types, and a
+/// verifier refuses a proof argued under the other variant: it reads the
+/// variant from its own config, never from a proof. The bin cap is part of
+/// the format because the bins are part of the transcript.
+///
+/// A verifier-side constant like the rest of [`ChainFormat`], and not absorbed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ArgueFormat {
+    /// One argument per table. Today's format.
+    #[default]
+    PerTable,
+    /// One argument per proof, the GKR trees in bins of at most
+    /// `2^bin_log_cells` input cells each.
+    Batched {
+        /// `log2` of a bin's cap on `Σ 2^{k_T}`, `k_T` a tree's input
+        /// variables. A tree at or over the cap sits alone.
+        bin_log_cells: u8,
+    },
+}
+
+impl ArgueFormat {
+    /// D-BATCH's production cap: `2^27` input cells a bin (§4.4).
+    pub const BATCHED: Self = Self::Batched { bin_log_cells: 27 };
 }
 
 /// Which proof-of-work nonces a round's encoding carries (P2's format half).

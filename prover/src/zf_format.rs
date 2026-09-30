@@ -395,6 +395,10 @@ impl ZfFormat {
             folds: self.whir_folds,
             stack: self.whir_stack,
             nonces: self.whir_grind.nonces(),
+            // No knob yet: the batched argue's proof type reaches no production
+            // caller until its wiring lands (D-BATCH B-4b), so a knob here could
+            // only make those callers refuse.
+            argue: multilinear::whir_chain::ArgueFormat::PerTable,
         }
     }
 
@@ -1281,6 +1285,7 @@ mod tests {
                 folds: WhirFolds::First(FirstFold::new(6).unwrap()),
                 stack: StackVars::new(27).unwrap(),
                 nonces: NonceLayout::Three,
+                argue: multilinear::whir_chain::ArgueFormat::PerTable,
             },
         };
         let opt_out = parse(&[(ENV_WHIR_GRIND, "all")]).unwrap();

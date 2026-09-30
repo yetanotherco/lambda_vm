@@ -3,6 +3,8 @@ pub mod argue_stage1_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
 #[cfg(test)]
+pub mod batched_argue_tests;
+#[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
 pub mod bitwise_tests;
