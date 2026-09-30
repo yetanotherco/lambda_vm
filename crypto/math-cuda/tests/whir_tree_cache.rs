@@ -1,17 +1,17 @@
-//! ★★ H4's result of record, and what replaced it — a commitment does NOT keep
-//! its TREE; it keeps its LEAF LAYER, and the bytes it holds are its codeword
-//! and that layer.
+//! ★★ H4's result of record, and what replaced it — a commitment keeps its tree
+//! INSIDE ITS PROMISE: the whole tree by default, its leaf layer under
+//! `LFM_WHIR_WHOLE_TREES=0`, and nothing of a tree outside the room it grew.
 //!
 //! ⛔ H4's finding stands and is not edited away below: keeping the whole node
-//! array LOST, measured on the card at about +15 s, because the retention is
-//! one object per commitment IN THE GROUP and ten of those put the device at
-//! 96%. What changed is WHICH object. A tree is `2·num_leaves − 1` nodes; its
-//! leaf layer is `num_leaves` of them — half the bytes — and the leaf pass it
-//! saves is two thirds of a base tree's permutations and six sevenths of an
-//! extension one, because a leaf absorbs a whole `2^k` coset while an inner
-//! node absorbs two digests. Half the memory for most of the saving is a
-//! different trade from the one H4 measured, and these tests now pin BOTH
-//! sides of it: the layer must be held, and a whole tree must still never be.
+//! array LOST, measured on the card at about +15 s, because its trees sat
+//! OUTSIDE any promise — one per commitment IN THE GROUP, ten of them put the
+//! device at 96%, and commits fell back to the host. What changed is WHERE the
+//! bytes sit. The leaf layer came first (half the bytes, most of the saving: a
+//! leaf absorbs a whole `2^k` coset while an inner node absorbs two digests),
+//! promised through the codeword's room and evictable; the whole tree came
+//! back on the same terms (job 248, −1.00 s). These tests pin BOTH sides of the
+//! invariant: what is kept is held AND promised, and nothing of a tree is held
+//! outside the promise.
 //!
 //! Needs a GPU:
 //!
@@ -21,30 +21,28 @@
 //!
 //! # What this is about
 //!
-//! `commit()` builds the tree, takes the root and drops the buffer; `paths()`
-//! rebuilds it to read a kilobyte per query out of it. Every commitment on this
-//! path is opened, so every one pays for two leaf-hash passes over its codeword
-//! — ~25 s of RPX device hashing on a real block, about half of it that second
-//! pass. H4 cached the first tree to remove the second pass. It was measured on
-//! the card and it LOST, ~+15 s in both hashes.
+//! `commit()` builds the tree and takes the root; `paths()` needs the same
+//! tree to read a kilobyte per query out of it. Every commitment on this path
+//! is opened, so without retention every one pays for two leaf-hash passes over
+//! its codeword — ~25 s of RPX device hashing on a real block, about half of it
+//! that second pass. H4 cached the first tree to remove the second pass. It was
+//! measured on the card and it LOST, ~+15 s in both hashes.
 //!
-//! # Why keeping the tree cannot work here, which is what these tests pin
+//! # Why H4's tree could not work, and what the tests pin instead
 //!
 //! Not because the cache missed — it returned exactly the hashing it promised.
 //! Because the retention is one tree per commitment IN THE GROUP, not one tree.
 //! `StackedCommitment::commit` builds every chain's commitment before it
 //! returns, since all the roots enter the transcript before any query index is
 //! drawn, and the openings follow one chain at a time. So the last chain's tree
-//! would live from its commit to the end of the proof, and no placement of an
-//! eviction call bounds that peak: all N trees exist before the first opening.
-//! Ten chains at half a gigabyte put the card at 96%, after which device
-//! allocations fail, commits fall back to the host, and the host grows ~1.5 GiB
-//! per fallen-back chain.
+//! lives from its commit to the end of the proof, and all N exist before the
+//! first opening. Held outside the ledger, ten chains at half a gigabyte put
+//! the card at 96%, after which device allocations fail, commits fall back to
+//! the host, and the host grows ~1.5 GiB per fallen-back chain.
 //!
-//! `multilinear::whir_commit`'s `paths` said this in its doc comment before any
-//! of it was built, and the reservation in `StackedCommitment::commit` — "nine
-//! codewords of room instead of sixteen" — budgets a retained codeword per
-//! commitment and no tree.
+//! Held INSIDE the ledger — grown into each codeword's room, and given back to
+//! any request that needs the bytes — the same window costs nothing but the
+//! re-hash of whatever a request took. That is the trade these tests pin.
 //!
 //! # ⚠ Why the counts are PER CODEWORD
 //!
@@ -61,11 +59,11 @@
 //! `Backend::reserved_bytes()` counts what callers promised, so it is silent
 //! about device memory allocated without a reservation — and it reads baseline
 //! while the card fills, which is how the H4 arm's retention stayed invisible
-//! to a unit test that passed. It is also trivially at baseline now, which is a
-//! check that cannot fail. So the guard samples `free_vram_bytes()` across four
-//! live, unopened commitments and asserts what they took is their codewords and
-//! nothing else. That one fails if a tree is ever held past the call that
-//! builds it, wherever the holding is written.
+//! to a unit test that passed. So the guard samples `free_vram_bytes()` across
+//! four live, unopened commitments and asserts two things: what they took is
+//! their codewords and what each keeps of its tree, and that equals what they
+//! PROMISED, give or take the pool. It fails if anything of a tree is ever held
+//! outside the promise, wherever the holding is written.
 
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
@@ -134,65 +132,105 @@ fn commit_on_device(
         .expect("device commit (needs a GPU)")
 }
 
-/// ★★ (1) THE COUNT. One leaf-hash pass per tree built: the commit's, and
-/// one more for each round that opens it.
+/// `LFM_WHIR_WHOLE_TREES` forced for one test — whole trees or leaf layers —
+/// and the environment's setting restored when this drops, on a panic too.
+/// Every test that asserts a count or a byte figure that depends on what is
+/// kept runs both ways under it, rather than at whatever the default is.
+struct WholeTrees;
+
+impl WholeTrees {
+    fn force(on: bool) -> Self {
+        math_cuda::whir::force_whole_trees(Some(on));
+        Self
+    }
+}
+
+impl Drop for WholeTrees {
+    fn drop(&mut self) {
+        math_cuda::whir::force_whole_trees(None);
+    }
+}
+
+/// What a codeword over `2^num_vars` values at `log_blowup = 2` keeps of its
+/// tree at `log_folding`: the whole node array, or its leaf layer.
+fn kept_bytes(num_vars: usize, log_folding: usize, whole: bool) -> u64 {
+    let leaves = ((1u64 << num_vars) << 2) >> log_folding;
+    if whole {
+        (2 * leaves - 1) * 32
+    } else {
+        leaves * 32
+    }
+}
+
+/// ★★ (1) THE COUNT. One leaf-hash pass per codeword while what it keeps is
+/// held, and a tree built at an opening only when no whole tree is kept.
 ///
-/// This is the cost H4 tried to remove and the number that says whether anyone
-/// has quietly re-added a cache. It is asserted as an integer in both
-/// directions — a commitment that read 1 after an opening would mean a tree is
-/// being kept, which is the state this file exists to forbid.
+/// This is the cost H4 tried to remove, asserted as integers in both retention
+/// modes. With leaf layers (`LFM_WHIR_WHOLE_TREES=0`) each opening builds its
+/// own tree on the kept layer: `tree_builds` climbs, `leaf_passes` stays at 1.
+/// With whole trees (the default) each opening is served the kept tree: both
+/// stay at 1. A 2 in `leaf_passes` is the retention not working in either mode;
+/// a build at an opening under whole trees is an opening that stopped reading
+/// the tree it kept; and the kept bytes say which object the counts are about.
 #[test]
 fn a_commitment_hashes_its_leaves_once_per_tree_it_builds() {
     let _exclusive = exclusive();
-    for (name, hash) in [("keccak", key::<KeccakWhir>()), ("rpx", key::<RpxWhir>())] {
-        let (codeword, _root) = commit_on_device(14, 4, hash);
-        assert_eq!(
-            codeword.tree_builds(),
-            1,
-            "{name}: the commit itself must hash the leaves exactly once"
-        );
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        // Trees an opening builds: one with leaf layers, none with whole trees.
+        let per_open = u64::from(!whole);
+        for (name, hash) in [("keccak", key::<KeccakWhir>()), ("rpx", key::<RpxWhir>())] {
+            let (codeword, _root) = commit_on_device(14, 4, hash);
+            assert_eq!(
+                codeword.tree_builds(),
+                1,
+                "{name}, whole trees {whole}: the commit itself must hash the leaves exactly once"
+            );
+            assert_eq!(
+                codeword.leaf_passes(),
+                1,
+                "{name}, whole trees {whole}: the commit hashes the leaves once"
+            );
 
-        assert_eq!(
-            codeword.leaf_passes(),
-            1,
-            "{name}: the commit hashes the leaves once"
-        );
+            let _ = codeword.paths(4, &[0, 1, 7], hash).expect("paths");
+            assert_eq!(
+                codeword.tree_builds(),
+                1 + per_open,
+                "{name}, whole trees {whole}: an opening builds a tree only when no \
+                 whole tree is kept"
+            );
+            // ★ THE OTHER DIRECTION, and it is the whole point of the retention:
+            // the leaves were not re-hashed, whether the opening built on the
+            // kept layer or read the kept tree. A 2 here is the retention not
+            // working.
+            assert_eq!(
+                codeword.leaf_passes(),
+                1,
+                "{name}, whole trees {whole}: the opening must reuse what was kept — \
+                 a 2 here means nothing was kept, or it was not matched"
+            );
 
-        let _ = codeword.paths(4, &[0, 1, 7], hash).expect("paths");
-        assert_eq!(
-            codeword.tree_builds(),
-            2,
-            "{name}: an opening builds its own tree — a 1 here means one is kept"
-        );
-        // ★ THE OTHER DIRECTION, and it is the whole point of the change: the
-        // tree was rebuilt, but its LEAF LAYER was not re-hashed. A 2 here is
-        // the retention not working.
-        assert_eq!(
-            codeword.leaf_passes(),
-            1,
-            "{name}: the opening must serve the retained leaf layer — a 2 here \
-             means the layer was not kept, or not matched"
-        );
-
-        // …and again, because a cache that served once and then evicted would
-        // read 2 on the line above too.
-        let _ = codeword.paths(4, &[2, 3], hash).expect("paths");
-        assert_eq!(
-            codeword.tree_builds(),
-            3,
-            "{name}: and a second opening builds a third"
-        );
-        assert_eq!(
-            codeword.leaf_passes(),
-            1,
-            "{name}: and still one leaf pass — a layer that served once and was \
-             then evicted would read 2 here"
-        );
-        assert!(
-            codeword.retained_leaf_bytes() > 0,
-            "{name}: the codeword reports no retained layer, so the counts above \
-             are agreeing about the wrong thing"
-        );
+            // …and again, because a cache that served once and then evicted
+            // would read 2 on the line above too.
+            let _ = codeword.paths(4, &[2, 3], hash).expect("paths");
+            assert_eq!(
+                codeword.tree_builds(),
+                1 + 2 * per_open,
+                "{name}, whole trees {whole}: and the second opening likewise"
+            );
+            assert_eq!(
+                codeword.leaf_passes(),
+                1,
+                "{name}, whole trees {whole}: and still one leaf pass — what served \
+                 once and was then evicted would read 2 here"
+            );
+            assert_eq!(
+                codeword.retained_leaf_bytes(),
+                kept_bytes(14, 4, whole),
+                "{name}, whole trees {whole}: the codeword keeps the wrong object, so \
+                 the counts above are agreeing about the wrong thing"
+            );
+        }
     }
 }
 
@@ -274,12 +312,15 @@ fn the_openings_verify_against_the_device_commitment() {
     check::<RpxWhir>("rpx");
 }
 
-/// ★★ (3) THE RESERVATION SEES THE CODEWORD, AND GETS IT BACK.
+/// ★★ (3) THE RESERVATION SEES THE CODEWORD AND WHAT IT KEEPS, AND GETS IT
+/// BACK.
 ///
 /// Device memory held outside the accounting is an under-count that nothing
 /// reports until a second prover shares the card. What a codeword promises is
-/// its own bytes and the folds that halve it — NOT a tree, which is never held
-/// past the call that builds it.
+/// its own bytes, the folds that halve it, and what it keeps of its tree — the
+/// whole tree or its leaf layer, grown into the promise when kept. A tree an
+/// opening builds without keeping it is a transient of that call and never
+/// enters the promise. Both retention modes, forced.
 #[test]
 fn the_codeword_is_inside_the_reservation_and_gives_it_back() {
     let _exclusive = exclusive();
@@ -287,60 +328,77 @@ fn the_codeword_is_inside_the_reservation_and_gives_it_back() {
     let hash = key::<RpxWhir>();
     let num_vars = 14;
     let log_folding = 4;
-
-    // ⚠ Read under the lock, and it is a BASELINE rather than an assumed zero:
-    // a sibling's reservation was what failed this test the first time it ran
-    // on a card (786,400 B of someone else's). What is asserted below is the
-    // DELTA this codeword is responsible for.
-    let before = be.reserved_bytes();
-    let (codeword, _root) = commit_on_device(num_vars, log_folding, hash);
-
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
-    // `2*L - 1` nodes of 32 bytes, from the shapes alone.
-    let leaves = ((1usize << num_vars) << 2) >> log_folding;
-    let tree_bytes = (2 * leaves as u64 - 1) * 32;
 
-    // (a) This codeword's OWN promise covers its codeword — no global involved,
-    // so this half would hold even without the lock.
-    let held = codeword.reserved_bytes();
-    assert!(
-        held >= codeword_bytes,
-        "the reservation holds {held} B, which does not cover the {codeword_bytes} B codeword"
-    );
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        // ⚠ Read under the lock, and it is a BASELINE rather than an assumed
+        // zero: a sibling's reservation was what failed this test the first
+        // time it ran on a card (786,400 B of someone else's). What is asserted
+        // below is the DELTA this codeword is responsible for.
+        let before = be.reserved_bytes();
+        let (codeword, _root) = commit_on_device(num_vars, log_folding, hash);
 
-    // (b) …and the global grew by exactly that, as a delta.
-    let grown = be.reserved_bytes() - before;
-    assert_eq!(
-        grown, held,
-        "this codeword's promise and the global's growth must be the same bytes"
-    );
+        // (a) This codeword's OWN promise covers its codeword — no global
+        // involved, so this half would hold even without the lock.
+        let held = codeword.reserved_bytes();
+        assert!(
+            held >= codeword_bytes,
+            "whole trees {whole}: the reservation holds {held} B, which does not cover the \
+             {codeword_bytes} B codeword"
+        );
 
-    // (c) ★ and a TREE is not in the promise. The codeword has been committed,
-    // so a kept tree would be sitting in this number; `paths` below builds a
-    // second one, and neither may appear. This is the half that H4's version of
-    // this test asserted the other way round.
-    let after_open = {
-        let _ = codeword.paths(log_folding, &[0, 1], hash).expect("paths");
-        codeword.reserved_bytes()
-    };
-    assert_eq!(
-        after_open, held,
-        "a tree was added to the reservation: {after_open} B against {held} B, \
-         and a tree here is {tree_bytes} B"
-    );
+        // (b) …and the global grew by exactly that, as a delta.
+        let grown = be.reserved_bytes() - before;
+        assert_eq!(
+            grown, held,
+            "whole trees {whole}: this codeword's promise and the global's growth must be \
+             the same bytes"
+        );
 
-    // (d) Dropping it gives every byte back. The irreducibly global
-    // proposition, and the reason this test holds the lock.
-    drop(codeword);
-    assert_eq!(
-        be.reserved_bytes(),
-        before,
-        "dropping the codeword must return the accounting to its baseline"
-    );
+        // (c) ★ What the commit kept of its tree is INSIDE the promise — H4's
+        // trees were the bytes that were not — and it is the object the mode
+        // names: the whole tree, or the leaf layer.
+        let kept = codeword.retained_leaf_bytes();
+        assert_eq!(
+            kept,
+            kept_bytes(num_vars, log_folding, whole),
+            "whole trees {whole}: the commit kept the wrong object"
+        );
+        assert!(
+            held >= codeword_bytes + kept,
+            "whole trees {whole}: the promise ({held} B) does not cover the codeword \
+             ({codeword_bytes} B) and what it keeps ({kept} B): a kept tree is outside it"
+        );
+
+        // (d) …and an opening adds nothing to it: it reads the kept tree, or
+        // builds a transient one on the kept layer and frees it on return.
+        let after_open = {
+            let _ = codeword.paths(log_folding, &[0, 1], hash).expect("paths");
+            codeword.reserved_bytes()
+        };
+        assert_eq!(
+            after_open, held,
+            "whole trees {whole}: an opening changed the reservation, {after_open} B against \
+             {held} B"
+        );
+
+        // (e) Dropping it gives every byte back, kept tree included. The
+        // irreducibly global proposition, and the reason this test holds the
+        // lock.
+        drop(codeword);
+        assert_eq!(
+            be.reserved_bytes(),
+            before,
+            "whole trees {whole}: dropping the codeword must return the accounting to its \
+             baseline"
+        );
+    }
 }
 
-/// ★★★ (4) THE GUARD, AT GROUP SCALE. Four commitments, none opened, hold
-/// four codewords and nothing else.
+/// ★★★ (4) THE GUARD, AT GROUP SCALE. Four commitments, none opened, hold four
+/// codewords and what each keeps of its tree — exactly what they promised — and
+/// nothing outside the promise.
 ///
 /// This is the test H4 needed and did not have. The unit test that shipped
 /// dropped ONE bare codeword and asserted the accounting returned to baseline;
@@ -351,23 +409,37 @@ fn the_codeword_is_inside_the_reservation_and_gives_it_back() {
 /// first opening — and the driver's own free-memory count is the instrument
 /// that cannot be fooled by where the retention is written.
 ///
-/// # The margin, and why it is this wide
+/// # The invariant, and its margins
 ///
 /// A codeword here is `2^20 << 2` u64 = 32 MiB. At `log_folding = 2` its tree
-/// is `2^20` leaves, `(2*2^20 - 1) * 32` B = **64 MiB** — two codewords, not
-/// half of one, which is the whole reason for that blocking. So four
-/// codewords are 128 MiB and four codewords with their kept trees are 384 MiB,
-/// and the bound sits at 256 MiB: 128 MiB of slack above the passing case and
-/// 128 MiB below the failing one.
+/// is `2^20` leaves: a leaf layer is 32 MiB — one codeword — and a whole tree
+/// `(2·2^20 − 1)·32` B ≈ 64 MiB — two — which is the whole reason for that
+/// blocking. Both retention modes, forced, each asserting three things:
+///
+/// - **What is kept is the object the mode names, and it is promised.** Each
+///   codeword keeps its leaf layer or its whole tree, and the ledger grew by
+///   EXACTLY four codewords and those four objects (a commit alone promises its
+///   codeword, and a capture grows that promise by what it keeps).
+/// - **Nothing is held outside the promise.** The driver's count less the
+///   ledger's — the pool's share, after a symmetric drain — stays under one
+///   tree and one codeword (96 MiB). H4's shape, a tree kept outside the
+///   promise, would put four trees there (256 MiB); a leaf layer kept outside
+///   it, four codewords (128). The allowance is the whole-node-array mutation
+///   run's pool share after the symmetric drain, 64 MiB — a fragmentation floor
+///   of one largest transient, which a best-effort trim cannot release — plus a
+///   codeword.
+/// - **What is kept is really held.** The driver took more than the next
+///   smaller retention would: four codewords alone (128 MiB) under leaf layers,
+///   four codewords and their layers (256 MiB) under whole trees. Under leaf
+///   layers it also took less than four codewords, their layers and one
+///   codeword (288 MiB) — the bound this guard carried before whole trees,
+///   kept as it was.
 ///
 /// ⚠ The slack is not decoration. `free_vram_bytes` reports what the PROCESS
 /// has taken from the driver, which includes whatever one-time workspace and
 /// twiddle caches the first commit of this size sets up, and those are counted
-/// identically in both cases. A bound only a codeword above the passing case
-/// would turn any such allocation into a false failure — and a wider blocking,
-/// where the tree is half a codeword, would leave no room for one. The warm-up
-/// commit below pays those costs before the sample, and the margin absorbs what
-/// it misses.
+/// identically in both cases. The warm-up commit below pays those costs before
+/// the sample, and the margins absorb what it misses.
 ///
 /// Keccak because this is a memory proposition and the two hash families build
 /// identically shaped trees; the cheaper kernel keeps the test short.
@@ -378,201 +450,202 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     let hash = key::<KeccakWhir>();
     let num_vars = 20;
     // ⚠ Not 4. At `log_folding = 2` the tree is TWO codewords rather than half
-    // of one, which is what puts 128 MiB between the passing and failing cases
-    // instead of 32.
+    // of one, which is what puts a codeword or more between every case below.
     let log_folding = 2;
-
-    // One commit of this exact shape before the sample, so the one-time costs
-    // of the first — twiddles, workspaces, whatever the pool grows to hold them
-    // — are paid outside the window and not attributed to retention.
-    drop(commit_on_device(num_vars, log_folding, hash));
-
-    // ⚠ And without this the measurement is the POOL's, not the caller's: the
-    // stream-ordered allocator keeps freed blocks, and the warm-up's own
-    // codeword would silently serve one of the four commits below. Drain, then
-    // sample.
-    math_cuda::device::drain_and_trim().expect("drain");
-    let free_before = be.free_vram_bytes().expect("cuMemGetInfo");
-    // ★ THE SECOND INSTRUMENT, and it is the one that can tell the two stories
-    // apart. `free_vram_bytes` is the DRIVER's count and includes whatever the
-    // pool is sitting on; `reserved_bytes` is what the CODE promised and is
-    // blind to the pool by construction. Their difference is the pool's, and
-    // printing it turns "either the pool retained a block or the code holds one
-    // more" from a question into a read.
-    let reserved_before = be.reserved_bytes();
-
-    let held: Vec<_> = (0..4)
-        .map(|_| commit_on_device(num_vars, log_folding, hash))
-        .collect();
-
-    // ⛔ SYMMETRIC SAMPLING, AND THIS LINE IS THE FIX. `free_before` is taken
-    // AFTER a drain and this one was not, so the difference measured the code
-    // plus every transient the four commits made — and with the pool set to
-    // retain all freed blocks, that is all of them. A delta between two samples
-    // is about the code only if both are taken at the same pool state.
-    //
-    // ★ WHAT IT COST, and why a widened bound was the wrong repair. The run of
-    // 2026-09-20 read `taken` = 301,989,888 B — EXACTLY nine codewords, on a
-    // bound of nine, where the model says eight are held. The old one-sided
-    // bound was `8 × codeword` against four codewords held, so it carried 128
-    // MiB of margin the pool had been living in unnoticed; the leaf-layer
-    // retention did not add pool retention, it CONSUMED that margin. And the
-    // slack was never sized against the transients anyway: the node buffer
-    // `build_tree` allocates is `(2L−1)·32` = 64 MiB, twice the bound's 32.
-    //
-    // The same run's mutation arm settles which it is. Holding a whole node
-    // array instead of a layer moved the measurement to 480 MiB where the code
-    // then holds 384 — an excess of 96 against the honest run's 32, tripling
-    // while the holding grew by half. No "the code holds one more object" form
-    // fits both (`4×(cw+tree)+tree` = 448, `+cw` = 416; `5×(cw+tree)` = 480 fits
-    // MUT C exactly and dies on the honest run, where `5×(cw+leaf)` = 320 ≠ 288).
-    // Every peak-demand model misses on BOTH sides (320 and 448 predicted), which
-    // is the signature of driver suballocation and not of anything this tree
-    // accounts for. ⇒ `free_vram_bytes()` cannot carry a bound this tight
-    // unless both samples are drained.
-    math_cuda::device::drain_and_trim().expect("drain");
-    let free_after = be.free_vram_bytes().expect("cuMemGetInfo");
-    let taken = free_before.saturating_sub(free_after);
-    let promised = be.reserved_bytes().saturating_sub(reserved_before);
-
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
-    let leaves = ((1u64 << num_vars) << 2) >> log_folding;
-    let leaf_bytes = leaves * 32;
-    let tree_bytes = (2 * leaves - 1) * 32;
-    // ⛔ TWO-SIDED, AND AGAINST THE FORM RATHER THAN A MULTIPLE. The layers must
-    // be HELD (so more than the codewords alone) and a whole TREE must still
-    // never be (so less than four of those). At this shape — `log_folding = 2`,
-    // chosen by the comment above because it makes a tree two codewords — a
-    // leaf layer is exactly ONE codeword, so the three cases are 128, 256 and
-    // 384 MiB and the bound sits between the last two with one codeword of
-    // slack. A one-sided bound passed either way and is what let the old
-    // arithmetic sit on its own edge.
-    let expect = 4 * (codeword_bytes + leaf_bytes);
-    let bound = expect + codeword_bytes;
-    let floor = 4 * codeword_bytes;
+    let leaf_bytes = kept_bytes(num_vars, log_folding, false);
+    let tree_bytes = kept_bytes(num_vars, log_folding, true);
     let mib = |b: u64| b / (1 << 20);
-    // ★ THE TWO ACCOUNTINGS, SIDE BY SIDE, IN WHICHEVER MESSAGE FIRES. A failure
-    // here used to say only how many bytes the DRIVER lost, which cannot
-    // distinguish "the pool retained a block" from "the code holds one more" —
-    // and those call for opposite repairs. `promised` is the code's own number
-    // and is blind to the pool; the per-codeword pair says how many layers are
-    // actually in hand. `driver − promised` is the pool's share, and it should
-    // now be small: the drain above is what makes that true.
-    let ledger = {
-        let per: Vec<String> = held
-            .iter()
-            .map(|(c, _)| {
-                format!(
-                    "{}/{}",
-                    mib(c.reserved_bytes()),
-                    mib(c.retained_leaf_bytes())
-                )
-            })
-            .collect();
-        format!(
-            "driver {} MiB · promised {} MiB · pool share {} MiB · per codeword \
-             reserved/retained MiB: [{}]",
-            mib(taken),
-            mib(promised),
-            mib(taken.saturating_sub(promised)),
-            per.join(", ")
-        )
-    };
-    // ⛔ UNCONDITIONAL, AND THAT IS THE WHOLE POINT. Built only inside the
-    // assertion messages, this line appears ONLY when the test fails — so on
-    // the honest path the numbers were inferred from a pass and never read.
-    //
-    // What a pass alone establishes is `driver < bound`, i.e. pool share under
-    // one codeword, and NOTHING narrower. The mutation run that keeps a whole
-    // node array reads `pool share 64 MiB` even after the symmetric drain — a
-    // fragmentation floor of one largest transient, because a best-effort
-    // `trim` cannot release a chunk still backing a live allocation. If the
-    // honest path sits anywhere near that, this guard has a margin of a few MiB
-    // and will flake, and nobody would learn it from a green run.
-    //
-    // ⇒ printed every time, under `--nocapture`, which is how the box gate runs
-    // this suite. The number becomes a READ, and a ceiling can be asserted
-    // against it once its honest value is known.
-    println!("   group guard: {ledger}");
-    assert!(
-        taken < bound,
-        "four unopened commitments took {} MiB from the device. Four codewords \
-         and their leaf layers are {} MiB and the bound is {} MiB; a TREE is {} \
-         MiB, so four of those kept would read {} MiB. Something bigger than a \
-         leaf layer is held per commitment.\n   {}",
-        mib(taken),
-        mib(expect),
-        mib(bound),
-        mib(tree_bytes),
-        mib(4 * (codeword_bytes + tree_bytes)),
-        ledger,
-    );
-    assert!(
-        taken > floor,
-        "four unopened commitments took only {} MiB, which is at or under the {} \
-         MiB their codewords alone need. The leaf layers ({} MiB for four) are \
-         NOT being held — either the capture never ran or the budget refused it, \
-         and in both cases every opening will re-hash its leaves.\n   {}",
-        mib(taken),
-        mib(floor),
-        mib(4 * leaf_bytes),
-        ledger,
-    );
 
-    // The commitments are alive up to here, which is the whole point: a `drop`
-    // any earlier and the assertion would be about a group that had already
-    // been released.
-    drop(held);
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        let kept = if whole { tree_bytes } else { leaf_bytes };
+
+        // One commit of this exact shape before the sample, so the one-time
+        // costs of the first — twiddles, workspaces, whatever the pool grows to
+        // hold them — are paid outside the window and not attributed to
+        // retention.
+        drop(commit_on_device(num_vars, log_folding, hash));
+
+        // ⚠ And without this the measurement is the POOL's, not the caller's:
+        // the stream-ordered allocator keeps freed blocks, and the warm-up's own
+        // codeword would silently serve one of the four commits below. Drain,
+        // then sample.
+        math_cuda::device::drain_and_trim().expect("drain");
+        let free_before = be.free_vram_bytes().expect("cuMemGetInfo");
+        // ★ THE SECOND INSTRUMENT, and it is the one that can tell the two
+        // stories apart. `free_vram_bytes` is the DRIVER's count and includes
+        // whatever the pool is sitting on; `reserved_bytes` is what the CODE
+        // promised and is blind to the pool by construction. Their difference is
+        // the pool's, and it is what "nothing outside the promise" is asserted on.
+        let reserved_before = be.reserved_bytes();
+
+        let held: Vec<_> = (0..4)
+            .map(|_| commit_on_device(num_vars, log_folding, hash))
+            .collect();
+
+        // ⛔ SYMMETRIC SAMPLING. `free_before` is taken AFTER a drain, so this
+        // one must be too: a delta between two samples is about the code only if
+        // both are taken at the same pool state. The run of 2026-09-20 read
+        // EXACTLY nine codewords on a bound of nine before this drain existed —
+        // the pool's transients, not the code's holding — and every peak-demand
+        // model missed on both sides, the signature of driver suballocation.
+        math_cuda::device::drain_and_trim().expect("drain");
+        let free_after = be.free_vram_bytes().expect("cuMemGetInfo");
+        let taken = free_before.saturating_sub(free_after);
+        let promised = be.reserved_bytes().saturating_sub(reserved_before);
+        let pool_share = taken.saturating_sub(promised);
+
+        // ★ THE TWO ACCOUNTINGS, SIDE BY SIDE, PRINTED EVERY TIME under
+        // `--nocapture` (which is how the box gate runs this suite), so the
+        // honest path's numbers are READ rather than inferred from a pass.
+        let ledger = {
+            let per: Vec<String> = held
+                .iter()
+                .map(|(c, _)| {
+                    format!(
+                        "{}/{}",
+                        mib(c.reserved_bytes()),
+                        mib(c.retained_leaf_bytes())
+                    )
+                })
+                .collect();
+            format!(
+                "whole trees {whole}: driver {} MiB · promised {} MiB · pool share {} MiB · \
+                 per codeword reserved/retained MiB: [{}]",
+                mib(taken),
+                mib(promised),
+                mib(pool_share),
+                per.join(", ")
+            )
+        };
+        println!("   group guard: {ledger}");
+
+        // (i) The object the mode names, and its promise.
+        for (c, _) in &held {
+            assert_eq!(
+                c.retained_leaf_bytes(),
+                kept,
+                "whole trees {whole}: a codeword keeps {} B where the mode keeps {} B\n   {}",
+                c.retained_leaf_bytes(),
+                kept,
+                ledger,
+            );
+        }
+        assert_eq!(
+            promised,
+            4 * (codeword_bytes + kept),
+            "whole trees {whole}: four commits must promise exactly four codewords and \
+             what each keeps\n   {ledger}"
+        );
+
+        // (ii) ⛔ Nothing held outside the promise.
+        assert!(
+            pool_share < tree_bytes + codeword_bytes,
+            "whole trees {whole}: the device holds {} MiB beyond what the four commits \
+             promised. A tree kept outside the promise, per commitment, reads {} MiB \
+             here; a leaf layer, {} MiB.\n   {}",
+            mib(pool_share),
+            mib(4 * tree_bytes),
+            mib(4 * leaf_bytes),
+            ledger,
+        );
+
+        // (iii) What is kept is really held.
+        let floor = if whole {
+            4 * (codeword_bytes + leaf_bytes)
+        } else {
+            4 * codeword_bytes
+        };
+        assert!(
+            taken > floor,
+            "whole trees {whole}: four unopened commitments took only {} MiB, at or under \
+             the {} MiB of the next smaller retention. What the mode keeps ({} MiB for \
+             four) is NOT being held — the capture never ran or the budget refused it, \
+             and every opening will pay for it again.\n   {}",
+            mib(taken),
+            mib(floor),
+            mib(4 * kept),
+            ledger,
+        );
+        if !whole {
+            let bound = 4 * (codeword_bytes + leaf_bytes) + codeword_bytes;
+            assert!(
+                taken < bound,
+                "leaf layers: four unopened commitments took {} MiB from the device, over \
+                 the {} MiB bound. Something bigger than a leaf layer is held per \
+                 commitment.\n   {}",
+                mib(taken),
+                mib(bound),
+                ledger,
+            );
+        }
+
+        // The commitments are alive up to here, which is the whole point: a
+        // `drop` any earlier and the assertions would be about a group that had
+        // already been released.
+        drop(held);
+    }
 }
 
 /// ★ (5) THE BLOCKING IS THE ONE THAT WAS ASKED FOR.
 ///
-/// The dangerous outcome a cache made reachable — serving a tree that answers a
-/// different question, whose paths are internally consistent and wrong — is
-/// unreachable once nothing is kept, and this pins that it stays unreachable:
-/// each call builds for the `log_folding` it was given, and the shapes differ.
+/// The dangerous outcome a cache makes reachable — serving a tree that answers a
+/// different question, whose paths are internally consistent and wrong — stays
+/// unreachable: whatever is kept is keyed by its blocking, a call at another
+/// blocking builds its own tree and hashes its own leaves, and the kept object
+/// still serves the blocking it was built for. Both retention modes, forced.
 #[test]
 fn a_tree_is_built_for_the_blocking_that_is_asked_for() {
     let _exclusive = exclusive();
     let hash = key::<RpxWhir>();
-    let (codeword, _root) = commit_on_device(14, 4, hash);
-    assert_eq!(codeword.tree_builds(), 1);
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        let (codeword, _root) = commit_on_device(14, 4, hash);
+        assert_eq!(codeword.tree_builds(), 1);
 
-    // Same codeword, different blocking: its own tree, its own pass.
-    let at_two = codeword.paths(2, &[0, 1], hash).expect("paths at k=2");
-    assert_eq!(
-        codeword.tree_builds(),
-        2,
-        "the opening must build a tree for the blocking it was given"
-    );
-    // ★ THE KEY, ASSERTED WHERE IT CAN FAIL. The retained layer was built at
-    // k=4; this opening is at k=2 and describes a DIFFERENT tree, so the layer
-    // must not be served and the leaves must be hashed again. A 1 here is a
-    // cache ignoring its key, which is the one way this change could hand back
-    // paths that are internally consistent and wrong.
-    assert_eq!(
-        codeword.leaf_passes(),
-        2,
-        "a k=2 opening must NOT be served the k=4 leaf layer"
-    );
+        // Same codeword, different blocking: its own tree, its own pass.
+        let at_two = codeword.paths(2, &[0, 1], hash).expect("paths at k=2");
+        assert_eq!(
+            codeword.tree_builds(),
+            2,
+            "whole trees {whole}: the opening must build a tree for the blocking it was given"
+        );
+        // ★ THE KEY, ASSERTED WHERE IT CAN FAIL. What was kept was built at
+        // k=4; this opening is at k=2 and describes a DIFFERENT tree, so it must
+        // not be served and the leaves must be hashed again. A 1 here is a cache
+        // ignoring its key, which is the one way retention could hand back paths
+        // that are internally consistent and wrong.
+        assert_eq!(
+            codeword.leaf_passes(),
+            2,
+            "whole trees {whole}: a k=2 opening must NOT be served what was kept at k=4"
+        );
 
-    // And the rebuild answered the question that was asked: at k=2 the tree has
-    // four times the leaves, so each path is two levels deeper.
-    let at_four = codeword.paths(4, &[0, 1], hash).expect("paths at k=4");
-    assert_eq!(codeword.tree_builds(), 3, "and a third for the k=4 opening");
-    // …and the k=4 layer IS still there and IS served, so the key rejects a
-    // mismatch without throwing away a match. Without this line the test above
-    // would also pass on a cache that had simply stopped working.
-    assert_eq!(
-        codeword.leaf_passes(),
-        2,
-        "the k=4 opening matches the retained layer's key and must not re-hash"
-    );
-    assert_eq!(
-        at_two.len(),
-        at_four.len() + 2 * 2 * 32,
-        "a k=2 tree's paths must be two levels deeper than a k=4 tree's"
-    );
+        // And the rebuild answered the question that was asked: at k=2 the tree
+        // has four times the leaves, so each path is two levels deeper.
+        let at_four = codeword.paths(4, &[0, 1], hash).expect("paths at k=4");
+        // …and what was kept at k=4 IS still there and IS served — the whole
+        // tree, with no build, or the layer, under a third tree — so the key
+        // rejects a mismatch without throwing away a match. Without these lines
+        // the test above would also pass on a cache that had simply stopped
+        // working.
+        assert_eq!(
+            codeword.tree_builds(),
+            if whole { 2 } else { 3 },
+            "whole trees {whole}: the k=4 opening builds a tree only when no whole tree is kept"
+        );
+        assert_eq!(
+            codeword.leaf_passes(),
+            2,
+            "whole trees {whole}: the k=4 opening matches what was kept and must not re-hash"
+        );
+        assert_eq!(
+            at_two.len(),
+            at_four.len() + 2 * 2 * 32,
+            "whole trees {whole}: a k=2 tree's paths must be two levels deeper than a k=4 tree's"
+        );
+    }
 }
 
 /// ✓ The cache is per hash too — the same codeword under two keys must build
@@ -601,41 +674,82 @@ fn the_process_wide_counter_tracks_the_same_passes() {
     let _exclusive = exclusive();
     let hash = key::<KeccakWhir>();
 
-    // ⛔ DELTAS, NOT ABSOLUTES. These three counters are process-wide and no
-    // longer resettable as a set, and the retention makes them diverge on
-    // purpose, so the assertions below are about what THIS codeword moved.
-    let at = || (tree_builds(), leaf_hash_calls(), retention_report().5);
+    // ⛔ DELTAS, NOT ABSOLUTES. These counters are process-wide and not
+    // resettable as a set, and the retention makes them diverge on purpose, so
+    // the assertions below are about what THIS codeword moved.
+    let at = || {
+        (
+            tree_builds(),
+            leaf_hash_calls(),
+            retention_report().5,
+            math_cuda::whir::retention_whole().1,
+        )
+    };
 
-    let (b0, p0, s0) = at();
-    let (codeword, _root) = commit_on_device(12, 4, hash);
-    let (b1, p1, s1) = at();
-    assert_eq!(b1 - b0, 1, "one commit, one tree assembled");
-    assert_eq!(p1 - p0, 1, "and it paid for its own leaf pass");
-    assert_eq!(s1 - s0, 0, "with nothing yet in hand to reuse");
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        let (b0, p0, s0, w0) = at();
+        let (codeword, _root) = commit_on_device(12, 4, hash);
+        let (b1, p1, s1, w1) = at();
+        assert_eq!(
+            b1 - b0,
+            1,
+            "whole trees {whole}: one commit, one tree assembled"
+        );
+        assert_eq!(
+            p1 - p0,
+            1,
+            "whole trees {whole}: and it paid for its own leaf pass"
+        );
+        assert_eq!(
+            s1 - s0,
+            0,
+            "whole trees {whole}: with nothing yet in hand to reuse"
+        );
+        assert_eq!(w1 - w0, 0, "whole trees {whole}: and nothing served");
 
-    let _ = codeword.paths(4, &[0, 1], hash).expect("paths");
-    let (b2, p2, s2) = at();
-    assert_eq!(b2 - b1, 1, "the opening assembles its own tree");
-    // ★ THE LINE THAT CHANGED WITH H4's REPLACEMENT. This used to assert the
-    // global counter moved by one too, because a tree and a leaf pass were the
-    // same event. They are not any more: the tree is assembled, the leaves are
-    // not re-hashed, and a 1 here is the retention failing to serve.
-    assert_eq!(p2 - p1, 0, "and does NOT re-hash the leaves");
-    assert_eq!(s2 - s1, 1, "the saving is counted where it happens");
+        let _ = codeword.paths(4, &[0, 1], hash).expect("paths");
+        let (b2, p2, s2, w2) = at();
+        // ★ THE LINES THAT CHANGED WITH H4's REPLACEMENTS. A tree and a leaf
+        // pass were once the same event. With the leaf layer kept, the opening
+        // assembles a tree and does not re-hash the leaves; with the whole tree
+        // kept, it assembles nothing and is served. A leaf pass here, in either
+        // mode, is the retention failing to serve.
+        assert_eq!(
+            b2 - b1,
+            u64::from(!whole),
+            "whole trees {whole}: the opening assembles a tree only when no whole tree is kept"
+        );
+        assert_eq!(
+            p2 - p1,
+            0,
+            "whole trees {whole}: and does NOT re-hash the leaves"
+        );
+        assert_eq!(
+            (s2 - s1, w2 - w1),
+            if whole { (0, 1) } else { (1, 0) },
+            "whole trees {whole}: the saving is counted where it happens (layer, served)"
+        );
 
-    // ⭐ THE ACCOUNTING IDENTITY, which is what the old equality became and
-    // which fails in BOTH directions: a tree that skipped its pass without
-    // recording a saving breaks it, and so does a saving recorded for a tree
-    // that was never assembled.
-    assert_eq!(
-        b2 - b0,
-        (p2 - p0) + (s2 - s0),
-        "every tree either paid for its leaf pass or reused one; trees {}, \
-         passes {}, savings {}",
-        b2 - b0,
-        p2 - p0,
-        s2 - s0
-    );
+        // ⭐ THE ACCOUNTING IDENTITIES, which fail in BOTH directions: every
+        // tree assembled either paid for its leaf pass or reused a kept layer,
+        // and every call that wanted a tree either assembled one or was served
+        // a kept one.
+        assert_eq!(
+            b2 - b0,
+            (p2 - p0) + (s2 - s0),
+            "whole trees {whole}: every tree either paid for its leaf pass or reused one; \
+             trees {}, passes {}, savings {}",
+            b2 - b0,
+            p2 - p0,
+            s2 - s0
+        );
+        assert_eq!(
+            (b2 - b0) + (w2 - w0),
+            2,
+            "whole trees {whole}: the commit and the opening each assembled a tree or were served one"
+        );
+    }
 }
 
 /// ⛔ THE ARGUE-SURFACE DEVICE-FALLBACK COUNTER FIRES AT A REAL SITE.
@@ -935,13 +1049,9 @@ fn a_miss_the_layers_cannot_cover_keeps_them_and_moves_no_path() {
 #[test]
 fn a_kept_whole_tree_serves_its_openings_and_moves_no_byte() {
     let _exclusive = exclusive();
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            math_cuda::whir::force_whole_trees(None);
-        }
-    }
-    let _restore = Restore;
+    // Leaf layers for the reference; switched to whole trees below. Dropped at
+    // the end, it restores the environment's setting.
+    let _mode = WholeTrees::force(false);
     let be = math_cuda::device::backend().expect("whole-tree test needs a GPU");
     let hash = key::<RpxWhir>();
     let (num_vars, log_folding, cap_height) = (14, 4, 3);
@@ -952,7 +1062,6 @@ fn a_kept_whole_tree_serves_its_openings_and_moves_no_byte() {
         .map(|p| *p as u32)
         .collect();
 
-    math_cuda::whir::force_whole_trees(Some(false));
     let (reference, reference_root) =
         math_cuda::whir::commit_codeword(&raw, 2, log_folding, false, hash)
             .expect("device commit (needs a GPU)");

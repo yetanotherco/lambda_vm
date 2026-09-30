@@ -7,12 +7,15 @@
 //! owner-encoded capped paths (`open_many_capped`), whose first path ends with
 //! the host tree's cap.
 //!
-//! Three regimes for the leaf layer, because the cap must come from the tree
-//! that was built whatever built its leaves: SERVED from the retained layer
-//! (same blocking as the commit), REHASHED (another blocking, so the retained
-//! layer's key does not match), and EVICTED (the layer reclaimed by the
+//! Three regimes for what the commit kept, because the cap must come from the
+//! same tree as the paths whatever supplied it: SERVED (same blocking as the
+//! commit: the kept whole tree is read, or the tree is built on the kept leaf
+//! layer), REHASHED (another blocking, so the kept object's key does not match
+//! and the leaves are hashed), and EVICTED (what was kept is reclaimed by the
 //! allocator's evictor before the opening). In each, the cap costs no extra
-//! tree build: `tree_builds` rises by exactly one per call.
+//! tree build: `tree_builds` rises by one per call, or by none when a kept
+//! whole tree serves it. SERVED and EVICTED run in both retention modes
+//! (`LFM_WHIR_WHOLE_TREES`, forced).
 
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
@@ -31,6 +34,23 @@ static DEVICE_GLOBALS: Mutex<()> = Mutex::new(());
 
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     DEVICE_GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `LFM_WHIR_WHOLE_TREES` forced for one test, and the environment's setting
+/// restored when this drops, on a panic too.
+struct WholeTrees;
+
+impl WholeTrees {
+    fn force(on: bool) -> Self {
+        math_cuda::whir::force_whole_trees(Some(on));
+        Self
+    }
+}
+
+impl Drop for WholeTrees {
+    fn drop(&mut self) {
+        math_cuda::whir::force_whole_trees(None);
+    }
 }
 
 /// Mirror of `DeviceHashKey::into_math_cuda` (cuda-gated on `multilinear`).
@@ -58,6 +78,9 @@ fn nodes(bytes: &[u8]) -> Vec<[u8; 32]> {
 /// The device result against the host tree at blocking `k`, every cap height
 /// up to `min(depth, 6)`. `before_each(c)` runs before the call at height `c`
 /// (the EVICTED regime evicts there, so every height meets a rebuilt tree).
+/// `builds` is the trees each call must build: one, or none when a kept whole
+/// tree serves it.
+#[allow(clippy::too_many_arguments)]
 fn assert_matches_host<H: WhirHash>(
     name: &str,
     device: &math_cuda::whir::DeviceCodeword,
@@ -65,6 +88,7 @@ fn assert_matches_host<H: WhirHash>(
     k: usize,
     positions: &[usize],
     mut before_each: impl FnMut(usize),
+    builds: u64,
     expect_leaf_pass: impl Fn(u64) -> bool,
 ) {
     let depth = host.depth();
@@ -72,15 +96,16 @@ fn assert_matches_host<H: WhirHash>(
     let pos32: Vec<u32> = positions.iter().map(|p| *p as u32).collect();
     for c in 0..=depth.min(6) {
         before_each(c);
-        let builds = device.tree_builds();
+        let before = device.tree_builds();
         let passes = device.leaf_passes();
         let (paths, cap) = device
             .paths_and_cap(k, &pos32, c, key::<H>())
             .unwrap_or_else(|e| panic!("{name} k={k} c={c}: paths_and_cap: {e:?}"));
         assert_eq!(
             device.tree_builds(),
-            builds + 1,
-            "{name} k={k} c={c}: paths and cap must come from ONE tree build"
+            before + builds,
+            "{name} k={k} c={c}: paths and cap must come from ONE tree — built by this \
+             call, or the kept one — with no extra build for the cap"
         );
         assert!(
             expect_leaf_pass(device.leaf_passes() - passes),
@@ -134,11 +159,11 @@ fn setup<H: WhirHash>(
     (device, host_codeword, domain)
 }
 
-/// SERVED and REHASHED, k = 1..5, both hashes.
+/// SERVED and REHASHED, k = 1..5, both hashes, both retention modes.
 #[test]
 fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
     let _exclusive = exclusive();
-    fn run<H: WhirHash>(name: &str) {
+    fn run<H: WhirHash>(name: &str, whole: bool) {
         let num_vars = 12;
         for k_commit in 1..=5usize {
             let (device, host_codeword, _) = setup::<H>(num_vars, k_commit);
@@ -146,7 +171,8 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
             let positions = [0usize, 1, leaves / 3, leaves - 1];
             let host =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_commit).expect("host commit");
-            // Same blocking as the commit: the retained layer is served.
+            // Same blocking as the commit: the kept whole tree is read (no
+            // build), or the tree is built on the kept layer (no leaf pass).
             assert_matches_host(
                 name,
                 &device,
@@ -154,9 +180,11 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
                 k_commit,
                 &positions,
                 |_| {},
+                u64::from(!whole),
                 |d| d == 0,
             );
-            // Another blocking: the layer does not match, the leaves are hashed.
+            // Another blocking: what was kept does not match, the leaves are
+            // hashed, and a tree is built every call.
             let k_other = if k_commit == 5 { 3 } else { k_commit + 1 };
             let other =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_other).expect("host commit");
@@ -169,26 +197,53 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
                 k_other,
                 &positions,
                 |_| {},
+                1,
                 |d| d == 1,
             );
         }
     }
-    run::<KeccakWhir>("keccak");
-    run::<RpxWhir>("rpx");
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        run::<KeccakWhir>(
+            if whole {
+                "keccak, whole trees"
+            } else {
+                "keccak, leaf layers"
+            },
+            whole,
+        );
+        run::<RpxWhir>(
+            if whole {
+                "rpx, whole trees"
+            } else {
+                "rpx, leaf layers"
+            },
+            whole,
+        );
+    }
 }
 
-/// EVICTED: the retained layer is reclaimed by the allocator's evictor, and
-/// the next opening rebuilds the whole tree — its cap still the host's.
+/// EVICTED: what the commit kept — the whole tree, or its leaf layer — is
+/// reclaimed by the allocator's evictor, and the next opening rebuilds the
+/// whole tree — its cap still the host's. Both retention modes.
 ///
-/// A rebuild RE-CAPTURES the layer (by design: the evictor keeps the codeword's
-/// registry entry because "the mutex lives with the codeword and may refill",
-/// `math-cuda/src/whir.rs`), so a second opening after one eviction is SERVED,
-/// not rebuilt. The eviction therefore runs before EVERY cap height: each
-/// height meets a rebuilt tree and pays exactly one leaf pass, and the layer is
-/// back after each rebuild (the next eviction's precondition says so).
+/// A rebuild RE-CAPTURES what was kept (by design: the evictor keeps the
+/// codeword's registry entry because "the mutex lives with the codeword and may
+/// refill", `math-cuda/src/whir.rs`), so a second opening after one eviction is
+/// SERVED, not rebuilt. The eviction therefore runs before EVERY cap height:
+/// each height meets a rebuilt tree and pays exactly one leaf pass, and what
+/// was kept is back after each rebuild (the next eviction's precondition says
+/// so).
 #[test]
 fn paths_and_cap_after_the_retained_layer_is_evicted() {
     let _exclusive = exclusive();
+    for whole in [false, true] {
+        let _mode = WholeTrees::force(whole);
+        evicted_regime(whole);
+    }
+}
+
+fn evicted_regime(whole: bool) {
     let be = math_cuda::device::backend().expect("eviction test needs a GPU");
     let k = 4;
     let (device, host_codeword, _) = setup::<RpxWhir>(14, k);
@@ -223,9 +278,12 @@ fn paths_and_cap_after_the_retained_layer_is_evicted() {
     let host = CodewordCommitment::<_, RpxWhir>::new(&host_codeword, k).expect("host commit");
     let leaves = host_codeword.len() >> k;
     let positions = [0usize, 5, leaves / 2, leaves - 1];
-    assert_matches_host("rpx evicted", &device, &host, k, &positions, evict, |d| {
-        d == 1
-    });
+    let name = if whole {
+        "rpx evicted, whole trees"
+    } else {
+        "rpx evicted, leaf layers"
+    };
+    assert_matches_host(name, &device, &host, k, &positions, evict, 1, |d| d == 1);
     assert_eq!(
         evictions,
         host.depth().min(6) + 1,
