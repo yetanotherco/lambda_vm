@@ -861,7 +861,7 @@ The lead's decisions after job 290:
   - the production tree at the default and at `zerotail`, each with its own path lines and the 5 ids =
     `ids-1010-f5.txt` (md5 5cc1445a, which job 290's A arm also printed).
 
-### 8.5 Results (FAST job 291, 16:01:43–16:08:53Z; written 2026-09-30 16:55Z)
+### 8.5 Results (FAST job 291, 16:01:43–16:08:53Z; written 2026-09-30 16:50Z)
 
 - **Measured at `fix2/1010-zerotail` @ `d9aab005a`, on 73342bc66.**
   - The landing candidate `land/1010-zerotail` @ `aa332efef` sits on 7c8272701. It differs from the measured sha only
