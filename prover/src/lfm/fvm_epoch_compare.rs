@@ -49,6 +49,14 @@ fn census<PI>(proof: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> (
     })
 }
 
+fn tables_of<PI>(p: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> String {
+    p.proofs
+        .iter()
+        .map(|p| format!("{}x{}", p.trace_length, p.trace_ood_evaluations.width))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `median (cv=…%, n=…)` of timings in milliseconds.
 fn stats(mut v: Vec<f64>) -> String {
     v.sort_by(f64::total_cmp);
@@ -673,10 +681,21 @@ fn epoch_field_vm_hash_chip() {
     let opts = crate::field_vm::prove::default_options();
 
     let hy = Hybrid::new(&program, &exec, &arenas, &opts);
+    let with_lfm = std::env::var_os("FVM_COMPARE_SKIP_LFM").is_none();
+    let artifacts =
+        with_lfm.then(|| super::registry::build_artifacts_with_hasher(&program, &opts, hasher));
 
-    let (mut prove_ms, mut verify_ms, mut trace_ms, mut shape, mut bytes) =
-        (Vec::new(), Vec::new(), Vec::new(), (0, 0), 0);
-    let mut tables = String::new();
+    // Interleaved: hybrid, then LFM, per run, so drift hits both alike.
+    let (mut h_prove, mut h_verify, mut trace_ms, mut l_prove, mut l_verify, mut ratio) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let (mut h_shape, mut h_bytes, mut h_tables) = ((0, 0), 0, String::new());
+    let (mut l_shape, mut l_bytes, mut l_tables) = ((0, 0), 0, String::new());
     for _ in 0..runs() {
         let s = Instant::now();
         let (mut traces, mut extra) = hy.traces();
@@ -684,67 +703,61 @@ fn epoch_field_vm_hash_chip() {
         let (proof, p, v) = hy
             .prove(&mut traces, &mut extra, &opts)
             .expect("FVM + hash chips prove and verify");
-        prove_ms.push(p);
-        verify_ms.push(v);
-        shape = census(&proof);
-        bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        h_prove.push(p);
+        h_verify.push(v);
+        h_shape = census(&proof);
+        h_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
             .map(|b| b.len())
             .unwrap_or(0);
-        tables = proof
-            .proofs
-            .iter()
-            .map(|p| format!("{}x{}", p.trace_length, p.trace_ood_evaluations.width))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    eprintln!("  hybrid tables: {tables}");
-    eprintln!(
-        "  hybrid blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={bytes} traces_ms={}",
-        opts.blowup_factor,
-        shape.0,
-        shape.1,
-        stats(prove_ms),
-        stats(verify_ms),
-        stats(trace_ms)
-    );
-
-    if std::env::var_os("FVM_COMPARE_SKIP_LFM").is_none() {
-        let artifacts = super::registry::build_artifacts_with_hasher(&program, &opts, hasher);
-        let (mut prove_ms, mut verify_ms, mut shape, mut bytes) =
-            (Vec::new(), Vec::new(), (0, 0), 0);
-        for _ in 0..runs() {
+        h_tables = tables_of(&proof);
+        drop(proof);
+        if let Some(artifacts) = &artifacts {
             let s = Instant::now();
             let proof =
-                super::proof::lfm_prove(&program, &artifacts, &arenas, &opts).expect("LFM proves");
-            prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
+                super::proof::lfm_prove(&program, artifacts, &arenas, &opts).expect("LFM proves");
+            let lp = s.elapsed().as_secs_f64() * 1e3;
+            l_prove.push(lp);
+            ratio.push(p / lp);
             let s = Instant::now();
             assert!(super::proof::verify_against_artifacts(
-                &artifacts,
+                artifacts,
                 &proof.proof,
                 &proof.public_words,
                 &opts
             ));
-            verify_ms.push(s.elapsed().as_secs_f64() * 1e3);
-            shape = census(&proof.proof);
-            bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof.proof)
+            l_verify.push(s.elapsed().as_secs_f64() * 1e3);
+            l_shape = census(&proof.proof);
+            l_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof.proof)
                 .map(|b| b.len())
                 .unwrap_or(0);
-            tables = proof
-                .proof
-                .proofs
-                .iter()
-                .map(|p| format!("{}x{}", p.trace_length, p.trace_ood_evaluations.width))
-                .collect::<Vec<_>>()
-                .join(" ");
+            l_tables = tables_of(&proof.proof);
         }
-        eprintln!("  lfm tables: {tables}");
+    }
+    eprintln!("  hybrid tables: {h_tables}");
+    eprintln!(
+        "  hybrid blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={h_bytes} traces_ms={}",
+        opts.blowup_factor,
+        h_shape.0,
+        h_shape.1,
+        stats(h_prove),
+        stats(h_verify),
+        stats(trace_ms)
+    );
+    if with_lfm {
+        eprintln!("  lfm tables: {l_tables}");
         eprintln!(
-            "  lfm blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={bytes}",
+            "  lfm blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={l_bytes}",
             opts.blowup_factor,
-            shape.0,
-            shape.1,
-            stats(prove_ms),
-            stats(verify_ms)
+            l_shape.0,
+            l_shape.1,
+            stats(l_prove),
+            stats(l_verify)
+        );
+        eprintln!(
+            "  paired hybrid/lfm prove ratio={} ({} of {} runs faster)",
+            stats(ratio.iter().map(|r| r * 1e3).collect()),
+            ratio.iter().filter(|&&r| r < 1.0).count(),
+            ratio.len()
         );
     }
 }

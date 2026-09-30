@@ -19,7 +19,7 @@ use super::air::FvmPublicInputs;
 use super::bridge::{self, BridgeConstraints, BridgeRow};
 use super::prove::ExtraAir;
 use crate::lfm::builder::{ArenaSchema, LfmProgramSource};
-use crate::lfm::chips::{bitdec, const_, hash, keccak, lanes, select};
+use crate::lfm::chips::{balu, bitdec, const_, hash, keccak, lanes, select, xalu};
 use crate::lfm::compiler::{LfmProgram, compile};
 use crate::lfm::executor::LfmExecution;
 use crate::lfm::hash::HasherKind;
@@ -37,7 +37,12 @@ type E = GoldilocksExtension;
 
 /// Selects move words (Merkle path order), whose fourth lane the Field VM
 /// does not hold, so they go with the hash half too.
+/// `FVM_HYBRID_ALL` moves everything but publics: the LFM's chips alone,
+/// as a control.
 pub fn is_hash_side(i: &Instr) -> bool {
+    if std::env::var_os("FVM_HYBRID_ALL").is_some() {
+        return !matches!(i, Instr::Public { .. });
+    }
     matches!(
         i,
         Instr::Hash { .. }
@@ -380,15 +385,83 @@ fn air<CS: ConstraintSet<F, E> + 'static>(
     )
 }
 
+/// `(first row, rows)` per chunk of a table with `real` rows: with
+/// `FVM_HYBRID_CHUNK`, the largest power of two and the rest when that saves
+/// an eighth of the rows. The chips split have no row-to-row constraints.
+fn chunk_plan(real: usize, height: usize) -> Vec<(usize, usize)> {
+    let first = height / 2;
+    let min = super::prove::MIN_ROWS;
+    if std::env::var_os("FVM_HYBRID_CHUNK").is_some() && real > first && first >= min {
+        let rest = (real - first).next_power_of_two().max(min);
+        if first + rest + height / 8 <= height {
+            return vec![(0, first), (first, rest)];
+        }
+    }
+    vec![(0, height)]
+}
+
+/// `t` cut per [`chunk_plan`]; a chunk's padding repeats `t`'s first padding row.
+fn chunks(t: &TraceTable<F, E>, real: usize) -> Vec<TraceTable<F, E>> {
+    let plan = chunk_plan(real, t.num_rows());
+    if plan.len() == 1 {
+        return vec![t.clone()];
+    }
+    let w = t.main_table.width;
+    plan.into_iter()
+        .map(|(start, rows)| {
+            let mut data = crate::tables::types::zeroed_fe_vec(rows * w);
+            for r in 0..rows {
+                let src = if start + r < real { start + r } else { real };
+                if src < t.num_rows() {
+                    for c in 0..w {
+                        data[r * w + c] = *t.main_table.get(src, c);
+                    }
+                }
+            }
+            TraceTable::new_main(data, w, 1)
+        })
+        .collect()
+}
+
+fn prep_roots(
+    chunks: &[TraceTable<F, E>],
+    prep: usize,
+    options: &ProofOptions,
+) -> Vec<stark::config::Commitment> {
+    chunks
+        .iter()
+        .map(|t| {
+            let columns: Vec<Vec<FE>> = (0..prep)
+                .map(|c| (0..t.num_rows()).map(|r| *t.main_table.get(r, c)).collect())
+                .collect();
+            crate::lfm::commit::commit_columns(&columns, options)
+        })
+        .collect()
+}
+
+fn group_roots(
+    g: &crate::lfm::compiler::ColumnGroup,
+    options: &ProofOptions,
+) -> Vec<stark::config::Commitment> {
+    if g.real_rows == 0 {
+        return Vec::new();
+    }
+    let t = TraceTable::new_main(g.data.clone(), g.width, 1);
+    prep_roots(&chunks(&t, g.real_rows), g.width, options)
+}
+
 /// The verifier's half of the statement: the preprocessed roots.
 pub struct HashSideId {
     pub bridge: Option<stark::config::Commitment>,
     pub hash: Vec<stark::config::Commitment>,
-    pub lanes: Option<stark::config::Commitment>,
+    /// One root per chunk ([`chunk_plan`]); empty when the chip has no rows.
+    pub lanes: Vec<stark::config::Commitment>,
     pub bitdec: Option<stark::config::Commitment>,
-    pub select: Option<stark::config::Commitment>,
-    pub hint: Option<stark::config::Commitment>,
+    pub select: Vec<stark::config::Commitment>,
+    pub hint: Vec<stark::config::Commitment>,
     pub const_: Option<stark::config::Commitment>,
+    pub balu: Vec<stark::config::Commitment>,
+    pub xalu: Vec<stark::config::Commitment>,
     /// `LFM_KECCAK` and `KECCAK_RC` roots and the `KECCAK_RND` chunk count.
     pub keccak: Option<(stark::config::Commitment, stark::config::Commitment, usize)>,
     pub bitwise: Option<stark::config::Commitment>,
@@ -413,17 +486,21 @@ pub fn side_id(
     HashSideId {
         bridge: (!side.merged).then(|| bridge::commitment(rows, options, super::prove::MIN_ROWS)),
         hash,
-        lanes: (g.lanes.real_rows > 0).then_some(artifacts.roots[7]),
+        lanes: group_roots(&g.lanes, options),
         bitdec: (g.bitdec.real_rows > 0).then_some(artifacts.roots[4]),
-        select: (g.select.real_rows > 0).then_some(artifacts.roots[3]),
+        select: group_roots(&g.select, options),
         const_: (g.const_.real_rows > 0).then_some(artifacts.roots[0]),
-        hint: (g.hint.real_rows > side.out.len()).then(|| {
-            let t = hint_table(side, None);
-            let columns: Vec<Vec<FE>> = (0..layout::hint::PREP_WIDTH)
-                .map(|c| (0..t.num_rows()).map(|r| *t.main_table.get(r, c)).collect())
-                .collect();
-            crate::lfm::commit::commit_columns(&columns, options)
-        }),
+        balu: group_roots(&g.balu, options),
+        xalu: group_roots(&g.xalu, options),
+        hint: if g.hint.real_rows > side.out.len() {
+            prep_roots(
+                &chunks(&hint_table(side, None), g.hint.real_rows - side.out.len()),
+                layout::hint::PREP_WIDTH,
+                options,
+            )
+        } else {
+            Vec::new()
+        },
         keccak: artifacts.chip_set.keccak.then_some((
             artifacts.roots[crate::lfm::airs::KECCAK_SLOT],
             artifacts.roots[crate::lfm::airs::KECCAK_RC_SLOT],
@@ -463,7 +540,7 @@ pub fn airs(id: &HashSideId, options: &ProofOptions) -> Vec<ExtraAir> {
             options,
         ));
     }
-    if let Some(root) = id.lanes {
+    for &root in &id.lanes {
         v.push(air(
             "LFM_LANES",
             lanes::cols::NUM_COLUMNS,
@@ -485,7 +562,7 @@ pub fn airs(id: &HashSideId, options: &ProofOptions) -> Vec<ExtraAir> {
             options,
         ));
     }
-    if let Some(root) = id.select {
+    for &root in &id.select {
         v.push(air(
             "LFM_SELECT",
             select::cols::NUM_COLUMNS,
@@ -507,7 +584,29 @@ pub fn airs(id: &HashSideId, options: &ProofOptions) -> Vec<ExtraAir> {
             options,
         ));
     }
-    if let Some(root) = id.hint {
+    for &root in &id.balu {
+        v.push(air(
+            "LFM_BALU",
+            balu::cols::NUM_COLUMNS,
+            balu::bus_interactions(),
+            balu::BaluConstraints,
+            root,
+            layout::balu::PREP_WIDTH,
+            options,
+        ));
+    }
+    for &root in &id.xalu {
+        v.push(air(
+            "LFM_XALU",
+            xalu::cols::NUM_COLUMNS,
+            xalu::bus_interactions(),
+            xalu::XaluConstraints,
+            root,
+            layout::xalu::PREP_WIDTH,
+            options,
+        ));
+    }
+    for &root in &id.hint {
         v.push(air(
             "LFM_HINT",
             crate::lfm::chips::hint::cols::NUM_COLUMNS,
@@ -599,20 +698,30 @@ pub fn traces(
         v.push(std::mem::replace(&mut t.hash, TraceTable::new_main(Vec::new(), 1, 1)));
         v.extend(t.hash_tail.drain(..));
     }
-    if id.lanes.is_some() {
-        v.push(std::mem::replace(&mut t.lanes, TraceTable::new_main(Vec::new(), 1, 1)));
+    let g = &side.sub.groups;
+    if !id.lanes.is_empty() {
+        v.extend(chunks(&t.lanes, g.lanes.real_rows));
     }
     if id.bitdec.is_some() {
         v.push(std::mem::replace(&mut t.bitdec, TraceTable::new_main(Vec::new(), 1, 1)));
     }
-    if id.select.is_some() {
-        v.push(std::mem::replace(&mut t.select, TraceTable::new_main(Vec::new(), 1, 1)));
+    if !id.select.is_empty() {
+        v.extend(chunks(&t.select, g.select.real_rows));
     }
     if id.const_.is_some() {
         v.push(std::mem::replace(&mut t.const_, TraceTable::new_main(Vec::new(), 1, 1)));
     }
-    if id.hint.is_some() {
-        v.push(hint_table(side, Some(&exec.records.hint)));
+    if !id.balu.is_empty() {
+        v.extend(chunks(&t.balu, g.balu.real_rows));
+    }
+    if !id.xalu.is_empty() {
+        v.extend(chunks(&t.xalu, g.xalu.real_rows));
+    }
+    if !id.hint.is_empty() {
+        v.extend(chunks(
+            &hint_table(side, Some(&exec.records.hint)),
+            g.hint.real_rows - side.out.len(),
+        ));
     }
     if let Some((.., chunks)) = id.keccak {
         assert_eq!(t.keccak_rnd.len(), chunks, "KECCAK_RND chunking");
