@@ -5156,6 +5156,11 @@ pub trait IsStarkProver<
                 Some(MainLdeSlot::DroppedDevice)
             ) {
                 let __ps_rc = crate::prove_split::mark();
+                // Its own label: the recommit runs inside the fused task, and
+                // under `nvtx` this range is how a timeline tells its kernels
+                // from the aux and rounds 2-4 work around it.
+                #[cfg(feature = "instruments")]
+                let __sp = crate::instruments::span("r1_main_recommit_table");
                 let (commit, cached_main, gpu_main) = {
                     let absorbed = main_commit_cells[idx].lock().unwrap();
                     Self::recommit_main_trace_device(
