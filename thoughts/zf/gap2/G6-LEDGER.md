@@ -922,7 +922,7 @@ The lead's decisions after job 290:
   lever. It should be sized against the in-proof 19 GB/s with the argue-overlap caveat above, and D-TRACE owns its
   design.
 
-## 9. The L1N2 noise: what the logs show, and one sampled job (pre-registered 2026-09-30 17:20Z, before any run)
+## 9. The L1N2 noise: what the logs show, and one sampled job (pre-registered 2026-09-30 17:05Z, before any run)
 
 The lead's priority 1 (2026-09-30): "the L1N2 noise … inflates every lane's A/B on FAST". Characterize it from the
 existing logs first, then, if needed, one short job of identical arms with host sampling (FAST 292–294).
@@ -1013,7 +1013,7 @@ slowdown with a benign shift.
   - UNRESOLVED: every lane uses more arms and the split base / level-1 readout.
   - No SLOW arm in 12: the rate is lower than 18 %. The distribution is reported as is.
 
-## 10. Stage 1b sized, with absorption (written 2026-09-30 17:20Z; nothing built)
+## 10. Stage 1b sized, with absorption (written 2026-09-30 17:05Z; nothing built)
 
 ### 10.1 The premise: the pageable upload IS bandwidth-bound (the lead's first question)
 
