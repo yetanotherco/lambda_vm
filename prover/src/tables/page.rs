@@ -737,19 +737,102 @@ pub fn data_page_lazy_commitment(
         None => {
             let (config, options) = (config.clone(), options.clone());
             stark::lookup::LazyCommitment::deferred(move || {
-                compute_precomputed_commitment(&config, &options)
+                data_page_commitment(&config, &options, LeafLayout::RowPair)
             })
         }
     };
     let (config, options) = (config.clone(), options.clone());
-    base.with_one_row(move || {
-        Some(compute_precomputed_commitment_with(
-            &config,
-            &options,
-            LeafLayout::Row,
-        ))
-    })
+    base.with_one_row(move || Some(data_page_commitment(&config, &options, LeafLayout::Row)))
 }
+
+/// A data page's commitment under `layout`: a root already recorded for these
+/// exact columns and options ([`record_data_page_commitment`]), else
+/// [`compute_precomputed_commitment_with`]. The record is keyed by everything
+/// the root is a function of (the page's INIT bytes, the blowup, the coset
+/// offset, the layout), so a recorded root is the value a recompute returns.
+pub fn data_page_commitment(
+    config: &PageConfig,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    let key = DataPageKey::of(config, options, layout);
+    if let Some(root) = DATA_PAGE_ROOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, r)| *r)
+    {
+        return root;
+    }
+    compute_precomputed_commitment_with(config, options, layout)
+}
+
+/// Record `root` as `config`'s data-page commitment under `layout`, for
+/// [`data_page_commitment`] to return instead of recomputing it on the host.
+/// The no-epoch block derives them on the device while it executes. A caller
+/// recording a root that is not the page's makes a proof every verifier
+/// rejects (the verifier recomputes it), never an accepted one.
+pub fn record_data_page_commitment(
+    config: &PageConfig,
+    options: &ProofOptions,
+    layout: LeafLayout,
+    root: Commitment,
+) {
+    let key = DataPageKey::of(config, options, layout);
+    let mut roots = DATA_PAGE_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !roots.iter().any(|(k, _)| *k == key) {
+        roots.push((key, root));
+    }
+}
+
+/// The preprocessed columns (OFFSET, INIT) of a page as the row-major group
+/// the device commit takes.
+pub fn preprocessed_group(config: &PageConfig) -> crate::lfm::compiler::ColumnGroup {
+    let columns = preprocessed_columns(config);
+    let rows = DEFAULT_PAGE_SIZE;
+    let mut data = Vec::with_capacity(rows * columns.len());
+    for row in 0..rows {
+        for column in &columns {
+            data.push(column[row]);
+        }
+    }
+    crate::lfm::compiler::ColumnGroup {
+        width: columns.len(),
+        real_rows: rows,
+        padded_rows: rows,
+        data,
+    }
+}
+
+/// What a data page's preprocessed root is a function of.
+#[derive(Clone, PartialEq, Eq)]
+struct DataPageKey {
+    init: Vec<u8>,
+    blowup: u8,
+    coset_offset: u64,
+    layout: LeafLayout,
+}
+
+impl DataPageKey {
+    fn of(config: &PageConfig, options: &ProofOptions, layout: LeafLayout) -> Self {
+        // Trailing zeros are the same INIT column (a short `init_values` reads
+        // as zero past its end), so they are not part of the key.
+        let mut init = config.init_values.clone().unwrap_or_default();
+        while init.last() == Some(&0) {
+            init.pop();
+        }
+        Self {
+            init,
+            blowup: options.blowup_factor,
+            coset_offset: options.coset_offset,
+            layout,
+        }
+    }
+}
+
+static DATA_PAGE_ROOTS: std::sync::Mutex<Vec<(DataPageKey, Commitment)>> =
+    std::sync::Mutex::new(Vec::new());
 
 // =========================================================================
 // Bus interactions

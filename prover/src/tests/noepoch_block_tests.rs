@@ -388,3 +388,68 @@ fn noepoch_keccak_rnd_chunked_proves_and_verifies() {
         "NOEPOCH KECCAK_RND CHUNKED: 3 instances, block verifier accepts, single shape refuses, bytes equal"
     );
 }
+
+/// The data-page record returns the root recorded for the same INIT column
+/// (trailing zeros are the same column; the page base is not part of the root),
+/// per layout.
+#[test]
+fn a_recorded_data_page_root_is_returned_for_the_same_columns_only() {
+    use crate::tables::page::{self, PageConfig};
+    use stark::leaf_layout::LeafLayout;
+    let opts = bytes_options();
+    // An INIT no real page has, so the process-wide record cannot reach another test.
+    let init: Vec<u8> = b"noepoch record test: not a real page".to_vec();
+    let mut padded = init.clone();
+    padded.extend([0, 0, 0]);
+    let config = PageConfig::with_data(0x7700_0000, padded);
+    let root = [0xAB; 32];
+    page::record_data_page_commitment(&config, &opts, LeafLayout::Row, root);
+    let same = PageConfig::with_data(0x7780_0000, init);
+    assert_eq!(
+        page::data_page_commitment(&same, &opts, LeafLayout::Row),
+        root
+    );
+    let other_layout_recorded = [0xCD; 32];
+    page::record_data_page_commitment(&config, &opts, LeafLayout::RowPair, other_layout_recorded);
+    assert_eq!(
+        page::data_page_commitment(&config, &opts, LeafLayout::RowPair),
+        other_layout_recorded,
+        "each layout has its own record"
+    );
+}
+
+/// ★ The device-derived data-page roots the block records are the host's: for
+/// every ELF data page of all_instructions_64 and of the ethrex guest (when
+/// `NOEPOCH_ELF` is set), both layouts, `commit_group_device_or_host_with` on a
+/// page group equals `compute_precomputed_commitment_with`.
+#[test]
+#[ignore = "device commits; GPU box gate (cuda)"]
+fn noepoch_device_page_roots_match_the_host() {
+    use crate::tables::page;
+    use stark::leaf_layout::LeafLayout;
+    let opts = crate::lfm::proof::block_base_options();
+    let mut elfs = vec![asm_elf_bytes("all_instructions_64")];
+    if let Ok(path) = std::env::var("NOEPOCH_ELF") {
+        elfs.push(std::fs::read(path).expect("read NOEPOCH_ELF"));
+    }
+    let mut checked = 0;
+    for bytes in elfs {
+        let program = Elf::load(&bytes).expect("load the ELF");
+        for config in Traces::page_configs_from_elf(&program) {
+            if config.init_values.is_none() {
+                continue;
+            }
+            let group = page::preprocessed_group(&config);
+            for layout in [LeafLayout::RowPair, LeafLayout::Row] {
+                let device = crate::lfm::commit::commit_group_device_or_host_with(
+                    "PAGE", &group, &opts, layout,
+                );
+                let host = page::compute_precomputed_commitment_with(&config, &opts, layout);
+                assert_eq!(device, host, "page {:#x} {layout:?}", config.page_base);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0);
+    println!("NOEPOCH PAGE ROOTS: {checked} device roots = host roots");
+}

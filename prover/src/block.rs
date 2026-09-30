@@ -21,11 +21,8 @@ use std::time::Instant;
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 use stark::prover::IsStarkProver;
 use stark::residency_mode::ResidencyMode;
-use stark::traits::AIR;
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
@@ -101,10 +98,40 @@ pub fn verify_block(
     )
 }
 
-/// `LAMBDA_VM_BLOCK_WARM_PRECOMPUTED=0` leaves the preprocessed commitments to
-/// Round 1 (the A arm of the warm A/B); unset or anything else warms them.
+/// `LAMBDA_VM_BLOCK_WARM_PRECOMPUTED=0` leaves the ELF data pages' preprocessed
+/// commitments to Round 1 (the A arm of the warm A/B); unset or anything else
+/// derives them beside the execution.
 fn warm_precomputed() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_WARM_PRECOMPUTED").map_or(true, |v| v != "0")
+}
+
+/// Derive every ELF data page's preprocessed root, both leaf layouts, with the
+/// device commit where it admits the shape, and record them
+/// ([`crate::tables::page::record_data_page_commitment`]) for the PAGE AIRs'
+/// lazy commitments to return. FAST 354 measured the alternative: derived on the
+/// host beside Round 1 they shortened Round 1 by 1.3 s and lengthened its
+/// prepass by as much (the host work competed with the prove's own).
+fn warm_data_page_commitments(program: &Elf, opts: &ProofOptions) {
+    use crate::tables::page;
+    use stark::leaf_layout::LeafLayout;
+    let t = Instant::now();
+    let mut n = 0;
+    for config in Traces::page_configs_from_elf(program) {
+        if config.init_values.is_none() || config.is_private_input {
+            continue;
+        }
+        let group = page::preprocessed_group(&config);
+        for layout in [LeafLayout::RowPair, LeafLayout::Row] {
+            let root =
+                crate::lfm::commit::commit_group_device_or_host_with("PAGE", &group, opts, layout);
+            page::record_data_page_commitment(&config, opts, layout, root);
+            n += 1;
+        }
+    }
+    eprintln!(
+        "BLOCK WARM: {n} data-page commitments in {:.2}s, beside the execution",
+        t.elapsed().as_secs_f64()
+    );
 }
 
 /// Wall times of one block prove, in seconds, for the readout.
@@ -166,6 +193,11 @@ pub fn prove_block_with(
                 .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
         });
         let artifacts = s.spawn(|| DecodeArtifacts::from_elf(&program));
+        // The ELF data pages' preprocessed roots, on the card while it is
+        // otherwise idle; Round 1 would otherwise derive each on the host.
+        if warm_precomputed() {
+            s.spawn(|| warm_data_page_commitments(&program, opts));
+        }
         let image = s.spawn(|| build_initial_image(&program, private_input));
         let run = Executor::new(&program, private_input.to_vec())
             .map_err(|e| Error::Execution(format!("{e}")))
@@ -280,54 +312,14 @@ pub fn prove_block_traces(
         times.setup
     );
 
-    // The preprocessed tables' commitments (46 PAGEs on the block, most of
-    // them derived on the host on first use) are needed only when Round 1
-    // reaches each table. Deriving them beside Round 1, from the start,
-    // takes them off its tail; the lazy cells make it the same value either way.
-    let warm: Vec<(
-        &dyn AIR<Field = _, FieldExtension = _, PublicInputs = ()>,
-        usize,
-    )> = if warm_precomputed() {
-        pairs
-            .iter()
-            .filter(|(air, _, _)| air.is_preprocessed())
-            .map(|(air, trace, _)| (*air, trace.num_rows()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     let t = Instant::now();
-    let proof = std::thread::scope(|s| {
-        if !warm.is_empty() {
-            s.spawn(|| {
-                let t = Instant::now();
-                let derive = |(air, rows): &(
-                    &dyn AIR<Field = _, FieldExtension = _, PublicInputs = ()>,
-                    usize,
-                )| {
-                    let layout = stark::leaf_layout::table_leaf_layout(*air, *rows);
-                    let _ = air.precomputed_commitment_for(layout);
-                };
-                #[cfg(feature = "parallel")]
-                warm.par_iter().for_each(derive);
-                #[cfg(not(feature = "parallel"))]
-                warm.iter().for_each(derive);
-                eprintln!(
-                    "BLOCK WARM: {} preprocessed commitments in {:.2}s, beside Round 1",
-                    warm.len(),
-                    t.elapsed().as_secs_f64()
-                );
-            });
-        }
-        crate::hash_pin::BlockProver::multi_prove(
-            pairs,
-            &mut transcript,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-            residency,
-        )
-    })
+    let proof = crate::hash_pin::BlockProver::multi_prove(
+        pairs,
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+        residency,
+    )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     times.prove = t.elapsed().as_secs_f64();
     eprintln!("BLOCK PHASE prove {:.2}s", times.prove);
