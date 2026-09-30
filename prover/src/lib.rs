@@ -271,6 +271,14 @@ impl TableCounts {
     /// MEMW balances and is an honest, wider proof. What keeps that trio sound
     /// is constraint equivalence, not this count.
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_for(AcceleratorShape::Single)
+    }
+
+    /// [`Self::validate`] under the verifier's own accelerator shape: the one
+    /// place `shape` may lift the one-table bound, and only for KECCAK_RND.
+    /// The shape is the VERIFIER's constant (the entry point it was called
+    /// through), never a value read from the proof.
+    pub fn validate_for(&self, shape: AcceleratorShape) -> Result<(), Error> {
         let required = [("cpu", self.cpu), ("memw_register", self.memw_register)];
         for (name, count) in required {
             if count == 0 {
@@ -292,9 +300,19 @@ impl TableCounts {
         // bound before these six existed: nothing is gained by claiming more
         // than one BLAKE3 table, and an unbounded count would have the verifier
         // allocate AIRs off a number the proof has not been checked against.
+        //
+        // `AcceleratorShape::KeccakRndChunked` (the block verifier) takes
+        // KECCAK_RND chunked like any splittable table: its constraints read
+        // one row (no transition reaches another), its rounds chain through
+        // the bus, so a cut between two permutations changes nothing a bus or
+        // a constraint sees — the argument that makes every chunked table sound.
+        let keccak_rnd_bound = match shape {
+            AcceleratorShape::Single => self.keccak_rnd,
+            AcceleratorShape::KeccakRndChunked => self.keccak_rnd.min(1),
+        };
         let at_most_one = [
             ("keccak", self.keccak),
-            ("keccak_rnd", self.keccak_rnd),
+            ("keccak_rnd", keccak_rnd_bound),
             ("ecsm", self.ecsm),
             ("ecdas", self.ecdas),
             ("hint", self.hint),
@@ -310,6 +328,20 @@ impl TableCounts {
         }
         Ok(())
     }
+}
+
+/// Which accelerator chips a verifier accepts in more than one table.
+///
+/// A verifier-side constant, chosen by the entry point: [`verify_with_options`]
+/// and every epoch and recursion verifier use `Single`; only the no-epoch block
+/// verifier ([`block::verify_block`]) uses `KeccakRndChunked`, because only the
+/// block prover chunks KECCAK_RND (`MaxRowsConfig::keccak_rnd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceleratorShape {
+    /// Every accelerator is one table or none.
+    Single,
+    /// KECCAK_RND may be chunked; the other accelerators are one table or none.
+    KeccakRndChunked,
 }
 
 /// A complete VM proof bundle containing the STARK proof and metadata
@@ -591,6 +623,7 @@ pub fn verify_recursion_blob<'a>(
         proof_options,
         Some(decode_commitment),
         Some(&page_commitments),
+        AcceleratorShape::Single,
     )?;
 
     Ok(RecursionVerification {
@@ -1747,6 +1780,27 @@ pub(crate) fn verify_prepared(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
+    verify_prepared_shaped(
+        vm_proof,
+        program,
+        elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+        AcceleratorShape::Single,
+    )
+}
+
+/// [`verify_prepared`] under an explicit [`AcceleratorShape`].
+pub(crate) fn verify_prepared_shaped(
+    vm_proof: &VmProof,
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+    shape: AcceleratorShape,
+) -> Result<bool, Error> {
     verify_proof_parts(
         MultiProofView::Owned(&vm_proof.proof),
         &vm_proof.table_counts,
@@ -1758,6 +1812,7 @@ pub(crate) fn verify_prepared(
         proof_options,
         decode_commitment,
         page_commitments,
+        shape,
     )
 }
 
@@ -1779,13 +1834,14 @@ fn verify_proof_parts(
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
+    shape: AcceleratorShape,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs. A zero count is legitimate
     // for every chip but CPU and MEMW_R — what keeps it honest is the LogUp bus,
     // not this call (see `TableCounts::validate`). This rejects the two counts
     // whose absence describes no execution at all, and the accelerator shapes no
     // prover can produce.
-    table_counts.validate()?;
+    table_counts.validate_for(shape)?;
 
     // Bound num_private_input_pages before allocating PageConfigs — the tight honest
     // max, shared with the continuation verifier (see `page::max_private_input_pages`).

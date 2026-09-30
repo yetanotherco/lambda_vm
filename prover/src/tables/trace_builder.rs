@@ -4191,12 +4191,23 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
-        generate_optional(
-            &keccak_rnd_ops,
-            keccak_rnd::generate_keccak_rnd_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.keccak_rnd == super::KECCAK_RND_UNCHUNKED {
+            generate_optional(
+                &keccak_rnd_ops,
+                keccak_rnd::generate_keccak_rnd_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // 24 rows per permutation; a chunk holds whole permutations.
+            chunk_and_generate_optional(
+                &keccak_rnd_ops,
+                (max_rows.keccak_rnd / 24).max(1),
+                keccak_rnd::generate_keccak_rnd_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
     let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);

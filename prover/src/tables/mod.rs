@@ -127,7 +127,15 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// KECCAK_RND rows per table, or [`KECCAK_RND_UNCHUNKED`] for one table
+    /// (every configuration but the no-epoch block's). A chunk holds whole
+    /// permutations: `keccak_rnd / 24` of them, at least one.
+    pub keccak_rnd: usize,
 }
+
+/// [`MaxRowsConfig::keccak_rnd`]'s "one table", the value every constructor
+/// here sets: a chunked KECCAK_RND is accepted only by the block verifier.
+pub const KECCAK_RND_UNCHUNKED: usize = usize::MAX;
 
 /// The uniform table cap this process proves at, or `None` for the production
 /// per-table values.
@@ -182,6 +190,7 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
         }
     }
 }
@@ -204,6 +213,7 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
         }
     }
 
@@ -225,6 +235,7 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
         }
     }
 }

@@ -26,16 +26,76 @@ use stark::residency_mode::ResidencyMode;
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::Traces;
-use crate::{Commitment, Error, ProofOptions, VmAirs, VmProof};
+use crate::tables::register;
+use crate::tables::trace_builder::{DecodeArtifacts, Traces, build_initial_image};
+use crate::{AcceleratorShape, Commitment, Error, ProofOptions, VmAirs, VmProof};
+
+/// A helper thread's result, its panic re-raised on the caller.
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
 
 /// Rows per full-height instance: every splittable table is cut into
 /// instances of `2^BLOCK_ROWS_LOG2` rows (the tail padded to its power of two).
 pub const BLOCK_ROWS_LOG2: u32 = 21;
 
-/// The block's table caps: [`BLOCK_ROWS_LOG2`] for every splittable table.
+/// KECCAK_RND rows per instance: 2^16, so the batching phase keeps its 128
+/// bits (D-NOEPOCH §6) and no instance outweighs the VRAM gate.
+pub const BLOCK_KECCAK_RND_ROWS_LOG2: u32 = 16;
+
+/// `LAMBDA_VM_BLOCK_KECCAK_RND_LOG2`: `off` proves KECCAK_RND as one table (the
+/// A arm of the chunking A/B), `5..=26` sets its cap; unset is
+/// [`BLOCK_KECCAK_RND_ROWS_LOG2`]. Anything else aborts.
+fn block_keccak_rnd_rows() -> usize {
+    match std::env::var("LAMBDA_VM_BLOCK_KECCAK_RND_LOG2")
+        .ok()
+        .as_deref()
+    {
+        None => 1 << BLOCK_KECCAK_RND_ROWS_LOG2,
+        Some("off") => crate::tables::KECCAK_RND_UNCHUNKED,
+        Some(v) => {
+            let n: u32 = v
+                .parse()
+                .ok()
+                .filter(|n| (5..=26).contains(n))
+                .unwrap_or_else(|| {
+                    panic!("LAMBDA_VM_BLOCK_KECCAK_RND_LOG2 must be `off` or 5..=26, got `{v}`")
+                });
+            1 << n
+        }
+    }
+}
+
+/// The block's table caps: [`BLOCK_ROWS_LOG2`] for every splittable table and
+/// KECCAK_RND chunked (see [`block_keccak_rnd_rows`]).
 pub fn block_max_rows() -> MaxRowsConfig {
-    MaxRowsConfig::uniform(1 << BLOCK_ROWS_LOG2)
+    MaxRowsConfig {
+        keccak_rnd: block_keccak_rnd_rows(),
+        ..MaxRowsConfig::uniform(1 << BLOCK_ROWS_LOG2)
+    }
+}
+
+/// The block verifier: [`crate::verify_with_options`] that also accepts a
+/// chunked KECCAK_RND ([`AcceleratorShape::KeccakRndChunked`]), the shape
+/// [`prove_block`] proves. Every other verifier keeps KECCAK_RND to one table.
+pub fn verify_block(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = crate::statement::elf_digest(elf_bytes);
+    crate::verify_prepared_shaped(
+        vm_proof,
+        &program,
+        &elf_digest,
+        opts,
+        None,
+        None,
+        AcceleratorShape::KeccakRndChunked,
+    )
 }
 
 /// Wall times of one block prove, in seconds, for the readout.
@@ -88,36 +148,51 @@ pub fn prove_block_with(
     let mut times = BlockTimes::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
+    // Beside the execution: DECODE's root (a function of the ELF and `opts`),
+    // the DECODE artifacts and the initial image — none reads the execution.
     let t = Instant::now();
-    let (decode_commitment, run) = std::thread::scope(|s| {
+    let (decode_commitment, artifacts, initial_image, run) = std::thread::scope(|s| {
         let decode = s.spawn(|| {
             crate::tables::decode::commitment_from_elf_device_or_host(&program, opts)
                 .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
         });
+        let artifacts = s.spawn(|| DecodeArtifacts::from_elf(&program));
+        let image = s.spawn(|| build_initial_image(&program, private_input));
         let run = Executor::new(&program, private_input.to_vec())
             .map_err(|e| Error::Execution(format!("{e}")))
             .and_then(|executor| executor.run().map_err(|e| Error::Execution(format!("{e}"))));
-        let decode = decode
-            .join()
-            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
-        (decode, run)
+        (join(decode), join(artifacts), join(image), run)
     });
-    let (decode_commitment, run) = (decode_commitment?, run?);
+    let (decode_commitment, artifacts, run) = (decode_commitment?, artifacts?, run?);
     times.execute = t.elapsed().as_secs_f64();
     eprintln!("BLOCK PHASE execute {:.2}s", times.execute);
 
+    // `Traces::from_elf_and_logs`, step by step, for the stamps.
     let t = Instant::now();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &run.logs,
+    let register_init = register::register_init_from_entry_point(program.entry_point);
+    let collected =
+        Traces::collect_epoch(&artifacts, &initial_image, &register_init, &run.logs, true)?;
+    drop(run);
+    let collect = t.elapsed().as_secs_f64();
+    let mut traces = Traces::build_from_collected(
+        &artifacts,
+        collected,
+        Some(&initial_image),
+        &register_init,
         max_rows,
         private_input,
+        true,
+        false,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )?;
-    drop(run);
+    drop(initial_image);
     times.build = t.elapsed().as_secs_f64();
-    eprintln!("BLOCK PHASE build {:.2}s", times.build);
+    eprintln!(
+        "BLOCK PHASE build {:.2}s (collect {collect:.2} · generate {:.2})",
+        times.build,
+        times.build - collect
+    );
 
     let proof = prove_block_traces(
         elf_bytes,

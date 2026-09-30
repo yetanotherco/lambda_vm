@@ -2203,8 +2203,15 @@ pub trait IsStarkProver<
     {
         #[cfg(any(test, feature = "test-utils"))]
         if crate::residency_mode::test_hooks::take_perturbation(idx) {
-            let v = trace.main_table.get(0, 0).clone();
-            trace.main_table.set(0, 0, v + FieldElement::<Field>::one());
+            // The last column: committed by the main (multiplicity) tree on
+            // every table, preprocessed or not. A preprocessed table's leading
+            // columns are the precomputed ones, whose tree comes from the
+            // process cache rather than from this trace.
+            let col = trace.main_table.width - 1;
+            let v = trace.main_table.get(0, col).clone();
+            trace
+                .main_table
+                .set(0, col, v + FieldElement::<Field>::one());
         }
         let precomputed = absorbed
             .precomputed_root

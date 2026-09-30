@@ -78,7 +78,7 @@ pub static DEVICE_RECOMMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// `0` is off. `i + 1` adds one to the first main-trace cell of table `i`
+    /// `0` is off. `i + 1` adds one to row 0 of the last main column of table `i`
     /// right before its device recommit, so the recommitted root differs from
     /// the absorbed one. Cleared by the recommit that fires it.
     pub static PERTURB_BEFORE_RECOMMIT: AtomicUsize = AtomicUsize::new(0);

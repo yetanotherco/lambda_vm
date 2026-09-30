@@ -88,6 +88,14 @@ impl OneBuild {
 
     fn verifies(&self, proof: &VmProof, opts: &ProofOptions) -> bool {
         matches!(
+            crate::block::verify_block(proof, &self.elf_bytes, opts),
+            Ok(true)
+        )
+    }
+
+    /// Whether the epoch-shape verifier (KECCAK_RND one table) accepts it.
+    fn verifies_single_shape(&self, proof: &VmProof, opts: &ProofOptions) -> bool {
+        matches!(
             crate::verify_with_options(proof, &self.elf_bytes, opts, None, None),
             Ok(true)
         )
@@ -260,7 +268,7 @@ fn noepoch_block_prove_and_verify() {
 
     let t = std::time::Instant::now();
     let verified = matches!(
-        crate::verify_with_options(&proof, &elf_bytes, &opts, None, None),
+        crate::block::verify_block(&proof, &elf_bytes, &opts),
         Ok(true)
     );
     let verify_secs = t.elapsed().as_secs_f64();
@@ -304,5 +312,79 @@ fn noepoch_epoch_base_reference() {
         "NOEPOCH REFERENCE: epoch base {base:.2} s · {} epochs · host peak {}",
         bundle.num_epochs(),
         vm_hwm_gib().map_or("unknown".to_string(), |g| format!("{g:.2} GiB")),
+    );
+}
+
+/// The block shape's accelerator rule, host only: a chunked KECCAK_RND count is
+/// accepted by the block shape and refused by the single shape every other
+/// verifier uses; the other accelerators stay at one table under both.
+#[test]
+fn a_chunked_keccak_rnd_is_accepted_only_by_the_block_shape() {
+    use crate::AcceleratorShape;
+    let build_counts = || {
+        let (elf, logs, _) = crate::test_utils::run_asm_elf("test_keccak");
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[])
+            .unwrap()
+            .table_counts()
+    };
+    let honest = build_counts();
+    assert_eq!(honest.keccak_rnd, 1);
+    let mut chunked = honest.clone();
+    chunked.keccak_rnd = 4;
+    assert!(
+        chunked
+            .validate_for(AcceleratorShape::KeccakRndChunked)
+            .is_ok()
+    );
+    assert!(
+        chunked.validate().is_err(),
+        "the single shape refuses 4 KECCAK_RND tables"
+    );
+    let mut two_keccak = honest.clone();
+    two_keccak.keccak = 2;
+    assert!(
+        two_keccak
+            .validate_for(AcceleratorShape::KeccakRndChunked)
+            .is_err(),
+        "KECCAK (the permutation table) stays one table under the block shape"
+    );
+}
+
+/// ★ KECCAK_RND chunked (S2): test_keccak_multi's three permutations at 24 rows
+/// per chunk give three KECCAK_RND instances. The block verifier accepts the
+/// proof; the single-shape verifier refuses the same bytes (the shape is the
+/// verifier's constant, never read from the proof). Retain and
+/// RecomputeLdeDevice agree byte for byte.
+#[test]
+#[ignore = "proves a VM program twice at blowup 4; GPU box gate (cuda)"]
+fn noepoch_keccak_rnd_chunked_proves_and_verifies() {
+    let max_rows = MaxRowsConfig {
+        keccak_rnd: 24,
+        ..MaxRowsConfig::default()
+    };
+    let build = OneBuild::new("test_keccak_multi", &max_rows);
+    assert_eq!(
+        build.traces.table_counts().keccak_rnd,
+        3,
+        "one permutation per chunk"
+    );
+    let opts = bytes_options();
+    let retained = build
+        .prove(&opts, ResidencyMode::Retain, false)
+        .expect("prove under Retain");
+    let recommitted = build
+        .prove(&opts, ResidencyMode::RecomputeLdeDevice, true)
+        .expect("prove under RecomputeLdeDevice");
+    assert!(
+        build.verifies(&recommitted, &opts),
+        "the block verifier accepts it"
+    );
+    assert!(
+        !build.verifies_single_shape(&recommitted, &opts),
+        "the single-shape verifier must refuse 3 KECCAK_RND tables"
+    );
+    assert!(proof_bytes(&retained) == proof_bytes(&recommitted));
+    println!(
+        "NOEPOCH KECCAK_RND CHUNKED: 3 instances, block verifier accepts, single shape refuses, bytes equal"
     );
 }
