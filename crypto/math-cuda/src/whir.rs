@@ -179,6 +179,104 @@ pub fn retention_evictions() -> (u64, u64) {
     )
 }
 
+/// Budget misses the retained layers could not have covered, and the bytes the
+/// layers could give back at each — see [`keep_futile`].
+static RETAIN_FUTILE_MISSES: AtomicU64 = AtomicU64::new(0);
+static RETAIN_FUTILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// (futile misses, the layers' reclaimable bytes summed over them, whether they
+/// were kept) this process — see [`keep_futile`]. Evicted, the bytes are what
+/// went for nothing; kept, a layer held through two misses counts twice.
+pub fn retention_futile() -> (u64, u64, bool) {
+    (
+        RETAIN_FUTILE_MISSES.load(Ordering::Relaxed),
+        RETAIN_FUTILE_BYTES.load(Ordering::Relaxed),
+        keep_futile(),
+    )
+}
+
+/// The switch [`keep_futile`] reads.
+const KEEP_FUTILE_ENV: &str = "LFM_WHIR_KEEP_FUTILE";
+/// Evict, as before, until an A/B says otherwise.
+const KEEP_FUTILE_DEFAULT: bool = false;
+
+/// ★ Whether a budget miss the retained layers CANNOT cover leaves them held.
+///
+/// `Backend::reserve` asks the evictor once for its deficit before it gives up.
+/// When every reclaimable layer together is less than that deficit, dropping
+/// them cannot make the request fit: the reserve fails anyway, and each opening
+/// that needed a dropped layer hashes its leaves again. The GKR input-layer
+/// tree's eager probe is such a request: it asks for the whole carry, and its
+/// `None` only picks the lazy tree.
+///
+/// On the block every eviction was of this kind. Job 243 evicted fifteen layers
+/// (2,432 MiB), and its whole-run ledger peak, 24,342 MiB, is below the 24,855
+/// MiB a request that fit after evicting would have left. Its epochs 3–5
+/// rebuilt 1.42 s more trees than epochs of the same shape, of the openings'
+/// 2.41 s — by the permutation count, those layers hashed again.
+///
+/// A miss the layers CAN cover evicts as before, so every `reserve` gets the
+/// answer it got without this switch; only the layers a failing request would
+/// have taken with it stay.
+///
+/// `LFM_WHIR_KEEP_FUTILE=1` keeps them and `0` evicts (the default); any other
+/// value aborts. Read once and printed once; a test forces it with
+/// [`force_keep_futile`].
+fn keep_futile() -> bool {
+    match KEEP_FUTILE_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                crate::rpx_paths::read(
+                    KEEP_FUTILE_ENV,
+                    KEEP_FUTILE_DEFAULT,
+                    "WHIR retention: a budget miss the leaf layers cannot cover keeps them",
+                    "WHIR retention: a budget miss evicts leaf layers even when they cannot cover it",
+                )
+            })
+        }
+    }
+}
+
+static KEEP_FUTILE_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LFM_WHIR_KEEP_FUTILE` for the whole process — for a test that
+/// takes a futile miss both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_keep_futile(on: Option<bool>) {
+    KEEP_FUTILE_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether evicting `reclaimable` bytes of layers is too little for a miss of
+/// `target`: the reserve fails whatever the evictor does. Zero reclaimable is
+/// not futile — there is nothing to keep.
+fn is_futile(target: u64, reclaimable: u64) -> bool {
+    reclaimable > 0 && reclaimable < target
+}
+
+/// Whether the evictor walks its layers for a miss of `target`: always, as
+/// before the switch, unless the miss is futile and the switch keeps them.
+fn evicts(target: u64, reclaimable: u64, keep_futile: bool) -> bool {
+    !(keep_futile && is_futile(target, reclaimable))
+}
+
+/// Seconds since the Unix epoch, the clock the prover's `t=` stamps read.
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 /// Whether the leaf-layer retention is enabled this process. `LFM_WHIR_RETENTION=0`
 /// turns it OFF (capture becomes a no-op), which is how the ABBA's control arm
 /// runs off the SAME binary as the retention arm — the two differ only by this
@@ -207,10 +305,14 @@ struct RetentionHandle {
 /// pruned when the codeword drops. Walked only on the rare eviction path.
 static RETENTION_REGISTRY: Mutex<Vec<RetentionHandle>> = Mutex::new(Vec::new());
 
-/// Install [`evict_retained_layers`] as the allocator's evictor, once.
+/// Install [`evict_retained_layers`] as the allocator's evictor, once, and say
+/// which way it treats a miss it cannot cover ([`keep_futile`]).
 fn ensure_evictor_installed() {
     static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| crate::device::set_retention_evictor(evict_retained_layers));
+    INSTALLED.call_once(|| {
+        keep_futile();
+        crate::device::set_retention_evictor(evict_retained_layers)
+    });
 }
 
 /// Register a codeword's layer slot for eviction. Called OUTSIDE the layer lock
@@ -229,6 +331,10 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
 /// path on the RESERVING thread. Frees at least `target` bytes of BUDGET by
 /// dropping retained leaf layers, FIFO (oldest first), pruning dead entries as it
 /// goes; returns the bytes freed.
+///
+/// ★ When the layers together cannot cover `target` the miss is FUTILE: the
+/// reserve fails whatever is dropped. It is counted and said either way, and
+/// under [`keep_futile`] nothing is dropped and this returns 0.
 ///
 /// SAFETY, the load-bearing facts:
 /// - NO REENTRANCY. It drops `RetainedLeaves` — two counter subtracts, one of
@@ -257,6 +363,47 @@ fn evict_retained_layers(target: u64) -> u64 {
         Ok(reg) => reg,
         Err(poisoned) => poisoned.into_inner(),
     };
+    // What an eviction can give back: the layers whose room is alive. A layer
+    // whose room is gone gave its budget back with the room, so dropping it
+    // frees device bytes and no budget. Same lock order as the walk below.
+    let mut reclaimable = 0u64;
+    reg.retain(|handle| {
+        let Some(leaves) = handle.leaves.upgrade() else {
+            return false;
+        };
+        let slot = match leaves.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(layer) = slot.as_ref()
+            && layer.room.strong_count() > 0
+        {
+            reclaimable += layer.bytes;
+        }
+        true
+    });
+    let keep = keep_futile();
+    let futile = is_futile(target, reclaimable);
+    if futile {
+        let misses = RETAIN_FUTILE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        RETAIN_FUTILE_BYTES.fetch_add(reclaimable, Ordering::Relaxed);
+        eprintln!(
+            "[whir] retention: a reserve missed the budget by {} MiB; the leaf layers can give back {} MiB — {}; \
+             futile misses {misses} t={:.3}",
+            target >> 20,
+            reclaimable >> 20,
+            if keep {
+                "kept (LFM_WHIR_KEEP_FUTILE=1)"
+            } else {
+                "evicted anyway, and the reserve still misses"
+            },
+            unix_secs(),
+        );
+    }
+    if !evicts(target, reclaimable, keep) {
+        return 0;
+    }
+    let mut layers = 0u64;
     reg.retain(|handle| {
         let Some(leaves) = handle.leaves.upgrade() else {
             return false; // the codeword is gone; prune this dead entry
@@ -276,11 +423,21 @@ fn evict_retained_layers(target: u64) -> u64 {
             // room (for argue), nodes freed (stream-ordered).
             drop(layer);
             freed += bytes;
+            layers += 1;
             RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
             RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
         }
         true // keep the entry: the mutex lives with the codeword and may refill
     });
+    if !futile && layers > 0 {
+        eprintln!(
+            "[whir] retention: a reserve missed the budget by {} MiB; evicted {layers} leaf layer(s), {} MiB, \
+             to cover it t={:.3}",
+            target >> 20,
+            freed >> 20,
+            unix_secs(),
+        );
+    }
     freed
 }
 
@@ -329,6 +486,54 @@ mod leaf_key_tests {
         assert!(
             !leaf_key_matches(kept, (2, DeviceHash::Keccak256, 512)),
             "and all three wrong is still not a match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod futile_miss_tests {
+    use super::{evicts, is_futile};
+
+    const MIB: u64 = 1 << 20;
+
+    /// A miss is futile exactly when the layers hold something and less than the
+    /// deficit. Both edges are pinned: at equality the eviction covers the miss,
+    /// and with nothing held there is nothing to keep.
+    #[test]
+    fn a_miss_is_futile_only_when_the_layers_hold_less_than_it() {
+        assert!(is_futile(900 * MIB, 832 * MIB), "832 MiB cannot cover 900");
+        assert!(!is_futile(832 * MIB, 832 * MIB), "equality covers the miss");
+        assert!(!is_futile(100 * MIB, 832 * MIB), "a small miss is covered");
+        assert!(!is_futile(900 * MIB, 0), "nothing held is nothing to keep");
+    }
+
+    /// The switch changes one cell of the table and no other: a futile miss
+    /// under `keep`. A covered miss evicts either way, which is what keeps every
+    /// `reserve`'s answer the same; and without the switch every miss walks the
+    /// layers, as before it existed.
+    #[test]
+    fn only_a_futile_miss_under_the_switch_keeps_the_layers() {
+        for (target, reclaimable) in [
+            (900 * MIB, 832 * MIB),
+            (100 * MIB, 832 * MIB),
+            (900 * MIB, 0),
+        ] {
+            assert!(
+                evicts(target, reclaimable, false),
+                "switch off: every miss walks the layers ({target}, {reclaimable})"
+            );
+        }
+        assert!(
+            !evicts(900 * MIB, 832 * MIB, true),
+            "switch on: a futile miss keeps them"
+        );
+        assert!(
+            evicts(100 * MIB, 832 * MIB, true),
+            "switch on: a covered miss still evicts, or a reserve that fit before would fail"
+        );
+        assert!(
+            evicts(900 * MIB, 0, true),
+            "switch on: nothing held, so the walk runs (and only prunes)"
         );
     }
 }

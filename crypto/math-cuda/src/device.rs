@@ -1297,6 +1297,9 @@ impl Backend {
                 // budget and argue fell to the host. Bounded to one pass by
                 // `evicted`, so a persistent miss returns None (and the call
                 // site's `note_device_fallback` counts it) rather than spinning.
+                // A miss the layers cannot cover may keep them
+                // (`whir::keep_futile`): nothing is freed, and this returns None
+                // as it would after evicting them.
                 if !evicted {
                     evicted = true;
                     let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;

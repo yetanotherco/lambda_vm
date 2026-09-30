@@ -108,8 +108,9 @@ pub fn limb_permute() -> bool {
 }
 
 /// One switch resolved and printed: the variable if it is set, else the
-/// default. A value the switch does not accept aborts.
-fn read(env: &str, default: bool, on: &str, off: &str) -> bool {
+/// default. A value the switch does not accept aborts. The WHIR retention's
+/// switch (`whir::keep_futile`) reads through here too.
+pub(crate) fn read(env: &str, default: bool, on: &str, off: &str) -> bool {
     let (value, source) = match std::env::var(env) {
         Err(VarError::NotPresent) => (default, "the pipeline default".to_string()),
         Ok(raw) => match parse(raw.trim()) {
