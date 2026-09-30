@@ -1097,7 +1097,7 @@ A **quiet-producer A/B**:
 - **Cost:** a small knob in `for_each_epoch_overlapped_prepped` and a flag around `multi_prove`'s argue, and about
   5 min of FAST.
 
-### 9.3 Job 292's result (FAST, 17:07–17:16:28Z; written 2026-09-30 17:40Z)
+### 9.3 Job 292's result (FAST, 17:07–17:16:28Z; written 2026-09-30 18:18Z)
 
 **Pre-registered verdict: `UNRESOLVED (no signal separates the slow arms)`, with 5 of 12 arms SLOW.**
 - The SLOW arms: wt1304, wt1308, wt1310, wt1311, wt1312. Their prologues read 4.89–5.53 s and level 1 8.0–8.7 s.
