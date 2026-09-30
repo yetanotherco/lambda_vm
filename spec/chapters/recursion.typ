@@ -250,13 +250,13 @@ We can now use this selector to define $verify^*$ --- a variation to $verify'$ -
 $
   verify^*([comm(x), comm(y)], [proof, b])
   :&= Delta_BB (verify(comm(x), proof), verify(comm(y([comm(x), comm(y)], dot)), proof), b)\
-  &= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof).
+  &= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof).
 $
 Note here that one can reconstruct $verify'$ from $verify^*$ as
 $
 	sum_(b in BB) verify^*([comm(x), comm(y)], [proof, b])
 	&=^((triangle)) or.big_(b in BB) verify^*([comm(x), comm(y)], [proof, b])\
-	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), 0), proof) or verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), 1), proof)\
+	&= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 0), proof) or verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 1), proof)\
 	&= verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof)\
 	&= verify'(comm(x), comm(y), proof),\
 $
@@ -270,17 +270,17 @@ has the proof include a bit $b$ indicating whether it is verifying a base proof 
 We now observe that, for a valid split $(verify_0, verify_1, d_verify)$ of $verify$,
 $
 	verify^*_0([comm(x), comm(y)], [[proof, b], r]) 
-	&:= verify_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+	&:= verify_0(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
 	verify^*_1([comm(x), comm(y)], [[proof, b], r]) 
-	&:= verify_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+	&:= verify_1(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
   d_(verify^*)([comm(x), comm(y)], [proof, b])
-  &:= d_verify (Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)
+  &:= d_verify (Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)
 $
 jointly form a valid split of $verify^*$, since
 $
 	verify^*([comm(x), comm(y)], [proof, b])
-	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
-	&= product(verify_0, verify_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+	&= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
+	&= product(verify_0, verify_1)(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
 	&= product(verify^*_0, verify^*_1)([comm(x), comm(y)], [[proof, b], r]),\
 $
 when
@@ -294,7 +294,7 @@ $
 	&= Delta_BB (verify(comm(instance), proof), verify(comm(product(verify^*_0, verify^*_1)([comm(instance),comm(product(verify^*_0, verify^*_1))], dot)), proof), b)\
 	&= verify(comm(instance), proof) dot (1-b) + verify(comm(product(verify^*_0, verify^*_1)([comm(instance),comm(product(verify^*_0, verify^*_1))], dot)), proof) dot b,
 $
-i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does when $b=1$.
+i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does, when $b=1$.
 Importantly, this can be achieved recursively, as
 $
 	#h(8em) // alignment purposes
