@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub mod argue_stage1_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
 #[cfg(test)]

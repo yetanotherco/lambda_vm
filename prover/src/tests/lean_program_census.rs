@@ -300,10 +300,10 @@ fn the_zerocheck_programs_and_their_live_sets() {
 
 // ── S1a: the zerocheck batches on demand (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`) ────
 
-type VmAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
+pub(crate) type VmAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
 
 /// Every VM table's AIR, named as the census names them.
-fn vm_airs() -> Vec<(VmAir, &'static str)> {
+pub(crate) fn vm_airs() -> Vec<(VmAir, &'static str)> {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
     vec![
         (Box::new(create_cpu_air(&opts)), "CPU"),
@@ -590,7 +590,7 @@ fn every_big_batch_rounds_the_same_on_demand_on_the_card() {
 
 /// The W-LFM chips as the pure-WHIR recursion proves them: the WHIR recursion
 /// chip set at the recursion's hasher, as `whir_proof::whir_lfm_airs` builds it.
-fn w_lfm_airs() -> crate::lfm::airs::LfmAirs {
+pub(crate) fn w_lfm_airs() -> crate::lfm::airs::LfmAirs {
     use crate::lfm::whir_leg::{RECURSION_CHIP_SET, RECURSION_HASHER};
 
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");

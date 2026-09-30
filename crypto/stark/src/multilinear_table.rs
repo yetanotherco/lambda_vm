@@ -1095,6 +1095,7 @@ where
     let r: Vec<FieldElement<E>> = (0..num_vars)
         .map(|_| transcript.sample_field_element())
         .collect();
+    argue_capture::record(table, &interactions, &gkr_out.claim, &r, beta);
 
     let (weight_r, weight_z) = weight_slots(table.kinds().len());
     let bus = logup::claim_statements(&interactions, &gkr_out.claim.point, num_vars, weight_z)?;
@@ -1139,6 +1140,92 @@ where
         point,
     ))
 }
+/// ⛔ TEST-ONLY: a table's argue inputs, recorded by [`prove`] while a test has
+/// armed the table's width — so the stage-1 reference
+/// (`multilinear::fused`, `thoughts/zf/gap2/fix2/D-ARGUE.md` §4.1(b)) can be run
+/// on a real trace that satisfies its AIR, which random columns never do.
+///
+/// Off unless armed, and then one atomic load a table. It records; it never
+/// changes what `prove` does.
+#[doc(hidden)]
+pub mod argue_capture {
+    use super::*;
+    use std::any::Any;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static WIDTHS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static CAPTURED: Mutex<Vec<Box<dyn Any + Send>>> = Mutex::new(Vec::new());
+
+    /// One table's argue as [`prove`] held it once the zerocheck point was
+    /// drawn: its committed columns and factor kinds, its constraint shape and
+    /// bus, the GKR input-layer claim, the zerocheck point and `beta`.
+    pub struct Captured<F: IsField, E: IsField> {
+        pub columns: Vec<Mle<F>>,
+        pub kinds: Vec<FactorKind>,
+        pub shape: IrShape<F, E>,
+        pub interactions: Vec<logup::Interaction<E>>,
+        pub claim: gkr::GkrClaim<E>,
+        pub r: Vec<FieldElement<E>>,
+        pub beta: FieldElement<E>,
+    }
+
+    /// Records every table with this many committed columns from now on; an
+    /// empty list disarms.
+    pub fn arm(widths: &[usize]) {
+        if let Ok(mut armed) = WIDTHS.lock() {
+            *armed = widths.to_vec();
+        }
+        ARMED.store(!widths.is_empty(), Ordering::Relaxed);
+    }
+
+    /// What has been recorded, in the order `prove` ran; the record empties.
+    pub fn take() -> Vec<Box<dyn Any + Send>> {
+        CAPTURED
+            .lock()
+            .map(|mut captured| std::mem::take(&mut *captured))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn record<F, E>(
+        table: &CommittedTable<'_, F, E>,
+        interactions: &[logup::Interaction<E>],
+        claim: &gkr::GkrClaim<E>,
+        r: &[FieldElement<E>],
+        beta: &FieldElement<E>,
+    ) where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        if !ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+        let width = table.num_committed_columns();
+        if !WIDTHS.lock().is_ok_and(|armed| armed.contains(&width)) {
+            return;
+        }
+        let captured = Captured {
+            columns: table.columns().to_vec(),
+            kinds: table.kinds().to_vec(),
+            shape: table.shape().clone(),
+            interactions: interactions.to_vec(),
+            claim: gkr::GkrClaim {
+                point: claim.point.clone(),
+                p: claim.p.clone(),
+                q: claim.q.clone(),
+            },
+            r: r.to_vec(),
+            beta: beta.clone(),
+        };
+        if let Ok(mut record) = CAPTURED.lock() {
+            record.push(Box::new(captured));
+        }
+    }
+}
+
 /// Whether the depth-1 tree prefetch is on. `LFM_WHIR_PREFETCH=1` (or `true`)
 /// turns it on; unset or anything else is off, and off is byte-for-byte today's
 /// serial path. Read once.
