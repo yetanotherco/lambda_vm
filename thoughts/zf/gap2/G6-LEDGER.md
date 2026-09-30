@@ -1256,7 +1256,7 @@ have drained. The commit ends on a synchronous root read, so none is expected [I
 
 **Runtime:** 4 arms plus a rebuild, ≈ 6–8 min. Tags wt1314–1317.
 
-### 11.4 Job 293's result (FAST, 18:37:40–18:40:16Z; written 2026-09-30 18:50Z)
+### 11.4 Job 293's result (FAST, 18:37:40–18:40:16Z; written 2026-09-30 20:21Z)
 
 - **HARNESS RED, rc 11, after 1 + 1 arms.** A (wt1314) is clean: base 28.4 s, whole 37.8 s. B (wt1315) finished its base
   (33.6 s), then the tree test panicked at its split-closure check: "epoch 0's argument does not close … 0.074 s
