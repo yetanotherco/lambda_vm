@@ -2906,6 +2906,20 @@ where
     None
 }
 
+impl ResidentColumns {
+    /// What putting these columns on the card moved, skipped and took, as one
+    /// log line.
+    #[cfg(feature = "cuda")]
+    pub fn upload_line(&self) -> String {
+        self.0.upload_record().line()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn upload_line(&self) -> String {
+        match self.0 {}
+    }
+}
+
 /// Where a run of columns is, for the entry points that take either.
 #[cfg(feature = "cuda")]
 fn columns_at<'a>(

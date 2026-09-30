@@ -1989,32 +1989,68 @@ pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
         elem_size <= STAGED_CHUNK_BYTES,
         "htod_staged: an element larger than a staging buffer"
     );
-    let n_elems = src_host.len();
     if std::mem::size_of_val(src_host) == 0 {
         return Ok(());
     }
-    // Whole elements per chunk, so a `T` never straddles two buffers.
-    let chunk_elems = STAGED_CHUNK_BYTES / elem_size.max(1);
-
-    let be = backend()?;
-    let mut loan = be.staging_pairs.lend(&be.ctx)?;
-    be.ctx.bind_to_thread()?;
     // SAFETY: `device_ptr_mut` yields the destination's base address and orders
     // the writes on `stream`; `dst.len() >= src_host.len()` (asserted), so every
     // chunk's range lies inside `dst`.
     let (dst_base, _record) = dst.device_ptr_mut(stream);
+    // Whole elements per chunk, so a `T` never straddles two buffers.
+    let chunk_bytes = (STAGED_CHUNK_BYTES / elem_size.max(1)) * elem_size;
+    // SAFETY: `src_host` is `size_of_val` initialised bytes, and the range at
+    // `dst_base` is `dst`, which the borrow keeps alive and unaliased.
+    unsafe {
+        let bytes = std::slice::from_raw_parts(
+            src_host.as_ptr() as *const u8,
+            std::mem::size_of_val(src_host),
+        );
+        staged_copy(stream, bytes, dst_base, chunk_bytes)
+    }
+}
+
+/// [`htod_staged`] to a raw device address: `src` lands at `dst`, through a
+/// staging pair of its own, and the call returns once the last chunk is queued.
+///
+/// For callers that fill disjoint ranges of one allocation from several threads
+/// at once, which a `CudaViewMut` cannot be split across.
+///
+/// # Safety
+///
+/// `dst .. dst + src.len()` lies inside one live device allocation that nothing
+/// else touches until `stream` has passed the copy, and the caller keeps that
+/// allocation alive until then.
+pub unsafe fn htod_staged_raw(stream: &Arc<CudaStream>, src: &[u8], dst: u64) -> Result<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { staged_copy(stream, src, dst, STAGED_CHUNK_BYTES) }
+}
+
+/// The chunk loop behind [`htod_staged`] and [`htod_staged_raw`].
+///
+/// # Safety
+///
+/// As [`htod_staged_raw`]; `chunk_bytes <= STAGED_CHUNK_BYTES`.
+unsafe fn staged_copy(
+    stream: &Arc<CudaStream>,
+    src: &[u8],
+    dst_base: u64,
+    chunk_bytes: usize,
+) -> Result<()> {
+    let be = backend()?;
+    let mut loan = be.staging_pairs.lend(&be.ctx)?;
+    be.ctx.bind_to_thread()?;
     // Declared after `loan`, so it drops FIRST: a DMA queued but not yet covered
     // by its buffer's event is drained before the pair can be lent again.
     let mut drain = DrainOnErr {
         stream,
         armed: false,
     };
-    let src = src_host.as_ptr() as *const u8;
-    let (mut elem_off, mut k) = (0usize, 0usize);
-    while elem_off < n_elems {
-        let this_elems = (n_elems - elem_off).min(chunk_elems);
-        let this_bytes = this_elems * elem_size;
-        let byte_off = elem_off * elem_size;
+    let (mut byte_off, mut k) = (0usize, 0usize);
+    while byte_off < src.len() {
+        let this_bytes = (src.len() - byte_off).min(chunk_bytes);
         let buf = loan.buf(k);
         // The DMA that last read this buffer — two chunks back, or the previous
         // borrower's — lands before the host overwrites it.
@@ -2023,7 +2059,11 @@ pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
         // last reader has landed (above), so nothing reads it while it is filled.
         unsafe {
             let copy_t0 = std::time::Instant::now();
-            std::ptr::copy_nonoverlapping(src.add(byte_off), buf.ptr as *mut u8, this_bytes);
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(byte_off),
+                buf.ptr as *mut u8,
+                this_bytes,
+            );
             STAGING_STATS.note_in(true, this_bytes, copy_t0.elapsed());
             let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst_base + byte_off as u64,
@@ -2040,7 +2080,7 @@ pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
         buf.record_event(stream)?;
         // The buffer's event now covers the DMA, for whoever refills it next.
         drain.armed = false;
-        elem_off += this_elems;
+        byte_off += this_bytes;
         k += 1;
     }
     Ok(())
