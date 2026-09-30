@@ -406,6 +406,9 @@ const MIN_LOOP_BODY: usize = 32;
 /// Registers are only ever the accumulator inside a body and the index `j`,
 /// which the body does not touch, so a chain that crosses from one repetition
 /// into the next still finds the accumulator it left.
+// The register check is on a per-build constant, but only fires when loops
+// are asked for.
+#[allow(clippy::assertions_on_constants)]
 fn reroll(program: &Program) -> Program {
     use super::isa::{ENTRY_PC, Instr, REG_PC};
     use std::collections::HashMap;
