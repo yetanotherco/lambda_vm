@@ -1143,3 +1143,74 @@ A **quiet-producer A/B**:
 prologue its own pool.
 - It would make the fast mode the only mode: ≈ 0.4 × 0.7 s ≈ 0.3 s on the mean at this head, and the noise gone.
 - It needs its own pre-registration.
+
+- **The ssh-hang windows are ruled out as the cause** (the lead's check, added 18:31Z). The boxes' ssh hung about
+  16:03–16:43Z and 17:17–17:57Z.
+  - Job 292's five SLOW arms ran 17:09:45–17:15:49Z, before the second window.
+  - Job 290's wt1291 (15:15Z) and job 250's wt1212/1213 (15:50Z) ran outside both windows.
+  - Job 291's arms (16:03–16:08Z) fell inside the first window, but only one of its eight was SLOW (wt1299).
+  - The prover logs to local files under nohup, never over ssh.
+  - PSI io was ≈ 0 in every prologue window of job 292, so there was no overlay or disk stall.
+
+## 11. The quiet-producer A/B (FAST 293), pre-registered 2026-09-30 18:31Z, before the run
+
+The lead's GO, with two uses pre-registered: (a) β for stage 1b; (b) the quiet producer as a lever in its own right.
+
+### 11.1 The knob [V: `fix2/1010-quiet-producer` @ `6e0b5f731` on 7c8272701]
+
+- `LAMBDA_VM_QUIET_PRODUCER=1`, default off, timing only.
+- **Producer side:** a stage (execute, collect, build, prep, and the global prep) does not start while an argue runs
+  or waits to run.
+- **Prover side:** `multi_prove`'s argue waits for the stage in progress before any table's timer starts, so the two
+  never overlap and the argue has priority.
+- The hand-off send stays outside the guard; otherwise a prover waiting to argue would wait on its own hand-off.
+- A `QUIET PRODUCER:` line after the base gives each side's waits.
+- Host tests pass: the setting; the guards are inert when off; a stage and an argue never overlap; an argue asked
+  mid-stage runs before the next stage. `make fmt` and `make lint` are green.
+
+### 11.2 The baseline, at 7c8272701 [V: job 292's twelve identical arms, `base292.py`]
+
+| quantity (over the 15 epochs) | mean | sd | range |
+|---|---|---|---|
+| Σargue | 11.70 s | 0.08 s | — |
+| Σ producer overlap with the argues | 7.86 s | 0.10 s | — |
+| Σ prover prep wait | 0.00 s in every arm | — | — |
+| Σ producer hand-off wait (the producer's slack) | 7.54 s | 0.18 s | 7.21–7.76 s |
+| base | — | — | 28.2–28.6 s |
+
+### 11.3 Rows and bands (`qp_readout.py`, md5 `2fa76515888a838addb2d8592d724dea`; selftest green on job 292's wt1303)
+
+| row | band | why |
+|---|---|---|
+| M0: A arms print no QUIET line; B arms print ≥ 16 argues and ≥ 60 stages; ids identical; proved | exact | the knob |
+| A's Σargue (control) | 11.45–11.95 s | 11.70 ± 0.08 |
+| A's Σoverlap (control) | 7.4–8.3 s | 7.86 ± 0.10 |
+| B's Σoverlap | ≤ 0.3 s | the exclusion leaves only timer granularity |
+| **(a) β = (Σargue_A − Σargue_B) ÷ (Σoverlap_A − Σoverlap_B)** | expected 0.075 ± 0.051 (Δ Σargue ≈ −0.59 ± 0.40 s) | the regression in §10.3. With 2 + 2 arms, the Δ Σargue SE ≈ 0.08 s gives β to ≈ ± 0.01 |
+| (a) the rule for 1b | β < 0.05: band −1.0 s [−1.2, −0.5] stands · β ≥ 0.15: centre (1 − β) × 1.13 s · between: low end (1 − β) × 1.06 s | §10.5 |
+| **(b) Δ base, B − A (the deciding row)** | **+3 to +8 s: REGRESSION expected** | below |
+| (b) B's Σ prep wait (the prover waits for the producer) | ≥ 2 s | the producer binds |
+| (b) B's Σ hand-off wait (the producer's slack) | ≤ 2 s (A: 7.54 s) | the producer binds |
+| Level 1 | reported, not decided on | bimodal (§9.3) |
+
+**Why (b) is expected to regress, and what the lever form could reach:**
+- **The producer cannot keep up.** At the default hand-off depth of one epoch it needs ≈ 1.19 s of work per epoch. It
+  can run only outside the argues: ≈ 1.71 s per prover epoch minus 0.78 s of argue = 0.93 s.
+- **The argue also waits.** Each argue waits for the producer stage already running (≈ 0.15 s on average).
+- **Result:** ≈ +0.3 to +0.4 s per epoch, so a base of +4.5 to +6 s.
+- **The slack cannot absorb the pause.** The 7.5 s of hand-off wait is time the producer sits holding a finished epoch
+  it cannot pass on. It cannot use that time to build the next epoch ahead of the argues.
+- **Any producer schedule at depth one** still overlaps the argue by at least 1.19 − 0.93 = 0.26 s per epoch. Only
+  (0.48 − 0.26) × 15 ≈ 3.3 s of today's overlap can be removed, so **the lever form is capped at β × 3.3 s ≈ −0.25 s
+  (−0.6 s at 2σ)**.
+- That needs a placement rule, or a hand-off depth of two (+1 epoch of host memory), and neither is built. It is worth
+  designing only if (a) reads β ≥ 0.15.
+
+**Verdict lines:**
+- (a) as the rule above;
+- (b) LEVER if Δ base ≤ −0.3 s and the producer never binds; REGRESSION if Δ base ≥ +0.3 s; otherwise NO EFFECT.
+
+**Confounder, named in advance:** B's argues start after a wait, so any device work left over from the commit would
+have drained. The commit ends on a synchronous root read, so none is expected [I].
+
+**Runtime:** 4 arms plus a rebuild, ≈ 6–8 min. Tags wt1314–1317.
