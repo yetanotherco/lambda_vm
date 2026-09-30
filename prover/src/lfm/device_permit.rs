@@ -755,6 +755,35 @@ mod tests {
         );
     }
 
+    /// With no global child in the level's pool the driver makes no latch, so
+    /// nothing defers: a node's opener would open a latch nobody waits on, and
+    /// a prove on a thread with no deferral takes the card at once. Both are
+    /// asserted, so the no-global tree cannot depend on a latch being made.
+    #[test]
+    fn armed_with_no_deferral_nothing_waits_and_an_unwaited_opener_is_harmless() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(2);
+        let unwaited = CardLatch::new();
+        drop(OpenOnDrop::new(unwaited.clone()));
+        assert!(unwaited.is_open(), "the opener opened its latch");
+        let (deferred_before, _) = defer_stats();
+        let t = Instant::now();
+        {
+            let _card = hold_labeled("multi_prove");
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "a prove with no deferral must take the card at once"
+        );
+        assert_eq!(
+            defer_stats().0,
+            deferred_before,
+            "no deferral may be counted on a thread that installed none"
+        );
+        disarm(&g);
+    }
+
     /// The holder name is the thread's, restored when its guard drops.
     #[test]
     fn a_holder_name_tags_this_threads_holds_and_is_restored() {

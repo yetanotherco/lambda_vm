@@ -4193,38 +4193,109 @@ fn tree_global_after_last() -> bool {
     }
 }
 
-/// Whether [`tree_global_after_last`] can apply: a wide level 1, the global
-/// child in the level's own pool, and a worker for every task at once.
+/// What [`tree_global_after_last`] does on one level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalAfterLast {
+    /// Unset or `0`.
+    Off,
+    /// The global child's prove waits for the last wide node's artifacts.
+    Active,
+    /// Asked for, but the global child is not a task of this level's pool —
+    /// not a wide level 1, or `LFM_TREE_TOP_OVERLAP=0`, which runs it as its
+    /// own stage after the level (and the fixture tree, which never overlaps).
+    /// Nothing waits on anything: no latch is made, and no node opens one.
+    NoGlobalInThePool,
+    /// Asked for, but the pool has fewer workers than tasks — a one-epoch
+    /// block among them, whose pool is one worker for the global and one node.
+    TooFewWorkers,
+}
+
+/// The mode of [`tree_global_after_last`] for a level.
 ///
-/// ⛔ THE LAST CONDITION IS THE DEADLOCK GUARD. With fewer workers than tasks a
+/// ⛔ `TooFewWorkers` IS THE DEADLOCK GUARD. With fewer workers than tasks, a
 /// worker could take the global and wait behind the latch while the node that
 /// opens it waits for a worker — the serial driver most of all, which runs the
 /// global first. (The permit also ignores deferrals while it is unarmed, and the
 /// wait itself is bounded; this keeps the lever from ever leaning on either.)
-fn global_after_last_active(
+///
+/// ★ Small blocks: a block of 2 to fan-in epochs is one wide node and the
+/// global, two tasks on `min(siblings, epochs)` workers — two or more, so the
+/// global waits for that one node's artifacts. A one-epoch block has one worker
+/// and does not take the lever.
+fn global_after_last_mode(
     knob: bool,
     wide: bool,
     top_overlap: bool,
     siblings: usize,
     tasks: usize,
-) -> bool {
-    knob && wide && top_overlap && tasks >= 2 && siblings >= tasks
+) -> GlobalAfterLast {
+    if !knob {
+        GlobalAfterLast::Off
+    } else if !(wide && top_overlap) || tasks < 2 {
+        GlobalAfterLast::NoGlobalInThePool
+    } else if siblings < tasks {
+        GlobalAfterLast::TooFewWorkers
+    } else {
+        GlobalAfterLast::Active
+    }
 }
 
 #[test]
 fn global_after_last_is_active_only_when_every_task_has_a_worker() {
+    use GlobalAfterLast::*;
     // The production level: 3 wide nodes and the global, 6 workers.
-    assert!(global_after_last_active(true, true, true, 6, 4));
-    assert!(global_after_last_active(true, true, true, 4, 4));
-    // Off, or not the level it orders.
-    assert!(!global_after_last_active(false, true, true, 6, 4));
-    assert!(!global_after_last_active(true, false, true, 6, 4));
-    assert!(!global_after_last_active(true, true, false, 6, 4));
+    assert_eq!(global_after_last_mode(true, true, true, 6, 4), Active);
+    assert_eq!(global_after_last_mode(true, true, true, 4, 4), Active);
+    assert_eq!(global_after_last_mode(false, true, true, 6, 4), Off);
     // Too few workers: the global could wait for a node nobody has taken.
-    assert!(!global_after_last_active(true, true, true, 3, 4));
-    assert!(!global_after_last_active(true, true, true, 1, 4));
-    // Nothing to order.
-    assert!(!global_after_last_active(true, true, true, 6, 1));
+    assert_eq!(
+        global_after_last_mode(true, true, true, 3, 4),
+        TooFewWorkers
+    );
+    assert_eq!(
+        global_after_last_mode(true, true, true, 1, 4),
+        TooFewWorkers
+    );
+}
+
+/// ★ Without the global in the level's pool there is nothing to order, and on
+/// small blocks the lever follows the worker count.
+#[test]
+fn global_after_last_without_the_global_or_on_small_blocks() {
+    use GlobalAfterLast::*;
+    // No global in the pool: a level of wraps, `LFM_TREE_TOP_OVERLAP=0`, or the
+    // fixture tree (one worker, no overlap).
+    assert_eq!(
+        global_after_last_mode(true, false, true, 6, 16),
+        NoGlobalInThePool
+    );
+    assert_eq!(
+        global_after_last_mode(true, true, false, 6, 3),
+        NoGlobalInThePool
+    );
+    assert_eq!(
+        global_after_last_mode(true, true, false, 1, 3),
+        NoGlobalInThePool
+    );
+    // A one-epoch block: one wide node and the global on min(6, 1) = 1 worker.
+    assert_eq!(
+        global_after_last_mode(true, true, true, 1, 2),
+        TooFewWorkers
+    );
+    // Two to five epochs at fan-in 5: one wide node and the global, 2..=5 workers.
+    for epochs in 2..=5 {
+        assert_eq!(
+            global_after_last_mode(true, true, true, epochs.min(6), 2),
+            Active
+        );
+    }
+    // Six epochs: two wide nodes and the global on 6 workers.
+    assert_eq!(global_after_last_mode(true, true, true, 6, 3), Active);
+    // A pool of the global alone has nothing to wait for.
+    assert_eq!(
+        global_after_last_mode(true, true, true, 6, 1),
+        NoGlobalInThePool
+    );
 }
 
 /// `LFM_TREE_REDERIVE_DECODE=1`: level 0's lead-in derives DECODE's
@@ -8842,29 +8913,32 @@ where
 
     // ★ `LFM_TREE_GLOBAL_AFTER_LAST`: the global child's prove waits behind a
     // latch the LAST wide node opens once its artifacts are built. See
-    // [`global_after_last_active`] for when it can apply, and
+    // [`global_after_last_mode`] for when it can apply, and
     // `device_permit::CardLatch` for the race it settles.
     let tasks = groups.len() + usize::from(top_overlap);
-    let knob = tree_global_after_last();
-    let last_latch = global_after_last_active(knob, wide, top_overlap, siblings, tasks)
-        .then(super::device_permit::CardLatch::new);
-    if wide && top_overlap {
-        match (&last_latch, knob) {
-            (Some(_), _) => println!(
-                "   ★ GLOBAL AFTER LAST: the WHIR GLOBAL child's prove waits until L1N{} has built \
-                 its artifacts (LFM_TREE_GLOBAL_AFTER_LAST=1)",
-                groups.len() - 1
-            ),
-            (None, true) => println!(
-                "   ★ GLOBAL AFTER LAST requested but INACTIVE: {siblings} worker(s) for {tasks} \
-                 tasks, so the global could wait for a node no worker has taken \
-                 (LFM_TREE_GLOBAL_AFTER_LAST=1)"
-            ),
-            (None, false) => println!(
-                "   ★ GLOBAL AFTER LAST OFF: the card is first come, first served \
-                 (unset or LFM_TREE_GLOBAL_AFTER_LAST=0)"
-            ),
-        }
+    let mode = global_after_last_mode(tree_global_after_last(), wide, top_overlap, siblings, tasks);
+    let last_latch = (mode == GlobalAfterLast::Active).then(super::device_permit::CardLatch::new);
+    match mode {
+        GlobalAfterLast::Active => println!(
+            "   ★ GLOBAL AFTER LAST: the WHIR GLOBAL child's prove waits until L1N{} has built \
+             its artifacts (LFM_TREE_GLOBAL_AFTER_LAST=1)",
+            groups.len() - 1
+        ),
+        GlobalAfterLast::TooFewWorkers => println!(
+            "   ★ GLOBAL AFTER LAST requested but INACTIVE: {siblings} worker(s) for {tasks} \
+             tasks, so the global could wait for a node no worker has taken \
+             (LFM_TREE_GLOBAL_AFTER_LAST=1)"
+        ),
+        GlobalAfterLast::NoGlobalInThePool => println!(
+            "   ★ GLOBAL AFTER LAST requested but INACTIVE: the global child is not a task of \
+             this level's pool, so there is nothing to order (LFM_TREE_GLOBAL_AFTER_LAST=1)"
+        ),
+        // Said only where the lever could act, so a tree of wraps prints nothing new.
+        GlobalAfterLast::Off if wide && top_overlap => println!(
+            "   ★ GLOBAL AFTER LAST OFF: the card is first come, first served \
+             (unset or LFM_TREE_GLOBAL_AFTER_LAST=0)"
+        ),
+        GlobalAfterLast::Off => {}
     }
 
     type WhirWrapSlot<C> = (C, SchemaLayout, Vec<u64>, u64, usize);
