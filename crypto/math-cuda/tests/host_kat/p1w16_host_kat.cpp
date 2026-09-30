@@ -1,6 +1,7 @@
 // Known-answer tests for `kernels/p1w16.cu` (the D-HASH stage-1 Poseidon1
 // width-16 measurement kernels), run on the HOST through the shim: no GPU, no
-// nvcc. Every check runs at both multiply variants.
+// nvcc. Every check runs at every variant (the two multiplies and the
+// Fourier-domain partial rounds).
 //
 // The vectors (`p1w16_kat_vectors.h`) come from the Python reference
 // (`scripts/poseidon1/p1_params.py cuda`); the permutation vectors are the ones
@@ -118,8 +119,9 @@ static void run() {
 int main() {
     run<0>();
     run<1>();
+    run<2>();
     if (g_fail == 0) {
-        std::printf("p1w16 host KAT: all checks pass (variants 0 and 1)\n");
+        std::printf("p1w16 host KAT: all checks pass (variants 0, 1 and 2)\n");
         return 0;
     }
     std::printf("p1w16 host KAT: %d FAILED\n", g_fail);

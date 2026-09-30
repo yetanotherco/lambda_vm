@@ -362,6 +362,23 @@ def emit_cuda(kernel_dir, kat_dir):
     c.append("// First ROW of the circulant MDS, `M[i][j] = MDS_ROW[(j - i) mod 16]`. `constexpr`, so a")
     c.append("// fully unrolled product folds every entry into an immediate. Row sum 371 < 2^9.")
     c.append("__device__ constexpr uint32_t MDS_ROW[16] = {" + ", ".join(map(str, MDS_ROW[t])) + "};")
+    # The Fourier-domain partial rounds (p1_fourier.py): omega = 2^12 of order 16, the MDS eigenvalues, the
+    # last partial round's eigenvalues with the inverse DFT's 1/16 folded in, and each partial round's constants
+    # in the Fourier domain.
+    import p1_fourier as pf
+    d = pf.eigenvalues(mds)
+    hx = lambda v: f"0x{v:016x}ull"
+    c.append("// Fourier-domain partial rounds (`scripts/poseidon1/p1_fourier.py`): OMEGA_POW[k] = 2^(12k) mod p")
+    c.append("// (omega = 2^12 has order 16); FD = the circulant's eigenvalues (DFT of its first column); FD_LAST =")
+    c.append("// FD / 16, the inverse DFT's scale folded into the last partial round; FC[k] = DFT(RC[4 + k]).")
+    c.append("__device__ constexpr uint64_t OMEGA_POW[16] = {" + ", ".join(hx(pow(pf.OMEGA, k, P)) for k in range(16)) + "};")
+    c.append("__device__ constexpr uint64_t FD[16] = {" + ", ".join(hx(v) for v in d) + "};")
+    c.append("__device__ constexpr uint64_t FD_LAST[16] = {" + ", ".join(hx(v * pf.INV16 % P) for v in d) + "};")
+    c.append(f"__device__ constexpr uint64_t INV16 = {hx(pf.INV16)};")
+    c.append(f"__device__ __constant__ uint64_t FC[{rp}][16] = {{")
+    for k in range(rp):
+        c.append("    {" + ", ".join(hx(v) for v in pf.dft(rc[rf // 2 + k], pf.OMEGA)) + "},")
+    c.append("};")
     c.append("}  // namespace p1w16")
     open(f"{kernel_dir}/p1w16_constants.cuh", "w").write("\n".join(c) + "\n")
 

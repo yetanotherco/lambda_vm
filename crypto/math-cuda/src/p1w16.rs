@@ -26,9 +26,8 @@ pub const RATE: usize = 12;
 pub const DIGEST: usize = 4;
 
 /// The kernel variants the cubin instantiates, in `p1w16.cu`'s order: the two
-/// multiply variants, then the limb variant under register caps of 4, 5 and 6
-/// resident 128-thread blocks per SM.
-pub const VARIANTS: [&str; 5] = ["v0", "v1", "v1b4", "v1b5", "v1b6"];
+/// multiply variants and the Fourier-domain partial rounds.
+pub const VARIANTS: [&str; 3] = ["v0", "v1", "v2"];
 
 /// One variant's kernels.
 pub struct Kernels {

@@ -38,8 +38,8 @@
 //   V = 0  every product through `goldilocks::mul`;
 //   V = 1  products and squares through the 32-bit-limb multiply (`rpx.cu`'s
 //          `RPX_V_LIMB_MUL | RPX_V_LIMB_SQR`, reproduced below);
-//   and V = 1 again under three register caps (`P1W16_LB`), because the
-//   uncapped kernels take 152-166 registers a thread (FAST job 280).
+//   V = 2  V = 1's multiply with the partial rounds in the Fourier domain of
+//          the circulant MDS (`permute_fourier`).
 // Every variant computes the same field values and `permute` canonicalises.
 
 #include <cstdint>
@@ -141,7 +141,7 @@ __device__ __forceinline__ uint64_t sqr_limb(uint64_t a) {
 
 template <int V>
 __device__ __forceinline__ uint64_t fmul(uint64_t a, uint64_t b) {
-    if constexpr (V == 1) {
+    if constexpr (V >= 1) {
         return mul_limb(a, b);
     } else {
         return goldilocks::mul(a, b);
@@ -150,7 +150,7 @@ __device__ __forceinline__ uint64_t fmul(uint64_t a, uint64_t b) {
 
 template <int V>
 __device__ __forceinline__ uint64_t fsqr(uint64_t a) {
-    if constexpr (V == 1) {
+    if constexpr (V >= 1) {
         return sqr_limb(a);
     } else {
         return goldilocks::mul(a, a);
@@ -194,10 +194,92 @@ __device__ __forceinline__ void mds(uint64_t s[WIDTH]) {
     }
 }
 
-// ★ The permutation. One rolled round loop with a warp-uniform branch on the
-// round kind, so the MDS body is emitted once.
+// One full round: constants, the S-box on every lane, the circulant MDS.
+template <int V>
+__device__ __forceinline__ void full_round(uint64_t s[WIDTH], int r) {
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = sbox<V>(goldilocks::add(s[i], RC[r][i]));
+    mds(s);
+}
+
+// The 16-point DFT in registers, radix-2 decimation in time over a
+// bit-reversed copy: X[k] = sum_n x[n]·omega^(±nk), omega = 2^12 (order 16).
+// `INV` takes omega^-1 and does NOT scale by 1/16 (the caller folds it into
+// the last partial round's eigenvalues). Every twiddle index is a
+// compile-time constant after unrolling, so each product is by an immediate.
+template <int V, bool INV>
+__device__ __forceinline__ void dft16(uint64_t x[WIDTH]) {
+    constexpr int BITREV[WIDTH] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    uint64_t y[WIDTH];
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) y[i] = x[BITREV[i]];
+#pragma unroll
+    for (int h = 1; h < WIDTH; h <<= 1) {
+#pragma unroll
+        for (int start = 0; start < WIDTH; start += 2 * h) {
+#pragma unroll
+            for (int j = 0; j < h; ++j) {
+                const int e = j * (8 / h);  // omega_{2h}^j = omega^(j·16/(2h))
+                const int ei = INV ? ((WIDTH - e) & (WIDTH - 1)) : e;
+                const uint64_t a = y[start + j];
+                const uint64_t t = (e == 0) ? y[start + j + h] : fmul<V>(y[start + j + h], OMEGA_POW[ei]);
+                y[start + j] = goldilocks::add(a, t);
+                y[start + j + h] = goldilocks::sub(a, t);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) x[i] = y[i];
+}
+
+// ★ The permutation with its 22 partial rounds in the Fourier domain of the
+// circulant MDS (`scripts/poseidon1/p1_fourier.py`, checked equal to the
+// textbook form there): the last initial full round's MDS becomes D·F, each
+// partial round is s0 = (1/16)·Σŝ, δ = (s0 + c0)^7 − (s0 + c0),
+// ŝ_j ← d_j·(ŝ_j + ĉ_j + δ), and one inverse DFT precedes the terminal full
+// rounds. 21 products a partial round instead of a dense MDS.
+template <int V>
+__device__ __forceinline__ void permute_fourier(uint64_t s[WIDTH]) {
+#pragma unroll 1
+    for (int r = 0; r < HALF_FULL - 1; ++r) full_round<V>(s, r);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = sbox<V>(goldilocks::add(s[i], RC[HALF_FULL - 1][i]));
+    dft16<V, false>(s);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = fmul<V>(s[i], FD[i]);
+#pragma unroll 1
+    for (int k = 0; k < PARTIAL; ++k) {
+        uint64_t sum = s[0];
+#pragma unroll
+        for (int i = 1; i < WIDTH; ++i) sum = goldilocks::add(sum, s[i]);
+        const uint64_t a0 = goldilocks::add(fmul<V>(sum, INV16), RC[HALF_FULL + k][0]);
+        const uint64_t delta = goldilocks::sub(sbox<V>(a0), a0);
+        if (k + 1 < PARTIAL) {
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i)
+                s[i] = fmul<V>(goldilocks::add(goldilocks::add(s[i], FC[k][i]), delta), FD[i]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i)
+                s[i] = fmul<V>(goldilocks::add(goldilocks::add(s[i], FC[k][i]), delta), FD_LAST[i]);
+        }
+    }
+    dft16<V, true>(s);
+#pragma unroll 1
+    for (int r = HALF_FULL + PARTIAL; r < ROUNDS; ++r) full_round<V>(s, r);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
+}
+
+// ★ The permutation. V = 2 takes the Fourier-domain partial rounds above;
+// otherwise one rolled round loop with a warp-uniform branch on the round
+// kind, so the MDS body is emitted once.
 template <int V>
 __device__ __forceinline__ void permute(uint64_t s[WIDTH]) {
+    if constexpr (V == 2) {
+        permute_fourier<V>(s);
+        return;
+    }
 #pragma unroll 1
     for (int r = 0; r < ROUNDS; ++r) {
 #pragma unroll
@@ -376,13 +458,14 @@ __device__ __forceinline__ void grind_search(const uint64_t *inner, uint64_t lim
         grind_search<V>(inner, limit, base, count, result);                                        \
     }
 
-// The two multiply variants, then the limb variant under three register caps
-// (`src/p1w16.rs` VARIANTS lists the same names in the same order).
+// The two multiply variants and the Fourier-domain partial rounds
+// (`src/p1w16.rs` VARIANTS lists the same names in the same order). FAST job
+// 281 measured the register caps (4/5/6 blocks of 128) SLOWER than uncapped
+// (+6 %, +63 %, ×4.6), so no capped variant is instantiated; `P1W16_LB` stays
+// for the next sweep.
 P1W16_ENTRIES(v0, 0, )
 P1W16_ENTRIES(v1, 1, )
-P1W16_ENTRIES(v1b4, 1, P1W16_LB(4))
-P1W16_ENTRIES(v1b5, 1, P1W16_LB(5))
-P1W16_ENTRIES(v1b6, 1, P1W16_LB(6))
+P1W16_ENTRIES(v2, 2, )
 
 // Bench fill: `out[i]` = a SplitMix64 of `i`, canonicalised — a codeword the
 // microbench hashes without a host upload.
