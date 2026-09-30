@@ -93,3 +93,30 @@ fn the_round_counts_meet_the_papers_bounds_with_the_margin() {
 }
 
 const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+/// Host cost per permutation against RPX's, same process and inputs
+/// (informational, `--ignored --nocapture`; a laptop number is not a box number).
+#[test]
+#[ignore = "timing; run with --ignored --nocapture"]
+fn host_permutation_cost_against_rpx() {
+    use std::time::Instant;
+    const N: usize = 200_000;
+    let mut s16 = fp16(&PERMUTATION_VECTORS[3].0);
+    let t = Instant::now();
+    for _ in 0..N {
+        s16 = permute(s16);
+    }
+    let p1 = t.elapsed().as_nanos() as f64 / N as f64;
+    let mut s12: [crate::hash::rpx::Fp; 12] = core::array::from_fn(|i| s16[i]);
+    let t = Instant::now();
+    for _ in 0..N {
+        s12 = crate::hash::rpx::permute(s12);
+    }
+    let rpx = t.elapsed().as_nanos() as f64 / N as f64;
+    println!(
+        "HOSTPERM p1w16 {p1:.0} ns/perm · rpx {rpx:.0} ns/perm · ratio {:.2} (sinks {} {})",
+        p1 / rpx,
+        s16[0].canonical(),
+        s12[0].canonical()
+    );
+}

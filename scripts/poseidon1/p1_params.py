@@ -407,6 +407,7 @@ def main():
     ap.add_argument("--width", type=int, default=16)
     ap.add_argument("--security", type=int, default=128)
     ap.add_argument("--out", default=".")
+    ap.add_argument("--mds", choices=["circulant", "cauchy"], default="circulant")
     ap.add_argument("--kat-out", default=".")
     ap.add_argument("--plonky3", default="/Users/maurofab/workspace/Plonky3/goldilocks/src/poseidon1.rs")
     a = ap.parse_args()
@@ -445,7 +446,10 @@ def main():
             for row in rc:
                 print(" ".join(f"0x{v:016x}" for v in row))
             return
-        mds = circulant(MDS_ROW[t])
+        # --mds cauchy: the paper's Grain Cauchy matrix (the first candidate; the
+        # subspace-trail checks run separately, p3_subspace_checks.py covers the
+        # circulant rows only).
+        mds = next(cauchy_candidates(t, rf, rp)) if a.mds == "cauchy" else circulant(MDS_ROW[t])
         for x in kat_inputs(t):
             y = permute(x, rc, mds, rf, rp)
             print("in  " + " ".join(str(v) for v in x))
