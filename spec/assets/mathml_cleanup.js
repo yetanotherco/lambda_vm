@@ -35,7 +35,7 @@
 
     let big = false;
     while (stack.length) {
-      big = big || stack.pop();
+      big = stack.pop() || big;
       if (!big) {
         stack.pop().setAttribute("stretchy", "false");
       }
