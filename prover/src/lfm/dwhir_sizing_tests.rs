@@ -254,3 +254,102 @@ fn dwhir_sizing() {
         }
     }
 }
+
+/// D-RATE (SOTA c.2 / Q3): one chain's in-guest cost at rate 1/4 (Q 112) against rate 1/2 (Q 225, and the
+/// calculator-tight 219), query-only 20-bit grind, the production format (caps auto, first6), from the landed
+/// closed forms.
+///
+/// cargo test --release -p lambda-vm-prover --lib drate_chain_costs -- --nocapture
+#[test]
+fn drate_chain_costs() {
+    use super::whir_chain::{
+        chain_grind_perms, chain_query_rows, chain_schedule_perms, chain_schedule_rows, chain_shape_rows,
+    };
+    use multilinear::whir_chain::GrindBits;
+    println!("\n== D-RATE: one chain, the production format, grind 0/0/20, entered fresh ==");
+    println!(
+        "{:>3} {:>5} {:>4} {:>6} {:>8} {:>6} {:>7} {:>8} {:>9} {:>8} {:>9} {:>7}",
+        "n", "rate", "Q", "rounds", "opening", "grind", "sponge", "perms", "shaperows", "queryrows", "schedrows", "words"
+    );
+    for n in 20..=28usize {
+        for (log_blowup, q) in [(2usize, 112usize), (1, 225), (1, 219)] {
+            let mut config = crate::multilinear_prove::chain_config(&[(1, n.min(27))]);
+            config.log_blowup = log_blowup;
+            config.num_queries = q;
+            config.grind = GrindBits { folding: 0, ood: 0, query: 20 };
+            let shape = ChainShape::new(&config, n);
+            let open = chain_opening_perms(&shape);
+            let grind = chain_grind_perms(&shape);
+            let sponge = chain_schedule_perms(&shape, SpongeEntry::fresh());
+            println!(
+                "{:>3} {:>5} {:>4} {:>6} {:>8} {:>6} {:>7} {:>8} {:>9} {:>8} {:>9} {:>7}",
+                n,
+                format!("1/{}", 1 << log_blowup),
+                q,
+                shape.rounds(),
+                open,
+                grind,
+                sponge,
+                open + grind + sponge,
+                chain_shape_rows(&shape),
+                chain_query_rows(&shape),
+                chain_schedule_rows(&shape, SpongeEntry::fresh()),
+                RoundStorage::words(&shape),
+            );
+        }
+    }
+}
+
+/// D-RATE: the same chain under a FIXED cap height `c` (`LAMBDA_VM_ZF_WHIR_CAP=c`), both rates — the one format knob
+/// whose optimum moves with the query count.
+#[test]
+fn drate_cap_sweep() {
+    use super::whir_chain::{chain_grind_perms, chain_schedule_perms, chain_shape_rows, chain_schedule_rows};
+    use crypto::merkle_tree::cap::CapPolicy;
+    use multilinear::whir_chain::GrindBits;
+    println!("\n== D-RATE: cap sweep, one chain (perms · rows · words), grind 0/0/20, entered fresh ==");
+    for n in [23usize, 25, 26, 27] {
+        for (log_blowup, q) in [(2usize, 112usize), (1, 225)] {
+            let mut line = format!("n {n:>2} rate 1/{} Q {q:>3}:", 1 << log_blowup);
+            for c in [0usize, 3, 4, 5, 6, 7, 8, 9] {
+                let mut config = crate::multilinear_prove::chain_config(&[(1, n.min(27))]);
+                config.log_blowup = log_blowup;
+                config.num_queries = q;
+                config.grind = GrindBits { folding: 0, ood: 0, query: 20 };
+                config.format.cap = if c == 0 { CapPolicy::Off } else { CapPolicy::Fixed(c as u8) };
+                let shape = ChainShape::new(&config, n);
+                let perms = chain_opening_perms(&shape)
+                    + chain_grind_perms(&shape)
+                    + chain_schedule_perms(&shape, SpongeEntry::fresh());
+                let rows = chain_shape_rows(&shape) + chain_schedule_rows(&shape, SpongeEntry::fresh());
+                line += &format!("  c{c}: {perms}/{rows}/{}", RoundStorage::words(&shape));
+            }
+            println!("{line}");
+        }
+    }
+}
+
+/// D-RATE: the EXACT per-chip rows of one emitted chain verifier (`whir_chain_tests::chain_program`), at rate 1/4
+/// (Q 112) and rate 1/2 (Q 225), grind 0/0/20, production caps and folds. Real rows per chip, from the census.
+#[test]
+fn drate_chain_census() {
+    use multilinear::whir_chain::GrindBits;
+    println!("\n== D-RATE: emitted chain census (real rows per chip) ==");
+    for n in [22usize, 23, 24, 25, 26, 27] {
+        for (log_blowup, q) in [(2usize, 112usize), (1, 225)] {
+            let mut config = crate::multilinear_prove::chain_config(&[(1, n.min(27))]);
+            config.log_blowup = log_blowup;
+            config.num_queries = q;
+            config.grind = GrindBits { folding: 0, ood: 0, query: 20 };
+            let shape = ChainShape::new(&config, n);
+            let program = super::whir_chain_tests::chain_program(&shape);
+            let census = super::airs::lfm_chip_census(&program);
+            let line: Vec<String> = census
+                .iter()
+                .filter(|c| c.real_rows > 0 && c.name != "LFM_RANGE")
+                .map(|c| format!("{}={}", &c.name[4..], c.real_rows))
+                .collect();
+            println!("CHAINCENSUS n={n} rate=1/{} Q={q} instrs={} {}", 1 << log_blowup, program.instrs.len(), line.join(" "));
+        }
+    }
+}
