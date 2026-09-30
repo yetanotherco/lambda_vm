@@ -317,7 +317,7 @@ We now discuss how the split-recursion system is integrated in practice.
 Let $v$ denote the verification algorithm performing all steps outlined in @verification.
 We split $v$ into halves $verify_f$ and $verify_b$ such that an efficient
 arithmetization is achieved when the former is executed in the _field-VM_ (@field-VM)
-and the latter on the _RiscV-VM_ (@decode through @ecall).
+and the latter on the _RiscV-VM_ (@cpu).
 Practically speaking, $verify_f$ is put in charge of all verification steps
 involving _field_ arithmetic --- e.g., verifying `FRI` folding, 
 while $verify_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
