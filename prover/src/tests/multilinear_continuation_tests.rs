@@ -2061,3 +2061,198 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         );
     });
 }
+
+// ── D-TRACE stage 1b: the epochs' columns in pinned slots ──────────────────
+
+/// The pinned-columns switch: `1` on; unset, empty and `0` off (the default).
+#[test]
+fn the_pinned_columns_switch_is_off_unless_exactly_one() {
+    use multilinear_continuation::whir_pinned_columns_setting as on;
+    assert!(!on(None));
+    assert!(!on(Some("")));
+    assert!(!on(Some("0")));
+    assert!(!on(Some(" 0 ")));
+    assert!(on(Some("1")));
+    assert!(on(Some(" 1 ")));
+}
+
+/// Anything else stops the run rather than measuring the default under the
+/// switch's name.
+#[test]
+#[should_panic(expected = "LAMBDA_VM_WHIR_PINNED_COLUMNS must be 0 or 1")]
+fn the_pinned_columns_switch_refuses_anything_else() {
+    multilinear_continuation::whir_pinned_columns_setting(Some("yes"));
+}
+
+/// What two bundles of one run must share whatever holds their columns: the
+/// shapes, outputs, register fini and bookend roots of every epoch, and the
+/// cross-epoch proof's roots.
+///
+/// ⚠ An epoch's FIRST group root is not compared, for the reason
+/// [`prep_ahead_proves_what_the_prover_thread_schedule_proves`] gives.
+fn assert_same_run(
+    a: &multilinear_continuation::ContinuationProof,
+    b: &multilinear_continuation::ContinuationProof,
+    at: &str,
+) {
+    assert_eq!(a.num_epochs(), b.num_epochs(), "{at}: epochs");
+    for (k, (x, y)) in a.epochs.iter().zip(&b.epochs).enumerate() {
+        assert_eq!(
+            x.proof.roots.len(),
+            y.proof.roots.len(),
+            "{at}: epoch {k} groups"
+        );
+        assert_eq!(
+            x.proof.roots.last(),
+            y.proof.roots.last(),
+            "{at}: epoch {k}: the bookend group's root"
+        );
+        assert_eq!(
+            x.table_num_vars, y.table_num_vars,
+            "{at}: epoch {k}: shapes"
+        );
+        assert_eq!(x.public_output, y.public_output, "{at}: epoch {k}: output");
+        assert_eq!(x.reg_fini, y.reg_fini, "{at}: epoch {k}: register fini");
+    }
+    assert_eq!(a.global.proof.roots, b.global.proof.roots, "{at}: global");
+    assert_eq!(a.touched_page_bases, b.touched_page_bases, "{at}: pages");
+}
+
+/// Asked for slots it cannot have — no device in this build, or one that has
+/// not allocated them yet — the base builds `Vec`s for the epochs that miss
+/// and proves what it proves without a pool.
+#[test]
+fn a_pool_that_cannot_lend_proves_what_vecs_prove() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (vecs, _) = multilinear_continuation::prove_continuation_pinned(
+        &elf_bytes, &input, 2, &opts, true, true, None,
+    )
+    .expect("prove");
+    let pool = multilinear::pinned::Pool::new(2, 64 << 20);
+    let (asked, _) = multilinear_continuation::prove_continuation_pinned(
+        &elf_bytes,
+        &input,
+        2,
+        &opts,
+        true,
+        true,
+        Some(pool.clone()),
+    )
+    .expect("prove");
+    assert!(asked.num_epochs() >= 2, "one epoch hands nothing over");
+    if !cfg!(feature = "cuda") {
+        assert_eq!(
+            pool.stats().leased,
+            0,
+            "a build without a device lent a slot"
+        );
+    }
+    assert_same_run(&asked, &vecs, "asked for slots");
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &asked, &opts).expect("verify"),
+        "the bundle does not verify"
+    );
+}
+
+/// The pinned tests' turn: the early-tail hook is process-wide.
+#[cfg(feature = "cuda")]
+static PINNED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One slot on a card, filled before the run so epoch 0 finds it. An epoch
+/// prepared while the one before it is proved in the slot finds it held and
+/// builds `Vec`s, without waiting; the epoch after that finds it free, since a
+/// prove returns its slot before the next epoch is taken. So no two epochs in a
+/// row miss, and a tiny epoch's preparation, far shorter than a prove, misses
+/// at least once. The slot is back when the run ends, and the bundle is the one
+/// `Vec`s give and verifies.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a card"]
+fn one_slot_alternates_and_proves_what_vecs_prove() {
+    let _turn = PINNED_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (vecs, _) = multilinear_continuation::prove_continuation_pinned(
+        &elf_bytes, &input, 2, &opts, true, true, None,
+    )
+    .expect("prove");
+
+    let pool = multilinear::pinned::Pool::new(1, 64 << 20);
+    pool.fill().expect("a pinned slot on the card");
+    let (pinned, _) = multilinear_continuation::prove_continuation_pinned(
+        &elf_bytes,
+        &input,
+        2,
+        &opts,
+        true,
+        true,
+        Some(pool.clone()),
+    )
+    .expect("prove");
+    let n = pinned.num_epochs();
+    assert!(n >= 3, "{n} epochs cannot show the alternation");
+    let stats = pool.stats();
+    println!("one slot over {n} epochs: {stats:?}");
+    assert_eq!(stats.too_small, 0, "an epoch did not fit 64 MiB");
+    assert_eq!(stats.not_ready, 0, "the slot was filled before the run");
+    assert_eq!(
+        (stats.leased + stats.none_free) as usize,
+        n,
+        "every epoch either took the slot or found it held"
+    );
+    assert!(
+        stats.leased as usize >= n.div_ceil(2),
+        "two epochs in a row missed: a slot was not back before the next epoch"
+    );
+    assert!(
+        stats.none_free >= 1,
+        "no epoch found the slot held, so the miss path went untested"
+    );
+    assert_eq!(stats.free, 1, "the slot did not come back");
+    assert_same_run(&pinned, &vecs, "one slot");
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &pinned, &opts).expect("verify"),
+        "the pinned bundle does not verify"
+    );
+}
+
+/// The negative: the first epoch written into the slot claims one column's
+/// zero tail starts a value too early, so the card holds a zero where the host
+/// holds that value. The run then refuses, or its bundle does not verify.
+/// The control: the same run without the hook verifies (the test above).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a card"]
+fn a_tail_claimed_early_yields_no_verifying_bundle() {
+    let _turn = PINNED_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let pool = multilinear::pinned::Pool::new(1, 64 << 20);
+    pool.fill().expect("a pinned slot on the card");
+    multilinear_continuation::CLAIM_A_TAIL_EARLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    let proved = multilinear_continuation::prove_continuation_pinned(
+        &elf_bytes,
+        &input,
+        2,
+        &opts,
+        true,
+        true,
+        Some(pool.clone()),
+    );
+    let armed = multilinear_continuation::CLAIM_A_TAIL_EARLY
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(!armed, "no epoch took the slot, so the hook never fired");
+    match proved {
+        Err(why) => println!("the run refused the early tail: {why:?}"),
+        Ok((bundle, _)) => {
+            let verdict = multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts);
+            println!("the early tail's bundle: {verdict:?}");
+            assert!(
+                !matches!(verdict, Ok(true)),
+                "a value left zero on the card still verified"
+            );
+        }
+    }
+    assert_eq!(pool.stats().free, 1, "the slot did not come back");
+}

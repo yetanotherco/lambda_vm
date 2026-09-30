@@ -270,6 +270,16 @@ where
         layout: TableLayout<'a, F, E>,
         mut main_column: impl FnMut(u16) -> Vec<FieldElement<F>>,
     ) -> Result<Self, MlError> {
+        Self::from_layout_mles(layout, |col| Mle::new(main_column(col)))
+    }
+
+    /// [`Self::from_layout`] with each column handed over as an [`Mle`]
+    /// already made: a view into an epoch's pinned slot ([`Mle::shared`]),
+    /// say, whose values stay where they are.
+    pub fn from_layout_mles(
+        layout: TableLayout<'a, F, E>,
+        mut main_column: impl FnMut(u16) -> Result<Mle<F>, MlError>,
+    ) -> Result<Self, MlError> {
         debug_assert!(
             {
                 let mut seen: Vec<u16> = layout.column_keys().iter().map(|k| k.col).collect();
@@ -287,11 +297,11 @@ where
                 key.main,
                 "the bus replaces every constraint that reads an auxiliary column"
             );
-            let values = main_column(key.col);
-            if values.len() != size {
-                return Err(MlError::NotPowerOfTwo(values.len()));
+            let column = main_column(key.col)?;
+            if column.len() != size {
+                return Err(MlError::NotPowerOfTwo(column.len()));
             }
-            columns.push(Mle::new(values)?);
+            columns.push(column);
         }
 
         let trace = TraceData::new(
@@ -339,6 +349,15 @@ where
     pub fn columns(&self) -> &[Mle<F>] {
         self.trace.columns()
     }
+}
+
+static HOST_BACKING_DETACHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Commits since the process started whose column upload was refused while
+/// some column was a view into shared host columns, so the views were copied
+/// out ([`CommittedTables::commit_grouped_settled`]).
+pub fn host_backing_detaches() -> u64 {
+    HOST_BACKING_DETACHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Every table's columns, committed **once**.
@@ -610,6 +629,19 @@ where
             column_at += table.num_committed_columns();
         }
         drop(all);
+        // Without the store every other path reads the host columns and may
+        // copy them to the card itself. A view into a pinned slot is copied
+        // into a `Vec` first, so the upload above stays the only copy that
+        // ever reads a slot (D-TRACE-1B §2.1, rule 5).
+        if store.is_none() {
+            let views: usize = tables
+                .iter_mut()
+                .map(|table| table.trace.detach_host_backing())
+                .sum();
+            if views > 0 {
+                HOST_BACKING_DETACHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         let mut groups = Vec::with_capacity(sizes.len());
         let mut roots = Vec::new();

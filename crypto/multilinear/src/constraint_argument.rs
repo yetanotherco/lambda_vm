@@ -236,6 +236,20 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         &self.columns
     }
 
+    /// Copies every column that is a view into shared host columns
+    /// ([`Mle::shared`]) into a `Vec` of its own, so nothing this table does
+    /// from here on reads the backing; returns how many were views.
+    pub fn detach_host_backing(&mut self) -> usize {
+        let mut views = 0;
+        for column in &mut self.columns {
+            if column.nonzero_len().is_some() {
+                column.detach();
+                views += 1;
+            }
+        }
+        views
+    }
+
     pub fn kinds(&self) -> &[FactorKind] {
         &self.kinds
     }

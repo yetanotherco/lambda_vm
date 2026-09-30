@@ -1986,8 +1986,10 @@ pub(crate) struct EpochPrepped {
     label: u64,
     airs: crate::VmAirs,
     l2g_air: Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
-    /// Per table in proof order, its main columns.
-    columns: Vec<Vec<Vec<FieldElement<F>>>>,
+    /// Every table's main columns, in proof order.
+    columns: PreppedColumns,
+    /// Why the columns are not in a pinned slot when one was asked for.
+    columns_miss: Option<multilinear::pinned::Miss>,
     /// Per table, `(width, num_vars)`.
     shapes: Vec<(usize, usize)>,
     names: Vec<String>,
@@ -1996,14 +1998,114 @@ pub(crate) struct EpochPrepped {
     public_output: Vec<u8>,
 }
 
+/// An epoch's main columns, as the producer hands them over.
+pub(crate) enum PreppedColumns {
+    /// Per table in proof order, its main columns.
+    Owned(Vec<Vec<Vec<FieldElement<F>>>>),
+    /// Every table's main columns in one pinned slot ([`WHIR_PINNED_COLUMNS_ENV`]),
+    /// back to back in proof order and each table's in column order: per table,
+    /// where its columns start, their height, and one past each column's last
+    /// raw nonzero value.
+    Pinned {
+        host: std::sync::Arc<dyn multilinear::mle::HostColumns<F>>,
+        tables: Vec<(usize, usize, Vec<usize>)>,
+    },
+}
+
+/// The error a table whose preprocessed column disagrees with its program
+/// gets: the verifier rebuilds these and demands the proof open to them, so a
+/// trace that disagrees produces a proof nobody can verify.
+fn preprocessed_mismatch(air: &str, col: usize) -> Error {
+    Error::Prover(format!(
+        "{air}: preprocessed column {col} is not what the program implies"
+    ))
+}
+
+/// Every table's main columns in `Vec`s, checked against its preprocessed
+/// columns.
+fn owned_columns(pairs: &[crate::AirTracePair<'_>]) -> Result<PreppedColumns, Error> {
+    let mut columns = Vec::with_capacity(pairs.len());
+    for (air, trace, _) in pairs {
+        let main = trace.columns_main();
+        for (col, expected) in air.precomputed_columns().iter().enumerate() {
+            if main.get(col) != Some(expected) {
+                return Err(preprocessed_mismatch(air.name(), col));
+            }
+        }
+        columns.push(main);
+    }
+    Ok(PreppedColumns::Owned(columns))
+}
+
+/// Every table's main columns written into `lease` back to back, checked
+/// against its preprocessed columns as [`owned_columns`] checks the `Vec`s,
+/// and frozen. The same pass finds each column's zero tail by the raw word —
+/// a non-canonical zero is not zero bytes, and the card must end up holding
+/// what the `Vec`s would have sent — so a tail and its values are fixed
+/// together.
+fn columns_into_slot(
+    mut lease: multilinear::pinned::Lease,
+    pairs: &[crate::AirTracePair<'_>],
+) -> Result<PreppedColumns, Error> {
+    let values = lease.values_mut();
+    let mut tables = Vec::with_capacity(pairs.len());
+    let mut at = 0usize;
+    for (air, trace, _) in pairs {
+        let table = &trace.main_table;
+        let (width, height) = (table.width, table.height);
+        let mut nonzero = vec![0usize; width];
+        let written = values
+            .get_mut(at..at + width * height)
+            .is_some_and(|region| table.columns_into(region, &mut nonzero, |v| *v.value() == 0));
+        if !written {
+            return Err(Error::Prover(format!(
+                "{}: its {width} × {height} columns do not fit the pinned slot at {at}",
+                air.name()
+            )));
+        }
+        let region = &values[at..at + width * height];
+        for (col, expected) in air.precomputed_columns().iter().enumerate() {
+            if region.get(col * height..(col + 1) * height) != Some(expected.as_slice()) {
+                return Err(preprocessed_mismatch(air.name(), col));
+            }
+        }
+        tables.push((at, height, nonzero));
+        at += width * height;
+    }
+    #[cfg(test)]
+    if CLAIM_A_TAIL_EARLY.swap(false, std::sync::atomic::Ordering::SeqCst)
+        && let Some(nonzero) = tables
+            .iter_mut()
+            .max_by_key(|(_, height, _)| *height)
+            .and_then(|(_, _, nonzero)| nonzero.iter_mut().max())
+    {
+        *nonzero = nonzero.saturating_sub(1);
+    }
+    Ok(PreppedColumns::Pinned {
+        host: lease.freeze(),
+        tables,
+    })
+}
+
+/// ⛔ TEST-ONLY: the next epoch written into a slot claims that one column's
+/// zero tail — the tallest table's longest — starts a value before its last
+/// nonzero one, so a test can show a wrong length yields a rejected proof.
+#[cfg(test)]
+pub(crate) static CLAIM_A_TAIL_EARLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The same host work [`prove_epoch`]'s `prep` stage does before its layouts,
 /// on whichever thread calls it. Prints one `BASE PREP <index>` line under
 /// `LAMBDA_VM_BASE_SPLIT=1`.
+///
+/// With `pinned`, the columns go into one of its slots when one is free, and
+/// a `PINNED COLUMNS <index>` line says which, or why not.
 pub(crate) fn prep_epoch_ahead(
     elf: &Elf,
     epoch: crate::continuation::PreparedEpoch,
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
+    pinned: Option<&multilinear::pinned::Pool>,
 ) -> Result<EpochPrepped, Error> {
     let t = std::time::Instant::now();
     let t0 = stark::prove_split::epoch_secs();
@@ -2045,7 +2147,7 @@ pub(crate) fn prep_epoch_ahead(
         Box::new(crate::continuation::l2g_memory_air(opts, label));
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
 
-    let (columns, shapes, names) = {
+    let (columns, columns_miss, shapes, names) = {
         let mut pairs = airs.air_trace_pairs(&mut traces);
         pairs.push((&*l2g_air, &mut l2g_trace, &()));
         let shapes: Vec<(usize, usize)> = pairs
@@ -2061,22 +2163,44 @@ pub(crate) fn prep_epoch_ahead(
             .iter()
             .map(|(air, _, _)| air.name().to_string())
             .collect();
-        let mut columns = Vec::with_capacity(pairs.len());
-        for (air, trace, _) in pairs.iter_mut() {
-            let main = trace.columns_main();
-            // The verifier rebuilds these and demands the proof open to them, so a
-            // trace that disagrees produces a proof nobody can verify.
-            for (col, expected) in air.precomputed_columns().iter().enumerate() {
-                if main.get(col) != Some(expected) {
-                    return Err(Error::Prover(format!(
-                        "{}: preprocessed column {col} is not what the program implies",
-                        air.name(),
-                    )));
+        let cells: usize = pairs
+            .iter()
+            .map(|(_, trace, _)| trace.main_table.width * trace.main_table.height)
+            .sum();
+        let (columns, columns_miss) = match pinned.map(|pool| pool.try_lease(cells)) {
+            Some(Ok(lease)) => {
+                let slot = lease.slot();
+                let columns = columns_into_slot(lease, &pairs)?;
+                if crate::continuation::base_split_enabled()
+                    && let PreppedColumns::Pinned { tables, .. } = &columns
+                {
+                    let tails: usize = tables
+                        .iter()
+                        .map(|(_, height, nonzero)| {
+                            nonzero.iter().map(|n| height - n).sum::<usize>()
+                        })
+                        .sum();
+                    println!(
+                        "PINNED COLUMNS {index}: slot {slot}, {:.3} GB, zero tails {:.3} GB",
+                        cells as f64 * 8.0 / 1e9,
+                        tails as f64 * 8.0 / 1e9,
+                    );
                 }
+                (columns, None)
             }
-            columns.push(main);
-        }
-        (columns, shapes, names)
+            Some(Err(miss)) => {
+                if crate::continuation::base_split_enabled() {
+                    println!(
+                        "PINNED COLUMNS {index}: fallback {} ({:.3} GB in Vecs)",
+                        miss.name(),
+                        cells as f64 * 8.0 / 1e9,
+                    );
+                }
+                (owned_columns(&pairs)?, Some(miss))
+            }
+            None => (owned_columns(&pairs)?, None),
+        };
+        (columns, columns_miss, shapes, names)
     };
     if crate::continuation::base_split_enabled() {
         println!(
@@ -2091,6 +2215,7 @@ pub(crate) fn prep_epoch_ahead(
         airs,
         l2g_air,
         columns,
+        columns_miss,
         shapes,
         names,
         reg_fini,
@@ -2115,7 +2240,8 @@ where
         label,
         airs,
         l2g_air,
-        mut columns,
+        columns,
+        columns_miss: _,
         shapes,
         names,
         reg_fini,
@@ -2141,15 +2267,47 @@ where
     multilinear::whir_split::set_table_names(names);
 
     let mut committed = Vec::with_capacity(refs.len());
-    for ((air, main), &(width, num_vars)) in refs.iter().zip(columns.iter_mut()).zip(&shapes) {
-        let layout = layout_of(*air, width, num_vars)
-            .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
-        committed.push(
-            CommittedTable::from_layout(layout, |col| core::mem::take(&mut main[col as usize]))
-                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
-        );
+    match columns {
+        PreppedColumns::Owned(mut columns) => {
+            for ((air, main), &(width, num_vars)) in
+                refs.iter().zip(columns.iter_mut()).zip(&shapes)
+            {
+                let layout = layout_of(*air, width, num_vars)
+                    .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+                committed.push(
+                    CommittedTable::from_layout(layout, |col| {
+                        core::mem::take(&mut main[col as usize])
+                    })
+                    .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
+                );
+            }
+        }
+        // Each committed column is a view into the slot, which goes back to
+        // the pool when the last of them drops with `committed`, at the end
+        // of this prove.
+        PreppedColumns::Pinned { host, tables } => {
+            for ((air, (start, height, nonzero)), &(width, num_vars)) in
+                refs.iter().zip(&tables).zip(&shapes)
+            {
+                let layout = layout_of(*air, width, num_vars)
+                    .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+                committed.push(
+                    CommittedTable::from_layout_mles(layout, |col| {
+                        let col = col as usize;
+                        let nonzero =
+                            *nonzero
+                                .get(col)
+                                .ok_or(multilinear::Error::UnknownPolynomial {
+                                    index: col,
+                                    len: width,
+                                })?;
+                        Mle::shared(host.clone(), start + col * height, *height, nonzero)
+                    })
+                    .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
+                );
+            }
+        }
     }
-    drop(columns);
     let sizes = epoch_groups(committed.len());
     prepared.agrees_with(&config)?;
     let __ws_airs = committed.len();
@@ -2388,6 +2546,131 @@ pub(crate) fn whir_head_ahead() -> bool {
     })
 }
 
+/// D-TRACE stage 1b: the producer writes each epoch's main columns straight
+/// into a page-locked slot instead of into `Vec`s, the committed columns are
+/// views into it, and the commit's upload is a DMA from it — no staging copy,
+/// and each column's all-zero tail zeroed on the card instead of sent. `1` on;
+/// unset, empty or `0` off (the default); anything else stops the run.
+///
+/// Why: the pageable upload ran at 19.0 GB/s in the proof, 1.78 s over the
+/// base's 33.84 GB (G6-LEDGER §8.5), against 57.3 GB/s from `cuMemHostAlloc`
+/// memory on the same card (FAST job 291's microbench). Two slots of
+/// `LAMBDA_VM_WHIR_PINNED_SLOT_MB` MiB (3072 by default) replace the two alive
+/// epochs' column `Vec`s; they are allocated on a helper after the DECODE
+/// commitment, and an epoch that finds no slot free builds its `Vec`s as
+/// before. The proofs are the same either way.
+pub const WHIR_PINNED_COLUMNS_ENV: &str = "LAMBDA_VM_WHIR_PINNED_COLUMNS";
+
+/// [`WHIR_PINNED_COLUMNS_ENV`] for a raw value: `1` on; unset, empty or `0`
+/// off. Anything else panics rather than measuring the default under the
+/// switch's name.
+pub fn whir_pinned_columns_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{WHIR_PINNED_COLUMNS_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// Whether this process's WHIR base writes its epochs' columns into pinned
+/// slots. Read once, and named on stderr in one write either way.
+pub(crate) fn whir_pinned_columns() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on =
+            whir_pinned_columns_setting(std::env::var(WHIR_PINNED_COLUMNS_ENV).ok().as_deref());
+        let line = if on {
+            format!(
+                "BASE COLUMNS (WHIR): pinned slots ({WHIR_PINNED_COLUMNS_ENV}=1) — the producer \
+                 writes each epoch's columns where the upload reads them\n"
+            )
+        } else {
+            "BASE COLUMNS (WHIR): Vec (the default)\n".to_string()
+        };
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        on
+    })
+}
+
+/// How a base's epochs took their columns, for the line after the base.
+#[derive(Default)]
+struct PinnedTally {
+    epochs: usize,
+    pinned: usize,
+    not_ready: usize,
+    none_free: usize,
+    too_small: usize,
+    no_device: usize,
+}
+
+impl PinnedTally {
+    fn note(&mut self, columns: &PreppedColumns, miss: Option<multilinear::pinned::Miss>) {
+        use multilinear::pinned::Miss;
+        self.epochs += 1;
+        match (columns, miss) {
+            (PreppedColumns::Pinned { .. }, _) => self.pinned += 1,
+            (PreppedColumns::Owned(_), Some(Miss::NotReady)) => self.not_ready += 1,
+            (PreppedColumns::Owned(_), Some(Miss::NoneFree)) => self.none_free += 1,
+            (PreppedColumns::Owned(_), Some(Miss::TooSmall)) => self.too_small += 1,
+            (PreppedColumns::Owned(_), Some(Miss::NoDevice)) => self.no_device += 1,
+            (PreppedColumns::Owned(_), None) => {}
+        }
+    }
+
+    fn line(&self, detached: u64, pool: &multilinear::pinned::Stats) -> String {
+        format!(
+            "PINNED SLOTS: epochs pinned {}/{} · fallbacks not-ready {} · none-free {} · too-small {} \
+             · no-device {} · detached {detached} · slots {}/{}",
+            self.pinned,
+            self.epochs,
+            self.not_ready,
+            self.none_free,
+            self.too_small,
+            self.no_device,
+            pool.created,
+            pool.slots,
+        )
+    }
+}
+
+/// Allocates `pool`'s slots on a helper, off the head's path, and prints when
+/// they are ready under `LAMBDA_VM_BASE_SPLIT=1`. An epoch prepared before a
+/// slot exists builds its `Vec`s as before.
+fn prewarm_pinned_slots(pool: multilinear::pinned::Pool) {
+    let spawned = std::thread::Builder::new()
+        .name("whir-pinned-slots".to_string())
+        .spawn(move || {
+            let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+            let filled = pool.fill();
+            if !crate::continuation::base_split_enabled() {
+                return;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let gib = pool.slot_elems() as f64 * 8.0 / f64::from(1u32 << 30);
+            let stats = pool.stats();
+            match filled {
+                Ok(took) => println!(
+                    "PINNED SLOTS: {} × {gib:.2} GiB in {secs:.2}s on a helper ({}), ready at \
+                     t={:.3} (started t={t0:.3})",
+                    stats.created,
+                    took.iter()
+                        .map(|s| format!("{s:.2}s"))
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                    stark::prove_split::epoch_secs(),
+                ),
+                Err(why) => println!(
+                    "PINNED SLOTS: allocation failed after {secs:.2}s ({why}); {} of {} slots exist",
+                    stats.created, stats.slots,
+                ),
+            }
+        });
+    if spawned.is_err() && crate::continuation::base_split_enabled() {
+        println!("PINNED SLOTS: the helper did not spawn; every epoch builds its Vecs");
+    }
+}
+
 /// Print a head step under `LAMBDA_VM_BASE_SPLIT=1`, like the epochs' stages.
 fn whir_head_done(step: &str, start: std::time::Instant, t0: f64) {
     if crate::continuation::base_split_enabled() {
@@ -2489,6 +2772,9 @@ impl DecodeRoot {
 /// ahead of its prove, and the global proof's there too once the last epoch is
 /// handed over; `head_ahead` computes DECODE's root on a helper beside epoch 0
 /// instead of before the pipeline. The proofs are the same every way.
+///
+/// The columns' storage is still [`WHIR_PINNED_COLUMNS_ENV`]'s, in the
+/// process's pool of slots.
 pub(crate) fn prove_continuation_scheduled(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -2497,6 +2783,32 @@ pub(crate) fn prove_continuation_scheduled(
     prep_ahead: bool,
     head_ahead: bool,
 ) -> Result<(ContinuationProof, BaseDecode), Error> {
+    prove_continuation_pinned(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        prep_ahead,
+        head_ahead,
+        whir_pinned_columns().then(multilinear::pinned::Pool::global),
+    )
+}
+
+/// [`prove_continuation_scheduled`] with the columns' storage named too:
+/// `Some(pool)` has each epoch prepared ahead write its columns into a slot of
+/// `pool` ([`WHIR_PINNED_COLUMNS_ENV`]), whose slots a helper allocates once
+/// the DECODE commitment is in; `None` builds `Vec`s. Only the preparation
+/// ahead of the prover takes slots. The proofs are the same every way.
+pub(crate) fn prove_continuation_pinned(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    prep_ahead: bool,
+    head_ahead: bool,
+    pinned: Option<multilinear::pinned::Pool>,
+) -> Result<(ContinuationProof, BaseDecode), Error> {
+    let pinned = pinned.filter(|_| prep_ahead);
     // The observer a caller installed for this thread, if any (see
     // [`crate::continuation::EpochObserver`]). It sees the pipeline and changes
     // nothing in it.
@@ -2533,6 +2845,13 @@ pub(crate) fn prove_continuation_scheduled(
         let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
         let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
         whir_head_done("DECODE prepared", start, t0);
+        // From here to epoch 0's commit the head's path makes no device call,
+        // so the slots are allocated beside it.
+        if let Some(pool) = &pinned {
+            prewarm_pinned_slots(pool.clone());
+        }
+        let mut tally = PinnedTally::default();
+        let detached_before = stark::multilinear_table::host_backing_detaches();
         let share = || -> Result<(), Error> {
             if let Some(observer) = observer {
                 observer.on_base_shared(std::sync::Arc::new(SharedDecode {
@@ -2556,7 +2875,7 @@ pub(crate) fn prove_continuation_scheduled(
                 on_count,
                 |p| {
                     let decode_commitment = root.get_for_prep(p.index)?;
-                    prep_epoch_ahead(&elf, p, opts, Some(decode_commitment))
+                    prep_epoch_ahead(&elf, p, opts, Some(decode_commitment), pinned.as_ref())
                 },
                 |boundaries| prep_global_ahead(boundaries, &elf, private_inputs, opts),
                 |p| {
@@ -2564,6 +2883,7 @@ pub(crate) fn prove_continuation_scheduled(
                         share()?;
                     }
                     let index = p.index as usize;
+                    tally.note(&p.columns, p.columns_miss);
                     let proof = prove_prepped_epoch::<H>(p, elf_bytes, &prepared)?;
                     if let Some(observer) = observer {
                         observer.on_epoch_proved(index, &proof);
@@ -2572,6 +2892,12 @@ pub(crate) fn prove_continuation_scheduled(
                     Ok(())
                 },
             )?;
+            if let Some(pool) = &pinned
+                && crate::continuation::base_split_enabled()
+            {
+                let detached = stark::multilinear_table::host_backing_detaches() - detached_before;
+                println!("{}", tally.line(detached, &pool.stats()));
+            }
             (boundaries, Some(global))
         } else {
             let boundaries = crate::continuation::for_each_epoch_overlapped_counted(

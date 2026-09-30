@@ -2870,6 +2870,17 @@ impl std::fmt::Debug for ResidentColumns {
     }
 }
 
+thread_local! {
+    static REFUSE_COLUMNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// ⛔ TEST-ONLY: this thread's [`upload_columns`] decline while `on`, as they
+/// do when the card will not promise the room — the path a refused store takes.
+#[doc(hidden)]
+pub fn refuse_column_uploads_on_this_thread(on: bool) {
+    REFUSE_COLUMNS.with(|refuse| refuse.set(on));
+}
+
 /// Puts every column of an epoch on the card, in the order given.
 ///
 /// `None` when there is no device or it will not promise the room, and then
@@ -2885,7 +2896,9 @@ where
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some()) {
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some())
+        || REFUSE_COLUMNS.with(std::cell::Cell::get)
+    {
         return None;
     }
     // A view into a pinned slot (`crate::pinned`) knows where its zero tail

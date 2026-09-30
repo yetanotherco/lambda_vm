@@ -407,6 +407,49 @@ impl<F: IsField> Table<F> {
         return (0..self.width).map(column).collect();
     }
 
+    /// [`Self::columns`], written into `out` column after column instead of
+    /// into fresh `Vec`s, one worker per column as there. The same pass writes
+    /// `nonzero[c]`: one past column `c`'s last value `is_zero` refuses, so
+    /// everything from there on is a zero tail by that test.
+    ///
+    /// `out` must hold `width × height` values and `nonzero` `width`; when
+    /// they do not, nothing is written and this returns `false`.
+    #[must_use]
+    pub fn columns_into(
+        &self,
+        out: &mut [FieldElement<F>],
+        nonzero: &mut [usize],
+        is_zero: impl Fn(&FieldElement<F>) -> bool + Sync,
+    ) -> bool {
+        if self.width.checked_mul(self.height) != Some(out.len()) || nonzero.len() != self.width {
+            return false;
+        }
+        if self.height == 0 {
+            nonzero.fill(0);
+            return true;
+        }
+        let column = |(col_idx, (dst, last)): (usize, (&mut [FieldElement<F>], &mut usize))| {
+            let mut end = 0usize;
+            for (row_idx, slot) in dst.iter_mut().enumerate() {
+                let value = self.get(row_idx, col_idx);
+                end = if is_zero(value) { end } else { row_idx + 1 };
+                *slot = value.clone();
+            }
+            *last = end;
+        };
+        #[cfg(feature = "parallel")]
+        out.par_chunks_exact_mut(self.height)
+            .zip(nonzero.par_iter_mut())
+            .enumerate()
+            .for_each(column);
+        #[cfg(not(feature = "parallel"))]
+        out.chunks_exact_mut(self.height)
+            .zip(nonzero.iter_mut())
+            .enumerate()
+            .for_each(column);
+        true
+    }
+
     /// Extract columns as owned vectors, with each allocated at `capacity`.
     ///
     /// `capacity` is a hint sized for downstream LDE expansion so the FFT grows
@@ -543,5 +586,96 @@ where
 
     pub fn get_aux_evaluation_element(&self, row: usize, col: usize) -> &FieldElement<E> {
         &self.aux_data[row][col]
+    }
+}
+
+#[cfg(test)]
+mod columns_into_tests {
+    use super::{FieldElement, Table};
+    use math::field::goldilocks::GoldilocksField as F;
+
+    type FE = FieldElement<F>;
+
+    /// Goldilocks' zero test on the raw word, as the pinned producer uses it: a
+    /// non-canonical representative of zero is not zero bytes.
+    fn raw_zero(v: &FE) -> bool {
+        *v.value() == 0
+    }
+
+    /// A row-major table whose column `c` has its last `tails[c]` rows zero.
+    fn table(height: usize, tails: &[usize], seed: u64) -> Table<F> {
+        let width = tails.len();
+        let mut state = seed;
+        let mut data = Vec::with_capacity(width * height);
+        for row in 0..height {
+            for &tail in tails {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let live = row + tail < height;
+                data.push(if live {
+                    FE::from((state >> 11) | 1)
+                } else {
+                    FE::zero()
+                });
+            }
+        }
+        Table::new(data, width)
+    }
+
+    /// What `columns_into` must agree with: `columns()` laid end to end, and a
+    /// plain backward scan of each for its last raw nonzero value.
+    fn expected(t: &Table<F>) -> (Vec<FE>, Vec<usize>) {
+        let columns = t.columns();
+        let nonzero = columns
+            .iter()
+            .map(|c| c.iter().rposition(|v| !raw_zero(v)).map_or(0, |i| i + 1))
+            .collect();
+        (columns.into_iter().flatten().collect(), nonzero)
+    }
+
+    #[test]
+    fn columns_into_writes_what_columns_returns_and_the_tails_it_saw() {
+        for (height, seed) in [(1usize, 1u64), (2, 2), (8, 3), (64, 4), (1024, 5)] {
+            let tails: Vec<usize> = (0..7).map(|c| (c * height / 5).min(height)).collect();
+            let t = table(height, &tails, seed);
+            let (values, nonzero) = expected(&t);
+            let mut out = vec![FE::from(99u64); t.width * t.height];
+            let mut got = vec![usize::MAX; t.width];
+            assert!(t.columns_into(&mut out, &mut got, raw_zero));
+            assert_eq!(out, values, "height {height}");
+            assert_eq!(got, nonzero, "height {height}");
+        }
+    }
+
+    /// A column whose last nonzero word is the prime itself — zero as a field
+    /// element — keeps it: the tail is cut on raw words only.
+    #[test]
+    fn a_non_canonical_zero_is_not_a_zero_tail() {
+        let p = FE::const_from_raw(0xFFFF_FFFF_0000_0001);
+        assert_eq!(p, FE::zero(), "the prime is zero as a field element");
+        let mut t = table(16, &[10, 16, 0], 7);
+        t.set(5, 0, p);
+        t.set(15, 1, p);
+        let (values, nonzero) = expected(&t);
+        let mut out = vec![FE::zero(); 48];
+        let mut got = vec![0; 3];
+        assert!(t.columns_into(&mut out, &mut got, raw_zero));
+        assert_eq!(out, values);
+        assert_eq!(got, [6, 16, 16]);
+        assert_eq!(got, nonzero);
+    }
+
+    #[test]
+    fn columns_into_refuses_buffers_of_the_wrong_size() {
+        let t = table(8, &[1, 2], 9);
+        let mut out = vec![FE::zero(); 15];
+        let mut nonzero = vec![7usize; 2];
+        assert!(!t.columns_into(&mut out, &mut nonzero, raw_zero));
+        assert_eq!(nonzero, [7, 7], "a refused call wrote");
+        let mut out = vec![FE::zero(); 16];
+        let mut short = vec![7usize; 1];
+        assert!(!t.columns_into(&mut out, &mut short, raw_zero));
+        assert!(out.iter().all(|v| *v == FE::zero()), "a refused call wrote");
     }
 }
