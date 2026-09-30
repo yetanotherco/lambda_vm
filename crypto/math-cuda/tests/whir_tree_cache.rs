@@ -919,3 +919,121 @@ fn a_miss_the_layers_cannot_cover_keeps_them_and_moves_no_path() {
         assert_eq!(got, want, "keep {keep}: the paths moved");
     }
 }
+
+/// ⛔ A WHOLE TREE KEPT UNDER `LFM_WHIR_WHOLE_TREES` SERVES ITS OPENINGS AND
+/// MOVES NO BYTE; EVICTED, THE NEXT OPENING BUILDS THE SAME TREE AND KEEPS IT
+/// WHOLE AGAIN.
+///
+/// The reference is a codeword opened with the switch off: its root, its paths,
+/// and its paths with their Merkle cap. With the switch on the commit keeps the
+/// whole node array, and two openings — the paths, then the paths and the cap —
+/// build nothing (`tree_builds` stays 1) and give the reference's bytes. Then a
+/// reserve the kept tree can cover evicts it and succeeds, as a layer's would,
+/// and the next opening hashes the leaves again, gives the same paths and keeps
+/// the tree whole again. An opening that stopped reading the kept tree reddens
+/// the build count; a capture that kept only the leaves reddens the byte count.
+#[test]
+fn a_kept_whole_tree_serves_its_openings_and_moves_no_byte() {
+    let _exclusive = exclusive();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            math_cuda::whir::force_whole_trees(None);
+        }
+    }
+    let _restore = Restore;
+    let be = math_cuda::device::backend().expect("whole-tree test needs a GPU");
+    let hash = key::<RpxWhir>();
+    let (num_vars, log_folding, cap_height) = (14, 4, 3);
+    let raw: Vec<u64> = poly(num_vars).evals().iter().map(|v| *v.value()).collect();
+    let leaves = (raw.len() << 2) >> log_folding;
+    let positions: Vec<u32> = [0usize, 1, leaves / 3, leaves - 1]
+        .iter()
+        .map(|p| *p as u32)
+        .collect();
+
+    math_cuda::whir::force_whole_trees(Some(false));
+    let (reference, reference_root) =
+        math_cuda::whir::commit_codeword(&raw, 2, log_folding, false, hash)
+            .expect("device commit (needs a GPU)");
+    let want = reference
+        .paths(log_folding, &positions, hash)
+        .expect("paths");
+    let want_capped = reference
+        .paths_and_cap(log_folding, &positions, cap_height, hash)
+        .expect("paths and cap");
+    assert_eq!(
+        reference.retained_leaf_bytes(),
+        leaves as u64 * 32,
+        "switch off: the leaf layer alone is kept"
+    );
+    drop(reference);
+
+    math_cuda::whir::force_whole_trees(Some(true));
+    let (codeword, root) =
+        math_cuda::whir::commit_codeword(&raw, 2, log_folding, false, hash).expect("device commit");
+    assert_eq!(root, reference_root, "the root moved");
+    let whole = codeword.retained_leaf_bytes();
+    assert_eq!(
+        whole,
+        (2 * leaves as u64 - 1) * 32,
+        "switch on: the commit must keep the whole tree"
+    );
+    let (_, served_before) = math_cuda::whir::retention_whole();
+    let got = codeword
+        .paths(log_folding, &positions, hash)
+        .expect("paths");
+    let got_capped = codeword
+        .paths_and_cap(log_folding, &positions, cap_height, hash)
+        .expect("paths and cap");
+    let (on, served_after) = math_cuda::whir::retention_whole();
+    assert!(on, "the switch must read back as forced");
+    assert_eq!(
+        served_after,
+        served_before + 2,
+        "both openings must be served the kept tree"
+    );
+    assert_eq!(
+        codeword.tree_builds(),
+        1,
+        "openings served a kept tree build none"
+    );
+    assert_eq!(codeword.leaf_passes(), 1, "and hash no leaf");
+    assert_eq!(got, want, "the paths moved");
+    assert_eq!(got_capped, want_capped, "the paths or the cap moved");
+
+    // A reserve the kept tree can cover evicts it, whole, and succeeds.
+    let (evictions_before, _) = math_cuda::whir::retention_evictions();
+    let gap = whole / 2;
+    let hog_bytes = be
+        .vram_budget_bytes()
+        .saturating_sub(be.reserved_bytes())
+        .saturating_sub(gap);
+    let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+    let room = math_cuda::device::reserve(whole)
+        .expect("a miss the kept tree can cover must evict it and succeed");
+    let (evictions_after, _) = math_cuda::whir::retention_evictions();
+    assert!(
+        evictions_after > evictions_before,
+        "the kept tree must have been evicted"
+    );
+    assert_eq!(codeword.retained_leaf_bytes(), 0, "the tree must be gone");
+    drop(room);
+    drop(hog);
+
+    let again = codeword
+        .paths(log_folding, &positions, hash)
+        .expect("paths");
+    assert_eq!(
+        codeword.tree_builds(),
+        2,
+        "evicted, the opening builds the tree again"
+    );
+    assert_eq!(codeword.leaf_passes(), 2, "and hashes its leaves again");
+    assert_eq!(again, want, "the rebuilt tree gives the same paths");
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        whole,
+        "and it is kept whole again"
+    );
+}
