@@ -949,8 +949,9 @@ impl Session<'_> {
     }
 }
 
-/// ★ Q1b device parity (FAST2): the fused rounds on the card send today's
-/// messages — the three at 2^10 and 2^12, every table at 2^8 — over random
+/// ★ Q1b device parity (box): the fused rounds on the card send today's
+/// messages — the three at 2^10 and 2^12, every table at 2^8 or the height
+/// the card's upload takes it at — over random
 /// columns, the corners summed (random columns break every AIR), with the
 /// cross-check on: today's device rounds replay the fused challenges and must
 /// agree. Each run must have taken the card (`fused_sessions`) and been
@@ -969,9 +970,18 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
     );
     let vm = vm_airs();
     let lfm = w_lfm_airs();
+    // Each table at 2^8, or as far above as the card's upload takes it: it
+    // declines a table under 4096 cells (`gpu::worth_the_device`), which the
+    // prover then argues on the host — EQ's 12 factors need 2^9, a two-factor
+    // chip 2^11.
     let mut runs: Vec<(String, usize)> = every_air(&vm, &lfm)
         .iter()
-        .map(|(_, label)| (label.clone(), 8))
+        .map(|(air, label)| {
+            let mut rng = Rng::new(0);
+            let width = Table::from_air(*air, label, 8, &mut rng).width();
+            let n = (8..).find(|n| width << n >= 4096).expect("a height");
+            (label.clone(), n)
+        })
         .collect();
     for label in THE_THREE {
         runs.push((label.to_string(), 10));
