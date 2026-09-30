@@ -521,6 +521,24 @@ enum MainLdeSlot<Field: IsField> {
     DroppedDevice,
 }
 
+/// One table's Round-1 main commit, made ahead of [`IsStarkProver::multi_prove_precommitted`]
+/// by [`IsStarkProver::precommit_main`] — typically on a producer thread the
+/// moment the table's trace exists, while the rest of the block is still being
+/// built. `multi_prove_precommitted` takes it in place of its own Round-1
+/// commit of that table and absorbs its root in AIR order like any other, so
+/// the transcript and the proof are the ones `multi_prove` would produce from
+/// the same traces.
+pub struct PrecommittedMain<Field: IsField + 'static, H: StarkHash>
+where
+    FieldElement<Field>: AsBytes + Sync + Send,
+{
+    commit: TableCommit<Field, H>,
+    cached_main: (Vec<FieldElement<Field>>, usize),
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    recommit_on_device: bool,
+}
+
 impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync + 'static,
@@ -4695,10 +4713,145 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        residency: ResidencyMode,
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        Self::multi_prove_precommitted(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            residency,
+            Vec::new(),
+        )
+    }
+
+    /// Round 1's main commit of one table, ahead of the prove: exactly the
+    /// commit [`Self::multi_prove`] would make of `trace` under `air` (the
+    /// same domain, leaf layout, device-only gate and residency), for
+    /// [`Self::multi_prove_precommitted`] to take in its place.
+    fn precommit_main(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &TraceTable<Field, FieldExtension>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        residency: ResidencyMode,
+    ) -> Result<PrecommittedMain<Field, H>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let layout = crate::leaf_layout::table_leaf_layout(air, trace.num_rows());
+        Self::r1_commit_table(
+            air,
+            trace,
+            &domain,
+            &twiddles,
+            layout,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            residency,
+        )
+    }
+
+    /// Round 1's main commit of one table: the precomputed root of its leaf
+    /// layout, the device-only gate, `commit_main_trace`, and under
+    /// `RecomputeLdeDevice` the device buffers freed at once (only the root is
+    /// kept).
+    #[allow(clippy::too_many_arguments)]
+    fn r1_commit_table(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        layout: LeafLayout,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        residency: ResidencyMode,
+    ) -> Result<PrecommittedMain<Field, H>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // The root of THIS layout; a layout the AIR has no root for is
+        // refused here, before anything is committed.
+        let precomputed = if air.is_preprocessed() {
+            let root = air.precomputed_commitment_for(layout).ok_or_else(|| {
+                ProvingError::PrecomputedCommitmentMissing(format!(
+                    "table {}: no precomputed commitment for the {layout:?} leaf layout",
+                    air.name()
+                ))
+            })?;
+            Some((root, air.num_precomputed_columns()))
+        } else {
+            None
+        };
+
+        // Stage-3 device-only gate: when it holds, `commit_main_trace`
+        // keeps the R1 LDE device-resident and skips the host D2H. A
+        // one-row table (S2) is no exception: its device trees and
+        // openings follow its leaf layout.
+        #[cfg(feature = "cuda")]
+        let device_only = Self::device_only_for(air, domain);
+
+        #[allow(unused_mut)]
+        let mut committed = Self::commit_main_trace(
+            air.name(),
+            trace,
+            domain,
+            twiddles,
+            precomputed,
+            layout,
+            #[cfg(feature = "cuda")]
+            device_only,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            residency,
+        )?;
+        // `RecomputeLdeDevice`: the root is all this phase keeps. The device
+        // LDE, tree and trace snapshot are freed here, inside the admitted
+        // region, so the next table's commit is admitted against an empty
+        // card rather than against every earlier table's buffers.
+        #[cfg(feature = "cuda")]
+        let recommit_on_device = residency.recommits_on_device() && committed.2.take().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let recommit_on_device = false;
+        #[cfg(feature = "cuda")]
+        let (commit, cached_main, gpu_main) = committed;
+        #[cfg(not(feature = "cuda"))]
+        let (commit, cached_main) = committed;
+        Ok(PrecommittedMain {
+            commit,
+            cached_main,
+            #[cfg(feature = "cuda")]
+            gpu_main,
+            recommit_on_device,
+        })
+    }
+
+    /// [`Self::multi_prove`] with some tables' Round-1 commits made ahead
+    /// ([`Self::precommit_main`]): `precommitted[i]`, when present, stands in
+    /// for table `i`'s commit (indices past its end have none). Each must have
+    /// been made from table `i`'s trace under its AIR and the same residency;
+    /// a precommit that is not is a proof no verifier accepts (and under
+    /// `RecomputeLdeDevice` the recommit's root check refuses it first).
+    #[allow(clippy::type_complexity)]
+    fn multi_prove_precommitted(
         #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         residency: ResidencyMode,
+        precommitted: Vec<Option<PrecommittedMain<Field, H>>>,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -4824,6 +4977,24 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        // A precommitted table's Round-1 task only hands its commit over, so it
+        // spends nothing at the gate.
+        let precommitted_cells: Vec<std::sync::Mutex<Option<PrecommittedMain<Field, H>>>> =
+            precommitted
+                .into_iter()
+                .map(std::sync::Mutex::new)
+                .collect();
+        let main_estimates: Vec<u64> = main_estimates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, est)| {
+                let pre = precommitted_cells
+                    .get(idx)
+                    .is_some_and(|c| c.lock().unwrap().is_some());
+                if pre { 0 } else { est }
+            })
+            .collect();
+
         // The AIR names, for the driver threads' panic payloads: a device abort
         // names its stage and shape, the driver adds which table.
         let table_names: Vec<String> = air_trace_pairs
@@ -4903,68 +5074,36 @@ pub trait IsStarkProver<
             k,
             |idx| table_names[idx].clone(),
             |idx| {
+                if let Some(pre) = precommitted_cells
+                    .get(idx)
+                    .and_then(|c| c.lock().unwrap().take())
+                {
+                    return Ok(pre);
+                }
                 let (air, trace, _) = &air_trace_pairs[idx];
-                let domain = &domains[idx];
-                let twiddles = &twiddle_caches[idx];
-
-                let layout = leaf_layouts[idx];
-                // The root of THIS layout; a layout the AIR has no root for is
-                // refused here, before anything is committed.
-                let precomputed = if air.is_preprocessed() {
-                    let root = air.precomputed_commitment_for(layout).ok_or_else(|| {
-                        ProvingError::PrecomputedCommitmentMissing(format!(
-                            "table {}: no precomputed commitment for the {layout:?} leaf layout",
-                            air.name()
-                        ))
-                    })?;
-                    Some((root, air.num_precomputed_columns()))
-                } else {
-                    None
-                };
-
-                // Stage-3 device-only gate: when it holds, `commit_main_trace`
-                // keeps the R1 LDE device-resident and skips the host D2H. A
-                // one-row table (S2) is no exception: its device trees and
-                // openings follow its leaf layout.
-                #[cfg(feature = "cuda")]
-                let device_only = Self::device_only_for(*air, domain);
-
-                #[allow(unused_mut)]
-                let mut committed = Self::commit_main_trace(
-                    air.name(),
-                    *trace,
-                    domain,
-                    twiddles,
-                    precomputed,
-                    layout,
-                    #[cfg(feature = "cuda")]
-                    device_only,
+                Self::r1_commit_table(
+                    *air,
+                    trace,
+                    &domains[idx],
+                    &twiddle_caches[idx],
+                    leaf_layouts[idx],
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
                     residency,
-                )?;
-                // `RecomputeLdeDevice`: the root is all this phase keeps. The
-                // device LDE, tree and trace snapshot are freed here, inside
-                // the admitted region, so the next table's commit is admitted
-                // against an empty card rather than against every earlier
-                // table's buffers.
-                #[cfg(feature = "cuda")]
-                let recommit_on_device =
-                    residency.recommits_on_device() && committed.2.take().is_some();
-                #[cfg(not(feature = "cuda"))]
-                let recommit_on_device = false;
-                Ok::<_, ProvingError>((committed, recommit_on_device))
+                )
             },
         );
         crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
         let __ps_abs = crate::prove_split::mark();
         for result in main_results {
             let result = result.expect("run_admitted fills every slot");
-            let (committed, recommit_on_device) = result?;
-            #[cfg(feature = "cuda")]
-            let (commit, cached_main, gpu_main) = committed;
-            #[cfg(not(feature = "cuda"))]
-            let (commit, cached_main) = committed;
+            let PrecommittedMain {
+                commit,
+                cached_main,
+                #[cfg(feature = "cuda")]
+                gpu_main,
+                recommit_on_device,
+            } = result?;
             if let Some(ref pre_root) = commit.precomputed_root {
                 transcript.append_bytes(pre_root);
             }

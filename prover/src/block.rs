@@ -21,8 +21,11 @@ use std::time::Instant;
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use stark::prover::IsStarkProver;
 use stark::residency_mode::ResidencyMode;
+use stark::traits::AIR;
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
@@ -96,6 +99,12 @@ pub fn verify_block(
         None,
         AcceleratorShape::KeccakRndChunked,
     )
+}
+
+/// `LAMBDA_VM_BLOCK_WARM_PRECOMPUTED=0` leaves the preprocessed commitments to
+/// Round 1 (the A arm of the warm A/B); unset or anything else warms them.
+fn warm_precomputed() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_WARM_PRECOMPUTED").map_or(true, |v| v != "0")
 }
 
 /// Wall times of one block prove, in seconds, for the readout.
@@ -271,14 +280,54 @@ pub fn prove_block_traces(
         times.setup
     );
 
+    // The preprocessed tables' commitments (46 PAGEs on the block, most of
+    // them derived on the host on first use) are needed only when Round 1
+    // reaches each table. Deriving them beside Round 1, from the start,
+    // takes them off its tail; the lazy cells make it the same value either way.
+    let warm: Vec<(
+        &dyn AIR<Field = _, FieldExtension = _, PublicInputs = ()>,
+        usize,
+    )> = if warm_precomputed() {
+        pairs
+            .iter()
+            .filter(|(air, _, _)| air.is_preprocessed())
+            .map(|(air, trace, _)| (*air, trace.num_rows()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let t = Instant::now();
-    let proof = crate::hash_pin::BlockProver::multi_prove(
-        pairs,
-        &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-        residency,
-    )
+    let proof = std::thread::scope(|s| {
+        if !warm.is_empty() {
+            s.spawn(|| {
+                let t = Instant::now();
+                let derive = |(air, rows): &(
+                    &dyn AIR<Field = _, FieldExtension = _, PublicInputs = ()>,
+                    usize,
+                )| {
+                    let layout = stark::leaf_layout::table_leaf_layout(*air, *rows);
+                    let _ = air.precomputed_commitment_for(layout);
+                };
+                #[cfg(feature = "parallel")]
+                warm.par_iter().for_each(derive);
+                #[cfg(not(feature = "parallel"))]
+                warm.iter().for_each(derive);
+                eprintln!(
+                    "BLOCK WARM: {} preprocessed commitments in {:.2}s, beside Round 1",
+                    warm.len(),
+                    t.elapsed().as_secs_f64()
+                );
+            });
+        }
+        crate::hash_pin::BlockProver::multi_prove(
+            pairs,
+            &mut transcript,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+            residency,
+        )
+    })
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     times.prove = t.elapsed().as_secs_f64();
     eprintln!("BLOCK PHASE prove {:.2}s", times.prove);
