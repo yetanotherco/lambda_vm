@@ -1,0 +1,5 @@
+# tag	name	knobs	log
+wt1200	P1	-	/root/prof/wt1200-tree.log
+wt1201	N	nsys	/root/prof/wt1201-tree.log
+wt1202	P2	-	/root/prof/wt1202-tree.log
+wt1203	C	LAMBDA_VM_ROW_CENSUS=1	/root/prof/wt1203-tree.log

@@ -1,0 +1,101 @@
+window	kernel	stage	family	launches	sum_s	threads
+base	rpx_leaves_base_coset	3a	3a leaves	83	7.1778	400162816
+base	sumcheck_round_ext3	4	4 zerocheck/GKR/LogUp (argue)	33046	5.2409	3673339968
+base	rpx_merkle_level	3b	3b merkle internal	1365	1.6518	697237504
+base	rpx_grind_search_queue	6	6 grind	519	1.4832	90347520
+base	whir_lean_round	5	5 WHIR fold	492	1.0671	416120832
+base	sumcheck_fold_ext3	4	4 zerocheck/GKR/LogUp (argue)	66539	1.0523	8199790848
+base	program_map_ext3	4	4 zerocheck/GKR/LogUp (argue)	45360	0.7840	4102419456
+base	ntt_cm_dit_k7	2	2 NTT column-major engine (K1)	147	0.6367	3748134912
+base	whir_fold_k_base_ext3	5	5 WHIR fold	82	0.6175	327811072
+base	rpx_leaves_ext3_coset	3a	3a leaves	436	0.4640	21873664
+base	fraction_fold_ext3	4	4 zerocheck/GKR/LogUp (argue)	7357	0.3224	3530091520
+base	eq_expand_level_ext3	4	4 zerocheck/GKR/LogUp (argue)	77133	0.2815	4408651776
+base	mobius_tile	2	2 Mobius (multilinear->coeff)	252	0.2147	20382220288
+base	ntt_cm_dit_k8	2	2 NTT column-major engine (K1)	61	0.2006	1200619520
+base	whir_lean_materialize	5	5 WHIR fold	82	0.1416	45252608
+base	rpx_merkle_tail_warp	3b	3b merkle internal	1458	0.1276	1028544
+base	rpx_merkle_level_warp	3b	3b merkle internal	5034	0.1136	263663616
+base	factors_from_columns_ext3	4	4 zerocheck/GKR/LogUp (argue)	351	0.0984	305868288
+base	sum_partials_ext3	4	4 zerocheck/GKR/LogUp (argue)	33044	0.0620	24340480
+base	mobius_low_levels	2	2 Mobius (multilinear->coeff)	68	0.0532	5127536640
+base	batched_column_ext3	4	4 zerocheck/GKR/LogUp (argue)	324	0.0329	159209472
+base	ntt_cm_dit_k6	2	2 NTT column-major engine (K1)	55	0.0285	169869312
+base	fill_ext3	4	4 zerocheck/GKR/LogUp (argue)	286	0.0247	1323575296
+base	sumcheck_round_ext3	5	5 WHIR open sumcheck	1748	0.0235	136203392
+base	mle_fold_base_ext3_many	4	4 zerocheck/GKR/LogUp (argue)	1739	0.0231	1731133696
+base	sumcheck_fold_ext3	5	5 WHIR open sumcheck	7352	0.0206	301347584
+base	whir_fold_k_ext3	5	5 WHIR fold	436	0.0180	21902336
+base	eq_expand_level_ext3	5	5 WHIR open sumcheck	6373	0.0155	99149824
+base	whir_lean_colmap	5	5 WHIR fold	82	0.0144	85983232
+base	fraction_fold_padded_ext3	4	4 zerocheck/GKR/LogUp (argue)	3	0.0126	201326592
+base	sum_partials_ext3	5	5 WHIR open sumcheck	2242	0.0056	1170944
+base	add_scaled_ext3	5	5 WHIR open sumcheck	436	0.0041	87609344
+base	merkle_gather_paths	5	5 query gather	954	0.0040	122112
+base	sumcheck_fold_ext3	0	0 sumcheck family outside argue/open windows	570	0.0031	16005120
+base	gather_cosets	5	5 WHIR fold	954	0.0029	2224128
+base	gather_ext3_at	5	5 query gather	1766	0.0018	240384
+base	mle_fold_base_ext3	0	0 sumcheck family outside argue/open windows	30	0.0014	15728640
+base	mle_fold_base_ext3	4	4 zerocheck/GKR/LogUp (argue)	58	0.0009	30408704
+base	mle_fold_base_ext3	5	5 WHIR open sumcheck	33	0.0008	17301504
+base	mle_fold_base_ext3_many	5	5 WHIR open sumcheck	27	0.0004	27525120
+base	batched_column_ext3	5	5 WHIR open sumcheck	7	0.0003	4718592
+level1	rpx_leaves_base_coset	3a	3a leaves	13	1.6548	92405760
+level1	sumcheck_round_ext3	0	0 sumcheck family outside argue/open windows	3432	0.8179	352859776
+level1	rpx_merkle_level	3b	3b merkle internal	328	0.4730	199983104
+level1	whir_lean_round	5	5 WHIR fold	72	0.2888	75497472
+level1	rpx_grind_search_queue	6	6 grind	82	0.2026	14274560
+level1	ntt_cm_dit_k7	2	2 NTT column-major engine (K1)	39	0.1962	1141374976
+level1	whir_fold_k_base_ext3	5	5 WHIR fold	12	0.1723	92274688
+level1	sumcheck_fold_ext3	0	0 sumcheck family outside argue/open windows	13494	0.1150	1241864704
+level1	rpx_leaves_ext3_coset	3a	3a leaves	70	0.1084	6154496
+level1	mobius_tile	2	2 Mobius (multilinear->coeff)	51	0.0642	5911871488
+level1	ntt_cm_dit_k8	2	2 NTT column-major engine (K1)	12	0.0566	336592896
+level1	whir_lean_materialize	5	5 WHIR fold	12	0.0374	12582912
+level1	program_map_ext3	0	0 sumcheck family outside argue/open windows	788	0.0306	213782528
+level1	rpx_merkle_level_warp	3b	3b merkle internal	908	0.0278	50092032
+level1	factors_from_columns_ext3	0	0 sumcheck family outside argue/open windows	34	0.0264	29898752
+level1	eq_expand_level_ext3	0	0 sumcheck family outside argue/open windows	8414	0.0240	305045504
+level1	rpx_merkle_tail_warp	3b	3b merkle internal	235	0.0212	173056
+level1	fraction_fold_ext3	0	0 sumcheck family outside argue/open windows	700	0.0177	197709824
+level1	mobius_low_levels	2	2 Mobius (multilinear->coeff)	13	0.0155	1478492160
+level1	sum_partials_ext3	0	0 sumcheck family outside argue/open windows	3504	0.0068	2504960
+level1	batched_column_ext3	0	0 sumcheck family outside argue/open windows	32	0.0067	20774912
+level1	mle_fold_base_ext3_many	0	0 sumcheck family outside argue/open windows	401	0.0061	411041792
+level1	whir_fold_k_ext3	5	5 WHIR fold	70	0.0042	6158848
+level1	whir_lean_colmap	5	5 WHIR fold	12	0.0036	12582912
+level1	fill_ext3	0	0 sumcheck family outside argue/open windows	16	0.0011	56950784
+level1	add_scaled_ext3	0	0 sumcheck family outside argue/open windows	70	0.0009	24635392
+level1	mle_fold_base_ext3	0	0 sumcheck family outside argue/open windows	103	0.0007	30801920
+level1	merkle_gather_paths	5	5 query gather	152	0.0007	19456
+level1	gather_cosets	5	5 WHIR fold	152	0.0005	352256
+level1	gather_ext3_at	5	5 query gather	401	0.0004	51840
+root	rpx_leaves_base_coset	3a	3a leaves	2	0.2191	12582912
+root	sumcheck_round_ext3	0	0 sumcheck family outside argue/open windows	780	0.1269	62640384
+root	rpx_merkle_level	3b	3b merkle internal	51	0.0628	27197440
+root	whir_lean_round	5	5 WHIR fold	12	0.0396	12582912
+root	ntt_cm_dit_k7	2	2 NTT column-major engine (K1)	7	0.0282	167772160
+root	rpx_grind_search_queue	6	6 grind	13	0.0242	2263040
+root	whir_fold_k_base_ext3	5	5 WHIR fold	2	0.0233	12582912
+root	rpx_leaves_ext3_coset	3a	3a leaves	11	0.0156	839296
+root	sumcheck_fold_ext3	0	0 sumcheck family outside argue/open windows	1838	0.0155	206358272
+root	mobius_tile	2	2 Mobius (multilinear->coeff)	8	0.0085	805306368
+root	ntt_cm_dit_k8	2	2 NTT column-major engine (K1)	1	0.0056	33554432
+root	program_map_ext3	0	0 sumcheck family outside argue/open windows	196	0.0055	45318144
+root	whir_lean_materialize	5	5 WHIR fold	2	0.0051	2097152
+root	eq_expand_level_ext3	0	0 sumcheck family outside argue/open windows	1902	0.0049	48575488
+root	factors_from_columns_ext3	0	0 sumcheck family outside argue/open windows	8	0.0036	7471104
+root	rpx_merkle_tail_warp	3b	3b merkle internal	37	0.0034	27520
+root	rpx_merkle_level_warp	3b	3b merkle internal	146	0.0032	7704576
+root	fraction_fold_ext3	0	0 sumcheck family outside argue/open windows	166	0.0029	32120832
+root	mobius_low_levels	2	2 Mobius (multilinear->coeff)	2	0.0021	201326592
+root	sum_partials_ext3	0	0 sumcheck family outside argue/open windows	792	0.0014	569600
+root	batched_column_ext3	0	0 sumcheck family outside argue/open windows	8	0.0010	4014080
+root	mle_fold_base_ext3_many	0	0 sumcheck family outside argue/open windows	53	0.0008	52363264
+root	whir_fold_k_ext3	5	5 WHIR fold	11	0.0006	839936
+root	whir_lean_colmap	5	5 WHIR fold	2	0.0005	2097152
+root	fill_ext3	0	0 sumcheck family outside argue/open windows	4	0.0002	9388032
+root	add_scaled_ext3	0	0 sumcheck family outside argue/open windows	11	0.0001	3359744
+root	merkle_gather_paths	5	5 query gather	24	0.0001	3072
+root	gather_cosets	5	5 WHIR fold	24	0.0001	57344
+root	gather_ext3_at	5	5 query gather	53	0.0001	6912

@@ -1,0 +1,45 @@
+window	stage	family	excl_s	sum_s	ops	threads_or_bytes
+base	0	0 sumcheck family outside argue/open windows	0.0025	0.0046	600	31733760
+base	2	2 Mobius (multilinear->coeff)	0.2670	0.2679	320	25509756928
+base	2	2 NTT column-major engine (K1)	0.8629	0.8658	263	5118623744
+base	3a	3a leaves	7.6355	7.6418	519	422036480
+base	3b	3b merkle internal	1.8801	1.8930	7857	961929664
+base	4	4 zerocheck/GKR/LogUp (argue)	7.9325	7.9358	265240	27690156096
+base	5	5 WHIR fold	1.8316	1.8614	2128	899294208
+base	5	5 WHIR open sumcheck	0.0653	0.0709	18218	675026304
+base	5	5 query gather	0.0058	0.0058	2720	362496
+base	6	6 grind	1.4789	1.4832	519	90347520
+base	7	7 D2D	0.0654	0.1651	35458	58784386400
+base	7	7 D2H (to Pageable)	0.0422	0.0425	95403	320663624
+base	7	7 D2H (to Pinned)	0.0009	0.0009	954	33291776
+base	7	7 H2D (from Pageable)	1.7850	1.8402	239088	35601361032
+base	7	7 memset	0.1832	0.1839	21162	324426435472
+base	8	8 idle card	7.4972	7.4972	0	0
+level1	0	0 sumcheck family outside argue/open windows	1.0524	1.0539	30988	2887870848
+level1	2	2 Mobius (multilinear->coeff)	0.0777	0.0797	64	7390363648
+level1	2	2 NTT column-major engine (K1)	0.2486	0.2528	51	1477967872
+level1	3a	3a leaves	1.7550	1.7632	83	98560256
+level1	3b	3b merkle internal	0.5052	0.5220	1471	250248192
+level1	5	5 WHIR fold	0.5009	0.5068	330	199449088
+level1	5	5 query gather	0.0011	0.0011	553	71296
+level1	6	6 grind	0.2016	0.2026	82	14274560
+level1	7	7 D2D	0.0148	0.0286	2021	14035661536
+level1	7	7 D2H (to Pageable)	0.0041	0.0041	9050	32151600
+level1	7	7 D2H (to Pinned)	0.0002	0.0002	152	5784576
+level1	7	7 H2D (from Pageable)	0.6811	0.6850	22944	13486081672
+level1	7	7 memset	0.0171	0.0172	2192	30447166536
+level1	8	8 idle card	2.7401	2.7401	0	0
+root	0	0 sumcheck family outside argue/open windows	0.1627	0.1629	5758	472178944
+root	2	2 Mobius (multilinear->coeff)	0.0106	0.0106	10	1006632960
+root	2	2 NTT column-major engine (K1)	0.0338	0.0338	8	201326592
+root	3a	3a leaves	0.2347	0.2347	13	13422208
+root	3b	3b merkle internal	0.0694	0.0694	234	34929536
+root	5	5 WHIR fold	0.0684	0.0692	53	30257408
+root	5	5 query gather	0.0002	0.0002	77	9984
+root	6	6 grind	0.0240	0.0242	13	2263040
+root	7	7 D2D	0.0025	0.0025	477	1877330608
+root	7	7 D2H (to Pageable)	0.0009	0.0009	2039	7239016
+root	7	7 D2H (to Pinned)	0.0000	0.0000	24	928256
+root	7	7 H2D (from Pageable)	0.0749	0.0749	4270	1878697220
+root	7	7 memset	0.0026	0.0026	487	4616622896
+root	8	8 idle card	0.9793	0.9793	0	0

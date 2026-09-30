@@ -1,0 +1,36 @@
+ZFW 2026-09-30T05:32:16Z plan: sha fd6da62a2 · worktree /workspace/lambda_vm-zf-whir · driver /root/whir_tree17.sh -> /root/A-tree-whir.v10.sh · 1 arm(s)
+ZFW 2026-09-30T05:32:16Z   wt1203  arm C  knobs: LAMBDA_VM_ROW_CENSUS=1
+ZFW 2026-09-30T05:32:16Z preflight:
+ZFW 2026-09-30T05:32:16Z   ok    record driver /root/whir_tree17.sh md5 d243d42e4035e5f954f0be519c4aed38 (called unchanged)
+ZFW 2026-09-30T05:32:16Z   ok    launcher /root/A-tree-whir.v10.sh md5 88dd158786704e98df5a726a29df0088
+ZFW 2026-09-30T05:32:16Z   ok    block ELF sha256 = record
+ZFW 2026-09-30T05:32:16Z   ok    block input sha256 = record
+ZFW 2026-09-30T05:32:16Z   ok    source repo /workspace/lambda_vm
+ZFW 2026-09-30T05:32:16Z   ok    nvidia-smi present
+ZFW 2026-09-30T05:32:16Z   ok    flock present
+ZFW 2026-09-30T05:32:16Z   ok    zf_summary.py parses a knob arm
+ZFW 2026-09-30T05:32:16Z run dir /root/zf/wt1203-wt1203 (driver.log is this output)
+ZFW 2026-09-30T05:32:16Z fetch: origin fix2/1010-g6-census
+ZFW 2026-09-30T05:32:17Z HEAD asserted: fd6da62a20f5c55d7b62471f5c6fddd2459d8154
+ZFW 2026-09-30T05:32:17Z ===== ARM wt1203 (1/1) name C · ZF knobs: LAMBDA_VM_ROW_CENSUS=1
+ZFW 2026-09-30T05:32:17Z card: 1 MiB used, 0 compute app(s)
+ZFW 2026-09-30T05:32:17Z HEAD asserted: fd6da62a20f5c55d7b62471f5c6fddd2459d8154
+ZFW 2026-09-30T05:32:17Z   knobs exported to the process: LAMBDA_VM_ROW_CENSUS=1 (every other LAMBDA_VM_ZF_* unset)
+ZFW 2026-09-30T05:33:47Z   record chain returned 0 after 90 s (its verdict is the WT _RC line)
+ZFW 2026-09-30T05:33:47Z   WT _RC=0
+ZFW 2026-09-30T05:33:47Z   prover binary lambda_vm_prover-5f16f3a860d7e6fd md5 aec696f183802a623e7059a69775bd7f
+ZFW 2026-09-30T05:33:47Z   ZF BANNER: NONDEFAULT banner on a no-knob arm: {'cap': 'auto', 'whir_cap': 'auto', 'fri': 'dp', 'whir_folds': 'first6'} — the code defaults are not the documented defaults; read before quoting
+  wt1203 | block wall (WHOLE RUN) | 40.3 s |
+  wt1203 | host peak (WHOLE RUN) | 16.268 GiB |
+  wt1203 | base | 30.6 s (15 epochs) |
+  wt1203 | level 0 | NA s |
+  wt1203 | interior (pooled) | NA s (levels NA, NA nodes) |
+  wt1203 | root stage · verify | 1.2 s · 0.1 s · 180 words |
+  wt1203 | device peak (10 ms sampler) | 27,794 MiB · base window 27,794 · after 25,554 · reserved high-water 24,342 |
+  wt1203 | fallbacks commit / device | 0 / 0 |
+  wt1203 | PROVED AND VERIFIED (root) | yes |
+  wt1203 | SHAPE | SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes |
+  wt1203 identities: 0 wraps md5 `None` · 3 nodes md5 `051f03969465` · global `a3f2833fe8c11ecf` · root `987a2780df8324ca`
+ZFW 2026-09-30T05:33:47Z   wt1203 green
+ZFW 2026-09-30T05:33:47Z ===== A/B over 1 arm(s)
+VERDICT: WHIR ARMS GREEN — 1 arm(s) wt1203..wt1203 at fd6da62a2; A/B in /root/zf/wt1203-wt1203/ab.md

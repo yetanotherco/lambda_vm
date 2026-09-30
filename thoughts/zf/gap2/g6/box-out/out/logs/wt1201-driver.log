@@ -1,0 +1,25 @@
+ZFW 2026-09-30T05:30:40Z run dir /root/zf/wt1201-wt1201 (driver.log is this output)
+ZFW 2026-09-30T05:30:40Z fetch: origin whir-recursion-rpx
+ZFW 2026-09-30T05:30:41Z HEAD asserted: 9e2728955f8d1f0b6e71f4e21d48d592aab06f5c
+ZFW 2026-09-30T05:30:41Z ===== ARM wt1201 (1/1) name N · ZF knobs: <none>
+ZFW 2026-09-30T05:30:41Z card: 1 MiB used, 0 compute app(s)
+ZFW 2026-09-30T05:30:41Z HEAD asserted: 9e2728955f8d1f0b6e71f4e21d48d592aab06f5c
+ZFW 2026-09-30T05:30:41Z   knobs exported to the process: <none> (every other LAMBDA_VM_ZF_* unset)
+ZFW 2026-09-30T05:31:32Z   record chain returned 0 after 51 s (its verdict is the WT _RC line)
+ZFW 2026-09-30T05:31:32Z   WT _RC=0
+ZFW 2026-09-30T05:31:32Z   prover binary lambda_vm_prover-5f16f3a860d7e6fd md5 a9f4f4283fc20b1848ea911aa22dc61e
+ZFW 2026-09-30T05:31:32Z   ZF BANNER: NONDEFAULT banner on a no-knob arm: {'cap': 'auto', 'whir_cap': 'auto', 'fri': 'dp', 'whir_folds': 'first6'} — the code defaults are not the documented defaults; read before quoting
+  wt1201 | block wall (WHOLE RUN) | 41.0 s |
+  wt1201 | host peak (WHOLE RUN) | 17.010 GiB |
+  wt1201 | base | 31.5 s (15 epochs) |
+  wt1201 | level 0 | NA s |
+  wt1201 | interior (pooled) | NA s (levels NA, NA nodes) |
+  wt1201 | root stage · verify | 1.2 s · 0.1 s · 180 words |
+  wt1201 | device peak (10 ms sampler) | 27,440 MiB · base window 27,440 · after 25,668 · reserved high-water 24,342 |
+  wt1201 | fallbacks commit / device | 0 / 0 |
+  wt1201 | PROVED AND VERIFIED (root) | yes |
+  wt1201 | SHAPE | SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes |
+  wt1201 identities: 0 wraps md5 `None` · 3 nodes md5 `051f03969465` · global `a3f2833fe8c11ecf` · root `987a2780df8324ca`
+ZFW 2026-09-30T05:31:32Z   wt1201 green
+ZFW 2026-09-30T05:31:32Z ===== A/B over 1 arm(s)
+VERDICT: WHIR ARMS GREEN — 1 arm(s) wt1201..wt1201 at 9e2728955; A/B in /root/zf/wt1201-wt1201/ab.md

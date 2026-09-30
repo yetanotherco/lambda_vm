@@ -1,0 +1,36 @@
+ZFW 2026-09-30T05:29:12Z plan: sha 9e2728955 · worktree /workspace/lambda_vm-zf-whir · driver /root/whir_tree17.sh -> /root/A-tree-whir.v10.sh · 1 arm(s)
+ZFW 2026-09-30T05:29:12Z   wt1200  arm P1  knobs: <none>
+ZFW 2026-09-30T05:29:12Z preflight:
+ZFW 2026-09-30T05:29:12Z   ok    record driver /root/whir_tree17.sh md5 d243d42e4035e5f954f0be519c4aed38 (called unchanged)
+ZFW 2026-09-30T05:29:12Z   ok    launcher /root/A-tree-whir.v10.sh md5 88dd158786704e98df5a726a29df0088
+ZFW 2026-09-30T05:29:12Z   ok    block ELF sha256 = record
+ZFW 2026-09-30T05:29:12Z   ok    block input sha256 = record
+ZFW 2026-09-30T05:29:12Z   ok    source repo /workspace/lambda_vm
+ZFW 2026-09-30T05:29:12Z   ok    nvidia-smi present
+ZFW 2026-09-30T05:29:12Z   ok    flock present
+ZFW 2026-09-30T05:29:12Z   ok    zf_summary.py parses a knob arm
+ZFW 2026-09-30T05:29:12Z run dir /root/zf/wt1200-wt1200 (driver.log is this output)
+ZFW 2026-09-30T05:29:12Z fetch: origin whir-recursion-rpx
+ZFW 2026-09-30T05:29:12Z HEAD asserted: 9e2728955f8d1f0b6e71f4e21d48d592aab06f5c
+ZFW 2026-09-30T05:29:12Z ===== ARM wt1200 (1/1) name P1 · ZF knobs: <none>
+ZFW 2026-09-30T05:29:12Z card: 1 MiB used, 0 compute app(s)
+ZFW 2026-09-30T05:29:12Z HEAD asserted: 9e2728955f8d1f0b6e71f4e21d48d592aab06f5c
+ZFW 2026-09-30T05:29:12Z   knobs exported to the process: <none> (every other LAMBDA_VM_ZF_* unset)
+ZFW 2026-09-30T05:30:40Z   record chain returned 0 after 88 s (its verdict is the WT _RC line)
+ZFW 2026-09-30T05:30:40Z   WT _RC=0
+ZFW 2026-09-30T05:30:40Z   prover binary lambda_vm_prover-5f16f3a860d7e6fd md5 a9f4f4283fc20b1848ea911aa22dc61e
+ZFW 2026-09-30T05:30:40Z   ZF BANNER: NONDEFAULT banner on a no-knob arm: {'cap': 'auto', 'whir_cap': 'auto', 'fri': 'dp', 'whir_folds': 'first6'} — the code defaults are not the documented defaults; read before quoting
+  wt1200 | block wall (WHOLE RUN) | 39.8 s |
+  wt1200 | host peak (WHOLE RUN) | 16.172 GiB |
+  wt1200 | base | 30.4 s (15 epochs) |
+  wt1200 | level 0 | NA s |
+  wt1200 | interior (pooled) | NA s (levels NA, NA nodes) |
+  wt1200 | root stage · verify | 1.2 s · 0.1 s · 180 words |
+  wt1200 | device peak (10 ms sampler) | 27,634 MiB · base window 27,634 · after 25,586 · reserved high-water 24,342 |
+  wt1200 | fallbacks commit / device | 0 / 0 |
+  wt1200 | PROVED AND VERIFIED (root) | yes |
+  wt1200 | SHAPE | SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes |
+  wt1200 identities: 0 wraps md5 `None` · 3 nodes md5 `051f03969465` · global `a3f2833fe8c11ecf` · root `987a2780df8324ca`
+ZFW 2026-09-30T05:30:40Z   wt1200 green
+ZFW 2026-09-30T05:30:40Z ===== A/B over 1 arm(s)
+VERDICT: WHIR ARMS GREEN — 1 arm(s) wt1200..wt1200 at 9e2728955; A/B in /root/zf/wt1200-wt1200/ab.md

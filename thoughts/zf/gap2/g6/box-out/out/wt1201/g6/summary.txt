@@ -1,0 +1,160 @@
+G6 analysis · log wt1201-tree.log · db g6-wt1201.sqlite · sampler wt1201.tsv
+windows: base 31.536 s · level1 7.800 s · root 1.664 s
+  defined by: run_start=1790746243.310, level1_start=1790746274.846, level1=7.800, whole_run=41.000, base=31.536
+base sub-phases: 10 · Σ 31.536 s of the base's 31.536 s · PARTITION OK
+  head 1.868 · epochs absorb+prep 0.090 · epochs argue 12.390 · epochs commit 9.183 · epochs open 6.471 · global absorb+prep 0.006 · global argue 0.360 · global commit 0.424 · global open 0.538 · prover gaps 0.206
+kernels 338172 · copies 411880 · memsets 23841 · API calls 1316542 · OSRT calls 910356 · prover pid 318382 · GPU NVIDIA GeForce RTX 5090 (170 SMs)
+  GPU span: first op +0.384 s from the base's start · last op -0.131 s from the last window's end
+base: 16 argue windows (Σ 12.75 s) · 16 open windows (Σ 7.01 s)
+
+=== PARTITION OF EACH WINDOW (exclusive s: kernels first, then copy/memset-only, then idle) ===
+window | wall | 1 | 2 | 3 | 4 | 5 | 6 | 0 | 7 | 8 | busy | Σ | closure
+base | 31.536 | 0.000 | 1.130 | 9.516 | 7.933 | 1.903 | 1.479 | 0.002 | 2.077 | 7.497 | 24.039 | 31.536 | ok
+level1 | 7.800 | 0.000 | 0.326 | 2.260 | 0.000 | 0.502 | 0.202 | 1.052 | 0.717 | 2.740 | 5.060 | 7.800 | ok
+root | 1.664 | 0.000 | 0.044 | 0.304 | 0.000 | 0.069 | 0.024 | 0.163 | 0.081 | 0.979 | 0.685 | 1.664 | ok
+key: 1=1 execution/trace generation (device part) · 2=2 LDE/encoding (NTT) · 3=3 commitment hashing · 4=4 constraint evaluation · 5=5 openings · 6=6 grinding · 0=0 unmapped/other kernels · 7=7 copy/memset-only · 8=8 idle card
+
+per family (exclusive s / Σ-kernel-or-copy s / ops):
+  [base]
+     0 sumcheck family outside argue/open windows            0.002 /    0.005 / 600
+     2 Mobius (multilinear->coeff)                           0.267 /    0.268 / 320
+     2 NTT column-major engine (K1)                          0.863 /    0.866 / 263
+     3a leaves                                               7.636 /    7.642 / 519
+     3b merkle internal                                      1.880 /    1.893 / 7857
+     4 zerocheck/GKR/LogUp (argue)                           7.933 /    7.936 / 265240
+     5 WHIR fold                                             1.832 /    1.861 / 2128
+     5 WHIR open sumcheck                                    0.065 /    0.071 / 18218
+     5 query gather                                          0.006 /    0.006 / 2720
+     6 grind                                                 1.479 /    1.483 / 519
+     7 D2D                                                   0.065 /    0.165 / 35458
+     7 D2H (to Pageable)                                     0.042 /    0.042 / 95403
+     7 D2H (to Pinned)                                       0.001 /    0.001 / 954
+     7 H2D (from Pageable)                                   1.785 /    1.840 / 239088
+     7 memset                                                0.183 /    0.184 / 21162
+     8 idle card                                             7.497 /    7.497 / 0
+  [level1]
+     0 sumcheck family outside argue/open windows            1.052 /    1.054 / 30988
+     2 Mobius (multilinear->coeff)                           0.078 /    0.080 / 64
+     2 NTT column-major engine (K1)                          0.249 /    0.253 / 51
+     3a leaves                                               1.755 /    1.763 / 83
+     3b merkle internal                                      0.505 /    0.522 / 1471
+     5 WHIR fold                                             0.501 /    0.507 / 330
+     5 query gather                                          0.001 /    0.001 / 553
+     6 grind                                                 0.202 /    0.203 / 82
+     7 D2D                                                   0.015 /    0.029 / 2021
+     7 D2H (to Pageable)                                     0.004 /    0.004 / 9050
+     7 D2H (to Pinned)                                       0.000 /    0.000 / 152
+     7 H2D (from Pageable)                                   0.681 /    0.685 / 22944
+     7 memset                                                0.017 /    0.017 / 2192
+     8 idle card                                             2.740 /    2.740 / 0
+  [root]
+     0 sumcheck family outside argue/open windows            0.163 /    0.163 / 5758
+     2 Mobius (multilinear->coeff)                           0.011 /    0.011 / 10
+     2 NTT column-major engine (K1)                          0.034 /    0.034 / 8
+     3a leaves                                               0.235 /    0.235 / 13
+     3b merkle internal                                      0.069 /    0.069 / 234
+     5 WHIR fold                                             0.068 /    0.069 / 53
+     5 query gather                                          0.000 /    0.000 / 77
+     6 grind                                                 0.024 /    0.024 / 13
+     7 D2D                                                   0.002 /    0.002 / 477
+     7 D2H (to Pageable)                                     0.001 /    0.001 / 2039
+     7 D2H (to Pinned)                                       0.000 /    0.000 / 24
+     7 H2D (from Pageable)                                   0.075 /    0.075 / 4270
+     7 memset                                                0.003 /    0.003 / 487
+     8 idle card                                             0.979 /    0.979 / 0
+
+=== BASE SUB-PHASES (disjoint; exclusive s) ===
+  head                               n=  1 wall   1.868 · busy   0.015 · idle  1.853 · copy-only  0.002 · s3=0.01
+                                     copies: D2D 0.000s/0.02GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 0.002s/0.04GB · memset 0.000s/0.07GB
+  epochs absorb+prep                 n= 15 wall   0.090 · busy   0.000 · idle  0.090 · copy-only  0.000 · 
+                                     copies: H2D (from Pageable) 0.000s/0.03GB
+  epochs argue                       n= 15 wall  12.390 · busy   8.121 · idle  4.269 · copy-only  0.302 · s4=7.81
+                                     copies: D2H (to Pageable) 0.036s/0.25GB · H2D (from Pageable) 0.110s/0.52GB · memset 0.155s/275.25GB
+  epochs commit                      n= 15 wall   9.183 · busy   8.918 · idle  0.265 · copy-only  1.650 · s2=1.08 s3=6.19
+                                     copies: D2D 0.046s/42.50GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 1.581s/33.02GB · memset 0.022s/38.99GB
+  epochs open                        n= 15 wall   6.471 · busy   5.940 · idle  0.531 · copy-only  0.058 · s3=2.87 s5=1.81 s6=1.20
+                                     copies: D2D 0.017s/14.00GB · D2H (to Pageable) 0.002s/0.03GB · D2H (to Pinned) 0.001s/0.03GB · H2D (from Pageable) 0.036s/0.83GB · memset 0.003s/5.03GB
+  global absorb+prep                 n=  1 wall   0.006 · busy   0.000 · idle  0.006 · copy-only  0.000 · 
+                                     copies: H2D (from Pageable) 0.000s/0.02GB
+  global argue                       n=  1 wall   0.360 · busy   0.128 · idle  0.232 · copy-only  0.009 · s4=0.12
+                                     copies: D2H (to Pageable) 0.003s/0.03GB · H2D (from Pageable) 0.004s/0.00GB · memset 0.002s/2.91GB
+  global commit                      n=  1 wall   0.424 · busy   0.418 · idle  0.006 · copy-only  0.050 · s2=0.05 s3=0.32
+                                     copies: D2D 0.002s/1.57GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 0.048s/1.09GB · memset 0.001s/1.95GB
+  global open                        n=  1 wall   0.538 · busy   0.493 · idle  0.045 · copy-only  0.004 · s3=0.13 s5=0.09 s6=0.27
+                                     copies: D2D 0.001s/0.69GB · D2H (to Pageable) 0.000s/0.01GB · D2H (to Pinned) 0.000s/0.01GB · H2D (from Pageable) 0.002s/0.11GB · memset 0.000s/0.22GB
+  prover gaps                        n= 17 wall   0.206 · busy   0.005 · idle  0.201 · copy-only  0.001 · 
+                                     copies: D2D 0.000s/0.00GB · D2H (to Pageable) 0.000s/0.00GB · D2H (to Pinned) 0.000s/0.00GB · H2D (from Pageable) 0.000s/0.01GB · memset 0.000s/0.02GB
+  Σ sub-phases 31.536 s (base 31.536) · idle Σ 7.497 s (base window's idle 7.497)
+
+=== IDLE BY MECHANISM (W1: the thread submitting the op that ends each gap, and its state) ===
+  [base] idle 7.497 s · next op not yet requested 5.912 s · untraced (host compute or descheduled) 2.566, OS wait on host threads (futex/cond) 1.858, API sync (stream/event/ctx) 0.785, API readback DtoH 0.668, API alloc/free 0.570, API upload HtoD 0.503, API launch 0.401, OS ioctl (outside API) 0.092, API memset 0.040, API other 0.012
+  [level1] idle 2.740 s · next op not yet requested 2.479 s · untraced (host compute or descheduled) 1.204, OS wait on host threads (futex/cond) 1.027, API sync (stream/event/ctx) 0.131, API upload HtoD 0.114, API alloc/free 0.093, API readback DtoH 0.090, API launch 0.072
+  [root] idle 0.979 s · next op not yet requested 0.819 s · untraced (host compute or descheduled) 0.539, OS wait on host threads (futex/cond) 0.376, API sync (stream/event/ctx) 0.028, API readback DtoH 0.013, API upload HtoD 0.012
+  [base: head] idle 1.853 s · not yet requested 1.853 s · OS wait on host threads (futex/cond) 1.459, untraced (host compute or descheduled) 0.284, OS ioctl (outside API) 0.092, API alloc/free 0.010, API other 0.006
+  [base: epochs absorb+prep] idle 0.090 s · not yet requested 0.089 s · untraced (host compute or descheduled) 0.083, OS wait on host threads (futex/cond) 0.006
+  [base: epochs argue] idle 4.269 s · not yet requested 3.053 s · untraced (host compute or descheduled) 1.783, API readback DtoH 0.591, API alloc/free 0.465, API sync (stream/event/ctx) 0.462, API launch 0.360, OS wait on host threads (futex/cond) 0.300, API upload HtoD 0.275, API memset 0.032
+  [base: epochs commit] idle 0.265 s · not yet requested 0.062 s · API upload HtoD 0.194, OS wait on host threads (futex/cond) 0.028, API alloc/free 0.023, untraced (host compute or descheduled) 0.010, API sync (stream/event/ctx) 0.006
+  [base: epochs open] idle 0.531 s · not yet requested 0.456 s · API sync (stream/event/ctx) 0.299, untraced (host compute or descheduled) 0.105, API alloc/free 0.059, API readback DtoH 0.027, API launch 0.018, API upload HtoD 0.015
+  [base: global absorb+prep] idle 0.006 s · not yet requested 0.006 s · 
+  [base: global argue] idle 0.232 s · not yet requested 0.165 s · untraced (host compute or descheduled) 0.142, API readback DtoH 0.042, API launch 0.018, API sync (stream/event/ctx) 0.011, API upload HtoD 0.010, API alloc/free 0.008
+  [base: global commit] idle 0.006 s · not yet requested 0.001 s · 
+  [base: global open] idle 0.045 s · not yet requested 0.028 s · untraced (host compute or descheduled) 0.020, API readback DtoH 0.006
+  [base: prover gaps] idle 0.201 s · not yet requested 0.200 s · untraced (host compute or descheduled) 0.136, OS wait on host threads (futex/cond) 0.063
+prover thread: tid 318386 (lfm::per_table_) · 10.384 s of CUDA API time inside the argue windows of 10.523 s over 3 thread(s)
+
+=== H2D / D2H / D2D / memset PER SUB-PHASE (bytes; copy-only exclusive s) ===
+  epochs argue                       D2H (to Pageable) 0.25 GB (0.036 s copy-only) · H2D (from Pageable) 0.52 GB (0.110 s copy-only) · memset 275.25 GB (0.155 s copy-only)
+  epochs commit                      D2D 42.50 GB (0.046 s copy-only) · H2D (from Pageable) 33.02 GB (1.581 s copy-only) · memset 38.99 GB (0.022 s copy-only)
+  epochs open                        D2D 14.00 GB (0.017 s copy-only) · H2D (from Pageable) 0.83 GB (0.036 s copy-only) · memset 5.03 GB (0.003 s copy-only)
+  global argue                       memset 2.91 GB (0.002 s copy-only)
+  global commit                      D2D 1.57 GB (0.002 s copy-only) · H2D (from Pageable) 1.09 GB (0.048 s copy-only) · memset 1.95 GB (0.001 s copy-only)
+  global open                        D2D 0.69 GB (0.001 s copy-only) · H2D (from Pageable) 0.11 GB (0.002 s copy-only) · memset 0.22 GB (0.000 s copy-only)
+
+=== HOST CPU PER BASE SUB-PHASE (sampler; on-CPU and runqueue wait from /proc/<pid>/task/*/schedstat) ===
+  name rule: the test's thread is tid 318386 (lfm::per_table_); the CUDA API names tid 318386: AGREE — the plain arms may use the rule
+  sampler: pid 318382 · 58 threads · interval 0.050 s · prover thread 318386 · producer thread 318429
+  box: cpus online 32 · the sampler's affinity 32 · cgroup cpu.max 3071999 100000 · clock ticks 100/s
+  head                               wall   1.868 · process on-CPU   35.63 s (19.07 cores) · runqueue wait   0.27 s · prover on   0.37 wait 0.000 · producer on   0.86 wait 0.004 · box busy 19.27 of  32.1 cores · cgroup 19.18 cores · throttled 0.061 s
+  epochs absorb+prep                 wall   0.090 · process on-CPU    0.17 s ( 1.88 cores) · runqueue wait   0.00 s · prover on   0.09 wait 0.000 · producer on   0.05 wait 0.000 · box busy  2.00 of  32.0 cores · cgroup  1.96 cores · throttled 0.000 s
+  epochs argue                       wall  12.390 · process on-CPU  132.93 s (10.73 cores) · runqueue wait   2.90 s · prover on  11.94 wait 0.074 · producer on   1.83 wait 0.000 · box busy 10.90 of  32.0 cores · cgroup 10.90 cores · throttled 0.007 s
+  epochs commit                      wall   9.183 · process on-CPU   38.62 s ( 4.21 cores) · runqueue wait   0.36 s · prover on   3.15 wait 0.000 · producer on   6.18 wait 0.002 · box busy  4.22 of  32.0 cores · cgroup  4.23 cores · throttled 0.000 s
+  epochs open                        wall   6.471 · process on-CPU    9.90 s ( 1.53 cores) · runqueue wait   0.03 s · prover on   6.46 wait 0.000 · producer on   0.35 wait 0.000 · box busy  1.60 of  32.0 cores · cgroup  1.60 cores · throttled 0.000 s
+  global absorb+prep                 wall   0.006 · process on-CPU    0.02 s ( 3.02 cores) · runqueue wait   0.00 s · prover on   0.01 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.55 of  32.1 cores · cgroup  3.05 cores · throttled 0.000 s
+  global argue                       wall   0.360 · process on-CPU    1.13 s ( 3.14 cores) · runqueue wait   0.00 s · prover on   0.36 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.16 of  32.0 cores · cgroup  3.16 cores · throttled 0.000 s
+  global commit                      wall   0.424 · process on-CPU    1.28 s ( 3.02 cores) · runqueue wait   0.00 s · prover on   0.42 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.08 of  32.0 cores · cgroup  3.04 cores · throttled 0.000 s
+  global open                        wall   0.538 · process on-CPU    1.95 s ( 3.63 cores) · runqueue wait   0.00 s · prover on   0.53 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.68 of  32.0 cores · cgroup  3.67 cores · throttled 0.000 s
+  prover gaps                        wall   0.206 · process on-CPU    0.76 s ( 3.68 cores) · runqueue wait   0.00 s · prover on   0.14 wait 0.000 · producer on   0.03 wait 0.000 · box busy  3.91 of  32.0 cores · cgroup  3.86 cores · throttled 0.000 s
+
+=== NAMED HOST WORK INSIDE EACH SUB-PHASE (log spans, overlap seconds) ===
+  head                               head helper: DECODE prepared 0.34 · head helper: DECODE root 1.12 · producer build 0.27 · producer collect 0.53 · producer execute 0.07 · producer prep@producer 0.47 · producer CPU stages (execute+collect+build+prep) 1.34
+  epochs absorb+prep                 level-1 prologues in the base's tail 0.01 · producer execute 0.08 · producer prep@producer 0.01 · producer CPU stages (execute+collect+build+prep) 0.09
+  epochs argue                       level-1 prologues in the base's tail 1.60 · producer build 1.48 · producer collect 0.16 · producer prep@producer 6.32 · producer hand-off wait (handoff minus prep) 4.43 · producer CPU stages (execute+collect+build+prep) 7.96
+  epochs commit                      level-1 prologues in the base's tail 0.73 · producer build 3.26 · producer collect 4.01 · producer execute 0.89 · producer prep@producer 1.03 · producer CPU stages (execute+collect+build+prep) 9.18
+  epochs open                        level-1 prologues in the base's tail 0.74 · producer prep@producer 0.38 · producer hand-off wait (handoff minus prep) 6.09 · producer CPU stages (execute+collect+build+prep) 0.38
+  global absorb+prep                 level-1 prologues in the base's tail 0.01
+  global argue                       level-1 prologues in the base's tail 0.36
+  global commit                      level-1 prologues in the base's tail 0.42
+  global open                        level-1 prologues in the base's tail 0.54
+  prover gaps                        level-1 prologues in the base's tail 0.16 · producer prep@producer 0.06 · producer hand-off wait (handoff minus prep) 0.05 · producer CPU stages (execute+collect+build+prep) 0.06
+  producer, 16 epoch(s)/stage(s): execute Σ 1.04 s · collect Σ 4.70 s · build Σ 5.02 s · prep@producer Σ 8.26 s · work Σ 19.02 s · hand-off wait Σ 10.56 s
+
+kernel names in the trace: 32 (names.tsv) · on the residual row 0: 12 (Σ 1.221 s of kernel time)
+  RESIDUAL add_scaled_ext3 [0 sumcheck family outside argue/open windows] launches 81 · Σ 0.001 s
+  RESIDUAL batched_column_ext3 [0 sumcheck family outside argue/open windows] launches 40 · Σ 0.008 s
+  RESIDUAL eq_expand_level_ext3 [0 sumcheck family outside argue/open windows] launches 10316 · Σ 0.029 s
+  RESIDUAL factors_from_columns_ext3 [0 sumcheck family outside argue/open windows] launches 42 · Σ 0.030 s
+  RESIDUAL fill_ext3 [0 sumcheck family outside argue/open windows] launches 20 · Σ 0.001 s
+  RESIDUAL fraction_fold_ext3 [0 sumcheck family outside argue/open windows] launches 866 · Σ 0.021 s
+  RESIDUAL mle_fold_base_ext3 [0 sumcheck family outside argue/open windows] launches 133 · Σ 0.002 s
+  RESIDUAL mle_fold_base_ext3_many [0 sumcheck family outside argue/open windows] launches 454 · Σ 0.007 s
+  RESIDUAL program_map_ext3 [0 sumcheck family outside argue/open windows] launches 984 · Σ 0.036 s
+  RESIDUAL sum_partials_ext3 [0 sumcheck family outside argue/open windows] launches 4296 · Σ 0.008 s
+  RESIDUAL sumcheck_fold_ext3 [0 sumcheck family outside argue/open windows] launches 15902 · Σ 0.134 s
+  RESIDUAL sumcheck_round_ext3 [0 sumcheck family outside argue/open windows] launches 4212 · Σ 0.945 s
+
+=== CHECKS ===
+closure: every window's partition sums to its wall within 2 ms: PASS
+base sub-phases cover the base: PASS (31.536 of 31.536 s)
+clock: tree-window kernel time starting inside a CARD HOLD: 99.86 % (expect >= 95 %)
+clock: last GPU op ends -0.000 s from the last multi_prove hold's end (expect |x| < 0.05)
+nsys PROFILER_OVERHEAD: Chunk Allocation n=2 Σ 0.000 s · TLS allocation n=65 Σ 0.016 s · OS runtime libraries profiling initialization n=2 Σ 0.002 s · dlopen(libcuda.so) n=1 Σ 0.001 s · dlopen(libcuda.so.1) n=2 Σ 0.000 s · dlopen(libcupti.so.13.1) n=1 Σ 0.001 s · CUDA profiling initialization n=1 Σ 0.106 s · Unknown n=34 Σ 0.000 s · CUDA profiling data flush on cuInit finished n=1 Σ 0.000 s · dlclose n=1 Σ 0.000 s · CUPTI Instrumentation n=2 Σ 0.000 s · CUPTI Resource Management n=9 Σ 0.011 s · CUDA profiling data flush on context created n=1 Σ 0.000 s · CUDA profiling data flush on process exit n=2 Σ 0.019 s · CUPTI Buffer flush n=139 Σ 0.027 s

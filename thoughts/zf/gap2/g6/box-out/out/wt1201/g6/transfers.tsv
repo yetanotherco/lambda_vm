@@ -1,0 +1,36 @@
+subphase	label	count	bytes	excl_s	sum_s
+head	7 D2D	1	16777216	0.0000	0.0000
+head	7 D2H (to Pageable)	1	32	0.0000	0.0000
+head	7 H2D (from Pageable)	7	41959424	0.0023	0.0023
+head	7 memset	1	67108864	0.0000	0.0000
+epochs absorb+prep	7 H2D (from Pageable)	3	25165824	0.0005	0.0005
+epochs argue	7 D2H (to Pageable)	83098	251515208	0.0365	0.0366
+epochs argue	7 H2D (from Pageable)	183367	516148828	0.1105	0.1238
+epochs argue	7 memset	15867	275248804728	0.1549	0.1551
+epochs commit	7 D2D	33339	42504592288	0.0461	0.1457
+epochs commit	7 D2H (to Pageable)	76	2192	0.0000	0.0001
+epochs commit	7 H2D (from Pageable)	33412	33017092288	1.5811	1.6125
+epochs commit	7 memset	50	38990249984	0.0223	0.0229
+epochs open	7 D2D	1484	13998927856	0.0167	0.0167
+epochs open	7 D2H (to Pageable)	4385	30168792	0.0022	0.0022
+epochs open	7 D2H (to Pinned)	771	27396096	0.0007	0.0007
+epochs open	7 H2D (from Pageable)	10321	828248368	0.0361	0.0420
+epochs open	7 memset	2401	5031590952	0.0027	0.0027
+global absorb+prep	7 H2D (from Pageable)	1	16777216	0.0002	0.0002
+global argue	7 D2H (to Pageable)	6862	31824984	0.0030	0.0030
+global argue	7 H2D (from Pageable)	9487	707908	0.0039	0.0039
+global argue	7 memset	2275	2906267136	0.0020	0.0020
+global commit	7 D2D	291	1572864000	0.0018	0.0018
+global commit	7 D2H (to Pageable)	16	512	0.0000	0.0000
+global commit	7 H2D (from Pageable)	275	1086324736	0.0478	0.0478
+global commit	7 memset	16	1946157056	0.0010	0.0010
+global open	7 D2D	336	687029968	0.0009	0.0009
+global open	7 D2H (to Pageable)	952	7098032	0.0004	0.0005
+global open	7 D2H (to Pinned)	176	5845504	0.0002	0.0002
+global open	7 H2D (from Pageable)	2200	106675576	0.0023	0.0068
+global open	7 memset	551	219479536	0.0003	0.0003
+prover gaps	7 D2D	7	4195072	0.0000	0.0000
+prover gaps	7 D2H (to Pageable)	13	53872	0.0000	0.0000
+prover gaps	7 D2H (to Pinned)	7	50176	0.0000	0.0000
+prover gaps	7 H2D (from Pageable)	21	12592536	0.0005	0.0005
+prover gaps	7 memset	1	16777216	0.0000	0.0000

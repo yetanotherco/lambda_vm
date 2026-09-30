@@ -1,0 +1,58 @@
+G6 census · wt1203-tree.log · scopes with shapes and argue lines: 16 (#0, #1, #2 …) · BASE ROWS lines 16 · BASE STACK lines 16
+
+=== PADDED SHARE (Q2) ===
+  [epochs] committed cells: padded 4,094,628,724 · real 3,556,532,603 · row padding 538,096,121 = 13.14 % of the tables' cells
+  [epochs] stacked polynomials 4,873,781,248 cells over the tables' 4,094,628,724: alignment padding 779,152,524 = 15.99 % of the stack; real cells are 72.97 % of what is committed (all padding 27.03 %)
+  [epochs] argue: Σ per-table 11.733 s · padded share [E, linear in padded rows] 1.973 s = 16.81 % · tables with ≥ 2^16 rows: 1.314 of 9.118 s
+  [global] committed cells: padded 135,790,592 · real 102,970,247 · row padding 32,820,345 = 24.17 % of the tables' cells
+  [global] stacked polynomials 243,269,632 cells over the tables' 135,790,592: alignment padding 107,479,040 = 44.18 % of the stack; real cells are 42.33 % of what is committed (all padding 57.67 %)
+  [global] argue: Σ per-table 0.327 s · padded share [E, linear in padded rows] 0.044 s = 13.34 % · tables with ≥ 2^16 rows: 0.044 of 0.327 s
+  argue per-table Σ 12.060 s vs the WHIR PROVE SPLIT argue Σ 12.060 s over the same scopes
+
+=== REAL / PADDED ROWS PER TABLE, SUMMED OVER THE EPOCHS (instances; columns; argue s) ===
+  CPU          rows   30,498,818 /   31,457,280 (  3.0 % padding) ·  15 tables ·  38 cols · cells    1195.4 M (29.2 % of all) · argue  2.449 s
+  MEMW_R       rows   62,795,227 /   63,602,688 (  1.3 % padding) ·  42 tables ·  10 cols · cells     636.0 M (15.5 % of all) · argue  1.208 s
+  MEMW_A       rows   10,572,828 /   15,728,640 ( 32.8 % padding) ·  15 tables ·  29 cols · cells     456.1 M (11.1 % of all) · argue  1.082 s
+  KECCAK_RND   rows      255,816 /      305,152 ( 16.2 % padding) ·  13 tables · 1480 cols · cells     451.6 M (11.0 % of all) · argue  2.764 s
+  BITWISE      rows   15,728,640 /   15,728,640 (  0.0 % padding) ·  15 tables ·  21 cols · cells     330.3 M ( 8.1 % of all) · argue  0.586 s
+  LT           rows   13,918,258 /   17,891,328 ( 22.2 % padding) ·  16 tables ·  17 cols · cells     304.2 M ( 7.4 % of all) · argue  0.594 s
+  LOAD         rows    6,434,037 /    8,388,608 ( 23.3 % padding) ·  15 tables ·  18 cols · cells     151.0 M ( 3.7 % of all) · argue  0.310 s
+  STORE        rows    4,952,887 /    7,340,032 ( 32.5 % padding) ·  15 tables ·  16 cols · cells     117.4 M ( 2.9 % of all) · argue  0.313 s
+  L2G_MEMORY   rows    7,363,343 /   11,010,048 ( 33.1 % padding) ·  15 tables ·   9 cols · cells      99.1 M ( 2.4 % of all) · argue  0.231 s
+  DECODE       rows   13,040,420 /   15,728,640 ( 17.1 % padding) ·  15 tables ·   6 cols · cells      94.4 M ( 2.3 % of all) · argue  0.133 s
+  MEMW         rows    1,084,345 /    1,736,704 ( 37.6 % padding) ·  15 tables ·  49 cols · cells      85.1 M ( 2.1 % of all) · argue  0.281 s
+  SHIFT        rows    2,171,937 /    2,916,352 ( 25.5 % padding) ·  15 tables ·  29 cols · cells      84.6 M ( 2.1 % of all) · argue  0.324 s
+  ECDAS        rows       44,418 /       65,536 ( 32.2 % padding) ·   1 tables · 521 cols · cells      34.1 M ( 0.8 % of all) · argue  0.223 s
+  BYTEWISE     rows      730,189 /    1,081,344 ( 32.5 % padding) ·  15 tables ·  26 cols · cells      28.1 M ( 0.7 % of all) · argue  0.125 s
+  BRANCH       rows      550,500 /      733,184 ( 24.9 % padding) ·  15 tables ·  14 cols · cells      10.3 M ( 0.3 % of all) · argue  0.089 s
+  KECCAK       rows       10,659 /       16,064 ( 33.6 % padding) ·  13 tables · 511 cols · cells       8.2 M ( 0.2 % of all) · argue  0.335 s
+  CPU32        rows       81,231 /      117,760 ( 31.0 % padding) ·  15 tables ·  38 cols · cells       4.5 M ( 0.1 % of all) · argue  0.125 s
+  MUL          rows       81,653 /       92,228 ( 11.5 % padding) ·  15 tables ·  26 cols · cells       2.4 M ( 0.1 % of all) · argue  0.080 s
+  EQ           rows       98,180 /      139,264 ( 29.5 % padding) ·  15 tables ·  12 cols · cells       1.7 M ( 0.0 % of all) · argue  0.083 s
+  ECSM         rows          116 /          128 (  9.4 % padding) ·   1 tables · 667 cols · cells       0.1 M ( 0.0 % of all) · argue  0.051 s
+  DVRM         rows        1,206 /        1,732 ( 30.4 % padding) ·   8 tables ·  34 cols · cells       0.1 M ( 0.0 % of all) · argue  0.033 s
+  REGISTER     rows        1,005 /        1,920 ( 47.7 % padding) ·  15 tables ·   5 cols · cells       0.0 M ( 0.0 % of all) · argue  0.135 s
+  HINT         rows           87 /          128 ( 32.0 % padding) ·   1 tables ·  41 cols · cells       0.0 M ( 0.0 % of all) · argue  0.003 s
+  COMMIT       rows          161 /          256 ( 37.1 % padding) ·   1 tables ·  19 cols · cells       0.0 M ( 0.0 % of all) · argue  0.003 s
+  KECCAK_RC    rows          480 /          480 (  0.0 % padding) ·  15 tables ·  10 cols · cells       0.0 M ( 0.0 % of all) · argue  0.172 s
+  HALT         rows            1 /            1 (  0.0 % padding) ·   1 tables ·   4 cols · cells       0.0 M ( 0.0 % of all) · argue  0.000 s
+
+=== CHECKS ===
+consistency: 17 finding(s)
+  #0: DECODE padded 1048576 in 1 tables but the generator noted 4194304 in 4
+  #0: L2G_MEMORY padded 2097152 in 1 tables but the generator noted 2097153 in 2
+  #1: L2G_MEMORY padded 1048576 in 1 tables but the generator noted 1048577 in 2
+  #2: L2G_MEMORY padded 1048576 in 1 tables but the generator noted 1048577 in 2
+  #3: L2G_MEMORY padded 524288 in 1 tables but the generator noted 524289 in 2
+  #4: L2G_MEMORY padded 1048576 in 1 tables but the generator noted 1048577 in 2
+  #5: L2G_MEMORY padded 1048576 in 1 tables but the generator noted 1048577 in 2
+  #6: L2G_MEMORY padded 1048576 in 1 tables but the generator noted 1048577 in 2
+  #7: L2G_MEMORY padded 524288 in 1 tables but the generator noted 524289 in 2
+  #8: L2G_MEMORY padded 262144 in 1 tables but the generator noted 262145 in 2
+  #9: L2G_MEMORY padded 262144 in 1 tables but the generator noted 262145 in 2
+  #10: L2G_MEMORY padded 262144 in 1 tables but the generator noted 262145 in 2
+  #11: L2G_MEMORY padded 262144 in 1 tables but the generator noted 262145 in 2
+  #12: L2G_MEMORY padded 524288 in 1 tables but the generator noted 524289 in 2
+  #13: L2G_MEMORY padded 524288 in 1 tables but the generator noted 524289 in 2
+  #14: DECODE padded 1048576 in 1 tables but the generator noted 3145728 in 3
+  #14: L2G_MEMORY padded 524288 in 1 tables but the generator noted 524289 in 2

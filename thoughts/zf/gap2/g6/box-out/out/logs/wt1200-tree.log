@@ -1,0 +1,737 @@
+WT launcher start 2026-09-30T05:29:12Z tag=wt1200 expect=9e2728955 worktree=/workspace/lambda_vm-zf-whir head=9e272895
+WT guest ELF:   /root/fixtures/ethrex_8f826601.elf 3948504 B sha256 8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a
+WT block input: /root/fixtures/ethrex_mainnet_25368371_573004e6.bin 1110183 B sha256 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
+WT spawn sites read by hand: multilinear_continuation.rs=0 continuation.rs=5
+WT launcher exports: _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1 LFM_EXEC_PARALLEL=1 LFM_PROVE_SPLIT=1 LAMBDA_VM_BASE_SPLIT=1 LFM_CARD_TRACE=1 SIBLINGS=4 VRAM_BUDGET_MB=query W_ALLOW_SPAWNS=1 ROOT_OPTION=A LFM_TREE_TOP_OVERLAP=<UNSET> LFM_TREE_LEVELS=<UNSET> A_CACHE_DIR=<UNSET>
+WT script md5: 88dd158786704e98df5a726a29df0088
+WT EXPECT_RETENTION=yes
+test present: lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root (1745 tests listed)
+spawn guard: prover/src/multilinear_continuation.rs has 0 `scope.spawn` sites (expected 0)
+block ELF: 3948504 bytes  sha256 8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a
+block input: 1110183 bytes  sha256 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
+fixtures verified by content against the record's pair
+building guest ELFs (asm + rust + recursion)…
+ARTIFACTS expected=267 missing=0
+--- environment handed to cargo (REQUIRED) ---
+  LFM_CENSUS_ELF=/root/fixtures/ethrex_8f826601.elf
+  LFM_CENSUS_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin
+  LFM_CENSUS_EPOCH_LOG2=21
+  LFM_TREE_PROVE_ROOT=1
+  LFM_TREE_ROOT_OPTION=A
+  LFM_WHIR_RETENTION=1
+  LAMBDA_VM_MAX_ROWS_LOG2=21
+  LAMBDA_VM_MEMPOOL_RELEASE_MB=0
+  LAMBDA_VM_WHIR_HASH=rpx
+  TABLE_PARALLELISM=4
+  LFM_TREE_SIBLINGS_L0=6
+  LFM_TREE_SIBLINGS=4
+  LFM_TREE_LEVEL_POOL=1
+  LFM_PRECOMPUTED_TREE_CACHE_CAP=64
+  LFM_EXEC_PARALLEL=1
+  LFM_PROVE_SPLIT=1
+  LAMBDA_VM_BASE_SPLIT=1
+  LFM_CARD_TRACE=1
+  LAMBDA_VM_GRIND_SCAN_FACTOR=8
+  LAMBDA_VM_GRIND_GRID=1024
+--- also exported (not counted) ---
+  LAMBDA_VM_VRAM_BUDGET_MB=<UNSET by VRAM_BUDGET_MB=query: the device layer queries the driver>
+  (none)
+environment: 20 of 20 required present
+
+HEAD asserted: 9e272895 on HEAD
+cgroup v2 memory.max: -
+cgroup v1 limit:      61774757888
+card idle at claim:   1 MiB, 0 apps
+
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/lib.rs (target/release/deps/lambda_vm_prover-5f16f3a860d7e6fd)
+
+running 1 test
+test lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root ... ★ LFM PROVER: whir
+★ LFM WIDE: on (level 1 verifies its epochs directly, k = the tree's fan-in)
+ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
+ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] n=21:[6,4,4,4,3] n=22:[6,4,4,4,4] n=23:[6,4,4,4,4,1] n=24:[6,4,4,4,4,2] n=25:[6,4,4,4,4,3] n=26:[6,4,4,4,4,4] n=27:[6,4,4,4,4,4,1]
+★★★ WHIR PRODUCTION TREE — base, level 0, the GLOBAL stage, the interior and the BLOCK-ARTIFACT ROOT (A: the root REPLACES the top interior level)
+   guest /root/fixtures/ethrex_8f826601.elf, 1110183 input bytes, 2^21 cycles/epoch, fan-in 5
+   inner blowup 4 / 110 q · wrap blowup 4 / 110 q
+   levels: prove 0..=the child level of root option A: the root REPLACES the top interior level · cache: NONE
+   cgroup ceiling: 57.53 GiB
+   ★ L1 WIDE PROLOGUES: in the base's tail (the default): 2 helper(s) build wide nodes 0..5, 5 epochs each (LFM_TREE_TAIL_PROLOGUES / LFM_TREE_TAIL_HELPERS)
+★ WHIR HASH: rpx256
+L0 DECODE: taken from the base (the default)
+BASE PREP: ahead of the prover thread (the default)
+BASE HEAD (WHIR): ahead (the default) — DECODE's root on a helper beside epoch 0
+BASE HEAD (WHIR): start t=1790746199.668
+[gpu] mempool release threshold: 0 MiB
+[gpu] RPX permutation: variant 5, 32-bit limb multiplies, squarings unrolled by four (rpx_v5.cubin) (the pipeline default)
+[gpu] LDE: column-major engine
+[gpu] RPX Merkle: a half-warp per parent up to 16384 pairs, then one 1024-thread tail block (the pipeline default)
+BASE HEAD (WHIR): DECODE prepared 0.32s t=[1790746199.731,1790746200.050]
+BASE EPOCH 0: execute 0.08s t=[1790746200.176,1790746200.252]
+BASE HEAD (WHIR): DECODE root 1.11s t=[1790746199.671,1790746200.777]
+BASE EPOCH 0: collect 0.53s t=[1790746200.252,1790746200.785]
+BASE EPOCH 0: build 0.27s t=[1790746200.785,1790746201.059]
+BASE HEAD (WHIR): epoch 0's prep waited 0.00s for the DECODE root
+BASE PREP 0: prep@producer 0.48s t=[1790746201.059,1790746201.534]
+BASE EPOCH 0: handoff 0.48s t=[1790746201.059,1790746201.534]
+BASE EPOCH 0: epoch 1.36s t=[1790746200.176,1790746201.534]
+BASE EPOCH 0: prep 0.00s t=[1790746201.534,1790746201.534]
+BASE EPOCH 0: absorb 0.01s t=[1790746201.534,1790746201.540]
+BASE EPOCH 1: execute 0.03s t=[1790746201.534,1790746201.565]
+BASE EPOCH 1: collect 0.26s t=[1790746201.565,1790746201.828]
+BASE EPOCH 0: commit 0.57s t=[1790746201.540,1790746202.112]
+BASE EPOCH 1: build 0.36s t=[1790746201.828,1790746202.186]
+BASE PREP 1: prep@producer 0.46s t=[1790746202.186,1790746202.642]
+[gpu] RPX grind: the work-queue kernel on a card-filling grid (the pipeline default)
+★ GRIND KNOBS: scan 8 · grid 1024 · stride rpx 131072 / keccak 262144
+[gpu] RPX grind queue: grid 1360 = 170 SMs x 8 blocks of 128 (62 regs/thread), 32 nonces per warp claim
+BASE EPOCH 0: prove 0.87s t=[1790746202.112,1790746202.981]
+BASE EPOCH 0: prove_epoch 1.45s t=[1790746201.534,1790746202.981]
+WHIR PROVE SPLIT #0: airs 20 · wall 1.45s · prep 0.00 · absorb 0.006 · commit 0.57 · prove 0.87 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.56 (max CPU[0] 0.17) · open_groups 0.28 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.06 · sumcheck 0.08 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.07 || round_wall 0.28 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.06 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #0: commit 12984 MiB · argue 20032 MiB · open 12841 MiB · budget 25688 MiB
+ARGUE COLUMNS #0: on the card 314 · on the host 79 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #0: built on the card 70 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #0: sessions read in one copy 0 · factors read one at a time 1498 || lean reads off
+ARGUE GKR #0: layers on the card 210 (rebuilt 0) · host tail rounds 1890 || between layers 60.93 ms, 290.2 µs a layer: lambda 0.54 · program 0.39 · lower 0.11 · session 15.96 · factors 1.61 · tail 41.18 (transcript 9.45) · close 1.15 || rebuild 0.00 · rounds 177.87 · values 8.63 (ms)
+ARGUE TAIL #0: lean 0 of device layers 210 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #0: big sessions 0 (lean 0 · xchecked 0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 171.66 · host tail 3.54 (ms) || lean program on · xcheck off
+BASE EPOCH 1: handoff 0.80s t=[1790746202.186,1790746202.982]
+BASE EPOCH 1: epoch 1.45s t=[1790746201.534,1790746202.982]
+BASE EPOCH 1: prep 0.00s t=[1790746202.982,1790746202.983]
+BASE EPOCH 1: absorb 0.01s t=[1790746202.983,1790746202.988]
+BASE EPOCH 2: execute 0.03s t=[1790746202.982,1790746203.017]
+BASE EPOCH 2: collect 0.27s t=[1790746203.017,1790746203.292]
+BASE EPOCH 1: commit 0.54s t=[1790746202.988,1790746203.523]
+BASE EPOCH 2: build 0.35s t=[1790746203.292,1790746203.640]
+BASE PREP 2: prep@producer 0.47s t=[1790746203.640,1790746204.106]
+BASE EPOCH 1: prove 0.86s t=[1790746203.523,1790746204.384]
+BASE EPOCH 1: prove_epoch 1.40s t=[1790746202.982,1790746204.384]
+WHIR PROVE SPLIT #1: airs 20 · wall 1.40s · prep 0.00 · absorb 0.005 · commit 0.54 · prove 0.86 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.58 (max CPU[0] 0.16) · open_groups 0.26 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.06 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.06 || round_wall 0.26 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #1: commit 12954 MiB · argue 19458 MiB · open 12267 MiB · budget 25688 MiB
+ARGUE COLUMNS #1: on the card 340 · on the host 53 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #1: built on the card 70 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #1: sessions read in one copy 0 · factors read one at a time 1488 || lean reads off
+ARGUE GKR #1: layers on the card 208 (rebuilt 0) · host tail rounds 1872 || between layers 69.24 ms, 332.9 µs a layer: lambda 0.62 · program 0.64 · lower 0.19 · session 19.19 · factors 1.81 · tail 45.47 (transcript 10.72) · close 1.33 || rebuild 0.00 · rounds 179.86 · values 9.50 (ms)
+ARGUE TAIL #1: lean 0 of device layers 208 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #1: big sessions 0 (lean 0 · xchecked 0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 176.53 · host tail 3.71 (ms) || lean program on · xcheck off
+BASE EPOCH 2: handoff 0.75s t=[1790746203.640,1790746204.385]
+BASE EPOCH 2: epoch 1.40s t=[1790746202.982,1790746204.385]
+BASE EPOCH 2: prep 0.00s t=[1790746204.385,1790746204.386]
+BASE EPOCH 2: absorb 0.01s t=[1790746204.386,1790746204.391]
+BASE EPOCH 3: execute 0.04s t=[1790746204.385,1790746204.422]
+BASE EPOCH 3: collect 0.30s t=[1790746204.422,1790746204.718]
+BASE EPOCH 2: commit 0.54s t=[1790746204.391,1790746204.929]
+BASE EPOCH 3: build 0.48s t=[1790746204.718,1790746205.194]
+BASE PREP 3: prep@producer 0.57s t=[1790746205.194,1790746205.764]
+BASE EPOCH 2: prove 1.06s t=[1790746204.929,1790746205.986]
+BASE EPOCH 2: prove_epoch 1.60s t=[1790746204.385,1790746205.986]
+WHIR PROVE SPLIT #2: airs 22 · wall 1.60s · prep 0.00 · absorb 0.005 · commit 0.54 · prove 1.06 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.77 (max CPU[0] 0.17) · open_groups 0.26 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.07 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.06 || round_wall 0.26 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.06 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #2: commit 13002 MiB · argue 19506 MiB · open 12315 MiB · budget 25688 MiB
+ARGUE COLUMNS #2: on the card 2343 · on the host 41 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #2: built on the card 78 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #2: sessions read in one copy 0 · factors read one at a time 3592 || lean reads off
+ARGUE GKR #2: layers on the card 229 (rebuilt 0) · host tail rounds 2061 || between layers 86.06 ms, 375.8 µs a layer: lambda 0.69 · program 0.83 · lower 0.25 · session 29.96 · factors 3.72 · tail 49.16 (transcript 11.77) · close 1.45 || rebuild 0.00 · rounds 207.88 · values 13.54 (ms)
+ARGUE TAIL #2: lean 0 of device layers 229 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #2: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 10 || big early 0.00 · big late 71.04 · other 176.23 · host tail 17.22 (ms) || lean program on · xcheck off
+BASE EPOCH 3: handoff 0.79s t=[1790746205.194,1790746205.987]
+BASE EPOCH 3: epoch 1.60s t=[1790746204.385,1790746205.987]
+BASE EPOCH 3: prep 0.00s t=[1790746205.987,1790746205.988]
+BASE EPOCH 3: absorb 0.01s t=[1790746205.988,1790746205.993]
+BASE EPOCH 4: execute 0.03s t=[1790746205.987,1790746206.021]
+BASE EPOCH 4: collect 0.30s t=[1790746206.021,1790746206.320]
+BASE EPOCH 3: commit 0.77s t=[1790746205.993,1790746206.766]
+BASE EPOCH 4: build 0.46s t=[1790746206.320,1790746206.777]
+BASE PREP 4: prep@producer 0.57s t=[1790746206.777,1790746207.347]
+BASE EPOCH 3: prove 1.88s t=[1790746206.766,1790746208.651]
+BASE EPOCH 3: prove_epoch 2.66s t=[1790746205.987,1790746208.651]
+WHIR PROVE SPLIT #3: airs 22 · wall 2.66s · prep 0.00 · absorb 0.005 · commit 0.77 · prove 1.88 · other 0.00 || inside[Σ] challenge 0.000 · argue 1.04 (max KECCAK_RND[0] 0.46) · open_groups 0.81 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.06 · sumcheck 0.09 · fold 0.00 · commit_folded 0.10 · ood 0.00 · queries 0.56 || round_wall 0.81 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.55 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 4 · rounds 27 · rebuild_calls 50 (derived 50)
+RESERVED HW #3: commit 18160 MiB · argue 24033 MiB · open 17169 MiB · budget 25688 MiB
+ARGUE COLUMNS #3: on the card 2350 · on the host 41 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #3: built on the card 76 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #3: sessions read in one copy 0 · factors read one at a time 3556 || lean reads off
+ARGUE GKR #3: layers on the card 226 (rebuilt 1) · host tail rounds 2034 || between layers 71.19 ms, 315.0 µs a layer: lambda 0.51 · program 0.47 · lower 0.13 · session 26.30 · factors 1.70 · tail 41.00 (transcript 9.20) · close 1.08 || rebuild 58.48 · rounds 274.23 · values 9.34 (ms)
+ARGUE TAIL #3: lean 0 of device layers 226 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #3: big sessions 2 (lean 2 · xchecked 0) · early rounds 3 · late rounds 15 || big early 95.46 · big late 91.95 · other 174.24 · host tail 17.24 (ms) || lean program on · xcheck off
+BASE EPOCH 4: handoff 1.88s t=[1790746206.777,1790746208.652]
+BASE EPOCH 4: epoch 2.67s t=[1790746205.987,1790746208.652]
+BASE EPOCH 4: prep 0.00s t=[1790746208.652,1790746208.653]
+BASE EPOCH 4: absorb 0.01s t=[1790746208.653,1790746208.658]
+BASE EPOCH 5: execute 0.03s t=[1790746208.652,1790746208.682]
+BASE EPOCH 5: collect 0.27s t=[1790746208.682,1790746208.950]
+BASE EPOCH 5: build 0.42s t=[1790746208.951,1790746209.370]
+BASE EPOCH 4: commit 0.78s t=[1790746208.658,1790746209.437]
+BASE PREP 5: prep@producer 0.60s t=[1790746209.370,1790746209.969]
+BASE EPOCH 4: prove 2.08s t=[1790746209.437,1790746211.516]
+BASE EPOCH 4: prove_epoch 2.86s t=[1790746208.652,1790746211.516]
+WHIR PROVE SPLIT #4: airs 22 · wall 2.86s · prep 0.00 · absorb 0.005 · commit 0.78 · prove 2.08 · other 0.00 || inside[Σ] challenge 0.000 · argue 1.20 (max KECCAK_RND[0] 0.41) · open_groups 0.84 (2 groups) · open_prepared 0.05 · other 0.00 || chain[Σ groups] grind 0.07 · sumcheck 0.09 · fold 0.00 · commit_folded 0.10 · ood 0.00 · queries 0.57 || round_wall 0.83 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.56 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 4 · rounds 27 · rebuild_calls 50 (derived 50)
+RESERVED HW #4: commit 18089 MiB · argue 24218 MiB · open 17354 MiB · budget 25688 MiB
+ARGUE COLUMNS #4: on the card 2343 · on the host 41 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #4: built on the card 76 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #4: sessions read in one copy 0 · factors read one at a time 3554 || lean reads off
+ARGUE GKR #4: layers on the card 227 (rebuilt 1) · host tail rounds 2043 || between layers 56.02 ms, 246.8 µs a layer: lambda 0.47 · program 0.21 · lower 0.05 · session 14.90 · factors 0.78 · tail 38.64 (transcript 8.53) · close 0.95 || rebuild 40.37 · rounds 265.23 · values 7.32 (ms)
+ARGUE TAIL #4: lean 0 of device layers 227 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #4: big sessions 2 (lean 2 · xchecked 0) · early rounds 3 · late rounds 15 || big early 92.12 · big late 93.02 · other 168.03 · host tail 16.38 (ms) || lean program on · xcheck off
+BASE EPOCH 5: handoff 2.15s t=[1790746209.370,1790746211.518]
+BASE EPOCH 5: epoch 2.87s t=[1790746208.652,1790746211.518]
+BASE EPOCH 5: prep 0.00s t=[1790746211.518,1790746211.519]
+BASE EPOCH 5: absorb 0.01s t=[1790746211.519,1790746211.524]
+BASE EPOCH 6: execute 0.04s t=[1790746211.518,1790746211.557]
+BASE EPOCH 6: collect 0.42s t=[1790746211.557,1790746211.973]
+BASE EPOCH 5: commit 0.77s t=[1790746211.524,1790746212.299]
+BASE EPOCH 6: build 0.34s t=[1790746211.973,1790746212.311]
+BASE PREP 6: prep@producer 0.43s t=[1790746212.311,1790746212.742]
+BASE EPOCH 5: prove 1.86s t=[1790746212.299,1790746214.154]
+BASE EPOCH 5: prove_epoch 2.64s t=[1790746211.518,1790746214.154]
+WHIR PROVE SPLIT #5: airs 23 · wall 2.64s · prep 0.00 · absorb 0.005 · commit 0.77 · prove 1.86 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.96 (max KECCAK_RND[0] 0.43) · open_groups 0.86 (2 groups) · open_prepared 0.04 · other 0.00 || chain[Σ groups] grind 0.10 · sumcheck 0.10 · fold 0.00 · commit_folded 0.10 · ood 0.00 · queries 0.56 || round_wall 0.85 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.55 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 4 · rounds 27 · rebuild_calls 50 (derived 50)
+RESERVED HW #5: commit 17920 MiB · argue 24049 MiB · open 17185 MiB · budget 25688 MiB
+ARGUE COLUMNS #5: on the card 2343 · on the host 75 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #5: built on the card 80 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #5: sessions read in one copy 0 · factors read one at a time 3663 || lean reads off
+ARGUE GKR #5: layers on the card 236 (rebuilt 1) · host tail rounds 2124 || between layers 72.51 ms, 307.2 µs a layer: lambda 0.52 · program 0.43 · lower 0.12 · session 26.97 · factors 1.61 · tail 41.74 (transcript 9.28) · close 1.12 || rebuild 35.70 · rounds 255.86 · values 9.17 (ms)
+ARGUE TAIL #5: lean 0 of device layers 236 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #5: big sessions 2 (lean 2 · xchecked 0) · early rounds 3 · late rounds 14 || big early 96.03 · big late 91.69 · other 160.41 · host tail 15.74 (ms) || lean program on · xcheck off
+BASE EPOCH 6: handoff 1.84s t=[1790746212.311,1790746214.156]
+BASE EPOCH 6: epoch 2.64s t=[1790746211.518,1790746214.156]
+BASE EPOCH 6: prep 0.00s t=[1790746214.156,1790746214.157]
+BASE EPOCH 6: absorb 0.01s t=[1790746214.157,1790746214.163]
+BASE EPOCH 7: execute 0.06s t=[1790746214.156,1790746214.220]
+BASE EPOCH 7: collect 0.31s t=[1790746214.220,1790746214.528]
+BASE EPOCH 7: build 0.28s t=[1790746214.528,1790746214.810]
+BASE EPOCH 6: commit 0.76s t=[1790746214.163,1790746214.920]
+BASE PREP 7: prep@producer 0.36s t=[1790746214.810,1790746215.167]
+BASE EPOCH 6: prove 1.41s t=[1790746214.920,1790746216.328]
+BASE EPOCH 6: prove_epoch 2.17s t=[1790746214.156,1790746216.328]
+WHIR PROVE SPLIT #6: airs 26 · wall 2.17s · prep 0.00 · absorb 0.005 · commit 0.76 · prove 1.41 · other 0.00 || inside[Σ] challenge 0.000 · argue 1.01 (max ECDAS[0] 0.22) · open_groups 0.36 (2 groups) · open_prepared 0.04 · other 0.00 || chain[Σ groups] grind 0.07 · sumcheck 0.08 · fold 0.00 · commit_folded 0.10 · ood 0.00 · queries 0.09 || round_wall 0.35 · round_other 0.00 · setup_tail 0.01 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.08 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 4 · rounds 27 · rebuild_calls 50 (derived 50)
+RESERVED HW #6: commit 17618 MiB · argue 24122 MiB · open 16931 MiB · budget 25688 MiB
+ARGUE COLUMNS #6: on the card 3557 · on the host 90 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #6: built on the card 88 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #6: sessions read in one copy 0 · factors read one at a time 5045 || lean reads off
+ARGUE GKR #6: layers on the card 265 (rebuilt 0) · host tail rounds 2385 || between layers 71.40 ms, 269.4 µs a layer: lambda 0.57 · program 0.38 · lower 0.10 · session 21.15 · factors 1.48 · tail 46.52 (transcript 10.32) · close 1.20 || rebuild 0.00 · rounds 212.78 · values 9.55 (ms)
+ARGUE TAIL #6: lean 0 of device layers 265 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #6: big sessions 4 (lean 4 · xchecked 0) · early rounds 3 · late rounds 22 || big early 72.92 · big late 190.05 · other 165.35 · host tail 36.84 (ms) || lean program on · xcheck off
+BASE EPOCH 7: handoff 1.52s t=[1790746214.810,1790746216.330]
+BASE EPOCH 7: epoch 2.17s t=[1790746214.156,1790746216.330]
+BASE EPOCH 7: prep 0.00s t=[1790746216.330,1790746216.331]
+BASE EPOCH 7: absorb 0.01s t=[1790746216.331,1790746216.336]
+BASE EPOCH 8: execute 0.38s t=[1790746216.330,1790746216.714]
+BASE EPOCH 7: commit 0.50s t=[1790746216.336,1790746216.839]
+BASE EPOCH 8: collect 0.29s t=[1790746216.714,1790746217.000]
+BASE EPOCH 8: build 0.30s t=[1790746217.000,1790746217.296]
+BASE PREP 8: prep@producer 0.33s t=[1790746217.296,1790746217.624]
+BASE EPOCH 7: prove 0.97s t=[1790746216.839,1790746217.809]
+BASE EPOCH 7: prove_epoch 1.48s t=[1790746216.330,1790746217.809]
+WHIR PROVE SPLIT #7: airs 23 · wall 1.48s · prep 0.00 · absorb 0.005 · commit 0.50 · prove 0.97 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.69 (max CPU[0] 0.17) · open_groups 0.26 (2 groups) · open_prepared 0.02 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.07 || round_wall 0.25 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.07 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #7: commit 12863 MiB · argue 19095 MiB · open 11904 MiB · budget 25688 MiB
+ARGUE COLUMNS #7: on the card 1858 · on the host 560 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #7: built on the card 80 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #7: sessions read in one copy 0 · factors read one at a time 3633 || lean reads off
+ARGUE GKR #7: layers on the card 230 (rebuilt 0) · host tail rounds 2070 || between layers 64.76 ms, 281.6 µs a layer: lambda 0.55 · program 0.42 · lower 0.12 · session 16.90 · factors 1.59 · tail 44.01 (transcript 9.87) · close 1.18 || rebuild 0.00 · rounds 175.71 · values 9.26 (ms)
+ARGUE TAIL #7: lean 0 of device layers 230 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #7: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 9 || big early 0.00 · big late 69.14 · other 167.45 · host tail 18.09 (ms) || lean program on · xcheck off
+BASE EPOCH 8: handoff 0.52s t=[1790746217.296,1790746217.811]
+BASE EPOCH 8: epoch 1.48s t=[1790746216.330,1790746217.811]
+BASE EPOCH 8: prep 0.00s t=[1790746217.811,1790746217.812]
+BASE EPOCH 8: absorb 0.01s t=[1790746217.812,1790746217.817]
+BASE EPOCH 9: execute 0.17s t=[1790746217.811,1790746217.979]
+BASE EPOCH 9: collect 0.28s t=[1790746217.979,1790746218.263]
+BASE EPOCH 8: commit 0.49s t=[1790746217.817,1790746218.310]
+BASE EPOCH 9: build 0.30s t=[1790746218.263,1790746218.564]
+BASE PREP 9: prep@producer 0.32s t=[1790746218.564,1790746218.880]
+BASE EPOCH 8: prove 0.95s t=[1790746218.310,1790746219.264]
+BASE EPOCH 8: prove_epoch 1.45s t=[1790746217.811,1790746219.264]
+WHIR PROVE SPLIT #8: airs 23 · wall 1.45s · prep 0.00 · absorb 0.005 · commit 0.49 · prove 0.95 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.67 (max CPU[0] 0.16) · open_groups 0.25 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.07 || round_wall 0.25 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.06 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 19 · rebuild_calls 35 (derived 35)
+RESERVED HW #8: commit 12822 MiB · argue 18918 MiB · open 11727 MiB · budget 25688 MiB
+ARGUE COLUMNS #8: on the card 1858 · on the host 560 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #8: built on the card 80 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #8: sessions read in one copy 0 · factors read one at a time 3613 || lean reads off
+ARGUE GKR #8: layers on the card 226 (rebuilt 0) · host tail rounds 2034 || between layers 66.10 ms, 292.5 µs a layer: lambda 0.56 · program 0.46 · lower 0.13 · session 17.00 · factors 1.65 · tail 45.11 (transcript 10.05) · close 1.19 || rebuild 0.00 · rounds 170.75 · values 9.33 (ms)
+ARGUE TAIL #8: lean 0 of device layers 226 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #8: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 7 || big early 0.00 · big late 51.99 · other 165.42 · host tail 16.12 (ms) || lean program on · xcheck off
+BASE EPOCH 9: handoff 0.70s t=[1790746218.564,1790746219.266]
+BASE EPOCH 9: epoch 1.46s t=[1790746217.811,1790746219.266]
+BASE EPOCH 9: prep 0.00s t=[1790746219.266,1790746219.267]
+BASE EPOCH 9: absorb 0.01s t=[1790746219.267,1790746219.272]
+BASE EPOCH 10: execute 0.04s t=[1790746219.266,1790746219.305]
+BASE EPOCH 10: collect 0.29s t=[1790746219.305,1790746219.598]
+BASE EPOCH 9: commit 0.51s t=[1790746219.272,1790746219.783]
+BASE EPOCH 10: build 0.31s t=[1790746219.598,1790746219.905]
+BASE PREP 10: prep@producer 0.34s t=[1790746219.905,1790746220.243]
+BASE EPOCH 9: prove 0.92s t=[1790746219.783,1790746220.703]
+BASE EPOCH 9: prove_epoch 1.44s t=[1790746219.266,1790746220.703]
+WHIR PROVE SPLIT #9: airs 23 · wall 1.44s · prep 0.00 · absorb 0.005 · commit 0.51 · prove 0.92 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.64 (max CPU[0] 0.17) · open_groups 0.25 (2 groups) · open_prepared 0.02 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.07 || round_wall 0.25 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.06 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 19 · rebuild_calls 35 (derived 35)
+RESERVED HW #9: commit 12822 MiB · argue 18918 MiB · open 11727 MiB · budget 25688 MiB
+ARGUE COLUMNS #9: on the card 1858 · on the host 560 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #9: built on the card 80 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #9: sessions read in one copy 0 · factors read one at a time 3613 || lean reads off
+ARGUE GKR #9: layers on the card 226 (rebuilt 0) · host tail rounds 2034 || between layers 58.29 ms, 257.9 µs a layer: lambda 0.47 · program 0.29 · lower 0.07 · session 15.81 · factors 1.02 · tail 39.63 (transcript 8.66) · close 0.99 || rebuild 0.00 · rounds 166.80 · values 7.82 (ms)
+ARGUE TAIL #9: lean 0 of device layers 226 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #9: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 7 || big early 0.00 · big late 52.00 · other 163.82 · host tail 17.16 (ms) || lean program on · xcheck off
+BASE EPOCH 10: handoff 0.80s t=[1790746219.905,1790746220.704]
+BASE EPOCH 10: epoch 1.44s t=[1790746219.266,1790746220.704]
+BASE EPOCH 10: prep 0.00s t=[1790746220.704,1790746220.705]
+BASE EPOCH 10: absorb 0.01s t=[1790746220.705,1790746220.710]
+BASE EPOCH 11: execute 0.04s t=[1790746220.704,1790746220.741]
+BASE EPOCH 11: collect 0.30s t=[1790746220.741,1790746221.044]
+BASE EPOCH 10: commit 0.51s t=[1790746220.710,1790746221.223]
+BASE EPOCH 11: build 0.29s t=[1790746221.044,1790746221.339]
+BASE PREP 11: prep@producer 0.33s t=[1790746221.339,1790746221.666]
+BASE EPOCH 10: prove 0.94s t=[1790746221.223,1790746222.164]
+BASE EPOCH 10: prove_epoch 1.46s t=[1790746220.704,1790746222.164]
+WHIR PROVE SPLIT #10: airs 23 · wall 1.46s · prep 0.00 · absorb 0.005 · commit 0.51 · prove 0.94 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.64 (max CPU[0] 0.17) · open_groups 0.26 (2 groups) · open_prepared 0.04 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.07 || round_wall 0.26 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.07 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 19 · rebuild_calls 35 (derived 35)
+RESERVED HW #10: commit 12821 MiB · argue 18917 MiB · open 11726 MiB · budget 25688 MiB
+ARGUE COLUMNS #10: on the card 1832 · on the host 586 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #10: built on the card 80 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #10: sessions read in one copy 0 · factors read one at a time 3608 || lean reads off
+ARGUE GKR #10: layers on the card 225 (rebuilt 0) · host tail rounds 2025 || between layers 61.13 ms, 271.7 µs a layer: lambda 0.49 · program 0.29 · lower 0.08 · session 18.29 · factors 1.12 · tail 39.83 (transcript 8.80) · close 1.03 || rebuild 0.00 · rounds 166.92 · values 8.04 (ms)
+ARGUE TAIL #10: lean 0 of device layers 225 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #10: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 7 || big early 0.00 · big late 54.41 · other 164.01 · host tail 16.60 (ms) || lean program on · xcheck off
+BASE EPOCH 11: handoff 0.83s t=[1790746221.339,1790746222.166]
+BASE EPOCH 11: epoch 1.46s t=[1790746220.704,1790746222.166]
+BASE EPOCH 11: prep 0.00s t=[1790746222.166,1790746222.167]
+BASE EPOCH 11: absorb 0.01s t=[1790746222.167,1790746222.172]
+BASE EPOCH 12: execute 0.04s t=[1790746222.166,1790746222.203]
+BASE EPOCH 12: collect 0.32s t=[1790746222.203,1790746222.523]
+BASE EPOCH 11: commit 0.52s t=[1790746222.172,1790746222.688]
+BASE EPOCH 12: build 0.31s t=[1790746222.523,1790746222.830]
+BASE PREP 12: prep@producer 0.36s t=[1790746222.830,1790746223.193]
+BASE EPOCH 11: prove 0.95s t=[1790746222.688,1790746223.637]
+BASE EPOCH 11: prove_epoch 1.47s t=[1790746222.166,1790746223.637]
+WHIR PROVE SPLIT #11: airs 23 · wall 1.47s · prep 0.00 · absorb 0.005 · commit 0.52 · prove 0.95 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.66 (max CPU[0] 0.17) · open_groups 0.25 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.06 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.06 || round_wall 0.25 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 19 · rebuild_calls 35 (derived 35)
+RESERVED HW #11: commit 12843 MiB · argue 18939 MiB · open 11748 MiB · budget 25688 MiB
+ARGUE COLUMNS #11: on the card 1832 · on the host 586 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #11: built on the card 78 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #11: sessions read in one copy 0 · factors read one at a time 3572 || lean reads off
+ARGUE GKR #11: layers on the card 223 (rebuilt 0) · host tail rounds 2007 || between layers 59.58 ms, 267.2 µs a layer: lambda 0.52 · program 0.38 · lower 0.10 · session 14.52 · factors 1.46 · tail 41.51 (transcript 9.32) · close 1.10 || rebuild 0.00 · rounds 170.68 · values 8.47 (ms)
+ARGUE TAIL #11: lean 0 of device layers 223 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #11: big sessions 2 (lean 2 · xchecked 0) · early rounds 0 · late rounds 9 || big early 0.00 · big late 69.19 · other 163.43 · host tail 21.16 (ms) || lean program on · xcheck off
+BASE EPOCH 12: handoff 0.81s t=[1790746222.830,1790746223.638]
+BASE EPOCH 12: epoch 1.47s t=[1790746222.166,1790746223.638]
+BASE EPOCH 12: prep 0.00s t=[1790746223.638,1790746223.639]
+BASE EPOCH 12: absorb 0.01s t=[1790746223.639,1790746223.644]
+BASE EPOCH 13: execute 0.03s t=[1790746223.638,1790746223.671]
+BASE EPOCH 13: collect 0.31s t=[1790746223.671,1790746223.984]
+BASE EPOCH 12: commit 0.52s t=[1790746223.644,1790746224.168]
+BASE EPOCH 13: build 0.35s t=[1790746223.984,1790746224.336]
+BASE PREP 13: prep@producer 0.35s t=[1790746224.336,1790746224.684]
+BASE EPOCH 12: prove 0.98s t=[1790746224.168,1790746225.146]
+BASE EPOCH 12: prove_epoch 1.51s t=[1790746223.638,1790746225.146]
+WHIR PROVE SPLIT #12: airs 23 · wall 1.51s · prep 0.00 · absorb 0.005 · commit 0.52 · prove 0.98 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.71 (max KECCAK_RND[0] 0.17) · open_groups 0.24 (2 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.04 · sumcheck 0.06 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.06 || round_wall 0.24 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.06 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #12: commit 12964 MiB · argue 19196 MiB · open 12005 MiB · budget 25688 MiB
+ARGUE COLUMNS #12: on the card 2343 · on the host 75 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #12: built on the card 78 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #12: sessions read in one copy 0 · factors read one at a time 3567 || lean reads off
+ARGUE GKR #12: layers on the card 224 (rebuilt 0) · host tail rounds 2016 || between layers 62.58 ms, 279.4 µs a layer: lambda 0.49 · program 0.32 · lower 0.08 · session 18.93 · factors 1.19 · tail 40.53 (transcript 8.97) · close 1.04 || rebuild 0.00 · rounds 185.73 · values 8.18 (ms)
+ARGUE TAIL #12: lean 0 of device layers 224 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #12: big sessions 2 (lean 2 · xchecked 0) · early rounds 1 · late rounds 12 || big early 13.99 · big late 86.54 · other 159.54 · host tail 14.63 (ms) || lean program on · xcheck off
+BASE EPOCH 13: handoff 0.81s t=[1790746224.336,1790746225.147]
+BASE EPOCH 13: epoch 1.51s t=[1790746223.638,1790746225.147]
+BASE EPOCH 13: prep 0.00s t=[1790746225.147,1790746225.148]
+BASE EPOCH 13: absorb 0.01s t=[1790746225.148,1790746225.153]
+BASE EPOCH 14: execute 0.02s t=[1790746225.147,1790746225.167]
+BASE EPOCH 14: collect 0.24s t=[1790746225.167,1790746225.408]
+BASE EPOCH 14: build 0.32s t=[1790746225.408,1790746225.725]
+BASE EPOCH 13: commit 0.74s t=[1790746225.153,1790746225.889]
+BASE PREP 14: prep@producer 0.45s t=[1790746225.725,1790746226.178]
+BASE EPOCH 13: prove 1.22s t=[1790746225.889,1790746227.106]
+BASE EPOCH 13: prove_epoch 1.96s t=[1790746225.147,1790746227.106]
+WHIR PROVE SPLIT #13: airs 21 · wall 1.96s · prep 0.00 · absorb 0.005 · commit 0.74 · prove 1.22 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.83 (max KECCAK_RND[0] 0.23) · open_groups 0.36 (2 groups) · open_prepared 0.02 · other 0.00 || chain[Σ groups] grind 0.08 · sumcheck 0.08 · fold 0.00 · commit_folded 0.10 · ood 0.00 · queries 0.10 || round_wall 0.36 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.09 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 4 · rounds 27 · rebuild_calls 50 (derived 50)
+RESERVED HW #13: commit 17512 MiB · argue 23744 MiB · open 16553 MiB · budget 25688 MiB
+ARGUE COLUMNS #13: on the card 2333 · on the host 41 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #13: built on the card 76 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #13: sessions read in one copy 0 · factors read one at a time 3540 || lean reads off
+ARGUE GKR #13: layers on the card 221 (rebuilt 0) · host tail rounds 1989 || between layers 63.57 ms, 287.7 µs a layer: lambda 0.50 · program 0.27 · lower 0.09 · session 19.93 · factors 1.10 · tail 40.64 (transcript 9.01) · close 1.04 || rebuild 0.00 · rounds 206.70 · values 23.34 (ms)
+ARGUE TAIL #13: lean 0 of device layers 221 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #13: big sessions 2 (lean 2 · xchecked 0) · early rounds 2 · late rounds 14 || big early 34.05 · big late 90.29 · other 165.50 · host tail 14.86 (ms) || lean program on · xcheck off
+BASE EPOCH 14: handoff 1.38s t=[1790746225.725,1790746227.108]
+BASE EPOCH 14: epoch 1.96s t=[1790746225.147,1790746227.108]
+BASE EPOCH 14: prep 0.00s t=[1790746227.108,1790746227.109]
+BASE EPOCH 14: absorb 0.01s t=[1790746227.109,1790746227.114]
+BASE EPOCH 14: commit 0.56s t=[1790746227.114,1790746227.678]
+WHIR FOLD: lean (the default)
+LFM HASH SPLIT: off (the pipeline default)
+BASE EPOCH 14: prove 1.02s t=[1790746227.678,1790746228.699]
+BASE EPOCH 14: prove_epoch 1.59s t=[1790746227.108,1790746228.699]
+WHIR PROVE SPLIT #14: airs 23 · wall 1.59s · prep 0.00 · absorb 0.006 · commit 0.56 · prove 1.02 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.71 (max KECCAK_RND[0] 0.23) · open_groups 0.27 (2 groups) · open_prepared 0.04 · other 0.00 || chain[Σ groups] grind 0.06 · sumcheck 0.07 · fold 0.00 · commit_folded 0.07 · ood 0.00 · queries 0.06 || round_wall 0.27 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 3 · rounds 20 · rebuild_calls 37 (derived 37)
+RESERVED HW #14: commit 12978 MiB · argue 19210 MiB · open 12019 MiB · budget 25688 MiB
+ARGUE COLUMNS #14: on the card 2307 · on the host 90 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES #14: built on the card 74 · xchecked 0 || device tables on · xcheck off
+ARGUE READS #14: sessions read in one copy 0 · factors read one at a time 3456 || lean reads off
+ARGUE GKR #14: layers on the card 206 (rebuilt 0) · host tail rounds 1854 || between layers 56.07 ms, 272.2 µs a layer: lambda 0.45 · program 0.27 · lower 0.07 · session 16.72 · factors 1.16 · tail 36.45 (transcript 8.06) · close 0.95 || rebuild 0.00 · rounds 188.26 · values 7.54 (ms)
+ARGUE TAIL #14: lean 0 of device layers 206 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK #14: big sessions 2 (lean 2 · xchecked 0) · early rounds 2 · late rounds 14 || big early 34.35 · big late 90.67 · other 146.14 · host tail 16.67 (ms) || lean program on · xcheck off
+BASE PREP global: prep@producer 1.63s t=[1790746227.108,1790746228.743]
+BASE EPOCH global: prep 0.00s t=[1790746228.825,1790746228.825]
+BASE EPOCH global: absorb 0.01s t=[1790746228.825,1790746228.831]
+BASE EPOCH global: commit 0.42s t=[1790746228.831,1790746229.253]
+BASE EPOCH global: prove 0.85s t=[1790746229.260,1790746230.115]
+BASE EPOCH global: prove_global 1.29s t=[1790746228.825,1790746230.115]
+WHIR PROVE SPLIT GLOBAL (in base): airs 50 · wall 1.29s · prep 0.00 · absorb 0.006 · commit 0.42 · prove 0.85 · other 0.01 || inside[Σ] challenge 0.000 · argue 0.33 (max unknown 0.02) · open_groups 0.50 (16 groups) · open_prepared 0.03 · other 0.00 || chain[Σ groups] grind 0.25 · sumcheck 0.05 · fold 0.00 · commit_folded 0.09 · ood 0.01 · queries 0.09 || round_wall 0.50 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.01 · tree_rebuild 0.07 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 16 · rounds 92 · rebuild_calls 168 (derived 168)
+RESERVED HW GLOBAL (in base): commit 9708 MiB · argue 10120 MiB · open 9672 MiB · budget 25688 MiB
+ARGUE COLUMNS GLOBAL (in base): on the card 275 · on the host 0 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES GLOBAL (in base): built on the card 200 · xchecked 0 || device tables on · xcheck off
+ARGUE READS GLOBAL (in base): sessions read in one copy 0 · factors read one at a time 2815 || lean reads off
+ARGUE GKR GLOBAL (in base): layers on the card 468 (rebuilt 0) · host tail rounds 4212 || between layers 99.30 ms, 212.2 µs a layer: lambda 0.92 · program 0.38 · lower 0.09 · session 15.81 · factors 1.61 · tail 78.59 (transcript 16.86) · close 1.90 || rebuild 0.00 · rounds 83.09 · values 14.73 (ms)
+ARGUE TAIL GLOBAL (in base): lean 0 of device layers 468 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK GLOBAL (in base): big sessions 0 (lean 0 · xchecked 0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 37.25 · host tail 1.75 (ms) || lean program on · xcheck off
+   base (WHIR): 15 epochs in 30.4s
+   base (WHIR): host peak 9.787 GiB at t=1790746228.7 (17.0% of 57.53) (proved)
+   MARK AFTER the WHIR base (this live figure is L_bundle): live Some(9.495330810546875) GiB / high-water Some(9.835968017578125) GiB / t=1790746230.1
+   AFTER the WHIR base: jemalloc allocated 3.233 GiB · resident 10.017 · RETAINED 6.784 (68% of resident) · caches: twiddles 0 · precomputed trees 0 (0h/0m/0e)
+   AFTER the WHIR base: staging: upload shared-slab 0.00 GB in 0.00 s memcpy (0.0 GB/s) · staged 0.00 GB in 0.00 s (0.0 GB/s) | retained-LDE download shared-slab 0.00 GB in 0.00 s (0.0 GB/s) · staged 0.00 GB in 0.00 s (0.0 GB/s) | staging pairs 0 of 8 · waits 0 | shared slabs pinned 0.01 GiB in 1 slot(s), 0 busy
+   ── WHIR BASE SPLIT over 15 epochs, base wall 30.4s ──
+   producer[Σ] execute 1.1s (3.5%) · collect 4.7s (15.4%) · build 5.1s (16.8%) · handoff 16.0s (52.7%) · wall 26.9s (88.5%)
+   prover[Σ]   prep 0.0s (0.0%) · absorb 0.08s · commit 9.1s (29.8%) · prove 18.0s (59.0%) · wall 27.1s (89.1%)
+   inside prove[Σ] challenge 0.00s · argue 11.7s (38.3%) · open_groups 5.8s (19.1%) · open_prepared 0.5s (1.6%)
+   chain[Σ epochs] grind 0.92s · sumcheck 1.09s · fold 0.01s · commit_folded 1.18s · ood 0.05s · queries 2.52s
+   queries[Σ epochs] query_sample 0.02s (1%) · tree_rebuild 2.42s (96%) · coset_gather 0.08s (3%) · open_assemble 0.00s (0%) · rebuild_calls 612 over 331 rounds in 50 chains
+   retention[leaf layers] admitted 519 · refused 0 · asked 12879 MiB · held 12879 MiB · leaf passes saved 939 · leaf_passes 519 of tree_builds 1458 · peak simultaneous footprint 833 MiB · evicted 15 (2432 MiB)
+   global (in base) wall 1.3s (4.2%)
+   slowest single table in any epoch: KECCAK_RND[0] at 0.46s
+   WHIR BASE SPLIT: closure GREEN (arms A-F at 3% tolerance)
+   BOTTLENECK: handoff is 59.6% of the producer's wall ⇒ THE PROVER IS THE BOTTLENECK (the producer waits at the hand-off; nothing spent on execute/collect/build buys wall)
+   headroom if the producer were free: Σ producer 26.9s vs Σ prover + global 28.4s
+   ★ SHAPE from 15 epochs at fan-in 5: 2 levels, 4 nodes
+     level 1: 3 nodes (0 short)
+     level 2: 1 nodes (1 short)
+   ★ LEVEL 1 (wide) START t=1790746230.120 (prove-split clock)
+   ★ LEVEL-0 CONCURRENCY: 6 wrap(s) at once (LFM_TREE_SIBLINGS_L0 or LFM_TREE_K_L0; 1 = the serial control)
+   ★ WHIR LEVEL 0: both DECODE derivations taken from the base in 0.00s (the prepared opening and the univariate root — different objects, one each per bundle rather than one each per epoch)
+   ★ L0 PROLOGUES: lead-in at level 0's start: 0 prologue(s) ready and 2 still building, of 5 wanted; the first finished at t=-, the last at t=-
+   ★ TOP OVERLAP: the WHIR GLOBAL child runs as task 0 of level 0's pool (the default; LFM_TREE_TOP_OVERLAP=0 puts it back as the K=1 stage after level 0)
+STAGE L1N0 (arity 5) prologue (harvest+emit, pre-device, lead-in, in the base's tail): 4.43s t=[1790746225.733,1790746230.167]
+LFM BITWISE: only where a chip sends it a lookup (the default)
+   ★ CENSUS L1N0 (arity 5): 290852608 cells (5355197 instructions), floor 9.1%
+     LFM_CONST             357/       512  headroom  30.3%  AT RISK  cliff +2048 cells
+     LFM_BALU           465888/    524288  headroom  11.1%  AT RISK  cliff +5242880 cells
+     LFM_XALU          1775348/   2097152  headroom  15.3%  AT RISK  cliff +37748736 cells
+     LFM_SELECT         745920/   1048576  headroom  28.9%  AT RISK  cliff +27262976 cells
+     LFM_BITDEC          16272/     16384  headroom   0.7%  AT RISK  cliff +2752512 cells
+     LFM_HASH           445665/    524288  headroom  15.0%  AT RISK  cliff +170393600 cells
+     LFM_LANES         1064240/   2097152  headroom  49.3%  AT RISK  cliff +39845888 cells
+     LFM_HINT           841363/   1048576  headroom  19.8%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            144/       256  headroom  43.8%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     ⇒ at 1.200× the workload these would STEP: ["LFM_BALU", "LFM_XALU", "LFM_BITDEC", "LFM_HASH"]
+★ LFM WHIR PREP: prepared
+STAGE L1N1 (arity 5) prologue (harvest+emit, pre-device, lead-in, in the base's tail): 4.53s t=[1790746225.739,1790746230.273]
+   ★ CENSUS L1N1 (arity 5): 290854656 cells (5632652 instructions), floor 9.1%
+     LFM_CONST             560/      1024  headroom  45.3%  AT RISK  cliff +4096 cells
+     LFM_BALU           458624/    524288  headroom  12.5%  AT RISK  cliff +5242880 cells
+     LFM_XALU          2016306/   2097152  headroom   3.9%  AT RISK  cliff +37748736 cells
+     LFM_SELECT         733824/   1048576  headroom  30.0%  AT RISK  cliff +27262976 cells
+     LFM_BITDEC          16046/     16384  headroom   2.1%  AT RISK  cliff +2752512 cells
+     LFM_HASH           450265/    524288  headroom  14.1%  AT RISK  cliff +170393600 cells
+     LFM_LANES         1105889/   2097152  headroom  47.3%  AT RISK  cliff +39845888 cells
+     LFM_HINT           850994/   1048576  headroom  18.8%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            144/       256  headroom  43.8%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     ⇒ at 1.200× the workload these would STEP: ["LFM_BALU", "LFM_XALU", "LFM_BITDEC", "LFM_HASH"]
+CARD HOLD #0 build_artifacts: waited 0.000s · held 0.243s · t=[1790746230.424,1790746230.667]
+CARD HOLD #1 build_artifacts: waited 0.139s · held 0.232s · t=[1790746230.667,1790746230.899]
+   ★ W-LFM CARD PERMIT: after the host prep (LFM_CARD_AFTER_PREP; unset = after the prep, the default; 0 = before it)
+
+   ★ THE WHIR GLOBAL WRAP (the root's extra child): 50 cross-epoch sub-proofs over 15 epochs and 35 touched pages
+     harvested + verified in 0.8s · emitted in 1.8s
+   ★ CENSUS the WHIR GLOBAL wrap: 238421440 cells (3227416 instructions), floor 11.1%
+     LFM_CONST             148/       256  headroom  42.2%  AT RISK  cliff +1024 cells
+     LFM_BALU           306384/    524288  headroom  41.6%  AT RISK  cliff +5242880 cells
+     LFM_XALU           987512/   1048576  headroom   5.8%  AT RISK  cliff +18874368 cells
+     LFM_SELECT         478576/    524288  headroom   8.7%  AT RISK  cliff +13631488 cells
+     LFM_BITDEC          10961/     16384  headroom  33.1%  AT RISK  cliff +2752512 cells
+     LFM_HASH           268706/    524288  headroom  48.7%  AT RISK  cliff +170393600 cells
+     LFM_LANES          635281/   1048576  headroom  39.4%  AT RISK  cliff +19922944 cells
+     LFM_HINT           539786/   1048576  headroom  48.5%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC             62/        64  headroom   3.1%  AT RISK  cliff +448 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     ⇒ at 1.200× the workload these would STEP: ["LFM_XALU", "LFM_SELECT", "LFM_PUBLIC"]
+WHIR PROVE SPLIT W-LFM: airs 10 · wall 1.75s · prep 0.36 · absorb 0.000 · commit 0.56 · prove 0.82 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.38 (max table#5 0.19) · open_groups 0.27 (1 groups) · open_prepared 0.17 · other 0.00 || chain[Σ groups] grind 0.05 · sumcheck 0.07 · fold 0.00 · commit_folded 0.07 · ood 0.01 · queries 0.07 || round_wall 0.27 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.01 · open_assemble 0.00 · queries_other 0.00 || chains 2 · rounds 14 · rebuild_calls 26 (derived 26)
+RESERVED HW W-LFM: commit 21998 MiB · argue 24342 MiB · open 21347 MiB · budget 25688 MiB
+ARGUE COLUMNS W-LFM: on the card 615 · on the host 14 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES W-LFM: built on the card 32 · xchecked 0 || device tables on · xcheck off
+ARGUE READS W-LFM: sessions read in one copy 0 · factors read one at a time 1111 || lean reads off
+ARGUE GKR W-LFM: layers on the card 91 (rebuilt 0) · host tail rounds 819 || between layers 30.05 ms, 330.2 µs a layer: lambda 0.26 · program 0.26 · lower 0.07 · session 9.06 · factors 0.92 · tail 18.93 (transcript 4.46) · close 0.55 || rebuild 0.00 · rounds 56.49 · values 4.29 (ms)
+ARGUE TAIL W-LFM: lean 0 of device layers 91 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK W-LFM: big sessions 1 (lean 1 · xchecked 0) · early rounds 6 · late rounds 8 || big early 127.38 · big late 19.10 · other 54.41 · host tail 6.30 (ms) || lean program on · xcheck off
+CARD HOLD #2 multi_prove: waited 0.000s · held 1.384s · t=[1790746231.833,1790746233.217]
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N0_(arity_5):prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N0_(arity_5):prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N0_(arity_5):prepared
+   L1N0 (arity 5) TIMING: wide, epochs 0..=4 · harvest-epochs 2.19s · emit+arenas 2.24s · artifacts 0.50s · prove 2.55s · harvest 0.14s (verify 0.14) · wall 3.25s ⓘ lead-in: harvest-epochs + emit ran in the base's tail, outside this wall
+   L1N0 (arity 5): host peak 16.162 GiB at t=1790746233.4 (28.1% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+WHIR PROVE SPLIT W-LFM: airs 10 · wall 1.66s · prep 0.42 · absorb 0.000 · commit 0.55 · prove 0.70 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.34 (max table#5 0.18) · open_groups 0.22 (1 groups) · open_prepared 0.14 · other 0.00 || chain[Σ groups] grind 0.04 · sumcheck 0.06 · fold 0.00 · commit_folded 0.06 · ood 0.00 · queries 0.05 || round_wall 0.22 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 2 · rounds 14 · rebuild_calls 26 (derived 26)
+RESERVED HW W-LFM: commit 21742 MiB · argue 19990 MiB · open 16995 MiB · budget 25688 MiB
+ARGUE COLUMNS W-LFM: on the card 615 · on the host 14 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES W-LFM: built on the card 34 · xchecked 0 || device tables on · xcheck off
+ARGUE READS W-LFM: sessions read in one copy 0 · factors read one at a time 1116 || lean reads off
+ARGUE GKR W-LFM: layers on the card 92 (rebuilt 0) · host tail rounds 828 || between layers 20.03 ms, 217.7 µs a layer: lambda 0.18 · program 0.08 · lower 0.02 · session 3.72 · factors 0.32 · tail 15.32 (transcript 3.33) · close 0.38 || rebuild 0.00 · rounds 55.63 · values 2.95 (ms)
+ARGUE TAIL W-LFM: lean 0 of device layers 92 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK W-LFM: big sessions 1 (lean 1 · xchecked 0) · early rounds 6 · late rounds 8 || big early 126.71 · big late 18.36 · other 54.26 · host tail 5.03 (ms) || lean program on · xcheck off
+CARD HOLD #3 multi_prove: waited 0.120s · held 1.245s · t=[1790746233.217,1790746234.462]
+CARD HOLD #4 build_artifacts: waited 1.322s · held 0.118s · t=[1790746234.462,1790746234.580]
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N1_(arity_5):prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N1_(arity_5):prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N1_(arity_5):prepared
+   L1N1 (arity 5) TIMING: wide, epochs 5..=9 · harvest-epochs 2.15s · emit+arenas 2.38s · artifacts 0.63s · prove 3.56s · harvest 0.15s (verify 0.14) · wall 4.49s ⓘ lead-in: harvest-epochs + emit ran in the base's tail, outside this wall
+   L1N1 (arity 5): host peak 16.172 GiB at t=1790746233.4 (28.1% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+   ★ CENSUS L1N2 (arity 5): 270931712 cells (5259025 instructions), floor 9.8%
+     LFM_CONST             568/      1024  headroom  44.5%  AT RISK  cliff +4096 cells
+     LFM_BALU           434096/    524288  headroom  17.2%  AT RISK  cliff +5242880 cells
+     LFM_XALU          1848404/   2097152  headroom  11.9%  AT RISK  cliff +37748736 cells
+     LFM_SELECT         692272/   1048576  headroom  34.0%  AT RISK  cliff +27262976 cells
+     LFM_BITDEC          15255/     16384  headroom   6.9%  AT RISK  cliff +2752512 cells
+     LFM_HASH           422961/    524288  headroom  19.3%  AT RISK  cliff +170393600 cells
+     LFM_LANES         1042383/   1048576  headroom   0.6%  AT RISK  cliff +19922944 cells
+     LFM_HINT           802902/   1048576  headroom  23.4%  AT RISK  cliff +7340032 cells
+     LFM_PUBLIC            184/       256  headroom  28.1%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     ⇒ at 1.200× the workload these would STEP: ["LFM_XALU", "LFM_BITDEC", "LFM_LANES"]
+CARD HOLD #5 build_artifacts: waited 0.000s · held 0.123s · t=[1790746234.850,1790746234.972]
+WHIR PROVE SPLIT W-LFM: airs 10 · wall 1.52s · prep 0.31 · absorb 0.000 · commit 0.50 · prove 0.71 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.42 (max table#5 0.26) · open_groups 0.21 (1 groups) · open_prepared 0.08 · other 0.00 || chain[Σ groups] grind 0.03 · sumcheck 0.05 · fold 0.00 · commit_folded 0.06 · ood 0.00 · queries 0.05 || round_wall 0.21 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 2 · rounds 14 · rebuild_calls 26 (derived 26)
+RESERVED HW W-LFM: commit 17234 MiB · argue 19578 MiB · open 16003 MiB · budget 25688 MiB
+ARGUE COLUMNS W-LFM: on the card 615 · on the host 14 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES W-LFM: built on the card 32 · xchecked 0 || device tables on · xcheck off
+ARGUE READS W-LFM: sessions read in one copy 0 · factors read one at a time 1087 || lean reads off
+ARGUE GKR W-LFM: layers on the card 88 (rebuilt 0) · host tail rounds 792 || between layers 38.49 ms, 437.4 µs a layer: lambda 0.34 · program 0.37 · lower 0.12 · session 13.13 · factors 1.57 · tail 22.22 (transcript 5.71) · close 0.74 || rebuild 0.00 · rounds 46.47 · values 6.29 (ms)
+ARGUE TAIL W-LFM: lean 0 of device layers 88 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK W-LFM: big sessions 1 (lean 1 · xchecked 0) · early rounds 6 · late rounds 8 || big early 127.48 · big late 19.55 · other 36.76 · host tail 8.72 (ms) || lean program on · xcheck off
+CARD HOLD #6 multi_prove: waited 0.000s · held 1.210s · t=[1790746235.359,1790746236.569]
+     W-LFM device commits + sumchecks during the WHIR GLOBAL wrap: 144
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:the_WHIR_GLOBAL_wrap:prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:the_WHIR_GLOBAL_wrap:prepared
+GAPB CHAIN num_vars=26 log_domain=28 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4] caps=[3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:the_WHIR_GLOBAL_wrap:prepared
+   whir global IDENTITY: program_id a3f2833fe8c11ecf · heights [8, 19, 20, 19, 14, 19, 20, 20, 6, 16] · blake3 chunk heights [] · published 62 words · 238421440 cells (3227416 instructions)
+     the WHIR GLOBAL wrap: prove 2.0s · verify 0.1s · 62 published words (15 bookend roots) · host peak 16.109 GiB at t=1790746236.3 (28.0% of 57.53)
+   MARK AFTER the WHIR global child: live Some(16.066131591796875) GiB / high-water Some(16.166202545166016) GiB / t=1790746236.7
+WHIR PROVE SPLIT W-LFM: airs 10 · wall 1.44s · prep 0.31 · absorb 0.000 · commit 0.51 · prove 0.63 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.33 (max table#5 0.18) · open_groups 0.22 (1 groups) · open_prepared 0.08 · other 0.00 || chain[Σ groups] grind 0.04 · sumcheck 0.06 · fold 0.00 · commit_folded 0.06 · ood 0.00 · queries 0.05 || round_wall 0.22 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.05 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 2 · rounds 14 · rebuild_calls 26 (derived 26)
+RESERVED HW W-LFM: commit 17518 MiB · argue 17686 MiB · open 14111 MiB · budget 25688 MiB
+ARGUE COLUMNS W-LFM: on the card 615 · on the host 14 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES W-LFM: built on the card 34 · xchecked 0 || device tables on · xcheck off
+ARGUE READS W-LFM: sessions read in one copy 0 · factors read one at a time 1111 || lean reads off
+ARGUE GKR W-LFM: layers on the card 91 (rebuilt 0) · host tail rounds 819 || between layers 19.15 ms, 210.5 µs a layer: lambda 0.18 · program 0.08 · lower 0.02 · session 3.41 · factors 0.31 · tail 14.79 (transcript 3.26) · close 0.37 || rebuild 0.00 · rounds 43.02 · values 2.83 (ms)
+ARGUE TAIL W-LFM: lean 0 of device layers 91 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK W-LFM: big sessions 1 (lean 1 · xchecked 0) · early rounds 6 · late rounds 8 || big early 126.68 · big late 18.62 · other 50.95 · host tail 4.78 (ms) || lean program on · xcheck off
+CARD HOLD #7 multi_prove: waited 0.265s · held 1.132s · t=[1790746236.569,1790746237.700]
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N2_(arity_5):prepared
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N2_(arity_5):prepared
+GAPB CHAIN num_vars=26 log_domain=28 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4] caps=[3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:L1N2_(arity_5):prepared
+   L1N2 (arity 5) TIMING: wide, epochs 10..=14 · harvest-epochs 2.05s · emit+arenas 2.53s · artifacts 0.28s · prove 2.73s · harvest 0.13s (verify 0.13) · wall 7.72s
+   L1N2 (arity 5): host peak 16.109 GiB at t=1790746236.3 (28.0% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+   L1N0 (arity 5) IDENTITY: program_id ab139aaa74a52e7c · heights [9, 19, 21, 20, 14, 19, 21, 20, 8, 16] · blake3 chunk heights [] · published 144 words · 290852608 cells (5355197 instructions)
+   L1N1 (arity 5) IDENTITY: program_id 43c471b4e2c21ba9 · heights [10, 19, 21, 20, 14, 19, 21, 20, 8, 16] · blake3 chunk heights [] · published 144 words · 290854656 cells (5632652 instructions)
+   L1N2 (arity 5) IDENTITY: program_id 3c46045c0e1dcbab · heights [10, 19, 21, 20, 14, 19, 20, 20, 8, 16] · blake3 chunk heights [] · published 184 words · 270931712 cells (5259025 instructions)
+   level 1 (wide): 3 wide nodes over 15 epochs in 7.7s
+   level 0: jemalloc allocated 0.113 GiB · resident 16.628 · RETAINED 16.515 (99% of resident) · caches: twiddles 0 · precomputed trees 0 (0h/0m/0e)
+   level 0: host peak 16.172 GiB at t=1790746233.4 (28.1% of 57.53), 6 wrap(s) in flight
+   level 0: card permit: 8 acquisitions · max holders 1 · held 5.7s of 7.7s (74%)
+   level 0: 4 proofs, 4 distinct programs, artifacts 3.3s (N/N — sibling programs differ by construction; nothing to cache)
+   ★ SIBLING CONCURRENCY: 4 proof(s) at once per interior level (LFM_TREE_SIBLINGS or LFM_TREE_K; 1 = the serial control)
+   ★ LEVEL POOL: levels 2..=1 run in dependency order, 2 level(s) in flight (LFM_TREE_LEVEL_POOL=1; unset = the per-level barrier)
+
+★★★ WHIR INTERIOR COMPOSED — 3 proof(s) at level 1
+
+level arity        cells  instructions  host GiB   argmax t    wall s
+
+★★★ THE WHIR BLOCK-ARTIFACT ROOT — option A: the root REPLACES the top interior level
+   3 interior children + the global child = 4 children, 40 sub-proofs (10 of them the global child's) · emitted in 0.1s
+   ★ CENSUS the WHIR BLOCK-ARTIFACT ROOT: 149556992 cells (2862759 instructions), floor 17.7%
+     LFM_CONST             462/       512  headroom   9.8%  AT RISK  cliff +2048 cells
+     LFM_BALU           272760/    524288  headroom  48.0%  AT RISK  cliff +5242880 cells
+     LFM_XALU           853145/   1048576  headroom  18.6%  AT RISK  cliff +18874368 cells
+     LFM_SELECT         448448/    524288  headroom  14.5%  AT RISK  cliff +13631488 cells
+     LFM_BITDEC           9266/     16384  headroom  43.4%  AT RISK  cliff +2752512 cells
+     LFM_HASH           253082/    262144  headroom   3.5%  AT RISK  cliff +85196800 cells
+     LFM_LANES          550660/   1048576  headroom  47.5%  AT RISK  cliff +19922944 cells
+     LFM_HINT           474756/    524288  headroom   9.4%  AT RISK  cliff +3670016 cells
+     LFM_PUBLIC            180/       256  headroom  29.7%  AT RISK  cliff +1792 cells
+     LFM_RANGE           65536/     65536  headroom   0.0%  fixed    cliff +262144 cells
+     ⇒ at 1.200× the workload these would STEP: ["LFM_CONST", "LFM_SELECT", "LFM_HASH", "LFM_HINT"]
+★ LFM ROOT PROVER: whir
+CARD HOLD #8 build_artifacts: waited 0.000s · held 0.113s · t=[1790746238.080,1790746238.193]
+WHIR PROVE SPLIT W-LFM: airs 10 · wall 0.83s · prep 0.16 · absorb 0.000 · commit 0.25 · prove 0.42 · other 0.00 || inside[Σ] challenge 0.000 · argue 0.23 (max table#5 0.11) · open_groups 0.11 (1 groups) · open_prepared 0.08 · other 0.00 || chain[Σ groups] grind 0.02 · sumcheck 0.03 · fold 0.00 · commit_folded 0.03 · ood 0.00 · queries 0.03 || round_wall 0.11 · round_other 0.00 · setup_tail 0.00 || queries[Σ groups] query_sample 0.00 · tree_rebuild 0.02 · coset_gather 0.00 · open_assemble 0.00 · queries_other 0.00 || chains 1 · rounds 7 · rebuild_calls 13 (derived 13)
+RESERVED HW W-LFM: commit 8728 MiB · argue 9930 MiB · open 8521 MiB · budget 25688 MiB
+ARGUE COLUMNS W-LFM: on the card 615 · on the host 14 · xchecked 0 || device columns on · xcheck off
+ARGUE TABLES W-LFM: built on the card 32 · xchecked 0 || device tables on · xcheck off
+ARGUE READS W-LFM: sessions read in one copy 0 · factors read one at a time 1086 || lean reads off
+ARGUE GKR W-LFM: layers on the card 86 (rebuilt 0) · host tail rounds 774 || between layers 18.03 ms, 209.6 µs a layer: lambda 0.17 · program 0.07 · lower 0.02 · session 3.08 · factors 0.28 · tail 14.06 (transcript 3.10) · close 0.35 || rebuild 0.00 · rounds 36.85 · values 2.66 (ms)
+ARGUE TAIL W-LFM: lean 0 of device layers 86 · xchecked 0 || lean tail off · xcheck off
+ARGUE ZEROCHECK W-LFM: big sessions 1 (lean 1 · xchecked 0) · early rounds 5 · late rounds 8 || big early 64.60 · big late 18.23 · other 34.94 · host tail 4.96 (ms) || lean program on · xcheck off
+CARD HOLD #9 multi_prove: waited 0.000s · held 0.670s · t=[1790746238.717,1790746239.386]
+GAPB CHAIN num_vars=27 log_domain=29 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4, 1] caps=[3, 3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:the_WHIR_BLOCK-ARTIFACT_ROOT:prepared
+GAPB CHAIN num_vars=26 log_domain=28 blowup_log=2 schedule=[6, 4, 4, 4, 4, 4] caps=[3, 3, 3, 3, 3, 2] queries=112 grind=0/0/20 who=w-lfm:the_WHIR_BLOCK-ARTIFACT_ROOT:prepared
+     W-LFM device commits + sumchecks during the WHIR BLOCK-ARTIFACT ROOT: 128
+   whir root IDENTITY: program_id 987a2780df8324ca · heights [9, 19, 20, 19, 14, 18, 20, 19, 8, 16] · blake3 chunk heights [] · published 180 words · 149556992 cells (2862759 instructions) · W-LFM
+   whir root W-LFM artifact: 1993808 B
+
+★★★ THE BLOCK IS COMPRESSED UNDER WHIR — the block-artifact ROOT PROVED AND VERIFIED
+   option A: the root REPLACES the top interior level
+   stage 1.2s · verify 0.1s · 180 published words (= root_schema_words(67, 40, AssertOnly), and NOTHING L2G-shaped)
+   host peak 15.712 GiB at t=1790746238.4 (27.3% of 57.53)
+   ⚠ the DEVICE peak is the prover's own VRAM accounting above, not a harness sample — this harness counts dispatches, it does not size the card
+   ⛔ CAVEAT, unchanged by this proof and by design: the attestation is NOT self-enforcing. The guest uses supplied roots verbatim, and the binding happens OUTSIDE — `recursion::check_attestation` recomputes the id from an ELF the consumer trusts, host-side. "One proof for this block" terminates there
+   ⛔ NOT YET "PINNED": that rung needs the tamper arms green in a `--lib` run — lfm::block_root's five, and the WHIR cross-epoch arms. This run PROVES; it runs none of them, so a root proved without them is a demonstration with a stated gap, not a soundness claim
+
+   ⚠ THE TWO-POSTURE BYTE-IDENTITY CHECK CANNOT RUN, and is therefore NOT PERFORMED: it needs the same block proved at TWO DISTINCT postures and it was given 1 (WHIR base, 15 epochs at 2^21, fan-in 5, root option A). A second posture means a second epoch size or a second fan-in, and at this encoding neither is available. ⛔ This is a REFUSAL BY NAME, not a skip: comparing one posture against itself would report `identical` from a check that cannot fail, which is worse than no check because it produces evidence. The artifact's WIDTH is pinned independently, by `root_schema_words`' signature; its VALUE is not, and that gap belongs in the claim rather than in a green test
+
+★★★ WHOLE RUN: host peak 16.172 GiB at t=1790746233.4, 39.8s total
+   whole-run staging: upload shared-slab 0.00 GB in 0.00 s memcpy (0.0 GB/s) · staged 0.00 GB in 0.00 s (0.0 GB/s) | retained-LDE download shared-slab 0.00 GB in 0.00 s (0.0 GB/s) · staged 0.00 GB in 0.00 s (0.0 GB/s) | staging pairs 0 of 8 · waits 0 | shared slabs pinned 0.01 GiB in 1 slot(s), 0 busy
+           = 28.1% of the 57.53 GiB cgroup ceiling
+   commit fallbacks 0
+   commit device errors 0
+   tree commit device errors 0
+   device fallbacks 0
+   gkr tree refusals 0
+   open host fallbacks 0
+   room turns: 59 parked, 72 taken back, 0 refused
+   whir kernels: fused folds 613 of 613 · lean opens 96 of 96 (6 rounds) · turn-sized rooms 131 of 131
+   argue probe: sumcheck 242154526720 B / 2613 ops · gkr 341277474816 B / 390 ops · columns 44031566240 B / 21 ops · total 627463567776 B
+   argue device-busy (round kernels): 0.000 s — idle = argue wall − this
+   reserved high-water 24342 MiB
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1744 filtered out; finished in 39.84s
+
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:40.37
+	Maximum resident set size (kbytes): 16951492
+
+exit status: 0
+tests passed: 1
+
+=== READ 0 ===
+WHIR banner:        1
+wrap IDENTITY:      0
+node IDENTITY:      3
+MARK lines:         2
+RPX device grinds:  0
+GRIND KNOBS banner:  1
+L0-HARVEST lines:   0
+GLOBAL WRAP banner: 1
+GLOBAL census:      1
+GLOBAL LFM_HASH:        LFM_HASH           268706/    524288  headroom  48.7%  AT RISK  cliff +170393600 cells
+GLOBAL wrap line:        the WHIR GLOBAL wrap: prove 2.0s · verify 0.1s · 62 published words (15 bookend roots) · host peak 16.109 GiB at t=1790746236.3 (28.0% of 57.53)
+INTERIOR:           ★★★ WHIR INTERIOR COMPOSED — 3 proof(s) at level 1
+ROOT banner:        1
+ROOT census:        1
+ROOT LFM_HASH:          LFM_HASH           253082/    262144  headroom   3.5%  AT RISK  cliff +85196800 cells
+COMPRESSED line:    1 (must be 1)
+   ★★★ THE BLOCK IS COMPRESSED UNDER WHIR — the block-artifact ROOT PROVED AND VERIFIED
+      option A: the root REPLACES the top interior level
+      stage 1.2s · verify 0.1s · 180 published words (= root_schema_words(67, 40, AssertOnly), and NOTHING L2G-shaped)
+      host peak 15.712 GiB at t=1790746238.4 (27.3% of 57.53)
+NO-ROOT notice:     0 (must be 0)
+COULD-NOT-BUILD:    0 (must be 0)
+identity lines kept at /tmp/W_identity_ordered.txt (3 lines)
+
+=== THE BASE'S STAGE BREAKDOWN ===
+epochs read from the log: 15  base wall: 30.4s
+BASE EPOCH lines:   155
+WHIR PROVE SPLIT:   21
+  expected: BASE EPOCH 155, WHIR PROVE SPLIT 16
+  ⚠ WHIR PROVE SPLIT count is NOT epochs+1
+OVERLAPPED marks:   0 (must be 0)
+   ── WHIR BASE SPLIT over 15 epochs, base wall 30.4s ──
+   producer[Σ] execute 1.1s (3.5%) · collect 4.7s (15.4%) · build 5.1s (16.8%) · handoff 16.0s (52.7%) · wall 26.9s (88.5%)
+   prover[Σ]   prep 0.0s (0.0%) · absorb 0.08s · commit 9.1s (29.8%) · prove 18.0s (59.0%) · wall 27.1s (89.1%)
+   inside prove[Σ] challenge 0.00s · argue 11.7s (38.3%) · open_groups 5.8s (19.1%) · open_prepared 0.5s (1.6%)
+   global (in base) wall 1.3s (4.2%)
+   slowest single table in any epoch: KECCAK_RND[0] at 0.46s
+   BOTTLENECK: handoff is 59.6% of the producer's wall ⇒ THE PROVER IS THE BOTTLENECK (the producer waits at the hand-off; nothing spent on execute/collect/build buys wall)
+   headroom if the producer were free: Σ producer 26.9s vs Σ prover + global 28.4s
+closure GREEN line: 1 (must be 1)
+NOT-TAKEN line:     0 (must be 0 — the knob is exported above)
+
+=== THE GRIND SLOT ===
+GRIND KNOBS banner:  1 (must be >= 1)
+  ★ GRIND KNOBS: scan 8 · grid 1024 · stride rpx 131072 / keccak 262144
+epoch records summed: 15
+chain[Σ epochs] grind 0.91 · sumcheck 1.08 · fold 0.00 · commit_folded 1.20 · ood 0.00 · queries 2.53
+  against open_groups[Σ epochs] 5.81 — the six close it, arm E asserts it in-process
+global (apart, NEVER added in): grind 0.25 · queries 0.09 of open_groups 0.50
+
+HARNESS:  chain[Σ epochs] grind 0.92s · sumcheck 1.09s · fold 0.01s · commit_folded 1.18s · ood 0.05s · queries 2.52s
+HARNESS:  queries[Σ epochs] query_sample 0.02s (1%) · tree_rebuild 2.42s (96%) · coset_gather 0.08s (3%) · open_assemble 0.00s (0%) · rebuild_calls 612 over 331 rounds in 50 chains
+
+=== ★ THE LEAF-LAYER RETENTION ===
+HARNESS:  retention[leaf layers] admitted 519 · refused 0 · asked 12879 MiB · held 12879 MiB · leaf passes saved 939 · leaf_passes 519 of tree_builds 1458 · peak simultaneous footprint 833 MiB · evicted 15 (2432 MiB)
+retention line: 1 · admitted: 519 (EXPECT_RETENTION=yes)
+  NOT-TAKEN marks: 0 · first-refusal marks: 0 (under a cap, refusals are EXPECTED — the cost of refusing is one leaf pass, not a fallback)
+queries[Σ epochs] line: 1 (must be 1 — the four-slot instrument is in this build)
+
+INTERIOR TABLE (level arity cells instructions host-GiB argmax wall):
+INTERIOR: no per-level table found
+
+=== DEVICE, 10ms sampling (3964 samples) ===
+device peak 27634 MiB at 2026/09/30 05:30:12.423 (epoch 1790746212.423000000)
+device peak IN THE BASE window:  27634 MiB over 3040 samples (~30.4 s)
+device peak AFTER the base:      25586 MiB over 924 samples
+  the base window is the one the leaf layers are held in; a higher peak after it is level 0 and the interior, which hold none
+  commit fallbacks 0
+  device fallbacks 0
+   base (WHIR): host peak 9.787 GiB at t=1790746228.7 (17.0% of 57.53) (proved)
+   L1N0 (arity 5): host peak 16.162 GiB at t=1790746233.4 (28.1% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+   L1N1 (arity 5): host peak 16.172 GiB at t=1790746233.4 (28.1% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+     the WHIR GLOBAL wrap: prove 2.0s · verify 0.1s · 62 published words (15 bookend roots) · host peak 16.109 GiB at t=1790746236.3 (28.0% of 57.53)
+   L1N2 (arity 5): host peak 16.109 GiB at t=1790746236.3 (28.0% of 57.53) ⓘ PROCESS-WIDE, 6 tasks in flight
+   level 0: host peak 16.172 GiB at t=1790746233.4 (28.1% of 57.53), 6 wrap(s) in flight
+   host peak 15.712 GiB at t=1790746238.4 (27.3% of 57.53)
+★★★ WHOLE RUN: host peak 16.172 GiB at t=1790746233.4, 39.8s total
+WHOLE-RUN host peak: 16.172 GiB · ceiling HOST_PEAK_HI_GIB=33.5 GiB
+trace kept at /tmp/W_tree_gpu.KhLi
+
+WHAT TO READ BACK — against the lead's wt9 pre-registration, in this order
+
+  ★ 1. The banner and the header: `WHIR HASH: rpx256`, the guest, 2^21
+       cycles/epoch, fan-in, and the stage list naming "the GLOBAL stage … and
+       the ROOT" (:7511). A run whose stage list ends at the interior (:7515)
+       ran without PROVE_ROOT and answers wt8's question again.
+  ★ 2. "base: N epochs in T s" — wt8's band at the merged tip is 84.2 s; level
+       0 24.0 s; 27.843 GiB device. Outside the bands, the base is the finding.
+  ★ 3. The FIFTEEN `wrap k IDENTITY` lines at 145 + out_halves words — wt8's.
+  ★ 4. ★ THE WHIR GLOBAL WRAP: the banner's `N cross-epoch sub-proofs over E
+       epochs and P touched pages`, then `★ CENSUS the WHIR GLOBAL wrap: cells
+       (instructions)` — the instruction count is the cross-epoch program's F1
+       at the block (V1j's band 2–4 M with the hybrid), and the `LFM_HASH` row's
+       committed height is the go/no-go the STARK global could not pass
+       (2^21 × 329 columns = 26.22 GiB, aborted unsliced). Then `the WHIR GLOBAL
+       wrap: prove · verify · N published words (E bookend roots)`: N = 2 + 4·E.
+  ★ 5. `★★★ WHIR INTERIOR COMPOSED — C proof(s) at level L`: under option A the
+       root REPLACES the top node, so L = top − 1 and C = fan_in (2 at level 3
+       for 15 wraps under fan-in 2); a `1 proof at level 4` here is wt8's tree
+       with a root bolted on top — a different artifact from the one named.
+  ★ 6. ★★★ THE WHIR BLOCK-ARTIFACT ROOT — option A: its census, its LFM_HASH
+       row, its dispatch count (must be > 0: the grind reached the device), and
+       `★★★ THE BLOCK IS COMPRESSED UNDER WHIR … N published words (=
+       root_schema_words(num_reg, out_halves, AssertOnly))` — the identity is
+       printed with its inputs; read N against the form, never against a
+       remembered number.
+  ★ 7. The WHOLE-RUN wall against wt8's 142.5 s: what the global stage and the
+       root ADD is the first version's price, scored against ds12's global
+       slices (6.5 + 8.5 s) and its root arm.
+
+  ★ 8. ★★★ THE BASE'S BREAKDOWN — what this run exists for. Read in this
+       order, and read the CLOSURE LINE FIRST: without `closure GREEN` the
+       table is not a measurement. Then
+         · `producer[Σ] … handoff Xs` — THE BOTTLENECK. A large handoff share
+           means the producer waits at the unbuffered channel and THE PROVER
+           sets the wall, so nothing spent on execute/collect/build buys any;
+           a handoff near zero means the producer does, and the prover idled.
+           The script prints the verdict; it is a READING, not an assertion.
+         · `prover[Σ] … prove Xs` then `inside prove[Σ] argue / open_groups /
+           open_prepared` — which of the argument and the openings dominates is
+           what picks round 2's lever. `argue` is a SERIAL loop over the
+           epoch's tables, so it is a wall as well as a sum; `open_groups` is
+           two full WHIR chains per epoch (`epoch_groups` = [n-1, 1]).
+         · `slowest single table in any epoch` — the sum alone cannot tell
+           fifty even tables from one that dominates, and those want opposite
+           levers.
+         · `global (in base) wall` — the cross-epoch stage, inside the 84.5 s.
+  ★ 9. ⛔ THE CONTROL THAT MAKES 8 QUOTABLE: the wall, the census, the pins and
+       the published words must be UNMOVED against wt9 (148.9 s) and wt11
+       (149.4 s), band ≈ 0.5 s. Timers move no bytes. A base outside 84.5-85.0 s
+       is the finding, not the breakdown.
+
+  ⚠ ONE test run --exact. NOT a suite result.
+  ⛔ `1 passed` AND the COMPRESSED line: the harness asserts the root under
+     PROVE_ROOT, this script asserts the line — two sources, or no artifact.
+  ⛔ `closure GREEN` is a THIRD source and it is required: exit 5 without it.
+WT _RC=0
+WT DONE 2026-09-30T05:30:40Z

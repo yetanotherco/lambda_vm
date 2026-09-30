@@ -1,0 +1,36 @@
+subphase	host_work	overlap_s
+head	head helper: DECODE prepared	0.3190
+head	head helper: DECODE root	1.1060
+head	producer build	0.2740
+head	producer collect	0.5330
+head	producer execute	0.0760
+head	producer prep@producer	0.4750
+head	producer CPU stages (execute+collect+build+prep)	1.3580
+epochs absorb+prep	level-1 prologues in the base's tail	0.0060
+epochs absorb+prep	producer execute	0.0850
+epochs absorb+prep	producer prep@producer	0.0060
+epochs absorb+prep	producer CPU stages (execute+collect+build+prep)	0.0910
+epochs argue	level-1 prologues in the base's tail	1.5400
+epochs argue	producer build	1.5770
+epochs argue	producer collect	0.1610
+epochs argue	producer prep@producer	6.1280
+epochs argue	producer hand-off wait (handoff minus prep)	3.8040
+epochs argue	producer CPU stages (execute+collect+build+prep)	7.8660
+epochs commit	level-1 prologues in the base's tail	0.7200
+epochs commit	producer build	3.2760
+epochs commit	producer collect	4.0040
+epochs commit	producer execute	0.9030
+epochs commit	producer prep@producer	0.9050
+epochs commit	producer CPU stages (execute+collect+build+prep)	9.0880
+epochs open	level-1 prologues in the base's tail	0.6980
+epochs open	producer prep@producer	0.4740
+epochs open	producer hand-off wait (handoff minus prep)	5.8200
+epochs open	producer CPU stages (execute+collect+build+prep)	0.4740
+global absorb+prep	level-1 prologues in the base's tail	0.0060
+global argue	level-1 prologues in the base's tail	0.3300
+global commit	level-1 prologues in the base's tail	0.4220
+global open	level-1 prologues in the base's tail	0.5250
+prover gaps	level-1 prologues in the base's tail	0.1400
+prover gaps	producer prep@producer	0.0440
+prover gaps	producer hand-off wait (handoff minus prep)	0.0210
+prover gaps	producer CPU stages (execute+collect+build+prep)	0.0440

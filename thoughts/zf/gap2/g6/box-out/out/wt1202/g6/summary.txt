@@ -1,0 +1,33 @@
+G6 analysis · log wt1202-tree.log · LOG ONLY (no trace) · sampler wt1202.tsv
+windows: base 30.837 s · level1 7.900 s · root 1.663 s
+  defined by: run_start=1790746295.292, level1_start=1790746326.129, level1=7.900, whole_run=40.400, base=30.837
+base sub-phases: 10 · Σ 30.837 s of the base's 30.837 s · PARTITION OK
+  head 1.833 · epochs absorb+prep 0.092 · epochs argue 12.000 · epochs commit 9.123 · epochs open 6.350 · global absorb+prep 0.006 · global argue 0.330 · global commit 0.445 · global open 0.526 · prover gaps 0.132
+
+=== HOST CPU PER BASE SUB-PHASE (sampler) ===
+  prover thread = the test's thread by the name rule (checked against the CUDA API in the traced arm): tid 319847 (lfm::per_table_)
+  sampler: pid 319846 · 52 threads · interval 0.050 s · prover thread 319847 · producer thread 319887
+  box: cpus online 32 · the sampler's affinity 32 · cgroup cpu.max 3071999 100000 · clock ticks 100/s
+  head                               wall   1.833 · process on-CPU   33.77 s (18.42 cores) · runqueue wait   0.68 s · prover on   0.40 wait 0.000 · producer on   0.86 wait 0.005 · box busy 18.49 of  32.0 cores · cgroup 18.48 cores · throttled 0.066 s
+  epochs absorb+prep                 wall   0.092 · process on-CPU    0.19 s ( 2.04 cores) · runqueue wait   0.00 s · prover on   0.09 wait 0.000 · producer on   0.05 wait 0.000 · box busy  2.08 of  32.0 cores · cgroup  2.05 cores · throttled 0.000 s
+  epochs argue                       wall  12.000 · process on-CPU  128.62 s (10.72 cores) · runqueue wait   3.20 s · prover on  11.38 wait 0.039 · producer on   1.77 wait 0.000 · box busy 10.80 of  32.0 cores · cgroup 10.80 cores · throttled 0.043 s
+  epochs commit                      wall   9.123 · process on-CPU   37.12 s ( 4.07 cores) · runqueue wait   0.23 s · prover on   3.07 wait 0.001 · producer on   6.22 wait 0.001 · box busy  4.16 of  32.0 cores · cgroup  4.11 cores · throttled 0.000 s
+  epochs open                        wall   6.350 · process on-CPU   11.80 s ( 1.86 cores) · runqueue wait   0.03 s · prover on   6.35 wait 0.000 · producer on   0.30 wait 0.000 · box busy  1.97 of  32.0 cores · cgroup  1.99 cores · throttled 0.000 s
+  global absorb+prep                 wall   0.006 · process on-CPU    0.02 s ( 3.01 cores) · runqueue wait   0.00 s · prover on   0.01 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.00 of  32.0 cores · cgroup  3.05 cores · throttled 0.000 s
+  global argue                       wall   0.330 · process on-CPU    0.99 s ( 3.01 cores) · runqueue wait   0.00 s · prover on   0.33 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.73 of  32.0 cores · cgroup  3.72 cores · throttled 0.000 s
+  global commit                      wall   0.445 · process on-CPU    1.34 s ( 3.00 cores) · runqueue wait   0.00 s · prover on   0.44 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.02 of  32.0 cores · cgroup  3.03 cores · throttled 0.000 s
+  global open                        wall   0.526 · process on-CPU    1.63 s ( 3.11 cores) · runqueue wait   0.01 s · prover on   0.52 wait 0.000 · producer on   0.00 wait 0.000 · box busy  3.25 of  32.0 cores · cgroup  3.25 cores · throttled 0.000 s
+  prover gaps                        wall   0.132 · process on-CPU    0.38 s ( 2.89 cores) · runqueue wait   0.00 s · prover on   0.13 wait 0.000 · producer on   0.01 wait 0.000 · box busy  3.08 of  32.1 cores · cgroup  3.01 cores · throttled 0.000 s
+
+=== NAMED HOST WORK INSIDE EACH SUB-PHASE (log spans, overlap seconds) ===
+  head                               head helper: DECODE prepared 0.36 · head helper: DECODE root 1.12 · producer build 0.28 · producer collect 0.51 · producer execute 0.09 · producer prep@producer 0.41 · producer CPU stages (execute+collect+build+prep) 1.29
+  epochs absorb+prep                 level-1 prologues in the base's tail 0.01 · producer execute 0.08 · producer prep@producer 0.01 · producer CPU stages (execute+collect+build+prep) 0.09
+  epochs argue                       level-1 prologues in the base's tail 1.56 · producer build 1.58 · producer collect 0.16 · producer prep@producer 6.19 · producer hand-off wait (handoff minus prep) 4.07 · producer CPU stages (execute+collect+build+prep) 7.93
+  epochs commit                      level-1 prologues in the base's tail 0.71 · producer build 3.20 · producer collect 4.03 · producer execute 0.91 · producer prep@producer 0.98 · producer CPU stages (execute+collect+build+prep) 9.12
+  epochs open                        level-1 prologues in the base's tail 0.73 · producer prep@producer 0.43 · producer hand-off wait (handoff minus prep) 5.89 · producer CPU stages (execute+collect+build+prep) 0.43
+  global absorb+prep                 level-1 prologues in the base's tail 0.01
+  global argue                       level-1 prologues in the base's tail 0.33
+  global commit                      level-1 prologues in the base's tail 0.44
+  global open                        level-1 prologues in the base's tail 0.53
+  prover gaps                        level-1 prologues in the base's tail 0.11 · producer hand-off wait (handoff minus prep) 0.02
+  producer, 16 epoch(s)/stage(s): execute Σ 1.08 s · collect Σ 4.70 s · build Σ 5.06 s · prep@producer Σ 8.02 s · work Σ 18.86 s · hand-off wait Σ 9.98 s

@@ -1,0 +1,11 @@
+subphase	n	wall_s	busy_s	idle_s	copy_only_s	stage1	stage2	stage3	stage4	stage5	stage6	stage0	copy_labels
+head	1	1.8680	0.0148	1.8532	0.0023	0.0000	0.0016	0.0109	0.0000	0.0000	0.0000	0.0000	D2D 0.000s/0.02GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 0.002s/0.04GB · memset 0.000s/0.07GB
+epochs absorb+prep	15	0.0900	0.0005	0.0895	0.0005	0.0000	0.0000	0.0000	0.0000	0.0000	0.0000	0.0000	H2D (from Pageable) 0.000s/0.03GB
+epochs argue	15	12.3900	8.1208	4.2692	0.3018	0.0000	0.0000	0.0010	7.8135	0.0044	0.0000	0.0000	D2H (to Pageable) 0.036s/0.25GB · H2D (from Pageable) 0.110s/0.52GB · memset 0.155s/275.25GB
+epochs commit	15	9.1830	8.9183	0.2647	1.6496	0.0000	1.0778	6.1882	0.0002	0.0000	0.0000	0.0025	D2D 0.046s/42.50GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 1.581s/33.02GB · memset 0.022s/38.99GB
+epochs open	15	6.4710	5.9397	0.5313	0.0584	0.0000	0.0000	2.8675	0.0000	1.8094	1.2045	0.0000	D2D 0.017s/14.00GB · D2H (to Pageable) 0.002s/0.03GB · D2H (to Pinned) 0.001s/0.03GB · H2D (from Pageable) 0.036s/0.83GB · memset 0.003s/5.03GB
+global absorb+prep	1	0.0060	0.0002	0.0058	0.0002	0.0000	0.0000	0.0000	0.0000	0.0000	0.0000	0.0000	H2D (from Pageable) 0.000s/0.02GB
+global argue	1	0.3600	0.1281	0.2319	0.0089	0.0000	0.0000	0.0000	0.1187	0.0005	0.0000	0.0000	D2H (to Pageable) 0.003s/0.03GB · H2D (from Pageable) 0.004s/0.00GB · memset 0.002s/2.91GB
+global commit	1	0.4240	0.4178	0.0062	0.0505	0.0000	0.0502	0.3171	0.0000	0.0000	0.0000	0.0000	D2D 0.002s/1.57GB · D2H (to Pageable) 0.000s/0.00GB · H2D (from Pageable) 0.048s/1.09GB · memset 0.001s/1.95GB
+global open	1	0.5380	0.4932	0.0448	0.0040	0.0000	0.0000	0.1272	0.0000	0.0883	0.2737	0.0000	D2D 0.001s/0.69GB · D2H (to Pageable) 0.000s/0.01GB · D2H (to Pinned) 0.000s/0.01GB · H2D (from Pageable) 0.002s/0.11GB · memset 0.000s/0.22GB
+prover gaps	17	0.2060	0.0054	0.2006	0.0005	0.0000	0.0003	0.0037	0.0002	0.0000	0.0008	0.0000	D2D 0.000s/0.00GB · D2H (to Pageable) 0.000s/0.00GB · D2H (to Pinned) 0.000s/0.00GB · H2D (from Pageable) 0.000s/0.01GB · memset 0.000s/0.02GB

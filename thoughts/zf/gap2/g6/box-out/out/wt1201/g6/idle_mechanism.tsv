@@ -1,0 +1,183 @@
+scope	idle_in_gpu_span_s	not_yet_requested_s	state	seconds
+base	7.4972	5.9118	API alloc/free	0.5703
+base	7.4972	5.9118	API launch	0.4013
+base	7.4972	5.9118	API memset	0.0402
+base	7.4972	5.9118	API other	0.0116
+base	7.4972	5.9118	API readback DtoH	0.6679
+base	7.4972	5.9118	API sync (stream/event/ctx)	0.7848
+base	7.4972	5.9118	API upload HtoD	0.5027
+base	7.4972	5.9118	OS file IO	0.0008
+base	7.4972	5.9118	OS ioctl (outside API)	0.0920
+base	7.4972	5.9118	OS mmap/munmap/madvise	0.0013
+base	7.4972	5.9118	OS other	0.0004
+base	7.4972	5.9118	OS poll/sleep/yield	0.0000
+base	7.4972	5.9118	OS wait on host threads (futex/cond)	1.8582
+base	7.4972	5.9118	untraced (host compute or descheduled)	2.5658
+level1	2.7401	2.4789	API alloc/free	0.0926
+level1	2.7401	2.4789	API launch	0.0718
+level1	2.7401	2.4789	API memset	0.0064
+level1	2.7401	2.4789	API other	0.0024
+level1	2.7401	2.4789	API readback DtoH	0.0901
+level1	2.7401	2.4789	API sync (stream/event/ctx)	0.1312
+level1	2.7401	2.4789	API upload HtoD	0.1143
+level1	2.7401	2.4789	OS file IO	0.0000
+level1	2.7401	2.4789	OS ioctl (outside API)	0.0000
+level1	2.7401	2.4789	OS mmap/munmap/madvise	0.0002
+level1	2.7401	2.4789	OS other	0.0001
+level1	2.7401	2.4789	OS poll/sleep/yield	0.0000
+level1	2.7401	2.4789	OS wait on host threads (futex/cond)	1.0270
+level1	2.7401	2.4789	untraced (host compute or descheduled)	1.2040
+root	0.9793	0.8190	API alloc/free	0.0066
+root	0.9793	0.8190	API launch	0.0044
+root	0.9793	0.8190	API memset	0.0005
+root	0.9793	0.8190	API other	0.0002
+root	0.9793	0.8190	API readback DtoH	0.0132
+root	0.9793	0.8190	API sync (stream/event/ctx)	0.0281
+root	0.9793	0.8190	API upload HtoD	0.0119
+root	0.9793	0.8190	OS file IO	0.0000
+root	0.9793	0.8190	OS ioctl (outside API)	0.0000
+root	0.9793	0.8190	OS mmap/munmap/madvise	0.0000
+root	0.9793	0.8190	OS other	0.0000
+root	0.9793	0.8190	OS poll/sleep/yield	0.0000
+root	0.9793	0.8190	OS wait on host threads (futex/cond)	0.3759
+root	0.9793	0.8190	untraced (host compute or descheduled)	0.5386
+base: head	1.8532	1.8528	API alloc/free	0.0101
+base: head	1.8532	1.8528	API launch	0.0000
+base: head	1.8532	1.8528	API memset	0.0000
+base: head	1.8532	1.8528	API other	0.0057
+base: head	1.8532	1.8528	API readback DtoH	0.0000
+base: head	1.8532	1.8528	API sync (stream/event/ctx)	0.0000
+base: head	1.8532	1.8528	API upload HtoD	0.0003
+base: head	1.8532	1.8528	OS file IO	0.0005
+base: head	1.8532	1.8528	OS ioctl (outside API)	0.0920
+base: head	1.8532	1.8528	OS mmap/munmap/madvise	0.0012
+base: head	1.8532	1.8528	OS other	0.0003
+base: head	1.8532	1.8528	OS poll/sleep/yield	0.0000
+base: head	1.8532	1.8528	OS wait on host threads (futex/cond)	1.4593
+base: head	1.8532	1.8528	untraced (host compute or descheduled)	0.2837
+base: epochs absorb+prep	0.0895	0.0889	API alloc/free	0.0002
+base: epochs absorb+prep	0.0895	0.0889	API launch	0.0000
+base: epochs absorb+prep	0.0895	0.0889	API memset	0.0000
+base: epochs absorb+prep	0.0895	0.0889	API other	0.0000
+base: epochs absorb+prep	0.0895	0.0889	API readback DtoH	0.0000
+base: epochs absorb+prep	0.0895	0.0889	API sync (stream/event/ctx)	0.0000
+base: epochs absorb+prep	0.0895	0.0889	API upload HtoD	0.0006
+base: epochs absorb+prep	0.0895	0.0889	OS file IO	0.0000
+base: epochs absorb+prep	0.0895	0.0889	OS ioctl (outside API)	0.0000
+base: epochs absorb+prep	0.0895	0.0889	OS mmap/munmap/madvise	0.0000
+base: epochs absorb+prep	0.0895	0.0889	OS other	0.0000
+base: epochs absorb+prep	0.0895	0.0889	OS poll/sleep/yield	0.0000
+base: epochs absorb+prep	0.0895	0.0889	OS wait on host threads (futex/cond)	0.0060
+base: epochs absorb+prep	0.0895	0.0889	untraced (host compute or descheduled)	0.0826
+base: epochs argue	4.2692	3.0529	API alloc/free	0.4655
+base: epochs argue	4.2692	3.0529	API launch	0.3599
+base: epochs argue	4.2692	3.0529	API memset	0.0319
+base: epochs argue	4.2692	3.0529	API other	0.0000
+base: epochs argue	4.2692	3.0529	API readback DtoH	0.5912
+base: epochs argue	4.2692	3.0529	API sync (stream/event/ctx)	0.4625
+base: epochs argue	4.2692	3.0529	API upload HtoD	0.2750
+base: epochs argue	4.2692	3.0529	OS file IO	0.0001
+base: epochs argue	4.2692	3.0529	OS ioctl (outside API)	0.0000
+base: epochs argue	4.2692	3.0529	OS mmap/munmap/madvise	0.0000
+base: epochs argue	4.2692	3.0529	OS other	0.0001
+base: epochs argue	4.2692	3.0529	OS poll/sleep/yield	0.0000
+base: epochs argue	4.2692	3.0529	OS wait on host threads (futex/cond)	0.3000
+base: epochs argue	4.2692	3.0529	untraced (host compute or descheduled)	1.7831
+base: epochs commit	0.2647	0.0616	API alloc/free	0.0234
+base: epochs commit	0.2647	0.0616	API launch	0.0005
+base: epochs commit	0.2647	0.0616	API memset	0.0014
+base: epochs commit	0.2647	0.0616	API other	0.0009
+base: epochs commit	0.2647	0.0616	API readback DtoH	0.0012
+base: epochs commit	0.2647	0.0616	API sync (stream/event/ctx)	0.0063
+base: epochs commit	0.2647	0.0616	API upload HtoD	0.1938
+base: epochs commit	0.2647	0.0616	OS file IO	0.0000
+base: epochs commit	0.2647	0.0616	OS ioctl (outside API)	0.0000
+base: epochs commit	0.2647	0.0616	OS mmap/munmap/madvise	0.0000
+base: epochs commit	0.2647	0.0616	OS other	0.0000
+base: epochs commit	0.2647	0.0616	OS poll/sleep/yield	0.0000
+base: epochs commit	0.2647	0.0616	OS wait on host threads (futex/cond)	0.0276
+base: epochs commit	0.2647	0.0616	untraced (host compute or descheduled)	0.0097
+base: epochs open	0.5313	0.4561	API alloc/free	0.0589
+base: epochs open	0.5313	0.4561	API launch	0.0181
+base: epochs open	0.5313	0.4561	API memset	0.0040
+base: epochs open	0.5313	0.4561	API other	0.0040
+base: epochs open	0.5313	0.4561	API readback DtoH	0.0275
+base: epochs open	0.5313	0.4561	API sync (stream/event/ctx)	0.2991
+base: epochs open	0.5313	0.4561	API upload HtoD	0.0146
+base: epochs open	0.5313	0.4561	OS file IO	0.0000
+base: epochs open	0.5313	0.4561	OS ioctl (outside API)	0.0000
+base: epochs open	0.5313	0.4561	OS mmap/munmap/madvise	0.0000
+base: epochs open	0.5313	0.4561	OS other	0.0000
+base: epochs open	0.5313	0.4561	OS poll/sleep/yield	0.0000
+base: epochs open	0.5313	0.4561	OS wait on host threads (futex/cond)	0.0000
+base: epochs open	0.5313	0.4561	untraced (host compute or descheduled)	0.1052
+base: global absorb+prep	0.0058	0.0058	API alloc/free	0.0000
+base: global absorb+prep	0.0058	0.0058	API launch	0.0000
+base: global absorb+prep	0.0058	0.0058	API memset	0.0000
+base: global absorb+prep	0.0058	0.0058	API other	0.0000
+base: global absorb+prep	0.0058	0.0058	API readback DtoH	0.0000
+base: global absorb+prep	0.0058	0.0058	API sync (stream/event/ctx)	0.0000
+base: global absorb+prep	0.0058	0.0058	API upload HtoD	0.0000
+base: global absorb+prep	0.0058	0.0058	OS file IO	0.0000
+base: global absorb+prep	0.0058	0.0058	OS ioctl (outside API)	0.0000
+base: global absorb+prep	0.0058	0.0058	OS mmap/munmap/madvise	0.0000
+base: global absorb+prep	0.0058	0.0058	OS other	0.0000
+base: global absorb+prep	0.0058	0.0058	OS poll/sleep/yield	0.0000
+base: global absorb+prep	0.0058	0.0058	OS wait on host threads (futex/cond)	0.0026
+base: global absorb+prep	0.0058	0.0058	untraced (host compute or descheduled)	0.0032
+base: global argue	0.2319	0.1652	API alloc/free	0.0077
+base: global argue	0.2319	0.1652	API launch	0.0185
+base: global argue	0.2319	0.1652	API memset	0.0019
+base: global argue	0.2319	0.1652	API other	0.0000
+base: global argue	0.2319	0.1652	API readback DtoH	0.0418
+base: global argue	0.2319	0.1652	API sync (stream/event/ctx)	0.0108
+base: global argue	0.2319	0.1652	API upload HtoD	0.0096
+base: global argue	0.2319	0.1652	OS file IO	0.0000
+base: global argue	0.2319	0.1652	OS ioctl (outside API)	0.0000
+base: global argue	0.2319	0.1652	OS mmap/munmap/madvise	0.0000
+base: global argue	0.2319	0.1652	OS other	0.0000
+base: global argue	0.2319	0.1652	OS poll/sleep/yield	0.0000
+base: global argue	0.2319	0.1652	OS wait on host threads (futex/cond)	0.0000
+base: global argue	0.2319	0.1652	untraced (host compute or descheduled)	0.1416
+base: global commit	0.0062	0.0011	API alloc/free	0.0001
+base: global commit	0.0062	0.0011	API launch	0.0000
+base: global commit	0.0062	0.0011	API memset	0.0001
+base: global commit	0.0062	0.0011	API other	0.0001
+base: global commit	0.0062	0.0011	API readback DtoH	0.0003
+base: global commit	0.0062	0.0011	API sync (stream/event/ctx)	0.0008
+base: global commit	0.0062	0.0011	API upload HtoD	0.0046
+base: global commit	0.0062	0.0011	OS file IO	0.0000
+base: global commit	0.0062	0.0011	OS ioctl (outside API)	0.0000
+base: global commit	0.0062	0.0011	OS mmap/munmap/madvise	0.0000
+base: global commit	0.0062	0.0011	OS other	0.0000
+base: global commit	0.0062	0.0011	OS poll/sleep/yield	0.0000
+base: global commit	0.0062	0.0011	OS wait on host threads (futex/cond)	0.0000
+base: global commit	0.0062	0.0011	untraced (host compute or descheduled)	0.0002
+base: global open	0.0448	0.0276	API alloc/free	0.0044
+base: global open	0.0448	0.0276	API launch	0.0044
+base: global open	0.0448	0.0276	API memset	0.0009
+base: global open	0.0448	0.0276	API other	0.0009
+base: global open	0.0448	0.0276	API readback DtoH	0.0060
+base: global open	0.0448	0.0276	API sync (stream/event/ctx)	0.0049
+base: global open	0.0448	0.0276	API upload HtoD	0.0034
+base: global open	0.0448	0.0276	OS file IO	0.0000
+base: global open	0.0448	0.0276	OS ioctl (outside API)	0.0000
+base: global open	0.0448	0.0276	OS mmap/munmap/madvise	0.0000
+base: global open	0.0448	0.0276	OS other	0.0000
+base: global open	0.0448	0.0276	OS poll/sleep/yield	0.0000
+base: global open	0.0448	0.0276	OS wait on host threads (futex/cond)	0.0000
+base: global open	0.0448	0.0276	untraced (host compute or descheduled)	0.0199
+base: prover gaps	0.2006	0.1998	API alloc/free	0.0002
+base: prover gaps	0.2006	0.1998	API launch	0.0000
+base: prover gaps	0.2006	0.1998	API memset	0.0000
+base: prover gaps	0.2006	0.1998	API other	0.0000
+base: prover gaps	0.2006	0.1998	API readback DtoH	0.0001
+base: prover gaps	0.2006	0.1998	API sync (stream/event/ctx)	0.0004
+base: prover gaps	0.2006	0.1998	API upload HtoD	0.0006
+base: prover gaps	0.2006	0.1998	OS file IO	0.0000
+base: prover gaps	0.2006	0.1998	OS ioctl (outside API)	0.0000
+base: prover gaps	0.2006	0.1998	OS mmap/munmap/madvise	0.0000
+base: prover gaps	0.2006	0.1998	OS other	0.0000
+base: prover gaps	0.2006	0.1998	OS poll/sleep/yield	0.0000
+base: prover gaps	0.2006	0.1998	OS wait on host threads (futex/cond)	0.0627
+base: prover gaps	0.2006	0.1998	untraced (host compute or descheduled)	0.1364

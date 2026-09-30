@@ -1,0 +1,21 @@
+G6 analysis · log wt1200-tree.log · LOG ONLY (no trace) · no sampler
+windows: base 30.452 s · level1 7.700 s · root 1.648 s
+  defined by: run_start=1790746199.668, level1_start=1790746230.120, level1=7.700, whole_run=39.800, base=30.452
+base sub-phases: 10 · Σ 30.452 s of the base's 30.452 s · PARTITION OK
+  head 1.866 · epochs absorb+prep 0.091 · epochs argue 11.670 · epochs commit 9.089 · epochs open 6.294 · global absorb+prep 0.006 · global argue 0.330 · global commit 0.422 · global open 0.525 · prover gaps 0.159
+
+=== HOST CPU PER BASE SUB-PHASE (sampler) ===
+  no sampler file
+
+=== NAMED HOST WORK INSIDE EACH SUB-PHASE (log spans, overlap seconds) ===
+  head                               head helper: DECODE prepared 0.32 · head helper: DECODE root 1.11 · producer build 0.27 · producer collect 0.53 · producer execute 0.08 · producer prep@producer 0.47 · producer CPU stages (execute+collect+build+prep) 1.36
+  epochs absorb+prep                 level-1 prologues in the base's tail 0.01 · producer execute 0.09 · producer prep@producer 0.01 · producer CPU stages (execute+collect+build+prep) 0.09
+  epochs argue                       level-1 prologues in the base's tail 1.54 · producer build 1.58 · producer collect 0.16 · producer prep@producer 6.13 · producer hand-off wait (handoff minus prep) 3.80 · producer CPU stages (execute+collect+build+prep) 7.87
+  epochs commit                      level-1 prologues in the base's tail 0.72 · producer build 3.28 · producer collect 4.00 · producer execute 0.90 · producer prep@producer 0.91 · producer CPU stages (execute+collect+build+prep) 9.09
+  epochs open                        level-1 prologues in the base's tail 0.70 · producer prep@producer 0.47 · producer hand-off wait (handoff minus prep) 5.82 · producer CPU stages (execute+collect+build+prep) 0.47
+  global absorb+prep                 level-1 prologues in the base's tail 0.01
+  global argue                       level-1 prologues in the base's tail 0.33
+  global commit                      level-1 prologues in the base's tail 0.42
+  global open                        level-1 prologues in the base's tail 0.53
+  prover gaps                        level-1 prologues in the base's tail 0.14 · producer prep@producer 0.04 · producer hand-off wait (handoff minus prep) 0.02 · producer CPU stages (execute+collect+build+prep) 0.04
+  producer, 16 epoch(s)/stage(s): execute Σ 1.06 s · collect Σ 4.70 s · build Σ 5.13 s · prep@producer Σ 8.03 s · work Σ 18.92 s · hand-off wait Σ 9.64 s
