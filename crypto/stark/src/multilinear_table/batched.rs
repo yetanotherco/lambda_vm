@@ -417,6 +417,72 @@ where
         absorb_roots_and_challenge::<E, T>(transcript, committed.roots(), &prepared_roots);
 
     let tables = committed.tables();
+    let (argue, reduced) = prove_argue::<F, E, T>(
+        tables,
+        &z,
+        &alpha,
+        &beta,
+        bin_log_cells,
+        transcript,
+        faults,
+        at,
+    )?;
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    let mut table_starts = Vec::with_capacity(tables.len());
+    for (table, claim) in tables.iter().zip(reduced) {
+        table_starts.push(points.len());
+        for _ in 0..table.num_committed_columns() {
+            points.push(claim.point.clone());
+        }
+        values.extend(claim.column_values);
+    }
+
+    // ── O: the openings, as the per-table format's ────────────────────────
+    let (columns, preprocessed) = prove_openings(
+        committed,
+        config,
+        transcript,
+        prepared,
+        &points,
+        &values,
+        &table_starts,
+    )?;
+
+    Ok(BatchedMultiProof {
+        roots: committed.roots().to_vec(),
+        argue,
+        columns,
+        preprocessed,
+    })
+}
+
+/// ★ The batched argue itself, from the shared challenges to every table's
+/// column claims: phases G, C and Rd of the module docs. The roots block
+/// before it and the openings after it are the caller's.
+///
+/// `pub` for the in-guest emitter's gate, which argues a few tables with no
+/// commitment at all, as the per-table leg's gate calls `prove`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_argue<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    beta: &FieldElement<E>,
+    bin_log_cells: u8,
+    transcript: &mut T,
+    faults: ProverFaults,
+    at: Where,
+) -> Result<(BatchedArgue<E>, Vec<claim_reduce::ReducedClaim<E>>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let beta = beta.clone();
     let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
     let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
     let plan = argue_plan(&shapes, faults.bin_log_cells.unwrap_or(bin_log_cells));
@@ -426,8 +492,8 @@ where
             multilinear_logup::interactions(
                 table.layout.interactions,
                 table.slot_of().len(),
-                &z,
-                &alpha,
+                z,
+                alpha,
                 |col| slot(table.slot_of(), col),
             )
         })
@@ -610,11 +676,8 @@ where
 
     // ── Rd: a shifted table's reduction; the others read their columns ────
     let mut reduces = Vec::with_capacity(tables.len());
-    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
-    let mut values: Vec<FieldElement<E>> = Vec::new();
-    let mut table_starts = Vec::with_capacity(tables.len());
+    let mut reduced = Vec::with_capacity(tables.len());
     for (t, table) in tables.iter().enumerate() {
-        table_starts.push(points.len());
         let at = &point[..table.num_vars()];
         let (column_point, column_values, reduce) = if plan.shapes[t].shifted {
             let sources: Vec<claim_reduce::FactorSource> = table
@@ -639,36 +702,22 @@ where
             )?;
             (at.to_vec(), column_values, None)
         };
-        for _ in 0..table.num_committed_columns() {
-            points.push(column_point.clone());
-        }
-        values.extend(column_values);
+        reduced.push(claim_reduce::ReducedClaim {
+            point: column_point,
+            column_values,
+        });
         reduces.push(reduce);
     }
-
-    // ── O: the openings, as the per-table format's ────────────────────────
-    let (columns, preprocessed) = prove_openings(
-        committed,
-        config,
-        transcript,
-        prepared,
-        &points,
-        &values,
-        &table_starts,
-    )?;
-
-    Ok(BatchedMultiProof {
-        roots: committed.roots().to_vec(),
-        argue: BatchedArgue {
+    Ok((
+        BatchedArgue {
             bus_outputs,
             gkr,
             constraint,
             factor_values,
             reduces,
         },
-        columns,
-        preprocessed,
-    })
+        reduced,
+    ))
 }
 
 /// Verifies a batched proof: every table, the bus balance across them, and
@@ -790,6 +839,89 @@ where
         prepared.as_ref().map(|p| p.roots).unwrap_or(&[]),
     );
 
+    let reduced_claims = verify_argue::<F, E, T>(
+        argue,
+        statements,
+        bin_log_cells,
+        &z,
+        &alpha,
+        &beta,
+        transcript,
+        checks,
+    )?;
+    let mut balance = FieldElement::<E>::zero();
+    for output in &argue.bus_outputs {
+        balance += contribution(output).ok_or(MlError::BusImbalance)?;
+    }
+    if checks.balance && balance != *expected {
+        return Err(MlError::BusImbalance);
+    }
+
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    let mut table_starts = Vec::with_capacity(n);
+    let mut settled_counts = Vec::with_capacity(n);
+    for (t, (statement, reduced)) in statements.iter().zip(reduced_claims).enumerate() {
+        table_starts.push(points.len());
+        let settled = settled_count(prepared.as_ref(), t, statement)?;
+        settled_counts.push(settled);
+        if checks.preprocessed {
+            check_preprocessed(*statement, &reduced, settled)?;
+        }
+        for _ in 0..statement.slot_of.len() {
+            points.push(reduced.point.clone());
+        }
+        values.extend(reduced.column_values);
+    }
+
+    // ── O ─────────────────────────────────────────────────────────────────
+    verify_openings::<F, E, T, H>(
+        &proof.roots,
+        &proof.columns,
+        proof.preprocessed.as_ref(),
+        statements,
+        layouts,
+        domains,
+        sizes,
+        config,
+        transcript,
+        prepared,
+        exclude_settled,
+        &points,
+        &values,
+        &table_starts,
+        &settled_counts,
+    )
+}
+
+/// ★ The batched argue's verifying half, from the shared challenges to every
+/// table's column claims (phases G, C, Rd). The bus balance, the preprocessed
+/// checks and the openings are the caller's.
+///
+/// `pub` for the in-guest emitter's gate, which checks a leg against it.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_argue<F, E, T>(
+    argue: &BatchedArgue<E>,
+    statements: &[TableStatement<'_, F, E>],
+    bin_log_cells: u8,
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    beta: &FieldElement<E>,
+    transcript: &mut T,
+    checks: VerifierChecks,
+) -> Result<Vec<claim_reduce::ReducedClaim<E>>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let n = statements.len();
+    if argue.bus_outputs.len() != n || argue.factor_values.len() != n || argue.reduces.len() != n {
+        return Err(MlError::ArgueShapeMismatch { part: "tables" });
+    }
+    let beta = beta.clone();
     let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
     let plan = argue_plan(&shapes, bin_log_cells);
     if argue.gkr.len() != plan.bins.len() {
@@ -801,8 +933,8 @@ where
             multilinear_logup::interactions(
                 statement.interactions,
                 statement.slot_of.len(),
-                &z,
-                &alpha,
+                z,
+                alpha,
                 |col| slot(statement.slot_of, col),
             )
         })
@@ -829,13 +961,6 @@ where
         .into_iter()
         .collect::<Option<_>>()
         .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
-    let mut balance = FieldElement::<E>::zero();
-    for output in &argue.bus_outputs {
-        balance += contribution(output).ok_or(MlError::BusImbalance)?;
-    }
-    if checks.balance && balance != *expected {
-        return Err(MlError::BusImbalance);
-    }
 
     // ── C ─────────────────────────────────────────────────────────────────
     let xi: Vec<FieldElement<E>> = (0..plan.num_vars)
@@ -886,14 +1011,8 @@ where
     }
 
     // ── Rd ────────────────────────────────────────────────────────────────
-    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
-    let mut values: Vec<FieldElement<E>> = Vec::new();
-    let mut table_starts = Vec::with_capacity(n);
-    let mut settled_counts = Vec::with_capacity(n);
+    let mut reduced_claims = Vec::with_capacity(n);
     for (t, statement) in statements.iter().enumerate() {
-        table_starts.push(points.len());
-        let settled = settled_count(prepared.as_ref(), t, statement)?;
-        settled_counts.push(settled);
         let at = &point[..statement.num_vars];
         let factor_values = &argue.factor_values[t];
         let reduced = match (plan.shapes[t].shifted, &argue.reduces[t]) {
@@ -930,33 +1049,9 @@ where
             },
             _ => return Err(MlError::ArgueShapeMismatch { part: "reduction" }),
         };
-        if checks.preprocessed {
-            check_preprocessed(*statement, &reduced, settled)?;
-        }
-        for _ in 0..statement.slot_of.len() {
-            points.push(reduced.point.clone());
-        }
-        values.extend(reduced.column_values);
+        reduced_claims.push(reduced);
     }
-
-    // ── O ─────────────────────────────────────────────────────────────────
-    verify_openings::<F, E, T, H>(
-        &proof.roots,
-        &proof.columns,
-        proof.preprocessed.as_ref(),
-        statements,
-        layouts,
-        domains,
-        sizes,
-        config,
-        transcript,
-        prepared,
-        exclude_settled,
-        &points,
-        &values,
-        &table_starts,
-        &settled_counts,
-    )
+    Ok(reduced_claims)
 }
 
 #[cfg(test)]

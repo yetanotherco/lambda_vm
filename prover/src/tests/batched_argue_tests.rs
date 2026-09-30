@@ -210,8 +210,11 @@ fn vm_round_trip_elf(
             at,
         )
         .expect("the batched prover runs");
-        // serde writes each element canonically, so equal bytes are equal proofs.
-        let bytes = serde_json::to_vec(&proof).expect("canonical bytes");
+        // serde writes each element canonically, so equal bytes are equal
+        // values. The roots and the argue only: the openings grind, and a
+        // parallel nonce search returns ANY valid nonce, so two honest proofs
+        // part there (memory: grinding-nonce-nondeterminism) — after the argue.
+        let bytes = serde_json::to_vec(&(&proof.roots, &proof.argue)).expect("canonical bytes");
         if let Some(tamper) = tamper {
             tamper(&mut proof);
         }
@@ -645,8 +648,10 @@ fn the_w_lfm_chips_round_trip_batched() {
 }
 
 /// ★ D-BATCH B-3 on real tables: the prover on the card proves the host
-/// reference's canonical bytes for every table of `test_keccak` and
-/// `test_ecsm`, and both verify.
+/// reference's canonical bytes — the roots and the whole argue — for every
+/// table of `test_keccak`, `test_ecsm` and `all_instructions_64`, and both
+/// verify. The openings are not compared: they grind under the production
+/// config, and the parallel nonce search makes any two runs part there.
 ///
 /// On a cuda build the device path runs the ladder's layers and the fused
 /// zerocheck on the card; on a host build it is the device path's fallbacks
@@ -664,10 +669,10 @@ fn the_card_proves_the_host_references_bytes_on_real_tables() {
         host.unwrap_or_else(|e| panic!("{name} on the host: {e:?}"));
         assert!(
             card_bytes == host_bytes,
-            "{name}: the card's proof is not the host reference's bytes"
+            "{name}: the card's argue is not the host reference's bytes"
         );
         eprintln!(
-            "batched argue B-3 {name}: {} tables, {fused} fused sessions on the card, {} bytes == the host's",
+            "batched argue B-3 {name}: {} tables, {fused} fused sessions on the card, {} argue bytes == the host's",
             names.len(),
             card_bytes.len()
         );
