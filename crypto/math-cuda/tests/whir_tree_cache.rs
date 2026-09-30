@@ -821,7 +821,7 @@ fn an_argue_reservation_refusal_bumps_the_device_fallback_counter() {
 /// (the peak `be.reserved`, the quantity argue's `reserve` is checked against).
 /// This proves both move with a real retention and, crucially, that the layer's
 /// bytes are GIVEN BACK when its codeword drops — the balance the eviction relies
-/// on. A broken `RetainedLeaves::drop` leaves the live count high and reddens the
+/// on. A broken `KeptNodes` drop leaves the live count high and reddens the
 /// final assertion; a missing `note_reserved` leaves the high-water below the
 /// live reserved total and reddens the middle one.
 #[test]
@@ -854,7 +854,7 @@ fn the_live_footprint_and_reserved_high_water_track_the_retention() {
     assert_eq!(
         math_cuda::whir::retained_bytes_live(),
         live_before,
-        "dropping the codeword must give the layer's bytes back: RetainedLeaves::drop \
+        "dropping the codeword must give the layer's bytes back: KeptNodes's drop \
          balances the admit, or the live footprint would only ever rise"
     );
 }
@@ -1144,5 +1144,134 @@ fn a_kept_whole_tree_serves_its_openings_and_moves_no_byte() {
         codeword.retained_leaf_bytes(),
         whole,
         "and it is kept whole again"
+    );
+}
+
+/// ⛔ A KEPT TREE AN OPENING IS READING STAYS PROMISED UNTIL THE OPENING LETS
+/// GO — through an eviction and through its codeword's drop.
+///
+/// A served opening reads a kept whole tree through its own handle after the
+/// slot's lock is let go. When the slot's drop gave the promise back, emptying
+/// the slot while that opening read — an eviction, or the codeword dropping —
+/// left the ledger counting less than the card held until the read ended. Now
+/// the promise goes with the buffer's LAST handle (`KeptNodes`), and:
+/// 1. the evictor passes over a tree an opening holds: a miss only that tree
+///    could cover fails, the tree stays kept, and the ledger still counts it;
+/// 2. once the opening lets go, the same miss evicts the tree and succeeds;
+/// 3. a codeword dropped while an opening holds its kept tree gives back
+///    nothing until the opening lets go — the tree's promise, and the room it
+///    was grown in, go with the last handle — and then every byte.
+///
+/// An evictor that ignores readers reddens (1); a promise given back by the
+/// slot's drop reddens (3).
+#[test]
+fn a_kept_tree_an_opening_reads_stays_promised_until_the_opening_lets_go() {
+    let _exclusive = exclusive();
+    let _mode = WholeTrees::force(true);
+    let be = math_cuda::device::backend().expect("reader test needs a GPU");
+    let hash = key::<RpxWhir>();
+    let (num_vars, log_folding) = (14, 4);
+
+    // Baselines, not assumed zeros: what this test is responsible for is the
+    // delta.
+    let before = be.reserved_bytes();
+    let live_before = math_cuda::whir::retained_bytes_live();
+    let (codeword, _root) = commit_on_device(num_vars, log_folding, hash);
+    let tree = codeword.retained_leaf_bytes();
+    assert_eq!(
+        tree,
+        kept_bytes(num_vars, log_folding, true),
+        "precondition: the commit keeps its whole tree"
+    );
+    let with_codeword = be.reserved_bytes();
+
+    // (1) An opening holds the tree; a miss only it could cover.
+    let reader = codeword
+        .hold_kept_tree(log_folding, hash)
+        .expect("a kept tree to read");
+    let passes_before = math_cuda::whir::retention_read_passes();
+    let (evictions_before, _) = math_cuda::whir::retention_evictions();
+    let gap = tree / 2;
+    let hog_bytes = be
+        .vram_budget_bytes()
+        .saturating_sub(be.reserved_bytes())
+        .saturating_sub(gap);
+    let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+    let miss = math_cuda::device::reserve(tree);
+    assert!(
+        miss.is_none(),
+        "the only kept tree is being read: nothing can cover this miss"
+    );
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        tree,
+        "the tree an opening reads must stay kept"
+    );
+    assert_eq!(
+        math_cuda::whir::retention_evictions().0,
+        evictions_before,
+        "nothing may be evicted"
+    );
+    assert!(
+        math_cuda::whir::retention_read_passes() > passes_before,
+        "the evictor must count the tree it passed over"
+    );
+    assert_eq!(
+        be.reserved_bytes(),
+        with_codeword + hog_bytes,
+        "the ledger must still count the tree an opening reads"
+    );
+
+    // (2) The opening lets go: the same miss evicts the tree and succeeds.
+    drop(reader);
+    let got = math_cuda::device::reserve(tree)
+        .expect("the opening let go: the miss must evict the tree and succeed");
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        0,
+        "the tree must have been evicted"
+    );
+    // The tree's bytes went back and the miss took as many again.
+    assert_eq!(
+        be.reserved_bytes(),
+        with_codeword + hog_bytes,
+        "the eviction must give back exactly the tree's bytes"
+    );
+    drop(got);
+    drop(hog);
+
+    // (3) The codeword drops while an opening holds its tree.
+    let _ = codeword.paths(log_folding, &[0, 1], hash).expect("paths");
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        tree,
+        "the rebuild keeps the tree whole again"
+    );
+    let reader = codeword
+        .hold_kept_tree(log_folding, hash)
+        .expect("a kept tree to read");
+    let held = be.reserved_bytes();
+    let live_held = math_cuda::whir::retained_bytes_live();
+    drop(codeword);
+    assert_eq!(
+        be.reserved_bytes(),
+        held,
+        "the codeword dropped while an opening reads its tree: nothing may be given back yet"
+    );
+    assert_eq!(
+        math_cuda::whir::retained_bytes_live(),
+        live_held,
+        "and the tree must still count as held"
+    );
+    drop(reader);
+    assert_eq!(
+        be.reserved_bytes(),
+        before,
+        "the opening let go: every byte must go back"
+    );
+    assert_eq!(
+        math_cuda::whir::retained_bytes_live(),
+        live_before,
+        "and the live footprint with it"
     );
 }

@@ -5,6 +5,7 @@
 //! one NTT onto the blown-up domain, then the strided-coset leaf hash and the
 //! Merkle tree. Parity against that pipeline is checked by `tests/whir_commit.rs`.
 
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, Once, Weak};
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
@@ -70,8 +71,8 @@ static RETAIN_FIRST_REFUSAL_HEADROOM: AtomicU64 = AtomicU64::new(0);
 /// Leaf passes SKIPPED because a matching layer was in hand. The saving, counted
 /// where it happens rather than inferred from two other counters.
 static LEAF_PASSES_SAVED: AtomicU64 = AtomicU64::new(0);
-/// ★ The SIMULTANEOUS retained device bytes held RIGHT NOW — `fetch_add` on
-/// admit, `fetch_sub` in [`RetainedLeaves`]'s `Drop`. Unlike
+/// ★ The SIMULTANEOUS retained device bytes held RIGHT NOW — `fetch_add` in
+/// [`KeptNodes::promise`], `fetch_sub` in its `Drop`. Unlike
 /// [`RETAIN_BYTES_ADMITTED`], which only ever rises (cumulative over the run),
 /// this rises and falls with the live layers, so it is the TRUE footprint: the
 /// quantity that contends with argue for the shared budget, and the one an
@@ -137,43 +138,122 @@ pub fn retained_bytes_peak() -> u64 {
 /// that are internally consistent and WRONG, which is the outcome that file
 /// exists to forbid. An exact match or a rebuild; there is no near miss.
 struct RetainedLeaves {
-    /// The leaf layer, or the whole node array when `whole`. Shared so an
-    /// opening served a whole tree can read it after the slot's lock is let go:
-    /// an eviction then drops the slot's handle, and the buffer is freed when
-    /// the opening's goes.
-    nodes: Arc<CudaSlice<u8>>,
+    /// The leaf layer, or the whole node array when `whole`, with the promise
+    /// it holds. Shared so an opening served a whole tree can read it after the
+    /// slot's lock is let go; the promise goes with the LAST handle, never with
+    /// the slot's alone ([`KeptNodes`]).
+    nodes: Arc<KeptNodes>,
     log_folding: usize,
     hash: crate::DeviceHash,
     num_leaves: usize,
-    bytes: u64,
-    /// The reservation `bytes` were promised under — the room of the codeword
-    /// that captured the layer, which a fold SHARES with the codeword it came
-    /// from. `Weak`: a layer never keeps a room alive.
-    room: Weak<DeviceReservation>,
     /// The whole tree rather than the leaf layer alone.
     whole: bool,
 }
 
-impl Drop for RetainedLeaves {
-    /// The other half of both accountings: whatever admitted the layer added to
-    /// [`RETAIN_BYTES_LIVE`] and to its room is given back when the layer drops
-    /// — with its codeword, or when an eviction sets the slot to `None`. `nodes`
-    /// (a `CudaSlice`) frees its device bytes on the line after this returns.
-    ///
-    /// ⛔ THE ROOM IS SHRUNK HERE, not by whoever dropped the layer. A fold
-    /// lives inside its source codeword's room and captures its own layer
-    /// against it, and a fold drops at the end of its round while the source
-    /// lives on to the end of the proof: shrunk only by the evictor, a fold's
-    /// layer stayed promised until the source dropped — every opened chain
-    /// leaving its folds' layers in the budget for the rest of the group, and
-    /// a commitment held across epochs gaining a set per epoch. When the room
-    /// is already gone, its drop took these bytes with the rest.
-    fn drop(&mut self) {
-        RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
-        if let Some(room) = self.room.upgrade() {
-            room.shrink(self.bytes);
-        }
+impl RetainedLeaves {
+    /// The bytes this holds, all of them promised.
+    fn bytes(&self) -> u64 {
+        self.nodes.bytes
     }
+
+    /// Whether an opening holds this right now: the slot's handle is not the
+    /// only one.
+    ///
+    /// ⛔ READ IT UNDER THE SLOT'S LOCK. An opening takes its handle under that
+    /// lock ([`DeviceCodeword::retained_tree`]) and lets it go without one, so
+    /// under the lock the count can fall but never rise: a `false` read there
+    /// stays right for as long as the lock is held, and a `true` can only go
+    /// stale in the safe direction — a tree kept a moment longer than it had
+    /// to be.
+    fn read_by_an_opening(&self) -> bool {
+        Arc::strong_count(&self.nodes) > 1
+    }
+}
+
+/// A kept device buffer that answers for its own promise: grown into its room
+/// when it is admitted, given back by its own `Drop`.
+///
+/// ⛔ THE PROMISE LEAVES WITH THE BUFFER, NOT WITH THE SLOT. An opening served
+/// a whole tree reads it through its own handle after the slot's lock is let
+/// go, so emptying the slot — an eviction, or the codeword dropping — does not
+/// free the buffer while that opening reads. The bytes are given back when the
+/// LAST handle drops, which is also when the buffer is freed; given back by
+/// whoever emptied the slot, the ledger would count less than the card holds
+/// for as long as the reading lasted.
+///
+/// ⛔ AND THE ROOM LIVES AS LONG AS THIS DOES. The handle is strong, so a room
+/// cannot drop — giving back every byte it counts, these included — while a
+/// buffer it counts is still held (the evictor's walk can hold a slot past its
+/// codeword for as long as it looks at it). A kept buffer outlives its
+/// codeword only there, so the rest of the room stays counted for that long,
+/// on the safe side.
+///
+/// The room is the codeword's, which a fold SHARES with the codeword it came
+/// from. So it is shrunk HERE, not by whoever dropped the layer: a fold drops
+/// at the end of its round while the source lives on to the end of the proof,
+/// and shrunk only by the evictor, a fold's layer stayed promised until the
+/// source dropped — every opened chain leaving its folds' layers in the budget
+/// for the rest of the group, and a commitment held across epochs gaining a set
+/// per epoch.
+struct KeptNodes {
+    /// Freed in `Drop`, before the promise goes back.
+    buffer: ManuallyDrop<CudaSlice<u8>>,
+    bytes: u64,
+    room: Arc<DeviceReservation>,
+}
+
+impl KeptNodes {
+    /// Promise `bytes` for `buffer` in `room`, or hand the buffer back when the
+    /// budget will not take them —
+    /// [`grow`](DeviceReservation::grow) changes nothing when it refuses.
+    fn promise(
+        buffer: CudaSlice<u8>,
+        bytes: u64,
+        room: &Arc<DeviceReservation>,
+    ) -> core::result::Result<Self, CudaSlice<u8>> {
+        if !room.grow(bytes) {
+            return Err(buffer);
+        }
+        // The live footprint rises here and falls in `Drop`, so the two balance
+        // over the buffer's lifetime; the peak is kept for the print, since the
+        // instantaneous count is ~0 by the time it is read.
+        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
+        Ok(Self {
+            buffer: ManuallyDrop::new(buffer),
+            bytes,
+            room: Arc::clone(room),
+        })
+    }
+
+    fn buffer(&self) -> &CudaSlice<u8> {
+        &self.buffer
+    }
+
+    fn buffer_mut(&mut self) -> &mut CudaSlice<u8> {
+        &mut self.buffer
+    }
+}
+
+impl Drop for KeptNodes {
+    /// The other half of both accountings: what [`KeptNodes::promise`] added to
+    /// [`RETAIN_BYTES_LIVE`] and to the room goes back here, once the free is
+    /// enqueued. cudarc's `CudaSlice::drop` frees on the slice's own stream,
+    /// after any work queued there on it.
+    fn drop(&mut self) {
+        // SAFETY: `buffer` is dropped exactly once, here, and nothing reads it
+        // afterwards: `self` is being dropped.
+        unsafe { ManuallyDrop::drop(&mut self.buffer) };
+        RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.room.shrink(self.bytes);
+    }
+}
+
+/// What [`DeviceCodeword::hold_kept_tree`] hands a test: a served opening's
+/// handle on a kept tree. The tree, and its promise, stay while this lives.
+#[doc(hidden)]
+pub struct KeptTreeHold {
+    _tree: Arc<KeptNodes>,
 }
 
 /// Retention evictions this process has done, and the bytes they gave back — the
@@ -181,6 +261,16 @@ impl Drop for RetainedLeaves {
 /// 0` is argue getting its budget FROM the retention instead of from the host.
 static RETAIN_EVICTED: AtomicU64 = AtomicU64::new(0);
 static RETAIN_BYTES_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// Kept trees an eviction passed over because an opening was reading them —
+/// see [`evict_retained_layers`].
+static RETAIN_READ_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Kept trees the evictor passed over this process because an opening was
+/// reading them at that moment.
+pub fn retention_read_passes() -> u64 {
+    RETAIN_READ_PASSES.load(Ordering::Relaxed)
+}
 
 /// (evictions, bytes evicted) this process — see [`RETAIN_EVICTED`].
 pub fn retention_evictions() -> (u64, u64) {
@@ -373,9 +463,10 @@ fn retention_enabled() -> bool {
 /// pressure. `Weak`, so the registry never keeps a codeword alive: `leaves`
 /// points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the MUTEX
 /// outlives any single layer, so this entry SURVIVES an eviction and a later
-/// re-capture refills the same `Option`. The layer knows its own room and gives
-/// the budget back when it drops. A dead `leaves` upgrade means the codeword is
-/// gone and the eviction walk prunes the entry.
+/// re-capture refills the same `Option`. The kept buffer knows its own room and
+/// gives the budget back when its last handle drops ([`KeptNodes`]). A dead
+/// `leaves` upgrade means the codeword is gone and the eviction walk prunes the
+/// entry.
 struct RetentionHandle {
     leaves: Weak<Mutex<Option<RetainedLeaves>>>,
 }
@@ -410,24 +501,32 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
 
 /// ⛔ THE EVICTOR — installed into `device::reserve`, called on its budget-miss
 /// path on the RESERVING thread. Frees at least `target` bytes of BUDGET by
-/// dropping retained leaf layers, FIFO (oldest first), pruning dead entries as it
-/// goes; returns the bytes freed.
+/// dropping retained leaf layers and whole trees, FIFO (oldest first), pruning
+/// dead entries as it goes; returns the bytes freed.
 ///
-/// ★ When the layers together cannot cover `target` the miss is FUTILE: the
+/// ★ When what it can give back cannot cover `target` the miss is FUTILE: the
 /// reserve fails whatever is dropped. It is counted and said either way, and
 /// under [`keep_futile`] nothing is dropped and this returns 0.
 ///
+/// ★ A kept tree an opening is reading is PASSED OVER, and not counted as
+/// reclaimable: its promise stays until the opening lets go ([`KeptNodes`]), so
+/// dropping the slot's handle would give nothing back and lose the tree. A
+/// request only that tree could cover fails, counted, rather than being handed
+/// bytes the card still holds.
+///
 /// SAFETY, the load-bearing facts:
-/// - NO REENTRANCY. It drops `RetainedLeaves` — two counter subtracts, one of
-///   them `room.shrink` (a lock-free `be.reserved` subtract), and a
-///   stream-ordered free. It NEVER calls `reserve`/`grow`, so it cannot re-enter
-///   the allocator that called it.
-/// - NO UAF. It takes the layer out UNDER the codeword's own `leaves` mutex, so a
-///   concurrent [`serve_retained_leaves`] either ran first (its `memcpy_dtod` is
-///   already enqueued on the codeword's stream) or sees `None` and rebuilds. An
-///   opening served a whole tree holds its own `Arc` of the buffer, so dropping
-///   the slot's leaves the buffer alive until that opening is done. The
-///   evicted `nodes` was allocated on that SAME stream, and cudarc 0.19.4
+/// - NO REENTRANCY. Dropping the last handle of a [`KeptNodes`] is two counter
+///   subtracts, one of them `room.shrink` (a lock-free `be.reserved` subtract),
+///   and a stream-ordered free. It NEVER calls `reserve`/`grow`, so it cannot
+///   re-enter the allocator that called it.
+/// - NO UAF, AND NO BYTE UNCOUNTED. It takes the layer out UNDER the codeword's
+///   own `leaves` mutex, so a concurrent [`serve_retained_leaves`] either ran
+///   first (its `memcpy_dtod` is already enqueued on the codeword's stream) or
+///   sees `None` and rebuilds. An opening served a whole tree takes its own
+///   handle under the same mutex, so what the walk takes has no other handle
+///   (checked there) and can get none once the slot is empty: the buffer is
+///   freed and its promise given back as the walk drops it. The evicted buffer
+///   was allocated on the codeword's stream, and cudarc 0.19.4
 ///   `CudaSlice::drop` (core.rs:776-795) first waits on the slice's own read/write
 ///   events, then frees on the slice's OWN stream — `free_async(ptr,
 ///   self.stream.cu_stream)` when `has_async_alloc`, else `synchronize()` +
@@ -446,10 +545,9 @@ fn evict_retained_layers(target: u64) -> u64 {
         Ok(reg) => reg,
         Err(poisoned) => poisoned.into_inner(),
     };
-    // What an eviction can give back: the layers whose room is alive. A layer
-    // whose room is gone gave its budget back with the room, so dropping it
-    // frees device bytes and no budget. Same lock order as the walk below.
-    let mut reclaimable = 0u64;
+    // What an eviction can give back now: everything kept that no opening is
+    // reading. Same lock order as the walk below.
+    let (mut reclaimable, mut being_read) = (0u64, 0u64);
     reg.retain(|handle| {
         let Some(leaves) = handle.leaves.upgrade() else {
             return false;
@@ -458,10 +556,10 @@ fn evict_retained_layers(target: u64) -> u64 {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(layer) = slot.as_ref()
-            && layer.room.strong_count() > 0
-        {
-            reclaimable += layer.bytes;
+        match slot.as_ref() {
+            Some(layer) if layer.read_by_an_opening() => being_read += 1,
+            Some(layer) => reclaimable += layer.bytes(),
+            None => {}
         }
         true
     });
@@ -472,7 +570,7 @@ fn evict_retained_layers(target: u64) -> u64 {
         RETAIN_FUTILE_BYTES.fetch_add(reclaimable, Ordering::Relaxed);
         eprintln!(
             "[whir] retention: a reserve missed the budget by {} MiB; the retention can give back {} MiB — {}; \
-             futile misses {misses} t={:.3}",
+             futile misses {misses} t={:.3}{}",
             target >> 20,
             reclaimable >> 20,
             if keep {
@@ -481,12 +579,13 @@ fn evict_retained_layers(target: u64) -> u64 {
                 "evicted anyway, and the reserve still misses"
             },
             unix_secs(),
+            BeingRead(being_read),
         );
     }
     if !evicts(target, reclaimable, keep) {
         return 0;
     }
-    let (mut layers, mut trees) = (0u64, 0u64);
+    let (mut layers, mut trees, mut passed) = (0u64, 0u64, 0u64);
     reg.retain(|handle| {
         let Some(leaves) = handle.leaves.upgrade() else {
             return false; // the codeword is gone; prune this dead entry
@@ -495,20 +594,33 @@ fn evict_retained_layers(target: u64) -> u64 {
             return true; // enough freed; keep the rest for next time
         }
         // Take the layer out under its own mutex — a concurrent serve holds this
-        // same lock across its copy enqueue, so the free cannot race it.
-        let taken = match leaves.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+        // same lock across its copy enqueue, so the free cannot race it — unless
+        // an opening is reading it, which keeps it until the opening lets go.
+        let taken = {
+            let mut slot = match leaves.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if slot
+                .as_ref()
+                .is_some_and(RetainedLeaves::read_by_an_opening)
+            {
+                passed += 1;
+                None
+            } else {
+                slot.take()
+            }
         };
         if let Some(layer) = taken {
-            let bytes = layer.bytes;
+            let bytes = layer.bytes();
             if layer.whole {
                 trees += 1;
             } else {
                 layers += 1;
             }
-            // RetainedLeaves::drop: live -= bytes, the BUDGET goes back to its
-            // room (for argue), nodes freed (stream-ordered).
+            // The walk holds the only handle: `KeptNodes`'s drop frees the
+            // buffer (stream-ordered) and gives the BUDGET back to its room
+            // (for argue), here.
             drop(layer);
             freed += bytes;
             RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
@@ -516,16 +628,34 @@ fn evict_retained_layers(target: u64) -> u64 {
         }
         true // keep the entry: the mutex lives with the codeword and may refill
     });
-    if !futile && layers + trees > 0 {
+    RETAIN_READ_PASSES.fetch_add(passed, Ordering::Relaxed);
+    if !futile && (layers + trees > 0 || passed > 0) {
         eprintln!(
             "[whir] retention: a reserve missed the budget by {} MiB; evicted {trees} whole tree(s) and {layers} \
-             leaf layer(s), {} MiB, to cover it t={:.3}",
+             leaf layer(s), {} MiB, to cover it t={:.3}{}",
             target >> 20,
             freed >> 20,
             unix_secs(),
+            BeingRead(passed),
         );
     }
     freed
+}
+
+/// The eviction lines' note on kept trees an opening was reading, and so kept:
+/// nothing when there were none.
+struct BeingRead(u64);
+
+impl core::fmt::Display for BeingRead {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 => Ok(()),
+            n => write!(
+                f,
+                " · {n} kept tree(s) passed over: an opening was reading them"
+            ),
+        }
+    }
 }
 
 /// May a layer built under `kept` be served for a tree asked for under `want`?
@@ -892,21 +1022,25 @@ impl DeviceCodeword {
             // A whole tree's leaves sit at the same offset in its own buffer.
             let leaves = kept
                 .nodes
+                .buffer()
                 .slice(leaves_offset..leaves_offset + num_leaves * 32);
             self.stream.memcpy_dtod(&leaves, &mut region)?;
         } else {
-            self.stream.memcpy_dtod(&*kept.nodes, &mut region)?;
+            self.stream.memcpy_dtod(kept.nodes.buffer(), &mut region)?;
         }
         Ok(true)
     }
 
     /// The whole tree kept under this key, if one is: a handle an opening reads
-    /// after the slot's lock is let go, with its leaf count.
+    /// after the slot's lock is let go, with its leaf count. Taken under that
+    /// lock, which is what lets the evictor tell a tree being read from one
+    /// that is not ([`RetainedLeaves::read_by_an_opening`]); the tree's promise
+    /// stays until the last handle goes ([`KeptNodes`]).
     fn retained_tree(
         &self,
         log_folding: usize,
         hash: crate::DeviceHash,
-    ) -> Option<(Arc<CudaSlice<u8>>, usize)> {
+    ) -> Option<(Arc<KeptNodes>, usize)> {
         let num_leaves = self.elements >> log_folding;
         let held = self.leaves.lock().ok()?;
         let kept = held.as_ref()?;
@@ -944,21 +1078,20 @@ impl DeviceCodeword {
         }
         let bytes = tree_bytes(num_leaves.trailing_zeros() as usize);
         RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
-        if !self.room.grow(bytes) {
-            Self::note_refusal();
-            return Some(nodes);
-        }
+        let kept = match KeptNodes::promise(nodes, bytes, &self.room) {
+            Ok(kept) => kept,
+            Err(nodes) => {
+                Self::note_refusal();
+                return Some(nodes);
+            }
+        };
         RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
         RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
-        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
         let replaced = held.replace(RetainedLeaves {
-            nodes: Arc::new(nodes),
+            nodes: Arc::new(kept),
             log_folding,
             hash,
             num_leaves,
-            bytes,
-            room: Arc::downgrade(&self.room),
             whole: true,
         });
         // As in `capture_leaves`: the layer lock goes before the registry is
@@ -1014,34 +1147,28 @@ impl DeviceCodeword {
         RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
         // SAFETY: every byte is written by the copy below before anything reads
         // it, and the slice is dropped on every path that does not copy.
-        let Ok(mut copy) = (unsafe { alloc_or_trim::<u8>(&self.stream, num_leaves * 32) }) else {
+        let Ok(copy) = (unsafe { alloc_or_trim::<u8>(&self.stream, num_leaves * 32) }) else {
             Self::note_refusal();
             return;
         };
-        if !self.room.grow(bytes) {
+        let Ok(mut kept) = KeptNodes::promise(copy, bytes, &self.room) else {
             Self::note_refusal();
             return;
-        }
+        };
         let region = nodes.slice(leaves_offset..leaves_offset + num_leaves * 32);
-        if self.stream.memcpy_dtod(&region, &mut copy).is_err() {
-            self.room.shrink(bytes);
+        if self.stream.memcpy_dtod(&region, kept.buffer_mut()).is_err() {
+            // Dropping it gives the promise back.
+            drop(kept);
             Self::note_refusal();
             return;
         }
         RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
         RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
-        // The live footprint rises here and falls in `RetainedLeaves`'s Drop, so
-        // the two balance over the layer's lifetime; the peak is kept for the
-        // print, since the instantaneous count is ~0 by the time it is read.
-        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
         *held = Some(RetainedLeaves {
-            nodes: Arc::new(copy),
+            nodes: Arc::new(kept),
             log_folding,
             hash,
             num_leaves,
-            bytes,
-            room: Arc::downgrade(&self.room),
             whole: false,
         });
         // Release the layer lock BEFORE touching the registry, so the only lock
@@ -1126,7 +1253,7 @@ impl DeviceCodeword {
     ) -> Result<R> {
         if let Some((tree, num_leaves)) = self.retained_tree(log_folding, hash) {
             WHOLE_TREE_SERVES.fetch_add(1, Ordering::Relaxed);
-            return f(&tree, num_leaves);
+            return f(tree.buffer(), num_leaves);
         }
         let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
         let out = f(&nodes, num_leaves)?;
@@ -1173,8 +1300,21 @@ impl DeviceCodeword {
         self.leaves
             .lock()
             .ok()
-            .and_then(|h| h.as_ref().map(|k| k.bytes))
+            .and_then(|h| h.as_ref().map(RetainedLeaves::bytes))
             .unwrap_or(0)
+    }
+
+    /// An opening's handle on the whole tree kept under this key, without the
+    /// opening: what a served opening holds while it reads the tree, for a test
+    /// that must keep one across an eviction. Not for production callers.
+    #[doc(hidden)]
+    pub fn hold_kept_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<KeptTreeHold> {
+        self.retained_tree(log_folding, hash)
+            .map(|(tree, _)| KeptTreeHold { _tree: tree })
     }
 
     /// The root of that tree, which is the commitment.
