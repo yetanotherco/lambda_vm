@@ -808,3 +808,114 @@ fn a_budget_miss_evicts_a_retained_layer_and_the_reserve_succeeds() {
     drop(got);
     drop(_hog);
 }
+
+/// ⛔ A MISS THE LAYERS CANNOT COVER KEEPS THEM UNDER `LFM_WHIR_KEEP_FUTILE`, AND
+/// MOVES NO PATH EITHER WAY.
+///
+/// The budget is filled to leave half a layer free, and the request asks for
+/// two layers more than that. Evicting the one layer held cannot cover the
+/// deficit, so the reserve fails whatever the evictor does. With the switch off
+/// the layer goes anyway and the opening hashes its leaves again; on, it stays
+/// and the opening is served from it. Both openings give the paths of a fresh
+/// codeword over the same evaluations: the switch decides where a leaf layer
+/// comes from, never what it is. A switch the evictor ignores, or a walk that
+/// no longer asks whether the miss is futile, reddens the kept arm's eviction
+/// count.
+#[test]
+fn a_miss_the_layers_cannot_cover_keeps_them_and_moves_no_path() {
+    let _exclusive = exclusive();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            math_cuda::whir::force_keep_futile(None);
+        }
+    }
+    let _restore = Restore;
+    let be = math_cuda::device::backend().expect("futile-miss test needs a GPU");
+    let hash = key::<RpxWhir>();
+    let (num_vars, log_folding) = (14, 4);
+    let raw: Vec<u64> = poly(num_vars).evals().iter().map(|v| *v.value()).collect();
+    let leaves = (raw.len() << 2) >> log_folding;
+    let positions: Vec<u32> = [0usize, 1, leaves / 3, leaves - 1]
+        .iter()
+        .map(|p| *p as u32)
+        .collect();
+    let (reference, reference_root) =
+        math_cuda::whir::commit_codeword(&raw, 2, log_folding, false, hash)
+            .expect("device commit (needs a GPU)");
+    let want = reference
+        .paths(log_folding, &positions, hash)
+        .expect("paths");
+    // Its layer must not be the one a miss below could reclaim.
+    drop(reference);
+
+    for keep in [false, true] {
+        math_cuda::whir::force_keep_futile(Some(keep));
+        let (codeword, root) = math_cuda::whir::commit_codeword(&raw, 2, log_folding, false, hash)
+            .expect("device commit");
+        assert_eq!(root, reference_root, "keep {keep}: the root moved");
+        let layer = codeword.retained_leaf_bytes();
+        assert!(
+            layer > 0,
+            "keep {keep}: precondition: the commit must have retained a layer"
+        );
+        let (evictions_before, _) = math_cuda::whir::retention_evictions();
+        let (futile_before, _, _) = math_cuda::whir::retention_futile();
+
+        // Half a layer free; the request's deficit is then two layers, against
+        // the one layer the evictor could give back.
+        let gap = layer / 2;
+        let hog_bytes = be
+            .vram_budget_bytes()
+            .saturating_sub(be.reserved_bytes())
+            .saturating_sub(gap);
+        let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+        let miss = math_cuda::device::reserve(gap + 2 * layer);
+        assert!(
+            miss.is_none(),
+            "keep {keep}: a miss no eviction can cover must fail either way"
+        );
+        drop(hog);
+
+        let (evictions_after, _) = math_cuda::whir::retention_evictions();
+        let (futile_after, _, kept) = math_cuda::whir::retention_futile();
+        assert_eq!(kept, keep, "the switch must read back as forced");
+        assert_eq!(
+            futile_after,
+            futile_before + 1,
+            "keep {keep}: the miss must be counted as futile exactly once"
+        );
+        if keep {
+            assert_eq!(
+                evictions_after, evictions_before,
+                "kept: a futile miss must evict nothing"
+            );
+            assert_eq!(
+                codeword.retained_leaf_bytes(),
+                layer,
+                "kept: the layer must still be held"
+            );
+        } else {
+            assert!(
+                evictions_after > evictions_before,
+                "off: the layer goes, as it did before the switch"
+            );
+            assert_eq!(
+                codeword.retained_leaf_bytes(),
+                0,
+                "off: the layer must be gone"
+            );
+        }
+
+        let passes = codeword.leaf_passes();
+        let got = codeword
+            .paths(log_folding, &positions, hash)
+            .expect("paths");
+        assert_eq!(
+            codeword.leaf_passes(),
+            passes + u64::from(!keep),
+            "keep {keep}: the opening is served when the layer was kept and hashes it again when not"
+        );
+        assert_eq!(got, want, "keep {keep}: the paths moved");
+    }
+}
