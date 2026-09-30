@@ -6,7 +6,10 @@
 //! generator's reference permutation and Plonky3's Rust `Poseidon1` (sparse
 //! partial rounds) fed these constants (lane note `I-HASH.md` §1).
 
-use super::kat::{LEAF_VECTORS, NODE4_VECTOR, PERMUTATION_VECTORS};
+use super::kat::{
+    CAUCHY_LEAF_VECTORS, CAUCHY_NODE4_VECTOR, CAUCHY_PERMUTATION_VECTORS, LEAF_VECTORS,
+    NODE4_VECTOR, PERMUTATION_VECTORS,
+};
 use super::*;
 
 fn fp16(v: &[u64; STATE_FELTS]) -> [Fp; STATE_FELTS] {
@@ -31,7 +34,10 @@ fn a_one_bit_change_in_one_round_constant_breaks_every_vector() {
     let mut rc = ROUND_CONSTANTS;
     rc[NUM_ROUNDS - 1][STATE_FELTS - 1] ^= 1;
     for (input, expected) in PERMUTATION_VECTORS.iter() {
-        assert_ne!(canon(&permute_with(&rc, fp16(input))), expected.to_vec());
+        assert_ne!(
+            canon(&permute_with(&rc, mds, fp16(input))),
+            expected.to_vec()
+        );
     }
 }
 
@@ -56,6 +62,34 @@ fn the_4ary_node_matches_the_reference_vector() {
     let children: [Digest; ARITY] =
         core::array::from_fn(|c| core::array::from_fn(|l| out[c * DIGEST_FELTS + l]));
     assert_eq!(canon(&compress4(&children)), NODE4_VECTOR.to_vec());
+}
+
+/// The Cauchy alternative's known answers — from the Python reference, whose
+/// permutation vectors Plonky3's generator (and its Cauchy matrix) reproduce.
+#[test]
+fn the_cauchy_alternative_matches_its_reference_vectors() {
+    for (input, expected) in CAUCHY_PERMUTATION_VECTORS.iter() {
+        assert_eq!(canon(&permute_cauchy(fp16(input))), expected.to_vec());
+    }
+    for (n, expected) in CAUCHY_LEAF_VECTORS.iter() {
+        let felts: alloc::vec::Vec<Fp> = (0..*n as u64)
+            .map(|i| Fp::from(i * 0x0123_4567_89ab_cdef + *n as u64))
+            .collect();
+        assert_eq!(
+            canon(&sponge_leaf_cauchy(&felts)),
+            expected.to_vec(),
+            "leaf of {n} felts"
+        );
+    }
+    let out = permute_cauchy(fp16(&CAUCHY_PERMUTATION_VECTORS[0].0));
+    let children: [Digest; ARITY] =
+        core::array::from_fn(|c| core::array::from_fn(|l| out[c * DIGEST_FELTS + l]));
+    assert_eq!(
+        canon(&compress4_cauchy(&children)),
+        CAUCHY_NODE4_VECTOR.to_vec()
+    );
+    // The two instances differ everywhere they should.
+    assert_ne!(CAUCHY_PERMUTATION_VECTORS[0].1, PERMUTATION_VECTORS[0].1);
 }
 
 #[test]
@@ -107,6 +141,12 @@ fn host_permutation_cost_against_rpx() {
         s16 = permute(s16);
     }
     let p1 = t.elapsed().as_nanos() as f64 / N as f64;
+    let mut sc = fp16(&PERMUTATION_VECTORS[3].0);
+    let t = Instant::now();
+    for _ in 0..N {
+        sc = permute_cauchy(sc);
+    }
+    let cauchy = t.elapsed().as_nanos() as f64 / N as f64;
     let mut s12: [crate::hash::rpx::Fp; 12] = core::array::from_fn(|i| s16[i]);
     let t = Instant::now();
     for _ in 0..N {
@@ -114,9 +154,12 @@ fn host_permutation_cost_against_rpx() {
     }
     let rpx = t.elapsed().as_nanos() as f64 / N as f64;
     println!(
-        "HOSTPERM p1w16 {p1:.0} ns/perm · rpx {rpx:.0} ns/perm · ratio {:.2} (sinks {} {})",
+        "HOSTPERM p1w16 {p1:.0} ns/perm · p1w16-cauchy {cauchy:.0} · rpx {rpx:.0} ns/perm · \
+         ratios {:.2} / {:.2} (sinks {} {} {})",
         p1 / rpx,
+        cauchy / rpx,
         s16[0].canonical(),
+        sc[0].canonical(),
         s12[0].canonical()
     );
 }

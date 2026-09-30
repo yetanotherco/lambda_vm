@@ -31,3 +31,22 @@ static const uint64_t P1_NODE4[4] = {0x1ddf6497ce8bd322ull, 0xe04a80a11f0adc0bul
 // Grind head: lane 0 of sponge_leaf([1, 2, 3, 4, nonce]) for nonce 0..8.
 static const uint64_t P1_GRIND_INNER[4] = {1, 2, 3, 4};
 static const uint64_t P1_GRIND_HEAD[8] = {0xf531bbf388c97eb1ull, 0x5cc396c83fb3167eull, 0xe8002eb0fcef46c1ull, 0xd3fcdabf15080d86ull, 0x834b28099e44c2c0ull, 0xe309f1c5ab496ab2ull, 0xe726b46acd5ec1f8ull, 0x3ffa4087ddb82244ull};
+// The same vectors under the Grain Cauchy MDS (`CAUCHY_*` on the host).
+static const uint64_t P1C_PERM_OUT[4][16] = {
+    {0x6a84bf02be1f328dull, 0xec14d274b936a21aull, 0xc0539d7bd4eb66deull, 0xb317ecf41fa8d55bull, 0x80b0d36f66671f8aull, 0x74a1592b9a16e832ull, 0x65e53afadfadc8c3ull, 0xa0007e5ee96ee4b2ull, 0x6dd5661a877003a8ull, 0xc36a09c2dc25cd6eull, 0xcbda3d58f7cf85f4ull, 0x34cb1d63c35596cfull, 0x4fcd09b24769e281ull, 0x6c514f906998c65dull, 0xc447035d8d71952bull, 0x591863454267826full},
+    {0x6739c9388c4e2ef0ull, 0xf30b2e3b622598adull, 0xe439dd54cf0a515full, 0x7e44fb022e6afd5eull, 0x6de7468bd2bc085dull, 0xd436b57bc7acc226ull, 0xdd008c3a59bda176ull, 0x58b4a5d48066e997ull, 0x156c5b75c7cac11eull, 0x1c76a3e41d07970eull, 0x839518ae672fd49eull, 0x82f2ac09ce6b0b1bull, 0xf8217338ffb9bdb0ull, 0x3ed3402e1f33629dull, 0x8b62125da646935full, 0x3b27d003425f5481ull},
+    {0x7a6e22f23f763ef2ull, 0x30e26031b6b94bb4ull, 0x269b80f1cbb79100ull, 0x2c724492563f5f30ull, 0xb7d98baf70824ef1ull, 0x99b7c1939dc54660ull, 0x6a12ad6e9d7969b3ull, 0x460f0a2fd8afc57bull, 0x68c84cb2bdce79fdull, 0x8330e46629523758ull, 0xfcdbe2677bd08018ull, 0xff0ba6fdd3cda119ull, 0xee98d495f18bf150ull, 0xeb2db2f0b53ca5c2ull, 0xf6b4a4d35797d71dull, 0xd90df4ca56b64d46ull},
+    {0x558ecb3ef284e7c9ull, 0xf5e658c0d4210d0eull, 0xd156f6ecf4a2dc39ull, 0x87398c68e9b1f36cull, 0x2ac68e0cd15c0e64ull, 0x63de5d8e79208b7aull, 0xb0c975579f5615e2ull, 0x6762becbdc2ac612ull, 0x48b6834353d9ba1dull, 0xb82339f848872615ull, 0x9bba130306252a7full, 0xc7e1d0c57fb3b2deull, 0x784ad3867f9ba9b1ull, 0x35c0d82ec7544ec2ull, 0x014c39294b4f3beeull, 0x361200fea1f613fcull},
+};
+static const uint64_t P1C_LEAF_DIGEST[7][4] = {
+    {0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+    {0x0f5a8171129f0e7cull, 0x369de019fc631f9aull, 0x11bcc39be3795febull, 0x938bda6a985e2cc0ull},
+    {0xaace96db56764328ull, 0x77b54185481ffa22ull, 0x6bb417ebc6dab7fbull, 0x7f0d29c8a4287602ull},
+    {0xe29c1b20e2c3b82cull, 0x0912444adbf7e934ull, 0xdd36f632aab73791ull, 0xd4f5efd18bbc032dull},
+    {0xd54b8304dd89f2acull, 0xff1de01d10fc30a2ull, 0x22dae57424c724d4ull, 0x7aa829fb45c98951ull},
+    {0x20f9f35b98a59030ull, 0x2923be0334af9725ull, 0x2b737bdff4fa2692ull, 0x0208ffa011fdb210ull},
+    {0x70a38779ef6e8fcaull, 0x6b8f35f6286ba1ffull, 0xdf914b7e3a041f39ull, 0xbb45d9892022e65dull},
+};
+// The 4-ary node over the four digests P1C_PERM_OUT[0][4c..4c+4].
+static const uint64_t P1C_NODE4[4] = {0x9aecf43b4bf5d329ull, 0x02c7d6eb8e9cc56aull, 0xecd69de566b23205ull, 0xf109da81efb2a483ull};
+static const uint64_t P1C_GRIND_HEAD[8] = {0xc77181c9446adee7ull, 0x6a27860d2b6b4ce0ull, 0x339336e869b457d7ull, 0x4831192e98131bc8ull, 0x57c664111dfafb33ull, 0x1724183da9b71e4full, 0xada78e17c78069deull, 0xaa346d67efce0e64ull};

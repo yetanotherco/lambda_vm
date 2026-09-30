@@ -40,6 +40,32 @@ fn fp(v: &[u64]) -> Vec<Fp> {
     v.iter().map(|x| Fp::from(*x)).collect()
 }
 
+/// The host reference for variant `v`: the circulant instance, or the Cauchy
+/// alternative for `c1`.
+fn host_permute(v: usize) -> fn([Fp; 16]) -> [Fp; 16] {
+    if p1w16::is_cauchy(v) {
+        host::permute_cauchy
+    } else {
+        host::permute
+    }
+}
+
+fn host_leaf(v: usize) -> fn(&[Fp]) -> host::Digest {
+    if p1w16::is_cauchy(v) {
+        host::sponge_leaf_cauchy
+    } else {
+        host::sponge_leaf
+    }
+}
+
+fn host_node(v: usize) -> fn(&[host::Digest; 4]) -> host::Digest {
+    if p1w16::is_cauchy(v) {
+        host::compress4_cauchy
+    } else {
+        host::compress4
+    }
+}
+
 #[test]
 fn the_device_permutation_matches_the_host_reference() {
     let mut rng = ChaCha8Rng::seed_from_u64(1);
@@ -51,7 +77,7 @@ fn the_device_permutation_matches_the_host_reference() {
             let s: [Fp; 16] = core::array::from_fn(|k| Fp::from(chunk[k]));
             assert_eq!(
                 got[i * 16..(i + 1) * 16],
-                canon(&host::permute(s))[..],
+                canon(&host_permute(v)(s))[..],
                 "variant {v} state {i}"
             );
         }
@@ -83,7 +109,7 @@ fn the_device_coset_leaves_match_the_host_sponge() {
                         felts.push(cw[at]);
                     }
                 }
-                let want = canon(&host::sponge_leaf(&fp(&felts)));
+                let want = canon(&host_leaf(v)(&fp(&felts)));
                 assert_eq!(
                     got[4 * j as usize..4 * j as usize + 4],
                     want[..],
@@ -107,7 +133,7 @@ fn the_device_4ary_level_matches_the_host_node() {
                 core::array::from_fn(|q| core::array::from_fn(|l| Fp::from(c[4 * q + l])));
             assert_eq!(
                 got[4 * i..4 * i + 4],
-                canon(&host::compress4(&kids))[..],
+                canon(&host_node(v)(&kids))[..],
                 "variant {v} node {i}"
             );
         }
@@ -120,14 +146,15 @@ fn the_device_4ary_level_matches_the_host_node() {
 fn the_device_grind_returns_the_smallest_valid_nonce() {
     let inner = [11u64, 22, 33, 44];
     let limit = 1u64 << (64 - 12);
-    let head = |nonce: u64| {
-        let felts = fp(&[inner[0], inner[1], inner[2], inner[3], nonce]);
-        host::sponge_leaf(&felts)[0].canonical()
-    };
-    let want = (0..1u64 << 20)
-        .find(|&n| head(n) < limit)
-        .expect("a hit below 2^20");
     for v in 0..p1w16::VARIANTS.len() {
+        let leaf = host_leaf(v);
+        let head = |nonce: u64| {
+            let felts = fp(&[inner[0], inner[1], inner[2], inner[3], nonce]);
+            leaf(&felts)[0].canonical()
+        };
+        let want = (0..1u64 << 20)
+            .find(|&n| head(n) < limit)
+            .expect("a hit below 2^20");
         for grid in [1u32, 1024] {
             let got = p1w16::grind(v, &inner, limit, 1 << 20, grid).expect("device");
             assert_eq!(got, Some(want), "variant {v} grid {grid}");

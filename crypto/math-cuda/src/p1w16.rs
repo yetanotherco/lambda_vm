@@ -26,8 +26,15 @@ pub const RATE: usize = 12;
 pub const DIGEST: usize = 4;
 
 /// The kernel variants the cubin instantiates, in `p1w16.cu`'s order: the two
-/// multiply variants and the Fourier-domain partial rounds.
-pub const VARIANTS: [&str; 3] = ["v0", "v1", "v2"];
+/// multiply variants and the Fourier-domain partial rounds of the circulant
+/// instance, then `c1`, the Grain Cauchy MDS alternative.
+pub const VARIANTS: [&str; 4] = ["v0", "v1", "v2", "c1"];
+
+/// Is variant `v` the Cauchy alternative (a different permutation, checked
+/// against `permute_cauchy` on the host)?
+pub fn is_cauchy(v: usize) -> bool {
+    VARIANTS[v].starts_with('c')
+}
 
 /// One variant's kernels.
 pub struct Kernels {
@@ -350,4 +357,23 @@ pub fn microbench(log_len: u32, reps: u32, grind_count: u64) -> Result<Vec<Strin
         }
     }
     Ok(lines)
+}
+
+/// A device buffer of `len` distinct canonical felts (the bench fill), for
+/// benches outside this crate that need a large random device matrix without
+/// a host upload.
+pub fn random_device_matrix(len: usize) -> Result<cudarc::driver::CudaSlice<u64>> {
+    let m = module()?;
+    let stream = backend()?.next_stream();
+    let mut out = stream.alloc_zeros::<u64>(len)?;
+    let n = len as u64;
+    unsafe {
+        stream
+            .launch_builder(&m.fill)
+            .arg(&mut out)
+            .arg(&n)
+            .launch(cfg(n))?;
+    }
+    stream.synchronize()?;
+    Ok(out)
 }

@@ -33,7 +33,8 @@
 //!   2020/500 (no invariant subspace trails) in Plonky3's implementation.
 //!   ⚠ It is NOT the paper's Grain-derived Cauchy matrix; see the lane note
 //!   for why that choice is open (eprint 2026/1760 attacks an MDS chosen after
-//!   the constants).
+//!   the constants). The Cauchy alternative is here too ([`permute_cauchy`],
+//!   same rounds and constants), so both options can be measured.
 //!
 //! # Lane conventions (the measurement's, not a frozen format)
 //!
@@ -52,7 +53,7 @@ mod tests;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 
-use constants::{MDS_CIRC_ROW, ROUND_CONSTANTS};
+use constants::{CAUCHY_MDS, MDS_CIRC_ROW, ROUND_CONSTANTS};
 
 /// A Goldilocks field element.
 pub type Fp = FieldElement<GoldilocksField>;
@@ -133,14 +134,30 @@ pub fn mds(state: &[Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
     out
 }
 
+/// The dense product by the Grain Cauchy matrix [`CAUCHY_MDS`] — the MDS
+/// alternative (full-field entries, so one field multiplication per entry).
+pub fn mds_cauchy(state: &[Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
+    let mut out = [Fp::zero(); STATE_FELTS];
+    for (row, o) in CAUCHY_MDS.iter().zip(out.iter_mut()) {
+        for (c, s) in row.iter().zip(state) {
+            *o += Fp::from(*c) * s;
+        }
+    }
+    out
+}
+
+/// A linear layer: [`mds`] or [`mds_cauchy`].
+type LinearLayer = fn(&[Fp; STATE_FELTS]) -> [Fp; STATE_FELTS];
+
 /// One round: add constants, S-box (every lane in a full round, lane 0 in a
 /// partial one), then the MDS.
 pub fn round(state: &[Fp; STATE_FELTS], r: usize) -> [Fp; STATE_FELTS] {
-    round_with(&ROUND_CONSTANTS, state, r)
+    round_with(&ROUND_CONSTANTS, mds, state, r)
 }
 
 fn round_with(
     rc: &[[u64; STATE_FELTS]; NUM_ROUNDS],
+    linear: LinearLayer,
     state: &[Fp; STATE_FELTS],
     r: usize,
 ) -> [Fp; STATE_FELTS] {
@@ -155,7 +172,7 @@ fn round_with(
     } else {
         s[0] = sbox(&s[0]);
     }
-    mds(&s)
+    linear(&s)
 }
 
 /// ★ The permutation: 4 full, 22 partial, 4 full rounds.
@@ -163,23 +180,40 @@ fn round_with(
 /// The textbook form (a dense round each time), not Plonky3's sparse
 /// partial-round decomposition — the known answers are reproduced by both.
 pub fn permute(state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
-    permute_with(&ROUND_CONSTANTS, state)
+    permute_with(&ROUND_CONSTANTS, mds, state)
 }
 
-/// [`permute`] over a given constant table — the tests' mutation seam.
+/// The same permutation with the Grain Cauchy MDS — the alternative instance
+/// (same rounds, same round constants).
+pub fn permute_cauchy(state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
+    permute_with(&ROUND_CONSTANTS, mds_cauchy, state)
+}
+
+/// A permutation over a given constant table and linear layer — the tests'
+/// mutation seam.
 fn permute_with(
     rc: &[[u64; STATE_FELTS]; NUM_ROUNDS],
+    linear: LinearLayer,
     state: [Fp; STATE_FELTS],
 ) -> [Fp; STATE_FELTS] {
     let mut s = state;
     for r in 0..NUM_ROUNDS {
-        s = round_with(rc, &s, r);
+        s = round_with(rc, linear, &s, r);
     }
     s
 }
 
 /// The rate-12 overwrite duplex over a felt stream (a Merkle leaf).
 pub fn sponge_leaf(felts: &[Fp]) -> Digest {
+    sponge_leaf_with(felts, permute)
+}
+
+/// [`sponge_leaf`] under [`permute_cauchy`].
+pub fn sponge_leaf_cauchy(felts: &[Fp]) -> Digest {
+    sponge_leaf_with(felts, permute_cauchy)
+}
+
+fn sponge_leaf_with(felts: &[Fp], perm: fn([Fp; STATE_FELTS]) -> [Fp; STATE_FELTS]) -> Digest {
     let mut state = [Fp::zero(); STATE_FELTS];
     state[RATE_FELTS + CAPACITY_PAD_LANE] = Fp::from((felts.len() % RATE_FELTS) as u64);
     state[RATE_FELTS + CAPACITY_DOMAIN_LANE] = Fp::from(DOMAIN_LEAF);
@@ -187,17 +221,29 @@ pub fn sponge_leaf(felts: &[Fp]) -> Digest {
         for (lane, slot) in state.iter_mut().take(RATE_FELTS).enumerate() {
             *slot = block.get(lane).copied().unwrap_or_else(Fp::zero);
         }
-        state = permute(state);
+        state = perm(state);
     }
     [state[0], state[1], state[2], state[3]]
 }
 
 /// A 4-ary Merkle node: permute the four children, truncate to four felts.
 pub fn compress4(children: &[Digest; ARITY]) -> Digest {
+    compress4_with(children, permute)
+}
+
+/// [`compress4`] under [`permute_cauchy`].
+pub fn compress4_cauchy(children: &[Digest; ARITY]) -> Digest {
+    compress4_with(children, permute_cauchy)
+}
+
+fn compress4_with(
+    children: &[Digest; ARITY],
+    perm: fn([Fp; STATE_FELTS]) -> [Fp; STATE_FELTS],
+) -> Digest {
     let mut state = [Fp::zero(); STATE_FELTS];
     for (c, child) in children.iter().enumerate() {
         state[c * DIGEST_FELTS..(c + 1) * DIGEST_FELTS].copy_from_slice(child);
     }
-    let out = permute(state);
+    let out = perm(state);
     [out[0], out[1], out[2], out[3]]
 }

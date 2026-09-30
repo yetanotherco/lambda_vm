@@ -303,6 +303,17 @@ def emit_rust(out_dir):
             lines.append(f"        {hx(v)},")
         lines.append("    ],")
     lines.append("];")
+    cm = next(cauchy_candidates(t, rf, rp))
+    lines += [
+        "",
+        "/// The paper's MDS alternative: the Grain Cauchy matrix `M[i][j] = 1/(x_i + y_j)`, drawn from",
+        "/// the same Grain stream after the round constants (the reference procedure; its first",
+        "/// candidate passes the subspace-trail checks, and Plonky3's generator picks the same matrix).",
+        "pub const CAUCHY_MDS: [[u64; 16]; 16] = [",
+    ]
+    for row in cm:
+        lines.append("    [" + ", ".join(hx(v) for v in row) + "],")
+    lines.append("];")
     open(f"{out_dir}/constants.rs", "w").write("\n".join(lines) + "\n")
 
     k = [
@@ -338,6 +349,31 @@ def emit_rust(out_dir):
     children = permute(list(range(16)), rc, mds, rf, rp)
     node = compress4_16([children[4 * c:4 * c + 4] for c in range(4)], rc, mds)
     k.append("pub const NODE4_VECTOR: [u64; 4] = [" + ", ".join(hx(v) for v in node) + "];")
+    # The same vectors under the Cauchy MDS (the instance's alternative), from this reference;
+    # Plonky3's generator's permutation reproduces the four permutation vectors.
+    cm = next(cauchy_candidates(t, rf, rp))
+    k.append("")
+    k.append("/// `(input, permute_cauchy(input))` for the inputs of [`PERMUTATION_VECTORS`].")
+    k.append("pub const CAUCHY_PERMUTATION_VECTORS: [([u64; 16], [u64; 16]); 4] = [")
+    for x in kat_inputs(t):
+        y = permute(x, rc, cm, rf, rp)
+        k.append("    (")
+        k.append("        [" + ", ".join(hx(v) for v in x) + "],")
+        k.append("        [" + ", ".join(hx(v) for v in y) + "],")
+        k.append("    ),")
+    k.append("];")
+    k.append("")
+    k.append("/// [`LEAF_VECTORS`]' leaves under the Cauchy MDS.")
+    k.append(f"pub const CAUCHY_LEAF_VECTORS: [(usize, [u64; 4]); {len(leaves)}] = [")
+    for f in leaves:
+        d = sponge_leaf16(f, rc, cm)
+        k.append(f"    ({len(f)}, [" + ", ".join(hx(v) for v in d) + "]),")
+    k.append("];")
+    children_c = permute(list(range(16)), rc, cm, rf, rp)
+    node_c = compress4_16([children_c[4 * c:4 * c + 4] for c in range(4)], rc, cm)
+    k.append("")
+    k.append("/// The 4-ary node over `CAUCHY_PERMUTATION_VECTORS[0].1`'s four digests.")
+    k.append("pub const CAUCHY_NODE4_VECTOR: [u64; 4] = [" + ", ".join(hx(v) for v in node_c) + "];")
     open(f"{out_dir}/kat.rs", "w").write("\n".join(k) + "\n")
 
 
@@ -379,6 +415,36 @@ def emit_cuda(kernel_dir, kat_dir):
     for k in range(rp):
         c.append("    {" + ", ".join(hx(v) for v in pf.dft(rc[rf // 2 + k], pf.OMEGA)) + "},")
     c.append("};")
+    # The Cauchy alternative: the dense matrix for the full rounds, and the paper's App. B sparse
+    # partial rounds derived for it (p1_sparse.py: constant folding + block-diagonal/sparse factors).
+    import p1_sparse as psp
+    cm = next(cauchy_candidates(t, rf, rp))
+    scal, carry, sparse, b0 = psp.derive(rc, cm)
+    c.append("// The Grain Cauchy MDS (the instance's alternative, `CAUCHY_MDS` on the host) and its sparse")
+    c.append("// partial rounds (`scripts/poseidon1/p1_sparse.py`, the paper's Appendix B): CAUCHY_B0 acts on")
+    c.append("// lanes 1..16 once after the last initial full round; partial round k adds CAUCHY_C0[k] to lane 0,")
+    c.append("// S-boxes it, then new0 = N00[k]·x0 + W[k]·x[1..], new_i = V[k][i-1]·x0 + x_i; the folded")
+    c.append("// carry joins the first terminal round's constants (CAUCHY_RC_T0).")
+    c.append("__device__ constexpr uint64_t CAUCHY_M[16][16] = {")
+    for row in cm:
+        c.append("    {" + ", ".join(hx(v) for v in row) + "},")
+    c.append("};")
+    c.append("__device__ constexpr uint64_t CAUCHY_B0[15][15] = {")
+    for i in range(1, 16):
+        c.append("    {" + ", ".join(hx(b0[i][j]) for j in range(1, 16)) + "},")
+    c.append("};")
+    c.append(f"__device__ __constant__ uint64_t CAUCHY_C0[{rp}] = {{" + ", ".join(hx(v) for v in scal) + "};")
+    c.append(f"__device__ __constant__ uint64_t CAUCHY_N00[{rp}] = {{" + ", ".join(hx(sp[0]) for sp in sparse) + "};")
+    c.append(f"__device__ __constant__ uint64_t CAUCHY_W[{rp}][15] = {{")
+    for sp in sparse:
+        c.append("    {" + ", ".join(hx(v) for v in sp[1]) + "},")
+    c.append("};")
+    c.append(f"__device__ __constant__ uint64_t CAUCHY_V[{rp}][15] = {{")
+    for sp in sparse:
+        c.append("    {" + ", ".join(hx(v) for v in sp[2]) + "},")
+    c.append("};")
+    t0 = [(a + b) % P for a, b in zip(rc[rf // 2 + rp], carry)]
+    c.append("__device__ constexpr uint64_t CAUCHY_RC_T0[16] = {" + ", ".join(hx(v) for v in t0) + "};")
     c.append("}  // namespace p1w16")
     open(f"{kernel_dir}/p1w16_constants.cuh", "w").write("\n".join(c) + "\n")
 
@@ -415,6 +481,22 @@ def emit_cuda(kernel_dir, kat_dir):
     k.append("static const uint64_t P1_GRIND_INNER[4] = {1, 2, 3, 4};")
     k.append("static const uint64_t P1_GRIND_HEAD[8] = {" +
              ", ".join(hx(sponge_leaf16(inner + [n], rc, mds)[0]) for n in range(8)) + "};")
+    cm = next(cauchy_candidates(t, rf, rp))
+    k.append("// The same vectors under the Grain Cauchy MDS (`CAUCHY_*` on the host).")
+    k.append("static const uint64_t P1C_PERM_OUT[4][16] = {")
+    for x in ins:
+        k.append("    {" + ", ".join(hx(v) for v in permute(x, rc, cm, rf, rp)) + "},")
+    k.append("};")
+    k.append(f"static const uint64_t P1C_LEAF_DIGEST[{len(leaves)}][4] = {{")
+    for f in leaves:
+        k.append("    {" + ", ".join(hx(v) for v in sponge_leaf16(f, rc, cm)) + "},")
+    k.append("};")
+    ch_c = permute(list(range(16)), rc, cm, rf, rp)
+    node_c = compress4_16([ch_c[4 * i:4 * i + 4] for i in range(4)], rc, cm)
+    k.append("// The 4-ary node over the four digests P1C_PERM_OUT[0][4c..4c+4].")
+    k.append("static const uint64_t P1C_NODE4[4] = {" + ", ".join(hx(v) for v in node_c) + "};")
+    k.append("static const uint64_t P1C_GRIND_HEAD[8] = {" +
+             ", ".join(hx(sponge_leaf16(inner + [n], rc, cm)[0]) for n in range(8)) + "};")
     open(f"{kat_dir}/p1w16_kat_vectors.h", "w").write("\n".join(k) + "\n")
 
 

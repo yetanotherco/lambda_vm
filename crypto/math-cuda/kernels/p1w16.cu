@@ -39,7 +39,9 @@
 //   V = 1  products and squares through the 32-bit-limb multiply (`rpx.cu`'s
 //          `RPX_V_LIMB_MUL | RPX_V_LIMB_SQR`, reproduced below);
 //   V = 2  V = 1's multiply with the partial rounds in the Fourier domain of
-//          the circulant MDS (`permute_fourier`).
+//          the circulant MDS (`permute_fourier`);
+//   V = 3  the Grain Cauchy MDS alternative (`permute_cauchy`: dense full
+//          rounds, the paper's sparse partial rounds, V = 1's multiply).
 // Every variant computes the same field values and `permute` canonicalises.
 
 #include <cstdint>
@@ -271,13 +273,88 @@ __device__ __forceinline__ void permute_fourier(uint64_t s[WIDTH]) {
     for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 
-// ★ The permutation. V = 2 takes the Fourier-domain partial rounds above;
-// otherwise one rolled round loop with a warp-uniform branch on the round
-// kind, so the MDS body is emitted once.
+// A dot product of full-field constants with raw state words, accumulated
+// as a 132-bit sum (lo, hi, top) and reduced once: 2^128 ≡ −2^32 (mod p),
+// because 2^96 ≡ −1. `N` terms, the constants at compile-time indices.
+template <int N>
+__device__ __forceinline__ uint64_t dot_lazy(const uint64_t *c, const uint64_t *x) {
+    uint64_t lo = 0, hi = 0, top = 0;
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const uint64_t pl = c[j] * x[j];
+        const uint64_t ph = __umul64hi(c[j], x[j]);
+        lo += pl;
+        const uint64_t c1 = (lo < pl) ? 1ull : 0ull;
+        const uint64_t h2 = hi + ph;
+        uint64_t c2 = (h2 < hi) ? 1ull : 0ull;
+        hi = h2 + c1;
+        c2 += (hi < h2) ? 1ull : 0ull;
+        top += c2;
+    }
+    return goldilocks::sub(goldilocks::reduce128(lo, hi), top << 32);
+}
+
+// The dense product by the Grain Cauchy matrix — the MDS alternative. 256
+// full products, where the circulant needs 512 small-constant MACs.
+__device__ __forceinline__ void mds_cauchy(uint64_t s[WIDTH]) {
+    uint64_t out[WIDTH];
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) out[i] = dot_lazy<WIDTH>(CAUCHY_M[i], s);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = out[i];
+}
+
+template <int V>
+__device__ __forceinline__ void full_round_cauchy(uint64_t s[WIDTH], const uint64_t *rc) {
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = sbox<V>(goldilocks::add(s[i], rc[i]));
+    mds_cauchy(s);
+}
+
+// ★ The Cauchy alternative, with the paper's Appendix B sparse partial rounds
+// (`scripts/poseidon1/p1_sparse.py`, checked equal to the textbook form there
+// for this matrix): dense full rounds; CAUCHY_B0 on lanes 1..16 once; per
+// partial round x0 = (s0 + C0[k])^7, new0 = N00[k]·x0 + W[k]·s[1..],
+// s_i += V[k][i-1]·x0; the folded carry rides in CAUCHY_RC_T0. The Fourier
+// trick does not apply: a Cauchy matrix is not circulant.
+template <int V>
+__device__ __forceinline__ void permute_cauchy(uint64_t s[WIDTH]) {
+#pragma unroll 1
+    for (int r = 0; r < HALF_FULL; ++r) full_round_cauchy<V>(s, RC[r]);
+    {
+        uint64_t t[WIDTH - 1];
+#pragma unroll
+        for (int i = 0; i < WIDTH - 1; ++i) t[i] = dot_lazy<WIDTH - 1>(CAUCHY_B0[i], s + 1);
+#pragma unroll
+        for (int i = 0; i < WIDTH - 1; ++i) s[i + 1] = t[i];
+    }
+#pragma unroll 1
+    for (int k = 0; k < PARTIAL; ++k) {
+        const uint64_t x0 = sbox<V>(goldilocks::add(s[0], CAUCHY_C0[k]));
+        const uint64_t new0 =
+            goldilocks::add(fmul<V>(CAUCHY_N00[k], x0), dot_lazy<WIDTH - 1>(CAUCHY_W[k], s + 1));
+#pragma unroll
+        for (int i = 1; i < WIDTH; ++i) s[i] = goldilocks::add(s[i], fmul<V>(CAUCHY_V[k][i - 1], x0));
+        s[0] = new0;
+    }
+    full_round_cauchy<V>(s, CAUCHY_RC_T0);
+#pragma unroll 1
+    for (int r = HALF_FULL + PARTIAL + 1; r < ROUNDS; ++r) full_round_cauchy<V>(s, RC[r]);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
+}
+
+// ★ The permutation. V = 2 takes the Fourier-domain partial rounds above,
+// V = 3 the Cauchy alternative; otherwise one rolled round loop with a
+// warp-uniform branch on the round kind, so the MDS body is emitted once.
 template <int V>
 __device__ __forceinline__ void permute(uint64_t s[WIDTH]) {
     if constexpr (V == 2) {
         permute_fourier<V>(s);
+        return;
+    }
+    if constexpr (V == 3) {
+        permute_cauchy<V>(s);
         return;
     }
 #pragma unroll 1
@@ -458,14 +535,16 @@ __device__ __forceinline__ void grind_search(const uint64_t *inner, uint64_t lim
         grind_search<V>(inner, limit, base, count, result);                                        \
     }
 
-// The two multiply variants and the Fourier-domain partial rounds
-// (`src/p1w16.rs` VARIANTS lists the same names in the same order). FAST job
+// The two multiply variants, the Fourier-domain partial rounds, and the
+// Cauchy alternative (`src/p1w16.rs` VARIANTS lists the same names in the
+// same order). FAST job
 // 281 measured the register caps (4/5/6 blocks of 128) SLOWER than uncapped
 // (+6 %, +63 %, ×4.6), so no capped variant is instantiated; `P1W16_LB` stays
 // for the next sweep.
 P1W16_ENTRIES(v0, 0, )
 P1W16_ENTRIES(v1, 1, )
 P1W16_ENTRIES(v2, 2, )
+P1W16_ENTRIES(c1, 3, )
 
 // Bench fill: `out[i]` = a SplitMix64 of `i`, canonicalised — a codeword the
 // microbench hashes without a host upload.

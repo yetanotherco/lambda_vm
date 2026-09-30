@@ -1,7 +1,8 @@
 // Known-answer tests for `kernels/p1w16.cu` (the D-HASH stage-1 Poseidon1
 // width-16 measurement kernels), run on the HOST through the shim: no GPU, no
 // nvcc. Every check runs at every variant (the two multiplies and the
-// Fourier-domain partial rounds).
+// Fourier-domain partial rounds against the circulant's vectors; the Cauchy
+// alternative against its own).
 //
 // The vectors (`p1w16_kat_vectors.h`) come from the Python reference
 // (`scripts/poseidon1/p1_params.py cuda`); the permutation vectors are the ones
@@ -29,20 +30,31 @@ static void check(bool ok, const char *what, int v) {
     }
 }
 
+// One instance's expected answers: the circulant's (P1_*) or the Cauchy
+// alternative's (P1C_*), over the same inputs.
+struct Vectors {
+    const uint64_t (*perm_out)[16];
+    const uint64_t (*leaf_digest)[4];
+    const uint64_t *node4;
+    const uint64_t *grind_head;
+};
+static const Vectors CIRCULANT = {P1_PERM_OUT, P1_LEAF_DIGEST, P1_NODE4, P1_GRIND_HEAD};
+static const Vectors CAUCHY = {P1C_PERM_OUT, P1C_LEAF_DIGEST, P1C_NODE4, P1C_GRIND_HEAD};
+
 template <int V>
-static void run() {
+static void run(const Vectors &want) {
     // Permutation: the four vectors through the probe kernel.
     uint64_t out[4 * 16];
     uint64_t in[4 * 16];
     std::memcpy(in, P1_PERM_IN, sizeof(in));
     CUDA_HOST_FOR_EACH_THREAD(t, 4) permute_probe<V>(in, 4, out);
-    check(std::memcmp(out, P1_PERM_OUT, sizeof(out)) == 0, "permutation vectors", V);
+    check(std::memcmp(out, want.perm_out, sizeof(out)) == 0, "permutation vectors", V);
 
     // Mutation control: one flipped input bit must move the output.
     in[15] ^= 1;
     uint64_t out2[4 * 16];
     CUDA_HOST_FOR_EACH_THREAD(t, 4) permute_probe<V>(in, 4, out2);
-    check(std::memcmp(out2, P1_PERM_OUT, 16 * 8) != 0, "a flipped input moves the output", V);
+    check(std::memcmp(out2, want.perm_out, 16 * 8) != 0, "a flipped input moves the output", V);
 
     // Leaves: a one-leaf coset of n felts is the leaf of those n felts.
     for (int k = 0; k < (int)(sizeof(P1_LEAF_N) / sizeof(P1_LEAF_N[0])); ++k) {
@@ -53,7 +65,7 @@ static void run() {
         CUDA_HOST_FOR_EACH_THREAD(t, 1) leaves_base_coset<V>(felts, 1, n, d);
         char what[64];
         std::snprintf(what, sizeof(what), "leaf of %llu felts", (unsigned long long)n);
-        check(std::memcmp(d, P1_LEAF_DIGEST[k], 32) == 0, what, V);
+        check(std::memcmp(d, want.leaf_digest[k], 32) == 0, what, V);
     }
 
     // Coset geometry: 4 leaves of block 16 over a strided codeword equal the
@@ -90,21 +102,21 @@ static void run() {
         check(ok, "ext3 coset stride", V);
     }
 
-    // The 4-ary node over the four digests P1_PERM_OUT[0][4c..4c+4].
+    // The 4-ary node over the four digests perm_out[0][4c..4c+4].
     {
         uint64_t parent[4];
-        CUDA_HOST_FOR_EACH_THREAD(t, 1) merkle_level4<V>(P1_PERM_OUT[0], parent, 1);
-        check(std::memcmp(parent, P1_NODE4, 32) == 0, "4-ary node", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, 1) merkle_level4<V>(want.perm_out[0], parent, 1);
+        check(std::memcmp(parent, want.node4, 32) == 0, "4-ary node", V);
     }
 
     // Grind: with limit = head(k) + 1 for the k-th vector, the search over
     // [0, 8) returns the smallest nonce whose head is below it.
     for (int k = 0; k < 8; ++k) {
-        const uint64_t limit = P1_GRIND_HEAD[k] + 1;
-        uint64_t want = ~0ull;
+        const uint64_t limit = want.grind_head[k] + 1;
+        uint64_t first = ~0ull;
         for (int n = 0; n < 8; ++n)
-            if (P1_GRIND_HEAD[n] < limit) {
-                want = n;
+            if (want.grind_head[n] < limit) {
+                first = n;
                 break;
             }
         unsigned long long result = ~0ull;
@@ -112,16 +124,17 @@ static void run() {
         grind_search<V>(P1_GRIND_INNER, limit, 0, 8, &result);
         char what[64];
         std::snprintf(what, sizeof(what), "grind, limit head[%d]+1", k);
-        check(result == want, what, V);
+        check(result == first, what, V);
     }
 }
 
 int main() {
-    run<0>();
-    run<1>();
-    run<2>();
+    run<0>(CIRCULANT);
+    run<1>(CIRCULANT);
+    run<2>(CIRCULANT);
+    run<3>(CAUCHY);
     if (g_fail == 0) {
-        std::printf("p1w16 host KAT: all checks pass (variants 0, 1 and 2)\n");
+        std::printf("p1w16 host KAT: all checks pass (circulant v0, v1, v2; Cauchy c1)\n");
         return 0;
     }
     std::printf("p1w16 host KAT: %d FAILED\n", g_fail);

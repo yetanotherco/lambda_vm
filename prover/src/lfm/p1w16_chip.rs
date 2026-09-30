@@ -36,8 +36,8 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 use crypto::hash::poseidon1_w16::{
-    self as p1, DOMAIN_LEAF, NUM_ROUNDS, RATE_FELTS, STATE_FELTS, constants::MDS_CIRC_ROW,
-    constants::ROUND_CONSTANTS, is_full_round,
+    self as p1, DOMAIN_LEAF, NUM_ROUNDS, RATE_FELTS, STATE_FELTS, constants::CAUCHY_MDS,
+    constants::MDS_CIRC_ROW, constants::ROUND_CONSTANTS, is_full_round,
 };
 use math::field::traits::IsPrimeField;
 
@@ -183,10 +183,39 @@ pub enum Mode {
     Leaf,
 }
 
-/// A row for `input` under `mode`, witnessed in `layout`. Lanes the mode takes
-/// from its capacity are overwritten; the filler walks the rounds itself
-/// rather than delegating to [`p1::permute`], and the tests pin `OUT` to it.
-pub fn fill_row(layout: Layout, mode: Mode, input: [FE; STATE_FELTS]) -> Vec<FE> {
+/// Which MDS the instance uses: Plonky3's small circulant (the measured
+/// default) or the paper's Grain Cauchy matrix (the alternative left open for
+/// the MDS decision). The layouts are the same — the linear layer costs no
+/// columns — so only the constants in the constraints differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mds {
+    Circulant,
+    Cauchy,
+}
+
+impl Mds {
+    /// `M[o][i]`.
+    pub const fn entry(self, o: usize, i: usize) -> u64 {
+        match self {
+            Mds::Circulant => MDS_CIRC_ROW[(i + STATE_FELTS - o) % STATE_FELTS],
+            Mds::Cauchy => CAUCHY_MDS[o][i],
+        }
+    }
+
+    /// The host reference's linear layer for this MDS.
+    fn apply(self, s: &[FE; STATE_FELTS]) -> [FE; STATE_FELTS] {
+        match self {
+            Mds::Circulant => p1::mds(s),
+            Mds::Cauchy => p1::mds_cauchy(s),
+        }
+    }
+}
+
+/// A row for `input` under `mode`, witnessed in `layout` for the instance with
+/// `mds`. Lanes the mode takes from its capacity are overwritten; the filler
+/// walks the rounds itself rather than delegating to [`p1::permute`], and the
+/// tests pin `OUT` to it.
+pub fn fill_row(layout: Layout, mds: Mds, mode: Mode, input: [FE; STATE_FELTS]) -> Vec<FE> {
     let mut row = vec![FE::zero(); layout.num_columns()];
     let sel = match mode {
         Mode::Node => MODE_C,
@@ -236,7 +265,7 @@ pub fn fill_row(layout: Layout, mode: Mode, input: [FE; STATE_FELTS]) -> Vec<FE>
             }
             f[lane] = x7;
         }
-        s = p1::mds(&f);
+        s = mds.apply(&f);
         if layout == Layout::Rule && r + 1 < NUM_ROUNDS {
             for j in 0..STATE_FELTS {
                 row[layout.out(r, j)] = s[j];
@@ -291,26 +320,24 @@ fn canon(x: &FE) -> u64 {
     GoldilocksField::canonical(x.value())
 }
 
-/// The MDS over affine forms: `out_o = Σ_i row[(i − o) mod 16]·f_i`.
-fn mds_affine(f: &[Affine]) -> Vec<Affine> {
+/// The MDS over affine forms: `out_o = Σ_i M[o][i]·f_i`.
+fn mds_affine(mds: Mds, f: &[Affine]) -> Vec<Affine> {
     let width = f[0].col.len();
     (0..STATE_FELTS)
         .map(|o| {
             let mut acc = Affine::zero(width);
             for (i, fi) in f.iter().enumerate() {
-                acc.add_scaled(
-                    fi,
-                    FE::from(MDS_CIRC_ROW[(i + STATE_FELTS - o) % STATE_FELTS]),
-                );
+                acc.add_scaled(fi, FE::from(mds.entry(o, i)));
             }
             acc
         })
         .collect()
 }
 
-/// The width-16 constraint set under a layout.
+/// The width-16 constraint set under a layout, for the instance with `mds`.
 pub struct P1W16Constraints {
     pub layout: Layout,
+    pub mds: Mds,
 }
 
 impl ConstraintSet<F, E> for P1W16Constraints {
@@ -394,7 +421,7 @@ impl ConstraintSet<F, E> for P1W16Constraints {
                     for o in 0..STATE_FELTS {
                         let mut acc = b.zero();
                         for (i, fi) in f.iter().enumerate() {
-                            let c = b.const_base(MDS_CIRC_ROW[(i + STATE_FELTS - o) % STATE_FELTS]);
+                            let c = b.const_base(self.mds.entry(o, i));
                             let term = if i < sboxed_lanes(r) {
                                 let x3 = b.main(0, layout.w2(r, i));
                                 x3.clone() * x3 * a[i].expr(b, &m)
@@ -412,7 +439,7 @@ impl ConstraintSet<F, E> for P1W16Constraints {
                         .collect();
                 }
                 Layout::Compact => {
-                    state = mds_affine(&f);
+                    state = mds_affine(self.mds, &f);
                 }
             }
         }
