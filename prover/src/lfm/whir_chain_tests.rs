@@ -2422,6 +2422,45 @@ fn a_query_only_chain_checks_its_query_nonce_in_every_round_on_both_sides() {
     }
 }
 
+/// ★ `LAMBDA_VM_ZF_WHIR_GRIND_BITS=18`'s trade, at a test width: the grind
+/// bits and Q are verifier constants. A chain ground at fewer bits and opened
+/// at more queries executes on the machine built for its own config, and both
+/// the host and the machine refuse it under a stricter grind at the same Q; the
+/// host refuses it under the smaller Q too.
+#[test]
+fn a_chain_ground_at_fewer_bits_is_refused_by_the_stricter_verifier() {
+    for num_vars in [6usize, 9] {
+        let cheap = query_only_config(4, 2);
+        let f = fixture_with(&cheap, num_vars);
+        assert!(
+            host_accepts(&f, &cheap, &f.proof),
+            "S={num_vars}: the control"
+        );
+        assert!(
+            machine_accepts(&chain_program(&f.shape), chain_arena(&f, &f.proof)),
+            "S={num_vars}: the honest proof must execute"
+        );
+
+        let strict = query_only_config(4, 12);
+        let strict_shape = ChainShape::new(&strict, num_vars);
+        assert!(
+            !host_accepts(&f, &strict, &f.proof),
+            "S={num_vars}: the host must refuse a 2-bit proof under 12 bits"
+        );
+        assert!(
+            !machine_accepts(
+                &chain_program(&strict_shape),
+                chain_arena_as(&strict_shape, &f, &f.proof)
+            ),
+            "S={num_vars}: the machine must refuse a 2-bit proof under 12 bits"
+        );
+        assert!(
+            !host_accepts(&f, &query_only_config(3, 2), &f.proof),
+            "S={num_vars}: the host must refuse a proof opened at a Q it does not expect"
+        );
+    }
+}
+
 /// ★ An unspent nonce has no word in the arena. Under `Spent`, a set folding or
 /// out-of-domain nonce, in any round and the last round's out-of-domain slot
 /// included, is refused by the host and cannot reach the machine: the arena
