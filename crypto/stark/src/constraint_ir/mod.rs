@@ -19,6 +19,8 @@
 //! - [`device`]: the concrete-Goldilocks flat lowering ([`DeviceProgram`]) for
 //!   the GPU kernel, plus a CPU walker over that flat blob (the pre-GPU parity
 //!   oracle).
+//! - [`codegen`]: straight-line CUDA for a lowered program, the compiled twin
+//!   of the composition interpreter.
 //! - [`artifact`]: the build-time serializable bundle ([`ConstraintArtifact`])
 //!   — the flat program PLUS the zerofier metadata capture discards and the
 //!   AIR's shape scalars, which is what "constraints as data" actually needs.
@@ -31,6 +33,7 @@
 
 pub mod artifact;
 pub mod builder;
+pub mod codegen;
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod gpu_interp;

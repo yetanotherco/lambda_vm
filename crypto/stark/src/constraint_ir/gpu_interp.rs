@@ -194,7 +194,79 @@ struct LoweredProgram {
     nodes: Vec<u64>,
     ext_consts: Vec<u64>,
     roots: Vec<u64>,
+    /// The compiled composition kernel generated for this program's structure
+    /// ([`super::codegen::structural_key`]), if the generator emitted one.
+    compiled: Option<&'static str>,
 }
+
+/// `LAMBDA_VM_GPU_COMPILED_CONSTRAINTS`: `1` evaluates the composition of every
+/// program that has a compiled kernel with it (`crypto/math-cuda/kernels/
+/// constraint_compiled.cu`) instead of the interpreter; unset, empty or `0`
+/// keeps the interpreter. Anything else stops the run.
+///
+/// ⛔ WHY. The interpreter reads every node from memory and every operand from,
+/// and every result to, a per-thread slot file in global memory, which caps its
+/// grid at 65,536 threads (0.30 waves on the 5090) and binds it on L2 (G5's
+/// ncu: 77 % of L2, 30 % issue). A compiled kernel is the same node walk as
+/// straight-line code over registers, with a grid that fills the card. It
+/// computes the same `H` bit for bit: see [`super::codegen`].
+pub const COMPILED_CONSTRAINTS_ENV: &str = "LAMBDA_VM_GPU_COMPILED_CONSTRAINTS";
+
+/// [`COMPILED_CONSTRAINTS_ENV`] for a raw value.
+pub fn compiled_constraints_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{COMPILED_CONSTRAINTS_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// A test's or benchmark's override of the switch: 0 none, 1 off, 2 on.
+static COMPILED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the compiled kernels on or off for this process (`None` returns to
+/// [`COMPILED_CONSTRAINTS_ENV`]). For tests and benchmarks that compare the
+/// two kernels in one process.
+pub fn override_compiled_constraints(on: Option<bool>) {
+    COMPILED_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// Whether compositions run their compiled kernel when one exists.
+pub fn compiled_constraints_enabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match COMPILED_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => false,
+        2 => true,
+        _ => *ENV.get_or_init(|| {
+            let on = compiled_constraints_setting(
+                std::env::var(COMPILED_CONSTRAINTS_ENV).ok().as_deref(),
+            );
+            let line = if on {
+                format!(
+                    "[gpu] constraint composition: compiled kernels for {} programs \
+                     ({COMPILED_CONSTRAINTS_ENV}=1), the interpreter for the rest\n",
+                    math_cuda::constraint_compiled_keys::COMPILED_COMPOSITION_KERNELS.len()
+                )
+            } else {
+                "[gpu] constraint composition: the interpreter (the default)\n".to_string()
+            };
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(line.as_bytes());
+            on
+        }),
+    }
+}
+
+/// Compositions evaluated by a compiled kernel, process-wide.
+pub static GPU_COMPOSITION_COMPILED_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The lowered device program plus the packed per-proof uniforms shared by both
 /// GPU dispatch entry points. Produced by [`lower_and_pack`].
@@ -285,11 +357,22 @@ where
             let nodes = pack_nodes(&dev);
             let ext_consts = flatten_ext3(&dev.ext_consts);
             let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+            let key = super::codegen::structural_key(&dev);
+            let compiled = math_cuda::constraint_interp::compiled_composition_kernel(key);
+            if compiled_constraints_enabled() {
+                // One line per distinct program, so a log shows which ran compiled.
+                println!(
+                    "[gpu] compiled composition: {} for a {}-node program (key {key:016x})",
+                    compiled.unwrap_or("none, the interpreter"),
+                    dev.nodes.len()
+                );
+            }
             let low = std::sync::Arc::new(LoweredProgram {
                 dev,
                 nodes,
                 ext_consts,
                 roots,
+                compiled,
             });
             lowering_cache()
                 .lock()
@@ -372,8 +455,10 @@ where
         b_z_inv: &b_z_inv,
     };
 
+    let compiled = lowered.compiled.filter(|_| compiled_constraints_enabled());
     let result = if keep {
         math_cuda::constraint_interp::eval_composition_on_device_keep(
+            compiled,
             &lowered.nodes,
             lowered.dev.nodes.len(),
             lowered.dev.num_base_slots as usize,
@@ -393,6 +478,7 @@ where
         .map(GpuComposition::Dev)
     } else {
         math_cuda::constraint_interp::eval_composition_on_device(
+            compiled,
             &lowered.nodes,
             lowered.dev.nodes.len(),
             lowered.dev.num_base_slots as usize,
@@ -413,6 +499,9 @@ where
     };
     if result.is_ok() {
         crate::gpu_lde::GPU_COMPOSITION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if compiled.is_some() {
+            GPU_COMPOSITION_COMPILED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     result.ok()
 }
