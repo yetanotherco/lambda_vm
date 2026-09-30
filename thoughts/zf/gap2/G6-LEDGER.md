@@ -774,7 +774,7 @@ Seconds after `BASE HEAD (WHIR): start`:
    the producer writes pinned slots, and the prover copies nothing. The logs do not measure the pinned DMA ceiling
    on FAST [I].
 
-## 8. The zero-tail skip alone, and D-TRACE's pinned microbench (pre-registered 2026-09-30 16:10Z, before any box run)
+## 8. The zero-tail skip alone, and D-TRACE's pinned microbench (pre-registered 2026-09-30 16:00Z, before any box run)
 
 The lead's decisions after job 290:
 - the head-only A/B: not run;
