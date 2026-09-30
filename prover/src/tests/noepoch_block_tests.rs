@@ -273,3 +273,31 @@ fn noepoch_block_prove_and_verify() {
     );
     assert!(verified, "the block proof does not verify");
 }
+
+/// The control arm for [`noepoch_block_prove_and_verify`]: #1009's base on the
+/// same binary and the same inputs, `continuation::prove_continuation` at 2^21
+/// epochs under the same options, timed the same way (execution to the last
+/// epoch's proof, the global proof included; no recursion, no verify).
+#[test]
+#[ignore = "proves a whole block; GPU box only (NOEPOCH_ELF, NOEPOCH_INPUT)"]
+fn noepoch_epoch_base_reference() {
+    let elf_bytes = std::fs::read(std::env::var("NOEPOCH_ELF").expect("NOEPOCH_ELF"))
+        .expect("read NOEPOCH_ELF");
+    let input = std::fs::read(std::env::var("NOEPOCH_INPUT").expect("NOEPOCH_INPUT"))
+        .expect("read NOEPOCH_INPUT");
+    let opts = crate::lfm::proof::block_base_options();
+    let t = std::time::Instant::now();
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &input,
+        crate::block::BLOCK_ROWS_LOG2,
+        &opts,
+    )
+    .expect("the epoch base must prove");
+    let base = t.elapsed().as_secs_f64();
+    println!(
+        "NOEPOCH REFERENCE: epoch base {base:.2} s · {} epochs · host peak {}",
+        bundle.num_epochs(),
+        vm_hwm_gib().map_or("unknown".to_string(), |g| format!("{g:.2} GiB")),
+    );
+}
