@@ -441,3 +441,50 @@ fn reroll_report(program: &crate::field_vm::isa::Program) {
         );
     }
 }
+
+/// The binary half of the epoch verifier, as the LFM runs it: hash rows by
+/// mode, the keccak / BLAKE3 accelerator calls and the byte and bit glue.
+/// What a 3MI RISC-V half would do instead of the Field VM.
+#[test]
+#[ignore]
+fn epoch_binary_work() {
+    use super::instr::{HashMode, Instr};
+    use std::collections::BTreeMap;
+    let e = super::epoch_tests::real_epoch_from(
+        inner_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut bump = |k: &str, n: u64| *counts.entry(k.to_string()).or_insert(0) += n;
+    for i in &program.instrs {
+        match i {
+            Instr::Hash { mode, .. } => bump(
+                match mode {
+                    HashMode::Compress => "hash.compress",
+                    HashMode::Transcript => "hash.transcript",
+                    HashMode::Leaf => "hash.leaf",
+                    HashMode::Permute => "hash.permute",
+                },
+                1,
+            ),
+            Instr::KeccakF(_) => bump("keccak_f", 1),
+            Instr::Blake3(_) => bump("blake3", 1),
+            Instr::Pack { .. } => bump("pack", 1),
+            Instr::Unpack { .. } => bump("unpack", 1),
+            Instr::BitDec { bits, halves, .. } => {
+                bump("bit_dec", 1);
+                bump("bit_dec.bits_used", bits.len() as u64);
+                bump("bit_dec.with_halves", halves.is_some() as u64);
+            }
+            Instr::Hint { .. } => bump("hint", 1),
+            Instr::Public { .. } => bump("public", 1),
+            _ => bump("field", 1),
+        }
+    }
+    eprintln!("epoch verifier: {} LFM instructions", program.instrs.len());
+    for (k, n) in &counts {
+        eprintln!("  {k}: {n}");
+    }
+    eprintln!("  LFM hasher: {:?}", crate::hash_pin::BLOCK_HASHER);
+}
