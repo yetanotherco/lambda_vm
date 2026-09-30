@@ -131,8 +131,18 @@ pub fn retained_bytes_peak() -> u64 {
 /// at two widths on purpose: served across widths, this would hand back paths
 /// that are internally consistent and WRONG, which is the outcome that file
 /// exists to forbid. An exact match or a rebuild; there is no near miss.
+///
+/// ★ OR THE WHOLE TREE, under [`whole_trees`]: the same slot, the same key and
+/// the same evictor, holding the node array the tree was built in (root first,
+/// leaves last) so an opening reads its paths without building anything. What
+/// separates this from H4 is that it is promised through the room and yields to
+/// the evictor like a layer does; H4 held its trees outside any promise.
 struct RetainedLeaves {
-    nodes: CudaSlice<u8>,
+    /// The leaf layer, or the whole node array when `whole`. Shared so an
+    /// opening served a whole tree can read it after the slot's lock is let go:
+    /// an eviction then drops the slot's handle, and the buffer is freed when
+    /// the opening's goes.
+    nodes: Arc<CudaSlice<u8>>,
     log_folding: usize,
     hash: crate::DeviceHash,
     num_leaves: usize,
@@ -141,6 +151,8 @@ struct RetainedLeaves {
     /// that captured the layer, which a fold SHARES with the codeword it came
     /// from. `Weak`: a layer never keeps a room alive.
     room: Weak<DeviceReservation>,
+    /// The whole tree rather than the leaf layer alone.
+    whole: bool,
 }
 
 impl Drop for RetainedLeaves {
@@ -259,6 +271,68 @@ pub fn force_keep_futile(on: Option<bool>) {
     );
 }
 
+/// Openings served a kept whole tree, which built nothing — see [`whole_trees`].
+static WHOLE_TREE_SERVES: AtomicU64 = AtomicU64::new(0);
+
+/// (whether whole trees are kept, the openings they served) this process.
+pub fn retention_whole() -> (bool, u64) {
+    (whole_trees(), WHOLE_TREE_SERVES.load(Ordering::Relaxed))
+}
+
+/// The switch [`whole_trees`] reads.
+const WHOLE_TREES_ENV: &str = "LFM_WHIR_WHOLE_TREES";
+/// The leaf layer alone, until an A/B says otherwise.
+const WHOLE_TREES_DEFAULT: bool = false;
+
+/// ★ Whether a tree is kept WHOLE past the call that built it, not just its
+/// leaf layer.
+///
+/// With the leaf layer kept, every opening still builds the inner levels, and
+/// on the block (job 246) that was the openings' 1.02 s of tree rebuilds: one
+/// permutation a node, level by level, the top levels in one block. The whole
+/// tree costs one more layer's bytes (`num_leaves − 1` nodes), and it is
+/// promised the same way — grown into the codeword's room, and given back to
+/// the evictor under pressure, whole — so a request it can cover still gets its
+/// bytes, and fallbacks cannot rise. The worst case is the old rebuild.
+///
+/// `LFM_WHIR_WHOLE_TREES=1` keeps whole trees; unset or `0` keeps leaf layers
+/// (the default); any other value aborts. Read once and printed once; a test
+/// forces it with [`force_whole_trees`].
+fn whole_trees() -> bool {
+    match WHOLE_TREES_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                crate::rpx_paths::read(
+                    WHOLE_TREES_ENV,
+                    WHOLE_TREES_DEFAULT,
+                    "WHIR retention: whole trees, the inner levels kept with the leaves",
+                    "WHIR retention: leaf layers, the inner levels rebuilt at each opening",
+                )
+            })
+        }
+    }
+}
+
+static WHOLE_TREES_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LFM_WHIR_WHOLE_TREES` for the whole process — for a test that
+/// opens the same codeword both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_whole_trees(on: Option<bool>) {
+    WHOLE_TREES_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Whether evicting `reclaimable` bytes of layers is too little for a miss of
 /// `target`: the reserve fails whatever the evictor does. Zero reclaimable is
 /// not futile — there is nothing to keep.
@@ -308,11 +382,13 @@ struct RetentionHandle {
 static RETENTION_REGISTRY: Mutex<Vec<RetentionHandle>> = Mutex::new(Vec::new());
 
 /// Install [`evict_retained_layers`] as the allocator's evictor, once, and say
-/// which way it treats a miss it cannot cover ([`keep_futile`]).
+/// which way it treats a miss it cannot cover ([`keep_futile`]) and what it
+/// keeps ([`whole_trees`]).
 fn ensure_evictor_installed() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         keep_futile();
+        whole_trees();
         crate::device::set_retention_evictor(evict_retained_layers)
     });
 }
@@ -345,7 +421,9 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
 ///   the allocator that called it.
 /// - NO UAF. It takes the layer out UNDER the codeword's own `leaves` mutex, so a
 ///   concurrent [`serve_retained_leaves`] either ran first (its `memcpy_dtod` is
-///   already enqueued on the codeword's stream) or sees `None` and rebuilds. The
+///   already enqueued on the codeword's stream) or sees `None` and rebuilds. An
+///   opening served a whole tree holds its own `Arc` of the buffer, so dropping
+///   the slot's leaves the buffer alive until that opening is done. The
 ///   evicted `nodes` was allocated on that SAME stream, and cudarc 0.19.4
 ///   `CudaSlice::drop` (core.rs:776-795) first waits on the slice's own read/write
 ///   events, then frees on the slice's OWN stream — `free_async(ptr,
@@ -390,7 +468,7 @@ fn evict_retained_layers(target: u64) -> u64 {
         let misses = RETAIN_FUTILE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
         RETAIN_FUTILE_BYTES.fetch_add(reclaimable, Ordering::Relaxed);
         eprintln!(
-            "[whir] retention: a reserve missed the budget by {} MiB; the leaf layers can give back {} MiB — {}; \
+            "[whir] retention: a reserve missed the budget by {} MiB; the retention can give back {} MiB — {}; \
              futile misses {misses} t={:.3}",
             target >> 20,
             reclaimable >> 20,
@@ -405,7 +483,7 @@ fn evict_retained_layers(target: u64) -> u64 {
     if !evicts(target, reclaimable, keep) {
         return 0;
     }
-    let mut layers = 0u64;
+    let (mut layers, mut trees) = (0u64, 0u64);
     reg.retain(|handle| {
         let Some(leaves) = handle.leaves.upgrade() else {
             return false; // the codeword is gone; prune this dead entry
@@ -421,20 +499,24 @@ fn evict_retained_layers(target: u64) -> u64 {
         };
         if let Some(layer) = taken {
             let bytes = layer.bytes;
+            if layer.whole {
+                trees += 1;
+            } else {
+                layers += 1;
+            }
             // RetainedLeaves::drop: live -= bytes, the BUDGET goes back to its
             // room (for argue), nodes freed (stream-ordered).
             drop(layer);
             freed += bytes;
-            layers += 1;
             RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
             RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
         }
         true // keep the entry: the mutex lives with the codeword and may refill
     });
-    if !futile && layers > 0 {
+    if !futile && layers + trees > 0 {
         eprintln!(
-            "[whir] retention: a reserve missed the budget by {} MiB; evicted {layers} leaf layer(s), {} MiB, \
-             to cover it t={:.3}",
+            "[whir] retention: a reserve missed the budget by {} MiB; evicted {trees} whole tree(s) and {layers} \
+             leaf layer(s), {} MiB, to cover it t={:.3}",
             target >> 20,
             freed >> 20,
             unix_secs(),
@@ -727,10 +809,13 @@ impl DeviceCodeword {
             // The borrow of `nodes` ends at the brace above, which is what lets
             // the capture below read the region it just wrote.
             // The pass was PAID here, so it is counted here — and the layer is
-            // offered for retention while it is in hand.
+            // offered for retention while it is in hand. Under `whole_trees` the
+            // whole tree is offered instead, once it is built (`with_tree`).
             LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
             self.leaf_passes.fetch_add(1, Ordering::Relaxed);
-            self.capture_leaves(&nodes, leaves_offset, num_leaves, log_folding, hash);
+            if !whole_trees() {
+                self.capture_leaves(&nodes, leaves_offset, num_leaves, log_folding, hash);
+            }
         } else {
             LEAF_PASSES_SAVED.fetch_add(1, Ordering::Relaxed);
         }
@@ -771,8 +856,88 @@ impl DeviceCodeword {
             return Ok(false);
         }
         let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-        self.stream.memcpy_dtod(&kept.nodes, &mut region)?;
+        if kept.whole {
+            // A whole tree's leaves sit at the same offset in its own buffer.
+            let leaves = kept
+                .nodes
+                .slice(leaves_offset..leaves_offset + num_leaves * 32);
+            self.stream.memcpy_dtod(&leaves, &mut region)?;
+        } else {
+            self.stream.memcpy_dtod(&*kept.nodes, &mut region)?;
+        }
         Ok(true)
+    }
+
+    /// The whole tree kept under this key, if one is: a handle an opening reads
+    /// after the slot's lock is let go, with its leaf count.
+    fn retained_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<(Arc<CudaSlice<u8>>, usize)> {
+        let num_leaves = self.elements >> log_folding;
+        let held = self.leaves.lock().ok()?;
+        let kept = held.as_ref()?;
+        (kept.whole
+            && leaf_key_matches(
+                (kept.log_folding, kept.hash, kept.num_leaves),
+                (log_folding, hash, num_leaves),
+            ))
+        .then(|| (kept.nodes.clone(), kept.num_leaves))
+    }
+
+    /// Offer the tree just built and used for retention WHOLE, and take the
+    /// answer: `None` when it is kept, the buffer back when the budget will not
+    /// take it — the caller then keeps the leaf layer, as without the switch.
+    ///
+    /// The whole tree replaces a leaf layer held under the same key: the tree
+    /// is promised first, then the layer's bytes go back when it drops, so the
+    /// ledger never counts less than it holds.
+    fn capture_tree(
+        &self,
+        nodes: CudaSlice<u8>,
+        num_leaves: usize,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<CudaSlice<u8>> {
+        if !retention_enabled() {
+            return Some(nodes);
+        }
+        ensure_evictor_installed();
+        let Ok(mut held) = self.leaves.lock() else {
+            return Some(nodes);
+        };
+        if held.as_ref().is_some_and(|kept| kept.whole) {
+            return Some(nodes);
+        }
+        let bytes = tree_bytes(num_leaves.trailing_zeros() as usize);
+        RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
+        if !self.room.grow(bytes) {
+            Self::note_refusal();
+            return Some(nodes);
+        }
+        RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
+        RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
+        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
+        let replaced = held.replace(RetainedLeaves {
+            nodes: Arc::new(nodes),
+            log_folding,
+            hash,
+            num_leaves,
+            bytes,
+            room: Arc::downgrade(&self.room),
+            whole: true,
+        });
+        // As in `capture_leaves`: the layer lock goes before the registry is
+        // touched. A leaf layer the tree supersedes gives its bytes back as it
+        // drops, after the tree was promised.
+        drop(held);
+        drop(replaced);
+        if !self.registered.swap(true, Ordering::Relaxed) {
+            register_retained(&self.leaves);
+        }
+        None
     }
 
     /// Offer the layer just hashed for retention, and take the answer.
@@ -839,12 +1004,13 @@ impl DeviceCodeword {
         let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
         RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
         *held = Some(RetainedLeaves {
-            nodes: copy,
+            nodes: Arc::new(copy),
             log_folding,
             hash,
             num_leaves,
             bytes,
             room: Arc::downgrade(&self.room),
+            whole: false,
         });
         // Release the layer lock BEFORE touching the registry, so the only lock
         // nesting anywhere is the evictor's registry→layer — acyclic. Register
@@ -934,14 +1100,36 @@ impl DeviceCodeword {
     ///
     /// The window is still the group's, because the window is the protocol's
     /// and nothing here changes it. What changed is what sits in it.
+    ///
+    /// # ★ Whole trees, evictable ([`whole_trees`])
+    ///
+    /// Under the switch the tree built here is kept whole after `f`, and an
+    /// opening with a matching kept tree runs `f` on it and builds nothing.
+    /// H4's objection was never the bytes as such but where they sat: outside
+    /// any promise, so a full card pushed commits to the host. These are grown
+    /// into the codeword's room like a layer, and the evictor takes them back
+    /// whole for any request they can cover. So a request gets the budget it
+    /// would get without them, and the worst case is the leaf pass again.
     fn with_tree<R>(
         &self,
         log_folding: usize,
         hash: crate::DeviceHash,
         f: impl FnOnce(&CudaSlice<u8>, usize) -> Result<R>,
     ) -> Result<R> {
+        if let Some((tree, num_leaves)) = self.retained_tree(log_folding, hash) {
+            WHOLE_TREE_SERVES.fetch_add(1, Ordering::Relaxed);
+            return f(&tree, num_leaves);
+        }
         let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
-        f(&nodes, num_leaves)
+        let out = f(&nodes, num_leaves)?;
+        if whole_trees()
+            && let Some(nodes) = self.capture_tree(nodes, num_leaves, log_folding, hash)
+        {
+            // The budget would not take the whole tree: keep its leaf layer, as
+            // without the switch (a no-op when a layer is already held).
+            self.capture_leaves(&nodes, (num_leaves - 1) * 32, num_leaves, log_folding, hash);
+        }
+        Ok(out)
     }
 
     /// Bytes this codeword's chain has promised the device budget. For tests
@@ -952,9 +1140,10 @@ impl DeviceCodeword {
 
     /// ★ How many times THIS codeword's leaf layer has been hashed.
     ///
-    /// One after a commit, and one more for each round that opens it. Unlike
-    /// the process-wide counter this number is unaffected by whatever else
-    /// shares the test binary, so an assertion on it is about this codeword.
+    /// One after a commit, and one more for each round that opens it — none
+    /// for an opening served a kept whole tree ([`whole_trees`]). Unlike the
+    /// process-wide counter this number is unaffected by whatever else shares
+    /// the test binary, so an assertion on it is about this codeword.
     pub fn tree_builds(&self) -> u64 {
         self.builds.load(Ordering::Relaxed)
     }
@@ -970,7 +1159,8 @@ impl DeviceCodeword {
         self.leaf_passes.load(Ordering::Relaxed)
     }
 
-    /// Bytes this codeword is holding as a retained leaf layer, or zero.
+    /// Bytes this codeword is holding retained — its leaf layer, or its whole
+    /// tree under [`whole_trees`] — or zero.
     pub fn retained_leaf_bytes(&self) -> u64 {
         self.leaves
             .lock()
