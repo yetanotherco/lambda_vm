@@ -1108,14 +1108,39 @@ where
     // the card builds them where the zerocheck folds them; the host builds them
     // only if the card turns the rounds down.
     let weights = if multilinear::gpu::argue_device_tables() {
-        vec![Weight::Eq(r), Weight::Eq(bus.row_point.clone())]
+        vec![Weight::Eq(r.clone()), Weight::Eq(bus.row_point.clone())]
     } else {
         vec![
             Weight::Table(eq_mle(&r)?),
             Weight::Table(eq_mle(&bus.row_point)?),
         ]
     };
-    let (constraint, point) = constraint_argument::prove_core::<F, E, T>(
+    // D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED`, default off): the same batch,
+    // described for the fused rounds — its constraint part in the base field.
+    // A table whose part is not (a constant with an extension limb) runs
+    // today's rounds.
+    let constraints = (multilinear::gpu_fused::argue_fused()
+        && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns()))
+    .then(|| {
+        multilinear::fused::Constraints::<F>::from_extension(
+            &shape.steps_as_ops(),
+            shape.root_steps(),
+            shape.selector_of_root(),
+            shape.degree(),
+        )
+        .ok()
+    })
+    .flatten();
+    let fused = constraints
+        .as_ref()
+        .map(|constraints| multilinear::gpu_fused::FusedInput {
+            constraints,
+            betas: &betas,
+            interactions: &interactions,
+            claim_point: &gkr_out.claim.point,
+            r: &r,
+        });
+    let (constraint, point) = constraint_argument::prove_core_with::<F, E, T>(
         &table.trace,
         weights,
         vec![zerocheck, bus.numerator, bus.denominator],
@@ -1124,6 +1149,7 @@ where
             gkr_out.claim.p.clone(),
             gkr_out.claim.q.clone(),
         ],
+        fused,
         transcript,
     )?;
     // The sumcheck folded the factors where they lay, so they are spent — and

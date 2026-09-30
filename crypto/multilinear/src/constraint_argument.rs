@@ -588,17 +588,38 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
+    prove_core_with(trace, weights, rules, claims, None, transcript)
+}
+
+/// [`prove_core`], with the zerocheck batch described for the stage-1 rounds
+/// (`batch::prove_resident_with`).
+pub fn prove_core_with<F, E, T>(
+    trace: &TraceData<F, E>,
+    weights: Vec<Weight<E>>,
+    rules: Vec<Rule<'_, E>>,
+    claims: &[FieldElement<E>],
+    fused: Option<crate::gpu_fused::FusedInput<'_, F, E>>,
+    transcript: &mut T,
+) -> Result<(ConstraintCore<E>, Vec<FieldElement<E>>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+{
     // The trace's factors are not built here when a device holds them: that
     // build is the whole trace in the extension, and nothing on that path
     // reads it. The closure is what makes them if the device turns the rounds
     // down.
     let resident = trace.device_factors();
-    let (sumcheck, point, bound) = batch::prove_resident(
+    let (sumcheck, point, bound) = batch::prove_resident_with(
         weights,
         resident,
         || trace.factors(),
         rules,
         claims,
+        fused,
         transcript,
     )?;
 

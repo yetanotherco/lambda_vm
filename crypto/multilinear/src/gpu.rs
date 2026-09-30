@@ -2938,6 +2938,28 @@ impl std::fmt::Debug for DeviceFactors {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl DeviceFactors {
+    /// The card's handle, for the fused rounds (`gpu_fused`).
+    pub(crate) fn inner(&self) -> &math_cuda::sumcheck::DeviceFactors {
+        &self.0
+    }
+
+    /// The factors held.
+    pub fn width(&self) -> usize {
+        self.0.width()
+    }
+
+    /// The cube they span.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Factors a build declined to upload. Never constructed.
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug)]

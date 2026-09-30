@@ -424,9 +424,16 @@ impl SumcheckSession {
                 Ok(())
             })?;
         }
+        // S1-1: integer nodes take the componentwise multiply — only when
+        // every node is `(k, 0, 0)`, where the two are the same value.
+        let kernel = if int_nodes() && t.chunks_exact(3).all(|n| n[1] == 0 && n[2] == 0) {
+            &be.sumcheck_round_ext3_int
+        } else {
+            &be.sumcheck_round_ext3
+        };
         unsafe {
             self.stream
-                .launch_builder(&be.sumcheck_round_ext3)
+                .launch_builder(kernel)
                 .arg(&self.factor_ptrs)
                 .arg(&half)
                 .arg(&self.nodes)
@@ -643,6 +650,36 @@ impl SumcheckSession {
     }
 }
 
+/// Whether a round with integer nodes takes the componentwise multiply
+/// (D-ARGUE S1-1, `LAMBDA_VM_ARGUE_INT_NODES=1`; default off). The same value
+/// either way: `(k, 0, 0)·d = (k·d₀, k·d₁, k·d₂)`. Read once.
+pub fn int_nodes() -> bool {
+    match INT_NODES_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LAMBDA_VM_ARGUE_INT_NODES").is_ok_and(|v| v == "1" || v == "true")
+    })
+}
+
+static INT_NODES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// A test's own setting in place of the environment's (`None` = the environment).
+#[doc(hidden)]
+pub fn force_int_nodes(on: Option<bool>) {
+    INT_NODES_FORCED.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// The most threads a program of `num_slots` live values may run at once: the
 /// slot file is per thread, so it is the thread count that gives way to a wider
 /// program.
@@ -656,7 +693,7 @@ pub fn thread_ceiling(num_slots: usize) -> u64 {
 /// The `(grid, block)` a launch of `work` indices takes, given the thread
 /// ceiling: one thread per index, spread over [`SPREAD_BLOCKS`] blocks before
 /// any block is made wider than a warp.
-fn launch_shape(ceiling: u64, work: u64) -> (u32, u32) {
+pub(crate) fn launch_shape(ceiling: u64, work: u64) -> (u32, u32) {
     let threads = work.clamp(1, ceiling);
     let wide = (threads / SPREAD_BLOCKS as u64).max(1);
     let block = (1u64 << (63 - wide.leading_zeros() as u64))
@@ -1136,6 +1173,11 @@ impl DeviceFactors {
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// The factors' device addresses, as the kernels read them.
+    pub(crate) fn factor_ptrs(&self) -> &CudaSlice<u64> {
+        &self.factor_ptrs
     }
 
     /// Writes `program`'s value at every row into a fresh buffer.
