@@ -957,6 +957,7 @@ impl Session<'_> {
 /// confirmed (`fused_xchecks`).
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
 fn the_fused_rounds_on_the_card_send_todays_messages() {
     use multilinear::gpu_fused::*;
     let _switches = CardSwitches::set(
@@ -1006,6 +1007,7 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
 /// with integer nodes send today's messages (the three at 2^10, fused off).
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
 fn the_int_node_rounds_send_todays_messages() {
     let _switches = CardSwitches::set(Default::default(), false);
     multilinear::gpu_fused::force_argue_fused(Some(false));
@@ -1035,6 +1037,7 @@ fn the_int_node_rounds_send_todays_messages() {
 /// comparison inert, and this test must then FAIL.
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
 fn a_wrong_bus_coefficient_on_the_card_is_refused_by_the_cross_check() {
     use multilinear::gpu_fused::*;
     let _switches = CardSwitches::set(
@@ -1074,6 +1077,7 @@ fn a_wrong_bus_coefficient_on_the_card_is_refused_by_the_cross_check() {
 /// this test must then FAIL.
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
 fn the_corner_check_on_the_card_refuses_a_broken_trace() {
     use multilinear::gpu_fused::*;
     let _switches = CardSwitches::set(FusedFaults::default(), true);
