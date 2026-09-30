@@ -3,7 +3,48 @@
 Lane G6 of the SOTA round, from the lead's message of 2026-09-30 (no brief file). Measurement only. Inputs:
 `SOTA.md` §c.3, §c.5, §d; method from `G1-LEDGER.md` (the last full ledger, at 0428c393b).
 
-## Summary (one screen)
+## ★ Resume point (2026-09-30 — read this first; the lane is closed)
+
+Lane G6-LEDGER (formerly g23b-profiles), 2026-09-30. It is **closed**. The lead gave stage 1b's build to a fresh lane,
+i-pinned, with D-TRACE-1B.md as its design, and the L1N2 schedule lever to i-whir, with §9.3 as its brief. Everything
+below was measured on FAST at #1010's heads.
+
+### What this lane established, in order
+
+| § | question | answer | evidence |
+|---|---|---|---|
+| 4 | Where is the #1010 base's idle, and how much of it is padding? (job 249, 9e2728955) | The card idles 7.50 of 31.54 s: head 1.85, argue 4.27, open 0.53, commit 0.27, global 0.29 s. Padding is 13.62 % of rows and 27.43 % of the stack. c.3 caps at 2.57 s. c.5 (jagged) is set aside by Mauro. | §4.0–§4.8 |
+| 7 | c.3's cheap slice: 4 staging threads + zero tails + `decode_prepared_for` off the head (job 290) | REGRESSION +0.35 s, not landed. The host copy into pinned memory runs at only 6.1–6.5 GB/s per thread. The head saved 0.32 s to epoch 0 but the host DECODE root then bound the hand-off at the same instant. | §7.6 |
+| 8 | Zero tails alone, on the pageable path (job 291) | NO EFFECT, −0.08 s whole. Commit −0.235 s, argue +0.11 s (mostly noise, §10.3). Not landed; parked at `land/1010-zerotail` @ aa332efef, where it can stack with 1b. | §8.5 |
+| 8 | Pure DMA from pinned memory against the pageable path (job 291 microbench) | **57.3 against 23.0 GB/s over epoch 0's columns (2.49×).** Stage 1b is worth building. | §8.5 |
+| 9 | The level-1 "L1N2" noise (job 292, 12 identical arms, host-sampled) | No host signal separates the slow arms. Post hoc: the level-1 schedule. The siblings' host work lands on L1N2's critical prologue in 20–40 % of arms, and total CPU is conserved. **Level 1 is bimodal (7.6–7.7 against 8.0–8.7 s): read the base apart.** | §9.1, §9.3 |
+| 10 | Stage 1b sized with absorption | Whole −1.0 s [−1.2, −0.5]. β = 0.075 ± 0.051 from the producer-overlap regression. | §10 |
+| 11 | The quiet producer: β measured directly, and as a lever (job 293) | The printed β = 0.281 is invalid. Corrected: **β ≈ 0.12** (n = 1+1, corrected after the run). The quiet producer as a lever: REGRESSION, +5.2 s base. The B arm went RED on an instrumentation bug in the knob. | §11 |
+
+### Branches (all pushed, signed)
+
+| branch | sha | contents | state |
+|---|---|---|---|
+| `fix2/1010-g6-census` | (this note's head) | the census commit fd6da62a2, this ledger, and every box script and analysis tool | notes |
+| `fix2/1010-trace-upload` | d0bf1ad8c | the staged slice (job 290) | regressed; do not land |
+| `fix2/1010-zerotail` / `land/1010-zerotail` | d9aab005a / aa332efef | zero tails plus the pinned microbench; aa332efef is rebased on 7c8272701 | gated GREEN at d9aab005a (FAST2 186); NO EFFECT; parked |
+| `fix2/1010-quiet-producer` | 6e0b5f731 | the quiet-producer knob (timing only, default off) | a measurement; not for landing |
+
+### What is open (none of it this lane's)
+
+- **Stage 1b**, the producer writing into pinned slots: i-pinned builds it from D-TRACE-1B.md (base −1.05 s
+  [−1.25, −0.80]) and re-bands S4 with β̂ from §11.
+- **The L1N2 schedule lever:** i-whir, from §9.3. Hold the siblings' host phases until L1N2's prologue is done, or give
+  that prologue its own pool.
+- **The #1009 ledger at cc411aa2c (FAST 294):** pending Mauro's approval.
+- **The device DECODE root:** parked.
+- **Measurement rules any lane on FAST should keep:**
+  - read the base apart from level 1;
+  - wrap every scripted ssh (`timeout 30 ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=2
+    -o BatchMode=yes`, with a retry);
+  - in zsh, never rely on word splitting in `$VAR` commands.
+
+## Summary of the G6 run itself (job 249; §§0–6)
 
 **Status 2026-09-30 14:45Z (11:45 UTC−3): RAN as FAST job 249 (wt1200–1203). Results in §4; §4.0 gives the c.3 and
 c.5 sizing and the recommendation. Headline: walls P1 39.8 · N 41.0 · P2 40.4 · C 40.3 s; the base card's idle (traced) is
@@ -1214,3 +1255,29 @@ The lead's GO, with two uses pre-registered: (a) β for stage 1b; (b) the quiet 
 have drained. The commit ends on a synchronous root read, so none is expected [I].
 
 **Runtime:** 4 arms plus a rebuild, ≈ 6–8 min. Tags wt1314–1317.
+
+### 11.4 Job 293's result (FAST, 18:37:40–18:40:16Z; written 2026-09-30 18:50Z)
+
+- **HARNESS RED, rc 11, after 1 + 1 arms.** A (wt1314) is clean: base 28.4 s, whole 37.8 s. B (wt1315) finished its base
+  (33.6 s), then the tree test panicked at its split-closure check: "epoch 0's argument does not close … 0.074 s
+  unattributed inside `prove`".
+- **Cause:** the knob's argue wait, taken before any table timer, is not attributed to any slot.
+  - It is an instrumentation bug in a measurement-only knob; production code is unaffected.
+  - The fix, if the knob is ever rerun: time the wait in its own slot, and have the readout start the argue window
+    after it.
+- **β, printed 0.281: invalid.**
+  - The numerator stands: Σargue A 11.69 → B 10.74 s, Δ −0.95 s, ≈ 12× job 292's arm sd of 0.08 s.
+  - The denominator is wrong. The untimed wait put B's argue windows too early in the readout, so it counted 4.47 s
+    of producer overlap that the exclusion rules out (unit-tested).
+  - With B's overlap ≈ 0: **β ≈ 0.95 ÷ 7.86 ≈ 0.12**, and 0.12–0.13 allowing some residual overlap. n = 1+1,
+    corrected after the run.
+  - §10.5's middle rule applies: 1b's centre −1.0 s stands, and its low end moves to (1 − 0.12) × 1.06 ≈ −0.93 s.
+  - This ruling went to the lead for i-pinned's S4 (FAST 311).
+- **Use (b):** REGRESSION, base +5.2 s, as predicted.
+  - The cost went into the argues' waits: 4.5 s over 15 argues. The producer's stages waited 5.5 s over 61 stages.
+  - The prover's prep wait stayed 0, and the producer's hand-off wait rose to 11.2 s.
+  - So the arithmetic in §11.3 holds: at hand-off depth one, keeping the producer off the argue costs far more than
+    the argue gains.
+- **β ≈ 0.12 is larger than the regression's 0.075 ± 0.051**, but inside its 1σ upper bound. The argue does slow
+  measurably under the producer's host work. The cap on a lever form (§11.3) becomes β × 3.3 s ≈ −0.4 s, still
+  needing a hand-off depth of two.
