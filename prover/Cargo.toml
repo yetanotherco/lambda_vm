@@ -12,6 +12,8 @@ fvm-d3 = []
 fvm-narrow = []
 # Field VM with a single general-purpose register.
 fvm-n1 = []
+# The block path at BLAKE3 (the pre-RPX pin); static roots are recomputed.
+blake3-pin = []
 parallel = [
     "stark/parallel",
     "math/parallel",

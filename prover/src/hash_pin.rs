@@ -104,13 +104,20 @@
 /// Every `multi_prove` / `multi_verify` instantiation in this crate names this
 /// rather than `stark::config::DefaultStarkHash`, so the two can differ on a
 /// branch without the workspace default moving.
+#[cfg(not(feature = "blake3-pin"))]
 pub type BlockStarkHash = crate::lfm::algebraic_commit::RpxStarkHash;
+#[cfg(feature = "blake3-pin")]
+pub type BlockStarkHash = stark::config::DefaultStarkHash;
 
 /// The Fiat–Shamir transcript OBJECT the block path builds.
 ///
 /// See the module header for why this is pinned separately from
 /// [`BlockStarkHash`] rather than derived from it.
+#[cfg(not(feature = "blake3-pin"))]
 pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
+#[cfg(feature = "blake3-pin")]
+pub type BlockTranscript =
+    stark::config::DefaultStarkTranscript<crate::tables::types::GoldilocksExtension>;
 
 /// A fresh block-path transcript over `seed`.
 ///
@@ -119,7 +126,10 @@ pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript
 /// algebraic one absorbs it as its first `append_bytes` call. Callers should not
 /// have to know which.
 pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
-    BlockTranscript::with_seed(BLOCK_HASHER, seed)
+    #[cfg(not(feature = "blake3-pin"))]
+    return BlockTranscript::with_seed(BLOCK_HASHER, seed);
+    #[cfg(feature = "blake3-pin")]
+    return BlockTranscript::new(seed);
 }
 
 /// The prover the block path drives, at [`BlockStarkHash`].
@@ -158,7 +168,10 @@ pub type BlockVerifier<Field, FieldExtension, PI> =
 /// Every `execute` and prove call on the block path names this rather than a
 /// literal, so the two axes cannot drift apart in a test harness while
 /// production stays correct.
+#[cfg(not(feature = "blake3-pin"))]
 pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Rpx;
+#[cfg(feature = "blake3-pin")]
+pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Test;
 
 /// The [`CommitmentHash`] the block path's roots may be called by.
 ///
