@@ -105,9 +105,12 @@
 }
 
 #let notelist(prefix, body) = {
-  show figure.where(kind: "note"): it => {
-    super(it.counter.display(it.numbering)) + box(it)
+  show list: it => context if target() == "html" {
+    html.div(class: "notelist", it)
+  } else {
+    it
   }
+  show figure.where(kind: "note"): it => super(it.counter.display(it.numbering)) + it
   show terms: it => list(marker: none, indent: 0pt, ..it.children.map(c => {
     let labelname = if c.term.has("text") {
       c.term.text
