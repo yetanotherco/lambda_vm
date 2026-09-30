@@ -268,6 +268,27 @@ pub fn compiled_constraints_enabled() -> bool {
 pub static GPU_COMPOSITION_COMPILED_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// A test's substitute for one compiled kernel (`test-utils` builds only):
+/// `(kernel, substitute)` launches `substitute` wherever `kernel` would run.
+/// The proof-bytes test's mutation control swaps in a kernel with one node
+/// wrong (`codegen::mutant_composition_kernel`).
+#[cfg(feature = "test-utils")]
+static COMPILED_SUBSTITUTE: std::sync::Mutex<Option<(&'static str, &'static str)>> =
+    std::sync::Mutex::new(None);
+
+/// Set (`Some((kernel, substitute))`) or clear the substitute kernel.
+#[cfg(feature = "test-utils")]
+pub fn substitute_compiled_kernel(sub: Option<(&'static str, &'static str)>) {
+    *COMPILED_SUBSTITUTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = sub;
+}
+
+/// Compositions evaluated by a substitute kernel, process-wide.
+#[cfg(feature = "test-utils")]
+pub static GPU_COMPOSITION_SUBSTITUTE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The lowered device program plus the packed per-proof uniforms shared by both
 /// GPU dispatch entry points. Produced by [`lower_and_pack`].
 struct LoweredCall {
@@ -456,6 +477,16 @@ where
     };
 
     let compiled = lowered.compiled.filter(|_| compiled_constraints_enabled());
+    #[cfg(feature = "test-utils")]
+    let (compiled, substituted) = match (
+        compiled,
+        *COMPILED_SUBSTITUTE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    ) {
+        (Some(k), Some((from, to))) if k == from => (Some(to), true),
+        (k, _) => (k, false),
+    };
     let result = if keep {
         math_cuda::constraint_interp::eval_composition_on_device_keep(
             compiled,
@@ -501,6 +532,10 @@ where
         crate::gpu_lde::GPU_COMPOSITION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if compiled.is_some() {
             GPU_COMPOSITION_COMPILED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(feature = "test-utils")]
+        if substituted {
+            GPU_COMPOSITION_SUBSTITUTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     result.ok()

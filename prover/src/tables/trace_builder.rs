@@ -3362,6 +3362,11 @@ impl CollectedEpoch {
 /// (padded) chunk — the same two `TableCounts::validate` requires. Several
 /// fields below spell this out individually; the rule is the struct's, not
 /// theirs.
+///
+/// `Clone` in this crate's tests only: the compiled-kernel byte test proves
+/// copies of ONE build, because two builds of one program lay some tables' rows
+/// out in different (`HashMap`) orders.
+#[cfg_attr(test, derive(Clone))]
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
     pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,

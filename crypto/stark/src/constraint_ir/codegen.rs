@@ -87,6 +87,11 @@ pub fn kernel_name(key: u64) -> String {
     format!("ccomp_{key:016x}")
 }
 
+/// The name of the program's [`mutant_composition_kernel`].
+pub fn mutant_kernel_name(key: u64) -> String {
+    format!("{}_mutant", kernel_name(key))
+}
+
 fn kind(enc: u32) -> u32 {
     enc >> OPK_SHIFT
 }
@@ -287,6 +292,16 @@ fn accumulate(c: usize, root: u32) -> String {
     }
 }
 
+/// The mutant's wrong statement: one added to a node's result.
+fn off_by_one(res: u32) -> String {
+    let slot = res & !RES_EXT_BIT;
+    if res & RES_EXT_BIT != 0 {
+        format!("e{slot} = ext3::add(e{slot}, ext3::make(1, 0, 0)); // MUTANT")
+    } else {
+        format!("b{slot} = goldilocks::add(b{slot}, 1); // MUTANT")
+    }
+}
+
 /// The source shared by every generated kernel: the includes, the block size
 /// and the two helpers. Emitted once at the top of the generated file.
 pub fn prelude() -> String {
@@ -346,6 +361,27 @@ pub fn composition_kernel(
     dev: &DeviceProgram,
     name: &str,
     label: &str,
+) -> Result<String, CodegenError> {
+    emit_kernel(dev, name, label, false)
+}
+
+/// The program's kernel with ONE node wrong, for a test's mutation control:
+/// the node that last writes the last root adds one to its result, so every
+/// row's `H` moves by that root's coefficient. No key maps to it; only a
+/// test's substitution launches it.
+pub fn mutant_composition_kernel(
+    dev: &DeviceProgram,
+    name: &str,
+    label: &str,
+) -> Result<String, CodegenError> {
+    emit_kernel(dev, name, label, true)
+}
+
+fn emit_kernel(
+    dev: &DeviceProgram,
+    name: &str,
+    label: &str,
+    mutant: bool,
 ) -> Result<String, CodegenError> {
     // Where each root's value is final: the LAST write to its slot. A root's
     // slot is pinned from the root node on, but before it a freed temporary may
@@ -426,8 +462,16 @@ pub fn composition_kernel(
     }
     let _ = writeln!(s, "        Fe3 sum = ext3::zero();");
     let mut next_root = 0usize;
+    let mutated = if mutant {
+        written_at.last().copied().flatten()
+    } else {
+        None
+    };
     for (i, n) in dev.nodes.iter().enumerate() {
         let _ = writeln!(s, "        {}", node_statement(i, n.op, n.a, n.b, n.res)?);
+        if mutated == Some(i) {
+            let _ = writeln!(s, "        {}", off_by_one(n.res));
+        }
         // Add every root whose value exists and whose predecessors are in.
         while next_root < dev.roots.len() && written_at[next_root].is_some_and(|w| w <= i) {
             let _ = writeln!(s, "        {}", accumulate(next_root, dev.roots[next_root]));
@@ -585,6 +629,21 @@ mod tests {
         assert_eq!(
             composition_kernel(&p, "k", "T"),
             Err(CodegenError::UnknownOp { node: 2, op: 99 })
+        );
+    }
+
+    /// The mutant is the kernel plus one statement: one added to the last
+    /// root's value, right after the node that last writes it.
+    #[test]
+    fn the_mutant_is_one_node_off() {
+        let p = program();
+        let good = composition_kernel(&p, "ccomp_test", "TEST").expect("emits");
+        let bad = mutant_composition_kernel(&p, "ccomp_test", "TEST").expect("emits");
+        let wrong = "        b2 = goldilocks::add(b2, 1); // MUTANT\n";
+        assert_eq!(bad.replacen(wrong, "", 1), good, "one statement added");
+        assert!(
+            bad.contains(&format!("        b2 = goldilocks::neg(b1);\n{wrong}")),
+            "right after the last root's write:\n{bad}"
         );
     }
 }
