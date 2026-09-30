@@ -205,19 +205,22 @@ when both algorithm-halves accept the same record for this input.
 ]
 
 More formally, we define
-$verify_0, verify_1: commitmentSpace times proofSpace times recordSpace to BB$ as a valid _split_ of 
+$(verify_0, verify_1, d_v)$ 
+as a valid _split_ of 
 verifier $verify in verifierSpace$ if
 $
-  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff exists record in recordSpace text("s.t.") verify_0(comm(instance), [proof, record]) = 1 and verify_1(comm(instance), [proof, record]) = 1,
+  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff verify_0(comm(instance), [proof, d_v (comm(instance), proof)]) = 1 and verify_1(comm(instance), [proof, d_v (comm(instance), proof)]) = 1,
 $
+with
+$verify_0, verify_1: commitmentSpace times proofSpace times recordSpace to BB$
+and $d_v: commitmentSpace times proofSpace to recordSpace$,
 where $recordSpace$ denotes the _communication record space_.
-One can now express 
+Note that one can now express 
 $
 	verify(comm(instance), proof) 
 	= verify_0(comm(instance), [proof, d_verify (comm(instance), proof)]) 
 		dot verify_1(comm(instance), [proof, d_verify (comm(instance), proof)]).
 $
-where $d_verify (comm(instance), proof)$ denotes the record derivation function for $verify$.
 We introduce the function product $product(f, g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$, which allows us to express
 $
 	prove(verify(comm(instance), dot); proof)
@@ -264,8 +267,7 @@ which is equivalent to addition in $BB$.
 Hence, $verify^*$ and $verify'$ are effectively equivalent, except that $verify^*$
 has the proof include a bit $b$ indicating whether it is verifying a base proof or recursion proof.
 
-We now observe that, for a valid split $(verify_0, verify_1)$ of $verify$ and
-record generator $d_verify$,
+We now observe that, for a valid split $(verify_0, verify_1, d_verify)$ of $verify$,
 $
 	verify^*_0([comm(x), comm(y)], [[proof, b], r]) 
 	&:= verify_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
