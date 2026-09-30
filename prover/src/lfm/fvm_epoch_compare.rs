@@ -135,13 +135,16 @@ fn epoch_field_vm_vs_lfm() {
 
     let opts = crate::field_vm::prove::default_options();
     for bit_dec in [false, true] {
+        let s = Instant::now();
         let tr = translate(&program, &exec, bit_dec);
+        let translate_ms = s.elapsed().as_secs_f64() * 1e3;
         eprintln!(
             "  bit_dec={bit_dec} lfm mix={:?} skipped={:?} public={}",
             tr.lfm_counts,
             tr.skipped,
             tr.public.len()
         );
+        let s = Instant::now();
         let run = execute(
             &tr.program,
             Memory::with_init(tr.mem.len(), &tr.mem),
@@ -149,14 +152,17 @@ fn epoch_field_vm_vs_lfm() {
             1 << 26,
         )
         .expect("the translation executes");
+        let execute_ms = s.elapsed().as_secs_f64() * 1e3;
         let s = Instant::now();
         let id = program_id(&tr.program, &opts);
         let build_ms = s.elapsed().as_secs_f64() * 1e3;
         let cells = public_cells(&run, &tr.public);
-        let (mut prove_ms, mut verify_ms, mut shape, mut bytes) =
-            (Vec::new(), Vec::new(), (0, 0), 0);
+        let (mut prove_ms, mut verify_ms, mut trace_ms, mut shape, mut bytes) =
+            (Vec::new(), Vec::new(), Vec::new(), (0, 0), 0);
         for _ in 0..runs() {
+            let s = Instant::now();
             let mut traces = generate_traces(&tr.program, &run, &tr.public);
+            trace_ms.push(s.elapsed().as_secs_f64() * 1e3);
             let s = Instant::now();
             let proof = prove_traces(&id, &cells, &mut traces, &opts).expect("FVM proves");
             prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
@@ -177,6 +183,10 @@ fn epoch_field_vm_vs_lfm() {
             shape.1,
             stats(prove_ms),
             stats(verify_ms)
+        );
+        eprintln!(
+            "  fvm stages bit_dec={bit_dec}: translate_ms={translate_ms:.1} execute_ms={execute_ms:.1} traces_ms={}",
+            stats(trace_ms)
         );
     }
 }
