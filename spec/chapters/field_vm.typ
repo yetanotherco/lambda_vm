@@ -215,7 +215,8 @@ CALL target:
   FMA fp == [fp], hint out       // Hint the old frame pointer to restore it
 
 RET:
-  FMA PC == [fp + 1], hint out   // Hint the PC to jump to the stored return address
+  FMA PC == [fp + 1], hint out   // Hint the PC to jump to the stored
+                                 // return address
 ```
 
 As a halting state, we choose to let the VM loop to itself at `PC = 0`, hinting all inputs.

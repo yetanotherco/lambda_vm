@@ -125,8 +125,8 @@ Further clarification is provided in the notes following the table.
   ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`signed2`, `muldiv_selector`], []),
   ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []),
   ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []),
-  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [@decode:note:word_instr, <note_signed>]),
-  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [@decode:note:word_instr, <note_signed>]),
+  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [@decode:note:word_instr@decode:note:signed]),
+  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [@decode:note:word_instr@decode:note:signed]),
   // LUI/AUIPC
   ([`LUI       rd, imm`], [`ADD`], [], [], [], [@decode:note:lui]),
   ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [@decode:note:auipc]),
