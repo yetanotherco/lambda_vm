@@ -187,11 +187,16 @@ fn noepoch_same_bytes_all_instructions_small_chunks() {
 /// preprocessed one (BITWISE, the split-tree path). The prover must refuse with
 /// `RecomputedCommitmentMismatch`, and the hook must have fired (so the device
 /// recommit ran for that table).
+///
+/// fib_iterative_160k, not add: add's CPU table has 8 rows, below the device
+/// floor, so it commits on the host and is never recommitted (FAST2 210 read
+/// exactly that: "CPU[0]: the perturbation never fired"). At 160k cycles CPU[0]
+/// is 2^18 rows and commits on the device at the default thresholds.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "proves a VM program at blowup 4; GPU box gate (cuda)"]
 fn noepoch_refuses_a_trace_that_moved() {
-    let build = OneBuild::new("add", &MaxRowsConfig::default());
+    let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
     let opts = bytes_options();
     for table in ["CPU[0]", "BITWISE"] {
         let idx = build.air_index(&opts, table);
