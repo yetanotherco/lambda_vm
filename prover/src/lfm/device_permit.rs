@@ -115,6 +115,44 @@ thread_local! {
     /// The latch this thread's `multi_prove` holds wait behind — see
     /// [`defer_multi_prove_until`].
     static DEFER_PROVE: RefCell<Option<Arc<CardLatch>>> = const { RefCell::new(None) };
+    /// The proof this thread's holds belong to, for the trace line — see
+    /// [`name_holder`].
+    static HOLDER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Name the proof this thread's card holds belong to until the guard drops,
+/// so each `CARD HOLD` trace line ends `· who=<name>`. A level's tasks run one
+/// to a thread, so the name is what tells the global child's prove from a wide
+/// node's in a log where both are just holds. Trace-only: nothing else reads it.
+pub fn name_holder(name: impl Into<String>) -> HolderGuard {
+    let previous = HOLDER.with(|h| h.borrow_mut().replace(name.into()));
+    HolderGuard {
+        previous,
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// Puts the thread's previous holder name back when it drops.
+pub struct HolderGuard {
+    previous: Option<String>,
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        HOLDER.with(|h| *h.borrow_mut() = previous);
+    }
+}
+
+/// ` · who=<name>` for a trace line, or nothing when no name is set.
+fn holder_suffix() -> String {
+    HOLDER.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map(|name| format!(" · who={name}"))
+            .unwrap_or_default()
+    })
 }
 
 /// A one-way gate a `multi_prove` can be told to wait behind: shut until
@@ -235,7 +273,7 @@ fn wait_deferral(phase: &'static str) {
         DEFER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
     }
     println!(
-        "CARD DEFER #{} {phase}: waited {:.3}s for its latch{} · t=[{t0:.3},{:.3}]",
+        "CARD DEFER #{} {phase}: waited {:.3}s for its latch{} · t=[{t0:.3},{:.3}]{}",
         DEFERRED.load(Ordering::Relaxed),
         waited.as_secs_f64(),
         if timed_out {
@@ -244,6 +282,7 @@ fn wait_deferral(phase: &'static str) {
             ""
         },
         stark::prove_split::epoch_secs(),
+        holder_suffix(),
     );
 }
 
@@ -318,6 +357,8 @@ pub struct CardPermit {
     /// this hold is, the seconds it queued, its sequence number, and the epoch
     /// second it was acquired.
     trace: Option<(&'static str, f64, usize, f64)>,
+    /// Trace-only: the holder's name suffix, read when the hold began.
+    who: String,
 }
 
 impl Drop for CardPermit {
@@ -342,9 +383,10 @@ impl Drop for CardPermit {
         }
         if let Some((phase, waited, seq, t0)) = self.trace {
             println!(
-                "CARD HOLD #{seq} {phase}: waited {waited:.3}s · held {:.3}s · t=[{t0:.3},{:.3}]",
+                "CARD HOLD #{seq} {phase}: waited {waited:.3}s · held {:.3}s · t=[{t0:.3},{:.3}]{}",
                 self.since.elapsed().as_secs_f64(),
                 stark::prove_split::epoch_secs(),
+                self.who,
             );
         }
     }
@@ -379,6 +421,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
             since: Instant::now(),
             probe: None,
             trace: None,
+            who: String::new(),
         };
     }
     // ★ Unarmed BUT traced or probed: there is no card to take (the serial
@@ -392,6 +435,11 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
             since: Instant::now(),
             probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
+            who: if traced {
+                holder_suffix()
+            } else {
+                String::new()
+            },
         };
     }
     assert!(
@@ -437,6 +485,11 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
                 stark::prove_split::epoch_secs(),
             )
         }),
+        who: if traced {
+            holder_suffix()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -700,6 +753,30 @@ mod tests {
             !bound_ran_out && waited < Duration::from_millis(100),
             "an open latch must not hold a waiter: {waited:?}"
         );
+    }
+
+    /// The holder name is the thread's, restored when its guard drops.
+    #[test]
+    fn a_holder_name_tags_this_threads_holds_and_is_restored() {
+        assert_eq!(holder_suffix(), "");
+        {
+            let _outer = name_holder("global");
+            assert_eq!(holder_suffix(), " · who=global");
+            {
+                let _inner = name_holder("L1N2");
+                assert_eq!(holder_suffix(), " · who=L1N2");
+            }
+            assert_eq!(
+                holder_suffix(),
+                " · who=global",
+                "the inner name must be undone"
+            );
+            let elsewhere = std::thread::spawn(holder_suffix)
+                .join()
+                .expect("the other thread");
+            assert_eq!(elsewhere, "", "the name is this thread's alone");
+        }
+        assert_eq!(holder_suffix(), "");
     }
 
     /// The level line says which resource bound the level, so a green run
