@@ -199,10 +199,11 @@ struct LoweredProgram {
     compiled: Option<&'static str>,
 }
 
-/// `LAMBDA_VM_GPU_COMPILED_CONSTRAINTS`: `1` evaluates the composition of every
-/// program that has a compiled kernel with it (`crypto/math-cuda/kernels/
-/// constraint_compiled.cu`) instead of the interpreter; unset, empty or `0`
-/// keeps the interpreter. Anything else stops the run.
+/// `LAMBDA_VM_GPU_COMPILED_CONSTRAINTS`: unset, empty or `1` (the default)
+/// evaluates the composition of every program that has a compiled kernel with
+/// it (`crypto/math-cuda/kernels/constraint_compiled.cu`) instead of the
+/// interpreter; `0` keeps the interpreter for every program. Anything else
+/// stops the run.
 ///
 /// ⛔ WHY. The interpreter reads every node from memory and every operand from,
 /// and every result to, a per-thread slot file in global memory, which caps its
@@ -215,8 +216,8 @@ pub const COMPILED_CONSTRAINTS_ENV: &str = "LAMBDA_VM_GPU_COMPILED_CONSTRAINTS";
 /// [`COMPILED_CONSTRAINTS_ENV`] for a raw value.
 pub fn compiled_constraints_setting(raw: Option<&str>) -> bool {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") | Some("1") => true,
+        Some("0") => false,
         Some(other) => panic!("{COMPILED_CONSTRAINTS_ENV} must be 0 or 1, got {other:?}"),
     }
 }
@@ -251,11 +252,15 @@ pub fn compiled_constraints_enabled() -> bool {
             let line = if on {
                 format!(
                     "[gpu] constraint composition: compiled kernels for {} programs \
-                     ({COMPILED_CONSTRAINTS_ENV}=1), the interpreter for the rest\n",
+                     (the default; {COMPILED_CONSTRAINTS_ENV}=0 opts out), the interpreter \
+                     for the rest\n",
                     math_cuda::constraint_compiled_keys::COMPILED_COMPOSITION_KERNELS.len()
                 )
             } else {
-                "[gpu] constraint composition: the interpreter (the default)\n".to_string()
+                format!(
+                    "[gpu] constraint composition: the interpreter \
+                     ({COMPILED_CONSTRAINTS_ENV}=0)\n"
+                )
             };
             use std::io::Write;
             let _ = std::io::stderr().write_all(line.as_bytes());
@@ -590,4 +595,25 @@ where
 
     // Any device error is mapped to a CPU fallback, never propagated.
     result.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compiled_constraints_setting;
+
+    /// The compiled kernels are the default; only `0` keeps the interpreter.
+    #[test]
+    fn compiled_constraints_are_the_default_and_zero_opts_out() {
+        assert!(compiled_constraints_setting(None));
+        assert!(compiled_constraints_setting(Some("")));
+        assert!(compiled_constraints_setting(Some(" 1 ")));
+        assert!(!compiled_constraints_setting(Some("0")));
+        assert!(!compiled_constraints_setting(Some(" 0\n")));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be 0 or 1")]
+    fn compiled_constraints_setting_refuses_other_values() {
+        compiled_constraints_setting(Some("on"));
+    }
 }
