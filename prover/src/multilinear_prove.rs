@@ -158,10 +158,40 @@ pub(crate) fn absorb(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    absorb_tagged(
+        t,
+        MULTILINEAR_TAG,
+        "monolithic",
+        elf_digest,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        table_num_vars,
+        config,
+    );
+}
+
+/// [`absorb`] under `tag` — the block prover's statement is this one under a
+/// tag of its own (`crate::block_whir`), so a block proof and a monolithic one
+/// never share a transcript prefix. `kind` names it in the padding diagnostic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_tagged(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+    tag: &[u8],
+    kind: &str,
+    elf_digest: &[u8; 32],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    table_num_vars: &[u8],
+    config: &ChainConfig,
+) {
     let mut len = 0usize;
 
-    t.append_bytes(MULTILINEAR_TAG);
-    len += MULTILINEAR_TAG.len();
+    t.append_bytes(tag);
+    len += tag.len();
     t.append_bytes(elf_digest);
     len += elf_digest.len();
 
@@ -217,7 +247,7 @@ pub(crate) fn absorb(
 
     statement::absorb_statement_padding(
         t,
-        "monolithic",
+        kind,
         len,
         &[
             ("public_output", public_output.len()),
@@ -229,7 +259,7 @@ pub(crate) fn absorb(
 
 /// Every table's `(main width, height in variables)`, checked to be what the
 /// AIR says and a power of two tall.
-fn shapes_of(pairs: &[crate::AirTracePair<'_>]) -> Result<Vec<Shape>, Error> {
+pub(crate) fn shapes_of(pairs: &[crate::AirTracePair<'_>]) -> Result<Vec<Shape>, Error> {
     pairs
         .iter()
         .map(|(air, trace, _)| {
@@ -374,7 +404,7 @@ pub fn prove_with_options(
 }
 
 /// One table's layout, from the AIR and its shape alone. Both sides call this.
-fn layout_of<'a>(
+pub(crate) fn layout_of<'a>(
     air: &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     width: usize,
     num_vars: usize,
@@ -416,7 +446,7 @@ pub(crate) fn stacks(
 }
 
 /// A table's preprocessed columns as MLEs, empty for a table that has none.
-fn preprocessed_mles(
+pub(crate) fn preprocessed_mles(
     air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
 ) -> Result<Vec<Mle<F>>, Error> {
     air.precomputed_columns()

@@ -350,6 +350,11 @@ pub(crate) fn absorb_table_counts(
 /// never share a transcript prefix.
 pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V2";
 
+/// The block prover's statement tag (`crate::block_whir`): the monolithic
+/// multilinear statement, proved in groups on forks of one transcript. Distinct
+/// from [`MULTILINEAR_TAG`] so a block proof is never read as a monolithic one.
+pub(crate) const MULTILINEAR_BLOCK_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1";
+
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
 /// `pub(crate)` so the LFM statement replay emits the identical tag instead of

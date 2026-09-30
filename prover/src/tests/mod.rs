@@ -7,6 +7,8 @@ pub mod bitwise_bus_tests;
 #[cfg(test)]
 pub mod bitwise_tests;
 #[cfg(test)]
+pub mod block_whir_tests;
+#[cfg(test)]
 pub mod branch_bus_tests;
 #[cfg(test)]
 pub mod branch_constraints_tests;
@@ -82,7 +84,6 @@ pub mod memw_tests;
 pub mod mul_tests;
 #[cfg(test)]
 pub mod multilinear_bench_tests;
-#[cfg(test)]
 pub mod multilinear_continuation_tests;
 pub mod multilinear_prove_tests;
 #[cfg(test)]
