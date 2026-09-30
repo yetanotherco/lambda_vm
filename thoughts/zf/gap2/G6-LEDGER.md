@@ -274,8 +274,8 @@ The idle and term expectations come from G1's partition at 0428c393b and D-ARGUE
 - **Build first: c.3's cheap slice** (pinned + per-table pipelined upload, no upload of all-zero padding,
   `decode_prepared_for` off the head). It is byte-identical, needs no decision from Mauro, and aims at measured terms
   (97 % of the 1.84 s H2D runs with no kernel beside it). **−1.0 s [−1.8, −0.3].**
-- **Then c.5 on Mauro's go.** Its argue part (0.87–1.33 s) is prover-only and can join i-argue [I]. Full device generators
-  come last: they pay only once the card side falls ≈ 10 s and the producer's 19 s becomes the floor.
+- **c.5: set aside by Mauro (09-30) for a separate evaluation** (§7.5). Full device generators come last: they pay only
+  once the card side falls ≈ 10 s and the producer's 19 s becomes the floor.
 
 Markers in this section: **[L]** read from a log stopwatch (the prover's own stamps; `ab.md`, `*-tree.log`) ·
 **[T]** from the nsys trace of N (`g6.out`, `ledger.tsv`, `transfers.tsv`; device timestamps) · **[S]** from the
@@ -649,3 +649,41 @@ off by default, and live on `fix2/1010-trace-upload`, branched from 73342bc66 (k
     resolves only about 0.4 s.
 - **Replication:** if the verdict is promoted to a default flip, a second ABBA on new tags comes first (memory:
   replicate an arm promoted after a run).
+
+### 7.4 Addendum to §7.3: the rule that decides the pinned part, and one band (written 2026-09-30 15:14Z, before job 290's readout)
+
+Written while job 290 was building its first arm: only `ARM wt1290 (1/4)` was in `tup.log`, and no `readout.txt`
+existed. The readout script is md5-pinned and already deployed, so the rule below is applied by hand to the rows it
+prints (M1, M2). The readout itself is unchanged.
+
+- **The pinned part keeps its place only if B's exclusive H2D ≤ A's ÷ 1.3.** Read as B's mean Σ `COLUMNS UPLOAD`
+  seconds (M2) against A's (M1), both taken over the base window.
+  - This stands in for D-TRACE's skipped microbench and its 1.3× stop rule.
+  - D-TRACE §1.1 puts one thread's host copy into pinned memory at ≈ 7.5 GB/s (ds941). Four threads reach 1.3× the
+    20.5 GB/s pageable rate only if the host copies scale. That is the open question, and this row answers it.
+- **If the 1.3× rule misses, or the whole-run Δ misses its band,** the landing is `head` only. The `head` part gets
+  its own short A/B (`LAMBDA_VM_TRACE_UPLOAD=head` against off). Its share cannot be subtracted from this combined
+  run.
+- **One band for this A/B, replacing §7.3's −1.0 s [−1.8, −0.3]: Δ whole −0.9 s [−1.4, −0.3].**
+  - **Head:** −0.36 s. This is D-TRACE §3.1's stage-0 row (head 1.83 → ≈ 1.47 s with `decode_prepared_for` off
+    the path), and it agrees with M6's [−0.45, −0.15]. D-TRACE's larger head numbers need its device DECODE root,
+    which this slice does not port: −0.97 s with the root on the card, −0.47 s without. They are not in this band.
+  - **Upload:** −0.25 … −0.95 s. At the bottom, 4 threads × 7.5 GB/s host copies land near the 1.3× line on
+    ≈ 31 GB sent, which is −0.4 s from rate plus −0.2 s from the 4 GB of zero tails not sent. At the top, the DMA
+    runs at ≈ 39 GiB/s.
+  - **Upper edge tightened** from −1.8 to −1.4 s: nothing in this slice can remove more than the head's 0.36 s plus
+    the upload's 1.79 s exclusive, and the upload cannot fall to zero.
+  - **D-TRACE's stage 1b** (pinned column slots written by the producer; −0.75 s [−1.1, −0.35], +5.9 GB of pinned
+    host memory) is a different mechanism: the producer writes into pinned memory, with no copy on the prover's
+    side. It sits inside this band, but this run does not measure it.
+- **Verdict mapping, unchanged:** EFFECTIVE if Δ whole ≤ −0.3 s. The landing is the full knob only if the 1.3× rule
+  also holds; otherwise it is `head` alone, after its own A/B.
+
+### 7.5 Mauro's rulings (relayed 2026-09-30)
+
+- **c.5:** set aside by Mauro (09-30) for a separate evaluation. It is not a next step, and its argue part goes to
+  no one.
+- **D-TRACE stage 0** (canonical row order) goes to f-sidle, not this lane.
+- **D1** (G6's ledger re-run at the slice's landed head, FAST 290–294) runs only after the slice lands. Its stop
+  rule is D-TRACE's: stop the generator track if the residual head + upload < 0.6 s and the producer's hand-off
+  wait Σ ≥ 3 s.
