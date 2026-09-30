@@ -687,3 +687,89 @@ prints (M1, M2). The readout itself is unchanged.
 - **D1** (G6's ledger re-run at the slice's landed head, FAST 290–294) runs only after the slice lands. Its stop
   rule is D-TRACE's: stop the generator track if the residual head + upload < 0.6 s and the producer's hand-off
   wait Σ ≥ 3 s.
+
+### 7.6 Job 290's result and diagnosis (written 2026-09-30 15:31Z, from job 290's logs only; no new run)
+
+**Readout** (FAST job 290, wt1290–1293, done 15:17Z): `REGRESSION Δ whole +0.35 s`. The A arms read 38.7 and 39.0 s,
+the B arms 39.6 and 38.8 s. By §7.4 the combined landing is off, and FAST2 job 185 was cancelled before it started.
+
+#### The columns path did engage [V: every `COLUMNS UPLOAD` line of the four logs]
+
+- All 21 uploads in each B arm print `(staged x4)`; all 21 in each A arm print `(pageable)`.
+- B left **7.82 GB** of the base's 33.84 GB behind as zero tails, the same in both B arms. "B's zero tails not sent"
+  failed from ABOVE its band (3.0–4.6 GB), not below.
+- The band was mine and it was wrong. It assumed zero tails are padding rows (4.46 GB), but real rows also end in
+  long zero runs in many columns [I: which columns is not logged].
+- The cut is correct: both B arms compressed and verified at the root, with ids identical to A's. A cut that dropped
+  a nonzero value would break a constraint that level 1 checks.
+
+#### Why the upload did not get faster
+
+| arm | Σ upload in the base [L] | sent | sent rate | host memcpy into pinned, Σ over threads [L: `AFTER the WHIR base: staging:`] |
+|---|---|---|---|---|
+| A wt1290 / wt1293 | 1.791 / 1.781 s | 33.84 GB | 18.9 / 19.0 GB/s | — |
+| B wt1291 / wt1292 | 1.722 / 1.655 s | 26.02 GB | 15.1 / 15.7 GB/s | 26.02 GB in 4.26 s (6.1 GB/s) / 26.03 GB in 3.98 s (6.5 GB/s) |
+
+- **The 1.3× rule (§7.4) misses:** B 1.688 s against A's 1.786 ÷ 1.3 = 1.374 s, a ratio of 1.06×. Per upload, B's
+  sent rate is 10.5–23.5 GB/s, mostly 14–18; A's is 16.0–22.9. The 23 % of bytes not sent only offset the slower
+  rate: Δ upload −0.10 s.
+- **Cause 1, the prover-side copy into pinned memory runs at 6.1–6.5 GB/s per thread** [L]. That is D-TRACE's
+  ≈ 7.5 GB/s (ds941) and h2d_bench's chunked-pinned regression again. Four threads would need perfect overlap to
+  reach ≈ 25 GB/s, only 1.3× pageable before any DMA limit.
+- **Cause 2, the four threads overlapped only ≈ 2.4–2.5×** (4.26 ÷ 1.722, 3.98 ÷ 1.655) [A], and the code shows why
+  [V code; the size of the effect is inferred]:
+  - each column is one `htod_staged_raw` call that lends a pair and starts at buffer 0 (`device.rs:2051`);
+  - the pool is LIFO (`:1769`), so a thread gets its own pair back and waits on buffer 0's event (`:1805-1806`),
+    which is its previous column's DMA, before copying the next column;
+  - for a column of one chunk (≤ 32 MiB, every column but the largest), a thread therefore alternates its copy and
+    its own DMA with no overlap;
+  - the four threads' DMAs also queue on one stream.
+- The scan for the zero tails (`sent_len`) runs on the same threads and is not timed separately [I].
+
+#### Why the head did not move the first commit [V: `BASE HEAD` / `BASE EPOCH 0` / `BASE PREP 0` lines]
+
+Seconds after `BASE HEAD (WHIR): start`:
+
+| arm | epoch 0 executes | collect | build | DECODE root done (helper) | prep waited for root | prep | hand-off |
+|---|---|---|---|---|---|---|---|
+| A wt1290 | 0.493 | 0.54 | 0.28 | 1.111 | 0.00 | 0.44 | **1.839** |
+| A wt1293 | 0.449 | 0.56 | 0.31 | 1.223 | 0.00 | 0.44 | **1.835** |
+| B wt1291 | 0.147 | 0.57 | **0.49** | **1.310** | 0.04 | 0.52 | **1.830** |
+| B wt1292 | 0.149 | 0.56 | **0.50** | **1.387** | 0.11 | 0.46 | **1.843** |
+
+- The head part did what it was built to do. Epoch 0 executes **0.32 s earlier**, the helper's opening took 0.28 s,
+  and the first prove waited 0.00 s.
+- But the path moved to the DECODE root. In A the producer binds: its build ends at 1.40 s, after the root. In B
+  the root binds: prep waits for it.
+- The root itself slowed from 1.11–1.22 s to 1.31–1.39 s, and epoch 0's build from 0.28–0.31 s to 0.49–0.50 s. In B
+  the build runs while the root is still hashing; in A it mostly did not [I: contention, read from the overlap; no
+  sampler ran].
+- Net: the hand-off lands at the same instant (Δ head → epoch 0's commit −0.000 s).
+- This row measures the head part alone. `upload_staged` runs only inside `DeviceColumns::upload`, which starts
+  inside epoch 0's commit, so the columns part cannot act before that commit begins [V code].
+
+#### The whole-run Δ
+
+- Base Δ is +0.05 s (29.1 / 29.3 against 29.2 / 29.3).
+- wt1291's extra lives in level 1's last node, L1N2: wall 8.71 s against 7.86–8.02 s in the other three arms.
+  - Its harvest-epochs took 2.68 s (others 2.01–2.13) and its artifacts 1.08 s (others 0.27–0.29).
+  - Its prove, 2.08 s, was the fastest of the four.
+  - Neither part of the knob touches harvest or artifacts [I].
+- The verdict stands as the readout printed it. The arm is not dropped after the fact.
+
+#### Pre-registration for what could follow (written before any of it is queued; the lead decides)
+
+1. **The head-only A/B as built** (`LAMBDA_VM_TRACE_UPLOAD=head` against off, A B B A, FAST 291, wt1294–1297).
+   - Predicted from the rows above: Δ head → epoch 0 executes −0.32 s [−0.45, −0.20]; Δ head → epoch 0's commit
+     0.00 s [−0.10, +0.05]; **Δ whole 0.0 s [−0.3, +0.3] ⇒ NO EFFECT.**
+   - **Recommendation: do not run it.** The combined run already measured this part on its own window.
+2. **Head + the DECODE root on the card** (D-TRACE §2.3: port #1009's `commitment_from_elf_device_or_host`, 0.29 s on
+   the card, pinned to the host root). Not built.
+   - Predicted: the producer path with an uncontended build is 0.15 + 0.07 + 0.56 + 0.30 + prep 0.44 ≈ 1.52 s.
+     That gives Δ head → epoch 0's commit −0.30 s [−0.45, −0.15] and Δ whole −0.3 s [−0.5, 0.0].
+   - One ABBA resolves only ≈ 0.4 s, so it would need 6–8 arms.
+3. **The zero-tail skip alone, on the pageable path, with the scan hidden on a helper thread.** Not built.
+   - At most 7.82 GB ÷ 19 GB/s ≈ −0.41 s of upload. Band −0.3 s [−0.45, −0.1] whole, which needs 6–8 arms.
+4. **The pinned part is dropped by the rule.** Only D-TRACE's stage 1b removes the prover-side copy that caps it:
+   the producer writes pinned slots, and the prover copies nothing. The logs do not measure the pinned DMA ceiling
+   on FAST [I].
