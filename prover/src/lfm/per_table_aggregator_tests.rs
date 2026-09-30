@@ -9329,6 +9329,12 @@ where
     // variants are very different sizes and the pool holds one slot per task.
     type L0Out<C> = PoolOut<Box<WhirWrapSlot<C>>, Box<WhirGlobalChild<C>>>;
     let l0_out = in_index_order(groups.len() + l0_offset, siblings, |j| -> L0Out<C> {
+        // Each task's card holds carry its proof's name on the trace line.
+        let _who = super::device_permit::name_holder(match j.checked_sub(l0_offset) {
+            None => "global".to_string(),
+            Some(k) if wide => format!("L1N{k}"),
+            Some(k) => format!("wrap {k}"),
+        });
         if top_overlap && j == 0 {
             // Behind the last node's artifacts, under `LFM_TREE_GLOBAL_AFTER_LAST`.
             let _deferred = last_latch
