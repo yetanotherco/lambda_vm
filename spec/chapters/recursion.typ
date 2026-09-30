@@ -130,11 +130,13 @@ $(comm(instance), comm(verify'))$ is _constant_ in the depth of the recursion.
 In fact, the size of the verification instance is typically fully determined by 
 $comm(instance)$, since $comm(verify')$ can often be precomputed.
 
-It is important to note that we have not proven soundness of this construction.
-For example, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
-Such a proof would be accepted by $verify'$ even if $instance in.not language$.
-In practice, one might be able to prevent this problem by including a recursion-level counter in the proof.
-The existence of other soundness gaps are not ruled out by the authors.
+#aside([Soundness])[
+  It is important to note that soundness of this construction is not yet proven.
+  For example, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
+  Such a proof would be accepted by $verify'$ even if $instance in.not language$.
+  In practice, one might be able to prevent this particular problem by including
+  a recursion-level counter in the proof.
+]
 
 #aside([$comm(verify')$ absorption])[
   Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
