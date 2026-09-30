@@ -1077,11 +1077,15 @@ where
     let t = tick();
     let tree = match prebuilt {
         Some(tree) => tree,
-        None => match table
-            .trace
-            .reside_from_columns()
-            .and_then(|resident| logup::resident_tree(&interactions, resident))
-        {
+        None => match {
+            let lift = tick();
+            let resident = table.trace.reside_from_columns();
+            if let Some(factors) = resident.as_ref() {
+                factors.tree_sync();
+            }
+            lap(&split::TREE_LIFT, lift);
+            resident.and_then(|resident| logup::resident_tree(&interactions, resident))
+        } {
             Some(tree) => tree,
             // No device took them, so the host builds what it needs: the
             // factors, used here and by the sumcheck that follows.

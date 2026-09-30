@@ -533,6 +533,56 @@ pub static REST_RELEASE: Slot = Slot::new();
 /// Tables argued.
 pub static REST_TABLES: Counter = Counter::new();
 
+// Of [`REST_TREE`], split — the factors lifted, the input layer's programs
+// lowered and written, the levels folded, the output read. The card runs the
+// first three asynchronously, so their host times say where the host waited,
+// not what the card spent; under `LAMBDA_VM_ARGUE_TREE_SYNC=1` (a diagnostic,
+// never a measurement of the wall) each part waits for its own kernels, and the
+// parts then say what the card spent on each.
+
+/// The factors lifted from the columns into the extension.
+pub static TREE_LIFT: Slot = Slot::new();
+/// The input layer's interaction programs lowered on the host.
+pub static TREE_LOWER: Slot = Slot::new();
+/// The input layer written (the lowering included).
+pub static TREE_WRITE: Slot = Slot::new();
+/// Every level folded up from it, the tree's promise included.
+pub static TREE_FOLD: Slot = Slot::new();
+/// The output fraction read back.
+pub static TREE_OUTPUT: Slot = Slot::new();
+
+/// Whether the tree's parts wait for their own kernels
+/// (`LAMBDA_VM_ARGUE_TREE_SYNC`, with the split on): a diagnostic.
+pub fn tree_sync() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled()
+        && *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ARGUE_TREE_SYNC").is_ok_and(|v| !v.is_empty() && v != "0")
+        })
+}
+
+/// A prove's tree region, split: seconds per part.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TreeSplit {
+    pub lift: f64,
+    pub lower: f64,
+    pub write: f64,
+    pub fold: f64,
+    pub output: f64,
+}
+
+impl TreeSplit {
+    fn take() -> Self {
+        Self {
+            lift: TREE_LIFT.take(),
+            lower: TREE_LOWER.take(),
+            write: TREE_WRITE.take(),
+            fold: TREE_FOLD.take(),
+            output: TREE_OUTPUT.take(),
+        }
+    }
+}
+
 /// A prove's per-table rest, split: seconds per region.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RestSplit {
@@ -1048,6 +1098,10 @@ pub struct ProverSplit {
     pub lean_program: bool,
     /// The per-table rest, split — [`RestSplit`] — and each table's census.
     pub rest: RestSplit,
+    /// The tree region, split — [`TreeSplit`] — and whether its parts waited
+    /// for their kernels.
+    pub tree: TreeSplit,
+    pub tree_sync: bool,
     pub air_census: Vec<AirCensus>,
 }
 
@@ -1291,6 +1345,31 @@ impl ProverSplit {
             fused_ms = ms(z.fused_time),
         )
     }
+    /// The tree line: `ARGUE TREE #k: lift · write (lower) · fold · output ·
+    /// of tree T (ms) || sync on|off` — [`TreeSplit`] beside the region it
+    /// splits.
+    pub fn tree_line(&self) -> String {
+        let t = &self.tree;
+        let ms = |secs: f64| secs * 1e3;
+        format!(
+            "ARGUE TREE {who}{tainted}: lift {lift:.2} · write {write:.2} (lower {lower:.2}) · fold \
+             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || sync {sync}",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            lift = ms(t.lift),
+            write = ms(t.write),
+            lower = ms(t.lower),
+            fold = ms(t.fold),
+            output = ms(t.output),
+            tree = ms(self.rest.tree),
+            sync = if self.tree_sync { "on" } else { "off" },
+        )
+    }
+
     /// The rest line, milliseconds, stamped as the split line is:
     /// `ARGUE REST #k: tables T || interactions · tree · output · gkr (prefix)
     /// · setup · batch · values · reduce · columns · release || Σ S of argue A
@@ -1448,6 +1527,8 @@ pub fn push_prover(mut rec: ProverSplit) {
         .map(|mut h| std::mem::take(&mut *h))
         .unwrap_or_default();
     rec.rest = RestSplit::take();
+    rec.tree = TreeSplit::take();
+    rec.tree_sync = tree_sync();
     rec.air_census = AIRS
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
@@ -1553,6 +1634,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.tail_line());
     println!("{}", rec.zerocheck_line());
     println!("{}", rec.rest_line());
+    println!("{}", rec.tree_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -2145,6 +2227,32 @@ mod tests {
             "ARGUE AIR #4 7 KECCAK_RND: n 16 · cols 1480 · factors 1482 (shifted 0) · interactions \
              1031 · k 27 · degree 4 · roots 140 · bus len 12 || tree 20.00 · gkr 150.00 · core \
              300.00 (ms)"
+        );
+    }
+
+    /// The tree line: the tree region's parts beside the region, and whether
+    /// they waited for their kernels.
+    #[test]
+    fn the_tree_line_splits_the_tree_region() {
+        let epoch = ProverSplit {
+            index: 3,
+            rest: RestSplit {
+                tree: 0.120,
+                ..Default::default()
+            },
+            tree: TreeSplit {
+                lift: 0.010,
+                lower: 0.020,
+                write: 0.050,
+                fold: 0.040,
+                output: 0.001,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.tree_line(),
+            "ARGUE TREE #3: lift 10.00 · write 50.00 (lower 20.00) · fold 40.00 · output 1.00 · of \
+             tree 120.00 (ms) || sync off"
         );
     }
 

@@ -121,6 +121,17 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
+/// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the stream's
+/// kernels so the tree's split charges each part its own card time.
+#[cfg(feature = "cuda")]
+macro_rules! tree_sync {
+    ($stream:expr) => {
+        if crate::whir_split::tree_sync() {
+            let _ = $stream.synchronize();
+        }
+    };
+}
+
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
 }
@@ -3189,6 +3200,13 @@ impl std::fmt::Debug for DeviceFactors {
 
 #[cfg(feature = "cuda")]
 impl DeviceFactors {
+    /// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the kernels
+    /// that built the factors, so the tree's split charges the lift its own
+    /// card time.
+    pub fn tree_sync(&self) {
+        tree_sync!(self.0.stream());
+    }
+
     /// The card's handle, for the fused rounds (`gpu_fused`).
     pub(crate) fn inner(&self) -> &math_cuda::sumcheck::DeviceFactors {
         &self.0
@@ -3213,6 +3231,13 @@ impl DeviceFactors {
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceFactors {
+    pub fn tree_sync(&self) {
+        match self.0 {}
+    }
+}
 
 /// A table's factors, built on the device out of its base columns.
 ///
@@ -3357,7 +3382,9 @@ where
 
     for (i, (numerator, denominator)) in numerators.iter().zip(denominators).enumerate() {
         for (program, out) in [(numerator, &mut p), (denominator, &mut q)] {
+            let t = crate::whir_split::tick();
             let lowered = lower(program)?;
+            crate::whir_split::add_tick(&crate::whir_split::TREE_LOWER, t);
             factors
                 .0
                 .map_program(
@@ -3477,11 +3504,19 @@ where
     let carried = math_cuda::device::reserve(eager);
     if carried.is_some() || eager - lazy < worth_handing_back() {
         drop(carried);
+        let t = crate::whir_split::tick();
         let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
-        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
+        tree_sync!(stream);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
+        let t = crate::whir_split::tick();
+        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream.clone(), p, q).ok()?;
+        tree_sync!(stream);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
         let output = std::sync::OnceLock::new();
         if !defer {
+            let t = crate::whir_split::tick();
             let _ = output.set(tree.output().ok()?);
+            crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
         }
         let num_layers = tree.num_layers();
         let input_num_vars = tree.layer_num_vars(num_layers - 1);
@@ -3512,14 +3547,22 @@ where
         return None;
     };
 
+    let t = crate::whir_split::tick();
     let (p, q) = write_input_layer(&factors, &numerators, &denominators, false)?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let num_vars = full.trailing_zeros() as usize;
+    let t = crate::whir_split::tick();
     let tree =
         math_cuda::gkr::DeviceFractionTree::from_padded_input(stream.clone(), p, q, real, num_vars)
             .ok()?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
     if !defer {
+        let t = crate::whir_split::tick();
         let _ = output.set(tree.output().ok()?);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
     }
     let num_layers = tree.num_layers();
 
