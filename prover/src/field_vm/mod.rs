@@ -23,4 +23,6 @@ pub(crate) mod lfm_translate;
 #[cfg(test)]
 mod prove_tests;
 #[cfg(test)]
+pub(crate) mod split;
+#[cfg(test)]
 mod tests;

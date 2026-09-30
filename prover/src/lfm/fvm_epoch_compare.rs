@@ -15,7 +15,7 @@ use crate::field_vm::prove::{generate_traces, program_id, prove_traces, public_c
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 /// Repetitions per configuration: `FVM_COMPARE_RUNS`, default 3.
-fn runs() -> usize {
+pub(super) fn runs() -> usize {
     std::env::var("FVM_COMPARE_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -30,7 +30,7 @@ fn blowup(b: u8) -> ProofOptions {
 
 /// The inner epoch's options: `FVM_EPOCH_PRESET` = `blowup2` | `blowup4` |
 /// `blowup8` picks a production preset; unset is the min-preset fixture.
-fn inner_options() -> ProofOptions {
+pub(super) fn inner_options() -> ProofOptions {
     use crate::recursion::Preset;
     match std::env::var("FVM_EPOCH_PRESET").as_deref() {
         Ok("blowup2") => Preset::Blowup2.options(),
@@ -40,7 +40,7 @@ fn inner_options() -> ProofOptions {
     }
 }
 
-fn census<PI>(proof: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> (usize, usize) {
+pub(super) fn census<PI>(proof: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> (usize, usize) {
     proof.proofs.iter().fold((0, 0), |(r, c), p| {
         (
             r + p.trace_length,
@@ -58,7 +58,7 @@ fn tables_of<PI>(p: &MultiProof<GoldilocksField, GoldilocksExtension, PI>) -> St
 }
 
 /// `median (cv=…%, n=…)` of timings in milliseconds.
-fn stats(mut v: Vec<f64>) -> String {
+pub(super) fn stats(mut v: Vec<f64>) -> String {
     v.sort_by(f64::total_cmp);
     let n = v.len() as f64;
     let mean = v.iter().sum::<f64>() / n;
