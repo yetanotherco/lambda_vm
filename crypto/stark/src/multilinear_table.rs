@@ -1539,6 +1539,10 @@ where
     // layers they kept, and whatever room a group still holds) and rises by
     // what the tables reserve.
     let __rw_argue = multilinear::whir_split::open_reserved();
+    // Under `LAMBDA_VM_QUIET_PRODUCER=1` (a measurement knob, default off) the
+    // argue waits here for a producer stage in progress, before any table's
+    // timer starts, and no producer stage starts until it ends.
+    let __quiet = multilinear::whir_split::argue_quiet();
     for (__sp_at, table) in committed.tables().iter().enumerate() {
         table_starts.push(points.len());
         // ⛔ SERIAL, and the instrument says so rather than a reader inferring
@@ -1566,6 +1570,7 @@ where
         values.extend(proof.constraint.reduce.column_values.iter().cloned());
         tables.push(proof);
     }
+    drop(__quiet);
     multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_ARGUE, __rw_argue);
 
     // One opening per group, over that group's columns. The points and values

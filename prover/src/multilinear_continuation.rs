@@ -2612,6 +2612,11 @@ pub(crate) fn prove_continuation_scheduled(
             global_prepped,
         )
     });
+    if crate::continuation::base_split_enabled()
+        && let Some(line) = multilinear::whir_split::quiet_report()
+    {
+        println!("{line} (the epochs)");
+    }
 
     let num_private_input_pages = crate::tables::page::private_input_page_count(private_inputs);
     // One source of truth: the same list drives the committed tables and

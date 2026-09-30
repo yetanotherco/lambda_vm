@@ -787,6 +787,157 @@ pub fn begin_prove() -> Option<ProveGuard> {
     Some(ProveGuard(()))
 }
 
+// ── the quiet producer (a measurement knob) ─────────────────────────────────
+
+/// `1` keeps the WHIR base's producer quiet while the prover argues: a producer
+/// stage (execute, collect, build, prep) does not start while an argue runs or
+/// waits to run, and an argue waits for the stage in progress to finish, so the
+/// two never overlap. Anything else, unset included (the default), lets them
+/// overlap as before. Timing only: nothing a proof holds depends on it.
+///
+/// It exists to measure how much the producer's host work slows the argue (the
+/// argue's seconds per second of producer overlap). At the default hand-off
+/// depth of one epoch the producer cannot fit its work outside the argues, so
+/// with the knob on it is expected to fall behind the prover.
+pub const QUIET_PRODUCER_ENV: &str = "LAMBDA_VM_QUIET_PRODUCER";
+
+/// Whether [`QUIET_PRODUCER_ENV`]'s raw value turns the quiet producer on.
+pub fn quiet_producer_setting(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+fn quiet_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = quiet_producer_setting(std::env::var(QUIET_PRODUCER_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "QUIET PRODUCER: on ({QUIET_PRODUCER_ENV}=1) — producer stages and argues never overlap"
+            );
+        }
+        on
+    })
+}
+
+/// Who holds the base's host right now.
+#[derive(Default)]
+struct QuietState {
+    argues_waiting: usize,
+    argues_running: usize,
+    stages_running: usize,
+}
+
+static QUIET: Mutex<QuietState> = Mutex::new(QuietState {
+    argues_waiting: 0,
+    argues_running: 0,
+    stages_running: 0,
+});
+static QUIET_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+/// `[argues, argue wait ns, stages, stage wait ns]` since the process started.
+static QUIET_TOTALS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Held while an argue runs under the quiet producer; releases on drop, so a
+/// `?` early return cannot leave the producer blocked.
+#[derive(Debug)]
+pub struct ArgueQuiet {
+    on: bool,
+}
+
+/// Held while a producer stage runs under the quiet producer; releases on drop.
+#[derive(Debug)]
+pub struct StageQuiet {
+    on: bool,
+}
+
+fn quiet_lock() -> std::sync::MutexGuard<'static, QuietState> {
+    QUIET.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Enter an argue: announce it (no new producer stage starts from here), wait
+/// for the stage in progress, then run. Inert when the knob is off.
+pub fn argue_quiet() -> ArgueQuiet {
+    argue_quiet_if(quiet_on())
+}
+
+fn argue_quiet_if(on: bool) -> ArgueQuiet {
+    if !on {
+        return ArgueQuiet { on: false };
+    }
+    let start = Instant::now();
+    let mut st = quiet_lock();
+    st.argues_waiting += 1;
+    while st.stages_running > 0 {
+        st = QUIET_CHANGED.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.argues_waiting -= 1;
+    st.argues_running += 1;
+    drop(st);
+    QUIET_TOTALS[0].fetch_add(1, Ordering::Relaxed);
+    QUIET_TOTALS[1].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ArgueQuiet { on: true }
+}
+
+impl Drop for ArgueQuiet {
+    fn drop(&mut self) {
+        if self.on {
+            quiet_lock().argues_running -= 1;
+            QUIET_CHANGED.notify_all();
+        }
+    }
+}
+
+/// Enter a producer stage: wait while an argue runs or waits to run, then run.
+/// Inert when the knob is off.
+pub fn stage_quiet() -> StageQuiet {
+    stage_quiet_if(quiet_on())
+}
+
+fn stage_quiet_if(on: bool) -> StageQuiet {
+    if !on {
+        return StageQuiet { on: false };
+    }
+    let start = Instant::now();
+    let mut st = quiet_lock();
+    while st.argues_waiting > 0 || st.argues_running > 0 {
+        st = QUIET_CHANGED.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.stages_running += 1;
+    drop(st);
+    QUIET_TOTALS[2].fetch_add(1, Ordering::Relaxed);
+    QUIET_TOTALS[3].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    StageQuiet { on: true }
+}
+
+impl Drop for StageQuiet {
+    fn drop(&mut self) {
+        if self.on {
+            quiet_lock().stages_running -= 1;
+            QUIET_CHANGED.notify_all();
+        }
+    }
+}
+
+/// The quiet producer's line, when it is on: how often and how long each side
+/// waited for the other.
+pub fn quiet_report() -> Option<String> {
+    if !quiet_on() {
+        return None;
+    }
+    let t = |i: usize| QUIET_TOTALS[i].load(Ordering::Relaxed);
+    Some(format!(
+        "QUIET PRODUCER: argues waited {:.3}s over {} argue(s) · producer stages waited {:.3}s over {} stage(s)",
+        t(1) as f64 / 1e9,
+        t(0),
+        t(3) as f64 / 1e9,
+        t(2),
+    ))
+}
+
 // ── the per-epoch records ───────────────────────────────────────────────────
 
 /// One epoch's producer-side stages. The four **partition** `wall`, so the only
@@ -1572,6 +1723,93 @@ pub fn check_closure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_quiet_producer_is_off_unless_exactly_one() {
+        for raw in [None, Some(""), Some("0"), Some("on"), Some("2")] {
+            assert!(!quiet_producer_setting(raw), "{raw:?}");
+        }
+        for raw in [Some("1"), Some(" 1 ")] {
+            assert!(quiet_producer_setting(raw), "{raw:?}");
+        }
+    }
+
+    /// With the knob off the guards take no lock and count nothing.
+    #[test]
+    fn quiet_guards_are_inert_when_off() {
+        let before: Vec<u64> = QUIET_TOTALS
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let a = argue_quiet_if(false);
+        let s = stage_quiet_if(false);
+        drop((a, s));
+        let after: Vec<u64> = QUIET_TOTALS
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// ★ The property the knob exists for: under it a producer stage and an
+    /// argue are never inside their guards at once, and an argue that asks
+    /// while a stage runs gets the host before the next stage starts.
+    #[test]
+    fn quiet_stages_and_argues_never_overlap_and_the_argue_goes_first() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let in_stage = Arc::new(AtomicBool::new(false));
+        let in_argue = Arc::new(AtomicBool::new(false));
+        let overlap = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let producer = {
+            let (in_stage, in_argue, overlap, order) = (
+                in_stage.clone(),
+                in_argue.clone(),
+                overlap.clone(),
+                order.clone(),
+            );
+            std::thread::spawn(move || {
+                for k in 0..6 {
+                    let _g = stage_quiet_if(true);
+                    in_stage.store(true, Ordering::SeqCst);
+                    if in_argue.load(Ordering::SeqCst) {
+                        overlap.store(true, Ordering::SeqCst);
+                    }
+                    order.lock().unwrap().push(format!("stage{k}"));
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    in_stage.store(false, Ordering::SeqCst);
+                }
+            })
+        };
+        // Let the first stage start, then ask for the host mid-stage.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for k in 0..3 {
+            let _g = argue_quiet_if(true);
+            in_argue.store(true, Ordering::SeqCst);
+            if in_stage.load(Ordering::SeqCst) {
+                overlap.store(true, Ordering::SeqCst);
+            }
+            order.lock().unwrap().push(format!("argue{k}"));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            in_argue.store(false, Ordering::SeqCst);
+            drop(_g);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        producer.join().unwrap();
+        assert!(
+            !overlap.load(Ordering::SeqCst),
+            "a stage and an argue overlapped"
+        );
+        let order = order.lock().unwrap().clone();
+        // The argue asked during stage 0, so it ran before stage 1 began.
+        let a0 = order.iter().position(|e| e == "argue0").unwrap();
+        let s1 = order.iter().position(|e| e == "stage1").unwrap();
+        assert!(
+            a0 < s1,
+            "the argue waited behind more than the stage in progress: {order:?}"
+        );
+    }
 
     /// ⛔ The disabled path must read no clock. Asserted through the only
     /// observable it has: [`mark`] returns `None`, so [`add`] cannot move a

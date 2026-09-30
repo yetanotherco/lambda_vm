@@ -1188,6 +1188,9 @@ pub(crate) fn for_each_epoch(
         // harness's check is for.
         let __bs_epoch = multilinear::whir_split::mark();
         let __bs_exec = multilinear::whir_split::mark();
+        // Under `LAMBDA_VM_QUIET_PRODUCER=1` each of the three stages below waits
+        // for any argue in progress before it starts (timing only).
+        let __quiet = multilinear::whir_split::stage_quiet();
         let logs = match executor
             .resume_with_limit(epoch_size)
             .map_err(|e| Error::Execution(format!("{e}")))?
@@ -1195,6 +1198,7 @@ pub(crate) fn for_each_epoch(
             Some(logs) => logs.to_vec(),
             None => break,
         };
+        drop(__quiet);
         let is_final = executor.pc() == 0;
         if !is_final && logs.len() != epoch_size {
             return Err(Error::ContinuationInvariant(format!(
@@ -1205,6 +1209,7 @@ pub(crate) fn for_each_epoch(
         let __bs_exec_s = multilinear::whir_split::stage_done(index, "execute", __bs_exec);
 
         let __bs_collect = multilinear::whir_split::mark();
+        let __quiet = multilinear::whir_split::stage_quiet();
         let label = local_to_global::epoch_label(index);
         let collected = Traces::collect_epoch(artifacts, &image, &register_init, &logs, is_final)?;
         let boundary = Arc::new(local_to_global::epoch_boundary(
@@ -1217,9 +1222,11 @@ pub(crate) fn for_each_epoch(
         for cell in boundary.iter() {
             image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
+        drop(__quiet);
         let __bs_collect_s = multilinear::whir_split::stage_done(index, "collect", __bs_collect);
 
         let __bs_build = multilinear::whir_split::mark();
+        let __quiet = multilinear::whir_split::stage_quiet();
         let traces = Traces::build_from_collected(
             artifacts,
             collected,
@@ -1234,6 +1241,7 @@ pub(crate) fn for_each_epoch(
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )?;
+        drop(__quiet);
         let __bs_build_s = multilinear::whir_split::stage_done(index, "build", __bs_build);
 
         // ★ THE BACKPRESSURE IS THE MEASUREMENT. Under
@@ -1385,7 +1393,11 @@ where
                     {
                         on_count(prepared.index as usize + 1);
                     }
+                    // The quiet producer's fourth stage; the send stays outside it,
+                    // or a prover waiting to argue would wait on its own hand-off.
+                    let quiet = multilinear::whir_split::stage_quiet();
                     let item = prep(prepared)?;
+                    drop(quiet);
                     sender.send(item).map_err(|_| {
                         Error::ContinuationInvariant("the epoch consumer stopped".to_string())
                     })
@@ -1394,7 +1406,9 @@ where
             // Closed here, so the consumer's loop ends as soon as it has taken
             // the last epoch, while `tail` runs.
             drop(sender);
+            let quiet = multilinear::whir_split::stage_quiet();
             let tailed = tail(&boundaries)?;
+            drop(quiet);
             Ok((boundaries, tailed))
         });
         let used = receiver.into_iter().try_for_each(&mut each);
