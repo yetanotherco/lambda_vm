@@ -24,6 +24,8 @@ pub struct Translation {
     /// LFM instructions per kind, and how many were skipped.
     pub lfm_counts: BTreeMap<&'static str, usize>,
     pub skipped: BTreeMap<&'static str, usize>,
+    /// The memory address of each cell asked to be kept, in request order.
+    pub kept: Vec<u64>,
 }
 
 fn cell(a: &Addr) -> Arg {
@@ -167,6 +169,18 @@ fn plan(program: &LfmProgram) -> Vec<Plan> {
 /// bit); otherwise it is skipped as RISC-V-half work. `FVM_TRANSLATE_OPT`
 /// turns on the planner above and moves base constants to public cells.
 pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Translation {
+    translate_keeping(program, exec, bit_dec, &[], &|_| false)
+}
+
+/// [`translate`] keeping the cells at `keep` in memory whether or not the
+/// program reads them.
+pub fn translate_keeping(
+    program: &LfmProgram,
+    exec: &LfmExecution,
+    bit_dec: bool,
+    keep: &[u64],
+    skip: &dyn Fn(&Instr) -> bool,
+) -> Translation {
     let n = program.num_addrs;
     let mut mem: Vec<FEE> = (0..n)
         .map(|a| {
@@ -233,6 +247,10 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
             Instr::Public { .. } => "public",
         };
         *lfm_counts.entry(kind).or_insert(0) += 1;
+        if skip(instr) {
+            *skipped.entry(kind).or_insert(0) += 1;
+            continue;
+        }
         match instr {
             Instr::Const { out, value, .. } => {
                 if value[1] == FE::zero() && value[2] == FE::zero() && !opt {
@@ -345,8 +363,9 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
     public.sort_unstable();
     public.dedup();
     let mut program = asm.finish().expect("translated program");
+    let mut kept = keep.to_vec();
     if std::env::var_os("FVM_MEM_COMPACT").is_some() {
-        (mem, public) = compact(&mut program, &mem, &public);
+        (mem, public, kept) = compact(&mut program, &mem, &public, keep);
     }
     if std::env::var_os("FVM_REROLL").is_some() {
         program = reroll(&program);
@@ -357,13 +376,19 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         public,
         lfm_counts,
         skipped,
+        kept,
     }
 }
 
 /// Keeps only the cells the program reads or publishes, renumbered densely in
 /// first-use order. Every memory argument of a translation is an absolute
 /// address, so renumbering is rewriting offsets.
-fn compact(program: &mut Program, mem: &[FEE], public: &[u64]) -> (Vec<FEE>, Vec<u64>) {
+fn compact(
+    program: &mut Program,
+    mem: &[FEE],
+    public: &[u64],
+    keep: &[u64],
+) -> (Vec<FEE>, Vec<u64>, Vec<u64>) {
     let mut remap: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     let mut dense = Vec::new();
     let mut slot = |old: u64, dense: &mut Vec<FEE>| {
@@ -385,7 +410,8 @@ fn compact(program: &mut Program, mem: &[FEE], public: &[u64]) -> (Vec<FEE>, Vec
     }
     let mut public: Vec<u64> = public.iter().map(|&a| slot(a, &mut dense)).collect();
     public.sort_unstable();
-    (dense, public)
+    let kept = keep.iter().map(|&a| slot(a, &mut dense)).collect();
+    (dense, public, kept)
 }
 
 /// Shortest loop body worth its two rows of per-iteration overhead.

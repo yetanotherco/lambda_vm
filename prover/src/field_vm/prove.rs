@@ -57,6 +57,9 @@ pub fn production_format(mut options: ProofOptions) -> ProofOptions {
     options
 }
 
+/// A table proved alongside the Field VM's own, sharing its buses.
+pub type ExtraAir = Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>>;
+
 struct Airs {
     /// One per FIELD_VM segment.
     fvm: Vec<AirWithBuses<F, E, FieldVmBoundary, FvmPublicInputs, FieldVmConstraints>>,
@@ -64,10 +67,17 @@ struct Airs {
     decode:
         Vec<AirWithBuses<F, E, NullBoundaryConstraintBuilder, FvmPublicInputs, EmptyConstraints>>,
     mem: AirWithBuses<F, E, MemBoundary, FvmPublicInputs, MemConstraints>,
+    extra: Vec<ExtraAir>,
 }
 
 impl Airs {
-    fn new(program_id: &[Commitment], options: &ProofOptions, segments: usize) -> Self {
+    fn new(
+        program_id: &[Commitment],
+        options: &ProofOptions,
+        segments: usize,
+        extra: Vec<ExtraAir>,
+        mem_lfm: bool,
+    ) -> Self {
         let aux = |interactions| AuxiliaryTraceBuildData { interactions };
         let fvm = AirWithBuses::new(
             air::cols::NUM_COLUMNS,
@@ -96,17 +106,26 @@ impl Airs {
                 })
                 .collect(),
             mem: AirWithBuses::new(
-                mem::cols::NUM_COLUMNS,
-                aux(mem::bus_interactions()),
+                if mem_lfm {
+                    mem::cols::NUM_COLUMNS_LFM
+                } else {
+                    mem::cols::NUM_COLUMNS
+                },
+                aux(if mem_lfm {
+                    mem::bus_interactions_lfm()
+                } else {
+                    mem::bus_interactions()
+                }),
                 options,
                 1,
-                MemConstraints,
+                MemConstraints { lfm: mem_lfm },
             )
             .with_name("FIELD_VM_MEM"),
+            extra,
         }
     }
 
-    /// The segments, then the DECODE chunks, then MEM.
+    /// The segments, then the DECODE chunks, then MEM, then the extra tables.
     fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = FvmPublicInputs>> =
             self.fvm.iter().map(|a| a as _).collect();
@@ -116,6 +135,7 @@ impl Airs {
             }),
         );
         refs.push(&self.mem);
+        refs.extend(self.extra.iter().map(|a| a.as_ref()));
         refs
     }
 }
@@ -218,12 +238,48 @@ pub fn generate_traces_with(
     public: &[u64],
     max_rows: Option<usize>,
 ) -> FvmTraces {
-    let seg = air::generate_segments(program, exec, MIN_ROWS, max_rows);
+    generate_traces_reading(program, exec, public, max_rows, &[])
+}
+
+/// [`generate_traces_with`] where MEM also serves one read of each address in
+/// `extra_reads` to a table outside the Field VM.
+pub fn generate_traces_reading(
+    program: &Program,
+    exec: &Execution,
+    public: &[u64],
+    max_rows: Option<usize>,
+    extra_reads: &[u64],
+) -> FvmTraces {
+    generate_traces_lfm(program, exec, public, max_rows, extra_reads, None)
+}
+
+/// [`generate_traces_reading`] with MEM on `LfmMem` for `lfm` cells.
+pub fn generate_traces_lfm(
+    program: &Program,
+    exec: &Execution,
+    public: &[u64],
+    max_rows: Option<usize>,
+    extra_reads: &[u64],
+    lfm: Option<&[mem::LfmCell]>,
+) -> FvmTraces {
+    let mut seg = air::generate_segments(program, exec, MIN_ROWS, max_rows);
+    for &a in extra_reads {
+        let a = a as usize;
+        if seg.mem_mult.len() <= a {
+            seg.mem_mult.resize(a + 1, 0);
+        }
+        seg.mem_mult[a] += 1;
+    }
     FvmTraces {
         fvm: seg.traces,
         segments: seg.public,
         decode: decode::generate_traces(program, &seg.decode_mult, MIN_ROWS),
-        mem: mem::generate_trace(&exec.mem, &seg.mem_mult, public, MIN_ROWS),
+        mem: match lfm {
+            Some(cells) => {
+                mem::generate_trace_lfm(&exec.mem, &seg.mem_mult, public, MIN_ROWS, cells)
+            }
+            None => mem::generate_trace(&exec.mem, &seg.mem_mult, public, MIN_ROWS),
+        },
     }
 }
 
@@ -233,9 +289,23 @@ pub fn prove_traces(
     traces: &mut FvmTraces,
     options: &ProofOptions,
 ) -> Result<FvmProof, ProvingError> {
+    prove_traces_with(program_id, public, traces, Vec::new(), &mut [], false, options)
+}
+
+/// [`prove_traces`] with `extra` tables, one trace each, after MEM.
+pub fn prove_traces_with(
+    program_id: &[Commitment],
+    public: &[PublicCell],
+    traces: &mut FvmTraces,
+    extra: Vec<ExtraAir>,
+    extra_traces: &mut [TraceTable<F, E>],
+    mem_lfm: bool,
+    options: &ProofOptions,
+) -> Result<FvmProof, ProvingError> {
+    assert_eq!(extra.len(), extra_traces.len(), "one trace per extra table");
     let none = FvmPublicInputs::default();
     let n = traces.fvm.len();
-    let airs = Airs::new(program_id, options, n);
+    let airs = Airs::new(program_id, options, n, extra, mem_lfm);
     let refs = airs.refs();
     let mut pairs: Vec<_> = refs
         .iter()
@@ -248,6 +318,9 @@ pub fn prove_traces(
         pairs.push((*air, trace, &none));
     }
     pairs.push((refs[n + chunks], &mut traces.mem, &none));
+    for (air, trace) in refs[n + chunks + 1..].iter().zip(extra_traces.iter_mut()) {
+        pairs.push((*air, trace, &none));
+    }
     crate::hash_pin::BlockProver::<F, E, FvmPublicInputs>::multi_prove(
         pairs,
         &mut transcript(program_id, public, &traces.segments),
@@ -280,13 +353,25 @@ pub fn verify(
     proof: &FvmProof,
     options: &ProofOptions,
 ) -> bool {
+    verify_with(program_id, public, proof, Vec::new(), false, options)
+}
+
+/// [`verify`] for a proof carrying `extra` tables after MEM.
+pub fn verify_with(
+    program_id: &[Commitment],
+    public: &[PublicCell],
+    proof: &FvmProof,
+    extra: Vec<ExtraAir>,
+    mem_lfm: bool,
+    options: &ProofOptions,
+) -> bool {
     if !public.windows(2).all(|w| w[0].0 < w[1].0) {
         return false;
     }
     let Some(n) = proof
         .proofs
         .len()
-        .checked_sub(program_id.len() + 1)
+        .checked_sub(program_id.len() + 1 + extra.len())
         .filter(|&n| n >= 1)
     else {
         return false;
@@ -314,7 +399,7 @@ pub fn verify(
     {
         return false;
     }
-    let airs = Airs::new(program_id, options, n);
+    let airs = Airs::new(program_id, options, n, extra, mem_lfm);
     let mut t = transcript(program_id, public, &segments);
     let (z, alpha) = logup_challenges(&airs, proof, &mut t.clone());
     let Some(expected) = expected_public_balance(public, &z, &alpha) else {
