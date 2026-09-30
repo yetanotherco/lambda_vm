@@ -621,4 +621,13 @@ mod tests {
         assert!(words > 0, "the later rounds still need their slot file");
         assert_eq!(fit(1 << 18, 0, 1, u64::MAX), None, "no rows, no launch");
     }
+
+    /// S1-1's default, pinned: integer nodes unless the variable says `0`.
+    #[test]
+    fn integer_nodes_are_on_unless_the_knob_says_0() {
+        use crate::sumcheck::int_nodes_from;
+        assert!(int_nodes_from(None));
+        assert!(int_nodes_from(Some("1")));
+        assert!(!int_nodes_from(Some("0")));
+    }
 }

@@ -522,6 +522,12 @@ pub static ZC_LEAN_XCHECKED: Counter = Counter::new();
 pub static ZC_BIG_EARLY_ROUNDS: Counter = Counter::new();
 /// The rounds in [`ZC_BIG_LATE`].
 pub static ZC_BIG_LATE_ROUNDS: Counter = Counter::new();
+/// Zerocheck sessions that ran D-ARGUE stage 1's fused rounds
+/// (`gpu_fused`, `LAMBDA_VM_ARGUE_FUSED`), their device rounds' time, and the
+/// sessions the fused rounds declined before round 0 (today's ran).
+pub static ZC_FUSED: Counter = Counter::new();
+pub static ZC_FUSED_TIME: Slot = Slot::new();
+pub static ZC_FUSED_DECLINED: Counter = Counter::new();
 
 /// A prove's zerocheck rounds, split: seconds per region and the counts they
 /// are over.
@@ -536,6 +542,9 @@ pub struct ZerocheckSplit {
     pub xchecked: u64,
     pub early_rounds: u64,
     pub late_rounds: u64,
+    pub fused: u64,
+    pub fused_time: f64,
+    pub fused_declined: u64,
 }
 
 impl ZerocheckSplit {
@@ -551,6 +560,9 @@ impl ZerocheckSplit {
             xchecked: ZC_LEAN_XCHECKED.take(),
             early_rounds: ZC_BIG_EARLY_ROUNDS.take(),
             late_rounds: ZC_BIG_LATE_ROUNDS.take(),
+            fused: ZC_FUSED.take(),
+            fused_time: ZC_FUSED_TIME.take(),
+            fused_declined: ZC_FUSED_DECLINED.take(),
         }
     }
 }
@@ -1094,7 +1106,8 @@ impl ProverSplit {
     /// The zerocheck line, milliseconds, stamped as the split line is:
     /// `ARGUE ZEROCHECK #k: big sessions B (lean L · xchecked X) · early rounds
     /// E · late rounds R || big early X · big late Y · other Z · host tail T
-    /// (ms) || lean program on|off · xcheck on|off`.
+    /// (ms) || lean program on|off · xcheck on|off || fused F (declined D) · M ms`
+    /// — the last part D-ARGUE stage 1's sessions and their device rounds' time.
     pub fn zerocheck_line(&self) -> String {
         let z = &self.zerocheck;
         let ms = |secs: f64| secs * 1e3;
@@ -1103,7 +1116,8 @@ impl ProverSplit {
             "ARGUE ZEROCHECK {who}{tainted}: big sessions {big} (lean {lean} · xchecked \
              {checked}) · early rounds {early} · late rounds {late} || big early {big_early:.2} · \
              big late {big_late:.2} · other {other:.2} · host tail {tail:.2} (ms) || lean \
-             program {knob} · xcheck {xcheck}",
+             program {knob} · xcheck {xcheck} || fused {fused} (declined {declined}) · \
+             {fused_ms:.2} ms",
             who = self.who(),
             tainted = if self.overlapped {
                 " ⛔OVERLAPPED"
@@ -1121,6 +1135,9 @@ impl ProverSplit {
             tail = ms(z.tail),
             knob = on_off(self.lean_program),
             xcheck = on_off(self.xcheck),
+            fused = z.fused,
+            declined = z.fused_declined,
+            fused_ms = ms(z.fused_time),
         )
     }
     /// The GKR line, milliseconds, stamped as the split line is:
@@ -1895,6 +1912,9 @@ mod tests {
                 xchecked: 4,
                 early_rounds: 30,
                 late_rounds: 36,
+                fused: 21,
+                fused_time: 0.8,
+                fused_declined: 2,
             },
             lean_program: true,
             xcheck: true,
@@ -1904,7 +1924,7 @@ mod tests {
             epoch.zerocheck_line(),
             "ARGUE ZEROCHECK #3: big sessions 4 (lean 4 · xchecked 4) · early rounds 30 · late \
              rounds 36 || big early 1250.00 · big late 40.50 · other 500.00 · host tail 12.00 \
-             (ms) || lean program on · xcheck on"
+             (ms) || lean program on · xcheck on || fused 21 (declined 2) · 800.00 ms"
         );
         let global = ProverSplit {
             index: GLOBAL_INDEX,
@@ -1915,7 +1935,7 @@ mod tests {
             global.zerocheck_line(),
             "ARGUE ZEROCHECK GLOBAL (in base) ⛔OVERLAPPED: big sessions 0 (lean 0 · xchecked \
              0) · early rounds 0 · late rounds 0 || big early 0.00 · big late 0.00 · other 0.00 · \
-             host tail 0.00 (ms) || lean program off · xcheck off"
+             host tail 0.00 (ms) || lean program off · xcheck off || fused 0 (declined 0) · 0.00 ms"
         );
     }
 

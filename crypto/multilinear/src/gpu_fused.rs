@@ -7,12 +7,19 @@
 //! round for round: the same parts (`T`, `U`, `A`, `B`), the same messages out
 //! of them ([`fused::message`]). The kernels are `math_cuda::argue_fused`'s.
 //!
-//! Off unless `LAMBDA_VM_ARGUE_FUSED=1`, and then for every table whose
-//! constraint part runs in the base field — or only the committed widths
-//! `LAMBDA_VM_ARGUE_FUSED_WIDTHS` lists. A table it declines runs today's
-//! rounds, counted. `LAMBDA_VM_ARGUE_FUSED_XCHECK=1` runs today's rounds after
-//! it over the same factors with the same challenges, refuses the prove at the
-//! first message that differs, times both, and checks the grid's corners.
+//! On by default for every table whose constraint part runs in the base field
+//! — or only the committed widths `LAMBDA_VM_ARGUE_FUSED_WIDTHS` lists;
+//! `LAMBDA_VM_ARGUE_FUSED=0` is the opt-out, and it is today's rounds exactly.
+//! A table it declines runs today's rounds, counted. `LAMBDA_VM_ARGUE_FUSED_XCHECK=1`
+//! runs today's rounds after it over the same factors with the same
+//! challenges, refuses the prove at the first message that differs, times
+//! both, and checks the grid's corners.
+//!
+//! The default was turned on by its A/B on the block (FAST jobs 274 and 270,
+//! `thoughts/zf/gap2/fix2/I-ARGUE.md` §4.5–4.6): with integer nodes, the argue
+//! 11.70 → 8.75 s and the whole run 2.80 s faster at 9e2728955, every arm
+//! proved and verified on the record's identities, and the cross-check arm —
+//! 390 fused tables, every message compared with today's — clean.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -250,13 +257,29 @@ fn store_forced(flag: &AtomicU8, on: Option<bool>) {
     );
 }
 
-/// Whether the zerocheck runs the fused rounds (`LAMBDA_VM_ARGUE_FUSED=1`;
-/// default off). Read once.
+/// Whether the zerocheck runs the fused rounds: on by default,
+/// `LAMBDA_VM_ARGUE_FUSED=0` the opt-out. Read once, with a banner.
 pub fn argue_fused() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     forced(&FUSED_FORCED, || {
-        *ON.get_or_init(|| env_is("LAMBDA_VM_ARGUE_FUSED"))
+        *ON.get_or_init(|| {
+            let on = fused_from(std::env::var("LAMBDA_VM_ARGUE_FUSED").ok().as_deref());
+            eprintln!(
+                "★ ARGUE FUSED: {}",
+                if on {
+                    "on (the default; LAMBDA_VM_ARGUE_FUSED=0 is today's rounds)"
+                } else {
+                    "off (LAMBDA_VM_ARGUE_FUSED=0)"
+                }
+            );
+            on
+        })
     })
+}
+
+/// The knob's reading of its variable: only `0` turns it off.
+fn fused_from(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 #[doc(hidden)]
@@ -698,6 +721,7 @@ where
         }
     }
     SESSIONS.fetch_add(1, Ordering::Relaxed);
+    crate::gpu::note_device_sumcheck(rounds.len() as u64);
     let times = FusedTimes {
         grid: grid_secs,
         fold2: fold2_secs,
@@ -778,6 +802,15 @@ mod tests {
                 "x={x} y={y} s={s}"
             );
         }
+    }
+
+    /// The default, pinned: on unless the variable says `0`.
+    #[test]
+    fn the_fused_rounds_are_on_unless_the_knob_says_0() {
+        assert!(fused_from(None));
+        assert!(fused_from(Some("1")));
+        assert!(fused_from(Some("")));
+        assert!(!fused_from(Some("0")));
     }
 
     #[test]

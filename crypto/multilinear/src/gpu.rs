@@ -193,6 +193,14 @@ pub fn sumcheck_calls() -> u64 {
     SUMCHECK_CALLS.load(Ordering::Relaxed)
 }
 
+/// A device sumcheck another path ran (`gpu_fused`): counted as one call and
+/// its rounds, as this file's own sessions are.
+#[cfg(feature = "cuda")]
+pub(crate) fn note_device_sumcheck(rounds: u64) {
+    SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    SUMCHECK_ROUNDS.fetch_add(rounds, Ordering::Relaxed);
+}
+
 pub fn sumcheck_rounds() -> u64 {
     SUMCHECK_ROUNDS.load(Ordering::Relaxed)
 }

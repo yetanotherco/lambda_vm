@@ -651,8 +651,10 @@ impl SumcheckSession {
 }
 
 /// Whether a round with integer nodes takes the componentwise multiply
-/// (D-ARGUE S1-1, `LAMBDA_VM_ARGUE_INT_NODES=1`; default off). The same value
-/// either way: `(k, 0, 0)·d = (k·d₀, k·d₁, k·d₂)`. Read once.
+/// (D-ARGUE S1-1): on by default, `LAMBDA_VM_ARGUE_INT_NODES=0` the opt-out.
+/// The same value either way: `(k, 0, 0)·d = (k·d₀, k·d₁, k·d₂)`. Read once,
+/// with a banner. Turned on with the fused zerocheck, by their A/B together
+/// (FAST jobs 274 and 270).
 pub fn int_nodes() -> bool {
     match INT_NODES_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         1 => return false,
@@ -661,12 +663,22 @@ pub fn int_nodes() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("LAMBDA_VM_ARGUE_INT_NODES").is_ok_and(|v| v == "1" || v == "true");
-        if on {
-            eprintln!("[gpu] sumcheck rounds: integer nodes (LAMBDA_VM_ARGUE_INT_NODES=1)");
-        }
+        let on = int_nodes_from(std::env::var("LAMBDA_VM_ARGUE_INT_NODES").ok().as_deref());
+        eprintln!(
+            "[gpu] sumcheck rounds: {}",
+            if on {
+                "integer nodes (the default; LAMBDA_VM_ARGUE_INT_NODES=0 is the full multiply)"
+            } else {
+                "the full ext3 multiply (LAMBDA_VM_ARGUE_INT_NODES=0)"
+            }
+        );
         on
     })
+}
+
+/// The knob's reading of its variable: only `0` turns it off.
+pub(crate) fn int_nodes_from(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 static INT_NODES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);

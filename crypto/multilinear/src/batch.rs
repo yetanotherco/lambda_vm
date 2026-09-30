@@ -458,10 +458,11 @@ where
                     transcript.sample_field_element()
                 },
             );
-            crate::whir_split::add_tick(&crate::whir_split::ZC_OTHER, start);
+            crate::whir_split::add_tick(&crate::whir_split::ZC_FUSED_TIME, start);
             match attempt {
                 None => {
                     crate::gpu_fused::note_decline();
+                    crate::whir_split::bump(&crate::whir_split::ZC_FUSED_DECLINED);
                     if check || crate::gpu_fused::argue_fused_log() {
                         eprintln!(
                             "ARGUE FUSED: declined · factors {} n={} (today's rounds run)",
@@ -472,6 +473,7 @@ where
                 }
                 Some(Err(error)) => return Err(error),
                 Some(Ok((mut rounds, mut point, factors, times))) => {
+                    crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     if check {
                         cross_check(
                             &device, &views, program, degree, &rounds, &point, &factors, times,

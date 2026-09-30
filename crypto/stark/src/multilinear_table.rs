@@ -1115,10 +1115,10 @@ where
             Weight::Table(eq_mle(&bus.row_point)?),
         ]
     };
-    // D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED`, default off): the same batch,
-    // described for the fused rounds — its constraint part in the base field.
-    // A table whose part is not (a constant with an extension limb) runs
-    // today's rounds.
+    // D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED`, on by default; `=0` is today's
+    // rounds): the same batch, described for the fused rounds — its constraint
+    // part in the base field. A table whose part is not (a constant with an
+    // extension limb) runs today's rounds.
     let constraints = (multilinear::gpu_fused::argue_fused()
         && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns()))
     .then(|| {
