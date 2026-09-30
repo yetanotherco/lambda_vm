@@ -2118,8 +2118,8 @@ fn assert_same_run(
     assert_eq!(a.touched_page_bases, b.touched_page_bases, "{at}: pages");
 }
 
-/// Asked for slots it cannot have — no device in this build, or one that has
-/// not allocated them yet — the base builds `Vec`s for the epochs that miss
+/// Asked for slots it cannot have — no device in this build, or slots nobody
+/// pinned (the base pins none itself) — the base builds `Vec`s for every epoch
 /// and proves what it proves without a pool.
 #[test]
 fn a_pool_that_cannot_lend_proves_what_vecs_prove() {
@@ -2141,13 +2141,8 @@ fn a_pool_that_cannot_lend_proves_what_vecs_prove() {
     )
     .expect("prove");
     assert!(asked.num_epochs() >= 2, "one epoch hands nothing over");
-    if !cfg!(feature = "cuda") {
-        assert_eq!(
-            pool.stats().leased,
-            0,
-            "a build without a device lent a slot"
-        );
-    }
+    assert_eq!(pool.stats().leased, 0, "an unpinned pool lent a slot");
+    assert_eq!(pool.stats().created, 0, "the base pinned a slot itself");
     assert_same_run(&asked, &vecs, "asked for slots");
     assert!(
         multilinear_continuation::verify_continuation(&elf_bytes, &asked, &opts).expect("verify"),
@@ -2159,13 +2154,14 @@ fn a_pool_that_cannot_lend_proves_what_vecs_prove() {
 #[cfg(feature = "cuda")]
 static PINNED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// One slot on a card, filled before the run so epoch 0 finds it. An epoch
+/// One slot on a card, pinned before the run as prover init pins them, so
+/// epoch 0 finds it. An epoch
 /// prepared while the one before it is proved in the slot finds it held and
 /// builds `Vec`s, without waiting; the epoch after that finds it free, since a
 /// prove returns its slot before the next epoch is taken. So no two epochs in a
 /// row miss, and a tiny epoch's preparation, far shorter than a prove, misses
-/// at least once. The slot is back, and released, when the run ends; the bundle
-/// is the one `Vec`s give and verifies.
+/// at least once. The slot is back when the run ends, and kept; the bundle is
+/// the one `Vec`s give and verifies.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a card"]
@@ -2178,7 +2174,7 @@ fn one_slot_alternates_and_proves_what_vecs_prove() {
     )
     .expect("prove");
 
-    let pool = multilinear::pinned::Pool::new(1, 64 << 20);
+    let pool = multilinear::pinned::Pool::new(1, 2 << 30);
     pool.fill().expect("a pinned slot on the card");
     let (pinned, _) = multilinear_continuation::prove_continuation_pinned(
         &elf_bytes,
@@ -2194,7 +2190,7 @@ fn one_slot_alternates_and_proves_what_vecs_prove() {
     assert!(n >= 3, "{n} epochs cannot show the alternation");
     let stats = pool.stats();
     println!("one slot over {n} epochs: {stats:?}");
-    assert_eq!(stats.too_small, 0, "an epoch did not fit 64 MiB");
+    assert_eq!(stats.too_small, 0, "an epoch did not fit 2 GiB");
     assert_eq!(stats.not_ready, 0, "the slot was filled before the run");
     assert_eq!(
         (stats.leased + stats.none_free) as usize,
@@ -2211,8 +2207,8 @@ fn one_slot_alternates_and_proves_what_vecs_prove() {
     );
     assert_eq!(
         (stats.created, stats.free),
-        (0, 0),
-        "the slot did not come back to be released after the epochs"
+        (1, 1),
+        "the slot did not come back"
     );
     assert_same_run(&pinned, &vecs, "one slot");
     assert!(
@@ -2232,7 +2228,7 @@ fn a_tail_claimed_early_yields_no_verifying_bundle() {
     let _turn = PINNED_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (elf_bytes, input) = a_run_that_touches_memory();
     let opts = ProofOptions::default_test_options();
-    let pool = multilinear::pinned::Pool::new(1, 64 << 20);
+    let pool = multilinear::pinned::Pool::new(1, 2 << 30);
     pool.fill().expect("a pinned slot on the card");
     multilinear_continuation::CLAIM_A_TAIL_EARLY.store(true, std::sync::atomic::Ordering::SeqCst);
     let proved = multilinear_continuation::prove_continuation_pinned(

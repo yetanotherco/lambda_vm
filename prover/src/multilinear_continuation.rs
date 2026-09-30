@@ -2555,10 +2555,10 @@ pub(crate) fn whir_head_ahead() -> bool {
 /// Why: the pageable upload ran at 19.0 GB/s in the proof, 1.78 s over the
 /// base's 33.84 GB (G6-LEDGER §8.5), against 57.3 GB/s from `cuMemHostAlloc`
 /// memory on the same card (FAST job 291's microbench). Two slots of
-/// `LAMBDA_VM_WHIR_PINNED_SLOT_MB` MiB (3072 by default) replace the two alive
-/// epochs' column `Vec`s; they are allocated on a helper after the DECODE
-/// commitment, and an epoch that finds no slot free builds its `Vec`s as
-/// before. The proofs are the same either way.
+/// `LAMBDA_VM_WHIR_PINNED_SLOT_MB` MiB (3072 by default) take the place of the
+/// two alive epochs' column `Vec`s; they are pinned once at prover init
+/// ([`init_pinned_columns`]) and kept, and an epoch that finds no slot free
+/// builds its `Vec`s as before. The proofs are the same either way.
 pub const WHIR_PINNED_COLUMNS_ENV: &str = "LAMBDA_VM_WHIR_PINNED_COLUMNS";
 
 /// [`WHIR_PINNED_COLUMNS_ENV`] for a raw value: `1` on; unset, empty or `0`
@@ -2634,71 +2634,45 @@ impl PinnedTally {
     }
 }
 
-/// Allocates `pool`'s slots on a helper, off the head's path, and prints when
-/// they are ready under `LAMBDA_VM_BASE_SPLIT=1`. An epoch prepared before a
-/// slot exists builds its `Vec`s as before.
-fn prewarm_pinned_slots(pool: multilinear::pinned::Pool) {
-    let spawned = std::thread::Builder::new()
-        .name("whir-pinned-slots".to_string())
-        .spawn(move || {
-            let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
-            let filled = pool.fill();
-            if !crate::continuation::base_split_enabled() {
-                return;
-            }
-            let secs = start.elapsed().as_secs_f64();
-            let gib = pool.slot_elems() as f64 * 8.0 / f64::from(1u32 << 30);
-            let stats = pool.stats();
-            match filled {
-                Ok(took) => println!(
-                    "PINNED SLOTS: {} × {gib:.2} GiB in {secs:.2}s on a helper ({}), ready at \
-                     t={:.3} (started t={t0:.3})",
-                    stats.created,
-                    took.iter()
-                        .map(|s| format!("{s:.2}s"))
-                        .collect::<Vec<_>>()
-                        .join(" + "),
-                    stark::prove_split::epoch_secs(),
-                ),
-                Err(why) => println!(
-                    "PINNED SLOTS: allocation failed after {secs:.2}s ({why}); {} of {} slots exist",
-                    stats.created, stats.slots,
-                ),
-            }
-        });
-    if spawned.is_err() && crate::continuation::base_split_enabled() {
-        println!("PINNED SLOTS: the helper did not spawn; every epoch builds its Vecs");
+/// Pins the process's slots at prover init, before any block is timed, when
+/// [`WHIR_PINNED_COLUMNS_ENV`] is on; a no-op otherwise. Pinning 6.4 GB stalls
+/// every other thread of the process for about as long as it takes (FAST job
+/// 311: +0.69 s on the head when pinned beside it, +0.39 s on the cross-epoch
+/// stage when freed there), so it happens once, here, and the slots are kept for
+/// the life of the process, as a proving server keeps its buffers across blocks.
+///
+/// Opens the device first if nothing has, and says how long each part took in
+/// one `PINNED SLOTS: init …` line, so a reader can tell the device's own start
+/// from the pinning. Returns that line, or `None` when the switch is off.
+pub fn init_pinned_columns() -> Option<String> {
+    if !whir_pinned_columns() {
+        return None;
     }
-}
-
-/// Frees `pool`'s slots once every epoch is proved, on a helper beside the
-/// cross-epoch proof: the tree's host peak comes later, in level 1, and slots
-/// kept to the end would add all of their bytes to it. Prints under
-/// `LAMBDA_VM_BASE_SPLIT=1`; the caller joins the handle before the base
-/// returns. Released here if the helper cannot be spawned.
-fn release_pinned_slots(pool: multilinear::pinned::Pool) -> Option<std::thread::JoinHandle<()>> {
-    fn release(pool: &multilinear::pinned::Pool) {
-        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
-        let freed = pool.release_free();
-        if crate::continuation::base_split_enabled() {
-            println!(
-                "PINNED SLOTS: released {freed} slot(s) in {:.2}s t=[{t0:.3},{:.3}]",
-                start.elapsed().as_secs_f64(),
-                stark::prove_split::epoch_secs(),
-            );
-        }
-    }
-    let helper_pool = pool.clone();
-    match std::thread::Builder::new()
-        .name("whir-pinned-release".to_string())
-        .spawn(move || release(&helper_pool))
-    {
-        Ok(helper) => Some(helper),
-        Err(_) => {
-            release(&pool);
-            None
-        }
-    }
+    let pool = multilinear::pinned::Pool::global();
+    let t0 = stark::prove_split::epoch_secs();
+    let line = match multilinear::pinned::open_device().and_then(|device| {
+        let started = std::time::Instant::now();
+        let took = pool.fill()?;
+        Ok((device, started.elapsed().as_secs_f64(), took))
+    }) {
+        Ok((device, pinning, took)) => format!(
+            "PINNED SLOTS: init {} × {:.2} GiB pinned in {pinning:.2}s ({}) after the device opened in              {device:.2}s, OUTSIDE the block wall t=[{t0:.3},{:.3}]",
+            pool.stats().created,
+            pool.slot_elems() as f64 * 8.0 / f64::from(1u32 << 30),
+            took.iter()
+                .map(|s| format!("{s:.2}s"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            stark::prove_split::epoch_secs(),
+        ),
+        Err(why) => format!(
+            "PINNED SLOTS: init failed ({why}); {} of {} slots exist, and epochs without one build Vecs",
+            pool.stats().created,
+            pool.stats().slots,
+        ),
+    };
+    println!("{line}");
+    Some(line)
 }
 
 /// Print a head step under `LAMBDA_VM_BASE_SPLIT=1`, like the epochs' stages.
@@ -2826,9 +2800,11 @@ pub(crate) fn prove_continuation_scheduled(
 
 /// [`prove_continuation_scheduled`] with the columns' storage named too:
 /// `Some(pool)` has each epoch prepared ahead write its columns into a slot of
-/// `pool` ([`WHIR_PINNED_COLUMNS_ENV`]), whose slots a helper allocates once
-/// the DECODE commitment is in; `None` builds `Vec`s. Only the preparation
-/// ahead of the prover takes slots. The proofs are the same every way.
+/// `pool` ([`WHIR_PINNED_COLUMNS_ENV`]) — slots pinned beforehand, at init
+/// ([`init_pinned_columns`]); nothing is pinned or freed inside the base, and an
+/// epoch that finds no slot builds `Vec`s. `None` builds `Vec`s. Only the
+/// preparation ahead of the prover takes slots. The proofs are the same every
+/// way.
 pub(crate) fn prove_continuation_pinned(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -2862,7 +2838,6 @@ pub(crate) fn prove_continuation_pinned(
     let on_count = observer.map(|o| move |n: usize| o.on_epoch_count(n));
 
     let mut epochs = Vec::new();
-    let mut release = None;
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
     // commitment — whose type names the hash — is built ONCE and held across
     // every epoch. Inside `prove_epoch` it could not outlive one call.
@@ -2876,11 +2851,6 @@ pub(crate) fn prove_continuation_pinned(
         let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
         let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
         whir_head_done("DECODE prepared", start, t0);
-        // From here to epoch 0's commit the head's path makes no device call,
-        // so the slots are allocated beside it.
-        if let Some(pool) = &pinned {
-            prewarm_pinned_slots(pool.clone());
-        }
         let mut tally = PinnedTally::default();
         let detached_before = stark::multilinear_table::host_backing_detaches();
         let share = || -> Result<(), Error> {
@@ -2923,15 +2893,11 @@ pub(crate) fn prove_continuation_pinned(
                     Ok(())
                 },
             )?;
-            if let Some(pool) = &pinned {
-                if crate::continuation::base_split_enabled() {
-                    let detached =
-                        stark::multilinear_table::host_backing_detaches() - detached_before;
-                    println!("{}", tally.line(detached, &pool.stats()));
-                }
-                // Every epoch is proved, so every slot is back: freed beside
-                // the cross-epoch proof.
-                release = release_pinned_slots(pool.clone());
+            if let Some(pool) = &pinned
+                && crate::continuation::base_split_enabled()
+            {
+                let detached = stark::multilinear_table::host_backing_detaches() - detached_before;
+                println!("{}", tally.line(detached, &pool.stats()));
             }
             (boundaries, Some(global))
         } else {
@@ -3008,9 +2974,6 @@ pub(crate) fn prove_continuation_pinned(
             })?
         }
     };
-    if let Some(release) = release {
-        let _ = release.join();
-    }
 
     Ok((
         ContinuationProof {

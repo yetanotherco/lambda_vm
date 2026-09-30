@@ -9988,6 +9988,9 @@ fn whir_production_tree<C: TreeChild>() {
         },
     );
 
+    // Prover init, before the block is timed: the pinned column slots when
+    // `LAMBDA_VM_WHIR_PINNED_COLUMNS=1` (nothing otherwise), pinned once and kept.
+    crate::multilinear_continuation::init_pinned_columns();
     let whole_run = HostSampler::start();
     let t_all = Instant::now();
 

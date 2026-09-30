@@ -57,6 +57,20 @@ pub struct Stats {
     pub too_small: u64,
 }
 
+/// Opens the device (its context and kernels) if nothing has yet, and returns
+/// the seconds that took: a caller that pins slots at its own init can then say
+/// how much of that init was the device and how much the pinning.
+pub fn open_device() -> Result<f64, String> {
+    #[cfg(feature = "cuda")]
+    {
+        let started = std::time::Instant::now();
+        math_cuda::device::backend().map_err(|e| format!("{e}"))?;
+        Ok(started.elapsed().as_secs_f64())
+    }
+    #[cfg(not(feature = "cuda"))]
+    Err("no device support in this build".to_string())
+}
+
 /// Slots of page-locked memory, lent one epoch at a time. Cloning gives
 /// another handle to the same pool.
 #[derive(Clone)]
