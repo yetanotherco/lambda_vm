@@ -1,8 +1,10 @@
 // verify_b of the 3MI split: runs the hash half of an LFM epoch verifier
 // (RPX over Goldilocks, keccak-f, select, pack/unpack, bit decomposition)
-// and commits keccak256(program) ‖ keccak256(record), the record being lanes
-// 0..3 of the cells the field half hands over (`out`, assumed) followed by
-// those it takes back (`back`, computed here).
+// and the field checks on its results, and commits keccak256(program) ‖
+// keccak256(input) ‖ keccak256(record). The input is lanes 0..3 of the hints
+// and hint lanes the field half reads too; the record is lanes 0..3 of the
+// cells the field half hands over (`out`, assumed here) followed by those it
+// takes back (`back`, computed here).
 //
 // Private input: u32 program length in words, u32 repetitions of the hash
 // half (a measurement knob; 0 and 1 run it once), the program words, then the
@@ -211,6 +213,89 @@ impl Reader<'_> {
     }
 }
 
+// Canonical arithmetic for the moved field instructions.
+fn fadd(a: u64, b: u64) -> u64 {
+    canonical(add(a, b))
+}
+
+fn fsub(a: u64, b: u64) -> u64 {
+    if a >= b { a - b } else { a + (P - b) }
+}
+
+fn fmul(a: u64, b: u64) -> u64 {
+    canonical(mul(a, b))
+}
+
+fn finv(a: u64) -> u64 {
+    let (mut r, mut x, mut e) = (1u64, a, P - 2);
+    while e > 0 {
+        if e & 1 == 1 {
+            r = fmul(r, x);
+        }
+        x = fmul(x, x);
+        e >>= 1;
+    }
+    r
+}
+
+/// The LFM's division: `0/0 = 1`, `x/0` an assertion failure.
+fn fdiv(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        assert!(a == 0, "division by zero");
+        1
+    } else {
+        fmul(a, finv(b))
+    }
+}
+
+type Fp3 = [u64; 3];
+
+fn ext(w: &Word) -> Fp3 {
+    assert!(w[3] == 0, "not an extension word");
+    [w[0], w[1], w[2]]
+}
+
+fn ext_add(a: &Fp3, b: &Fp3) -> Fp3 {
+    [fadd(a[0], b[0]), fadd(a[1], b[1]), fadd(a[2], b[2])]
+}
+
+fn ext_sub(a: &Fp3, b: &Fp3) -> Fp3 {
+    [fsub(a[0], b[0]), fsub(a[1], b[1]), fsub(a[2], b[2])]
+}
+
+fn fp3_mul(a: &Fp3, b: &Fp3) -> Fp3 {
+    let (b1_2, b2_2) = (fadd(b[1], b[1]), fadd(b[2], b[2]));
+    [
+        fadd(fmul(a[0], b[0]), fadd(fmul(a[1], b2_2), fmul(a[2], b1_2))),
+        fadd(fmul(a[0], b[1]), fadd(fmul(a[1], b[0]), fmul(a[2], b2_2))),
+        fadd(fmul(a[0], b[2]), fadd(fmul(a[1], b[1]), fmul(a[2], b[0]))),
+    ]
+}
+
+fn fp3_div(a: &Fp3, b: &Fp3) -> Fp3 {
+    if *b == [0; 3] {
+        assert!(*a == [0; 3], "division by zero");
+        return [1, 0, 0];
+    }
+    let (b0, b1, b2) = (b[0], b[1], b[2]);
+    let (s0, s1, s2) = (fmul(b0, b0), fmul(b1, b1), fmul(b2, b2));
+    let t = fmul(fmul(b0, b1), b2);
+    let norm = fsub(
+        fadd(
+            fmul(s0, b0),
+            fadd(fadd(fmul(s1, b1), fmul(s1, b1)), fmul(4, fmul(s2, b2))),
+        ),
+        fmul(6, t),
+    );
+    let ni = finv(norm);
+    let inv = [
+        fmul(fsub(s0, fadd(fmul(b1, b2), fmul(b1, b2))), ni),
+        fmul(fsub(fadd(s2, s2), fmul(b0, b1)), ni),
+        fmul(fsub(s1, fmul(b0, b2)), ni),
+    ];
+    fp3_mul(a, &inv)
+}
+
 fn base(w: &Word) -> u64 {
     assert!(w[1] == 0 && w[2] == 0 && w[3] == 0, "not a base word");
     w[0]
@@ -229,18 +314,17 @@ pub fn main() {
         bytes: program,
         at: 0,
     };
-    assert_eq!(p.u32(), 1, "encoding version");
+    assert_eq!(p.u32(), 2, "encoding version");
     let n_cells = p.a();
     let n_out = p.a();
     let n_back = p.a();
     let n_instr = p.a();
     let mut mem: Vec<Word> = vec![[0; 4]; n_cells];
     let mut record: Vec<u8> = Vec::with_capacity(24 * (n_out + n_back));
+    let mut shared: Vec<u8> = Vec::new();
     for cell in mem.iter_mut().take(n_out) {
-        let is_word = p.u32() != 0;
-        let l3c = p.u32() as u64 | ((p.u32() as u64) << 32);
         let w = values.word();
-        assert!(is_word || w[3] == l3c, "fourth lane of a field cell");
+        assert!(w[3] == 0, "fourth lane of a field cell");
         for lane in &w[..3] {
             record.extend_from_slice(&lane.to_le_bytes());
         }
@@ -249,7 +333,7 @@ pub fn main() {
     let back_at = p.at;
     let instr_at = back_at + 4 * n_back;
     let hints_at = values.at;
-    for _ in 0..reps {
+    for rep in 0..reps {
         p.at = instr_at;
         values.at = hints_at;
         for _ in 0..n_instr {
@@ -303,11 +387,18 @@ pub fn main() {
                     ];
                     mem[p.a()] = w;
                 }
-                // Unpack: input, four outs.
+                // Unpack: input, four outs, the mask of outs the Field VM
+                // reads too (lanes of a hint, so input).
                 4 => {
                     let w = mem[p.a()];
-                    for lane in w {
-                        mem[p.a()] = [lane, 0, 0, 0];
+                    let outs = [p.a(), p.a(), p.a(), p.a()];
+                    let mask = p.u32();
+                    for (k, (lane, a)) in w.into_iter().zip(outs).enumerate() {
+                        mem[a] = [lane, 0, 0, 0];
+                        if mask >> k & 1 != 0 && rep == 0 {
+                            shared.extend_from_slice(&lane.to_le_bytes());
+                            shared.extend_from_slice(&[0; 16]);
+                        }
                     }
                 }
                 // BitDec: input, bits, the bit cells, halves flag, [hi, lo].
@@ -384,15 +475,56 @@ pub fn main() {
                     }
                 }
                 // Hint: out, value from the hint stream.
+                // Hint: out, whether the Field VM reads it too; the value from
+                // the hint stream.
                 7 => {
                     let w = values.word();
                     mem[p.a()] = w;
+                    if p.u32() != 0 && rep == 0 {
+                        for lane in &w[..3] {
+                            shared.extend_from_slice(&lane.to_le_bytes());
+                        }
+                    }
                 }
                 // Const: out, four lanes.
                 8 => {
                     let a = p.a();
                     let w = [p.u64(), p.u64(), p.u64(), p.u64()];
                     mem[a] = w;
+                }
+                // BaseAlu: op, a, b, [c], out.
+                9 => {
+                    let op = p.u32();
+                    let a = base(&mem[p.a()]);
+                    let b = base(&mem[p.a()]);
+                    let v = match op {
+                        0 => fadd(a, b),
+                        1 => fsub(a, b),
+                        2 => fmul(a, b),
+                        3 => fdiv(a, b),
+                        4 => fadd(fmul(a, b), base(&mem[p.a()])),
+                        _ => panic!("base op"),
+                    };
+                    mem[p.a()] = [v, 0, 0, 0];
+                }
+                // ExtAlu over Fp[w]/(w³ − 2): op, a, b, [c], out.
+                10 => {
+                    let op = p.u32();
+                    let a = ext(&mem[p.a()]);
+                    let bw = mem[p.a()];
+                    let v = match op {
+                        0 => ext_add(&a, &ext(&bw)),
+                        1 => ext_sub(&a, &ext(&bw)),
+                        2 => fp3_mul(&a, &ext(&bw)),
+                        3 => fp3_div(&a, &ext(&bw)),
+                        4 => ext_add(&fp3_mul(&a, &ext(&bw)), &ext(&mem[p.a()])),
+                        5 => {
+                            let b = base(&bw);
+                            [fmul(a[0], b), fmul(a[1], b), fmul(a[2], b)]
+                        }
+                        _ => panic!("ext op"),
+                    };
+                    mem[p.a()] = [v[0], v[1], v[2], 0];
                 }
                 t => panic!("unknown instruction {t}"),
             }
@@ -407,8 +539,9 @@ pub fn main() {
         }
     }
     assert_eq!(end, program.len(), "trailing program words");
-    let mut out = [0u8; 64];
+    let mut out = [0u8; 96];
     out[..32].copy_from_slice(&keccak256(program));
-    out[32..].copy_from_slice(&keccak256(&record));
+    out[32..64].copy_from_slice(&keccak256(&shared));
+    out[64..].copy_from_slice(&keccak256(&record));
     syscalls::commit(&out);
 }
