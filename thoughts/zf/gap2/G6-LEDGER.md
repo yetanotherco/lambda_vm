@@ -921,3 +921,178 @@ The lead's decisions after job 290:
 - **Decision by §8.3's rule:** NO EFFECT, so `zerotail` does not land. The stop rule makes stage 1b the live upload
   lever. It should be sized against the in-proof 19 GB/s with the argue-overlap caveat above, and D-TRACE owns its
   design.
+
+## 9. The L1N2 noise: what the logs show, and one sampled job (pre-registered 2026-09-30 17:20Z, before any run)
+
+The lead's priority 1 (2026-09-30): "the L1N2 noise … inflates every lane's A/B on FAST". Characterize it from the
+existing logs first, then, if needed, one short job of identical arms with host sampling (FAST 292–294).
+
+### 9.1 From the existing logs [V: `l1n2_scan.py` over all 64 WHIR tree logs on FAST, wt1000–wt1301]
+
+**Level 1's critical path is L1N2.**
+- L1N0 and L1N1 harvest and emit in the base's tail (the lead-in, `ⓘ lead-in`), so their level-1 walls are only
+  artifacts and prove.
+- L1N2 (epochs 10–14) runs its prologue (harvest-epochs + emit) inside level 1. Its wall equals level 1's to within
+  0.1 s in every arm.
+- **Level 1's variance lives in L1N2's host prologue.** It is pure host CPU work
+  (`real_epoch_from_whir_continuation_under` × 5, then `wide_prologue_emit`,
+  `per_table_aggregator_tests.rs:9046-9093`), running beside L1N0 and L1N1's artifacts and proves.
+
+**The prologue, jobs 246–291 (28 arms at fan-in 5):** median 4.66 s. Five arms read ≥ 4.95 s:
+
+| arm | prologue | level 1 |
+|---|---|---|
+| wt1086 | 5.08 s | 8.0 s |
+| wt1212 | 4.97 s | 8.2 s |
+| wt1213 | 5.09 s | 8.4 s |
+| wt1291 | 5.41 s | 8.7 s |
+| wt1299 | 5.00 s | 8.1 s |
+
+Four of 28 arms have level 1 ≥ 8.1 s; the rest read 7.6–8.0 s.
+
+**"artifacts > 0.6 s" is NOT a slowdown.** In every arm, L1N2's artifacts + prove is 2.95–3.15 s (job 291: 3.13,
+3.14, 3.13, 3.11, 3.00, 2.95, 2.97, 3.05). When artifacts grows, prove shrinks by the same amount, because the prove
+waits for the card less. The lead's anomaly rule (harvest-epochs > 2.4 or artifacts > 0.6) therefore mixes a real
+slowdown with a benign shift.
+- **The metric from here on is the prologue sum and the level-1 wall.** harvest-epochs alone also shifts against emit:
+  wt1294 read 2.63 + 2.04, wt1296 2.10 + 2.26.
+
+**What the logs exclude:**
+- *Setting:* slow arms in both settings (A: wt1213; B: wt1212, wt1291, wt1299).
+- *Position:* slow arms at positions 2, 3, 4 and 6; job 250's pair read 7.8, 7.6, 8.2, 8.4.
+- *Gap since the previous arm:* 2 s in every harness run, so the logs cannot test it.
+- *Card work:* L1N0 and L1N1's prove times do not follow the slow arms.
+
+**What the logs cannot tell:** why the prologue slows.
+- G6's three sampled arms (wt1201–1203) had no slow prologue (4.75, 4.68, 4.86 s).
+- Their level-1 baseline [V: `l1_contention.py` over `/root/zf/g6/sampler/`]:
+  - the process at 10.1–11.1 cores of 32;
+  - host busy = the process (no outside load seen);
+  - CFS throttling 1–5 periods, 0.002–0.10 s;
+  - process runqueue wait 1.5–3.4 s summed over threads.
+  - The rayon pool's threads carry the name `whir-head-root`: the DECODE-root helper built the pool, so its workers
+    inherited that name.
+- **Hence one sampled job.**
+
+**For every lane now:** report the base and level 1 apart. The base's spread is about 0.2 s, and level 1 carries
+≈ 0.25 s of arm noise (sd) with one-arm outliers of +0.5 to +0.9 s.
+
+### 9.2 The job (FAST 292): twelve identical default arms, three samplers for the whole run
+
+- **Code:** `land/1010-whole-trees` @ `7c8272701` (#1010's next head, gated on FAST2 as job 166). Arms A:- × 12,
+  wt1302–1313, through the harness 86951bc2.
+- **Samplers,** all running across all 12 arms:
+  - `g6_sampler.py` (56eff730, 0.05 s): the prover's threads (on-CPU, runqueue wait), cgroup CPU and throttling,
+    host busy;
+  - `sys_sampler.py` (md5 `1a9c9163e0272ed47bde40003eef34a6`, 0.25 s): per-CPU MHz, Tctl/Tccd, PSI cpu/memory/io,
+    loadavg, meminfo, vmstat (major faults, compaction, direct reclaim), and every container process's CPU by short
+    name;
+  - `nvidia-smi` (0.5 s): SM clock, temperature, power.
+  - The selftest ran green on FAST2's /proc, which is laptop-built and box-checked.
+- **Readout** `l1n2_readout.py` (md5 `171e2f145e2f700d6cab0fde5add7274`; synthetic selftest green). Driver
+  `l1n2-box.sh` (md5 `75afdd56445e75a43b15de5c9d3eb525`). Runtime [E]: 12 × 41 s + a rebuild ≈ 12 min.
+- **SLOW rule (pre-registered):** level-1 wall ≥ 8.1 s or L1N2 prologue ≥ 4.95 s. The history above gives 18 %, so
+  P(at least one SLOW arm in 12) ≈ 91 %.
+- **Separation rules,** read over each arm's prologue window, SLOW arms (O) against the rest (N):
+
+| hypothesis | signal | separates when |
+|---|---|---|
+| H-ext | other processes' cores | min(O) ≥ max(N) + 0.5 |
+| H-quota | CFS throttled seconds | min(O) ≥ max(0.15, 3 × median(N)) |
+| H-freq | mean CPU MHz | max(O) ≤ 0.97 × min(N) |
+| H-thermal | Tctl max | min(O) ≥ 95 °C and max(N) < 95 °C (FAST2's Tctl read 90.75 °C under a gate run) |
+| H-psi | PSI cpu stall fraction | min(O) ≥ 1.5 × max(N) |
+| H-mem | major faults | min(O) ≥ 50 and max(N) < 50; or direct reclaim only in O |
+| H-internal | the prover's runqueue wait | min(O) ≥ 1.5 × median(N), and nothing above separates |
+
+- **Readings and what each implies:**
+  - HOST SIGNAL (named): a box condition to control. Examples: pin or quiet the other processes, raise or lift the
+    quota, fix the fan curve.
+  - INTERNAL CONTENTION: the schedule of L1N0, L1N1 and L1N2 on the shared rayon pool. The fix is in the code's
+    scheduling, and until then the measurement rule above applies.
+  - UNRESOLVED: every lane uses more arms and the split base / level-1 readout.
+  - No SLOW arm in 12: the rate is lower than 18 %. The distribution is reported as is.
+
+## 10. Stage 1b sized, with absorption (written 2026-09-30 17:20Z; nothing built)
+
+### 10.1 The premise: the pageable upload IS bandwidth-bound (the lead's first question)
+
+- **Job 291's shortfall:** B sent 23 % fewer bytes and the upload fell 14 % (−0.251 s), because B's sent rate dropped
+  from 19.0 to 17.0 GB/s.
+- **Both rates sit at the pageable ceiling** the microbench measured alone: 21.1 GB/s at 256 KiB copies, 23.0 GB/s
+  from 4 MiB. The proof's host load takes ≈ 17 % off that.
+- **The zero-tail path lost ≈ 10 % more** to the work it added beside the copies: two scanners reading ≈ 0.5 GB of
+  tails per epoch, and per-column memsets [I: the two are not separated].
+- **So the upload is bound by the driver's pageable staging, not by fixed per-copy costs** (≈ 1 µs per copy in the
+  microbench). Pure DMA from pinned memory runs 2.49× faster: stage 1b's premise holds.
+
+### 10.2 The term
+
+- Today: 33.84 GB in 1.781 s (job 291's A arms).
+- At the microbench's 57.3 GB/s the upload takes 0.59 s. Allowing the proof's host load to take 0–17 % off, as it
+  does from pageable, it takes 0.59–0.72 s.
+- **Commit saving S = 1.06–1.19 s.**
+
+### 10.3 Absorption
+
+- **The prior from job 291:** commit −0.235 s, argue +0.11 s, open +0.04 s, base −0.05 s, whole −0.08 s. Taken at
+  face value, that is 34 % retained.
+- **The measurement that bounds it** [V: `absorb.py`, 420 epoch × arm samples from jobs 246, 248, 249, 250, 290 and
+  291]:
+  - the argue's overlap with the producer's execute, collect, build and prep@producer spans is 0.48 s per epoch;
+  - within each epoch, the argue grows by **β = 0.075 ± 0.051 s per second of producer overlap** (t 1.5).
+- **Job 291 read against it:**
+  - its B arms overlapped the producer 0.17 s more in Σ (7.24–7.31 against 6.99–7.14 s), which predicts
+    +0.013 s of argue;
+  - the observed +0.11 s is spread +0.00 … +0.02 s over 12 of 15 epochs;
+  - B's lowest arm (11.69) is under A's highest (11.70);
+  - **so it is mostly noise, and at most ≈ 0.03 s of it is real producer-overlap absorption.**
+- **G6's runqueue wait (0.03–0.07 s) agrees.** The prover thread is not descheduled, so any absorption goes through
+  memory bandwidth or cache. The regression measures that directly, whatever the channel.
+- **What β means for 1b:** each epoch's argue starts at most Δcommit earlier, so the extra overlap is ≤ S. The
+  retained fraction is r ≥ 1 − β: central 0.93, 2σ bound 0.82.
+
+### 10.4 Band and costs
+
+**Whole run −1.0 s [−1.2, −0.5]:**
+- central: 0.93 × 1.13 s − ≈ 0.05 s of overhead;
+- high end: r = 1 × 1.19 s;
+- low end: 0.82 × 1.06 s, less up to 0.3 s if the pinned allocation lands on the head's path.
+
+This supersedes D-TRACE's −0.75 s [−1.1, −0.35], which predates the measured 57 GB/s.
+
+**Costs [I unless marked]:**
+- **Pinned host memory: +5.9 GB**, two slots of the largest epoch's 2.92 GB [V: job 291's upload lines]. The peak
+  goes from 16.2 to ≈ 22 GiB of the box's 57.5 GiB.
+- **Allocation:** `cuMemHostAlloc` of 2 × 2.92 GB, not measured.
+  - h2d_bench measured registering existing pages at 0.95 s per 42.56 GiB, which puts this at ≈ 0.13 s.
+  - It goes on a helper at process start: the head has ≈ 1.4 s before epoch 0's prep needs a slot.
+- **The producer:**
+  - prep's transpose writes into a slot instead of fresh `Vec`s;
+  - a slot is recycled only once its epoch's proof is done, because host columns are read in the argue ("on the host"
+    tables) and in the opening.
+  - **The hard part is ownership.** `Mle` owns a `Vec`, and `cuMemHostAlloc` memory cannot back a `Vec`. `Mle` needs
+    a storage abstraction, or the slot has to be the upload source while the `Vec` remains, which doubles host
+    memory. D-TRACE owns the design.
+- **Not covered:** the global stage's and level 1's uploads (0.45–0.56 s per run, pageable) stay as they are.
+- **It stacks with zero tails:** the producer can record each column's last nonzero value while it transposes, at no
+  extra cost. At 57 GB/s the 7.82 GB of tails is worth ≈ −0.14 s more. `land/1010-zerotail` @ aa332efef is parked for
+  that.
+
+### 10.5 The ONE measurement that tells absorption from noise, before building
+
+A **quiet-producer A/B**:
+- **The knob** is timing only, so proofs are unchanged: the producer does not start an execute, collect, build or
+  prep while the prover is inside an argue.
+- **The arms:** A B B A.
+- **What it reads:** Σ argue and Σ producer overlap per arm, with β = −ΔΣargue ÷ ΔΣoverlap.
+  - Σ overlap falls from ≈ 7.1 s to ≈ 1–2 s: a stage already running finishes, since the knob only holds off the next
+    one.
+  - That is about 100× the regression's leverage, so four arms resolve β to ≈ ±0.02.
+  - The whole-run wall is not read: a paused producer may become binding.
+- **Rule:**
+  - β < 0.05 ⇒ absorption negligible; 1b's band stands.
+  - β ≥ 0.15 ⇒ 1b's retained fraction is 1 − β; the band's centre moves to (1 − β) × 1.13 s.
+  - In between, the band's low end moves to (1 − β) × 1.06 s.
+- **Cost:** a small knob in `for_each_epoch_overlapped_prepped` and a flag around `multi_prove`'s argue, and about
+  5 min of FAST.
