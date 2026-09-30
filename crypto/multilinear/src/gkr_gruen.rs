@@ -43,23 +43,29 @@ use math::field::{element::FieldElement, traits::IsField};
 
 use crate::gkr::Cubic;
 
-/// Whether a device GKR layer runs Gruen's rounds (`LAMBDA_VM_ARGUE_GKR_GRUEN`,
-/// any non-empty value other than `0`). Off by default until its A/B; off is
-/// today's rounds exactly. Read once, with a banner.
+/// Whether a device GKR layer runs Gruen's rounds: on by default,
+/// `LAMBDA_VM_ARGUE_GKR_GRUEN=0` the opt-out, and off is the old layer rounds
+/// exactly. Read once, with a banner.
+///
+/// Turned on by its A/B on the block (FAST job 330, 4 + 4 arms): base −1.77 s,
+/// the argue −2.08 s, the whole run −1.57 s, the GKR 4.24 → 2.13 s, the same
+/// identities; the cross-check arm compared 3,381 real layers with the old
+/// rounds and found every one equal.
 pub fn argue_gkr_gruen() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     forced(&GRUEN_FORCED, || {
         *ON.get_or_init(|| {
-            let on = on_from(std::env::var("LAMBDA_VM_ARGUE_GKR_GRUEN").ok().as_deref());
+            let on = not_off(std::env::var("LAMBDA_VM_ARGUE_GKR_GRUEN").ok().as_deref());
             eprintln!(
                 "★ ARGUE GKR GRUEN: {}",
                 if on {
                     format!(
-                        "on (LAMBDA_VM_ARGUE_GKR_GRUEN=1; the host tail from a cube of {})",
+                        "on (the default; LAMBDA_VM_ARGUE_GKR_GRUEN=0 is the old layer rounds; the host tail \
+                         from a cube of {})",
                         gkr_gruen_tail()
                     )
                 } else {
-                    "off (today's layer rounds)".to_string()
+                    "off (LAMBDA_VM_ARGUE_GKR_GRUEN=0)".to_string()
                 }
             );
             on
@@ -125,6 +131,11 @@ fn tail_from(value: Option<&str>) -> usize {
 
 fn on_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// A default-on knob's reading of its variable: only `0` turns it off.
+fn not_off(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 static GRUEN_FORCED: AtomicU8 = AtomicU8::new(0);
@@ -599,12 +610,25 @@ mod tests {
         );
     }
 
+    /// ★ The default: on unless `LAMBDA_VM_ARGUE_GKR_GRUEN=0` (FAST job 330).
+    #[test]
+    fn the_gruen_knob_is_on_unless_its_variable_is_zero() {
+        assert_eq!(
+            argue_gkr_gruen(),
+            not_off(std::env::var("LAMBDA_VM_ARGUE_GKR_GRUEN").ok().as_deref())
+        );
+    }
+
     #[test]
     fn the_knobs_read_their_variables() {
         assert!(!on_from(None));
         assert!(!on_from(Some("0")));
         assert!(!on_from(Some("")));
         assert!(on_from(Some("1")));
+        // The main knob is on unless its variable is `0`.
+        assert!(not_off(None));
+        assert!(not_off(Some("1")));
+        assert!(!not_off(Some("0")));
         assert_eq!(tail_from(None), GRUEN_TAIL_DEFAULT);
         assert_eq!(tail_from(Some("32")), 32);
         assert_eq!(tail_from(Some("512")), 512);
