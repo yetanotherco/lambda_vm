@@ -65,7 +65,26 @@ fn vm_round_trip(
     name: &str,
     tamper: Option<Tamper>,
 ) -> (Result<(), multilinear::Error>, Vec<String>) {
-    let elf_bytes = crate::test_utils::asm_elf_bytes(name);
+    vm_round_trip_elf(name, &crate::test_utils::asm_elf_bytes(name), tamper)
+}
+
+/// A Rust guest's ELF, built by `make compile-programs-rust`.
+fn rust_elf_bytes(name: &str) -> Vec<u8> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    std::fs::read(root.join(format!("executor/program_artifacts/rust/{name}.elf")))
+        .unwrap_or_else(|e| panic!("{name}.elf — run `make compile-programs-rust`: {e}"))
+}
+
+/// [`vm_round_trip`] over an ELF in hand.
+fn vm_round_trip_elf(
+    name: &str,
+    elf_bytes: &[u8],
+    tamper: Option<Tamper>,
+) -> (Result<(), multilinear::Error>, Vec<String>) {
+    let elf_bytes = elf_bytes.to_vec();
     let program = Elf::load(&elf_bytes).expect("ELF");
     let result = Executor::new(&program, Vec::new())
         .expect("executor")
@@ -223,23 +242,240 @@ fn vm_round_trip(
     (verdict, names)
 }
 
-/// ★ Every table `test_keccak` and `all_instructions_64` light up, argued
-/// batched and verified.
+/// The VM's AIR labels, as `lean_program_census::vm_airs` names them: what a
+/// table's name reduces to (`CPU[0]` → `CPU`, `PAGE:0x…` → `PAGE`).
+fn label(name: &str) -> String {
+    name.split(['[', ':']).next().unwrap_or(name).to_string()
+}
+
+/// ★ Every VM table, argued batched and verified: the monolithic proofs of
+/// programs that light them up between them, then every epoch of two
+/// continuations (the epoch's L2G bookend, DECODE's prepared opening, two
+/// commitment groups). The labels seen must cover every AIR of
+/// `lean_program_census::vm_airs`.
 #[test]
-#[ignore = "proves a program: a box run"]
+#[ignore = "proves programs: a box run"]
 fn every_vm_table_round_trips_batched() {
     let mut seen: Vec<String> = Vec::new();
-    for name in ["test_keccak", "all_instructions_64"] {
+    let mut note = |names: Vec<String>| {
+        for n in names {
+            let l = label(&n);
+            if !seen.contains(&l) {
+                seen.push(l);
+            }
+        }
+    };
+    for name in [
+        "test_keccak",
+        "all_instructions_64",
+        "test_ecsm",
+        "test_lb_lh_8",
+        "misalign_lw",
+        "all_loadstore_32",
+    ] {
         let (verdict, names) = vm_round_trip(name, None);
         verdict.unwrap_or_else(|e| panic!("{name}: {e:?}"));
         eprintln!("batched argue {name}: VERIFIED over {} tables", names.len());
-        for n in names {
-            if !seen.contains(&n) {
-                seen.push(n);
-            }
-        }
+        note(names);
     }
-    eprintln!("batched argue: {} distinct VM tables: {seen:?}", seen.len());
+    let (verdict, names) = vm_round_trip_elf("hint_min", &rust_elf_bytes("hint_min"), None);
+    verdict.unwrap_or_else(|e| panic!("hint_min: {e:?}"));
+    eprintln!(
+        "batched argue hint_min: VERIFIED over {} tables",
+        names.len()
+    );
+    note(names);
+    for (name, log) in [("sub", 2u32), ("test_ecsm", 10)] {
+        let (epochs, names) = epochs_round_trip(name, log);
+        eprintln!("batched argue {name} at 2^{log}: {epochs} epochs VERIFIED");
+        note(names);
+    }
+    let want: Vec<String> = crate::tests::lean_program_census::vm_airs()
+        .into_iter()
+        .map(|(_, l)| l.to_string())
+        .collect();
+    let missing: Vec<&String> = want.iter().filter(|l| !seen.contains(l)).collect();
+    eprintln!(
+        "batched argue: {} distinct VM labels {seen:?}; census wants {}, missing {missing:?}",
+        seen.len(),
+        want.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "VM tables never argued batched: {missing:?}"
+    );
+}
+
+/// Every epoch of `name` at `2^log`, batched: `prove_epoch`'s statement,
+/// tables, groups and DECODE opening, with the argue swapped, and
+/// `verify_epoch_bookend`'s side. Returns the epoch count and every table name.
+fn epochs_round_trip(name: &str, log: u32) -> (usize, Vec<String>) {
+    use crate::continuation::{self, PreparedEpoch};
+    use crate::multilinear_continuation::{
+        absorb_epoch, decode_prepared_for, decode_table_index, epoch_groups, owed,
+    };
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::DecodeArtifacts;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes(name);
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let opts = ProofOptions::default_test_options();
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let digest = statement::elf_digest(&elf_bytes);
+    let mut carried = register::register_init_from_entry_point(elf.entry_point);
+    let mut count = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    crate::with_whir_hash!(|H| {
+        type Tr = DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>;
+        let pinned = decode_prepared_for::<H>(&elf, &elf_bytes).expect("DECODE's commitment");
+        continuation::for_each_epoch(&elf, &[], log, &artifacts, |prepared, _| {
+            let PreparedEpoch {
+                register_init,
+                label,
+                mut traces,
+                boundary,
+                is_final,
+                ..
+            } = prepared;
+            assert_eq!(register_init, carried, "epoch {label}: the register chain");
+            crate::tables::bitwise::update_multiplicities(
+                &mut traces.bitwise,
+                &local_to_global::collect_bitwise_from_l2g(&boundary),
+            );
+            let reg_fini = register::fini_from_trace(&traces.register);
+            let table_counts = traces.table_counts();
+            let public_output = traces.public_output_bytes.clone();
+            let build_airs = || {
+                (
+                    continuation::build_epoch_airs(
+                        &elf,
+                        &opts,
+                        &[],
+                        &table_counts,
+                        &register_init,
+                        &reg_fini,
+                        is_final,
+                        None,
+                    ),
+                    continuation::l2g_memory_air(&opts, label),
+                )
+            };
+            let (airs, l2g_air) = build_airs();
+            let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
+            let mut pairs = airs.air_trace_pairs(&mut traces);
+            pairs.push((&l2g_air, &mut l2g_trace, &()));
+            let air_list: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+                pairs.iter().map(|(air, _, _)| *air).collect();
+            let decode_at = decode_table_index(&air_list).expect("DECODE");
+            let shapes: Vec<(usize, usize)> = pairs
+                .iter()
+                .map(|(_, trace, _)| {
+                    (
+                        trace.main_table.width,
+                        trace.main_table.height.trailing_zeros() as usize,
+                    )
+                })
+                .collect();
+            names.extend(pairs.iter().map(|(air, _, _)| air.name().to_string()));
+            let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
+            let config = batched(multilinear_prove::chain_config(&shapes));
+            let mut committed = Vec::with_capacity(pairs.len());
+            for ((air, trace, _), &shape) in pairs.iter_mut().zip(&shapes) {
+                let mut columns = trace.columns_main();
+                committed.push(
+                    CommittedTable::from_layout(layout(*air, shape), |col| {
+                        core::mem::take(&mut columns[col as usize])
+                    })
+                    .expect("table"),
+                );
+            }
+            drop(pairs);
+            let sizes = epoch_groups(committed.len());
+            pinned
+                .agrees_with(&config)
+                .expect("DECODE's commitment agrees");
+            let absorb = |t: &mut Tr| {
+                absorb_epoch(
+                    t,
+                    &digest,
+                    &public_output,
+                    &table_counts,
+                    label,
+                    &table_num_vars,
+                    &config,
+                )
+            };
+            let mut transcript = Tr::new(&[]);
+            absorb(&mut transcript);
+            let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+                .expect("commit");
+            let borrowed = multilinear::stacking::borrow(&pinned.columns);
+            let decode_columns = pinned.settled_at(decode_at);
+            let proof = multilinear_table::multi_prove_batched(
+                &committed,
+                &config,
+                &mut transcript,
+                Some(pinned.opening(&borrowed, &decode_columns)),
+            )
+            .expect("the batched prover runs");
+
+            // The verifier's side, from AIRs of its own.
+            let (vairs, vl2g) = build_airs();
+            let mut refs = vairs.air_refs();
+            refs.push(&vl2g);
+            let layouts: Vec<TableLayout<'_, F, E>> = refs
+                .iter()
+                .zip(&shapes)
+                .map(|(air, &shape)| layout(*air, shape))
+                .collect();
+            let preprocessed: Vec<Vec<Mle<F>>> = refs
+                .iter()
+                .map(|air| {
+                    air.precomputed_columns()
+                        .into_iter()
+                        .map(|values| Mle::new(values).expect("column"))
+                        .collect()
+                })
+                .collect();
+            let statements: Vec<TableStatement<'_, F, E>> = layouts
+                .iter()
+                .zip(&preprocessed)
+                .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+                .collect();
+            let (group_layouts, domains) =
+                multilinear_prove::stacks(&shapes, &sizes, &config).expect("stacks");
+            let mut transcript = Tr::new(&[]);
+            absorb(&mut transcript);
+            let check = pinned.check(&decode_columns);
+            let owed = owed(
+                &public_output,
+                &register_init,
+                &proof.roots,
+                check.roots,
+                &transcript,
+            )
+            .expect("the commit offset");
+            multilinear_table::multi_verify_batched::<_, _, _, H>(
+                &proof,
+                &statements,
+                &group_layouts,
+                &domains,
+                &sizes,
+                &owed,
+                &config,
+                &mut transcript,
+                Some(check),
+            )
+            .unwrap_or_else(|e| panic!("{name} epoch {label}: {e:?}"));
+            carried = reg_fini;
+            count += 1;
+            Ok(())
+        })
+    })
+    .expect("the epochs prepare");
+    assert!(count > 0, "{name}: no epoch");
+    (count, names)
 }
 
 /// The same program with one table's factor value, one bus output, or one
