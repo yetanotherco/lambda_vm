@@ -1516,6 +1516,19 @@ impl ContinuationProof {
         &self.epochs
     }
 
+    /// `(rows, committed cells)` over every epoch's tables and the global proof.
+    #[cfg(test)]
+    pub(crate) fn census(&self) -> (usize, usize) {
+        self.epochs
+            .iter()
+            .map(|e| &e.proof)
+            .chain(std::iter::once(&self.global))
+            .flat_map(|m| &m.proofs)
+            .fold((0, 0), |(r, c), p| {
+                (r + p.trace_length, c + p.trace_length * p.trace_ood_evaluations.width)
+            })
+    }
+
     /// The global proof, as the same view the verifier reads.
     #[cfg(test)]
     pub(crate) fn global_proof_view(&self) -> MultiProofView<'_, F, E, ()> {
