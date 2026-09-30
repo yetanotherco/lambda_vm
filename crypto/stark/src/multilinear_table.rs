@@ -2425,6 +2425,8 @@ mod tests {
         /// the ones the cross-check walked today's program beside.
         lean_programs: u64,
         lean_program_xchecks: u64,
+        /// Zerocheck sessions that ran D-ARGUE stage 1's fused rounds.
+        fused: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
@@ -2434,6 +2436,10 @@ mod tests {
     /// Under `program` every batch counts as big, so these small tables take
     /// the path the VM's four big batches do
     /// ([`the_tall_batches_hold_fewer_values_on_demand`]).
+    ///
+    /// `fused` is D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED` with
+    /// `LAMBDA_VM_ARGUE_INT_NODES`, on by default in production): off, the
+    /// zerocheck takes today's rounds — the path every other knob here acts on.
     #[derive(Clone, Copy, Debug, Default)]
     struct Knobs {
         columns: bool,
@@ -2441,6 +2447,7 @@ mod tests {
         reads: bool,
         tail: bool,
         program: bool,
+        fused: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2449,6 +2456,7 @@ mod tests {
         reads: false,
         tail: false,
         program: false,
+        fused: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2481,6 +2489,10 @@ mod tests {
         multilinear::gpu::force_argue_lean_tail(Some(knobs.tail));
         multilinear::gpu::force_argue_lean_program(Some(knobs.program));
         multilinear::gpu::force_lean_program_gate(knobs.program.then_some(0));
+        multilinear::gpu_fused::force_argue_fused(Some(knobs.fused));
+        #[cfg(feature = "cuda")]
+        math_cuda::sumcheck::force_int_nodes(Some(knobs.fused));
+        let fused = multilinear::gpu_fused::fused_sessions();
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2507,7 +2519,11 @@ mod tests {
             lean_tails: multilinear::gpu::lean_tails() - lean,
             lean_programs: multilinear::gpu::lean_programs() - demand,
             lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
+            fused: multilinear::gpu_fused::fused_sessions() - fused,
         });
+        multilinear::gpu_fused::force_argue_fused(None);
+        #[cfg(feature = "cuda")]
+        math_cuda::sumcheck::force_int_nodes(None);
         multilinear::gpu::force_argue_device_columns(None);
         multilinear::gpu::force_argue_device_tables(None);
         multilinear::gpu::force_argue_lean_reads(None);
@@ -3316,6 +3332,118 @@ mod tests {
         }
     }
 
+    /// ★ D-ARGUE stage 1 (the fused zerocheck with integer nodes — on by default
+    /// in production) moves no byte of the proof, alone or with the other argue
+    /// knobs on: the same canonical bytes, table by table and whole, the same
+    /// transcript and next challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, no session
+    /// runs the fused rounds; on, the tall tables do (each is 2^13 or 2^14 rows,
+    /// past the fused rounds' 2^7). ⚠ Run it alone (`--exact`): the counters are
+    /// process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_the_fused_rounds() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let mut today = prove_tall(&airs, &columns, TODAY);
+        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+        let today_state = today.transcript.state();
+        let today_next = today.transcript.sample_field_element();
+        let device = a_device();
+        assert_eq!(today.fused, 0, "today runs no fused session");
+        let fused = Knobs {
+            fused: true,
+            ..TODAY
+        };
+        let all = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            fused: true,
+            ..TODAY
+        };
+        for knobs in [fused, all] {
+            let mut arm = prove_tall(&airs, &columns, knobs);
+            if device {
+                assert!(arm.fused > 0, "{knobs:?}: the card ran the fused rounds");
+                eprintln!("argue fused: {knobs:?}: {} fused sessions", arm.fused);
+            } else {
+                assert_eq!(arm.fused, 0, "{knobs:?}: no device, no fused session");
+                eprintln!("argue fused: no device; today's rounds ran");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &arm.proof),
+                None,
+                "{knobs:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&arm.proof).unwrap(),
+                "{knobs:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                arm.transcript.state(),
+                "{knobs:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                arm.transcript.sample_field_element(),
+                "{knobs:?}: the next challenge moved"
+            );
+            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail. With the fused rounds' bus coefficient
+    /// off by one on the card, the proof must differ from today's at CPU, the
+    /// first table argued, and must not verify. Needs a device, and says so
+    /// rather than passing without one.
+    #[test]
+    fn a_wrong_fused_bus_coefficient_changes_the_argument_and_fails_it() {
+        use multilinear::gpu_fused::{FusedFaults, force_fused_faults};
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue fused: SKIPPED, no device to corrupt a coefficient on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, TODAY);
+        force_fused_faults(FusedFaults {
+            bus: true,
+            ..FusedFaults::default()
+        });
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    fused: true,
+                    ..TODAY
+                },
+            )
+        }));
+        force_fused_faults(FusedFaults::default());
+        let faulted = faulted.expect("the faulted arm proves");
+        assert!(faulted.fused > 0, "the fault is on the fused path");
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        let verdict = verify_tall(&faulted.committed, &faulted.proof);
+        assert!(
+            verdict.is_err(),
+            "a proof over a wrong bus coefficient must not verify, got {verdict:?}"
+        );
+        eprintln!("argue fused: the wrong coefficient was refused: {verdict:?}");
+    }
+
     /// ⛔ The identity above can fail. With the fault armed, every gathered
     /// read hands back its first word plus one; the proof must then differ from
     /// today's at CPU, the first table argued, and must not verify. Needs a
@@ -3553,12 +3681,15 @@ mod tests {
         let today_next = today.transcript.sample_field_element();
         let device = a_device();
         assert_eq!(today.lean_programs, 0, "today no program runs on demand");
+        // Every knob of today's rounds: the fused rounds take the zerocheck
+        // away from the program these knobs act on, so they stay off here.
         let every = Knobs {
             columns: true,
             tables: true,
             reads: true,
             tail: true,
             program: true,
+            fused: false,
         };
         for knobs in [
             Knobs {

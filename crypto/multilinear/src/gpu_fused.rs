@@ -343,22 +343,31 @@ pub struct FusedFaults {
     pub corners_inert: bool,
 }
 
-static FAULTS: AtomicU8 = AtomicU8::new(0);
+thread_local! {
+    // Per thread, not per process: the fused rounds are on by default, so a
+    // fault armed for one test must not reach a proof another test runs beside
+    // it. A table's argument runs on the thread that calls it (the table loop
+    // is serial), which is the test's own.
+    static FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
+/// Arms `faults` for the calling thread's proofs; `FusedFaults::default()`
+/// disarms.
 #[doc(hidden)]
 pub fn force_fused_faults(faults: FusedFaults) {
-    FAULTS.store(
-        u8::from(faults.bus)
-            | (u8::from(faults.keep_corners) << 1)
-            | (u8::from(faults.xcheck_inert) << 2)
-            | (u8::from(faults.corners_inert) << 3),
-        Ordering::Relaxed,
-    );
+    FAULTS.with(|f| {
+        f.set(
+            u8::from(faults.bus)
+                | (u8::from(faults.keep_corners) << 1)
+                | (u8::from(faults.xcheck_inert) << 2)
+                | (u8::from(faults.corners_inert) << 3),
+        )
+    });
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn faults() -> FusedFaults {
-    let f = FAULTS.load(Ordering::Relaxed);
+    let f = FAULTS.with(std::cell::Cell::get);
     FusedFaults {
         bus: f & 1 != 0,
         keep_corners: f & 2 != 0,
