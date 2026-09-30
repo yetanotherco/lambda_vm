@@ -1053,6 +1053,9 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    use multilinear::whir_split::{self as split, lap, tick};
+
+    let t = tick();
     let interactions = multilinear_logup::interactions(
         table.layout.interactions,
         table.slot_of().len(),
@@ -1060,6 +1063,7 @@ where
         alpha,
         |col| slot(table.slot_of(), col),
     )?;
+    lap(&split::REST_INTERACTIONS, t);
 
     // The input layer reads the trace's factors. On a device they stay there
     // for the sumcheck too — they are the biggest thing the argument holds —
@@ -1070,6 +1074,7 @@ where
     // (its output read here, at the consume site). Prefetch never changes WHAT
     // is built — same factors, same (z, alpha, beta) — only when, so a prebuilt
     // tree yields byte-for-byte the same proof as building it here now.
+    let t = tick();
     let tree = match prebuilt {
         Some(tree) => tree,
         None => match table
@@ -1086,11 +1091,17 @@ where
             }
         },
     };
+    let tree_secs = lap(&split::REST_TREE, t);
+    let t = tick();
     let bus_output = tree.output();
     transcript.append_field_element(&bus_output.0);
     transcript.append_field_element(&bus_output.1);
+    lap(&split::REST_OUTPUT, t);
+    let t = tick();
     let gkr_out = gkr::prove(&tree, transcript)?;
+    let gkr_secs = lap(&split::REST_GKR, t);
 
+    let t = tick();
     let num_vars = table.num_vars();
     let r: Vec<FieldElement<E>> = (0..num_vars)
         .map(|_| transcript.sample_field_element())
@@ -1140,6 +1151,8 @@ where
             claim_point: &gkr_out.claim.point,
             r: &r,
         });
+    lap(&split::REST_SETUP, t);
+    let t = tick();
     let (constraint, point) = constraint_argument::prove_core_with::<F, E, T>(
         &table.trace,
         weights,
@@ -1155,7 +1168,39 @@ where
     // The sumcheck folded the factors where they lay, so they are spent — and
     // the table outlives its own argument. Letting go of them here is what
     // keeps a proof from holding every table's at once.
+    let core_secs = t.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    let t = tick();
     table.trace.release_device();
+    lap(&split::REST_RELEASE, t);
+    split::bump(&split::REST_TABLES);
+    if split::enabled() {
+        split::note_air(split::AirCensus {
+            // Its position in the prove's walk: `note_air` numbers it.
+            index: 0,
+            num_vars,
+            columns: table.num_committed_columns(),
+            factors: table.kinds().len(),
+            shifted: table
+                .kinds()
+                .iter()
+                .filter(|kind| kind.source().is_some_and(|source| source.offset != 0))
+                .count(),
+            interactions: interactions.len(),
+            input_vars: logup::input_layer_vars(interactions.len(), num_vars),
+            degree: shape.degree(),
+            roots: shape.num_roots(),
+            bus_len_max: table
+                .layout
+                .interactions
+                .iter()
+                .map(BusInteraction::num_bus_elements)
+                .max()
+                .unwrap_or(0),
+            tree: tree_secs,
+            gkr: gkr_secs,
+            core: core_secs,
+        });
+    }
 
     Ok((
         TableProof {

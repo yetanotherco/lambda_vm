@@ -689,7 +689,9 @@ where
     let (mut p_claim, mut q_claim) = tree.output();
     // The levels near the output, fetched once. Their rounds are over cubes a
     // core walks in microseconds, and a device pays a launch for each.
+    let t = whir_split::tick();
     let prefix = tree.host_prefix();
+    whir_split::add_tick(&whir_split::REST_PREFIX, t);
 
     for i in 0..tree.num_layers() - 1 {
         // A layer the device runs, whose host work the instrument splits

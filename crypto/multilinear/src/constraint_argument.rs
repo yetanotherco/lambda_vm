@@ -613,6 +613,7 @@ where
     // reads it. The closure is what makes them if the device turns the rounds
     // down.
     let resident = trace.device_factors();
+    let t = crate::whir_split::tick();
     let (sumcheck, point, bound) = batch::prove_resident_with(
         weights,
         resident,
@@ -622,11 +623,13 @@ where
         fused,
         transcript,
     )?;
+    crate::whir_split::add_tick(&crate::whir_split::REST_BATCH, t);
 
     // The sumcheck leaves a claim about the factors at its point. Settle it in
     // two steps: reduce every committed factor's value there to a claim about
     // the column it reads, then open each column once. The public factors need
     // neither step.
+    let t = crate::whir_split::tick();
     let factor_values = if bound.len() >= trace.kinds.len() {
         // The rounds folded every factor to exactly this, so reading it back is
         // the whole of it. Slot order is `kinds` order, and the weight tables
@@ -650,6 +653,7 @@ where
             .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
             .collect::<Result<Vec<_>, _>>()?
     };
+    crate::whir_split::add_tick(&crate::whir_split::REST_VALUES, t);
 
     let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(
         &trace.columns,
