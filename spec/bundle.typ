@@ -106,9 +106,9 @@
       html.link(href: "/style.css", rel: "stylesheet")
       html.link(href: "/fonts.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
-      html.script(src: "/sidenotes.js", defer: true)
+      html.script(src: "/defered.js", defer: true)
       html.div(class: "headerButtons")
-      html.script(src: "/themetoggle.js")
+      html.script(src: "/instant.js")
       html.header(title(link(<doc:index>, vistitle)))
       html.main(mainbody)
       nav(filename)
@@ -116,11 +116,9 @@
   })#label("doc:"+filename)
 ]
 
-#asset("/style.css", read("/assets/style.css"))
-#asset("/fonts.css", read("/assets/fonts.css"))
-#asset("/sidenotes.css", read("/assets/sidenotes.css"))
-#asset("/sidenotes.js", read("/assets/sidenotes.js"))
-#asset("/themetoggle.js", read("/assets/themetoggle.js"))
+#asset("/style.css", read("/assets/style.css") + read("/assets/fonts.css") + read("/assets/sidenotes.css"))
+#asset("/defered.js", read("/assets/sidenotes.js") + read("/assets/mathml_cleanup.js"))
+#asset("/instant.js", read("/assets/themetoggle.js"))
 
 // Bundled fonts
 #for f in (
