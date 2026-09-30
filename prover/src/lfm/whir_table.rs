@@ -252,7 +252,7 @@ pub struct TableVerdictWires {
 /// computed; this puts them back in factor order, with any weight tables a
 /// statement appended landing at the end. Costs NO rows: it is a reordering of
 /// wires that already exist.
-fn weave(kinds: &[FactorKind], committed: &[Ext], public: &[Ext]) -> Vec<Ext> {
+pub(crate) fn weave(kinds: &[FactorKind], committed: &[Ext], public: &[Ext]) -> Vec<Ext> {
     let want_committed = kinds.iter().filter(|k| k.source().is_some()).count();
     assert_eq!(
         committed.len(),
@@ -637,7 +637,7 @@ fn draw_ext(leg: &mut Cost, schedule: &mut SpongeSchedule, count: usize) {
 /// Counting them would not do: `claim_reduce` runs at degree 2 and the GKR
 /// ladder at 3, so `j = 1`'s pair is the same pair twice and the program pays
 /// for it once. `sumcheck_round_consts` is the count for a leg standing alone.
-fn newton_constants(degree: usize) -> Vec<FEE> {
+pub(crate) fn newton_constants(degree: usize) -> Vec<FEE> {
     let d = degree.max(1);
     let mut values = Vec::with_capacity(2 * d.saturating_sub(1));
     for j in 1..d {
@@ -680,7 +680,7 @@ fn newton_constants(degree: usize) -> Vec<FEE> {
 /// Found by the assembled walk's F1 over three tables whose AIRs carry
 /// `EmptyConstraints`: it read exactly three rows under its prediction, one per
 /// table. No fixture with an empty DAG existed before it.
-fn dag_constant_rows(ir: &IrShape<GoldilocksField, GoldilocksExtension>) -> usize {
+pub(crate) fn dag_constant_rows(ir: &IrShape<GoldilocksField, GoldilocksExtension>) -> usize {
     if ir.root_steps().is_empty() {
         return 1;
     }
