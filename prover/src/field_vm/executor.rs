@@ -250,6 +250,9 @@ fn apply_input_hints(
     mem: &Memory,
     oracle: &mut dyn HintOracle,
 ) -> Result<(), ExecError> {
+    if !instr.hint_in.contains(&true) {
+        return Ok(());
+    }
     let hinted: Vec<usize> = (0..N).filter(|&g| instr.hint_in[g]).collect();
     if state.pc == HALT_PC {
         state.regs = [FEE::zero(); N];

@@ -107,44 +107,83 @@ pub fn decode_tuple(pc: u64, instr: &Instr) -> [FE; 11] {
 // Trace generation
 // =========================================================================
 
-fn set_ext(t: &mut stark::table::Table<F>, row: usize, col: usize, v: &FEE) {
-    for (k, c) in v.value().iter().enumerate() {
-        t.set(row, col + k, *c);
-    }
+fn set_ext(row: &mut [FE], col: usize, v: &FEE) {
+    row[col..col + 3].copy_from_slice(v.value());
 }
 
-fn fill_row(t: &mut stark::table::Table<F>, row: usize, program: &Program, step: &Step) {
+/// One FIELD_VM row; `out_inv` is `args[0]⁻¹`, or zero when it is zero.
+fn fill_row(row: &mut [FE], program: &Program, step: &Step, out_inv: &FEE) {
     let State { zero, pc, regs } = step.state;
     let instr = &program.instrs[pc as usize];
-    t.set(row, cols::PC, FE::from(pc));
+    row[cols::PC] = FE::from(pc);
     for (i, a) in instr.args().iter().enumerate() {
         let x = FE::from(a.reg as u64);
-        t.set(row, cols::ARG_REG + i, x);
-        t.set(row, cols::ARG_SCALE + i, a.scale);
-        t.set(row, cols::ARG_OFFSET + i, a.offset);
-        t.set(row, cols::MEM_FLAG + i, FE::from(a.mem as u64));
+        row[cols::ARG_REG + i] = x;
+        row[cols::ARG_SCALE + i] = a.scale;
+        row[cols::ARG_OFFSET + i] = a.offset;
+        row[cols::MEM_FLAG + i] = FE::from(a.mem as u64);
         let pows = split_powers(x);
         for (k, p) in pows.iter().enumerate().skip(1) {
-            t.set(row, cols::pow(i, k), *p);
+            row[cols::pow(i, k)] = *p;
         }
         if a.mem {
-            t.set(row, cols::addr(i), step.args_premem[i].value()[0]);
+            row[cols::addr(i)] = step.args_premem[i].value()[0];
         }
-        set_ext(t, row, cols::arg(i), &step.args[i]);
+        set_ext(row, cols::arg(i), &step.args[i]);
     }
     for (g, r) in regs.iter().enumerate() {
-        t.set(row, cols::HINT_IN + g, FE::from(instr.hint_in[g] as u64));
-        set_ext(t, row, cols::reg(g), r);
+        row[cols::HINT_IN + g] = FE::from(instr.hint_in[g] as u64);
+        set_ext(row, cols::reg(g), r);
     }
-    t.set(row, cols::HINT_OUT, FE::from(instr.hint_out as u64));
-    t.set(row, cols::ZERO, FE::from(zero as u64));
-    let d = step.args[0];
-    let inv = if d == FEE::zero() {
-        FEE::zero()
-    } else {
-        d.inv().expect("nonzero")
+    row[cols::HINT_OUT] = FE::from(instr.hint_out as u64);
+    row[cols::ZERO] = FE::from(zero as u64);
+    set_ext(row, cols::OUT_INV, out_inv);
+}
+
+/// Rows per block of the parallel fill; each block inverts its `args[0]` in
+/// one batch.
+const FILL_BLOCK: usize = 4096;
+
+/// A FIELD_VM table of `rows` rows whose row `r` holds `step(r)`.
+fn fill_table<'a>(
+    program: &Program,
+    rows: usize,
+    step: impl Fn(usize) -> &'a Step + Sync,
+) -> TraceTable<F, E> {
+    let width = cols::NUM_COLUMNS;
+    let mut data = zeroed_fe_vec(rows * width);
+    let fill = |(b, block): (usize, &mut [FE])| {
+        let first = b * FILL_BLOCK;
+        let n = block.len() / width;
+        let mut inv: Vec<FEE> = (0..n)
+            .map(|r| {
+                let d = step(first + r).args[0];
+                if d == FEE::zero() { FEE::one() } else { d }
+            })
+            .collect();
+        FEE::inplace_batch_inverse(&mut inv).expect("no zero left to invert");
+        for (r, row) in block.chunks_mut(width).enumerate() {
+            let st = step(first + r);
+            let out_inv = if st.args[0] == FEE::zero() {
+                FEE::zero()
+            } else {
+                inv[r]
+            };
+            fill_row(row, program, st, &out_inv);
+        }
     };
-    set_ext(t, row, cols::OUT_INV, &inv);
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(FILL_BLOCK * width)
+            .enumerate()
+            .for_each(fill);
+    }
+    #[cfg(not(feature = "parallel"))]
+    data.chunks_mut(FILL_BLOCK * width)
+        .enumerate()
+        .for_each(fill);
+    TraceTable::new_main(data, width, 1)
 }
 
 /// The padding share (in percent) a single power-of-two table may waste
@@ -231,21 +270,15 @@ pub fn generate_segments(
     let mut start = 0;
     for (k, &(real, rows)) in plan.iter().enumerate() {
         let last = k + 1 == plan.len();
-        let mut trace = TraceTable::new_main(
-            zeroed_fe_vec(rows * cols::NUM_COLUMNS),
-            cols::NUM_COLUMNS,
-            1,
-        );
-        for row in 0..rows {
-            let step = if row < real {
+        let trace = fill_table(program, rows, |row| {
+            if row < real {
                 &exec.steps[start + row]
             } else if last {
                 &halt
             } else {
                 &exec.steps[start + real]
-            };
-            fill_row(&mut trace.main_table, row, program, step);
-        }
+            }
+        });
         if last {
             decode_mult[halt.state.pc as usize] += (rows - real) as u64;
         } else {
