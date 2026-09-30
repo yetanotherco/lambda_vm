@@ -2671,6 +2671,36 @@ fn prewarm_pinned_slots(pool: multilinear::pinned::Pool) {
     }
 }
 
+/// Frees `pool`'s slots once every epoch is proved, on a helper beside the
+/// cross-epoch proof: the tree's host peak comes later, in level 1, and slots
+/// kept to the end would add all of their bytes to it. Prints under
+/// `LAMBDA_VM_BASE_SPLIT=1`; the caller joins the handle before the base
+/// returns. Released here if the helper cannot be spawned.
+fn release_pinned_slots(pool: multilinear::pinned::Pool) -> Option<std::thread::JoinHandle<()>> {
+    fn release(pool: &multilinear::pinned::Pool) {
+        let (start, t0) = (std::time::Instant::now(), stark::prove_split::epoch_secs());
+        let freed = pool.release_free();
+        if crate::continuation::base_split_enabled() {
+            println!(
+                "PINNED SLOTS: released {freed} slot(s) in {:.2}s t=[{t0:.3},{:.3}]",
+                start.elapsed().as_secs_f64(),
+                stark::prove_split::epoch_secs(),
+            );
+        }
+    }
+    let helper_pool = pool.clone();
+    match std::thread::Builder::new()
+        .name("whir-pinned-release".to_string())
+        .spawn(move || release(&helper_pool))
+    {
+        Ok(helper) => Some(helper),
+        Err(_) => {
+            release(&pool);
+            None
+        }
+    }
+}
+
 /// Print a head step under `LAMBDA_VM_BASE_SPLIT=1`, like the epochs' stages.
 fn whir_head_done(step: &str, start: std::time::Instant, t0: f64) {
     if crate::continuation::base_split_enabled() {
@@ -2832,6 +2862,7 @@ pub(crate) fn prove_continuation_pinned(
     let on_count = observer.map(|o| move |n: usize| o.on_epoch_count(n));
 
     let mut epochs = Vec::new();
+    let mut release = None;
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
     // commitment — whose type names the hash — is built ONCE and held across
     // every epoch. Inside `prove_epoch` it could not outlive one call.
@@ -2892,11 +2923,15 @@ pub(crate) fn prove_continuation_pinned(
                     Ok(())
                 },
             )?;
-            if let Some(pool) = &pinned
-                && crate::continuation::base_split_enabled()
-            {
-                let detached = stark::multilinear_table::host_backing_detaches() - detached_before;
-                println!("{}", tally.line(detached, &pool.stats()));
+            if let Some(pool) = &pinned {
+                if crate::continuation::base_split_enabled() {
+                    let detached =
+                        stark::multilinear_table::host_backing_detaches() - detached_before;
+                    println!("{}", tally.line(detached, &pool.stats()));
+                }
+                // Every epoch is proved, so every slot is back: freed beside
+                // the cross-epoch proof.
+                release = release_pinned_slots(pool.clone());
             }
             (boundaries, Some(global))
         } else {
@@ -2973,6 +3008,9 @@ pub(crate) fn prove_continuation_pinned(
             })?
         }
     };
+    if let Some(release) = release {
+        let _ = release.join();
+    }
 
     Ok((
         ContinuationProof {

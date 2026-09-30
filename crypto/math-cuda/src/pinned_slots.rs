@@ -315,6 +315,26 @@ impl SlotPool {
         }
     }
 
+    /// Frees every block nobody holds, so the slots stop weighing on the host
+    /// once the epochs that needed them are proved; a later
+    /// [`SlotPool::fill`] allocates them again, and until then a lease misses
+    /// as not ready. A block still lent out stays. Returns how many were
+    /// freed.
+    pub fn release_free(&self) -> usize {
+        let blocks = {
+            let mut list = self.0.list();
+            let blocks = std::mem::take(&mut list.blocks);
+            list.created -= blocks.len();
+            blocks
+        };
+        let freed = blocks.len();
+        for block in blocks {
+            // SAFETY: taken out of the free list, so nothing points at it.
+            unsafe { block.free(self.0.ctx.get()) };
+        }
+        freed
+    }
+
     pub fn stats(&self) -> SlotStats {
         let (created, free) = {
             let list = self.0.list();
@@ -548,6 +568,33 @@ mod tests {
         assert_eq!(slots, [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
         let stats = pool.stats();
         assert_eq!((stats.leased, stats.none_free, stats.not_ready), (10, 0, 0));
+    }
+
+    /// Releasing frees only the blocks nobody holds: a lent block survives it
+    /// and comes back to the list afterwards; a lease meanwhile misses as not
+    /// ready, and the next fill makes the freed blocks again.
+    #[test]
+    fn releasing_frees_only_the_blocks_nobody_holds() {
+        let pool = pool(2, 16);
+        let mut held = pool.try_lease(16).unwrap();
+        held.as_mut_slice().fill(5);
+        assert_eq!(pool.release_free(), 1);
+        let s = pool.stats();
+        assert_eq!((s.created, s.free), (1, 0));
+        assert_eq!(pool.try_lease(1).err(), Some(Miss::NotReady));
+        assert!(
+            held.as_mut_slice().iter().all(|&v| v == 5),
+            "a held block was freed"
+        );
+        drop(held);
+        assert_eq!(pool.stats().free, 1);
+        assert_eq!(pool.release_free(), 1);
+        assert_eq!(pool.stats().created, 0);
+        assert_eq!(pool.release_free(), 0);
+        pool.fill_from_heap();
+        let s = pool.stats();
+        assert_eq!((s.created, s.free), (2, 2));
+        assert!(pool.try_lease(16).is_ok());
     }
 
     /// Threads leasing, writing, freezing and dropping at once never share a

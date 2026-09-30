@@ -113,6 +113,16 @@ impl Pool {
         }
     }
 
+    /// Frees the slots nobody holds, once the epochs that needed them are
+    /// proved: a later [`Pool::fill`] allocates them again. Returns how many
+    /// were freed.
+    pub fn release_free(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        return self.0.release_free();
+        #[cfg(not(feature = "cuda"))]
+        return 0;
+    }
+
     /// The most field elements one slot holds.
     pub fn slot_elems(&self) -> usize {
         #[cfg(feature = "cuda")]

@@ -2164,8 +2164,8 @@ static PINNED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// builds `Vec`s, without waiting; the epoch after that finds it free, since a
 /// prove returns its slot before the next epoch is taken. So no two epochs in a
 /// row miss, and a tiny epoch's preparation, far shorter than a prove, misses
-/// at least once. The slot is back when the run ends, and the bundle is the one
-/// `Vec`s give and verifies.
+/// at least once. The slot is back, and released, when the run ends; the bundle
+/// is the one `Vec`s give and verifies.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a card"]
@@ -2209,7 +2209,11 @@ fn one_slot_alternates_and_proves_what_vecs_prove() {
         stats.none_free >= 1,
         "no epoch found the slot held, so the miss path went untested"
     );
-    assert_eq!(stats.free, 1, "the slot did not come back");
+    assert_eq!(
+        (stats.created, stats.free),
+        (0, 0),
+        "the slot did not come back to be released after the epochs"
+    );
     assert_same_run(&pinned, &vecs, "one slot");
     assert!(
         multilinear_continuation::verify_continuation(&elf_bytes, &pinned, &opts).expect("verify"),
@@ -2254,5 +2258,9 @@ fn a_tail_claimed_early_yields_no_verifying_bundle() {
             );
         }
     }
-    assert_eq!(pool.stats().free, 1, "the slot did not come back");
+    let stats = pool.stats();
+    assert_eq!(
+        stats.free, stats.created,
+        "a slot is still held after the run"
+    );
 }
