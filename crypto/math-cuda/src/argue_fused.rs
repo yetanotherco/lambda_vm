@@ -71,7 +71,10 @@ pub struct FusedZerocheck<'f> {
     /// `width` factor slabs and then `L`'s, a quarter of the cube each.
     folded: CudaSlice<u64>,
     folded_ptrs: CudaSlice<u64>,
-    l_address: u64,
+    /// The fold's pointer table — every folded factor, then `L` — built once:
+    /// the addresses never move, and a table built per fold would have to be
+    /// waited for before it could be dropped.
+    fold_ptrs: CudaSlice<u64>,
     slots: CudaSlice<u64>,
     partials: CudaSlice<u64>,
     sums: CudaSlice<u64>,
@@ -220,8 +223,8 @@ impl<'f> FusedZerocheck<'f> {
             let (base, _record) = folded.device_ptr(&stream);
             (0..=width).map(|k| base + (k * q * 24) as u64).collect()
         };
-        let l_address = addresses[width];
         let folded_ptrs = htod_or_trim(&stream, &addresses[..width])?;
+        let fold_ptrs = htod_or_trim(&stream, &addresses)?;
         // SAFETY: a thread writes a slot before it reads it.
         let slots = unsafe { alloc_or_trim::<u64>(&stream, words) }?;
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_ROWS * MAX_GRID as usize * 3) }?;
@@ -250,7 +253,7 @@ impl<'f> FusedZerocheck<'f> {
             eq_rho,
             folded,
             folded_ptrs,
-            l_address,
+            fold_ptrs,
             slots,
             partials,
             sums,
@@ -272,6 +275,12 @@ impl<'f> FusedZerocheck<'f> {
 
     /// Sums `rows × grid` partials into `rows` ext3 values and reads them back.
     fn reduce(&mut self, rows: usize, grid: u32) -> Result<Vec<u64>> {
+        self.reduce_enqueue(rows, grid)?;
+        self.collect(rows)
+    }
+
+    /// [`reduce`](Self::reduce)'s launch, not waited for.
+    fn reduce_enqueue(&mut self, rows: usize, grid: u32) -> Result<()> {
         let be = backend()?;
         let reduce_block = 256u32;
         unsafe {
@@ -286,6 +295,11 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
+        Ok(())
+    }
+
+    /// The `rows` sums a queued launch left, read back once the stream is idle.
+    pub fn collect(&self, rows: usize) -> Result<Vec<u64>> {
         let out = self.stream.clone_dtoh(&self.sums.slice(0..rows * 3))?;
         self.stream.synchronize()?;
         Ok(out)
@@ -469,6 +483,15 @@ impl<'f> FusedZerocheck<'f> {
     /// A later round (S1-4): `A` at each integer node of `nodes`, then `B(0)`
     /// and `B(1)`, three u64 each.
     pub fn round(&mut self, nodes: &[u32]) -> Result<Vec<u64>> {
+        let rows = self.round_enqueue(nodes)?;
+        self.collect(rows)
+    }
+
+    /// [`round`](Self::round)'s launches, queued and not waited for; the
+    /// caller reads the sums with [`collect`](Self::collect) and the returned
+    /// row count. The batched argue queues every table's round before it
+    /// reads any back.
+    pub fn round_enqueue(&mut self, nodes: &[u32]) -> Result<usize> {
         assert!(self.len >= 2, "a round needs a variable to bind");
         let rows = nodes.len() + 2;
         assert!(rows <= MAX_ROWS, "nodes per launch");
@@ -511,7 +534,8 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
-        self.reduce(rows, grid)
+        self.reduce_enqueue(rows, grid)?;
+        Ok(rows)
     }
 
     /// Binds the round's variable to `s` (three u64) in every folded factor and
@@ -522,23 +546,14 @@ impl<'f> FusedZerocheck<'f> {
         let half = (self.len / 2) as u64;
         self.stream
             .memcpy_htod(&s[..], &mut self.scratch.slice_mut(0..3))?;
-        // The factors and `L`, through one pointer table of `width + 1`.
-        let mut addresses: Vec<u64> = {
-            let (base, _record) = self.folded.device_ptr(&self.stream);
-            let q = self.rows / 4;
-            (0..self.width)
-                .map(|k| base + (k * q * 24) as u64)
-                .collect()
-        };
-        addresses.push(self.l_address);
-        let mut ptrs = htod_or_trim(&self.stream, &addresses)?;
-        let width = addresses.len() as u64;
+        // The factors and `L`, through the one pointer table of `width + 1`.
+        let width = self.width as u64 + 1;
         let total = width * half;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_fold_ext3)
-                .arg(&mut ptrs)
+                .arg(&mut self.fold_ptrs)
                 .arg(&half)
                 .arg(&width)
                 .arg(&self.scratch)
@@ -552,7 +567,6 @@ impl<'f> FusedZerocheck<'f> {
         if more {
             self.halve_weights()?;
         }
-        self.stream.synchronize()?;
         Ok(())
     }
 

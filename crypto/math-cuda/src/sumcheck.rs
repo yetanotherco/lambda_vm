@@ -375,6 +375,17 @@ impl SumcheckSession {
     /// `t` holds the nodes as ext3 (three u64 each). Returns one ext3 sum per
     /// node, as `t.len()/3` triples.
     pub fn round(&mut self, t: &[u64]) -> Result<Vec<u64>> {
+        let num_t = self.round_enqueue(t)?;
+        self.round_collect(num_t)
+    }
+
+    /// [`round`](Self::round)'s launches, queued on the session's stream and
+    /// not waited for: the caller collects the answer with
+    /// [`round_collect`](Self::round_collect). Several sessions' rounds can so
+    /// be queued before one wait — the batched argue's ladder, whose active
+    /// trees each run a session and share one challenge a round. Returns the
+    /// node count `round_collect` reads.
+    pub fn round_enqueue(&mut self, t: &[u64]) -> Result<usize> {
         assert!(t.len().is_multiple_of(3), "three u64 per ext3 node");
         let num_t = t.len() / 3;
         assert!(num_t > 0 && num_t <= MAX_NODES, "nodes per round");
@@ -471,9 +482,15 @@ impl SumcheckSession {
                 Ok(())
             })?;
         }
+        Ok(num_t)
+    }
+
+    /// The answer of the round [`round_enqueue`](Self::round_enqueue) queued:
+    /// three u64 per interpolation node, read back once the stream is idle.
+    pub fn round_collect(&self, num_t: usize) -> Result<Vec<u64>> {
         let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
-        if busy_probe {
+        if crate::argue_probe::busy_probe_enabled() {
             BUSY_EVENTS.with(|cell| -> Result<()> {
                 let ev = cell.borrow();
                 let (start, end) = ev.as_ref().unwrap();

@@ -55,6 +55,12 @@ pub trait RoundStepper<F: IsField> {
     fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error>;
     /// Its value once every variable is bound.
     fn value(&self) -> Result<FieldElement<F>, Error>;
+    /// Queues this round's work on a device without waiting for it; the
+    /// batch queues every table's before reading any back, so a round costs
+    /// one wait rather than one a table.
+    fn prefetch(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A host polynomial's rounds: [`round_evaluations`] and a fold, as the
@@ -284,6 +290,17 @@ where
         }
     }
 
+    fn prefetch(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Host(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            Self::Fused { stepper, .. } => match stepper {
+                Some(stepper) => stepper.prefetch(),
+                None => Ok(()),
+            },
+        }
+    }
+
     fn value(&self) -> Result<FieldElement<E>, Error> {
         if RoundStepper::num_vars(self) != 0 {
             return Err(Error::VariableCountMismatch {
@@ -366,6 +383,11 @@ where
     let mut point = Vec::with_capacity(rounds);
 
     for j in 0..rounds {
+        for poly in polys.iter_mut() {
+            if poly.num_vars() > 0 {
+                poly.prefetch()?;
+            }
+        }
         let mut sent = vec![FieldElement::<F>::zero(); degree];
         for (t, (poly, weight)) in polys.iter_mut().zip(weights).enumerate() {
             if poly.num_vars() > 0 {

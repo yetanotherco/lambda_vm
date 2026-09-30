@@ -524,6 +524,8 @@ pub struct FusedStepper<'f, E: IsField> {
     bound: Vec<FieldElement<E>>,
     /// The message of the round under way, once asked for.
     pending: Option<Vec<FieldElement<E>>>,
+    /// A round queued on the card by [`Self::prefetch`], its rows unread.
+    queued: Option<usize>,
     started: std::time::Instant,
     times: FusedTimes,
 }
@@ -704,6 +706,7 @@ where
             e_rho: FieldElement::one(),
             bound: Vec::with_capacity(there),
             pending: None,
+            queued: None,
             started,
             times,
         }))
@@ -722,6 +725,22 @@ where
     /// The claim the round under way carries in.
     pub(crate) fn claim(&self) -> &FieldElement<E> {
         &self.claim
+    }
+
+    /// Queues the round under way's launches on the card, not waited for, so
+    /// the batched argue can queue every table's before it reads any back.
+    /// Rounds 0 and 1 come from the grid pass and queue nothing.
+    pub(crate) fn prefetch(&mut self) -> Result<(), crate::Error> {
+        let j = self.bound.len();
+        if j >= 2 && j < self.there && self.pending.is_none() && self.queued.is_none() {
+            let rows = self.session.round_enqueue(&self.walked).map_err(|_| {
+                crate::Error::DeviceFailed {
+                    stage: "fused round",
+                }
+            })?;
+            self.queued = Some(rows);
+        }
+        Ok(())
     }
 
     /// The round under way's message: its polynomial at `1..=d + 1`.
@@ -765,9 +784,16 @@ where
             _ => {
                 let tick = std::time::Instant::now();
                 let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
+                let rows = match self.queued.take() {
+                    Some(rows) => rows,
+                    None => self
+                        .session
+                        .round_enqueue(&self.walked)
+                        .map_err(|_| failed("fused round"))?,
+                };
                 let sums = self
                     .session
-                    .round(&self.walked)
+                    .collect(rows)
                     .map_err(|_| failed("fused round"))?;
                 let mut a = vec![FieldElement::<E>::zero(); d + 1];
                 for (k, &node) in self.walked.iter().enumerate() {

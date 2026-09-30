@@ -169,6 +169,20 @@ pub trait TreeStep<F: IsField> {
     fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error>;
     /// The four halves once every variable is bound.
     fn halves(&self) -> Result<TreeHalves<F>, Error>;
+    /// Queues this round's work without waiting for it, where there is a
+    /// device to queue on: the ladder queues every active tree's round before
+    /// it reads any back, so a round costs one wait, not one a tree.
+    fn prefetch(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// The cube this step still has on a device; zero on the host.
+    fn device_cube(&self) -> usize {
+        0
+    }
+    /// Takes the step's factors to the host, from here on stepped there.
+    fn to_host(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A tree the ladder descends: where its layers are is its own business — on
@@ -285,24 +299,25 @@ impl<F: IsField + 'static> DeviceStep<F>
 where
     FieldElement<F>: Send + Sync,
 {
-    /// The host's relation over what the card folded, once the cube is small.
-    fn current(&mut self) -> Result<&mut dyn TreeStep<F>, Error> {
-        let here = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize;
-        if let Some(session) = self.session.as_ref()
-            && session.num_vars() <= here
-        {
+    /// The card's factors, folded so far, brought here: the step goes on on
+    /// the host's relation over them.
+    fn hand_over(&mut self) -> Result<(), Error> {
+        if let Some(session) = self.session.take() {
             let factors = session.factors::<F>()?;
             if factors.len() != 5 {
                 return Err(Error::DeviceFailed {
                     stage: "layer factors",
                 });
             }
-            self.session = None;
             self.host = Some(HostStep(LockstepRelation {
                 polys: factors,
                 weights: self.weights.to_vec(),
             }));
         }
+        Ok(())
+    }
+
+    fn current(&mut self) -> Result<&mut dyn TreeStep<F>, Error> {
         match (self.session.as_mut(), self.host.as_mut()) {
             (Some(session), _) => Ok(session as &mut dyn TreeStep<F>),
             (None, Some(host)) => Ok(host as &mut dyn TreeStep<F>),
@@ -357,6 +372,23 @@ where
             (None, Some(host)) => host.halves(),
             (None, None) => Err(Error::NoVariablesLeft),
         }
+    }
+
+    fn prefetch(&mut self) -> Result<(), Error> {
+        match self.session.as_mut() {
+            Some(session) => session.enqueue(),
+            None => Ok(()),
+        }
+    }
+
+    fn device_cube(&self) -> usize {
+        self.session
+            .as_ref()
+            .map_or(0, |session| 1usize << session.num_vars())
+    }
+
+    fn to_host(&mut self) -> Result<(), Error> {
+        self.hand_over()
     }
 }
 
@@ -507,6 +539,19 @@ where
         let mut rounds = Vec::with_capacity(i);
         let mut z = Vec::with_capacity(i);
         for _ in 0..i {
+            // The crossover on the step's SUMMED cube: while the active
+            // trees' device cubes together are worth a launch, they stay on
+            // the card; below it every one comes here — a batched host round
+            // then walks all of them at the cost of one.
+            let cube: usize = stepping.iter().map(|step| step.device_cube()).sum();
+            if cube > 0 && cube <= crate::HOST_CUBE_DIRECT {
+                for step in stepping.iter_mut() {
+                    step.to_host()?;
+                }
+            }
+            for step in stepping.iter_mut() {
+                step.prefetch()?;
+            }
             let mut sent = vec![FieldElement::<F>::zero(); 3];
             for step in stepping.iter_mut() {
                 let own = step.round()?;

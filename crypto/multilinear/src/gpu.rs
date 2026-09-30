@@ -2875,6 +2875,8 @@ pub struct LayerSession {
     session: math_cuda::sumcheck::SumcheckSession,
     /// The interpolation nodes `1..=degree`, three u64 each.
     nodes: Vec<u64>,
+    /// A round queued by [`Self::enqueue`] and not yet read back.
+    pending: Option<usize>,
 }
 
 /// A layer session the build could not open. Never constructed.
@@ -2938,7 +2940,11 @@ impl DeviceTree {
             )
         };
         let session = session.ok()?;
-        Some(LayerSession { session, nodes })
+        Some(LayerSession {
+            session,
+            nodes,
+            pending: None,
+        })
     }
 }
 
@@ -2970,16 +2976,32 @@ impl LayerSession {
         self.session.len().trailing_zeros() as usize
     }
 
-    /// This round's polynomial at `1..=degree`.
+    /// Queues this round's launches without waiting for them, so the ladder
+    /// can queue every active tree's before it reads any back.
+    pub(crate) fn enqueue(&mut self) -> Result<(), crate::Error> {
+        if self.pending.is_none() {
+            let num_t = self
+                .session
+                .round_enqueue(&self.nodes)
+                .map_err(|_| crate::Error::DeviceFailed { stage: "round" })?;
+            self.pending = Some(num_t);
+        }
+        Ok(())
+    }
+
+    /// This round's polynomial at `1..=degree`: the queued round read back,
+    /// or queued and read back now.
     pub(crate) fn round<E>(
         &mut self,
     ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
     where
         E: math::field::traits::IsField + 'static,
     {
+        self.enqueue()?;
+        let num_t = self.pending.take().unwrap_or(0);
         let sums = self
             .session
-            .round(&self.nodes)
+            .round_collect(num_t)
             .map_err(|_| crate::Error::DeviceFailed { stage: "round" })?;
         SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
         Ok(sums.chunks_exact(3).map(ext3_from_raw::<E>).collect())
@@ -3019,6 +3041,10 @@ impl LayerSession {
 #[cfg(not(feature = "cuda"))]
 impl LayerSession {
     pub(crate) fn num_vars(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn enqueue(&mut self) -> Result<(), crate::Error> {
         match self.0 {}
     }
 
