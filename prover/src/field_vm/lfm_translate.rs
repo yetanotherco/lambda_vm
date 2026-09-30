@@ -181,8 +181,9 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
         mem.len() as u64 - 1
     };
     // A select never meets a chain (chains feed only the next ALU
-    // instruction), so with one register it borrows the accumulator.
-    let (acc, tmp) = (gpr(0), gpr(if super::isa::N >= 2 { 1 } else { 0 }));
+    // instruction), so it borrows the accumulator; the second register is
+    // left free for loop indices (`FVM_REROLL`).
+    let (acc, tmp) = (gpr(0), gpr(0));
     let opt = std::env::var_os("FVM_TRANSLATE_OPT").is_some();
     let plan = if opt {
         plan(program)
@@ -347,6 +348,9 @@ pub fn translate(program: &LfmProgram, exec: &LfmExecution, bit_dec: bool) -> Tr
     if std::env::var_os("FVM_MEM_COMPACT").is_some() {
         (mem, public) = compact(&mut program, &mem, &public);
     }
+    if std::env::var_os("FVM_REROLL").is_some() {
+        program = reroll(&program);
+    }
     Translation {
         program,
         mem,
@@ -382,4 +386,166 @@ fn compact(program: &mut Program, mem: &[FEE], public: &[u64]) -> (Vec<FEE>, Vec
     let mut public: Vec<u64> = public.iter().map(|&a| slot(a, &mut dense)).collect();
     public.sort_unstable();
     (dense, public)
+}
+
+/// Shortest loop body worth its two rows of per-iteration overhead.
+const MIN_LOOP_BODY: usize = 32;
+
+/// Re-rolls repeated straight-line blocks into loops over the second
+/// register. A block qualifies when it repeats at least three times with the
+/// same instruction shapes and every memory offset moving by one common stride
+/// per repetition, or not at all. Each loop is
+///
+/// ```text
+///     j = −reps·s
+/// top: body, strided offsets as MEM[j + base + reps·s]
+///     j = j + s          // ZERO once j reaches 0
+///     JNZ top
+/// ```
+///
+/// Registers are only ever the accumulator inside a body and the index `j`,
+/// which the body does not touch, so a chain that crosses from one repetition
+/// into the next still finds the accumulator it left.
+fn reroll(program: &Program) -> Program {
+    use super::isa::{ENTRY_PC, Instr, REG_PC};
+    use std::collections::HashMap;
+    assert!(
+        super::isa::N >= 2,
+        "loops need a second register for their index"
+    );
+    let j = gpr(1);
+    let src = &program.instrs;
+    let shape = |i: &Instr| {
+        let mut h = format!("{}{:?}", i.hint_out as u8, i.hint_in);
+        for a in i.args() {
+            h.push_str(&format!(
+                "|{}:{}:{}",
+                a.reg,
+                a.scale.canonical(),
+                a.mem as u8
+            ));
+            if !a.mem {
+                h.push_str(&format!(":{}", a.offset.canonical()));
+            }
+        }
+        h
+    };
+    let ids: Vec<u32> = {
+        let mut map: HashMap<String, u32> = HashMap::new();
+        src.iter()
+            .map(|i| {
+                let n = map.len() as u32;
+                *map.entry(shape(i)).or_insert(n)
+            })
+            .collect()
+    };
+    // Candidate periods: the commonest distances between repeats of a window.
+    const K: usize = 32;
+    let mut last: HashMap<&[u32], usize> = HashMap::new();
+    let mut dist: HashMap<usize, usize> = HashMap::new();
+    for i in 0..src.len().saturating_sub(K) {
+        if let Some(&q) = last.get(&ids[i..i + K]) {
+            *dist.entry(i - q).or_insert(0) += 1;
+        }
+        last.insert(&ids[i..i + K], i);
+    }
+    let mut periods: Vec<(usize, usize)> = dist
+        .into_iter()
+        .filter(|&(p, _)| p >= MIN_LOOP_BODY)
+        .collect();
+    periods.sort_by(|a, b| b.1.cmp(&a.1));
+    periods.truncate(16);
+    let offsets =
+        |i: &Instr| -> [Option<u64>; 4] { i.args().map(|a| a.mem.then(|| a.offset.canonical())) };
+    // The common stride between repetition 0 and repetition `k` at `i`.
+    let stride = |i: usize, p: usize, k: usize| -> Option<i128> {
+        let mut s: Option<i128> = None;
+        for t in 0..p {
+            if ids[i + t] != ids[i + t + k * p] {
+                return None;
+            }
+            for (x, y) in offsets(&src[i + t])
+                .into_iter()
+                .zip(offsets(&src[i + t + k * p]))
+            {
+                if let (Some(x), Some(y)) = (x, y) {
+                    let d = y as i128 - x as i128;
+                    if d != 0 {
+                        match s {
+                            None => s = Some(d),
+                            Some(v) if v == d => {}
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+        }
+        Some(s.unwrap_or(0))
+    };
+    let mut out: Vec<Instr> = src[..ENTRY_PC as usize].to_vec();
+    let mut i = ENTRY_PC as usize;
+    while i < src.len() {
+        let mut best: Option<(usize, usize, i128)> = None;
+        for &(p, _) in &periods {
+            if i + 3 * p > src.len() {
+                continue;
+            }
+            let Some(s) = stride(i, p, 1).filter(|&s| s != 0) else {
+                continue;
+            };
+            let mut reps = 2;
+            while i + (reps + 1) * p <= src.len() && stride(i, p, reps) == Some(s * reps as i128) {
+                reps += 1;
+            }
+            if reps >= 3 && best.is_none_or(|(bp, br, _)| reps * p > bp * br) {
+                best = Some((p, reps, s));
+            }
+        }
+        let Some((p, reps, s)) = best else {
+            out.push(src[i]);
+            i += 1;
+            continue;
+        };
+        let span = s * reps as i128;
+        out.push(Instr::new(
+            Arg::reg(j),
+            Arg::imm(0),
+            Arg::imm(0),
+            Arg::imm_fe(FE::from(-span as i64)),
+            true,
+        ));
+        let top = out.len() as i64;
+        for t in 0..p {
+            let mut instr = src[i + t];
+            let moved = offsets(&src[i + t + p]);
+            for (k, arg) in [&mut instr.d, &mut instr.a, &mut instr.b, &mut instr.c]
+                .into_iter()
+                .enumerate()
+            {
+                if let (Some(x), Some(y)) = (offsets(&src[i + t])[k], moved[k])
+                    && y != x
+                {
+                    *arg = Arg::mem(j, x as i64 + span as i64);
+                }
+            }
+            out.push(instr);
+        }
+        out.push(Instr::new(
+            Arg::reg(j),
+            Arg::imm(1),
+            Arg::reg(j),
+            Arg::imm_fe(FE::from(s as i64)),
+            true,
+        ));
+        // JNZ top: PC' = ZERO·(PC − top) + (ZERO + top).
+        out.push(Instr::new(
+            Arg::reg(REG_PC),
+            Arg::reg(REG_ZERO),
+            Arg::lin(REG_PC, 1, -top),
+            Arg::lin(REG_ZERO, 1, top),
+            true,
+        ));
+        i += reps * p;
+    }
+    Program { instrs: out }
 }
