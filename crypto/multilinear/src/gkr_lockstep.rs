@@ -159,6 +159,282 @@ fn line<F: IsField>(
     lo + c * &(hi - lo)
 }
 
+/// One tree's side of one ladder step: its relation
+/// `eq(P, ·)·(w_p·(p_lo q_hi + p_hi q_lo) + w_q·q_lo q_hi)` over layer `i + 1`,
+/// stepped by the shared challenges.
+pub trait TreeStep<F: IsField> {
+    /// This round's polynomial at `1, 2, 3`.
+    fn round(&mut self) -> Result<Vec<FieldElement<F>>, Error>;
+    /// Binds this round's variable to `r`.
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error>;
+    /// The four halves once every variable is bound.
+    fn halves(&self) -> Result<TreeHalves<F>, Error>;
+}
+
+/// A tree the ladder descends: where its layers are is its own business — on
+/// the host, or on a device that steps them where they lie — and the ladder
+/// cannot tell, which is what makes a device ladder the host's bytes.
+pub trait LadderTree<F: IsField> {
+    /// `k`: its input layer's variables.
+    fn input_vars(&self) -> usize;
+    /// The output fraction.
+    fn output(&self) -> (FieldElement<F>, FieldElement<F>);
+    /// Layer `layer`'s step (`layer ≥ 1`), at `point` (`layer − 1`
+    /// coordinates), weighted `[w_p, w_q]`.
+    fn step(
+        &self,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: [FieldElement<F>; 2],
+    ) -> Result<Box<dyn TreeStep<F> + '_>, Error>;
+}
+
+/// The step over a layer the host holds: one tree's [`LockstepRelation`].
+struct HostStep<F: IsField>(LockstepRelation<F>);
+
+impl<F: IsField + 'static> HostStep<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn over(
+        next: &FractionLayer<F>,
+        point: &[FieldElement<F>],
+        weights: [FieldElement<F>; 2],
+    ) -> Result<Self, Error> {
+        let half = next.p.len() / 2;
+        let mut polys = Vec::with_capacity(5);
+        polys.push(eq_mle(point)?);
+        for m in [&next.p, &next.q] {
+            polys.push(Mle::new(m.evals()[..half].to_vec())?);
+            polys.push(Mle::new(m.evals()[half..].to_vec())?);
+        }
+        Ok(Self(LockstepRelation {
+            polys,
+            weights: weights.to_vec(),
+        }))
+    }
+}
+
+impl<F: IsField + 'static> TreeStep<F> for HostStep<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn round(&mut self) -> Result<Vec<FieldElement<F>>, Error> {
+        Ok(sumcheck::round_evaluations(&self.0, 3, false))
+    }
+
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        self.0.fix_first_variable(r)
+    }
+
+    fn halves(&self) -> Result<TreeHalves<F>, Error> {
+        let bound = |slot: usize| -> Result<FieldElement<F>, Error> {
+            self.0.polys[slot]
+                .as_constant()
+                .cloned()
+                .ok_or(Error::NoVariablesLeft)
+        };
+        Ok(TreeHalves {
+            p_lo: bound(1)?,
+            p_hi: bound(2)?,
+            q_lo: bound(3)?,
+            q_hi: bound(4)?,
+        })
+    }
+}
+
+/// A tree's layers held here, output first.
+pub struct HostLayers<'a, F: IsField>(pub &'a [FractionLayer<F>]);
+
+impl<F: IsField + 'static> LadderTree<F> for HostLayers<'_, F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn input_vars(&self) -> usize {
+        self.0.len().saturating_sub(1)
+    }
+
+    fn output(&self) -> (FieldElement<F>, FieldElement<F>) {
+        (
+            self.0[0].p.evals()[0].clone(),
+            self.0[0].q.evals()[0].clone(),
+        )
+    }
+
+    fn step(
+        &self,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: [FieldElement<F>; 2],
+    ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
+        let next = self.0.get(layer).ok_or(Error::NoVariablesLeft)?;
+        Ok(Box::new(HostStep::over(next, point, weights)?))
+    }
+}
+
+/// The step over a layer a device holds: its rounds on the card while the cube
+/// is worth a launch, then the host's over the factors it hands back — today's
+/// crossover ([`crate::HOST_CUBE_DIRECT`]).
+struct DeviceStep<F: IsField> {
+    session: Option<crate::gpu::LayerSession>,
+    host: Option<HostStep<F>>,
+    weights: [FieldElement<F>; 2],
+}
+
+impl<F: IsField + 'static> DeviceStep<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    /// The host's relation over what the card folded, once the cube is small.
+    fn current(&mut self) -> Result<&mut dyn TreeStep<F>, Error> {
+        let here = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize;
+        if let Some(session) = self.session.as_ref()
+            && session.num_vars() <= here
+        {
+            let factors = session.factors::<F>()?;
+            if factors.len() != 5 {
+                return Err(Error::DeviceFailed {
+                    stage: "layer factors",
+                });
+            }
+            self.session = None;
+            self.host = Some(HostStep(LockstepRelation {
+                polys: factors,
+                weights: self.weights.to_vec(),
+            }));
+        }
+        match (self.session.as_mut(), self.host.as_mut()) {
+            (Some(session), _) => Ok(session as &mut dyn TreeStep<F>),
+            (None, Some(host)) => Ok(host as &mut dyn TreeStep<F>),
+            (None, None) => Err(Error::DeviceFailed {
+                stage: "layer session",
+            }),
+        }
+    }
+}
+
+impl<F: IsField + 'static> TreeStep<F> for crate::gpu::LayerSession {
+    fn round(&mut self) -> Result<Vec<FieldElement<F>>, Error> {
+        crate::gpu::LayerSession::round::<F>(self)
+    }
+
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        self.fold(r)
+    }
+
+    fn halves(&self) -> Result<TreeHalves<F>, Error> {
+        let factors = self.factors::<F>()?;
+        let one = |slot: usize| -> Result<FieldElement<F>, Error> {
+            factors
+                .get(slot)
+                .and_then(|f| f.as_constant().cloned())
+                .ok_or(Error::NoVariablesLeft)
+        };
+        Ok(TreeHalves {
+            p_lo: one(1)?,
+            p_hi: one(2)?,
+            q_lo: one(3)?,
+            q_hi: one(4)?,
+        })
+    }
+}
+
+impl<F: IsField + 'static> TreeStep<F> for DeviceStep<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn round(&mut self) -> Result<Vec<FieldElement<F>>, Error> {
+        self.current()?.round()
+    }
+
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        self.current()?.bind(r)
+    }
+
+    fn halves(&self) -> Result<TreeHalves<F>, Error> {
+        match (&self.session, &self.host) {
+            (Some(session), _) => TreeStep::<F>::halves(session),
+            (None, Some(host)) => host.halves(),
+            (None, None) => Err(Error::NoVariablesLeft),
+        }
+    }
+}
+
+/// `eq·(w_p·(p_lo q_hi + p_hi q_lo) + w_q·q_lo q_hi)` as the device's program:
+/// the batched step's relation for one tree.
+fn tree_program<F: IsField + 'static>(
+    weights: &[FieldElement<F>; 2],
+) -> Result<crate::program::Program<F>, Error> {
+    use crate::program::Builder;
+    let mut b = Builder::<F>::new();
+    let eq = b.var(0);
+    let p_lo = b.var(1);
+    let p_hi = b.var(2);
+    let q_lo = b.var(3);
+    let q_hi = b.var(4);
+    let first = b.mul(p_lo, q_hi);
+    let second = b.mul(p_hi, q_lo);
+    let numerator = b.add(first, second);
+    let denominator = b.mul(q_lo, q_hi);
+    let wp = b.fixed(weights[0].clone());
+    let wq = b.fixed(weights[1].clone());
+    let a = b.mul(wp, numerator);
+    let c = b.mul(wq, denominator);
+    let sum = b.add(a, c);
+    let root = b.mul(eq, sum);
+    b.finish(root)
+}
+
+/// A table's tree as the argue builds it: its levels here, or on a device.
+impl<F: IsField + 'static> LadderTree<F> for crate::gkr::FractionTree<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn input_vars(&self) -> usize {
+        self.num_layers().saturating_sub(1)
+    }
+
+    fn output(&self) -> (FieldElement<F>, FieldElement<F>) {
+        crate::gkr::FractionTree::output(self)
+    }
+
+    fn step(
+        &self,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: [FieldElement<F>; 2],
+    ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
+        let Some(device) = self.device() else {
+            return Ok(Box::new(HostStep::over(self.layer(layer), point, weights)?));
+        };
+        // A level near the output comes here whole, as today's prefix does:
+        // its rounds are over cubes a core walks in microseconds. Never the
+        // input layer, which a tree that gave it back writes again.
+        let prefix = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
+        if layer <= prefix && layer + 1 < self.num_layers() {
+            let (p, q) = device
+                .layer_to_host::<F>(layer)
+                .ok_or(Error::DeviceFailed {
+                    stage: "layer to host",
+                })?;
+            let next = FractionLayer::new(p, q)?;
+            return Ok(Box::new(HostStep::over(&next, point, weights)?));
+        }
+        let program = tree_program(&weights)?;
+        let session =
+            device
+                .layer_session(layer, point, &program, 3)
+                .ok_or(Error::DeviceFailed {
+                    stage: "layer session",
+                })?;
+        Ok(Box::new(DeviceStep {
+            session: Some(session),
+            host: None,
+            weights,
+        }))
+    }
+}
+
 /// Proves every tree's layers in lockstep, on the host.
 ///
 /// `trees[t]` is tree `t`'s layers, output first (`trees[t][0]` has no
@@ -174,15 +450,7 @@ where
     T: IsTranscript<F>,
     FieldElement<F>: Send + Sync,
 {
-    let mut input_vars = Vec::with_capacity(trees.len());
     for tree in trees {
-        let top = tree.first().ok_or(Error::EmptyPolynomial)?;
-        if top.num_vars() != 0 {
-            return Err(Error::VariableCountMismatch {
-                expected: 0,
-                got: top.num_vars(),
-            });
-        }
         for (i, layer) in tree.iter().enumerate() {
             if layer.num_vars() != i {
                 return Err(Error::VariableCountMismatch {
@@ -191,14 +459,29 @@ where
                 });
             }
         }
-        input_vars.push(tree.len() - 1);
+        if tree.is_empty() {
+            return Err(Error::EmptyPolynomial);
+        }
     }
+    let hosts: Vec<HostLayers<'_, F>> = trees.iter().map(|t| HostLayers(t)).collect();
+    let trees: Vec<&dyn LadderTree<F>> = hosts.iter().map(|t| t as &dyn LadderTree<F>).collect();
+    prove_trees(&trees, transcript)
+}
+
+/// [`prove`] over trees wherever their layers are.
+pub fn prove_trees<F, T>(
+    trees: &[&dyn LadderTree<F>],
+    transcript: &mut T,
+) -> Result<(LockstepProof<F>, Vec<GkrClaim<F>>), Error>
+where
+    F: IsField + 'static,
+    T: IsTranscript<F>,
+{
+    let input_vars: Vec<usize> = trees.iter().map(|t| t.input_vars()).collect();
     let steps = input_vars.iter().copied().max().unwrap_or(0);
 
-    let mut claims: Vec<(FieldElement<F>, FieldElement<F>)> = trees
-        .iter()
-        .map(|tree| (tree[0].p.evals()[0].clone(), tree[0].q.evals()[0].clone()))
-        .collect();
+    let mut claims: Vec<(FieldElement<F>, FieldElement<F>)> =
+        trees.iter().map(|tree| tree.output()).collect();
     let mut inputs: Vec<Option<GkrClaim<F>>> = (0..trees.len())
         .map(|t| {
             (input_vars[t] == 0).then(|| GkrClaim {
@@ -215,41 +498,49 @@ where
         let active = active(&input_vars, i);
         let mu: FieldElement<F> = transcript.sample_field_element();
         let weights = challenge_powers(&mu, 2 * active.len());
+        let mut stepping: Vec<Box<dyn TreeStep<F> + '_>> = active
+            .iter()
+            .zip(weights.chunks(2))
+            .map(|(&t, w)| trees[t].step(i + 1, &point, [w[0].clone(), w[1].clone()]))
+            .collect::<Result<_, _>>()?;
 
-        let mut polys = Vec::with_capacity(1 + 4 * active.len());
-        polys.push(eq_mle(&point)?);
-        for &t in &active {
-            let next = &trees[t][i + 1];
-            let half = next.p.len() / 2;
-            for m in [&next.p, &next.q] {
-                polys.push(Mle::new(m.evals()[..half].to_vec())?);
-                polys.push(Mle::new(m.evals()[half..].to_vec())?);
+        let mut rounds = Vec::with_capacity(i);
+        let mut z = Vec::with_capacity(i);
+        for _ in 0..i {
+            let mut sent = vec![FieldElement::<F>::zero(); 3];
+            for step in stepping.iter_mut() {
+                let own = step.round()?;
+                if own.len() != 3 {
+                    return Err(Error::RoundDegreeMismatch {
+                        round: rounds.len(),
+                        expected: 3,
+                        got: own.len(),
+                    });
+                }
+                for (s, v) in sent.iter_mut().zip(own) {
+                    *s += v;
+                }
             }
+            for e in &sent {
+                transcript.append_field_element(e);
+            }
+            let r: FieldElement<F> = transcript.sample_field_element();
+            for step in stepping.iter_mut() {
+                step.bind(&r)?;
+            }
+            rounds.push(sumcheck::RoundProof { evaluations: sent });
+            z.push(r);
         }
-        // Reordered to `p_lo, p_hi, q_lo, q_hi`, which is what `relation` reads:
-        // the loop above pushed exactly that.
-        let mut step = LockstepRelation { polys, weights };
-        let (rounds, z) = sumcheck::prove_rounds(&mut step, i, transcript)?;
 
-        let bound = |slot: usize| -> Result<FieldElement<F>, Error> {
-            step.polys[slot]
-                .as_constant()
-                .cloned()
-                .ok_or(Error::NoVariablesLeft)
-        };
         let mut halves = Vec::with_capacity(active.len());
-        for a in 0..active.len() {
-            let h = TreeHalves {
-                p_lo: bound(1 + 4 * a)?,
-                p_hi: bound(2 + 4 * a)?,
-                q_lo: bound(3 + 4 * a)?,
-                q_hi: bound(4 + 4 * a)?,
-            };
+        for step in &stepping {
+            let h = step.halves()?;
             for v in [&h.p_lo, &h.p_hi, &h.q_lo, &h.q_hi] {
                 transcript.append_field_element(v);
             }
             halves.push(h);
         }
+        drop(stepping);
         let c: FieldElement<F> = transcript.sample_field_element();
         point = std::iter::once(c.clone()).chain(z).collect();
         for (&t, h) in active.iter().zip(&halves) {

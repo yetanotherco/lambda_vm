@@ -451,6 +451,9 @@ pub(crate) type FusedRounds<E> = (
 /// challenge, as today's device rounds call it.
 ///
 /// `None` is a decline, always before the first message; `Some(Err)` after.
+///
+/// The rounds are [`FusedStepper`]'s, driven here one after the other; the
+/// batched argue drives the same stepper in lockstep with other tables'.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_fused<B, E>(
@@ -467,280 +470,421 @@ where
     E: IsField + 'static,
     FieldElement<E>: Send + Sync,
 {
-    use crate::fused::{self, BusColumn};
-    use crate::gpu::{ext3_from_raw, ext3_raw};
-    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
-    use std::time::Instant;
-
-    if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() || lambdas.len() != 3 {
-        return None;
-    }
-    let started = Instant::now();
-    let device = resident.inner();
-    let rows = device.len();
-    let num_vars = rows.trailing_zeros() as usize;
-    let constraints = input.constraints;
-    let d = constraints.degree().max(1);
-    if degree != d + 1 || input.r.len() != num_vars || input.claim_point.len() < num_vars {
-        return None;
-    }
-    // Rounds 0 and 1 on the grid, then the later rounds down to where today's
-    // hand the cube to the host.
-    let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
-    if there < 2 || input.betas.len() != constraints.roots().len() {
-        return None;
-    }
-    let lowered = lower_fused(constraints)?;
-    let (interaction_point, rho) = input
-        .claim_point
-        .split_at(input.claim_point.len() - num_vars);
-    let mut bus = BusColumn::new(
-        input.interactions,
-        interaction_point,
-        &lambdas[1],
-        &lambdas[2],
-    )
-    .ok()?;
-    if faults().bus
-        && let Some((slot, a)) = bus.terms().first().cloned()
-    {
-        let mut terms = bus.terms().to_vec();
-        terms[0] = (slot, a + FieldElement::<E>::one());
-        bus = BusColumn::from_parts(bus.constant().clone(), terms);
-    }
-    let keep = faults().keep_corners;
-    let check_corners = check_corners && !keep;
-    let points: Vec<(u32, u32)> = (0..=d as u32)
-        .flat_map(|a| (0..=d as u32).map(move |b| (a, b)))
-        .filter(|&(a, b)| check_corners || keep || !(a < 2 && b < 2))
-        .collect();
-    let walked: Vec<u32> = core::iter::once(0).chain(2..=d as u32).collect();
-    if points.len() > math_cuda::argue_fused::MAX_ROWS
-        || walked.len() + 3 > math_cuda::argue_fused::MAX_ROWS
-    {
-        return None;
-    }
-
-    let raw = |v: &FieldElement<E>| ext3_raw(v);
-    let flat = |vs: &[FieldElement<E>]| -> Option<Vec<u64>> {
-        let mut out = Vec::with_capacity(vs.len() * 3);
-        for v in vs {
-            out.extend_from_slice(&raw(v)?);
-        }
-        Some(out)
-    };
-    let betas = flat(input.betas)?;
-    let slots: Vec<u32> = bus
-        .terms()
-        .iter()
-        .map(|(slot, _)| u32::try_from(*slot).ok())
-        .collect::<Option<_>>()?;
-    if slots.iter().any(|&s| s as usize >= device.width())
-        || constraints.reads().iter().any(|&s| s >= device.width())
-    {
-        return None;
-    }
-    let coeffs = flat(
-        &bus.terms()
-            .iter()
-            .map(|(_, a)| a.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    let r_tail = flat(&input.r[2..])?;
-    let rho_tail = flat(&rho[2..])?;
-    let program = math_cuda::argue_fused::FusedProgram {
-        nodes: &lowered.nodes,
-        base_consts: &lowered.base_consts,
-        ext_consts: &lowered.ext_consts,
-        betas: &betas,
-        num_slots: lowered.num_slots,
-    };
-    let fused_bus = math_cuda::argue_fused::FusedBus {
-        slots: &slots,
-        coeffs: &coeffs,
-        constant: raw(bus.constant())?,
-    };
-    let mut session = match math_cuda::argue_fused::FusedZerocheck::new(
-        device,
-        program,
-        fused_bus,
-        &r_tail,
-        &rho_tail,
-        points.len(),
-        walked.len() + 2,
-    ) {
-        Ok(Some(session)) => session,
-        _ => return None,
-    };
-
-    let failed = |stage| crate::Error::DeviceFailed { stage };
-    let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
-    let one = FieldElement::<E>::one();
-    let big = FieldElement::<E>::from(degree as u64);
-    let side = d + 1;
-    let r = input.r;
-
-    // ── rounds 0 and 1: one base-field pass ──
-    let tick = Instant::now();
-    let Ok((t_sums, u_sums, violation)) = session.grid(&points, keep) else {
-        return None;
-    };
-    if check_corners {
-        if let Some(row) = violation
-            && !faults().corners_inert
-        {
-            eprintln!(
-                "[argue] FUSED XCHECK: the trace breaks its constraints at row {row} (2^{num_vars} rows)"
-            );
-            return Some(Err(crate::Error::ConstraintViolated { row: row as usize }));
-        }
-        CORNER_CHECKS.fetch_add(1, Ordering::Relaxed);
-    }
-    let mut t = vec![vec![FieldElement::<E>::zero(); side]; side];
-    for (k, &(a, b)) in points.iter().enumerate() {
-        if a < 2 && b < 2 && !keep {
-            continue;
-        }
-        t[a as usize][b as usize] = from(&t_sums[k * 3..k * 3 + 3]);
-    }
-    let u: [[FieldElement<E>; 2]; 2] = core::array::from_fn(|b| {
-        core::array::from_fn(|c| from(&u_sums[(2 * b + c) * 3..(2 * b + c) * 3 + 3]))
-    });
-    let grid_secs = tick.elapsed().as_secs_f64();
-
-    let mut claim = claim.clone();
+    let mut stepper =
+        match FusedStepper::new(resident, input, lambdas, claim, degree, check_corners)? {
+            Ok(stepper) => stepper,
+            Err(error) => return Some(Err(error)),
+        };
+    let there = stepper.device_rounds();
     let mut rounds = Vec::with_capacity(there);
     let mut point = Vec::with_capacity(there);
-    let (mut e_r, mut e_rho) = (one.clone(), one.clone());
-    let mut send = |g: Vec<FieldElement<E>>,
-                    claim: &mut FieldElement<E>,
-                    rounds: &mut Vec<crate::sumcheck::RoundProof<E>>,
-                    point: &mut Vec<FieldElement<E>>| {
+    for _ in 0..there {
+        let g = match stepper.message() {
+            Ok(g) => g,
+            Err(error) => return Some(Err(error)),
+        };
         let s = challenge(&g);
-        let mut all = Vec::with_capacity(g.len() + 1);
-        all.push(&*claim - &g[0]);
-        all.extend(g.iter().cloned());
-        *claim = crate::sumcheck::interpolate(&all, &s);
+        if let Err(error) = stepper.bind(&s) {
+            return Some(Err(error));
+        }
         rounds.push(crate::sumcheck::RoundProof { evaluations: g });
-        point.push(s.clone());
-        s
-    };
-
-    let a0: Vec<FieldElement<E>> = (0..=d)
-        .map(|a| (&one - &r[1]) * &t[a][0] + &r[1] * &t[a][1])
-        .collect();
-    let b0: [FieldElement<E>; 2] =
-        core::array::from_fn(|b| (&one - &rho[1]) * &u[b][0] + &rho[1] * &u[b][1]);
-    let g0 = fused::message(&r[0], &rho[0], &e_r, &e_rho, &a0, &b0, &big);
-    let s0 = send(g0, &mut claim, &mut rounds, &mut point);
-    e_r = &e_r * fused::eq1(&r[0], &s0);
-    e_rho = &e_rho * fused::eq1(&rho[0], &s0);
-    let a1: Vec<FieldElement<E>> = (0..=d)
-        .map(|b| {
-            let column: Vec<FieldElement<E>> = (0..=d).map(|a| t[a][b].clone()).collect();
-            crate::sumcheck::interpolate(&column, &s0)
-        })
-        .collect();
-    let b1: [FieldElement<E>; 2] =
-        core::array::from_fn(|c| (&one - &s0) * &u[0][c] + &s0 * &u[1][c]);
-    let g1 = fused::message(&r[1], &rho[1], &e_r, &e_rho, &a1, &b1, &big);
-    let s1 = send(g1, &mut claim, &mut rounds, &mut point);
-    e_r = &e_r * fused::eq1(&r[1], &s1);
-    e_rho = &e_rho * fused::eq1(&rho[1], &s1);
-
-    // ── both folds at once ──
-    let tick = Instant::now();
-    let mut w = [0u64; 12];
-    for a in 0..2u64 {
-        for b in 0..2u64 {
-            let wab = fused::eq1(&s0, &FieldElement::<E>::from(a))
-                * fused::eq1(&s1, &FieldElement::<E>::from(b));
-            let at = (2 * a + b) as usize * 3;
-            let Some(limbs) = raw(&wab) else {
-                return Some(Err(failed("fused weights")));
-            };
-            w[at..at + 3].copy_from_slice(&limbs);
-        }
+        point.push(s);
     }
-    if session.fold2(&w).is_err() {
-        return Some(Err(failed("fused double fold")));
-    }
-    let fold2_secs = tick.elapsed().as_secs_f64();
-
-    // ── the later rounds ──
-    let tick = Instant::now();
-    for j in 2..there {
-        let Ok(sums) = session.round(&walked) else {
-            return Some(Err(failed("fused round")));
-        };
-        let mut a = vec![FieldElement::<E>::zero(); d + 1];
-        for (k, &node) in walked.iter().enumerate() {
-            a[node as usize] = from(&sums[k * 3..k * 3 + 3]);
-        }
-        let nb = walked.len();
-        let b = [
-            from(&sums[nb * 3..nb * 3 + 3]),
-            from(&sums[nb * 3 + 3..nb * 3 + 6]),
-        ];
-        let (r_j, rho_j) = (&r[j], &rho[j]);
-        let divisor = &e_r * r_j;
-        let bus_part = &e_rho * ((&one - rho_j) * &b[0] + rho_j * &b[1]);
-        a[1] = match divisor.inv() {
-            Ok(inverse) => (&claim - &e_r * (&one - r_j) * &a[0] - bus_part) * inverse,
-            // `E^r_j·r_j` vanished: the claim says nothing about `A(1)`, so it
-            // is walked.
-            Err(_) => match session.round(&[1]) {
-                Ok(direct) => from(&direct[0..3]),
-                Err(_) => return Some(Err(failed("fused round"))),
-            },
-        };
-        let g = fused::message(r_j, rho_j, &e_r, &e_rho, &a, &b, &big);
-        let s = send(g, &mut claim, &mut rounds, &mut point);
-        e_r = &e_r * fused::eq1(r_j, &s);
-        e_rho = &e_rho * fused::eq1(rho_j, &s);
-        let Some(limbs) = raw(&s) else {
-            return Some(Err(failed("fused challenge")));
-        };
-        if session.fold(&limbs, j + 1 < there).is_err() {
-            return Some(Err(failed("fused fold")));
-        }
-    }
-    let rounds_secs = tick.elapsed().as_secs_f64();
-
-    // What the host tail reads: the trace's factors as folded, then the two
-    // weights folded by the same challenges — `E^·` times `eq` of the rest.
-    let Ok(values) = session.values() else {
-        return Some(Err(failed("fused factor values")));
-    };
-    let mut factors: Vec<crate::mle::Mle<E>> = Vec::with_capacity(values.len() + 2);
-    for factor in &values {
-        match crate::mle::Mle::new(factor.chunks_exact(3).map(from).collect()) {
-            Ok(mle) => factors.push(mle),
-            Err(_) => return Some(Err(failed("fused factor values"))),
-        }
-    }
-    for (scale, tail) in [(&e_r, &r[there..]), (&e_rho, &rho[there..])] {
-        let table: Vec<FieldElement<E>> = crate::eq::eq_evals(tail)
-            .into_iter()
-            .map(|v| v * scale)
-            .collect();
-        match crate::mle::Mle::new(table) {
-            Ok(mle) => factors.push(mle),
-            Err(_) => return Some(Err(failed("fused weights"))),
-        }
-    }
-    SESSIONS.fetch_add(1, Ordering::Relaxed);
-    crate::gpu::note_device_sumcheck(rounds.len() as u64);
-    let times = FusedTimes {
-        grid: grid_secs,
-        fold2: fold2_secs,
-        rounds: rounds_secs,
-        total: started.elapsed().as_secs_f64(),
-        roots: constraints.roots().len(),
-        terms: slots.len(),
-        slots: lowered.num_slots,
+    let (factors, times) = match stepper.into_factors() {
+        Ok(done) => done,
+        Err(error) => return Some(Err(error)),
     };
     Some(Ok((rounds, point, factors, times)))
+}
+
+/// A table's fused zerocheck rounds, stepped by its caller: the message of the
+/// round under way, then the challenge to bind it with — so several tables'
+/// rounds can share one challenge (the batched argue, D-BATCH B-3) and one
+/// table's can run alone ([`prove_fused`]) with the same messages.
+///
+/// Rounds 0 and 1 come from the grid pass (S1-5), the later ones from the
+/// Gruen rounds (S1-4) until today's host crossover; [`Self::into_factors`]
+/// then hands back every factor as the last fold left it, for the host tail.
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub struct FusedStepper<'f, E: IsField> {
+    session: math_cuda::argue_fused::FusedZerocheck<'f>,
+    r: Vec<FieldElement<E>>,
+    rho: Vec<FieldElement<E>>,
+    d: usize,
+    big: FieldElement<E>,
+    walked: Vec<u32>,
+    there: usize,
+    t: Vec<Vec<FieldElement<E>>>,
+    u: [[FieldElement<E>; 2]; 2],
+    claim: FieldElement<E>,
+    e_r: FieldElement<E>,
+    e_rho: FieldElement<E>,
+    /// The challenges bound so far.
+    bound: Vec<FieldElement<E>>,
+    /// The message of the round under way, once asked for.
+    pending: Option<Vec<FieldElement<E>>>,
+    started: std::time::Instant,
+    times: FusedTimes,
+}
+
+#[cfg(feature = "cuda")]
+impl<'f, E> FusedStepper<'f, E>
+where
+    E: IsField + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    /// Sets the session up and runs the grid pass. `None` is a decline, before
+    /// anything is sent; `Some(Err)` a trace the corner check refuses.
+    pub(crate) fn new<B>(
+        resident: &'f crate::gpu::DeviceFactors,
+        input: &FusedInput<'_, B, E>,
+        lambdas: &[FieldElement<E>],
+        claim: &FieldElement<E>,
+        degree: usize,
+        check_corners: bool,
+    ) -> Option<Result<Self, crate::Error>>
+    where
+        B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
+    {
+        use crate::fused::BusColumn;
+        use crate::gpu::{ext3_from_raw, ext3_raw};
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        use std::time::Instant;
+
+        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() || lambdas.len() != 3 {
+            return None;
+        }
+        let started = Instant::now();
+        let device = resident.inner();
+        let rows = device.len();
+        let num_vars = rows.trailing_zeros() as usize;
+        let constraints = input.constraints;
+        let d = constraints.degree().max(1);
+        if degree != d + 1 || input.r.len() != num_vars || input.claim_point.len() < num_vars {
+            return None;
+        }
+        // Rounds 0 and 1 on the grid, then the later rounds down to where today's
+        // hand the cube to the host.
+        let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
+        if there < 2 || input.betas.len() != constraints.roots().len() {
+            return None;
+        }
+        let lowered = lower_fused(constraints)?;
+        let (interaction_point, rho) = input
+            .claim_point
+            .split_at(input.claim_point.len() - num_vars);
+        let mut bus = BusColumn::new(
+            input.interactions,
+            interaction_point,
+            &lambdas[1],
+            &lambdas[2],
+        )
+        .ok()?;
+        if faults().bus
+            && let Some((slot, a)) = bus.terms().first().cloned()
+        {
+            let mut terms = bus.terms().to_vec();
+            terms[0] = (slot, a + FieldElement::<E>::one());
+            bus = BusColumn::from_parts(bus.constant().clone(), terms);
+        }
+        let keep = faults().keep_corners;
+        let check_corners = check_corners && !keep;
+        let points: Vec<(u32, u32)> = (0..=d as u32)
+            .flat_map(|a| (0..=d as u32).map(move |b| (a, b)))
+            .filter(|&(a, b)| check_corners || keep || !(a < 2 && b < 2))
+            .collect();
+        let walked: Vec<u32> = core::iter::once(0).chain(2..=d as u32).collect();
+        if points.len() > math_cuda::argue_fused::MAX_ROWS
+            || walked.len() + 3 > math_cuda::argue_fused::MAX_ROWS
+        {
+            return None;
+        }
+
+        let raw = |v: &FieldElement<E>| ext3_raw(v);
+        let flat = |vs: &[FieldElement<E>]| -> Option<Vec<u64>> {
+            let mut out = Vec::with_capacity(vs.len() * 3);
+            for v in vs {
+                out.extend_from_slice(&raw(v)?);
+            }
+            Some(out)
+        };
+        let betas = flat(input.betas)?;
+        let slots: Vec<u32> = bus
+            .terms()
+            .iter()
+            .map(|(slot, _)| u32::try_from(*slot).ok())
+            .collect::<Option<_>>()?;
+        if slots.iter().any(|&s| s as usize >= device.width())
+            || constraints.reads().iter().any(|&s| s >= device.width())
+        {
+            return None;
+        }
+        let coeffs = flat(
+            &bus.terms()
+                .iter()
+                .map(|(_, a)| a.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let r_tail = flat(&input.r[2..])?;
+        let rho_tail = flat(&rho[2..])?;
+        let program = math_cuda::argue_fused::FusedProgram {
+            nodes: &lowered.nodes,
+            base_consts: &lowered.base_consts,
+            ext_consts: &lowered.ext_consts,
+            betas: &betas,
+            num_slots: lowered.num_slots,
+        };
+        let fused_bus = math_cuda::argue_fused::FusedBus {
+            slots: &slots,
+            coeffs: &coeffs,
+            constant: raw(bus.constant())?,
+        };
+        let mut session = match math_cuda::argue_fused::FusedZerocheck::new(
+            device,
+            program,
+            fused_bus,
+            &r_tail,
+            &rho_tail,
+            points.len(),
+            walked.len() + 2,
+        ) {
+            Ok(Some(session)) => session,
+            _ => return None,
+        };
+
+        let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
+        let side = d + 1;
+
+        // ── rounds 0 and 1: one base-field pass ──
+        let tick = Instant::now();
+        let Ok((t_sums, u_sums, violation)) = session.grid(&points, keep) else {
+            return None;
+        };
+        if check_corners {
+            if let Some(row) = violation
+                && !faults().corners_inert
+            {
+                eprintln!(
+                    "[argue] FUSED XCHECK: the trace breaks its constraints at row {row} (2^{num_vars} rows)"
+                );
+                return Some(Err(crate::Error::ConstraintViolated { row: row as usize }));
+            }
+            CORNER_CHECKS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut t = vec![vec![FieldElement::<E>::zero(); side]; side];
+        for (k, &(a, b)) in points.iter().enumerate() {
+            if a < 2 && b < 2 && !keep {
+                continue;
+            }
+            t[a as usize][b as usize] = from(&t_sums[k * 3..k * 3 + 3]);
+        }
+        let u: [[FieldElement<E>; 2]; 2] = core::array::from_fn(|b| {
+            core::array::from_fn(|c| from(&u_sums[(2 * b + c) * 3..(2 * b + c) * 3 + 3]))
+        });
+        let times = FusedTimes {
+            grid: tick.elapsed().as_secs_f64(),
+            roots: constraints.roots().len(),
+            terms: slots.len(),
+            slots: lowered.num_slots,
+            ..FusedTimes::default()
+        };
+        Some(Ok(Self {
+            session,
+            r: input.r.to_vec(),
+            rho: rho.to_vec(),
+            d,
+            big: FieldElement::<E>::from(degree as u64),
+            walked,
+            there,
+            t,
+            u,
+            claim: claim.clone(),
+            e_r: FieldElement::one(),
+            e_rho: FieldElement::one(),
+            bound: Vec::with_capacity(there),
+            pending: None,
+            started,
+            times,
+        }))
+    }
+
+    /// Rounds the card runs before the host takes the cube.
+    pub(crate) fn device_rounds(&self) -> usize {
+        self.there
+    }
+
+    /// Variables this table has left to bind on the card.
+    pub(crate) fn rounds_left(&self) -> usize {
+        self.there - self.bound.len()
+    }
+
+    /// The claim the round under way carries in.
+    pub(crate) fn claim(&self) -> &FieldElement<E> {
+        &self.claim
+    }
+
+    /// The round under way's message: its polynomial at `1..=d + 1`.
+    pub(crate) fn message(&mut self) -> Result<Vec<FieldElement<E>>, crate::Error> {
+        use crate::fused;
+        use crate::gpu::ext3_from_raw;
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let j = self.bound.len();
+        if j >= self.there {
+            return Err(failed("fused round"));
+        }
+        if let Some(g) = &self.pending {
+            return Ok(g.clone());
+        }
+        let one = FieldElement::<E>::one();
+        let d = self.d;
+        let (r, rho) = (&self.r, &self.rho);
+        let g = match j {
+            0 => {
+                let a0: Vec<FieldElement<E>> = (0..=d)
+                    .map(|a| (&one - &r[1]) * &self.t[a][0] + &r[1] * &self.t[a][1])
+                    .collect();
+                let b0: [FieldElement<E>; 2] = core::array::from_fn(|b| {
+                    (&one - &rho[1]) * &self.u[b][0] + &rho[1] * &self.u[b][1]
+                });
+                fused::message(&r[0], &rho[0], &self.e_r, &self.e_rho, &a0, &b0, &self.big)
+            }
+            1 => {
+                let s0 = &self.bound[0];
+                let a1: Vec<FieldElement<E>> = (0..=d)
+                    .map(|b| {
+                        let column: Vec<FieldElement<E>> =
+                            (0..=d).map(|a| self.t[a][b].clone()).collect();
+                        crate::sumcheck::interpolate(&column, s0)
+                    })
+                    .collect();
+                let b1: [FieldElement<E>; 2] =
+                    core::array::from_fn(|c| (&one - s0) * &self.u[0][c] + s0 * &self.u[1][c]);
+                fused::message(&r[1], &rho[1], &self.e_r, &self.e_rho, &a1, &b1, &self.big)
+            }
+            _ => {
+                let tick = std::time::Instant::now();
+                let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
+                let sums = self
+                    .session
+                    .round(&self.walked)
+                    .map_err(|_| failed("fused round"))?;
+                let mut a = vec![FieldElement::<E>::zero(); d + 1];
+                for (k, &node) in self.walked.iter().enumerate() {
+                    a[node as usize] = from(&sums[k * 3..k * 3 + 3]);
+                }
+                let nb = self.walked.len();
+                let b = [
+                    from(&sums[nb * 3..nb * 3 + 3]),
+                    from(&sums[nb * 3 + 3..nb * 3 + 6]),
+                ];
+                let (r_j, rho_j) = (&r[j], &rho[j]);
+                let divisor = &self.e_r * r_j;
+                let bus_part = &self.e_rho * ((&one - rho_j) * &b[0] + rho_j * &b[1]);
+                a[1] = match divisor.inv() {
+                    Ok(inverse) => {
+                        (&self.claim - &self.e_r * (&one - r_j) * &a[0] - bus_part) * inverse
+                    }
+                    // `E^r_j·r_j` vanished: the claim says nothing about `A(1)`, so
+                    // it is walked.
+                    Err(_) => match self.session.round(&[1]) {
+                        Ok(direct) => from(&direct[0..3]),
+                        Err(_) => return Err(failed("fused round")),
+                    },
+                };
+                self.times.rounds += tick.elapsed().as_secs_f64();
+                fused::message(r_j, rho_j, &self.e_r, &self.e_rho, &a, &b, &self.big)
+            }
+        };
+        self.pending = Some(g.clone());
+        Ok(g)
+    }
+
+    /// Binds the round under way to `s`: the claim carried on, the weights'
+    /// prefix products, and the fold on the card.
+    pub(crate) fn bind(&mut self, s: &FieldElement<E>) -> Result<(), crate::Error> {
+        use crate::fused;
+        use crate::gpu::ext3_raw;
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let j = self.bound.len();
+        let g = self.pending.take().ok_or(failed("fused bind"))?;
+        let mut all = Vec::with_capacity(g.len() + 1);
+        all.push(&self.claim - &g[0]);
+        all.extend(g.iter().cloned());
+        self.claim = crate::sumcheck::interpolate(&all, s);
+        self.e_r = &self.e_r * fused::eq1(&self.r[j], s);
+        self.e_rho = &self.e_rho * fused::eq1(&self.rho[j], s);
+        self.bound.push(s.clone());
+        match j {
+            0 => {}
+            1 => {
+                // ── both folds at once ──
+                let tick = std::time::Instant::now();
+                let (s0, s1) = (&self.bound[0], &self.bound[1]);
+                let mut w = [0u64; 12];
+                for a in 0..2u64 {
+                    for b in 0..2u64 {
+                        let wab = fused::eq1(s0, &FieldElement::<E>::from(a))
+                            * fused::eq1(s1, &FieldElement::<E>::from(b));
+                        let at = (2 * a + b) as usize * 3;
+                        let limbs = ext3_raw(&wab).ok_or(failed("fused weights"))?;
+                        w[at..at + 3].copy_from_slice(&limbs);
+                    }
+                }
+                self.session
+                    .fold2(&w)
+                    .map_err(|_| failed("fused double fold"))?;
+                self.times.fold2 = tick.elapsed().as_secs_f64();
+            }
+            _ => {
+                let tick = std::time::Instant::now();
+                let limbs = ext3_raw(s).ok_or(failed("fused challenge"))?;
+                self.session
+                    .fold(&limbs, j + 1 < self.there)
+                    .map_err(|_| failed("fused fold"))?;
+                self.times.rounds += tick.elapsed().as_secs_f64();
+            }
+        }
+        Ok(())
+    }
+
+    /// What the host tail reads once the card's rounds are bound: the trace's
+    /// factors as folded, then the two weights folded by the same challenges —
+    /// `E^·` times `eq` of the rest.
+    pub(crate) fn into_factors(
+        mut self,
+    ) -> Result<(Vec<crate::mle::Mle<E>>, FusedTimes), crate::Error> {
+        use crate::gpu::ext3_from_raw;
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        if self.bound.len() != self.there {
+            return Err(failed("fused factor values"));
+        }
+        let values = self
+            .session
+            .values()
+            .map_err(|_| failed("fused factor values"))?;
+        let mut factors: Vec<crate::mle::Mle<E>> = Vec::with_capacity(values.len() + 2);
+        for factor in &values {
+            factors.push(
+                crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+                    .map_err(|_| failed("fused factor values"))?,
+            );
+        }
+        for (scale, tail) in [
+            (&self.e_r, &self.r[self.there..]),
+            (&self.e_rho, &self.rho[self.there..]),
+        ] {
+            let table: Vec<FieldElement<E>> = crate::eq::eq_evals(tail)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect();
+            factors.push(crate::mle::Mle::new(table).map_err(|_| failed("fused weights"))?);
+        }
+        SESSIONS.fetch_add(1, Ordering::Relaxed);
+        crate::gpu::note_device_sumcheck(self.there as u64);
+        self.times.total = self.started.elapsed().as_secs_f64();
+        Ok((factors, self.times))
+    }
 }
 
 #[cfg(test)]

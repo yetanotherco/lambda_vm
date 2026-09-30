@@ -30,12 +30,10 @@
 use super::*;
 
 use multilinear::{
-    batch::Batched,
     front_loaded::{self, PaddingFault},
     gkr::{FractionLayer, GkrClaim},
     gkr_lockstep::{self, LockstepProof},
     logup::Interaction,
-    poly::SumcheckPolynomial,
     sumcheck::{self, SumcheckProof},
 };
 
@@ -336,16 +334,30 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
-    prove_batched_with(
+    prove_batched_on(
         committed,
         config,
         transcript,
         prepared,
         ProverFaults::default(),
+        Where::Device,
     )
 }
 
-/// [`multi_prove_batched`], with faults a negative test arms.
+/// Where the batched prover runs its trees and rounds.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Where {
+    /// Every tree and every round here: the host reference.
+    Host,
+    /// On the card where it takes them — the trees where the factors are, the
+    /// ladder's layers stepped there, the fused zerocheck rounds — and here
+    /// where it declines. The same bytes as [`Where::Host`].
+    Device,
+}
+
+/// [`multi_prove_batched`] as the host reference, with faults a negative test
+/// arms.
 #[doc(hidden)]
 pub fn prove_batched_with<F, E, T, H>(
     committed: &CommittedTables<'_, F, E, H>,
@@ -353,6 +365,34 @@ pub fn prove_batched_with<F, E, T, H>(
     transcript: &mut T,
     prepared: Option<Prepared<'_, F, H>>,
     faults: ProverFaults,
+) -> Result<BatchedMultiProof<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    prove_batched_on(committed, config, transcript, prepared, faults, Where::Host)
+}
+
+/// A bin's tree, where it was built.
+enum BinTree<E: IsField> {
+    Host(Vec<FractionLayer<E>>),
+    Built(Box<multilinear::gkr::FractionTree<E>>),
+}
+
+/// [`multi_prove_batched`] on the host or the card, with faults.
+#[doc(hidden)]
+pub fn prove_batched_on<F, E, T, H>(
+    committed: &CommittedTables<'_, F, E, H>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: Option<Prepared<'_, F, H>>,
+    faults: ProverFaults,
+    at: Where,
 ) -> Result<BatchedMultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -398,18 +438,54 @@ where
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
     let mut gkr = Vec::with_capacity(plan.bins.len());
     for bin in &plan.bins {
-        let trees: Vec<Vec<FractionLayer<E>>> = bin
+        let trees: Vec<BinTree<E>> = bin
             .iter()
-            .map(|&t| host_tree(&interactions[t], &tables[t].trace))
+            .map(|&t| -> Result<BinTree<E>, MlError> {
+                let (trace, interactions) = (&tables[t].trace, &interactions[t]);
+                if at == Where::Host {
+                    return Ok(BinTree::Host(host_tree(interactions, trace)?));
+                }
+                // Where today's argue builds it: from the factors on the card,
+                // else here — and a big host tree still folds on a device.
+                let tree = match trace
+                    .reside_from_columns()
+                    .and_then(|resident| logup::resident_tree(interactions, resident))
+                {
+                    Some(tree) => tree,
+                    None => {
+                        let factors = trace.factors()?;
+                        multilinear::gkr::FractionTree::build(logup::input_layer(
+                            interactions,
+                            &factors,
+                        )?)?
+                    }
+                };
+                Ok(BinTree::Built(Box::new(tree)))
+            })
             .collect::<Result<_, _>>()?;
-        for (&t, tree) in bin.iter().zip(&trees) {
-            let output = (tree[0].p.evals()[0].clone(), tree[0].q.evals()[0].clone());
+        let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
+            .iter()
+            .map(|tree| match tree {
+                BinTree::Host(layers) => Some(gkr_lockstep::HostLayers(layers)),
+                BinTree::Built(_) => None,
+            })
+            .collect();
+        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = trees
+            .iter()
+            .zip(&hosts)
+            .map(|(tree, host)| match (tree, host) {
+                (_, Some(host)) => host as &dyn gkr_lockstep::LadderTree<E>,
+                (BinTree::Built(tree), None) => &**tree as &dyn gkr_lockstep::LadderTree<E>,
+                (BinTree::Host(_), None) => unreachable!("a host tree has its layers"),
+            })
+            .collect();
+        for (&t, tree) in bin.iter().zip(&refs) {
+            let output = tree.output();
             transcript.append_field_element(&output.0);
             transcript.append_field_element(&output.1);
             bus_outputs[t] = Some(output);
         }
-        let refs: Vec<&[FractionLayer<E>]> = trees.iter().map(Vec::as_slice).collect();
-        let (ladder, inputs) = gkr_lockstep::prove(&refs, transcript)?;
+        let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
         for (&t, claim) in bin.iter().zip(inputs) {
             claims[t] = Some(claim);
         }
@@ -442,6 +518,16 @@ where
         weights[t] = &weights[t] * &lambda;
     }
     let lambdas = vec![FieldElement::one(), lambda.clone(), &lambda * &lambda];
+    let lambda2 = &lambda * &lambda;
+    // The factors each table's fused rounds would read, held for as long as
+    // the rounds do.
+    let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
+        .iter()
+        .map(|table| match at {
+            Where::Host => None,
+            Where::Device => table.trace.device_factors(),
+        })
+        .collect();
     let mut polys = Vec::with_capacity(tables.len());
     for (t, table) in tables.iter().enumerate() {
         let n = table.num_vars();
@@ -452,10 +538,43 @@ where
         } else {
             &xi[..n]
         };
-        let mut factors = table.trace.factors()?;
-        factors.push(eq_mle(xi_t)?);
-        factors.push(eq_mle(&row_point)?);
-        polys.push(Batched::new(factors, rules, lambdas.clone())?);
+        let shape = table.shape();
+        let constraints = device[t]
+            .as_ref()
+            .filter(|_| {
+                multilinear::gpu_fused::argue_fused()
+                    && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns())
+            })
+            .and_then(|_| {
+                multilinear::fused::Constraints::<F>::from_extension(
+                    &shape.steps_as_ops(),
+                    shape.root_steps(),
+                    shape.selector_of_root(),
+                    shape.degree(),
+                )
+                .ok()
+            });
+        let betas = multilinear_air::beta_powers(&beta, shape.num_roots());
+        let fused = constraints
+            .as_ref()
+            .map(|constraints| multilinear::gpu_fused::FusedInput {
+                constraints,
+                betas: &betas,
+                interactions: &interactions[t],
+                claim_point: &claims[t].point,
+                r: xi_t,
+            });
+        let claim = &lambda * &claims[t].p + &lambda2 * &claims[t].q;
+        polys.push(front_loaded::TableRounds::new(
+            rules,
+            lambdas.clone(),
+            &claim,
+            [xi_t, &row_point],
+            n,
+            device[t].as_deref(),
+            fused,
+            || table.trace.factors(),
+        )?);
     }
     let (constraint, point) = front_loaded::prove_with(
         &mut polys,
@@ -479,6 +598,10 @@ where
         factor_values.push(values);
     }
     drop(polys);
+    drop(device);
+    for table in tables {
+        table.trace.release_device();
+    }
     for values in &factor_values {
         for value in values {
             transcript.append_field_element(value);

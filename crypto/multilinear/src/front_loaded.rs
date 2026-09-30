@@ -38,6 +38,268 @@ pub fn padding_product<F: IsField>(point: &[FieldElement<F>], vars: usize) -> Fi
         .fold(FieldElement::one(), |acc, r| acc * r)
 }
 
+/// One polynomial's side of a front-loaded batch: its round messages on
+/// demand, bound by the batch's shared challenges.
+///
+/// The host's is any [`SumcheckPolynomial`]; a device-resident table brings
+/// its own (the fused zerocheck's stepper), and the batch cannot tell them
+/// apart — which is what makes a device proof the host reference's bytes.
+pub trait RoundStepper<F: IsField> {
+    /// Variables left to bind.
+    fn num_vars(&self) -> usize;
+    /// The degree of its round polynomials.
+    fn degree(&self) -> usize;
+    /// This round's polynomial at `1..=degree` (`degree` at least its own).
+    fn round(&mut self, degree: usize) -> Result<Vec<FieldElement<F>>, Error>;
+    /// Binds this round's variable to `r`.
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error>;
+    /// Its value once every variable is bound.
+    fn value(&self) -> Result<FieldElement<F>, Error>;
+}
+
+/// A host polynomial's rounds: [`round_evaluations`] and a fold, as the
+/// plain sumcheck runs them.
+macro_rules! host_stepper {
+    ($($ty:ty),*) => {$(
+        impl<F> RoundStepper<F> for $ty
+        where
+            F: IsField + 'static,
+            FieldElement<F>: Send + Sync,
+        {
+            fn num_vars(&self) -> usize {
+                SumcheckPolynomial::num_vars(self)
+            }
+
+            fn degree(&self) -> usize {
+                SumcheckPolynomial::degree(self)
+            }
+
+            fn round(&mut self, degree: usize) -> Result<Vec<FieldElement<F>>, Error> {
+                Ok(round_evaluations(self, degree, false))
+            }
+
+            fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+                self.fix_first_variable(r)
+            }
+
+            fn value(&self) -> Result<FieldElement<F>, Error> {
+                if SumcheckPolynomial::num_vars(self) != 0 {
+                    return Err(Error::VariableCountMismatch {
+                        expected: 0,
+                        got: SumcheckPolynomial::num_vars(self),
+                    });
+                }
+                Ok(self.eval_at_index(0))
+            }
+        }
+    )*};
+}
+
+host_stepper!(
+    crate::batch::Batched<'_, F>,
+    crate::virtual_poly::VirtualPolynomial<F>
+);
+
+/// One table's rule in the batched constraint sumcheck (D-BATCH phase C): its
+/// factors and weights on the host, or its fused rounds on a device down to
+/// today's crossover and the host's over what the card folded from there.
+/// Either way the same messages, so a device proof is the host reference's.
+pub enum TableRounds<'a, E: IsField> {
+    Host(crate::batch::Batched<'a, E>),
+    #[cfg(feature = "cuda")]
+    Fused {
+        stepper: Option<Box<crate::gpu_fused::FusedStepper<'a, E>>>,
+        /// The rules and weights, adopting the factors at the crossover.
+        batched: crate::batch::Batched<'a, E>,
+        /// Variables left to bind.
+        vars: usize,
+    },
+}
+
+impl<'a, E> TableRounds<'a, E>
+where
+    E: IsField + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    /// A table's rounds, on its device factors when the fused rounds take
+    /// them, else on the host over `factors()` and the two weights built from
+    /// their points.
+    ///
+    /// `claim` is the table's own `Σ λ^j·claim_j` — what the fused rounds
+    /// carry to reconstruct `A(1)`. The rules are `[zerocheck, numerator,
+    /// denominator]` and `lambdas` their `[1, λ, λ²]`, today's batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<B, P>(
+        rules: Vec<crate::batch::Rule<'a, E>>,
+        lambdas: Vec<FieldElement<E>>,
+        claim: &FieldElement<E>,
+        weights: [&[FieldElement<E>]; 2],
+        num_vars: usize,
+        device: Option<&'a crate::gpu::DeviceFactors>,
+        fused: Option<crate::gpu_fused::FusedInput<'_, B, E>>,
+        factors: P,
+    ) -> Result<Self, Error>
+    where
+        B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
+        P: FnOnce() -> Result<Vec<crate::mle::Mle<E>>, Error>,
+    {
+        #[cfg(feature = "cuda")]
+        if let (Some(device), Some(input)) = (device, fused.as_ref())
+            && crate::gpu_fused::argue_fused()
+        {
+            let degree = rules
+                .iter()
+                .map(crate::batch::Rule::degree)
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            let check = crate::gpu_fused::argue_fused_xcheck();
+            match crate::gpu_fused::FusedStepper::new(device, input, &lambdas, claim, degree, check)
+            {
+                Some(Ok(stepper)) => {
+                    let batched = crate::batch::Batched::new(Vec::new(), rules, lambdas)?;
+                    return Ok(Self::Fused {
+                        stepper: Some(Box::new(stepper)),
+                        batched,
+                        vars: num_vars,
+                    });
+                }
+                Some(Err(error)) => return Err(error),
+                None => {
+                    crate::gpu_fused::note_decline();
+                    crate::whir_split::bump(&crate::whir_split::ZC_FUSED_DECLINED);
+                }
+            }
+        }
+        let _ = (device, &fused, claim, num_vars);
+        let mut polys = factors()?;
+        polys.push(crate::eq::eq_mle(weights[0])?);
+        polys.push(crate::eq::eq_mle(weights[1])?);
+        Ok(Self::Host(crate::batch::Batched::new(
+            polys, rules, lambdas,
+        )?))
+    }
+
+    /// Every factor slot, once all are bound: the trace's, then the weights.
+    pub fn polys(&self) -> &[crate::mle::Mle<E>] {
+        match self {
+            Self::Host(batched) => batched.polys(),
+            #[cfg(feature = "cuda")]
+            Self::Fused { batched, .. } => batched.polys(),
+        }
+    }
+
+    /// Whether the card runs its rounds.
+    pub fn on_device(&self) -> bool {
+        match self {
+            Self::Host(_) => false,
+            #[cfg(feature = "cuda")]
+            Self::Fused { .. } => true,
+        }
+    }
+}
+
+impl<E> RoundStepper<E> for TableRounds<'_, E>
+where
+    E: IsField + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    fn num_vars(&self) -> usize {
+        match self {
+            Self::Host(batched) => SumcheckPolynomial::num_vars(batched),
+            #[cfg(feature = "cuda")]
+            Self::Fused { vars, .. } => *vars,
+        }
+    }
+
+    fn degree(&self) -> usize {
+        match self {
+            Self::Host(batched) => SumcheckPolynomial::degree(batched),
+            #[cfg(feature = "cuda")]
+            Self::Fused { batched, .. } => SumcheckPolynomial::degree(batched),
+        }
+    }
+
+    fn round(&mut self, degree: usize) -> Result<Vec<FieldElement<E>>, Error> {
+        match self {
+            Self::Host(batched) => Ok(round_evaluations(batched, degree, false)),
+            #[cfg(feature = "cuda")]
+            Self::Fused {
+                stepper, batched, ..
+            } => match stepper {
+                None => Ok(round_evaluations(batched, degree, false)),
+                Some(stepper) => {
+                    let g = stepper.message()?;
+                    if g.len() > degree {
+                        return Err(Error::RoundDegreeMismatch {
+                            round: 0,
+                            expected: degree,
+                            got: g.len(),
+                        });
+                    }
+                    // Past its own degree the message is the same polynomial,
+                    // read at more nodes: `g(0)` from the claim, then
+                    // interpolation.
+                    let mut all = Vec::with_capacity(g.len() + 1);
+                    all.push(stepper.claim() - &g[0]);
+                    all.extend(g.iter().cloned());
+                    let mut out = g;
+                    for node in out.len() + 1..=degree {
+                        out.push(crate::sumcheck::interpolate(
+                            &all,
+                            &FieldElement::<E>::from(node as u64),
+                        ));
+                    }
+                    Ok(out)
+                }
+            },
+        }
+    }
+
+    fn bind(&mut self, r: &FieldElement<E>) -> Result<(), Error> {
+        match self {
+            Self::Host(batched) => batched.fix_first_variable(r),
+            #[cfg(feature = "cuda")]
+            Self::Fused {
+                stepper,
+                batched,
+                vars,
+            } => {
+                *vars -= 1;
+                match stepper.as_mut() {
+                    None => batched.fix_first_variable(r),
+                    Some(on_card) => {
+                        on_card.bind(r)?;
+                        if on_card.rounds_left() == 0 {
+                            let (factors, _) = stepper
+                                .take()
+                                .ok_or(Error::DeviceFailed { stage: "fused" })?
+                                .into_factors()?;
+                            batched.adopt(factors)?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    fn value(&self) -> Result<FieldElement<E>, Error> {
+        if RoundStepper::num_vars(self) != 0 {
+            return Err(Error::VariableCountMismatch {
+                expected: 0,
+                got: RoundStepper::num_vars(self),
+            });
+        }
+        let batched = match self {
+            Self::Host(batched) => batched,
+            #[cfg(feature = "cuda")]
+            Self::Fused { batched, .. } => batched,
+        };
+        Ok(batched.eval_at_index(0))
+    }
+}
+
 /// ⛔ A FAULT for the negative test: the named polynomial is padded the `2^Δ`
 /// way — constant in the variables it lacks, its round polynomial `v·2^{rest}` —
 /// which is a different batch than the one the verifier checks.
@@ -61,8 +323,7 @@ pub fn prove<F, T, P>(
 where
     F: IsField + 'static,
     T: IsTranscript<F>,
-    P: SumcheckPolynomial<F> + Sync,
-    FieldElement<F>: Send + Sync,
+    P: RoundStepper<F>,
 {
     prove_with(polys, weights, degree, transcript, PaddingFault::default())
 }
@@ -79,8 +340,7 @@ pub fn prove_with<F, T, P>(
 where
     F: IsField + 'static,
     T: IsTranscript<F>,
-    P: SumcheckPolynomial<F> + Sync,
-    FieldElement<F>: Send + Sync,
+    P: RoundStepper<F>,
 {
     if polys.len() != weights.len() {
         return Err(Error::VariableCountMismatch {
@@ -107,9 +367,16 @@ where
 
     for j in 0..rounds {
         let mut sent = vec![FieldElement::<F>::zero(); degree];
-        for (t, (poly, weight)) in polys.iter().zip(weights).enumerate() {
+        for (t, (poly, weight)) in polys.iter_mut().zip(weights).enumerate() {
             if poly.num_vars() > 0 {
-                let own = round_evaluations(poly, degree, false);
+                let own = poly.round(degree)?;
+                if own.len() != degree {
+                    return Err(Error::RoundDegreeMismatch {
+                        round: j,
+                        expected: degree,
+                        got: own.len(),
+                    });
+                }
                 for (s, v) in sent.iter_mut().zip(&own) {
                     *s += weight * v;
                 }
@@ -118,7 +385,7 @@ where
             let value = match &done[t] {
                 Some(value) => value.clone(),
                 None => {
-                    let value = poly.eval_at_index(0);
+                    let value = poly.value()?;
                     done[t] = Some(value.clone());
                     value
                 }
@@ -140,7 +407,7 @@ where
         let r: FieldElement<F> = transcript.sample_field_element();
         for (t, poly) in polys.iter_mut().enumerate() {
             if poly.num_vars() > 0 {
-                poly.fix_first_variable(&r)?;
+                poly.bind(&r)?;
             } else if let Some(value) = done[t].as_mut() {
                 *value *= &r;
             }

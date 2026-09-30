@@ -2863,6 +2863,192 @@ impl DeviceTree {
     }
 }
 
+/// One layer's sumcheck on the card, stepped a round at a time by its caller:
+/// the batched argue's lockstep ladder (D-BATCH B-3), where every active tree's
+/// round is summed on the host before the one shared challenge is drawn.
+///
+/// The same session [`DeviceTree::prove_layer`] opens — over the layer where it
+/// lies, the input layer written again for a tree that gave it back — with the
+/// rounds left to the caller.
+#[cfg(feature = "cuda")]
+pub struct LayerSession {
+    session: math_cuda::sumcheck::SumcheckSession,
+    /// The interpolation nodes `1..=degree`, three u64 each.
+    nodes: Vec<u64>,
+}
+
+/// A layer session the build could not open. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct LayerSession(std::convert::Infallible);
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// Opens layer `layer`'s sumcheck under `program` at `point`, or `None`
+    /// before anything moves when the card declines.
+    pub(crate) fn layer_session<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        program: &crate::program::Program<E>,
+        degree: usize,
+    ) -> Option<LayerSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let lowered = lower(program)?;
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let mut nodes = Vec::with_capacity(degree * 3);
+        for node in 1..=degree as u64 {
+            nodes.extend_from_slice(&ext3_raw(&math::field::element::FieldElement::<E>::from(
+                node,
+            ))?);
+        }
+        let input_layer = layer + 1 == self.num_layers;
+        let session = if input_layer && self.rebuild.is_some() {
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            whir_split_bump_rebuild();
+            rebuilt.sumcheck(
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_sumcheck(
+                layer,
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        };
+        let session = session.ok()?;
+        Some(LayerSession { session, nodes })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn whir_split_bump_rebuild() {
+    crate::whir_split::bump(&crate::whir_split::GKR_REBUILDS);
+}
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceTree {
+    pub(crate) fn layer_session<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _program: &crate::program::Program<E>,
+        _degree: usize,
+    ) -> Option<LayerSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl LayerSession {
+    /// Variables left to bind.
+    pub(crate) fn num_vars(&self) -> usize {
+        self.session.len().trailing_zeros() as usize
+    }
+
+    /// This round's polynomial at `1..=degree`.
+    pub(crate) fn round<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let sums = self
+            .session
+            .round(&self.nodes)
+            .map_err(|_| crate::Error::DeviceFailed { stage: "round" })?;
+        SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        Ok(sums.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+    }
+
+    /// Binds the round's variable to `r` in every factor.
+    pub(crate) fn fold<E>(
+        &mut self,
+        r: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let raw = ext3_raw(r).ok_or(crate::Error::DeviceFailed { stage: "challenge" })?;
+        self.session
+            .fold(&raw)
+            .map_err(|_| crate::Error::DeviceFailed { stage: "fold" })
+    }
+
+    /// Every factor as the folds left it — the weight, then the four halves.
+    pub(crate) fn factors<E>(&self) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let values = session_values(&self.session).map_err(|_| crate::Error::DeviceFailed {
+            stage: "layer values",
+        })?;
+        values
+            .iter()
+            .map(|factor| {
+                crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl LayerSession {
+    pub(crate) fn num_vars(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn round<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn fold<E>(
+        &mut self,
+        _r: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn factors<E>(&self) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
 /// The epoch's columns on the card, read by everything that would otherwise
 /// upload its own copy of them.
 #[cfg(feature = "cuda")]

@@ -865,3 +865,80 @@ fn the_preprocessed_check_is_load_bearing() {
         "made inert, a wrong preprocessed column is accepted"
     );
 }
+
+// ─── B-3: the card proves the host reference's bytes ─────────────────────
+
+/// Whether a device promises any room (the parent module's probe).
+fn a_device() -> bool {
+    multilinear::gpu::reserve_budget() > 0
+}
+
+/// ★ D-BATCH B-3's gate: the prover on the card ([`Where::Device`]) proves the
+/// host reference's canonical bytes — every tree, ladder step, round and value
+/// — with the transcript in the same state after, and the proof verifies.
+///
+/// The tables are tall enough for the card to take them: CPU 2^13 rows (a tree
+/// of 2^14 input cells, the device's tree threshold), ADD 2^13, MUL 2^12, all
+/// past the fused rounds' 2^7. On a device the fused sessions and the ladder's
+/// device rounds are counted, so the comparison is not of the host with
+/// itself; without one it is the host reference against the device path's
+/// host fallbacks, and says so.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
+///     multilinear_table::batched::tests::the_card_proves_the_host_references_bytes --exact --nocapture
+/// ```
+#[test]
+fn the_card_proves_the_host_references_bytes() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let airs = airs();
+    for (a, pad, cap) in [(12usize, 1usize, 27u8), (12, 1, 14), (3, 1, 27)] {
+        let cfg = batched(cap);
+        let cols = columns(a, pad);
+        let run = |at: Where| {
+            let committed = commit(tables(&airs, &cols, false), &cfg);
+            let fused = multilinear::gpu_fused::fused_sessions();
+            let rounds = multilinear::gpu::sumcheck_rounds();
+            let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+            let proof = prove_batched_on(
+                &committed,
+                &cfg,
+                &mut transcript,
+                None,
+                ProverFaults::default(),
+                at,
+            )
+            .unwrap_or_else(|e| panic!("{at:?}: {e:?}"));
+            verify(&committed, &proof, &cfg).unwrap_or_else(|e| panic!("{at:?}: {e:?}"));
+            let fused = multilinear::gpu_fused::fused_sessions() - fused;
+            let rounds = multilinear::gpu::sumcheck_rounds() - rounds;
+            (
+                bincode::serialize(&proof).expect("bytes"),
+                transcript.state(),
+                transcript.sample_field_element(),
+                fused,
+                rounds,
+            )
+        };
+        let host = run(Where::Host);
+        let card = run(Where::Device);
+        assert_eq!(host.3, 0, "the host reference ran no fused session");
+        eprintln!(
+            "batched argue B-3 a={a} pad={pad} cap={cap}: device {} fused sessions, {} device rounds; {} bytes",
+            card.3,
+            card.4,
+            card.0.len()
+        );
+        if a_device() && a >= 7 {
+            assert!(card.3 > 0, "a={a}: the card ran fused sessions");
+            assert!(card.4 > 0, "a={a}: the card ran rounds");
+        }
+        assert!(
+            host.0 == card.0,
+            "a={a} cap={cap}: the canonical bytes differ"
+        );
+        assert_eq!(host.1, card.1, "a={a} cap={cap}: the transcripts parted");
+        assert_eq!(host.2, card.2, "a={a} cap={cap}: the next challenge moved");
+    }
+}

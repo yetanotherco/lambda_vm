@@ -22,6 +22,7 @@ use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig};
 use stark::multilinear_air::Uniforms;
+use stark::multilinear_table::batched::{self, Where};
 use stark::multilinear_table::{
     self, ArgueShape, BatchedMultiProof, CommittedTable, CommittedTables, Prepared, TableLayout,
     TableStatement, argue_plan,
@@ -65,7 +66,13 @@ fn vm_round_trip(
     name: &str,
     tamper: Option<Tamper>,
 ) -> (Result<(), multilinear::Error>, Vec<String>) {
-    vm_round_trip_elf(name, &crate::test_utils::asm_elf_bytes(name), tamper)
+    let (verdict, names, _) = vm_round_trip_elf(
+        name,
+        &crate::test_utils::asm_elf_bytes(name),
+        tamper,
+        Where::Device,
+    );
+    (verdict, names)
 }
 
 /// A Rust guest's ELF, built by `make compile-programs-rust`.
@@ -79,11 +86,17 @@ fn rust_elf_bytes(name: &str) -> Vec<u8> {
 }
 
 /// [`vm_round_trip`] over an ELF in hand.
+///
+/// `at` is where the prover runs: [`Where::Device`] is what
+/// `multi_prove_batched` does (the card where it takes the work), and
+/// [`Where::Host`] the host reference. The proof's canonical bytes come back
+/// too, so the two can be compared.
 fn vm_round_trip_elf(
     name: &str,
     elf_bytes: &[u8],
     tamper: Option<Tamper>,
-) -> (Result<(), multilinear::Error>, Vec<String>) {
+    at: Where,
+) -> (Result<(), multilinear::Error>, Vec<String>, Vec<u8>) {
     let elf_bytes = elf_bytes.to_vec();
     let program = Elf::load(&elf_bytes).expect("ELF");
     let result = Executor::new(&program, Vec::new())
@@ -188,9 +201,17 @@ fn vm_round_trip_elf(
         let mut transcript = Tr::new(&[]);
         absorb(&mut transcript);
         let committed = CommittedTables::<_, _, H>::commit(committed, &config).expect("commit");
-        let mut proof =
-            multilinear_table::multi_prove_batched(&committed, &config, &mut transcript, None)
-                .expect("the batched prover runs");
+        let mut proof = batched::prove_batched_on(
+            &committed,
+            &config,
+            &mut transcript,
+            None,
+            batched::ProverFaults::default(),
+            at,
+        )
+        .expect("the batched prover runs");
+        // serde writes each element canonically, so equal bytes are equal proofs.
+        let bytes = serde_json::to_vec(&proof).expect("canonical bytes");
         if let Some(tamper) = tamper {
             tamper(&mut proof);
         }
@@ -227,7 +248,7 @@ fn vm_round_trip_elf(
         let alpha: FieldElement<E> = probe.sample_field_element();
         let owed = crate::compute_commit_bus_offset(&public_output, 0, &z, &alpha)
             .expect("the commit offset");
-        multilinear_table::multi_verify_batched::<_, _, _, H>(
+        let verdict = multilinear_table::multi_verify_batched::<_, _, _, H>(
             &proof,
             &statements,
             &group_layouts,
@@ -237,9 +258,11 @@ fn vm_round_trip_elf(
             &config,
             &mut transcript,
             None,
-        )
+        );
+        (verdict, bytes)
     });
-    (verdict, names)
+    let (verdict, bytes) = verdict;
+    (verdict, names, bytes)
 }
 
 /// The VM's AIR labels, as `lean_program_census::vm_airs` names them: what a
@@ -278,7 +301,8 @@ fn every_vm_table_round_trips_batched() {
         eprintln!("batched argue {name}: VERIFIED over {} tables", names.len());
         note(names);
     }
-    let (verdict, names) = vm_round_trip_elf("hint_min", &rust_elf_bytes("hint_min"), None);
+    let (verdict, names, _) =
+        vm_round_trip_elf("hint_min", &rust_elf_bytes("hint_min"), None, Where::Device);
     verdict.unwrap_or_else(|e| panic!("hint_min: {e:?}"));
     eprintln!(
         "batched argue hint_min: VERIFIED over {} tables",
@@ -618,4 +642,34 @@ fn the_w_lfm_chips_round_trip_batched() {
     bad.argue.factor_values[0][0] += FieldElement::<E>::one();
     assert!(verify(&bad).is_err(), "a tampered W-LFM factor value");
     eprintln!("batched argue W-LFM: VERIFIED; tamper refused");
+}
+
+/// ★ D-BATCH B-3 on real tables: the prover on the card proves the host
+/// reference's canonical bytes for every table of `test_keccak` and
+/// `test_ecsm`, and both verify.
+///
+/// On a cuda build the device path runs the ladder's layers and the fused
+/// zerocheck on the card; on a host build it is the device path's fallbacks
+/// against the reference.
+#[test]
+#[ignore = "proves programs: a box run"]
+fn the_card_proves_the_host_references_bytes_on_real_tables() {
+    for name in ["test_keccak", "test_ecsm", "all_instructions_64"] {
+        let elf = crate::test_utils::asm_elf_bytes(name);
+        let fused = multilinear::gpu_fused::fused_sessions();
+        let (card, names, card_bytes) = vm_round_trip_elf(name, &elf, None, Where::Device);
+        let fused = multilinear::gpu_fused::fused_sessions() - fused;
+        let (host, _, host_bytes) = vm_round_trip_elf(name, &elf, None, Where::Host);
+        card.unwrap_or_else(|e| panic!("{name} on the card: {e:?}"));
+        host.unwrap_or_else(|e| panic!("{name} on the host: {e:?}"));
+        assert!(
+            card_bytes == host_bytes,
+            "{name}: the card's proof is not the host reference's bytes"
+        );
+        eprintln!(
+            "batched argue B-3 {name}: {} tables, {fused} fused sessions on the card, {} bytes == the host's",
+            names.len(),
+            card_bytes.len()
+        );
+    }
 }
