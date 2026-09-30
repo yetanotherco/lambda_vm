@@ -327,4 +327,107 @@ fn epoch_translation_shapes() {
         }
     }
     eprintln!("memory args per row: {by_count:?}; per position d,a,b,c: {by_pos:?}");
+    reroll_report(&tr.program);
+}
+
+/// How much of a straight-line program repeats as a loop body: blocks of the
+/// same instruction shapes whose memory offsets move by one stride per
+/// repetition (or stay put).
+fn reroll_report(program: &crate::field_vm::isa::Program) {
+    use crate::field_vm::isa::Instr;
+    use std::collections::HashMap;
+    let instrs = &program.instrs;
+    // The shape: everything but memory offsets.
+    let shape = |i: &Instr| {
+        let mut h = format!("{}{:?}", i.hint_out as u8, i.hint_in);
+        for a in i.args() {
+            h.push_str(&format!(
+                "|{}:{}:{}",
+                a.reg,
+                a.scale.canonical(),
+                a.mem as u8
+            ));
+            if !a.mem {
+                h.push_str(&format!(":{}", a.offset.canonical()));
+            }
+        }
+        h
+    };
+    let ids: Vec<u32> = {
+        let mut map: HashMap<String, u32> = HashMap::new();
+        instrs
+            .iter()
+            .map(|i| {
+                let n = map.len() as u32;
+                *map.entry(shape(i)).or_insert(n)
+            })
+            .collect()
+    };
+    let offs = |i: &Instr| -> Vec<Option<u64>> {
+        i.args()
+            .iter()
+            .map(|a| a.mem.then(|| a.offset.canonical()))
+            .collect()
+    };
+    // Candidate periods from the distances between repeats of a 32-shape window.
+    const K: usize = 32;
+    let mut last: HashMap<&[u32], usize> = HashMap::new();
+    let mut dist: HashMap<usize, usize> = HashMap::new();
+    for i in 0..ids.len().saturating_sub(K) {
+        if let Some(&j) = last.get(&ids[i..i + K]) {
+            *dist.entry(i - j).or_insert(0) += 1;
+        }
+        last.insert(&ids[i..i + K], i);
+    }
+    let mut cands: Vec<(usize, usize)> = dist.into_iter().collect();
+    cands.sort_by(|a, b| b.1.cmp(&a.1));
+    // For each candidate period: greedy loops of >= 3 repetitions where every
+    // memory offset moves by 0 or by one common stride per repetition.
+    for &(p, _) in cands.iter().take(6) {
+        let (mut covered, mut loops, mut i) = (0usize, 0usize, 0usize);
+        while i + 2 * p <= instrs.len() {
+            let delta = |k: usize| -> Option<i128> {
+                let mut stride: Option<i128> = None;
+                for t in 0..p {
+                    let (a, b) = (&instrs[i + t], &instrs[i + t + k * p]);
+                    if ids[i + t] != ids[i + t + k * p] {
+                        return None;
+                    }
+                    for (x, y) in offs(a).into_iter().zip(offs(b)) {
+                        if let (Some(x), Some(y)) = (x, y) {
+                            let d = y as i128 - x as i128;
+                            if d != 0 {
+                                match stride {
+                                    None => stride = Some(d),
+                                    Some(s) if s == d => {}
+                                    _ => return None,
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(stride.unwrap_or(0))
+            };
+            let Some(s1) = delta(1) else {
+                i += 1;
+                continue;
+            };
+            let mut reps = 2;
+            while i + (reps + 1) * p <= instrs.len() && delta(reps) == Some(s1 * reps as i128) {
+                reps += 1;
+            }
+            if reps >= 3 {
+                covered += reps * p;
+                loops += 1;
+                i += reps * p;
+            } else {
+                i += 1;
+            }
+        }
+        eprintln!(
+            "reroll period={p}: {loops} loops cover {covered} of {} instructions ({:.1}%)",
+            instrs.len(),
+            100.0 * covered as f64 / instrs.len() as f64
+        );
+    }
 }
