@@ -75,6 +75,15 @@ pub fn challenge_powers<F: IsField>(gamma: &FieldElement<F>, count: usize) -> Ve
 pub enum Error {
     #[error("expected a power-of-two number of evaluations, got {0}")]
     NotPowerOfTwo(usize),
+    /// A view into shared host columns (`Mle::shared`) that its backing cannot
+    /// hold, or whose zero tail starts past its end.
+    #[error("{len} values from {start}, {nonzero} before the zero tail, do not fit {backing}")]
+    ViewOutOfBounds {
+        start: usize,
+        len: usize,
+        nonzero: usize,
+        backing: usize,
+    },
     #[error("expected {expected} variables, got {got}")]
     VariableCountMismatch { expected: usize, got: usize },
     #[error("polynomial has no variables left to fold")]

@@ -3,6 +3,8 @@
 //! Index `i` is read with **variable 0 as the most significant bit**. Every
 //! fold in this crate assumes that.
 
+use std::sync::Arc;
+
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
@@ -13,11 +15,110 @@ use rayon::prelude::*;
 
 use crate::Error;
 
+/// Host memory holding several columns' evaluations back to back, written
+/// once and only read after that: an epoch's trace columns, say, laid out
+/// where a copy to the card reads them directly. [`Mle::shared`] makes a
+/// column that is a view into it.
+///
+/// The slice must not change for as long as the backing lives: every view
+/// hands it out as its evaluations, and clones of a view share it.
+pub trait HostColumns<F: IsField>:
+    Send + Sync + std::panic::RefUnwindSafe + std::panic::UnwindSafe
+{
+    /// The whole backing.
+    fn slice(&self) -> &[FieldElement<F>];
+
+    /// Whether the backing is page-locked, so a copy to the card reads it
+    /// without staging it first.
+    fn is_pinned(&self) -> bool;
+}
+
+/// Where an [`Mle`]'s evaluations are.
+enum Evals<F: IsField> {
+    /// Its own `Vec`.
+    Owned(Vec<FieldElement<F>>),
+    /// `len` values from `start` of a backing other columns share. From
+    /// `nonzero` on, the values are zero in their raw representation, as the
+    /// backing's writer found them.
+    Shared {
+        backing: Arc<dyn HostColumns<F>>,
+        start: usize,
+        len: usize,
+        nonzero: usize,
+    },
+}
+
+impl<F: IsField> Evals<F> {
+    fn as_slice(&self) -> &[FieldElement<F>] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared {
+                backing,
+                start,
+                len,
+                ..
+            } => &backing.slice()[*start..*start + *len],
+        }
+    }
+}
+
+impl<F: IsField> Clone for Evals<F> {
+    /// A view's clone is another view of the same backing: its values cannot
+    /// change, so the two read the same either way.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(values) => Self::Owned(values.clone()),
+            Self::Shared {
+                backing,
+                start,
+                len,
+                nonzero,
+            } => Self::Shared {
+                backing: backing.clone(),
+                start: *start,
+                len: *len,
+                nonzero: *nonzero,
+            },
+        }
+    }
+}
+
 /// A multilinear polynomial held by its hypercube evaluations.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The evaluations are either its own or a view into a [`HostColumns`] backing
+/// ([`Mle::shared`]). Every method reads the two alike; the folds in place and
+/// [`Mle::into_evals`] copy a view out first, since the backing is read-only.
 pub struct Mle<F: IsField> {
-    evals: Vec<FieldElement<F>>,
+    evals: Evals<F>,
     num_vars: usize,
+}
+
+impl<F: IsField> Clone for Mle<F> {
+    fn clone(&self) -> Self {
+        Self {
+            evals: self.evals.clone(),
+            num_vars: self.num_vars,
+        }
+    }
+}
+
+/// Equal when the evaluations are, wherever each side holds them.
+impl<F: IsField> PartialEq for Mle<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.evals.as_slice() == other.evals.as_slice() && self.num_vars == other.num_vars
+    }
+}
+
+impl<F: IsField> Eq for Mle<F> {}
+
+/// The evaluations and the variable count, wherever the evaluations are held.
+impl<F: IsField> std::fmt::Debug for Mle<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mle")
+            .field("evals", &self.evals.as_slice())
+            .field("num_vars", &self.num_vars)
+            .finish()
+    }
 }
 
 impl<F: IsField + 'static> Mle<F> {
@@ -29,14 +130,50 @@ impl<F: IsField + 'static> Mle<F> {
         }
         Ok(Self {
             num_vars: len.trailing_zeros() as usize,
-            evals,
+            evals: Evals::Owned(evals),
+        })
+    }
+
+    /// An MLE over `len = 2^n` evaluations from `start` of `backing`, which
+    /// stay there: the MLE holds the backing, not a copy of its values.
+    ///
+    /// `nonzero` is where the view's all-zero tail starts, zero in the raw
+    /// representation rather than as field elements, as whoever wrote the
+    /// backing found it. It is carried for [`Mle::nonzero_len`], never checked
+    /// here.
+    pub fn shared(
+        backing: Arc<dyn HostColumns<F>>,
+        start: usize,
+        len: usize,
+        nonzero: usize,
+    ) -> Result<Self, Error> {
+        if !len.is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(len));
+        }
+        let size = backing.slice().len();
+        if start.checked_add(len).is_none_or(|end| end > size) || nonzero > len {
+            return Err(Error::ViewOutOfBounds {
+                start,
+                len,
+                nonzero,
+                backing: size,
+            });
+        }
+        Ok(Self {
+            num_vars: len.trailing_zeros() as usize,
+            evals: Evals::Shared {
+                backing,
+                start,
+                len,
+                nonzero,
+            },
         })
     }
 
     /// The constant polynomial on zero variables.
     pub fn constant(value: FieldElement<F>) -> Self {
         Self {
-            evals: vec![value],
+            evals: Evals::Owned(vec![value]),
             num_vars: 0,
         }
     }
@@ -46,19 +183,57 @@ impl<F: IsField + 'static> Mle<F> {
     }
 
     pub fn len(&self) -> usize {
-        self.evals.len()
+        match &self.evals {
+            Evals::Owned(values) => values.len(),
+            Evals::Shared { len, .. } => *len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.evals.is_empty()
+        self.len() == 0
     }
 
     pub fn evals(&self) -> &[FieldElement<F>] {
-        &self.evals
+        self.evals.as_slice()
     }
 
-    pub fn into_evals(self) -> Vec<FieldElement<F>> {
-        self.evals
+    /// Where a view's all-zero tail starts, as [`Mle::shared`] was told; `None`
+    /// for evaluations of its own, whose tail nobody has looked at.
+    pub fn nonzero_len(&self) -> Option<usize> {
+        match &self.evals {
+            Evals::Owned(_) => None,
+            Evals::Shared { nonzero, .. } => Some(*nonzero),
+        }
+    }
+
+    /// Whether the evaluations are a view into page-locked host memory.
+    pub fn is_pinned(&self) -> bool {
+        match &self.evals {
+            Evals::Owned(_) => false,
+            Evals::Shared { backing, .. } => backing.is_pinned(),
+        }
+    }
+
+    /// Detaches a view from its backing, copying its values into a `Vec` of its
+    /// own; evaluations already its own stay where they are.
+    pub fn detach(&mut self) {
+        if let Evals::Shared { .. } = self.evals {
+            let values = self.take_owned();
+            self.evals = Evals::Owned(values);
+        }
+    }
+
+    pub fn into_evals(mut self) -> Vec<FieldElement<F>> {
+        self.take_owned()
+    }
+
+    /// The evaluations as a `Vec` to fold or hand out, leaving an empty one
+    /// behind: its own moved out, or a view's values copied.
+    fn take_owned(&mut self) -> Vec<FieldElement<F>> {
+        match std::mem::replace(&mut self.evals, Evals::Owned(Vec::new())) {
+            Evals::Owned(values) => values,
+            shared => shared.as_slice().to_vec(),
+        }
     }
 
     /// Fixes variable 0 to `r`, returning a polynomial on `n - 1` variables.
@@ -69,17 +244,18 @@ impl<F: IsField + 'static> Mle<F> {
         if self.num_vars == 0 {
             return Err(Error::NoVariablesLeft);
         }
-        let half = self.evals.len() / 2;
+        let values = self.evals();
+        let half = values.len() / 2;
         let evals = (0..half)
             .map(|j| {
-                let lo = &self.evals[j];
-                let hi = &self.evals[j + half];
+                let lo = &values[j];
+                let hi = &values[j + half];
                 // lo + r·(hi - lo) — one multiplication instead of two.
                 lo + r * &(hi - lo)
             })
             .collect();
         Ok(Self {
-            evals,
+            evals: Evals::Owned(evals),
             num_vars: self.num_vars - 1,
         })
     }
@@ -90,8 +266,9 @@ impl<F: IsField + 'static> Mle<F> {
         if self.num_vars == 0 {
             return Err(Error::NoVariablesLeft);
         }
-        let half = self.evals.len() / 2;
-        let (lo, hi) = self.evals.split_at_mut(half);
+        let mut evals = self.take_owned();
+        let half = evals.len() / 2;
+        let (lo, hi) = evals.split_at_mut(half);
         // Every index is independent, and the halves are disjoint slices, so the
         // split is what lets the rows go out to the pool at all.
         let fold = |(a, b): (&mut FieldElement<F>, &FieldElement<F>)| *a = &*a + r * &(b - &*a);
@@ -103,7 +280,8 @@ impl<F: IsField + 'static> Mle<F> {
         }
         #[cfg(not(feature = "parallel"))]
         lo.iter_mut().zip(hi.iter()).for_each(fold);
-        self.evals.truncate(half);
+        evals.truncate(half);
+        self.evals = Evals::Owned(evals);
         self.num_vars -= 1;
         Ok(())
     }
@@ -118,13 +296,15 @@ impl<F: IsField + 'static> Mle<F> {
         if self.num_vars == 0 {
             return Err(Error::NoVariablesLeft);
         }
-        let half = self.evals.len() / 2;
+        let mut evals = self.take_owned();
+        let half = evals.len() / 2;
         for j in 0..half {
-            let lo = self.evals[2 * j].clone();
-            let delta = &self.evals[2 * j + 1] - &lo;
-            self.evals[j] = lo + r * &delta;
+            let lo = evals[2 * j].clone();
+            let delta = &evals[2 * j + 1] - &lo;
+            evals[j] = lo + r * &delta;
         }
-        self.evals.truncate(half);
+        evals.truncate(half);
+        self.evals = Evals::Owned(evals);
         self.num_vars -= 1;
         Ok(())
     }
@@ -137,7 +317,7 @@ impl<F: IsField + 'static> Mle<F> {
                 got: point.len(),
             });
         }
-        Self::evaluate_at(&self.evals, point)
+        Self::evaluate_at(self.evals(), point)
     }
 
     /// The extension of `evals` at `point`, without owning an [`Mle`].
@@ -209,7 +389,7 @@ impl<F: IsField + 'static> Mle<F> {
                 got: point.len(),
             });
         }
-        if let Some(value) = crate::gpu::evaluate_mle(&self.evals, point) {
+        if let Some(value) = crate::gpu::evaluate_mle(self.evals(), point) {
             return Ok(value);
         }
         self.evaluate_in_on_host(point)
@@ -231,15 +411,16 @@ impl<F: IsField + 'static> Mle<F> {
                 got: point.len(),
             });
         }
+        let values = self.evals();
         let Some((first, rest)) = point.split_first() else {
-            return Ok(self.evals[0].clone().to_extension::<E>());
+            return Ok(values[0].clone().to_extension::<E>());
         };
 
-        let half = self.evals.len() / 2;
+        let half = values.len() / 2;
         let mut current: Vec<FieldElement<E>> = (0..half)
             .map(|j| {
-                let lo = &self.evals[j];
-                let hi = &self.evals[j + half];
+                let lo = &values[j];
+                let hi = &values[j + half];
                 // The base element on the left: the only direction the tower
                 // gives.
                 lo.clone().to_extension::<E>() + (hi - lo) * first
@@ -259,7 +440,7 @@ impl<F: IsField + 'static> Mle<F> {
 
     /// The single remaining evaluation, once every variable has been fixed.
     pub fn as_constant(&self) -> Option<&FieldElement<F>> {
-        (self.num_vars == 0).then(|| &self.evals[0])
+        (self.num_vars == 0).then(|| &self.evals()[0])
     }
 }
 
@@ -432,5 +613,285 @@ mod tests {
         let mut by_last = f;
         by_last.fix_last_variable_in_place(&r).unwrap();
         assert_ne!(by_first, by_last);
+    }
+
+    // ── Views into shared host columns ───────────────────────────────────────
+
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type ExtE = FieldElement<Ext>;
+
+    /// Columns laid end to end in a `Vec`: the shape an epoch's pinned slot
+    /// has, without the pinning. Raises `dropped` when it goes.
+    struct Backing {
+        values: Vec<FE>,
+        pinned: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl HostColumns<F> for Backing {
+        fn slice(&self) -> &[FE] {
+            &self.values
+        }
+
+        fn is_pinned(&self) -> bool {
+            self.pinned
+        }
+    }
+
+    impl Drop for Backing {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn backing(values: Vec<FE>, pinned: bool) -> (Arc<dyn HostColumns<F>>, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let backing = Backing {
+            values,
+            pinned,
+            dropped: dropped.clone(),
+        };
+        (Arc::new(backing), dropped)
+    }
+
+    /// splitmix64: a fixed stream, so a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn fe(&mut self) -> FE {
+            FE::from(self.next())
+        }
+
+        fn ext(&mut self) -> ExtE {
+            ExtE::new([self.fe(), self.fe(), self.fe()])
+        }
+
+        fn table(&mut self, len: usize) -> Vec<FE> {
+            (0..len).map(|_| self.fe()).collect()
+        }
+    }
+
+    /// Every method of a view answers what the same table owned answers, for
+    /// tables of 0 to 7 variables sitting at every place in a backing: first,
+    /// between two others, and last.
+    #[test]
+    fn a_view_answers_every_method_as_the_owned_table_does() {
+        let mut rng = Rng(0x5eed);
+        for num_vars in 0..=7usize {
+            let size = 1usize << num_vars;
+            let tables = [rng.table(size), rng.table(size), rng.table(size)];
+            // Three values before the first table, so no view starts at 0.
+            let mut laid = rng.table(3);
+            let mut starts = Vec::new();
+            for table in &tables {
+                starts.push(laid.len());
+                laid.extend_from_slice(table);
+            }
+            let (host, _) = backing(laid, true);
+
+            for (table, &start) in tables.iter().zip(&starts) {
+                let owned = Mle::new(table.clone()).unwrap();
+                let view = Mle::shared(host.clone(), start, size, size).unwrap();
+                let ctx = format!("num_vars {num_vars}, start {start}");
+
+                assert_eq!(view.num_vars(), owned.num_vars(), "{ctx}");
+                assert_eq!(view.len(), owned.len(), "{ctx}");
+                assert_eq!(view.is_empty(), owned.is_empty(), "{ctx}");
+                assert_eq!(view.evals(), owned.evals(), "{ctx}");
+                assert_eq!(view.as_constant(), owned.as_constant(), "{ctx}");
+                assert_eq!(format!("{view:?}"), format!("{owned:?}"), "{ctx}");
+
+                let point: Vec<FE> = (0..num_vars).map(|_| rng.fe()).collect();
+                assert_eq!(
+                    view.evaluate(&point).unwrap(),
+                    owned.evaluate(&point).unwrap(),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    Mle::evaluate_at(view.evals(), &point).unwrap(),
+                    Mle::evaluate_at(owned.evals(), &point).unwrap(),
+                    "{ctx}"
+                );
+                let lifted: Vec<ExtE> = (0..num_vars).map(|_| rng.ext()).collect();
+                assert_eq!(
+                    view.evaluate_in(&lifted).unwrap(),
+                    owned.evaluate_in(&lifted).unwrap(),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    view.evaluate_in_on_host(&lifted).unwrap(),
+                    owned.evaluate_in_on_host(&lifted).unwrap(),
+                    "{ctx}"
+                );
+
+                if num_vars > 0 {
+                    let r = rng.fe();
+                    assert_eq!(
+                        view.fix_first_variable(&r).unwrap(),
+                        owned.fix_first_variable(&r).unwrap(),
+                        "{ctx}"
+                    );
+                    let (mut v, mut o) = (view.clone(), owned.clone());
+                    v.fix_first_variable_in_place(&r).unwrap();
+                    o.fix_first_variable_in_place(&r).unwrap();
+                    assert_eq!(v, o, "{ctx}");
+                    let (mut v, mut o) = (view.clone(), owned.clone());
+                    v.fix_last_variable_in_place(&r).unwrap();
+                    o.fix_last_variable_in_place(&r).unwrap();
+                    assert_eq!(v, o, "{ctx}");
+                } else {
+                    let r = rng.fe();
+                    let (mut v, mut o) = (view.clone(), owned.clone());
+                    assert_eq!(
+                        v.fix_first_variable_in_place(&r),
+                        o.fix_first_variable_in_place(&r)
+                    );
+                    assert_eq!(
+                        v.fix_last_variable_in_place(&r),
+                        o.fix_last_variable_in_place(&r)
+                    );
+                    assert_eq!(view.fix_first_variable(&r), owned.fix_first_variable(&r));
+                }
+
+                // Equality runs both ways and sees a changed value.
+                assert_eq!(view, owned, "{ctx}");
+                assert_eq!(owned, view, "{ctx}");
+                let mut changed = table.clone();
+                changed[size - 1] += FE::one();
+                assert_ne!(view, Mle::new(changed).unwrap(), "{ctx}");
+
+                let cloned = view.clone();
+                assert_eq!(cloned, owned, "{ctx}");
+                assert_eq!(cloned.nonzero_len(), Some(size), "{ctx}");
+                assert!(cloned.is_pinned(), "a view's clone is still a view");
+
+                assert_eq!(view.into_evals(), owned.into_evals(), "{ctx}");
+            }
+        }
+    }
+
+    /// Folding a view in place copies it out first: the backing, and every
+    /// other view of it, still read the original values.
+    #[test]
+    fn a_fold_in_place_leaves_the_backing_alone() {
+        let mut rng = Rng(0xc0de);
+        let table = rng.table(16);
+        let (host, _) = backing(table.clone(), true);
+        let mut folded = Mle::shared(host.clone(), 0, 16, 16).unwrap();
+        let mut folded_last = folded.clone();
+        let mut detached = folded.clone();
+        let other = folded.clone();
+
+        let r = rng.fe();
+        folded.fix_first_variable_in_place(&r).unwrap();
+        folded_last.fix_last_variable_in_place(&r).unwrap();
+        detached.detach();
+
+        assert_eq!(host.slice(), table.as_slice(), "the backing changed");
+        assert_eq!(other.evals(), table.as_slice(), "another view changed");
+        assert_eq!(
+            folded,
+            Mle::new(table.clone())
+                .unwrap()
+                .fix_first_variable(&r)
+                .unwrap()
+        );
+        for (copy, what) in [(&folded, "first"), (&folded_last, "last")] {
+            assert_eq!(copy.nonzero_len(), None, "the {what} fold left a view");
+            assert!(!copy.is_pinned(), "the {what} fold left a view");
+        }
+        assert_eq!(detached, other);
+        assert_eq!(detached.nonzero_len(), None);
+        assert!(!detached.is_pinned());
+        assert!(other.is_pinned());
+    }
+
+    /// A view holds its backing: dropping the handle it was made from keeps
+    /// the values readable, and the backing goes exactly when the last view
+    /// does — which is when a pinned slot may be written again.
+    #[test]
+    fn the_backing_goes_with_its_last_view() {
+        let (host, dropped) = backing((0..8).map(FE::from).collect(), true);
+        let a = Mle::shared(host.clone(), 0, 4, 4).unwrap();
+        let b = Mle::shared(host.clone(), 4, 4, 2).unwrap();
+        drop(host);
+        let a2 = a.clone();
+        drop(a);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(a2.evals(), &(0..4).map(FE::from).collect::<Vec<_>>()[..]);
+        assert_eq!(b.nonzero_len(), Some(2));
+        let owned_copy = b.clone().into_evals();
+        drop(a2);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(b);
+        assert!(dropped.load(Ordering::SeqCst), "the last view let go");
+        assert_eq!(owned_copy, (4..8).map(FE::from).collect::<Vec<_>>());
+    }
+
+    /// Views the backing cannot hold are refused, as is a zero tail starting
+    /// past the view's end; the edges themselves are fine.
+    #[test]
+    fn a_view_that_does_not_fit_is_refused() {
+        let (host, _) = backing(vec![FE::one(); 12], false);
+        assert_eq!(
+            Mle::shared(host.clone(), 0, 3, 3).unwrap_err(),
+            Error::NotPowerOfTwo(3)
+        );
+        assert_eq!(
+            Mle::shared(host.clone(), 0, 0, 0).unwrap_err(),
+            Error::NotPowerOfTwo(0)
+        );
+        let refused = |start: usize, len: usize, nonzero: usize| Error::ViewOutOfBounds {
+            start,
+            len,
+            nonzero,
+            backing: 12,
+        };
+        assert_eq!(
+            Mle::shared(host.clone(), 5, 8, 8).unwrap_err(),
+            refused(5, 8, 8)
+        );
+        assert_eq!(
+            Mle::shared(host.clone(), 0, 16, 16).unwrap_err(),
+            refused(0, 16, 16)
+        );
+        assert_eq!(
+            Mle::shared(host.clone(), usize::MAX, 4, 4).unwrap_err(),
+            refused(usize::MAX, 4, 4)
+        );
+        assert_eq!(
+            Mle::shared(host.clone(), 0, 4, 5).unwrap_err(),
+            refused(0, 4, 5)
+        );
+
+        let last = Mle::shared(host.clone(), 4, 8, 0).unwrap();
+        assert_eq!(last.num_vars(), 3);
+        assert_eq!(last.nonzero_len(), Some(0));
+        assert!(!last.is_pinned(), "the backing says it is not pinned");
+        assert!(Mle::shared(host, 11, 1, 1).is_ok());
+    }
+
+    /// A table of its own reports no zero tail and no pinning, before and after
+    /// a fold.
+    #[test]
+    fn an_owned_table_is_neither_a_view_nor_pinned() {
+        let mut f = mle(&[1, 2, 3, 0]);
+        assert_eq!(f.nonzero_len(), None);
+        assert!(!f.is_pinned());
+        f.detach();
+        assert_eq!(f, mle(&[1, 2, 3, 0]));
+        f.fix_first_variable_in_place(&FE::from(3)).unwrap();
+        assert_eq!(f.nonzero_len(), None);
+        assert!(!f.is_pinned());
     }
 }
