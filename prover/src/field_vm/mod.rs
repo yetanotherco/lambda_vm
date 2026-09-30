@@ -6,6 +6,7 @@
 
 pub mod air;
 pub mod asm;
+pub mod bridge;
 pub mod decode;
 pub mod executor;
 pub mod isa;
@@ -13,6 +14,8 @@ pub mod mem;
 pub mod mux;
 pub mod prove;
 
+#[cfg(test)]
+pub(crate) mod hash_side;
 #[cfg(test)]
 mod lfm_compare;
 #[cfg(test)]

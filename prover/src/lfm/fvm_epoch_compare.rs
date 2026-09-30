@@ -521,3 +521,283 @@ fn riscv_keccak_compress_cost() {
         );
     }
 }
+
+/// The Field VM translation of `program`'s field half and the hash half it
+/// hands to the LFM chips.
+struct Hybrid {
+    side: crate::field_vm::hash_side::HashSide,
+    tr: crate::field_vm::lfm_translate::Translation,
+    rows: Vec<crate::field_vm::bridge::BridgeRow>,
+    run: crate::field_vm::executor::Execution,
+    pid: crate::field_vm::prove::ProgramId,
+    id: crate::field_vm::hash_side::HashSideId,
+    cells: Vec<crate::field_vm::prove::PublicCell>,
+    reads: Vec<u64>,
+}
+
+impl Hybrid {
+    fn new(
+        program: &super::compiler::LfmProgram,
+        exec: &super::executor::LfmExecution,
+        arenas: &[Vec<super::word::LfmWord>],
+        opts: &ProofOptions,
+    ) -> Self {
+        use crate::field_vm::hash_side;
+        let s = Instant::now();
+        let mut side = hash_side::split(program, exec, arenas);
+        let crossing = side.crossing();
+        let tr = crate::field_vm::lfm_translate::translate_keeping(
+            program,
+            exec,
+            false,
+            &crossing,
+            &hash_side::is_hash_side,
+        );
+        let faddr: std::collections::HashMap<u64, u64> =
+            crossing.iter().copied().zip(tr.kept.iter().copied()).collect();
+        let rows = if std::env::var_os("FVM_HYBRID_MERGE").is_some() {
+            hash_side::renumber(&mut side, &|a| faddr[&a], tr.mem.len() as u64);
+            hash_side::bridge_rows(&side, |a| a)
+        } else {
+            hash_side::bridge_rows(&side, |a| faddr[&a])
+        };
+        eprintln!(
+            "  split: hash half {} instrs, out {} (words {}), back {}, fvm program {} mem {} split_ms={:.1}",
+            side.sub.instrs.len() - side.out.len(),
+            side.out.len(),
+            side.out.iter().filter(|c| c.is_word).count(),
+            side.back.len(),
+            tr.program.len(),
+            tr.mem.len(),
+            s.elapsed().as_secs_f64() * 1e3
+        );
+        let run = execute(
+            &tr.program,
+            Memory::with_init(tr.mem.len(), &tr.mem),
+            &mut NoHints,
+            1 << 26,
+        )
+        .expect("the translation executes");
+        let s = Instant::now();
+        let pid = program_id(&tr.program, opts);
+        let artifacts =
+            super::registry::build_artifacts_with_hasher(&side.sub, opts, crate::hash_pin::BLOCK_HASHER);
+        let id = hash_side::side_id(&side, &rows, &artifacts, opts);
+        eprintln!("  hybrid build_ms={:.1}", s.elapsed().as_secs_f64() * 1e3);
+        let cells = public_cells(&run, &tr.public);
+        let reads = if side.merged {
+            Vec::new()
+        } else {
+            rows.iter().map(|r| r.faddr).collect()
+        };
+        Hybrid {
+            side,
+            tr,
+            rows,
+            run,
+            pid,
+            id,
+            cells,
+            reads,
+        }
+    }
+
+    fn traces(&self) -> (crate::field_vm::prove::FvmTraces, Vec<stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>>) {
+        let (extra, cells) =
+            crate::field_vm::hash_side::traces(&self.side, &self.rows, &self.id, &self.run.mem);
+        (
+            crate::field_vm::prove::generate_traces_lfm(
+                &self.tr.program,
+                &self.run,
+                &self.tr.public,
+                None,
+                &self.reads,
+                self.side.merged.then_some(&cells[..]),
+            ),
+            extra,
+        )
+    }
+
+    /// Proves the traces; `None` when proving or verification fails.
+    fn prove(
+        &self,
+        traces: &mut crate::field_vm::prove::FvmTraces,
+        extra: &mut [stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>],
+        opts: &ProofOptions,
+    ) -> Option<(crate::field_vm::prove::FvmProof, f64, f64)> {
+        use crate::field_vm::hash_side::airs;
+        use crate::field_vm::prove::{prove_traces_with, verify_with};
+        let s = Instant::now();
+        let proof =
+            prove_traces_with(
+                &self.pid,
+                &self.cells,
+                traces,
+                airs(&self.id, opts),
+                extra,
+                self.side.merged,
+                opts,
+            )
+            .ok()?;
+        let prove_ms = s.elapsed().as_secs_f64() * 1e3;
+        let s = Instant::now();
+        let ok = verify_with(
+            &self.pid,
+            &self.cells,
+            &proof,
+            airs(&self.id, opts),
+            self.side.merged,
+            opts,
+        );
+        let verify_ms = s.elapsed().as_secs_f64() * 1e3;
+        ok.then_some((proof, prove_ms, verify_ms))
+    }
+}
+
+/// Option 3: the Field VM with the LFM's hash-side chips in the same proof,
+/// against the LFM at the same blowup.
+#[test]
+#[ignore]
+fn epoch_field_vm_hash_chip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let e = super::epoch_tests::real_epoch_from(
+        inner_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let hasher = crate::hash_pin::BLOCK_HASHER;
+    let exec =
+        super::executor::execute(&program, &arenas, &hasher).expect("the epoch verifier executes");
+    let opts = crate::field_vm::prove::default_options();
+
+    let hy = Hybrid::new(&program, &exec, &arenas, &opts);
+
+    let (mut prove_ms, mut verify_ms, mut trace_ms, mut shape, mut bytes) =
+        (Vec::new(), Vec::new(), Vec::new(), (0, 0), 0);
+    let mut tables = String::new();
+    for _ in 0..runs() {
+        let s = Instant::now();
+        let (mut traces, mut extra) = hy.traces();
+        trace_ms.push(s.elapsed().as_secs_f64() * 1e3);
+        let (proof, p, v) = hy
+            .prove(&mut traces, &mut extra, &opts)
+            .expect("FVM + hash chips prove and verify");
+        prove_ms.push(p);
+        verify_ms.push(v);
+        shape = census(&proof);
+        bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        tables = proof
+            .proofs
+            .iter()
+            .map(|p| format!("{}x{}", p.trace_length, p.trace_ood_evaluations.width))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    eprintln!("  hybrid tables: {tables}");
+    eprintln!(
+        "  hybrid blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={bytes} traces_ms={}",
+        opts.blowup_factor,
+        shape.0,
+        shape.1,
+        stats(prove_ms),
+        stats(verify_ms),
+        stats(trace_ms)
+    );
+
+    if std::env::var_os("FVM_COMPARE_SKIP_LFM").is_none() {
+        let artifacts = super::registry::build_artifacts_with_hasher(&program, &opts, hasher);
+        let (mut prove_ms, mut verify_ms, mut shape, mut bytes) =
+            (Vec::new(), Vec::new(), (0, 0), 0);
+        for _ in 0..runs() {
+            let s = Instant::now();
+            let proof =
+                super::proof::lfm_prove(&program, &artifacts, &arenas, &opts).expect("LFM proves");
+            prove_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            let s = Instant::now();
+            assert!(super::proof::verify_against_artifacts(
+                &artifacts,
+                &proof.proof,
+                &proof.public_words,
+                &opts
+            ));
+            verify_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            shape = census(&proof.proof);
+            bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof.proof)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            tables = proof
+                .proof
+                .proofs
+                .iter()
+                .map(|p| format!("{}x{}", p.trace_length, p.trace_ood_evaluations.width))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        eprintln!("  lfm tables: {tables}");
+        eprintln!(
+            "  lfm blowup={} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={bytes}",
+            opts.blowup_factor,
+            shape.0,
+            shape.1,
+            stats(prove_ms),
+            stats(verify_ms)
+        );
+    }
+}
+
+/// A cheating prover moving a cell across the bridge: a hash output the field
+/// half reads, given another value in MEM and on the bridge, and a field cell
+/// handed to the hash half with a fourth lane its writer never set.
+#[test]
+#[ignore]
+fn epoch_hash_chip_rejects_tampering() {
+    let e = super::epoch_tests::real_epoch_from(
+        super::proof_fixture::fixture_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the epoch verifier executes");
+    let opts = crate::field_vm::prove::default_options();
+    let hy = Hybrid::new(&program, &exec, &arenas, &opts);
+    use crate::field_vm::{bridge, mem};
+    use crate::tables::types::FE;
+
+    let (mut traces, mut extra) = hy.traces();
+    assert!(hy.prove(&mut traces, &mut extra, &opts).is_some(), "honest");
+
+    let back = hy.rows.iter().position(|r| r.is_in).expect("an incoming cell");
+    let faddr = hy.rows[back].faddr as usize;
+    let (mut traces, mut extra) = hy.traces();
+    let bump = |t: &mut stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>, r, c| {
+        let v = *t.main_table.get(r, c) + FE::one();
+        t.main_table.set(r, c, v);
+    };
+    bump(&mut traces.mem, faddr, mem::cols::VALUE);
+    if !hy.side.merged {
+        bump(&mut extra[0], back, bridge::cols::V0);
+    }
+    assert!(hy.prove(&mut traces, &mut extra, &opts).is_none(), "hash output moved");
+
+    if hy.side.merged {
+        // MEM relaying the cell with a zero fourth lane.
+        let (mut traces, mut extra) = hy.traces();
+        bump(&mut traces.mem, faddr, mem::cols::M_IN);
+        bump(&mut traces.mem, faddr, mem::cols::M_OUT);
+        assert!(hy.prove(&mut traces, &mut extra, &opts).is_none(), "relayed");
+        return;
+    }
+    let out = hy
+        .rows
+        .iter()
+        .position(|r| !r.is_in && !r.is_word)
+        .expect("an outgoing field cell");
+    let (mut traces, mut extra) = hy.traces();
+    bump(&mut extra[0], out, bridge::cols::V0 + 3);
+    assert!(hy.prove(&mut traces, &mut extra, &opts).is_none(), "fourth lane set");
+}
