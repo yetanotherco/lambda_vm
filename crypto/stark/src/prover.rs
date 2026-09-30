@@ -1006,6 +1006,115 @@ impl VramGate {
     }
 }
 
+impl VramGate {
+    /// The packing arm of [`run_admitted`]: claim the first index of `order`
+    /// not yet claimed whose estimate fits beside what is admitted (any index
+    /// fits an empty gate), waiting while none does. `None` once every index
+    /// is claimed. Without it a worker takes the next index in walk order and
+    /// blocks on it, and every worker behind it blocks too, while a smaller
+    /// table further down the walk would fit.
+    fn acquire_first_fitting<'g>(
+        &'g self,
+        order: &[usize],
+        estimates: &[u64],
+        claimed: &std::sync::Mutex<Vec<bool>>,
+    ) -> Option<(usize, VramPermit<'g>)> {
+        let mut used = self.used.lock().unwrap();
+        loop {
+            {
+                let mut claimed = claimed.lock().unwrap();
+                let mut any_left = false;
+                for (pos, &idx) in order.iter().enumerate() {
+                    if claimed[pos] {
+                        continue;
+                    }
+                    any_left = true;
+                    let bytes = estimates[idx];
+                    if *used == 0 || used.saturating_add(bytes) <= self.budget {
+                        claimed[pos] = true;
+                        *used = used.saturating_add(bytes);
+                        return Some((idx, VramPermit { gate: self, bytes }));
+                    }
+                }
+                if !any_left {
+                    return None;
+                }
+            }
+            used = self.freed.wait(used).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod vram_gate_packing_tests {
+    use super::VramGate;
+
+    /// The packing claim skips a table that does not fit and takes the next
+    /// one that does, in walk order; it takes anything on an empty gate; and it
+    /// reports `None` only when every index is claimed.
+    #[test]
+    fn first_fitting_skips_what_does_not_fit_and_claims_each_index_once() {
+        let gate = VramGate::new(12);
+        let order = [0usize, 1, 2, 3];
+        let estimates = [10u64, 10, 2, 20];
+        let claimed = std::sync::Mutex::new(vec![false; order.len()]);
+        let (a, pa) = gate
+            .acquire_first_fitting(&order, &estimates, &claimed)
+            .unwrap();
+        assert_eq!(a, 0);
+        let (b, pb) = gate
+            .acquire_first_fitting(&order, &estimates, &claimed)
+            .unwrap();
+        assert_eq!(
+            b, 2,
+            "table 1 (10) does not fit beside 10 of 12; table 2 (2) does"
+        );
+        drop(pa);
+        drop(pb);
+        let (c, pc) = gate
+            .acquire_first_fitting(&order, &estimates, &claimed)
+            .unwrap();
+        assert_eq!(c, 1);
+        drop(pc);
+        let (d, pd) = gate
+            .acquire_first_fitting(&order, &estimates, &claimed)
+            .unwrap();
+        assert_eq!(
+            d, 3,
+            "over the whole budget, admitted alone on an empty gate"
+        );
+        drop(pd);
+        assert!(
+            gate.acquire_first_fitting(&order, &estimates, &claimed)
+                .is_none()
+        );
+        assert_eq!(*gate.used.lock().unwrap(), 0);
+    }
+}
+
+/// `LAMBDA_VM_GATE_PACKING=1`: [`run_admitted`] admits the first table in walk
+/// order that fits the gate instead of blocking on the next one. Off by
+/// default (the walk-order admission every measurement so far used).
+fn gate_packing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("LAMBDA_VM_GATE_PACKING").is_ok_and(|v| v == "1");
+        if on {
+            eprintln!("[prover] VRAM gate: packing admission (LAMBDA_VM_GATE_PACKING=1)");
+        }
+        on
+    })
+}
+
+/// `LAMBDA_VM_TABLE_TIMELINE=1`: one `TABLE TL` line per table per admitted
+/// phase — when a driver claimed it, when the gate admitted it and when it
+/// finished (unix seconds, the clock the `PROVE SPLIT` line's `t=[..]` uses),
+/// and the bytes it was admitted for. Off by default.
+fn table_timeline() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1"))
+}
+
 impl Drop for VramPermit<'_> {
     fn drop(&mut self) {
         let mut used = self.gate.used.lock().unwrap();
@@ -1023,6 +1132,7 @@ impl Drop for VramPermit<'_> {
 /// long pole starts early and small tables fill around it. Returns one slot
 /// per original index.
 fn run_admitted<T: Send>(
+    phase: &'static str,
     order: &[usize],
     estimates: &[u64],
     gate: &VramGate,
@@ -1030,6 +1140,9 @@ fn run_admitted<T: Send>(
     label: impl Fn(usize) -> String + Sync,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
+    let packing = gate_packing();
+    let timeline = table_timeline();
+    let claimed = std::sync::Mutex::new(vec![false; order.len()]);
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
         .iter()
         .map(|_| std::sync::Mutex::new(None))
@@ -1062,20 +1175,45 @@ fn run_admitted<T: Send>(
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
                 loop {
-                    let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if pos >= order.len() {
+                    let t_claim = timeline.then(crate::prove_split::epoch_secs);
+                    let (idx, permit) = if packing {
+                        if taken(&first_panic) {
+                            return;
+                        }
+                        match gate.acquire_first_fitting(order, estimates, &claimed) {
+                            Some(claim) => claim,
+                            None => return,
+                        }
+                    } else {
+                        let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if pos >= order.len() {
+                            return;
+                        }
+                        // ⚖ Stop pulling work once a sibling has failed. The result
+                        // is discarded either way, so this only declines to spend
+                        // cores on it; the previous code let every remaining index
+                        // run to completion before the scope re-panicked.
+                        if taken(&first_panic) {
+                            return;
+                        }
+                        let idx = order[pos];
+                        (idx, gate.acquire(estimates[idx]))
+                    };
+                    // A sibling may have failed while this driver waited.
+                    if packing && taken(&first_panic) {
                         return;
                     }
-                    // ⚖ Stop pulling work once a sibling has failed. The result
-                    // is discarded either way, so this only declines to spend
-                    // cores on it; the previous code let every remaining index
-                    // run to completion before the scope re-panicked.
-                    if taken(&first_panic) {
-                        return;
-                    }
-                    let idx = order[pos];
-                    let permit = gate.acquire(estimates[idx]);
+                    let t_start = timeline.then(crate::prove_split::epoch_secs);
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
+                    if let (Some(t_claim), Some(t_start)) = (t_claim, t_start) {
+                        eprintln!(
+                            "TABLE TL {phase} idx={idx} {} est={:.2}GiB claim={t_claim:.3} \
+                             start={t_start:.3} end={:.3}",
+                            label(idx),
+                            estimates[idx] as f64 / (1u64 << 30) as f64,
+                            crate::prove_split::epoch_secs(),
+                        );
+                    }
                     // Released explicitly: the catch means unwinding no longer
                     // drops it for us, and a leaked permit would deadlock every
                     // remaining worker on the gate.
@@ -4751,6 +4889,7 @@ pub trait IsStarkProver<
         // Fiat-Shamir requires before sampling the shared challenges.
         let __ps_mc = crate::prove_split::mark();
         let main_results = run_admitted(
+            "r1",
             &main_walk_order,
             &main_estimates,
             &vram_gate,
@@ -5413,6 +5552,7 @@ pub trait IsStarkProver<
         // per-table), so any order is sound; proofs are drained in index order.
         #[cfg(not(feature = "debug-checks"))]
         let table_results = run_admitted(
+            "fused",
             &peak_order,
             &peak_estimates,
             &vram_gate,
@@ -5430,6 +5570,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "debug-checks")]
         let table_results = {
             let aux_outs = run_admitted(
+                "aux",
                 &peak_order,
                 &peak_estimates,
                 &vram_gate,
@@ -5459,6 +5600,7 @@ pub trait IsStarkProver<
                 .map(|p| std::sync::Mutex::new(Some(p)))
                 .collect();
             run_admitted(
+                "rounds",
                 &peak_order,
                 &peak_estimates,
                 &vram_gate,
