@@ -661,7 +661,11 @@ pub fn int_nodes() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("LAMBDA_VM_ARGUE_INT_NODES").is_ok_and(|v| v == "1" || v == "true")
+        let on = std::env::var("LAMBDA_VM_ARGUE_INT_NODES").is_ok_and(|v| v == "1" || v == "true");
+        if on {
+            eprintln!("[gpu] sumcheck rounds: integer nodes (LAMBDA_VM_ARGUE_INT_NODES=1)");
+        }
+        on
     })
 }
 
