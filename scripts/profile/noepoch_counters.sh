@@ -41,9 +41,9 @@
 #      and the top kernels; the fused stage second by second; the kernels each NVTX label launched (the
 #      recommit's own); the CUDA API seconds per category (alloc, free, pinned host, sync, copies),
 #      per thread and per stage; a 100 ms time series.
-#   7. Run B, Nsight Compute: 30 short passes, 15 per workload, on the kernels that carry the main
+#   7. Run B, Nsight Compute: 32 short passes, 16 per workload, on the kernels that carry the main
 #      commit, the fused rounds and the recommit (RPX leaves and Merkle levels, the NTT, the compiled
-#      constraint kernels, DEEP and FRI leaves), with the sections SpeedOfLight, MemoryWorkloadAnalysis,
+#      constraint kernels, DEEP, FRI leaves, grinding), with the sections SpeedOfLight, MemoryWorkloadAnalysis,
 #      ComputeWorkloadAnalysis, Occupancy and LaunchStats plus stall and pipe metrics, at --clock-control
 #      base. A config pass profiles one launch of every launch shape of ONE kernel, so each instance size
 #      either workload ran is measured; a window pass profiles the first N launches of a family and ends
@@ -65,9 +65,11 @@
 #   Compute >= 2025.1 (the toolkit's own are fine); GPU performance counters open to this user; RAM: 47 GiB
 #   available when the script starts (the no-epoch run peaks at 43.9 GiB on the host; close big
 #   programs first); >= 40 GiB free in the work directory; rustup with the toolchain 1.94.0; git, curl,
-#   python3 >= 3.8 with sqlite3; internet (GitHub, crates.io). Named NVTX ranges need a libnvToolsExt
-#   (CUDA 12.9 and later ship none): export LAMBDA_VM_NVTX_LIB=/path/to/libnvToolsExt.so.1 as on
-#   2026-09-28. Without one, run A takes its stages from the harness log and has no recommit row.
+#   python3 >= 3.8 with sqlite3; internet (GitHub, crates.io, files.pythonhosted.org). Named NVTX ranges
+#   need a libnvToolsExt (CUDA 12.9 and later ship none): LAMBDA_VM_NVTX_LIB=/path/to/libnvToolsExt.so.1
+#   when you have one (as on 2026-09-28); otherwise the script fetches the nvidia-nvtx-cu12 12.8.90 wheel
+#   (the last release that ships the library) and checks it by sha256. Without any, run A takes its
+#   stages from the harness log and has no recommit row.
 #
 # RUN
 #   bash noepoch_counters.sh --preflight-only   # the checks alone, about two minutes
@@ -108,6 +110,7 @@
 #   NP_BUILD_TIMEOUT   seconds for the build (7200)
 #   NP_IDLE_MIB        the GPU counts as idle below this many MiB in use with no compute process (500)
 #   NP_MIN_AVAIL_GIB   host MemAvailable the checks require at start (default 47)
+#   NP_FETCH_NVTX      1 (default) fetches the NVTX library when none is found; 0 does not
 #   NP_SCAN_ALLOW      environment variable NAMES whose values may appear in the bundle (after a look)
 #   NCU / NSYS         explicit tool paths
 #   NP_REPO_URL / NP_INPUT_URL   mirrors; the content stays pinned by commit sha and by sha256
@@ -119,7 +122,7 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION=iprof-2026-09-30b
+SCRIPT_VERSION=iprof-2026-09-30c
 REPO_URL_DEFAULT=https://github.com/yetanotherco/lambda_vm
 PIN_SHA=80e6aa89f841950c46a76d66c6b87f83e44290b8            # profile/noepoch-counters: noepoch/stark + the recommit span
 NOEPOCH_SHA=fe3f6bf0538936ad8c1b4dc015d42ff383c90e2c        # noepoch/stark (PR #1013), PIN_SHA's parent
@@ -135,6 +138,9 @@ MIN_CUDA=12.8
 MIN_NSIGHT=2025.1              # Blackwell-capable nsys and ncu
 EPOCH_TEST=tests::noepoch_block_tests::noepoch_epoch_base_reference
 NOEPOCH_TEST=tests::noepoch_block_tests::noepoch_block_prove_and_verify
+NVTX_WHEEL_URL=https://files.pythonhosted.org/packages/a2/eb/86626c1bbc2edb86323022371c39aa48df6fd8b0a1647bc274577f72e90b/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+NVTX_WHEEL_SHA256=5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f
+NVTX_LIB_SHA256=c498fcbab0202886c27a0adeac44abf233ade03d30680ffa2d2abe93ab88d913   # nvidia/nvtx/lib/libnvToolsExt.so.1 in it
 RUN_VRAM_MB=24000              # the record's budget (FAST 351/352)
 CUBINS="arith ntt ntt_cm keccak barycentric deep fri inverse rpx_v0 rpx_v5 logup constraint_interp constraint_compiled blake3 sumcheck whir_fold"
 
@@ -166,7 +172,7 @@ smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio,\
 l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,\
 l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"
 
-# Run B's pass plan: the same 15 passes for each workload, the kernels that carried the STARK base on
+# Run B's pass plan: the same 16 passes for each workload, the kernels that carried the STARK base on
 # 09-28 (lane G1's ledger, NCU-5090.md): RPX leaves and Merkle levels (main commit, recommit, aux and
 # composition trees), the NTT (LDE), the compiled constraint kernels (ccomp_<hash>, one per constraint
 # program since cc411aa2c, so a window rather than a config pass), DEEP and the FRI leaves. Kernels are
@@ -191,7 +197,8 @@ plan_rows() { # plan_rows WORKLOAD
     "${w}_quotient	$w	window	0	32	ccomp_[0-9a-f]+|constraint_composition_kernel	quotient	constraint composition (round 2): the compiled per-program kernels, the first 32 launches (largest tables first in the walk)" \
     "${w}_ntt_other	$w	window	0	24	ntt_cm_dif_k[4-8]|ntt_cm_dit_k[456]|ntt_dit_level_row_major|ntt_dit_8_levels_row_major|matrix_transpose_strided|bit_reverse_row_major	lde	LDE, the rest (dif kernels, legacy row-major passes, transposes): the first 24" \
     "${w}_merkle_warp	$w	window	0	16	rpx_merkle_(level_warp|tail_warp)	merkle	narrow Merkle levels, the half-warp kernels: one tree's first 16" \
-    "${w}_logup	$w	window	0	8	logup_[a-z0-9_]+	logup	LogUp aux columns (fused aux build): the first 8"
+    "${w}_logup	$w	window	0	8	logup_[a-z0-9_]+	logup	LogUp aux columns (fused aux build): the first 8" \
+    "${w}_grind	$w	window	0	5	rpx_grind_search_queue	grind	grinding, the queue kernel (round 4): the first 5"
 }
 default_plan() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' pass workload mode skip count kernels family note
@@ -341,6 +348,21 @@ find_nvtx_lib() { # the libnvToolsExt a --features nvtx binary can dlopen (crypt
   done
   return 1
 }
+fetch_nvtx_lib() { # the nvidia-nvtx-cu12 12.8.90 wheel's libnvToolsExt.so.1 into $W/nvtx, both checked by sha256
+  local d="$W/nvtx" whl lib
+  lib="$d/libnvToolsExt.so.1" whl="$d/nvidia_nvtx_cu12-12.8.90.whl"
+  if [ -f "$lib" ] && [ "$(sha256_of "$lib")" = "$NVTX_LIB_SHA256" ]; then printf '%s\n' "$lib"; return 0; fi
+  mkdir -p "$d"
+  curl -fsSL --retry 3 -o "$whl" "$NVTX_WHEEL_URL" > "$d/curl.log" 2>&1 || return 1
+  [ "$(sha256_of "$whl")" = "$NVTX_WHEEL_SHA256" ] || return 1
+  python3 - "$whl" "$lib" <<'PY' >> "$d/curl.log" 2>&1 || return 1
+import sys, zipfile
+with open(sys.argv[2], "wb") as f:
+    f.write(zipfile.ZipFile(sys.argv[1]).read("nvidia/nvtx/lib/libnvToolsExt.so.1"))
+PY
+  [ "$(sha256_of "$lib")" = "$NVTX_LIB_SHA256" ] || return 1
+  printf '%s\n' "$lib"
+}
 
 # ---------------------------------------------------------------------------------------------------
 # knobs, work directory, run directory
@@ -368,11 +390,12 @@ knob_defaults() {
   NP_BUILD_TIMEOUT="${NP_BUILD_TIMEOUT:-7200}"
   NP_IDLE_MIB="${NP_IDLE_MIB:-500}"
   NP_MIN_AVAIL_GIB="${NP_MIN_AVAIL_GIB:-47}"
+  NP_FETCH_NVTX="${NP_FETCH_NVTX:-1}"
   NP_REPO_URL="${NP_REPO_URL:-$REPO_URL_DEFAULT}"
   NP_INPUT_URL="${NP_INPUT_URL:-$INPUT_URL_DEFAULT}"
   NP_SCAN_ALLOW="${NP_SCAN_ALLOW:-}"
   case "$NP_GPU" in ''|*[!0-9]*) echo "NP_GPU must be a number, got '$NP_GPU'" >&2; exit 2 ;; esac
-  for v in NP_DRY NP_REFERENCE NP_RUN_A NP_RUN_B; do
+  for v in NP_DRY NP_REFERENCE NP_RUN_A NP_RUN_B NP_FETCH_NVTX; do
     case "${!v}" in 0|1) ;; *) echo "$v must be 0 or 1, got '${!v}'" >&2; exit 2 ;; esac
   done
   case "$NP_CLOCK" in base|boost|none) ;; *) echo "NP_CLOCK must be base, boost or none, got '$NP_CLOCK'" >&2; exit 2 ;; esac
@@ -2757,7 +2780,12 @@ preflight() {
   fi
   NVTX_LIB="$(find_nvtx_lib || true)"
   if [ -n "$NVTX_LIB" ]; then chk PASS "nvtx: $NVTX_LIB (handed to the runs as LAMBDA_VM_NVTX_LIB: the prover's phases and the recommit are named ranges)"
-  else chk WARN "nvtx: no libnvToolsExt found (CUDA 12.9 and later ship none), so the NVTX ranges are silent no-ops: run A's stages come from the harness log and it has no recommit row. If you have one (09-28: ~/nvtx/libnvToolsExt.so.1): export LAMBDA_VM_NVTX_LIB=/path/to/libnvToolsExt.so.1"; fi
+  elif [ "$NP_FETCH_NVTX" = 1 ] && NVTX_LIB="$(fetch_nvtx_lib)"; then
+    chk PASS "nvtx: $NVTX_LIB, fetched (nvidia-nvtx-cu12 12.8.90, sha256-checked) and handed to the runs as LAMBDA_VM_NVTX_LIB"
+  else
+    NVTX_LIB=""
+    chk WARN "nvtx: no libnvToolsExt found (CUDA 12.9 and later ship none)$([ "$NP_FETCH_NVTX" = 1 ] && echo " and the fetch failed (see $W/nvtx/curl.log)"), so the NVTX ranges are silent no-ops: run A's stages come from the harness log and it has no recommit row. If you have one: export LAMBDA_VM_NVTX_LIB=/path/to/libnvToolsExt.so.1"
+  fi
 
   # -- Nsight Compute, recognised by its banner; counters proven on one real kernel
   NCU_BIN="$(find_tool ncu || true)"

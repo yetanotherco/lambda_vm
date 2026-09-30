@@ -9,8 +9,9 @@ performance counters are open (the 09-25 and 09-28 runs used the same machine).
 
 - Close big programs. The no-epoch run peaks at 43.9 GiB of host RAM, and the checks refuse to
   start with less than 47 GiB available.
-- Make the NVTX library visible, as on 09-28, so the prover's phases show up as named ranges:
-  `export LAMBDA_VM_NVTX_LIB=~/nvtx/libnvToolsExt.so.1`
+- Optional: make your NVTX library visible, as on 09-28, so the prover's phases show up as named
+  ranges: `export LAMBDA_VM_NVTX_LIB=~/nvtx/libnvToolsExt.so.1`. If none is found, the script
+  downloads one (the nvidia-nvtx-cu12 12.8.90 wheel from PyPI) and checks it by sha256.
 - Run it inside tmux or screen, with the GPU otherwise idle.
 
 ## Run
@@ -28,7 +29,7 @@ and the guest ELF (both checked by sha256), builds the prover, and runs everythi
 environment (`env -i`).
 
 - **Runtime:** about 60 to 90 minutes. The build takes 5 to 30 minutes, the reference runs 2 to 3,
-  run A (Nsight Systems) 8 to 12, and run B (Nsight Compute, 30 passes) 40 to 50.
+  run A (Nsight Systems) 8 to 12, and run B (Nsight Compute, 32 passes) 40 to 50.
 - **Short version:** `NP_RUN_B=0 bash noepoch_counters.sh` runs the reference and run A only, in
   about 15 minutes plus the build.
 - **Disk:** about 25 to 35 GiB, and the checks require 40 GiB free. After you send the bundle you
