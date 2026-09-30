@@ -4026,6 +4026,110 @@ pub(crate) fn commit_resident(
     Some((DeviceCodeword(codeword), root))
 }
 
+/// The codeword [`commit_resident`] would commit, with no tree built: what
+/// the block prover's phase B rebuilds for an opening whose root it already
+/// holds. Declines exactly where [`commit_resident`] does, so a stack committed
+/// on the card is re-encoded on the card.
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_resident(
+    store: &ResidentColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+) -> Option<DeviceCodeword> {
+    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+        return None;
+    }
+    math_cuda::device::backend().ok()?;
+    match math_cuda::whir::encode_codeword_resident(
+        &store.0, parts, log_evals, log_blowup, transient,
+    ) {
+        Ok(codeword) => Some(DeviceCodeword(codeword)),
+        Err(err) => {
+            note_commit_error("encode resident", log_evals, log_blowup, &err);
+            None
+        }
+    }
+}
+
+/// [`encode_resident`] over columns the host holds, as [`commit_parts`].
+#[cfg(feature = "cuda")]
+pub(crate) fn encode_parts<F>(
+    parts: &[(&crate::mle::Mle<F>, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+) -> Option<DeviceCodeword>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|(column, offset)| offset + column.len() > (1usize << log_evals))
+    {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw: Vec<(&[u64], usize)> = parts
+        .iter()
+        .map(|(column, offset)| unsafe {
+            (
+                core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len()),
+                *offset,
+            )
+        })
+        .collect();
+    math_cuda::device::backend().ok()?;
+    match math_cuda::whir::encode_codeword_parts(&raw, log_evals, log_blowup, transient) {
+        Ok(codeword) => Some(DeviceCodeword(codeword)),
+        Err(err) => {
+            note_commit_error("encode parts", log_evals, log_blowup, &err);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn encode_resident(
+    _store: &ResidentColumns,
+    _parts: &[(usize, usize)],
+    _log_evals: usize,
+    _log_blowup: usize,
+    _transient: bool,
+) -> Option<DeviceCodeword> {
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn encode_parts<F>(
+    _parts: &[(&crate::mle::Mle<F>, usize)],
+    _log_evals: usize,
+    _log_blowup: usize,
+    _transient: bool,
+) -> Option<DeviceCodeword>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn commit_resident(
     _store: &ResidentColumns,
@@ -4102,6 +4206,27 @@ impl DeviceCodeword {
         let root = self.0.commit(log_folding, hash.into_math_cuda()).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(root)
+    }
+
+    /// Waits for this codeword's stream (see
+    /// `math_cuda::whir::DeviceCodeword::synchronize`).
+    pub(crate) fn synchronize(&self) -> bool {
+        self.0.synchronize().is_ok()
+    }
+
+    /// The tree's first `nodes` nodes (its top levels, root first), brought
+    /// home — what a commitment that lets its codeword go keeps.
+    pub(crate) fn top_nodes(
+        &self,
+        log_folding: usize,
+        nodes: usize,
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<Vec<[u8; 32]>> {
+        let bytes = self
+            .0
+            .top_nodes_to_host(log_folding, hash.into_math_cuda(), nodes)
+            .ok()?;
+        nodes_in_place(bytes)
     }
 
     /// One authentication path per index, against the same tree.
@@ -4265,6 +4390,19 @@ where
 #[cfg(not(feature = "cuda"))]
 impl DeviceCodeword {
     pub(crate) fn elements(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn top_nodes(
+        &self,
+        _log_folding: usize,
+        _nodes: usize,
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<Vec<[u8; 32]>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn synchronize(&self) -> bool {
         match self.0 {}
     }
 

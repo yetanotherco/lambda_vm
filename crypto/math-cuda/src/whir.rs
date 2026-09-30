@@ -902,6 +902,13 @@ impl DeviceCodeword {
         Ok(values)
     }
 
+    /// Waits for the work queued on this codeword's stream — an encode's
+    /// transform — to finish, so a caller's stopwatch reads it where it ran.
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
     /// The first value, which is what the last fold leaves behind.
     pub fn first(&self) -> Result<[u64; 3]> {
         let limbs = if self.base { 1 } else { 3 };
@@ -1343,6 +1350,27 @@ impl DeviceCodeword {
         })
     }
 
+    /// The first `nodes` nodes of the tree in the host layout (root first):
+    /// its top levels, which is what a prover that lets the codeword go keeps
+    /// to answer the paths later. `nodes` must be `2^(t+1) − 1` for some level
+    /// `t` of the tree.
+    pub fn top_nodes_to_host(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+        nodes: usize,
+    ) -> Result<Vec<u8>> {
+        self.with_tree(log_folding, hash, |tree, num_leaves| {
+            assert!(
+                (nodes + 1).is_power_of_two() && nodes < 2 * num_leaves,
+                "{nodes} nodes are not whole top levels of a tree of {num_leaves} leaves"
+            );
+            let out = self.stream.clone_dtoh(&tree.slice(0..nodes * 32))?;
+            self.stream.synchronize()?;
+            Ok(out)
+        })
+    }
+
     /// The authentication paths of `positions`, against the same tree.
     ///
     /// ★ Read from the kept whole tree when one matches; otherwise the tree is
@@ -1559,15 +1587,60 @@ fn commit_from(
     transient: bool,
     hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
-    let log_evals = source.log_evals();
-    let log_n = log_evals + log_blowup as u64;
-    let n = 1usize << log_n;
+    let log_n = source.log_evals() + log_blowup as u64;
     assert!(
         log_folding as u64 <= log_n,
         "a leaf cannot exceed the domain"
     );
-    let num_leaves = n >> log_folding;
-    assert!(num_leaves >= 2, "tree needs at least two leaves");
+    assert!(
+        (1usize << log_n) >> log_folding >= 2,
+        "tree needs at least two leaves"
+    );
+    let codeword = encode_from(source, log_blowup, transient)?;
+    let root = codeword.commit(log_folding, hash)?;
+    Ok((codeword, root))
+}
+
+/// The codeword of a stacked polynomial whose columns the card already holds,
+/// with NO tree: what a prover that committed it earlier, kept the root and
+/// let the codeword go, rebuilds before its opening. The transform is
+/// [`commit_codeword_resident`]'s, so the values are the committed ones; the
+/// caller answers for the tree (the block prover keeps its top levels on the
+/// host and re-hashes the bottom ones a query needs).
+pub fn encode_codeword_resident(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+) -> Result<DeviceCodeword> {
+    encode_from(
+        Source::Resident {
+            store,
+            parts,
+            log_evals,
+        },
+        log_blowup,
+        transient,
+    )
+}
+
+/// [`encode_codeword_resident`] over columns the host holds.
+pub fn encode_codeword_parts(
+    parts: &[(&[u64], usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+) -> Result<DeviceCodeword> {
+    encode_from(Source::Parts { parts, log_evals }, log_blowup, transient)
+}
+
+/// The Reed–Solomon codeword of `source`, on the card, reserved like a
+/// commit's: the codeword, plus its working set when `transient`.
+fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result<DeviceCodeword> {
+    let log_evals = source.log_evals();
+    let log_n = log_evals + log_blowup as u64;
+    let n = 1usize << log_n;
     assert!(
         n <= u32::MAX as usize,
         "codeword length {n} exceeds u32 range — kernel grid would silently truncate",
@@ -1649,8 +1722,7 @@ fn commit_from(
         room: Arc::new(room),
         registered: Arc::new(AtomicBool::new(false)),
     };
-    let root = codeword.commit(log_folding, hash)?;
-    Ok((codeword, root))
+    Ok(codeword)
 }
 
 /// Levels a tile fuses at once: 32 rows of 32 columns is a full block, and the

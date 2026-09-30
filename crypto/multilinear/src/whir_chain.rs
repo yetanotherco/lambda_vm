@@ -820,6 +820,48 @@ where
     Ok((commitment, domain))
 }
 
+/// The codeword [`commit_stacked`] commits, with no tree: on the card when the
+/// card would have committed it, on the host otherwise. What a retired
+/// commitment is revived over (`stacked_eval::RetiredStack::revive`); the
+/// values are the committed ones because the transform is the same one.
+pub fn encode_stacked<F>(
+    f: &Stacked<'_, F>,
+    config: &ChainConfig,
+    transient: bool,
+) -> Result<Codeword<F>, Error>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let num_vars = f.num_vars();
+    let attempt = match &f.resident {
+        Some((store, parts)) => {
+            crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient)
+        }
+        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
+    };
+    match attempt {
+        Some(codeword) => {
+            // The transform is queued on the codeword's stream; the opening
+            // needs it done, and a stopwatch around this call should see it.
+            if !codeword.synchronize() {
+                return Err(Error::DeviceFailed {
+                    stage: "re-encoding a retired codeword",
+                });
+            }
+            Ok(Codeword::Device(codeword))
+        }
+        None => {
+            crate::gpu::note_host_fallback();
+            let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
+            Ok(Codeword::Host(encode::<F, F>(
+                &lift_coefficients(&f.assemble()?),
+                &domain,
+            )?))
+        }
+    }
+}
+
 /// The product of a chain's two tables, which is what its rounds evaluate —
 /// and what sizes a device session's slot file.
 pub(crate) fn opening_program<E: IsField + 'static>() -> Result<crate::program::Program<E>, Error> {

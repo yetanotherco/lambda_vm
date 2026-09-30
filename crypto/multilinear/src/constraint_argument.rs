@@ -186,6 +186,14 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
+    /// Forgets the device copy [`set_resident`](Self::set_resident) pointed at,
+    /// so the store can go while the table (and its host columns) stay: the
+    /// block prover gives a group's columns back to the card between its commit
+    /// and its argument.
+    pub fn clear_resident(&mut self) {
+        self.resident = None;
+    }
+
     /// The epoch's columns on the card, and where this table's start.
     pub fn resident(&self) -> Option<(&crate::gpu::ResidentColumns, usize)> {
         self.resident

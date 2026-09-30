@@ -145,6 +145,11 @@ pub enum Error {
     /// the host: the transcript has moved.
     #[error("the device failed mid-{stage}, after the transcript had moved")]
     DeviceFailed { stage: &'static str },
+    /// A commitment rebuilt from a kept tree top and a recomputed codeword:
+    /// the codeword's leaves under one kept node do not hash to it, so the
+    /// recomputation is not the committed codeword.
+    #[error("leaf block {block}: the recomputed codeword does not hash to the kept tree")]
+    RecomputedCodewordMismatch { block: usize },
     /// A constraint program's constant has an extension part, so the program
     /// cannot run in the base field (`fused`).
     #[error("step {step} of the constraint program is not a base-field constant")]

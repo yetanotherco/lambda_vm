@@ -285,6 +285,132 @@ where
     pub fn layout(&self) -> &StackedLayout {
         &self.layout
     }
+
+    /// Lets every codeword go — and the room the group promised the card —
+    /// keeping the roots and each tree's top (all but its bottom
+    /// `drop_levels` levels) on the host. See [`RetiredStack::revive`].
+    pub fn retire(
+        self,
+        drop_levels: usize,
+        config: &ChainConfig,
+    ) -> Result<RetiredStack<F>, Error> {
+        // The group's room goes back here (`room: _` drops it); each codeword
+        // goes as its top comes home, so the card never holds more than it did
+        // at the commit.
+        let Self {
+            layout,
+            commitments,
+            domain,
+            room: _,
+        } = self;
+        let commitments = commitments
+            .into_iter()
+            .map(|commitment| commitment.retire(drop_levels, config.format.cap))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(RetiredStack {
+            layout,
+            commitments,
+            domain,
+        })
+    }
+}
+
+/// A group committed and then let go: its layout, its domain, and per stacked
+/// polynomial the root and the top of its tree.
+///
+/// ★ THE BLOCK PROVER'S HOLD BETWEEN ITS TWO PHASES. Every group is committed
+/// before any challenge exists, and no card holds every group's codewords, so
+/// each group gives its codewords back as soon as its roots are taken and
+/// rebuilds them for its opening. What it keeps of a tree is the top: the
+/// paths an opening sends are the whole tree's, byte for byte, because the
+/// dropped levels are re-hashed from the rebuilt codeword and checked against
+/// the kept node before a path leaves (`CodewordCommitment::retire`).
+pub struct RetiredStack<F: IsFFTField + IsPrimeField + 'static> {
+    layout: StackedLayout,
+    commitments: Vec<crate::whir_commit::RetiredCommitment>,
+    domain: Domain<F>,
+}
+
+impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static> RetiredStack<F>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    pub fn roots(&self) -> Vec<Commitment> {
+        self.commitments.iter().map(|c| c.root()).collect()
+    }
+
+    pub fn layout(&self) -> &StackedLayout {
+        &self.layout
+    }
+
+    /// Host bytes kept of the trees.
+    pub fn tree_bytes(&self) -> usize {
+        self.commitments.iter().map(|c| c.tree_bytes()).sum()
+    }
+
+    /// The group openable again: every codeword recomputed from `columns` —
+    /// the group's columns, in the order they were committed — with no tree
+    /// built. `resident` names them on the card as at the commit.
+    pub fn revive<H: WhirHash>(
+        self,
+        columns: &[&Mle<F>],
+        resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+        config: &ChainConfig,
+    ) -> Result<StackedCommitment<F, H>, Error> {
+        if let Some((_, ColumnsAt::Map(map))) = resident
+            && map.len() != columns.len()
+        {
+            return Err(Error::QueryCountMismatch {
+                expected: columns.len(),
+                got: map.len(),
+            });
+        }
+        let Self {
+            layout,
+            commitments: retired,
+            domain,
+        } = self;
+        // The openings' turn, held from here to the last opening: the codewords
+        // come back one at a time and the chain works beside each.
+        let room = if retired.is_empty() {
+            None
+        } else {
+            crate::gpu::reserve_room(room_bytes(&layout, config, resident.is_none(), Turn::Open))
+        };
+        let transient = room.is_none();
+        let mut commitments = Vec::with_capacity(retired.len());
+        for (poly, retired) in retired.into_iter().enumerate() {
+            let source = whir_chain::Stacked {
+                parts: layout
+                    .parts_of(poly)
+                    .into_iter()
+                    .map(|(column, offset)| (columns[column], offset))
+                    .collect(),
+                resident: resident.map(|(store, at)| {
+                    (
+                        store,
+                        layout
+                            .parts_of(poly)
+                            .into_iter()
+                            .map(|(column, offset)| (at.store_column(column), offset))
+                            .collect(),
+                    )
+                }),
+                num_vars: layout.n_stack(),
+            };
+            let codeword = whir_chain::encode_stacked::<F>(&source, config, transient)?;
+            commitments.push(retired.revive::<F, H>(codeword)?);
+        }
+        Ok(StackedCommitment {
+            layout,
+            commitments,
+            domain,
+            room: match room {
+                Some(room) => Room::Held(room),
+                None => Room::Own,
+            },
+        })
+    }
 }
 
 /// One weighted, chained evaluation proof per stacked polynomial.
@@ -722,6 +848,196 @@ mod tests {
             &mut transcript(),
         )?;
         Ok(roots.len())
+    }
+
+    /// A stack committed, retired and revived, opened at `at`: the proof's
+    /// Debug text (every opened value and path).
+    fn opened_after_retire(
+        layout: StackedLayout,
+        committed: &[Mle<F>],
+        revived_over: &[Mle<F>],
+        at: &[FE],
+        claimed: &[FE],
+        drop_levels: usize,
+    ) -> Result<String, Error> {
+        opened_after_retire_under(
+            &config(),
+            layout,
+            committed,
+            revived_over,
+            at,
+            claimed,
+            drop_levels,
+        )
+    }
+
+    fn opened_after_retire_under(
+        config: &ChainConfig,
+        layout: StackedLayout,
+        committed: &[Mle<F>],
+        revived_over: &[Mle<F>],
+        at: &[FE],
+        claimed: &[FE],
+        drop_levels: usize,
+    ) -> Result<String, Error> {
+        let retired = StackedCommitment::<F, KeccakWhir>::commit(
+            layout,
+            &crate::stacking::borrow(committed),
+            None,
+            config,
+        )?
+        .retire(drop_levels, config)?;
+        let revived =
+            retired.revive::<KeccakWhir>(&crate::stacking::borrow(revived_over), None, config)?;
+        let proof = prove(
+            &revived,
+            &crate::stacking::borrow(revived_over),
+            None,
+            &Claimed::Shared(at),
+            claimed,
+            config,
+            &mut transcript(),
+        )?;
+        Ok(format!("{proof:?}"))
+    }
+
+    /// ★ The block prover's hold: a stack that let its codewords go and kept
+    /// only the top of each tree opens to EXACTLY the proof of one that kept
+    /// everything — at every depth of the drop, including none and more than
+    /// the tree has — and the revived proof verifies against the first roots.
+    #[test]
+    fn a_retired_and_revived_stack_opens_to_the_same_bytes() {
+        let num_vars = 6;
+        let (layout, columns) = stack_of(5, num_vars, 8);
+        assert!(layout.num_polys() >= 2);
+        let at = point(num_vars);
+        let claimed = values(&columns, &at);
+        let kept = StackedCommitment::<F, KeccakWhir>::commit(
+            layout.clone(),
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap();
+        let roots = kept.roots();
+        let proof = prove(
+            &kept,
+            &crate::stacking::borrow(&columns),
+            None,
+            &Claimed::Shared(&at),
+            &claimed,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
+        let want = format!("{proof:?}");
+        for drop_levels in [0, 1, 3, 64] {
+            let got = opened_after_retire(
+                layout.clone(),
+                &columns,
+                &columns,
+                &at,
+                &claimed,
+                drop_levels,
+            )
+            .unwrap();
+            assert_eq!(got, want, "drop {drop_levels}: the revived opening differs");
+        }
+        // The retired roots are the committed ones.
+        let retired = StackedCommitment::<F, KeccakWhir>::commit(
+            layout.clone(),
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap()
+        .retire(3, &config())
+        .unwrap();
+        assert_eq!(retired.roots(), roots);
+        assert!(retired.tree_bytes() > 0);
+        verify::<F, _, _, KeccakWhir>(
+            &proof,
+            &layout,
+            &roots,
+            &Claimed::Shared(&at),
+            &claimed,
+            kept.domain(),
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
+    }
+
+    /// The same under a Merkle cap (production runs `whir_cap=auto`, height 3
+    /// on the first round's tree): the owner's cap comes from the kept top.
+    #[test]
+    fn a_retired_stack_opens_to_the_same_bytes_under_a_cap() {
+        let mut capped = config();
+        capped.format.cap = crate::whir_chain::CapPolicy::Fixed(2);
+        let num_vars = 6;
+        let (layout, columns) = stack_of(5, num_vars, 8);
+        let at = point(num_vars);
+        let claimed = values(&columns, &at);
+        let kept = StackedCommitment::<F, KeccakWhir>::commit(
+            layout.clone(),
+            &crate::stacking::borrow(&columns),
+            None,
+            &capped,
+        )
+        .unwrap();
+        let want = format!(
+            "{:?}",
+            prove(
+                &kept,
+                &crate::stacking::borrow(&columns),
+                None,
+                &Claimed::Shared(&at),
+                &claimed,
+                &capped,
+                &mut transcript(),
+            )
+            .unwrap()
+        );
+        for drop_levels in [0, 2, 3] {
+            let got = opened_after_retire_under(
+                &capped,
+                layout.clone(),
+                &columns,
+                &columns,
+                &at,
+                &claimed,
+                drop_levels,
+            )
+            .unwrap();
+            assert_eq!(
+                got, want,
+                "drop {drop_levels}: the capped revived opening differs"
+            );
+        }
+    }
+
+    /// The negative: revived over columns that are NOT the committed ones (one
+    /// value changed), the opening refuses rather than send paths the kept
+    /// tree does not authenticate. With no level dropped there is nothing to
+    /// re-hash, so the refusal needs at least one.
+    #[test]
+    fn a_stack_revived_over_other_columns_refuses_to_open() {
+        let num_vars = 6;
+        let (layout, columns) = stack_of(5, num_vars, 8);
+        let at = point(num_vars);
+        let claimed = values(&columns, &at);
+        let mut other = columns.clone();
+        let mut evals = other[2].evals().to_vec();
+        evals[5] += FE::one();
+        other[2] = Mle::new(evals).unwrap();
+        for drop_levels in [1, 3] {
+            let got =
+                opened_after_retire(layout.clone(), &columns, &other, &at, &claimed, drop_levels);
+            assert!(
+                matches!(got, Err(Error::RecomputedCodewordMismatch { .. })),
+                "drop {drop_levels}: {got:?}"
+            );
+        }
     }
 
     /// The point of the module: many columns, one commitment, one opening.

@@ -46,6 +46,84 @@ where
     codeword: Codeword<F>,
     log_folding: usize,
     log_domain_size: usize,
+    /// The top of the tree, when the commitment was retired and revived
+    /// ([`Self::retire`], [`RetiredCommitment::revive`]): the paths are then
+    /// read from it and from the leaves under one kept node, re-hashed from
+    /// the codeword. `None` on every commitment that kept its tree.
+    top: Option<TreeTop>,
+}
+
+/// What a retired commitment keeps of its tree: the heap prefix down to the
+/// level whose nodes each cover `2^dropped` leaves.
+///
+/// ★ A PROVER-SIDE MEMORY CHOICE, NOT A FORMAT ONE. The paths it answers are
+/// the paths of the whole tree, byte for byte: the levels it dropped are
+/// rebuilt from the codeword's queried cosets, and the rebuilt node is checked
+/// against the kept one before any path leaves.
+#[derive(Clone, Debug)]
+pub struct TreeTop {
+    /// `2^(depth − dropped + 1) − 1` nodes, root first (the host layout).
+    nodes: Vec<Commitment>,
+    dropped: usize,
+}
+
+impl TreeTop {
+    /// Bytes held.
+    pub fn bytes(&self) -> usize {
+        self.nodes.len() * core::mem::size_of::<Commitment>()
+    }
+}
+
+/// A commitment whose codeword was let go after its root was taken: the root,
+/// the top of its tree and its shape. [`Self::revive`] makes it openable again
+/// once the caller has recomputed the same codeword.
+#[derive(Clone, Debug)]
+pub struct RetiredCommitment {
+    root: Commitment,
+    top: TreeTop,
+    log_folding: usize,
+    log_domain_size: usize,
+}
+
+impl RetiredCommitment {
+    pub fn root(&self) -> Commitment {
+        self.root
+    }
+
+    /// Host bytes this keeps of the tree.
+    pub fn tree_bytes(&self) -> usize {
+        self.top.bytes()
+    }
+
+    pub fn log_domain_size(&self) -> usize {
+        self.log_domain_size
+    }
+
+    /// The commitment again, over `codeword` — which must be the committed
+    /// codeword. A wrong one is caught when a path is read: its leaves then do
+    /// not hash to the kept node ([`Error::RecomputedCodewordMismatch`]), so no
+    /// path of a codeword the root does not bind can leave.
+    pub fn revive<F: IsField + 'static, H: WhirHash>(
+        self,
+        codeword: Codeword<F>,
+    ) -> Result<CodewordCommitment<F, H>, Error>
+    where
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        if codeword.len() != 1usize << self.log_domain_size {
+            return Err(Error::CodewordTooShort {
+                coefficients: codeword.len(),
+                domain: 1usize << self.log_domain_size,
+            });
+        }
+        Ok(CodewordCommitment {
+            tree: Tree::<F, H>::from_root(self.root),
+            codeword,
+            log_folding: self.log_folding,
+            log_domain_size: self.log_domain_size,
+            top: Some(self.top),
+        })
+    }
 }
 
 /// Where a commitment's codeword lives.
@@ -174,6 +252,7 @@ where
                 codeword: Codeword::Host(codeword),
                 log_folding,
                 log_domain_size,
+                top: None,
             });
         }
         Self::from_codeword_on_host(codeword, log_folding)
@@ -221,6 +300,7 @@ where
             codeword: Codeword::Host(codeword),
             log_folding,
             log_domain_size,
+            top: None,
         })
     }
 
@@ -249,6 +329,7 @@ where
             codeword: Codeword::Host(codeword),
             log_folding,
             log_domain_size,
+            top: None,
         })
     }
 
@@ -278,6 +359,7 @@ where
             codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
+            top: None,
         })
     }
 
@@ -309,6 +391,150 @@ where
     /// after the sumcheck, and it computes something already in memory.
     pub fn codeword(&self) -> &Codeword<F> {
         &self.codeword
+    }
+
+    /// Lets the codeword go and keeps the root and the tree's top: every level
+    /// but the bottom `drop_levels` — fewer when the tree is shallower, and
+    /// never into the Merkle cap `cap` may ask this tree for, which is read
+    /// from the kept levels. What the block prover holds between committing a
+    /// group and opening it.
+    pub fn retire(
+        self,
+        drop_levels: usize,
+        cap: crypto::merkle_tree::cap::CapPolicy,
+    ) -> Result<RetiredCommitment, Error> {
+        if let Some(top) = self.top {
+            // Already a revived one: its top is what it keeps.
+            return Ok(RetiredCommitment {
+                root: self.tree.root,
+                top,
+                log_folding: self.log_folding,
+                log_domain_size: self.log_domain_size,
+            });
+        }
+        let depth = self.depth();
+        // The tallest cap the policy gives a tree this deep, whatever its
+        // opening count (the height is monotone in it).
+        let tallest_cap = cap.height(usize::MAX, depth);
+        let dropped = drop_levels.min(depth - tallest_cap);
+        let keep = (1usize << (depth - dropped + 1)) - 1;
+        let nodes =
+            match &self.codeword {
+                Codeword::Device(device) => device
+                    .top_nodes(self.log_folding, keep, H::DEVICE)
+                    .ok_or(Error::DeviceFailed {
+                        stage: "retiring a commitment",
+                    })?,
+                Codeword::Host(_) => {
+                    let all = self.tree.nodes();
+                    if all.len() < keep {
+                        return Err(Error::DeviceFailed {
+                            stage: "retiring a commitment with no host tree",
+                        });
+                    }
+                    all[..keep].to_vec()
+                }
+            };
+        if nodes.len() != keep || nodes.first() != Some(&self.tree.root) {
+            return Err(Error::RecomputedCodewordMismatch { block: 0 });
+        }
+        Ok(RetiredCommitment {
+            root: self.tree.root,
+            top: TreeTop { nodes, dropped },
+            log_folding: self.log_folding,
+            log_domain_size: self.log_domain_size,
+        })
+    }
+
+    /// The paths of `indices` from the kept top: the leaves of each queried
+    /// block of `2^dropped` are gathered from the codeword and hashed here,
+    /// their subtree's root is checked against the kept node, and the path
+    /// continues through the kept levels.
+    fn top_paths(&self, top: &TreeTop, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
+        let num_leaves = self.num_leaves();
+        if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
+            return Err(Error::QueryOutOfRange {
+                index: bad,
+                bound: num_leaves,
+            });
+        }
+        let depth = self.depth();
+        let dropped = top.dropped;
+        let span = 1usize << dropped;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> dropped).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let leaves: Vec<usize> = blocks
+            .iter()
+            .flat_map(|block| (block << dropped)..((block + 1) << dropped))
+            .collect();
+        let values = self.gather(&leaves)?;
+        let frontier = (1usize << (depth - dropped)) - 1;
+        let mut subtrees = Vec::with_capacity(blocks.len());
+        for (k, &block) in blocks.iter().enumerate() {
+            let hashed: Vec<Commitment> = values[k * span..(k + 1) * span]
+                .iter()
+                .map(Backend::<F, H>::hash_data)
+                .collect();
+            let subtree =
+                Tree::<F, H>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
+            if top.nodes.get(frontier + block) != Some(&subtree.root) {
+                return Err(Error::RecomputedCodewordMismatch { block });
+            }
+            subtrees.push(subtree);
+        }
+        indices
+            .iter()
+            .map(|&index| {
+                let block = index >> dropped;
+                let at = blocks
+                    .binary_search(&block)
+                    .map_err(|_| Error::QueryOutOfRange {
+                        index,
+                        bound: num_leaves,
+                    })?;
+                let mut merkle_path = subtrees[at]
+                    .get_proof_by_pos(index & (span - 1))
+                    .ok_or(Error::QueryOutOfRange {
+                        index,
+                        bound: num_leaves,
+                    })?
+                    .merkle_path;
+                let mut pos = frontier + block;
+                while pos != 0 {
+                    let sibling = if pos.is_multiple_of(2) {
+                        pos - 1
+                    } else {
+                        pos + 1
+                    };
+                    merkle_path.push(top.nodes[sibling]);
+                    pos = (pos - 1) / 2;
+                }
+                Ok(Proof { merkle_path })
+            })
+            .collect()
+    }
+
+    /// The fold blocks of `indices`, from wherever the codeword is.
+    fn gather(&self, indices: &[usize]) -> Result<Vec<Vec<FieldElement<F>>>, Error> {
+        let num_leaves = self.num_leaves();
+        match &self.codeword {
+            Codeword::Host(values) => Ok(indices
+                .iter()
+                .map(|index| {
+                    coset_of(*index, self.log_domain_size, self.log_folding)
+                        .into_iter()
+                        .map(|p| values[p].clone())
+                        .collect()
+                })
+                .collect()),
+            Codeword::Device(device) => device
+                .cosets(indices, num_leaves, 1usize << self.log_folding)
+                .ok_or(Error::QueryOutOfRange {
+                    index: 0,
+                    bound: num_leaves,
+                }),
+        }
     }
 
     /// Opens every block a round asks for.
@@ -396,6 +622,9 @@ where
     /// a gigabyte is the slowest thing in the commit. What a proof wants of a
     /// tree is a kilobyte per query.
     fn paths(&self, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
+        if let Some(top) = &self.top {
+            return self.top_paths(top, indices);
+        }
         let num_leaves = self.num_leaves();
         let out_of_range = |index: usize| Error::QueryOutOfRange {
             index,
@@ -449,7 +678,17 @@ where
         let embed_failed = |_: crypto::merkle_tree::cap::CapError| Error::CapEmbedFailed {
             reason: "path or cap of the wrong length",
         };
-        let (mut proofs, cap) = if owner {
+        let (mut proofs, cap) = if owner && let Some(top) = &self.top {
+            // The cap is kept whole when it sits in the kept levels.
+            if cap_height > depth - top.dropped {
+                return Err(Error::CapEmbedFailed {
+                    reason: "cap below the kept top of a retired tree",
+                });
+            }
+            let start = (1usize << cap_height) - 1;
+            let cap = top.nodes[start..2 * start + 1].to_vec();
+            (self.top_paths(top, indices)?, Some(cap))
+        } else if owner {
             match &self.codeword {
                 Codeword::Device(device) => {
                     let num_leaves = self.num_leaves();
