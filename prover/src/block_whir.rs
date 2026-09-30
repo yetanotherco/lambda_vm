@@ -252,7 +252,7 @@ fn table_of<'a>(
 ) -> Result<CommittedTable<'a, F, E>, Error> {
     let layout = layout_of(air, width, num_vars)
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
-    let mut columns = trace.columns_main();
+    let mut columns = trace.main_table.columns_blocked();
     // The row-major copy goes as soon as the columns exist: a block's traces
     // are tens of GiB, and two copies of them at once is the peak this entry
     // point exists to avoid.
