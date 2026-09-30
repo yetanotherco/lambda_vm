@@ -2597,6 +2597,25 @@ impl DeviceTree {
         match self.0 {}
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_layer_gruen<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _lambda: &math::field::element::FieldElement<E>,
+        _claim: math::field::element::FieldElement<E>,
+        _tail: usize,
+        _today: Option<&crate::program::Program<E>>,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
     pub(crate) fn layer_to_host<E>(
         &self,
         _layer: usize,
@@ -2858,6 +2877,228 @@ impl DeviceTree {
         };
         add_tick(&whir_split::GKR_FACTORS, t);
         whir_split::bump(&whir_split::GKR_LAYERS);
+        SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+        Some(Ok((rounds, challenges, factors)))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// [`prove_layer`](Self::prove_layer) with Gruen's rounds
+    /// ([`crate::gkr_gruen`]): the same rounds, challenges and factors, from a
+    /// pass that sums `H(1)` and `H(2)` and folds the previous challenge on the
+    /// way in. `claim` is `p + λ·q` of the level above, the value round 0's
+    /// `s(0) + s(1)` has to meet; `tail` the cube the host finishes from.
+    ///
+    /// With `today` (`LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK`), today's program walks
+    /// the same folded halves every round beside these, and the prove fails
+    /// where the two disagree — rounds or factors.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_layer_gruen<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        lambda: &math::field::element::FieldElement<E>,
+        claim: math::field::element::FieldElement<E>,
+        tail: usize,
+        today: Option<&crate::program::Program<E>>,
+        mut challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        use crate::gkr_gruen::{self as gruen, Chain};
+        use crate::whir_split::{self, add_tick, tick};
+        use math::field::element::FieldElement;
+
+        let t = tick();
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let raw_lambda: [u64; 3] = ext3_raw(lambda)?;
+        let lowered = match today {
+            Some(program) => Some(lower(program)?),
+            None => None,
+        };
+        let low = tail.max(1).trailing_zeros() as usize;
+        add_tick(&whir_split::GKR_LOWER, t);
+        let input_layer = layer + 1 == self.num_layers;
+        let rebuilds = input_layer && self.rebuild.is_some();
+        let t = tick();
+        let session = if rebuilds {
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            rebuilt.gruen(&raw_point, low)
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_gruen(layer, &raw_point, low)
+        };
+        let Ok(mut session) = session else {
+            return None;
+        };
+        // Today's session beside it, when the card has room for its `eq` table.
+        let shadow = match lowered.as_ref() {
+            Some(lowered) => {
+                let room = math_cuda::device::reserve(session.shadow_bytes(lowered.num_slots));
+                let made = room.as_ref().and_then(|_| {
+                    session
+                        .shadow(
+                            &lowered.nodes,
+                            &lowered.consts,
+                            lowered.num_slots,
+                            lowered.root_slot,
+                        )
+                        .ok()
+                });
+                if made.is_none() {
+                    gruen::note_xcheck_skipped();
+                }
+                made.map(|shadow| (shadow, room))
+            }
+            None => None,
+        };
+        if rebuilds {
+            add_tick(&whir_split::GKR_REBUILD, t);
+            whir_split::bump(&whir_split::GKR_REBUILDS);
+        } else {
+            add_tick(&whir_split::GKR_SESSION, t);
+        }
+        let rounds_here = session.rounds();
+        let lefts = gruen::inverse_lefts(&point[..rounds_here]);
+        let chain = Chain::new(claim);
+        let mut nodes = Vec::with_capacity(9);
+        for node in 1..=3u64 {
+            nodes.extend_from_slice(&ext3_raw(&FieldElement::<E>::from(node))?);
+        }
+
+        // Past here the transcript moves: the host path is no longer an option.
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let mut shadow = shadow;
+        let t = tick();
+        let outcome = (|| -> Result<_, crate::Error> {
+            let mut chain = chain.ok_or(failed("gruen chain"))?;
+            let mut rounds = Vec::with_capacity(rounds_here);
+            let mut challenges: Vec<FieldElement<E>> = Vec::with_capacity(rounds_here);
+            let mut previous: Option<[u64; 3]> = None;
+            for (j, left) in lefts.iter().enumerate() {
+                let want_h0 = left.is_none();
+                let sums = session
+                    .round(previous.as_ref(), &raw_lambda, want_h0)
+                    .map_err(|_| failed("gruen round"))?;
+                let sum = |k: usize| ext3_from_raw::<E>(&sums[k * 3..k * 3 + 3]);
+                let h0 = want_h0.then(|| sum(2));
+                if want_h0 {
+                    gruen::note_direct_h0();
+                }
+                let mut message = chain
+                    .message(&point[j], left.as_ref(), &sum(0), &sum(1), h0.as_ref())
+                    .ok_or(failed("gruen message"))?;
+                if j == 0 && gruen::gkr_gruen_fault() {
+                    // `s(0) = claim − s(1)`: what the claim then implies.
+                    message.sent[0] += FieldElement::<E>::one();
+                    message.s0 = &message.s0 - FieldElement::<E>::one();
+                }
+                if let Some((shadow, _)) = shadow.as_mut() {
+                    if let Some(r) = previous.as_ref() {
+                        shadow
+                            .fold_first(1, r)
+                            .map_err(|_| failed("gruen shadow"))?;
+                    }
+                    let want: Vec<FieldElement<E>> = shadow
+                        .round(&nodes)
+                        .map_err(|_| failed("gruen shadow"))?
+                        .chunks_exact(3)
+                        .map(ext3_from_raw::<E>)
+                        .collect();
+                    let parted = want != message.sent; // XCHECK-COMPARE
+                    if parted {
+                        return Err(failed("gkr gruen xcheck"));
+                    }
+                }
+                let z = challenge(&message.sent);
+                chain.advance(&point[j], &message, &z);
+                previous = Some(ext3_raw(&z).ok_or(failed("challenge"))?);
+                rounds.push(crate::sumcheck::RoundProof {
+                    evaluations: message.sent,
+                });
+                challenges.push(z);
+                SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok((rounds, challenges, chain, previous))
+        })();
+        add_tick(&whir_split::GKR_ROUNDS, t);
+        let (rounds, challenges, chain, previous) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+        let t = tick();
+        let Ok(values) = session.finish(previous.as_ref()) else {
+            return Some(Err(failed("layer values")));
+        };
+        add_tick(&whir_split::GKR_VALUES, t);
+        let t = tick();
+        let cells = 1usize << session.low();
+        if values.len() != 4 * cells * 3 {
+            return Some(Err(failed("layer factors")));
+        }
+        let e_lo = crate::eq::eq_evals(&point[rounds_here..]);
+        let mut factors = Vec::with_capacity(5);
+        let eq: Vec<FieldElement<E>> = e_lo.iter().map(|v| chain.kappa() * v).collect();
+        let Ok(eq) = crate::mle::Mle::new(eq) else {
+            return Some(Err(failed("layer factors")));
+        };
+        factors.push(eq);
+        for half in values.chunks_exact(cells * 3) {
+            let Ok(table) =
+                crate::mle::Mle::new(half.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            else {
+                return Some(Err(failed("layer factors")));
+            };
+            factors.push(table);
+        }
+        add_tick(&whir_split::GKR_FACTORS, t);
+        let checked = match shadow.as_mut() {
+            Some((shadow, _)) => {
+                if let Some(r) = previous.as_ref()
+                    && shadow.fold_first(1, r).is_err()
+                {
+                    return Some(Err(failed("gruen shadow")));
+                }
+                let Ok(want) = shadow.values_gathered() else {
+                    return Some(Err(failed("gruen shadow")));
+                };
+                let same = want.len() == 5
+                    && want.iter().zip(&factors).all(|(raw, table)| {
+                        raw.len() == table.len() * 3
+                            && raw
+                                .chunks_exact(3)
+                                .zip(table.evals())
+                                .all(|(cell, value)| ext3_from_raw::<E>(cell) == *value)
+                    });
+                if !same {
+                    return Some(Err(failed("gkr gruen xcheck")));
+                }
+                true
+            }
+            None => false,
+        };
+        gruen::note_layer(rounds_here as u64, checked);
+        whir_split::bump(&whir_split::GKR_LAYERS);
+        whir_split::bump(&whir_split::GKR_GRUEN);
+        if checked {
+            whir_split::bump(&whir_split::GKR_GRUEN_XCHECKED);
+        }
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Ok((rounds, challenges, factors)))
     }

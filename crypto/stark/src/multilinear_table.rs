@@ -2427,6 +2427,8 @@ mod tests {
         lean_program_xchecks: u64,
         /// Zerocheck sessions that ran D-ARGUE stage 1's fused rounds.
         fused: u64,
+        /// Device GKR layers that ran Gruen's rounds (D-ARGUE S1-3).
+        gruen: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
@@ -2448,6 +2450,7 @@ mod tests {
         tail: bool,
         program: bool,
         fused: bool,
+        gruen: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2457,6 +2460,7 @@ mod tests {
         tail: false,
         program: false,
         fused: false,
+        gruen: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2492,7 +2496,9 @@ mod tests {
         multilinear::gpu_fused::force_argue_fused(Some(knobs.fused));
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(Some(knobs.fused));
+        multilinear::gkr_gruen::force_argue_gkr_gruen(Some(knobs.gruen));
         let fused = multilinear::gpu_fused::fused_sessions();
+        let gruen = multilinear::gkr_gruen::gruen_layers();
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2520,7 +2526,9 @@ mod tests {
             lean_programs: multilinear::gpu::lean_programs() - demand,
             lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
             fused: multilinear::gpu_fused::fused_sessions() - fused,
+            gruen: multilinear::gkr_gruen::gruen_layers() - gruen,
         });
+        multilinear::gkr_gruen::force_argue_gkr_gruen(None);
         multilinear::gpu_fused::force_argue_fused(None);
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(None);
@@ -3602,6 +3610,139 @@ mod tests {
         eprintln!("argue lean tail: the wrong tail was refused: {verdict:?}");
     }
 
+    /// ★ `LAMBDA_VM_ARGUE_GKR_GRUEN` (D-ARGUE S1-3) moves no byte of the proof,
+    /// alone, beside the fused zerocheck (the production default), and with
+    /// every other argue knob: the same canonical bytes, table by table and
+    /// whole, the same transcript and next challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, no GKR
+    /// layer runs Gruen's rounds; on, CPU's and ADD's card layers do. ⚠ Run it
+    /// alone (`--exact`): the counters are process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_the_gkr_gruen_rounds() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let device = a_device();
+        for (base, arms) in [
+            (
+                TODAY,
+                vec![
+                    Knobs {
+                        gruen: true,
+                        ..TODAY
+                    },
+                    Knobs {
+                        columns: true,
+                        tables: true,
+                        reads: true,
+                        tail: true,
+                        gruen: true,
+                        ..TODAY
+                    },
+                ],
+            ),
+            (
+                Knobs {
+                    fused: true,
+                    ..TODAY
+                },
+                vec![Knobs {
+                    columns: true,
+                    tables: true,
+                    reads: true,
+                    fused: true,
+                    gruen: true,
+                    ..TODAY
+                }],
+            ),
+        ] {
+            let mut today = prove_tall(&airs, &columns, base);
+            verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+            assert_eq!(today.gruen, 0, "{base:?}: no Gruen layer");
+            let today_state = today.transcript.state();
+            let today_next = today.transcript.sample_field_element();
+            for knobs in arms {
+                let mut arm = prove_tall(&airs, &columns, knobs);
+                if device {
+                    assert!(
+                        arm.gruen > 0,
+                        "{knobs:?}: the card layers ran Gruen's rounds"
+                    );
+                    eprintln!("argue gkr gruen: {knobs:?}: {} Gruen layers", arm.gruen);
+                } else {
+                    assert_eq!(arm.gruen, 0, "{knobs:?}: no device, no Gruen layer");
+                    eprintln!("argue gkr gruen: no device; today's layer rounds ran");
+                }
+                assert_eq!(
+                    first_table_that_differs(&today.proof, &arm.proof),
+                    None,
+                    "{knobs:?}: a table's argument changed"
+                );
+                assert_eq!(
+                    bincode::serialize(&today.proof).unwrap(),
+                    bincode::serialize(&arm.proof).unwrap(),
+                    "{knobs:?}: the proofs' canonical bytes differ"
+                );
+                assert_eq!(
+                    today_state,
+                    arm.transcript.state(),
+                    "{knobs:?}: the transcripts parted"
+                );
+                assert_eq!(
+                    today_next,
+                    arm.transcript.sample_field_element(),
+                    "{knobs:?}: the next challenge moved"
+                );
+                verify_tall(&arm.committed, &arm.proof)
+                    .unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+            }
+        }
+    }
+
+    /// ⛔ The identity above can fail. With the fault armed, every Gruen layer
+    /// adds one to its first round's `s(1)`. The proof must then differ from
+    /// today's at CPU, the first table argued, and be refused by GKR's layer
+    /// check. Needs a device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_gkr_gruen_round_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue gkr gruen: SKIPPED, no device to corrupt a round on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, TODAY);
+        multilinear::gkr_gruen::force_gkr_gruen_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    gruen: true,
+                    ..TODAY
+                },
+            )
+        }));
+        multilinear::gkr_gruen::force_gkr_gruen_fault(false);
+        let faulted = faulted.expect("the faulted arm proves");
+        assert!(faulted.gruen > 0, "the fault is on the Gruen path");
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        let verdict = verify_tall(&faulted.committed, &faulted.proof);
+        assert!(
+            matches!(verdict, Err(MlError::LayerRelationMismatch { .. })),
+            "GKR's layer check must refuse it, got {verdict:?}"
+        );
+        eprintln!("argue gkr gruen: the wrong round was refused: {verdict:?}");
+    }
+
     /// A tall table's zerocheck batch as [`prove`] builds it — the constraint
     /// rule beside the bus's two, combined — at arbitrary challenges: the
     /// program a device's rounds walk.
@@ -3690,6 +3831,7 @@ mod tests {
             tail: true,
             program: true,
             fused: false,
+            gruen: false,
         };
         for knobs in [
             Knobs {

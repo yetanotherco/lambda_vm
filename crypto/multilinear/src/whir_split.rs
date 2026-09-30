@@ -430,6 +430,12 @@ pub static TAILS_LEAN: Counter = Counter::new();
 /// Of [`TAILS_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
 /// against the generic rounds and found equal.
 pub static TAILS_XCHECKED: Counter = Counter::new();
+/// Of [`GKR_LAYERS`], the ones that ran Gruen's rounds
+/// (`LAMBDA_VM_ARGUE_GKR_GRUEN`, D-ARGUE S1-3) — the mechanism line of that knob.
+pub static GKR_GRUEN: Counter = Counter::new();
+/// Of [`GKR_GRUEN`], the ones `LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK` compared with
+/// today's rounds and found equal.
+pub static GKR_GRUEN_XCHECKED: Counter = Counter::new();
 
 /// A prove's device GKR layers, split: seconds per region, in the order a
 /// layer runs them, and the counts they are over.
@@ -449,6 +455,8 @@ pub struct GkrSplit {
     pub layers: u64,
     pub rebuilds: u64,
     pub tail_rounds: u64,
+    pub gruen: u64,
+    pub gruen_xchecked: u64,
 }
 
 impl GkrSplit {
@@ -469,6 +477,8 @@ impl GkrSplit {
             layers: GKR_LAYERS.take(),
             rebuilds: GKR_REBUILDS.take(),
             tail_rounds: GKR_TAIL_ROUNDS.take(),
+            gruen: GKR_GRUEN.take(),
+            gruen_xchecked: GKR_GRUEN_XCHECKED.take(),
         }
     }
 
@@ -1143,7 +1153,8 @@ impl ProverSplit {
     /// The GKR line, milliseconds, stamped as the split line is:
     /// `ARGUE GKR #k: layers on the card N (rebuilt R) · host tail rounds T ||
     /// between layers B ms, M µs a layer: lambda · program · lower · session ·
-    /// factors · tail (transcript) · close || rebuild · rounds · values (ms)`.
+    /// factors · tail (transcript) · close || rebuild · rounds · values (ms) ||
+    /// gruen G (xchecked X)` — the last part D-ARGUE S1-3's layers.
     pub fn gkr_line(&self) -> String {
         let g = &self.gkr;
         let ms = |secs: f64| secs * 1e3;
@@ -1157,7 +1168,8 @@ impl ProverSplit {
              rounds {tail_rounds} || between layers {between:.2} ms, {mean:.1} µs a layer: lambda \
              {lambda:.2} · program {program:.2} · lower {lower:.2} · session {session:.2} · \
              factors {factors:.2} · tail {tail:.2} (transcript {heard:.2}) · close {close:.2} || \
-             rebuild {rebuild:.2} · rounds {rounds:.2} · values {values:.2} (ms)",
+             rebuild {rebuild:.2} · rounds {rounds:.2} · values {values:.2} (ms) || gruen \
+             {gruen} (xchecked {gruen_xchecked})",
             who = self.who(),
             tainted = if self.overlapped {
                 " ⛔OVERLAPPED"
@@ -1179,6 +1191,8 @@ impl ProverSplit {
             rebuild = ms(g.rebuild),
             rounds = ms(g.rounds),
             values = ms(g.values),
+            gruen = g.gruen,
+            gruen_xchecked = g.gruen_xchecked,
         )
     }
 }
@@ -1838,6 +1852,8 @@ mod tests {
                 layers: 200,
                 rebuilds: 12,
                 tail_rounds: 1800,
+                gruen: 150,
+                gruen_xchecked: 140,
             },
             ..Default::default()
         };
@@ -1847,7 +1863,7 @@ mod tests {
             "ARGUE GKR #5: layers on the card 200 (rebuilt 12) · host tail rounds 1800 || \
              between layers 50.00 ms, 250.0 µs a layer: lambda 2.00 · program 1.00 · lower 3.00 · \
              session 10.00 · factors 0.50 · tail 30.00 (transcript 20.00) · close 3.50 || \
-             rebuild 50.00 · rounds 200.00 · values 4.00 (ms)"
+             rebuild 50.00 · rounds 200.00 · values 4.00 (ms) || gruen 150 (xchecked 140)"
         );
         let global = ProverSplit {
             index: GLOBAL_INDEX,
@@ -1859,7 +1875,7 @@ mod tests {
             "ARGUE GKR GLOBAL (in base) ⛔OVERLAPPED: layers on the card 0 (rebuilt 0) · host tail \
              rounds 0 || between layers 0.00 ms, 0.0 µs a layer: lambda 0.00 · program 0.00 · \
              lower 0.00 · session 0.00 · factors 0.00 · tail 0.00 (transcript 0.00) · close 0.00 \
-             || rebuild 0.00 · rounds 0.00 · values 0.00 (ms)"
+             || rebuild 0.00 · rounds 0.00 · values 0.00 (ms) || gruen 0 (xchecked 0)"
         );
     }
 

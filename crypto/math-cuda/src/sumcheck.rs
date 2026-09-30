@@ -514,6 +514,36 @@ impl SumcheckSession {
         Ok(())
     }
 
+    /// Binds the round's variable to `r` in the first `count` factors only,
+    /// and takes the cube down with them: for a shadow whose other factors a
+    /// leader folds where they lie ([`crate::gkr::GruenLayer::shadow`]).
+    pub fn fold_first(&mut self, count: usize, r: &[u64]) -> Result<()> {
+        assert_eq!(r.len(), 3, "an ext3 challenge");
+        assert!(self.len >= 2, "a fold needs a variable to bind");
+        assert!(count <= self.width, "the factors to fold are the session's");
+        let be = backend()?;
+        let half = (self.len / 2) as u64;
+        self.stream.memcpy_htod(r, &mut self.r_dev)?;
+        let total = count as u64 * half;
+        let grid = total.div_ceil(BLOCK_DIM as u64).min(4096) as u32;
+        let width = count as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&be.sumcheck_fold_ext3)
+                .arg(&mut self.factor_ptrs)
+                .arg(&half)
+                .arg(&width)
+                .arg(&self.r_dev)
+                .launch(LaunchConfig {
+                    grid_dim: (grid.max(1), 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        self.len /= 2;
+        Ok(())
+    }
+
     /// Whether [`download`](Self::download) can read the factors back: only a
     /// session that uploaded them knows their layout.
     pub fn can_download(&self) -> bool {

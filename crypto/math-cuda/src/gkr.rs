@@ -391,3 +391,320 @@ pub fn sumcheck_over_layer(
 pub fn padded_peak_bytes(real: usize, full: usize) -> u64 {
     ((2 * real + full).max(2 * full)) as u64 * 24
 }
+
+/// Blocks a Gruen round launches at most; past it the grid-stride loop takes
+/// over. A few blocks an SM on a 170-SM card, and the partials stay small.
+const GRUEN_MAX_GRID: u32 = 2048;
+
+/// One GKR layer's device rounds with Gruen's split (D-ARGUE S1-3): the round
+/// sums `H(1)` and `H(2)` of `h = p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi` under
+/// `eq(u_{>j}, ·)`, and the host puts `eq(u_{≤j})` back in (see
+/// `multilinear::gkr_gruen`). The fold by a round's challenge rides the next
+/// round's pass, and the weight is two small tables a layer instead of an `eq`
+/// table the size of the layer folded every round.
+///
+/// Folds the layer's halves in place, as [`sumcheck_over_layer`]'s session
+/// does: GKR visits each layer once.
+pub struct GruenLayer {
+    stream: Arc<CudaStream>,
+    /// The buffers the halves live in, kept alive; the kernels see addresses.
+    p: Arc<CudaSlice<u64>>,
+    q: Arc<CudaSlice<u64>>,
+    p_at: u64,
+    q_at: u64,
+    /// Cells in each half: `2^m`.
+    half: usize,
+    /// The point's limbs, `m` ext3 values.
+    point: Vec<u64>,
+    /// `L`: the variables left to the host, `2^L` cells.
+    low: usize,
+    /// `J = m − L`: the rounds this layer runs here.
+    rounds: usize,
+    /// Every `eq` level ([`gkr_eq_levels_ext3`'s layout](crate) — `e_lo`, then
+    /// one `e_hi` level per round).
+    eq: CudaSlice<u64>,
+    partials: CudaSlice<u64>,
+    sums: CudaSlice<u64>,
+    /// Rounds run so far.
+    done: usize,
+}
+
+impl GruenLayer {
+    /// Over one layer's halves: `p` and `q` of `2^num_vars` cells each, the
+    /// point `m = num_vars − 1` ext3 values, and at most `low` variables left
+    /// to the host (fewer when the layer is smaller).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stream: &Arc<CudaStream>,
+        p: &Arc<CudaSlice<u64>>,
+        q: &Arc<CudaSlice<u64>>,
+        num_vars: usize,
+        point: &[u64],
+        low: usize,
+    ) -> Result<Self> {
+        assert!(num_vars > 0, "the output layer has nothing to bind");
+        let m = num_vars - 1;
+        assert_eq!(point.len(), m * 3, "the point spans the halves");
+        let half = 1usize << m;
+        assert_eq!(p.len(), 2 * half * 3, "p spans the layer");
+        assert_eq!(q.len(), 2 * half * 3, "q spans the layer");
+        let low = low.min(m);
+        let rounds = m - low;
+
+        let be = backend()?;
+        let cells = (1usize << low) + (1usize << rounds) - 1;
+        // SAFETY: the kernel writes every cell.
+        let mut eq = unsafe { crate::device::alloc_or_trim::<u64>(stream, cells * 3) }?;
+        let point_dev = crate::device::htod_or_trim(
+            stream,
+            if point.is_empty() { &[0u64][..] } else { point },
+        )?;
+        let low_arg = low as u32;
+        let rounds_arg = rounds as u32;
+        unsafe {
+            stream
+                .launch_builder(&be.gkr_eq_levels_ext3)
+                .arg(&point_dev)
+                .arg(&low_arg)
+                .arg(&rounds_arg)
+                .arg(&mut eq)
+                .launch(LaunchConfig {
+                    grid_dim: ((cells as u64).div_ceil(256).min(4096) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let partials = unsafe {
+            crate::device::alloc_or_trim::<u64>(stream, 3 * GRUEN_MAX_GRID as usize * 3)
+        }?;
+        let sums = crate::device::alloc_zeros_or_trim::<u64>(stream, 3 * 3)?;
+        let p_at = {
+            let (at, _guard) = p.device_ptr(stream);
+            at
+        };
+        let q_at = {
+            let (at, _guard) = q.device_ptr(stream);
+            at
+        };
+        Ok(Self {
+            stream: stream.clone(),
+            p: p.clone(),
+            q: q.clone(),
+            p_at,
+            q_at,
+            half,
+            point: point.to_vec(),
+            low,
+            rounds,
+            eq,
+            partials,
+            sums,
+            done: 0,
+        })
+    }
+
+    /// The rounds this layer runs on the card, `J`.
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
+
+    /// The variables left to the host, `L`: the halves come back over `2^L`.
+    pub fn low(&self) -> usize {
+        self.low
+    }
+
+    /// The next round's sums, `H(1)` and `H(2)` — and `H(0)` third with
+    /// `want_h0` — three u64 each. `fold_by` is the previous round's challenge,
+    /// and every round but the first has one.
+    pub fn round(
+        &mut self,
+        fold_by: Option<&[u64; 3]>,
+        lambda: &[u64; 3],
+        want_h0: bool,
+    ) -> Result<Vec<u64>> {
+        assert!(self.done < self.rounds, "every card round has run");
+        assert_eq!(
+            fold_by.is_some(),
+            self.done > 0,
+            "a challenge to fold by after the first round"
+        );
+        let be = backend()?;
+        let m = self.half.trailing_zeros() as usize;
+        let quarter = 1u64 << (m - self.done - 1);
+        let (grid, block) = gruen_shape(quarter);
+        let rows = if want_h0 { 3u32 } else { 2 };
+        let s = fold_by.copied().unwrap_or([0; 3]);
+        let fold = u32::from(fold_by.is_some());
+        let at =
+            (1usize << self.low) + (1usize << self.rounds) - (1usize << (self.rounds - self.done));
+        let e_lo = self.eq.slice(0..(1usize << self.low) * 3);
+        let e_hi = self
+            .eq
+            .slice(at * 3..(at + (1usize << (self.rounds - 1 - self.done))) * 3);
+        let half = self.half as u64;
+        let low = self.low as u32;
+        let want = u32::from(want_h0);
+        unsafe {
+            self.stream
+                .launch_builder(&be.gkr_round_gruen)
+                .arg(&self.p_at)
+                .arg(&self.q_at)
+                .arg(&half)
+                .arg(&quarter)
+                .arg(&fold)
+                .arg(&s[0])
+                .arg(&s[1])
+                .arg(&s[2])
+                .arg(&lambda[0])
+                .arg(&lambda[1])
+                .arg(&lambda[2])
+                .arg(&e_hi)
+                .arg(&e_lo)
+                .arg(&low)
+                .arg(&want)
+                .arg(&mut self.partials)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: block * 3 * 8,
+                })?;
+            let reduce_block = 256u32;
+            self.stream
+                .launch_builder(&be.sum_partials_ext3)
+                .arg(&self.partials)
+                .arg(&(grid as u64))
+                .arg(&mut self.sums)
+                .launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (reduce_block, 1, 1),
+                    shared_mem_bytes: reduce_block * 3 * 8,
+                })?;
+        }
+        let sums = self
+            .stream
+            .clone_dtoh(&self.sums.slice(0..rows as usize * 3))?;
+        self.stream.synchronize()?;
+        self.done += 1;
+        Ok(sums)
+    }
+
+    /// After the last card round: the four halves bound to its challenge
+    /// (`fold_by`, `None` for a layer that ran no card round), over `2^L`
+    /// cells, laid end to end — `p_lo, p_hi, q_lo, q_hi`, three u64 a cell.
+    /// Also left in place, where a [`shadow`](Self::shadow) reads them.
+    pub fn finish(&mut self, fold_by: Option<&[u64; 3]>) -> Result<Vec<u64>> {
+        assert_eq!(self.done, self.rounds, "the card's rounds are done");
+        assert_eq!(
+            fold_by.is_some(),
+            self.rounds > 0,
+            "a challenge to fold by after a card round"
+        );
+        let be = backend()?;
+        let cells = 1u64 << self.low;
+        // SAFETY: the kernel writes every cell.
+        let mut out =
+            unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, 4 * cells as usize * 3) }?;
+        let s = fold_by.copied().unwrap_or([0; 3]);
+        let fold = u32::from(fold_by.is_some());
+        let half = self.half as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&be.gkr_gruen_finish)
+                .arg(&self.p_at)
+                .arg(&self.q_at)
+                .arg(&half)
+                .arg(&cells)
+                .arg(&fold)
+                .arg(&s[0])
+                .arg(&s[1])
+                .arg(&s[2])
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: ((4 * cells).div_ceil(256).min(4096) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let values = self.stream.clone_dtoh(&out)?;
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+
+    /// Today's session over the same halves, for checking these rounds against
+    /// it (`LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK`): factor 0 its own `eq(u, ·)`
+    /// table, factors 1..5 the halves where they lie. Run its round after this
+    /// layer's round `j` has folded the halves, with
+    /// [`SumcheckSession::fold_first`] keeping its `eq` in step.
+    pub fn shadow(
+        &self,
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+    ) -> Result<SumcheckSession> {
+        let eq = Arc::new(crate::sumcheck::eq_table_ext3(
+            &self.stream,
+            &self.point,
+            self.half,
+        )?);
+        let eq_at = {
+            let (at, _guard) = eq.device_ptr(&self.stream);
+            at
+        };
+        let stride = (self.half * 3 * 8) as u64;
+        let addresses = vec![
+            eq_at,
+            self.p_at,
+            self.p_at + stride,
+            self.q_at,
+            self.q_at + stride,
+        ];
+        SumcheckSession::from_device(
+            self.stream.clone(),
+            &addresses,
+            self.half,
+            vec![eq, self.p.clone(), self.q.clone()],
+            nodes,
+            consts,
+            num_slots,
+            root_slot,
+        )
+    }
+
+    /// Bytes [`shadow`](Self::shadow) allocates: the `eq` table and today's
+    /// round scratch.
+    pub fn shadow_bytes(&self, num_slots: usize) -> u64 {
+        self.half as u64 * 24 + SumcheckSession::scratch_bytes(self.half, num_slots)
+    }
+}
+
+/// A Gruen round's launch: 256-thread blocks for a wide cube, narrower ones —
+/// down to a warp — for a narrow one, and at most [`GRUEN_MAX_GRID`] blocks.
+fn gruen_shape(quarter: u64) -> (u32, u32) {
+    let block = quarter.next_power_of_two().clamp(32, 256) as u32;
+    let grid = quarter
+        .div_ceil(block as u64)
+        .clamp(1, GRUEN_MAX_GRID as u64) as u32;
+    (grid, block)
+}
+
+impl DeviceFractionTree {
+    /// Layer `layer`'s Gruen rounds ([`GruenLayer`]), at most `low` variables
+    /// left to the host.
+    pub fn layer_gruen(&self, layer: usize, point: &[u64], low: usize) -> Result<GruenLayer> {
+        let level = match self.layers.get(layer) {
+            Some(level) => level,
+            None => self.input.as_ref().ok_or(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            ))?,
+        };
+        GruenLayer::new(&self.stream, &level.p, &level.q, level.num_vars, point, low)
+    }
+}
+
+impl InputLayer {
+    /// The input layer's Gruen rounds, the ones that end GKR.
+    pub fn gruen(&self, point: &[u64], low: usize) -> Result<GruenLayer> {
+        GruenLayer::new(&self.stream, &self.p, &self.q, self.num_vars, point, low)
+    }
+}
