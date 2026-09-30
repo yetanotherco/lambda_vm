@@ -860,3 +860,64 @@ The lead's decisions after job 290:
   - `trace_upload_identity` (off, on, off: identical bytes; control; mutation);
   - the production tree at the default and at `zerotail`, each with its own path lines and the 5 ids =
     `ids-1010-f5.txt` (md5 5cc1445a, which job 290's A arm also printed).
+
+### 8.5 Results (FAST job 291, 16:01:43–16:08:53Z; written 2026-09-30 16:55Z)
+
+- **Measured at `fix2/1010-zerotail` @ `d9aab005a`, on 73342bc66.**
+  - The landing candidate `land/1010-zerotail` @ `aa332efef` sits on 7c8272701. It differs from the measured sha only
+    by the whole-trees commits (3332c1bf3..7c8272701), and its change lines are identical to d9aab005a's.
+  - The upload term does not depend on tree retention.
+  - FAST2 job 186 gated d9aab005a (it started at 16:14:04Z, before the rebase was asked for). No gate has run at
+    aa332efef.
+
+#### Part 1, the microbench [V: `microbench.log`] — stage 1b **WORTH IT**
+
+| columns | pageable GB/s | pinned GB/s | pinned × 2 streams | pinned ÷ pageable |
+|---|---|---|---|---|
+| 256 KiB × 8192 | 21.1 | 47.9 | 47.1 | 2.27× |
+| 1 MiB × 2048 | 22.9 | 54.5 | 53.9 | 2.38× |
+| 4 MiB × 512 | 23.0 | 57.0 | 56.9 | 2.48× |
+| 16 / 32 / 64 MiB | 23.0 | 57.7–57.9 | 57.6–57.8 | 2.50–2.51× |
+| **epoch 0's 393 columns (2.06 GB)** | **23.0** | **57.3** | **57.2** | **2.49×** |
+
+- The stop rule (≥ 1.3×) is met 2.49×, so D-TRACE's stage 1b (the producer writes pinned slots) is worth designing.
+- A second stream adds nothing: one stream already fills the link.
+- The in-proof pageable rate is 18.9–19.0 GB/s against 23.0 alone, so the proof's own host load costs pageable
+  ≈ 18 %.
+- At 57 GB/s the base's 33.84 GB would take ≈ 0.59 s against today's 1.79 s [E, if the producer's writes into pinned
+  memory cost the prover nothing].
+
+#### Part 2, the A/B [V: `readout.txt`; per-phase sums from the tree logs] — **NO EFFECT, Δ whole −0.08 s**
+
+| arm | whole | base (exact) | Σ upload | Σ commit | Σ argue | Σ open | L1N2 harvest / artifacts |
+|---|---|---|---|---|---|---|---|
+| A wt1294 | 38.6 | 29.021 | 1.780 | 9.08 | 11.58 | 4.88 | **2.63** / 0.29 |
+| B wt1295 | 38.4 | 28.942 | 1.531 | 8.89 | 11.69 | 4.93 | 2.06 / 0.27 |
+| B wt1296 | 38.4 | 29.106 | 1.521 | 8.88 | 11.84 | 4.93 | 2.10 / 0.28 |
+| A wt1297 | 38.6 | 29.238 | 1.758 | 9.11 | 11.70 | 4.99 | 2.18 / 0.29 |
+| A wt1298 | 38.5 | 29.114 | 1.790 | 9.13 | 11.63 | 4.91 | **2.43** / 0.28 |
+| B wt1299 | 38.9 | 29.128 | 1.531 | 8.87 | 11.78 | 4.97 | 2.06 / **0.85** |
+| B wt1300 | 38.4 | 29.097 | 1.538 | 8.89 | 11.72 | 4.98 | 2.18 / 0.27 |
+| A wt1301 | 38.7 | 29.099 | 1.797 | 9.15 | 11.68 | 4.86 | **2.61** / **0.62** |
+
+- **Mechanism rows, all PASS:**
+  - M2: 7.82 GB not sent in each B arm.
+  - M3: Δ upload −0.251 s, on the edge of [−0.50, −0.25].
+  - M4: B's sent rate 17.0 GB/s, on the floor (A 19.0).
+  - M5: scan on the path 0.000 s.
+  - M6: head Δ −0.006 s.
+- **M7 FAILs:** Δ base −0.05 s.
+- **The commit gained what the upload saved:** Σ commit Δ −0.235 s, with every B arm below every A arm.
+- **The argue gave most of it back:** Σ argue Δ +0.11 s (A 11.58–11.70, B 11.69–11.84; three of four B arms above
+  A's maximum), and open +0.04 s (grind noise).
+  - The argue's +0.11 s is either noise (t ≈ 2.6 on four arms each) or the argue absorbing the earlier start into
+    more overlap with the producer's prep and build [I]. G6 saw no descheduling of the prover thread, so
+    bandwidth, not CPU, would be the channel. No sampler ran in this job, so it cannot tell which.
+- **Why M3 fell short of −0.41 s:** B's sent rate dropped from 19.0 to 17.0 GB/s. The per-column memsets and two
+  scanners reading beside the copies are the candidates [I].
+- **Whole:** A 38.60 (spread 0.20), B 38.52 (spread 0.50), Δ −0.08 s; per ABBA −0.20 / +0.05.
+- **L1N2:** the anomaly appeared in 4 of 8 arms, **3 A and 1 B**. It is box noise, not the knob and not pinned
+  memory, and wt1291's reading in job 290 was the same noise.
+- **Decision by §8.3's rule:** NO EFFECT, so `zerotail` does not land. The stop rule makes stage 1b the live upload
+  lever. It should be sized against the in-proof 19 GB/s with the argue-overlap caveat above, and D-TRACE owns its
+  design.
