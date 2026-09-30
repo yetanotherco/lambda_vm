@@ -132,9 +132,9 @@ tag = "COMMIT_DEFER"
 kind = "interaction"
 input = ["Word", "DWordWL", "DWordWL", "DWordWL"]
 
-# MEMMOVE_NEXT[timestamp, src, dst, count, is_set, is_commit]
+# COPY_NEXT[timestamp, src, dst, count, is_set, is_commit]
 [[signatures]]
-tag = "MEMMOVE_NEXT"
+tag = "COPY_NEXT"
 kind = "interaction"
 input = ["Word", "DWordWL", "DWordWL", "DWordWL", "Bit", "Bit"]
 
@@ -177,6 +177,13 @@ input = ["Byte", "Byte"]
 tag = "IS_HALF"
 kind = "interaction"
 input = ["Half"]
+
+# IS_WHH[X]
+[[signatures]]
+tag = "IS_WHH"
+kind = "template"
+input = ["DWordWHH"]
+cond = "BaseField"
 
 # IS_B20[X]
 [[signatures]]

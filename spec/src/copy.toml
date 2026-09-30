@@ -208,7 +208,7 @@ ref = "copy:c:read_count"
 [[constraints.read_input]]
 kind = "template"
 tag = "REG"
-input = [["+", 10, ["*", 244, "is_write"]], "dst_res", "timestamp"]
+input = [["+", 10, ["*", 244, "is_write"]], ["cast", "dst_res", "DWordWL"], "timestamp"]
 output = "dst"
 cond = "first"
 ref = "copy:c:read_dst"
@@ -218,14 +218,14 @@ kind = "template"
 tag = "ADD"
 input = ["dst", "count"]
 output = ["cast", "dst_res", "DWordWL"]
-cond = "is_write"
+cond = "μ"
 ref = "copy:c:dst_res_is_write"
 
 [[constraints.read_input]]
 kind = "arith"
 constraint = "$!#`is_write` => #`dst_res` = #`dst`$"
-poly = ["*", "is_write", ["-", ["idx", "dst_res", "i"], ["idx", "dst", "i"]]]
-iter = ["i", 0, 2]
+poly = ["*", "is_write", ["-", ["idx", ["cast", "dst_res", "DWordWL"], "i"], ["idx", "dst", "i"]]]
+iter = ["i", 0, 1]
 ref = "copy:c:dst_res_non_write"
 
 [[constraints.read_input]]
@@ -249,21 +249,21 @@ name = "forward"
 [[constraints.forward]]
 kind = "template"
 tag = "ADD"
-input = [["cast", "src", "DWordWL"], ["cast", "step", "DWordWL"]]
+input = [["cast", "src", "DWordWL"], ["arr", "step", 0]]
 output = ["cast", "src_incr", "DWordWL"]
 ref = "copy:c:src_incr"
 
 [[constraints.forward]]
 kind = "template"
 tag = "ADD"
-input = [["cast", "dst", "DWordWL"], ["cast", "step", "DWordWL"]]
+input = [["cast", "dst", "DWordWL"], ["arr", "step", 0]]
 output = ["cast", "dst_incr", "DWordWL"]
 ref = "copy:c:dst_incr"
 
 [[constraints.forward]]
 kind = "template"
 tag = "SUB"
-input = [["cast", "count", "DWordWL"], ["cast", "step", "DWordWL"]]
+input = [["cast", "count", "DWordWL"], ["arr", "step", 0]]
 output = ["cast", "count_decr", "DWordWL"]
 ref = "copy:c:count_decr"
 
@@ -326,20 +326,19 @@ ref = "copy:c:zc_implies_end"
 kind = "arith"
 constraint = "$#`zc` => #`count` = 0$"
 poly = ["*", "zc", ["idx", "count", "i"]]
-iter = ["i", 0, 2]
+iter = ["i", 0, 1]
 ref = "copy:c:zc_implies_count_is_zero"
 
 [[constraints.restrict_end]]
 kind = "arith"
 constraint = "$#`end` => #`zc` = 1 or floor.l #`count` / 2^16 floor.r = 0$"
-poly = ["*", "end", ["not", "zc"], ["idx", "count", "i"]]
-iter = ["i", 1, 2]
+poly = ["*", "end", ["not", "zc"], ["idx", "count", 1]]
 ref = "copy:c:end_implies_count_is_step_or_zc_upper"
 
 [[constraints.restrict_end]]
 kind = "arith"
 constraint = "$#`end` => #`zc` = 1 or #`count[0]` = #`step`$"
-poly = ["*", "end", ["not", "zc"], ["-", ["idx", "count", "0"], "step"]]
+poly = ["*", "end", ["not", "zc"], ["-", ["idx", "count", 0], "step"]]
 ref = "copy:c:end_implies_count_is_step_or_zc_lower"
 
 [[constraint_groups]]
