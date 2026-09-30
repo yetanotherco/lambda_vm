@@ -1074,18 +1074,20 @@ where
     // (its output read here, at the consume site). Prefetch never changes WHAT
     // is built — same factors, same (z, alpha, beta) — only when, so a prebuilt
     // tree yields byte-for-byte the same proof as building it here now.
+    // The tree where the factors reside, the lift timed on its own.
+    let resident_tree = || {
+        let lift = tick();
+        let resident = table.trace.reside_from_columns();
+        if let Some(factors) = resident.as_ref() {
+            factors.tree_sync();
+        }
+        lap(&split::TREE_LIFT, lift);
+        resident.and_then(|resident| logup::resident_tree(&interactions, resident))
+    };
     let t = tick();
     let tree = match prebuilt {
         Some(tree) => tree,
-        None => match {
-            let lift = tick();
-            let resident = table.trace.reside_from_columns();
-            if let Some(factors) = resident.as_ref() {
-                factors.tree_sync();
-            }
-            lap(&split::TREE_LIFT, lift);
-            resident.and_then(|resident| logup::resident_tree(&interactions, resident))
-        } {
+        None => match resident_tree() {
             Some(tree) => tree,
             // No device took them, so the host builds what it needs: the
             // factors, used here and by the sumcheck that follows.
