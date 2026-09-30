@@ -1,7 +1,7 @@
 # noepoch_counters.sh
 
 GPU counters for one question: why the no-epoch STARK base (block 25368371 as one proof, PR #1013)
-takes about 38 s when #1009's epoch base takes about 26 s on the same card. The script profiles
+takes about 31 s when #1009's epoch base takes about 26 s on the same card. The script profiles
 both on one binary and sends back text only. It runs on a Linux machine with an RTX 5090 whose
 performance counters are open (the 09-25 and 09-28 runs used the same machine).
 
