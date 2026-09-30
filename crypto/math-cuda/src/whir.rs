@@ -197,8 +197,10 @@ pub fn retention_futile() -> (u64, u64, bool) {
 
 /// The switch [`keep_futile`] reads.
 const KEEP_FUTILE_ENV: &str = "LFM_WHIR_KEEP_FUTILE";
-/// Evict, as before, until an A/B says otherwise.
-const KEEP_FUTILE_DEFAULT: bool = false;
+/// Keep. Job 246 (A B B A on the block): the whole run −1.25 s and the openings'
+/// tree rebuilds −1.39 s, with no layer evicted. The argue's peak in epochs 3–5
+/// rose by the layers it kept, to 25,034 of the 25,688 MiB budget.
+const KEEP_FUTILE_DEFAULT: bool = true;
 
 /// ★ Whether a budget miss the retained layers CANNOT cover leaves them held.
 ///
@@ -219,9 +221,9 @@ const KEEP_FUTILE_DEFAULT: bool = false;
 /// answer it got without this switch; only the layers a failing request would
 /// have taken with it stay.
 ///
-/// `LFM_WHIR_KEEP_FUTILE=1` keeps them and `0` evicts (the default); any other
-/// value aborts. Read once and printed once; a test forces it with
-/// [`force_keep_futile`].
+/// `LFM_WHIR_KEEP_FUTILE` unset or `1` keeps them (the default); `0` evicts
+/// them as before the switch; any other value aborts. Read once and printed
+/// once; a test forces it with [`force_keep_futile`].
 fn keep_futile() -> bool {
     match KEEP_FUTILE_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -393,7 +395,7 @@ fn evict_retained_layers(target: u64) -> u64 {
             target >> 20,
             reclaimable >> 20,
             if keep {
-                "kept (LFM_WHIR_KEEP_FUTILE=1)"
+                "kept"
             } else {
                 "evicted anyway, and the reserve still misses"
             },
@@ -534,6 +536,21 @@ mod futile_miss_tests {
         assert!(
             evicts(900 * MIB, 0, true),
             "switch on: nothing held, so the walk runs (and only prunes)"
+        );
+    }
+
+    /// ★ The default keeps the layers through a futile miss (job 246). Going
+    /// back is `LFM_WHIR_KEEP_FUTILE=0` at run time; a change here moves the
+    /// default for every run, and must fail this first.
+    #[test]
+    fn the_default_keeps_the_layers_through_a_futile_miss() {
+        assert!(
+            !evicts(900 * MIB, 832 * MIB, super::KEEP_FUTILE_DEFAULT),
+            "the default must keep the layers through a miss they cannot cover"
+        );
+        assert!(
+            evicts(100 * MIB, 832 * MIB, super::KEEP_FUTILE_DEFAULT),
+            "and still evict for a miss they can"
         );
     }
 }
