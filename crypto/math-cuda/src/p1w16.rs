@@ -25,8 +25,10 @@ pub const WIDTH: usize = 16;
 pub const RATE: usize = 12;
 pub const DIGEST: usize = 4;
 
-/// The two multiply variants the cubin instantiates (`p1w16.cu` VARIANTS).
-pub const VARIANTS: [u32; 2] = [0, 1];
+/// The kernel variants the cubin instantiates, in `p1w16.cu`'s order: the two
+/// multiply variants, then the limb variant under register caps of 4, 5 and 6
+/// resident 128-thread blocks per SM.
+pub const VARIANTS: [&str; 5] = ["v0", "v1", "v1b4", "v1b5", "v1b6"];
 
 /// One variant's kernels.
 pub struct Kernels {
@@ -37,10 +39,10 @@ pub struct Kernels {
     pub grind_search: CudaFunction,
 }
 
-/// The loaded module: both variants and the bench fill.
+/// The loaded module: every variant and the bench fill.
 pub struct Module {
     _module: std::sync::Arc<CudaModule>,
-    pub variants: [Kernels; 2],
+    pub variants: Vec<Kernels>,
     pub fill: CudaFunction,
 }
 
@@ -52,17 +54,17 @@ pub fn module() -> Result<&'static Module> {
     }
     let be = backend()?;
     let module = be.ctx.load_module(Ptx::from_binary(P1W16_CUBIN.to_vec()))?;
-    let kernels = |v: u32| -> Result<Kernels> {
+    let kernels = |v: &str| -> Result<Kernels> {
         Ok(Kernels {
-            permute_probe: module.load_function(&format!("p1w16_permute_probe_v{v}"))?,
-            leaves_base_coset: module.load_function(&format!("p1w16_leaves_base_coset_v{v}"))?,
-            leaves_ext3_coset: module.load_function(&format!("p1w16_leaves_ext3_coset_v{v}"))?,
-            merkle_level4: module.load_function(&format!("p1w16_merkle_level4_v{v}"))?,
-            grind_search: module.load_function(&format!("p1w16_grind_search_v{v}"))?,
+            permute_probe: module.load_function(&format!("p1w16_permute_probe_{v}"))?,
+            leaves_base_coset: module.load_function(&format!("p1w16_leaves_base_coset_{v}"))?,
+            leaves_ext3_coset: module.load_function(&format!("p1w16_leaves_ext3_coset_{v}"))?,
+            merkle_level4: module.load_function(&format!("p1w16_merkle_level4_{v}"))?,
+            grind_search: module.load_function(&format!("p1w16_grind_search_{v}"))?,
         })
     };
     let m = Module {
-        variants: [kernels(0)?, kernels(1)?],
+        variants: VARIANTS.iter().map(|v| kernels(v)).collect::<Result<_>>()?,
         fill: module.load_function("p1w16_fill")?,
         _module: module,
     };
@@ -78,10 +80,10 @@ fn cfg(threads: u64) -> LaunchConfig {
 }
 
 /// `n` permutations of `states` (`n·16` felts) on device.
-pub fn permute_many(variant: u32, states: &[u64]) -> Result<Vec<u64>> {
+pub fn permute_many(variant: usize, states: &[u64]) -> Result<Vec<u64>> {
     assert_eq!(states.len() % WIDTH, 0);
     let n = (states.len() / WIDTH) as u64;
-    let k = &module()?.variants[variant as usize];
+    let k = &module()?.variants[variant];
     let stream = backend()?.next_stream();
     let input = stream.clone_htod(states)?;
     let mut out = stream.alloc_zeros::<u64>(states.len())?;
@@ -100,10 +102,10 @@ pub fn permute_many(variant: u32, states: &[u64]) -> Result<Vec<u64>> {
 
 /// Coset leaves over a base (`ext3 = false`) or ext3 codeword: `num_leaves`
 /// digests of `block` elements each, element `t` of leaf `j` at `j + t·num_leaves`.
-pub fn leaves_coset(variant: u32, codeword: &[u64], block: u64, ext3: bool) -> Result<Vec<u64>> {
+pub fn leaves_coset(variant: usize, codeword: &[u64], block: u64, ext3: bool) -> Result<Vec<u64>> {
     let per = if ext3 { 3 } else { 1 };
     let num_leaves = codeword.len() as u64 / (block * per);
-    let k = &module()?.variants[variant as usize];
+    let k = &module()?.variants[variant];
     let stream = backend()?.next_stream();
     let input = stream.clone_htod(codeword)?;
     let mut out = stream.alloc_zeros::<u64>(num_leaves as usize * DIGEST)?;
@@ -127,10 +129,10 @@ pub fn leaves_coset(variant: u32, codeword: &[u64], block: u64, ext3: bool) -> R
 }
 
 /// One 4-ary level: `children.len() / 16` parents.
-pub fn merkle_level4(variant: u32, children: &[u64]) -> Result<Vec<u64>> {
+pub fn merkle_level4(variant: usize, children: &[u64]) -> Result<Vec<u64>> {
     assert_eq!(children.len() % WIDTH, 0);
     let n = (children.len() / WIDTH) as u64;
-    let k = &module()?.variants[variant as usize];
+    let k = &module()?.variants[variant];
     let stream = backend()?.next_stream();
     let input = stream.clone_htod(children)?;
     let mut out = stream.alloc_zeros::<u64>(n as usize * DIGEST)?;
@@ -149,13 +151,13 @@ pub fn merkle_level4(variant: u32, children: &[u64]) -> Result<Vec<u64>> {
 
 /// The smallest nonce in `[0, count)` whose grind head is `< limit`, if any.
 pub fn grind(
-    variant: u32,
+    variant: usize,
     inner: &[u64; 4],
     limit: u64,
     count: u64,
     grid: u32,
 ) -> Result<Option<u64>> {
-    let k = &module()?.variants[variant as usize];
+    let k = &module()?.variants[variant];
     let stream = backend()?.next_stream();
     let inner_dev = stream.clone_htod(inner.as_slice())?;
     let mut result = stream.clone_htod(&[u64::MAX])?;
@@ -251,9 +253,9 @@ pub fn microbench(log_len: u32, reps: u32, grind_count: u64) -> Result<Vec<Strin
 
     // Poseidon1 W16, both variants: the coset leaves, then 4-ary levels down to
     // fewer than four nodes.
-    for v in VARIANTS {
-        let k = &m.variants[v as usize];
-        let name = format!("p1w16-v{v}");
+    for (v, tag) in VARIANTS.iter().enumerate() {
+        let k = &m.variants[v];
+        let name = format!("p1w16-{tag}");
         let mut leaves = stream.alloc_zeros::<u64>(num_leaves as usize * DIGEST)?;
         let ns = median_ns(reps, || {
             unsafe {
@@ -330,8 +332,8 @@ pub fn microbench(log_len: u32, reps: u32, grind_count: u64) -> Result<Vec<Strin
             stream.synchronize()
         })?;
         line("grind", &format!("rpx-g{grid}"), ns, grind_count);
-        for v in VARIANTS {
-            let k = &m.variants[v as usize];
+        for (v, tag) in VARIANTS.iter().enumerate() {
+            let k = &m.variants[v];
             let ns = median_ns(reps, || {
                 unsafe {
                     stream
@@ -345,7 +347,7 @@ pub fn microbench(log_len: u32, reps: u32, grind_count: u64) -> Result<Vec<Strin
                 }
                 stream.synchronize()
             })?;
-            line("grind", &format!("p1-v{v}-g{grid}"), ns, grind_count);
+            line("grind", &format!("p1-{tag}-g{grid}"), ns, grind_count);
         }
     }
     Ok(lines)

@@ -45,14 +45,14 @@ fn the_device_permutation_matches_the_host_reference() {
     let mut rng = ChaCha8Rng::seed_from_u64(1);
     let n = 4099;
     let states = random_felts(&mut rng, n * 16);
-    for v in p1w16::VARIANTS {
+    for v in 0..p1w16::VARIANTS.len() {
         let got = p1w16::permute_many(v, &states).expect("device");
         for (i, chunk) in states.chunks(16).enumerate() {
             let s: [Fp; 16] = core::array::from_fn(|k| Fp::from(chunk[k]));
             assert_eq!(
                 got[i * 16..(i + 1) * 16],
                 canon(&host::permute(s))[..],
-                "v{v} state {i}"
+                "variant {v} state {i}"
             );
         }
     }
@@ -71,7 +71,7 @@ fn the_device_coset_leaves_match_the_host_sponge() {
         let per = if ext3 { 3 } else { 1 };
         let num_leaves = 1027u64;
         let cw = random_felts(&mut rng, (num_leaves * block * per) as usize);
-        for v in p1w16::VARIANTS {
+        for v in 0..p1w16::VARIANTS.len() {
             let got = p1w16::leaves_coset(v, &cw, block, ext3).expect("device");
             for j in 0..num_leaves {
                 let mut felts = Vec::new();
@@ -87,7 +87,7 @@ fn the_device_coset_leaves_match_the_host_sponge() {
                 assert_eq!(
                     got[4 * j as usize..4 * j as usize + 4],
                     want[..],
-                    "v{v} block {block} ext3 {ext3} leaf {j}"
+                    "variant {v} block {block} ext3 {ext3} leaf {j}"
                 );
             }
         }
@@ -99,7 +99,7 @@ fn the_device_4ary_level_matches_the_host_node() {
     let mut rng = ChaCha8Rng::seed_from_u64(3);
     let n = 2049;
     let children = random_felts(&mut rng, n * 16);
-    for v in p1w16::VARIANTS {
+    for v in 0..p1w16::VARIANTS.len() {
         let got = p1w16::merkle_level4(v, &children).expect("device");
         for i in 0..n {
             let c = &children[i * 16..(i + 1) * 16];
@@ -108,7 +108,7 @@ fn the_device_4ary_level_matches_the_host_node() {
             assert_eq!(
                 got[4 * i..4 * i + 4],
                 canon(&host::compress4(&kids))[..],
-                "v{v} node {i}"
+                "variant {v} node {i}"
             );
         }
     }
@@ -127,10 +127,10 @@ fn the_device_grind_returns_the_smallest_valid_nonce() {
     let want = (0..1u64 << 20)
         .find(|&n| head(n) < limit)
         .expect("a hit below 2^20");
-    for v in p1w16::VARIANTS {
+    for v in 0..p1w16::VARIANTS.len() {
         for grid in [1u32, 1024] {
             let got = p1w16::grind(v, &inner, limit, 1 << 20, grid).expect("device");
-            assert_eq!(got, Some(want), "v{v} grid {grid}");
+            assert_eq!(got, Some(want), "variant {v} grid {grid}");
         }
         assert_eq!(
             p1w16::grind(v, &inner, 0, 1 << 16, 64).expect("device"),

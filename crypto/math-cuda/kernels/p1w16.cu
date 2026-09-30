@@ -33,10 +33,13 @@
 // 32-bit half (15,360 MACs) plus 16 reductions. Against RPX's 2,736 field
 // multiplications + 2,016 MACs.
 //
-// VARIANTS (template `V`, both instantiated so one job measures both):
+// VARIANTS (template `V`; every entry below is instantiated so one job
+// measures them all):
 //   V = 0  every product through `goldilocks::mul`;
 //   V = 1  products and squares through the 32-bit-limb multiply (`rpx.cu`'s
-//          `RPX_V_LIMB_MUL | RPX_V_LIMB_SQR`, reproduced below).
+//          `RPX_V_LIMB_MUL | RPX_V_LIMB_SQR`, reproduced below);
+//   and V = 1 again under three register caps (`P1W16_LB`), because the
+//   uncapped kernels take 152-166 registers a thread (FAST job 280).
 // Every variant computes the same field values and `permute` canonicalises.
 
 #include <cstdint>
@@ -338,34 +341,48 @@ __device__ __forceinline__ void grind_search(const uint64_t *inner, uint64_t lim
     }
 }
 
-#define P1W16_ENTRIES(V)                                                                          \
-    extern "C" __global__ void p1w16_permute_probe_v##V(const uint64_t *states, uint64_t n,       \
-                                                        uint64_t *out) {                          \
+// Register caps for the occupancy sweep: `__launch_bounds__(128, minb)` asks for
+// `minb` resident 128-thread blocks per SM, i.e. at most 65536 / (128·minb)
+// registers per thread (128 at 4, 102 at 5, 85 at 6). The host shim has none.
+#if defined(__CUDACC__)
+#define P1W16_LB(minb) __launch_bounds__(128, minb)
+#else
+#define P1W16_LB(minb)
+#endif
+
+#define P1W16_ENTRIES(NAME, V, BOUND)                                                             \
+    extern "C" __global__ void BOUND p1w16_permute_probe_##NAME(const uint64_t *states,          \
+                                                                uint64_t n, uint64_t *out) {      \
         permute_probe<V>(states, n, out);                                                          \
     }                                                                                              \
-    extern "C" __global__ void p1w16_leaves_base_coset_v##V(                                      \
+    extern "C" __global__ void BOUND p1w16_leaves_base_coset_##NAME(                              \
         const uint64_t *__restrict__ codeword, uint64_t num_leaves, uint64_t block,               \
         uint64_t *__restrict__ out) {                                                              \
         leaves_base_coset<V>(codeword, num_leaves, block, out);                                    \
     }                                                                                              \
-    extern "C" __global__ void p1w16_leaves_ext3_coset_v##V(                                      \
+    extern "C" __global__ void BOUND p1w16_leaves_ext3_coset_##NAME(                              \
         const uint64_t *__restrict__ codeword, uint64_t num_leaves, uint64_t block,               \
         uint64_t *__restrict__ out) {                                                              \
         leaves_ext3_coset<V>(codeword, num_leaves, block, out);                                    \
     }                                                                                              \
-    extern "C" __global__ void p1w16_merkle_level4_v##V(const uint64_t *__restrict__ children,   \
-                                                        uint64_t *__restrict__ parents,           \
-                                                        uint64_t n_parents) {                     \
+    extern "C" __global__ void BOUND p1w16_merkle_level4_##NAME(                                  \
+        const uint64_t *__restrict__ children, uint64_t *__restrict__ parents,                    \
+        uint64_t n_parents) {                                                                      \
         merkle_level4<V>(children, parents, n_parents);                                            \
     }                                                                                              \
-    extern "C" __global__ void p1w16_grind_search_v##V(const uint64_t *inner, uint64_t limit,     \
-                                                       uint64_t base, uint64_t count,             \
-                                                       volatile unsigned long long *result) {     \
+    extern "C" __global__ void BOUND p1w16_grind_search_##NAME(                                   \
+        const uint64_t *inner, uint64_t limit, uint64_t base, uint64_t count,                     \
+        volatile unsigned long long *result) {                                                     \
         grind_search<V>(inner, limit, base, count, result);                                        \
     }
 
-P1W16_ENTRIES(0)
-P1W16_ENTRIES(1)
+// The two multiply variants, then the limb variant under three register caps
+// (`src/p1w16.rs` VARIANTS lists the same names in the same order).
+P1W16_ENTRIES(v0, 0, )
+P1W16_ENTRIES(v1, 1, )
+P1W16_ENTRIES(v1b4, 1, P1W16_LB(4))
+P1W16_ENTRIES(v1b5, 1, P1W16_LB(5))
+P1W16_ENTRIES(v1b6, 1, P1W16_LB(6))
 
 // Bench fill: `out[i]` = a SplitMix64 of `i`, canonicalised — a codeword the
 // microbench hashes without a host upload.
