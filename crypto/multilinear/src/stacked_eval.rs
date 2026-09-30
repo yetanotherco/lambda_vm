@@ -196,21 +196,25 @@ where
         // device at all. If the card will not promise it, each commitment
         // promises its own, which is the conservative accounting.
         //
-        // ★ AND THE LEAF LAYERS ARE NOW IN THIS NUMBER, as a named term rather
-        // than as a surprise. A commitment that is opened keeps the leaf layer
-        // its commit hashed — `num_leaves × 32` = `C · 2^(5−k)` bytes at fold
-        // width `k`, a QUARTER of a base codeword at the production `k = 4` —
-        // so a group of `n` commitments holds `n · C/4` more than the codewords
-        // alone. It is not reserved here, because the width is not known until
-        // the tree is built: each codeword grows THIS reservation when it
-        // captures (`DeviceCodeword::capture_leaves`), and `grow` refuses
-        // without changing anything when the budget will not take it. A refused
+        // ★ AND WHAT EACH COMMITMENT KEEPS OF ITS TREE IS IN THIS NUMBER, as a
+        // named term rather than as a surprise. A commitment that is opened
+        // keeps its whole tree by default — `(2·num_leaves − 1) × 32` ≈
+        // `C · 2^(6−k)` bytes at fold width `k`, HALF a base codeword at the
+        // production `k = 4` — or, under `LFM_WHIR_WHOLE_TREES=0`, its leaf
+        // layer alone, `C · 2^(5−k)`, a quarter. So a group of `n` commitments
+        // holds up to `n · C/2` more than the codewords alone. It is not
+        // reserved here, because the width is not known until the tree is
+        // built: each codeword grows THIS reservation when it captures
+        // (`DeviceCodeword::capture_leaves`), and `grow` refuses without
+        // changing anything when the budget will not take it. A refused
         // retention costs the leaf pass again and nothing else.
         //
-        // ⚠ A TREE is still not in this number and must never be. H4 kept the
-        // whole node array — twice these bytes — and the card reached 96%, after
-        // which commits fell back to the host at ~1.5 GiB each. The layer is
-        // half of what that held and two thirds of what it saved.
+        // ⚠ NOTHING of a tree may be held OUTSIDE this number. H4 kept whole
+        // node arrays outside any promise, and the card reached 96%, after
+        // which commits fell back to the host at ~1.5 GiB each. What is kept
+        // now is grown into the room and handed to the evictor for any request
+        // it can cover, so a request gets the budget it would get with nothing
+        // kept, and the worst case is the old rebuild.
         //
         // ★ HOW MUCH: the turn it is held for (`room_bytes`) — the commits'
         // when it is given back before the openings, which then take their

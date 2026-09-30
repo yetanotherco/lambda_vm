@@ -115,14 +115,19 @@ pub fn retained_bytes_peak() -> u64 {
     RETAIN_BYTES_LIVE_PEAK.load(Ordering::Relaxed)
 }
 
-/// A leaf layer kept past the call that built it — and NOTHING else.
+/// What a codeword keeps of its tree past the call that built it: the whole
+/// tree (the default, [`whole_trees`]) or its leaf layer alone — and in either
+/// case NOTHING outside a promise.
 ///
-/// ⛔ NOT A TREE. H4 kept the whole node array, `2·num_leaves − 1` nodes, and
-/// lost: at fold width `k` that is `C · 2^(6−k)` bytes against this layer's
-/// `C · 2^(5−k)`, so at the production `k = 4` H4 held half a base codeword per
-/// commitment where this holds a quarter. The inner levels are cheap to rebuild
-/// — one permutation a node against two per leaf on a base codeword and six on
-/// an extension one — so the expensive two thirds is what is kept.
+/// ⛔ THE INVARIANT: every byte kept here is promised — grown into the room of
+/// the codeword that captured it, given back when it drops — and the evictor
+/// hands it to any request it can cover. H4 kept whole node arrays OUTSIDE any
+/// promise, so a full card pushed commits to the host at ~1.5 GiB a chain, and
+/// it lost ~15 s. The leaf layer came first — half the bytes, most of the
+/// saving: a round-0 leaf absorbs a whole `2^k` coset, an inner node two
+/// digests — and the whole tree came back once both were promised and
+/// evictable (job 248, −1.00 s): what separates it from H4 is where the bytes
+/// sit, not how many there are.
 ///
 /// ⛔ THE KEY IS PART OF THE OBJECT. A leaf is the `2^log_folding` coset that
 /// folds onto one position, so a layer is valid ONLY for the width it was built
@@ -131,12 +136,6 @@ pub fn retained_bytes_peak() -> u64 {
 /// at two widths on purpose: served across widths, this would hand back paths
 /// that are internally consistent and WRONG, which is the outcome that file
 /// exists to forbid. An exact match or a rebuild; there is no near miss.
-///
-/// ★ OR THE WHOLE TREE, under [`whole_trees`]: the same slot, the same key and
-/// the same evictor, holding the node array the tree was built in (root first,
-/// leaves last) so an opening reads its paths without building anything. What
-/// separates this from H4 is that it is promised through the room and yields to
-/// the evictor like a layer does; H4 held its trees outside any promise.
 struct RetainedLeaves {
     /// The leaf layer, or the whole node array when `whole`. Shared so an
     /// opening served a whole tree can read it after the slot's lock is let go:
@@ -281,8 +280,12 @@ pub fn retention_whole() -> (bool, u64) {
 
 /// The switch [`whole_trees`] reads.
 const WHOLE_TREES_ENV: &str = "LFM_WHIR_WHOLE_TREES";
-/// The leaf layer alone, until an A/B says otherwise.
-const WHOLE_TREES_DEFAULT: bool = false;
+/// Whole trees. Job 248 (A B B A on the block): the whole run −1.00 s, the base
+/// −0.90 s, the openings' tree rebuilds −0.82 s; 952 openings served a kept
+/// tree, and epoch 4's argue evicted two kept trees. The argue's peaks in
+/// epochs 3–5 were 25,633 / 25,306 / 25,681 of the 25,688 MiB budget — epoch 5
+/// within 7 MiB of it, and safe because everything kept is evictable.
+const WHOLE_TREES_DEFAULT: bool = true;
 
 /// ★ Whether a tree is kept WHOLE past the call that built it, not just its
 /// leaf layer.
@@ -295,9 +298,9 @@ const WHOLE_TREES_DEFAULT: bool = false;
 /// the evictor under pressure, whole — so a request it can cover still gets its
 /// bytes, and fallbacks cannot rise. The worst case is the old rebuild.
 ///
-/// `LFM_WHIR_WHOLE_TREES=1` keeps whole trees; unset or `0` keeps leaf layers
-/// (the default); any other value aborts. Read once and printed once; a test
-/// forces it with [`force_whole_trees`].
+/// `LFM_WHIR_WHOLE_TREES` unset or `1` keeps whole trees (the default); `0`
+/// keeps leaf layers, as before the switch; any other value aborts. Read once
+/// and printed once; a test forces it with [`force_whole_trees`].
 fn whole_trees() -> bool {
     match WHOLE_TREES_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -638,6 +641,31 @@ mod futile_miss_tests {
 }
 
 #[cfg(test)]
+mod whole_tree_tests {
+    use super::tree_bytes;
+
+    /// ★ The default keeps whole trees (job 248). Going back is
+    /// `LFM_WHIR_WHOLE_TREES=0` at run time; a change here moves every run's
+    /// default, and must fail this first.
+    #[test]
+    fn the_default_keeps_whole_trees() {
+        let default = super::WHOLE_TREES_DEFAULT;
+        assert!(default, "the default must keep whole trees");
+    }
+
+    /// What a whole tree adds to the promise over its leaf layer is its inner
+    /// levels: one node fewer than the leaves. So a kept tree costs one more
+    /// layer, less 32 bytes — the figure the argue's margin was sized with.
+    #[test]
+    fn a_kept_tree_is_its_leaf_layer_and_one_layer_more_less_a_node() {
+        for log_leaves in [1usize, 12, 23] {
+            let layer = 32u64 << log_leaves;
+            assert_eq!(tree_bytes(log_leaves), 2 * layer - 32);
+        }
+    }
+}
+
+#[cfg(test)]
 mod fold_transient_tests {
     use super::fold_transient_bytes;
 
@@ -699,22 +727,26 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
-    /// Leaf-hash passes this codeword has paid for: one per tree built, so
-    /// two for a commitment that is opened — the root's and the paths'.
+    /// Trees this codeword has built: the commit's, and one for each opening
+    /// that no kept whole tree served.
     builds: BuildCount,
     /// Leaf-hash passes this codeword actually paid for. Diverges from
     /// [`builds`](Self::tree_builds) exactly when a retained layer was served.
     leaf_passes: BuildCount,
-    /// ★ The leaf layer kept past the call that built it, with the key it is
-    /// valid under. `Arc` for the same reason `room` is one: `DeviceCodeword`
-    /// is `Clone` and the folds share the original's accounting, so a clone
-    /// must share the layer rather than silently rebuild beside it.
+    /// ★ What is kept of the tree past the call that built it — the whole
+    /// tree or its leaf layer — with the key it is valid under. `Arc` for the
+    /// same reason `room` is one: `DeviceCodeword` is `Clone` and the folds
+    /// share the original's accounting, so a clone must share what is kept
+    /// rather than silently rebuild beside it.
     leaves: Arc<Mutex<Option<RetainedLeaves>>>,
     /// The room the chain promised itself: this codeword and the folds that
     /// halve it, shared with those folds because they live inside it.
     ///
-    /// A tree is NOT in this number, because a tree is never held past the
-    /// call that builds it — see [`with_tree`](Self::with_tree).
+    /// ⛔ Whatever is kept of a tree is IN this number, and nothing of a tree
+    /// outside it: a capture grows the room by exactly what it keeps (the whole
+    /// tree, or its leaf layer), and the bytes leave it when that drops or is
+    /// evicted. A tree an opening builds and does not keep lives only for that
+    /// call — see [`with_tree`](Self::with_tree).
     room: Arc<crate::device::DeviceReservation>,
     /// Whether this codeword has been registered with the eviction registry.
     /// Set once, on the first capture, so a rebuild-after-eviction re-capture
@@ -1044,72 +1076,48 @@ impl DeviceCodeword {
         );
     }
 
-    /// Run `f` against this codeword's tree, built here and freed on return.
+    /// Run `f` against this codeword's tree: a kept whole tree when one
+    /// matches, else one built here — kept afterwards, whole or as its leaf
+    /// layer, inside the codeword's promise.
     ///
-    /// # Why the tree is not kept
+    /// # ⛔ The invariant: nothing of a tree is held outside a promise
     ///
-    /// A commitment that is opened pays for its leaf layer twice — once for
-    /// the root, once for the paths — and keeping the first tree would remove
-    /// the second pass. H4 built that cache and measured it: it returned the
-    /// hashing it promised and cost more than it returned, ~+15 s in both
-    /// hashes, because the retention is not one tree but one per commitment
-    /// in the group.
+    /// A commitment that is opened needs its tree twice — for the root and for
+    /// the paths — and the window between is forced by the protocol, not by
+    /// this file. `StackedCommitment::commit` builds EVERY chain's commitment
+    /// before it returns, because all the roots go into the transcript before
+    /// any query index is drawn; the openings come afterwards, one chain at a
+    /// time. So whatever is kept of the last chain's tree lives from its commit
+    /// to its opening, and all N exist before the first opening.
     ///
-    /// The window is forced by the protocol, not by this file.
-    /// `StackedCommitment::commit` builds EVERY chain's commitment before it
-    /// returns, because all the roots go into the transcript before any query
-    /// index is drawn; the openings come afterwards, one chain at a time. So
-    /// the last chain's tree would live from its commit to its opening — the
-    /// whole proof — and no placement of an eviction call bounds that peak,
-    /// since all N trees exist before the first opening. Ten chains at half a
-    /// gigabyte put the card at 96%, after which device allocations fail,
-    /// commits silently fall back to the host, and the host grows by ~1.5 GiB
-    /// per fallen-back chain.
+    /// H4 kept whole trees and lost, ~+15 s in both hashes: its node arrays sat
+    /// OUTSIDE any promise, so ten chains at half a gigabyte put the card at
+    /// 96%, device allocations failed, commits silently fell back to the host,
+    /// and the host grew ~1.5 GiB per fallen-back chain. The objection was
+    /// never the bytes but where they sat. What is kept now is promised and
+    /// evictable:
     ///
-    /// `crypto/multilinear/src/whir_commit.rs`'s `paths` said this in its doc
-    /// comment before any of it was built, and `StackedCommitment::commit`'s
-    /// reservation — "nine codewords of room instead of sixteen" — budgets a
-    /// retained codeword per commitment and no tree. Both were right.
+    /// - **The capture asks first.**
+    ///   [`DeviceReservation::grow`](crate::device::DeviceReservation::grow)
+    ///   declines without changing anything when the budget will not take the
+    ///   bytes, and a refusal costs exactly the pass the retention would have
+    ///   saved. The cliff is unreachable rather than unmeasured.
+    /// - **The evictor gives it back** to any request it can cover
+    ///   ([`evict_retained_layers`]), so a request gets the budget it would get
+    ///   with nothing kept, and fallbacks cannot rise. A miss nothing kept can
+    ///   cover keeps it ([`keep_futile`]): that request fails either way.
+    /// - **The leaf layer, then the whole tree.** The layer came first: half the
+    ///   bytes and most of the saving, since a round-0 leaf absorbs a whole
+    ///   `2^k` coset against two digests for an inner node. The whole tree
+    ///   ([`whole_trees`], the default since job 248: −1.00 s) keeps the inner
+    ///   levels too, and an opening served one builds nothing. Evicted, its
+    ///   worst case is the leaf pass again.
     ///
-    /// What is left of H4 is the counters: [`tree_builds`](Self::tree_builds)
-    /// and [`leaf_hash_calls`] make the two passes visible, and the group-scale
-    /// test in `tests/whir_tree_cache.rs` fails if a tree is ever held past
-    /// this call again.
-    ///
-    /// # ★ What DID work, and why it is a different object
-    ///
-    /// The tree is still not kept. Its LEAF LAYER is — see
-    /// [`capture_leaves`](Self::capture_leaves) — and that is not a softer
-    /// version of H4 but a different trade:
-    ///
-    /// - **Half the bytes.** A tree is `2·num_leaves − 1` nodes; the layer is
-    ///   `num_leaves` of them. At fold width `k` that is `C · 2^(5−k)` bytes
-    ///   against a tree's `C · 2^(6−k)` — at the production `k = 4`, a quarter
-    ///   of a base codeword where H4 held half of one.
-    /// - **Most of the saving.** The leaf pass absorbs a whole `2^k` coset per
-    ///   leaf: two permutations on a base codeword, six on an extension one,
-    ///   against one per inner node. So the layer carries two thirds of a base
-    ///   tree's work and six sevenths of an extension tree's, and rebuilding
-    ///   the inner levels from it is the cheap third.
-    /// - **It can decline.** H4 could not: it allocated, and when the card said
-    ///   no the commit fell back to the host at ~1.5 GiB a chain. The capture
-    ///   asks [`DeviceReservation::grow`](crate::device::DeviceReservation::grow)
-    ///   first, and a refusal costs exactly one leaf pass — the behaviour of
-    ///   this file before the change. The cliff is unreachable rather than
-    ///   unmeasured.
-    ///
-    /// The window is still the group's, because the window is the protocol's
-    /// and nothing here changes it. What changed is what sits in it.
-    ///
-    /// # ★ Whole trees, evictable ([`whole_trees`])
-    ///
-    /// Under the switch the tree built here is kept whole after `f`, and an
-    /// opening with a matching kept tree runs `f` on it and builds nothing.
-    /// H4's objection was never the bytes as such but where they sat: outside
-    /// any promise, so a full card pushed commits to the host. These are grown
-    /// into the codeword's room like a layer, and the evictor takes them back
-    /// whole for any request they can cover. So a request gets the budget it
-    /// would get without them, and the worst case is the leaf pass again.
+    /// The counters keep both kinds of work visible —
+    /// [`tree_builds`](Self::tree_builds), [`leaf_hash_calls`] and
+    /// [`retention_whole`] — and the group-scale test in
+    /// `tests/whir_tree_cache.rs` fails if anything of a tree is ever held
+    /// outside its promise.
     fn with_tree<R>(
         &self,
         log_folding: usize,
@@ -1138,7 +1146,7 @@ impl DeviceCodeword {
         self.room.bytes()
     }
 
-    /// ★ How many times THIS codeword's leaf layer has been hashed.
+    /// ★ How many trees THIS codeword has built.
     ///
     /// One after a commit, and one more for each round that opens it — none
     /// for an opening served a kept whole tree ([`whole_trees`]). Unlike the
@@ -1151,10 +1159,10 @@ impl DeviceCodeword {
     /// ★ Leaf-hash passes over THIS codeword — the number the retention moves.
     ///
     /// Equal to [`tree_builds`](Self::tree_builds) when nothing is retained, and
-    /// 1 however many times the codeword is opened when the layer is kept. The
-    /// two together are what make the retention assertable in BOTH directions:
-    /// a cache that stopped working reads them equal, a tree kept past its call
-    /// reads `tree_builds` short.
+    /// 1 however many times the codeword is opened when a leaf layer or a whole
+    /// tree is kept. The two together are what make the retention assertable
+    /// in BOTH directions: a cache that stopped working reads them equal, and
+    /// an opening served a kept whole tree leaves both where they were.
     pub fn leaf_passes(&self) -> u64 {
         self.leaf_passes.load(Ordering::Relaxed)
     }
@@ -1171,10 +1179,10 @@ impl DeviceCodeword {
 
     /// The root of that tree, which is the commitment.
     ///
-    /// ★ The tree is KEPT (H4). The other thing anyone wants from it is a path
-    /// per query, and rebuilding it then cost a second leaf-hash pass over the
-    /// whole codeword — half of this path's device hashing, for a buffer that
-    /// was already in hand.
+    /// ★ The tree is kept past this call, inside the codeword's promise — whole
+    /// by default, or its leaf layer — because the other thing anyone wants
+    /// from it is a path per query, and building it again then would cost a
+    /// second leaf-hash pass over the whole codeword ([`with_tree`](Self::with_tree)).
     pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
         self.with_tree(log_folding, hash, |nodes, _| {
             let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
@@ -1197,8 +1205,9 @@ impl DeviceCodeword {
 
     /// The authentication paths of `positions`, against the same tree.
     ///
-    /// ★ Read from the tree the commit kept, not rebuilt (H4). Bringing the
-    /// tree home is still not done — a pageable copy of half a gigabyte is the
+    /// ★ Read from the kept whole tree when one matches; otherwise the tree is
+    /// built here, its leaves served from a kept layer when one matches. The
+    /// tree is never brought home — a pageable copy of half a gigabyte is the
     /// slowest thing in the commit, and what the host needs of a tree is a
     /// kilobyte per query.
     pub fn paths(
@@ -1785,9 +1794,10 @@ pub const fn tree_bytes(log_leaves: usize) -> u64 {
 /// which are freed before the transform runs; and the tree over the codeword's
 /// `2^log_folding`-value blocks, built after it. So the peak is the larger of
 /// the two, not their sum. The transform runs in place, and its twiddles are
-/// cached for the process outside every promise. The leaf layer a tree offers
-/// for retention is not in this number either: the codeword's own room grows
-/// by it when it is kept.
+/// cached for the process outside every promise. What the commit then keeps of
+/// the tree — the whole tree by default, or its leaf layer — is not a transient
+/// and is not in this number: the codeword's own room grows by exactly that
+/// when it is kept.
 pub const fn commit_transient_bytes(
     log_evals: usize,
     log_blowup: usize,

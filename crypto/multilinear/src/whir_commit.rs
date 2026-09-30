@@ -388,12 +388,13 @@ where
 
     /// One authentication path per index, from wherever the tree is.
     ///
-    /// A codeword the device kept has no tree here — only its root. Rebuilding
-    /// it there costs a keccak pass; keeping it would cost half a gigabyte of
-    /// device memory per commitment for the whole proof, and bringing it home
-    /// costs ten times the rehash, because a pageable copy of half a gigabyte
-    /// is the slowest thing in the commit. What a proof wants of a tree is a
-    /// kilobyte per query.
+    /// A codeword the device kept has no tree here — only its root. The device
+    /// keeps the tree past the commit, inside the codeword's promise and
+    /// evictable (`math_cuda::whir`: whole by default, or its leaf layer under
+    /// `LFM_WHIR_WHOLE_TREES=0`), and rebuilds what an eviction took. Bringing
+    /// it home would cost ten times the rehash, because a pageable copy of half
+    /// a gigabyte is the slowest thing in the commit. What a proof wants of a
+    /// tree is a kilobyte per query.
     fn paths(&self, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
         let num_leaves = self.num_leaves();
         let out_of_range = |index: usize| Error::QueryOutOfRange {
@@ -406,8 +407,8 @@ where
                     return Err(out_of_range(bad));
                 }
                 // Past the range check there is one way to fail, and it is the
-                // device: the tree has to be rebuilt there because that is
-                // where the codeword is.
+                // device: the paths are read there — from the kept tree, or a
+                // tree rebuilt — because that is where the codeword is.
                 Ok(device
                     .paths(self.log_folding, indices, H::DEVICE)
                     .ok_or(Error::DeviceFailed {

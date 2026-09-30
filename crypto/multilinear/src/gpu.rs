@@ -4059,9 +4059,11 @@ impl DeviceCodeword {
 
     /// The root of the tree over its fold blocks.
     ///
-    /// The tree is not kept: the only other thing a proof wants from it is a
-    /// path per query, and [`paths`](Self::paths) rebuilds it then, when the
-    /// queries are known — see the note there.
+    /// The tree is kept past this call, inside the codeword's promise and
+    /// evictable — whole by default, or its leaf layer under
+    /// `LFM_WHIR_WHOLE_TREES=0` — because the only other thing a proof wants
+    /// from it is a path per query, which [`paths`](Self::paths) reads when the
+    /// queries are known (see `math_cuda::whir::DeviceCodeword::commit`).
     pub(crate) fn commit(
         &self,
         log_folding: usize,
