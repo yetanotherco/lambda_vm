@@ -73,12 +73,20 @@ __device__ __forceinline__ void store_slot(uint64_t *slots, uint64_t stride, uin
 
 // The program's value at cube index `j`, with every factor extended to the
 // interpolation node `t`: `f(j) + t·(f(j + half) − f(j))`.
-__device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes,
-                                            uint64_t num_nodes,
-                                            const uint64_t *__restrict__ d_consts,
-                                            const uint64_t *const *__restrict__ d_factors,
-                                            uint64_t j, uint64_t half, const Fe3 &t,
-                                            uint64_t *slots, uint64_t stride, uint32_t root_slot) {
+//
+// `INT` (D-ARGUE S1-1, `LAMBDA_VM_ARGUE_INT_NODES`): the node is a base-field
+// integer `(k, 0, 0)` — every round's nodes are `1..=D` — so `t·(hi − lo)` is
+// the componentwise `k·(hi − lo)`: three products where the full multiply
+// spends nine. The same value; the host only takes this variant when every
+// node's upper limbs are zero.
+template <bool INT>
+__device__ __forceinline__ Fe3 eval_program_t(const uint64_t *__restrict__ d_nodes,
+                                              uint64_t num_nodes,
+                                              const uint64_t *__restrict__ d_consts,
+                                              const uint64_t *const *__restrict__ d_factors,
+                                              uint64_t j, uint64_t half, const Fe3 &t,
+                                              uint64_t *slots, uint64_t stride,
+                                              uint32_t root_slot) {
     for (uint64_t i = 0; i < num_nodes; i++) {
         Node nd = load_node(d_nodes, i);
         switch (nd.op) {
@@ -86,7 +94,8 @@ __device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes
             const uint64_t *column = d_factors[nd.a];
             Fe3 lo = load_ext(column + j * 3);
             Fe3 hi = load_ext(column + (j + half) * 3);
-            Fe3 v = ext3::add(lo, ext3::mul(t, ext3::sub(hi, lo)));
+            Fe3 v = INT ? ext3::add(lo, ext3::mul_base(ext3::sub(hi, lo), t.a))
+                        : ext3::add(lo, ext3::mul(t, ext3::sub(hi, lo)));
             store_slot(slots, stride, nd.res, v);
             break;
         }
@@ -115,8 +124,26 @@ __device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes
     return load_slot(slots, stride, root_slot);
 }
 
+__device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes,
+                                            uint64_t num_nodes,
+                                            const uint64_t *__restrict__ d_consts,
+                                            const uint64_t *const *__restrict__ d_factors,
+                                            uint64_t j, uint64_t half, const Fe3 &t,
+                                            uint64_t *slots, uint64_t stride, uint32_t root_slot) {
+    return eval_program_t<false>(d_nodes, num_nodes, d_consts, d_factors, j, half, t, slots,
+                                 stride, root_slot);
+}
+
 // Capped at the block size the launcher uses and two blocks per SM: without a
 // bound the compiler spends 67 registers a thread and occupancy stops at half.
+template <bool INT>
+__device__ __forceinline__ void sumcheck_round_body(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, uint32_t root_slot,
+    const uint64_t *__restrict__ d_t, uint32_t num_t, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials);
+
 extern "C" __global__ __launch_bounds__(256, 2) void sumcheck_round_ext3(
     // one device pointer per factor; factor `k` at cube index `j`, component
     // `c`, is `d_factors[k][j*3 + c]`
@@ -131,6 +158,28 @@ extern "C" __global__ __launch_bounds__(256, 2) void sumcheck_round_ext3(
     // per-thread slot file
     uint64_t *__restrict__ d_slots,
     // out: one partial per (node, block), ext3
+    uint64_t *__restrict__ d_partials) {
+    sumcheck_round_body<false>(d_factors, half, d_nodes, num_nodes, d_consts, root_slot, d_t,
+                               num_t, d_slots, d_partials);
+}
+
+// The same round with integer nodes (D-ARGUE S1-1): see `eval_program_t`.
+extern "C" __global__ __launch_bounds__(256, 2) void sumcheck_round_ext3_int(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, uint32_t root_slot,
+    const uint64_t *__restrict__ d_t, uint32_t num_t, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials) {
+    sumcheck_round_body<true>(d_factors, half, d_nodes, num_nodes, d_consts, root_slot, d_t,
+                              num_t, d_slots, d_partials);
+}
+
+template <bool INT>
+__device__ __forceinline__ void sumcheck_round_body(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, uint32_t root_slot,
+    const uint64_t *__restrict__ d_t, uint32_t num_t, uint64_t *__restrict__ d_slots,
     uint64_t *__restrict__ d_partials) {
     // The slot file is per thread and a thread is a (cube index, node) pair,
     // so both grid dimensions go into the address.
@@ -151,8 +200,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void sumcheck_round_ext3(
     for (uint64_t j = index; j < half; j += index_stride) {
         for (uint32_t ti = blockIdx.y; ti < num_t; ti += gridDim.y) {
             Fe3 t = load_ext(d_t + (uint64_t)ti * 3);
-            Fe3 v = eval_program(d_nodes, num_nodes, d_consts, d_factors, j, half, t, slots,
-                                 num_threads, root_slot);
+            Fe3 v = eval_program_t<INT>(d_nodes, num_nodes, d_consts, d_factors, j, half, t,
+                                        slots, num_threads, root_slot);
             acc[ti] = ext3::add(acc[ti], v);
         }
     }
@@ -566,5 +615,363 @@ extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_fa
         column[j * 3 + 0] = v.a;
         column[j * 3 + 1] = v.b;
         column[j * 3 + 2] = v.c;
+    }
+}
+
+// ── D-ARGUE stage 1: the fused zerocheck (S1-2, S1-4, S1-5) ──────────────────
+//
+// A table's zerocheck batch is `eq(r,x)·C(x) + eq(ρ,x)·L(x)`, `C = Σ β_i·sel_i·root_i`
+// the constraint part and `L` the bus's two rules as one affine column
+// (`multilinear::fused`, the host reference these kernels are checked against).
+// Rounds 0 and 1 come from one base-field pass over the 4-row groups
+// `(a, b, x'')` — rows `a·2q + b·q + x''`, `q` a quarter of the cube — on the
+// grid `{0..d}²` (`zc_grid01`, `zc_bus_u`); the factors are then folded by both
+// challenges at once into a quarter-size ext3 buffer (`zc_fold2`), `L` is built
+// there (`zc_bus_column`), and the later rounds walk `C` alone at the integer
+// nodes `{0, 2..d}` under split `eq` weights (`zc_round_gruen`).
+//
+// The constraint program is the table's base DAG with one extra op, `ACC`:
+// `acc += β[res]·(value[a]·factor[b])` (`b == NO_SELECTOR`: no factor), placed
+// right after each root — so the roots are summed as they are made and never
+// held to the end. Op tags and the packing MUST stay in sync with
+// `crypto/multilinear/src/gpu_fused.rs`.
+
+#define OP_ACC 6u
+#define NO_SELECTOR 0xFFFFFFFFu
+
+// A factor's value on the grid point `(a, b)` of group `x`, from its four rows
+// — base limbs of the lifted ext3 factor, whose upper limbs are zero before
+// the first fold (the base-field precondition). Bilinear, exact.
+__device__ __forceinline__ uint64_t grid_value(const uint64_t *__restrict__ column, uint64_t x,
+                                               uint64_t q, uint64_t a, uint64_t b) {
+    uint64_t f00 = column[x * 3];
+    uint64_t f01 = column[(x + q) * 3];
+    uint64_t f10 = column[(x + 2 * q) * 3];
+    uint64_t f11 = column[(x + 3 * q) * 3];
+    uint64_t da = goldilocks::sub(f10, f00);
+    uint64_t db = goldilocks::sub(f01, f00);
+    uint64_t dab = goldilocks::sub(goldilocks::sub(f11, f10), db);
+    uint64_t v = f00;
+    if (a) v = goldilocks::add(v, goldilocks::mul(da, a));
+    if (b) v = goldilocks::add(v, goldilocks::mul(db, b));
+    if (a && b) v = goldilocks::add(v, goldilocks::mul(dab, goldilocks::mul(a, b)));
+    return v;
+}
+
+// One thread per (group, grid point): `gridDim.y` is the point count and each
+// block owns one point. `T(a, b) = Σ_x eq_r[x]·C(a, b, x)` summed per block
+// into `d_partials[(point·gridDim.x + block)·3]`. A corner (`a, b < 2`) is on
+// the list only when the corners are checked or kept. Checked
+// (`keep_corners == 0`): its `C` must be zero on every row, the first row that
+// is not is kept in `d_violation` (atomicMin), and it adds nothing to `T`.
+// Kept (`keep_corners == 1`, random columns in a test): it adds to `T` like
+// any point.
+extern "C" __global__ __launch_bounds__(256) void zc_grid01(
+    const uint64_t *const *__restrict__ d_factors, uint64_t q,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
+    const uint64_t *__restrict__ d_points, const uint64_t *__restrict__ d_eq_r,
+    uint64_t *__restrict__ d_slots, uint64_t *__restrict__ d_partials,
+    unsigned long long *__restrict__ d_violation, uint32_t keep_corners) {
+    uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
+    uint64_t *slots = d_slots + tid;
+    uint64_t point = d_points[blockIdx.y];
+    uint64_t a = point & 0xFFFFFFFFull;
+    uint64_t b = point >> 32;
+    bool corner = a < 2 && b < 2;
+
+    Fe3 t_acc = ext3::zero();
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < q;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 c = ext3::zero();
+        for (uint64_t i = 0; i < num_nodes; i++) {
+            Node nd = load_node(d_nodes, i);
+            uint64_t *out = slots + (uint64_t)nd.res * num_threads;
+            switch (nd.op) {
+            case OP_VAR:
+                *out = grid_value(d_factors[nd.a], x, q, a, b);
+                break;
+            case OP_FIXED:
+                *out = d_consts[nd.a];
+                break;
+            case OP_ADD:
+                *out = goldilocks::add(slots[(uint64_t)nd.a * num_threads],
+                                       slots[(uint64_t)nd.b * num_threads]);
+                break;
+            case OP_SUB:
+                *out = goldilocks::sub(slots[(uint64_t)nd.a * num_threads],
+                                       slots[(uint64_t)nd.b * num_threads]);
+                break;
+            case OP_MUL:
+                *out = goldilocks::mul(slots[(uint64_t)nd.a * num_threads],
+                                       slots[(uint64_t)nd.b * num_threads]);
+                break;
+            case OP_NEG:
+                *out = goldilocks::neg(slots[(uint64_t)nd.a * num_threads]);
+                break;
+            case OP_ACC: {
+                uint64_t v = slots[(uint64_t)nd.a * num_threads];
+                if (nd.b != NO_SELECTOR) {
+                    v = goldilocks::mul(v, grid_value(d_factors[nd.b], x, q, a, b));
+                }
+                c = ext3::add(c, ext3::mul_base(load_ext(d_betas + (uint64_t)nd.res * 3), v));
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (corner && !keep_corners) {
+            Fe3 k = ext3::canonical(c);
+            if (k.a | k.b | k.c) {
+                atomicMin(d_violation, (unsigned long long)(a * 2 * q + b * q + x));
+            }
+            continue;
+        }
+        t_acc = ext3::add(t_acc, ext3::mul(load_ext(d_eq_r + x * 3), c));
+    }
+
+    extern __shared__ uint64_t shared[];
+    shared[threadIdx.x * 3 + 0] = t_acc.a;
+    shared[threadIdx.x * 3 + 1] = t_acc.b;
+    shared[threadIdx.x * 3 + 2] = t_acc.c;
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                load_ext(shared + (threadIdx.x + width) * 3));
+            shared[threadIdx.x * 3 + 0] = sum.a;
+            shared[threadIdx.x * 3 + 1] = sum.b;
+            shared[threadIdx.x * 3 + 2] = sum.c;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        uint64_t at = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * 3;
+        d_partials[at + 0] = shared[0];
+        d_partials[at + 1] = shared[1];
+        d_partials[at + 2] = shared[2];
+    }
+}
+
+// `U(b, c) = Σ_x eq_rho[x]·L(b, c, x)` for `(b, c) ∈ {0,1}²`, `L = a₀ + Σ a_k·f_k`
+// from each term's four base rows. One thread per group; the block's four sums
+// go to `d_partials[(bc·gridDim.x + block)·3]`, `bc = 2b + c`.
+extern "C" __global__ __launch_bounds__(256) void zc_bus_u(
+    const uint64_t *const *__restrict__ d_factors, uint64_t q,
+    const uint32_t *__restrict__ d_term_slots, const uint64_t *__restrict__ d_term_coeffs,
+    uint64_t num_terms, const uint64_t *__restrict__ d_constant,
+    const uint64_t *__restrict__ d_eq_rho, uint64_t *__restrict__ d_partials) {
+    Fe3 u[4] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
+    Fe3 a0 = load_ext(d_constant);
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < q;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 l[4] = {a0, a0, a0, a0};
+        for (uint64_t k = 0; k < num_terms; k++) {
+            const uint64_t *column = d_factors[d_term_slots[k]];
+            Fe3 coeff = load_ext(d_term_coeffs + k * 3);
+            for (uint32_t bc = 0; bc < 4; bc++) {
+                l[bc] = ext3::add(l[bc], ext3::mul_base(coeff, column[(x + bc * q) * 3]));
+            }
+        }
+        Fe3 w = load_ext(d_eq_rho + x * 3);
+        for (uint32_t bc = 0; bc < 4; bc++) {
+            u[bc] = ext3::add(u[bc], ext3::mul(w, l[bc]));
+        }
+    }
+    extern __shared__ uint64_t shared[];
+    for (uint32_t bc = 0; bc < 4; bc++) {
+        shared[threadIdx.x * 3 + 0] = u[bc].a;
+        shared[threadIdx.x * 3 + 1] = u[bc].b;
+        shared[threadIdx.x * 3 + 2] = u[bc].c;
+        __syncthreads();
+        for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+            if (threadIdx.x < width) {
+                Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                    load_ext(shared + (threadIdx.x + width) * 3));
+                shared[threadIdx.x * 3 + 0] = sum.a;
+                shared[threadIdx.x * 3 + 1] = sum.b;
+                shared[threadIdx.x * 3 + 2] = sum.c;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            uint64_t at = ((uint64_t)bc * gridDim.x + blockIdx.x) * 3;
+            d_partials[at + 0] = shared[0];
+            d_partials[at + 1] = shared[1];
+            d_partials[at + 2] = shared[2];
+        }
+        __syncthreads();
+    }
+}
+
+// Both folds at once, base to ext3: `out_k[x] = Σ_{a,b} w[2a+b]·f_k(a, b, x)` over
+// the four rows of each group, into factor `k`'s quarter-size slab of `out`.
+// One thread per (factor, group).
+extern "C" __global__ void zc_fold2(const uint64_t *const *__restrict__ d_factors, uint64_t q,
+                                    uint64_t width, const uint64_t *__restrict__ d_w,
+                                    uint64_t *__restrict__ out) {
+    Fe3 w0 = load_ext(d_w), w1 = load_ext(d_w + 3), w2 = load_ext(d_w + 6),
+        w3 = load_ext(d_w + 9);
+    uint64_t total = width * q;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t k = task / q;
+        uint64_t x = task - k * q;
+        const uint64_t *column = d_factors[k];
+        Fe3 v = ext3::mul_base(w0, column[x * 3]);
+        v = ext3::add(v, ext3::mul_base(w1, column[(x + q) * 3]));
+        v = ext3::add(v, ext3::mul_base(w2, column[(x + 2 * q) * 3]));
+        v = ext3::add(v, ext3::mul_base(w3, column[(x + 3 * q) * 3]));
+        uint64_t *at = out + task * 3;
+        at[0] = v.a;
+        at[1] = v.b;
+        at[2] = v.c;
+    }
+}
+
+// `L[x] = a₀ + Σ a_k·F_k[x]` over the folded (ext3) factors. One thread per row.
+extern "C" __global__ void zc_bus_column(const uint64_t *const *__restrict__ d_factors,
+                                         uint64_t rows, const uint32_t *__restrict__ d_term_slots,
+                                         const uint64_t *__restrict__ d_term_coeffs,
+                                         uint64_t num_terms,
+                                         const uint64_t *__restrict__ d_constant,
+                                         uint64_t *__restrict__ out) {
+    Fe3 a0 = load_ext(d_constant);
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < rows;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 acc = a0;
+        for (uint64_t k = 0; k < num_terms; k++) {
+            acc = ext3::add(acc, ext3::mul(load_ext(d_term_coeffs + k * 3),
+                                           load_ext(d_factors[d_term_slots[k]] + x * 3)));
+        }
+        uint64_t *at = out + x * 3;
+        at[0] = acc.a;
+        at[1] = acc.b;
+        at[2] = acc.c;
+    }
+}
+
+// `eq(a_{>j+1}, ·)` from `eq(a_{>j}, ·)` in place: `t[x] += t[x + half]`.
+extern "C" __global__ void zc_halve(uint64_t *__restrict__ table, uint64_t half) {
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < half;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 v = ext3::add(load_ext(table + x * 3), load_ext(table + (x + half) * 3));
+        table[x * 3 + 0] = v.a;
+        table[x * 3 + 1] = v.b;
+        table[x * 3 + 2] = v.c;
+    }
+}
+
+// A later round (S1-4 with S1-1): `gridDim.y` is `num_a + 2` and each block owns
+// one of them. Block row `y < num_a` sums `eq_r[j]·C(j, node[y])`, every factor
+// read at the integer node `k = node[y]` as `lo + k·(hi − lo)` (`lo` itself at
+// `k = 0`); row `num_a + b` sums `eq_rho[j]·L[j + b·half]`. The per-block sums go
+// to `d_partials[(y·gridDim.x + block)·3]`.
+extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
+    const uint32_t *__restrict__ d_node_ints, uint32_t num_a,
+    const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,
+    const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials) {
+    uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
+    uint64_t *slots = d_slots + tid;
+    uint64_t start = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t step = (uint64_t)gridDim.x * blockDim.x;
+
+    Fe3 acc = ext3::zero();
+    if (blockIdx.y < num_a) {
+        uint64_t k = d_node_ints[blockIdx.y];
+        for (uint64_t j = start; j < half; j += step) {
+            Fe3 c = ext3::zero();
+            for (uint64_t i = 0; i < num_nodes; i++) {
+                Node nd = load_node(d_nodes, i);
+                switch (nd.op) {
+                case OP_VAR: {
+                    const uint64_t *column = d_factors[nd.a];
+                    Fe3 lo = load_ext(column + j * 3);
+                    Fe3 v = lo;
+                    if (k) {
+                        Fe3 hi = load_ext(column + (j + half) * 3);
+                        v = ext3::add(lo, ext3::mul_base(ext3::sub(hi, lo), k));
+                    }
+                    store_slot(slots, num_threads, nd.res, v);
+                    break;
+                }
+                case OP_FIXED:
+                    store_slot(slots, num_threads, nd.res, load_ext(d_consts + (uint64_t)nd.a * 3));
+                    break;
+                case OP_ADD:
+                    store_slot(slots, num_threads, nd.res,
+                               ext3::add(load_slot(slots, num_threads, nd.a),
+                                         load_slot(slots, num_threads, nd.b)));
+                    break;
+                case OP_SUB:
+                    store_slot(slots, num_threads, nd.res,
+                               ext3::sub(load_slot(slots, num_threads, nd.a),
+                                         load_slot(slots, num_threads, nd.b)));
+                    break;
+                case OP_MUL:
+                    store_slot(slots, num_threads, nd.res,
+                               ext3::mul(load_slot(slots, num_threads, nd.a),
+                                         load_slot(slots, num_threads, nd.b)));
+                    break;
+                case OP_NEG:
+                    store_slot(slots, num_threads, nd.res,
+                               ext3::neg(load_slot(slots, num_threads, nd.a)));
+                    break;
+                case OP_ACC: {
+                    Fe3 v = load_slot(slots, num_threads, nd.a);
+                    if (nd.b != NO_SELECTOR) {
+                        const uint64_t *column = d_factors[nd.b];
+                        Fe3 lo = load_ext(column + j * 3);
+                        Fe3 s = lo;
+                        if (k) {
+                            Fe3 hi = load_ext(column + (j + half) * 3);
+                            s = ext3::add(lo, ext3::mul_base(ext3::sub(hi, lo), k));
+                        }
+                        v = ext3::mul(v, s);
+                    }
+                    c = ext3::add(c, ext3::mul(load_ext(d_betas + (uint64_t)nd.res * 3), v));
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+            acc = ext3::add(acc, ext3::mul(load_ext(d_eq_r + j * 3), c));
+        }
+    } else {
+        uint64_t b = blockIdx.y - num_a;
+        for (uint64_t j = start; j < half; j += step) {
+            acc = ext3::add(acc, ext3::mul(load_ext(d_eq_rho + j * 3),
+                                           load_ext(d_l + (j + b * half) * 3)));
+        }
+    }
+
+    extern __shared__ uint64_t shared[];
+    shared[threadIdx.x * 3 + 0] = acc.a;
+    shared[threadIdx.x * 3 + 1] = acc.b;
+    shared[threadIdx.x * 3 + 2] = acc.c;
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                load_ext(shared + (threadIdx.x + width) * 3));
+            shared[threadIdx.x * 3 + 0] = sum.a;
+            shared[threadIdx.x * 3 + 1] = sum.b;
+            shared[threadIdx.x * 3 + 2] = sum.c;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        uint64_t at = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * 3;
+        d_partials[at + 0] = shared[0];
+        d_partials[at + 1] = shared[1];
+        d_partials[at + 2] = shared[2];
     }
 }

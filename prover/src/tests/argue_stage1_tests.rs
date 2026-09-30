@@ -802,6 +802,302 @@ fn the_stage1_reference_on_real_traces() {
     );
 }
 
+// ── Q1b: the card (`multilinear::gpu_fused`) ─────────────────────────────────
+
+/// ★ The blob the fused kernels walk is the constraint part: on every VM table
+/// and W-LFM chip, the lowered program with its `ACC` steps, walked as the
+/// grid kernel walks it, gives today's zerocheck rule (weight one) at random
+/// rows. Host only — this is what makes the card's walk checkable without one.
+#[test]
+fn the_fused_blob_is_the_constraint_part_on_every_table() {
+    use multilinear::gpu_fused::{lower_fused, run_lowered_host};
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    for (at, (air, label)) in every_air(&vm, &lfm).into_iter().enumerate() {
+        let mut rng = Rng::new(0xB10B + at as u64);
+        let table = Table::from_air(air, &label, 4, &mut rng);
+        let lowered =
+            lower_fused(&table.constraints).unwrap_or_else(|| panic!("{label}: no lowering"));
+        let width = table.width();
+        let rule = Rule::compiled(
+            table.constraints.degree() + 1,
+            table
+                .constraints
+                .zerocheck_program(&table.betas, width)
+                .unwrap(),
+        );
+        for row in 0..3 {
+            let values: Vec<FB> = (0..width).map(|_| rng.base()).collect();
+            let mut lifted: Vec<EE> = values.iter().map(|v| v.to_extension::<Ext3>()).collect();
+            lifted.push(EE::one());
+            assert_eq!(
+                run_lowered_host(&lowered, &table.betas, &values),
+                rule.apply(&lifted),
+                "{label}: row {row} ({} slots)",
+                lowered.num_slots
+            );
+        }
+    }
+}
+
+/// Card tests share process-global switches; this puts them back however a
+/// test ends.
+#[cfg(feature = "cuda")]
+struct CardSwitches;
+
+#[cfg(feature = "cuda")]
+impl CardSwitches {
+    fn set(faults: multilinear::gpu_fused::FusedFaults, xcheck: bool) -> Self {
+        use multilinear::gpu_fused::*;
+        // A mutation run (the box's) makes one check inert from outside, to
+        // show the test that relies on it fails without it.
+        let mut faults = faults;
+        match std::env::var("LAMBDA_VM_ARGUE_FUSED_MUTATE").as_deref() {
+            Ok("xcheck") => faults.xcheck_inert = true,
+            Ok("corners") => faults.corners_inert = true,
+            _ => {}
+        }
+        force_fused_faults(faults);
+        force_argue_fused(Some(true));
+        force_argue_fused_xcheck(Some(xcheck));
+        Self
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CardSwitches {
+    fn drop(&mut self) {
+        use multilinear::gpu_fused::*;
+        force_fused_faults(FusedFaults::default());
+        force_argue_fused(None);
+        force_argue_fused_xcheck(None);
+        math_cuda::sumcheck::force_int_nodes(None);
+    }
+}
+
+#[cfg(feature = "cuda")]
+type OnCard = Result<(SumcheckProof<Ext3>, Vec<EE>, Vec<EE>), multilinear::Error>;
+
+#[cfg(feature = "cuda")]
+impl Session<'_> {
+    /// The batch through the prover's entry (`batch::prove_resident_with`)
+    /// with the factors on the card — the fused rounds, when they are on.
+    fn on_the_card(&self, claims: &[EE; 3]) -> OnCard {
+        use multilinear::batch::Weight;
+        let table = self.table;
+        let n = self.num_vars();
+        let public: Vec<Mle<Ext3>> = table
+            .shape
+            .public_selectors()
+            .iter()
+            .map(|s| s.table::<Ext3>(n).unwrap())
+            .collect();
+        let device = multilinear::gpu::upload_factors_from_columns(
+            &self.columns,
+            &table.kinds,
+            &public,
+            None,
+        )
+        .unwrap_or_else(|| panic!("{}: the card takes the factors", table.label));
+        let (polys, rules) = self.todays();
+        let lifted: Vec<Mle<Ext3>> = polys[..table.width()].to_vec();
+        let rho = self.claim_point[self.claim_point.len() - n..].to_vec();
+        let mut t = self.transcript();
+        batch::prove_resident_with(
+            vec![Weight::Eq(self.r.clone()), Weight::Eq(rho)],
+            Some(std::sync::Arc::new(device)),
+            || Ok(lifted.clone()),
+            rules,
+            claims,
+            Some(multilinear::gpu_fused::FusedInput {
+                constraints: &table.constraints,
+                betas: &table.betas,
+                interactions: &table.interactions,
+                claim_point: &self.claim_point,
+                r: &self.r,
+            }),
+            &mut t,
+        )
+    }
+
+    /// The card's proof against today's host rounds: messages, point, and
+    /// every trace factor's value at the point.
+    fn assert_card_is_today(&self, claims: &[EE; 3], card: OnCard, what: &str) {
+        let label = &self.table.label;
+        let n = self.num_vars();
+        let (proof, point, bound) = card.unwrap_or_else(|e| panic!("{label} n={n} {what}: {e:?}"));
+        let (today, today_point, _) = self.today(claims);
+        for (round, (a, b)) in today.rounds.iter().zip(&proof.rounds).enumerate() {
+            assert_eq!(
+                a.evaluations, b.evaluations,
+                "{label} n={n} {what}: round {round}"
+            );
+        }
+        assert_eq!(
+            proof.rounds.len(),
+            today.rounds.len(),
+            "{label} n={n} {what}"
+        );
+        assert_eq!(point, today_point, "{label} n={n} {what}: the point");
+        for (slot, factor) in self.factors.iter().enumerate() {
+            assert_eq!(
+                bound[slot],
+                factor.evaluate_in(&point).unwrap(),
+                "{label} n={n} {what}: factor {slot} at the point"
+            );
+        }
+    }
+}
+
+/// ★ Q1b device parity (FAST2): the fused rounds on the card send today's
+/// messages — the three at 2^10 and 2^12, every table at 2^8 — over random
+/// columns, the corners summed (random columns break every AIR), with the
+/// cross-check on: today's device rounds replay the fused challenges and must
+/// agree. Each run must have taken the card (`fused_sessions`) and been
+/// confirmed (`fused_xchecks`).
+#[cfg(feature = "cuda")]
+#[test]
+fn the_fused_rounds_on_the_card_send_todays_messages() {
+    use multilinear::gpu_fused::*;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        true,
+    );
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    let mut runs: Vec<(String, usize)> = every_air(&vm, &lfm)
+        .iter()
+        .map(|(_, label)| (label.clone(), 8))
+        .collect();
+    for label in THE_THREE {
+        runs.push((label.to_string(), 10));
+        runs.push((label.to_string(), 12));
+    }
+    let airs = every_air(&vm, &lfm);
+    for (at, (label, n)) in runs.iter().enumerate() {
+        let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+        let mut rng = Rng::new(0xCA4D + at as u64);
+        let table = Table::from_air(air, label, *n, &mut rng);
+        let session = table.session(table.random_columns(*n, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        let (sessions, checks) = (fused_sessions(), fused_xchecks());
+        session.assert_card_is_today(&claims, session.on_the_card(&claims), "fused");
+        assert_eq!(
+            fused_sessions(),
+            sessions + 1,
+            "{label} n={n}: the card ran the fused rounds"
+        );
+        assert_eq!(
+            fused_xchecks(),
+            checks + 1,
+            "{label} n={n}: today's rounds confirmed them"
+        );
+    }
+    eprintln!(
+        "argue Q1b: {} fused card runs sent today's messages",
+        runs.len()
+    );
+}
+
+/// ★ S1-1 on today's kernel (`LAMBDA_VM_ARGUE_INT_NODES`): the device rounds
+/// with integer nodes send today's messages (the three at 2^10, fused off).
+#[cfg(feature = "cuda")]
+#[test]
+fn the_int_node_rounds_send_todays_messages() {
+    let _switches = CardSwitches::set(Default::default(), false);
+    multilinear::gpu_fused::force_argue_fused(Some(false));
+    math_cuda::sumcheck::force_int_nodes(Some(true));
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    for (at, (air, label)) in every_air(&vm, &lfm)
+        .into_iter()
+        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .enumerate()
+    {
+        let mut rng = Rng::new(0x1A7 + at as u64);
+        let table = Table::from_air(air, &label, 10, &mut rng);
+        let session = table.session(table.random_columns(10, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        let before = multilinear::gpu::sumcheck_calls();
+        session.assert_card_is_today(&claims, session.on_the_card(&claims), "int nodes");
+        assert!(
+            multilinear::gpu::sumcheck_calls() > before,
+            "{label}: the card ran the rounds"
+        );
+    }
+}
+
+/// ⛔ A wrong bus coefficient on the card: the cross-check refuses the prove
+/// (the three at 2^10). Mutation `LAMBDA_VM_ARGUE_FUSED_MUTATE=xcheck` makes the
+/// comparison inert, and this test must then FAIL.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_wrong_bus_coefficient_on_the_card_is_refused_by_the_cross_check() {
+    use multilinear::gpu_fused::*;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            bus: true,
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        true,
+    );
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    for (at, (air, label)) in every_air(&vm, &lfm)
+        .into_iter()
+        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .enumerate()
+    {
+        let mut rng = Rng::new(0xBAD + at as u64);
+        let table = Table::from_air(air, &label, 10, &mut rng);
+        let session = table.session(table.random_columns(10, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        match session.on_the_card(&claims) {
+            Err(multilinear::Error::DeviceFailed {
+                stage: "fused cross-check",
+            }) => {}
+            other => panic!(
+                "{label}: a wrong bus coefficient was not refused: {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+}
+
+/// ⛔ The corner check on the card refuses a trace that breaks its AIR —
+/// random columns, the corners checked rather than summed (the three at
+/// 2^10). Mutation `LAMBDA_VM_ARGUE_FUSED_MUTATE=corners` makes it inert, and
+/// this test must then FAIL.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_corner_check_on_the_card_refuses_a_broken_trace() {
+    use multilinear::gpu_fused::*;
+    let _switches = CardSwitches::set(FusedFaults::default(), true);
+    let vm = vm_airs();
+    let lfm = w_lfm_airs();
+    for (at, (air, label)) in every_air(&vm, &lfm)
+        .into_iter()
+        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .enumerate()
+    {
+        let mut rng = Rng::new(0xC0 + at as u64);
+        let table = Table::from_air(air, &label, 10, &mut rng);
+        let session = table.session(table.random_columns(10, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        match session.on_the_card(&claims) {
+            Err(multilinear::Error::ConstraintViolated { .. }) => {}
+            other => panic!(
+                "{label}: a broken trace was not refused: {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+}
+
 // ── census and op report (printing) ──────────────────────────────────────────
 
 /// Stand-ins for a batch's challenges and points at `num_vars`, and today's

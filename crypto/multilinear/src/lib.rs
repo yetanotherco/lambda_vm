@@ -12,6 +12,7 @@ pub mod eq;
 pub mod fused;
 pub mod gkr;
 pub mod gpu;
+pub mod gpu_fused;
 pub mod logup;
 pub mod mle;
 pub mod poly;

@@ -356,7 +356,16 @@ pub struct Backend {
 
     // sumcheck.cubin
     pub sumcheck_round_ext3: CudaFunction,
+    /// D-ARGUE S1-1: the round with integer interpolation nodes.
+    pub sumcheck_round_ext3_int: CudaFunction,
     pub sum_partials_ext3: CudaFunction,
+    // D-ARGUE stage 1's fused zerocheck (`crate::argue_fused`).
+    pub zc_grid01: CudaFunction,
+    pub zc_bus_u: CudaFunction,
+    pub zc_fold2: CudaFunction,
+    pub zc_bus_column: CudaFunction,
+    pub zc_halve: CudaFunction,
+    pub zc_round_gruen: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
     pub mle_fold_base_ext3: CudaFunction,
     pub eq_expand_level_ext3: CudaFunction,
@@ -1175,7 +1184,14 @@ impl Backend {
             whir_lean_round: whir_fold.load_function("whir_lean_round")?,
             whir_lean_materialize: whir_fold.load_function("whir_lean_materialize")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
+            sumcheck_round_ext3_int: sumcheck.load_function("sumcheck_round_ext3_int")?,
             sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
+            zc_grid01: sumcheck.load_function("zc_grid01")?,
+            zc_bus_u: sumcheck.load_function("zc_bus_u")?,
+            zc_fold2: sumcheck.load_function("zc_fold2")?,
+            zc_bus_column: sumcheck.load_function("zc_bus_column")?,
+            zc_halve: sumcheck.load_function("zc_halve")?,
+            zc_round_gruen: sumcheck.load_function("zc_round_gruen")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,

@@ -361,9 +361,35 @@ pub fn prove_resident<F, T, B>(
 ) -> Result<ResidentProof<F>, Error>
 where
     F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
     T: IsTranscript<F>,
     B: Fn() -> Result<Vec<Mle<F>>, Error>,
 {
+    prove_resident_with::<F, F, T, B>(extra, device, absent, rules, claims, None, transcript)
+}
+
+/// [`prove_resident`], with the zerocheck's rounds the stage-1 way when
+/// `fused` describes the batch and `LAMBDA_VM_ARGUE_FUSED` is on
+/// ([`crate::gpu_fused`]): the same messages, the same proof. A decline runs
+/// today's device rounds, then the host's, as before.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_resident_with<Base, F, T, B>(
+    extra: Vec<Weight<F>>,
+    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
+    absent: B,
+    rules: Vec<Rule<'_, F>>,
+    claims: &[FieldElement<F>],
+    fused: Option<crate::gpu_fused::FusedInput<'_, Base, F>>,
+    transcript: &mut T,
+) -> Result<ResidentProof<F>, Error>
+where
+    Base: IsField + math::field::traits::IsSubFieldOf<F> + 'static,
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+    T: IsTranscript<F>,
+    B: Fn() -> Result<Vec<Mle<F>>, Error>,
+{
+    let _ = &fused;
     if claims.len() != rules.len() {
         return Err(Error::VariableCountMismatch {
             expected: rules.len(),
@@ -396,6 +422,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         (tables, Vec::new())
     };
+    #[cfg(feature = "cuda")]
+    let weights = lambdas.clone();
     let mut batched = Batched::new(built, rules, lambdas)?;
     let degree = batched.degree().max(1);
     if let Some(program) = batched.program() {
@@ -408,6 +436,66 @@ where
                 .map(crate::gpu::WeightView::Table)
                 .collect()
         };
+        #[cfg(feature = "cuda")]
+        if let Some(input) = fused.as_ref().filter(|_| crate::gpu_fused::argue_fused()) {
+            let claim = weights
+                .iter()
+                .zip(claims)
+                .fold(FieldElement::<F>::zero(), |acc, (l, c)| acc + l * c);
+            let check = crate::gpu_fused::argue_fused_xcheck();
+            let start = crate::whir_split::tick();
+            let attempt = crate::gpu_fused::prove_fused(
+                &device,
+                input,
+                &weights,
+                &claim,
+                degree,
+                check,
+                |evaluations| {
+                    for e in evaluations {
+                        transcript.append_field_element(e);
+                    }
+                    transcript.sample_field_element()
+                },
+            );
+            crate::whir_split::add_tick(&crate::whir_split::ZC_OTHER, start);
+            match attempt {
+                None => crate::gpu_fused::note_decline(),
+                Some(Err(error)) => return Err(error),
+                Some(Ok((mut rounds, mut point, factors, times))) => {
+                    if check {
+                        cross_check(
+                            &device, &views, program, degree, &rounds, &point, &factors, times,
+                        )?;
+                    } else if crate::gpu_fused::argue_fused_log() {
+                        eprintln!(
+                            "ARGUE FUSED: factors {} n={} · fused {:.3} ms (grid {:.3} fold2 {:.3} rounds {:.3})",
+                            device.width(),
+                            device.len().trailing_zeros(),
+                            times.total * 1e3,
+                            times.grid * 1e3,
+                            times.fold2 * 1e3,
+                            times.rounds * 1e3,
+                        );
+                    }
+                    let host_tail = crate::whir_split::tick();
+                    batched.adopt(factors)?;
+                    let left = batched.num_vars();
+                    let (tail, tail_point) =
+                        sumcheck::prove_rounds(&mut batched, left, transcript)?;
+                    rounds.extend(tail);
+                    point.extend(tail_point);
+                    let bound: Option<Vec<FieldElement<F>>> = batched
+                        .polys()
+                        .iter()
+                        .map(|factor| factor.as_constant().cloned())
+                        .collect();
+                    let bound = bound.ok_or(Error::NoVariablesLeft)?;
+                    crate::whir_split::add_tick(&crate::whir_split::ZC_TAIL, host_tail);
+                    return Ok((SumcheckProof { rounds }, point, bound));
+                }
+            }
+        }
         let attempt =
             crate::gpu::prove_sumcheck_resident(&device, &views, program, degree, |evaluations| {
                 for e in evaluations {
@@ -449,6 +537,81 @@ where
     batched.prepend(absent()?)?;
     let (proof, point) = sumcheck::prove(batched, transcript)?;
     Ok((proof, point, Vec::new()))
+}
+
+/// `LAMBDA_VM_ARGUE_FUSED_XCHECK`: today's device rounds over the same factors
+/// with the fused rounds' challenges, every message and the factors at the
+/// crossover compared, both timed. The fused rounds only read the lifted
+/// factors, so today's can still fold them. A difference refuses the prove.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cross_check<F>(
+    device: &crate::gpu::DeviceFactors,
+    views: &[crate::gpu::WeightView<'_, F>],
+    program: &Program<F>,
+    degree: usize,
+    rounds: &[crate::sumcheck::RoundProof<F>],
+    point: &[FieldElement<F>],
+    factors: &[Mle<F>],
+    times: crate::gpu_fused::FusedTimes,
+) -> Result<(), Error>
+where
+    F: IsField + 'static,
+{
+    let inert = crate::gpu_fused::faults().xcheck_inert;
+    let mut at = 0usize;
+    let mut parted: Option<usize> = None;
+    let started = std::time::Instant::now();
+    let replay =
+        crate::gpu::prove_sumcheck_resident(device, views, program, degree, |evaluations| {
+            let k = at.min(point.len() - 1);
+            if parted.is_none() && rounds.get(at).is_none_or(|r| r.evaluations != evaluations) {
+                parted = Some(at);
+            }
+            at += 1;
+            point[k].clone()
+        });
+    let today = started.elapsed().as_secs_f64();
+    let verdict = match replay {
+        None => "unchecked (today's rounds declined)".to_string(),
+        Some(Err(error)) => format!("unchecked (today's rounds failed: {error})"),
+        Some(Ok((today_rounds, _, today_factors))) => {
+            if parted.is_none() && today_rounds.len() != rounds.len() {
+                parted = Some(today_rounds.len().min(rounds.len()));
+            }
+            let same_factors = today_factors.len() == factors.len()
+                && today_factors
+                    .iter()
+                    .zip(factors)
+                    .all(|(a, b)| a.evals() == b.evals());
+            match (parted, same_factors) {
+                (None, true) => "ok".to_string(),
+                (Some(round), _) => format!("PARTED at round {round}"),
+                (None, false) => "PARTED at the crossover's factors".to_string(),
+            }
+        }
+    };
+    eprintln!(
+        "ARGUE FUSED: factors {} n={} · fused {:.3} ms (grid {:.3} fold2 {:.3} rounds {:.3}) · today {:.3} ms · \
+         R {:.3} · xcheck {verdict}",
+        device.width(),
+        device.len().trailing_zeros(),
+        times.total * 1e3,
+        times.grid * 1e3,
+        times.fold2 * 1e3,
+        times.rounds * 1e3,
+        today * 1e3,
+        times.total / today.max(1e-9),
+    );
+    if verdict.starts_with("PARTED") && !inert {
+        return Err(Error::DeviceFailed {
+            stage: "fused cross-check",
+        });
+    }
+    if verdict == "ok" {
+        crate::gpu_fused::note_xcheck();
+    }
+    Ok(())
 }
 
 /// Checks the batched sumcheck against the factor values it reduces to.

@@ -848,7 +848,7 @@ fn halve<E: IsField>(table: &mut Vec<FieldElement<E>>, ops: &mut Ops) {
 }
 
 /// `eq₁(a, t) = (1 − a)(1 − t) + a·t`.
-fn eq1<E: IsField>(a: &FieldElement<E>, t: &FieldElement<E>) -> FieldElement<E> {
+pub(crate) fn eq1<E: IsField>(a: &FieldElement<E>, t: &FieldElement<E>) -> FieldElement<E> {
     let one = FieldElement::<E>::one();
     (&one - a) * (&one - t) + a * t
 }
@@ -1372,7 +1372,7 @@ where
 /// `d`), `B` at `0` and `1` (the bus column's, linear), and the weights'
 /// products so far. `g(t) = E^r·eq₁(r_j, t)·A(t) + E^ρ·eq₁(ρ_j, t)·B(t)` for
 /// `t = 1..=D`, `D = d + 1`, with `A(D)` from the Lagrange form over `0..=d`.
-fn message<E: IsField>(
+pub(crate) fn message<E: IsField>(
     r_j: &FieldElement<E>,
     rho_j: &FieldElement<E>,
     e_r: &FieldElement<E>,
