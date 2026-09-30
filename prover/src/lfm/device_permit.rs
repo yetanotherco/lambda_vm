@@ -51,10 +51,10 @@
 //! probe's cached `OnceLock<bool>` and returns. Nothing that ships arms it, and
 //! nothing that ships sets `LAMBDA_VM_TREE_BUSY_PROBE`.
 
-use std::cell::Cell;
-use std::sync::Mutex;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// How many sibling proofs the driver intends to run at once. 1 = the serial
 /// driver, and the permit is inert.
@@ -112,6 +112,139 @@ thread_local! {
     /// exactly how the census memo cost twelve minutes of a test binary sitting
     /// at 0% CPU with nothing printed. A panic names it instead.
     static HELD_HERE: Cell<bool> = const { Cell::new(false) };
+    /// The latch this thread's `multi_prove` holds wait behind — see
+    /// [`defer_multi_prove_until`].
+    static DEFER_PROVE: RefCell<Option<Arc<CardLatch>>> = const { RefCell::new(None) };
+}
+
+/// A one-way gate a `multi_prove` can be told to wait behind: shut until
+/// [`open`](Self::open), then open for good.
+///
+/// ★ What it orders is level 1's card. There, the WHIR global child's prove and
+/// the last wide node's artifact build ask for the card within a few hundred
+/// milliseconds of each other. When the global asks first, the last node's
+/// artifacts wait out its whole prove, and the last node's host prep then runs
+/// while the card idles; asked the other way round, the global's prove covers
+/// that prep. The driver's `LFM_TREE_GLOBAL_AFTER_LAST` puts the global behind
+/// this latch and has the last node open it.
+pub struct CardLatch {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl CardLatch {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+        })
+    }
+
+    /// Open it, for every waiter now and later.
+    pub fn open(&self) {
+        *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.opened.notify_all();
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait until it opens or `bound` passes: the time waited, and whether the
+    /// bound ended the wait.
+    fn wait(&self, bound: Duration) -> (Duration, bool) {
+        let since = Instant::now();
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (open, _) = self
+            .opened
+            .wait_timeout_while(open, bound, |open| !*open)
+            .unwrap_or_else(|e| e.into_inner());
+        (since.elapsed(), !*open)
+    }
+}
+
+/// Opens its latch when it drops: where it is dropped on purpose, and as a
+/// panic unwinds, so a waiter is never left behind a task that died.
+pub struct OpenOnDrop(Arc<CardLatch>);
+
+impl OpenOnDrop {
+    pub fn new(latch: Arc<CardLatch>) -> Self {
+        Self(latch)
+    }
+}
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// The longest a deferred `multi_prove` waits for its latch before it queues
+/// for the card anyway, and says so. The latch orders the card; it must never
+/// be able to stop a proof. On the block the wait is at most about a second.
+const DEFER_BOUND: Duration = Duration::from_secs(30);
+
+/// Deferred `multi_prove` holds, and those the bound released.
+static DEFERRED: AtomicUsize = AtomicUsize::new(0);
+static DEFER_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
+/// (deferred `multi_prove` holds, those the bound released) this process.
+pub fn defer_stats() -> (usize, usize) {
+    (
+        DEFERRED.load(Ordering::Relaxed),
+        DEFER_TIMEOUTS.load(Ordering::Relaxed),
+    )
+}
+
+/// While the guard lives, this thread's `multi_prove` holds wait for `latch`
+/// to open before they queue for the card — for at most [`DEFER_BOUND`]. Other
+/// phases do not wait, and neither does anything while the permit is unarmed:
+/// the serial driver takes no card at all, so there is nothing to order.
+pub fn defer_multi_prove_until(latch: Arc<CardLatch>) -> DeferGuard {
+    DEFER_PROVE.with(|d| *d.borrow_mut() = Some(latch));
+    DeferGuard {
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// Clears this thread's deferral when it drops. Not `Send`: the deferral
+/// belongs to the thread that installed it.
+pub struct DeferGuard {
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for DeferGuard {
+    fn drop(&mut self) {
+        DEFER_PROVE.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+/// Wait out this thread's deferral before a `multi_prove` queues for the card,
+/// if it has one, and print what it cost.
+fn wait_deferral(phase: &'static str) {
+    if phase != "multi_prove" {
+        return;
+    }
+    let Some(latch) = DEFER_PROVE.with(|d| d.borrow().clone()) else {
+        return;
+    };
+    let t0 = stark::prove_split::epoch_secs();
+    let (waited, timed_out) = latch.wait(DEFER_BOUND);
+    DEFERRED.fetch_add(1, Ordering::Relaxed);
+    if timed_out {
+        DEFER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+    println!(
+        "CARD DEFER #{} {phase}: waited {:.3}s for its latch{} · t=[{t0:.3},{:.3}]",
+        DEFERRED.load(Ordering::Relaxed),
+        waited.as_secs_f64(),
+        if timed_out {
+            " — THE BOUND RAN OUT, queued anyway"
+        } else {
+            ""
+        },
+        stark::prove_split::epoch_secs(),
+    );
 }
 
 /// Arm the permit for `workers` concurrent proofs. `workers <= 1` leaves it
@@ -266,6 +399,9 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         "the card permit is not reentrant and this thread already holds it; \
          taking it twice without releasing parks the thread forever"
     );
+    // ★ Before the queue, not in it: a deferred prove must not hold a place in
+    // the line while it waits for its latch, or it would still go first.
+    wait_deferral(phase);
     // A poisoned card is a panic already being reported: take it through the
     // poison rather than turning one failure into two.
     let blocked_from = Instant::now();
@@ -433,6 +569,137 @@ mod tests {
         .join();
         assert!(panicked.is_err(), "a reentrant hold must panic");
         disarm(&g);
+    }
+
+    /// ★ A DEFERRED `multi_prove` WAITS FOR ITS LATCH, AND NOTHING ELSE DOES.
+    ///
+    /// The worker's artifact hold goes straight to the card; its prove hold
+    /// takes the card only after the latch opens, which the main thread does
+    /// after a pause the prove cannot have waited out by accident. A permit
+    /// that ignored the deferral takes the prove's card within milliseconds,
+    /// before the latch opens, and fails the order assertion.
+    #[test]
+    fn armed_a_deferred_prove_waits_for_its_latch_and_an_artifact_build_does_not() {
+        const PAUSE: Duration = Duration::from_millis(200);
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(2);
+        let latch = CardLatch::new();
+        let (deferred_before, _) = defer_stats();
+        let artifacts_at = Mutex::new(None);
+        let prove_at = Mutex::new(None);
+        let opened_at = Mutex::new(None);
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _deferred = defer_multi_prove_until(latch.clone());
+                {
+                    let _card = hold_labeled("build_artifacts");
+                }
+                *artifacts_at.lock().expect("the timing lock") = Some(t0.elapsed());
+                let _card = hold_labeled("multi_prove");
+                *prove_at.lock().expect("the timing lock") = Some(t0.elapsed());
+            });
+            std::thread::sleep(PAUSE);
+            *opened_at.lock().expect("the timing lock") = Some(t0.elapsed());
+            latch.open();
+        });
+        let artifacts = artifacts_at
+            .lock()
+            .expect("the timing lock")
+            .expect("built");
+        let prove = prove_at.lock().expect("the timing lock").expect("proved");
+        let opened = opened_at.lock().expect("the timing lock").expect("opened");
+        assert!(
+            artifacts < PAUSE / 2,
+            "an artifact build must not wait for the latch: it took the card at {artifacts:?}"
+        );
+        assert!(
+            prove >= opened,
+            "the deferred prove took the card at {prove:?}, before its latch opened at {opened:?}"
+        );
+        assert!(
+            defer_stats().0 > deferred_before,
+            "the deferral must be counted"
+        );
+        disarm(&g);
+    }
+
+    /// An open latch costs nothing, and a dropped guard leaves no deferral
+    /// behind.
+    #[test]
+    fn armed_an_open_latch_or_a_dropped_guard_does_not_delay_a_prove() {
+        const QUICK: Duration = Duration::from_millis(100);
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(2);
+        let open = CardLatch::new();
+        open.open();
+        {
+            let _deferred = defer_multi_prove_until(open);
+            let t = Instant::now();
+            let _card = hold_labeled("multi_prove");
+            assert!(
+                t.elapsed() < QUICK,
+                "an open latch must not delay the prove"
+            );
+        }
+        let shut = CardLatch::new();
+        drop(defer_multi_prove_until(shut));
+        let t = Instant::now();
+        {
+            let _card = hold_labeled("multi_prove");
+        }
+        assert!(
+            t.elapsed() < QUICK,
+            "a dropped guard must clear the deferral, or the prove waits for a shut latch"
+        );
+        disarm(&g);
+    }
+
+    /// Unarmed, the permit takes no card, so there is nothing to order: a
+    /// deferral is ignored rather than parking the serial driver behind a
+    /// latch only a later task would open.
+    #[test]
+    fn unarmed_a_deferral_is_ignored() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        let shut = CardLatch::new();
+        let _deferred = defer_multi_prove_until(shut);
+        let t = Instant::now();
+        {
+            let _card = hold_labeled("multi_prove");
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "the serial driver must never wait for a latch"
+        );
+        disarm(&g);
+    }
+
+    /// The opener opens as a panic unwinds, so a waiter never outlives the
+    /// task that was to open its latch; and the wait itself is bounded.
+    #[test]
+    fn an_opener_opens_as_its_task_unwinds_and_the_wait_is_bounded() {
+        let latch = CardLatch::new();
+        let (waited, bound_ran_out) = latch.wait(Duration::from_millis(50));
+        assert!(
+            bound_ran_out && waited >= Duration::from_millis(40),
+            "a shut latch must hold a waiter until the bound: {waited:?}"
+        );
+        let opener = OpenOnDrop::new(latch.clone());
+        let died = std::thread::spawn(move || {
+            let _opener = opener;
+            panic!("the task that was to open the latch died");
+        })
+        .join();
+        assert!(died.is_err(), "the task must have panicked");
+        assert!(latch.is_open(), "its unwind must have opened the latch");
+        let (waited, bound_ran_out) = latch.wait(Duration::from_secs(5));
+        assert!(
+            !bound_ran_out && waited < Duration::from_millis(100),
+            "an open latch must not hold a waiter: {waited:?}"
+        );
     }
 
     /// The level line says which resource bound the level, so a green run
