@@ -488,3 +488,36 @@ fn epoch_binary_work() {
     }
     eprintln!("  LFM hasher: {:?}", crate::hash_pin::BLOCK_HASHER);
 }
+
+/// The RISC-V cost of a Merkle compression, h = keccak256(h ‖ h), under the
+/// production base options (blowup 4, the pipeline's format, RPX commitments):
+/// prove time and committed cells at several N, whose slope is the per-hash
+/// cost a 3MI RISC-V half pays. Needs `executor/program_artifacts/rust/keccak_chain.elf`.
+#[test]
+#[ignore]
+fn riscv_keccak_compress_cost() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf = std::fs::read(root.join("../executor/program_artifacts/rust/keccak_chain.elf"))
+        .expect("build keccak_chain.elf first");
+    let opts = super::proof::block_base_options();
+    for n in [1024u32, 4096, 16384, 65536] {
+        let mut ms = Vec::new();
+        let mut cells = 0;
+        for _ in 0..runs() {
+            let t = Instant::now();
+            let proof = crate::prove_with_options_and_inputs(
+                &elf,
+                &n.to_le_bytes(),
+                &opts,
+                &crate::tables::MaxRowsConfig::default(),
+            )
+            .expect("keccak_chain proves");
+            ms.push(t.elapsed().as_secs_f64() * 1e3);
+            cells = census(&proof.proof).1;
+        }
+        eprintln!(
+            "riscv keccak_chain n={n} cells={cells} prove_ms={}",
+            stats(ms)
+        );
+    }
+}
