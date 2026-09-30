@@ -161,6 +161,22 @@ pub fn within_waste(used: usize, rows: usize) -> bool {
     (rows - used) * 100 <= rows * max_waste_percent()
 }
 
+/// A split must save at least this share (in percent) of the whole table's
+/// rows to pay for the extra table: `FVM_SPLIT_MIN_SAVE`, default 0.
+pub fn min_save_percent() -> usize {
+    std::env::var("FVM_SPLIT_MIN_SAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether splitting `left` into `half` and the rest saves enough of `total`.
+pub fn split_pays(left: usize, half: usize, total: usize, min_rows: usize) -> bool {
+    let full = left.next_power_of_two().max(min_rows);
+    let split = half + (left - half).next_power_of_two().max(min_rows);
+    full.saturating_sub(split) * 100 >= total * min_save_percent()
+}
+
 /// At most this many FIELD_VM segments when no cap forces more.
 pub const MAX_SEGMENTS: usize = 4;
 
@@ -178,7 +194,8 @@ pub fn segment_plan(steps: usize, min_rows: usize, max_rows: Option<usize>) -> V
         let rows = (full / 2).min(cap).max(min_rows);
         let fits = full <= cap;
         let last_allowed = max_rows.is_none() && plan.len() + 1 == MAX_SEGMENTS;
-        if fits && (within_waste(left, full) || last_allowed || rows > left) {
+        let pays = max_rows.is_some() || split_pays(left, rows - 1, steps, min_rows);
+        if fits && (within_waste(left, full) || last_allowed || rows > left || !pays) {
             plan.push((left, full));
             return plan;
         }

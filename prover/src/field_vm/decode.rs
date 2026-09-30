@@ -36,6 +36,7 @@ pub fn chunks(program: &Program, min_rows: usize) -> Vec<(usize, usize, usize)> 
             || plan.len() + 1 == MAX_CHUNKS
             || half < min_rows
             || half >= left
+            || !super::air::split_pays(left, half, program.len(), min_rows)
         {
             plan.push((start, left, full));
             return plan;
