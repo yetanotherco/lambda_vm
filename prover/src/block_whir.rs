@@ -23,6 +23,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
+use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
 use stark::multilinear_table::{CommittedTable, MultiProof, TableLayout, TableStatement};
 use stark::table::Table;
@@ -127,6 +128,13 @@ pub struct BlockStamps {
     pub tables: usize,
     pub cells: usize,
     pub groups: Vec<GroupStamps>,
+    /// The trace build's phase ends and each phase-5 generator's finish,
+    /// seconds into the build.
+    pub build_marks: Vec<(String, f64)>,
+    /// Phase B's first-round trees: `open_many` calls served from the kept
+    /// tops and the leaves re-hashed for them. A revived commitment never
+    /// builds a device tree, so nothing re-commits.
+    pub top_paths: (u64, u64),
 }
 
 impl BlockStamps {
@@ -145,10 +153,11 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A upload {:.3} commit {:.3} retire {:.3} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} commit {:.3} retire {:.3} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
+                s.wait_a,
                 s.upload_a,
                 s.commit,
                 s.retire,
@@ -158,15 +167,28 @@ impl BlockStamps {
                 s.open,
             ));
         }
+        if !self.build_marks.is_empty() {
+            let marks: Vec<String> = self
+                .build_marks
+                .iter()
+                .map(|(label, at)| format!("{label} {at:.2}"))
+                .collect();
+            out.push_str(&format!("BLOCK BUILD MARKS: {}\n", marks.join(" · ")));
+        }
+        out.push_str(&format!(
+            "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed on the host · phase B on one thread + one upload helper\n",
+            self.top_paths.0, self.top_paths.1,
+        ));
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
         out.push_str(&format!(
-            "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (upload {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
+            "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
             self.execute,
             self.build,
             self.prep,
             self.phase_a,
+            sum(|g| g.wait_a),
             sum(|g| g.upload_a),
             sum(|g| g.commit),
             sum(|g| g.retire),
@@ -219,6 +241,36 @@ fn split_rows(table: TraceTable<F, E>, rows: usize) -> Vec<TraceTable<F, E>> {
         .collect()
 }
 
+/// One table of the proof: its layout and its columns, taken out of the trace
+/// (whose row-major copy goes when `release_rows`), checked against the
+/// columns the program implies.
+fn table_of<'a>(
+    air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    trace: &mut TraceTable<F, E>,
+    (width, num_vars): (usize, usize),
+    release_rows: bool,
+) -> Result<CommittedTable<'a, F, E>, Error> {
+    let layout = layout_of(air, width, num_vars)
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+    let mut columns = trace.columns_main();
+    // The row-major copy goes as soon as the columns exist: a block's traces
+    // are tens of GiB, and two copies of them at once is the peak this entry
+    // point exists to avoid.
+    if release_rows {
+        trace.main_table = Table::new(Vec::new(), 0);
+    }
+    for (col, expected) in air.precomputed_columns().iter().enumerate() {
+        if columns.get(col) != Some(expected) {
+            return Err(Error::Prover(format!(
+                "{}: preprocessed column {col} is not what the program implies",
+                air.name(),
+            )));
+        }
+    }
+    CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
+}
+
 /// Proves a block in one proof.
 pub fn prove_block_whir(
     elf_bytes: &[u8],
@@ -268,6 +320,7 @@ pub(crate) fn prove_block_whir_with(
         .map_err(|e| Error::Execution(format!("{e}")))?;
     stamps.execute = t.elapsed().as_secs_f64();
 
+    crate::tables::trace_builder::build_stamps::start();
     let t = Instant::now();
     let mut traces = Traces::from_elf_and_logs(
         &program,
@@ -279,6 +332,7 @@ pub(crate) fn prove_block_whir_with(
     )?;
     drop(result);
     stamps.build = t.elapsed().as_secs_f64();
+    stamps.build_marks = crate::tables::trace_builder::build_stamps::take();
 
     let t = Instant::now();
     split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2);
@@ -349,41 +403,28 @@ pub(crate) fn prove_traces(
         None,
     );
 
-    let mut pairs = airs.air_trace_pairs(traces);
+    let pairs = airs.air_trace_pairs(traces);
     let shapes = shapes_of(&pairs)?;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config_under(&format.zf, &shapes);
     let sizes = block_groups(&shapes, config.format.stack, format.group_polys)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
-    let mut committed = Vec::with_capacity(pairs.len());
-    for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
-        let layout = layout_of(*air, width, num_vars)
-            .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
-        let mut columns = trace.columns_main();
-        // The row-major copy goes as soon as the columns exist: a block's
-        // traces are tens of GiB, and two copies of them at once is the peak
-        // this entry point exists to avoid.
-        if release_rows {
-            trace.main_table = Table::new(Vec::new(), 0);
-        }
-        for (col, expected) in air.precomputed_columns().iter().enumerate() {
-            if columns.get(col) != Some(expected) {
-                return Err(Error::Prover(format!(
-                    "{}: preprocessed column {col} is not what the program implies",
-                    air.name(),
-                )));
-            }
-        }
-        committed.push(
-            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
-                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
-        );
-    }
-    stamps.tables = committed.len();
+    stamps.tables = pairs.len();
     stamps.cells = shapes.iter().map(|&(w, n)| w << n).sum();
     stamps.prep += t.elapsed().as_secs_f64();
 
+    // The pairs, cut into the groups phase A commits: a producer lays each
+    // group's tables out (its tables in parallel) while the card commits the
+    // group before it.
+    let mut groups_of_pairs: Vec<Vec<(crate::AirTracePair<'_>, (usize, usize))>> =
+        Vec::with_capacity(sizes.len());
+    {
+        let mut pairs = pairs.into_iter().zip(shapes.iter().copied());
+        for &size in &sizes {
+            groups_of_pairs.push(pairs.by_ref().take(size).collect());
+        }
+    }
     let proof = crate::with_whir_hash!(|H| {
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
@@ -400,10 +441,40 @@ pub(crate) fn prove_traces(
             &config,
         );
         let t = Instant::now();
-        let block = BlockCommitted::commit::<H>(committed, &sizes, &config, options.drop_levels)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let (block, produced) = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let producer = scope.spawn(move || -> Result<f64, Error> {
+                let mut busy = 0.0;
+                for group in groups_of_pairs {
+                    let t = Instant::now();
+                    let tables = group
+                        .into_par_iter()
+                        .map(|((air, trace, _), shape)| table_of(air, trace, shape, release_rows))
+                        .collect::<Result<Vec<_>, Error>>()?;
+                    busy += t.elapsed().as_secs_f64();
+                    if tx.send(tables).is_err() {
+                        break;
+                    }
+                }
+                Ok(busy)
+            });
+            let block = BlockCommitted::commit_streamed::<H>(
+                rx.iter(),
+                &sizes,
+                &config,
+                options.drop_levels,
+            );
+            (block, producer.join())
+        });
+        // The producer's error names the cause; a commit that ran out of
+        // groups only says that it did.
+        let produced =
+            produced.map_err(|_| Error::Prover("the block's table producer panicked".into()))??;
+        let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        stamps.prep += produced;
         stamps.phase_a = t.elapsed().as_secs_f64();
         let t = Instant::now();
+        let paths_before = multilinear::whir_commit::top_path_counts();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -417,6 +488,11 @@ pub(crate) fn prove_traces(
         )
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        let paths_after = multilinear::whir_commit::top_path_counts();
+        stamps.top_paths = (
+            paths_after.0 - paths_before.0,
+            paths_after.1 - paths_before.1,
+        );
         stamps.groups = groups;
         proof
     });

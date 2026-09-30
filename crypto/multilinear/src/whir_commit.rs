@@ -53,6 +53,22 @@ where
     top: Option<TreeTop>,
 }
 
+/// Paths served from a kept tree top, and the leaves re-hashed on the host to
+/// serve them — the whole cost of not keeping the bottom levels. A revived
+/// commitment never builds a device tree (there is no code path for it), so
+/// these two are all a phase-B opening spends on its first round's tree.
+static TOP_PATH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_LEAVES_REHASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(open_many calls served from a kept top, leaves re-hashed for them)`.
+pub fn top_path_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TOP_PATH_CALLS.load(Relaxed),
+        TOP_LEAVES_REHASHED.load(Relaxed),
+    )
+}
+
 /// What a retired commitment keeps of its tree: the heap prefix down to the
 /// level whose nodes each cover `2^dropped` leaves.
 ///
@@ -469,6 +485,8 @@ where
             .flat_map(|block| (block << dropped)..((block + 1) << dropped))
             .collect();
         let values = self.gather(&leaves)?;
+        TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let frontier = (1usize << (depth - dropped)) - 1;
         let mut subtrees = Vec::with_capacity(blocks.len());
         for (k, &block) in blocks.iter().enumerate() {

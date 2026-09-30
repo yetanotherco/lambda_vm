@@ -98,7 +98,9 @@ pub struct GroupStamps {
     pub tables: usize,
     pub polys: usize,
     pub cells: usize,
-    /// Phase A: the columns up, the commit, the roots, the tops home.
+    /// Phase A: the wait for the group's tables (a streamed producer), the
+    /// columns up, the commit, the roots, the tops home.
+    pub wait_a: f64,
     pub upload_a: f64,
     pub commit: f64,
     pub retire: f64,
@@ -152,14 +154,45 @@ where
                 got: sizes.iter().sum(),
             });
         }
-        let mut groups = Vec::with_capacity(sizes.len());
+        let mut tables = tables.into_iter();
+        let groups = sizes
+            .iter()
+            .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        Self::commit_streamed::<H>(groups, sizes, config, drop_levels)
+    }
+
+    /// [`Self::commit`] over groups handed over one at a time, in group order —
+    /// by a producer still preparing the later ones while the card commits
+    /// the earlier. Each group's wait for its tables is stamped (`wait_a`). A
+    /// producer that stops early leaves fewer groups than `sizes` names, which
+    /// is refused.
+    pub fn commit_streamed<H: WhirHash>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+        drop_levels: usize,
+    ) -> Result<Self, MlError> {
+        let mut tables = Vec::with_capacity(sizes.iter().sum());
+        let mut retired_groups = Vec::with_capacity(sizes.len());
         let mut roots = Vec::new();
         let mut stamps = Vec::with_capacity(sizes.len());
-        let mut at = 0usize;
+        let mut incoming = groups.into_iter();
         for &size in sizes {
-            let group = &tables[at..at + size];
+            let waited = Instant::now();
+            let group = incoming.next().ok_or(MlError::QueryCountMismatch {
+                expected: sizes.len(),
+                got: stamps.len(),
+            })?;
+            if group.len() != size {
+                return Err(MlError::QueryCountMismatch {
+                    expected: size,
+                    got: group.len(),
+                });
+            }
             let mut stamp = GroupStamps {
                 tables: size,
+                wait_a: waited.elapsed().as_secs_f64(),
                 ..Default::default()
             };
             let t = Instant::now();
@@ -187,16 +220,17 @@ where
             let t = Instant::now();
             let retired = stacked.retire(drop_levels, config)?;
             drop(store);
+            drop(columns);
             stamp.retire = t.elapsed().as_secs_f64();
             stamp.tree_bytes = retired.tree_bytes();
-            groups.push(retired);
+            retired_groups.push(retired);
             stamps.push(stamp);
-            at += size;
+            tables.extend(group);
         }
         Ok(Self {
             tables,
             sizes: sizes.to_vec(),
-            groups,
+            groups: retired_groups,
             roots,
             stamps,
         })
@@ -219,6 +253,22 @@ where
     pub fn stamps(&self) -> &[GroupStamps] {
         &self.stamps
     }
+}
+
+/// A group's columns on the card, shared by its tables.
+type Store = Option<Arc<multilinear::gpu::ResidentColumns>>;
+
+/// Uploads a group's columns, in table order; `None` when the card declines
+/// (every reader then takes the host copy).
+fn upload_group<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+    multilinear::gpu::upload_columns(&columns).map(Arc::new)
 }
 
 /// The fork a group proves on: `S_post` then the group's index.
@@ -290,15 +340,20 @@ where
     let mut table_proofs = Vec::with_capacity(tables.len());
     let mut openings = Vec::with_capacity(sizes.len());
     let mut at = 0usize;
+    // The next group's columns, uploaded during this group's argument — the
+    // card idles through the argument's host glue, and a group's store is a
+    // few GiB beside the argument's working set, not beside its codewords.
+    let mut pre_uploaded: Option<Store> = None;
     for (g, (retired, &size)) in groups.into_iter().zip(&sizes).enumerate() {
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
-        let stamp = &mut stamps[g];
-        let group = &mut tables[at..at + size];
+        let (head, tail) = tables.split_at_mut(at + size);
+        let group = &mut head[at..];
+        let next = sizes.get(g + 1).map(|&n| &tail[..n]);
 
         let t = Instant::now();
-        let store = {
-            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            multilinear::gpu::upload_columns(&columns).map(Arc::new)
+        let store = match pre_uploaded.take() {
+            Some(store) => store,
+            None => upload_group(group),
         };
         if let Some(store) = &store {
             let mut first = 0usize;
@@ -307,22 +362,41 @@ where
                 first += table.num_committed_columns();
             }
         }
-        stamp.upload_b = t.elapsed().as_secs_f64();
+        stamps[g].upload_b += t.elapsed().as_secs_f64();
 
         // The group's tables, one after another, each leaving its columns
-        // claimed at its own point.
+        // claimed at its own point — with the next group's upload beside them.
         let t = Instant::now();
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
-        for table in group.iter() {
-            let (proof, point) = prove(table, &z, &alpha, &beta, &mut fork, None)?;
-            for _ in 0..table.num_committed_columns() {
-                points.push(point.clone());
-            }
-            values.extend(proof.constraint.reduce.column_values.iter().cloned());
-            table_proofs.push(proof);
+        let group_ref: &[CommittedTable<'_, F, E>] = group;
+        let (argued, next_store, joined) = std::thread::scope(|scope| {
+            let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
+            let argued = (|| -> Result<(), MlError> {
+                for table in group_ref.iter() {
+                    let (proof, point) = prove(table, &z, &alpha, &beta, &mut fork, None)?;
+                    for _ in 0..table.num_committed_columns() {
+                        points.push(point.clone());
+                    }
+                    values.extend(proof.constraint.reduce.column_values.iter().cloned());
+                    table_proofs.push(proof);
+                }
+                Ok(())
+            })();
+            let argue_end = Instant::now();
+            let next_store = uploader.map(|handle| handle.join());
+            (argued, next_store, argue_end.elapsed().as_secs_f64())
+        });
+        argued?;
+        stamps[g].argue = t.elapsed().as_secs_f64() - joined;
+        if let Some(next_store) = next_store {
+            // The wait for the upload after the argument ended is the next
+            // group's upload cost; the rest of it hid behind this argument.
+            stamps[g + 1].upload_b += joined;
+            pre_uploaded = Some(next_store.map_err(|_| MlError::DeviceFailed {
+                stage: "uploading the next group's columns",
+            })?);
         }
-        stamp.argue = t.elapsed().as_secs_f64();
 
         let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
         let t = Instant::now();
@@ -331,7 +405,7 @@ where
             store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
             config,
         )?;
-        stamp.encode = t.elapsed().as_secs_f64();
+        stamps[g].encode = t.elapsed().as_secs_f64();
         let t = Instant::now();
         openings.push(stacked_eval::prove::<F, E, T, H>(
             &stacked,
@@ -342,7 +416,7 @@ where
             config,
             &mut fork,
         )?);
-        stamp.open = t.elapsed().as_secs_f64();
+        stamps[g].open = t.elapsed().as_secs_f64();
         drop(stacked);
         drop(columns);
         for table in group.iter_mut() {

@@ -3770,6 +3770,52 @@ fn collect_all_ops(
     }
 }
 
+/// When each phase of a trace build ended, and when each table type's phase-5
+/// generator finished — seconds since [`build_stamps::start`]. Off (one atomic
+/// load a mark) unless the block prover turns it on for its readout; the
+/// epoch pipeline never does.
+pub(crate) mod build_stamps {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// A build's start and its marks, `(label, seconds since the start)`.
+    type Marks = (Instant, Vec<(String, f64)>);
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static LOG: Mutex<Option<Marks>> = Mutex::new(None);
+
+    /// Starts recording, clearing what an earlier build left.
+    pub(crate) fn start() {
+        if let Ok(mut log) = LOG.lock() {
+            *log = Some((Instant::now(), Vec::new()));
+        }
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark(label: &str) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut log) = LOG.lock()
+            && let Some((t0, marks)) = log.as_mut()
+        {
+            let at = t0.elapsed().as_secs_f64();
+            marks.push((label.to_string(), at));
+        }
+    }
+
+    /// Stops recording and hands back the marks.
+    pub(crate) fn take() -> Vec<(String, f64)> {
+        ON.store(false, Ordering::Relaxed);
+        LOG.lock()
+            .ok()
+            .and_then(|mut log| log.take())
+            .map(|(_, marks)| marks)
+            .unwrap_or_default()
+    }
+}
+
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
 /// `initial_image` controls PAGE table generation: `Some(image)` generates real
@@ -3830,6 +3876,8 @@ fn build_traces<I: ImageSource + Sync>(
             LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
+
+    build_stamps::mark("p3 lt");
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3982,6 +4030,7 @@ fn build_traces<I: ImageSource + Sync>(
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
+    build_stamps::mark("p4 bitwise");
     // =====================================================================
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p5_generate_tables");
@@ -4264,7 +4313,10 @@ fn build_traces<I: ImageSource + Sync>(
             macro_rules! spawn_into {
                 ($slot:ident, $gen:ident) => {{
                     let slot = &mut $slot;
-                    s.spawn(move |_| *slot = Some($gen()));
+                    s.spawn(move |_| {
+                        *slot = Some($gen());
+                        build_stamps::mark(concat!("p5 ", stringify!($gen)));
+                    });
                 }};
             }
             // Heaviest builds first so the scheduler overlaps them with the rest.
@@ -4326,6 +4378,7 @@ fn build_traces<I: ImageSource + Sync>(
         hints_slot = Some(gen_hints());
     }
 
+    build_stamps::mark("p5 end");
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
     let cpus = cpus_slot.expect(PHASE5_RAN)?;
     let memws = memws_slot.expect(PHASE5_RAN)?;
@@ -5420,6 +5473,7 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p1 cpu ops");
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
@@ -5443,6 +5497,7 @@ impl Traces {
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p2a collect");
 
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p2b_collect_all");
@@ -5466,6 +5521,7 @@ impl Traces {
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p2b route");
 
         Ok(CollectedEpoch {
             ops,
