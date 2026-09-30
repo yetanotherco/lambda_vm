@@ -1096,3 +1096,50 @@ A **quiet-producer A/B**:
   - In between, the band's low end moves to (1 − β) × 1.06 s.
 - **Cost:** a small knob in `for_each_epoch_overlapped_prepped` and a flag around `multi_prove`'s argue, and about
   5 min of FAST.
+
+### 9.3 Job 292's result (FAST, 17:07–17:16:28Z; written 2026-09-30 17:40Z)
+
+**Pre-registered verdict: `UNRESOLVED (no signal separates the slow arms)`, with 5 of 12 arms SLOW.**
+- The SLOW arms: wt1304, wt1308, wt1310, wt1311, wt1312. Their prologues read 4.89–5.53 s and level 1 8.0–8.7 s.
+- The normal arms read 4.43–4.69 s and level 1 7.6–7.7 s.
+- wt1302 sits on the edge: prologue 4.94 s against a 4.95 s threshold, level 1 8.0 s. It counts as normal by the rule.
+- **The SLOW rate is 42 %**, against 18 % over the 28 earlier arms. This head (7c8272701, whole trees on) may shift the
+  schedule [I].
+
+**No host signal separates** [V: `readout.txt`]:
+- other processes: 0.06–0.14 cores in every arm;
+- CFS throttling: 0.01–0.23 s in both groups;
+- Tctl: 77–86 °C, never near 95 °C;
+- PSI cpu: 0.012–0.019 in both groups;
+- no major faults, no direct reclaim, ≈ 40 GiB available.
+- Mean CPU MHz is *higher* in the SLOW arms, because more cores are busy. The pre-registered runqueue rule (1.5× the
+  median) does not separate either: SLOW 2.05–2.90 s against normal 1.68–2.29 s.
+
+**Post hoc (NOT pre-registered; `l1n2_threads.py`): the level-1 schedule inside the process.**
+- The rayon pool's CPU inside L1N2's prologue window (the threads named `whir-head-root`, see §9.1) is bimodal:
+  - **≈ 50 cpu-s in all five SLOW arms and the edge arm wt1302** (50.3, 50.2, 49.9, 50.4; wt1302 50.7);
+  - **≈ 37 cpu-s in all six normal arms** (35.5–38.0);
+  - wt1310 in between at 42.7, with its lead-in thread busy a further 4.6 s inside the window.
+- **Total process CPU over level 1 is conserved:** 79.7–82.4 cpu-s in every arm (SLOW mean 81.6, normal 81.0).
+  - So the SLOW arms do not do more work. More of the same work lands inside the L1N2 prologue, which is level 1's
+    critical path.
+  - That work is L1N0 and L1N1's host-side artifacts and proving on the shared pool.
+  - In the normal arms it falls later, beside L1N2's artifacts and prove wait, where it costs nothing. There L1N2's
+    prove waits 2.5–2.8 s, against 2.05 s in the SLOW arms.
+- The order in which L1N0 and L1N1 take the card does not decide the mode: N1 first in wt1303 and wt1309 (normal) and
+  in wt1312 (SLOW).
+
+**Reading:** the L1N2 noise is internal contention.
+- The two sibling nodes' host work coincides, in about 20–40 % of arms, with the critical node's prologue on one rayon
+  pool.
+- It is not the box, which is quiet: no other load, no thermal or quota signal.
+
+**What it means for every lane's A/B on FAST:**
+- read the base apart (sd ≈ 0.13 s at 7c8272701: 28.2–28.6 s);
+- read level 1 as a bimodal quantity: fast 7.6–7.7 s, slow 8.0–8.7 s;
+- or use ≥ 8 arms per setting.
+
+**A lever, not built [I, post hoc]:** hold L1N0 and L1N1's host phases until L1N2's prologue is done, or give that
+prologue its own pool.
+- It would make the fast mode the only mode: ≈ 0.4 × 0.7 s ≈ 0.3 s on the mean at this head, and the noise gone.
+- It needs its own pre-registration.
