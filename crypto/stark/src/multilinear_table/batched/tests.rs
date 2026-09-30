@@ -923,6 +923,17 @@ fn the_card_proves_the_host_references_bytes() {
         };
         let host = run(Where::Host);
         let card = run(Where::Device);
+        // A refusal on the card is the host's rounds, never another proof: the
+        // fused rounds switched off leave the ladder on the card and the
+        // constraint rounds here.
+        multilinear::gpu_fused::force_argue_fused(Some(false));
+        let declined = run(Where::Device);
+        multilinear::gpu_fused::force_argue_fused(None);
+        assert_eq!(declined.3, 0, "fused rounds off: no fused session");
+        assert!(
+            host.0 == declined.0,
+            "a={a} cap={cap}: the declined card's bytes differ"
+        );
         assert_eq!(host.3, 0, "the host reference ran no fused session");
         eprintln!(
             "batched argue B-3 a={a} pad={pad} cap={cap}: device {} fused sessions, {} device rounds; {} bytes",

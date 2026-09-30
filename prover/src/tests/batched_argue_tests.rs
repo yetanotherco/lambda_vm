@@ -70,7 +70,7 @@ fn vm_round_trip(
         name,
         &crate::test_utils::asm_elf_bytes(name),
         tamper,
-        Where::Device,
+        &[Where::Device],
     );
     (verdict, names)
 }
@@ -87,7 +87,8 @@ fn rust_elf_bytes(name: &str) -> Vec<u8> {
 
 /// [`vm_round_trip`] over an ELF in hand.
 ///
-/// `at` is where the prover runs: [`Where::Device`] is what
+/// `ats` are where the prover runs, one proof each over the SAME committed
+/// tables: [`Where::Device`] is what
 /// `multi_prove_batched` does (the card where it takes the work), and
 /// [`Where::Host`] the host reference. The proof's canonical bytes come back
 /// too, so the two can be compared.
@@ -95,8 +96,8 @@ fn vm_round_trip_elf(
     name: &str,
     elf_bytes: &[u8],
     tamper: Option<Tamper>,
-    at: Where,
-) -> (Result<(), multilinear::Error>, Vec<String>, Vec<u8>) {
+    ats: &[Where],
+) -> (Result<(), multilinear::Error>, Vec<String>, Vec<Vec<u8>>) {
     let elf_bytes = elf_bytes.to_vec();
     let program = Elf::load(&elf_bytes).expect("ELF");
     let result = Executor::new(&program, Vec::new())
@@ -198,73 +199,94 @@ fn vm_round_trip_elf(
                 &config,
             )
         };
-        let mut transcript = Tr::new(&[]);
-        absorb(&mut transcript);
         let committed = CommittedTables::<_, _, H>::commit(committed, &config).expect("commit");
-        let mut proof = batched::prove_batched_on(
-            &committed,
-            &config,
-            &mut transcript,
-            None,
-            batched::ProverFaults::default(),
-            at,
-        )
-        .expect("the batched prover runs");
-        // serde writes each element canonically, so equal bytes are equal
-        // values. The roots and the argue only: the openings grind, and a
-        // parallel nonce search returns ANY valid nonce, so two honest proofs
-        // part there (memory: grinding-nonce-nondeterminism) — after the argue.
-        let bytes = serde_json::to_vec(&(&proof.roots, &proof.argue)).expect("canonical bytes");
-        if let Some(tamper) = tamper {
-            tamper(&mut proof);
-        }
+        // ★ Every arm proves THESE committed tables: six trace builders lay rows
+        // out in HashMap order, so two trace builds are two different (valid)
+        // traces, and only one commitment makes two provers comparable.
+        let mut verdicts = Vec::with_capacity(ats.len());
+        let mut all_bytes = Vec::with_capacity(ats.len());
+        for &at in ats {
+            let mut transcript = Tr::new(&[]);
+            absorb(&mut transcript);
+            multilinear::gpu::reset_reserved_window();
+            let mut proof = batched::prove_batched_on(
+                &committed,
+                &config,
+                &mut transcript,
+                None,
+                batched::ProverFaults::default(),
+                at,
+            )
+            .expect("the batched prover runs");
+            if at == Where::Device && multilinear::gpu::reserve_budget() > 0 {
+                eprintln!(
+                    "batched argue {name}: device ledger peak {} MiB of a {} MiB budget",
+                    multilinear::gpu::reserved_window_peak() >> 20,
+                    multilinear::gpu::reserve_budget() >> 20
+                );
+            }
+            // serde writes each element canonically, so equal bytes are equal
+            // values. The roots and the argue only: the openings grind, and a
+            // parallel nonce search returns ANY valid nonce, so two honest proofs
+            // part there (memory: grinding-nonce-nondeterminism) — after the argue.
+            let bytes = serde_json::to_vec(&(&proof.roots, &proof.argue)).expect("canonical bytes");
+            if let Some(tamper) = tamper {
+                tamper(&mut proof);
+            }
 
-        // The verifier's side: layouts, preprocessed copies and stacks rebuilt
-        // from the AIRs and the shapes alone.
-        let layouts: Vec<TableLayout<'_, F, E>> = refs
-            .iter()
-            .zip(&shapes)
-            .map(|(air, &shape)| layout(*air, shape))
-            .collect();
-        let preprocessed: Vec<Vec<Mle<F>>> = refs
-            .iter()
-            .map(|air| {
-                air.precomputed_columns()
-                    .into_iter()
-                    .map(|values| Mle::new(values).expect("column"))
-                    .collect()
-            })
-            .collect();
-        let statements: Vec<TableStatement<'_, F, E>> = layouts
-            .iter()
-            .zip(&preprocessed)
-            .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
-            .collect();
-        let sizes = [shapes.len()];
-        let (group_layouts, domains) =
-            multilinear_prove::stacks(&shapes, &sizes, &config).expect("stacks");
-        let mut transcript = Tr::new(&[]);
-        absorb(&mut transcript);
-        let mut probe = transcript.clone();
-        multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.roots, &[]);
-        let z: FieldElement<E> = probe.sample_field_element();
-        let alpha: FieldElement<E> = probe.sample_field_element();
-        let owed = crate::compute_commit_bus_offset(&public_output, 0, &z, &alpha)
-            .expect("the commit offset");
-        let verdict = multilinear_table::multi_verify_batched::<_, _, _, H>(
-            &proof,
-            &statements,
-            &group_layouts,
-            &domains,
-            &sizes,
-            &owed,
-            &config,
-            &mut transcript,
-            None,
-        );
-        (verdict, bytes)
+            // The verifier's side: layouts, preprocessed copies and stacks rebuilt
+            // from the AIRs and the shapes alone.
+            let layouts: Vec<TableLayout<'_, F, E>> = refs
+                .iter()
+                .zip(&shapes)
+                .map(|(air, &shape)| layout(*air, shape))
+                .collect();
+            let preprocessed: Vec<Vec<Mle<F>>> = refs
+                .iter()
+                .map(|air| {
+                    air.precomputed_columns()
+                        .into_iter()
+                        .map(|values| Mle::new(values).expect("column"))
+                        .collect()
+                })
+                .collect();
+            let statements: Vec<TableStatement<'_, F, E>> = layouts
+                .iter()
+                .zip(&preprocessed)
+                .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+                .collect();
+            let sizes = [shapes.len()];
+            let (group_layouts, domains) =
+                multilinear_prove::stacks(&shapes, &sizes, &config).expect("stacks");
+            let mut transcript = Tr::new(&[]);
+            absorb(&mut transcript);
+            let mut probe = transcript.clone();
+            multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.roots, &[]);
+            let z: FieldElement<E> = probe.sample_field_element();
+            let alpha: FieldElement<E> = probe.sample_field_element();
+            let owed = crate::compute_commit_bus_offset(&public_output, 0, &z, &alpha)
+                .expect("the commit offset");
+            let verdict = multilinear_table::multi_verify_batched::<_, _, _, H>(
+                &proof,
+                &statements,
+                &group_layouts,
+                &domains,
+                &sizes,
+                &owed,
+                &config,
+                &mut transcript,
+                None,
+            );
+            all_bytes.push(bytes);
+            verdicts.push(verdict);
+        }
+        (verdicts, all_bytes)
     });
-    let (verdict, bytes) = verdict;
+    let (verdicts, bytes) = verdict;
+    let verdict = verdicts
+        .into_iter()
+        .collect::<Result<Vec<()>, _>>()
+        .map(|_| ());
     (verdict, names, bytes)
 }
 
@@ -304,8 +326,12 @@ fn every_vm_table_round_trips_batched() {
         eprintln!("batched argue {name}: VERIFIED over {} tables", names.len());
         note(names);
     }
-    let (verdict, names, _) =
-        vm_round_trip_elf("hint_min", &rust_elf_bytes("hint_min"), None, Where::Device);
+    let (verdict, names, _) = vm_round_trip_elf(
+        "hint_min",
+        &rust_elf_bytes("hint_min"),
+        None,
+        &[Where::Device],
+    );
     verdict.unwrap_or_else(|e| panic!("hint_min: {e:?}"));
     eprintln!(
         "batched argue hint_min: VERIFIED over {} tables",
@@ -662,11 +688,11 @@ fn the_card_proves_the_host_references_bytes_on_real_tables() {
     for name in ["test_keccak", "test_ecsm", "all_instructions_64"] {
         let elf = crate::test_utils::asm_elf_bytes(name);
         let fused = multilinear::gpu_fused::fused_sessions();
-        let (card, names, card_bytes) = vm_round_trip_elf(name, &elf, None, Where::Device);
+        let (verdict, names, bytes) =
+            vm_round_trip_elf(name, &elf, None, &[Where::Host, Where::Device]);
         let fused = multilinear::gpu_fused::fused_sessions() - fused;
-        let (host, _, host_bytes) = vm_round_trip_elf(name, &elf, None, Where::Host);
-        card.unwrap_or_else(|e| panic!("{name} on the card: {e:?}"));
-        host.unwrap_or_else(|e| panic!("{name} on the host: {e:?}"));
+        verdict.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let (host_bytes, card_bytes) = (&bytes[0], &bytes[1]);
         assert!(
             card_bytes == host_bytes,
             "{name}: the card's argue is not the host reference's bytes"
