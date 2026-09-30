@@ -633,6 +633,11 @@ pub fn compute_offset_only_commitment_with(
 /// have program-dependent INIT columns and no static entry; compute their
 /// commitments with [`compute_precomputed_commitment`] directly.
 pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    #[cfg(feature = "blake3-pin")]
+    return crate::tables::pinned_root("zero_page", options, false, || {
+        compute_precomputed_commitment(&PageConfig::zero_init(0), options)
+    });
+    #[allow(unreachable_code)]
     if options.coset_offset == 3
         && let Some(commitment) = static_zero_page_commitment(options.blowup_factor)
     {
@@ -656,6 +661,11 @@ pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// `blowup_factor` covers every private page in the system — and the same value
 /// serves GLOBAL_MEMORY, whose OFFSET column is identical.
 pub fn private_page_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    #[cfg(feature = "blake3-pin")]
+    return crate::tables::pinned_root("private_page", options, false, || {
+        compute_offset_only_commitment(options)
+    });
+    #[allow(unreachable_code)]
     if options.coset_offset == 3
         && let Some(commitment) = static_private_page_commitment(options.blowup_factor)
     {
@@ -681,6 +691,11 @@ pub fn zero_init_preprocessed_commitment_for(
 ) -> Option<Commitment> {
     match layout {
         LeafLayout::RowPair => Some(zero_init_preprocessed_commitment(options)),
+        #[cfg(feature = "blake3-pin")]
+        LeafLayout::Row => Some(crate::tables::pinned_root("zero_page", options, true, || {
+            compute_precomputed_commitment_with(&PageConfig::zero_init(0), options, LeafLayout::Row)
+        })),
+        #[cfg(not(feature = "blake3-pin"))]
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_zero_page_commitment_one_row(options.blowup_factor))
             .flatten(),
@@ -695,6 +710,11 @@ pub fn private_page_preprocessed_commitment_for(
 ) -> Option<Commitment> {
     match layout {
         LeafLayout::RowPair => Some(private_page_preprocessed_commitment(options)),
+        #[cfg(feature = "blake3-pin")]
+        LeafLayout::Row => Some(crate::tables::pinned_root("private_page", options, true, || {
+            compute_offset_only_commitment_with(options, LeafLayout::Row)
+        })),
+        #[cfg(not(feature = "blake3-pin"))]
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_private_page_commitment_one_row(options.blowup_factor))
             .flatten(),

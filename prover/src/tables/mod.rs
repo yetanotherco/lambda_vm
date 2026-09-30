@@ -69,6 +69,28 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 /// miss, never a recompute.
 pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
 
+/// Under `blake3-pin` the blessed roots are RPX roots, so every static
+/// preprocessed root is recomputed once per `(table, blowup, coset, layout)`.
+#[cfg(feature = "blake3-pin")]
+pub(crate) fn pinned_root(
+    table: &'static str,
+    options: &crate::ProofOptions,
+    one_row: bool,
+    f: impl FnOnce() -> stark::config::Commitment,
+) -> stark::config::Commitment {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (&'static str, u8, u64, bool);
+    static CACHE: OnceLock<Mutex<HashMap<Key, stark::config::Commitment>>> = OnceLock::new();
+    let key = (table, options.blowup_factor, options.coset_offset as u64, one_row);
+    if let Some(c) = CACHE.get_or_init(Default::default).lock().unwrap().get(&key) {
+        return *c;
+    }
+    let c = f();
+    CACHE.get().unwrap().lock().unwrap().insert(key, c);
+    c
+}
+
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
