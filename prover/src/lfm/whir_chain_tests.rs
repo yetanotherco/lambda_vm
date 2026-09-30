@@ -2740,3 +2740,39 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
         );
     }
 }
+
+/// I-GRIND instrument (not a gate): the emitted chain verifier's real rows per
+/// chip at every production height, under the production format at 20 grind
+/// bits (Q 112) and at `LAMBDA_VM_ZF_WHIR_GRIND_BITS=18` (Q 114). The per-chain
+/// deltas size the recursion's table heights under the arm.
+///
+/// cargo test -p lambda-vm-prover --lib grind_bits_chain_census -- --ignored --nocapture
+#[test]
+#[ignore = "instrument: prints the per-chip census, asserts nothing"]
+fn grind_bits_chain_census() {
+    for bits in crate::zf_format::WHIR_GRIND_BITS {
+        let format = crate::zf_format::ZfFormat {
+            whir_grind_bits: bits,
+            ..crate::zf_format::ZfFormat::DEFAULT
+        };
+        for n in 21..=27usize {
+            let config = crate::multilinear_prove::chain_config_under(&format, &[(1, n)]);
+            let shape = ChainShape::new(&config, n);
+            let program = chain_program(&shape);
+            let census = super::airs::lfm_chip_census(&program);
+            let line: Vec<String> = census
+                .iter()
+                .filter(|c| c.real_rows > 0 && c.name != "LFM_RANGE")
+                .map(|c| format!("{}={}", &c.name[4..], c.real_rows))
+                .collect();
+            println!(
+                "GRINDCENSUS bits={bits} n={n} Q={} caps={:?} perms={} instrs={} {}",
+                config.num_queries,
+                config.tree_caps(n),
+                chain_perms(&shape, SpongeEntry::fresh()),
+                program.instrs.len(),
+                line.join(" ")
+            );
+        }
+    }
+}
