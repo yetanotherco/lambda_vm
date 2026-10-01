@@ -450,18 +450,7 @@ pub(crate) fn prepared_tables(
             airs.pages.len()
         )));
     }
-    let first_page = match airs.pages.first() {
-        Some(page) => refs
-            .iter()
-            .position(|air| {
-                std::ptr::eq(
-                    *air as *const _ as *const (),
-                    page.as_ref() as *const _ as *const (),
-                )
-            })
-            .ok_or_else(|| Error::Prover("the page tables are not in the AIR set".into()))?,
-        None => refs.len(),
-    };
+    let first_page = first_page_index(airs)?;
     let decode = crate::multilinear_continuation::decode_table_index(&refs)?;
     let mut tables = vec![(decode, refs[decode].precomputed_columns())];
     let plan = crate::continuation::genesis_stack_plan(
@@ -477,6 +466,24 @@ pub(crate) fn prepared_tables(
     }
     tables.sort_by_key(|&(table, _)| table);
     Ok(tables)
+}
+
+/// Where the page tables start in [`VmAirs::air_refs`] order (its length when
+/// there are none): page `i` of the configs is table `first + i`.
+pub(crate) fn first_page_index(airs: &VmAirs) -> Result<usize, Error> {
+    let refs = airs.air_refs();
+    match airs.pages.first() {
+        Some(page) => refs
+            .iter()
+            .position(|air| {
+                std::ptr::eq(
+                    *air as *const _ as *const (),
+                    page.as_ref() as *const _ as *const (),
+                )
+            })
+            .ok_or_else(|| Error::Prover("the page tables are not in the AIR set".into())),
+        None => Ok(refs.len()),
+    }
 }
 
 /// Commits one prepared table's columns under `config`.
@@ -1352,6 +1359,49 @@ fn prove_streamed(
     })
 }
 
+/// The bytes [`absorb_block`] appends, in its order and with its pad: what an
+/// in-guest verifier absorbs as one run of program constants. One stream, so a
+/// test can hold the two to the same transcript.
+pub(crate) fn block_statement_bytes(
+    statement: BlockStatement<'_>,
+    elf_digest: &[u8; 32],
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(MULTILINEAR_BLOCK_TAG);
+    bytes.extend_from_slice(elf_digest);
+    bytes.extend_from_slice(&(statement.public_output.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(statement.public_output);
+    for count in statement::table_count_values(statement.table_counts) {
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    bytes.extend_from_slice(&(statement.num_private_input_pages as u64).to_le_bytes());
+    bytes.extend_from_slice(&(statement.runtime_page_ranges.len() as u64).to_le_bytes());
+    for range in statement.runtime_page_ranges {
+        bytes.extend_from_slice(&range.base.to_le_bytes());
+        bytes.extend_from_slice(&range.count.to_le_bytes());
+    }
+    bytes.extend_from_slice(&(statement.table_num_vars.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(statement.table_num_vars);
+    for value in [
+        config.log_blowup as u64,
+        config.fold_word(),
+        config.num_queries as u64,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[config.grind.folding, config.grind.ood, config.grind.query]);
+    bytes.resize(bytes.len() + statement::statement_padding(bytes.len()), 0);
+    bytes.extend_from_slice(&(statement.groups.len() as u64).to_le_bytes());
+    for group in statement.groups {
+        bytes.extend_from_slice(&(group.len() as u64).to_le_bytes());
+        for &index in group {
+            bytes.extend_from_slice(&u64::from(index).to_le_bytes());
+        }
+    }
+    bytes
+}
+
 /// The statement's fields: everything of a [`BlockWhirProof`] the verifier
 /// reads before any root, which is everything but its argument.
 #[derive(Clone, Copy, Debug)]
@@ -1382,7 +1432,6 @@ impl BlockWhirProof {
 /// once the statement's checks pass. The host verifier and the recursion's tree
 /// plan both start from it, so they check one statement the same way.
 pub(crate) struct BlockFrame {
-    pub(crate) program: Elf,
     pub(crate) page_configs: Vec<crate::tables::page::PageConfig>,
     pub(crate) airs: VmAirs,
     /// Per table in [`VmAirs::air_refs`] order: the AIR's width and the stated
@@ -1498,7 +1547,6 @@ pub(crate) fn block_frame(
         )));
     }
     Ok(BlockFrame {
-        program,
         page_configs,
         airs,
         shapes,

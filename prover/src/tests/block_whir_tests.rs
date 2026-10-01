@@ -489,6 +489,46 @@ fn a_prepared_opening_of_another_program_is_refused() {
     assert!(!verify(&other, &elf, &one_group()));
 }
 
+/// The statement as one byte run is the stream `absorb_block` appends: two
+/// transcripts fed each way draw the same challenge after a root.
+#[test]
+fn the_statement_bytes_are_what_absorb_block_appends() {
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
+    let digest = crate::statement::elf_digest(&elf);
+    let bytes = block_whir::block_statement_bytes(proof.statement(), &digest, &frame.config);
+    let (a, b) = crate::with_whir_hash!(|H| {
+        type T = DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>;
+        let mut host = T::new(&[]);
+        block_whir::absorb_block(
+            &mut host,
+            &elf,
+            &proof.public_output,
+            &proof.table_counts,
+            proof.num_private_input_pages,
+            &proof.runtime_page_ranges,
+            &proof.table_num_vars,
+            &frame.config,
+            &proof.groups,
+        );
+        let mut run = T::new(&[]);
+        run.append_bytes(&bytes);
+        for t in [&mut host, &mut run] {
+            t.append_bytes(&proof.proof.roots[0]);
+        }
+        let a: FieldElement<E> = host.sample_field_element();
+        let b: FieldElement<E> = run.sample_field_element();
+        (a, b)
+    });
+    assert_eq!(a, b);
+    assert_eq!(bytes.len() % 8, 0, "the run ends on a felt boundary");
+}
+
 /// The KECCAK_RND count is bounded before the verifier builds an AIR off it.
 #[test]
 fn an_inflated_keccak_rnd_count_is_refused() {
