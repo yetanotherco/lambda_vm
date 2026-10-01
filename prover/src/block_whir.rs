@@ -1631,10 +1631,17 @@ fn prove_streamed(
     let start = Instant::now();
 
     crate::with_whir_hash!(|H| {
+        // Profiling builds: phase A as one process-wide range (its uploads and
+        // commits run on this thread, the builders on their own), and each
+        // thread's role as a range on its own stack.
+        #[cfg(feature = "nvtx")]
+        let nvtx_phase = stark::instruments::nvtx_process_range(|| "blk_phase_a".into());
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             // The executor, a window at a time, two windows ahead of the walk.
             let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
             let executor = scope.spawn(move || -> Result<f64, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_executor".into());
                 let mut executor = Executor::new(program, private_inputs.to_vec())
                     .map_err(|e| Error::Execution(format!("{e}")))?;
                 while let Some(logs) = executor
@@ -1649,6 +1656,8 @@ fn prove_streamed(
             });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
             let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_builder".into());
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 if options.stream_keccak_rnd {
@@ -1666,6 +1675,8 @@ fn prove_streamed(
                     std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
                         let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
                         let walking = inner.spawn(move || -> Result<_, Error> {
+                            #[cfg(feature = "nvtx")]
+                            let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_walker".into());
                             // One window held back: only the run's last window
                             // is `finish`'s, and it is the last only once the
                             // executor stops.
@@ -1698,7 +1709,11 @@ fn prove_streamed(
                 let window_stamps = builder.stamps();
                 // The table phase's marks, for `finish` alone.
                 crate::tables::trace_builder::build_stamps::start();
+                #[cfg(feature = "nvtx")]
+                let nvtx_finish = stark::instruments::nvtx_range_fmt(|| "blk_finish".into());
                 let mut rest = builder.finish(&last)?;
+                #[cfg(feature = "nvtx")]
+                drop(nvtx_finish);
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
@@ -1726,6 +1741,8 @@ fn prove_streamed(
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_layout".into());
                 let packer = Packer {
                     open: Vec::new(),
                     open_shapes: Vec::new(),
@@ -1858,6 +1875,8 @@ fn prove_streamed(
                 BlockCommitted::commit_groups::<H>(grx.iter(), &commit_config, options.drop_levels);
             (block, builder.join(), layout.join(), executor.join())
         });
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_phase);
         stamps.execute =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
@@ -1900,8 +1919,12 @@ fn prove_streamed(
             &config,
             &laid.groups,
         );
+        #[cfg(feature = "nvtx")]
+        let nvtx_prepared = stark::instruments::nvtx_process_range(|| "blk_prepared".into());
         let (prepared, tampered, derive) =
             prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_prepared);
         stamps.prepared = (prepared.len(), derive);
         on_statement(
             BlockStatement {
@@ -1928,6 +1951,8 @@ fn prove_streamed(
                 columns,
             })
             .collect();
+        #[cfg(feature = "nvtx")]
+        let nvtx_phase = stark::instruments::nvtx_process_range(|| "blk_phase_b".into());
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
         let identity = |g: usize| g;
@@ -1946,6 +1971,8 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_phase);
         let paths_after = multilinear::whir_commit::top_path_counts();
         stamps.top_paths = (
             paths_after.0 - paths_before.0,
