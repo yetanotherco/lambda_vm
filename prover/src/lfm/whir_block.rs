@@ -278,7 +278,13 @@ impl WhirBlockPlan {
         // The prepared tables: their layouts and domains from their shapes,
         // their roots committed here (or the prover's own, see
         // [`Self::derive_with`]).
-        let columns = prepared_tables(&frame.airs, &frame.page_configs)
+        if !format.prepared {
+            return Err(
+                "the block's recursion needs the prepared openings (BlockFormat::prepared)"
+                    .to_string(),
+            );
+        }
+        let columns = prepared_tables(&frame.airs, &frame.page_configs, format)
             .map_err(|e| format!("prepared tables: {e:?}"))?;
         let config = &frame.config;
         if let Some(roots) = prepared_roots
@@ -610,8 +616,58 @@ pub fn top_claims(plan: &WhirBlockPlan, words: &[(u32, LfmWord)]) -> bool {
 /// ★ The no-epoch WHIR block's verifier over its tree's top proof: derive the
 /// plan and the top program from the trusted ELF and the statement, verify
 /// `top` against that program, and check it claims the block.
-#[allow(clippy::too_many_arguments)]
+///
+/// Every preset is pinned here, none is a caller's: the base's proof options
+/// ([`super::proof::block_base_options`]), the block format
+/// ([`BlockFormat::production`]), the tree's options
+/// ([`super::proof::aggregation_wrap_options`]), the plan's leaf rule and its
+/// fan-in ([`BLOCK_FAN_IN`]). A caller who could pass weaker ones would choose
+/// the programs the top is checked against.
 pub fn verify_block_tree(
+    elf_bytes: &[u8],
+    statement: BlockStatement<'_>,
+    top: &super::proof::LfmProof,
+) -> Result<(), String> {
+    verify_block_tree_with(
+        elf_bytes,
+        &super::proof::block_base_options(),
+        &BlockFormat::production(),
+        statement,
+        None,
+        BLOCK_FAN_IN,
+        &super::proof::aggregation_wrap_options(),
+        top,
+    )
+}
+
+/// [`verify_block_tree`] under presets of the caller's: the fixture formats,
+/// leaf counts and fan-ins the tests run at. Test-only.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_block_tree_under(
+    elf_bytes: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &BlockFormat,
+    statement: BlockStatement<'_>,
+    num_leaves: Option<usize>,
+    fan_in: usize,
+    wrap_opts: &crate::ProofOptions,
+    top: &super::proof::LfmProof,
+) -> Result<(), String> {
+    verify_block_tree_with(
+        elf_bytes,
+        proof_options,
+        format,
+        statement,
+        num_leaves,
+        fan_in,
+        wrap_opts,
+        top,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_block_tree_with(
     elf_bytes: &[u8],
     proof_options: &crate::ProofOptions,
     format: &BlockFormat,

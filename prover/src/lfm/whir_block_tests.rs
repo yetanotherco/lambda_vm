@@ -26,6 +26,7 @@ use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
 use super::whir_block::{
     BLOCK_FAN_IN, BlockPartition, LeafChecks, WhirBlockPlan, artifacts_of, block_leaf_arena,
     id_words, leaf_program_with, out_halves, partition_groups, verify_block_tree,
+    verify_block_tree_under,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -38,6 +39,7 @@ fn small_format() -> BlockFormat {
         zf,
         group_polys: 2,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
     }
 }
 
@@ -294,6 +296,184 @@ fn a_block_leaf_refuses_a_tampered_witness() {
     );
 }
 
+/// The leaf's bus share divides `p` by `q`: a zero `q` has no satisfying
+/// assignment, which is the host's `contribution() = None` refusal.
+#[test]
+fn a_zero_denominator_has_no_satisfying_assignment() {
+    let run = |q: u64| {
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let a = b.declare_arena(2);
+        let p = b.hint_word(a, 0).as_ext();
+        let q_wire = b.hint_word(a, 1).as_ext();
+        let share = b.ediv(p, q_wire);
+        b.public(share.as_cell());
+        let program = compile(b.finish());
+        let words = vec![
+            super::word::ext_word(&FEE::from(7u64)),
+            super::word::ext_word(&FEE::from(q)),
+        ];
+        execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER).map(|_| ())
+    };
+    assert!(run(3).is_ok());
+    assert!(run(0).is_err());
+}
+
+/// The production format with three polynomials a group: the dense fixture's
+/// pages share groups with tables of their height.
+fn dense_format() -> BlockFormat {
+    BlockFormat {
+        zf: ZfFormat::DEFAULT,
+        group_polys: block_whir::BLOCK_GROUP_POLYS,
+        max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
+    }
+}
+
+fn dense_block_with(
+    deviations: &block_whir::Deviations,
+) -> (Vec<u8>, BlockWhirProof, Vec<block_whir::PreparedRoots>) {
+    let elf = asm_elf_bytes("test_dense_pages");
+    let roots = std::sync::Mutex::new(Vec::new());
+    let proof = block_whir::prove_block_whir_observed_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &dense_format(),
+        &BlockOptions {
+            max_rows: MaxRowsConfig::default(),
+            keccak_rnd_rows_log2: 16,
+            drop_levels: 3,
+            window_log2: None,
+        },
+        deviations,
+        &|_, r| *roots.lock().expect("lock") = r.to_vec(),
+    )
+    .expect("the block proves")
+    .0;
+    let roots = roots.into_inner().expect("lock");
+    (elf, proof, roots)
+}
+
+/// ★ A leaf refuses a prepared table opened wrongly — two pages' openings
+/// swapped, a page opened at another table's point, a page opened against the
+/// other page's commitment — and with the prepared openings left out (the
+/// mutation) each executes. Then DECODE's prepared commitment over another
+/// program's columns: refused by a leaf of the verifier's plan (it absorbs the
+/// root it derives), and by a leaf of a plan given the prover's own roots; with
+/// those roots AND the openings left out, it executes — the two together are
+/// what bind DECODE to the program.
+#[test]
+#[ignore = "proves the dense fixture under RPX and executes its leaf; box tier"]
+fn a_block_leaf_refuses_wrong_prepared_openings() {
+    use block_whir::{Deviations, PreparedTamper};
+    let format = dense_format();
+    let skip = LeafChecks {
+        prepared: false,
+        ..LeafChecks::ALL
+    };
+    let (elf, honest, _) = dense_block_with(&Deviations::default());
+    let plan = plan_of(&elf, &honest, &format, Some(1));
+    assert!(plan.prepared().len() >= 3, "DECODE and two pages");
+    run_leaf(&plan, &honest, 0, LeafChecks::ALL).expect("the honest leaf executes");
+
+    // The openings in the proof's order (the plan's), and two pages' places in
+    // it: a page settles its two columns, DECODE its five.
+    let pages: Vec<usize> = plan
+        .prepared()
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.settled == 2)
+        .map(|(i, _)| i)
+        .take(2)
+        .collect();
+    assert_eq!(pages.len(), 2);
+    let mut swapped = honest.clone();
+    swapped.prepared.swap(pages[0], pages[1]);
+    assert!(
+        run_leaf(&plan, &swapped, 0, LeafChecks::ALL).is_err(),
+        "swapped"
+    );
+    assert!(
+        run_leaf(&plan, &swapped, 0, skip).is_ok(),
+        "swapped, mutation"
+    );
+
+    // AIR-order indices for the prover's tampers: 0 is DECODE, then the pages.
+    let page = plan
+        .prepared()
+        .iter()
+        .map(|p| p.table)
+        .filter(|&t| t != plan.prepared()[0].table)
+        .min()
+        .expect("a page");
+    let height = honest.table_num_vars[page];
+    let other = honest
+        .groups
+        .iter()
+        .find(|g| g.contains(&(page as u32)))
+        .and_then(|g| {
+            g.iter()
+                .map(|&t| t as usize)
+                .find(|&t| t != page && honest.table_num_vars[t] == height)
+        })
+        .expect("a table of the page's height in its group");
+    for (name, tamper) in [
+        (
+            "wrong point",
+            PreparedTamper {
+                open: 1,
+                at_table: Some(other),
+                with: None,
+            },
+        ),
+        (
+            "wrong commitment",
+            PreparedTamper {
+                open: 1,
+                at_table: None,
+                with: Some(2),
+            },
+        ),
+    ] {
+        let (_, wrong, _) = dense_block_with(&Deviations {
+            prepared_openings: vec![tamper],
+            ..Default::default()
+        });
+        assert!(
+            run_leaf(&plan, &wrong, 0, LeafChecks::ALL).is_err(),
+            "{name}"
+        );
+        assert!(run_leaf(&plan, &wrong, 0, skip).is_ok(), "{name}, mutation");
+    }
+
+    let (_, other_program, prover_roots) = dense_block_with(&Deviations {
+        other_prepared: true,
+        ..Default::default()
+    });
+    assert!(
+        run_leaf(&plan, &other_program, 0, LeafChecks::ALL).is_err(),
+        "verifier's roots"
+    );
+    let trusting = WhirBlockPlan::derive_with(
+        &elf,
+        &ProofOptions::default_test_options(),
+        &format,
+        other_program.statement(),
+        Some(1),
+        BLOCK_FAN_IN,
+        Some(&prover_roots),
+    )
+    .expect("a plan over the prover's roots");
+    assert!(
+        run_leaf(&trusting, &other_program, 0, LeafChecks::ALL).is_err(),
+        "prover's roots"
+    );
+    assert!(
+        run_leaf(&trusting, &other_program, 0, skip).is_ok(),
+        "the prover's roots trusted and the openings left out admit another program's DECODE"
+    );
+}
+
 // ================================= the nodes ==============================
 
 /// A node's binding step over HINTED child words: the checks and publishes
@@ -540,7 +720,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     let wrap = aggregation_wrap_options();
     let plan = plan_of(&elf, &proof, &format, Some(2));
     let (top, _) = compose(&plan, &proof, "TREE").expect("the honest tree proves");
-    verify_block_tree(
+    verify_block_tree_under(
         &elf,
         &opts,
         &format,
@@ -552,6 +732,44 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     )
     .expect("the block's verifier accepts the honest top");
 
+    // The prover's roots shortcut only the prover's side. A plan built from
+    // tampered ones holds other leaf programs, so another top; its leaves
+    // refuse the honest proof (every leaf absorbs the roots), so no tree can be
+    // built over them; and the plan built from the true roots is the
+    // verifier's own.
+    let roots: Vec<block_whir::PreparedRoots> = plan
+        .prepared()
+        .iter()
+        .map(|p| (p.table, p.roots.clone()))
+        .collect();
+    let mut tampered = roots.clone();
+    tampered[0].1[0][0] ^= 1;
+    let from = |roots: &[block_whir::PreparedRoots]| {
+        WhirBlockPlan::derive_with(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            Some(roots),
+        )
+        .expect("a plan over supplied roots")
+    };
+    let honest_top = plan.derive_top(&wrap).expect("the top derives").program_id;
+    assert_eq!(
+        from(&roots).derive_top(&wrap).expect("top").program_id,
+        honest_top
+    );
+    let bad = from(&tampered);
+    assert_ne!(bad.derive_top(&wrap).expect("top").program_id, honest_top);
+    for k in 0..bad.partition().num_leaves() {
+        assert!(
+            run_leaf(&bad, &proof, k, LeafChecks::ALL).is_err(),
+            "leaf {k} over tampered roots"
+        );
+    }
+
     let groups = plan.num_groups();
     assert!(groups >= 2, "the block spans at least two groups");
     let lists = plan.partition().leaves().to_vec();
@@ -562,7 +780,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     let (other, _) =
         compose(&swapped, &proof, "SWAPPED").expect("a tree over another partition proves");
     assert!(
-        verify_block_tree(
+        verify_block_tree_under(
             &elf,
             &opts,
             &format,
@@ -640,7 +858,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     match compose(&skewed, &proof, "SKEWED") {
         Err(e) => println!("   SKEWED: refused while proving: {e}"),
         Ok((bad, _)) => assert!(
-            verify_block_tree(
+            verify_block_tree_under(
                 &elf,
                 &opts,
                 &format,
@@ -981,16 +1199,22 @@ fn the_whir_block_tree_on_a_real_block() {
     );
     assert!(ok, "the block proof must verify");
     let t = std::time::Instant::now();
-    let verdict = verify_block_tree(
-        &elf,
-        &opts,
-        &format,
-        proof.statement(),
-        leaves,
-        fan_in,
-        &wrap,
-        top,
-    );
+    // The production verifier when the run is at its presets; the fixture form
+    // only when a knob moved the tree off them.
+    let verdict = if leaves.is_none() && fan_in == BLOCK_FAN_IN {
+        verify_block_tree(&elf, proof.statement(), top)
+    } else {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            leaves,
+            fan_in,
+            &wrap,
+            top,
+        )
+    };
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {
