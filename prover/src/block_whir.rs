@@ -709,6 +709,12 @@ fn stream_name(table: StreamTable, index: usize) -> String {
     format!("{base}[{index}]")
 }
 
+/// What the builder thread reports when the run is built: when its windows
+/// were all collected and when the run was built (seconds since the prove
+/// started), how many chunks it handed out, the windows' stamps and `finish`'s
+/// phase marks.
+type BuilderReport = (f64, f64, usize, WindowStamps, Vec<(String, f64)>);
+
 /// What the builder thread hands the layout thread.
 enum Built {
     Job(Box<ChunkJob>),
@@ -835,72 +841,66 @@ fn prove_streamed(
                 Ok(start.elapsed().as_secs_f64())
             });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
-            let builder = scope.spawn(
-                move || -> Result<(f64, f64, usize, WindowStamps, Vec<(String, f64)>), Error> {
-                    let mut builder =
-                        WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
-                    let mut streamed = 0usize;
-                    // The walk on its own thread, doing nothing but walk; this
-                    // thread appends each walked window, routes it and hands its
-                    // chunks out as jobs (the layout thread generates them).
-                    let last = {
-                        let (mut walker, mut accumulator) = builder.split();
-                        std::thread::scope(
-                            |inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
-                                let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
-                                let walking = inner.spawn(move || -> Result<_, Error> {
-                                    // One window held back: only the run's last window
-                                    // is `finish`'s, and it is the last only once the
-                                    // executor stops.
-                                    let mut held: Option<Vec<executor::vm::logs::Log>> = None;
-                                    for logs in lrx {
-                                        if let Some(w) = held.replace(logs) {
-                                            if wtx.send(walker.walk(&w)?).is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    held.ok_or_else(|| {
-                                        Error::Execution("the run executed no cycle".to_string())
-                                    })
-                                });
-                                for walked in wrx {
-                                    for job in accumulator.absorb(walked) {
-                                        streamed += 1;
-                                        if btx.send(Built::Job(Box::new(job))).is_err() {
-                                            return Err(Error::Prover(
-                                                "the layout thread stopped".into(),
-                                            ));
-                                        }
-                                    }
+            let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
+                let mut builder =
+                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
+                let mut streamed = 0usize;
+                // The walk on its own thread, doing nothing but walk; this
+                // thread appends each walked window, routes it and hands its
+                // chunks out as jobs (the layout thread generates them).
+                let last = {
+                    let (mut walker, mut accumulator) = builder.split();
+                    std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
+                        let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
+                        let walking = inner.spawn(move || -> Result<_, Error> {
+                            // One window held back: only the run's last window
+                            // is `finish`'s, and it is the last only once the
+                            // executor stops.
+                            let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                            for logs in lrx {
+                                if let Some(w) = held.replace(logs)
+                                    && wtx.send(walker.walk(&w)?).is_err()
+                                {
+                                    break;
                                 }
-                                walking.join().map_err(|_| {
-                                    Error::Prover("the block's walker panicked".into())
-                                })?
-                            },
-                        )?
-                    };
-                    let windows_done = start.elapsed().as_secs_f64();
-                    let window_stamps = builder.stamps();
-                    // The table phase's marks, for `finish` alone.
-                    crate::tables::trace_builder::build_stamps::start();
-                    let mut rest = builder.finish(&last)?;
-                    let finish_marks = crate::tables::trace_builder::build_stamps::take();
-                    split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
-                    if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
-                        rest.keccak_rnds.remove(0);
-                    }
-                    let finished = start.elapsed().as_secs_f64();
-                    let _ = btx.send(Built::Rest(Box::new(rest)));
-                    Ok((
-                        windows_done,
-                        finished,
-                        streamed,
-                        window_stamps,
-                        finish_marks,
-                    ))
-                },
-            );
+                            }
+                            held.ok_or_else(|| {
+                                Error::Execution("the run executed no cycle".to_string())
+                            })
+                        });
+                        for walked in wrx {
+                            for job in accumulator.absorb(walked) {
+                                streamed += 1;
+                                if btx.send(Built::Job(Box::new(job))).is_err() {
+                                    return Err(Error::Prover("the layout thread stopped".into()));
+                                }
+                            }
+                        }
+                        walking
+                            .join()
+                            .map_err(|_| Error::Prover("the block's walker panicked".into()))?
+                    })?
+                };
+                let windows_done = start.elapsed().as_secs_f64();
+                let window_stamps = builder.stamps();
+                // The table phase's marks, for `finish` alone.
+                crate::tables::trace_builder::build_stamps::start();
+                let mut rest = builder.finish(&last)?;
+                let finish_marks = crate::tables::trace_builder::build_stamps::take();
+                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
+                if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
+                    rest.keccak_rnds.remove(0);
+                }
+                let finished = start.elapsed().as_secs_f64();
+                let _ = btx.send(Built::Rest(Box::new(rest)));
+                Ok((
+                    windows_done,
+                    finished,
+                    streamed,
+                    window_stamps,
+                    finish_marks,
+                ))
+            });
 
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
             let stream_airs = &stream_airs;
