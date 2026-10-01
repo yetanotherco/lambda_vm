@@ -19,6 +19,11 @@
 //!    top is kept — and its stack is opened at the tables' points
 //!    ([`stacked_eval::prove`]).
 //!
+//! A table whose leading preprocessed columns are settled out of band
+//! ([`BlockPrepared`]) has its derived commitment's roots absorbed after the
+//! groups' roots, and its opening proved on its group's fork after the group's
+//! own opening.
+//!
 //! The verifier mirrors it and checks the bus balance ONCE, over every table of
 //! the block: the LogUp challenges are shared, so the block's fractions sum to
 //! what the statement owes exactly as one monolithic proof's do.
@@ -52,7 +57,7 @@ use math::{
 use multilinear::{
     Error as MlError,
     mle::Mle,
-    stacked_eval::{self, Claimed, ColumnsAt, RetiredStack, StackedCommitment},
+    stacked_eval::{self, Claimed, ColumnsAt, RetiredStack, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
     whir_chain::{ChainConfig, StackVars},
@@ -114,6 +119,61 @@ pub struct GroupStamps {
     pub tree_bytes: usize,
     /// When the group's commit ended, seconds since phase A started.
     pub committed_at: f64,
+}
+
+/// A table's PREPARED opening in a block: a commitment both sides derive from
+/// the program, over the table's leading preprocessed columns, opened at the
+/// table's own point on its group's fork, after the group's own opening.
+///
+/// It is the epoch's prepared opening ([`crate::multilinear_table::Prepared`])
+/// at the granularity of one table: the root is DERIVED by the verifier and
+/// absorbed after the group roots, before `z`; the columns stay in the group's
+/// stack too, and the opening proves the derived commitment takes the values
+/// the table's own argument settled on, at that table's point. One commitment
+/// per table keeps every derived root independent of the grouping.
+pub struct BlockPrepared<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// The table's position in the proof's table order.
+    pub table: usize,
+    pub commitment: &'a StackedCommitment<F, H>,
+    /// The table's leading preprocessed columns, in order: the prefix the
+    /// opening settles.
+    pub columns: &'a [&'a Mle<F>],
+}
+
+/// What the verifier settles a [`BlockPrepared`] opening against.
+pub struct BlockPreparedCheck<'a, F>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+{
+    /// The table's position in the proof's table order.
+    pub table: usize,
+    /// Derived from the program by the verifier, never read from the proof.
+    pub roots: &'a [Commitment],
+    /// Its columns are the table's leading preprocessed columns, so their count
+    /// is the prefix `check_preprocessed` skips.
+    pub layout: &'a StackedLayout,
+    pub domain: &'a Domain<F>,
+}
+
+/// Prepared tables must name distinct tables in increasing order, so each
+/// table has at most one opening and the derived roots have one order.
+fn prepared_order(tables: impl Iterator<Item = usize>, num_tables: usize) -> Result<(), MlError> {
+    let mut last: Option<usize> = None;
+    for table in tables {
+        if table >= num_tables || last.is_some_and(|l| table <= l) {
+            return Err(MlError::UnknownPolynomial {
+                index: table,
+                len: num_tables,
+            });
+        }
+        last = Some(table);
+    }
+    Ok(())
 }
 
 /// The block after phase A: every table, the groups' roots and the tops of
@@ -330,19 +390,26 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone,
 {
-    block_prove_on_forks::<F, E, T, H>(committed, config, transcript, &|g| g)
+    let (proof, _, stamps) =
+        block_prove_on_forks::<F, E, T, H>(committed, config, transcript, &[], &|g| g)?;
+    Ok((proof, stamps))
 }
 
-/// [`block_prove`] with group `g` proved on the fork of index `fork_of(g)`.
-/// Only a test proves on anything but the identity: it is how a proof whose
-/// groups sit on the wrong forks is built, for the verifier to refuse.
+/// [`block_prove`] with the tables' prepared openings, and group `g` proved on
+/// the fork of index `fork_of(g)`. Returns the proof, the prepared openings in
+/// `prepared`'s order, and the stamps.
+///
+/// Only a test proves on a fork map other than the identity: it is how a proof
+/// whose groups sit on the wrong forks is built, for the verifier to refuse.
 #[doc(hidden)]
+#[allow(clippy::type_complexity)]
 pub fn block_prove_on_forks<F, E, T, H>(
     committed: BlockCommitted<'_, F, E>,
     config: &ChainConfig,
     transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
     fork_of: &dyn Fn(usize) -> usize,
-) -> Result<(MultiProof<F, E>, Vec<GroupStamps>), MlError>
+) -> Result<(MultiProof<F, E>, Vec<StackedProof<F, E>>, Vec<GroupStamps>), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
@@ -360,10 +427,21 @@ where
         roots,
         mut stamps,
     } = committed;
-    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &[]);
+    prepared_order(prepared.iter().map(|p| p.table), tables.len())?;
+    for p in prepared {
+        if p.columns.is_empty() || p.columns.len() > tables[p.table].num_committed_columns() {
+            return Err(MlError::QueryCountMismatch {
+                expected: tables[p.table].num_committed_columns(),
+                got: p.columns.len(),
+            });
+        }
+    }
+    let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
+    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
 
     let mut table_proofs = Vec::with_capacity(tables.len());
     let mut openings = Vec::with_capacity(sizes.len());
+    let mut prepared_openings = Vec::with_capacity(prepared.len());
     let mut at = 0usize;
     // The next group's columns, uploaded during this group's argument — the
     // card idles through the argument's host glue, and a group's store is a
@@ -441,6 +519,24 @@ where
             config,
             &mut fork,
         )?);
+        // The group's prepared tables, in table order: each opened at its own
+        // point for its own prefix, on this fork.
+        let mut first = 0usize;
+        for (index, table) in group.iter().enumerate() {
+            if let Some(p) = prepared.iter().find(|p| p.table == at + index) {
+                let n = p.columns.len();
+                prepared_openings.push(stacked_eval::prove::<F, E, T, H>(
+                    p.commitment,
+                    p.columns,
+                    None,
+                    &Claimed::PerColumn(&points[first..first + n]),
+                    &values[first..first + n],
+                    config,
+                    &mut fork,
+                )?);
+            }
+            first += table.num_committed_columns();
+        }
         stamps[g].open = t.elapsed().as_secs_f64();
         drop(stacked);
         drop(columns);
@@ -457,6 +553,7 @@ where
             columns: openings,
             preprocessed: None,
         },
+        prepared_openings,
         stamps,
     ))
 }
@@ -465,10 +562,14 @@ where
 /// and the bus balance over every table of the block against `expected`.
 ///
 /// `layouts`/`domains` are one per group, rebuilt by the caller from the
-/// shapes and `sizes` ([`block_groups`]) — never from the proof.
+/// shapes and `sizes` ([`block_groups`]) — never from the proof. `prepared` are
+/// the tables' prepared checks the caller derived from the program, and
+/// `prepared_openings` the proof's openings of them, one each, in that order.
 #[allow(clippy::too_many_arguments)]
 pub fn block_verify<F, E, T, H>(
     proof: &MultiProof<F, E>,
+    prepared_openings: &[StackedProof<F, E>],
+    prepared: &[BlockPreparedCheck<'_, F>],
     statements: &[TableStatement<'_, F, E>],
     layouts: &[StackedLayout],
     domains: &[Domain<F>],
@@ -518,7 +619,32 @@ where
             got: 1,
         });
     }
-    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &proof.roots, &[]);
+    // One opening per prepared table, each table at most once, and each
+    // settling a prefix of the table's preprocessed columns — never more than
+    // the table has, which would skip a check nothing replaced.
+    if prepared_openings.len() != prepared.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: prepared.len(),
+            got: prepared_openings.len(),
+        });
+    }
+    prepared_order(prepared.iter().map(|p| p.table), statements.len())?;
+    let mut settled = vec![0usize; statements.len()];
+    for p in prepared {
+        let n = p.layout.placements().len();
+        if n == 0 || n > statements[p.table].num_preprocessed {
+            return Err(MlError::QueryCountMismatch {
+                expected: statements[p.table].num_preprocessed,
+                got: n,
+            });
+        }
+        settled[p.table] = n;
+    }
+    let derived: Vec<Commitment> = prepared
+        .iter()
+        .flat_map(|p| p.roots.iter().copied())
+        .collect();
+    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &proof.roots, &derived);
 
     let mut balance = FieldElement::<E>::zero();
     let mut statement_at = 0usize;
@@ -534,11 +660,13 @@ where
         let mut fork = group_fork::<E, T>(transcript, g);
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
-        for (table, statement) in proof.tables[statement_at..statement_at + size]
+        for ((table, statement), &settled) in proof.tables[statement_at..statement_at + size]
             .iter()
             .zip(&statements[statement_at..statement_at + size])
+            .zip(&settled[statement_at..statement_at + size])
         {
-            let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, &mut fork, 0)?;
+            let (output, reduced) =
+                verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
             balance += contribution(&output).ok_or(MlError::BusImbalance)?;
             for _ in 0..statement.slot_of.len() {
                 points.push(reduced.point.clone());
@@ -556,6 +684,32 @@ where
             config,
             &mut fork,
         )?;
+        // The group's prepared tables, in table order, on this fork: each
+        // derived commitment must take the values the table settled on, at the
+        // table's point.
+        let mut first = 0usize;
+        for (index, statement) in statements[statement_at..statement_at + size]
+            .iter()
+            .enumerate()
+        {
+            if let Some(k) = prepared
+                .iter()
+                .position(|p| p.table == statement_at + index)
+            {
+                let (p, n) = (&prepared[k], settled[statement_at + index]);
+                stacked_eval::verify::<F, E, T, H>(
+                    &prepared_openings[k],
+                    p.layout,
+                    p.roots,
+                    &Claimed::PerColumn(&points[first..first + n]),
+                    &values[first..first + n],
+                    p.domain,
+                    config,
+                    &mut fork,
+                )?;
+            }
+            first += statement.slot_of.len();
+        }
         statement_at += size;
         root_at += layout.num_polys();
     }

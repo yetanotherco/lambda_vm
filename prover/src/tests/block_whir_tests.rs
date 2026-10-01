@@ -390,6 +390,105 @@ fn an_extra_root_is_refused() {
     assert!(!verify(&proof, &elf, &one_group()));
 }
 
+/// DECODE's columns are settled by a prepared opening: one per prepared table,
+/// and a small program's only prepared table is DECODE.
+#[test]
+fn the_block_carries_decodes_prepared_opening() {
+    let elf = asm_elf_bytes("sub");
+    let proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+    assert_eq!(proof.prepared.len(), 1);
+    assert!(verify(&proof, &elf, &one_group()));
+}
+
+/// The prepared set is DECODE and every genesis page the cross-epoch rule
+/// stacks — a page with thousands of nonzero genesis bytes — and never a zero
+/// page or a private one, whose columns cost the guest nothing or are committed.
+#[test]
+fn the_prepared_set_is_decode_and_the_dense_pages() {
+    use crate::tables::page::PageConfig;
+    let elf = asm_elf_bytes("sub");
+    let counts = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16)).table_counts;
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let configs = vec![
+        PageConfig::zero_init(0x1000_0000),
+        PageConfig {
+            page_base: 0x2000_0000,
+            init_values: Some(vec![7u8; 20_000]),
+            is_private_input: false,
+        },
+        PageConfig {
+            page_base: 0x3000_0000,
+            init_values: Some(vec![7u8; 20_000]),
+            is_private_input: true,
+        },
+    ];
+    let opts = ProofOptions::default_test_options();
+    let airs = crate::VmAirs::new(
+        &program, &opts, false, &configs, &counts, None, true, None, None, None,
+    );
+    let prepared = block_whir::prepared_tables(&airs, &configs).expect("the prepared set");
+    let refs = airs.air_refs();
+    let decode = refs
+        .iter()
+        .position(|air| air.name() == "DECODE")
+        .expect("a DECODE");
+    let first_page = refs.len() - airs.pages.len() - {
+        // The tables after the pages, in `air_refs` order.
+        airs.memw_registers.len()
+            + airs.eqs.len()
+            + airs.bytewises.len()
+            + airs.stores.len()
+            + airs.cpu32s.len()
+    };
+    let tables: Vec<usize> = prepared.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tables, vec![decode, first_page + 1]);
+    assert_eq!(
+        prepared[1].1,
+        crate::tables::page::preprocessed_columns(&configs[1])
+    );
+}
+
+/// A prepared opening altered in one value is refused. The openings sit last on
+/// their group's fork, so nothing after them reads the tamper: only the
+/// opening's own check can refuse it.
+#[test]
+fn a_tampered_prepared_opening_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    assert!(verify(&proof, &elf, &format));
+    proof.prepared[0].polys[0].final_value += FieldElement::<E>::one();
+    assert!(!verify(&proof, &elf, &format));
+}
+
+/// A proof that leaves a prepared opening out is refused: the verifier derives
+/// the prepared set from the program, not from the proof.
+#[test]
+fn a_missing_prepared_opening_is_refused() {
+    let elf = asm_elf_bytes("sub");
+    let mut proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+    proof.prepared.pop();
+    assert!(!verify(&proof, &elf, &one_group()));
+}
+
+/// A prover that commits DECODE's prepared columns for another program (one
+/// entry differs) and opens that commitment is refused: the verifier absorbs
+/// the root it derived itself, so the transcripts part at the roots block.
+#[test]
+fn a_prepared_opening_of_another_program_is_refused() {
+    let elf = asm_elf_bytes("sub");
+    let other = prove_with(
+        &elf,
+        &one_group(),
+        &options(MaxRowsConfig::default(), 16),
+        &Deviations {
+            other_prepared: true,
+            ..Default::default()
+        },
+    );
+    assert!(!verify(&other, &elf, &one_group()));
+}
+
 /// The KECCAK_RND count is bounded before the verifier builds an AIR off it.
 #[test]
 fn an_inflated_keccak_rnd_count_is_refused() {

@@ -14,6 +14,11 @@
 //! argues and opens each group on its own fork of that transcript. The bus
 //! balance is checked once, over every table of the block.
 //!
+//! The columns an in-guest verifier cannot evaluate — DECODE's, and the dense
+//! genesis pages' — are settled by PREPARED openings ([`prepared_tables`]):
+//! commitments both sides derive from the program, absorbed after the groups'
+//! roots and opened on the table's group fork, as an epoch settles DECODE.
+//!
 //! ★ #1010's epoch pipeline is untouched: this is a separate entry point with a
 //! statement tag of its own ([`statement::MULTILINEAR_BLOCK_TAG`]).
 
@@ -144,6 +149,9 @@ pub struct BlockWhirProof {
     /// each group's stack from it under its own stack cap. The proof's tables
     /// are in this order.
     pub groups: Vec<Vec<u32>>,
+    /// The prepared openings ([`prepared_tables`]), one per prepared table, in
+    /// the proof's table order.
+    pub prepared: Vec<multilinear::stacked_eval::StackedProof<F, E>>,
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -171,6 +179,8 @@ pub struct BlockStamps {
     /// A streamed build's windows: the walk, the routing and the streamed
     /// chunks' generation, summed.
     pub windows: WindowStamps,
+    /// The prepared commitments: how many, and the seconds deriving them.
+    pub prepared: (usize, f64),
 }
 
 impl BlockStamps {
@@ -233,6 +243,10 @@ impl BlockStamps {
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
+        out.push_str(&format!(
+            "BLOCK PREPARED: tables {} · derived in {:.3}\n",
+            self.prepared.0, self.prepared.1
+        ));
         out.push_str(&format!(
             "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
             self.execute,
@@ -396,6 +410,156 @@ fn table_of<'a>(
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
 }
 
+/// A prepared table's index in [`VmAirs::air_refs`] order and the columns its
+/// opening settles.
+pub(crate) type PreparedColumns = (usize, Vec<Vec<FieldElement<F>>>);
+
+/// One table's PREPARED commitment ([`multilinear_block::BlockPrepared`]): its
+/// leading preprocessed columns, committed under the block's parameters. Both
+/// sides derive it from the program — the prover opens it, the verifier absorbs
+/// its roots and checks the opening — and no proof carries it.
+pub(crate) struct TablePrepared<H: multilinear::whir_hash::WhirHash> {
+    /// The table's index in [`VmAirs::air_refs`] order.
+    pub(crate) table: usize,
+    pub(crate) columns: Vec<Mle<F>>,
+    pub(crate) roots: Vec<multilinear::whir_commit::Commitment>,
+    pub(crate) commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+}
+
+/// The tables a block opens out of band, in [`VmAirs::air_refs`] order, with
+/// the columns each opening settles:
+/// - DECODE: its ELF-derived columns, all of them;
+/// - every genesis page the cross-epoch rule stacks
+///   ([`crate::continuation::genesis_stack_plan`]): both its columns.
+///
+/// These are the columns an in-guest verifier cannot evaluate: five columns of
+/// 2^20, and a dense page whose sparse form is millions of rows. So the block
+/// settles them with an opening, as an epoch settles DECODE. The result is a
+/// function of the ELF and the page configs alone. The rule reads no private
+/// page's bytes, so the prover's and the verifier's views of the configs give
+/// the same set.
+pub(crate) fn prepared_tables(
+    airs: &VmAirs,
+    page_configs: &[crate::tables::page::PageConfig],
+) -> Result<Vec<PreparedColumns>, Error> {
+    let refs = airs.air_refs();
+    if page_configs.len() != airs.pages.len() {
+        return Err(Error::Prover(format!(
+            "{} page configs for {} page tables",
+            page_configs.len(),
+            airs.pages.len()
+        )));
+    }
+    let first_page = match airs.pages.first() {
+        Some(page) => refs
+            .iter()
+            .position(|air| {
+                std::ptr::eq(
+                    *air as *const _ as *const (),
+                    page.as_ref() as *const _ as *const (),
+                )
+            })
+            .ok_or_else(|| Error::Prover("the page tables are not in the AIR set".into()))?,
+        None => refs.len(),
+    };
+    let decode = crate::multilinear_continuation::decode_table_index(&refs)?;
+    let mut tables = vec![(decode, refs[decode].precomputed_columns())];
+    let plan = crate::continuation::genesis_stack_plan(
+        page_configs,
+        first_page,
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    for route in plan.routes.iter().filter(|route| route.dense) {
+        tables.push((
+            route.table,
+            crate::tables::page::preprocessed_columns(&page_configs[route.table - first_page]),
+        ));
+    }
+    tables.sort_by_key(|&(table, _)| table);
+    Ok(tables)
+}
+
+/// Commits one prepared table's columns under `config`.
+pub(crate) fn commit_prepared<H: multilinear::whir_hash::WhirHash>(
+    table: usize,
+    columns: Vec<Vec<FieldElement<F>>>,
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<TablePrepared<H>, Error> {
+    let columns: Vec<Mle<F>> = columns
+        .into_iter()
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("table {table}: {e:?}"))))
+        .collect::<Result<_, _>>()?;
+    let num_vars = columns
+        .first()
+        .ok_or_else(|| Error::Prover(format!("table {table} has no prepared column")))?
+        .num_vars();
+    if columns.iter().any(|c| c.num_vars() != num_vars) {
+        return Err(Error::Prover(format!(
+            "table {table}: prepared columns of different heights"
+        )));
+    }
+    let layout =
+        stark::multilinear_table::global_layout(&[(columns.len(), num_vars)], config.format.stack)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+        layout,
+        &multilinear::stacking::borrow(&columns),
+        None,
+        config,
+    )
+    .map_err(|e| Error::Prover(format!("table {table}: {e:?}")))?;
+    let roots = commitment.roots();
+    Ok(TablePrepared {
+        table,
+        columns,
+        roots,
+        commitment,
+    })
+}
+
+/// Each prepared table's position in the proof's table order (the groups
+/// concatenated), with its index in `prepared`, sorted by position.
+pub(crate) fn prepared_positions<H: multilinear::whir_hash::WhirHash>(
+    prepared: &[TablePrepared<H>],
+    groups: &[Vec<u32>],
+) -> Result<Vec<(usize, usize)>, Error> {
+    let mut out = prepared
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            groups
+                .iter()
+                .flatten()
+                .position(|&t| t as usize == p.table)
+                .map(|position| (position, k))
+                .ok_or_else(|| Error::Prover(format!("prepared table {} is in no group", p.table)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// The prover's prepared commitments over `columns` ([`prepared_tables`]),
+/// with the deviation applied, and the seconds they took.
+fn prover_prepared<H: multilinear::whir_hash::WhirHash>(
+    columns: Vec<PreparedColumns>,
+    config: &multilinear::whir_chain::ChainConfig,
+    deviations: &Deviations,
+) -> Result<(Vec<TablePrepared<H>>, f64), Error> {
+    let t = Instant::now();
+    let prepared = columns
+        .into_iter()
+        .enumerate()
+        .map(|(k, (table, mut columns))| {
+            if k == 0 && deviations.other_prepared {
+                columns[0][0] += FieldElement::<F>::one();
+            }
+            commit_prepared::<H>(table, columns, config)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((prepared, t.elapsed().as_secs_f64()))
+}
+
 /// Proves a block in one proof.
 pub fn prove_block_whir(
     elf_bytes: &[u8],
@@ -425,6 +589,9 @@ pub(crate) struct Deviations {
     pub omit_first_keccak_rnd: bool,
     /// Prove group `g` on the fork of this index instead of `g`.
     pub fork_of: Option<fn(usize) -> usize>,
+    /// Commit and open the first prepared table over columns that differ from
+    /// the program's in one entry, as a prover of another program would.
+    pub other_prepared: bool,
 }
 
 pub(crate) fn prove_block_whir_with(
@@ -543,6 +710,7 @@ pub(crate) fn prove_traces(
         None,
     );
 
+    let prepared_columns = prepared_tables(&airs, &traces.page_configs)?;
     let pairs = airs.air_trace_pairs(traces);
     let shapes = shapes_of(&pairs)?;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
@@ -624,6 +792,21 @@ pub(crate) fn prove_traces(
         let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.prep += produced;
         stamps.phase_a = t.elapsed().as_secs_f64();
+        let (prepared, derive) = prover_prepared::<H>(prepared_columns, &config, deviations)?;
+        stamps.prepared = (prepared.len(), derive);
+        let positions = prepared_positions(&prepared, &groups)?;
+        let borrowed: Vec<Vec<&Mle<F>>> = prepared
+            .iter()
+            .map(|p| multilinear::stacking::borrow(&p.columns))
+            .collect();
+        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = positions
+            .iter()
+            .map(|&(table, k)| multilinear_block::BlockPrepared {
+                table,
+                commitment: &prepared[k].commitment,
+                columns: &borrowed[k],
+            })
+            .collect();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
         let identity = |g: usize| g;
@@ -631,13 +814,15 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, groups) = multilinear_block::block_prove_on_forks::<_, _, _, H>(
-            block,
-            &config,
-            &mut transcript,
-            fork_of,
-        )
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let (proof, prepared_openings, groups) =
+            multilinear_block::block_prove_on_forks::<_, _, _, H>(
+                block,
+                &config,
+                &mut transcript,
+                &openings,
+                fork_of,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
         let paths_after = multilinear::whir_commit::top_path_counts();
         stamps.top_paths = (
@@ -645,17 +830,18 @@ pub(crate) fn prove_traces(
             paths_after.1 - paths_before.1,
         );
         stamps.groups = groups;
-        proof
+        (proof, prepared_openings)
     });
 
     Ok(BlockWhirProof {
-        proof,
+        proof: proof.0,
         table_num_vars,
         runtime_page_ranges,
         table_counts,
         public_output,
         num_private_input_pages,
         groups,
+        prepared: proof.1,
     })
 }
 
@@ -804,6 +990,8 @@ struct Laid {
     public_output: Vec<u8>,
     shapes: Vec<(usize, usize)>,
     groups: Vec<Vec<u32>>,
+    /// The prepared tables' columns ([`prepared_tables`]).
+    prepared: Vec<PreparedColumns>,
     busy: f64,
 }
 
@@ -983,6 +1171,7 @@ fn prove_streamed(
                         None,
                     )
                 });
+                let prepared = prepared_tables(airs, &traces.page_configs)?;
                 let refs = airs.air_refs();
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
@@ -1062,6 +1251,7 @@ fn prove_streamed(
                     public_output,
                     shapes,
                     groups,
+                    prepared,
                     busy,
                 })
             });
@@ -1111,6 +1301,21 @@ fn prove_streamed(
             &config,
             &laid.groups,
         );
+        let (prepared, derive) = prover_prepared::<H>(laid.prepared, &config, deviations)?;
+        stamps.prepared = (prepared.len(), derive);
+        let positions = prepared_positions(&prepared, &laid.groups)?;
+        let borrowed: Vec<Vec<&Mle<F>>> = prepared
+            .iter()
+            .map(|p| multilinear::stacking::borrow(&p.columns))
+            .collect();
+        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = positions
+            .iter()
+            .map(|&(table, k)| multilinear_block::BlockPrepared {
+                table,
+                commitment: &prepared[k].commitment,
+                columns: &borrowed[k],
+            })
+            .collect();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
         let identity = |g: usize| g;
@@ -1118,13 +1323,15 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, groups) = multilinear_block::block_prove_on_forks::<_, _, _, H>(
-            block,
-            &config,
-            &mut transcript,
-            fork_of,
-        )
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let (proof, prepared_openings, groups) =
+            multilinear_block::block_prove_on_forks::<_, _, _, H>(
+                block,
+                &config,
+                &mut transcript,
+                &openings,
+                fork_of,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
         let paths_after = multilinear::whir_commit::top_path_counts();
         stamps.top_paths = (
@@ -1140,6 +1347,7 @@ fn prove_streamed(
             public_output: laid.public_output,
             num_private_input_pages: laid.num_private_input_pages,
             groups: laid.groups,
+            prepared: prepared_openings,
         })
     })
 }
@@ -1246,6 +1454,7 @@ pub fn verify_block_whir(
     let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
     let (stack_layouts, domains) = stacks(&group_shapes, &sizes, &config)?;
+    let prepared_columns = prepared_tables(&airs, &page_configs)?;
     // Every group within the stack budget — the verifier's constant, not the
     // prover's packing — except a table that alone needs more: it cannot be
     // split, so it is a group of its own (the packing's rule too).
@@ -1275,10 +1484,36 @@ pub fn verify_block_whir(
             &config,
             &proof.groups,
         );
+        // The prepared commitments, derived here from the program: their roots
+        // are the verifier's, never the proof's.
+        let prepared: Vec<TablePrepared<H>> = match prepared_columns
+            .into_iter()
+            .map(|(table, columns)| commit_prepared::<H>(table, columns, &config))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(prepared) => prepared,
+            Err(_) => return Ok(false),
+        };
+        let Ok(positions) = prepared_positions(&prepared, &proof.groups) else {
+            return Ok(false);
+        };
+        let checks: Vec<multilinear_block::BlockPreparedCheck<'_, F>> = positions
+            .iter()
+            .map(|&(table, k)| multilinear_block::BlockPreparedCheck {
+                table,
+                roots: &prepared[k].roots,
+                layout: prepared[k].commitment.layout(),
+                domain: prepared[k].commitment.domain(),
+            })
+            .collect();
+        let derived: Vec<multilinear::whir_commit::Commitment> = checks
+            .iter()
+            .flat_map(|c| c.roots.iter().copied())
+            .collect();
         // What the tables owe: the COMMIT bus's counterparty, at the block's
         // challenges — replayed on a fork through the roots block itself.
         let mut probe = transcript.clone();
-        stark::multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &[]);
+        stark::multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &derived);
         let z: FieldElement<E> = probe.sample_field_element();
         let alpha: FieldElement<E> = probe.sample_field_element();
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
@@ -1287,6 +1522,8 @@ pub fn verify_block_whir(
         };
         multilinear_block::block_verify::<_, _, _, H>(
             &proof.proof,
+            &proof.prepared,
+            &checks,
             &statements,
             &stack_layouts,
             &domains,
