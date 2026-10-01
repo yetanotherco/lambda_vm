@@ -66,7 +66,7 @@ as enforced by @copy:c:one_hot.
 
 == Chip state assignment
 
-Each of the three chip states corresponds to a syscall number: $-30$ for `memmove`/`memcpy`, $-32$ for `memset`, and $64$ to `write`.#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
+Each of the three chip states corresponds to a syscall number: $-30$ for `memmove`/`memcpy`, $-31$ for `memset`, and $64$ to `write`.#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
 The chip is to accept `ECALL`s with all three of these numbers.
 Rather than having a separate interactions for each, this chip leverages the 
 prover-hinted `is_commit` and `is_set` flags to extract the correct syscall number from the bus:

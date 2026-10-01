@@ -26,7 +26,7 @@ where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
 We provide a list of supported ECALL numbers.
 Negative numbers (represented as 2s complement 64-bit numbers), are used for our own custom accelerators/extensions.
 
-/ 64: `write` (@commit)
+/ 64: `write` (@copy)
 / 93: `exit` (@halt)
 / -1: `SHA256` (@sha256)
 / -2: `KECCAK` (@keccak)
@@ -35,6 +35,5 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / -20: `FEXT_LOAD` (@fext)
 / -21: `FEXT_FMA` (@fext)
 / -22: `FEXT_ZERO` (@fext)
-/ -30: `MEMMOVE`/`memcpy`/`memmove` (@copy)
-/ -31: `HINT` (reserved, not yet specified)
-/ -32: `MEMMOVE`/`memset` (@copy)
+/ -30: `memcpy`/`memmove` (@copy)
+/ -31: `memset` (@copy)
