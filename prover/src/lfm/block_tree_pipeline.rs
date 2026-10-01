@@ -35,6 +35,25 @@ pub(super) struct Pipe {
     leaves: Vec<Slot>,
     levels: Vec<Vec<Slot>>,
     failed: AtomicBool,
+    /// Per stage (0 = the leaves, then each node level): a prover has come
+    /// for one of its slots, so the stage is proving.
+    started: Mutex<Vec<bool>>,
+    stage_started: Condvar,
+}
+
+/// When the pipeline's builder takes the card permit
+/// (`NOEPOCH_BUILDER_FIRST`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BuilderFirst {
+    /// In turn with the proofs.
+    No,
+    /// Ahead of every waiting proof ([`super::device_permit::go_first_here`]).
+    All,
+    /// Ahead of every waiting proof, each node level's builds above the first
+    /// held back until the level below starts proving: they land in the card's
+    /// idle window while that level's nodes execute and fill, instead of in the
+    /// card-bound level 0.
+    Next,
 }
 
 /// When the builder finished each stage, in seconds since it started.
@@ -61,6 +80,8 @@ impl Pipe {
                 .map(|l| (0..l.arities.len()).map(|_| Slot::default()).collect())
                 .collect(),
             failed: AtomicBool::new(false),
+            started: Mutex::new(vec![false; levels.len() + 1]),
+            stage_started: Condvar::new(),
         }
     }
 
@@ -81,24 +102,34 @@ impl Pipe {
         } else {
             levels.remove(0)
         };
+        let stages = levels.len() + 1;
         Self {
             leaves,
             levels,
             failed: AtomicBool::new(false),
+            started: Mutex::new(vec![false; stages]),
+            stage_started: Condvar::new(),
         }
     }
 
     /// Leaf `k`'s program and artifacts, waiting for them.
     pub(super) fn take_leaf(&self, k: usize, label: &str) -> (LfmProgram, LfmArtifacts) {
-        self.take(&self.leaves[k], label)
+        self.take(&self.leaves[k], 0, label)
     }
 
     /// Node `j` of node level `lv` (0 = the first above the leaves), waiting.
     pub(super) fn take_node(&self, lv: usize, j: usize, label: &str) -> (LfmProgram, LfmArtifacts) {
-        self.take(&self.levels[lv][j], label)
+        self.take(&self.levels[lv][j], lv + 1, label)
     }
 
-    fn take(&self, slot: &Slot, label: &str) -> (LfmProgram, LfmArtifacts) {
+    fn take(&self, slot: &Slot, stage: usize, label: &str) -> (LfmProgram, LfmArtifacts) {
+        {
+            let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+            if !started[stage] {
+                started[stage] = true;
+                self.stage_started.notify_all();
+            }
+        }
         let mut value = slot.value.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = value.take() {
@@ -116,6 +147,17 @@ impl Pipe {
         }
     }
 
+    /// Waits until a prover has come for a slot of `stage`.
+    fn wait_started(&self, stage: usize) {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        while !started[stage] {
+            started = self
+                .stage_started
+                .wait(started)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     fn put(&self, slot: &Slot, program: LfmProgram, artifacts: LfmArtifacts) {
         *slot.value.lock().unwrap_or_else(|e| e.into_inner()) = Some((program, artifacts));
         slot.ready.notify_all();
@@ -125,17 +167,18 @@ impl Pipe {
     /// order, then each node level's programs (emitted in parallel on the host
     /// from the children's derived shapes) and their artifacts, each put in its
     /// slot as soon as it exists. A failure marks the pipe failed, so no prover
-    /// waits forever. With `first`, the builder takes the card permit ahead of
-    /// every other waiter ([`super::device_permit::go_first_here`]).
+    /// waits forever. `first` says when the builder takes the card permit.
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
-        first: bool,
+        first: BuilderFirst,
     ) -> Result<BuilderTimes, String> {
-        let _first = first.then(super::device_permit::go_first_here);
-        let run = std::panic::AssertUnwindSafe(|| self.build(plan, leaf_programs, wrap_opts));
+        let _first = (first != BuilderFirst::No).then(super::device_permit::go_first_here);
+        let defer = first == BuilderFirst::Next;
+        let run =
+            std::panic::AssertUnwindSafe(|| self.build(plan, leaf_programs, wrap_opts, defer));
         let outcome = std::panic::catch_unwind(run);
         if !matches!(outcome, Ok(Ok(_))) {
             self.failed.store(true, Ordering::SeqCst);
@@ -151,25 +194,30 @@ impl Pipe {
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
+        defer: bool,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
         let waited_from = super::device_permit::waited_secs();
         let words = plan.child_layout().total();
         let mut build_secs = 0.0;
-        let mut built = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
-            let t = Instant::now();
-            let artifacts = super::program_census::build_artifacts_counted(
-                program,
-                wrap_opts,
-                crate::hash_pin::BLOCK_HASHER,
-            );
-            let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
-            build_secs += t.elapsed().as_secs_f64();
-            Ok((artifacts, derived))
-        };
+        let mut built =
+            |program: &LfmProgram, stage: usize| -> Result<(LfmArtifacts, DerivedChild), String> {
+                if defer && stage >= 2 {
+                    self.wait_started(stage - 1);
+                }
+                let t = Instant::now();
+                let artifacts = super::program_census::build_artifacts_counted(
+                    program,
+                    wrap_opts,
+                    crate::hash_pin::BLOCK_HASHER,
+                );
+                let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+                build_secs += t.elapsed().as_secs_f64();
+                Ok((artifacts, derived))
+            };
         let mut children = Vec::with_capacity(leaf_programs.len());
         for (k, program) in leaf_programs.into_iter().enumerate() {
-            let (artifacts, derived) = built(&program)?;
+            let (artifacts, derived) = built(&program, 0)?;
             children.push(derived);
             self.put(&self.leaves[k], program, artifacts);
         }
@@ -213,7 +261,7 @@ impl Pipe {
             emit += t.elapsed().as_secs_f64();
             children = Vec::with_capacity(programs.len());
             for (j, program) in programs.into_iter().enumerate() {
-                let (artifacts, derived) = built(&program)?;
+                let (artifacts, derived) = built(&program, lv + 1)?;
                 children.push(derived);
                 self.put(&self.levels[lv][j], program, artifacts);
             }

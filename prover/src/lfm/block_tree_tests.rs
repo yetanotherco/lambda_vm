@@ -23,7 +23,7 @@ use super::block_node::{
 };
 use super::block_plan::{BlockShape, BlockTreePlan, le_halves, top_claims};
 use super::block_replay::{BlockStatementShape, replay_block_front};
-use super::block_tree_pipeline::Pipe;
+use super::block_tree_pipeline::{BuilderFirst, Pipe};
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::edsl::WrapHash;
@@ -1210,11 +1210,17 @@ fn tree_ahead_mode() -> Option<AheadMode> {
     }
 }
 
-/// `NOEPOCH_BUILDER_FIRST=1`: the pipeline's builder takes the card permit
-/// ahead of the waiting proofs, since its artifacts gate whole levels. Off by
-/// default.
-fn builder_first_knob() -> bool {
-    std::env::var("NOEPOCH_BUILDER_FIRST").is_ok_and(|v| v == "1")
+/// `NOEPOCH_BUILDER_FIRST`: `1` lets the pipeline's builder take the card
+/// permit ahead of the waiting proofs, since its artifacts gate whole levels;
+/// `next` does too, each node level's builds above the first held back until
+/// the level below starts proving. Unset or `0`, the builder waits its turn.
+fn builder_first_knob() -> BuilderFirst {
+    match std::env::var("NOEPOCH_BUILDER_FIRST").ok().as_deref() {
+        None | Some("" | "0") => BuilderFirst::No,
+        Some("1") => BuilderFirst::All,
+        Some("next") => BuilderFirst::Next,
+        Some(v) => panic!("NOEPOCH_BUILDER_FIRST must be 0, 1 or next, got `{v}`"),
+    }
 }
 
 /// [`compose_block_tree`], each node proved from the program and artifacts
@@ -2362,7 +2368,7 @@ fn the_block_tree_composes_to_a_top_node() {
             println!(
                 "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
                  emission Σ {:.2}s · artifact builds Σ {:.2}s (holding the card permit, waited Σ \
-                 {:.2}s for it; builder first: {builder_first})",
+                 {:.2}s for it; builder first: {builder_first:?})",
                 times.leaves, times.levels, times.emit, times.build, times.waited
             );
         }
