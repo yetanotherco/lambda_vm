@@ -34,7 +34,8 @@ r1_aux_commit_table and rounds_2to4_table. The disjoint stages are: head = the t
 first prepass; prepass, main_commit, fused = the unions of those ranges; between = the rest of
 [first prepass, last fused end] (the absorb, and in the epoch base the waits between epochs);
 tail = after the last fused range (the no-epoch arm's verify). recommit = the union of the
-recommit ranges, a part of fused, reported as its own row. Without NVTX ranges (no libnvToolsExt)
+recommit ranges, a part of fused, and precommit = the union of r1_precommit_table (the streamed
+block's CPU commits, made on builder threads during the head), each reported as its own row. Without NVTX ranges (no libnvToolsExt)
 the stages come from the log's PROVE SPLIT lines (t=[..] plus the phase walls, the `other`
 remainder unplaced) and there is no recommit row.
 
@@ -980,6 +981,7 @@ def base_line(lg):
 
 STAGES = ("head", "prepass", "main_commit", "between", "fused", "tail")
 RECOMMIT_LABEL = "r1_main_recommit_table"
+PRECOMMIT_LABEL = "r1_precommit_table"
 TASK_LABELS = ("r1_main_recommit_table", "r1_aux_build_table", "r1_aux_commit_table", "rounds_2to4_table")
 
 
@@ -990,6 +992,7 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
         by.setdefault(lab, []).append((s, e))
     pre, mc, fu = union(by.get("r1_prepass", [])), union(by.get("r1_main_commit", [])), union(by.get("rounds_2to4", []))
     rc = union(by.get(RECOMMIT_LABEL, []))
+    pc = union(by.get(PRECOMMIT_LABEL, []))
     src = "NVTX ranges"
     if not (pre or mc or fu) and lg["splits"] and t0_ns is not None:
         src = "the log's PROVE SPLIT lines (no NVTX ranges; `other` unplaced, no recommit row)"
@@ -1000,7 +1003,7 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
             mc.append((a + sp["prepass"] * 1e9, a + (sp["prepass"] + sp["main_commit"]) * 1e9))
             fu.append((b - sp["fused"] * 1e9, b))
         pre, mc, fu = union(pre), union(mc), union(fu)
-        rc = []
+        rc, pc = [], []
     if not (pre or mc or fu):
         return {"whole": [(0, end_ns)]}, "no NVTX ranges and no PROVE SPLIT line: one window only"
     allp = union(pre + mc + fu)
@@ -1009,9 +1012,11 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
     fu = subtract(fu, union(pre + mc))
     w = {"head": [(0, first)] if first > 0 else [], "prepass": pre, "main_commit": mc, "fused": fu,
          "between": subtract([(first, last)], union(pre + mc + fu)),
-         "tail": [(last, end_ns)] if end_ns > last else [], "recommit": rc, "whole": [(0, end_ns)]}
-    if not rc:
-        w.pop("recommit")
+         "tail": [(last, end_ns)] if end_ns > last else [], "precommit": pc, "recommit": rc,
+         "whole": [(0, end_ns)]}
+    for k, v in (("precommit", pc), ("recommit", rc)):
+        if not v:
+            w.pop(k)
     return w, src
 
 
@@ -1113,7 +1118,7 @@ def cmd_runa(a):
                         nl += 1
         return ksum, nl, kk
 
-    order = [s for s in STAGES if s in w] + [s for s in ("recommit", "whole") if s in w]
+    order = [s for s in STAGES if s in w] + [s for s in ("precommit", "recommit", "whole") if s in w]
     stages, per_kernel = [], {}
     for name in order:
         ivs = w[name]
@@ -1282,7 +1287,7 @@ def cmd_runa(a):
             "driver thread at a time); recommits = the mean open recommit ranges. VRAM = the nvidia-smi maximum in "
             "the stage (200 ms samples). GPU metrics are nsys's samples averaged over the stage "
             f"({mets.why or 'collected'}): warps = Compute Warps in Flight, % of the card's warp slots (an "
-            "occupancy proxy over time). `recommit` overlaps `fused`; `whole` is the run.\n\n")
+            "occupancy proxy over time). `precommit` overlaps `head`, `recommit` overlaps `fused`; `whole` is the run.\n\n")
     o.write("| stage | wall s | busy % | kernel busy % | copy busy % | Σ kernel s | launches | tasks | recommits | "
             "VRAM MiB | SM active % | SM issue % | warps % | DRAM rd % | DRAM wr % | PCIe rx % | PCIe tx % | "
             "top kernels (Σ s in the stage) |\n")
@@ -1315,10 +1320,9 @@ def cmd_runa(a):
                 "|---|---|---|---|---|---|---|\n")
         for r in arows[1:]:
             o.write("| " + " | ".join(str(x) for x in r) + " |\n")
-        unattr = sum((e - s) for s, e, *_ in kernels) / 1e9 - (attr.get("r1_main_commit", {}).get("kernel_s", 0.0)
-                                                               + sum(attr.get(l, {}).get("kernel_s", 0.0)
-                                                                     for l in TASK_LABELS))
-        o.write(f"\nΣ kernel time not launched from r1_main_commit or a fused-task range: {unattr:.2f} s "
+        unattr = sum((e - s) for s, e, *_ in kernels) / 1e9 - sum(attr.get(l, {}).get("kernel_s", 0.0) for l in
+                                                                   ("r1_main_commit", PRECOMMIT_LABEL) + TASK_LABELS)
+        o.write(f"\nΣ kernel time not launched from r1_main_commit, a precommit or a fused-task range: {unattr:.2f} s "
                 "(the main commits' own drivers, the head, rayon workers).\n")
     if api:
         o.write("\n## CUDA API time (calls x duration on the calling thread, by the call's start)\n\n")
@@ -1833,6 +1837,7 @@ def build_synth_sqlite(path):
         db.execute("INSERT INTO NVTX_EVENTS VALUES (?, ?, 59, 0, 0, 0, ?, ?, ?, ?, 0)",
                    (int(a * sec), int(b * sec), text, tid, tid, text_id))
 
+    rng(0.5, 1.5, "r1_precommit_table", DRV_TID)
     rng(2.0, 2.5, "r1_prepass", MAIN_TID)
     rng(2.5, 5.0, None, MAIN_TID, 11)        # a registered string: the text through StringIds
     rng(5.2, 9.0, "rounds_2to4", MAIN_TID)
@@ -2015,8 +2020,10 @@ def selftest():
         ok(rc == 0 and "| fused | 3.80 |" in printed and "Stages from NVTX ranges" in printed,
            f"runa exits 0 with a 3.8 s fused stage ({printed[:600]!r})")
         srows = {r["stage"]: r for r in read_tsv(os.path.join(rout, "runa-noepoch-stages.tsv"))}
-        ok(set(srows) == {"head", "prepass", "main_commit", "between", "fused", "tail", "recommit", "whole"},
+        ok(set(srows) == {"head", "prepass", "main_commit", "between", "fused", "tail", "precommit", "recommit", "whole"},
            f"runa's stages ({sorted(srows)})")
+        ok(abs(fnum(srows["precommit"]["wall_s"]) - 1.0) < 1e-6 and abs(fnum(srows["precommit"]["copy_busy_pct"]) - 50.0) < 1e-6,
+           f"runa's precommit row ({srows.get('precommit')})")
         ok(abs(fnum(srows["main_commit"]["wall_s"]) - 2.5) < 1e-6 and abs(fnum(srows["between"]["wall_s"]) - 0.2) < 1e-6
            and abs(fnum(srows["recommit"]["wall_s"]) - 0.8) < 1e-6 and abs(fnum(srows["head"]["wall_s"]) - 2.0) < 1e-6,
            "runa's stage walls")
@@ -2054,7 +2061,7 @@ def selftest():
         rc, printed = run(cmd_runa, argparse.Namespace(sqlite=db2, log=rlog, workload="noepoch", out=os.path.join(d, "r2"),
                                                        smi=None, bin_ms=1000))
         s2 = {r["stage"]: r for r in read_tsv(os.path.join(d, "r2", "runa-noepoch-stages.tsv"))}
-        ok(rc == 0 and "PROVE SPLIT lines" in printed and "recommit" not in s2
+        ok(rc == 0 and "PROVE SPLIT lines" in printed and "recommit" not in s2 and "precommit" not in s2
            and abs(fnum(s2["fused"]["wall_s"]) - 3.8) < 1e-3 and abs(fnum(s2["main_commit"]["wall_s"]) - 2.5) < 1e-3,
            f"runa's log fallback ({sorted(s2)})")
         # dry against the synthetic trace
