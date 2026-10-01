@@ -265,6 +265,19 @@ fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
+/// The streamed build cuts ECDAS at the run's end like the whole-run build:
+/// test_ecsm_multi's 64 ECDAS rows in 16-row tables, windows of 2^4 cycles.
+#[test]
+fn a_streamed_block_with_ecdas_chunks_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_ecsm_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 16, 4);
+    o.ecdas_rows_log2 = 4;
+    let proof = prove(&elf, &format, &o);
+    assert_eq!(proof.table_counts.ecdas, 4);
+    assert!(verify(&proof, &elf, &format));
+}
+
 /// The same with KECCAK_RND's chunks streamed as their ops arrive (chunks of
 /// 2^5 rows, the builder's smallest): the same table count as built at the
 /// end, and the proof verifies.
