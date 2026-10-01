@@ -1149,6 +1149,20 @@ fn the_whir_block_tree_on_a_real_block() {
         .expect("the planner did not panic")
         .expect("the plan and the leaves derive");
     print!("{}", stamps.report());
+    // LT's chunk heights (what its per-chunk deduplication leaves): equal across
+    // runs of one setting when the chunking is deterministic.
+    {
+        let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format)
+            .expect("the statement's frame");
+        let refs = frame.airs.air_refs();
+        let lt: Vec<u8> = refs
+            .iter()
+            .zip(&proof.table_num_vars)
+            .filter(|(air, _)| air.name().starts_with("LT["))
+            .map(|(_, &n)| n)
+            .collect();
+        println!("W3 LT HEIGHTS: {lt:?}");
+    }
     println!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",
         programs.len(),
