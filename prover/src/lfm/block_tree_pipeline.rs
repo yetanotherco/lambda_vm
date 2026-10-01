@@ -123,14 +123,19 @@ impl Pipe {
     /// order, then each node level's programs (emitted in parallel on the host
     /// from the children's derived shapes) and their artifacts, each put in its
     /// slot as soon as it exists. A failure marks the pipe failed, so no prover
-    /// waits forever.
+    /// waits forever. With `emit_threads` > 0 the node programs are emitted on a
+    /// pool of that many host-only threads of the builder's own, not on the
+    /// global pool the provers' host phases use.
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
+        emit_threads: usize,
     ) -> Result<BuilderTimes, String> {
-        let run = std::panic::AssertUnwindSafe(|| self.build(plan, leaf_programs, wrap_opts));
+        let run = std::panic::AssertUnwindSafe(|| {
+            self.build(plan, leaf_programs, wrap_opts, emit_threads)
+        });
         let outcome = std::panic::catch_unwind(run);
         if !matches!(outcome, Ok(Ok(_))) {
             self.failed.store(true, Ordering::SeqCst);
@@ -146,8 +151,28 @@ impl Pipe {
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
+        emit_threads: usize,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
+        // ⚠ On the global pool, a prover that joins inside its `multi_prove`
+        // can steal one of these ≈ 1 s emissions and hold the card idle until
+        // it finishes (FAST 454: one leaf hold of 1.2 s at a third busy, in half
+        // the runs, at the instant the level-1 emission starts).
+        #[cfg(feature = "parallel")]
+        let emit_pool = if emit_threads > 0 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(emit_threads)
+                    .thread_name(|i| format!("tree-emit-{i}"))
+                    .start_handler(|_| super::commit::mark_thread_host_only())
+                    .build()
+                    .map_err(|e| format!("the emission pool: {e}"))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "parallel"))]
+        let _ = emit_threads;
         let words = plan.child_layout().total();
         let mut build_secs = 0.0;
         let mut built = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
@@ -194,10 +219,16 @@ impl Pipe {
             #[cfg(feature = "parallel")]
             let programs: Vec<LfmProgram> = {
                 use rayon::prelude::*;
-                groups
-                    .par_iter()
-                    .map(|kids| plan.node_program(kids, top))
-                    .collect::<Result<_, String>>()?
+                let emit = || {
+                    groups
+                        .par_iter()
+                        .map(|kids| plan.node_program(kids, top))
+                        .collect::<Result<_, String>>()
+                };
+                match &emit_pool {
+                    Some(pool) => pool.install(emit),
+                    None => emit(),
+                }?
             };
             #[cfg(not(feature = "parallel"))]
             let programs: Vec<LfmProgram> = groups

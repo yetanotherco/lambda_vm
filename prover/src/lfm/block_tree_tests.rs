@@ -1210,6 +1210,18 @@ fn tree_ahead_mode() -> Option<AheadMode> {
     }
 }
 
+/// `NOEPOCH_EMIT_POOL=<threads>`: the pipeline's builder emits the node
+/// programs on a host-only pool of its own with that many threads; unset or `0`,
+/// on the global pool the provers use.
+fn emit_pool_knob() -> usize {
+    match std::env::var("NOEPOCH_EMIT_POOL") {
+        Ok(v) if !v.is_empty() => v
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("NOEPOCH_EMIT_POOL must be a thread count, got `{v}`")),
+        _ => 0,
+    }
+}
+
 /// [`compose_block_tree`], each node proved from the program and artifacts
 /// derived ahead when `ahead` holds the node levels, and each node below the top
 /// verified on `beside` when given (the top is verified inline).
@@ -2047,6 +2059,7 @@ fn the_block_tree_composes_to_a_top_node() {
     // from the shape the base hands out before its prove, and the levels prove
     // from them.
     let tree_ahead = elf_beside.and(tree_ahead_mode());
+    let emit_threads = emit_pool_knob();
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2114,7 +2127,7 @@ fn the_block_tree_composes_to_a_top_node() {
             let _ = ready_tx.send((consts, secs, ahead));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
-            Some(pipe.run_builder(&plan, leaves, &wrap))
+            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads))
         })
     });
 
@@ -2353,8 +2366,16 @@ fn the_block_tree_composes_to_a_top_node() {
             let times = times.expect("the tree's builder");
             println!(
                 "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
-                 emission Σ {:.2}s · artifact builds Σ {:.2}s (holding the card permit)",
-                times.leaves, times.levels, times.emit, times.build
+                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit)",
+                times.leaves,
+                times.levels,
+                times.emit,
+                if emit_threads > 0 {
+                    format!("own pool of {emit_threads}")
+                } else {
+                    "global pool".to_string()
+                },
+                times.build
             );
         }
     }
