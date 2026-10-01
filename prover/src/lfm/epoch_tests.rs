@@ -1797,10 +1797,7 @@ pub(super) fn host_table_forked(
     use stark::domain::new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
 
-    let opts = air.options();
     let trace_length = view.trace_length();
-    let log2_trace_length = trace_length.trailing_zeros();
-    let log2_blowup = (opts.blowup_factor as usize).trailing_zeros();
     let domain = new_verifier_domain(air, trace_length);
     let layout = Verifier::<Gl, Ext3, ()>::ood_layout(air);
     let challenges = Verifier::<Gl, Ext3, ()>::replay_rounds_after_round_1(
@@ -1825,25 +1822,26 @@ pub(super) fn host_table_forked(
 
     let ood_c = view.trace_ood_evaluations();
     let ood_n = view.trace_ood_next_evaluations();
-    let shape = TableChallengeShape {
-        index,
-        num_tables,
-        has_aux_root: view.lde_trace_aux_merkle_root().is_some(),
-        has_contribution: view.bus_table_contribution().is_some(),
-        log2_trace_length,
-        log2_blowup,
-        coset_offset: FE::from(opts.coset_offset),
-        ood_current_dims: (ood_c.width(), ood_c.height()),
-        ood_next_dims: (ood_n.width(), ood_n.height()),
-        num_parts: view.composition_poly_parts_ood_evaluation().len(),
-        fri: FriShape::for_layout(
-            opts,
-            log2_trace_length + log2_blowup,
-            stark::leaf_layout::table_leaf_layout(air, view.trace_length()),
+    // The shape is the AIR's at this trace length; the proof is checked against
+    // it, never read into it.
+    let shape = TableChallengeShape::derive(air, index, num_tables, trace_length);
+    assert_eq!(
+        (
+            view.lde_trace_aux_merkle_root().is_some(),
+            view.bus_table_contribution().is_some(),
+            (ood_c.width(), ood_c.height()),
+            (ood_n.width(), ood_n.height()),
+            view.composition_poly_parts_ood_evaluation().len(),
         ),
-        grinding_factor: opts.grinding_factor,
-        num_queries: opts.fri_number_of_queries,
-    };
+        (
+            shape.has_aux_root,
+            shape.has_contribution,
+            shape.ood_current_dims,
+            shape.ood_next_dims,
+            shape.num_parts,
+        ),
+        "table {index}: the proof's aux root, L, OOD blocks and part count are the AIR's"
+    );
 
     HostTable {
         shape,

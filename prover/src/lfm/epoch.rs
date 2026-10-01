@@ -54,6 +54,14 @@ use super::fri::FriShape;
 use super::layout::keccak::DIGEST_WORDS;
 use super::transcript_replay::{ByteString, TranscriptReplay};
 
+/// A sub-proof's AIR as the shape derivations read it: the block's VM AIRs and
+/// the LFM chips alike.
+pub type DynVmAir<'a> = dyn stark::traits::AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    > + 'a;
+
 /// The grinding prefix, `crypto/stark/src/grinding.rs`'s `PREFIX`.
 const GRINDING_PREFIX: [u8; 8] = 0x0123_4567_89ab_cded_u64.to_be_bytes();
 
@@ -297,6 +305,54 @@ pub struct TableChallengeShape {
 }
 
 impl TableChallengeShape {
+    /// The challenge replay's shape for `air`'s sub-proof over `trace_length`
+    /// rows, at position `index` of `num_tables` — from the AIR, the trace
+    /// length and the AIR's options, never from a proof. Every field is the
+    /// value the host verifier pins the proof's copy to: the part count to the
+    /// AIR's degree bound (`verifier.rs:1730`), the OOD blocks to
+    /// `ood_blocks_well_formed`, the `L` presence to `has_trace_interaction`.
+    ///
+    /// `trace_length` must be a power of two; the caller bounds it.
+    pub fn derive(
+        air: &DynVmAir<'_>,
+        index: usize,
+        num_tables: usize,
+        trace_length: usize,
+    ) -> Self {
+        use stark::verifier::IsStarkVerifier;
+        debug_assert!(trace_length.is_power_of_two(), "a power-of-two trace");
+        let opts = air.options();
+        let log2_trace_length = trace_length.trailing_zeros();
+        let log2_blowup = (opts.blowup_factor as usize).trailing_zeros();
+        let layout = stark::verifier::Verifier::<
+            crate::tables::types::GoldilocksField,
+            GoldilocksExtension,
+            (),
+        >::ood_layout(air);
+        Self {
+            index,
+            num_tables,
+            has_aux_root: air.has_aux_trace(),
+            has_contribution: air.has_trace_interaction(),
+            log2_trace_length,
+            log2_blowup,
+            coset_offset: FE::from(opts.coset_offset),
+            ood_current_dims: (
+                air.trace_layout().0 + air.num_auxiliary_rap_columns(),
+                layout.step_size(),
+            ),
+            ood_next_dims: (layout.expected_next_width(), layout.expected_next_height()),
+            num_parts: air.composition_poly_degree_bound(trace_length) / trace_length,
+            fri: FriShape::for_layout(
+                opts,
+                log2_trace_length + log2_blowup,
+                stark::leaf_layout::table_leaf_layout(air, trace_length),
+            ),
+            grinding_factor: opts.grinding_factor,
+            num_queries: opts.fri_number_of_queries,
+        }
+    }
+
     /// `log2` of the LDE domain.
     pub fn log2_lde_length(&self) -> u32 {
         self.log2_trace_length + self.log2_blowup

@@ -102,6 +102,103 @@ pub struct ChildShape<'a> {
     pub tables: Vec<ChildTable<'a>>,
 }
 
+/// One sub-proof's shapes in a [`DerivedChild`].
+struct DerivedTable {
+    challenge: TableChallengeShape,
+    verify: TableVerifyShape,
+    analysis: Analysis,
+    precomputed_root: Option<Commitment>,
+}
+
+/// A child's shapes derived from its ARTIFACTS — its program's AIR set and
+/// heights — with no proof of it: what a verifier needs to derive a node's
+/// program from the programs below it. [`Self::shape`] is the emitter's view.
+pub struct DerivedChild {
+    program_id: Commitment,
+    num_public_words: usize,
+    fri_final_poly_log_degree: u8,
+    tables: Vec<DerivedTable>,
+}
+
+impl DerivedChild {
+    /// The child whose program `artifacts` describes, proved under `opts` and
+    /// publishing `num_public_words` words (its layout's, a constant of the
+    /// tree). Every table shape is the AIR's at the artifacts' height
+    /// ([`TableChallengeShape::derive`], [`TableVerifyShape::derive`]); the
+    /// preprocessed roots are the AIR set's, as `verify_against_artifacts`
+    /// builds it.
+    pub fn from_artifacts(
+        artifacts: &super::registry::LfmArtifacts,
+        opts: &crate::ProofOptions,
+        num_public_words: usize,
+    ) -> Result<Self, String> {
+        let heights = super::airs::LfmAirs::log_heights_in_air_order(artifacts)
+            .ok_or("a child with KECCAK_RND chunks has workload heights")?;
+        let airs = super::airs::LfmAirs::for_artifacts(artifacts, opts);
+        let refs = airs.air_refs();
+        if heights.len() != refs.len() {
+            return Err(format!("{} heights for {} AIRs", heights.len(), refs.len()));
+        }
+        let n = refs.len();
+        let tables = refs
+            .iter()
+            .zip(heights)
+            .enumerate()
+            .map(|(idx, (air, h))| {
+                let rows = 1usize << h;
+                let (verify, analysis) = TableVerifyShape::derive(*air, rows)?;
+                let precomputed_root = if air.is_preprocessed() {
+                    Some(
+                        super::epoch_verify::layout_precomputed_commitment(*air, rows)
+                            .ok_or_else(|| format!("table {idx}: no preprocessed root"))?,
+                    )
+                } else {
+                    None
+                };
+                Ok(DerivedTable {
+                    challenge: TableChallengeShape::derive(*air, idx, n, rows),
+                    verify,
+                    analysis,
+                    precomputed_root,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self {
+            program_id: artifacts.program_id,
+            num_public_words,
+            fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
+            tables,
+        })
+    }
+
+    /// The child as the node's emitter reads it.
+    pub fn shape(&self) -> ChildShape<'_> {
+        ChildShape {
+            program_id: &self.program_id,
+            num_public_words: self.num_public_words,
+            fri_final_poly_log_degree: self.fri_final_poly_log_degree,
+            tables: self
+                .tables
+                .iter()
+                .map(|t| ChildTable {
+                    challenge: &t.challenge,
+                    verify: &t.verify,
+                    analysis: &t.analysis,
+                    precomputed_root: t.precomputed_root.as_ref(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Each sub-proof's `log2` trace length, in proof order.
+    pub fn log2_trace_lengths(&self) -> Vec<u32> {
+        self.tables
+            .iter()
+            .map(|t| t.challenge.log2_trace_length)
+            .collect()
+    }
+}
+
 // ==================== the emitted statement + publics ====================
 
 /// One hinted public word of a child: the emit-time-constant index, the eight

@@ -1254,6 +1254,29 @@ impl LfmAirs {
         refs
     }
 
+    /// Each sub-proof's trace log-height, in [`Self::air_refs`]' frozen order,
+    /// from `artifacts` alone — what a parent's emitter needs to derive its
+    /// child's shapes without the child's proof. `None` when the keccak family
+    /// is present: `KECCAK_RND`'s chunk heights are its workload's, which the
+    /// artifacts do not carry.
+    pub fn log_heights_in_air_order(artifacts: &super::registry::LfmArtifacts) -> Option<Vec<u8>> {
+        let set = artifacts.chip_set;
+        if set.keccak {
+            return None;
+        }
+        let h = &artifacts.log_heights;
+        let mut out: Vec<u8> = h[..HASH_SLOT].to_vec();
+        out.extend(artifacts.hash_chunk_log_heights.iter().copied());
+        out.extend(h[KECCAK_SLOT + 1..BLAKE3_SLOT].iter().copied());
+        if set.blake3 {
+            out.extend(artifacts.blake3_chunk_log_heights.iter().copied());
+        }
+        if set.bitwise {
+            out.push(h[BITWISE_SLOT]);
+        }
+        Some(out)
+    }
+
     /// Prove-side projection, frozen order (must match `air_refs`).
     ///
     /// When the keccak family is present, `traces.keccak_rnd` must have exactly
