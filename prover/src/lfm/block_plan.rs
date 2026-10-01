@@ -106,6 +106,32 @@ pub struct PlannedInstance {
     pub precomputed_root: Option<Commitment>,
 }
 
+/// The plan's inputs that are a function of the ELF and the options alone —
+/// DECODE's preprocessed root, recomputed on the host from the ELF (never a
+/// prover's or a device's copy) — so a caller can compute them before the
+/// block's shape exists. Constructed only by [`Self::compute`], and tied to the
+/// ELF digest and the options it was computed under.
+pub struct ElfConstants {
+    elf_digest: [u8; 32],
+    /// The options, as their `Debug` rendering: every field the roots depend on.
+    opts: String,
+    decode: Commitment,
+}
+
+impl ElfConstants {
+    /// Compute the constants for `elf_bytes` under `opts`.
+    pub fn compute(elf_bytes: &[u8], opts: &crate::ProofOptions) -> Result<Self, String> {
+        let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
+        let decode = crate::tables::decode::commitment_from_elf(&elf, opts)
+            .map_err(|e| format!("DECODE commitment: {e:?}"))?;
+        Ok(Self {
+            elf_digest: crate::statement::elf_digest(elf_bytes),
+            opts: format!("{opts:?}"),
+            decode,
+        })
+    }
+}
+
 /// Every program of a block's tree, derived from the trusted ELF, the options
 /// and the block's shape. See the module docs.
 pub struct BlockTreePlan {
@@ -135,12 +161,32 @@ impl BlockTreePlan {
         opts: &crate::ProofOptions,
         shape: &BlockShape,
     ) -> Result<Self, String> {
+        Self::derive_with(
+            elf_bytes,
+            opts,
+            shape,
+            &ElfConstants::compute(elf_bytes, opts)?,
+        )
+    }
+
+    /// [`Self::derive`] over ELF constants computed ahead of the shape (beside
+    /// the base, once per ELF): refuses constants of another ELF or options.
+    pub fn derive_with(
+        elf_bytes: &[u8],
+        opts: &crate::ProofOptions,
+        shape: &BlockShape,
+        consts: &ElfConstants,
+    ) -> Result<Self, String> {
+        if consts.elf_digest != crate::statement::elf_digest(elf_bytes)
+            || consts.opts != format!("{opts:?}")
+        {
+            return Err("ELF constants of another ELF or other options".to_string());
+        }
         let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
         let page_configs = check_shape(&elf, opts, shape)?;
         let n = shape.trace_lengths.len();
 
-        let decode = crate::tables::decode::commitment_from_elf(&elf, opts)
-            .map_err(|e| format!("DECODE commitment: {e:?}"))?;
+        let decode = consts.decode;
         let airs = crate::VmAirs::new(
             &elf,
             opts,

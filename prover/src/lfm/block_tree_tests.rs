@@ -400,6 +400,36 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
+/// The ELF constants a plan may take from ahead of time (beside the base) are
+/// tied to the ELF and the options they were computed under: another ELF's, or
+/// another blowup's, are refused, and the matching ones derive the plan.
+#[test]
+fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
+    use super::block_plan::ElfConstants;
+    let opts = fixture_block_options();
+    let a = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let b = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let consts = ElfConstants::compute(&a, &opts).expect("the constants compute");
+    let shape = honest_fixture_shape(&executor::elf::Elf::load(&a).expect("load the ELF"));
+    assert!(
+        BlockTreePlan::derive_with(&b, &opts, &shape, &consts).is_err(),
+        "another ELF's constants are refused"
+    );
+    let mut other = opts.clone();
+    other.blowup_factor *= 2;
+    assert!(
+        BlockTreePlan::derive_with(&a, &other, &shape, &consts).is_err(),
+        "constants computed under other options are refused"
+    );
+    let plan = BlockTreePlan::derive_with(&a, &opts, &shape, &consts).expect("the plan derives");
+    let inline = BlockTreePlan::derive(&a, &opts, &shape).expect("the plan derives");
+    assert_eq!(
+        plan.attested(),
+        inline.attested(),
+        "constants ahead and inline give one plan"
+    );
+}
+
 /// m5: a nonzero pad byte in the public output's last half is refused.
 /// `test_commit_3` commits three bytes, so the last half carries one pad byte,
 /// which the statement's `bit_dec(half, 8·live)` keeps zero; the honest arenas
@@ -650,12 +680,30 @@ pub(super) fn harvest_block_with(
     proof: &crate::VmProof,
     verify: bool,
 ) -> Result<(RealBlock, f64, f64), String> {
+    harvest_block_over(opts, elf_bytes, proof, verify, None)
+}
+
+/// [`harvest_block_with`] over ELF constants computed ahead (beside the base),
+/// or computed here when `None`. Prints the split of its first half: the plan,
+/// the COMMIT-bus target, the host verify.
+pub(super) fn harvest_block_over(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    proof: &crate::VmProof,
+    verify: bool,
+    consts: Option<&super::block_plan::ElfConstants>,
+) -> Result<(RealBlock, f64, f64), String> {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use rayon::prelude::*;
     use stark::verifier::IsStarkVerifier;
 
     let t_verify = std::time::Instant::now();
-    let plan = BlockTreePlan::derive(elf_bytes, opts, &BlockShape::of_proof(proof))?;
+    let shape = BlockShape::of_proof(proof);
+    let plan = match consts {
+        Some(c) => BlockTreePlan::derive_with(elf_bytes, opts, &shape, c)?,
+        None => BlockTreePlan::derive(elf_bytes, opts, &shape)?,
+    };
+    let plan_secs = t_verify.elapsed().as_secs_f64();
     let view = MultiProofView::Owned(&proof.proof);
     let refs = plan.airs().air_refs();
     let seed = || {
@@ -676,6 +724,7 @@ pub(super) fn harvest_block_with(
         &mut seed(),
     )
     .ok_or("the COMMIT bus target must compute")?;
+    let target_secs = t_verify.elapsed().as_secs_f64() - plan_secs;
     if verify
         && !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
             &refs,
@@ -687,6 +736,17 @@ pub(super) fn harvest_block_with(
         return Err("production's verifier rejects the block".to_string());
     }
     let verify_secs = t_verify.elapsed().as_secs_f64();
+    println!(
+        "   harvest split ({}): plan {plan_secs:.2}s ({}) · bus target {target_secs:.2}s · \
+         host verify {:.2}s",
+        if verify { "verifying" } else { "reading" },
+        if consts.is_some() {
+            "ELF constants ahead"
+        } else {
+            "ELF constants inline"
+        },
+        verify_secs - plan_secs - target_secs
+    );
 
     // ---- Phase A, as `multi_verify_views` absorbs it: the plan's preprocessed
     // roots (the AIR's, never the proof's), then the proof's main roots.
@@ -1584,6 +1644,19 @@ const D12_LEAVES: [&[usize]; 8] = [
     ],
 ];
 
+/// `NOEPOCH_ELF_BESIDE`: threads for the ELF constants beside the base; unset or
+/// zero computes them inline in the harvest.
+fn elf_beside_knob() -> Option<usize> {
+    std::env::var("NOEPOCH_ELF_BESIDE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("NOEPOCH_ELF_BESIDE must be a thread count, got `{v}`"))
+        })
+        .filter(|&t| t > 0)
+}
+
 /// `NOEPOCH_LEAVES`: the leaf count; unset is the rule's `⌈Σ cost / 279 000⌉`.
 fn leaves_knob() -> Option<usize> {
     std::env::var("NOEPOCH_LEAVES")
@@ -1650,6 +1723,25 @@ fn the_block_tree_composes_to_a_top_node() {
     let whole = HostSampler::start();
     let t_all = Instant::now();
 
+    // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`): the
+    // plan's ELF-only input (DECODE's root, recomputed on the host) computed on a
+    // pool of its own while the base proves, joined by the harvest. Unset: the
+    // harvest computes it inline, as before.
+    let elf_beside = elf_beside_knob();
+    let consts_beside = elf_beside.map(|threads| {
+        let (elf, opts) = (elf_bytes.clone(), inner.clone());
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("elf-beside-{i}"))
+                .build()
+                .expect("the ELF constants pool builds");
+            let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
+            (consts, t.elapsed().as_secs_f64())
+        })
+    });
+
     // ---- the base.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
@@ -1676,21 +1768,37 @@ fn the_block_tree_composes_to_a_top_node() {
     // verifies first, as before.
     let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
     let t = Instant::now();
+    let consts = consts_beside.map(|handle| {
+        let tj = Instant::now();
+        let (consts, secs) = handle.join().expect("the ELF constants thread panicked");
+        println!(
+            "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
+             waited {:.2}s (counted in the harvest)",
+            elf_beside.unwrap_or(0),
+            tj.elapsed().as_secs_f64()
+        );
+        std::sync::Arc::new(consts.expect("the ELF constants compute"))
+    });
     let shape = BlockShape::of_proof(&proof);
     let (mut rb, verify, replay, beside) = if inline_verify {
-        let (rb, verify, replay) = harvest_block(&inner, &elf_bytes, &proof).expect("harvest");
+        let (rb, verify, replay) =
+            harvest_block_over(&inner, &elf_bytes, &proof, true, consts.as_deref())
+                .expect("harvest");
         drop(proof);
         (rb, Some(verify), replay, None)
     } else {
         let proof = std::sync::Arc::new(proof);
         let beside = {
             let (proof, opts, elf) = (proof.clone(), inner.clone(), elf_bytes.clone());
+            let consts = consts.clone();
             std::thread::spawn(move || {
-                harvest_block(&opts, &elf, &proof).map(|(rb, verify, _)| (rb.state, verify))
+                harvest_block_over(&opts, &elf, &proof, true, consts.as_deref())
+                    .map(|(rb, verify, _)| (rb.state, verify))
             })
         };
         let (rb, _, replay) =
-            harvest_block_with(&inner, &elf_bytes, &proof, false).expect("harvest");
+            harvest_block_over(&inner, &elf_bytes, &proof, false, consts.as_deref())
+                .expect("harvest");
         drop(proof);
         (rb, None, replay, Some(beside))
     };
