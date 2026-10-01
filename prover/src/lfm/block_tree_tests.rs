@@ -1185,7 +1185,7 @@ pub(super) fn compose_block_tree(
     opts: &crate::ProofOptions,
     siblings: usize,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
-    compose_block_tree_with(plan, leaves, opts, siblings, None, None)
+    compose_block_tree_with(plan, leaves, opts, siblings, None, None, false)
 }
 
 /// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`). Unset or `pipe`,
@@ -1229,6 +1229,59 @@ fn emit_pool_knob() -> usize {
     }
 }
 
+/// `NOEPOCH_TREE_EAGER=1`: the pipeline's builder hands each program out before
+/// its artifacts (a prover executes and fills meanwhile and waits for them only
+/// at `multi_prove`) and emits each node as soon as its own children are built
+/// ([`super::block_tree_pipeline`]). Off by default.
+fn tree_eager_knob() -> bool {
+    std::env::var("NOEPOCH_TREE_EAGER").is_ok_and(|v| v == "1")
+}
+
+/// [`prove_program_with`] for a program whose artifacts come later: execute and
+/// fill first (they read no artifact), then wait for `artifacts` and prove.
+pub(super) fn prove_program_deferred(
+    label: &str,
+    program: &LfmProgram,
+    artifacts: impl FnOnce() -> LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+    verify_inline: bool,
+) -> (RealChild, super::proof::LfmProof) {
+    let t = std::time::Instant::now();
+    let prepared = super::proof::lfm_prepare(program, arenas, crate::hash_pin::BLOCK_HASHER)
+        .unwrap_or_else(|e| panic!("{label} must execute: {e:?}"));
+    let t_prepare = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let artifacts = artifacts();
+    let t_wait = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let proved = super::proof::lfm_prove_prepared(&artifacts, prepared, opts)
+        .unwrap_or_else(|e| panic!("{label} must prove: {e:?}"));
+    let t_prove = t_prepare + t.elapsed().as_secs_f64();
+    super::per_table_aggregator_tests::print_prove_split(label);
+    let t = std::time::Instant::now();
+    let (child, verified) = if verify_inline {
+        let (child, t_verify) =
+            super::per_table_aggregator_tests::real_child_timed(artifacts, opts.clone(), &proved);
+        (child, format!("verify {t_verify:.2}"))
+    } else {
+        let child = super::per_table_aggregator_tests::real_child_unverified(
+            artifacts,
+            opts.clone(),
+            &proved,
+        );
+        (child, "verified beside".to_string())
+    };
+    println!(
+        "   {label} TIMING: {} instructions · build_artifacts 0.00s · prove {t_prove:.2}s · \
+         harvest {:.2}s ({verified})",
+        program.instrs.len(),
+        t.elapsed().as_secs_f64()
+    );
+    println!("   {label} ARTIFACTS: waited {t_wait:.2}s after execute + fill");
+    (child, proved)
+}
+
 /// [`compose_block_tree`], each node proved from the program and artifacts
 /// derived ahead when `ahead` holds the node levels, and each node below the top
 /// verified on `beside` when given (the top is verified inline).
@@ -1239,6 +1292,7 @@ pub(super) fn compose_block_tree_with(
     siblings: usize,
     ahead: Option<&Pipe>,
     beside: Option<&BesideVerifies>,
+    eager: bool,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
     let fan_in = super::block_plan::block_fan_in();
     let shape = plan.levels();
@@ -1265,16 +1319,20 @@ pub(super) fn compose_block_tree_with(
                 if top { " TOP" } else { "" }
             );
             let te = std::time::Instant::now();
-            let (program, built) = match ahead {
-                Some(p) => {
+            let (program, built) = match (ahead, eager) {
+                (Some(p), false) => {
                     let (program, artifacts) = p.take_node(lv, j, &label);
                     (program, Some(artifacts))
                 }
-                None => (block_node_program(plan, &kids, top), None),
+                (Some(p), true) => (p.take_node_program(lv, j, &label), None),
+                (None, _) => (
+                    std::sync::Arc::new(block_node_program(plan, &kids, top)),
+                    None,
+                ),
             };
             println!(
                 "   {label}: {} in {:.2}s",
-                if built.is_some() {
+                if ahead.is_some() {
                     "program ahead"
                 } else {
                     "emitted"
@@ -1283,14 +1341,18 @@ pub(super) fn compose_block_tree_with(
             );
             super::per_table_aggregator_tests::census_and_panel(&program, &label, fan_in);
             let inline = top || beside.is_none();
-            let (child, proof) = prove_program_with(
-                &label,
-                &program,
-                built,
-                &block_node_arenas(&kids),
-                opts,
-                inline,
-            );
+            let arenas = block_node_arenas(&kids);
+            let (child, proof) = match (ahead, eager) {
+                (Some(p), true) => prove_program_deferred(
+                    &label,
+                    &program,
+                    || p.take_node_artifacts(lv, j, &label),
+                    &arenas,
+                    opts,
+                    inline,
+                ),
+                _ => prove_program_with(&label, &program, built, &arenas, opts, inline),
+            };
             if let (false, Some(b)) = (inline, beside) {
                 b.spawn(&label, child.artifacts.clone(), proof, opts.clone());
                 return (child, None);
@@ -2067,6 +2129,7 @@ fn the_block_tree_composes_to_a_top_node() {
     // from them.
     let tree_ahead = elf_beside.and(tree_ahead_mode());
     let emit_threads = emit_pool_knob();
+    let tree_eager = tree_eager_knob();
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2134,7 +2197,7 @@ fn the_block_tree_composes_to_a_top_node() {
             let _ = ready_tx.send((consts, secs, ahead));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
-            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads))
+            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads, tree_eager))
         })
     });
 
@@ -2305,17 +2368,18 @@ fn the_block_tree_composes_to_a_top_node() {
     let leaves = in_index_order(k, l0, |j| {
         let label = format!("BLOCK L0 leaf {j}");
         let te = Instant::now();
-        let (program, built) = match &pipe {
-            Some(p) => {
+        let (program, built) = match (pipe.as_deref(), tree_eager) {
+            (Some(p), false) => {
                 let (program, artifacts) = p.take_leaf(j, &label);
                 (program, Some(artifacts))
             }
-            None => (block_leaf_program(&rb, j), None),
+            (Some(p), true) => (p.take_leaf_program(j, &label), None),
+            (None, _) => (std::sync::Arc::new(block_leaf_program(&rb, j)), None),
         };
         let arenas = block_leaf_arenas(&rb, &partition, j);
         println!(
             "   {label}: {} + arenas in {:.2}s",
-            if built.is_some() {
+            if pipe.is_some() {
                 "program ahead"
             } else {
                 "emitted"
@@ -2327,14 +2391,24 @@ fn the_block_tree_composes_to_a_top_node() {
             &label,
             super::block_plan::block_fan_in(),
         );
-        let (child, proof) = prove_program_with(
-            &label,
-            &program,
-            built,
-            &arenas,
-            &wrap_opts,
-            beside_verifies.is_none(),
-        );
+        let (child, proof) = match (pipe.as_deref(), tree_eager) {
+            (Some(p), true) => prove_program_deferred(
+                &label,
+                &program,
+                || p.take_leaf_artifacts(j, &label),
+                &arenas,
+                &wrap_opts,
+                beside_verifies.is_none(),
+            ),
+            _ => prove_program_with(
+                &label,
+                &program,
+                built,
+                &arenas,
+                &wrap_opts,
+                beside_verifies.is_none(),
+            ),
+        };
         if let Some(b) = &beside_verifies {
             b.spawn(&label, child.artifacts.clone(), proof, wrap_opts.clone());
         }
@@ -2365,6 +2439,7 @@ fn the_block_tree_composes_to_a_top_node() {
         siblings,
         pipe.as_deref(),
         beside_verifies.as_ref(),
+        tree_eager,
     );
     // The pipeline's builder is done by now (every node took its program).
     if let Some(handle) = consts_beside {
@@ -2373,7 +2448,8 @@ fn the_block_tree_composes_to_a_top_node() {
             let times = times.expect("the tree's builder");
             println!(
                 "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
-                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit)",
+                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit) · \
+                 eager: {tree_eager}{}",
                 times.leaves,
                 times.levels,
                 times.emit,
@@ -2382,7 +2458,12 @@ fn the_block_tree_composes_to_a_top_node() {
                 } else {
                     "global pool".to_string()
                 },
-                times.build
+                times.build,
+                if tree_eager {
+                    format!(" (node programs by {:?} s)", times.emitted)
+                } else {
+                    String::new()
+                }
             );
         }
     }
