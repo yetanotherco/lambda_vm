@@ -66,8 +66,9 @@ pub const COORDINATES_PER_EXT: usize = 3;
 /// Bytes one felt occupies in the sponge's stream.
 const BYTES_PER_FELT: usize = 8;
 
-/// The WHIR transcript, replayed.
-#[derive(Default)]
+/// The WHIR transcript, replayed. A clone is a fork: the host's
+/// `transcript.clone()`, as the block's per-group forks take it.
+#[derive(Default, Clone)]
 pub struct WhirTranscript {
     /// Constant bytes absorbed but not yet packed into felts. Only a trailing
     /// run of constants can be pending: any runtime absorb flushes.

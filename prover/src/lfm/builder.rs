@@ -614,6 +614,12 @@ impl LfmBuilder {
         (self.arena_schema.lens.len() - 1) as ArenaId
     }
 
+    /// Sets a declared arena's length: for an emitter whose hint count is known
+    /// only once it has hinted everything from its shapes.
+    pub fn set_arena_len(&mut self, arena: ArenaId, len: u32) {
+        self.arena_schema.lens[arena as usize] = len;
+    }
+
     /// One arena word → one memory cell. Arena values are unconstrained by
     /// the reading chip; the arena rule (transitively hash-authenticate
     /// everything hinted; never derive challenges from arenas) is what makes

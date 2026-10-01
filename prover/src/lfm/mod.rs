@@ -21,6 +21,7 @@ pub mod algebraic_transcript;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
+pub mod block_node;
 pub mod block_root;
 pub mod builder;
 pub mod chips;
@@ -67,6 +68,7 @@ pub mod transcript_replay;
 pub mod tree_probe;
 pub mod validator;
 pub mod whir_air;
+pub mod whir_block;
 pub mod whir_bus;
 pub mod whir_chain;
 pub mod whir_epoch;
@@ -192,6 +194,8 @@ mod preprocessed_tests;
 mod program_shape_tests;
 #[cfg(test)]
 mod whir_air_tests;
+#[cfg(test)]
+mod whir_block_tests;
 #[cfg(test)]
 mod whir_bus_tests;
 #[cfg(test)]

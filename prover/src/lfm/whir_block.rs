@@ -1,0 +1,1041 @@
+//! The no-epoch WHIR BLOCK's recursion: the tree plan, the leaf program and its
+//! arena (D-NOEPOCH §12.5, I-NOEPOCH-W §9).
+//!
+//! A block proof ([`crate::block_whir`]) is ONE multilinear proof: the
+//! statement and the partition, every group's roots and every prepared table's
+//! derived roots, then `(z, α, β)`, then each group on its own fork `S_post ‖ g`
+//! — its tables' arguments, its stacked opening, its prepared openings. The
+//! recursion splits the GROUPS across leaves: a group's opening covers all its
+//! tables, so a group is the smallest unit a leaf can verify alone.
+//!
+//! # What a leaf does
+//!
+//! 1. The statement, as program constants ([`block_statement_bytes`]), then the
+//!    roots block over EVERY root of the block — the groups' (arena) and the
+//!    prepared tables' (constants the plan derived) — then `z, α, β` and the
+//!    transcript's state digest. Every leaf replays the same front, so every leaf
+//!    forks from the same `S_post`.
+//! 2. Per group of its own: the fork, each table's argument with its
+//!    preprocessed leg ([`emit_table_walk`]), the group's opening
+//!    ([`emit_group_walk`]), each prepared table's opening
+//!    ([`emit_prepared_group`]) — #1010's epoch legs, unchanged, on the fork.
+//! 3. Publishes the block layout ([`BlockLayout::child`]): the block's id, the
+//!    state, the public output's halves, and `Σ p/q` over its tables — minus the
+//!    COMMIT-bus target on the leaf that carries it ([`CARRIER`]).
+//!
+//! The nodes are [`super::block_node`]'s, unchanged: they check the id, the
+//! state and the output equal across children, add the sums, and the top
+//! asserts the total is zero — the host's single bus check, where every table's
+//! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does
+//! (a zero denominator has no satisfying assignment, the host's `None`), so the
+//! node needs no fraction arithmetic.
+//!
+//! # Never from a proof
+//!
+//! [`WhirBlockPlan::derive`] takes the statement's fields through the host
+//! verifier's own checks ([`crate::block_whir::block_frame`]); every shape comes
+//! from the AIR at the stated height, every count a leaf hints from that shape
+//! ([`hint_table_wires_shaped`]), every derived root from the program; the leaf
+//! partition and its carrier are the plan's. The proof is read only to fill a
+//! leaf's arena — the witness.
+
+use multilinear::stacking::StackedLayout;
+use multilinear::whir::Domain;
+use multilinear::whir_commit::Commitment;
+use stark::multilinear_logup::InteractionShape;
+use stark::multilinear_table::TableLayout;
+
+use crate::block_whir::{
+    BlockFormat, BlockFrame, BlockStatement, BlockWhirProof, block_frame, block_statement_bytes,
+    commit_prepared, first_page_index, prepared_tables,
+};
+use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+
+use super::block_node::{BlockLayout, BlockNodeInputs};
+use super::builder::{Cell, Ext, LfmBuilder};
+use super::compiler::{LfmProgram, compile};
+use super::per_table_aggregator::DerivedChild;
+use super::registry::LfmArtifacts;
+use super::whir_chain::ChainShape;
+use super::whir_epoch::{
+    BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
+    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_prepared_group,
+    emit_roots_block, emit_table_walk, fresh_schedule, group_columns, hint_group_chains_shaped,
+    hint_table_wires_shaped, prepared_cost, push_table_words, table_words,
+};
+use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
+use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
+use super::whir_transcript::WhirTranscript;
+use super::word::{LfmWord, base_word};
+
+/// The leaf-load cap in permutations: today's wrap LFM_HASH shape, 2^18 + 2^15
+/// rows, less the headroom wrap 2 runs at (D-NOEPOCH §12.2, the STARK block's
+/// cap too).
+pub const LEAF_PERMS_CAP: usize = 279_000;
+
+/// The leaf that subtracts the COMMIT-bus target.
+pub const CARRIER: usize = 0;
+
+// =============================== the partition ============================
+
+/// Which groups each leaf verifies: lists of group indices that together cover
+/// `0..num_groups` exactly once. (The no-epoch STARK block's `BlockPartition`,
+/// over groups.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPartition {
+    leaves: Vec<Vec<usize>>,
+    num_units: usize,
+}
+
+impl BlockPartition {
+    /// Validate and sort each list. Refuses an empty leaf, an index out of
+    /// range, an index in two leaves (or twice in one), and a unit in none.
+    pub fn new(leaves: Vec<Vec<usize>>, num_units: usize) -> Result<Self, String> {
+        let mut seen = vec![None::<usize>; num_units];
+        let mut sorted = Vec::with_capacity(leaves.len());
+        for (k, mut list) in leaves.into_iter().enumerate() {
+            if list.is_empty() {
+                return Err(format!("leaf {k} verifies nothing"));
+            }
+            list.sort_unstable();
+            for &i in &list {
+                let slot = seen
+                    .get_mut(i)
+                    .ok_or_else(|| format!("leaf {k}: {i} is out of range 0..{num_units}"))?;
+                if let Some(other) = slot.replace(k) {
+                    return Err(format!("{i} is in leaf {other} and leaf {k}"));
+                }
+            }
+            sorted.push(list);
+        }
+        if let Some(i) = seen.iter().position(Option::is_none) {
+            return Err(format!("{i} is in no leaf"));
+        }
+        Ok(Self {
+            leaves: sorted,
+            num_units,
+        })
+    }
+
+    /// Lists taken as given, with none of [`Self::new`]'s checks: what an
+    /// adversarial prover may emit leaves over. Only the tests that show such a
+    /// tree is refused at the final check build one.
+    #[cfg(test)]
+    pub(crate) fn unvalidated(leaves: Vec<Vec<usize>>, num_units: usize) -> Self {
+        Self { leaves, num_units }
+    }
+
+    pub fn num_leaves(&self) -> usize {
+        self.leaves.len()
+    }
+
+    pub fn num_units(&self) -> usize {
+        self.num_units
+    }
+
+    /// Leaf `k`'s units, ascending.
+    pub fn leaf(&self, k: usize) -> &[usize] {
+        &self.leaves[k]
+    }
+
+    pub fn leaves(&self) -> &[Vec<usize>] {
+        &self.leaves
+    }
+}
+
+/// The groups over `num_leaves` leaves: heaviest first, each onto the leaf with
+/// the least load so far (ties: the lower group, then the lower leaf). Pure —
+/// every emitter derives the same partition from the same costs — and never
+/// more leaves than groups.
+pub fn partition_groups(costs: &[usize], num_leaves: usize) -> BlockPartition {
+    let k = num_leaves.clamp(1, costs.len().max(1));
+    let mut order: Vec<usize> = (0..costs.len()).collect();
+    order.sort_by_key(|&g| (std::cmp::Reverse(costs[g]), g));
+    let mut leaves: Vec<Vec<usize>> = vec![Vec::new(); k];
+    let mut load = vec![0usize; k];
+    for g in order {
+        let leaf = (0..k)
+            .min_by_key(|&l| (load[l], l))
+            .expect("at least one leaf");
+        leaves[leaf].push(g);
+        load[leaf] += costs[g];
+    }
+    BlockPartition::new(leaves, costs.len())
+        .expect("the rule places every group exactly once by construction")
+}
+
+// ================================= the plan ===============================
+
+/// One prepared table, as the plan derived it.
+pub struct PlannedPrepared {
+    /// The table's index in `VmAirs::air_refs` order.
+    pub table: usize,
+    /// Its group, and its place in that group's table order.
+    pub group: usize,
+    pub slot: usize,
+    /// The leading preprocessed columns its opening settles.
+    pub settled: usize,
+    /// Derived from the program, never read from a proof.
+    pub roots: Vec<Commitment>,
+    pub layout: StackedLayout,
+    pub domain: Domain<GoldilocksField>,
+}
+
+/// Every program of a block's tree, derived from the trusted ELF, the options,
+/// the format and the statement. See the module docs.
+pub struct WhirBlockPlan {
+    frame: BlockFrame,
+    statement_bytes: Vec<u8>,
+    public_output: Vec<u8>,
+    /// The statement's groups: AIR indices in each group's order.
+    groups: Vec<Vec<usize>>,
+    /// The prepared tables, in the proof's table order (the order their roots
+    /// are absorbed and their openings carried).
+    prepared: Vec<PlannedPrepared>,
+    /// Each group's in-guest cost, in permutations.
+    costs: Vec<usize>,
+    partition: BlockPartition,
+    /// A digest of the statement run: the block's identity, published by every
+    /// leaf and node.
+    id: [u8; 32],
+}
+
+impl WhirBlockPlan {
+    /// Derive the plan over `num_leaves` leaves (`⌈Σ cost / cap⌉` when `None`),
+    /// or refuse a statement the host verifier refuses.
+    pub fn derive(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: Option<usize>,
+    ) -> Result<Self, String> {
+        // The machine replays the algebraic transcript: it verifies a block
+        // proved over RPX, and nothing else.
+        if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
+            return Err(
+                "the block's recursion verifies a block proved over RPX; set LAMBDA_VM_WHIR_HASH=rpx"
+                    .to_string(),
+            );
+        }
+        let frame = block_frame(statement, elf_bytes, proof_options, format)
+            .map_err(|e| format!("statement: {e:?}"))?;
+        let elf_digest = crate::statement::elf_digest(elf_bytes);
+        let statement_bytes = block_statement_bytes(statement, &elf_digest, &frame.config);
+        let groups: Vec<Vec<usize>> = statement
+            .groups
+            .iter()
+            .map(|g| g.iter().map(|&t| t as usize).collect())
+            .collect();
+
+        // The prepared tables and their derived commitments.
+        let columns = prepared_tables(&frame.airs, &frame.page_configs)
+            .map_err(|e| format!("prepared tables: {e:?}"))?;
+        let config = &frame.config;
+        let mut prepared: Vec<(usize, PlannedPrepared)> = crate::with_whir_hash!(|H| {
+            columns
+                .into_iter()
+                .map(
+                    |(table, columns)| -> Result<(usize, PlannedPrepared), String> {
+                        let settled = columns.len();
+                        let p = commit_prepared::<H>(table, columns, config)
+                            .map_err(|e| format!("prepared table {table}: {e:?}"))?;
+                        let (group, slot) = groups
+                            .iter()
+                            .enumerate()
+                            .find_map(|(g, list)| {
+                                list.iter().position(|&t| t == table).map(|s| (g, s))
+                            })
+                            .ok_or_else(|| format!("prepared table {table} is in no group"))?;
+                        let position: usize =
+                            groups[..group].iter().map(Vec::len).sum::<usize>() + slot;
+                        Ok((
+                            position,
+                            PlannedPrepared {
+                                table,
+                                group,
+                                slot,
+                                settled,
+                                roots: p.roots,
+                                layout: p.commitment.layout().clone(),
+                                domain: p.commitment.domain().clone(),
+                            },
+                        ))
+                    },
+                )
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        prepared.sort_by_key(|(position, _)| *position);
+        let prepared: Vec<PlannedPrepared> = prepared.into_iter().map(|(_, p)| p).collect();
+
+        // Each group's cost: its tables' legs, its opening, its prepared ones.
+        let refs = frame.airs.air_refs();
+        let mut costs = Vec::with_capacity(groups.len());
+        for (g, list) in groups.iter().enumerate() {
+            let owned = Shapes::build(&refs, &frame.shapes, list)?;
+            let shapes = owned.table_shapes();
+            let entry = fresh_schedule().entry();
+            let tables: usize = shapes
+                .iter()
+                .map(|shape| table_verify_cost(shape, entry).perms())
+                .sum();
+            let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
+            let (_, group_of) = group_columns(&group_shapes);
+            let layout = &frame.stack_layouts[g];
+            let chain = ChainShape::new(config, layout.n_stack());
+            let opening = stacked_verify_cost(layout, &group_of, &chain, entry).perms();
+            let prepared_perms: usize = prepared
+                .iter()
+                .filter(|p| p.group == g)
+                .map(|p| prepared_cost(&p.layout, config, entry).perms())
+                .sum();
+            costs.push(tables + opening + prepared_perms);
+        }
+        drop(refs);
+        let k = num_leaves
+            .unwrap_or_else(|| costs.iter().sum::<usize>().div_ceil(LEAF_PERMS_CAP))
+            .max(1);
+        let partition = partition_groups(&costs, k);
+        let id = crate::statement::elf_digest(&statement_bytes);
+        Ok(Self {
+            frame,
+            statement_bytes,
+            public_output: statement.public_output.to_vec(),
+            groups,
+            prepared,
+            costs,
+            partition,
+            id,
+        })
+    }
+
+    pub fn partition(&self) -> &BlockPartition {
+        &self.partition
+    }
+
+    /// Each group's in-guest cost, in permutations.
+    pub fn costs(&self) -> &[usize] {
+        &self.costs
+    }
+
+    pub fn carrier(&self) -> usize {
+        CARRIER
+    }
+
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The prepared tables, in the proof's table order.
+    pub fn prepared(&self) -> &[PlannedPrepared] {
+        &self.prepared
+    }
+
+    /// The block's identity: a digest of the statement run.
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    /// What a leaf and a non-top node publish.
+    pub fn child_layout(&self) -> BlockLayout {
+        BlockLayout::child(STATE_WORDS, out_halves(&self.public_output).len())
+    }
+
+    /// What the top node publishes.
+    pub fn top_layout(&self) -> BlockLayout {
+        BlockLayout::top(STATE_WORDS, out_halves(&self.public_output).len())
+    }
+
+    /// Leaf `k`, emitted and validated.
+    pub fn leaf_program(&self, k: usize) -> Result<LfmProgram, String> {
+        if k >= self.partition.num_leaves() {
+            return Err(format!("no leaf {k}"));
+        }
+        let mut b = builder();
+        emit_block_leaf(&mut b, self, k)?;
+        finish(b)
+    }
+
+    /// The node over `children`, the top when `top`, emitted and validated.
+    pub fn node_program(&self, children: &[DerivedChild], top: bool) -> Result<LfmProgram, String> {
+        let shapes: Vec<_> = children.iter().map(DerivedChild::shape).collect();
+        let mut b = builder();
+        super::block_node::emit_block_node(
+            &mut b,
+            &BlockNodeInputs {
+                children: &shapes,
+                layout: self.child_layout(),
+                top,
+            },
+        );
+        finish(b)
+    }
+
+    /// The levels above the leaves: fan-in
+    /// [`super::per_table_aggregator::FAN_IN`], leftovers in arity-1 nodes, the
+    /// last level's single node the top. A one-leaf block still gets a top node:
+    /// the bus closes there.
+    pub fn levels(&self) -> Vec<super::per_table_aggregator::Level> {
+        use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
+        let mut shape = tree_shape(self.partition.num_leaves(), FAN_IN);
+        if shape.is_empty() {
+            shape.push(Level { arities: vec![1] });
+        }
+        shape
+    }
+
+    /// The top program's artifacts, with no proof: every leaf emitted and its
+    /// artifacts built, each node emitted over its children's derived shapes,
+    /// level by level, under the tree's options.
+    pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
+        let words = self.child_layout().total();
+        let child = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
+            let artifacts = artifacts_of(program, wrap_opts);
+            let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+            Ok((artifacts, derived))
+        };
+        let mut level: Vec<(LfmArtifacts, DerivedChild)> = (0..self.partition.num_leaves())
+            .map(|k| child(&self.leaf_program(k)?))
+            .collect::<Result<_, String>>()?;
+        let levels = self.levels();
+        for (lv, arities) in levels.iter().enumerate() {
+            let top = lv + 1 == levels.len();
+            let mut next = Vec::with_capacity(arities.arities.len());
+            let mut rest = level.into_iter();
+            for &a in &arities.arities {
+                let kids: Vec<DerivedChild> = rest.by_ref().take(a).map(|(_, d)| d).collect();
+                if kids.len() != a {
+                    return Err(format!("level {}: arities overrun the children", lv + 1));
+                }
+                next.push(child(&self.node_program(&kids, top)?)?);
+            }
+            if rest.next().is_some() {
+                return Err(format!("level {}: arities leave children over", lv + 1));
+            }
+            level = next;
+        }
+        match <[_; 1]>::try_from(level) {
+            Ok([(artifacts, _)]) => Ok(artifacts),
+            Err(level) => Err(format!("the tree closes to {} nodes", level.len())),
+        }
+    }
+
+    /// Replace the partition — another tree, test-only: what a prover may emit
+    /// leaves over, refused at the final check.
+    #[cfg(test)]
+    pub(crate) fn with_partition(mut self, partition: BlockPartition) -> Self {
+        assert_eq!(partition.num_units(), self.groups.len());
+        self.partition = partition;
+        self
+    }
+
+    /// Where group `g`'s first table sits in the proof's table order.
+    fn group_start(&self, g: usize) -> usize {
+        self.groups[..g].iter().map(Vec::len).sum()
+    }
+
+    /// Where group `g`'s first root sits among the proof's roots.
+    fn root_start(&self, g: usize) -> usize {
+        self.frame.stack_layouts[..g]
+            .iter()
+            .map(StackedLayout::num_polys)
+            .sum()
+    }
+}
+
+/// Words the transcript's state digest occupies: one, on the algebraic sponge.
+const STATE_WORDS: usize = 1;
+
+/// The public output as the statement's 32-bit halves, little-endian, the last
+/// one zero-padded.
+pub fn out_halves(bytes: &[u8]) -> Vec<FE> {
+    super::keccak_host::pack_stream(bytes)
+}
+
+/// The two published words of the block's id: its eight little-endian `u32`
+/// halves, four to a word.
+pub fn id_words(id: &[u8; 32]) -> [LfmWord; 2] {
+    let halves = super::keccak_host::pack_stream(id);
+    [
+        [halves[0], halves[1], halves[2], halves[3]],
+        [halves[4], halves[5], halves[6], halves[7]],
+    ]
+}
+
+/// A tree program's artifacts, under the block hasher.
+pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> LfmArtifacts {
+    super::program_census::build_artifacts_counted(
+        program,
+        wrap_opts,
+        crate::hash_pin::BLOCK_HASHER,
+    )
+}
+
+fn builder() -> LfmBuilder {
+    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
+}
+
+fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
+    let program = compile(b.finish());
+    super::validator::validate(&program).map_err(|e| format!("not admissible: {e:?}"))?;
+    Ok(program)
+}
+
+/// Whether `words`, a top proof's published words, claim the block: the plan's
+/// id and the public output, in the top layout. The state is bound across the
+/// children by the nodes.
+pub fn top_claims(plan: &WhirBlockPlan, words: &[(u32, LfmWord)]) -> bool {
+    let layout = plan.top_layout();
+    if words.len() != layout.total()
+        || words
+            .iter()
+            .enumerate()
+            .any(|(i, (at, _))| *at as usize != i)
+    {
+        return false;
+    }
+    let id = id_words(&plan.id);
+    (0..2).all(|h| words[layout.id(h)].1 == id[h])
+        && out_halves(&plan.public_output)
+            .iter()
+            .enumerate()
+            .all(|(i, v)| words[layout.out_half(i)].1 == base_word(*v))
+}
+
+/// ★ The no-epoch WHIR block's verifier over its tree's top proof: derive the
+/// plan and the top program from the trusted ELF and the statement, verify
+/// `top` against that program, and check it claims the block.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_block_tree(
+    elf_bytes: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &BlockFormat,
+    statement: BlockStatement<'_>,
+    num_leaves: Option<usize>,
+    wrap_opts: &crate::ProofOptions,
+    top: &super::proof::LfmProof,
+) -> Result<(), String> {
+    let plan = WhirBlockPlan::derive(elf_bytes, proof_options, format, statement, num_leaves)?;
+    let artifacts = plan.derive_top(wrap_opts)?;
+    if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
+    {
+        return Err("the top proof does not verify against the derived top program".to_string());
+    }
+    if !top_claims(&plan, &top.public_words) {
+        return Err("the top proof does not claim this block".to_string());
+    }
+    Ok(())
+}
+
+// ================================ the leaf ================================
+
+/// Some tables' layouts and buses, owned, for [`TableShape`]s to borrow.
+struct Shapes<'a> {
+    layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>>,
+    buses: Vec<Vec<InteractionShape<GoldilocksExtension>>>,
+}
+
+type DynAir<'a> = dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    > + 'a;
+
+impl<'a> Shapes<'a> {
+    /// The layouts of `tables` (AIR indices) at their stated shapes.
+    fn build(
+        refs: &[&'a DynAir<'a>],
+        shapes: &[(usize, usize)],
+        tables: &[usize],
+    ) -> Result<Self, String> {
+        let mut layouts = Vec::with_capacity(tables.len());
+        let mut buses = Vec::with_capacity(tables.len());
+        for &t in tables {
+            let air = refs[t];
+            let (width, num_vars) = shapes[t];
+            let layout = crate::multilinear_prove::layout_of(air, width, num_vars)
+                .map_err(|e| format!("{}: {e:?}", air.name()))?;
+            let slots = layout.slot_of().to_vec();
+            let bus = stark::multilinear_logup::interaction_shapes(
+                air.bus_interactions(),
+                slots.len(),
+                |column| {
+                    slots
+                        .get(column)
+                        .copied()
+                        .ok_or(multilinear::Error::UnknownPolynomial {
+                            index: column,
+                            len: slots.len(),
+                        })
+                },
+            )
+            .map_err(|e| format!("{}: bus: {e:?}", air.name()))?;
+            layouts.push(layout);
+            buses.push(bus);
+        }
+        Ok(Self { layouts, buses })
+    }
+
+    fn table_shapes(&self) -> Vec<TableShape<'_>> {
+        self.layouts
+            .iter()
+            .zip(&self.buses)
+            .map(|(layout, bus)| TableShape {
+                ir: layout.shape(),
+                bus,
+                kinds: layout.kinds(),
+                num_columns: layout.num_columns(),
+                num_vars: layout.num_vars(),
+            })
+            .collect()
+    }
+}
+
+/// How a table's preprocessed columns are discharged in a leaf: the epoch's
+/// routes by name, the page route for a page table, and nothing left for a
+/// prepared table, whose opening settles every one of them. A table with
+/// preprocessed columns and no route is refused, never skipped.
+enum Route {
+    None,
+    Bitwise,
+    ConstMle(Vec<Vec<FE>>),
+    Page(Vec<Vec<FE>>),
+    Prepared(usize),
+}
+
+fn route_of(
+    plan: &WhirBlockPlan,
+    air: &DynAir<'_>,
+    table: usize,
+    first_page: usize,
+) -> Result<Route, String> {
+    if let Some(p) = plan.prepared.iter().find(|p| p.table == table) {
+        return Ok(Route::Prepared(p.settled));
+    }
+    let pages = first_page..first_page + plan.frame.page_configs.len();
+    if pages.contains(&table) {
+        let config = &plan.frame.page_configs[table - first_page];
+        let columns = if config.is_private_input {
+            vec![crate::tables::page::offset_column()]
+        } else {
+            crate::tables::page::preprocessed_columns(config)
+        };
+        return Ok(Route::Page(columns));
+    }
+    let columns = air.precomputed_columns();
+    if columns.is_empty() {
+        return Ok(Route::None);
+    }
+    match air.name() {
+        BITWISE_NAME => Ok(Route::Bitwise),
+        KECCAK_RC_NAME | REGISTER_NAME => Ok(Route::ConstMle(columns)),
+        DECODE_NAME => Err("DECODE is not prepared".to_string()),
+        other => Err(format!(
+            "table {table} ({other}) carries {} preprocessed columns and no route covers them",
+            columns.len()
+        )),
+    }
+}
+
+/// What every leaf's front leaves: the carried roots, the transcript after the
+/// draws, the challenges and the state digest.
+struct Front {
+    carried: Vec<Cell>,
+    transcript: WhirTranscript,
+    z: Ext,
+    alpha: Ext,
+    beta: Ext,
+    state: Cell,
+}
+
+/// The front every leaf replays: every group's roots (hinted), the statement
+/// (constants), the roots block with the derived prepared roots, `z, α, β`,
+/// and the state digest (which does not advance the transcript).
+fn emit_front(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+) -> Front {
+    let num_roots: usize = plan
+        .frame
+        .stack_layouts
+        .iter()
+        .map(StackedLayout::num_polys)
+        .sum();
+    let carried: Vec<Cell> = (0..num_roots)
+        .map(|_| {
+            let cell = b.hint_word(arena, *at);
+            *at += 1;
+            cell
+        })
+        .collect();
+    let mut transcript = WhirTranscript::new();
+    transcript.absorb_const_bytes(&plan.statement_bytes);
+    let derived: Vec<LfmWord> = plan
+        .prepared
+        .iter()
+        .flat_map(|p| {
+            p.roots
+                .iter()
+                .map(super::algebraic_commit::commitment_to_digest)
+        })
+        .collect();
+    let (z, alpha, beta) = emit_roots_block(b, &mut transcript, &carried, &derived);
+    let state = transcript.state(b);
+    Front {
+        carried,
+        transcript,
+        z,
+        alpha,
+        beta,
+        state,
+    }
+}
+
+/// The front alone, publishing `z, α, β` and then group `g`'s fork's first
+/// draw — what a test compares against the host's transcript.
+#[cfg(test)]
+pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
+    let mut b = builder();
+    let arena = b.declare_arena(0);
+    let mut at = 0u32;
+    let front = emit_front(&mut b, plan, arena, &mut at);
+    for e in [front.z, front.alpha, front.beta] {
+        b.public(e.as_cell());
+    }
+    let mut fork = front.transcript.clone();
+    fork.absorb_const_bytes(&(g as u64).to_le_bytes());
+    let first = fork.sample_ext(&mut b);
+    b.public(first.as_cell());
+    b.set_arena_len(arena, at);
+    compile(b.finish())
+}
+
+/// Which of a leaf's own checks it emits. Production emits all of them
+/// ([`LeafChecks::ALL`]); a weakened set exists so a negative test can show the
+/// check it names is the one refusing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafChecks {
+    /// The prepared openings (their chains are hinted either way, so the arena
+    /// does not move).
+    pub(crate) prepared: bool,
+    /// Whether the carrier subtracts the COMMIT-bus target.
+    pub(crate) target: bool,
+}
+
+impl LeafChecks {
+    pub const ALL: Self = Self {
+        prepared: true,
+        target: true,
+    };
+}
+
+/// ★ Emit block leaf `k`: the shared front, then its groups on their forks,
+/// then its share of the bus and the block layout's publishes.
+pub fn emit_block_leaf(b: &mut LfmBuilder, plan: &WhirBlockPlan, k: usize) -> Result<(), String> {
+    emit_leaf(b, plan, k, LeafChecks::ALL)
+}
+
+/// [`emit_block_leaf`] under a weakened check set — a mutation, test-only.
+#[cfg(test)]
+pub(crate) fn leaf_program_with(
+    plan: &WhirBlockPlan,
+    k: usize,
+    checks: LeafChecks,
+) -> Result<LfmProgram, String> {
+    let mut b = builder();
+    emit_leaf(&mut b, plan, k, checks)?;
+    finish(b)
+}
+
+fn emit_leaf(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    k: usize,
+    checks: LeafChecks,
+) -> Result<(), String> {
+    let frame = &plan.frame;
+    let config = &frame.config;
+    let refs = frame.airs.air_refs();
+    let first_page = first_page_index(&frame.airs).map_err(|e| format!("{e:?}"))?;
+    let arena = b.declare_arena(0);
+    let mut at = 0u32;
+
+    // ---- 1. the front.
+    let Front {
+        carried,
+        transcript,
+        z,
+        alpha,
+        beta,
+        state,
+    } = emit_front(b, plan, arena, &mut at);
+
+    // ---- 2. the leaf's groups, each on its fork.
+    let mut outputs: Vec<(Ext, Ext)> = Vec::new();
+    for &g in plan.partition.leaf(k) {
+        let tables = &plan.groups[g];
+        let owned = Shapes::build(&refs, &frame.shapes, tables)?;
+        let shapes = owned.table_shapes();
+        let routes: Vec<Route> = tables
+            .iter()
+            .map(|&t| route_of(plan, refs[t], t, first_page))
+            .collect::<Result<_, _>>()?;
+        let views: Vec<Vec<&[FE]>> = routes
+            .iter()
+            .map(|route| match route {
+                Route::ConstMle(columns) | Route::Page(columns) => {
+                    columns.iter().map(Vec::as_slice).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let plans: Vec<PreprocessedPlan<'_>> = routes
+            .iter()
+            .zip(&views)
+            .map(|(route, view)| match route {
+                Route::None => PreprocessedPlan {
+                    settled: 0,
+                    route: PreprocessedRoute::None,
+                },
+                Route::Bitwise => PreprocessedPlan {
+                    settled: 0,
+                    route: PreprocessedRoute::Bitwise,
+                },
+                Route::ConstMle(_) => PreprocessedPlan {
+                    settled: 0,
+                    route: PreprocessedRoute::ConstMle(view),
+                },
+                Route::Page(_) => PreprocessedPlan {
+                    settled: 0,
+                    route: PreprocessedRoute::Page {
+                        offset: view[0],
+                        init: view.get(1).copied(),
+                    },
+                },
+                Route::Prepared(settled) => PreprocessedPlan {
+                    settled: *settled,
+                    route: PreprocessedRoute::None,
+                },
+            })
+            .collect();
+        let slots: Vec<&[usize]> = owned.layouts.iter().map(|l| l.slot_of()).collect();
+        let ladder_len = shapes
+            .iter()
+            .map(|shape| super::whir_bus::alpha_powers_read(shape.bus))
+            .max()
+            .unwrap_or(1);
+        let ladder = super::whir_poly::emit_challenge_powers(b, alpha, ladder_len);
+
+        let mut fork = transcript.clone();
+        fork.absorb_const_bytes(&(g as u64).to_le_bytes());
+        let store: Vec<TableWires> = shapes
+            .iter()
+            .map(|shape| hint_table_wires_shaped(b, arena, &mut at, shape))
+            .collect();
+        let wires: Vec<TableProofWires<'_>> = store.iter().map(TableWires::borrow).collect();
+        let walk = emit_table_walk(
+            b, &mut fork, &wires, &shapes, &plans, &slots, z, &ladder, beta,
+        );
+
+        // The group's opening, against its own carried roots.
+        let layout = &frame.stack_layouts[g];
+        let chain = ChainShape::new(config, layout.n_stack());
+        let held = hint_group_chains_shaped(b, arena, &mut at, layout.num_polys(), &chain);
+        let openings: Vec<_> = held
+            .storage
+            .iter()
+            .map(super::whir_chain::RoundStorage::openings)
+            .collect();
+        let rounds: Vec<Vec<super::whir_chain::ChainRoundWires<'_>>> = held
+            .storage
+            .iter()
+            .zip(&openings)
+            .map(|(chain, (current, next))| chain.wires(current, next))
+            .collect();
+        let root_at = plan.root_start(g);
+        let polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
+            .map(|poly| StackedPolyWires {
+                rounds: &rounds[poly],
+                root: carried[root_at + poly],
+                final_value: held.finals[poly],
+            })
+            .collect();
+        emit_group_walk(
+            b,
+            &mut fork,
+            &[GroupWires {
+                layout,
+                polys: &polys,
+                shape: &chain,
+                domain: &frame.domains[g],
+            }],
+            &[tables.len()],
+            &walk,
+        );
+
+        // Its prepared tables, in table order, against the derived roots.
+        for p in plan.prepared.iter().filter(|p| p.group == g) {
+            let shape = ChainShape::new(config, p.layout.n_stack());
+            let held = hint_group_chains_shaped(b, arena, &mut at, p.layout.num_polys(), &shape);
+            let roots: Vec<Cell> = p
+                .roots
+                .iter()
+                .map(|root| {
+                    b.digest_const(super::algebraic_commit::commitment_to_digest(root))
+                        .as_cell()
+                })
+                .collect();
+            let openings: Vec<_> = held
+                .storage
+                .iter()
+                .map(super::whir_chain::RoundStorage::openings)
+                .collect();
+            let rounds: Vec<Vec<super::whir_chain::ChainRoundWires<'_>>> = held
+                .storage
+                .iter()
+                .zip(&openings)
+                .map(|(chain, (current, next))| chain.wires(current, next))
+                .collect();
+            let polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
+                .map(|poly| StackedPolyWires {
+                    rounds: &rounds[poly],
+                    root: roots[poly],
+                    final_value: held.finals[poly],
+                })
+                .collect();
+            if !checks.prepared {
+                continue;
+            }
+            let column_at = walk.column_at(p.slot);
+            emit_prepared_group(
+                b,
+                &mut fork,
+                &p.layout,
+                &polys,
+                &shape,
+                &p.domain,
+                &walk.points[p.slot],
+                &walk.values[column_at..column_at + p.settled],
+            );
+        }
+        outputs.extend(walk.outputs.iter().copied());
+    }
+
+    // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on
+    // the carrier (commits are indexed from 0 in a block).
+    let mut sum: Option<Ext> = None;
+    for (p, q) in &outputs {
+        let share = b.ediv(*p, *q);
+        sum = Some(match sum {
+            None => share,
+            Some(running) => b.eadd(running, share),
+        });
+    }
+    let mut sum = sum.unwrap_or_else(|| b.ext_const(&FEE::zero()));
+    if k == CARRIER && checks.target {
+        let target = emit_expected(b, &plan.public_output, 0, z, alpha);
+        sum = b.esub(sum, target);
+    }
+
+    // ---- the publishes, in `BlockLayout::child`'s order.
+    for word in id_words(&plan.id) {
+        let cell = b.digest_const(word).as_cell();
+        b.public(cell);
+    }
+    b.public(state);
+    for half in out_halves(&plan.public_output) {
+        let felt = b.felt_const(half);
+        b.public(felt.as_cell());
+    }
+    b.public(sum.as_cell());
+    b.set_arena_len(arena, at);
+    Ok(())
+}
+
+// ================================ the arena ===============================
+
+/// Leaf `k`'s arena from the block proof — the witness — in the order
+/// [`emit_block_leaf`] hints it. Refuses a proof whose argument does not have
+/// the shapes the plan derived (a count the leaf would misread).
+pub fn block_leaf_arena(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    k: usize,
+) -> Result<Vec<Vec<LfmWord>>, String> {
+    let frame = &plan.frame;
+    let refs = frame.airs.air_refs();
+    let mut words: Vec<LfmWord> = proof
+        .proof
+        .roots
+        .iter()
+        .map(super::algebraic_commit::commitment_to_digest)
+        .collect();
+    for &g in plan.partition.leaf(k) {
+        let tables = &plan.groups[g];
+        let owned = Shapes::build(&refs, &frame.shapes, tables)?;
+        let start = plan.group_start(g);
+        for (slot, shape) in owned.table_shapes().iter().enumerate() {
+            let table = proof
+                .proof
+                .tables
+                .get(start + slot)
+                .ok_or("the proof is short of tables")?;
+            let before = words.len();
+            push_table_words(&mut words, table);
+            if words.len() - before != table_words(shape) {
+                return Err(format!(
+                    "table {} carries {} words, its shape {}",
+                    tables[slot],
+                    words.len() - before,
+                    table_words(shape)
+                ));
+            }
+        }
+        let layout = &frame.stack_layouts[g];
+        let chain = ChainShape::new(&frame.config, layout.n_stack());
+        let opening = proof
+            .proof
+            .columns
+            .get(g)
+            .ok_or("the proof is short of openings")?;
+        push_chains(&mut words, opening, layout.num_polys(), &chain)?;
+        for (index, p) in plan.prepared.iter().enumerate() {
+            if p.group != g {
+                continue;
+            }
+            let shape = ChainShape::new(&frame.config, p.layout.n_stack());
+            let opening = proof
+                .prepared
+                .get(index)
+                .ok_or("the proof is short of prepared openings")?;
+            push_chains(&mut words, opening, p.layout.num_polys(), &shape)?;
+        }
+    }
+    Ok(vec![words])
+}
+
+/// One opening's chains: per polynomial its final value, then its rounds.
+fn push_chains(
+    words: &mut Vec<LfmWord>,
+    opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    polys: usize,
+    shape: &ChainShape,
+) -> Result<(), String> {
+    if opening.polys.len() != polys {
+        return Err(format!(
+            "an opening of {} chains where the layout has {polys}",
+            opening.polys.len()
+        ));
+    }
+    for chain in &opening.polys {
+        words.push(super::word::ext_word(&chain.final_value));
+        let before = words.len();
+        super::whir_chain::push_round_words(words, shape, chain);
+        if words.len() - before != super::whir_chain::RoundStorage::words(shape) as usize {
+            return Err("a chain whose rounds are not its shape's".to_string());
+        }
+    }
+    Ok(())
+}

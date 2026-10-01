@@ -495,7 +495,7 @@ pub fn emit_epoch_closure(
 }
 
 /// `compute_commit_bus_offset`, emitted — see [`expected_rows`] for the terms.
-fn emit_expected(
+pub(crate) fn emit_expected(
     b: &mut LfmBuilder,
     published: &[u8],
     start_index: u64,
@@ -1355,9 +1355,9 @@ struct EpochPlan<'a> {
 /// become (`multilinear_table.rs:943`). A fifth preprocessed table added
 /// upstream must fail this build rather than go quietly unchecked.
 pub const BITWISE_NAME: &str = "BITWISE";
-const DECODE_NAME: &str = "DECODE";
-const KECCAK_RC_NAME: &str = "KECCAK_RC";
-const REGISTER_NAME: &str = "REGISTER";
+pub(crate) const DECODE_NAME: &str = "DECODE";
+pub(crate) const KECCAK_RC_NAME: &str = "KECCAK_RC";
+pub(crate) const REGISTER_NAME: &str = "REGISTER";
 
 impl<'a> EpochPlan<'a> {
     fn build(epoch: &WhirRealEpoch, airs: EpochAirs<'a>) -> Self {
@@ -1995,6 +1995,95 @@ pub(crate) fn hint_table_wires(
         reduce_sumcheck,
         column_values,
     }
+}
+
+/// How many words [`push_table_words`] writes for a table of `shape`: the
+/// counts [`hint_table_wires_shaped`] hints, from the shape alone.
+pub(crate) fn table_words(shape: &TableShape<'_>) -> usize {
+    use super::whir_gkr::GKR_SUMCHECK_DEGREE;
+    use super::whir_reduce::REDUCE_DEGREE;
+    let layers = shape.gkr_layers();
+    let gkr: usize = (0..layers).map(|i| i * GKR_SUMCHECK_DEGREE + 4).sum();
+    2 + gkr
+        + shape.num_vars * shape.sumcheck_degree()
+        + shape.sources().len()
+        + shape.num_vars * REDUCE_DEGREE
+        + shape.num_columns
+}
+
+/// [`hint_table_wires`] with every count taken from the table's SHAPE — the
+/// AIR at the stated height — rather than from a proof: what an emitter that
+/// derives its program from the statement alone hints. The counts are
+/// `emit_table_verify`'s own (one GKR layer per input variable, layer `i` with
+/// `i` rounds; one main round per row variable at the batch's degree; one factor
+/// value per committed source; one reduce round per row variable; one value per
+/// committed column), so a proof of another shape cannot be read into it.
+pub(crate) fn hint_table_wires_shaped(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    shape: &TableShape<'_>,
+) -> TableWires {
+    use super::whir_gkr::GKR_SUMCHECK_DEGREE;
+    use super::whir_reduce::REDUCE_DEGREE;
+    let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
+        (0..count)
+            .map(|_| {
+                let wire = b.hint_word(arena, *at).as_ext();
+                *at += 1;
+                wire
+            })
+            .collect()
+    };
+    let output = take(b, 2);
+    let gkr = (0..shape.gkr_layers())
+        .map(|i| {
+            let sumcheck: Vec<Vec<Ext>> = (0..i).map(|_| take(b, GKR_SUMCHECK_DEGREE)).collect();
+            let halves = take(b, 4);
+            super::whir_gkr::GkrLayerWires {
+                sumcheck,
+                p_lo: halves[0],
+                p_hi: halves[1],
+                q_lo: halves[2],
+                q_hi: halves[3],
+            }
+        })
+        .collect();
+    let degree = shape.sumcheck_degree();
+    let sumcheck: Vec<Vec<Ext>> = (0..shape.num_vars).map(|_| take(b, degree)).collect();
+    let factor_values = take(b, shape.sources().len());
+    let reduce_sumcheck: Vec<Vec<Ext>> = (0..shape.num_vars)
+        .map(|_| take(b, REDUCE_DEGREE))
+        .collect();
+    let column_values = take(b, shape.num_columns);
+    TableWires {
+        bus_output: (output[0], output[1]),
+        gkr,
+        sumcheck,
+        factor_values,
+        reduce_sumcheck,
+        column_values,
+    }
+}
+
+/// [`hint_group_chains`] for `polys` chains of `shape`, the count the verifier's
+/// own layout gives rather than the proof's.
+pub(crate) fn hint_group_chains_shaped(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    polys: usize,
+    shape: &ChainShape,
+) -> GroupChains {
+    let mut finals = Vec::with_capacity(polys);
+    let mut storage = Vec::with_capacity(polys);
+    for _ in 0..polys {
+        finals.push(b.hint_word(arena, *at).as_ext());
+        *at += 1;
+        storage.push(super::whir_chain::RoundStorage::hint(b, arena, *at, shape));
+        *at += super::whir_chain::RoundStorage::words(shape);
+    }
+    GroupChains { finals, storage }
 }
 
 /// One commitment group's hinted chains, OWNED for the same reason.
