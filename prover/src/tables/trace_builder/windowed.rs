@@ -50,8 +50,8 @@ use stark::trace::TraceTable;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, RegisterState, RoutedSegments,
-    StreamSkip, Traces, WalkOutputs, build_initial_image, build_traces, collect_cpu_ops_into,
-    collect_halt_ops, collect_ops_from_cpu_into, route_ops,
+    StreamSkip, Traces, WalkOutputs, build_initial_image, build_traces, collect_halt_ops,
+    collect_ops_from_cpu_into, route_ops,
 };
 use crate::Error;
 use crate::tables::{cpu, load, lt, memw, memw_aligned, memw_register, register, shift, store};
@@ -104,18 +104,18 @@ pub struct WindowedTraceBuilder<'a> {
     register_state: RegisterState,
     /// Cycles collected so far: the next window's first cycle.
     cycles: usize,
-    /// The run's CPU ops and the walk's lists so far, appended in place (the
-    /// routing's are in `segments`).
-    cpu_ops: Vec<super::CpuOperation>,
-    walk: WalkOutputs,
+    /// The walked windows, in run order, kept as they were walked: moved here,
+    /// never copied. `finish` concatenates them once, list by list.
+    windows: Vec<WalkedWindow>,
+    /// The routing's segments (smaller lists), appended per window.
     segments: RoutedSegments,
     emitted: StreamSkip,
     stamps: WindowStamps,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
-/// the CPU-op collection and the walk, the routing, and the streamed chunks'
-/// generation (`finish` is timed by its caller).
+/// the walk, the routing (with the window's bookkeeping), and handing the
+/// streamed chunks out (`finish` is timed by its caller).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowStamps {
     pub windows: usize,
@@ -145,8 +145,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             memory_state,
             register_state,
             cycles: 0,
-            cpu_ops: Vec::new(),
-            walk: WalkOutputs::with_capacity(0),
+            windows: Vec::new(),
             segments: RoutedSegments::default(),
             emitted: StreamSkip::default(),
             stamps: WindowStamps::default(),
@@ -159,15 +158,21 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// A window may be any length; the chunks do not depend on where the
     /// windows fall.
     pub fn push(&mut self, logs: &[Log]) -> Result<Vec<StreamedChunk>, Error> {
-        // As a whole-run build: only the last cycle may halt.
-        if logs.iter().any(|log| log.next_pc == 0) {
-            return Err(Error::HaltInNonFinalEpoch);
-        }
-        self.collect(logs)?;
-        let t = std::time::Instant::now();
-        let chunks = self.stream();
-        self.stamps.generate += t.elapsed().as_secs_f64();
-        Ok(chunks)
+        Ok(self
+            .push_jobs(logs)?
+            .into_par_iter()
+            .map(ChunkJob::generate)
+            .collect())
+    }
+
+    /// Like [`push`](Self::push), but hands back each completed chunk as a
+    /// [`ChunkJob`] — its ops, copied out — instead of generating it here, so
+    /// the caller can generate it on another thread while this one walks the
+    /// next window. The chunks are the same.
+    pub fn push_jobs(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
+        let (mut walker, mut accumulator) = self.split();
+        let walked = walker.walk(logs)?;
+        Ok(accumulator.absorb(walked))
     }
 
     /// The time the windows took so far.
@@ -175,11 +180,27 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.stamps
     }
 
+    /// How many chunks of each streamed table have been handed out.
+    pub fn streamed(&self) -> StreamSkip {
+        self.emitted
+    }
+
     /// Collects the run's last window and builds every table the windows did
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
     pub fn finish(mut self, logs: &[Log]) -> Result<Traces, Error> {
-        self.collect(logs)?;
+        // The last window may halt: it is walked here, not by the `Walker`.
+        let cpu_ops = super::collect_cpu_ops_from(logs, &self.artifacts.instructions, self.cycles)?;
+        self.cycles += logs.len();
+        let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
+        collect_ops_from_cpu_into(
+            &cpu_ops,
+            &mut self.memory_state,
+            &mut self.register_state,
+            &mut walk,
+        );
+        self.segments.append(route_ops(&cpu_ops, &walk.cpu32_ops));
+        self.windows.push(WalkedWindow { cpu_ops, walk });
         let Self {
             artifacts,
             image,
@@ -188,12 +209,12 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             memory_state,
             mut register_state,
-            cpu_ops,
-            walk,
+            windows,
             segments,
             emitted,
             ..
         } = self;
+        let (cpu_ops, walk) = concatenate(windows);
         let ops = assemble(cpu_ops, walk, segments, &mut register_state);
         build_traces(
             ops,
@@ -213,82 +234,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         )
     }
 
-    /// How many chunks of each streamed table have been handed out.
-    pub fn streamed(&self) -> StreamSkip {
-        self.emitted
-    }
-
-    /// The walk and the routing over one window, appended to the run's lists
-    /// in place.
-    fn collect(&mut self, logs: &[Log]) -> Result<(), Error> {
-        let t = std::time::Instant::now();
-        let cpu_from = self.cpu_ops.len();
-        let cpu32_from = self.walk.cpu32_ops.len();
-        collect_cpu_ops_into(
-            logs,
-            &self.artifacts.instructions,
-            self.cycles,
-            &mut self.cpu_ops,
-        )?;
-        self.cycles += logs.len();
-        collect_ops_from_cpu_into(
-            &self.cpu_ops[cpu_from..],
-            &mut self.memory_state,
-            &mut self.register_state,
-            &mut self.walk,
-        );
-        self.stamps.walk += t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        self.segments.append(route_ops(
-            &self.cpu_ops[cpu_from..],
-            &self.walk.cpu32_ops[cpu32_from..],
-        ));
-        self.stamps.route += t.elapsed().as_secs_f64();
-        self.stamps.windows += 1;
-        Ok(())
-    }
-
-    /// Every full chunk the lists now hold that was not handed out yet,
-    /// generated in parallel.
-    fn stream(&mut self) -> Vec<StreamedChunk> {
-        self.chunk_jobs()
-            .into_par_iter()
-            .map(ChunkJob::generate)
-            .collect()
-    }
-
-    /// Like [`push`](Self::push), but hands back each completed chunk as a
-    /// [`ChunkJob`] — its op slice, copied — instead of generating it here, so
-    /// the caller can generate it on another thread while this one walks the
-    /// next window. The chunks are the same.
-    pub fn push_jobs(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
-        if logs.iter().any(|log| log.next_pc == 0) {
-            return Err(Error::HaltInNonFinalEpoch);
-        }
-        self.collect(logs)?;
-        let t = std::time::Instant::now();
-        let jobs = self.chunk_jobs();
-        self.stamps.generate += t.elapsed().as_secs_f64();
-        Ok(jobs)
-    }
-
-    /// Every full chunk the lists now hold that was not handed out yet, its
-    /// ops copied out of the run's lists.
-    fn chunk_jobs(&mut self) -> Vec<ChunkJob> {
-        chunk_jobs(
-            &self.max_rows,
-            &self.cpu_ops,
-            &self.walk,
-            &self.segments,
-            &mut self.emitted,
-        )
-    }
-
     /// The builder in its two halves, to run on two threads: the [`Walker`]
     /// walks each window (the state it carries is the walk's), the
-    /// [`Accumulator`] appends each walked window to the run's lists, routes it
-    /// and hands out the chunks it completed. Fed the windows in order, the two
-    /// build exactly what [`push_jobs`](Self::push_jobs) builds; afterwards
+    /// [`Accumulator`] keeps each walked window, routes it and hands out the
+    /// chunks it completed. Fed the windows in order, the two build exactly
+    /// what [`push_jobs`](Self::push_jobs) builds; afterwards
     /// [`finish`](Self::finish) takes the last window as usual.
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
         (
@@ -302,8 +252,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             },
             Accumulator {
                 max_rows: &self.max_rows,
-                cpu_ops: &mut self.cpu_ops,
-                walk: &mut self.walk,
+                windows: &mut self.windows,
                 segments: &mut self.segments,
                 emitted: &mut self.emitted,
                 route_secs: &mut self.stamps.route,
@@ -332,6 +281,7 @@ pub struct Walker<'b> {
 impl Walker<'_> {
     /// Walks the next window (not the run's last) into fresh lists.
     pub fn walk(&mut self, logs: &[Log]) -> Result<WalkedWindow, Error> {
+        // As a whole-run build: only the last cycle may halt.
         if logs.iter().any(|log| log.next_pc == 0) {
             return Err(Error::HaltInNonFinalEpoch);
         }
@@ -350,8 +300,7 @@ impl Walker<'_> {
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Accumulator<'b> {
     max_rows: &'b crate::tables::MaxRowsConfig,
-    cpu_ops: &'b mut Vec<super::CpuOperation>,
-    walk: &'b mut WalkOutputs,
+    windows: &'b mut Vec<WalkedWindow>,
     segments: &'b mut RoutedSegments,
     emitted: &'b mut StreamSkip,
     route_secs: &'b mut f64,
@@ -359,80 +308,207 @@ pub struct Accumulator<'b> {
 }
 
 impl Accumulator<'_> {
-    /// Routes a walked window, appends it to the run's lists and hands out
-    /// the chunks it completed. Windows must come in run order.
+    /// Routes a walked window, keeps it, and hands out the chunks the run's
+    /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
         self.segments
             .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
-        self.cpu_ops.extend(window.cpu_ops);
-        self.walk.append(window.walk);
+        self.windows.push(window);
         *self.route_secs += t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
-        let jobs = chunk_jobs(
-            self.max_rows,
-            self.cpu_ops,
-            self.walk,
-            self.segments,
-            self.emitted,
-        );
+        let jobs = chunk_jobs(self.max_rows, self.windows, self.segments, self.emitted);
         *self.handout_secs += t.elapsed().as_secs_f64();
         jobs
     }
 }
 
-/// Every full chunk the lists hold that was not handed out yet, its ops copied
-/// out of the run's lists.
+/// `range` of the run's list that `list` picks out of each window, gathered
+/// into one vector (the windows' lists concatenate to the run's).
+fn gather<T: Clone>(
+    windows: &[WalkedWindow],
+    list: impl Fn(&WalkedWindow) -> &[T],
+    range: std::ops::Range<usize>,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(range.len());
+    let mut at = 0usize;
+    for window in windows {
+        let part = list(window);
+        let (lo, hi) = (at, at + part.len());
+        if hi > range.start && lo < range.end {
+            let from = range.start.max(lo) - lo;
+            let to = range.end.min(hi) - lo;
+            out.extend_from_slice(&part[from..to]);
+        }
+        at = hi;
+        if at >= range.end {
+            break;
+        }
+    }
+    out
+}
+
+// The run's lists, as each window holds its part.
+fn list_cpu(w: &WalkedWindow) -> &[super::CpuOperation] {
+    &w.cpu_ops
+}
+fn list_register_rows(w: &WalkedWindow) -> &[super::RegRow] {
+    &w.walk.memw.register_rows
+}
+fn list_aligned(w: &WalkedWindow) -> &[super::MemwOperation] {
+    &w.walk.memw.aligned
+}
+fn list_general(w: &WalkedWindow) -> &[super::MemwOperation] {
+    &w.walk.memw.general
+}
+fn list_load(w: &WalkedWindow) -> &[super::LoadOperation] {
+    &w.walk.load_ops
+}
+fn list_lt(w: &WalkedWindow) -> &[super::LtOperation] {
+    &w.walk.lt_ops
+}
+fn list_shift(w: &WalkedWindow) -> &[super::ShiftOperation] {
+    &w.walk.shift_ops
+}
+
+/// Every full chunk the run's lists hold that was not handed out yet, its ops
+/// gathered out of the windows.
 fn chunk_jobs(
     m: &crate::tables::MaxRowsConfig,
-    cpu_ops: &[super::CpuOperation],
-    w: &WalkOutputs,
+    windows: &[WalkedWindow],
     segments: &RoutedSegments,
     e: &mut StreamSkip,
 ) -> Vec<ChunkJob> {
     let mut jobs = Vec::new();
     macro_rules! full_chunks {
         ($table:expr, $variant:ident, $list:expr, $max:expr, $done:expr) => {{
-            let list = &$list;
+            let list = $list;
+            let len: usize = windows.iter().map(|w| list(w).len()).sum();
             let max = $max;
-            while ($done + 1) * max <= list.len() {
+            while ($done + 1) * max <= len {
                 let index = $done;
                 jobs.push(ChunkJob {
                     table: $table,
                     index,
-                    ops: ChunkOps::$variant(list[index * max..(index + 1) * max].to_vec()),
+                    ops: ChunkOps::$variant(gather(windows, list, index * max..(index + 1) * max)),
                 });
                 $done += 1;
             }
         }};
     }
-    full_chunks!(StreamTable::Cpu, Cpu, *cpu_ops, m.cpu, e.cpu);
+    full_chunks!(StreamTable::Cpu, Cpu, list_cpu, m.cpu, e.cpu);
     full_chunks!(
         StreamTable::MemwRegister,
         MemwRegister,
-        w.memw.register_rows,
+        list_register_rows,
         m.memw_register,
         e.memw_register
     );
     full_chunks!(
         StreamTable::MemwAligned,
         MemwAligned,
-        w.memw.aligned,
+        list_aligned,
         m.memw_aligned,
         e.memw_aligned
     );
-    full_chunks!(StreamTable::Memw, Memw, w.memw.general, m.memw, e.memw);
-    full_chunks!(StreamTable::Load, Load, w.load_ops, m.load, e.load);
-    full_chunks!(StreamTable::Lt, Lt, w.lt_ops, m.lt, e.lt);
-    full_chunks!(StreamTable::Shift, Shift, w.shift_ops, m.shift, e.shift);
-    full_chunks!(
-        StreamTable::Store,
-        Store,
-        segments.store_ops,
-        m.store,
-        e.store
-    );
+    full_chunks!(StreamTable::Memw, Memw, list_general, m.memw, e.memw);
+    full_chunks!(StreamTable::Load, Load, list_load, m.load, e.load);
+    full_chunks!(StreamTable::Lt, Lt, list_lt, m.lt, e.lt);
+    full_chunks!(StreamTable::Shift, Shift, list_shift, m.shift, e.shift);
+    // STORE's ops are a routing segment, already one list.
+    let store = &segments.store_ops;
+    while (e.store + 1) * m.store <= store.len() {
+        let index = e.store;
+        jobs.push(ChunkJob {
+            table: StreamTable::Store,
+            index,
+            ops: ChunkOps::Store(store[index * m.store..(index + 1) * m.store].to_vec()),
+        });
+        e.store += 1;
+    }
     jobs
+}
+
+/// The windows' lists concatenated into the run's, once: list by list in
+/// parallel, each window's list freed as it is copied.
+fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOutputs) {
+    fn cat<T: Send>(parts: Vec<Vec<T>>) -> Vec<T> {
+        let total = parts.iter().map(Vec::len).sum();
+        let mut out = Vec::with_capacity(total);
+        for part in parts {
+            out.extend(part);
+        }
+        out
+    }
+    let n = windows.len();
+    let mut cpu = Vec::with_capacity(n);
+    let mut register_rows = Vec::with_capacity(n);
+    let mut aligned = Vec::with_capacity(n);
+    let mut general = Vec::with_capacity(n);
+    let mut load = Vec::with_capacity(n);
+    let mut lt = Vec::with_capacity(n);
+    let mut shift = Vec::with_capacity(n);
+    let mut bitwise = Vec::with_capacity(n);
+    let mut commit = Vec::with_capacity(n);
+    let mut keccak = Vec::with_capacity(n);
+    let mut blake3 = Vec::with_capacity(n);
+    let mut blake3_absorb = Vec::with_capacity(n);
+    let mut cpu32 = Vec::with_capacity(n);
+    let mut ecsm = Vec::with_capacity(n);
+    let mut ecdas = Vec::with_capacity(n);
+    let mut hint = Vec::with_capacity(n);
+    for WalkedWindow { cpu_ops, walk } in windows {
+        cpu.push(cpu_ops);
+        register_rows.push(walk.memw.register_rows);
+        aligned.push(walk.memw.aligned);
+        general.push(walk.memw.general);
+        load.push(walk.load_ops);
+        lt.push(walk.lt_ops);
+        shift.push(walk.shift_ops);
+        bitwise.push(walk.bitwise_ops);
+        commit.push(walk.commit_ops);
+        keccak.push(walk.keccak_ops);
+        blake3.push(walk.blake3_ops);
+        blake3_absorb.push(walk.blake3_absorb_ops);
+        cpu32.push(walk.cpu32_ops);
+        ecsm.push(walk.ecsm_ops);
+        ecdas.push(walk.ecdas_ops);
+        hint.push(walk.hint_ops);
+    }
+    let ((cpu, (register_rows, aligned)), ((general, bitwise), (load, (lt, shift)))) = rayon::join(
+        || {
+            (
+                cat(cpu),
+                rayon::join(|| cat(register_rows), || cat(aligned)),
+            )
+        },
+        || {
+            rayon::join(
+                || rayon::join(|| cat(general), || cat(bitwise)),
+                || rayon::join(|| cat(load), || rayon::join(|| cat(lt), || cat(shift))),
+            )
+        },
+    );
+    let walk = WalkOutputs {
+        memw: MemwBuckets {
+            register_rows,
+            aligned,
+            general,
+        },
+        load_ops: load,
+        lt_ops: lt,
+        shift_ops: shift,
+        bitwise_ops: bitwise,
+        commit_ops: cat(commit),
+        keccak_ops: cat(keccak),
+        blake3_ops: cat(blake3),
+        blake3_absorb_ops: cat(blake3_absorb),
+        cpu32_ops: cat(cpu32),
+        ecsm_ops: cat(ecsm),
+        ecdas_ops: cat(ecdas),
+        hint_ops: cat(hint),
+    };
+    (cpu, walk)
 }
 
 /// A completed chunk not generated yet: which chunk it is, and its ops.
