@@ -378,12 +378,13 @@ fn stream_by_push() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_STREAM").is_ok_and(|v| v == "push")
 }
 
-/// `LAMBDA_VM_BLOCK_DROP_OPS=1`: the builder drops each streamed chunk's ops as
-/// the chunk leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so phase A
-/// does not hold the run's op lists to its end; the traces are the same. Off by
-/// default until its box gate (D-MEMORY M1).
+/// `LAMBDA_VM_BLOCK_DROP_OPS=0` keeps every walked window's op lists to the
+/// finish (the A arm of the drop A/B); unset or anything else drops each
+/// streamed chunk's ops as the chunk leaves
+/// ([`WindowedTraceBuilder::drop_streamed_ops`]), so phase A does not hold the
+/// run's op lists to its end. The traces are the same either way.
 fn drop_streamed_ops() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").is_ok_and(|v| v.trim() == "1")
+    std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").map_or(true, |v| v.trim() != "0")
 }
 
 /// Committer threads for the streamed instances.
