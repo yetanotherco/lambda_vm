@@ -26,9 +26,11 @@
 //! The nodes are [`super::block_node`]'s, unchanged: they check the id, the
 //! state and the output equal across children, add the sums, and the top
 //! asserts the total is zero — the host's single bus check, where every table's
-//! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does
-//! (a zero denominator has no satisfying assignment, the host's `None`), so the
-//! node needs no fraction arithmetic.
+//! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does,
+//! so the node needs no fraction arithmetic ([`emit_share`]: under
+//! `LFM_WHIR_SHARE_INVERSE=1` a zero denominator has no satisfying assignment
+//! whatever `p` is, the host's `None`; the default `ediv(p, q)` leaves the share
+//! free when `p = q = 0`).
 //!
 //! # Never from a proof
 //!
@@ -75,6 +77,36 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
+
+/// `LFM_WHIR_SHARE_INVERSE`: `1` emits a leaf's bus share as `p · (1/q)`
+/// ([`emit_share`]); unset or `0` keeps `ediv(p, q)`, today's leaf programs.
+/// Read once per process. Both sides derive the leaf programs, so the
+/// verifier's setting is part of the tree identity it derives.
+pub fn share_inverse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("LFM_WHIR_SHARE_INVERSE").as_deref() {
+            Err(_) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(v) => panic!("LFM_WHIR_SHARE_INVERSE must be 0 or 1, got `{v}`"),
+        },
+    )
+}
+
+/// One table's share `p/q` of the block's bus sum. XALU division constrains
+/// `q · out = p`, so `ediv(p, q)` has no satisfying assignment when `q = 0`
+/// and `p ≠ 0`, but leaves `out` free when `p = q = 0`. With `inverse`, the
+/// share is `p · ediv(1, q)`: `q · inv = 1` has no assignment for any `q = 0`,
+/// whatever `p` is — the host's `contribution() = None` refusal.
+pub fn emit_share(b: &mut LfmBuilder, p: Ext, q: Ext, inverse: bool) -> Ext {
+    if inverse {
+        let one = b.ext_const(&FEE::one());
+        let inv = b.ediv(one, q);
+        b.emul(p, inv)
+    } else {
+        b.ediv(p, q)
+    }
+}
 
 /// Children a node verifies: three, so the block's three leaves close in ONE
 /// node, the top, instead of two levels.
@@ -1164,8 +1196,9 @@ fn emit_leaf(
     // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on
     // the carrier (commits are indexed from 0 in a block).
     let mut sum: Option<Ext> = None;
+    let inverse = share_inverse();
     for (p, q) in &outputs {
-        let share = b.ediv(*p, *q);
+        let share = emit_share(b, *p, *q, inverse);
         sum = Some(match sum {
             None => share,
             Some(running) => b.eadd(running, share),

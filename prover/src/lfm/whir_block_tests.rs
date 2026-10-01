@@ -25,8 +25,8 @@ use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child
 use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
 use super::whir_block::{
     BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
-    block_leaf_arena, id_words, leaf_partition, leaf_program_with, out_halves, partition_groups,
-    verify_block_tree, verify_block_tree_under,
+    block_leaf_arena, emit_share, id_words, leaf_partition, leaf_program_with, out_halves,
+    partition_groups, verify_block_tree, verify_block_tree_under,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -340,26 +340,40 @@ fn a_block_leaf_refuses_a_tampered_witness() {
     );
 }
 
-/// The leaf's bus share divides `p` by `q`: a zero `q` has no satisfying
-/// assignment, which is the host's `contribution() = None` refusal.
+/// ★ W1: the leaf's bus share ([`emit_share`]). Under the inverse form
+/// (`LFM_WHIR_SHARE_INVERSE=1`) a zero `q` has no satisfying assignment whatever
+/// `p` is — `q · inv = 1` — which is the host's `contribution() = None`
+/// refusal. The default `ediv(p, q)` refuses `q = 0` only when `p ≠ 0`: at
+/// `p = q = 0` its constraint `q · out = p` holds for every `out` (the executor
+/// writes 1), so the share is free — the gap the inverse form closes.
 #[test]
 fn a_zero_denominator_has_no_satisfying_assignment() {
-    let run = |q: u64| {
+    let run = |p: u64, q: u64, inverse: bool| {
         let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
         let a = b.declare_arena(2);
-        let p = b.hint_word(a, 0).as_ext();
+        let p_wire = b.hint_word(a, 0).as_ext();
         let q_wire = b.hint_word(a, 1).as_ext();
-        let share = b.ediv(p, q_wire);
+        let share = emit_share(&mut b, p_wire, q_wire, inverse);
         b.public(share.as_cell());
         let program = compile(b.finish());
         let words = vec![
-            super::word::ext_word(&FEE::from(7u64)),
+            super::word::ext_word(&FEE::from(p)),
             super::word::ext_word(&FEE::from(q)),
         ];
         execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER).map(|_| ())
     };
-    assert!(run(3).is_ok());
-    assert!(run(0).is_err());
+    for inverse in [false, true] {
+        assert!(run(7, 3, inverse).is_ok(), "inverse {inverse}: 7/3");
+        assert!(run(7, 0, inverse).is_err(), "inverse {inverse}: 7/0");
+    }
+    assert!(
+        run(0, 0, true).is_err(),
+        "the inverse form must refuse p = q = 0"
+    );
+    assert!(
+        run(0, 0, false).is_ok(),
+        "the default ediv(p, q) executes p = q = 0 (its share is free): the gap"
+    );
 }
 
 /// The production format with three polynomials a group: the dense fixture's
