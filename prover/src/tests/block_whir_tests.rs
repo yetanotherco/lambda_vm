@@ -784,18 +784,37 @@ fn block_whir_on_a_real_block() {
         prepared,
         ..BlockFormat::production()
     };
-    let options = BlockOptions::production();
+    let mut options = BlockOptions::production();
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 3; 0 is the inline layout) and
+    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them.
+    if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        options.layout_workers = n;
+    }
+    options.pack_rest_as_laid_out =
+        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
         options.drop_levels,
         if prepared { "on" } else { "off" },
+        options.layout_workers,
+        options.pack_rest_as_laid_out,
         format.zf.banner(),
     );
     // The options #1010's base proves its epochs under.
     let opts = crate::lfm::proof::block_base_options();
+    // The wall clock at the prove's start, to place a box's memory samples.
+    println!(
+        "W3 PROVE START: unix {:.3}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    );
     let wall = std::time::Instant::now();
     let (proof, stamps) = block_whir::prove_block_whir(&elf, &input, &opts, &format, &options)
         .expect("the block proves");
