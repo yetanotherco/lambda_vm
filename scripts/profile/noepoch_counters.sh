@@ -18,17 +18,19 @@
 #      probe; ERR_NVGPUCTRPERM gets the fix printed); RAM (the no-epoch run peaks at 43.9 GiB on the
 #      host) and disk; the Rust toolchain.
 #   2. Clones https://github.com/yetanotherco/lambda_vm (public, HTTPS) into its own work directory and
-#      checks out PIN_SHA below: noepoch/stark @ cea6a10dd (the no-epoch prover: packing admission
-#      behind a knob; KECCAK_RND chunked to 2^16, the data pages' roots derived on the device and phase A
-#      streamed, all default-on) plus two instruments-only commits, NVTX ranges around the device
-#      recommit and around the streamed CPU precommits. That branch sits 8 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
+#      checks out PIN_SHA below: noepoch/stark @ 199ff359b (the no-epoch prover: KECCAK_RND chunked to
+#      2^16, the data pages' roots derived on the device and phase A streamed, all default-on; packing
+#      admission and kept top levels (LAMBDA_VM_RECOMMIT_TOP_LEVELS) behind knobs) plus two
+#      instruments-only commits, NVTX ranges around the device recommit and around the streamed CPU
+#      precommits. That branch sits 9 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
 #      as a control test, so ONE build runs both workloads:
 #        epoch    tests::noepoch_block_tests::noepoch_epoch_base_reference   (#1009's base: 15 epochs of
 #                 2^21 rows and the global proof, continuation::prove_continuation; no recursion, no verify)
 #        noepoch  tests::noepoch_block_tests::noepoch_block_prove_and_verify (prove_block with
 #                 LAMBDA_VM_GATE_PACKING=1, then the monolithic verifier)
 #      both in the FAST 351/352 posture (i-noepoch's nm-ab.sh): TABLE_PARALLELISM=4, a 24000 MiB VRAM
-#      budget, 2^21-row caps, the PROVE SPLIT line and the per-table timeline on.
+#      budget, 2^21-row caps, the PROVE SPLIT line and the per-table timeline on. NP_NOEPOCH_KNOBS adds
+#      knobs to the no-epoch arm only (e.g. LAMBDA_VM_RECOMMIT_TOP_LEVELS=10 once that lever lands).
 #   3. Fetches block 25368371 from the public release (the Makefile's ETHREX_REAL_BLOCK_FIXTURE_URL) and
 #      the record's guest ELF from the public repository; both are checked by sha256. No guest is built.
 #   4. Builds the prover's test binary with --features cuda,nvtx. math-cuda's build.rs compiles the
@@ -111,6 +113,8 @@
 #   NP_IDLE_MIB        the GPU counts as idle below this many MiB in use with no compute process (500)
 #   NP_MIN_AVAIL_GIB   host MemAvailable the checks require at start (default 47)
 #   NP_FETCH_NVTX      1 (default) fetches the NVTX library when none is found; 0 does not
+#   NP_NOEPOCH_KNOBS   extra NAME=VALUE knobs for the no-epoch arm only, blank-separated (default none);
+#                      with any set, the recommit-range count is reported, not gated
 #   NP_SCAN_ALLOW      environment variable NAMES whose values may appear in the bundle (after a look)
 #   NCU / NSYS         explicit tool paths
 #   NP_REPO_URL / NP_INPUT_URL   mirrors; the content stays pinned by commit sha and by sha256
@@ -122,10 +126,10 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION=iprof-2026-09-30d
+SCRIPT_VERSION=iprof-2026-10-01a
 REPO_URL_DEFAULT=https://github.com/yetanotherco/lambda_vm
-PIN_SHA=ca89d301cfef90c6252f4b9f662426602b0b9eb8            # profile/noepoch-counters: noepoch/stark + two NVTX spans
-NOEPOCH_SHA=cea6a10dd6d775179a3f8ed7945d0382a8fcfba6        # noepoch/stark (PR #1013), PIN_SHA's parent
+PIN_SHA=19ef394ece27379faa580b0b119e672c95778e2f            # profile/noepoch-counters: noepoch/stark + two NVTX spans
+NOEPOCH_SHA=199ff359b7c974ee9708dd83aa7be6eb56d486de        # noepoch/stark (PR #1013), PIN_SHA's parent
 EPOCH_SHA=cc411aa2c7a779464b577b5751eb846cf755b3d6          # stark-recursion-rpx (#1009), an ancestor of both
 ELF_COMMIT=da2a423b137b87e04213ecafbfd5d16e98a1f4a3         # whir/profile-rpx, where the record ELF is committed
 ELF_REPO_PATH=scripts/profile/fixtures/ethrex_8f826601.elf
@@ -210,7 +214,8 @@ prereg_text() {
   cat <<'PREREG'
 Pre-registered 2026-09-30 (lane I-PROF), before any run of this script. Sources: FAST 351 (ds1002, i-noepoch
 I-NOEPOCH.md §5), FAST 352 (ds1003, packing: -0.64 s), the later FAST arms (KECCAK_RND chunking -3.23 s,
-device page roots -1.43 s, FAST 355; streamed phase A -2.76 s to 27.98 s, FAST 356 at cea6a10dd) and this
+device page roots -1.43 s, FAST 355; streamed phase A -2.76 s to 27.98 s, FAST 356 at cea6a10dd; the kept
+top levels at 199ff359b are off by default, so the default arm is cea6a10dd's) and this
 script's own dry runs FAST 370/371 at fe3f6bf05 (ds1100/ds1101: no-epoch base 30.62 s, 130 device recommits,
 host peak 35.5 GiB; epoch base 25.74 s). Mauro's machine is not FAST (another CPU), so the
 walls get wide bands; the structural checks are exact.
@@ -220,7 +225,8 @@ Gates (a miss makes the VERDICT PARTIAL or FAILED):
   - the no-epoch log carries the packing banner (LAMBDA_VM_GATE_PACKING=1) and a PROVE SPLIT line with a
     recommit[Σ] field; the epoch log carries PROVE SPLIT lines (16 on FAST 351: 15 epochs and the global proof);
   - run A's stages come from NVTX ranges (needs LAMBDA_VM_NVTX_LIB), and the no-epoch trace has exactly as
-    many r1_main_recommit_table ranges as the log's `device recommits` (130 in FAST 371 at fe3f6bf05); the epoch trace 0;
+    many r1_main_recommit_table ranges as the log's `device recommits` (130 in FAST 371 at fe3f6bf05; gated only
+    with NP_NOEPOCH_KNOBS empty: kept top levels recompute without counting a device recommit); the epoch trace 0;
   - every run-B pass profiles at least one launch.
 Expected (reported, not gated):
   - reference walls: epoch base 23-30 s (FAST 26.05), no-epoch base 24-33 s (FAST 27.98 at cea6a10dd);
@@ -393,6 +399,7 @@ knob_defaults() {
   NP_IDLE_MIB="${NP_IDLE_MIB:-500}"
   NP_MIN_AVAIL_GIB="${NP_MIN_AVAIL_GIB:-47}"
   NP_FETCH_NVTX="${NP_FETCH_NVTX:-1}"
+  NP_NOEPOCH_KNOBS="${NP_NOEPOCH_KNOBS:-}"
   NP_REPO_URL="${NP_REPO_URL:-$REPO_URL_DEFAULT}"
   NP_INPUT_URL="${NP_INPUT_URL:-$INPUT_URL_DEFAULT}"
   NP_SCAN_ALLOW="${NP_SCAN_ALLOW:-}"
@@ -405,6 +412,9 @@ knob_defaults() {
     case "${!v}" in ''|*[!0-9]*) echo "$v must be a number, got '${!v}'" >&2; exit 2 ;; esac
   done
   [ -n "$NP_WORKLOADS" ] || { echo "NP_WORKLOADS is empty" >&2; exit 2; }
+  for v in $NP_NOEPOCH_KNOBS; do
+    [[ "$v" =~ ^(LAMBDA_VM|LFM)_[A-Z0-9_]+=[A-Za-z0-9_.,:-]*$ ]] || { echo "NP_NOEPOCH_KNOBS: '$v' is not LAMBDA_VM_*/LFM_* NAME=VALUE" >&2; exit 2; }
+  done
   for w in $NP_WORKLOADS; do
     case "$w" in epoch|noepoch) ;; *) echo "NP_WORKLOADS: unknown workload '$w' (epoch, noepoch)" >&2; exit 2 ;; esac
   done
@@ -2686,7 +2696,11 @@ wl_env() { # wl_env epoch|noepoch record|runb: the workload's knobs, as i-noepoc
     "_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1" "LAMBDA_VM_TABLE_TIMELINE=1")
   case "$1" in
     epoch) WL_TEST="$EPOCH_TEST" ;;
-    noepoch) WL_ENV+=("LAMBDA_VM_GATE_PACKING=1"); WL_TEST="$NOEPOCH_TEST" ;;
+    noepoch)
+      WL_ENV+=("LAMBDA_VM_GATE_PACKING=1")
+      # shellcheck disable=SC2206 # blank-separated NAME=VALUE words, validated in knob_defaults
+      WL_ENV+=($NP_NOEPOCH_KNOBS)
+      WL_TEST="$NOEPOCH_TEST" ;;
     *) die 2 "unknown workload '$1' in the plan" ;;
   esac
 }
@@ -3141,7 +3155,7 @@ write_env_facts() { # an allowlist of run facts (this file leaves the machine; t
   local e w po f="$SEND/env.txt"
   {
     echo "# noepoch_counters.sh run facts: an allowlist. The environment is never recorded here."
-    echo "script=$SCRIPT_VERSION md5 $(md5_of "$0") mode=$([ "$NP_DRY" = 1 ] && echo dry || echo counters) workloads=$NP_WORKLOADS reference=$NP_REFERENCE run_a=$NP_RUN_A run_b=$NP_RUN_B"
+    echo "script=$SCRIPT_VERSION md5 $(md5_of "$0") mode=$([ "$NP_DRY" = 1 ] && echo dry || echo counters) workloads=$NP_WORKLOADS reference=$NP_REFERENCE run_a=$NP_RUN_A run_b=$NP_RUN_B noepoch_knobs=${NP_NOEPOCH_KNOBS:-none}"
     echo "repo=$NP_REPO_URL head=$(git -C "$REPO" rev-parse HEAD) (asserted = $PIN_SHA, profile/noepoch-counters)"
     echo "noepoch_base=$NOEPOCH_SHA (noepoch/stark, PR #1013) · epoch_base=$EPOCH_SHA (#1009; its base runs as $EPOCH_TEST on this binary)"
     echo "tracked_files_modified_after_build=$(git -C "$REPO" status --porcelain --untracked-files=no | awk 'END { print NR }')"
@@ -3336,7 +3350,7 @@ run_a() { # each workload under nsys (GPU metrics unless dry); per-stage tables,
     log "run A $w: rc=$rc in $((t1 - t0)) s · $(printf '%s' "$rb" | cut -f5) · tables rc=$arc · plan rc=$drc · stages from $src · recommit ranges ${nrec:--} (device recommits $drec) · VRAM max $vr MiB"
     if [ "$rc" -ne 0 ] || [ "$arc" -ne 0 ] || ! readback_ok "$w" "$rb"; then RUNA_OK=0; fi
     if [ "$src" != nvtx ]; then RUNA_OK=0; fi
-    if [ "$w" = noepoch ] && [ "${nrec:-x}" != "$drec" ]; then RUNA_OK=0; log "run A noepoch: recommit ranges ${nrec:--} != device recommits $drec"; fi
+    if [ "$w" = noepoch ] && [ -z "$NP_NOEPOCH_KNOBS" ] && [ "${nrec:-x}" != "$drec" ]; then RUNA_OK=0; log "run A noepoch: recommit ranges ${nrec:--} != device recommits $drec"; fi
     if [ "$w" = epoch ] && [ "${nrec:-0}" != 0 ]; then RUNA_OK=0; fi
     if [ "$NP_DRY" = 1 ] && [ "$drc" -ne 0 ]; then RUNA_OK=0; fi
     RUNA_LINE="${RUNA_LINE:+$RUNA_LINE · }$w rc $rc $((t1 - t0)) s, stages $src, recommits ${nrec:--}/$drec"
