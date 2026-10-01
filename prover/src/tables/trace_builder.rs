@@ -637,25 +637,6 @@ pub(crate) struct WalkOutputs {
 }
 
 impl WalkOutputs {
-    /// Appends a later window's lists, list by list.
-    fn append(&mut self, other: Self) {
-        self.memw.register_rows.extend(other.memw.register_rows);
-        self.memw.aligned.extend(other.memw.aligned);
-        self.memw.general.extend(other.memw.general);
-        self.load_ops.extend(other.load_ops);
-        self.lt_ops.extend(other.lt_ops);
-        self.shift_ops.extend(other.shift_ops);
-        self.bitwise_ops.extend(other.bitwise_ops);
-        self.commit_ops.extend(other.commit_ops);
-        self.keccak_ops.extend(other.keccak_ops);
-        self.blake3_ops.extend(other.blake3_ops);
-        self.blake3_absorb_ops.extend(other.blake3_absorb_ops);
-        self.cpu32_ops.extend(other.cpu32_ops);
-        self.ecsm_ops.extend(other.ecsm_ops);
-        self.ecdas_ops.extend(other.ecdas_ops);
-        self.hint_ops.extend(other.hint_ops);
-    }
-
     /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it.
     fn with_capacity(cpu_ops: usize) -> Self {
         Self {
