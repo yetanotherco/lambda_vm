@@ -1563,6 +1563,35 @@ fn coset_lde_row_major_inner(
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
 
+    let (col_major_dev, ready, lde_out) =
+        drain_and_transpose(&stream, be, buf, lde_size, total_cols, retain_host_lde)?;
+
+    let tree = GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    };
+    Ok((
+        tree,
+        col_major_dev,
+        lde_out,
+        trace_col_major,
+        Arc::new(ready),
+    ))
+}
+
+/// The row-major commit's tail: the optional D2H of the row-major LDE, then the
+/// in-place transpose to the column-major layout the downstream kernels read
+/// (`buf[c * lde_size + r]`), with the `ready` event recorded behind it.
+fn drain_and_transpose(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    buf: CudaSlice<u64>,
+    lde_size: usize,
+    total_cols: usize,
+    retain_host_lde: bool,
+) -> Result<(CudaSlice<u64>, crate::device::PooledEvent, Vec<u64>)> {
+    let stream = stream.clone();
     // Transpose row-major buf into column-major for the handle, in place.
     // Downstream kernels (DEEP, barycentric) expect buf[c * lde_size + r].
     // No host synchronize after it: the handle carries a `ready` event instead,
@@ -1620,18 +1649,78 @@ fn coset_lde_row_major_inner(
         (col_major_dev, ready, Vec::new())
     };
 
-    let tree = GpuMerkleTree {
-        nodes: Arc::new(nodes_dev),
-        leaves_len: num_leaves,
-        root,
+    Ok((col_major_dev, ready, lde_out))
+}
+
+/// The row-major coset LDE kept device-resident as the keep path leaves it
+/// (column-major, with the trace-domain snapshot), WITHOUT leaf hashing or a
+/// Merkle tree: `tree` is `None`. For a table whose tree is already committed
+/// and whose openings are answered from elsewhere (the no-epoch block's kept
+/// top levels), so the second commit re-runs the LDE and not the hash.
+pub fn coset_lde_row_major_keep_no_tree(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let input = match predev {
+        Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
+        _ => InnerInput::Host(row_major),
     };
-    Ok((
-        tree,
-        col_major_dev,
-        lde_out,
-        trace_col_major,
-        Arc::new(ready),
-    ))
+    assert_eq!(row_major.len(), n * m);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_keep_no_tree lde_size");
+    let be = backend()?;
+    let stream = be.next_stream();
+    let (col_major_dev, ready, lde_out, trace_col_major) =
+        if row_major_commit_takes_engine(n, blowup_factor, retain_host_lde) {
+            let (buf, trace_col_major) =
+                expand_col_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+            let ready = be.take_event()?;
+            ready.event().record(&stream)?;
+            (buf, ready, Vec::new(), trace_col_major)
+        } else {
+            let (buf, trace_col_major) =
+                expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+            let (col_major_dev, ready, lde_out) =
+                drain_and_transpose(&stream, be, buf, lde_size, m, retain_host_lde)?;
+            (col_major_dev, ready, lde_out, trace_col_major)
+        };
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+        tree: None,
+        ready: Some(Arc::new(ready)),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((handle, lde_out))
+}
+
+/// The first `n_nodes` nodes of a device tree (root first, heap order: the
+/// levels from the root down, each level contiguous), copied to host.
+pub fn download_tree_prefix(tree: &GpuMerkleTree, n_nodes: usize) -> Result<Vec<[u8; 32]>> {
+    let n = n_nodes.min(2 * tree.leaves_len - 1);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut bytes = vec![0u8; n * 32];
+    stream.memcpy_dtoh(&tree.nodes.slice(0..n * 32), &mut bytes)?;
+    stream.synchronize()?;
+    Ok(bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut node = [0u8; 32];
+            node.copy_from_slice(c);
+            node
+        })
+        .collect())
 }
 
 /// The row-major coset LDE **alone** — no leaf hashing, no Merkle tree.

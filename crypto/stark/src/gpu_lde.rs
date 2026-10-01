@@ -1519,6 +1519,86 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// [`try_expand_leaf_and_tree_row_major_keep`] without the leaf hashing and
+/// the tree: the device LDE kept (column-major, with the trace snapshot) and,
+/// when `retain_host_lde`, its row-major host copy. `None` when the device
+/// declines (the caller then commits in full). For a table whose tree is
+/// already committed and whose openings come from its kept top levels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_expand_row_major_keep_no_tree<F, E>(
+    table: &str,
+    row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+) -> Option<(math_cuda::lde::GpuLdeBase, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<GoldilocksField>()
+        || row_major.len() != n * m
+        || m == 0
+        || n == 0
+    {
+        return None;
+    }
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        table,
+        what: "main LDE recompute (kept top levels)",
+        n,
+        base_cols: m,
+        blowup: blowup_factor,
+    };
+    // The commit's device set bounds this one (the same LDE, no tree).
+    let set = commit_device_set_rpl(n, m, blowup_factor, true, 2);
+    admit_commit(lde_size, &shape, &set)?;
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_keep_no_tree(
+        raw,
+        predev,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        retain_host_lde,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
+    };
+    Some((handle, lde_out))
+}
+
+/// The first `n_nodes` nodes of a device tree, on the host.
+pub(crate) fn download_tree_prefix(
+    tree: &math_cuda::lde::GpuMerkleTree,
+    n_nodes: usize,
+) -> math_cuda::Result<Vec<Commitment>> {
+    math_cuda::lde::download_tree_prefix(tree, n_nodes)
+}
+
 /// Convert a GPU-built full node buffer (`(2*leaves - 1) * 32` bytes, inner
 /// nodes first, root at offset 0, leaves at the tail) into a host
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.

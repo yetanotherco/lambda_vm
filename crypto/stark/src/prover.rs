@@ -156,6 +156,56 @@ where
     pub(crate) precomputed_root: Option<Commitment>,
     /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
     pub(crate) num_precomputed_cols: usize,
+    /// `RecomputeLdeDevice` with kept top levels: the committed tree's levels
+    /// from the root down to `TopTree::top_level`, copied off the device before
+    /// it was freed. The openings rebuild only each queried subtree below them
+    /// from the recomputed LDE (see `top_tree_proofs`), so the table's second
+    /// device commit is the LDE alone.
+    #[cfg(feature = "cuda")]
+    pub(crate) top_tree: Option<Arc<TopTree>>,
+}
+
+/// A committed Merkle tree's top levels, heap order (the root first, each
+/// level contiguous): levels `0..=top_level` of a tree over `leaves` leaves.
+#[cfg(feature = "cuda")]
+pub(crate) struct TopTree {
+    nodes: Vec<Commitment>,
+    leaves: usize,
+    top_level: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl TopTree {
+    /// Levels `0..=depth − subtree_levels` of `tree` (all of it but the
+    /// bottom `subtree_levels`; just the root when the tree is that short).
+    fn from_device(
+        tree: &math_cuda::lde::GpuMerkleTree,
+        subtree_levels: usize,
+    ) -> math_cuda::Result<Self> {
+        let depth = tree.leaves_len.trailing_zeros() as usize;
+        let top_level = depth.saturating_sub(subtree_levels);
+        let nodes = crate::gpu_lde::download_tree_prefix(tree, (2usize << top_level) - 1)?;
+        Ok(Self {
+            nodes,
+            leaves: tree.leaves_len,
+            top_level,
+        })
+    }
+
+    /// Leaves under one node of the deepest kept level.
+    fn subtree_leaves(&self) -> usize {
+        self.leaves >> self.top_level
+    }
+
+    /// Node `j` of kept level `level`.
+    fn node(&self, level: usize, j: usize) -> Option<&Commitment> {
+        self.nodes.get((1usize << level) - 1 + j)
+    }
+
+    /// The `2^c` nodes of level `c`, when it is kept.
+    fn cap(&self, c: usize) -> Option<Vec<Commitment>> {
+        (c <= self.top_level).then(|| self.nodes[(1usize << c) - 1..(2usize << c) - 1].to_vec())
+    }
 }
 
 impl<F: IsField + 'static, H: StarkHash> TableCommit<F, H>
@@ -170,6 +220,8 @@ where
             precomputed_tree: None,
             precomputed_root: None,
             num_precomputed_cols: 0,
+            #[cfg(feature = "cuda")]
+            top_tree: None,
         }
     }
 
@@ -189,6 +241,8 @@ where
             precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
+            #[cfg(feature = "cuda")]
+            top_tree: None,
         }
     }
 
@@ -200,6 +254,8 @@ where
             precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
             precomputed_root: self.precomputed_root,
             num_precomputed_cols: self.num_precomputed_cols,
+            #[cfg(feature = "cuda")]
+            top_tree: self.top_tree.clone(),
         }
     }
 
@@ -1109,6 +1165,33 @@ mod vram_gate_packing_tests {
         assert_eq!(*gate.used.lock().unwrap(), 0);
     }
 }
+
+/// `LAMBDA_VM_RECOMMIT_TOP_LEVELS=k` (k ≥ 1): under `RecomputeLdeDevice` a
+/// plain table's Round 1 keeps its tree's top levels (all but the bottom `k`)
+/// on the host, and its fused task recomputes the LDE alone on the device —
+/// no second hash; the openings rebuild each queried `2^k`-leaf subtree from the
+/// recomputed rows and check it against the kept node. Unset or 0: the full
+/// device recommit with its root check.
+#[cfg(feature = "cuda")]
+fn recommit_top_levels() -> Option<usize> {
+    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = std::env::var("LAMBDA_VM_RECOMMIT_TOP_LEVELS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&k| k > 0);
+        if let Some(k) = k {
+            eprintln!(
+                "[prover] RecomputeLdeDevice: tree top levels kept, subtrees of 2^{k} leaves \
+                 rebuilt at the openings (LAMBDA_VM_RECOMMIT_TOP_LEVELS)"
+            );
+        }
+        k
+    })
+}
+
+/// Tables whose fused task recomputed the LDE alone against kept top levels.
+pub static TOP_TREE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `LAMBDA_VM_GATE_PACKING=1`: [`run_admitted`] admits the first table in walk
 /// order that fits the gate instead of blocking on the next one. Off by
@@ -2258,6 +2341,110 @@ pub trait IsStarkProver<
         }
         crate::residency_mode::DEVICE_RECOMMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(recommitted)
+    }
+
+    /// The main-trace Merkle proofs of `indexes` (leaf indices) for a table
+    /// whose tree's top levels were kept and whose device LDE was recomputed
+    /// without a tree: each queried `2^k`-leaf subtree is rebuilt from the
+    /// device LDE's rows with the host twins of the device kernels (the leaf
+    /// hash of `commit_rows_bit_reversed_subset_with`, the backend's parent
+    /// hash), checked against the kept node at its root, and the path is its
+    /// in-subtree siblings then the kept levels' — the path the full tree gives.
+    /// A subtree that does not match refuses the proof: the recomputed rows are
+    /// not the rows the root commits to.
+    #[cfg(feature = "cuda")]
+    fn top_tree_proofs(
+        top: &TopTree,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        indexes: &[usize],
+        layout: LeafLayout,
+        lde_len: usize,
+    ) -> Result<Vec<Proof<Commitment>>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+    {
+        use math::traits::ByteConversion;
+        let handle = lde_trace.gpu_main().ok_or_else(|| {
+            ProvingError::DevicePath("kept top levels without a device LDE".to_string())
+        })?;
+        let stream = lde_trace
+            .bound_stream()
+            .ok_or_else(|| ProvingError::DevicePath("no bound stream".to_string()))?;
+        let per = top.subtree_leaves();
+        let mut bases: Vec<usize> = indexes.iter().map(|&q| q / per).collect();
+        bases.sort_unstable();
+        bases.dedup();
+        let rows: Vec<u32> = bases
+            .iter()
+            .flat_map(|&b| {
+                (b * per..(b + 1) * per).flat_map(move |leaf| {
+                    let (row, sym) = layout.query_rows(leaf, lde_len);
+                    core::iter::once(row as u32).chain(sym.map(|r| r as u32))
+                })
+            })
+            .collect();
+        let raw = math_cuda::barycentric::gather_rows_base_on_device(handle, &rows, &stream)
+            .map_err(|e| ProvingError::DevicePath(format!("subtree row gather: {e:?}")))?;
+        let vals = crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
+            .ok_or_else(|| ProvingError::DevicePath("subtree rows: not Goldilocks".to_string()))?;
+        let ncols = handle.m;
+        let rpl = layout.rows_per_leaf();
+        let byte_len = <FieldElement<Field> as ByteConversion>::BYTE_LEN;
+        let mut buf = vec![0u8; rpl * ncols * byte_len];
+        // Every level of each rebuilt subtree, leaves first.
+        let mut subtrees: Vec<Vec<Vec<Commitment>>> = Vec::with_capacity(bases.len());
+        for (bi, &b) in bases.iter().enumerate() {
+            let mut level: Vec<Commitment> = (0..per)
+                .map(|j| {
+                    let first = (bi * per + j) * rpl * ncols;
+                    for (k, v) in vals[first..first + rpl * ncols].iter().enumerate() {
+                        v.write_bytes_be(&mut buf[k * byte_len..(k + 1) * byte_len]);
+                    }
+                    <H::Batched<Field> as IsStreamingLeafBackend<Field>>::hash_bytes(&buf)
+                })
+                .collect();
+            let mut levels = Vec::new();
+            while level.len() > 1 {
+                let up: Vec<Commitment> = level
+                    .chunks_exact(2)
+                    .map(|p| {
+                        <H::Batched<Field> as IsMerkleTreeBackend>::hash_new_parent(&p[0], &p[1])
+                    })
+                    .collect();
+                levels.push(std::mem::replace(&mut level, up));
+            }
+            if top.node(top.top_level, b) != Some(&level[0]) {
+                return Err(ProvingError::RecomputedCommitmentMismatch(format!(
+                    "the rebuilt subtree {b} (2^{} leaves) does not match the kept tree",
+                    per.trailing_zeros()
+                )));
+            }
+            subtrees.push(levels);
+        }
+        Ok(indexes
+            .iter()
+            .map(|&q| {
+                let b = q / per;
+                let levels = &subtrees[bases.binary_search(&b).expect("every base was rebuilt")];
+                let mut path = Vec::with_capacity(levels.len() + top.top_level);
+                let mut i = q - b * per;
+                for level in levels {
+                    path.push(level[i ^ 1]);
+                    i >>= 1;
+                }
+                let mut pos = (1usize << top.top_level) - 1 + b;
+                while pos != 0 {
+                    let sibling = if pos.is_multiple_of(2) {
+                        pos - 1
+                    } else {
+                        pos + 1
+                    };
+                    path.push(top.nodes[sibling]);
+                    pos = (pos - 1) / 2;
+                }
+                Proof { merkle_path: path }
+            })
+            .collect())
     }
 
     /// Expand a table's main trace to its coset LDE, row-major, without
@@ -3412,12 +3599,31 @@ pub trait IsStarkProver<
             .map(|layer| layer.merkle_tree.root)
             .collect();
 
+        // A table proved against kept top levels: its main-trace proofs are
+        // rebuilt here, where a subtree that does not match the kept tree can
+        // refuse the proof.
+        #[cfg(feature = "cuda")]
+        let main_top_proofs = match (
+            round_1_result.main.top_tree.as_ref(),
+            round_1_result.lde_trace.gpu_main(),
+        ) {
+            (Some(top), Some(handle)) if handle.tree.is_none() => Some(Self::top_tree_proofs(
+                top,
+                &round_1_result.lde_trace,
+                &iotas,
+                leaf_layout,
+                domain.lde_roots_of_unity_coset.len(),
+            )?),
+            _ => None,
+        };
         let mut deep_poly_openings = Self::open_deep_composition_poly(
             domain,
             round_1_result,
             round_2_result,
             &iotas,
             leaf_layout,
+            #[cfg(feature = "cuda")]
+            main_top_proofs,
         );
 
         // Merkle caps: a post-pass over the finished
@@ -3531,9 +3737,21 @@ pub trait IsStarkProver<
         let (depth, c) = (caps.trace_depth, caps.trace);
         if c > 0 {
             #[cfg(feature = "cuda")]
-            let main_dev = dev(lde_trace.gpu_main().and_then(|h| h.tree.as_ref()), || {
-                lde_trace.bound_stream()
-            });
+            let main_dev = {
+                let resident = dev(lde_trace.gpu_main().and_then(|h| h.tree.as_ref()), || {
+                    lde_trace.bound_stream()
+                });
+                let top = round_1_result.main.top_tree.clone();
+                move |c: usize| {
+                    resident(c).or_else(|| {
+                        top.as_ref().map(|t| {
+                            t.cap(c).ok_or_else(|| {
+                                format!("cap height {c} is below the kept top levels")
+                            })
+                        })
+                    })
+                }
+            };
             #[cfg(not(feature = "cuda"))]
             let main_dev = |_| None;
             let main_cap = Self::tree_cap(&round_1_result.main.tree, depth, c, "main", main_dev)?;
@@ -4292,6 +4510,7 @@ pub trait IsStarkProver<
         round_2_result: &Round2<FieldExtension, H>,
         indexes_to_open: &[usize],
         leaf_layout: LeafLayout,
+        #[cfg(feature = "cuda")] main_top_proofs: Option<Vec<Proof<Commitment>>>,
     ) -> DeepPolynomialOpenings<Field, FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -4340,7 +4559,9 @@ pub trait IsStarkProver<
                 // One proof per query at leaf `challenge` (either layout).
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
                     .expect("device main-tree gather failed; resident tree has no host fallback")
-            });
+            })
+            // Kept top levels: the proofs rebuilt from them (checked there).
+            .or(main_top_proofs);
 
         // Same for the aux trace tree, when it is device resident.
         #[cfg(feature = "cuda")]
@@ -4823,7 +5044,28 @@ pub trait IsStarkProver<
         // region, so the next table's commit is admitted against an empty
         // card rather than against every earlier table's buffers.
         #[cfg(feature = "cuda")]
-        let recommit_on_device = residency.recommits_on_device() && committed.2.take().is_some();
+        let recommit_on_device = residency.recommits_on_device()
+            && match committed.2.take() {
+                None => false,
+                Some(handle) => {
+                    // A plain table's top levels, off the device before its
+                    // buffers are freed (preprocessed tables recommit in full).
+                    if let (Some(k), None, Some(tree)) = (
+                        recommit_top_levels(),
+                        committed.0.precomputed_root,
+                        handle.tree.as_ref(),
+                    ) {
+                        let top = TopTree::from_device(tree, k).map_err(|e| {
+                            ProvingError::DevicePath(format!(
+                                "table {}: copying the tree's top levels: {e:?}",
+                                air.name()
+                            ))
+                        })?;
+                        committed.0.top_tree = Some(Arc::new(top));
+                    }
+                    true
+                }
+            };
         #[cfg(not(feature = "cuda"))]
         let recommit_on_device = false;
         #[cfg(feature = "cuda")]
@@ -5302,31 +5544,74 @@ pub trait IsStarkProver<
                 Some(MainLdeSlot::DroppedDevice)
             ) {
                 let __ps_rc = crate::prove_split::mark();
-                let (commit, cached_main, gpu_main) = {
-                    let absorbed = main_commit_cells[idx].lock().unwrap();
-                    Self::recommit_main_trace_device(
-                        *air,
-                        &mut **trace,
-                        domain,
-                        twiddles,
-                        leaf_layouts[idx],
-                        idx,
-                        absorbed
-                            .as_ref()
-                            .expect("main commit present until the table's aux stage"),
-                        #[cfg(feature = "disk-spill")]
-                        storage_mode,
-                    )?
-                };
-                if let Some(handle) = &gpu_main
-                    && let Some(td) = &handle.trace_dev
-                {
-                    trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                // Kept top levels: the LDE alone, no second hash. The commit
+                // (root-only tree + top levels) stays; the openings rebuild the
+                // queried subtrees and check them against the kept nodes.
+                let top_levels_kept = main_commit_cells[idx]
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|c| c.top_tree.is_some());
+                #[cfg(any(test, feature = "test-utils"))]
+                if top_levels_kept && crate::residency_mode::test_hooks::take_perturbation(idx) {
+                    let col = trace.main_table.width - 1;
+                    let v = *trace.main_table.get(0, col);
+                    trace
+                        .main_table
+                        .set(0, col, v + FieldElement::<Field>::one());
                 }
-                *main_commit_cells[idx].lock().unwrap() = Some(commit);
-                *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
-                *gpu_main_cells[idx].lock().unwrap() = gpu_main;
-                crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+                let relde = if top_levels_kept {
+                    let (trace_slice, num_cols) = trace.main_data_row_major();
+                    let n = trace_slice.len().checked_div(num_cols).unwrap_or(0);
+                    crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
+                        air.name(),
+                        trace_slice,
+                        trace.main_rowmajor_dev(),
+                        n,
+                        num_cols,
+                        domain.blowup_factor,
+                        &twiddles.coset_weights,
+                        !Self::device_only_for(*air, domain),
+                    )
+                    .map(|(handle, lde)| (handle, (lde, num_cols)))
+                } else {
+                    None
+                };
+                if let Some((handle, cached_main)) = relde {
+                    if let Some(td) = &handle.trace_dev {
+                        trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                    }
+                    *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
+                    *gpu_main_cells[idx].lock().unwrap() = Some(handle);
+                    TOP_TREE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+                } else {
+                    let (commit, cached_main, gpu_main) = {
+                        let absorbed = main_commit_cells[idx].lock().unwrap();
+                        Self::recommit_main_trace_device(
+                            *air,
+                            &mut **trace,
+                            domain,
+                            twiddles,
+                            leaf_layouts[idx],
+                            idx,
+                            absorbed
+                                .as_ref()
+                                .expect("main commit present until the table's aux stage"),
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                        )?
+                    };
+                    if let Some(handle) = &gpu_main
+                        && let Some(td) = &handle.trace_dev
+                    {
+                        trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                    }
+                    *main_commit_cells[idx].lock().unwrap() = Some(commit);
+                    *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
+                    *gpu_main_cells[idx].lock().unwrap() = gpu_main;
+                    crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+                }
             }
 
             let __ps_ab = crate::prove_split::mark();

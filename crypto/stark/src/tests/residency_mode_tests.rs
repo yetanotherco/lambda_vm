@@ -361,3 +361,71 @@ fn recompute_lde_device_refuses_a_trace_that_moved() {
         }
     }
 }
+
+/// ★ Kept top levels (`LAMBDA_VM_RECOMMIT_TOP_LEVELS`): every table's fused
+/// task recomputes the LDE alone, the openings rebuild the queried subtrees,
+/// and the proof is `Retain`'s byte for byte and verifies.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn recompute_lde_device_top_levels_on_the_card() {
+    use std::sync::atomic::Ordering;
+    let retained = bincode::serialize(&prove_under(ResidencyMode::Retain)).unwrap();
+    let before = crate::prover::TOP_TREE_RECOMPUTES.load(Ordering::SeqCst);
+    let recomputed = prove_under(ResidencyMode::RecomputeLdeDevice);
+    let tops = crate::prover::TOP_TREE_RECOMPUTES.load(Ordering::SeqCst) - before;
+    assert_eq!(
+        tops, 3,
+        "every table must recompute against kept top levels (is LAMBDA_VM_RECOMMIT_TOP_LEVELS set?)"
+    );
+    assert!(verifies(&recomputed), "the top-levels proof must verify");
+    assert!(
+        retained == bincode::serialize(&recomputed).unwrap(),
+        "proof bytes moved between Retain and the kept top levels"
+    );
+}
+
+/// ★ Kept top levels refuse a trace that moved: the rebuilt subtrees do not
+/// match the kept nodes, and the prover refuses with
+/// `RecomputedCommitmentMismatch` at the openings.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn recompute_lde_device_top_levels_refuse_a_trace_that_moved() {
+    use crate::prover::ProvingError;
+    for table in 0..3 {
+        crate::residency_mode::test_hooks::perturb_before_recommit(table);
+        let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
+        let proof_options = test_options();
+        let cpu_air = new_cpu_air_with_lookup(&proof_options);
+        let add_air = new_add_air_with_lookup(&proof_options);
+        let mul_air = new_mul_air_with_lookup(&proof_options);
+        let pairs: Vec<(
+            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+            _,
+            _,
+        )> = vec![
+            (&cpu_air, &mut cpu_trace, &()),
+            (&add_air, &mut add_trace, &()),
+            (&mul_air, &mut mul_trace, &()),
+        ];
+        let out = Prover::multi_prove(
+            pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            ResidencyMode::RecomputeLdeDevice,
+        );
+        assert_eq!(
+            crate::residency_mode::test_hooks::PERTURB_BEFORE_RECOMMIT
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "table {table}: the perturbation never fired"
+        );
+        assert!(
+            matches!(out, Err(ProvingError::RecomputedCommitmentMismatch(_))),
+            "table {table}: expected a refusal, got {:?}",
+            out.as_ref().map(|_| "a proof")
+        );
+    }
+}
