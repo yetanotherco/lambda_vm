@@ -749,7 +749,8 @@ pub fn data_page_lazy_commitment(
 /// exact columns and options ([`record_data_page_commitment`]), else
 /// [`compute_precomputed_commitment_with`]. The record is keyed by everything
 /// the root is a function of (the page's INIT bytes, the blowup, the coset
-/// offset, the layout), so a recorded root is the value a recompute returns.
+/// offset, the layout), so a correctly recorded root is the value a recompute
+/// returns (see [`record_data_page_commitment`] on a wrong one).
 pub fn data_page_commitment(
     config: &PageConfig,
     options: &ProofOptions,
@@ -770,9 +771,14 @@ pub fn data_page_commitment(
 
 /// Record `root` as `config`'s data-page commitment under `layout`, for
 /// [`data_page_commitment`] to return instead of recomputing it on the host.
-/// The no-epoch block derives them on the device while it executes. A caller
-/// recording a root that is not the page's makes a proof every verifier
-/// rejects (the verifier recomputes it), never an accepted one.
+/// The no-epoch block derives them on the device while it executes.
+///
+/// ⚠ The record is process-wide and [`data_page_commitment`] returns it before
+/// it would recompute, so a verifier in ANOTHER process recomputes the root on
+/// the host and rejects a proof made over a wrong one — but a verifier, and an
+/// AIR set, built in the proving process read the recorded root back. Inside
+/// that process a wrong device root is accepted everywhere; what keeps it out
+/// is the device-equals-host gate on the recorded roots, not this cache.
 pub fn record_data_page_commitment(
     config: &PageConfig,
     options: &ProofOptions,
