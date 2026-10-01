@@ -413,11 +413,17 @@ where
         .as_ref()
         .map(|p| p.commitment.roots())
         .unwrap_or_default();
+    let __sp_challenge = multilinear::whir_split::mark();
     let (z, alpha, beta) =
         absorb_roots_and_challenge::<E, T>(transcript, committed.roots(), &prepared_roots);
+    multilinear::whir_split::add(&multilinear::whir_split::CHALLENGE, __sp_challenge);
 
     let tables = committed.tables();
-    let (argue, reduced) = prove_argue::<F, E, T>(
+    // The base split's `argue` and `RESERVED HW`'s, as `multi_prove` keeps
+    // them — the whole batched argue as one window (it has no per-table loop).
+    let __rw_argue = multilinear::whir_split::open_reserved();
+    let __sp_argue = multilinear::whir_split::mark();
+    let argued = prove_argue::<F, E, T>(
         tables,
         &z,
         &alpha,
@@ -426,7 +432,11 @@ where
         transcript,
         faults,
         at,
-    )?;
+    );
+    let __sp_secs = multilinear::whir_split::add(&multilinear::whir_split::ARGUE, __sp_argue);
+    multilinear::whir_split::note_table(0, __sp_secs);
+    multilinear::whir_split::close_reserved(&multilinear::whir_split::RESERVED_ARGUE, __rw_argue);
+    let (argue, reduced) = argued?;
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
     let mut table_starts = Vec::with_capacity(tables.len());

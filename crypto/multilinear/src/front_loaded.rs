@@ -163,6 +163,7 @@ where
             match crate::gpu_fused::FusedStepper::new(device, input, &lambdas, claim, degree, check)
             {
                 Some(Ok(stepper)) => {
+                    crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     let batched = crate::batch::Batched::new(Vec::new(), rules, lambdas)?;
                     return Ok(Self::Fused {
                         stepper: Some(Box::new(stepper)),

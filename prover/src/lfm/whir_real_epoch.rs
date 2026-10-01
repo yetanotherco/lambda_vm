@@ -321,6 +321,10 @@ pub(crate) fn real_epoch_from_whir_epochs_under<H>(
 where
     H: WhirHash,
 {
+    // ⛔ A measurement-only run's epoch proofs carry no argue, so no wrap may
+    // harvest one (`crate::argue_measure`).
+    crate::argue_measure::refuse_consumers("a level-0 wrap harvest")
+        .map_err(|e| format!("{e:?}"))?;
     let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
     let decode_commitment = match decode_commitment {
         Some(c) => c,

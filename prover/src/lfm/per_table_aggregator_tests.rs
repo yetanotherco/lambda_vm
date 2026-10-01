@@ -9505,6 +9505,55 @@ where
     Ok(WhirGlobalChild { child, published })
 }
 
+/// ★ D-BATCH B-3's base-only arm: the WHIR block's BASE and nothing else — no
+/// level 0, no prologues, no verify — timed, with the base split read back.
+///
+/// Arm A runs it as it is (today's argue); arm B with
+/// `LAMBDA_VM_ARGUE_BATCHED_MEASURE=1`, which this test alone may honour: it
+/// takes the base-only permit (`crate::argue_measure`), and the epoch proofs
+/// it makes under the knob are placeholders it never verifies or wraps. Both
+/// arms are base-only, so neither pays the lead-in's prologues the tree's
+/// base runs beside: the comparison is between them, not with a tree's base.
+///
+/// ```text
+/// LFM_CENSUS_ELF=… LFM_CENSUS_INPUT=… LFM_CENSUS_EPOCH_LOG2=21 LAMBDA_VM_BASE_SPLIT=1 \
+/// [LAMBDA_VM_ARGUE_BATCHED_MEASURE=1] cargo test --release -p lambda-vm-prover --features cuda --lib \
+///   lfm::per_table_aggregator_tests::the_whir_base_alone -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "proves a block's base: a box run"]
+fn the_whir_base_alone() {
+    let inputs = super::epoch_tests::EpochInputs::from_env();
+    let inner = super::proof::block_base_options();
+    let _permit = crate::argue_measure::permit_base_only();
+    let batched = crate::argue_measure::requested();
+    println!(
+        "★★★ WHIR BASE ALONE — {}, {} input bytes, 2^{} cycles/epoch · argue: {}",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+        if batched {
+            "BATCHED (LAMBDA_VM_ARGUE_BATCHED_MEASURE=1, measurement only: no verify, no wrap)"
+        } else {
+            "per table (today)"
+        }
+    );
+    let t = std::time::Instant::now();
+    let bundle = crate::multilinear_continuation::prove_continuation(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+        &inner,
+    )
+    .expect("the WHIR base must prove");
+    let base_secs = t.elapsed().as_secs_f64();
+    println!(
+        "   base (WHIR): {} epochs in {base_secs:.1}s",
+        bundle.num_epochs()
+    );
+    whir_base_split_readback(base_secs);
+}
+
 /// ★★★ THE WHIR PRODUCTION TREE — the WHIR base, one LFM wrap per epoch, and
 /// the same interior above them.
 ///
