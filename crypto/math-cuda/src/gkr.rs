@@ -522,6 +522,20 @@ impl GruenLayer {
         lambda: &[u64; 3],
         want_h0: bool,
     ) -> Result<Vec<u64>> {
+        let rows = self.round_enqueue(fold_by, lambda, want_h0)?;
+        self.round_collect(rows)
+    }
+
+    /// [`round`](Self::round)'s launches, queued without waiting for them —
+    /// so the batched argue's ladder can queue every tree's round before it
+    /// reads any back. Returns the rows [`round_collect`](Self::round_collect)
+    /// reads.
+    pub fn round_enqueue(
+        &mut self,
+        fold_by: Option<&[u64; 3]>,
+        lambda: &[u64; 3],
+        want_h0: bool,
+    ) -> Result<u32> {
         assert!(self.done < self.rounds, "every card round has run");
         assert_eq!(
             fold_by.is_some(),
@@ -580,11 +594,17 @@ impl GruenLayer {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
+        self.done += 1;
+        Ok(rows)
+    }
+
+    /// The sums a [`round_enqueue`](Self::round_enqueue) queued, `rows` of
+    /// them, three u64 each.
+    pub fn round_collect(&self, rows: u32) -> Result<Vec<u64>> {
         let sums = self
             .stream
             .clone_dtoh(&self.sums.slice(0..rows as usize * 3))?;
         self.stream.synchronize()?;
-        self.done += 1;
         Ok(sums)
     }
 

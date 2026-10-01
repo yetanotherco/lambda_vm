@@ -100,7 +100,11 @@ fn sources_of(kinds: &[FactorKind]) -> Vec<FactorSource> {
 ///
 /// `public` covers the trace's public factors first; anything left over is a
 /// weight table a statement appended, so it lands at the end.
-fn weave<E: IsField>(
+///
+/// `pub` for the batched argue (`stark::multilinear_table::batched`), whose
+/// verifier weaves each table's values the same way: one spelling of the order
+/// the rules index.
+pub fn weave<E: IsField>(
     kinds: &[FactorKind],
     committed: &[FieldElement<E>],
     public: &[FieldElement<E>],

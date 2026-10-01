@@ -1946,13 +1946,12 @@ where
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
     let decode_columns = prepared.settled_at(decode_at);
     let __ws_prove = multilinear::whir_split::mark();
-    let proof = multilinear_table::multi_prove(
+    let proof = prove_epoch_argue::<H>(
         &committed,
         &config,
         &mut transcript,
         Some(prepared.opening(&borrowed, &decode_columns)),
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    )?;
     let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
     let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_epoch", __ws_wall);
     multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
@@ -1973,6 +1972,42 @@ where
         public_output,
         reg_fini,
     })
+}
+
+/// An epoch's argue and openings: today's `multi_prove`.
+///
+/// ⛔ Under `LAMBDA_VM_ARGUE_BATCHED_MEASURE=1` — a MEASUREMENT-ONLY knob that
+/// is never a default and never a production path ([`crate::argue_measure`]) —
+/// the batched argue runs instead, and the proof returned is a PLACEHOLDER: the
+/// roots and the openings, with no argue. It does not verify, and every epoch
+/// verify and level-0 harvest refuses while the knob is set. Without the
+/// base-only timing test's permit the knob is refused here.
+fn prove_epoch_argue<H>(
+    committed: &CommittedTables<'_, F, E, H>,
+    config: &ChainConfig,
+    transcript: &mut DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>,
+    prepared: Option<multilinear_table::Prepared<'_, F, H>>,
+) -> Result<MultiProof<F, E>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    if crate::argue_measure::active()? {
+        let mut batched = *config;
+        batched.format.argue = multilinear::whir_chain::ArgueFormat::Batched {
+            bin_log_cells: crate::argue_measure::bin_log_cells()?,
+        };
+        let proof =
+            multilinear_table::multi_prove_batched(committed, &batched, transcript, prepared)
+                .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        return Ok(MultiProof {
+            roots: proof.roots,
+            tables: Vec::new(),
+            columns: proof.columns,
+            preprocessed: proof.preprocessed,
+        });
+    }
+    multilinear_table::multi_prove(committed, config, transcript, prepared)
+        .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
 /// One epoch's host preparation, done ahead of its prove
@@ -2177,13 +2212,12 @@ where
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
     let decode_columns = prepared.settled_at(decode_at);
     let __ws_prove = multilinear::whir_split::mark();
-    let proof = multilinear_table::multi_prove(
+    let proof = prove_epoch_argue::<H>(
         &committed,
         &config,
         &mut transcript,
         Some(prepared.opening(&borrowed, &decode_columns)),
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    )?;
     let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
     let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_epoch", __ws_wall);
     multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
@@ -2932,6 +2966,8 @@ pub(crate) fn verify_epoch_bookend<H>(
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    // ⛔ A measurement-only run's epoch proofs carry no argue.
+    crate::argue_measure::refuse_consumers("an epoch verify")?;
     // ★ THE SAME DERIVATION THE LEVEL-0 DRIVER USES. `None` is this side's
     // answer for DECODE's preprocessed commitment, unchanged.
     let air_set = epoch_airs_for(elf, opts, epoch, register_init, is_final, label, None);

@@ -10,6 +10,8 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+/// ⛔ Measurement only: `LAMBDA_VM_ARGUE_BATCHED_MEASURE` (never a default).
+pub mod argue_measure;
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 // The block prover runs its phases on threads and rayon: a host prover, built

@@ -3257,6 +3257,424 @@ impl DeviceTree {
     }
 }
 
+/// One layer's sumcheck on the card, stepped a round at a time by its caller:
+/// the batched argue's lockstep ladder (D-BATCH B-3), where every active tree's
+/// round is summed on the host before the one shared challenge is drawn.
+///
+/// The same session [`DeviceTree::prove_layer`] opens — over the layer where it
+/// lies, the input layer written again for a tree that gave it back — with the
+/// rounds left to the caller.
+#[cfg(feature = "cuda")]
+pub struct LayerSession {
+    session: math_cuda::sumcheck::SumcheckSession,
+    /// The interpolation nodes `1..=degree`, three u64 each.
+    nodes: Vec<u64>,
+    /// A round queued by [`Self::enqueue`] and not yet read back.
+    pending: Option<usize>,
+}
+
+/// A layer session the build could not open. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct LayerSession(std::convert::Infallible);
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// Opens layer `layer`'s sumcheck under `program` at `point`, or `None`
+    /// before anything moves when the card declines.
+    pub(crate) fn layer_session<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        program: &crate::program::Program<E>,
+        degree: usize,
+    ) -> Option<LayerSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let lowered = lower(program)?;
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let mut nodes = Vec::with_capacity(degree * 3);
+        for node in 1..=degree as u64 {
+            nodes.extend_from_slice(&ext3_raw(&math::field::element::FieldElement::<E>::from(
+                node,
+            ))?);
+        }
+        let input_layer = layer + 1 == self.num_layers;
+        let session = if input_layer && self.rebuild.is_some() {
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            whir_split_bump_rebuild();
+            rebuilt.sumcheck(
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_sumcheck(
+                layer,
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        };
+        let session = session.ok()?;
+        Some(LayerSession {
+            session,
+            nodes,
+            pending: None,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn whir_split_bump_rebuild() {
+    crate::whir_split::bump(&crate::whir_split::GKR_REBUILDS);
+}
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceTree {
+    pub(crate) fn layer_session<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _program: &crate::program::Program<E>,
+        _degree: usize,
+    ) -> Option<LayerSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl LayerSession {
+    /// Variables left to bind.
+    pub(crate) fn num_vars(&self) -> usize {
+        self.session.len().trailing_zeros() as usize
+    }
+
+    /// Queues this round's launches without waiting for them, so the ladder
+    /// can queue every active tree's before it reads any back.
+    pub(crate) fn enqueue(&mut self) -> Result<(), crate::Error> {
+        if self.pending.is_none() {
+            let num_t = self
+                .session
+                .round_enqueue(&self.nodes)
+                .map_err(|_| crate::Error::DeviceFailed { stage: "round" })?;
+            self.pending = Some(num_t);
+        }
+        Ok(())
+    }
+
+    /// This round's polynomial at `1..=degree`: the queued round read back,
+    /// or queued and read back now.
+    pub(crate) fn round<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        self.enqueue()?;
+        let num_t = self.pending.take().unwrap_or(0);
+        let sums = self
+            .session
+            .round_collect(num_t)
+            .map_err(|_| crate::Error::DeviceFailed { stage: "round" })?;
+        SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        Ok(sums.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+    }
+
+    /// Binds the round's variable to `r` in every factor.
+    pub(crate) fn fold<E>(
+        &mut self,
+        r: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let raw = ext3_raw(r).ok_or(crate::Error::DeviceFailed { stage: "challenge" })?;
+        self.session
+            .fold(&raw)
+            .map_err(|_| crate::Error::DeviceFailed { stage: "fold" })
+    }
+
+    /// Every factor as the folds left it — the weight, then the four halves.
+    pub(crate) fn factors<E>(&self) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let values = session_values(&self.session).map_err(|_| crate::Error::DeviceFailed {
+            stage: "layer values",
+        })?;
+        values
+            .iter()
+            .map(|factor| {
+                crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl LayerSession {
+    pub(crate) fn num_vars(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn enqueue(&mut self) -> Result<(), crate::Error> {
+        match self.0 {}
+    }
+
+    pub(crate) fn round<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn fold<E>(
+        &mut self,
+        _r: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn factors<E>(&self) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+/// One layer's Gruen rounds ([`crate::gkr_gruen`]) on the card, stepped a
+/// round at a time by the batched argue's ladder: the card sums `H(1)`, `H(2)`
+/// (and `H(0)` where asked) of `p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi`, folding
+/// the previous challenge on the way in, and the caller's chain makes the
+/// messages. The session [`DeviceTree::prove_layer_gruen`] opens, with the
+/// rounds left to the caller.
+#[cfg(feature = "cuda")]
+pub struct GruenSession {
+    layer: math_cuda::gkr::GruenLayer,
+    lambda: [u64; 3],
+    /// A round queued by [`Self::enqueue`] and not yet read back: its rows.
+    pending: Option<u32>,
+}
+
+/// A Gruen session the build could not open. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct GruenSession(std::convert::Infallible);
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// Opens layer `layer`'s Gruen rounds at `point` under `lambda`, at most
+    /// `log2(tail)` variables left to the host, or `None` before anything
+    /// moves when the card declines.
+    pub(crate) fn gruen_session<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        lambda: &math::field::element::FieldElement<E>,
+        tail: usize,
+    ) -> Option<GruenSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let lambda = ext3_raw(lambda)?;
+        let low = tail.max(1).trailing_zeros() as usize;
+        let input_layer = layer + 1 == self.num_layers;
+        let session = if input_layer && self.rebuild.is_some() {
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            whir_split_bump_rebuild();
+            rebuilt.gruen(&raw_point, low)
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_gruen(layer, &raw_point, low)
+        };
+        Some(GruenSession {
+            layer: session.ok()?,
+            lambda,
+            pending: None,
+        })
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceTree {
+    pub(crate) fn gruen_session<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _lambda: &math::field::element::FieldElement<E>,
+        _tail: usize,
+    ) -> Option<GruenSession>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl GruenSession {
+    /// The rounds the card runs, `J`.
+    pub(crate) fn rounds(&self) -> usize {
+        self.layer.rounds()
+    }
+
+    /// Queues the next round — folding by `previous`, the last round's
+    /// challenge — without waiting for it.
+    pub(crate) fn enqueue<E>(
+        &mut self,
+        previous: Option<&math::field::element::FieldElement<E>>,
+        want_h0: bool,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        if self.pending.is_none() {
+            let failed = || crate::Error::DeviceFailed {
+                stage: "gruen round",
+            };
+            let fold_by = match previous {
+                Some(r) => Some(ext3_raw(r).ok_or_else(failed)?),
+                None => None,
+            };
+            let rows = self
+                .layer
+                .round_enqueue(fold_by.as_ref(), &self.lambda, want_h0)
+                .map_err(|_| failed())?;
+            self.pending = Some(rows);
+        }
+        Ok(())
+    }
+
+    /// The round's sums — `H(1)`, `H(2)`, then `H(0)` when asked — the queued
+    /// round read back, or queued and read back now.
+    pub(crate) fn sums<E>(
+        &mut self,
+        previous: Option<&math::field::element::FieldElement<E>>,
+        want_h0: bool,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        self.enqueue(previous, want_h0)?;
+        let rows = self.pending.take().unwrap_or(0);
+        let sums = self
+            .layer
+            .round_collect(rows)
+            .map_err(|_| crate::Error::DeviceFailed {
+                stage: "gruen round",
+            })?;
+        SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        Ok(sums.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+    }
+
+    /// After the card's last round (challenge `previous`, `None` if it ran
+    /// none): the four halves `p_lo, p_hi, q_lo, q_hi` over `2^L` cells.
+    pub(crate) fn finish<E>(
+        &mut self,
+        previous: Option<&math::field::element::FieldElement<E>>,
+    ) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let failed = || crate::Error::DeviceFailed {
+            stage: "layer values",
+        };
+        let fold_by = match previous {
+            Some(r) => Some(ext3_raw(r).ok_or_else(failed)?),
+            None => None,
+        };
+        let values = self.layer.finish(fold_by.as_ref()).map_err(|_| failed())?;
+        let cells = 1usize << self.layer.low();
+        if values.len() != 4 * cells * 3 {
+            return Err(failed());
+        }
+        values
+            .chunks_exact(cells * 3)
+            .map(|half| {
+                crate::mle::Mle::new(half.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl GruenSession {
+    pub(crate) fn rounds(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn enqueue<E>(
+        &mut self,
+        _previous: Option<&math::field::element::FieldElement<E>>,
+        _want_h0: bool,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn sums<E>(
+        &mut self,
+        _previous: Option<&math::field::element::FieldElement<E>>,
+        _want_h0: bool,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn finish<E>(
+        &mut self,
+        _previous: Option<&math::field::element::FieldElement<E>>,
+    ) -> Result<Vec<crate::mle::Mle<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
 /// The epoch's columns on the card, read by everything that would otherwise
 /// upload its own copy of them.
 #[cfg(feature = "cuda")]

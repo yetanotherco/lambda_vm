@@ -68,6 +68,8 @@ pub mod transcript_replay;
 pub mod tree_probe;
 pub mod validator;
 pub mod whir_air;
+/// The batched argue as a machine leg (D-BATCH B-4a).
+pub mod whir_batch;
 #[cfg(feature = "parallel")]
 pub mod whir_block;
 pub mod whir_bus;
@@ -197,6 +199,8 @@ mod program_shape_tests;
 mod whir_air_tests;
 #[cfg(all(test, feature = "parallel"))]
 mod whir_block_tests;
+#[cfg(test)]
+mod whir_batch_tests;
 #[cfg(test)]
 mod whir_bus_tests;
 #[cfg(test)]
