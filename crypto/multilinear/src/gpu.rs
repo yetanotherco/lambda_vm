@@ -2110,11 +2110,15 @@ pub fn argue_lean_tail() -> bool {
 static ARGUE_LEAN_TAIL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether a table's GKR input layer is written straight from its resident
-/// base columns (`LAMBDA_VM_ARGUE_GKR_INPUT`, any non-empty value other than
-/// `0`; D-BATCH M1-2): one launch for every interaction, base × ext3, where
-/// today's path runs two programs an interaction over the lifted factors. The
-/// same cells, so the same tree and proof. Off by default until its A/B; off is
-/// today's path. Read once, with a banner.
+/// base columns (D-BATCH M1-2): one launch for every interaction, base × ext3,
+/// where the old path runs two programs an interaction over the lifted factors.
+/// The same cells, so the same tree and proof. On by default;
+/// `LAMBDA_VM_ARGUE_GKR_INPUT=0` is the old path exactly. Read once, with a
+/// banner.
+///
+/// Turned on by its A/B on the block (FAST job 333, 4 + 4 arms): base −0.75 s,
+/// the argue −0.97 s, the whole run −0.73 s, the tree region 1.98 → 1.11 s,
+/// every arm on the record's program ids.
 pub fn argue_gkr_input() -> bool {
     match ARGUE_GKR_INPUT_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -2122,13 +2126,14 @@ pub fn argue_gkr_input() -> bool {
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                let on = env_on("LAMBDA_VM_ARGUE_GKR_INPUT");
+                let on = env_not_off("LAMBDA_VM_ARGUE_GKR_INPUT");
                 eprintln!(
                     "★ ARGUE GKR INPUT: {}",
                     if on {
-                        "from the base columns (LAMBDA_VM_ARGUE_GKR_INPUT=1)"
+                        "from the base columns (the default; LAMBDA_VM_ARGUE_GKR_INPUT=0 is the lifted \
+                         factors)"
                     } else {
-                        "from the lifted factors (today's)"
+                        "from the lifted factors (LAMBDA_VM_ARGUE_GKR_INPUT=0)"
                     }
                 );
                 on
@@ -2140,32 +2145,41 @@ pub fn argue_gkr_input() -> bool {
 static ARGUE_GKR_INPUT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether a table's factors stay base columns on the card, with no lift
-/// (`LAMBDA_VM_ARGUE_NO_LIFT`; D-BATCH M1-2, its second half). The input layer
-/// is written from the columns ([`argue_gkr_input`], which this needs) and the
-/// fused zerocheck's first pass reads them where they lie, so the `W·rows·24 B`
-/// lift is made only when today's rounds need it. The same rounds and proof.
-/// Off by default until its A/B.
+/// (D-BATCH M1-2, its second half). The input layer is written from the columns
+/// ([`argue_gkr_input`], which this needs) and the fused zerocheck's first pass
+/// reads them where they lie, so the `W·rows·24 B` lift is made only when the
+/// old rounds need it. The same rounds and proof. On by default;
+/// `LAMBDA_VM_ARGUE_NO_LIFT=0` lifts every table's factors as before.
+///
+/// Turned on by its A/B on the block (FAST job 335, 4 + 4 arms over the input
+/// from the columns): base −0.90 s, the whole run −1.55 s, the argue's
+/// reserved peak −1.5 GiB, kept WHIR trees evicted 13 → 2 a run and the
+/// openings' tree rebuilds 0.74 → 0.04 s, every arm on the record's program
+/// ids.
 pub fn argue_no_lift() -> bool {
-    let on = match ARGUE_NO_LIFT_FORCED.load(Ordering::Relaxed) {
-        1 => true,
+    match ARGUE_NO_LIFT_FORCED.load(Ordering::Relaxed) {
+        1 => argue_gkr_input(),
         2 => false,
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                let on = env_on("LAMBDA_VM_ARGUE_NO_LIFT");
+                let wanted = env_not_off("LAMBDA_VM_ARGUE_NO_LIFT");
+                let input = argue_gkr_input();
                 eprintln!(
                     "★ ARGUE NO LIFT: {}",
-                    if on {
-                        "on (LAMBDA_VM_ARGUE_NO_LIFT=1; with LAMBDA_VM_ARGUE_GKR_INPUT=1)"
-                    } else {
-                        "off (the factors are lifted, today's)"
+                    match (wanted, input) {
+                        (true, true) => {
+                            "on (the default, with the input from the columns; \
+                             LAMBDA_VM_ARGUE_NO_LIFT=0 lifts the factors)"
+                        }
+                        (false, _) => "off (LAMBDA_VM_ARGUE_NO_LIFT=0)",
+                        (true, false) => "off (it needs the input from the columns)",
                     }
                 );
-                on
+                wanted && input
             })
         }
-    };
-    on && argue_gkr_input()
+    }
 }
 
 static ARGUE_NO_LIFT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -5019,6 +5033,27 @@ mod tests {
         assert!(not_off(Some("")), "empty is not the opt-out");
         assert!(not_off(Some("1")));
         assert!(!not_off(Some("0")), "`0` is the opt-out");
+    }
+
+    /// The GKR input knob reads its variable the default-on way, whatever the
+    /// environment sets. ⚠ No test in this binary forces the knob, which is
+    /// what makes the reading the environment's.
+    #[test]
+    fn the_gkr_input_knob_is_on_unless_its_variable_is_zero() {
+        let variable = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
+        assert_eq!(argue_gkr_input(), not_off(variable.as_deref()));
+    }
+
+    /// No lift reads its variable the default-on way, and needs the input
+    /// from the columns.
+    #[test]
+    fn the_no_lift_knob_is_on_unless_either_variable_is_zero() {
+        let input = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
+        let variable = std::env::var("LAMBDA_VM_ARGUE_NO_LIFT").ok();
+        assert_eq!(
+            argue_no_lift(),
+            not_off(variable.as_deref()) && not_off(input.as_deref())
+        );
     }
 
     /// The tables knob reads its variable the default-on way, whatever the
