@@ -1777,7 +1777,7 @@ impl CacheMode {
 /// bare line is unattributable the moment two proofs are in flight. Silent on a
 /// LOADED stage, because nothing proved: `take_prove_split` returns `None` and
 /// there is nothing to attribute.
-fn print_prove_split(label: &str) {
+pub(super) fn print_prove_split(label: &str) {
     if let Some(split) = super::proof::take_prove_split() {
         println!(
             "   {label} LFM PROVE: execute {:.2}s · fill {:.2}s · multi_prove {:.2}s{}",
@@ -3263,13 +3263,13 @@ fn assert_the_rpx_grind_reached_the_device(stage: &str) {
 /// cannot: a level's peak is the max inside ITS OWN window rather than the
 /// process's, and the host peak can be checked for SIMULTANEITY against an
 /// external device trace. Non-simultaneous maxima must not be summed.
-struct HostSampler {
+pub(super) struct HostSampler {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<(f64, f64)>>,
 }
 
 impl HostSampler {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
@@ -3294,7 +3294,7 @@ impl HostSampler {
     }
 
     /// `(peak GiB, argmax UNIX seconds)` over this sampler's window.
-    fn stop(mut self) -> (f64, f64) {
+    pub(super) fn stop(mut self) -> (f64, f64) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.handle
             .take()
@@ -3317,7 +3317,7 @@ fn unix_now() -> f64 {
 /// reports no error, so a percentage-of-ceiling silently becomes a percentage of
 /// zero — or of a default nobody chose. Both paths are tried and a miss is
 /// LOUD; the caller must not print a percentage without a ceiling.
-fn cgroup_limit_gib() -> Result<f64, String> {
+pub(super) fn cgroup_limit_gib() -> Result<f64, String> {
     const PATHS: [&str; 2] = [
         "/sys/fs/cgroup/memory.max",                   // v2
         "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1
@@ -3365,7 +3365,11 @@ fn cgroup_limit_gib() -> Result<f64, String> {
 /// libtest's global hook files a spawned thread's own message against no test
 /// and drops it on the floor. The prover's `run_admitted` learned that the
 /// expensive way — eleven anonymous failures in one suite run.
-fn in_index_order<T: Send>(n: usize, workers: usize, task: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub(super) fn in_index_order<T: Send>(
+    n: usize,
+    workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
     let slots: Vec<std::sync::Mutex<Option<T>>> =
         (0..n).map(|_| std::sync::Mutex::new(None)).collect();
     if workers <= 1 {
@@ -3610,7 +3614,7 @@ fn in_index_order_re_raises_a_worker_panic_with_its_message() {
 /// the number of PROOFS in flight, and the card permit is what governs it. The
 /// two multiply: at `TABLE_PARALLELISM=4` and two siblings the card still sees
 /// one proof's four tables, because the permit admits one proof at a time.
-fn tree_siblings() -> usize {
+pub(super) fn tree_siblings() -> usize {
     let k = std::env::var("LFM_TREE_K").ok();
     let s = std::env::var("LFM_TREE_SIBLINGS").ok();
     resolve_siblings(k.as_deref(), s.as_deref())
@@ -3777,7 +3781,7 @@ fn l0_takes_base_decode() -> bool {
     })
 }
 
-fn tree_siblings_l0() -> usize {
+pub(super) fn tree_siblings_l0() -> usize {
     let k = std::env::var("LFM_TREE_K_L0").ok();
     let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
     resolve_siblings(k.as_deref(), s.as_deref())
@@ -3846,7 +3850,7 @@ fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
     );
 }
 
-fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
+pub(super) fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
     let (main, aux) =
         super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
     let cells = main + 3 * aux;
