@@ -218,7 +218,7 @@ kind = "template"
 tag = "ADD"
 input = ["dst", "count"]
 output = ["cast", "dst_res", "DWordWL"]
-cond = "μ"
+cond = "is_write"
 ref = "copy:c:dst_res_is_write"
 
 [[constraints.read_input]]
@@ -331,7 +331,7 @@ ref = "copy:c:zc_implies_count_is_zero"
 
 [[constraints.restrict_end]]
 kind = "arith"
-constraint = "$#`end` => #`zc` = 1 or floor.l #`count` / 2^16 floor.r = 0$"
+constraint = "$#`end` => #`zc` = 1 or floor.l #`count` / 2^32 floor.r = 0$"
 poly = ["*", "end", ["not", "zc"], ["idx", "count", 1]]
 ref = "copy:c:end_implies_count_is_step_or_zc_upper"
 
@@ -347,7 +347,7 @@ name = "copy"
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "src", "value", ["+", "timestamp", 1, "is_set"], 0, 0, ["not", "single"]]
+input = [0, "src", "value", ["+", "timestamp", "is_set"], 0, 0, ["not", "single"]]
 output = "value"
 multiplicity = ["-", "μ", "zc"]
 ref = "copy:c:read_value"
@@ -355,7 +355,7 @@ ref = "copy:c:read_value"
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
-input = [["*", 2, "is_write"], "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "single"]]
+input = [["*", 2, "is_write"], "dst", "value", ["+", "timestamp", ["-", 1, "is_set"]], 0, 0, ["not", "single"]]
 multiplicity = ["-", "μ", "zc"]
 ref = "copy:c:write_value"
 

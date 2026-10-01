@@ -15,13 +15,8 @@
 #let copy = raw(chip.name)
 
 The #copy chip copies a range of bytes from one location to another.
-This single chip serves the standard `C` memory functions `memcpy`, `memmove` and (a variation to) `memset`, as well as the `write` sycall.
-
-*Note.* Each of these four operations modifies a _variable_ number of bytes.
-To accomodate this behaviour, this chip was given an atypical design:
-it performs the first small "chunk" of the requested work in each row and 
-recursively "calls itself" on the remaining work.
-
+This single chip serves the standard `C` memory functions `memcpy`, `memmove` and 
+(a variation to#footnote[See @reading-parameters]) `memset`, as well as the `write` sycall.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -208,9 +203,11 @@ Memory Operations standard.
 This standard fixes what an accelerated `memcpy`, `memmove` and `memset` must provide.
 #footnote([Accelerated Memory Operations; eth-act/zkevm-standards, commit `a97934c`, 2026-08-11. #link("https://github.com/eth-act/zkevm-standards/blob/a97934cae02693d3b69f07a7cd6e3ed6fb5e8053/standards/accelerated-memory-operations/README.md")[[src]]])
 As requested by the standard, this chip accepts arbitrary operand alignment.
-One limitation is that this chip does not fully capture the `memset` interface just yet;
-calls to this operation will have to be wrapped by some `CPU` operations to 
-transpose to this chip's interface.
+
+Note that this chip is only an accelerator; in practice, a library with functions
+has to be made to resolve the differences in calling ABI between the
+`memset`/`memcpy`/`memmove`/`write` functions and the syscalls this chip accelerates.
+
 Moreover, the standard's fourth operation, `memcmp`, is not covered by this chip, as it does not involve copying.
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
 
