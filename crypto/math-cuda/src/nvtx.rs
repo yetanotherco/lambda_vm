@@ -35,6 +35,10 @@ mod imp {
         range_push: unsafe extern "C" fn(*const c_char) -> c_int,
         range_pop: unsafe extern "C" fn() -> c_int,
         mark: unsafe extern "C" fn(*const c_char),
+        /// Process-wide start/end ranges; `None` when the library lacks them
+        /// (push/pop keep working).
+        range_start: Option<unsafe extern "C" fn(*const c_char) -> u64>,
+        range_end: Option<unsafe extern "C" fn(u64)>,
         _lib: libloading::Library,
     }
     // SAFETY: the NVTX v2 API is thread-safe (push/pop stacks are per-thread)
@@ -82,10 +86,25 @@ mod imp {
                     )
                 };
                 if let (Ok(range_push), Ok(range_pop), Ok(mark)) = syms {
+                    // SAFETY: signatures match the NVTX v2 C API.
+                    let (range_start, range_end) = unsafe {
+                        (
+                            lib.get::<unsafe extern "C" fn(*const c_char) -> u64>(
+                                b"nvtxRangeStartA\0",
+                            )
+                            .map(|s| *s)
+                            .ok(),
+                            lib.get::<unsafe extern "C" fn(u64)>(b"nvtxRangeEnd\0")
+                                .map(|s| *s)
+                                .ok(),
+                        )
+                    };
                     return Some(Api {
                         range_push,
                         range_pop,
                         mark,
+                        range_start,
+                        range_end,
                         _lib: lib,
                     });
                 }
@@ -178,6 +197,51 @@ mod imp {
         }
     }
 
+    /// RAII process-wide NVTX range (`nvtxRangeStartA` / `nvtxRangeEnd`):
+    /// started on construction, ended on drop, on any thread. Unlike [`Range`]
+    /// it sits on no thread's stack, so every kernel launched while it is open,
+    /// from any thread, falls inside it — the window a phase whose launches come
+    /// from worker threads needs (`ncu --nvtx --nvtx-include "<name>"`, no
+    /// trailing slash, selects them).
+    pub struct ProcessRange {
+        id: Option<u64>,
+    }
+
+    impl ProcessRange {
+        #[inline]
+        pub fn new(name: &str) -> ProcessRange {
+            let id = api().and_then(|a| {
+                let start = a.range_start?;
+                a.range_end?;
+                let c =
+                    CString::new(name).unwrap_or_else(|_| CString::new("invalid-label").unwrap());
+                // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
+                Some(unsafe { start(c.as_ptr()) })
+            });
+            ProcessRange { id }
+        }
+
+        /// Like [`ProcessRange::new`] but the label is only formatted when a
+        /// profiler-visible NVTX library is actually loaded.
+        #[inline]
+        pub fn fmt<F: FnOnce() -> String>(label: F) -> ProcessRange {
+            if is_active() {
+                ProcessRange::new(&label())
+            } else {
+                ProcessRange { id: None }
+            }
+        }
+    }
+
+    impl Drop for ProcessRange {
+        fn drop(&mut self) {
+            if let (Some(id), Some(end)) = (self.id, api().and_then(|a| a.range_end)) {
+                // SAFETY: `id` came from this library's nvtxRangeStartA.
+                unsafe { end(id) };
+            }
+        }
+    }
+
     // --- CUDA profiler capture-range control -------------------------------
     //
     // cuProfilerStart/Stop gate `nsys profile --capture-range=cudaProfilerApi`,
@@ -256,6 +320,20 @@ mod imp {
         #[inline(always)]
         pub fn fmt<F: FnOnce() -> String>(_label: F) -> Range {
             Range
+        }
+    }
+
+    /// No-op stub; see the `nvtx`-feature implementation above.
+    pub struct ProcessRange;
+
+    impl ProcessRange {
+        #[inline(always)]
+        pub fn new(_name: &str) -> ProcessRange {
+            ProcessRange
+        }
+        #[inline(always)]
+        pub fn fmt<F: FnOnce() -> String>(_label: F) -> ProcessRange {
+            ProcessRange
         }
     }
 
