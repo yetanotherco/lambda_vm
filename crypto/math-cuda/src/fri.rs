@@ -17,9 +17,9 @@ use crate::device::backend;
 use crate::merkle::build_inner_tree_levels;
 
 /// Test-only fault injection. When the `test-faults` feature is on, setting
-/// this to a finite value forces the next `fold_and_commit_layer` /
-/// `fold_final` call to return Err and decrement the counter. Tests use
-/// this to exercise the CPU-fallback path in `try_fri_commit_gpu`.
+/// this to a finite value forces the next `fold_and_commit_layer` call to
+/// return Err and decrement the counter. Tests use this to exercise the
+/// CPU-fallback path in `try_fri_commit_gpu`.
 #[cfg(feature = "test-faults")]
 pub static FAULT_FOLDS_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(-1);
@@ -40,23 +40,21 @@ fn check_fault_injection() -> Result<()> {
     Ok(())
 }
 
-/// Device-side state across FRI commit iterations. Owns two ext3 eval
-/// buffers (flip-flopped as layer input / output) and the inv_twiddles
-/// buffer. Freed when dropped.
+/// Device-side state across FRI commit iterations. Owns the current fold
+/// input (the previous layer's evals) and the inv_twiddles buffer. The input
+/// is an `Arc` because the caller may also retain it as that layer's
+/// `gpu_evals` — it does so only on the device-only path, where no host copy
+/// of the evals exists. Freed when the last holder drops.
 pub struct FriCommitState {
     pub stream: Arc<CudaStream>,
-    // Ping-pong evaluation buffers. Both sized `3 * n0` u64 at init. Each
-    // successive fold uses half the space. Cheap to pre-allocate vs. per-
-    // layer alloc.
-    evals_a: CudaSlice<u64>,
-    evals_b: CudaSlice<u64>,
+    /// Current fold input. Each fold allocates a fresh output buffer that is
+    /// both returned to the caller (kept resident for the query phase) and
+    /// becomes the next fold's input.
+    current: Arc<CudaSlice<u64>>,
     /// Base-field inv_twiddles; `n0 / 2` u64 at init, halved each layer.
     inv_tw: CudaSlice<u64>,
-    /// Number of ext3 elements in the buffer currently acting as fold input
-    /// (`evals_a` or `evals_b`, selected by `a_is_input`).
+    /// Number of ext3 elements in `current`.
     pub current_n: usize,
-    /// Which buffer holds the current layer's input. Toggles each fold.
-    a_is_input: bool,
 }
 
 impl FriCommitState {
@@ -71,43 +69,63 @@ impl FriCommitState {
         let be = backend()?;
         let stream = be.next_stream();
 
-        // SAFETY: every byte of evals_a is overwritten by the H2D below.
-        // evals_b is written by the first fold before it is read.
-        let mut evals_a = unsafe { stream.alloc::<u64>(3 * n0) }?;
-        let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
-        stream.memcpy_htod(evals_host, &mut evals_a)?;
+        // SAFETY: every byte of evals is overwritten by the H2D below.
+        let mut evals = unsafe { stream.alloc::<u64>(3 * n0) }?;
+        stream.memcpy_htod(evals_host, &mut evals)?;
         let inv_tw = stream.clone_htod(inv_tw_host)?;
 
         Ok(Self {
             stream,
-            evals_a,
-            evals_b,
+            current: Arc::new(evals),
             inv_tw,
             current_n: n0,
-            a_is_input: true,
         })
     }
 
-    /// Fold the current layer using `zeta`, run the row-pair Keccak leaves
-    /// + pair-hash Merkle tree kernels on the result, and D2H:
-    ///   - the new root (32 bytes)
-    ///   - the new layer's evals (3 * (current_n / 2) u64s)
-    ///   - the new layer's Merkle tree nodes (standard layout, byte-packed)
+    /// Like [`Self::new`], but adopts a device-resident codeword (already in
+    /// FRI bit-reversed order) and its producing stream — no evals H2D.
+    pub fn new_dev(codeword: crate::deep::GpuDeepCodeword, inv_tw_host: &[u64]) -> Result<Self> {
+        let crate::deep::GpuDeepCodeword { buf, n, stream } = codeword;
+        assert!(n >= 2 && n.is_power_of_two());
+        assert_eq!(buf.len(), 3 * n);
+        assert_eq!(inv_tw_host.len(), n / 2);
+
+        let inv_tw = stream.clone_htod(inv_tw_host)?;
+
+        Ok(Self {
+            stream,
+            current: Arc::new(buf),
+            inv_tw,
+            current_n: n,
+        })
+    }
+
+    /// Fold the current layer using `zeta`, run the row-pair Keccak leaves and
+    /// pair-hash Merkle tree kernels on the result, and return the layer's
+    /// evals — device-resident Arc, plus a host copy only when `want_host` —
+    /// with its resident Merkle tree (root D2H'd, 32 bytes).
     ///
     /// Also advances the internal twiddle factors for the next layer.
+    #[allow(clippy::type_complexity)]
     pub fn fold_and_commit_layer(
         &mut self,
         zeta_raw: [u64; 3],
-    ) -> Result<(Vec<u8>, Vec<u64>, Vec<u8>)> {
+        want_host: bool,
+    ) -> Result<(
+        Option<Vec<u64>>,
+        Arc<CudaSlice<u64>>,
+        crate::lde::GpuMerkleTree,
+    )> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
         let n_in = self.current_n;
         let n_out = n_in / 2;
-        // fold_final handles the n_out == 1 last layer (no Merkle commit).
+        // n_out == 1 (terminal_len < 2) never reaches this path: `try_fri_commit_gpu`
+        // filters it out and returns None so the CPU fallback handles it.
         assert!(
             n_out >= 2,
-            "fold_and_commit_layer requires n_out >= 2; use fold_final"
+            "fold_and_commit_layer requires n_out >= 2 (n_out == 1 falls back to the CPU path)"
         );
 
         // Row-pair leaves: each leaf hashes two consecutive ext3 evals.
@@ -124,15 +142,11 @@ impl FriCommitState {
         };
         let n_out_u64 = n_out as u64;
 
-        // Split the eval buffers into (input, output) based on a_is_input.
-        // Disjoint-field borrow is fine since evals_a and evals_b are
-        // separate fields.
-        let (input_evals, output_evals): (&CudaSlice<u64>, &mut CudaSlice<u64>) = if self.a_is_input
-        {
-            (&self.evals_a, &mut self.evals_b)
-        } else {
-            (&self.evals_b, &mut self.evals_a)
-        };
+        // Fresh output buffer per layer: it is retained by the caller for the
+        // query phase and becomes the next fold's input.
+        // SAFETY: the fold kernel writes all 3 * n_out slots before any read.
+        let mut out = unsafe { self.stream.alloc::<u64>(3 * n_out) }?;
+        let input_evals: &CudaSlice<u64> = self.current.as_ref();
         unsafe {
             self.stream
                 .launch_builder(&be.fri_fold_ext3)
@@ -140,7 +154,7 @@ impl FriCommitState {
                 .arg(&n_out_u64)
                 .arg(&self.inv_tw)
                 .arg(&zeta_dev)
-                .arg(output_evals)
+                .arg(&mut out)
                 .launch(cfg)?;
         }
 
@@ -159,17 +173,10 @@ impl FriCommitState {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
-            // Leaves read from the layer's OUTPUT eval buffer (the buffer
-            // we just wrote to above).
-            let output_evals: &CudaSlice<u64> = if self.a_is_input {
-                &self.evals_b
-            } else {
-                &self.evals_a
-            };
             unsafe {
                 self.stream
                     .launch_builder(&be.keccak_fri_leaves_ext3)
-                    .arg(output_evals)
+                    .arg(&out)
                     .arg(&num_leaves_u64)
                     .arg(&mut leaves_view)
                     .launch(kcfg)?;
@@ -202,76 +209,91 @@ impl FriCommitState {
             self.inv_tw = tw_out;
         }
 
-        // Sync and D2H.
-        self.stream.synchronize()?;
-
-        // Layer evals: 3 * n_out u64 from the output buffer.
-        let layer_evals: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+        // Layer evals to host only when a host copy is wanted (fallback
+        // consumers), staged through the per-worker pinned slab (async DMA);
+        // the wait is deferred past the root copy below.
+        let n_evals = 3 * n_out;
+        let pending = if want_host {
+            Some(crate::device::async_dtoh_via(
+                &self.stream,
+                be.pinned_staging(),
+                &be.ctx,
+                &out,
+                n_evals,
+            )?)
         } else {
-            let view = self.evals_a.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+            None
         };
 
-        // Tree nodes.
-        let nodes_bytes: Vec<u8> = self.stream.clone_dtoh(&nodes_dev)?;
-        debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
+        // Keep the layer tree resident on device; copy only the 32-byte root so
+        // R4 query openings gather paths on device instead of copying the tree.
+        // This pageable copy drains the stream (including any evals DMA above),
+        // so the pending wait after it is instant — one block covers both.
+        let mut root = [0u8; 32];
+        self.stream
+            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        let layer_evals = match pending {
+            Some(p) => {
+                let mut v = vec![0u64; n_evals];
+                p.wait_into_u64(&mut v)?;
+                Some(v)
+            }
+            None => None,
+        };
 
-        let mut root = vec![0u8; 32];
-        root.copy_from_slice(&nodes_bytes[0..32]);
-
-        self.a_is_input = !self.a_is_input;
+        let out = Arc::new(out);
+        self.current = Arc::clone(&out);
         self.current_n = n_out;
 
-        Ok((root, layer_evals, nodes_bytes))
+        let tree = crate::lde::GpuMerkleTree {
+            nodes: std::sync::Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        };
+        Ok((layer_evals, out, tree))
     }
+}
 
-    /// Final fold, no Merkle commit. Returns the single ext3 output
-    /// element (the FRI last_value).
-    pub fn fold_final(&mut self, zeta_raw: [u64; 3]) -> Result<[u64; 3]> {
-        #[cfg(feature = "test-faults")]
-        check_fault_injection()?;
-        let be = backend()?;
-        let n_in = self.current_n;
-        let n_out = n_in / 2;
-        assert!(n_out >= 1);
-
-        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n_out_u64 = n_out as u64;
-
-        let (input_evals, output_evals): (&CudaSlice<u64>, &mut CudaSlice<u64>) = if self.a_is_input
-        {
-            (&self.evals_a, &mut self.evals_b)
-        } else {
-            (&self.evals_b, &mut self.evals_a)
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&be.fri_fold_ext3)
-                .arg(input_evals)
-                .arg(&n_out_u64)
-                .arg(&self.inv_tw)
-                .arg(&zeta_dev)
-                .arg(output_evals)
-                .launch(cfg)?;
-        }
-
-        self.stream.synchronize()?;
-        let out_first: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3);
-            self.stream.clone_dtoh(&view)?
-        } else {
-            let view = self.evals_a.slice(0..3);
-            self.stream.clone_dtoh(&view)?
-        };
-        self.a_is_input = !self.a_is_input;
-        self.current_n = n_out;
-        Ok([out_first[0], out_first[1], out_first[2]])
+/// Gather interleaved ext3 elements at `positions` from a resident evals
+/// buffer — a small D2H of only the queried values (the FRI query phase's
+/// `evaluation[index ^ 1]` reads).
+pub fn gather_ext3_at(
+    evals: &CudaSlice<u64>,
+    positions: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u64>> {
+    let q = positions.len();
+    if q == 0 {
+        return Ok(Vec::new());
     }
+    // Guard the kernel's device reads: a position past the evals buffer would
+    // be a silent out-of-bounds read. Positions are valid by construction;
+    // this catches a caller bug host-side before it becomes device garbage
+    // (matching `gather_merkle_paths_dev`).
+    assert!(
+        positions.iter().all(|&p| (p as usize) < evals.len() / 3),
+        "gather_ext3_at: position >= evals length"
+    );
+    let be = backend()?;
+    let pos_dev = stream.clone_htod(positions)?;
+    // SAFETY: the gather kernel writes all 3 * q slots.
+    let mut out_dev = unsafe { stream.alloc::<u64>(3 * q) }?;
+    let cfg = LaunchConfig {
+        grid_dim: ((q as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let q_u64 = q as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.gather_ext3_at)
+            .arg(evals)
+            .arg(&pos_dev)
+            .arg(&q_u64)
+            .arg(&mut out_dev)
+            .launch(cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
 }

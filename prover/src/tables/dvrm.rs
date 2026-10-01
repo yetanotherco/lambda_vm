@@ -22,25 +22,21 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
+//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
-//! - Sender: LT (×1 for abs_r < abs_d)
-//! - Sender: MUL (×2 for n_sub_r = d * q verification)
+//! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
+//!   ×2 MUL-flavored for `n - r = d * q` lo/hi)
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
-//! - Receiver: DVRM (×2 for quotient and remainder results)
+//! - Receiver: ALU (×2, on the unified bus, for quotient and remainder results)
+
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::trace::TraceTable;
 
 use std::collections::HashMap;
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
-use stark::trace::TraceTable;
-
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16,
+    BusId, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
+    NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
 };
 
 // =========================================================================
@@ -301,11 +297,14 @@ pub fn generate_dvrm_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         let q = op.compute_quotient();
         let r = op.compute_remainder();
         let n_sub_r = op.n_sub_r();
@@ -313,59 +312,41 @@ pub fn generate_dvrm_trace(
         let abs_d = op.abs_d();
 
         // Fill n as DWordHL (4 halfwords)
-        data[base + cols::N_0] = FE::from(op.n & 0xFFFF);
-        data[base + cols::N_1] = FE::from((op.n >> 16) & 0xFFFF);
-        data[base + cols::N_2] = FE::from((op.n >> 32) & 0xFFFF);
-        data[base + cols::N_3] = FE::from((op.n >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::N_0, op.n);
 
         // Fill d as DWordHL (4 halfwords)
-        data[base + cols::D_0] = FE::from(op.d & 0xFFFF);
-        data[base + cols::D_1] = FE::from((op.d >> 16) & 0xFFFF);
-        data[base + cols::D_2] = FE::from((op.d >> 32) & 0xFFFF);
-        data[base + cols::D_3] = FE::from((op.d >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::D_0, op.d);
 
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
 
         // Fill q as DWordHL (4 halfwords)
-        data[base + cols::Q_0] = FE::from(q & 0xFFFF);
-        data[base + cols::Q_1] = FE::from((q >> 16) & 0xFFFF);
-        data[base + cols::Q_2] = FE::from((q >> 32) & 0xFFFF);
-        data[base + cols::Q_3] = FE::from((q >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::Q_0, q);
 
         // Fill r as DWordHL (4 halfwords)
-        data[base + cols::R_0] = FE::from(r & 0xFFFF);
-        data[base + cols::R_1] = FE::from((r >> 16) & 0xFFFF);
-        data[base + cols::R_2] = FE::from((r >> 32) & 0xFFFF);
-        data[base + cols::R_3] = FE::from((r >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::R_0, r);
 
         // Fill auxiliary columns
-        data[base + cols::DIV_BY_ZERO] = FE::from(op.is_div_by_zero() as u64);
-        data[base + cols::OVERFLOW] = FE::from(op.is_overflow() as u64);
+        table.set_bool(row_idx, cols::DIV_BY_ZERO, op.is_div_by_zero());
+        table.set_bool(row_idx, cols::OVERFLOW, op.is_overflow());
 
-        data[base + cols::ABS_R_0] = FE::from(abs_r & 0xFFFF_FFFF);
-        data[base + cols::ABS_R_1] = FE::from(abs_r >> 32);
-
-        data[base + cols::ABS_D_0] = FE::from(abs_d & 0xFFFF_FFFF);
-        data[base + cols::ABS_D_1] = FE::from(abs_d >> 32);
+        table.set_dword_wl(row_idx, cols::ABS_R_0, abs_r);
+        table.set_dword_wl(row_idx, cols::ABS_D_0, abs_d);
 
         // Fill n_sub_r as DWordHL (4 halfwords)
-        data[base + cols::N_SUB_R_0] = FE::from(n_sub_r & 0xFFFF);
-        data[base + cols::N_SUB_R_1] = FE::from((n_sub_r >> 16) & 0xFFFF);
-        data[base + cols::N_SUB_R_2] = FE::from((n_sub_r >> 32) & 0xFFFF);
-        data[base + cols::N_SUB_R_3] = FE::from((n_sub_r >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::N_SUB_R_0, n_sub_r);
 
-        data[base + cols::SIGN_N_SUB_R] = FE::from(op.sign_n_sub_r() as u64);
-        data[base + cols::SIGN_N] = FE::from(op.sign_n() as u64);
-        data[base + cols::SIGN_D] = FE::from(op.sign_d() as u64);
-        data[base + cols::SIGN_Q] = FE::from(op.sign_q() as u64);
-        data[base + cols::SIGN_R] = FE::from(op.sign_r() as u64);
+        table.set_bool(row_idx, cols::SIGN_N_SUB_R, op.sign_n_sub_r());
+        table.set_bool(row_idx, cols::SIGN_N, op.sign_n());
+        table.set_bool(row_idx, cols::SIGN_D, op.sign_d());
+        table.set_bool(row_idx, cols::SIGN_Q, op.sign_q());
+        table.set_bool(row_idx, cols::SIGN_R, op.sign_r());
 
         // Multiplicities
-        data[base + cols::MU_Q] = FE::from(multiplicities.mu_q);
-        data[base + cols::MU_R] = FE::from(multiplicities.mu_r);
+        table.set_u64(row_idx, cols::MU_Q, multiplicities.mu_q);
+        table.set_u64(row_idx, cols::MU_R, multiplicities.mu_r);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -384,9 +365,34 @@ pub fn generate_dvrm_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
-    // DVRM-A1.i (IS_HALF[n[i]]) and DVRM-A2.i (IS_HALF[d[i]]) are assumptions:
-    // the CPU (sender) is responsible for range-checking n and d before sending
-    // to DVRM. The DVRM table does NOT send these IS_HALF lookups.
+    // -------------------------------------------------------------------------
+    // DVRM-A1.i: IS_HALF[n[i]] (×4) and DVRM-A2.i: IS_HALF[d[i]] (×4),
+    // multiplicity: μ_q + μ_r.
+    // The bus binds only the packed 32-bit words (DWordHL/DWordBL emit two
+    // words, not the four halves), so without these the input halves are free:
+    // a prover could supply non-canonical halves that re-pack to the same word
+    // yet sum to 0 in the field, forging div_by_zero (DVRM-C17 keys on the
+    // half-sum) for a nonzero denominator. Range-checking each half closes that.
+    // -------------------------------------------------------------------------
+    for col in [
+        cols::N_0,
+        cols::N_1,
+        cols::N_2,
+        cols::N_3,
+        cols::D_0,
+        cols::D_1,
+        cols::D_2,
+        cols::D_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
@@ -492,12 +498,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C2: LT[1-div_by_zero; abs_r, abs_d, 0]
-    // Verify |r| < |d| when d != 0
+    // DVRM-C2: ALU[abs_r, abs_d, opsel(LT), 1-div_by_zero, 0]
+    // Verify |r| < |d| when d != 0 (the ALU output is 1 iff abs_r < abs_d).
+    // This lookup is dispatched on the unified ALU bus with signed=0/invert=0
+    // (there is no dedicated `Lt` bus).
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::Lt,
+        BusId::Alu,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
         vec![
             // abs_r as DWordWL (2 words → 2 elements)
@@ -510,9 +518,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::ABS_D_0,
                 packing: Packing::DWordWL,
             },
-            // signed = 0 (unsigned comparison of absolute values)
-            BusValue::constant(0),
-            // lt_result = 1 - div_by_zero
+            // flags = opsel(LT) (signed=0, invert=0)
+            BusValue::constant(alu_op::LT as u64),
+            // out_lo = 1 - div_by_zero (LT result fits in the low word)
             BusValue::linear(vec![
                 LinearTerm::Constant(1),
                 LinearTerm::Column {
@@ -520,81 +528,81 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::DIV_BY_ZERO,
                 },
             ]),
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C9: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
-    // Verify n - r = d * q (lower 64 bits)
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Mul,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
-            // d as DWordHL (lhs)
-            BusValue::Packed {
-                start_column: cols::D_0,
-                packing: Packing::DWordHL,
-            },
-            // lhs_signed = signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // q as DWordHL (rhs)
-            BusValue::Packed {
-                start_column: cols::Q_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs_signed = sign_q
-            BusValue::Packed {
-                start_column: cols::SIGN_Q,
-                packing: Packing::Direct,
-            },
-            // result: n_sub_r as DWordHL (lower 64 bits of d*q)
-            BusValue::Packed {
-                start_column: cols::N_SUB_R_0,
-                packing: Packing::DWordHL,
-            },
-            // muldiv_selector = 0 (lo)
+            // out_hi = 0
             BusValue::constant(0),
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C10: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
-    // Verify upper 64 bits of d * q = sign extension of n_sub_r
+    // DVRM-C9: ALU[d, q, opsel(MUL)+32*signed+64*sign_q, n_sub_r]
+    // Verify n - r = d * q (lower 64 bits). The lookup is dispatched on the
+    // unified ALU bus with the lo selector (flags `+0`); there is no dedicated
+    // `Mul` bus.
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
+    let mul_flags = |hi: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Constant(alu_op::MUL as i64 + hi),
+            LinearTerm::Column {
+                coefficient: 32,
+                column: cols::SIGNED,
+            },
+            LinearTerm::Column {
+                coefficient: 64,
+                column: cols::SIGN_Q,
+            },
+        ])
+    };
     interactions.push(BusInteraction::sender(
-        BusId::Mul,
+        BusId::Alu,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
         vec![
-            // d as DWordHL (lhs)
+            // lhs = d as DWordHL
             BusValue::Packed {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed = signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // q as DWordHL (rhs)
+            // rhs = q as DWordHL
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed = sign_q
+            // flags = opsel(MUL) + 32*signed + 64*sign_q (lo half)
+            mul_flags(0),
+            // result = n_sub_r as DWordHL (lower 64 bits of d*q)
             BusValue::Packed {
-                start_column: cols::SIGN_Q,
-                packing: Packing::Direct,
+                start_column: cols::N_SUB_R_0,
+                packing: Packing::DWordHL,
             },
-            // result: sign extension of n_sub_r as DWordHL
-            // Each halfword = sign_n_sub_r * 65535
-            // lo32 = sign_n_sub_r * (65535 + 65535 * 2^16) = sign_n_sub_r * 0xFFFFFFFF
-            // hi32 = same
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // DVRM-C10: ALU[d, q, opsel(MUL)+32*signed+64*sign_q+128, sign_ext(n_sub_r)]
+    // Verify upper 64 bits of d * q = sign extension of n_sub_r.
+    // Dispatched on the unified ALU bus with the hi selector (flags `+128`).
+    // multiplicity: μ_q + μ_r
+    // -------------------------------------------------------------------------
+    interactions.push(BusInteraction::sender(
+        BusId::Alu,
+        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        vec![
+            // lhs = d as DWordHL
+            BusValue::Packed {
+                start_column: cols::D_0,
+                packing: Packing::DWordHL,
+            },
+            // rhs = q as DWordHL
+            BusValue::Packed {
+                start_column: cols::Q_0,
+                packing: Packing::DWordHL,
+            },
+            // flags = opsel(MUL) + 32*signed + 64*sign_q + 128 (hi half)
+            mul_flags(128),
+            // result: sign extension of n_sub_r.
+            // The MUL Alu receiver consumes the result as `Packed{HI_0, DWordHL}`
+            // → 2 elements `[HI_0 + 2^16*HI_1, HI_2 + 2^16*HI_3]`. Both equal
+            // SIGN_N_SUB_R * 0xFFFFFFFF (each halfword is SIGN_FILL when negative).
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
                 column: cols::SIGN_N_SUB_R,
@@ -603,8 +611,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
                 column: cols::SIGN_N_SUB_R,
             }]),
-            // muldiv_selector = 1 (hi)
-            BusValue::constant(1),
         ],
     ));
 
@@ -893,11 +899,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C21: Receiver for quotient result
-    // DVRM[q::DWordWL; n, d, signed, 0] with multiplicity -μ_q
+    // DVRM-C21: Quotient result on the unified ALU bus.
+    // ALU[q::DWordWL; n, d, opsel(DIVREM) + 32*signed] | μ_q  (muldiv bit 7 = 0)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_Q),
         vec![
             // n as DWordHL (4 halfwords → 2 words)
@@ -910,27 +916,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
+            // flags = DIVREM + 32*signed (quotient: muldiv selector = 0)
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::DIVREM as i64),
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+            ]),
             // q as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 0 (quotient)
-            BusValue::constant(0),
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C22: Receiver for remainder result
-    // DVRM[r::DWordWL; n, d, signed, 1] with multiplicity -μ_r
+    // DVRM-C22: Remainder result on the unified ALU bus.
+    // ALU[r::DWordWL; n, d, opsel(DIVREM) + 32*signed + 128] | μ_r  (muldiv bit 7 = 1)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Dvrm,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_R),
         vec![
             // n as DWordHL
@@ -943,18 +950,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
+            // flags = DIVREM + 32*signed + 128 (remainder: muldiv selector = 1)
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::DIVREM as i64 + 128),
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+            ]),
             // r as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::R_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 1 (remainder)
-            BusValue::constant(1),
         ],
     ));
 
@@ -962,339 +970,187 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..19.
 
-/// DVRM table constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum DvrmConstraintKind {
-    /// DVRM-A3: signed * (1 - signed) = 0
-    SignedIsBit,
-    /// DVRM-C1: (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n) = 0
-    RemainderSignMatchesNumerator,
-    /// DVRM-C4.i: (1-sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0
-    AbsRFormula(usize),
-    /// DVRM-C6.i: (1-sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0
-    AbsDFormula(usize),
-    /// DVRM-C7: signed * (1-overflow) - sign_q = 0
-    SignQFormula,
-    /// DVRM-C12.i: carry[i] * (1 - carry[i]) = 0 (virtual carries from n = n_sub_r + r)
-    CarryIsBit(usize),
-    /// DVRM-C15: sign_n_sub_r * (1-sign_n_sub_r) = 0
-    SignNSubRIsBit,
-    /// DVRM-C18b: (1-signed) * sign_n = 0
-    UnsignedSignN,
-    /// DVRM-C19b: (1-signed) * sign_r = 0
-    UnsignedSignR,
-    /// DVRM-C20b: (1-signed) * sign_d = 0
-    UnsignedSignD,
-    /// DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
-    DivByZeroQ(usize),
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// DVRM table constraint.
-pub struct DvrmConstraint {
-    constraint_idx: usize,
-    kind: DvrmConstraintKind,
-}
+/// DVRM table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the DVRM layout is fixed via `cols`).
+#[derive(Clone, Copy)]
+pub struct DvrmConstraints;
 
-impl DvrmConstraint {
-    /// Create a new DVRM constraint.
-    pub fn new(kind: DvrmConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
-    }
-
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-
-        match self.kind {
-            DvrmConstraintKind::SignedIsBit => {
-                // signed * (1 - signed) = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                &signed * (&one - &signed)
+impl DvrmConstraints {
+    /// Sign-extended QuadWL word `k` (0..4) of a halfword group:
+    /// `[hw0 + hw1·2^16, hw2 + hw3·2^16, ext, ext]`, where
+    /// `ext = sign·SIGN_FILL + sign·SIGN_FILL·2^16`.
+    fn ext_quad<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        hw: [usize; 4],
+        sign_col: usize,
+        k: usize,
+    ) -> B::Expr {
+        let shift_16 = b.const_base(SHIFT_16);
+        match k {
+            0 => {
+                let hw0 = b.main(0, hw[0]);
+                let hw1 = b.main(0, hw[1]);
+                hw0 + hw1 * shift_16
             }
-            DvrmConstraintKind::RemainderSignMatchesNumerator => {
-                // (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n) = 0
-                let r0 = step.get_main_evaluation_element(0, cols::R_0).clone();
-                let r1 = step.get_main_evaluation_element(0, cols::R_1).clone();
-                let r2 = step.get_main_evaluation_element(0, cols::R_2).clone();
-                let r3 = step.get_main_evaluation_element(0, cols::R_3).clone();
-                let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-                let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
-                let r_sum = &r0 + &r1 + &r2 + &r3;
-                &r_sum * (&sign_r - &sign_n)
+            1 => {
+                let hw2 = b.main(0, hw[2]);
+                let hw3 = b.main(0, hw[3]);
+                hw2 + hw3 * shift_16
             }
-            DvrmConstraintKind::AbsRFormula(i) => {
-                // (1-sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0
-                let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-                let abs_r_col = if i == 0 { cols::ABS_R_0 } else { cols::ABS_R_1 };
-                let abs_r = step.get_main_evaluation_element(0, abs_r_col).clone();
-
-                // r::DWordWL[i]: lo32 = r[0] + r[1]*2^16, hi32 = r[2] + r[3]*2^16
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let r_wl = if i == 0 {
-                    let r0 = step.get_main_evaluation_element(0, cols::R_0).clone();
-                    let r1 = step.get_main_evaluation_element(0, cols::R_1).clone();
-                    &r0 + &r1 * &shift_16
-                } else {
-                    let r2 = step.get_main_evaluation_element(0, cols::R_2).clone();
-                    let r3 = step.get_main_evaluation_element(0, cols::R_3).clone();
-                    &r2 + &r3 * &shift_16
-                };
-
-                (&one - &sign_r) * (&abs_r - &r_wl)
-            }
-            DvrmConstraintKind::AbsDFormula(i) => {
-                // (1-sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0
-                let sign_d = step.get_main_evaluation_element(0, cols::SIGN_D).clone();
-                let abs_d_col = if i == 0 { cols::ABS_D_0 } else { cols::ABS_D_1 };
-                let abs_d = step.get_main_evaluation_element(0, abs_d_col).clone();
-
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let d_wl = if i == 0 {
-                    let d0 = step.get_main_evaluation_element(0, cols::D_0).clone();
-                    let d1 = step.get_main_evaluation_element(0, cols::D_1).clone();
-                    &d0 + &d1 * &shift_16
-                } else {
-                    let d2 = step.get_main_evaluation_element(0, cols::D_2).clone();
-                    let d3 = step.get_main_evaluation_element(0, cols::D_3).clone();
-                    &d2 + &d3 * &shift_16
-                };
-
-                (&one - &sign_d) * (&abs_d - &d_wl)
-            }
-            DvrmConstraintKind::SignQFormula => {
-                // signed * (1-overflow) - sign_q = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let overflow = step.get_main_evaluation_element(0, cols::OVERFLOW).clone();
-                let sign_q = step.get_main_evaluation_element(0, cols::SIGN_Q).clone();
-                &signed * (&one - &overflow) - &sign_q
-            }
-            DvrmConstraintKind::CarryIsBit(i) => {
-                // Virtual carry from n = n_sub_r + r
-                // carry[i] * (1 - carry[i]) = 0
-                let carry = self.compute_carry(i, step);
-                &carry * (&one - &carry)
-            }
-            DvrmConstraintKind::SignNSubRIsBit => {
-                // sign_n_sub_r * (1 - sign_n_sub_r) = 0
-                let sign = step
-                    .get_main_evaluation_element(0, cols::SIGN_N_SUB_R)
-                    .clone();
-                &sign * (&one - &sign)
-            }
-            DvrmConstraintKind::UnsignedSignN => {
-                // (1-signed) * sign_n = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
-                (&one - &signed) * &sign_n
-            }
-            DvrmConstraintKind::UnsignedSignR => {
-                // (1-signed) * sign_r = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-                (&one - &signed) * &sign_r
-            }
-            DvrmConstraintKind::UnsignedSignD => {
-                // (1-signed) * sign_d = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_d = step.get_main_evaluation_element(0, cols::SIGN_D).clone();
-                (&one - &signed) * &sign_d
-            }
-            DvrmConstraintKind::DivByZeroQ(i) => {
-                // div_by_zero * (q[i] - 65535) = 0
-                let dbz = step
-                    .get_main_evaluation_element(0, cols::DIV_BY_ZERO)
-                    .clone();
-                let q_col = match i {
-                    0 => cols::Q_0,
-                    1 => cols::Q_1,
-                    2 => cols::Q_2,
-                    3 => cols::Q_3,
-                    _ => unreachable!(),
-                };
-                let q = step.get_main_evaluation_element(0, q_col).clone();
-                let fill = FieldElement::<F>::from(SIGN_FILL);
-                &dbz * (&q - &fill)
+            _ => {
+                // ext = sign * SIGN_FILL + sign * SIGN_FILL * 2^16
+                let sign = b.main(0, sign_col);
+                let sign_fill = b.const_base(SIGN_FILL);
+                let sign_fill2 = b.const_base(SIGN_FILL);
+                let shift_16b = b.const_base(SHIFT_16);
+                sign.clone() * sign_fill + sign * sign_fill2 * shift_16b
             }
         }
     }
 
-    /// Compute virtual carry[i] for the addition n_sub_r + r = n.
-    ///
-    /// The carries verify that n = n_sub_r + r by checking the carry chain.
-    /// We use sign-extended versions for signed arithmetic.
-    fn compute_carry<F, E>(&self, i: usize, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        let sign_fill = FieldElement::<F>::from(SIGN_FILL);
-
-        // Get n, n_sub_r, r halfwords
-        let n: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::N_0).clone(),
-            step.get_main_evaluation_element(0, cols::N_1).clone(),
-            step.get_main_evaluation_element(0, cols::N_2).clone(),
-            step.get_main_evaluation_element(0, cols::N_3).clone(),
+    /// Virtual carry[i] for `n = n_sub_r + r` (extended QuadWL, recursive chain).
+    fn carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        const N: [usize; 4] = [cols::N_0, cols::N_1, cols::N_2, cols::N_3];
+        const NSR: [usize; 4] = [
+            cols::N_SUB_R_0,
+            cols::N_SUB_R_1,
+            cols::N_SUB_R_2,
+            cols::N_SUB_R_3,
         ];
-        let nsr: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::N_SUB_R_0).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_1).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_2).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_3).clone(),
-        ];
-        let r: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::R_0).clone(),
-            step.get_main_evaluation_element(0, cols::R_1).clone(),
-            step.get_main_evaluation_element(0, cols::R_2).clone(),
-            step.get_main_evaluation_element(0, cols::R_3).clone(),
-        ];
+        const R: [usize; 4] = [cols::R_0, cols::R_1, cols::R_2, cols::R_3];
 
-        let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
-        let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-        let sign_nsr = step
-            .get_main_evaluation_element(0, cols::SIGN_N_SUB_R)
-            .clone();
+        let ext_n = Self::ext_quad(b, N, cols::SIGN_N, i);
+        let ext_r = Self::ext_quad(b, R, cols::SIGN_R, i);
+        let ext_nsr = Self::ext_quad(b, NSR, cols::SIGN_N_SUB_R, i);
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
 
-        // Build extended QuadWL values (4 words each)
-        // extended_n[0] = n[0] + n[1]*2^16
-        // extended_n[1] = n[2] + n[3]*2^16
-        // extended_n[2] = sign_n * 0xFFFFFFFF
-        // extended_n[3] = sign_n * 0xFFFFFFFF
-        let ext_n = self.build_extended_quad(&n, &sign_n, &shift_16, &sign_fill);
-        let ext_r = self.build_extended_quad(&r, &sign_r, &shift_16, &sign_fill);
-        let ext_nsr = self.build_extended_quad(&nsr, &sign_nsr, &shift_16, &sign_fill);
-
-        // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
-        // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
         if i == 0 {
-            (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32
+            // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
+            (ext_nsr + ext_r - ext_n) * inv_2_32
         } else {
-            let prev_carry = self.compute_carry(i - 1, step);
-            (&ext_nsr[i] + &ext_r[i] + &prev_carry - &ext_n[i]) * &inv_2_32
+            // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
+            let prev = Self::carry(b, i - 1);
+            (ext_nsr + ext_r + prev - ext_n) * inv_2_32
         }
     }
 
-    /// Build sign-extended QuadWL representation.
-    fn build_extended_quad<F: IsSubFieldOf<E>, E: IsField>(
-        &self,
-        halfwords: &[FieldElement<F>; 4],
-        sign: &FieldElement<F>,
-        shift_16: &FieldElement<F>,
-        sign_fill: &FieldElement<F>,
-    ) -> [FieldElement<F>; 4] {
-        let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
-        [
-            &halfwords[0] + &halfwords[1] * shift_16,
-            &halfwords[2] + &halfwords[3] * shift_16,
-            ext_word.clone(),
-            ext_word,
+    /// `r::DWordWL[i]` (i = 0 → lo32, else hi32); used generically for r or d
+    /// halfword groups.
+    fn dword_wl<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        lo: usize,
+        hi: usize,
+    ) -> B::Expr {
+        let shift_16 = b.const_base(SHIFT_16);
+        let a = b.main(0, lo);
+        let c = b.main(0, hi);
+        a + c * shift_16
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: SignedIsBit — signed * (1 - signed)
+        let signed = b.main(0, cols::SIGNED);
+        let one = b.one();
+        b.emit_base(0, signed.clone() * (one - signed));
+
+        // idx 1: RemainderSignMatchesNumerator —
+        // (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n)
+        let r0 = b.main(0, cols::R_0);
+        let r1 = b.main(0, cols::R_1);
+        let r2 = b.main(0, cols::R_2);
+        let r3 = b.main(0, cols::R_3);
+        let sign_r = b.main(0, cols::SIGN_R);
+        let sign_n = b.main(0, cols::SIGN_N);
+        let r_sum = r0 + r1 + r2 + r3;
+        b.emit_base(1, r_sum * (sign_r - sign_n));
+
+        // idx 2,3: AbsRFormula(0,1) — (1-sign_r) * (abs_r[i] - r::DWordWL[i])
+        for (off, (abs_col, lo, hi)) in [
+            (cols::ABS_R_0, cols::R_0, cols::R_1),
+            (cols::ABS_R_1, cols::R_2, cols::R_3),
         ]
-    }
-}
+        .into_iter()
+        .enumerate()
+        {
+            let sign_r = b.main(0, cols::SIGN_R);
+            let one = b.one();
+            let abs_r = b.main(0, abs_col);
+            let r_wl = Self::dword_wl(b, lo, hi);
+            b.emit_base(2 + off, (one - sign_r) * (abs_r - r_wl));
+        }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            DvrmConstraintKind::SignedIsBit => 2,
-            DvrmConstraintKind::RemainderSignMatchesNumerator => 2,
-            DvrmConstraintKind::AbsRFormula(_) => 2,
-            DvrmConstraintKind::AbsDFormula(_) => 2,
-            DvrmConstraintKind::SignQFormula => 2,
-            DvrmConstraintKind::CarryIsBit(_) => 2,
-            DvrmConstraintKind::SignNSubRIsBit => 2,
-            DvrmConstraintKind::UnsignedSignN => 2,
-            DvrmConstraintKind::UnsignedSignR => 2,
-            DvrmConstraintKind::UnsignedSignD => 2,
-            DvrmConstraintKind::DivByZeroQ(_) => 2,
+        // idx 4,5: AbsDFormula(0,1) — (1-sign_d) * (abs_d[i] - d::DWordWL[i])
+        for (off, (abs_col, lo, hi)) in [
+            (cols::ABS_D_0, cols::D_0, cols::D_1),
+            (cols::ABS_D_1, cols::D_2, cols::D_3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sign_d = b.main(0, cols::SIGN_D);
+            let one = b.one();
+            let abs_d = b.main(0, abs_col);
+            let d_wl = Self::dword_wl(b, lo, hi);
+            b.emit_base(4 + off, (one - sign_d) * (abs_d - d_wl));
+        }
+
+        // idx 6: SignQFormula — signed * (1-overflow) - sign_q
+        let signed = b.main(0, cols::SIGNED);
+        let overflow = b.main(0, cols::OVERFLOW);
+        let sign_q = b.main(0, cols::SIGN_Q);
+        let one = b.one();
+        b.emit_base(6, signed * (one - overflow) - sign_q);
+
+        // idx 7..11: CarryIsBit(0..4) — carry[i] * (1 - carry[i])
+        for i in 0..4 {
+            let carry = Self::carry(b, i);
+            let one = b.one();
+            b.emit_base(7 + i, carry.clone() * (one - carry));
+        }
+
+        // idx 11: SignNSubRIsBit — sign_n_sub_r * (1 - sign_n_sub_r)
+        let sign = b.main(0, cols::SIGN_N_SUB_R);
+        let one = b.one();
+        b.emit_base(11, sign.clone() * (one - sign));
+
+        // idx 12: UnsignedSignN — (1-signed) * sign_n
+        let signed = b.main(0, cols::SIGNED);
+        let sign_n = b.main(0, cols::SIGN_N);
+        let one = b.one();
+        b.emit_base(12, (one - signed) * sign_n);
+
+        // idx 13: UnsignedSignR — (1-signed) * sign_r
+        let signed = b.main(0, cols::SIGNED);
+        let sign_r = b.main(0, cols::SIGN_R);
+        let one = b.one();
+        b.emit_base(13, (one - signed) * sign_r);
+
+        // idx 14: UnsignedSignD — (1-signed) * sign_d
+        let signed = b.main(0, cols::SIGNED);
+        let sign_d = b.main(0, cols::SIGN_D);
+        let one = b.one();
+        b.emit_base(14, (one - signed) * sign_d);
+
+        // idx 15..19: DivByZeroQ(0..4) — div_by_zero * (q[i] - 65535)
+        let q_cols = [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3];
+        for (i, &q_col) in q_cols.iter().enumerate() {
+            let dbz = b.main(0, cols::DIV_BY_ZERO);
+            let q = b.main(0, q_col);
+            let fill = b.const_base(SIGN_FILL);
+            b.emit_base(15 + i, dbz * (q - fill));
         }
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the DVRM table.
-///
-/// Returns: (constraints, next_constraint_idx)
-pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut constraints = Vec::new();
-
-    // DVRM-A3: signed is bit
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignedIsBit, idx));
-    idx += 1;
-
-    // DVRM-C1: remainder sign matches numerator sign
-    constraints.push(DvrmConstraint::new(
-        DvrmConstraintKind::RemainderSignMatchesNumerator,
-        idx,
-    ));
-    idx += 1;
-
-    // DVRM-C4: abs_r formula (×2)
-    for i in 0..2 {
-        constraints.push(DvrmConstraint::new(DvrmConstraintKind::AbsRFormula(i), idx));
-        idx += 1;
-    }
-
-    // DVRM-C6: abs_d formula (×2)
-    for i in 0..2 {
-        constraints.push(DvrmConstraint::new(DvrmConstraintKind::AbsDFormula(i), idx));
-        idx += 1;
-    }
-
-    // DVRM-C7: sign_q formula
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignQFormula, idx));
-    idx += 1;
-
-    // DVRM-C12.i: carry is bit (×4)
-    for i in 0..4 {
-        constraints.push(DvrmConstraint::new(DvrmConstraintKind::CarryIsBit(i), idx));
-        idx += 1;
-    }
-
-    // DVRM-C15: sign_n_sub_r is bit
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignNSubRIsBit, idx));
-    idx += 1;
-
-    // DVRM-C18b: unsigned sign_n = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignN, idx));
-    idx += 1;
-
-    // DVRM-C19b: unsigned sign_r = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignR, idx));
-    idx += 1;
-
-    // DVRM-C20b: unsigned sign_d = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignD, idx));
-    idx += 1;
-
-    // DVRM-C16.i: div_by_zero implies q = all 1s (×4)
-    for i in 0..4 {
-        constraints.push(DvrmConstraint::new(DvrmConstraintKind::DivByZeroQ(i), idx));
-        idx += 1;
-    }
-
-    (constraints, idx)
 }

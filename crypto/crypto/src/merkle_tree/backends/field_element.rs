@@ -34,7 +34,7 @@ where
 
     fn hash_data(input: &FieldElement<F>) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input.as_bytes());
+        input.stream_bytes(&mut |b| hasher.update(b));
         hasher.finalize().into()
     }
 

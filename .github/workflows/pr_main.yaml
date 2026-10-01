@@ -37,6 +37,17 @@ jobs:
       - name: Run lint checks
         run: make lint
 
+      - name: Check ethrex fixture checksums
+        run: make check-ethrex-fixture-checksums
+
+      # The benchmark comment harness: verifies every steps.X.outputs.Y consumed in
+      # benchmark-pr.yml has a producer (the orphaned-wiring class that once broke
+      # /bench-growth silently), then renders the full comment scenario suite.
+      # Pure node, no dependencies, ~10 s. Lives in Lint so it runs on every PR —
+      # a path filter would have to enumerate every file that can break the wiring.
+      - name: Check benchmark comment wiring
+        run: node scripts/render_bench_comment.js
+
   test-executor:
     name: Executor tests
     runs-on: ubuntu-latest
@@ -53,6 +64,18 @@ jobs:
         with:
           shared-key: "lambda-vm-test"
           cache-all-crates: "true"
+          # ethrex-tests is a detached workspace (own Cargo.lock, own target dir), so
+          # the default `. -> target` misses it and its release tree would rebuild
+          # from scratch every run. `cache-all-crates` only covers the registry, not
+          # compiled artifacts.
+          #
+          # ethrex-block-converter is deliberately NOT here: this job no longer builds it.
+          # That workspace is the expensive one (~335 packages, including the blst,
+          # c-kzg and secp256k1-sys C builds, malachite and ark-ff/asm) and it now
+          # builds only in ethrex-block-converter.yml, which carries its own cache entry.
+          workspaces: |
+            . -> target
+            tooling/ethrex-tests -> target
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs
@@ -94,38 +117,114 @@ jobs:
         run: |
           cargo test --release -p executor --test flamegraph
 
+      # The unit tests under `executor/src/tests/` are a *lib* target (`pub mod tests;`
+      # in lib.rs), which none of the `--test <name>` steps above select — and the
+      # `test_ckzg` step below filters by name, so it doesn't run them either. Without
+      # this step they never run in CI. It shares the lib test binary with that step,
+      # so it costs a test run, not an extra compile.
+      - name: Run executor lib unit tests
+        run: |
+          cargo test --release -p executor --lib
+
       - name: Run ignored executor tests
         run: |
-          make prepare-test-data
-          cargo test --release -p executor test_ethrex -- --ignored
           cargo test --release -p executor test_ckzg -- --ignored
 
+      # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
+      # workspace (ethrex pins rkyv's `unaligned` feature, which must not
+      # feature-unify with the main workspace's aligned proof format), so run
+      # them from that directory to use its isolated Cargo.lock. The guest ELF
+      # and committed fixtures are already present from the steps above.
+      # --include-ignored also runs the heavier synthetic-block test.
+      #
+      # `--skip test_ethrex_real_block` is a substring match, so it drops BOTH
+      # real-block tests (the `_vm` and `_native` ones) and with them this job's need
+      # for the real-block fixture. That fixture is a benchmark input: it has to be
+      # right once, not on every PR, and fetching plus screening it here put a network
+      # download and a ~335-package build in the required gate for an artifact with no
+      # bearing on correctness. Both moved to ethrex-block-converter.yml, which runs when
+      # the converter or the block pin actually changes. `no_kzg_backend_linked` still
+      # runs here — it is a pure unit test, and it is the property the real-block
+      # screen over there depends on.
+      #
+      # This is `make test-ethrex-offline` spelled out, matching the other test steps
+      # in this job: they all bypass make so its dependency check cannot decide the
+      # cache-restored ELFs are stale and trigger a rebuild.
+      - name: Run ethrex host-reference tests (detached workspace)
+        run: |
+          cd tooling/ethrex-tests && \
+            cargo test --release -- --include-ignored --skip test_ethrex_real_block
+
+  test-cli:
+    name: CLI tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-cli-test"
+          cache-all-crates: "true"
+
+      - name: Run CLI tests
+        run: cargo test -p cli
+
+      - name: Run syscalls host tests (allocator + keccak differential vs sha3)
+        run: make test-syscalls
+
+      # The dlmalloc fallback is feature-selected, so nothing else in CI compiles it and it
+      # can rot silently. Its tests run here too.
+      - name: Test the dlmalloc guest allocator fallback
+        run: |
+          cd syscalls
+          cargo test --features dlmalloc-alloc
+          cargo test --release --features dlmalloc-alloc
+
+      - name: Run ethrex-crypto host tests (hint verify-then-fallback + ecrecover)
+        run: make test-ethrex-crypto
+
   # "Test" is a required check — keep this name to avoid branch protection changes.
-  # This gate job passes only when executor tests AND all prover shards succeed.
+  # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-prover, test-disk-spill]
+    needs: [test-executor, test-cli, test-prover, test-disk-spill, test-stark-cuda-lib]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
           executor="${{ needs.test-executor.result }}"
+          cli="${{ needs.test-cli.result }}"
           prover="${{ needs.test-prover.result }}"
           disk_spill="${{ needs.test-disk-spill.result }}"
+          stark_cuda_lib="${{ needs.test-stark-cuda-lib.result }}"
 
           echo "test-executor: $executor"
+          echo "test-cli: $cli"
           echo "test-prover: $prover"
           echo "test-disk-spill: $disk_spill"
+          echo "test-stark-cuda-lib: $stark_cuda_lib"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$cli" != "success" && "$cli" != "skipped" ]]; then
             exit 1
           fi
           if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
             exit 1
           fi
           if [[ "$disk_spill" != "success" && "$disk_spill" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$stark_cuda_lib" != "success" && "$stark_cuda_lib" != "skipped" ]]; then
             exit 1
           fi
 
@@ -188,6 +287,33 @@ jobs:
         run: |
           cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
+  test-stark-cuda-lib:
+    name: Stark cuda-feature lib tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-stark-cuda-lib"
+          cache-all-crates: "true"
+
+      # The cuda feature gates the logup_gpu module, whose descriptor /
+      # CPU-mirror parity tests are pure CPU (they never touch the driver).
+      # Without nvcc the kernels build as empty PTX stubs, so these run on a
+      # plain runner; GPU-dependent tests are #[ignore] and stay skipped.
+      # Scoped to logup_gpu: the rest of the cuda-feature lib suite dispatches
+      # to the GPU and needs the CUDA driver.
+      - name: Run stark logup_gpu parity tests (no GPU required)
+        run: |
+          cargo test --release -p stark --features cuda --lib logup_gpu
+
   build-prover-tests:
     name: Build prover tests
     runs-on: ubuntu-latest
@@ -213,7 +339,7 @@ jobs:
       - name: Build and archive prover + crypto tests
         run: |
           cargo nextest archive --release \
-            -p lambda-vm-prover -p stark -p crypto \
+            -p lambda-vm-prover -p stark -p crypto -p ecsm \
             --archive-file prover-tests.tar.zst
 
       - name: Upload test archive
@@ -271,6 +397,24 @@ jobs:
         run: |
           make compile-programs-rust
 
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
+
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
@@ -282,6 +426,15 @@ jobs:
           name: prover-tests
 
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        # Shard 1 only: force k > 1 so the per-table admission scheduler really
+        # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
+        # and table_parallelism() defaults to (cores / 3).max(1), so every
+        # other shard proves with a single driver thread and never exercises
+        # the concurrent path or VramGate's blocking path on a PR. The other
+        # three shards keep the default-k coverage. An empty value on those
+        # fails to parse and falls back to the default, so this is inert there.
+        env:
+          TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
@@ -343,12 +496,30 @@ jobs:
         with:
           name: prover-tests
 
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
+
       - name: Run comprehensive prover tests
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
             --test-threads=1 \
-            -E 'test(test_prove_elfs_all_instructions_64_full)' \
+            -E 'test(test_prove_elfs_all_instructions_64_full) | test(test_recursion_execute)' \
             --run-ignored ignored-only
 
   # Seed ELF caches on refs/heads/main so merge-queue runs can restore them.
@@ -397,3 +568,20 @@ jobs:
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: make compile-programs-rust
+
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: make compile-recursion-elfs

@@ -1,4 +1,4 @@
-use sha3::Keccak256;
+use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 
 use super::{
     field_element::FieldElementBackend,

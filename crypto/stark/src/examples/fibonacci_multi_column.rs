@@ -3,7 +3,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraintEvaluator,
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -15,108 +18,45 @@ use math::field::{
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
-/// Transition constraint for a single Fibonacci column.
-/// Enforces: col[i+2] = col[i+1] + col[i]
-#[derive(Clone)]
-pub struct FibColumnConstraint<F, E>
-where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    column_idx: usize,
-    constraint_idx: usize,
-    phantom_f: PhantomData<F>,
-    phantom_e: PhantomData<E>,
-}
-
-impl<F, E> FibColumnConstraint<F, E>
-where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    pub fn new(column_idx: usize, constraint_idx: usize) -> Self {
-        Self {
-            column_idx,
-            constraint_idx,
-            phantom_f: PhantomData,
-            phantom_e: PhantomData,
-        }
-    }
-}
-
-impl<F, E> TransitionConstraintEvaluator<F, E> for FibColumnConstraint<F, E>
-where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        2
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let step_0 = frame.get_evaluation_step(0);
-                let step_1 = frame.get_evaluation_step(1);
-                let step_2 = frame.get_evaluation_step(2);
-
-                // Get the values from the column at each step
-                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
-                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
-                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
-
-                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-                let res = a2 - a1 - a0;
-
-                transition_evaluations[self.constraint_idx] = res.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let step_0 = frame.get_evaluation_step(0);
-                let step_1 = frame.get_evaluation_step(1);
-                let step_2 = frame.get_evaluation_step(2);
-
-                // Get the values from the column at each step
-                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
-                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
-                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
-
-                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-                let res = a2 - a1 - a0;
-
-                transition_evaluations[self.constraint_idx] = res;
-            }
-        }
-    }
-}
-
 /// Public inputs for the multi-column Fibonacci AIR.
 /// Contains the initial values (first two elements) for each column.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct FibonacciMultiColumnPublicInputs<F: IsFFTField> {
     /// Initial values for each column: (a0, a1) pairs
     pub initial_values: Vec<(FieldElement<F>, FieldElement<F>)>,
+}
+
+/// Single-body [`ConstraintSet`] for [`FibonacciMultiColumnAIR`]: one
+/// Fibonacci constraint per column, written once against the
+/// [`ConstraintBuilder`].
+pub struct FibonacciMultiColumnConstraints {
+    pub num_columns: usize,
+}
+
+impl<F, E> ConstraintSet<F, E> for FibonacciMultiColumnConstraints
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        for col in 0..self.num_columns {
+            let a0 = b.main(0, col);
+            let a1 = b.main(1, col);
+            let a2 = b.main(2, col);
+            // idx col: column col's a_{j+2} = a_{j+1} + a_j; reads two next rows
+            // ⇒ 2 end exemptions.
+            b.emit_base_rows(col, RowDomain::except_last(2), a2 - a1 - a0);
+        }
+    }
 }
 
 /// Multi-column Fibonacci AIR.
@@ -127,8 +67,9 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
+    meta: Vec<ConstraintMeta>,
     num_columns: usize,
+    phantom: PhantomData<(F, E)>,
 }
 
 impl<F, E> AIR for FibonacciMultiColumnAIR<F, E>
@@ -153,8 +94,46 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> {
-        &self.constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &FibonacciMultiColumnConstraints {
+                num_columns: self.num_columns,
+            },
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &FibonacciMultiColumnConstraints {
+                num_columns: self.num_columns,
+            },
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&ConstraintSet::<F, E>::meta(
+            &FibonacciMultiColumnConstraints {
+                num_columns: self.num_columns,
+            },
+        ))
     }
 
     fn boundary_constraints(
@@ -201,25 +180,20 @@ where
 {
     /// Creates a new multi-column Fibonacci AIR with the specified number of columns.
     pub fn with_num_columns(proof_options: &ProofOptions, num_columns: usize) -> Self {
-        // Create one constraint per column
-        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = (0..num_columns)
-            .map(|col_idx| {
-                Box::new(FibColumnConstraint::new(col_idx, col_idx))
-                    as Box<dyn TransitionConstraintEvaluator<F, E>>
-            })
-            .collect();
+        let meta = ConstraintSet::<F, E>::meta(&FibonacciMultiColumnConstraints { num_columns });
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: num_columns,
             transition_offsets: vec![0, 1, 2],
-            num_transition_constraints: num_columns,
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
-            constraints,
+            meta,
             num_columns,
+            phantom: PhantomData,
         }
     }
 }

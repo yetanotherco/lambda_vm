@@ -1,10 +1,7 @@
 //! Tests for the 64-bit VM constraint templates.
 
-use crate::constraints::templates::{
-    AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint, SHIFT_32, new_is_bit_constraints,
-};
+use crate::constraints::templates::{AddLinearTerm, AddOperand, SHIFT_32};
 use crate::tables::types::FE;
-use stark::constraints::transition::TransitionConstraint;
 
 // =========================================================================
 // Basic tests
@@ -17,43 +14,6 @@ fn test_inv_2_32() {
     let inv = two_32.inv().expect("Should be invertible");
     let product = two_32 * inv;
     assert_eq!(product, FE::one());
-}
-
-#[test]
-fn test_is_bit_constraint_degree() {
-    // Conditional: degree 3
-    let conditional = IsBitConstraint::new(0, 1, 0);
-    assert_eq!(conditional.degree(), 3);
-
-    // Unconditional: degree 2
-    let unconditional = IsBitConstraint::unconditional(1, 0);
-    assert_eq!(unconditional.degree(), 2);
-}
-
-#[test]
-fn test_add_constraint_degree() {
-    let (c0, c1) = AddConstraint::new_pair(
-        vec![0],
-        AddOperand::dword(1),
-        AddOperand::dword(3),
-        AddOperand::dword(5),
-        0,
-    );
-    assert_eq!(c0.degree(), 3);
-    assert_eq!(c1.degree(), 3);
-}
-
-#[test]
-fn test_add_constraint_indices() {
-    let (c0, c1) = AddConstraint::new_pair(
-        vec![0],
-        AddOperand::dword(1),
-        AddOperand::dword(3),
-        AddOperand::dword(5),
-        10,
-    );
-    assert_eq!(c0.constraint_idx(), 10);
-    assert_eq!(c1.constraint_idx(), 11);
 }
 
 // =========================================================================
@@ -184,25 +144,6 @@ fn test_carry_max_values() {
     let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     assert_eq!(carry, FE::one());
-}
-
-// =========================================================================
-// Helper function tests
-// =========================================================================
-
-#[test]
-fn test_new_is_bit_constraints_count() {
-    let (constraints, next_idx) = new_is_bit_constraints(&[1, 2, 3, 4], 10);
-    assert_eq!(constraints.len(), 4);
-    assert_eq!(next_idx, 14);
-}
-
-#[test]
-fn test_new_is_bit_constraints_indices() {
-    let (constraints, _) = new_is_bit_constraints(&[5, 6, 7], 100);
-    assert_eq!(constraints[0].constraint_idx(), 100);
-    assert_eq!(constraints[1].constraint_idx(), 101);
-    assert_eq!(constraints[2].constraint_idx(), 102);
 }
 
 // =========================================================================
@@ -366,14 +307,14 @@ fn test_add_operand_linear_with_negative_coefficient() {
     // Test linear operand with negative coefficient: 4 - 2*c
     // This represents expressions like `4 - 2 * c_type_instruction`
     let op = AddOperand::linear(
-        vec![
+        &[
             AddLinearTerm::Constant(4),
             AddLinearTerm::Column {
                 coefficient: -2,
                 column: 0,
             },
         ],
-        vec![], // hi = 0
+        &[], // hi = 0
     );
     match op {
         AddOperand::Linear { lo, hi } => {
@@ -403,7 +344,7 @@ fn test_add_operand_linear_with_negative_coefficient() {
 fn test_add_operand_linear_with_nonzero_hi() {
     // Test linear operand with non-trivial hi terms (virtual column case)
     let op = AddOperand::linear(
-        vec![
+        &[
             AddLinearTerm::Column {
                 coefficient: 1 << 16,
                 column: 0,
@@ -417,7 +358,7 @@ fn test_add_operand_linear_with_nonzero_hi() {
                 column: 2,
             },
         ],
-        vec![
+        &[
             AddLinearTerm::Column {
                 coefficient: 1 << 16,
                 column: 3,
@@ -512,156 +453,35 @@ fn test_dword_bl_repack_formula() {
 // CPU Constraints tests
 // =========================================================================
 
-use crate::constraints::cpu::{
-    Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
-    EbreakConstraint, ExtBitZeroConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint,
-    create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
-    create_slt_res_zero_constraints,
-};
-
+use crate::constraints::cpu::{BIT_FLAG_COLUMNS, CpuConstraints, NUM_CPU_CONSTRAINTS};
 use crate::tables::cpu::cols as cpu_cols;
+use stark::constraints::builder::{ConstraintSet, num_base_from_meta};
 
 #[test]
 fn test_cpu_bit_flag_columns_count() {
-    // Should have 34 bit flag columns (includes read_register1, read_register2, inline-pc columns)
-    assert_eq!(BIT_FLAG_COLUMNS.len(), 34);
+    // 10 top-level flags + pc_double_read + prev_pc_timestamp_borrow + non_padding.
+    assert_eq!(BIT_FLAG_COLUMNS.len(), 12);
 }
 
 #[test]
 fn test_cpu_bit_flag_columns_valid() {
-    // All columns should be valid CPU column indices
     for &col in BIT_FLAG_COLUMNS {
         assert!(col < cpu_cols::NUM_COLUMNS, "Column {} out of range", col);
     }
 }
 
 #[test]
-fn test_create_is_bit_constraints() {
-    let (constraints, next_idx) = create_is_bit_constraints(0);
-
-    assert_eq!(constraints.len(), 34);
-    assert_eq!(next_idx, 34);
-
-    // Check constraint indices are sequential
-    for (i, c) in constraints.iter().enumerate() {
-        assert_eq!(c.constraint_idx(), i);
-    }
-}
-
-#[test]
-fn test_create_add_constraints() {
-    let (constraints, next_idx) = create_add_constraints(0);
-
-    // Should create 4 constraints: 2 for ADD+LOAD, 2 for STORE (res = arg1 + imm)
-    assert_eq!(constraints.len(), 4);
-    assert_eq!(next_idx, 4);
-
-    assert_eq!(constraints[0].constraint_idx(), 0);
-    assert_eq!(constraints[1].constraint_idx(), 1);
-    assert_eq!(constraints[2].constraint_idx(), 2);
-    assert_eq!(constraints[3].constraint_idx(), 3);
-}
-
-#[test]
-fn test_create_slt_res_zero_constraints() {
-    let (constraints, next_idx) = create_slt_res_zero_constraints(0);
-
-    // Should create 7 constraints (for bytes 1-7)
-    assert_eq!(constraints.len(), 7);
-    assert_eq!(next_idx, 7);
-
-    for (i, c) in constraints.iter().enumerate() {
-        assert_eq!(c.constraint_idx(), i);
-    }
-}
-
-#[test]
-fn test_branch_cond_constraint_degree() {
-    let c = BranchCondConstraint::new(0);
-    assert_eq!(c.degree(), 3);
-}
-
-#[test]
-fn test_ebreak_constraint_degree() {
-    let c = EbreakConstraint::new(0);
-    assert_eq!(c.degree(), 1);
-}
-
-#[test]
-fn test_arg1_lower_constraint_degree() {
-    let c = Arg1LowerConstraint::new(0);
-    assert_eq!(c.degree(), 1);
-}
-
-#[test]
-fn test_arg1_upper_constraint_degree() {
-    let c = Arg1UpperConstraint::new(0);
-    assert_eq!(c.degree(), 3);
-}
-
-#[test]
-fn test_ext_bit_zero_constraint_degree() {
-    let c = ExtBitZeroConstraint::new(0, cpu_cols::RV1_EXT_BIT);
-    assert_eq!(c.degree(), 2);
-}
-
-#[test]
-fn test_next_pc_add_constraint_degree() {
-    let c = NextPcAddConstraint::new(0, 0);
-    assert_eq!(c.degree(), 3);
-}
-
-#[test]
-fn test_next_pc_add_constraint_new_pair() {
-    let (c0, c1) = NextPcAddConstraint::new_pair(10);
-    assert_eq!(c0.constraint_idx(), 10);
-    assert_eq!(c1.constraint_idx(), 11);
-}
-
-#[test]
-fn test_create_all_cpu_constraints() {
-    let (is_bit, add, other, total) = create_all_cpu_constraints();
-
-    assert_eq!(is_bit.len(), 34);
-    // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
-    assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
-    assert_eq!(other.len(), 26);
-
-    // Total should be 34 + 8 + 26 = 68
-    assert_eq!(total, 68);
-    assert_eq!(total, NUM_CPU_CONSTRAINTS);
-}
-
-#[test]
-fn test_cpu_constraint_indices_are_unique() {
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
-
-    let mut indices: Vec<usize> = Vec::new();
-
-    for c in &is_bit {
-        indices.push(c.constraint_idx());
-    }
-    for c in &add {
-        indices.push(c.constraint_idx());
-    }
-    for c in &other {
-        indices.push(c.constraint_idx());
-    }
-
-    // Check no duplicates
-    indices.sort();
-    for i in 1..indices.len() {
-        assert_ne!(
-            indices[i],
-            indices[i - 1],
-            "Duplicate constraint index: {}",
-            indices[i]
+fn test_cpu_constraint_set_meta_is_dense_all_base() {
+    // The CPU single-source set declares exactly NUM_CPU_CONSTRAINTS base
+    // constraints, dense and idx-ordered (per-constraint degrees and the
+    // folder-vs-capture faithfulness are covered by constraint_set_tests_b).
+    let meta = CpuConstraints.meta();
+    assert_eq!(meta.len(), NUM_CPU_CONSTRAINTS);
+    assert_eq!(num_base_from_meta(&meta), NUM_CPU_CONSTRAINTS);
+    for (i, m) in meta.iter().enumerate() {
+        assert_eq!(
+            m.constraint_idx, i,
+            "constraint indices cover 0..N in order"
         );
-    }
-
-    // Check sequential
-    for (i, &idx) in indices.iter().enumerate() {
-        assert_eq!(idx, i, "Expected index {} but got {}", i, idx);
     }
 }

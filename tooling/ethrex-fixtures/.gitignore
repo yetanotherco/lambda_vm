@@ -1,0 +1,3 @@
+/target
+# Transient in-memory store path created by the generator (see src/main.rs).
+.ethrex-fixtures-tmp/

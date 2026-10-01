@@ -2,16 +2,13 @@ use super::domain::Domain;
 use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
-use crate::lookup::{LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
+use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
-use math::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, IsField},
-    },
-    polynomial::Polynomial,
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField},
 };
 
 /// Validates that the trace is valid with respect to the supplied AIR constraints.
@@ -53,19 +50,6 @@ pub fn validate_trace<
     let lde_trace =
         LDETraceTable::from_columns(main_trace_columns, aux_trace_columns, air.step_size(), 1);
 
-    let periodic_columns: Vec<_> = air
-        .get_periodic_column_polynomials(domain.interpolation_domain_size)
-        .iter()
-        .map(|poly| {
-            Polynomial::<FieldElement<Field>>::evaluate_fft::<Field>(
-                poly,
-                1,
-                Some(domain.interpolation_domain_size),
-            )
-            .unwrap()
-        })
-        .collect();
-
     // --------- VALIDATE BOUNDARY CONSTRAINTS ------------
     let trace_length = domain.interpolation_domain_size;
     air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length)
@@ -89,12 +73,11 @@ pub fn validate_trace<
         });
 
     // --------- VALIDATE TRANSITION CONSTRAINTS -----------
-    let n_transition_constraints = air.context().num_transition_constraints;
-    let exemption_steps: Vec<usize> =
-        std::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
-            .zip(air.transition_constraints())
-            .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
-            .collect();
+    let exemption_steps: Vec<usize> = air
+        .constraints_meta()
+        .iter()
+        .map(|m| lde_trace.num_steps() - m.end_exemptions)
+        .collect();
 
     let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
         if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
@@ -117,20 +100,13 @@ pub fn validate_trace<
     };
 
     // Iterate over trace and compute transitions
-    let packing_shifts = PackingShifts::<Field>::new();
     for step in 0..lde_trace.num_steps() {
         let frame = Frame::read_step_from_lde(&lde_trace, step, &air.context().transition_offsets);
-        let periodic_values: Vec<_> = periodic_columns
-            .iter()
-            .map(|col| col[step].clone())
-            .collect();
         let transition_evaluation_context = TransitionEvaluationContext::new_prover(
-            &frame,
-            &periodic_values,
+            frame.as_row_frame(),
             rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
-            &packing_shifts,
         );
         let evaluations = air.compute_transition(&transition_evaluation_context);
 

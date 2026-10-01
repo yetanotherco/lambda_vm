@@ -1,5 +1,12 @@
 [workspace]
 
+# Thin LTO measurably lowers executed guest cycles (~2.3% on the committed
+# ethrex_bench fixtures) at a small ELF-size cost, which is free in this VM
+# (execution is priced per executed instruction, not by ELF size). Cargo's
+# release default is lto = false / codegen-units = 16.
+[profile.release]
+lto = "thin"
+
 [package]
 name = "ethrex"
 version = "0.1.0"
@@ -7,16 +14,24 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "a9de3e8b405dbf406cac31b930fd1ffdc216a429", package="guest_program", default-features = false, features=["c-kzg"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
-c-kzg = { version = "2.1.1", features = ["eip-7594"] }
+# LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
+# lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
+# and don't require an ethrex PR.
+lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
+# Pinned by immutable `rev` to a commit on the open LambdaVM-backend PR branch
+# (feat/lambdavm-prover-backend) of ethrex; re-pin to the merge commit once it
+# lands on ethrex `main`. The `lambdavm` feature is kept only for its dependency
+# wiring (`ProgramInput`/`execution_program`/`ProgramOutput::encode` + pure-Rust
+# crypto defaults); ethrex's own `LambdaVmCrypto` compiles unused — we inject our
+# own. KZG is NOT linked under this feature, so the point-evaluation precompile
+# (0x0a) is unsupported — see src/main.rs.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+# Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
+# executor test reader so the rkyv ProgramInput layout stays consistent.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-[patch.crates-io]
-c-kzg = { git = "https://github.com/risc0/c-kzg-4844", tag = "c-kzg/v2.1.1-risczero.0" }
-
-# Route ethrex's crypto through the lambda-vm keccak precompile (riscv64).
-# Replaces the upstream ethrex-crypto crate (whose keccak is tiny-keccak/software)
-# with a local copy whose keccak module calls the keccak_permute syscall on the
-# guest target; native builds keep the vendored asm. See patches/ethrex-crypto/.
-[patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-crypto = { path = "patches/ethrex-crypto" }
+# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
+# older commit. Override it with our working-tree copy so the guest links our
+# current syscalls (keccak_permute + the Print-ecall no-op fix).
+[patch."https://github.com/yetanotherco/lambda_vm.git"]
+lambda-vm-syscalls = { path = "../../../../syscalls" }

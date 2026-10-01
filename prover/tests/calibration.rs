@@ -11,7 +11,7 @@ use lambda_vm_prover::tables::MaxRowsConfig;
 use lambda_vm_prover::tables::trace_builder::count_table_lengths;
 use lambda_vm_prover::test_utils::{asm_elf_bytes, run_asm_elf};
 use stark::proof::options::GoldilocksCubicProofOptions;
-use stark::prover::table_parallelism;
+use stark::prover::storage_estimate_parallelism;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -36,7 +36,8 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
         count_table_lengths(&elf, &logs, &max_rows, &[]).expect("count_table_lengths succeeds");
 
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
-    let predicted = peak_bytes(&lengths, opts.blowup_factor, table_parallelism()) as usize;
+    let predicted =
+        peak_bytes(&lengths, opts.blowup_factor, storage_estimate_parallelism()) as usize;
 
     drop(logs);
 

@@ -29,8 +29,9 @@ fn test_disk_spill_prove_verify_and_roundtrip_small() {
         "verification returned false"
     );
 
-    let bytes = bincode::serialize(&proof).expect("serialize failed");
-    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize failed");
+    let proof2: VmProof =
+        rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&bytes).expect("deserialize failed");
     assert!(
         crate::verify_with_options(&proof2, &elf_bytes, &opts, None, None).expect("verify failed"),
         "verification failed after serialization roundtrip"
@@ -49,8 +50,9 @@ fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
         "verification returned false"
     );
 
-    let bytes = bincode::serialize(&proof).expect("serialize failed");
-    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize failed");
+    let proof2: VmProof =
+        rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&bytes).expect("deserialize failed");
     assert!(
         crate::verify_with_options(&proof2, &elf_bytes, &opts, None, None).expect("verify failed"),
         "verification failed after serialization roundtrip (chunked)"

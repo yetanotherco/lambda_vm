@@ -6,7 +6,7 @@
 //! - Use multi_prove/multi_verify with bus interactions
 //!
 //! Wired buses:
-//! - CPU sends AND_BYTE, OR_BYTE, XOR_BYTE to Bitwise (×8 each)
+//! - Byte-level AND/OR/XOR lookups are routed through BYTE_ALU
 //! - CPU sends MSB16 to Bitwise (for rv1_sign_bit, arg2_sign_bit when word_instr=1)
 //! - CPU sends MSB8 to Bitwise (for res_sign_bit when word_instr=1)
 //! - CPU sends ZERO to Bitwise (for is_equal when BEQ=1)
@@ -15,9 +15,10 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraintEvaluator;
+use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
+use stark::proof::view::{MultiProofView, StarkProofView};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -59,6 +60,9 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
 
@@ -72,19 +76,25 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
+    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
-        &multi_proof,
+        &views,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify(
+    Verifier::multi_verify_views(
         &airs.air_refs(),
-        &multi_proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -109,6 +119,9 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         true,
         &traces.page_configs,
         &table_counts,
+        None,
+        true,
+        None,
         None,
         None,
     );
@@ -142,7 +155,9 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &elf,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
-    );
+        usize::MAX,
+    )
+    .expect("honest page layout");
     let airs = VmAirs::new(
         &elf,
         &proof_options,
@@ -150,20 +165,30 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &page_configs,
         &vm_proof.table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let air_refs = airs.air_refs();
+    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
+        .proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &air_refs,
-        &vm_proof.proof,
+        &views,
         &vm_proof.public_output,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
-    Verifier::multi_verify(
+    Verifier::multi_verify_views(
         &air_refs,
-        &vm_proof.proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -192,18 +217,22 @@ fn test_cpu_only_no_bus() {
     let proof_options = ProofOptions::default_test_options();
 
     // Create AIR with NO bus interactions
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![], // NO bus interactions
     };
-    let cpu_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
-        AirWithBuses::new(
-            crate::tables::cpu::cols::NUM_COLUMNS,
-            auxiliary_trace_build_data,
-            &proof_options,
-            1,
-            transition_constraints,
-        );
+    let cpu_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        crate::tables::cpu::cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -806,8 +835,8 @@ fn test_prove_elfs_test_shift_8() {
 }
 
 // Tests that right shift by 0 bits (srli a0, a2, 0) is provable.
-// Regression test for SHIFT-C4: previously C4 sent AND_BYTE[bit_shift; 256, 15] when
-// shift=0, which is out of AND_BYTE's byte range (0-255), making the proof fail.
+// Regression test for SHIFT-C4: previously the shift mask lookup could send 256
+// as a byte input when shift=0, making the proof fail.
 #[test]
 fn test_prove_elfs_srli_one_zero() {
     let (elf, logs, instructions) = run_asm_elf("srli_one_zero");
@@ -1075,12 +1104,510 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 }
 
+#[test]
+fn test_prove_elfs_ecsm() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest computes 5·G and commits the 32-byte x-coordinate; cross-check it against
+    // the reference scalar multiplication. Gx, little-endian:
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    let expected_xr = ecsm::scalar_mul_x(&k, &gx).unwrap();
+    assert_eq!(
+        result.return_values.memory_values,
+        expected_xr.to_vec(),
+        "committed xR must equal x(5G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM prove/verify failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_ecsm_multi() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Gx little-endian.
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+
+    // The guest commits x(1·G) || x(5·G) || x(0xABCDEF·G); cross-check each 32-byte chunk.
+    // k=1 exercises the zero-ECDAS-steps edge; 0xABCDEF exercises many doubles + adds.
+    let mut expected = Vec::new();
+    for kv in [1u64, 5, 0xABCDEF] {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&kv.to_le_bytes());
+        expected.extend_from_slice(&ecsm::scalar_mul_x(&k, &gx).unwrap());
+    }
+    assert_eq!(
+        result.return_values.memory_values, expected,
+        "committed outputs must equal x(1G) || x(5G) || x(0xABCDEF·G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM multi-call prove/verify failed"
+    );
+}
+
+/// End-to-end via the **Rust-guest path**: the `syscalls::ecsm_mul` wrapper computes 5·G and
+/// commits its x-coordinate. Verifies the wrapper works end-to-end (parity with the asm guest).
+#[test]
+fn test_prove_ecsm_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm.elf"))
+        .expect("ecsm.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "ecsm rust guest should verify"
+    );
+
+    // Committed output must equal x(5·G).
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        proof.public_output,
+        ecsm::scalar_mul_x(&k, &gx).unwrap().to_vec()
+    );
+}
+
+/// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
+/// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
+/// This exercises the whole HINT table bus surface (Ecall receive, the x10/x11/x12
+/// register reads, the two ALU `LT` operand range-checks, the four 8-byte output MEMW
+/// writes and the output byte range-checks) end-to-end through prove→verify, de-risking
+/// the bus balance before scaling to real consumers. The committed output must equal
+/// the value the executor's `compute_hint` produced (= 3^{-1} mod p).
+#[test]
+fn test_prove_hint_min_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_min rust guest should verify"
+    );
+
+    // Committed output must equal the hinted value (field inverse of 3, 32-byte BE).
+    let mut input = [0u8; 32];
+    input[31] = 3;
+    let expected =
+        executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Multi-hint: three `hint` ecalls, one per selector, each result read back with
+/// ordinary `LOAD`s. Complements `test_prove_hint_min_rust_guest` by proving the
+/// paths the ethrex consumer relies on that a single-call guest doesn't: **multiple
+/// real HINT rows** (padded), **all three selectors** (so the AIR's `selector < 3`
+/// range-check is exercised at every accepted value, not only at 0) and **read-back
+/// via normal LOAD** (MEMW reads chaining to the HINT writes). Committed output =
+/// XOR of the three hinted values.
+#[test]
+fn test_prove_hint_multi_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_multi.elf"))
+            .expect("hint_multi.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_multi rust guest should verify"
+    );
+
+    // Expected = XOR of inv(3) mod p, inv(5) mod n and sqrt(4) mod p (32-byte BE),
+    // matching the guest's one-call-per-selector loop.
+    use executor::vm::instruction::execution::{
+        HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV, compute_hint,
+    };
+    let mut expected = [0u8; 32];
+    for (hint_id, seed) in [
+        (HINT_FIELD_INV, 3u8),
+        (HINT_SCALAR_INV, 5u8),
+        (HINT_FIELD_SQRT, 4u8),
+    ] {
+        let mut input = [0u8; 32];
+        input[31] = seed;
+        let out = compute_hint(hint_id, &input);
+        for i in 0..32 {
+            expected[i] ^= out[i];
+        }
+    }
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Consistency: the verifier REJECTS a HINT row that disagrees with the
+/// MEMW rows.
+///
+/// The HINT table's `out_bytes` are unconstrained *by the table* — the point of a
+/// non-constraining hint. Editing one output byte on the (single) real HINT row makes
+/// the MEMW write it sends stop matching the write the MEMW table received (the honest
+/// value `collect_hint_ops` derived), so the Memw LogUp bus unbalances and the proof
+/// must fail to verify.
+///
+/// What this covers is an *internally inconsistent* trace — the failure mode of a buggy
+/// trace builder. It is **not** a forgery test: a prover that edits the HINT row and the
+/// corresponding MEMW rows together satisfies every constraint, because nothing in the
+/// AIR pins *which* value was hinted. That guarantee lives in the guest's verify
+/// (`x·inv == 1`, `y² == x³+7`), which this minimal guest deliberately omits. What the
+/// AIR does pin is *where* the value lands and that it is 32 bytes — see
+/// `test_hint_binds_out_addr_to_x12` and `test_hint_range_checks_its_output_bytes`.
+#[test]
+fn test_prove_hint_min_inconsistent_output_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of the output on the (single) real HINT row.
+    let orig = *traces.hint.main_table.get(0, hint_cols::out(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.hint.main_table.set(0, hint_cols::out(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged hint output byte"
+    );
+}
+
+/// Load `hint_min` and build its minimal traces (for the operand-forgery tests below).
+fn hint_min_traces() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose selector is out of range.
+///
+/// The executor rejects `hint_id ∉ {0,1,2}` up front (`HintUnknownSelector`). The AIR
+/// now matches that: it binds the selector to `x10` and range-checks it `< 3`, so a
+/// witness cannot prove a hint the executor would reject. Before `a0` was bound this
+/// forgery verified. Forcing the selector to 3 (one past the valid set) unbalances both
+/// the `x10` register read and the `LT(selector, 3)` interaction.
+#[test]
+fn test_prove_hint_min_forged_selector_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces.hint.main_table.set(
+        0,
+        hint_cols::SEL_0,
+        FieldElement::<GoldilocksField>::from(3u64),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint with an out-of-range selector"
+    );
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose input address would straddle the
+/// 32-bit limb boundary — the executor rejects it (`HintAddressOverflow`), and the AIR
+/// now binds `in_addr` to `x11` and range-checks its low limb `< 2^32 - 31`. Forcing
+/// the low limb to `2^32 - 1` unbalances the `x11` read and the `LT` interaction.
+#[test]
+fn test_prove_hint_min_forged_input_address_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces.hint.main_table.set(
+        0,
+        hint_cols::ADDR_IN_0,
+        FieldElement::<GoldilocksField>::from(0xFFFF_FFFFu64),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint whose input range crosses the limb boundary"
+    );
+}
+
+/// Column a bus value reads, for the structural HINT tests below.
+fn hint_bus_column(v: &stark::lookup::BusValue) -> Option<usize> {
+    match v {
+        stark::lookup::BusValue::Packed { start_column, .. } => Some(*start_column),
+        stark::lookup::BusValue::Linear(_) => None,
+    }
+}
+
+/// Constant a bus value holds, for the structural HINT tests below.
+fn hint_bus_constant(v: &stark::lookup::BusValue) -> Option<i64> {
+    match v {
+        stark::lookup::BusValue::Linear(terms) => match terms.as_slice() {
+            [stark::lookup::LinearTerm::Constant(c)] => Some(*c),
+            _ => None,
+        },
+        stark::lookup::BusValue::Packed { .. } => None,
+    }
+}
+
+/// Soundness: the HINT table must bind its output address to `x12` (the ecall's `a2`).
+///
+/// The four output writes take their base from `ADDR_OUT_0`, an ordinary column in a
+/// table with no algebraic constraints, so the register read asserted here is the only
+/// thing pinning that column to the register the CPU actually held. Without it the
+/// witness chooses *where* the 32 hinted bytes land — an arbitrary memory write, which
+/// is a strictly larger hole than the unconstrained value the table is designed around.
+///
+/// Asserted structurally rather than by tampering: editing `ADDR_OUT_0` in a trace also
+/// unbalances the honest MEMW rows, so a tamper test passes either way and would not
+/// notice this interaction being dropped.
+#[test]
+fn test_hint_binds_out_addr_to_x12() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let memw_id = u64::from(BusId::Memw);
+    let reads: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == memw_id && i.is_sender && i.values.len() == 24)
+        .collect();
+    assert_eq!(
+        reads.len(),
+        3,
+        "HINT must send three MEMW register reads (a0 → x10, a1 → x11, a2 → x12)"
+    );
+    // The out_addr binding is the x12 read (base address 2*12); the a0/a1 reads bind
+    // the selector and input address, checked by the range-check interactions.
+    let out_read = reads
+        .iter()
+        .find(|r| hint_bus_constant(&r.values[9]) == Some(2 * 12))
+        .expect("HINT must send a MEMW register read for x12 (out_addr)");
+    let v = &out_read.values;
+
+    // CO24 read layout: old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi,
+    // w2, w4, w8.
+    assert_eq!(hint_bus_constant(&v[8]), Some(1), "is_register must be 1");
+    assert_eq!(
+        hint_bus_constant(&v[9]),
+        Some(2 * 12),
+        "register address must be x12 (the ecall's a2)"
+    );
+    assert_eq!(hint_bus_constant(&v[10]), Some(0), "address hi must be 0");
+    assert_eq!(
+        hint_bus_constant(&v[21]),
+        Some(1),
+        "w2 must be 1 for a 2-word register access"
+    );
+    for (slot, col) in [(0, hint_cols::ADDR_OUT_0), (1, hint_cols::ADDR_OUT_1)] {
+        assert_eq!(
+            hint_bus_column(&v[slot]),
+            Some(col),
+            "old[{slot}] must carry out_addr"
+        );
+        assert_eq!(
+            hint_bus_column(&v[11 + slot]),
+            Some(col),
+            "value[{slot}] must carry out_addr (a read leaves the register unchanged)"
+        );
+    }
+    // The read must happen at THE ecall's timestamp (ts_lo/ts_hi = slots 19/20). A
+    // register read bound to x12 but at some other timestamp would pin out_addr to
+    // whatever x12 held then, not at the ecall — the writes below all use the same
+    // TIMESTAMP columns, so the binding is only meaningful if it reads x12 at T.
+    assert_eq!(
+        hint_bus_column(&v[19]),
+        Some(hint_cols::TIMESTAMP_0),
+        "ts_lo must be the ecall timestamp (the read must occur at T)"
+    );
+    assert_eq!(
+        hint_bus_column(&v[20]),
+        Some(hint_cols::TIMESTAMP_1),
+        "ts_hi must be the ecall timestamp (the read must occur at T)"
+    );
+    assert!(
+        matches!(out_read.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+        "the register read must be gated by mu, like every other HINT interaction"
+    );
+}
+
+/// Soundness: the HINT table must range-check all 32 output cells as bytes.
+///
+/// The cells are free columns that enter memory as MEMW write values, and MEMW
+/// range-checks nothing it receives — every table that writes fresh values into memory
+/// (STORE, KECCAK, ECSM, PAGE) checks its own cells for that reason. The hinted value is
+/// allowed to be wrong; it is not allowed to be a field element outside `[0, 256)`, or
+/// the witness can smuggle non-bytes into memory and break the byte decomposition that
+/// loads and the ALU rely on.
+#[test]
+fn test_hint_range_checks_its_output_bytes() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let are_bytes_id = u64::from(BusId::AreBytes);
+    let checks: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == are_bytes_id)
+        .collect();
+    assert_eq!(checks.len(), 16, "32 output cells, paired two per lookup");
+
+    let mut covered = std::collections::BTreeSet::new();
+    for check in &checks {
+        assert!(check.is_sender, "range checks are sends; BITWISE receives");
+        assert_eq!(check.values.len(), 2, "ARE_BYTES takes exactly two values");
+        assert!(
+            matches!(check.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+            "range checks must be gated by mu, or padding rows unbalance BITWISE"
+        );
+        for v in &check.values {
+            covered
+                .insert(hint_bus_column(v).expect("a range check must reference an output column"));
+        }
+    }
+
+    // 16 lookups × 2 slots = 32 slots; 32 distinct columns means each cell exactly once.
+    let expected: std::collections::BTreeSet<usize> = (0..32).map(hint_cols::out).collect();
+    assert_eq!(
+        covered, expected,
+        "every output cell must be range-checked exactly once"
+    );
+}
+
+/// Soundness: the verifier REJECTS a forged ECSM result.
+///
+/// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
+/// x-coordinate `xR` in the ECSM trace (to a different valid byte). `xR` is bound by the
+/// final ECDAS-bus tuple (the constrained double-and-add output) and by the `xR < p`
+/// carry-chain check, so the forgery unbalances the buses / breaks the constraints and the
+/// proof must fail to verify.
+#[test]
+fn test_prove_elfs_ecsm_forged_result_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of xR on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::xr(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::xr(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECSM result xR"
+    );
+}
+
+/// Regression test: `µ` is the multiplicity of every ECDAS bus interaction, so it must remain
+/// boolean. Forge a non-boolean `µ` on a real ECDAS row and assert the verifier rejects.
+/// (k=5 produces 3 ECDAS rows.)
+#[test]
+fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
+    use crate::tables::ecdas::cols as ecdas_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
+    traces.ecdas.main_table.set(
+        0,
+        ecdas_cols::MU,
+        FieldElement::<GoldilocksField>::from(2u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a non-boolean ECDAS multiplicity"
+    );
+}
+
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///
 /// Without the ARE_BYTES range checks on addr(0..7), an attacker could keep
 /// `addr_lo = b0 + 256·b1 + 65536·b2 + 2^24·b3` equal to an unaligned target
-/// address as a field element while setting addr(0)=0 (passing the AndByte
+/// address as a field element while setting addr(0)=0 (passing the BYTE_ALU
 /// alignment check) and folding the carry into addr(1) as a non-byte
 /// FE-element. This test asserts that mutating addr(1) to a non-byte value
 /// unbalances the verifier's bus checks and the proof is rejected.
@@ -1167,6 +1694,9 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let proof = multi_prove_ram(
@@ -1176,7 +1706,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -1184,21 +1715,27 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &wrong_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let views: Vec<StarkProofView<F, E, ()>> =
+        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
-        &proof,
+        &views,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_views(
         &verifier_air_refs,
-        &proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1248,7 +1785,7 @@ fn test_verify_rejects_tampered_public_output() {
 /// - Division: DIV, DIVU, REM, REMU
 /// - Control: LUI, AUIPC, JALR
 #[test]
-#[ignore] // Slow: run with `cargo test --ignored` or `make test-prover-all`
+#[ignore] // Slow: run with `cargo test -- --ignored` or `make test-prover-all`
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -1916,6 +2453,9 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let proof = multi_prove_ram(
@@ -1924,7 +2464,9 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -1932,21 +2474,27 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &verifier_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let views: Vec<StarkProofView<F, E, ()>> =
+        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
-        &proof,
+        &views,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_views(
         &verifier_air_refs,
-        &proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -1982,6 +2530,9 @@ fn test_deep_stack_missing_pages_rejected() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let proof = multi_prove_ram(
@@ -1990,7 +2541,8 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -1998,21 +2550,27 @@ fn test_deep_stack_missing_pages_rejected() {
         &wrong_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let views: Vec<StarkProofView<F, E, ()>> =
+        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
-        &proof,
+        &views,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_views(
         &verifier_air_refs,
-        &proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2083,6 +2641,9 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let proof = multi_prove_ram(
@@ -2091,7 +2652,9 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2099,21 +2662,27 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &verifier_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
+    let views: Vec<StarkProofView<F, E, ()>> =
+        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
-        &proof,
+        &views,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_views(
         &verifier_air_refs,
-        &proof,
+        &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2177,6 +2746,10 @@ fn test_verify_rejects_zero_table_counts() {
             shift: 0,
             branch: 0,
             memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
         },
         ..vm_proof
     };
@@ -2248,11 +2821,26 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
         memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, None);
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &[],
+        &zero_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 8);
+    assert_eq!(verifier_air_refs.len(), crate::FIXED_TABLE_COUNT);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
@@ -2265,8 +2853,8 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         _,
         _,
     )> = vec![
-        (&airs.bitwise, &mut bitwise_trace, &()),
-        (&airs.decode, &mut decode_trace, &()),
+        (airs.bitwise.as_ref(), &mut bitwise_trace, &()),
+        (airs.decode.as_ref(), &mut decode_trace, &()),
     ];
 
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
@@ -2377,8 +2965,8 @@ fn test_prove_wsuffix_64bit() {
 
 /// Proves a minimal Rust std program that uses `init_allocator()` and
 /// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
-/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
-/// the Rust toolchain, and the allocator's memory access patterns.
+/// guest heap init, CSR instructions injected by the Rust toolchain, and the
+/// allocator's memory access patterns.
 #[test]
 fn test_prove_allocator_minimal_reproducer() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -2586,7 +3174,7 @@ fn test_verify_rejects_num_private_input_pages_exceeds_max() {
     let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     let tampered = crate::VmProof {
-        num_private_input_pages: 1000,
+        num_private_input_pages: crate::tables::page::max_private_input_pages() + 1,
         ..vm_proof
     };
 
@@ -2675,5 +3263,602 @@ fn test_count_elements_nonzero() {
     assert!(
         aux > 0,
         "total_auxiliary_field_elements should be nonzero (got {aux})"
+    );
+}
+
+/// Prove and verify the FIRST continuation epoch in isolation. Epoch 0 starts
+/// from the program's initial memory/registers (so its init is correct) and does
+/// not terminate, so it is proven with the HALT table excluded (`include_halt = false`).
+#[test]
+fn test_prove_first_epoch_without_halt() {
+    use crate::compute_expected_commit_bus_balance_view;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("arith_8");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // arith_8 is ~10 cycles; a power-of-two epoch_size of 4 makes epoch 0 an
+    // intermediate epoch (4 cycles → no CPU padding rows) with the program
+    // continuing past it.
+    let epoch_size = 4;
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // Epoch 0's starting memory/registers are the program-start image; it does
+    // not halt (is_final=false).
+    let image = build_initial_image(&elf, &[]);
+    let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        None,
+        None,
+        None,
+    );
+
+    let multi_proof = multi_prove_ram(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("first epoch failed to prove");
+
+    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+        &airs.air_refs(),
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify_views(
+            &airs.air_refs(),
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "first epoch (HALT excluded) failed to verify"
+    );
+}
+
+/// Prove and verify a NON-first continuation epoch (epoch 1) in isolation. Its
+/// starting memory and registers come from epoch 0's boundary snapshot, and it
+/// does not terminate (HALT excluded).
+#[test]
+fn test_prove_second_epoch_from_snapshot() {
+    use crate::compute_expected_commit_bus_balance_view;
+    use crate::tables::register;
+    use crate::test_utils::asm_elf_bytes;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("arith_8");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // arith_8 is ~10 cycles; epoch_size 4 (power of two) yields epochs 4/4/2, so
+    // epoch 1 is intermediate (4 cycles → no CPU padding rows).
+    let epoch_size = 4;
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 3, "need an intermediate epoch 1");
+
+    // Epoch 1 starts from epoch 0's ending memory + register snapshot.
+    let image: std::collections::HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
+    let register_init =
+        register::register_init_from_snapshot(&epochs[0].end_registers, epochs[0].end_pc);
+
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[1].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    // The REGISTER commitment is built from this epoch's boundary register init.
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        Some(&register_init),
+        None,
+        None,
+    );
+
+    let multi_proof = multi_prove_ram(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("second epoch failed to prove");
+
+    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+        &airs.air_refs(),
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify_views(
+            &airs.air_refs(),
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "second epoch (register init from snapshot) failed to verify"
+    );
+}
+
+/// An epoch proof can COMMIT the local-to-global table inertly — committed
+/// columns, but no GlobalMemory bus and no constraints in the epoch proof — and
+/// still verify, exposing the L2G commitment root that the final proof (Step 4)
+/// will bind to. The cross-epoch GlobalMemory matching is proven separately.
+#[test]
+fn test_epoch_proof_commits_l2g() {
+    use crate::compute_expected_commit_bus_balance_view;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
+    // makes epoch 0 an intermediate epoch with no CPU padding rows.
+    let epoch_size = 8;
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    // Epoch 0's local-to-global trace, committed inertly below.
+    let register_init0 = register::register_init_from_entry_point(elf.entry_point);
+    let touched = epoch_touched_cells(&elf, &image, &register_init0, &epochs[0].logs).unwrap();
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[0]);
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        None,
+        None,
+        None,
+    );
+
+    // Inert L2G AIR: commits the trace columns, but no bus and no constraints.
+    let inert_l2g_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
+
+    let mut pairs = airs.air_trace_pairs(&mut traces);
+    pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
+
+    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("epoch proof with inert L2G failed to prove");
+
+    let mut refs = airs.air_refs();
+    refs.push(&inert_l2g_air);
+
+    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+        &refs,
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify_views(
+            &refs,
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "epoch proof with inert L2G failed to verify"
+    );
+
+    // The L2G table (pushed last) is committed: its Merkle root is exposed and
+    // non-zero — this is the `R_i` the final proof will be bound to in Step 4.
+    let l2g_root = multi_proof
+        .proofs
+        .last()
+        .unwrap()
+        .lde_trace_main_merkle_root;
+    assert_ne!(
+        l2g_root, [0u8; 32],
+        "L2G commitment root should be non-zero"
+    );
+}
+
+/// End-to-end continuation pipeline over a real ELF: split execution into epochs,
+/// prove+verify each epoch (each committing its local-to-global table inertly and
+/// exposing a root R_i), prove the cross-epoch GlobalMemory bus balances over the
+/// real per-epoch boundaries, and finally bind the cross-epoch proof to the REAL
+/// per-epoch roots. The R_i collected from the independent epoch proofs equal the
+/// per-epoch L2G sub-table roots in the cross-epoch proof — that root equality is
+/// the shared-commitment linkage between the epoch proofs and the global memory
+/// argument.
+#[test]
+fn test_continuation_pipeline_end_to_end() {
+    use crate::compute_expected_commit_bus_balance_view;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Split execution into power-of-two epochs (all_loadstore_32 is ~34 cycles, so
+    // epoch_size 8 gives intermediate epochs with no CPU padding rows).
+    let epoch_size = 8;
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image0 = build_initial_image(&elf, &[]);
+    let initial_memory: HashMap<u64, u64> = image0.iter().map(|(&a, &v)| (a, v as u64)).collect();
+
+    // Pass 1: each epoch's starting state + the cells it touches. Epoch 0 starts
+    // from the program image; epoch i>0 from epoch i-1's boundary snapshot.
+    let mut images: Vec<HashMap<u64, u8>> = Vec::with_capacity(epochs.len());
+    let mut register_inits: Vec<Vec<u32>> = Vec::with_capacity(epochs.len());
+    let mut all_touched: Vec<Vec<(u64, u64, u64)>> = Vec::with_capacity(epochs.len());
+    for (i, epoch) in epochs.iter().enumerate() {
+        let (image_i, register_init_i) = if i == 0 {
+            (
+                image0.clone(),
+                register::register_init_from_entry_point(elf.entry_point),
+            )
+        } else {
+            let image_i: HashMap<u64, u8> = epochs[i - 1].end_memory.iter_bytes().collect();
+            let register_init_i = register::register_init_from_snapshot(
+                &epochs[i - 1].end_registers,
+                epochs[i - 1].end_pc,
+            );
+            (image_i, register_init_i)
+        };
+        let touched_i = epoch_touched_cells(&elf, &image_i, &register_init_i, &epoch.logs).unwrap();
+        images.push(image_i);
+        register_inits.push(register_init_i);
+        all_touched.push(touched_i);
+    }
+    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &all_touched);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // Pass 2: prove+verify each epoch, committing boundaries[i] inertly, and
+    // collect the L2G commitment root each epoch proof exposes.
+    let mut epoch_roots = Vec::with_capacity(epochs.len());
+    for (i, epoch) in epochs.iter().enumerate() {
+        let is_final = i == epochs.len() - 1;
+        let mut traces = Traces::from_image_and_logs(
+            &elf,
+            &images[i],
+            &register_inits[i],
+            &epoch.logs,
+            &MaxRowsConfig::default(),
+            &[],
+            is_final,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .unwrap();
+
+        let table_counts = traces.table_counts();
+        let register_init_arg = if i == 0 {
+            None
+        } else {
+            Some(register_inits[i].as_slice())
+        };
+        let airs = VmAirs::new(
+            &elf,
+            &proof_options,
+            true,
+            &traces.page_configs,
+            &table_counts,
+            None,
+            is_final,
+            register_init_arg,
+            None,
+            None,
+        );
+
+        let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
+        let inert_l2g_air: AirWithBuses<
+            F,
+            E,
+            stark::lookup::NullBoundaryConstraintBuilder,
+            (),
+            EmptyConstraints,
+        > = AirWithBuses::new(
+            local_to_global::cols::NUM_COLUMNS,
+            AuxiliaryTraceBuildData {
+                interactions: vec![],
+            },
+            &proof_options,
+            1,
+            EmptyConstraints,
+        );
+
+        let mut pairs = airs.air_trace_pairs(&mut traces);
+        pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
+        let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("epoch proof failed to prove");
+
+        let mut refs = airs.air_refs();
+        refs.push(&inert_l2g_air);
+        let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+            .proofs
+            .iter()
+            .map(StarkProofView::Owned)
+            .collect();
+        let mut replay = DefaultTranscript::<E>::new(&[]);
+        let expected_bus_balance = compute_expected_commit_bus_balance_view(
+            &refs,
+            &views,
+            &traces.public_output_bytes,
+            0,
+            &mut replay,
+        )
+        .expect("fingerprint collision in test");
+        assert!(
+            Verifier::multi_verify_views(
+                &refs,
+                &views,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &expected_bus_balance,
+            ),
+            "epoch {i} failed to verify"
+        );
+
+        epoch_roots.push(
+            multi_proof
+                .proofs
+                .last()
+                .unwrap()
+                .lde_trace_main_merkle_root,
+        );
+    }
+
+    // The cross-epoch GlobalMemory bus balances over the real per-epoch boundaries.
+    assert!(
+        crate::tests::local_to_global_bus_tests::prove_and_verify(&boundaries),
+        "final GlobalMemory bus must balance over real epoch data"
+    );
+
+    // The cross-epoch proof is bound to the REAL per-epoch roots: the L2G root each
+    // epoch proof exposed equals the per-epoch L2G sub-table root in the final proof.
+    let final_proof = crate::tests::local_to_global_bus_tests::prove_global(&boundaries);
+    assert!(
+        crate::verify_l2g_commitment_binding_view(
+            &epoch_roots,
+            MultiProofView::Owned(&final_proof)
+        ),
+        "final proof must be bound to the real per-epoch L2G roots"
+    );
+}
+
+/// A continuation epoch built with `l2g_memory_bookend = true` proves and verifies:
+/// PAGE no longer bookends the touched RAM bytes (they self-cancel), and the
+/// local-to-global table provides their `Memory`-bus init/fini instead. The epoch
+/// `Memory` bus still nets to zero — L2G has replaced PAGE as the bookend.
+#[test]
+fn test_epoch_memory_bus_with_l2g_bookend() {
+    use crate::compute_expected_commit_bus_balance_view;
+    use crate::tables::local_to_global;
+    use crate::tables::register;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let elf = Elf::load(&elf_bytes).unwrap();
+
+    // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
+    // makes epoch 0 an intermediate epoch with no CPU padding rows.
+    let epoch_size = 8;
+    let epochs = Executor::new(&elf, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // Epoch 0 starts from the program image; build it with the L2G memory bookend.
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &epochs[0].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries =
+        local_to_global::epoch_boundaries(&initial_memory, &[traces.touched_memory_cells.clone()]);
+    traces.local_to_global = local_to_global::generate_local_to_global_trace(&boundaries[0]);
+
+    let proof_options = ProofOptions::default_test_options();
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        false,
+        None,
+        None,
+        None,
+    );
+
+    // L2G air on the epoch-local Memory bus (the bookend that replaces PAGE).
+    let l2g_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: local_to_global::memory_bus_interactions(),
+        },
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
+
+    // Take the L2G trace out of `traces` so `air_trace_pairs` can borrow the rest.
+    let mut l2g_trace = std::mem::replace(
+        &mut traces.local_to_global,
+        local_to_global::generate_local_to_global_trace(&[]),
+    );
+
+    let mut pairs = airs.air_trace_pairs(&mut traces);
+    pairs.push((&l2g_air, &mut l2g_trace, &()));
+    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("epoch with L2G memory bookend failed to prove");
+
+    let mut refs = airs.air_refs();
+    refs.push(&l2g_air);
+    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+        &refs,
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut replay,
+    )
+    .expect("fingerprint collision in test");
+
+    assert!(
+        Verifier::multi_verify_views(
+            &refs,
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &expected_bus_balance,
+        ),
+        "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
 }

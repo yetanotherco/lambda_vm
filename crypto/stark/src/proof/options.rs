@@ -38,13 +38,26 @@ impl fmt::Display for ProofOptionsError {
 /// - `fri_number_of_queries`: the number of queries for the FRI layer
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
+/// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ProofOptions {
     pub blowup_factor: u8,
     pub fri_number_of_queries: usize,
     pub coset_offset: u64,
     pub grinding_factor: u8,
+    /// Log2 of the FRI final-polynomial degree bound. FRI stops folding when the
+    /// polynomial has degree < 2^fri_final_poly_log_degree; the prover sends those
+    /// 2^k coefficients instead of folding to a constant.
+    pub fri_final_poly_log_degree: u8,
 }
 
 impl ProofOptions {
@@ -56,6 +69,7 @@ impl ProofOptions {
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
+            fri_final_poly_log_degree: DEFAULT_FRI_FINAL_POLY_LOG_DEGREE,
         }
     }
 }
@@ -74,6 +88,9 @@ impl ProofOptions {
 /// (192 - 40 bits max domain), so the FRI query count is always the
 /// security bottleneck — field size is not.
 pub struct GoldilocksCubicProofOptions;
+
+// Shared by both ProofOptions::default_test_options and GoldilocksCubicProofOptions::with_params.
+const DEFAULT_FRI_FINAL_POLY_LOG_DEGREE: u8 = 7;
 
 impl GoldilocksCubicProofOptions {
     const DEFAULT_GRINDING: u8 = 20;
@@ -112,6 +129,7 @@ impl GoldilocksCubicProofOptions {
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
+            fri_final_poly_log_degree: DEFAULT_FRI_FINAL_POLY_LOG_DEGREE,
         })
     }
 }

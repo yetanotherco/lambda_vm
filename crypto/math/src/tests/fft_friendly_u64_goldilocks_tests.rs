@@ -272,9 +272,8 @@ fn test_from_i64_max_value() {
 #[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
-    use crate::fft::roots_of_unity::{
-        get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
-    };
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root_coset;
+    use crate::fft::test_helpers::get_powers_of_primitive_root;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
     use alloc::vec::Vec;

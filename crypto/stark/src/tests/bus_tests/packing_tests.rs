@@ -1,5 +1,6 @@
 //! Unit tests for Packing combine logic.
 
+use crate::constraints::builder::EmptyConstraints;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 
@@ -317,12 +318,12 @@ fn test_air_layout_single_interaction() {
     };
 
     let proof_options = ProofOptions::default_test_options();
-    let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+    let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
         4,
         build_data,
         &proof_options,
         1,
-        vec![],
+        EmptyConstraints,
     );
 
     // 4 main, 1 aux (0 committed pairs + 1 accumulated with 1 absorbed)
@@ -348,12 +349,12 @@ fn test_air_layout_multiple_interactions() {
     };
 
     let proof_options = ProofOptions::default_test_options();
-    let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+    let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
         5,
         build_data,
         &proof_options,
         1,
-        vec![],
+        EmptyConstraints,
     );
 
     // 5 main, 1 aux (0 committed pairs + 1 accumulated with 2 absorbed)

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use getrandom::Error;
 use lazy_static::lazy_static;
 use rand::Rng;
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 
 use crate::syscalls::print_string;
 
@@ -31,10 +31,22 @@ pub unsafe extern "C" fn sys_rand(buf: *mut u8, len: usize) {
     }
 }
 
+/// Custom getrandom v0.3 backend (selected via `--cfg getrandom_backend="custom"`).
+///
+/// Fills `dest` with deterministic bytes from the constant-seeded `StdRng` (ChaCha20)
+/// instead of panicking. This keeps weak-random consumers (e.g. `std::HashMap`'s
+/// `RandomState`) working in-guest at the cost of being insecure — the seed is fixed.
+///
+/// # Safety
+///
+/// `dest_ptr` must be valid for writes of `len` bytes.
 #[unsafe(no_mangle)]
-unsafe extern "Rust" fn __getrandom_v03_custom(
-    _dest_ptr: *mut u8,
-    _len: usize,
-) -> Result<(), Error> {
-    panic!("getrandom is not supported");
+unsafe extern "Rust" fn __getrandom_v03_custom(dest_ptr: *mut u8, len: usize) -> Result<(), Error> {
+    print_string("getrandom called\n");
+    print_string("WARNING: Using getrandom is insecure\n");
+
+    let mut rng = RNG.lock().unwrap();
+    let dest = unsafe { core::slice::from_raw_parts_mut(dest_ptr, len) };
+    rng.fill_bytes(dest);
+    Ok(())
 }

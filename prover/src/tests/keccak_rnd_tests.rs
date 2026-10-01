@@ -21,7 +21,6 @@ fn test_pi_virtual_matches_rotate() {
         output,
     };
     let trace = generate_keccak_rnd_trace(&[op]);
-    let base = 0;
 
     // Recompute theta for round 0 in u64 to compare against virtual pi.
     let mut c = [0u64; 5];
@@ -46,8 +45,7 @@ fn test_pi_virtual_matches_rotate() {
             let rotated = theta_lanes[sx + 5 * sy].rotate_left(KECCAK_RHO[sx][sy]);
             for z in 0..8 {
                 let (l_col, r_col) = cols::pi_src_cols(x, y, z);
-                let virtual_pi =
-                    &trace.main_table.data[base + l_col] + &trace.main_table.data[base + r_col];
+                let virtual_pi = *trace.get_main(0, l_col) + *trace.get_main(0, r_col);
                 let expected = FE::from((rotated >> (z * 8)) & 0xFF);
                 assert_eq!(
                     virtual_pi, expected,

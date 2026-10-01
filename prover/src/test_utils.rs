@@ -10,6 +10,7 @@
 //! - Minimal trace generation for testing
 //! - AIR creation helpers
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
@@ -19,8 +20,12 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::constraints::builder::{ConstraintSet, EmptyConstraints};
+use stark::debug::validate_trace;
+use stark::domain::Domain;
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover, ProvingError};
@@ -29,63 +34,96 @@ use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 
-use crate::constraints::cpu::create_all_cpu_constraints;
+use crate::constraints::cpu::CpuConstraints;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
 };
 use crate::tables::branch::{
-    branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
+    BranchConstraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
+};
+use crate::tables::bytewise::{
+    bus_interactions as bytewise_bus_interactions, cols as bytewise_cols,
 };
 use crate::tables::commit::{
-    bus_interactions as commit_bus_interactions, cols as commit_cols,
-    create_constraints as commit_constraints,
+    CommitConstraints, bus_interactions as commit_bus_interactions, cols as commit_cols,
 };
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::cpu32::{
+    Cpu32Constraints, bus_interactions as cpu32_bus_interactions, cols as cpu32_cols,
+};
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::dvrm::{
-    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
+    DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
+use crate::tables::ecdas::{
+    EcdasConstraints, bus_interactions as ecdas_bus_interactions, cols as ecdas_cols,
+};
+use crate::tables::ecsm::{
+    EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
+};
+use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
-use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
+use crate::tables::hint::{
+    HintConstraints, bus_interactions as hint_bus_interactions, cols as hint_cols,
+};
+use crate::tables::keccak::{
+    KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
+};
 use crate::tables::keccak_rc::{
     bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
 };
 use crate::tables::keccak_rnd::{
-    bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
+    KeccakRndConstraints, bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
 };
 use crate::tables::load::{
-    bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
+    LoadConstraints, bus_interactions as load_bus_interactions, cols as load_cols,
 };
-use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
+use crate::tables::lt::{
+    LtConstraints, LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols,
+};
 use crate::tables::memw::{
-    bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
+    MemwConstraints, bus_interactions as memw_bus_interactions, cols as memw_cols,
 };
 use crate::tables::memw_aligned::{
-    bus_interactions as memw_aligned_bus_interactions, cols as memw_aligned_cols,
-    constraints as memw_aligned_constraints,
+    MemwAlignedConstraints, bus_interactions as memw_aligned_bus_interactions,
+    cols as memw_aligned_cols,
 };
 use crate::tables::memw_register::{
-    bus_interactions as memw_register_bus_interactions, cols as memw_register_cols,
-    constraints as memw_register_constraints,
+    MemwRegisterConstraints, bus_interactions as memw_register_bus_interactions,
+    cols as memw_register_cols,
 };
-use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
+use crate::tables::mul::{
+    MulConstraints, bus_interactions as mul_bus_interactions, cols as mul_cols,
+};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
 };
 use crate::tables::shift::{
-    bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
+    ShiftConstraints, bus_interactions as shift_bus_interactions, cols as shift_cols,
 };
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::store::{
+    StoreConstraints, bus_interactions as store_bus_interactions, cols as store_cols,
+};
+use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
 pub type E = GoldilocksExtension;
 pub type FE = FieldElement<F>;
 
-pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
+/// A boxed VM table AIR. Each table's `AirWithBuses<..., XxxConstraints>` is a
+/// distinct concrete type now that the constraint set is a type parameter, so
+/// the heterogeneous per-table AIRs are stored behind a trait object.
+pub type VmAir = Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>;
+
+/// The concrete `AirWithBuses` for a table with constraint set `CS`. The
+/// `create_*_air` helpers return this so callers can still chain the inherent
+/// `.with_name` / `.with_preprocessed` builder methods before boxing into a
+/// [`VmAir`].
+pub type ConcreteVmAir<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
 
 type GoldilocksPair<'a, PI> = (
     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
@@ -106,6 +144,80 @@ where
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )
+}
+
+// =============================================================================
+// Soundness regression helpers (negative AIR tests)
+// =============================================================================
+
+/// Build a bus-less AIR carrying only the given in-chip transition constraints.
+/// With zero bus interactions, `AirWithBuses::new` appends no LogUp constraints
+/// and allocates no aux columns, so `validate_trace` evaluates exactly the chip's
+/// transition constraints over a main-only trace.
+pub fn busless_air<CS: ConstraintSet<F, E> + 'static>(
+    num_columns: usize,
+    constraint_set: CS,
+) -> VmAir {
+    Box::new(
+        AirWithBuses::<_, _, NullBoundaryConstraintBuilder, (), _>::new(
+            num_columns,
+            AuxiliaryTraceBuildData {
+                interactions: vec![],
+            },
+            &ProofOptions::default_test_options(),
+            1,
+            constraint_set,
+        ),
+    )
+}
+
+/// Run `validate_trace` for a bus-less chip AIR over a main-only trace.
+/// Returns `true` iff every transition constraint holds on every row.
+pub fn validate_busless(air: &VmAir, trace: &TraceTable<F, E>) -> bool {
+    let domain = Domain::new(air.as_ref(), trace.num_rows());
+    validate_trace(air.as_ref(), &(), trace, &domain, &[], None)
+}
+
+/// Number of transition constraints a production builder registers on top of its
+/// bus constraints, as a delta against a bus-only AIR with the same interactions
+/// but no in-chip constraints. Isolates the in-chip count even though
+/// `AirWithBuses::new` also appends LogUp constraints, so a plain count cannot.
+pub fn in_chip_constraint_count(
+    wired: usize,
+    num_columns: usize,
+    buses: Vec<BusInteraction>,
+) -> usize {
+    let bus_only = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>::new(
+        num_columns,
+        AuxiliaryTraceBuildData {
+            interactions: buses,
+        },
+        &ProofOptions::default_test_options(),
+        1,
+        EmptyConstraints,
+    )
+    .num_transition_constraints();
+    wired
+        .checked_sub(bus_only)
+        .expect("wired (in-chip + bus constraints) must be >= bus-only constraint count")
+}
+
+/// Collect the `start_column`s of every `IS_HALFWORD` sender in `interactions`.
+/// Used to assert input/operand half-limbs are range-checked. Scope: only
+/// single-column `Packed` senders (which is how every current IS_HALFWORD sender is
+/// declared); it does not inspect `Linear` senders or sender multiplicities.
+pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize> {
+    let id: u64 = BusId::IsHalfword.into();
+    interactions
+        .iter()
+        .filter(|i| i.is_sender && i.bus_id == id)
+        .flat_map(|i| {
+            i.values.iter().filter_map(|v| match v {
+                BusValue::Packed { start_column, .. } => Some(*start_column),
+                BusValue::Linear(_) => None,
+            })
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -413,16 +525,16 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     for op in ops {
         let key = (op.x, op.y, op.z);
         let mu_idx = match op.lookup_type {
-            BitwiseOperationType::AndByte => 0,
-            BitwiseOperationType::OrByte => 1,
-            BitwiseOperationType::XorByte => 2,
-            BitwiseOperationType::Msb8 => 3,
-            BitwiseOperationType::Msb16 => 4,
-            BitwiseOperationType::Zero => 5,
-            BitwiseOperationType::AreBytes => 6,
-            BitwiseOperationType::IsHalf => 7,
-            BitwiseOperationType::IsB20 => 8,
-            BitwiseOperationType::Hwsl => 9,
+            BitwiseOperationType::Msb8 => 0,
+            BitwiseOperationType::Msb16 => 1,
+            BitwiseOperationType::Zero => 2,
+            BitwiseOperationType::AreBytes => 3,
+            BitwiseOperationType::IsHalf => 4,
+            BitwiseOperationType::IsB20 => 5,
+            BitwiseOperationType::Hwsl => 6,
+            BitwiseOperationType::ByteAluAnd => 7,
+            BitwiseOperationType::ByteAluOr => 8,
+            BitwiseOperationType::ByteAluXor => 9,
         };
         row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
@@ -472,16 +584,16 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
         // Multiplicity columns
         let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
+        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[0]);
+        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[1]);
+        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[2]);
+        data[base + bitwise_cols::MU_ARE_BYTES] = FE::from(mus[3]);
+        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[4]);
+        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[5]);
+        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_BYTE_ALU_AND] = FE::from(mus[7]);
+        data[base + bitwise_cols::MU_BYTE_ALU_OR] = FE::from(mus[8]);
+        data[base + bitwise_cols::MU_BYTE_ALU_XOR] = FE::from(mus[9]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
@@ -491,163 +603,228 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 // AIR Creation Helpers
 // =============================================================================
 
+/// Build a boxed `AirWithBuses` for a table from its columns, bus interactions,
+/// step size, and single-source [`ConstraintSet`]. The framework appends the
+/// LogUp constraints from the interactions; `constraint_set` supplies the
+/// base-field (table) constraints (or [`EmptyConstraints`] for pure-lookup
+/// tables).
+/// Process-wide cache of pre-built, pre-captured AIR prototypes, keyed by
+/// `(table name, proof options)`. Constructing an [`AirWithBuses`] runs every
+/// constraint body through a MetaBuilder, and its first `constraint_program()`
+/// runs them again for the IR capture — for the big tables (ECDAS/ECSM/
+/// KECCAK_RND, 16-25K IR nodes) that is by far the dominant cost of building
+/// an AIR. Continuation epochs rebuild the full table set per epoch and shard
+/// tables build one instance per shard, so without this cache the same walks
+/// re-run dozens of times per prove. A prototype is built (and captured) once;
+/// every later request clones it — the clone copies the derived metadata and
+/// the already-captured IR, never re-running the bodies.
+///
+/// Key correctness: for a given name the constraint set and bus interactions
+/// are a pure function of the table module (PAGE embeds its page base in the
+/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads.
+/// The cached prototype is pristine — `with_name` / `with_preprocessed` apply
+/// to the caller's clone only.
+fn air_prototype_cache()
+-> &'static std::sync::Mutex<HashMap<AirProtoKey, Box<dyn std::any::Any + Send + Sync>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<AirProtoKey, Box<dyn std::any::Any + Send + Sync>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+type AirProtoKey = (String, u8, usize, u64, u8, u8);
+
+fn air_proto_key(name: &str, o: &ProofOptions) -> AirProtoKey {
+    (
+        name.to_string(),
+        o.blowup_factor,
+        o.fri_number_of_queries,
+        o.coset_offset,
+        o.grinding_factor,
+        o.fri_final_poly_log_degree,
+    )
+}
+
+fn build_air<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
+    num_columns: usize,
+    interactions: Vec<BusInteraction>,
+    proof_options: &ProofOptions,
+    step_size: usize,
+    constraint_set: CS,
+    name: &str,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
+    type Proto<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
+    let key = air_proto_key(name, proof_options);
+    {
+        let cache = air_prototype_cache().lock().unwrap();
+        if let Some(proto) = cache.get(&key).and_then(|p| p.downcast_ref::<Proto<CS>>()) {
+            return proto.clone();
+        }
+    }
+    let air = Proto::<CS>::new(
+        num_columns,
+        AuxiliaryTraceBuildData { interactions },
+        proof_options,
+        step_size,
+        constraint_set,
+    )
+    .with_name(name);
+    // Pre-capture the constraint IR so every clone carries it (the prover's
+    // GPU lowering and interpreter paths force it per instance otherwise).
+    let _ = air.constraint_program();
+    air_prototype_cache()
+        .lock()
+        .unwrap()
+        .insert(key, Box::new(air.clone()));
+    air
+}
+
 /// Create CPU AIR with all constraints and bus interactions.
-pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
-    // Get all CPU constraints
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
-
-    // All CPU constraints
-    let mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = Vec::new();
-    for c in is_bit {
-        transition_constraints.push(c.boxed());
-    }
-    for c in add {
-        transition_constraints.push(c.boxed());
-    }
-    for c in other {
-        transition_constraints.push(c);
-    }
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: cpu_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_cpu_air(proof_options: &ProofOptions) -> ConcreteVmAir<CpuConstraints> {
+    build_air(
         cpu_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        cpu_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        CpuConstraints,
+        "CPU",
     )
-    .with_name("CPU")
 }
 
 /// Create Bitwise AIR with bus interactions.
-pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: bitwise_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_bitwise_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         bitwise_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        bitwise_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        "BITWISE",
     )
-    .with_name("BITWISE")
 }
 
-/// Create LT AIR with bus interactions.
-pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: lt_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+/// Create LT AIR with constraints and bus interactions.
+pub fn create_lt_air(proof_options: &ProofOptions) -> ConcreteVmAir<LtConstraints> {
+    build_air(
         lt_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        lt_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        LtConstraints,
+        "LT",
     )
-    .with_name("LT")
 }
 
 /// Create SHIFT AIR with constraints and bus interactions.
-pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = shift_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
-        constraints.into_iter().map(|c| c.boxed()).collect();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: shift_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_shift_air(proof_options: &ProofOptions) -> ConcreteVmAir<ShiftConstraints> {
+    build_air(
         shift_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        shift_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        ShiftConstraints,
+        "SHIFT",
     )
-    .with_name("SHIFT")
+}
+
+/// Create the EQ AIR.
+pub fn create_eq_air(proof_options: &ProofOptions) -> ConcreteVmAir<EqConstraints> {
+    build_air(
+        eq_cols::NUM_COLUMNS,
+        eq_bus_interactions(),
+        proof_options,
+        1,
+        EqConstraints,
+        "EQ",
+    )
+}
+
+/// Create the BYTEWISE AIR. No polynomial constraints.
+pub fn create_bytewise_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        bytewise_cols::NUM_COLUMNS,
+        bytewise_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "BYTEWISE",
+    )
+}
+
+/// Create the STORE AIR.
+pub fn create_store_air(proof_options: &ProofOptions) -> ConcreteVmAir<StoreConstraints> {
+    build_air(
+        store_cols::NUM_COLUMNS,
+        store_bus_interactions(),
+        proof_options,
+        1,
+        StoreConstraints,
+        "STORE",
+    )
+}
+
+/// Create the CPU32 AIR.
+pub fn create_cpu32_air(proof_options: &ProofOptions) -> ConcreteVmAir<Cpu32Constraints> {
+    build_air(
+        cpu32_cols::NUM_COLUMNS,
+        cpu32_bus_interactions(),
+        proof_options,
+        1,
+        Cpu32Constraints,
+        "CPU32",
+    )
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
-pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints = memw_constraints();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: memw_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_memw_air(proof_options: &ProofOptions) -> ConcreteVmAir<MemwConstraints> {
+    build_air(
         memw_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        memw_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        MemwConstraints,
+        "MEMW",
     )
-    .with_name("MEMW")
 }
 
 /// Create MEMW_A (aligned) AIR with constraints and bus interactions.
-pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints = memw_aligned_constraints();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: memw_aligned_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_memw_aligned_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<MemwAlignedConstraints> {
+    build_air(
         memw_aligned_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        memw_aligned_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        MemwAlignedConstraints,
+        "MEMW_A",
     )
-    .with_name("MEMW_A")
 }
 
 /// Create MEMW_R (register) AIR with constraints and bus interactions.
-pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints = memw_register_constraints();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: memw_register_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_memw_register_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<MemwRegisterConstraints> {
+    build_air(
         memw_register_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        memw_register_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        MemwRegisterConstraints,
+        "MEMW_R",
     )
-    .with_name("MEMW_R")
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
-pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints = load_constraints();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: load_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_load_air(proof_options: &ProofOptions) -> ConcreteVmAir<LoadConstraints> {
+    build_air(
         load_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        load_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        LoadConstraints,
+        "LOAD",
     )
-    .with_name("LOAD")
 }
 
 /// Create DECODE AIR with bus interactions.
@@ -655,67 +832,41 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
 /// The DECODE table has no transition constraints (it's a pure lookup table).
 /// It receives lookups from the CPU table via the DECODE bus.
 ///
-/// For production use with preprocessed verification, chain with `.with_preprocessed()`:
-/// ```ignore
-/// let decode_air = create_decode_air(&opts)
-///     .with_preprocessed(
-///         decode::compute_precomputed_commitment(&instructions, &opts),
-///         decode::NUM_PRECOMPUTED_COLS,
-///     );
-/// ```
-pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: decode_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+/// For production use with preprocessed verification, chain with `.with_preprocessed()`
+/// on the concrete `AirWithBuses` before boxing.
+pub fn create_decode_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         decode_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        decode_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        "DECODE",
     )
-    .with_name("DECODE")
 }
 
-/// Create MUL AIR with bus interactions.
-pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: mul_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+/// Create MUL AIR with constraints and bus interactions.
+pub fn create_mul_air(proof_options: &ProofOptions) -> ConcreteVmAir<MulConstraints> {
+    build_air(
         mul_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        mul_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        MulConstraints,
+        "MUL",
     )
-    .with_name("MUL")
 }
 
 /// Create DVRM AIR with constraints and bus interactions.
-pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = dvrm_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
-        constraints.into_iter().map(|c| c.boxed()).collect();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: dvrm_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_dvrm_air(proof_options: &ProofOptions) -> ConcreteVmAir<DvrmConstraints> {
+    build_air(
         dvrm_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        dvrm_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        DvrmConstraints,
+        "DVRM",
     )
-    .with_name("DVRM")
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.
@@ -723,59 +874,54 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
 /// The BRANCH table computes next_pc for branch/jump instructions:
 /// - For branches (BEQ, BLT, JAL): next_pc = pc + sign_extend(offset)
 /// - For JALR: next_pc = (register + sign_extend(offset)) & ~1
-pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = branch_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
-        constraints.into_iter().map(|c| c.boxed()).collect();
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: branch_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_branch_air(proof_options: &ProofOptions) -> ConcreteVmAir<BranchConstraints> {
+    build_air(
         branch_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        branch_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        BranchConstraints,
+        "BRANCH",
     )
-    .with_name("BRANCH")
 }
 
 /// Create HALT AIR with bus interactions (no transition constraints).
-pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: halt_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_halt_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         halt_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        halt_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        "HALT",
     )
-    .with_name("HALT")
+}
+
+/// Create HINT AIR: a receiver for the `hint` ecall (Ecall receive, the x10/x11/x12
+/// register reads, the three ALU `LT` operand range-checks, four output MEMW writes,
+/// output byte range-checks) with a single boolean constraint on the multiplicity
+/// column `mu`.
+pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstraints> {
+    build_air(
+        hint_cols::NUM_COLUMNS,
+        hint_bus_interactions(),
+        proof_options,
+        1,
+        HintConstraints,
+        "HINT",
+    )
 }
 
 /// Create COMMIT AIR with constraints and bus interactions.
-pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
-    let (transition_constraints, _) = commit_constraints(0);
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: commit_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_commit_air(proof_options: &ProofOptions) -> ConcreteVmAir<CommitConstraints> {
+    build_air(
         commit_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        commit_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        CommitConstraints,
+        "COMMIT",
     )
-    .with_name("COMMIT")
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.
@@ -785,99 +931,91 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
 /// the base address of this page.
 ///
 /// The PAGE table has no transition constraints (it's a pure lookup table).
-/// It interacts with:
-/// - ARE_BYTES bus: range checks for init/fini values
-/// - Memory bus: provides initial and final memory tokens
-pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: page_bus_interactions(page_base),
-    };
-
-    AirWithBuses::new(
+pub fn create_page_air(
+    proof_options: &ProofOptions,
+    page_base: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         page_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        page_bus_interactions(page_base),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        &format!("PAGE:0x{:x}", page_base),
     )
-    .with_name(&format!("PAGE:0x{:x}", page_base))
 }
 
 /// Create REGISTER AIR with bus interactions.
 ///
 /// The REGISTER table provides initial and final tokens for register accesses
 /// on the Memory bus (is_register=1).
-pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: register_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_register_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         register_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        register_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        "REGISTER",
     )
-    .with_name("REGISTER")
 }
 
 /// Create KECCAK core AIR with ADD constraints and bus interactions.
-pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = crate::tables::keccak::create_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = constraints;
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: keccak_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_keccak_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakConstraints> {
+    build_air(
         keccak_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        keccak_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        KeccakConstraints,
+        "KECCAK",
     )
-    .with_name("KECCAK")
 }
 
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
-pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = crate::tables::keccak_rnd::create_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = constraints;
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: keccak_rnd_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakRndConstraints> {
+    build_air(
         keccak_rnd_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        keccak_rnd_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        KeccakRndConstraints,
+        "KECCAK_RND",
     )
-    .with_name("KECCAK_RND")
 }
 
 /// Create KECCAK_RC AIR with bus interactions (preprocessed table).
-pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: keccak_rc_bus_interactions(),
-    };
-
-    AirWithBuses::new(
+pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
         keccak_rc_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
+        keccak_rc_bus_interactions(),
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
+        "KECCAK_RC",
     )
-    .with_name("KECCAK_RC")
+}
+
+/// Create ECSM core AIR (secp256k1 scalar-multiplication orchestrator).
+pub fn create_ecsm_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcsmConstraints> {
+    build_air(
+        ecsm_cols::NUM_COLUMNS,
+        ecsm_bus_interactions(),
+        proof_options,
+        1,
+        EcsmConstraints,
+        "ECSM",
+    )
+}
+
+/// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).
+pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasConstraints> {
+    build_air(
+        ecdas_cols::NUM_COLUMNS,
+        ecdas_bus_interactions(),
+        proof_options,
+        1,
+        EcdasConstraints,
+        "ECDAS",
+    )
 }
