@@ -466,10 +466,47 @@ fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + 
 
 /// The windows' lists concatenated into the run's, once: list by list in
 /// parallel, each window's list freed as it is copied.
+/// Whether [`concatenate`] copies each list's windows one after another on one
+/// thread (`LAMBDA_VM_BUILDER_CONCAT=serial`), the control for the parallel copy.
+/// Read once. The two give the same lists.
+#[cfg(feature = "parallel")]
+fn serial_concat() -> bool {
+    static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SERIAL.get_or_init(|| {
+        std::env::var("LAMBDA_VM_BUILDER_CONCAT").is_ok_and(|v| v.trim() == "serial")
+    })
+}
+
 fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOutputs) {
+    /// The windows' lists one after another, in window order. Under `parallel`
+    /// each window's part is moved into its own disjoint slice of the output
+    /// on a thread of its own: the copy and the first touch of a list of
+    /// several GiB are spread over the pool instead of one thread.
     fn cat<T: Send>(parts: Vec<Vec<T>>) -> Vec<T> {
         let total = parts.iter().map(Vec::len).sum();
         let mut out = Vec::with_capacity(total);
+        #[cfg(feature = "parallel")]
+        if !serial_concat() && parts.len() > 1 {
+            let mut slots: Vec<&mut [std::mem::MaybeUninit<T>]> = Vec::with_capacity(parts.len());
+            let mut rest = &mut out.spare_capacity_mut()[..total];
+            for part in &parts {
+                let (head, tail) = rest.split_at_mut(part.len());
+                slots.push(head);
+                rest = tail;
+            }
+            parts
+                .into_par_iter()
+                .zip(slots.into_par_iter())
+                .for_each(|(part, slot)| {
+                    for (dst, src) in slot.iter_mut().zip(part) {
+                        dst.write(src);
+                    }
+                });
+            // SAFETY: the slots tile `0..total` of the spare capacity, and each
+            // was written element for element by its part, whose length it has.
+            unsafe { out.set_len(total) };
+            return out;
+        }
         for part in parts {
             out.extend(part);
         }
