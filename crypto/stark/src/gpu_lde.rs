@@ -499,6 +499,15 @@ pub(crate) fn gpu_xcheck() -> bool {
     *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_XCHECK").is_ok_and(|v| v != "0"))
 }
 
+/// The resident aux build waits (device-side) on the event of the stream that
+/// wrote its resident main trace. `LAMBDA_VM_GPU_AUX_WAIT=0` drops the wait —
+/// for the A/B that measures it and the run that reproduces the race it
+/// closes; never in production.
+pub(crate) fn aux_waits_for_resident_main() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_AUX_WAIT").as_deref() != Ok("0"))
+}
+
 /// Serialize the SUBMISSION of the device R2 window (constraint eval +
 /// decompose) across tables. Concurrent R2 windows under VRAM pressure can
 /// transiently corrupt a whole H buffer (root mechanism unidentified; reruns
