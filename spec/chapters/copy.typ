@@ -68,7 +68,7 @@ prover-hinted `is_commit` and `is_set` flags to extract the correct syscall numb
 
 #render_constraint_table(chip, config, groups: "ecall")
 
-Note that this step is performed only when the prover-hinted `first` flag is set,
+Note that this step is performed exactly when the prover-hinted `first` flag is set,
 ensuring this flag is only set on the first row of a copy sequence.
 
 == Reading parameters <reading-parameters>
