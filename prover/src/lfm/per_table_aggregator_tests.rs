@@ -9523,7 +9523,23 @@ where
 #[test]
 #[ignore = "proves a block's base: a box run"]
 fn the_whir_base_alone() {
-    let inputs = super::epoch_tests::EpochInputs::from_env();
+    // The block from the environment and nothing else: `EpochInputs::from_env`
+    // starts from the recursion fixture, whose ELF a base-only run neither needs
+    // nor builds (FAST 344's A arm panicked reading it).
+    let var = |name: &str| {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} must name the block to prove"))
+    };
+    let elf_path = var("LFM_CENSUS_ELF");
+    let inputs = super::epoch_tests::EpochInputs {
+        elf_bytes: std::fs::read(&elf_path)
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_ELF {elf_path}: {e}")),
+        private_input: std::fs::read(var("LFM_CENSUS_INPUT"))
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_INPUT: {e}")),
+        epoch_log2: var("LFM_CENSUS_EPOCH_LOG2")
+            .parse()
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_EPOCH_LOG2: {e}")),
+        label: elf_path,
+    };
     let inner = super::proof::block_base_options();
     let _permit = crate::argue_measure::permit_base_only();
     let batched = crate::argue_measure::requested();
