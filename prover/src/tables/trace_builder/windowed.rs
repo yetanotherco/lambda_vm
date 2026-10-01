@@ -451,13 +451,17 @@ fn chunk_jobs(
     jobs
 }
 
-/// `rayon::join`, or the two calls in turn without the `parallel` feature (the
-/// recursion ELFs build this crate without it).
+/// `rayon::join` under the `parallel` feature, the two calls in order without
+/// it (the prover's guests take it without rayon).
 fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
     #[cfg(feature = "parallel")]
-    return rayon::join(a, b);
+    {
+        rayon::join(a, b)
+    }
     #[cfg(not(feature = "parallel"))]
-    (a(), b())
+    {
+        (a(), b())
+    }
 }
 
 /// The windows' lists concatenated into the run's, once: list by list in
