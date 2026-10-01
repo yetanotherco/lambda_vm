@@ -1352,31 +1352,81 @@ fn prove_streamed(
     })
 }
 
-/// Verifies a proof from [`prove_block_whir`] under `format` — the verifier's
-/// own constants, never the proof's.
-pub fn verify_block_whir(
-    proof: &BlockWhirProof,
+/// The statement's fields: everything of a [`BlockWhirProof`] the verifier
+/// reads before any root, which is everything but its argument.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockStatement<'a> {
+    pub table_num_vars: &'a [u8],
+    pub runtime_page_ranges: &'a [RuntimePageRange],
+    pub table_counts: &'a TableCounts,
+    pub public_output: &'a [u8],
+    pub num_private_input_pages: usize,
+    pub groups: &'a [Vec<u32>],
+}
+
+impl BlockWhirProof {
+    /// The proof's statement.
+    pub fn statement(&self) -> BlockStatement<'_> {
+        BlockStatement {
+            table_num_vars: &self.table_num_vars,
+            runtime_page_ranges: &self.runtime_page_ranges,
+            table_counts: &self.table_counts,
+            public_output: &self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: &self.groups,
+        }
+    }
+}
+
+/// What a verifier derives from the program and a statement before any root,
+/// once the statement's checks pass. The host verifier and the recursion's tree
+/// plan both start from it, so they check one statement the same way.
+pub(crate) struct BlockFrame {
+    pub(crate) program: Elf,
+    pub(crate) page_configs: Vec<crate::tables::page::PageConfig>,
+    pub(crate) airs: VmAirs,
+    /// Per table in [`VmAirs::air_refs`] order: the AIR's width and the stated
+    /// height in variables.
+    pub(crate) shapes: Vec<(usize, usize)>,
+    pub(crate) config: multilinear::whir_chain::ChainConfig,
+    /// The proof's table order: AIR indices, the groups concatenated.
+    pub(crate) order: Vec<usize>,
+    /// Tables per group.
+    pub(crate) sizes: Vec<usize>,
+    /// Each group's stack and domain, from the shapes and the verifier's stack
+    /// cap.
+    pub(crate) stack_layouts: Vec<multilinear::stacking::StackedLayout>,
+    pub(crate) domains: Vec<multilinear::whir::Domain<F>>,
+}
+
+/// The statement's checks, and what they leave: the counts within bounds, the
+/// page layout the ELF and the ranges imply, one height per table the counts
+/// imply, the AIR set, the groups an exact partition within the group maximum
+/// and each within the stack budget.
+pub(crate) fn block_frame(
+    statement: BlockStatement<'_>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     format: &BlockFormat,
-) -> Result<bool, Error> {
+) -> Result<BlockFrame, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
-    validate_block_counts(&proof.table_counts)?;
+    validate_block_counts(statement.table_counts)?;
     let max_pages = crate::tables::page::max_private_input_pages();
-    if proof.num_private_input_pages > max_pages {
+    if statement.num_private_input_pages > max_pages {
         return Err(Error::InvalidTableCounts(format!(
             "num_private_input_pages ({}) exceeds max ({max_pages})",
-            proof.num_private_input_pages,
+            statement.num_private_input_pages,
         )));
     }
+    let num_tables = statement.table_num_vars.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
-        &proof.runtime_page_ranges,
-        proof.num_private_input_pages,
-        proof.proof.tables.len(),
+        statement.runtime_page_ranges,
+        statement.num_private_input_pages,
+        num_tables,
     )?;
-    let Some(expected) = proof
+    let Some(expected) = statement
         .table_counts
         .total()
         .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
@@ -1386,11 +1436,9 @@ pub fn verify_block_whir(
             "the table counts do not sum to a usize".to_string(),
         ));
     };
-    if expected != proof.proof.tables.len() || proof.table_num_vars.len() != expected {
+    if expected != num_tables {
         return Err(Error::InvalidTableCounts(format!(
-            "the statement implies {expected} tables; the proof carries {} and {} heights",
-            proof.proof.tables.len(),
-            proof.table_num_vars.len(),
+            "the statement implies {expected} tables and states {num_tables} heights",
         )));
     }
 
@@ -1399,7 +1447,7 @@ pub fn verify_block_whir(
         proof_options,
         false,
         &page_configs,
-        &proof.table_counts,
+        statement.table_counts,
         None,
         true,
         None,
@@ -1407,54 +1455,34 @@ pub fn verify_block_whir(
         None,
     );
     let air_refs = airs.air_refs();
-    if air_refs.len() != proof.proof.tables.len() {
+    if air_refs.len() != num_tables {
         return Err(Error::InvalidTableCounts(format!(
-            "the layout has {} tables, the proof carries {}",
+            "the layout has {} tables, the statement {num_tables}",
             air_refs.len(),
-            proof.proof.tables.len(),
         )));
     }
     // The width is the AIR's, never the proof's; only the height is stated.
     let shapes: Vec<(usize, usize)> = air_refs
         .iter()
-        .zip(&proof.table_num_vars)
+        .zip(statement.table_num_vars)
         .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
         .collect();
     let config = chain_config_under(&format.zf, &shapes);
-    let layouts: Vec<TableLayout<'_, F, E>> = air_refs
-        .iter()
-        .zip(&shapes)
-        .map(|(air, &(width, num_vars))| {
-            layout_of(*air, width, num_vars)
-                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
-        })
-        .collect::<Result<_, _>>()?;
-    let preprocessed: Vec<Vec<Mle<F>>> = air_refs
-        .iter()
-        .map(|air| preprocessed_mles(*air))
-        .collect::<Result<_, _>>()?;
-    let statements: Vec<TableStatement<'_, F, E>> = layouts
-        .iter()
-        .zip(&preprocessed)
-        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
-        .collect();
+    drop(air_refs);
 
     // The groups are the statement's; their stacks are built here, from the
-    // shapes and the verifier's stack cap. The proof's tables are in group
-    // order, so the statements are taken in that order too.
-    if proof.groups.len() > format.max_groups {
+    // shapes and the verifier's stack cap.
+    if statement.groups.len() > format.max_groups {
         return Err(Error::InvalidTableCounts(format!(
             "{} groups — a block takes at most {}",
-            proof.groups.len(),
+            statement.groups.len(),
             format.max_groups
         )));
     }
-    let order = validate_groups(&proof.groups, shapes.len())?;
-    let sizes: Vec<usize> = proof.groups.iter().map(Vec::len).collect();
+    let order = validate_groups(statement.groups, shapes.len())?;
+    let sizes: Vec<usize> = statement.groups.iter().map(Vec::len).collect();
     let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();
-    let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
     let (stack_layouts, domains) = stacks(&group_shapes, &sizes, &config)?;
-    let prepared_columns = prepared_tables(&airs, &page_configs)?;
     // Every group within the stack budget — the verifier's constant, not the
     // prover's packing — except a table that alone needs more: it cannot be
     // split, so it is a group of its own (the packing's rule too).
@@ -1469,6 +1497,68 @@ pub fn verify_block_whir(
             format.group_polys
         )));
     }
+    Ok(BlockFrame {
+        program,
+        page_configs,
+        airs,
+        shapes,
+        config,
+        order,
+        sizes,
+        stack_layouts,
+        domains,
+    })
+}
+
+/// Verifies a proof from [`prove_block_whir`] under `format` — the verifier's
+/// own constants, never the proof's.
+pub fn verify_block_whir(
+    proof: &BlockWhirProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+) -> Result<bool, Error> {
+    if proof.proof.tables.len() != proof.table_num_vars.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "the proof carries {} table arguments and {} heights",
+            proof.proof.tables.len(),
+            proof.table_num_vars.len(),
+        )));
+    }
+    let frame = block_frame(proof.statement(), elf_bytes, proof_options, format)?;
+    let BlockFrame {
+        airs,
+        page_configs,
+        shapes,
+        config,
+        order,
+        sizes,
+        stack_layouts,
+        domains,
+        ..
+    } = &frame;
+    let air_refs = airs.air_refs();
+    let layouts: Vec<TableLayout<'_, F, E>> = air_refs
+        .iter()
+        .zip(shapes)
+        .map(|(air, &(width, num_vars))| {
+            layout_of(*air, width, num_vars)
+                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
+        })
+        .collect::<Result<_, _>>()?;
+    let preprocessed: Vec<Vec<Mle<F>>> = air_refs
+        .iter()
+        .map(|air| preprocessed_mles(*air))
+        .collect::<Result<_, _>>()?;
+    let statements: Vec<TableStatement<'_, F, E>> = layouts
+        .iter()
+        .zip(&preprocessed)
+        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .collect();
+    // The proof's tables are in group order, so the statements are taken in
+    // that order too.
+    let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
+    let prepared_columns = prepared_tables(airs, page_configs)?;
 
     Ok(crate::with_whir_hash!(|H| {
         let mut transcript =
@@ -1481,14 +1571,14 @@ pub fn verify_block_whir(
             proof.num_private_input_pages,
             &proof.runtime_page_ranges,
             &proof.table_num_vars,
-            &config,
+            config,
             &proof.groups,
         );
         // The prepared commitments, derived here from the program: their roots
         // are the verifier's, never the proof's.
         let prepared: Vec<TablePrepared<H>> = match prepared_columns
             .into_iter()
-            .map(|(table, columns)| commit_prepared::<H>(table, columns, &config))
+            .map(|(table, columns)| commit_prepared::<H>(table, columns, config))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(prepared) => prepared,
@@ -1525,11 +1615,11 @@ pub fn verify_block_whir(
             &proof.prepared,
             &checks,
             &statements,
-            &stack_layouts,
-            &domains,
-            &sizes,
+            stack_layouts,
+            domains,
+            sizes,
             &owed,
-            &config,
+            config,
             &mut transcript,
         )
         .is_ok()
