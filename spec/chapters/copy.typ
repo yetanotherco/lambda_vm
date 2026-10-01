@@ -14,7 +14,7 @@
 #let chip = load_chip("src/copy.toml", config)
 #let copy = raw(chip.name)
 
-The #copy chip moves a range of bytes from one location to another.
+The #copy chip copies a range of bytes from one location to another.
 This single chip serves the standard `C` memory functions `memcpy`, `memmove` and (a variation to) `memset`, as well as the `write` sycall.
 
 *Note.* Each of these four operations modifies a _variable_ number of bytes.
@@ -92,7 +92,7 @@ SD dst, ch; // store `ch` at `dst`
 memcpy(dest + 8, dest, count - 8)
 ```
 #et[technically, you'd have to duplicate the `ch`.... Also, hte ref to memcpy is confusing...]
-where we expect the `memcpy` function to perform the copy one byte at a time, incrementing the address at is goes along.
+where we expect the `memcpy` function to perform the copy one byte at a time, incrementing the address as it goes along.
 This leads to eight copies of `ch` being repeated across the entire address interval $[#`dest`, #`dest` + #`count`)$, which is equivalent to setting the values held by all these addresses to `ch`.
 We will later show how this chip achieves this when $#`is_set` = 1$.
 Lastly, note that `memset` calls with $#`count` <= 8$ should be mapped to a `STORE` operation directly, which is more efficient anyway.
@@ -211,7 +211,7 @@ As requested by the standard, this chip accepts arbitrary operand alignment.
 One limitation is that this chip does not fully capture the `memset` interface just yet;
 calls to this operation will have to be wrapped by some `CPU` operations to 
 transpose to this chip's interface.
-Moreover, the standard's fourth operation, `memcmp`, is not covered, as that does involve copying.
+Moreover, the standard's fourth operation, `memcmp`, is not covered by this chip, as it does not involve copying.
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
 
 = Notes/optimizations
