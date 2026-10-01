@@ -1999,6 +1999,7 @@ pub(crate) fn hint_table_wires(
 
 /// How many words [`push_table_words`] writes for a table of `shape`: the
 /// counts [`hint_table_wires_shaped`] hints, from the shape alone.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn table_words(shape: &TableShape<'_>) -> usize {
     use super::whir_gkr::GKR_SUMCHECK_DEGREE;
     use super::whir_reduce::REDUCE_DEGREE;
@@ -2018,6 +2019,7 @@ pub(crate) fn table_words(shape: &TableShape<'_>) -> usize {
 /// `i` rounds; one main round per row variable at the batch's degree; one factor
 /// value per committed source; one reduce round per row variable; one value per
 /// committed column), so a proof of another shape cannot be read into it.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn hint_table_wires_shaped(
     b: &mut LfmBuilder,
     arena: super::instr::ArenaId,
@@ -2068,6 +2070,7 @@ pub(crate) fn hint_table_wires_shaped(
 
 /// [`hint_group_chains`] for `polys` chains of `shape`, the count the verifier's
 /// own layout gives rather than the proof's.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn hint_group_chains_shaped(
     b: &mut LfmBuilder,
     arena: super::instr::ArenaId,

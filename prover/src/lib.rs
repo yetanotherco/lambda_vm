@@ -12,6 +12,9 @@
 
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
+// The block prover runs its phases on threads and rayon: a host prover, built
+// with `parallel` (the guests take the crate without it).
+#[cfg(feature = "parallel")]
 pub mod block_whir;
 pub mod constraints;
 pub mod continuation;

@@ -4073,6 +4073,7 @@ pub(crate) mod build_stamps {
     static LOG: Mutex<Option<Marks>> = Mutex::new(None);
 
     /// Starts recording, clearing what an earlier build left.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn start() {
         if let Ok(mut log) = LOG.lock() {
             *log = Some((Instant::now(), Vec::new()));
@@ -4093,6 +4094,7 @@ pub(crate) mod build_stamps {
     }
 
     /// Stops recording and hands back the marks.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn take() -> Vec<(String, f64)> {
         ON.store(false, Ordering::Relaxed);
         LOG.lock()

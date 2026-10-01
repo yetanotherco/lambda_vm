@@ -68,6 +68,7 @@ pub mod transcript_replay;
 pub mod tree_probe;
 pub mod validator;
 pub mod whir_air;
+#[cfg(feature = "parallel")]
 pub mod whir_block;
 pub mod whir_bus;
 pub mod whir_chain;
@@ -194,7 +195,7 @@ mod preprocessed_tests;
 mod program_shape_tests;
 #[cfg(test)]
 mod whir_air_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "parallel"))]
 mod whir_block_tests;
 #[cfg(test)]
 mod whir_bus_tests;
