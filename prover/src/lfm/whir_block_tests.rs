@@ -67,6 +67,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             window_log2: None,
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            drop_streamed_ops: false,
             layout_workers: 0,
             pack_rest_as_laid_out: false,
         },
@@ -350,6 +351,7 @@ fn dense_block_with(
             window_log2: None,
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            drop_streamed_ops: false,
             layout_workers: 0,
             pack_rest_as_laid_out: false,
         },
@@ -1092,15 +1094,18 @@ fn the_whir_block_tree_on_a_real_block() {
     // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
+    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
     println!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} · rest packed as laid out {}",
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {}",
         options.stream_keccak_rnd,
         options.stream_memw_lt,
         options.layout_workers,
-        options.pack_rest_as_laid_out
+        options.pack_rest_as_laid_out,
+        options.drop_streamed_ops
     );
 
     let t0 = std::time::Instant::now();

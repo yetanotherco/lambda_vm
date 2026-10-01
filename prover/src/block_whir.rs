@@ -127,6 +127,11 @@ pub struct BlockOptions {
     /// whole-run build's, the same LT multiplicities). Off by default: the
     /// extra chunks bind the layout thread, a REGRESSION (FAST 420).
     pub stream_memw_lt: bool,
+    /// With windows: the builder drops each streamed chunk's ops as the chunk
+    /// leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so the build does
+    /// not hold the run's op lists to its end; the traces are the same. Off by
+    /// default until its box gate (D-MEMORY M1).
+    pub drop_streamed_ops: bool,
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
     /// order all the same, while the layout thread lays out the rest of the
@@ -149,6 +154,7 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            drop_streamed_ops: false,
             layout_workers: 3,
             pack_rest_as_laid_out: false,
         }
@@ -1723,6 +1729,9 @@ fn prove_streamed(
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
+                }
+                if options.drop_streamed_ops {
+                    builder = builder.drop_streamed_ops()?;
                 }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
