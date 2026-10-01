@@ -3623,6 +3623,14 @@ pub struct StreamSkip {
     /// only from the ops past these. Zero everywhere else.
     pub memw_lt_done: usize,
     pub memw_aligned_lt_done: usize,
+    /// The streamed tables' op lists hold only the ops past their streamed
+    /// chunks (a windowed build that drops each chunk's ops as it hands the
+    /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and
+    /// `memw_lt_done` / `memw_aligned_lt_done` count within those. `false`
+    /// everywhere else: the lists are the whole run's.
+    ///
+    /// [`WindowedTraceBuilder::drop_streamed_ops`]: windowed::WindowedTraceBuilder::drop_streamed_ops
+    pub tails: bool,
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -3635,6 +3643,16 @@ pub(crate) struct PreCounted {
     pub(crate) histogram: bitwise::BitwiseHistogram,
     pub(crate) bitwise_ops: usize,
     pub(crate) memw_register_rows: usize,
+    /// The (timestamp, next pc) of the last ECALL among CPU ops that are no
+    /// longer in the CPU list ([`StreamSkip::tails`]): the HALT search's answer
+    /// when the list left holds none.
+    pub(crate) last_ecall: Option<(u64, u64)>,
+    /// The phase-3 LT ops of the MEMW (general) and MEMW_A ops that are no
+    /// longer in their lists ([`StreamSkip::tails`] without the MEMW-derived LT
+    /// ops streamed), in list order: phase 3 puts each before the LT ops of the
+    /// list it derives from the ops left.
+    pub(crate) memw_lt: Vec<LtOperation>,
+    pub(crate) memw_aligned_lt: Vec<LtOperation>,
 }
 
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
@@ -3644,11 +3662,13 @@ pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksEx
 
 /// [`chunk_and_generate`] / [`chunk_and_generate_optional`] (`optional`) with
 /// the first `skip` chunks already handed out: those slots get placeholders
-/// and are not generated again. `skip == 0` is the plain call.
+/// and are not generated again. `skip == 0` is the plain call. With `tails`,
+/// `ops` holds only the ops past those chunks ([`StreamSkip::tails`]).
 fn chunk_and_generate_skipping<T: Sync>(
     ops: &[T],
     max_rows: usize,
     skip: usize,
+    tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -3673,13 +3693,17 @@ fn chunk_and_generate_skipping<T: Sync>(
         };
     }
     let chunks: Vec<&[T]> = ops.chunks(max_rows).collect();
-    if skip > chunks.len() {
-        return Err(Error::Prover(format!(
-            "{skip} chunks were streamed but the run has {} of this table",
-            chunks.len()
-        )));
-    }
-    let rest = chunks[skip..].to_vec();
+    let rest = if tails {
+        chunks
+    } else {
+        if skip > chunks.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                chunks.len()
+            )));
+        }
+        chunks[skip..].to_vec()
+    };
     let mut tables: Vec<_> = (0..skip).map(|_| streamed_placeholder()).collect();
     tables.extend(generate_chunks(
         rest,
@@ -4088,7 +4112,7 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
     skip: &StreamSkip,
-    pre: Option<PreCounted>,
+    mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -4118,9 +4142,15 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
+    if let Some(pre) = pre.as_mut() {
+        lt_ops.extend(std::mem::take(&mut pre.memw_lt));
+    }
     lt_ops.extend(collect_lt_from_memw(
         &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
     ));
+    if let Some(pre) = pre.as_mut() {
+        lt_ops.extend(std::mem::take(&mut pre.memw_aligned_lt));
+    }
     lt_ops.extend(collect_lt_from_memw_aligned(
         &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
     ));
@@ -4149,10 +4179,17 @@ fn build_traces<I: ImageSource + Sync>(
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
+    // Without the streamed chunks' ops (`skip.tails`), their full chunks pad too.
+    let padding = |len: usize| len.next_power_of_two().max(4) - len;
     let num_padding_rows: usize = cpu_ops
         .chunks(max_rows.cpu)
-        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-        .sum();
+        .map(|chunk| padding(chunk.len()))
+        .sum::<usize>()
+        + if skip.tails {
+            skip.cpu * padding(max_rows.cpu)
+        } else {
+            0
+        };
 
     // The per-source bitwise collectors are all pure functions of their inputs, and the
     // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
@@ -4222,6 +4259,7 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
+    let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
     let (mut base, counted_iw, counted_reg) = match pre {
         Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
         None => (bitwise::BitwiseHistogram::new(), 0, 0),
@@ -4301,10 +4339,12 @@ fn build_traces<I: ImageSource + Sync>(
     // to the next epoch via the register snapshot, and HALT is excluded from the
     // proof (`include_halt = false`) so `halt_trace` is unused there.
     let (halt_timestamp, halt_next_pc) = if is_final {
-        let halt_op = cpu_ops
+        let (halt_timestamp, halt_next_pc) = cpu_ops
             .iter()
             .rev()
             .find(|op| op.decode.fields.ecall)
+            .map(|op| (op.timestamp, op.next_pc))
+            .or(streamed_last_ecall)
             .ok_or(Error::MissingHaltEcall)?;
         // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
         // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
@@ -4312,8 +4352,8 @@ fn build_traces<I: ImageSource + Sync>(
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
         // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
         // must match that last write to balance the memory argument.
-        register_state.write_pc(1, halt_op.timestamp + 4 * num_padding_rows as u64 + 1);
-        (halt_op.timestamp, halt_op.next_pc)
+        register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
+        (halt_timestamp, halt_next_pc)
     } else {
         (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
     };
@@ -4329,6 +4369,7 @@ fn build_traces<I: ImageSource + Sync>(
             cpu_ops_ref,
             max_rows.cpu,
             skip.cpu,
+            skip.tails,
             false,
             cpu::generate_cpu_trace,
             #[cfg(feature = "disk-spill")]
@@ -4340,6 +4381,7 @@ fn build_traces<I: ImageSource + Sync>(
             &memw_ops,
             max_rows.memw,
             skip.memw,
+            skip.tails,
             true,
             memw::generate_memw_trace,
             #[cfg(feature = "disk-spill")]
@@ -4351,6 +4393,7 @@ fn build_traces<I: ImageSource + Sync>(
             &memw_aligned_ops,
             max_rows.memw_aligned,
             skip.memw_aligned,
+            skip.tails,
             true,
             memw_aligned::generate_memw_aligned_trace,
             #[cfg(feature = "disk-spill")]
@@ -4364,6 +4407,7 @@ fn build_traces<I: ImageSource + Sync>(
             &memw_register_rows,
             max_rows.memw_register,
             skip.memw_register,
+            skip.tails,
             false,
             memw_register::generate_memw_register_trace_from_rows,
             #[cfg(feature = "disk-spill")]
@@ -4375,6 +4419,7 @@ fn build_traces<I: ImageSource + Sync>(
             &load_ops,
             max_rows.load,
             skip.load,
+            skip.tails,
             true,
             load::generate_load_trace,
             #[cfg(feature = "disk-spill")]
@@ -4386,6 +4431,7 @@ fn build_traces<I: ImageSource + Sync>(
             &lt_ops,
             max_rows.lt,
             skip.lt,
+            skip.tails,
             true,
             lt::generate_lt_trace,
             #[cfg(feature = "disk-spill")]
@@ -4397,6 +4443,7 @@ fn build_traces<I: ImageSource + Sync>(
             &shift_ops,
             max_rows.shift,
             skip.shift,
+            skip.tails,
             true,
             shift::generate_shift_trace,
             #[cfg(feature = "disk-spill")]
@@ -4455,6 +4502,7 @@ fn build_traces<I: ImageSource + Sync>(
             &store_ops,
             max_rows.store,
             skip.store,
+            skip.tails,
             true,
             store::generate_store_trace,
             #[cfg(feature = "disk-spill")]

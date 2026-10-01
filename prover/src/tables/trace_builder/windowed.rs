@@ -34,13 +34,30 @@
 //! a SCHEDULE, not a different trace: `windowed_builds_the_whole_run_tables`
 //! checks every table against [`Traces::from_elf_and_logs`].
 //!
+//! # Dropping the streamed ops
+//!
+//! By default the builder keeps every walked window until [`finish`], so the
+//! run's op lists are all resident at the end of the run (≈ 300 B per cycle).
+//! With [`WindowedTraceBuilder::drop_streamed_ops`] it keeps, per streamed
+//! table, only the ops not yet in a handed-out chunk ([`Tail`]), and takes what
+//! the table phase would have read from a chunk's ops as the chunk leaves:
+//! BITWISE's lookups from LT, SHIFT, STORE, MEMW_A and MEMW_R, DECODE's lookups
+//! and the last ECALL from CPU are counted; the phase-3 LT ops of MEMW and
+//! MEMW_A are derived and kept (unless [`stream_memw_lt`] already put them in
+//! the windows' LT lists). The other walk lists are appended window by window;
+//! the in-walk BITWISE lookups are counted and dropped. [`finish`] then runs
+//! the table phase over the tails ([`StreamSkip::tails`]). The tables are the
+//! same as without it.
+//!
+//! [`stream_memw_lt`]: WindowedTraceBuilder::stream_memw_lt
+//!
 //! Row order inside the tables that deduplicate through a `HashMap` (EQ,
 //! BYTEWISE, BRANCH, DVRM, LT, MUL) is not reproducible between ANY two builds;
 //! their chunks hold the same ops, so the same rows.
 //!
 //! [`finish`]: WindowedTraceBuilder::finish
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use executor::elf::Elf;
 use executor::vm::logs::Log;
@@ -55,7 +72,9 @@ use super::{
     collect_halt_ops, collect_ops_from_cpu_into, route_ops,
 };
 use crate::Error;
-use crate::tables::{cpu, load, lt, memw, memw_aligned, memw_register, register, shift, store};
+use crate::tables::{
+    cpu, decode, load, lt, memw, memw_aligned, memw_register, register, shift, store,
+};
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
@@ -117,6 +136,9 @@ pub struct WindowedTraceBuilder<'a> {
     stamps: WindowStamps,
     /// [`Self::stream_memw_lt`].
     stream_memw_lt: bool,
+    /// [`Self::drop_streamed_ops`]: the run so far, without the handed-out ops
+    /// (`windows` stays empty).
+    kept: Option<Kept>,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -158,9 +180,13 @@ impl<'a> WindowedTraceBuilder<'a> {
                 histogram: bitwise::BitwiseHistogram::new(),
                 bitwise_ops: 0,
                 memw_register_rows: 0,
+                last_ecall: None,
+                memw_lt: Vec::new(),
+                memw_aligned_lt: Vec::new(),
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
+            kept: None,
         })
     }
 
@@ -205,6 +231,41 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// Drop each streamed chunk's ops once the chunk is handed out, instead of
+    /// keeping every walked window to the run's end (see the module docs): the
+    /// builder then holds less than a chunk of each streamed table's ops, plus
+    /// the other tables' lists and (without [`Self::stream_memw_lt`]) the
+    /// phase-3 LT ops of the MEMW ops it dropped. The tables are the same.
+    /// Before the first window only.
+    pub fn drop_streamed_ops(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "drop_streamed_ops after a window was walked".to_string(),
+            ));
+        }
+        self.kept = Some(Kept::new(self.artifacts.decode_trace.clone()));
+        Ok(self)
+    }
+
+    /// Per streamed table (CPU, MEMW_R, MEMW_A, MEMW, LOAD, LT, SHIFT, STORE),
+    /// the ops the builder holds that were not handed out in a chunk, and the
+    /// ops its held lists take room for (those plus a part's handed-out head):
+    /// under [`Self::drop_streamed_ops`] only; `None` otherwise.
+    pub fn held_streamed_ops(&self) -> Option<[(usize, usize); 8]> {
+        let kept = self.kept.as_ref()?;
+        let store = self.segments.store_ops.len();
+        Some([
+            kept.cpu.held(),
+            kept.register_rows.held(),
+            kept.aligned.held(),
+            kept.general.held(),
+            kept.load.held(),
+            kept.lt.held(),
+            kept.shift.held(),
+            (store, store),
+        ])
+    }
+
     /// The time the windows took so far.
     pub fn stamps(&self) -> WindowStamps {
         self.stamps
@@ -230,7 +291,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             &mut walk,
         );
         self.segments.append(route_ops(&cpu_ops, &walk.cpu32_ops));
-        self.windows.push(WalkedWindow { cpu_ops, walk });
+        let last = WalkedWindow { cpu_ops, walk };
         let Self {
             artifacts,
             image,
@@ -239,20 +300,65 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             memory_state,
             mut register_state,
-            windows,
+            mut windows,
             segments,
             emitted,
             counted,
+            kept,
+            stream_memw_lt,
             ..
         } = self;
-        let (cpu_ops, walk) = concatenate(windows);
-        let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+        let (ops, decode_trace, skip, pre) = match kept {
+            None => {
+                windows.push(last);
+                let (cpu_ops, walk) = concatenate(windows);
+                let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+                (ops, artifacts.decode_trace.clone(), emitted, counted)
+            }
+            Some(mut kept) => {
+                // The last window's ops, its in-walk lookups and its MEMW
+                // ops' LT ops are all still to count, as the tails are.
+                kept.append(last);
+                let (cpu_ops, walk, decode_trace) = kept.into_run();
+                let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+                // With the MEMW-derived LT ops streamed, `memw_lt_done` counts
+                // the dropped ops too; without, it is zero and the dropped
+                // ops' LT ops are in `counted`.
+                let converted = |done: usize, chunks: usize, max: usize| {
+                    if !stream_memw_lt {
+                        return Ok(done);
+                    }
+                    done.checked_sub(chunks * max).ok_or_else(|| {
+                        Error::Prover(format!(
+                            "{chunks} MEMW chunks of {max} were dropped but only {done} ops' LT ops \
+                             were derived"
+                        ))
+                    })
+                };
+                let skip = StreamSkip {
+                    tails: true,
+                    memw_lt_done: converted(emitted.memw_lt_done, emitted.memw, max_rows.memw)?,
+                    memw_aligned_lt_done: converted(
+                        emitted.memw_aligned_lt_done,
+                        emitted.memw_aligned,
+                        max_rows.memw_aligned,
+                    )?,
+                    ..emitted
+                };
+                let pre = PreCounted {
+                    bitwise_ops: 0,
+                    memw_register_rows: 0,
+                    ..counted
+                };
+                (ops, decode_trace, skip, pre)
+            }
+        };
         build_traces(
             ops,
             Some(&image),
             &memory_state,
             &register_init,
-            artifacts.decode_trace.clone(),
+            decode_trace,
             &artifacts.decode_pc_to_row,
             register_state,
             &max_rows,
@@ -261,8 +367,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             true,
             false,
-            &emitted,
-            Some(counted),
+            &skip,
+            Some(pre),
         )
     }
 
@@ -285,6 +391,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             Accumulator {
                 stream_memw_lt: self.stream_memw_lt,
                 max_rows: &self.max_rows,
+                pc_to_row: &self.artifacts.decode_pc_to_row,
+                kept: self.kept.as_mut(),
                 windows: &mut self.windows,
                 segments: &mut self.segments,
                 emitted: &mut self.emitted,
@@ -335,6 +443,8 @@ impl Walker<'_> {
 pub struct Accumulator<'b> {
     stream_memw_lt: bool,
     max_rows: &'b crate::tables::MaxRowsConfig,
+    pc_to_row: &'b decode::PcToRow,
+    kept: Option<&'b mut Kept>,
     windows: &'b mut Vec<WalkedWindow>,
     segments: &'b mut RoutedSegments,
     emitted: &'b mut StreamSkip,
@@ -359,20 +469,41 @@ impl Accumulator<'_> {
         }
         self.segments
             .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
-        // The table phase's two dominant BITWISE sources, counted now.
+        // The table phase's dominant BITWISE source, counted now.
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
-        super::memw_register::collect_bitwise_from_memw_register(
-            &window.walk.memw.register_rows,
-            &mut self.counted.histogram,
-        );
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
-        self.counted.memw_register_rows += window.walk.memw.register_rows.len();
-        self.windows.push(window);
-        *self.route_secs += t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        let jobs = chunk_jobs(self.max_rows, self.windows, self.segments, self.emitted);
-        *self.handout_secs += t.elapsed().as_secs_f64();
-        jobs
+        if let Some(kept) = self.kept.as_deref_mut() {
+            // Nothing else reads the in-walk lookups; MEMW_R's rows are
+            // counted as their chunks leave.
+            drop(std::mem::take(&mut window.walk.bitwise_ops));
+            kept.append(window);
+            *self.route_secs += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let jobs = tail_jobs(
+                self.max_rows,
+                self.stream_memw_lt,
+                self.pc_to_row,
+                kept,
+                self.segments,
+                self.emitted,
+                self.counted,
+            );
+            *self.handout_secs += t.elapsed().as_secs_f64();
+            jobs
+        } else {
+            // And the second, MEMW_R.
+            super::memw_register::collect_bitwise_from_memw_register(
+                &window.walk.memw.register_rows,
+                &mut self.counted.histogram,
+            );
+            self.counted.memw_register_rows += window.walk.memw.register_rows.len();
+            self.windows.push(window);
+            *self.route_secs += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let jobs = chunk_jobs(self.max_rows, self.windows, self.segments, self.emitted);
+            *self.handout_secs += t.elapsed().as_secs_f64();
+            jobs
+        }
     }
 }
 
@@ -476,6 +607,278 @@ fn chunk_jobs(
             table: StreamTable::Store,
             index,
             ops: ChunkOps::Store(store[index * m.store..(index + 1) * m.store].to_vec()),
+        });
+        e.store += 1;
+    }
+    jobs
+}
+
+/// A streamed table's ops not yet in a handed-out chunk
+/// ([`WindowedTraceBuilder::drop_streamed_ops`]): the windows' lists, moved in
+/// whole, of which the first `start` ops of the first have left.
+struct Tail<T> {
+    parts: VecDeque<Vec<T>>,
+    start: usize,
+    len: usize,
+}
+
+impl<T: Clone> Tail<T> {
+    fn new() -> Self {
+        Self {
+            parts: VecDeque::new(),
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, part: Vec<T>) {
+        if !part.is_empty() {
+            self.len += part.len();
+            self.parts.push_back(part);
+        }
+    }
+
+    /// The first `n` ops (at most `len`). A part that is exactly the chunk
+    /// moves out whole; a part the chunk uses up is freed.
+    fn take(&mut self, n: usize) -> Vec<T> {
+        let n = n.min(self.len);
+        self.len -= n;
+        if self.start == 0 && self.parts.front().is_some_and(|part| part.len() == n) {
+            return self.parts.pop_front().unwrap_or_default();
+        }
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let Some(front) = self.parts.front() else {
+                break;
+            };
+            let want = n - out.len();
+            if front.len() - self.start <= want {
+                out.extend_from_slice(&front[self.start..]);
+                self.parts.pop_front();
+                self.start = 0;
+            } else {
+                out.extend_from_slice(&front[self.start..self.start + want]);
+                self.start += want;
+            }
+        }
+        out
+    }
+
+    /// (ops not handed out, ops the parts hold).
+    fn held(&self) -> (usize, usize) {
+        (self.len, self.len + self.start)
+    }
+
+    /// The ops not handed out, as one list.
+    fn into_vec(mut self) -> Vec<T> {
+        if self.start == 0 && self.parts.len() == 1 {
+            return self.parts.pop_front().unwrap_or_default();
+        }
+        let mut out = Vec::with_capacity(self.len);
+        for (i, part) in self.parts.into_iter().enumerate() {
+            out.extend_from_slice(&part[if i == 0 { self.start } else { 0 }..]);
+        }
+        out
+    }
+}
+
+/// The run so far under [`WindowedTraceBuilder::drop_streamed_ops`].
+struct Kept {
+    cpu: Tail<super::CpuOperation>,
+    register_rows: Tail<super::RegRow>,
+    aligned: Tail<super::MemwOperation>,
+    general: Tail<super::MemwOperation>,
+    load: Tail<super::LoadOperation>,
+    lt: Tail<super::LtOperation>,
+    shift: Tail<super::ShiftOperation>,
+    /// Every other walk list, the run so far (the streamed lists' fields stay
+    /// empty; the in-walk lookups only hold what is left to count).
+    rest: WalkOutputs,
+    /// DECODE with the lookups of the CPU ops handed out counted.
+    decode: Table,
+}
+
+impl Kept {
+    fn new(decode: Table) -> Self {
+        Self {
+            cpu: Tail::new(),
+            register_rows: Tail::new(),
+            aligned: Tail::new(),
+            general: Tail::new(),
+            load: Tail::new(),
+            lt: Tail::new(),
+            shift: Tail::new(),
+            rest: WalkOutputs::with_capacity(0),
+            decode,
+        }
+    }
+
+    /// A walked window's lists, appended in run order.
+    fn append(&mut self, window: WalkedWindow) {
+        let WalkedWindow { cpu_ops, walk } = window;
+        let WalkOutputs {
+            memw,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
+            cpu32_ops,
+            ecsm_ops,
+            ecdas_ops,
+            hint_ops,
+        } = walk;
+        self.cpu.push(cpu_ops);
+        self.register_rows.push(memw.register_rows);
+        self.aligned.push(memw.aligned);
+        self.general.push(memw.general);
+        self.load.push(load_ops);
+        self.lt.push(lt_ops);
+        self.shift.push(shift_ops);
+        let rest = &mut self.rest;
+        rest.bitwise_ops.extend(bitwise_ops);
+        rest.commit_ops.extend(commit_ops);
+        rest.keccak_ops.extend(keccak_ops);
+        rest.blake3_ops.extend(blake3_ops);
+        rest.blake3_absorb_ops.extend(blake3_absorb_ops);
+        rest.cpu32_ops.extend(cpu32_ops);
+        rest.ecsm_ops.extend(ecsm_ops);
+        rest.ecdas_ops.extend(ecdas_ops);
+        rest.hint_ops.extend(hint_ops);
+    }
+
+    /// The run's lists with the handed-out ops left out, and DECODE.
+    fn into_run(self) -> (Vec<super::CpuOperation>, WalkOutputs, Table) {
+        let Kept {
+            cpu,
+            register_rows,
+            aligned,
+            general,
+            load,
+            lt,
+            shift,
+            mut rest,
+            decode,
+        } = self;
+        rest.memw = MemwBuckets {
+            register_rows: register_rows.into_vec(),
+            aligned: aligned.into_vec(),
+            general: general.into_vec(),
+        };
+        rest.load_ops = load.into_vec();
+        rest.lt_ops = lt.into_vec();
+        rest.shift_ops = shift.into_vec();
+        (cpu.into_vec(), rest, decode)
+    }
+}
+
+/// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
+/// chunk taken out of the tails, and what the table phase reads from its ops
+/// counted as it leaves (`counted`, and DECODE in `kept`).
+fn tail_jobs(
+    m: &crate::tables::MaxRowsConfig,
+    stream_memw_lt: bool,
+    pc_to_row: &decode::PcToRow,
+    kept: &mut Kept,
+    segments: &mut RoutedSegments,
+    e: &mut StreamSkip,
+    counted: &mut PreCounted,
+) -> Vec<ChunkJob> {
+    let mut jobs = Vec::new();
+    macro_rules! take_chunks {
+        ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr) => {
+            take_chunks!($table, $variant, $tail, $max, $done, |ops| {})
+        };
+        ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
+            let max = $max;
+            while $tail.len >= max {
+                let $ops = $tail.take(max);
+                $count
+                jobs.push(ChunkJob {
+                    table: $table,
+                    index: $done,
+                    ops: ChunkOps::$variant($ops),
+                });
+                $done += 1;
+            }
+        }};
+    }
+    take_chunks!(StreamTable::Cpu, Cpu, kept.cpu, m.cpu, e.cpu, |ops| {
+        let pcs: Vec<u64> = ops.iter().map(|op| op.decode.pc).collect();
+        decode::update_multiplicities(&mut kept.decode, pc_to_row, &pcs);
+        if let Some(op) = ops.iter().rev().find(|op| op.decode.fields.ecall) {
+            counted.last_ecall = Some((op.timestamp, op.next_pc));
+        }
+    });
+    take_chunks!(
+        StreamTable::MemwRegister,
+        MemwRegister,
+        kept.register_rows,
+        m.memw_register,
+        e.memw_register,
+        |ops| {
+            super::memw_register::collect_bitwise_from_memw_register(&ops, &mut counted.histogram)
+        }
+    );
+    take_chunks!(
+        StreamTable::MemwAligned,
+        MemwAligned,
+        kept.aligned,
+        m.memw_aligned,
+        e.memw_aligned,
+        |ops| {
+            let lookups = super::collect_bitwise_from_memw_aligned(&ops);
+            counted.histogram.add_ops(&lookups);
+            if !stream_memw_lt {
+                let lt = super::collect_lt_from_memw_aligned(&ops);
+                counted.memw_aligned_lt.extend(lt);
+            }
+        }
+    );
+    take_chunks!(
+        StreamTable::Memw,
+        Memw,
+        kept.general,
+        m.memw,
+        e.memw,
+        |ops| {
+            if !stream_memw_lt {
+                counted.memw_lt.extend(super::collect_lt_from_memw(&ops));
+            }
+        }
+    );
+    take_chunks!(StreamTable::Load, Load, kept.load, m.load, e.load);
+    take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
+        counted
+            .histogram
+            .add_ops(&super::collect_bitwise_from_lt(&ops))
+    });
+    take_chunks!(
+        StreamTable::Shift,
+        Shift,
+        kept.shift,
+        m.shift,
+        e.shift,
+        |ops| {
+            counted
+                .histogram
+                .add_ops(&shift::collect_bitwise_from_shift(&ops))
+        }
+    );
+    // STORE's ops are a routing segment: its own tail.
+    let store = &mut segments.store_ops;
+    while store.len() >= m.store {
+        let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
+        for op in &ops {
+            counted.histogram.add_ops(&op.collect_bitwise_ops());
+        }
+        jobs.push(ChunkJob {
+            table: StreamTable::Store,
+            index: e.store,
+            ops: ChunkOps::Store(ops),
         });
         e.store += 1;
     }
