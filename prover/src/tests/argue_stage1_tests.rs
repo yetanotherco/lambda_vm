@@ -915,6 +915,7 @@ impl Session<'_> {
                 interactions: &table.interactions,
                 claim_point: &self.claim_point,
                 r: &self.r,
+                columns: None,
             }),
             &mut t,
         )

@@ -44,6 +44,35 @@ pub struct FusedInput<'a, B: IsField, E: IsField> {
     /// The GKR input-layer claim's point; its last `num_vars` coordinates are `ρ`.
     pub claim_point: &'a [FieldElement<E>],
     pub r: &'a [FieldElement<E>],
+    /// The table's base columns on the card as factors, with no lift
+    /// (`LAMBDA_VM_ARGUE_NO_LIFT`, D-BATCH M1-2): the rounds read them when no
+    /// lifted factors were made.
+    pub columns: Option<&'a crate::gpu::ColumnFactors>,
+}
+
+/// What the fused rounds read their factors through: the lifted factors, or
+/// the base columns where they lie (D-BATCH M1-2).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub(crate) enum FusedSource<'a> {
+    Lifted(&'a crate::gpu::DeviceFactors),
+    Columns(&'a crate::gpu::ColumnFactors),
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> FusedSource<'a> {
+    /// `(width, rows)`: the factors and the cube they span.
+    pub(crate) fn shape(self) -> (usize, usize) {
+        let view = self.view();
+        (view.width, view.rows)
+    }
+
+    fn view(self) -> math_cuda::sumcheck::FactorView<'a> {
+        match self {
+            Self::Lifted(factors) => factors.inner().view(),
+            Self::Columns(columns) => columns.view(),
+        }
+    }
 }
 
 /// The constraint part lowered for both kernels: the base DAG with an `ACC`
@@ -454,7 +483,7 @@ pub(crate) type FusedRounds<E> = (
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_fused<B, E>(
-    resident: &crate::gpu::DeviceFactors,
+    source: FusedSource<'_>,
     input: &FusedInput<'_, B, E>,
     lambdas: &[FieldElement<E>],
     claim: &FieldElement<E>,
@@ -476,8 +505,8 @@ where
         return None;
     }
     let started = Instant::now();
-    let device = resident.inner();
-    let rows = device.len();
+    let device = source.view();
+    let rows = device.rows;
     let num_vars = rows.trailing_zeros() as usize;
     let constraints = input.constraints;
     let d = constraints.degree().max(1);
@@ -535,8 +564,8 @@ where
         .iter()
         .map(|(slot, _)| u32::try_from(*slot).ok())
         .collect::<Option<_>>()?;
-    if slots.iter().any(|&s| s as usize >= device.width())
-        || constraints.reads().iter().any(|&s| s >= device.width())
+    if slots.iter().any(|&s| s as usize >= device.width)
+        || constraints.reads().iter().any(|&s| s >= device.width)
     {
         return None;
     }

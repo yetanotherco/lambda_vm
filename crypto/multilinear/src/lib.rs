@@ -11,6 +11,7 @@ pub mod constraint_argument;
 pub mod eq;
 pub mod fused;
 pub mod gkr;
+pub mod gkr_gruen;
 pub mod gpu;
 pub mod gpu_fused;
 pub mod logup;

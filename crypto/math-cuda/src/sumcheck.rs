@@ -514,6 +514,36 @@ impl SumcheckSession {
         Ok(())
     }
 
+    /// Binds the round's variable to `r` in the first `count` factors only,
+    /// and takes the cube down with them: for a shadow whose other factors a
+    /// leader folds where they lie ([`crate::gkr::GruenLayer::shadow`]).
+    pub fn fold_first(&mut self, count: usize, r: &[u64]) -> Result<()> {
+        assert_eq!(r.len(), 3, "an ext3 challenge");
+        assert!(self.len >= 2, "a fold needs a variable to bind");
+        assert!(count <= self.width, "the factors to fold are the session's");
+        let be = backend()?;
+        let half = (self.len / 2) as u64;
+        self.stream.memcpy_htod(r, &mut self.r_dev)?;
+        let total = count as u64 * half;
+        let grid = total.div_ceil(BLOCK_DIM as u64).min(4096) as u32;
+        let width = count as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&be.sumcheck_fold_ext3)
+                .arg(&mut self.factor_ptrs)
+                .arg(&half)
+                .arg(&width)
+                .arg(&self.r_dev)
+                .launch(LaunchConfig {
+                    grid_dim: (grid.max(1), 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        self.len /= 2;
+        Ok(())
+    }
+
     /// Whether [`download`](Self::download) can read the factors back: only a
     /// session that uploaded them knows their layout.
     pub fn can_download(&self) -> bool {
@@ -1175,6 +1205,18 @@ impl DeviceFactors {
         })
     }
 
+    /// The factors as the fused zerocheck reads them: lifted, three u64 a
+    /// cell, of which the first is the base value before any fold.
+    pub fn view(&self) -> FactorView<'_> {
+        FactorView {
+            stream: &self.stream,
+            ptrs: &self.factor_ptrs,
+            stride: 3,
+            rows: self.len,
+            width: self.addresses.len(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1189,11 +1231,6 @@ impl DeviceFactors {
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
-    }
-
-    /// The factors' device addresses, as the kernels read them.
-    pub(crate) fn factor_ptrs(&self) -> &CudaSlice<u64> {
-        &self.factor_ptrs
     }
 
     /// Writes `program`'s value at every row into a fresh buffer.
@@ -1749,6 +1786,108 @@ mod tests {
                     work /= 2;
                 }
             }
+        }
+    }
+}
+
+/// A table's factors as the fused zerocheck's base-field rounds read them
+/// (`crate::argue_fused`): one device address a factor, `stride` u64 between
+/// rows — three for lifted factors, whose first limb is the base value, one
+/// for base columns read where they lie (D-BATCH M1-2).
+#[derive(Clone, Copy)]
+pub struct FactorView<'f> {
+    pub stream: &'f Arc<CudaStream>,
+    pub ptrs: &'f CudaSlice<u64>,
+    pub stride: u64,
+    pub rows: usize,
+    pub width: usize,
+}
+
+/// Where a factor's base values are, for [`ColumnFactors`]: column `k` of the
+/// table's resident run, or a public table's base values (uploaded).
+pub enum ColumnSlot<'a> {
+    Column(usize),
+    Public(&'a [u64]),
+}
+
+/// A table's factors as base columns on the card, with no lift (D-BATCH M1-2):
+/// a committed factor is its column where the epoch's columns reside, a public
+/// one a base copy uploaded here. Holds no column: the caller keeps the run it
+/// points into alive for as long as this lives.
+pub struct ColumnFactors {
+    stream: Arc<CudaStream>,
+    ptrs: CudaSlice<u64>,
+    /// The public factors' base copies, end to end.
+    _public: Option<CudaSlice<u64>>,
+    rows: usize,
+    width: usize,
+}
+
+impl ColumnFactors {
+    /// `run` is the table's resident columns, `rows` each, end to end; `slots`
+    /// one per factor, in slot order.
+    pub fn new(
+        run: &cudarc::driver::CudaView<'_, u64>,
+        rows: usize,
+        slots: &[ColumnSlot<'_>],
+    ) -> Result<Self> {
+        assert!(rows.is_power_of_two(), "the cube is a power of two");
+        let be = backend()?;
+        let stream = be.next_stream();
+        let publics: Vec<&[u64]> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                ColumnSlot::Public(table) => Some(*table),
+                ColumnSlot::Column(_) => None,
+            })
+            .collect();
+        assert!(
+            publics.iter().all(|t| t.len() == rows),
+            "a public table spans the cube"
+        );
+        let public = if publics.is_empty() {
+            None
+        } else {
+            Some(crate::device::htod_or_trim(&stream, &publics.concat())?)
+        };
+        let run_at = {
+            let (at, _guard) = run.device_ptr(&stream);
+            at
+        };
+        let public_at = public.as_ref().map(|buffer: &CudaSlice<u64>| {
+            let (at, _guard) = buffer.device_ptr(&stream);
+            at
+        });
+        let mut next_public = 0u64;
+        let addresses: Vec<u64> = slots
+            .iter()
+            .map(|slot| match slot {
+                ColumnSlot::Column(k) => run_at + (k * rows * 8) as u64,
+                ColumnSlot::Public(_) => {
+                    let at = public_at.expect("a public slot has its copy")
+                        + next_public * rows as u64 * 8;
+                    next_public += 1;
+                    at
+                }
+            })
+            .collect();
+        let ptrs = crate::device::htod_or_trim(&stream, &addresses)?;
+        Ok(Self {
+            stream,
+            ptrs,
+            _public: public,
+            rows,
+            width: slots.len(),
+        })
+    }
+
+    pub fn view(&self) -> FactorView<'_> {
+        FactorView {
+            stream: &self.stream,
+            ptrs: &self.ptrs,
+            stride: 1,
+            rows: self.rows,
+            width: self.width,
         }
     }
 }

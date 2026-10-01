@@ -430,6 +430,12 @@ pub static TAILS_LEAN: Counter = Counter::new();
 /// Of [`TAILS_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
 /// against the generic rounds and found equal.
 pub static TAILS_XCHECKED: Counter = Counter::new();
+/// Of [`GKR_LAYERS`], the ones that ran Gruen's rounds
+/// (`LAMBDA_VM_ARGUE_GKR_GRUEN`, D-ARGUE S1-3) — the mechanism line of that knob.
+pub static GKR_GRUEN: Counter = Counter::new();
+/// Of [`GKR_GRUEN`], the ones `LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK` compared with
+/// today's rounds and found equal.
+pub static GKR_GRUEN_XCHECKED: Counter = Counter::new();
 
 /// A prove's device GKR layers, split: seconds per region, in the order a
 /// layer runs them, and the counts they are over.
@@ -449,6 +455,8 @@ pub struct GkrSplit {
     pub layers: u64,
     pub rebuilds: u64,
     pub tail_rounds: u64,
+    pub gruen: u64,
+    pub gruen_xchecked: u64,
 }
 
 impl GkrSplit {
@@ -469,6 +477,8 @@ impl GkrSplit {
             layers: GKR_LAYERS.take(),
             rebuilds: GKR_REBUILDS.take(),
             tail_rounds: GKR_TAIL_ROUNDS.take(),
+            gruen: GKR_GRUEN.take(),
+            gruen_xchecked: GKR_GRUEN_XCHECKED.take(),
         }
     }
 
@@ -484,6 +494,207 @@ impl GkrSplit {
             + self.factors
             + self.tail
             + self.close
+    }
+}
+
+// ── inside the argue: a table's work around its GKR layers and zerocheck ────
+//
+// D-BATCH S0. The argue's "rest" — what is neither a device GKR layer nor a
+// zerocheck round — was only known by subtraction (3.19 s a block at FAST job
+// 292), and a batched argument removes some of it and keeps the rest. These
+// split it per table, in the order `stark::multilinear_table::prove` runs, so
+// the part batching removes is measured before it is built. Timed with
+// [`tick`], as the GKR regions are; instrumentation only, no proof byte moves.
+
+/// The table's interactions, with `z` and `α` baked in.
+pub static REST_INTERACTIONS: Slot = Slot::new();
+/// Its fraction tree: the factors lifted, the input layer written, every level
+/// folded (and, built eagerly, the output read).
+pub static REST_TREE: Slot = Slot::new();
+/// The bus output read off the tree and absorbed.
+pub static REST_OUTPUT: Slot = Slot::new();
+/// `gkr::prove`'s wall: the device layers ([`GkrSplit`]) and the rest of it.
+pub static REST_GKR: Slot = Slot::new();
+/// Of [`REST_GKR`], the host prefix: one level down and the folds above it.
+pub static REST_PREFIX: Slot = Slot::new();
+/// The zerocheck point drawn, the bus statements, the rule, the weights and
+/// the fused rounds' description.
+pub static REST_SETUP: Slot = Slot::new();
+/// The zerocheck batch's wall ([`ZerocheckSplit`] splits its rounds).
+pub static REST_BATCH: Slot = Slot::new();
+/// The committed factors' values at the batch's point.
+pub static REST_VALUES: Slot = Slot::new();
+/// The claim reduce: the factor values absorbed, `γ′`, its sumcheck.
+pub static REST_REDUCE: Slot = Slot::new();
+/// The columns evaluated at the reduced point and absorbed.
+pub static REST_COLUMNS: Slot = Slot::new();
+/// The table's factors let go.
+pub static REST_RELEASE: Slot = Slot::new();
+/// Tables argued.
+pub static REST_TABLES: Counter = Counter::new();
+
+// Of [`REST_TREE`], split — the factors lifted, the input layer's programs
+// lowered and written, the levels folded, the output read. The card runs the
+// first three asynchronously, so their host times say where the host waited,
+// not what the card spent; under `LAMBDA_VM_ARGUE_TREE_SYNC=1` (a diagnostic,
+// never a measurement of the wall) each part waits for its own kernels, and the
+// parts then say what the card spent on each.
+
+/// The factors lifted from the columns into the extension.
+pub static TREE_LIFT: Slot = Slot::new();
+/// The input layer's interaction programs lowered on the host.
+pub static TREE_LOWER: Slot = Slot::new();
+/// The input layer written (the lowering included).
+pub static TREE_WRITE: Slot = Slot::new();
+/// Every level folded up from it, the tree's promise included.
+pub static TREE_FOLD: Slot = Slot::new();
+/// The output fraction read back.
+pub static TREE_OUTPUT: Slot = Slot::new();
+/// Trees whose input layer was written from the base columns
+/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+pub static TREE_FROM_COLUMNS: Counter = Counter::new();
+/// Tables whose factors stayed base columns, with no lift
+/// (`LAMBDA_VM_ARGUE_NO_LIFT`), and of them the ones lifted after all.
+pub static NO_LIFT: Counter = Counter::new();
+pub static LATE_LIFT: Counter = Counter::new();
+
+/// Whether the tree's parts wait for their own kernels
+/// (`LAMBDA_VM_ARGUE_TREE_SYNC`, with the split on): a diagnostic.
+pub fn tree_sync() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled()
+        && *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ARGUE_TREE_SYNC").is_ok_and(|v| !v.is_empty() && v != "0")
+        })
+}
+
+/// A prove's tree region, split: seconds per part.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TreeSplit {
+    pub lift: f64,
+    pub lower: f64,
+    pub write: f64,
+    pub fold: f64,
+    pub output: f64,
+    pub from_columns: u64,
+    pub no_lift: u64,
+    pub late_lift: u64,
+}
+
+impl TreeSplit {
+    fn take() -> Self {
+        Self {
+            lift: TREE_LIFT.take(),
+            lower: TREE_LOWER.take(),
+            write: TREE_WRITE.take(),
+            fold: TREE_FOLD.take(),
+            output: TREE_OUTPUT.take(),
+            from_columns: TREE_FROM_COLUMNS.take(),
+            no_lift: NO_LIFT.take(),
+            late_lift: LATE_LIFT.take(),
+        }
+    }
+}
+
+/// A prove's per-table rest, split: seconds per region.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RestSplit {
+    pub interactions: f64,
+    pub tree: f64,
+    pub output: f64,
+    pub gkr: f64,
+    pub prefix: f64,
+    pub setup: f64,
+    pub batch: f64,
+    pub values: f64,
+    pub reduce: f64,
+    pub columns: f64,
+    pub release: f64,
+    pub tables: u64,
+}
+
+impl RestSplit {
+    fn take() -> Self {
+        Self {
+            interactions: REST_INTERACTIONS.take(),
+            tree: REST_TREE.take(),
+            output: REST_OUTPUT.take(),
+            gkr: REST_GKR.take(),
+            prefix: REST_PREFIX.take(),
+            setup: REST_SETUP.take(),
+            batch: REST_BATCH.take(),
+            values: REST_VALUES.take(),
+            reduce: REST_REDUCE.take(),
+            columns: REST_COLUMNS.take(),
+            release: REST_RELEASE.take(),
+            tables: REST_TABLES.take(),
+        }
+    }
+
+    /// Every region of a table's `prove`: what the argue's wall should come to,
+    /// less the loop's own bookkeeping.
+    pub fn sum(&self) -> f64 {
+        self.interactions
+            + self.tree
+            + self.output
+            + self.gkr
+            + self.setup
+            + self.batch
+            + self.values
+            + self.reduce
+            + self.columns
+            + self.release
+    }
+}
+
+/// One table's shape and its regions, for the census line D-BATCH's plan is
+/// sized from: `n`, the committed columns, the factors and how many read a
+/// shifted row, the interactions, the input layer's variables `k`, the
+/// constraint degree and roots, and the widest bus message.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AirCensus {
+    pub index: usize,
+    pub num_vars: usize,
+    pub columns: usize,
+    pub factors: usize,
+    pub shifted: usize,
+    pub interactions: usize,
+    pub input_vars: usize,
+    pub degree: usize,
+    pub roots: usize,
+    pub bus_len_max: usize,
+    /// Seconds: the tree, `gkr::prove`, and the constraint core (the batch,
+    /// the factor values, the reduce and its columns).
+    pub tree: f64,
+    pub gkr: f64,
+    pub core: f64,
+}
+
+static AIRS: Mutex<Vec<AirCensus>> = Mutex::new(Vec::new());
+
+/// Note one table's census, numbered by its place in the prove's walk. Inert
+/// when the instrument is off.
+pub fn note_air(mut air: AirCensus) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = AIRS.lock() {
+        air.index = held.len();
+        held.push(air);
+    }
+}
+
+/// Seconds since `start`, added to `slot` — zero, and no clock read, when the
+/// instrument is off.
+#[inline]
+pub fn lap(slot: &Slot, start: Option<Instant>) -> f64 {
+    match start {
+        Some(t) => {
+            let nanos = t.elapsed().as_nanos() as u64;
+            slot.0.fetch_add(nanos, Ordering::Relaxed);
+            nanos as f64 * 1e-9
+        }
+        None => 0.0,
     }
 }
 
@@ -898,6 +1109,13 @@ pub struct ProverSplit {
     /// ran under (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
     pub zerocheck: ZerocheckSplit,
     pub lean_program: bool,
+    /// The per-table rest, split — [`RestSplit`] — and each table's census.
+    pub rest: RestSplit,
+    /// The tree region, split — [`TreeSplit`] — and whether its parts waited
+    /// for their kernels.
+    pub tree: TreeSplit,
+    pub tree_sync: bool,
+    pub air_census: Vec<AirCensus>,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -1140,10 +1358,102 @@ impl ProverSplit {
             fused_ms = ms(z.fused_time),
         )
     }
+    /// The tree line: `ARGUE TREE #k: lift · write (lower) · fold · output ·
+    /// of tree T (ms) || sync on|off` — [`TreeSplit`] beside the region it
+    /// splits.
+    pub fn tree_line(&self) -> String {
+        let t = &self.tree;
+        let ms = |secs: f64| secs * 1e3;
+        format!(
+            "ARGUE TREE {who}{tainted}: lift {lift:.2} · write {write:.2} (lower {lower:.2}) · fold \
+             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || sync {sync} || from the \
+             columns {from_columns} · no lift {no_lift} (late {late_lift})",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            lift = ms(t.lift),
+            write = ms(t.write),
+            lower = ms(t.lower),
+            fold = ms(t.fold),
+            output = ms(t.output),
+            tree = ms(self.rest.tree),
+            sync = if self.tree_sync { "on" } else { "off" },
+            from_columns = t.from_columns,
+            no_lift = t.no_lift,
+            late_lift = t.late_lift,
+        )
+    }
+
+    /// The rest line, milliseconds, stamped as the split line is:
+    /// `ARGUE REST #k: tables T || interactions · tree · output · gkr (prefix)
+    /// · setup · batch · values · reduce · columns · release || Σ S of argue A
+    /// (ms)` — every region of a table's `prove`, summed over the epoch's
+    /// tables, against the argue's wall.
+    pub fn rest_line(&self) -> String {
+        let r = &self.rest;
+        let ms = |secs: f64| secs * 1e3;
+        format!(
+            "ARGUE REST {who}{tainted}: tables {tables} || interactions {interactions:.2} · tree \
+             {tree:.2} · output {output:.2} · gkr {gkr:.2} (prefix {prefix:.2}) · setup {setup:.2} · \
+             batch {batch:.2} · values {values:.2} · reduce {reduce:.2} · columns {columns:.2} · \
+             release {release:.2} || Σ {sum:.2} of argue {argue:.2} (ms)",
+            who = self.who(),
+            tainted = if self.overlapped {
+                " ⛔OVERLAPPED"
+            } else {
+                ""
+            },
+            tables = r.tables,
+            interactions = ms(r.interactions),
+            tree = ms(r.tree),
+            output = ms(r.output),
+            gkr = ms(r.gkr),
+            prefix = ms(r.prefix),
+            setup = ms(r.setup),
+            batch = ms(r.batch),
+            values = ms(r.values),
+            reduce = ms(r.reduce),
+            columns = ms(r.columns),
+            release = ms(r.release),
+            sum = ms(r.sum()),
+            argue = ms(self.argue),
+        )
+    }
+
+    /// One table's census line:
+    /// `ARGUE AIR #k t NAME: n N · cols W · factors F (shifted S) · interactions
+    /// I · k K · degree D · roots R · bus len L || tree · gkr · core (ms)`.
+    pub fn air_line(&self, air: &AirCensus, name: &str) -> String {
+        let ms = |secs: f64| secs * 1e3;
+        format!(
+            "ARGUE AIR {who} {at} {name}: n {n} · cols {cols} · factors {factors} (shifted {shifted}) \
+             · interactions {interactions} · k {k} · degree {degree} · roots {roots} · bus len {bus} \
+             || tree {tree:.2} · gkr {gkr:.2} · core {core:.2} (ms)",
+            who = self.who(),
+            at = air.index,
+            n = air.num_vars,
+            cols = air.columns,
+            factors = air.factors,
+            shifted = air.shifted,
+            interactions = air.interactions,
+            k = air.input_vars,
+            degree = air.degree,
+            roots = air.roots,
+            bus = air.bus_len_max,
+            tree = ms(air.tree),
+            gkr = ms(air.gkr),
+            core = ms(air.core),
+        )
+    }
+
     /// The GKR line, milliseconds, stamped as the split line is:
     /// `ARGUE GKR #k: layers on the card N (rebuilt R) · host tail rounds T ||
     /// between layers B ms, M µs a layer: lambda · program · lower · session ·
-    /// factors · tail (transcript) · close || rebuild · rounds · values (ms)`.
+    /// factors · tail (transcript) · close || rebuild · rounds · values (ms) ||
+    /// gruen G (xchecked X)` — the last part D-ARGUE S1-3's layers.
     pub fn gkr_line(&self) -> String {
         let g = &self.gkr;
         let ms = |secs: f64| secs * 1e3;
@@ -1157,7 +1467,8 @@ impl ProverSplit {
              rounds {tail_rounds} || between layers {between:.2} ms, {mean:.1} µs a layer: lambda \
              {lambda:.2} · program {program:.2} · lower {lower:.2} · session {session:.2} · \
              factors {factors:.2} · tail {tail:.2} (transcript {heard:.2}) · close {close:.2} || \
-             rebuild {rebuild:.2} · rounds {rounds:.2} · values {values:.2} (ms)",
+             rebuild {rebuild:.2} · rounds {rounds:.2} · values {values:.2} (ms) || gruen \
+             {gruen} (xchecked {gruen_xchecked})",
             who = self.who(),
             tainted = if self.overlapped {
                 " ⛔OVERLAPPED"
@@ -1179,6 +1490,8 @@ impl ProverSplit {
             rebuild = ms(g.rebuild),
             rounds = ms(g.rounds),
             values = ms(g.values),
+            gruen = g.gruen,
+            gruen_xchecked = g.gruen_xchecked,
         )
     }
 }
@@ -1230,6 +1543,20 @@ pub fn push_prover(mut rec: ProverSplit) {
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
         .unwrap_or_default();
+    rec.rest = RestSplit::take();
+    rec.tree = TreeSplit::take();
+    rec.tree_sync = tree_sync();
+    rec.air_census = AIRS
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    for air in &rec.air_census {
+        let name = names
+            .get(air.index)
+            .cloned()
+            .unwrap_or_else(|| format!("table#{}", air.index));
+        println!("{}", rec.air_line(air, &name));
+    }
     rec.max_table = MAX_TABLE
         .lock()
         .ok()
@@ -1323,6 +1650,8 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.gkr_line());
     println!("{}", rec.tail_line());
     println!("{}", rec.zerocheck_line());
+    println!("{}", rec.rest_line());
+    println!("{}", rec.tree_line());
 
     if let Ok(mut held) = PROVER.lock() {
         held.push(rec);
@@ -1838,6 +2167,8 @@ mod tests {
                 layers: 200,
                 rebuilds: 12,
                 tail_rounds: 1800,
+                gruen: 150,
+                gruen_xchecked: 140,
             },
             ..Default::default()
         };
@@ -1847,7 +2178,7 @@ mod tests {
             "ARGUE GKR #5: layers on the card 200 (rebuilt 12) · host tail rounds 1800 || \
              between layers 50.00 ms, 250.0 µs a layer: lambda 2.00 · program 1.00 · lower 3.00 · \
              session 10.00 · factors 0.50 · tail 30.00 (transcript 20.00) · close 3.50 || \
-             rebuild 50.00 · rounds 200.00 · values 4.00 (ms)"
+             rebuild 50.00 · rounds 200.00 · values 4.00 (ms) || gruen 150 (xchecked 140)"
         );
         let global = ProverSplit {
             index: GLOBAL_INDEX,
@@ -1859,7 +2190,87 @@ mod tests {
             "ARGUE GKR GLOBAL (in base) ⛔OVERLAPPED: layers on the card 0 (rebuilt 0) · host tail \
              rounds 0 || between layers 0.00 ms, 0.0 µs a layer: lambda 0.00 · program 0.00 · \
              lower 0.00 · session 0.00 · factors 0.00 · tail 0.00 (transcript 0.00) · close 0.00 \
-             || rebuild 0.00 · rounds 0.00 · values 0.00 (ms)"
+             || rebuild 0.00 · rounds 0.00 · values 0.00 (ms) || gruen 0 (xchecked 0)"
+        );
+    }
+
+    /// The rest line: every region in milliseconds, their sum against the
+    /// argue's wall; the census line: a table's shape and its three regions.
+    #[test]
+    fn the_rest_and_air_lines_split_a_table() {
+        let epoch = ProverSplit {
+            index: 4,
+            argue: 0.100,
+            rest: RestSplit {
+                interactions: 0.001,
+                tree: 0.010,
+                output: 0.0005,
+                gkr: 0.040,
+                prefix: 0.002,
+                setup: 0.003,
+                batch: 0.030,
+                values: 0.0005,
+                reduce: 0.008,
+                columns: 0.004,
+                release: 0.001,
+                tables: 22,
+            },
+            ..Default::default()
+        };
+        assert!((epoch.rest.sum() - 0.098).abs() < 1e-12);
+        assert_eq!(
+            epoch.rest_line(),
+            "ARGUE REST #4: tables 22 || interactions 1.00 · tree 10.00 · output 0.50 · gkr 40.00 \
+             (prefix 2.00) · setup 3.00 · batch 30.00 · values 0.50 · reduce 8.00 · columns 4.00 · \
+             release 1.00 || Σ 98.00 of argue 100.00 (ms)"
+        );
+        let air = AirCensus {
+            index: 7,
+            num_vars: 16,
+            columns: 1480,
+            factors: 1482,
+            shifted: 0,
+            interactions: 1031,
+            input_vars: 27,
+            degree: 4,
+            roots: 140,
+            bus_len_max: 12,
+            tree: 0.020,
+            gkr: 0.150,
+            core: 0.300,
+        };
+        assert_eq!(
+            epoch.air_line(&air, "KECCAK_RND"),
+            "ARGUE AIR #4 7 KECCAK_RND: n 16 · cols 1480 · factors 1482 (shifted 0) · interactions \
+             1031 · k 27 · degree 4 · roots 140 · bus len 12 || tree 20.00 · gkr 150.00 · core \
+             300.00 (ms)"
+        );
+    }
+
+    /// The tree line: the tree region's parts beside the region, and whether
+    /// they waited for their kernels.
+    #[test]
+    fn the_tree_line_splits_the_tree_region() {
+        let epoch = ProverSplit {
+            index: 3,
+            rest: RestSplit {
+                tree: 0.120,
+                ..Default::default()
+            },
+            tree: TreeSplit {
+                lift: 0.010,
+                lower: 0.020,
+                write: 0.050,
+                fold: 0.040,
+                output: 0.001,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            epoch.tree_line(),
+            "ARGUE TREE #3: lift 10.00 · write 50.00 (lower 20.00) · fold 40.00 · output 1.00 · of \
+             tree 120.00 (ms) || sync off || from the columns 0 · no lift 0 (late 0)"
         );
     }
 

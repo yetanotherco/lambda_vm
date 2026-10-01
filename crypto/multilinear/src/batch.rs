@@ -389,21 +389,69 @@ where
     T: IsTranscript<F>,
     B: Fn() -> Result<Vec<Mle<F>>, Error>,
 {
-    let _ = &fused;
+    prove_resident_lazy(
+        extra,
+        device,
+        || None,
+        absent,
+        rules,
+        claims,
+        fused,
+        transcript,
+    )
+}
+
+/// [`prove_resident_with`] for factors that may not be lifted yet (D-BATCH
+/// M1-2, `LAMBDA_VM_ARGUE_NO_LIFT`): with no `device` but the table's base
+/// columns in `fused`, the fused rounds read the columns where they lie, and
+/// `lift` makes the lifted factors only when today's rounds need them — the
+/// fused rounds declined, or the cross-check replays today's beside them. The
+/// same messages and proof either way.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_resident_lazy<Base, F, T, L, B>(
+    extra: Vec<Weight<F>>,
+    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
+    lift: L,
+    absent: B,
+    rules: Vec<Rule<'_, F>>,
+    claims: &[FieldElement<F>],
+    fused: Option<crate::gpu_fused::FusedInput<'_, Base, F>>,
+    transcript: &mut T,
+) -> Result<ResidentProof<F>, Error>
+where
+    Base: IsField + math::field::traits::IsSubFieldOf<F> + 'static,
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+    T: IsTranscript<F>,
+    L: Fn() -> Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
+    B: Fn() -> Result<Vec<Mle<F>>, Error>,
+{
+    let _ = (&fused, &lift);
     if claims.len() != rules.len() {
         return Err(Error::VariableCountMismatch {
             expected: rules.len(),
             got: claims.len(),
         });
     }
-    let Some(device) = device else {
+    // The base columns stand in for factors no one lifted, when the fused
+    // rounds will read them.
+    #[cfg(feature = "cuda")]
+    let columns = fused
+        .as_ref()
+        .and_then(|input| input.columns)
+        .filter(|_| device.is_none() && crate::gpu_fused::argue_fused());
+    #[cfg(not(feature = "cuda"))]
+    let columns: Option<&crate::gpu::ColumnFactors> = None;
+    if device.is_none() && columns.is_none() {
         let mut polys = absent()?;
         for weight in extra {
             polys.push(weight.materialize()?);
         }
         let (proof, point) = prove(polys, rules, claims, transcript)?;
         return Ok((proof, point, Vec::new()));
-    };
+    }
+    #[allow(unused_mut)]
+    let mut device = device;
 
     for claim in claims {
         transcript.append_field_element(claim);
@@ -437,7 +485,16 @@ where
                 .collect()
         };
         #[cfg(feature = "cuda")]
-        if let Some(input) = fused.as_ref().filter(|_| crate::gpu_fused::argue_fused()) {
+        let source = device
+            .as_deref()
+            .map(crate::gpu_fused::FusedSource::Lifted)
+            .or(columns.map(crate::gpu_fused::FusedSource::Columns));
+        #[cfg(feature = "cuda")]
+        if let (Some(input), Some(source)) = (
+            fused.as_ref().filter(|_| crate::gpu_fused::argue_fused()),
+            source,
+        ) {
+            let (width, rows) = source.shape();
             let claim = weights
                 .iter()
                 .zip(claims)
@@ -445,7 +502,7 @@ where
             let check = crate::gpu_fused::argue_fused_xcheck();
             let start = crate::whir_split::tick();
             let attempt = crate::gpu_fused::prove_fused(
-                &device,
+                source,
                 input,
                 &weights,
                 &claim,
@@ -466,8 +523,8 @@ where
                     if check || crate::gpu_fused::argue_fused_log() {
                         eprintln!(
                             "ARGUE FUSED: declined · factors {} n={} (today's rounds run)",
-                            device.width(),
-                            device.len().trailing_zeros(),
+                            width,
+                            rows.trailing_zeros(),
                         );
                     }
                 }
@@ -475,18 +532,26 @@ where
                 Some(Ok((mut rounds, mut point, factors, times))) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     if check {
+                        // Today's rounds replay over lifted factors, made now
+                        // when the fused rounds read the columns.
+                        if device.is_none() {
+                            device = lift();
+                        }
+                        let lifted = device.as_deref().ok_or(Error::DeviceFailed {
+                            stage: "fused cross-check lift",
+                        })?;
                         cross_check(
-                            &device, &views, program, degree, &rounds, &point, &factors, times,
+                            lifted, &views, program, degree, &rounds, &point, &factors, times,
                         )?;
                     } else if crate::gpu_fused::argue_fused_log() {
                         eprintln!(
                             "ARGUE FUSED: factors {} roots {} terms {} slots {} n={} · fused {:.3} ms (grid \
                              {:.3} fold2 {:.3} rounds {:.3})",
-                            device.width(),
+                            width,
                             times.roots,
                             times.terms,
                             times.slots,
-                            device.len().trailing_zeros(),
+                            rows.trailing_zeros(),
                             times.total * 1e3,
                             times.grid * 1e3,
                             times.fold2 * 1e3,
@@ -511,13 +576,22 @@ where
                 }
             }
         }
-        let attempt =
-            crate::gpu::prove_sumcheck_resident(&device, &views, program, degree, |evaluations| {
+        // Today's device rounds need the lifted factors: made now if no one
+        // lifted them (the fused rounds declined).
+        if device.is_none() {
+            device = lift();
+            if device.is_some() {
+                crate::gpu::note_late_lift();
+            }
+        }
+        let attempt = device.as_deref().and_then(|device| {
+            crate::gpu::prove_sumcheck_resident(device, &views, program, degree, |evaluations| {
                 for e in evaluations {
                     transcript.append_field_element(e);
                 }
                 transcript.sample_field_element()
-            });
+            })
+        });
         if let Some(outcome) = attempt {
             let (mut rounds, mut point, factors) = outcome?;
             let host_tail = crate::whir_split::tick();

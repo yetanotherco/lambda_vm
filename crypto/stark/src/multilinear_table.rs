@@ -1068,6 +1068,9 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    use multilinear::whir_split::{self as split, lap, tick};
+
+    let t = tick();
     let interactions = multilinear_logup::interactions(
         table.layout.interactions,
         table.slot_of().len(),
@@ -1075,6 +1078,7 @@ where
         alpha,
         |col| slot(table.slot_of(), col),
     )?;
+    lap(&split::REST_INTERACTIONS, t);
 
     // The input layer reads the trace's factors. On a device they stay there
     // for the sumcheck too — they are the biggest thing the argument holds —
@@ -1085,13 +1089,37 @@ where
     // (its output read here, at the consume site). Prefetch never changes WHAT
     // is built — same factors, same (z, alpha, beta) — only when, so a prebuilt
     // tree yields byte-for-byte the same proof as building it here now.
+    // The tree where the factors reside, the lift timed on its own.
+    // Under `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) the input layer is
+    // written from the resident base columns; the factors are still lifted, for
+    // the zerocheck.
+    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`, M1-2's second half) a tree written
+    // from the columns needs no factors at all: they are lifted later only if
+    // the zerocheck needs them.
+    let no_lift = multilinear::gpu::argue_no_lift();
+    let resident_tree = || {
+        if no_lift
+            && table.trace.device_factors().is_none()
+            && let Some(tree) = logup::resident_tree_from_columns(&interactions, &table.trace)
+        {
+            return Some(tree);
+        }
+        let lift = tick();
+        let resident = table.trace.reside_from_columns();
+        if let Some(factors) = resident.as_ref() {
+            factors.tree_sync();
+        }
+        lap(&split::TREE_LIFT, lift);
+        let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
+            .then(|| logup::resident_tree_from_columns(&interactions, &table.trace))
+            .flatten();
+        from_columns
+            .or_else(|| resident.and_then(|resident| logup::resident_tree(&interactions, resident)))
+    };
+    let t = tick();
     let tree = match prebuilt {
         Some(tree) => tree,
-        None => match table
-            .trace
-            .reside_from_columns()
-            .and_then(|resident| logup::resident_tree(&interactions, resident))
-        {
+        None => match resident_tree() {
             Some(tree) => tree,
             // No device took them, so the host builds what it needs: the
             // factors, used here and by the sumcheck that follows.
@@ -1101,11 +1129,17 @@ where
             }
         },
     };
+    let tree_secs = lap(&split::REST_TREE, t);
+    let t = tick();
     let bus_output = tree.output();
     transcript.append_field_element(&bus_output.0);
     transcript.append_field_element(&bus_output.1);
+    lap(&split::REST_OUTPUT, t);
+    let t = tick();
     let gkr_out = gkr::prove(&tree, transcript)?;
+    let gkr_secs = lap(&split::REST_GKR, t);
 
+    let t = tick();
     let num_vars = table.num_vars();
     let r: Vec<FieldElement<E>> = (0..num_vars)
         .map(|_| transcript.sample_field_element())
@@ -1146,6 +1180,20 @@ where
         .ok()
     })
     .flatten();
+    // With no lift, the fused rounds read the base columns; a table they cannot
+    // read that way (a shifted factor, a public table above the base field, no
+    // fused description) is lifted here, as it would have been.
+    let column_factors = if no_lift && table.trace.device_factors().is_none() {
+        let made = constraints
+            .as_ref()
+            .and_then(|_| table.trace.column_factors());
+        if made.is_none() {
+            let _ = table.trace.reside_from_columns();
+        }
+        made
+    } else {
+        None
+    };
     let fused = constraints
         .as_ref()
         .map(|constraints| multilinear::gpu_fused::FusedInput {
@@ -1154,7 +1202,10 @@ where
             interactions: &interactions,
             claim_point: &gkr_out.claim.point,
             r: &r,
+            columns: column_factors.as_ref(),
         });
+    lap(&split::REST_SETUP, t);
+    let t = tick();
     let (constraint, point) = constraint_argument::prove_core_with::<F, E, T>(
         &table.trace,
         weights,
@@ -1170,7 +1221,39 @@ where
     // The sumcheck folded the factors where they lay, so they are spent — and
     // the table outlives its own argument. Letting go of them here is what
     // keeps a proof from holding every table's at once.
+    let core_secs = t.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    let t = tick();
     table.trace.release_device();
+    lap(&split::REST_RELEASE, t);
+    split::bump(&split::REST_TABLES);
+    if split::enabled() {
+        split::note_air(split::AirCensus {
+            // Its position in the prove's walk: `note_air` numbers it.
+            index: 0,
+            num_vars,
+            columns: table.num_committed_columns(),
+            factors: table.kinds().len(),
+            shifted: table
+                .kinds()
+                .iter()
+                .filter(|kind| kind.source().is_some_and(|source| source.offset != 0))
+                .count(),
+            interactions: interactions.len(),
+            input_vars: logup::input_layer_vars(interactions.len(), num_vars),
+            degree: shape.degree(),
+            roots: shape.num_roots(),
+            bus_len_max: table
+                .layout
+                .interactions
+                .iter()
+                .map(BusInteraction::num_bus_elements)
+                .max()
+                .unwrap_or(0),
+            tree: tree_secs,
+            gkr: gkr_secs,
+            core: core_secs,
+        });
+    }
 
     Ok((
         TableProof {
@@ -2442,6 +2525,12 @@ mod tests {
         lean_program_xchecks: u64,
         /// Zerocheck sessions that ran D-ARGUE stage 1's fused rounds.
         fused: u64,
+        /// Device GKR layers that ran Gruen's rounds (D-ARGUE S1-3).
+        gruen: u64,
+        /// Fraction trees whose input layer was written from the base columns.
+        input: u64,
+        /// Tables whose zerocheck read the base columns with no lift.
+        nolift: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
@@ -2463,6 +2552,9 @@ mod tests {
         tail: bool,
         program: bool,
         fused: bool,
+        gruen: bool,
+        input: bool,
+        nolift: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2472,6 +2564,9 @@ mod tests {
         tail: false,
         program: false,
         fused: false,
+        gruen: false,
+        input: false,
+        nolift: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2507,7 +2602,13 @@ mod tests {
         multilinear::gpu_fused::force_argue_fused(Some(knobs.fused));
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(Some(knobs.fused));
+        multilinear::gkr_gruen::force_argue_gkr_gruen(Some(knobs.gruen));
+        multilinear::gpu::force_argue_gkr_input(Some(knobs.input));
+        multilinear::gpu::force_argue_no_lift(Some(knobs.nolift));
         let fused = multilinear::gpu_fused::fused_sessions();
+        let gruen = multilinear::gkr_gruen::gruen_layers();
+        let input = multilinear::gpu::input_columns_trees();
+        let nolift = multilinear::gpu::column_factor_tables();
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2535,7 +2636,13 @@ mod tests {
             lean_programs: multilinear::gpu::lean_programs() - demand,
             lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
             fused: multilinear::gpu_fused::fused_sessions() - fused,
+            gruen: multilinear::gkr_gruen::gruen_layers() - gruen,
+            input: multilinear::gpu::input_columns_trees() - input,
+            nolift: multilinear::gpu::column_factor_tables() - nolift,
         });
+        multilinear::gkr_gruen::force_argue_gkr_gruen(None);
+        multilinear::gpu::force_argue_gkr_input(None);
+        multilinear::gpu::force_argue_no_lift(None);
         multilinear::gpu_fused::force_argue_fused(None);
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(None);
@@ -3617,6 +3724,233 @@ mod tests {
         eprintln!("argue lean tail: the wrong tail was refused: {verdict:?}");
     }
 
+    /// ★ `LAMBDA_VM_ARGUE_GKR_GRUEN` (D-ARGUE S1-3) moves no byte of the proof,
+    /// alone, beside the fused zerocheck (the production default), and with
+    /// every other argue knob: the same canonical bytes, table by table and
+    /// whole, the same transcript and next challenge, and every proof verifies.
+    ///
+    /// On a device the arms are shown to take their own paths: off, no GKR
+    /// layer runs Gruen's rounds; on, CPU's and ADD's card layers do. ⚠ Run it
+    /// alone (`--exact`): the counters are process-wide.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_the_gkr_gruen_rounds() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let device = a_device();
+        for (base, arms) in [
+            (
+                TODAY,
+                vec![
+                    Knobs {
+                        gruen: true,
+                        ..TODAY
+                    },
+                    Knobs {
+                        columns: true,
+                        tables: true,
+                        reads: true,
+                        tail: true,
+                        gruen: true,
+                        ..TODAY
+                    },
+                ],
+            ),
+            (
+                Knobs {
+                    fused: true,
+                    ..TODAY
+                },
+                vec![Knobs {
+                    columns: true,
+                    tables: true,
+                    reads: true,
+                    fused: true,
+                    gruen: true,
+                    ..TODAY
+                }],
+            ),
+        ] {
+            let mut today = prove_tall(&airs, &columns, base);
+            verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+            assert_eq!(today.gruen, 0, "{base:?}: no Gruen layer");
+            let today_state = today.transcript.state();
+            let today_next = today.transcript.sample_field_element();
+            for knobs in arms {
+                let mut arm = prove_tall(&airs, &columns, knobs);
+                if device {
+                    assert!(
+                        arm.gruen > 0,
+                        "{knobs:?}: the card layers ran Gruen's rounds"
+                    );
+                    eprintln!("argue gkr gruen: {knobs:?}: {} Gruen layers", arm.gruen);
+                } else {
+                    assert_eq!(arm.gruen, 0, "{knobs:?}: no device, no Gruen layer");
+                    eprintln!("argue gkr gruen: no device; today's layer rounds ran");
+                }
+                assert_eq!(
+                    first_table_that_differs(&today.proof, &arm.proof),
+                    None,
+                    "{knobs:?}: a table's argument changed"
+                );
+                assert_eq!(
+                    bincode::serialize(&today.proof).unwrap(),
+                    bincode::serialize(&arm.proof).unwrap(),
+                    "{knobs:?}: the proofs' canonical bytes differ"
+                );
+                assert_eq!(
+                    today_state,
+                    arm.transcript.state(),
+                    "{knobs:?}: the transcripts parted"
+                );
+                assert_eq!(
+                    today_next,
+                    arm.transcript.sample_field_element(),
+                    "{knobs:?}: the next challenge moved"
+                );
+                verify_tall(&arm.committed, &arm.proof)
+                    .unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
+            }
+        }
+    }
+
+    /// ★ `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) moves no byte of the proof,
+    /// alone and with the production defaults beside it (the fused zerocheck and
+    /// the Gruen layers): the same canonical bytes, table by table and whole, the
+    /// same transcript and next challenge, and every proof verifies. On a device
+    /// the arms show their trees written from the columns. ⚠ Run it alone.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_the_input_from_columns() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let device = a_device();
+        let production = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            fused: true,
+            gruen: true,
+            ..TODAY
+        };
+        for (base, arm) in [
+            (
+                TODAY,
+                Knobs {
+                    input: true,
+                    ..TODAY
+                },
+            ),
+            (
+                production,
+                Knobs {
+                    input: true,
+                    ..production
+                },
+            ),
+            (
+                production,
+                Knobs {
+                    input: true,
+                    nolift: true,
+                    ..production
+                },
+            ),
+        ] {
+            let mut today = prove_tall(&airs, &columns, base);
+            verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+            assert_eq!(today.input, 0, "{base:?}: no tree from the columns");
+            let today_state = today.transcript.state();
+            let today_next = today.transcript.sample_field_element();
+            let mut got = prove_tall(&airs, &columns, arm);
+            if device {
+                assert!(
+                    got.input > 0,
+                    "{arm:?}: the trees were written from the columns"
+                );
+                if arm.nolift {
+                    assert!(
+                        got.nolift > 0,
+                        "{arm:?}: the zerocheck read the columns, no lift"
+                    );
+                }
+                eprintln!(
+                    "argue gkr input: {arm:?}: {} trees from the columns, {} tables with no lift",
+                    got.input, got.nolift
+                );
+            } else {
+                assert_eq!(got.input, 0, "{arm:?}: no device, no tree from the columns");
+                eprintln!("argue gkr input: no device; today's trees");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &got.proof),
+                None,
+                "{arm:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&got.proof).unwrap(),
+                "{arm:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                got.transcript.state(),
+                "{arm:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                got.transcript.sample_field_element(),
+                "{arm:?}: the next challenge moved"
+            );
+            verify_tall(&got.committed, &got.proof).unwrap_or_else(|e| panic!("{arm:?}: {e:?}"));
+        }
+    }
+
+    /// ⛔ The identity above can fail. With the fault armed, every Gruen layer
+    /// adds one to its first round's `s(1)`. The proof must then differ from
+    /// today's at CPU, the first table argued, and be refused by GKR's layer
+    /// check. Needs a device, and says so rather than passing without one.
+    #[test]
+    fn a_wrong_gkr_gruen_round_changes_the_argument_and_fails_it() {
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        if !a_device() {
+            eprintln!("argue gkr gruen: SKIPPED, no device to corrupt a round on");
+            return;
+        }
+        let today = prove_tall(&airs, &columns, TODAY);
+        multilinear::gkr_gruen::force_gkr_gruen_fault(true);
+        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_tall(
+                &airs,
+                &columns,
+                Knobs {
+                    gruen: true,
+                    ..TODAY
+                },
+            )
+        }));
+        multilinear::gkr_gruen::force_gkr_gruen_fault(false);
+        let faulted = faulted.expect("the faulted arm proves");
+        assert!(faulted.gruen > 0, "the fault is on the Gruen path");
+        assert_eq!(
+            first_table_that_differs(&today.proof, &faulted.proof),
+            Some(0),
+            "the identity must name CPU, the first table argued"
+        );
+        let verdict = verify_tall(&faulted.committed, &faulted.proof);
+        assert!(
+            matches!(verdict, Err(MlError::LayerRelationMismatch { .. })),
+            "GKR's layer check must refuse it, got {verdict:?}"
+        );
+        eprintln!("argue gkr gruen: the wrong round was refused: {verdict:?}");
+    }
+
     /// A tall table's zerocheck batch as [`prove`] builds it — the constraint
     /// rule beside the bus's two, combined — at arbitrary challenges: the
     /// program a device's rounds walk.
@@ -3705,6 +4039,9 @@ mod tests {
             tail: true,
             program: true,
             fused: false,
+            gruen: false,
+            input: false,
+            nolift: false,
         };
         for knobs in [
             Knobs {
