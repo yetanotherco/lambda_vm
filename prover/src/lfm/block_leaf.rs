@@ -34,11 +34,11 @@ use stark::config::Commitment;
 
 use crate::tables::types::{FE, FEE};
 
-use super::block_replay::{BlockStatementShape, replay_block_front};
+use super::block_plan::{BlockTreePlan, PlannedInstance};
+use super::block_replay::replay_block_front;
 use super::builder::{Ext, LfmBuilder};
-use super::constraints::Analysis;
-use super::epoch::{RootCells, TableAbsorbs, TableChallengeShape, fork_table};
-use super::epoch_verify::{TableQueryArenas, TableVerifyShape};
+use super::epoch::{RootCells, TableAbsorbs, fork_table};
+use super::epoch_verify::TableQueryArenas;
 use super::instr::ArenaId;
 use super::statement_replay::{PhaseAPreprocessed, PhaseATable};
 
@@ -124,8 +124,12 @@ impl BlockPartition {
 /// `names` are the AIRs' names (`CPU[3]`, `PAGE:0x1000` …; the instance suffix
 /// after `[` or `:` is ignored) and `costs` any additive per-instance cost.
 /// Pure: every emitter that needs the partition derives the same one from the
-/// same instance list.
-pub fn partition_by_rule(names: &[&str], costs: &[usize], num_leaves: usize) -> BlockPartition {
+/// same instance list. Refuses a leaf count that leaves a leaf empty.
+pub fn partition_by_rule(
+    names: &[&str],
+    costs: &[usize],
+    num_leaves: usize,
+) -> Result<BlockPartition, String> {
     assert_eq!(names.len(), costs.len(), "one cost per instance");
     assert!(num_leaves >= 1, "a block has at least one leaf");
     let kind = |name: &str| -> String { name.split(['[', ':']).next().unwrap_or(name).to_string() };
@@ -166,42 +170,12 @@ pub fn partition_by_rule(names: &[&str], costs: &[usize], num_leaves: usize) -> 
         leaves[k].push(i);
         load[k] += costs[i];
     }
+    // The rule places every instance exactly once by construction; only an
+    // empty leaf (more leaves than the rule can fill) is refused here.
     BlockPartition::new(leaves, names.len())
-        .expect("the rule places every instance exactly once by construction")
 }
 
 // ================================ the leaf ================================
-
-/// One instance a leaf verifies, as its emitter needs it. Every field is
-/// program shape, derived from the AIR and the proof options.
-pub struct BlockInstance<'a> {
-    pub challenge: &'a TableChallengeShape,
-    pub verify: &'a TableVerifyShape,
-    pub analysis: &'a Analysis,
-}
-
-/// Everything a leaf's program is a function of.
-pub struct BlockLeafInputs<'a> {
-    pub statement: &'a BlockStatementShape,
-    /// The trusted ELF's digest — absorbed as program text (host attestation).
-    pub elf_digest: &'a [u8; 32],
-    /// Per instance of the WHOLE block, in AIR order: the preprocessed root the
-    /// verifier takes from the AIR (`air.precomputed_commitment_for(layout)`),
-    /// when the instance is preprocessed. Program text, never proof data.
-    pub precomputed_roots: &'a [Option<Commitment>],
-    pub partition: &'a BlockPartition,
-    /// Which of the partition's leaves this is.
-    pub leaf: usize,
-    /// One per index of `partition.leaf(leaf)`, in that order.
-    pub instances: &'a [BlockInstance<'a>],
-    /// The attestation id over the ELF's inputs
-    /// (`programs::AttestedInputs::program_id`), published as two constant
-    /// words in the wraps' layout.
-    pub program_id: &'a [u8; 32],
-    /// Whether this leaf subtracts the COMMIT-bus target from its sum — exactly
-    /// one leaf of a block does.
-    pub carries_commit_target: bool,
-}
 
 struct InstanceArenas {
     aux_root: Option<ArenaId>,
@@ -216,32 +190,56 @@ struct InstanceArenas {
     legs: TableQueryArenas,
 }
 
-/// Emit a block leaf: declare its arenas (the public output, every instance's
-/// main root, then per verified instance its proof data and query arenas, in
-/// that order), replay the shared front, verify its instances, publish.
-pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
-    let BlockLeafInputs {
-        statement,
-        elf_digest,
-        precomputed_roots,
-        partition,
-        leaf,
-        instances,
-        program_id,
-        carries_commit_target,
-    } = *inputs;
-    let n = partition.num_instances();
-    let indices = partition.leaf(leaf);
+/// Emit leaf `leaf` of `plan`: declare its arenas (the public output, every
+/// instance's main root, then per verified instance its proof data and query
+/// arenas, in that order), replay the shared front, verify its instances,
+/// publish.
+///
+/// Everything the program is a function of comes from the ONE derivation: the
+/// statement, the instances' shapes and preprocessed roots, the partition, the
+/// carrier (`leaf == plan.carrier()`, settable by nothing else) and the
+/// published attestation id (over the very roots Phase A absorbs).
+pub fn emit_block_leaf(b: &mut LfmBuilder, plan: &BlockTreePlan, leaf: usize) {
+    emit_leaf(b, plan, plan.partition(), leaf, leaf == plan.carrier());
+}
+
+/// [`emit_block_leaf`] over another partition and carrier bit — a tree the
+/// verifier did not derive, test-only: what a prover may emit leaves over,
+/// refused at the final check (another partition) or at the top (zero or two
+/// carriers).
+#[cfg(test)]
+pub(crate) fn emit_block_leaf_over(
+    b: &mut LfmBuilder,
+    plan: &BlockTreePlan,
+    partition: &BlockPartition,
+    leaf: usize,
+    carries: bool,
+) {
+    emit_leaf(b, plan, partition, leaf, carries);
+}
+
+fn emit_leaf(
+    b: &mut LfmBuilder,
+    plan: &BlockTreePlan,
+    partition: &BlockPartition,
+    leaf: usize,
+    carries_commit_target: bool,
+) {
+    let statement = plan.statement();
+    let elf_digest = plan.elf_digest();
+    let n = plan.num_instances();
     assert_eq!(
-        precomputed_roots.len(),
+        partition.num_instances(),
         n,
-        "one preprocessed-root slot per instance of the block"
+        "the partition covers the plan's instances"
     );
-    assert_eq!(
-        instances.len(),
-        indices.len(),
-        "one shape per verified index"
-    );
+    let indices = partition.leaf(leaf);
+    let precomputed_roots: Vec<Option<Commitment>> = plan
+        .instances()
+        .iter()
+        .map(|i| i.precomputed_root)
+        .collect();
+    let instances: Vec<&PlannedInstance> = indices.iter().map(|&i| plan.instance(i)).collect();
     for (inst, &idx) in instances.iter().zip(indices) {
         assert_eq!(
             (inst.challenge.index, inst.challenge.num_tables),
@@ -249,6 +247,8 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
             "an instance's fork is its position in the block"
         );
     }
+    // The attestation id, over the roots Phase A absorbs below.
+    let program_id = plan.attested().program_id();
     let per_root = RootCells::words_per_root(b);
 
     // ---- arenas, in declaration order.
@@ -257,7 +257,7 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
     let arenas: Vec<InstanceArenas> = instances
         .iter()
         .map(|inst| {
-            let c = inst.challenge;
+            let c = &inst.challenge;
             InstanceArenas {
                 aux_root: c.has_aux_root.then(|| b.declare_arena(per_root)),
                 contribution: c.has_contribution.then(|| b.declare_arena(1)),
@@ -268,7 +268,7 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
                 fri_roots: b.declare_arena(per_root * c.fri.num_committed() as u32),
                 fri_coeffs: b.declare_arena(c.fri.num_terminal_coeffs() as u32),
                 nonce: (c.grinding_factor > 0).then(|| b.declare_arena(1)),
-                legs: super::epoch_verify::declare_table_arenas(b, inst.verify),
+                legs: super::epoch_verify::declare_table_arenas(b, &inst.verify),
             }
         })
         .collect();
@@ -294,7 +294,7 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
     // ---- one fork per verified instance, with the full verification legs.
     let mut contributions: Vec<Ext> = Vec::new();
     for ((inst, a), &idx) in instances.iter().zip(&arenas).zip(indices) {
-        let c = inst.challenge;
+        let c = &inst.challenge;
         let aux = a.aux_root.map(|id| RootCells::hint(b, id, 0));
         let contribution = a.contribution.map(|id| b.hint_word(id, 0).as_ext());
         let composition = RootCells::hint(b, a.composition_root, 0);
@@ -335,8 +335,8 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
         let prep = precomputed_roots[idx].map(|r| RootCells::constant(b, &r));
         super::epoch_verify::emit_table_verification(
             b,
-            inst.verify,
-            inst.analysis,
+            &inst.verify,
+            &inst.analysis,
             &ch,
             &absorbs,
             &super::epoch_verify::TableInputs {
@@ -367,7 +367,7 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, inputs: &BlockLeafInputs<'_>) {
     }
 
     // ---- publishes, in `BlockLayout::child`'s order.
-    for word in super::programs::program_id_words(program_id) {
+    for word in super::programs::program_id_words(&program_id) {
         let cell = b.digest_const(word).as_cell();
         b.public(cell);
     }

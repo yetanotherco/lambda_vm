@@ -24,6 +24,7 @@ pub mod blake3_chip;
 pub mod blake3_socket;
 pub mod block_leaf;
 pub mod block_node;
+pub mod block_plan;
 pub mod block_replay;
 pub mod block_root;
 pub mod builder;

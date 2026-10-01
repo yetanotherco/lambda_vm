@@ -16,12 +16,11 @@ use stark::proof::view::MultiProofView;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-use super::block_leaf::{
-    BlockInstance, BlockLeafInputs, BlockPartition, emit_block_leaf, partition_by_rule,
-};
+use super::block_leaf::{BlockPartition, emit_block_leaf_over, partition_by_rule};
 use super::block_node::{
-    BlockBindings, BlockLayout, BlockNodeInputs, bind_and_publish, emit_block_node,
+    BlockBindings, BlockLayout, BlockNodeInputs, bind_and_publish_with, emit_block_node_with,
 };
+use super::block_plan::{BlockShape, BlockTreePlan, le_halves, top_claims};
 use super::block_replay::{BlockStatementShape, replay_block_front};
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
@@ -29,7 +28,7 @@ use super::edsl::WrapHash;
 use super::epoch_tests::HostTable;
 use super::epoch_verify_tests::TableLegs;
 use super::executor::execute;
-use super::per_table_aggregator::{LegCells, hint_public_words, publics_arena};
+use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, publics_arena};
 use super::per_table_aggregator_tests::{RealChild, child_arena_words, child_shape};
 use super::statement_replay::{NUM_TABLE_COUNTS, PhaseAPreprocessed, PhaseATable};
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
@@ -43,17 +42,6 @@ fn production_builder() -> LfmBuilder {
 
 /// Bytes as the arena's `u32` halves: four bytes each, little-endian, the last
 /// zero-padded.
-fn le_halves(bytes: &[u8]) -> Vec<FE> {
-    bytes
-        .chunks(4)
-        .map(|c| {
-            let mut le = [0u8; 4];
-            le[..c.len()].copy_from_slice(c);
-            FE::from(u64::from(u32::from_le_bytes(le)))
-        })
-        .collect()
-}
-
 /// The host transcript every block prover and verifier starts from:
 /// `StatementKind::Monolithic` over the block's statement fields.
 fn block_seed(
@@ -277,7 +265,7 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
         "MEMW_R[0]",
     ];
     let costs = [1, 1, 1, 1, 1, 1, 50, 60, 60, 40, 40, 1, 30, 30, 10, 30];
-    let p = partition_by_rule(&names, &costs, 4);
+    let p = partition_by_rule(&names, &costs, 4).expect("four leaves fill");
     // Seeds: KECCAK_RND 0/1 → leaves 0/1, ECDAS → 1, ECSM → 2, KECCAK → 3,
     // the fixed and tiny tables → 0. Loads after seeding: 67, 100, 40, 50.
     // Fill in AIR order, PAGE last: CPU[0] → 2 (40 → 70), CPU[1] → 3 (50 → 80),
@@ -292,8 +280,124 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
         ]
     );
     // One leaf takes everything; the seeds wrap modulo the leaf count.
-    let one = partition_by_rule(&names, &costs, 1);
+    let one = partition_by_rule(&names, &costs, 1).expect("one leaf fills");
     assert_eq!(one.leaves(), &[(0..names.len()).collect::<Vec<_>>()]);
+    // More leaves than the rule can fill: refused, never an empty leaf.
+    assert!(partition_by_rule(&names, &costs, names.len() + 1).is_err());
+}
+
+// ============================ (M1) the plan's shape ========================
+
+/// A block shape for `poc_rodata_commit` the host's pre-checks accept: one CPU
+/// and one MEMW_R table, the ELF's pages, every trace 2^5 rows.
+fn honest_fixture_shape(elf: &executor::elf::Elf) -> BlockShape {
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 1,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
+        blake3: 0,
+    };
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf(elf).len();
+    let n = counts.total().expect("fits") + crate::FIXED_TABLE_COUNT + pages;
+    BlockShape {
+        table_counts: counts,
+        runtime_page_ranges: Vec::new(),
+        num_private_input_pages: 0,
+        public_output_len: 4,
+        trace_lengths: vec![32; n],
+    }
+}
+
+/// ★ M1: the plan refuses every shape the host verifier refuses, before it
+/// builds an AIR ([`super::block_plan::check_shape`], `verify_proof_parts`'
+/// pre-checks): a non-chunked accelerator counted twice, a KECCAK_RND count the
+/// trace lengths do not cover, more private-input pages than the bound, a
+/// runtime page range over an ELF page, and a trace length that is not a power
+/// of two. Each tamper is the only change to a shape the checks accept.
+#[test]
+fn the_plan_refuses_a_shape_the_host_refuses() {
+    use super::block_plan::check_shape;
+    let opts = fixture_block_options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let honest = honest_fixture_shape(&elf);
+    assert!(
+        check_shape(&elf, &opts, &honest).is_ok(),
+        "the honest shape passes, so each refusal below is its tamper's"
+    );
+    let elf_page = crate::tables::trace_builder::Traces::page_configs_from_elf(&elf)
+        .first()
+        .expect("the ELF has a page")
+        .page_base;
+    type Tamper = Box<dyn Fn(&mut BlockShape)>;
+    let tampers: Vec<(&str, Tamper)> = vec![
+        (
+            "a non-chunked accelerator counted twice",
+            Box::new(|s| {
+                s.table_counts.keccak = 2;
+                s.trace_lengths.extend([32, 32]);
+            }),
+        ),
+        (
+            "a KECCAK_RND count the trace lengths do not cover",
+            Box::new(|s| s.table_counts.keccak_rnd = 3),
+        ),
+        (
+            "more private-input pages than the bound",
+            Box::new(|s| {
+                s.num_private_input_pages = crate::tables::page::max_private_input_pages() + 1;
+            }),
+        ),
+        (
+            "a runtime page range over an ELF page",
+            Box::new(move |s| {
+                s.runtime_page_ranges.push(crate::RuntimePageRange {
+                    base: elf_page,
+                    count: 1,
+                });
+                s.trace_lengths.push(32);
+            }),
+        ),
+        (
+            "a trace length that is not a power of two",
+            Box::new(|s| s.trace_lengths[0] = 48),
+        ),
+    ];
+    for (what, tamper) in tampers {
+        let mut shape = honest.clone();
+        tamper(&mut shape);
+        let refused = check_shape(&elf, &opts, &shape);
+        assert!(refused.is_err(), "the plan must refuse {what}");
+        assert!(
+            BlockTreePlan::derive(&elf_bytes, &opts, &shape).is_err(),
+            "the derivation refuses {what}"
+        );
+        println!("PLAN refuses {what}: {}", refused.err().unwrap_or_default());
+    }
+    // KECCAK_RND is chunked under the block's accelerator shape: a count the
+    // trace lengths DO cover passes the pre-checks (the sub-proof count is its
+    // bound, as in `verify_proof_parts`).
+    let mut chunked = honest.clone();
+    chunked.table_counts.keccak_rnd = 3;
+    chunked.trace_lengths.extend([32, 32, 32]);
+    assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
 // =============================== (c) the bindings =========================
@@ -343,7 +447,7 @@ fn bindings_program(
             z_alpha: (zero, zero),
         })
         .collect();
-    bind_and_publish(&mut b, &legs, layout, top, checks);
+    bind_and_publish_with(&mut b, &legs, layout, top, checks);
     compile(b.finish())
 }
 
@@ -423,19 +527,17 @@ fn every_block_binding_refuses_its_tamper_and_is_load_bearing() {
 
 // =============================== the block harvest ========================
 
-/// One block proof, production-accepted, read for leaf emission: the statement,
-/// every instance's roots, the shared challenges and state, and per instance the
-/// fork's shape and data ([`HostTable`]) and the legs' shapes and openings
-/// ([`TableLegs`]).
+/// One block proof, production-accepted, read for leaf emission.
+///
+/// `plan` is the verifier's: every shape and constant a leaf is emitted from,
+/// derived from the ELF, the options and the shape the proof claims — never
+/// from its data. The other fields are the proof's DATA, which the leaves'
+/// arenas carry: every instance's main root, the shared state, and per instance
+/// the fork's data ([`HostTable`]) and the legs' openings ([`TableLegs`]), each
+/// checked against the AIR's shape as it is read.
 pub(super) struct RealBlock {
-    pub(super) statement: BlockStatementShape,
-    pub(super) elf_digest: [u8; 32],
+    pub(super) plan: BlockTreePlan,
     pub(super) public_output: Vec<u8>,
-    /// AIR names, in AIR order.
-    pub(super) names: Vec<String>,
-    /// Per instance, the preprocessed root at its leaf layout — the AIR's, never
-    /// the proof's.
-    pub(super) precomputed_roots: Vec<Option<Commitment>>,
     pub(super) main_roots: Vec<Commitment>,
     pub(super) tables: Vec<HostTable>,
     pub(super) legs: Vec<TableLegs>,
@@ -443,54 +545,40 @@ pub(super) struct RealBlock {
     pub(super) state: LfmWord,
     /// The COMMIT-bus target production computed.
     pub(super) expected_bus_balance: FEE,
-    /// The ELF-derived inputs the leaves' attestation id covers: the ELF digest,
-    /// the entry point, DECODE's root and the ELF data pages' roots.
-    pub(super) attested: super::programs::AttestedInputs,
 }
-
-/// Permutations of transcript and grinding per instance fork, on top of its
-/// legs' closed form: D-NOEPOCH §12.2's 694 (690 transcript + 4 PoW, the mean
-/// over 337 measured sub-proofs).
-const FORK_PERMS: usize = 694;
-
-/// The leaf-load cap: today's wrap LFM_HASH shape, 2^18 + 2^15 rows, less the
-/// headroom wrap 2 runs at (D-NOEPOCH §12.2).
-const LEAF_PERMS_CAP: usize = 279_000;
 
 impl RealBlock {
     pub(super) fn num_instances(&self) -> usize {
-        self.names.len()
+        self.plan.num_instances()
     }
 
-    /// Per instance, its in-guest verification cost: the legs' closed form plus
-    /// the fork's transcript and grinding.
-    pub(super) fn leg_costs(&self) -> Vec<usize> {
-        self.legs
+    /// AIR names, in AIR order.
+    pub(super) fn names(&self) -> Vec<&str> {
+        self.plan
+            .instances()
             .iter()
-            .map(|l| {
-                super::epoch_verify::table_permutations_for(&l.verify, WrapHash::production())
-                    + FORK_PERMS
-            })
+            .map(|i| i.name.as_str())
             .collect()
     }
 
-    /// The §12.2 partition, over `num_leaves` leaves or `⌈Σ cost / cap⌉`.
-    pub(super) fn partition(&self, num_leaves: Option<usize>) -> BlockPartition {
-        let costs = self.leg_costs();
-        let k = num_leaves.unwrap_or_else(|| costs.iter().sum::<usize>().div_ceil(LEAF_PERMS_CAP));
-        let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
-        partition_by_rule(&names, &costs, k.max(1))
+    /// The rule over `num_leaves` leaves: a TEST partition, another tree than
+    /// the plan's unless the count is the plan's own.
+    pub(super) fn partition_over(&self, num_leaves: usize) -> BlockPartition {
+        partition_by_rule(&self.names(), &self.plan.costs(), num_leaves)
+            .expect("the rule fills every leaf")
     }
 
-    /// What leaf `k` must publish, from the host's own values: the id, the
-    /// state, the output halves, and its share of the bus.
+    /// What leaf `k` of `partition` must publish, from the host's own values:
+    /// the id, the state, the output halves, and its share of the bus — less
+    /// the target when it `carries` it.
     pub(super) fn expected_leaf_publics(
         &self,
         partition: &BlockPartition,
         k: usize,
-        carrier: usize,
+        carries: bool,
     ) -> Vec<LfmWord> {
-        let mut words = super::programs::program_id_words(&self.attested.program_id()).to_vec();
+        let mut words =
+            super::programs::program_id_words(&self.plan.attested().program_id()).to_vec();
         words.push(self.state);
         words.extend(le_halves(&self.public_output).into_iter().map(base_word));
         let mut share = partition
@@ -498,7 +586,7 @@ impl RealBlock {
             .iter()
             .filter_map(|&i| self.tables[i].contribution)
             .fold(FEE::zero(), |acc, l| acc + l);
-        if k == carrier {
+        if carries {
             share = share - self.expected_bus_balance;
         }
         words.push(ext_word(&share));
@@ -508,10 +596,10 @@ impl RealBlock {
 
 /// Harvest a block proof that production's block verifier accepts.
 ///
-/// The AIR set is the monolithic verifier's (`verify_proof_parts`): page
-/// configs from the ELF and the proof's ranges, `VmAirs::new` with HALT and the
-/// production BITWISE, DECODE's root from the ELF. Returns the harvest and the
-/// seconds of its two halves — the host verify, which only refuses (a harness
+/// The plan comes first ([`BlockTreePlan::derive`], from the shape the proof
+/// claims), and the harvest verifies and reads the proof over the plan's own
+/// AIR set — `verify_proof_parts`' set. Returns the harvest and the seconds of
+/// its two halves — the plan and the host verify, which only refuses (a harness
 /// assert, as in every tree driver), and the replay a driver needs.
 pub(super) fn harvest_block(
     opts: &crate::ProofOptions,
@@ -536,47 +624,12 @@ pub(super) fn harvest_block_with(
     use stark::verifier::IsStarkVerifier;
 
     let t_verify = std::time::Instant::now();
-    let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
-    let elf_digest = crate::statement::elf_digest(elf_bytes);
+    let plan = BlockTreePlan::derive(elf_bytes, opts, &BlockShape::of_proof(proof))?;
     let view = MultiProofView::Owned(&proof.proof);
-    proof
-        .table_counts
-        .validate_for(crate::AcceleratorShape::KeccakRndChunked)
-        .map_err(|e| format!("table counts: {e:?}"))?;
-    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
-        &elf,
-        &proof.runtime_page_ranges,
-        proof.num_private_input_pages,
-        view.len(),
-    )
-    .map_err(|e| format!("page configs: {e:?}"))?;
-    let expected_count = proof.table_counts.total().expect("counts fit")
-        + crate::FIXED_TABLE_COUNT
-        + page_configs.len();
-    if expected_count != view.len() {
-        return Err(format!(
-            "{expected_count} sub-proofs declared, {} in the proof",
-            view.len()
-        ));
-    }
-    let decode = crate::tables::decode::commitment_from_elf(&elf, opts)
-        .map_err(|e| format!("DECODE commitment: {e:?}"))?;
-    let airs = crate::VmAirs::new(
-        &elf,
-        opts,
-        false,
-        &page_configs,
-        &proof.table_counts,
-        Some(decode),
-        true,
-        None,
-        None,
-        None,
-    );
-    let refs = airs.air_refs();
+    let refs = plan.airs().air_refs();
     let seed = || {
         block_seed(
-            &elf_digest,
+            plan.elf_digest(),
             &proof.public_output,
             &proof.table_counts,
             proof.num_private_input_pages,
@@ -604,45 +657,20 @@ pub(super) fn harvest_block_with(
     }
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    // ---- Phase A, as `multi_verify_views` absorbs it.
+    // ---- Phase A, as `multi_verify_views` absorbs it: the plan's preprocessed
+    // roots (the AIR's, never the proof's), then the proof's main roots.
     let t_replay = std::time::Instant::now();
     let n = refs.len();
     let mut transcript = seed();
-    let mut names = Vec::with_capacity(n);
-    let mut precomputed_roots = Vec::with_capacity(n);
     let mut main_roots = Vec::with_capacity(n);
-    let mut decode_root = None;
-    let mut data_pages = Vec::new();
-    let mut page = 0usize;
-    for (idx, air) in refs.iter().enumerate() {
+    for idx in 0..n {
         let v = view.get(idx);
-        names.push(air.name().to_string());
-        let prep = air.is_preprocessed().then(|| {
-            super::epoch_verify_tests::layout_precomputed_commitment(*air, v.trace_length())
-        });
-        if let Some(p) = &prep {
+        if let Some(p) = &plan.instance(idx).precomputed_root {
             transcript.append_bytes(p);
         }
         transcript.append_bytes(v.lde_trace_main_merkle_root());
-        if air.name() == "DECODE" {
-            decode_root = prep;
-        }
-        if air.name().starts_with("PAGE:") {
-            let config = &page_configs[page];
-            page += 1;
-            if config.init_values.is_some() && !config.is_private_input {
-                data_pages.push((config.page_base, prep.expect("a data page is preprocessed")));
-            }
-        }
-        precomputed_roots.push(prep);
         main_roots.push(*v.lde_trace_main_merkle_root());
     }
-    assert_eq!(
-        page,
-        page_configs.len(),
-        "one PAGE sub-proof per page config"
-    );
-    assert!(refs.iter().any(|a| a.has_aux_trace()), "a block uses LogUp");
     let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
         .map(|_| transcript.sample_field_element())
         .collect();
@@ -670,81 +698,58 @@ pub(super) fn harvest_block_with(
         })
         .collect();
     let (tables, legs): (Vec<_>, Vec<_>) = per_instance.into_iter().unzip();
-    for (i, t) in tables.iter().enumerate() {
+    // The proof-reading path and the plan derive one shape per instance.
+    for (i, (t, l)) in tables.iter().zip(&legs).enumerate() {
+        let planned = plan.instance(i);
         assert_eq!(
-            t.precomputed_root, precomputed_roots[i],
-            "instance {i}: the fork's and Phase A's preprocessed roots are one value"
+            t.precomputed_root, planned.precomputed_root,
+            "instance {i}: the fork's and the plan's preprocessed roots are one value"
+        );
+        assert_eq!(
+            format!("{:?}", t.shape),
+            format!("{:?}", planned.challenge),
+            "instance {i}: the plan's challenge shape is the one the proof is read against"
+        );
+        assert_eq!(
+            format!("{:?}", l.verify),
+            format!("{:?}", planned.verify),
+            "instance {i}: the plan's legs shape is the one the proof is read against"
         );
     }
     let replay_secs = t_replay.elapsed().as_secs_f64();
 
-    let attested = super::programs::AttestedInputs {
-        elf_digest,
-        pc_start: elf.entry_point,
-        decode: decode_root.ok_or("a block has a DECODE sub-proof")?,
-        pages: data_pages,
-    };
     Ok((
         RealBlock {
-            statement: BlockStatementShape {
-                public_output_len: proof.public_output.len(),
-                table_counts: crate::statement::table_count_values(&proof.table_counts),
-                num_private_input_pages: proof.num_private_input_pages as u64,
-                fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
-                page_ranges: proof
-                    .runtime_page_ranges
-                    .iter()
-                    .map(|r| (r.base, r.count))
-                    .collect(),
-            },
-            elf_digest,
+            plan,
             public_output: proof.public_output.clone(),
-            names,
-            precomputed_roots,
             main_roots,
             tables,
             legs,
             state,
             expected_bus_balance: expected,
-            attested,
         },
         verify_secs,
         replay_secs,
     ))
 }
 
-/// Leaf `k` of `partition`, `carrier` being the leaf that subtracts the
-/// COMMIT-bus target.
-pub(super) fn block_leaf_program(
+/// Leaf `k` of the plan — the program the verifier derives.
+pub(super) fn block_leaf_program(rb: &RealBlock, k: usize) -> LfmProgram {
+    rb.plan
+        .leaf_program(k)
+        .unwrap_or_else(|e| panic!("leaf {k} must emit: {e}"))
+}
+
+/// Leaf `k` of another partition, carrying the COMMIT-bus target when
+/// `carries` — a tree the verifier did not derive, for the negatives.
+pub(super) fn block_leaf_program_over(
     rb: &RealBlock,
     partition: &BlockPartition,
     k: usize,
-    carrier: usize,
+    carries: bool,
 ) -> LfmProgram {
-    let instances: Vec<BlockInstance> = partition
-        .leaf(k)
-        .iter()
-        .map(|&i| BlockInstance {
-            challenge: &rb.tables[i].shape,
-            verify: &rb.legs[i].verify,
-            analysis: &rb.legs[i].analysis,
-        })
-        .collect();
-    let id = rb.attested.program_id();
     let mut b = production_builder();
-    emit_block_leaf(
-        &mut b,
-        &BlockLeafInputs {
-            statement: &rb.statement,
-            elf_digest: &rb.elf_digest,
-            precomputed_roots: &rb.precomputed_roots,
-            partition,
-            leaf: k,
-            instances: &instances,
-            program_id: &id,
-            carries_commit_target: k == carrier,
-        },
-    );
+    emit_block_leaf_over(&mut b, &rb.plan, partition, k, carries);
     let program = compile(b.finish());
     super::validator::validate(&program).expect("a block leaf must be admissible");
     program
@@ -789,16 +794,10 @@ pub(super) fn block_leaf_arenas(
     arenas
 }
 
-/// The layout a block's leaves and non-top nodes publish.
-pub(super) fn child_layout(rb: &RealBlock) -> BlockLayout {
-    BlockLayout::child(
-        super::proof_arena::words_per_root(),
-        rb.statement.out_halves(),
-    )
-}
-
-/// A block node over `children` (leaves or nodes), emitted and validated.
-pub(super) fn block_node_program(
+/// A block node over `children` from their PROOF-read shapes, under a
+/// weakened binding set — a mutation, for the negatives. Production nodes come
+/// from the plan over the children's derived shapes ([`compose_block_tree`]).
+pub(super) fn block_node_program_with(
     children: &[&RealChild],
     layout: BlockLayout,
     top: bool,
@@ -806,18 +805,44 @@ pub(super) fn block_node_program(
 ) -> LfmProgram {
     let shapes: Vec<_> = children.iter().map(|c| child_shape(c)).collect();
     let mut b = production_builder();
-    emit_block_node(
+    emit_block_node_with(
         &mut b,
         &BlockNodeInputs {
             children: &shapes,
             layout,
             top,
-            checks,
         },
+        checks,
     );
     let program = compile(b.finish());
     super::validator::validate(&program).expect("a block node must be admissible");
     program
+}
+
+/// The plan's node over `children`, from the shapes their ARTIFACTS give — no
+/// child proof — checked against the heights their proofs carry.
+pub(super) fn block_node_program(
+    plan: &BlockTreePlan,
+    children: &[&RealChild],
+    top: bool,
+) -> LfmProgram {
+    let words = plan.child_layout().total();
+    let derived: Vec<DerivedChild> = children
+        .iter()
+        .map(|c| {
+            let d = DerivedChild::from_artifacts(&c.artifacts, &c.opts, words)
+                .unwrap_or_else(|e| panic!("a child's shapes derive from its artifacts: {e}"));
+            let proved: Vec<u32> = c.tables.iter().map(|t| t.shape.log2_trace_length).collect();
+            assert_eq!(
+                d.log2_trace_lengths(),
+                proved,
+                "the artifacts' heights are the child proof's trace lengths"
+            );
+            d
+        })
+        .collect();
+    plan.node_program(&derived, top)
+        .unwrap_or_else(|e| panic!("a block node must emit: {e}"))
 }
 
 /// A block node's arenas: its children's, in child order.
@@ -867,18 +892,14 @@ pub(super) fn prove_program(
     (child, proved)
 }
 
-/// ★ The block tree's FINAL check — what the block's verifier runs on the top
-/// proof.
-///
-/// It mirrors the epoch tree's (`per_table_aggregator_tests`, the block-artifact
-/// root's `verify_against_artifacts` against the root program the harness itself
-/// emitted; SOUNDNESS.md §6.9): the top proof is checked against `expected`, the
-/// artifacts of the top program the VERIFIER derived from the ELF it trusts, the
-/// block's shape and the partition constant — never against a program named by
-/// whoever produced the proof. The partition is bound only through program
+/// ★ The block tree's FINAL check over the plan the harness holds: the top
+/// proof against `expected`, the artifacts of the top program the plan derives
+/// with no proof ([`BlockTreePlan::derive_top`]) — never against a program named
+/// by whoever produced the proof. The partition is bound only through program
 /// identity (a leaf's id commits to its list, each node interns its children's
 /// ids), so this is where a tree over any other partition is refused: its top is
-/// another program, and its proof fails here.
+/// another program, and its proof fails here. Production's whole verifier,
+/// which derives the plan itself, is [`super::block_plan::verify_block_tree`].
 pub(super) fn verify_block_top(
     expected: &super::registry::LfmArtifacts,
     top: &super::proof::LfmProof,
@@ -892,8 +913,8 @@ pub(super) fn verify_block_top(
 /// node the top. A one-leaf block still gets a top node: the bus closes there.
 /// Returns the top child, its proof and each level's wall.
 pub(super) fn compose_block_tree(
+    plan: &BlockTreePlan,
     leaves: Vec<RealChild>,
-    layout: BlockLayout,
     opts: &crate::ProofOptions,
     siblings: usize,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
@@ -925,7 +946,7 @@ pub(super) fn compose_block_tree(
                 if top { " TOP" } else { "" }
             );
             let te = std::time::Instant::now();
-            let program = block_node_program(&kids, layout, top, BlockBindings::ALL);
+            let program = block_node_program(plan, &kids, top);
             println!("   {label}: emitted in {:.2}s", te.elapsed().as_secs_f64());
             super::per_table_aggregator_tests::census_and_panel(&program, &label, FAN_IN);
             let (child, proof) = prove_program(&label, &program, &block_node_arenas(&kids), opts);
@@ -958,13 +979,17 @@ pub(super) fn compose_block_tree(
 /// public output.
 pub(super) fn assert_top_claims_the_block(top: &RealChild, rb: &RealBlock) {
     let words: Vec<LfmWord> = top.public_words.iter().map(|(_, w)| *w).collect();
-    let mut want = super::programs::program_id_words(&rb.attested.program_id()).to_vec();
+    let mut want = super::programs::program_id_words(&rb.plan.attested().program_id()).to_vec();
     want.push(rb.state);
     want.extend(le_halves(&rb.public_output).into_iter().map(base_word));
     assert_eq!(
         words, want,
         "the top node publishes the block's claim: the attestation id, the state and \
          the public output"
+    );
+    assert!(
+        top_claims(&rb.plan, &top.public_words, &rb.public_output),
+        "the block verifier's claim check accepts the honest top"
     );
 }
 
@@ -1015,48 +1040,183 @@ fn small_block(name: &str, input: &[u8], opts: &crate::ProofOptions) -> (Vec<u8>
 ///
 /// `poc_rodata_commit` carries an ELF data page (an ELF-derived preprocessed root
 /// besides DECODE's) and a public output (a nonzero COMMIT-bus target). Three
-/// leaves, so the shares are split and the target sits in one of them.
+/// leaves (a test partition: the plan's own is one leaf at this size), so the
+/// shares are split and the target sits in one of them.
+///
+/// Then, per leaf, the arena census (every declared word is a proof word the
+/// shapes prescribe, and nothing more), and the leaf-level refusals: a tampered
+/// `L`, a non-canonical output half, and a leaf emitted from any other part
+/// count or contribution flag than the AIR's is another program.
 #[test]
 #[ignore = "proves a VM block (BITWISE is 2^20 rows); box tier"]
 fn block_leaves_execute_over_a_real_block_proof() {
     let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
     let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &opts);
     assert!(
         crate::block::verify_block(&proof, &elf_bytes, &opts).expect("verifies"),
         "the block verifier accepts the small block"
     );
-    let (rb, verify, replay) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
+    let (mut rb, verify, replay) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
     assert!(!rb.public_output.is_empty(), "a nonzero COMMIT-bus target");
     assert!(
-        !rb.attested.pages.is_empty(),
+        !rb.plan.attested().pages.is_empty(),
         "an ELF data page is attested"
     );
-    let partition = rb.partition(Some(3));
+    println!(
+        "BLOCK FIXTURE: the plan's own partition is {} leaf(s)",
+        rb.plan.partition().num_leaves()
+    );
+    let three = rb.partition_over(3);
+    rb.plan = rb.plan.with_partition(three);
+    let partition = rb.plan.partition().clone();
     println!(
         "BLOCK FIXTURE: {} instances, verify {verify:.2}s · replay {replay:.2}s, leaves {:?}",
         rb.num_instances(),
         partition.leaves()
     );
+    let dw = super::proof_arena::words_per_root();
     let mut total = FEE::zero();
     for k in 0..partition.num_leaves() {
-        let program = block_leaf_program(&rb, &partition, k, 0);
+        let program = block_leaf_program(&rb, k);
         let arenas = block_leaf_arenas(&rb, &partition, k);
         let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .unwrap_or_else(|e| panic!("leaf {k} must execute: {e:?}"));
         let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
         assert_eq!(
             got,
-            rb.expected_leaf_publics(&partition, k, 0),
+            rb.expected_leaf_publics(&partition, k, k == rb.plan.carrier()),
             "leaf {k} publishes the host's id, state, output and share"
         );
         total += word_as_ext(got.last().expect("a share")).expect("an ext share");
+
+        // ---- the census: the schema is the proof's words, counted from the
+        // proof's own blocks, and not one more — a surplus word is where an
+        // unbound second copy of a value hides.
+        let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
+        let mut want = rb.public_output.len().div_ceil(4) + dw * rb.num_instances();
+        for &i in partition.leaf(k) {
+            let (h, leg) = (&rb.tables[i], &rb.legs[i]);
+            want += dw * usize::from(h.aux_root.is_some())
+                + usize::from(h.contribution.is_some())
+                + dw
+                + h.ood_current.len()
+                + h.ood_next.len()
+                + h.parts.len()
+                + dw * h.fri_roots.len()
+                + h.fri_coeffs.len()
+                + usize::from(h.nonce.is_some())
+                + leg.opening_arena().len()
+                + leg.fri_arena().len()
+                + leg.caps_arena().iter().map(Vec::len).sum::<usize>();
+        }
+        assert_eq!(
+            declared, want,
+            "leaf {k}: the arena schema is exactly the proof's words"
+        );
+
+        // ---- a tampered `L`: the fork absorbs it, so every later challenge
+        // moves and the leaf does not execute.
+        if let Some((i, at)) = contribution_arena(&rb, &partition, k) {
+            let mut bad = arenas.clone();
+            assert_eq!(
+                bad[at],
+                vec![ext_word(&rb.tables[i].contribution.expect("an L"))],
+                "the census found instance {i}'s L"
+            );
+            bad[at][0][0] += FE::from(1u64);
+            assert!(
+                execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER).is_err(),
+                "leaf {k}: a tampered L of instance {i} must not execute"
+            );
+        }
         println!(
-            "BLOCK FIXTURE leaf {k}: {} instances, {} instructions, executes",
+            "BLOCK FIXTURE leaf {k}: {} instances, {} instructions, {declared} arena words, \
+             executes",
             partition.leaf(k).len(),
             program.instrs.len()
         );
     }
     assert_eq!(total, FEE::zero(), "the leaves' shares close the bus");
+
+    // ---- a non-canonical output half: the statement decomposes each half into
+    // its live bytes, so a half at or over 2^32, or a nonzero pad byte, is refused.
+    let program = block_leaf_program(&rb, 0);
+    let arenas = block_leaf_arenas(&rb, &partition, 0);
+    let half0: u64 = arenas[0][0][0].canonical();
+    let mut over = arenas.clone();
+    over[0][0] = base_word(FE::from(half0 + (1u64 << 32)));
+    assert!(
+        execute(&program, &over, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        "an output half at or over 2^32 must not execute"
+    );
+    let live = rb.public_output.len() % 4;
+    if live != 0 {
+        let last = arenas[0].len() - 1;
+        let v: u64 = arenas[0][last][0].canonical();
+        let mut padded = arenas.clone();
+        padded[0][last] = base_word(FE::from(v | (1u64 << (8 * live))));
+        assert!(
+            execute(&program, &padded, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "a nonzero pad byte in the last output half must not execute"
+        );
+    } else {
+        println!("BLOCK FIXTURE: the output fills its last half; no pad byte to tamper");
+    }
+
+    // ---- M1: a leaf emitted from any other part count or contribution flag
+    // than the AIR's is another program — so a tree over it has another top,
+    // refused at the final check (the fixture tree's partition negatives show
+    // that refusal on proved trees).
+    let (k, i) = (0..partition.num_leaves())
+        .flat_map(|k| partition.leaf(k).iter().map(move |&i| (k, i)))
+        .find(|&(_, i)| rb.plan.instance(i).challenge.has_contribution)
+        .expect("an instance with a bus contribution");
+    let honest =
+        super::block_plan::artifacts_of(&block_leaf_program(&rb, k), &wrap_opts).program_id;
+    type Mutation = fn(&mut super::block_plan::PlannedInstance);
+    let mutations: [(&str, Mutation); 2] = [
+        ("an inflated part count", |p| {
+            p.challenge.num_parts += 1;
+            p.verify.quotient.num_composition_parts += 1;
+            p.verify.sub.deep.num_composition_parts += 1;
+        }),
+        ("a dropped contribution", |p| {
+            p.challenge.has_contribution = false
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut plan = BlockTreePlan::derive(&elf_bytes, &opts, &BlockShape::of_proof(&proof))
+            .expect("the plan derives")
+            .with_partition(partition.clone());
+        mutate(plan.instance_mut(i));
+        let program = plan.leaf_program(k).expect("the mutant emits");
+        let id = super::block_plan::artifacts_of(&program, &wrap_opts).program_id;
+        assert_ne!(
+            id, honest,
+            "leaf {k} emitted from {what} on instance {i} is another program"
+        );
+        println!("BLOCK FIXTURE: {what} on instance {i} makes leaf {k} another program");
+    }
+}
+
+/// Instance and arena index of the first `L` leaf `k`'s arenas carry, in
+/// [`block_leaf_arenas`]' order.
+fn contribution_arena(
+    rb: &RealBlock,
+    partition: &BlockPartition,
+    k: usize,
+) -> Option<(usize, usize)> {
+    let mut at = 2;
+    for &i in partition.leaf(k) {
+        let (h, leg) = (&rb.tables[i], &rb.legs[i]);
+        at += usize::from(h.aux_root.is_some());
+        if h.contribution.is_some() {
+            return Some((i, at));
+        }
+        at += 6 + usize::from(h.nonce.is_some()) + 2 + usize::from(leg.caps_arena().is_some());
+    }
+    None
 }
 
 /// ★ (b)–(e) at fixture scale, PROVED: three leaves, the nodes above them and the
@@ -1090,18 +1250,28 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         crate::statement::table_count_values(&proof_b.table_counts),
         "the same shape"
     );
-    let (a, ..) = harvest_block(&opts, &elf_bytes, &proof_a).expect("harvest A");
-    let (b, ..) = harvest_block(&opts, &elf_bytes, &proof_b).expect("harvest B");
+    let (mut a, ..) = harvest_block(&opts, &elf_bytes, &proof_a).expect("harvest A");
+    let (mut b, ..) = harvest_block(&opts, &elf_bytes, &proof_b).expect("harvest B");
     assert_ne!(a.state, b.state, "the blocks differ in their roots");
-    let partition = a.partition(Some(3));
-    assert_eq!(partition, b.partition(Some(3)), "the same partition");
-    let layout = child_layout(&a);
+    // A test partition of three leaves (the plan's own is one at this size), in
+    // both plans: the final check below derives over it.
+    let partition = a.partition_over(3);
+    assert_eq!(partition, b.partition_over(3), "the same partition");
+    a.plan = a.plan.with_partition(partition.clone());
+    b.plan = b.plan.with_partition(partition.clone());
+    let layout = a.plan.child_layout();
 
-    // Leaves of A, and of B; the same programs, since the shapes are equal.
-    let leaves = |rb: &RealBlock, carrier: usize, tag: &str| -> Vec<RealChild> {
+    // Leaves of A, and of B; the same programs, since the shapes are equal. The
+    // plan's carrier unless `carriers` names others (the negatives).
+    let leaves = |rb: &RealBlock, carriers: &[usize], tag: &str| -> Vec<RealChild> {
         (0..partition.num_leaves())
             .map(|k| {
-                let program = block_leaf_program(rb, &partition, k, carrier);
+                let carries = carriers.contains(&k);
+                let program = if carriers == [rb.plan.carrier()] {
+                    block_leaf_program(rb, k)
+                } else {
+                    block_leaf_program_over(rb, &partition, k, carries)
+                };
                 let child = prove_as_child(
                     &format!("{tag} leaf {k}"),
                     &program,
@@ -1109,13 +1279,13 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
                     &wrap_opts,
                 );
                 let words: Vec<LfmWord> = child.public_words.iter().map(|(_, w)| *w).collect();
-                assert_eq!(words, rb.expected_leaf_publics(&partition, k, carrier));
+                assert_eq!(words, rb.expected_leaf_publics(&partition, k, carries));
                 child
             })
             .collect()
     };
-    let leaves_a = leaves(&a, 0, "A");
-    let leaves_b = leaves(&b, 0, "B");
+    let leaves_a = leaves(&a, &[0], "A");
+    let leaves_b = leaves(&b, &[0], "B");
     assert_eq!(
         leaves_a[1].artifacts.program_id, leaves_b[1].artifacts.program_id,
         "a leaf's program is a function of the shape, so B's leaf 1 is A's program"
@@ -1124,7 +1294,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
     // ---- another block's leaf, beside A's leaf 0, at the first node.
     let mixed = [&leaves_a[0], &leaves_b[1]];
     let node = |checks: BlockBindings| {
-        let program = block_node_program(&mixed, layout, false, checks);
+        let program = block_node_program_with(&mixed, layout, false, checks);
         execute(
             &program,
             &block_node_arenas(&mixed),
@@ -1140,31 +1310,40 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         "with the state check removed it executes: the state check is what refuses it"
     );
 
-    // ---- no leaf carries the target: the shares sum to it, and the top refuses.
-    let uncarried_leaves = leaves(&a, usize::MAX, "A uncarried");
-    let uncarried: Vec<&RealChild> = uncarried_leaves.iter().collect();
-    let top_over = |checks: BlockBindings| {
-        let program = block_node_program(&uncarried, layout, true, checks);
-        execute(
-            &program,
-            &block_node_arenas(&uncarried),
-            &crate::hash_pin::BLOCK_HASHER,
-        )
-    };
-    assert!(
-        top_over(BlockBindings::ALL).is_err(),
-        "a top over shares that do not close the bus must not execute"
-    );
-    assert!(
-        top_over(BlockBindings::without("bus")).is_ok(),
-        "with the bus assert removed it executes: the bus assert is what refuses it"
-    );
+    // ---- no leaf, or two, carry the target: the shares sum to E or to −E, and
+    // the top refuses.
+    for (what, carriers) in [("no leaf", &[][..]), ("two leaves", &[0, 1][..])] {
+        let wrong_leaves = leaves(&a, carriers, &format!("A carried by {what}"));
+        let wrong: Vec<&RealChild> = wrong_leaves.iter().collect();
+        let top_over = |checks: BlockBindings| {
+            let program = block_node_program_with(&wrong, layout, true, checks);
+            execute(
+                &program,
+                &block_node_arenas(&wrong),
+                &crate::hash_pin::BLOCK_HASHER,
+            )
+        };
+        assert!(
+            top_over(BlockBindings::ALL).is_err(),
+            "a top over shares {what} carries must not execute: they do not close the bus"
+        );
+        assert!(
+            top_over(BlockBindings::without("bus")).is_ok(),
+            "{what} carrying: with the bus assert removed it executes, so the bus assert \
+             is what refuses it"
+        );
+    }
 
     // ---- the honest tree over A, and the final check against the top program
     // the verifier derives from the partition.
-    let (top, top_proof, walls) = compose_block_tree(leaves_a, layout, &wrap_opts, 1);
+    let (top, top_proof, walls) = compose_block_tree(&a.plan, leaves_a, &wrap_opts, 1);
     assert_top_claims_the_block(&top, &a);
-    assert!(verify_block_top(&top.artifacts, &top_proof, &wrap_opts));
+    let expected = a.plan.derive_top(&wrap_opts).expect("the top derives");
+    assert_eq!(
+        expected.program_id, top.artifacts.program_id,
+        "the plan derives, with no proof, the top program the harness proved"
+    );
+    assert!(verify_block_top(&expected, &top_proof, &wrap_opts));
     println!("BLOCK FIXTURE TREE: levels {walls:?}, the top claims block A");
 
     // ---- a tree over ANOTHER partition of the same block: one instance moved from
@@ -1179,20 +1358,20 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         .map(|k| {
             prove_as_child(
                 &format!("A other-partition leaf {k}"),
-                &block_leaf_program(&a, &other, k, 0),
+                &block_leaf_program_over(&a, &other, k, k == 0),
                 &block_leaf_arenas(&a, &other, k),
                 &wrap_opts,
             )
         })
         .collect();
-    let (other_top, other_proof, _) = compose_block_tree(other_leaves, layout, &wrap_opts, 1);
+    let (other_top, other_proof, _) = compose_block_tree(&a.plan, other_leaves, &wrap_opts, 1);
     assert_eq!(
         other_top.public_words, top.public_words,
         "the other partition's top claims the same block"
     );
     assert_ne!(other_top.artifacts.program_id, top.artifacts.program_id);
     assert!(
-        !verify_block_top(&top.artifacts, &other_proof, &wrap_opts),
+        !verify_block_top(&expected, &other_proof, &wrap_opts),
         "a tree over another partition must be refused at the final check"
     );
     assert!(
@@ -1223,7 +1402,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         );
     println!(
         "BLOCK FIXTURE TREE: instance {skipped} ({}) of leaf {k_leaf} has a zero bus contribution",
-        a.names[skipped]
+        a.names()[skipped]
     );
     let mut skip = lists.clone();
     skip[k_leaf].retain(|&i| i != skipped);
@@ -1241,20 +1420,20 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
             .map(|k| {
                 prove_as_child(
                     &format!("A tree that {what} instance {skipped}, leaf {k}"),
-                    &block_leaf_program(&a, &bad, k, 0),
+                    &block_leaf_program_over(&a, &bad, k, k == 0),
                     &block_leaf_arenas(&a, &bad, k),
                     &wrap_opts,
                 )
             })
             .collect();
-        let (bad_top, bad_proof, _) = compose_block_tree(bad_leaves, layout, &wrap_opts, 1);
+        let (bad_top, bad_proof, _) = compose_block_tree(&a.plan, bad_leaves, &wrap_opts, 1);
         assert_eq!(
             bad_top.public_words, top.public_words,
             "a tree that {what} an instance claims the same block"
         );
         assert_ne!(bad_top.artifacts.program_id, top.artifacts.program_id);
         assert!(
-            !verify_block_top(&top.artifacts, &bad_proof, &wrap_opts),
+            !verify_block_top(&expected, &bad_proof, &wrap_opts),
             "a tree that {what} an instance must be refused at the final check"
         );
         assert!(
@@ -1268,11 +1447,85 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
     }
 }
 
+/// ★ M1 end to end at fixture scale: the block VERIFIER
+/// ([`super::block_plan::verify_block_tree`]) derives the plan and the top
+/// program from the trusted ELF, the options and the claimed shape — no proof
+/// read — and accepts the honest tree's top proof over the plan's OWN partition
+/// and carrier. It refuses the same top proof under another ELF, another
+/// claimed output, and a shape that lies about one trace length (each derives
+/// another top or another claim).
+#[test]
+#[ignore = "proves a VM block and its tree; box tier"]
+fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
+    let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &opts);
+    let shape = BlockShape::of_proof(&proof);
+    let (rb, ..) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
+    let partition = rb.plan.partition().clone();
+    println!(
+        "BLOCK VERIFIER FIXTURE: the plan's partition is {} leaf(s), {} instances",
+        partition.num_leaves(),
+        rb.num_instances()
+    );
+    let leaves: Vec<RealChild> = (0..partition.num_leaves())
+        .map(|k| {
+            prove_as_child(
+                &format!("plan leaf {k}"),
+                &block_leaf_program(&rb, k),
+                &block_leaf_arenas(&rb, &partition, k),
+                &wrap_opts,
+            )
+        })
+        .collect();
+    let (top, top_proof, _) = compose_block_tree(&rb.plan, leaves, &wrap_opts, 1);
+    assert_top_claims_the_block(&top, &rb);
+
+    let verify = |elf: &[u8], shape: &BlockShape, output: &[u8]| {
+        super::block_plan::verify_block_tree(elf, &opts, &wrap_opts, shape, output, &top_proof)
+    };
+    verify(&elf_bytes, &shape, &proof.public_output).expect("the verifier accepts the block");
+    let (_, derived) = super::block_plan::derive_block_top(&elf_bytes, &opts, &wrap_opts, &shape)
+        .expect("derives");
+    assert_eq!(
+        derived.program_id, top.artifacts.program_id,
+        "the verifier's top is the program the harness proved"
+    );
+
+    let other_elf = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let other = verify(&other_elf, &shape, &proof.public_output);
+    assert!(
+        other.is_err(),
+        "another ELF's verifier must refuse the block"
+    );
+    let mut output = proof.public_output.clone();
+    output[0] ^= 1;
+    assert!(
+        verify(&elf_bytes, &shape, &output).is_err(),
+        "another claimed output must be refused"
+    );
+    let mut lie = shape.clone();
+    let i = (0..lie.trace_lengths.len())
+        .find(|&i| !rb.plan.instance(i).name.starts_with("PAGE") && lie.trace_lengths[i] < 1 << 10)
+        .expect("a small table");
+    lie.trace_lengths[i] *= 2;
+    assert!(
+        verify(&elf_bytes, &lie, &proof.public_output).is_err(),
+        "a shape that lies about instance {i}'s trace length must be refused"
+    );
+    println!(
+        "BLOCK VERIFIER FIXTURE: accepts the plan's tree; refuses another ELF ({}), another \
+         output, a trace-length lie",
+        other.err().unwrap_or_default()
+    );
+}
+
 // ============================ production scale ============================
 
 /// D-NOEPOCH §12.2's partition of block 25368371's 137 instances, as the
-/// designer's script printed it — compared against the rule's own output on the
-/// block, never substituted for it.
+/// designer's script printed it: the rule over `legmodel.py`'s costs, which
+/// differ from the closed form the plan prices with. Reported beside the plan's
+/// partition, never substituted for it.
 const D12_LEAVES: [&[usize]; 8] = [
     &[
         0, 1, 2, 3, 4, 5, 7, 13, 49, 61, 69, 77, 85, 93, 101, 109, 117, 125, 133,
@@ -1392,7 +1645,8 @@ fn the_block_tree_composes_to_a_top_node() {
     // verifies first, as before.
     let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
     let t = Instant::now();
-    let (rb, verify, replay, beside) = if inline_verify {
+    let shape = BlockShape::of_proof(&proof);
+    let (mut rb, verify, replay, beside) = if inline_verify {
         let (rb, verify, replay) = harvest_block(&inner, &elf_bytes, &proof).expect("harvest");
         drop(proof);
         (rb, Some(verify), replay, None)
@@ -1421,44 +1675,38 @@ fn the_block_tree_composes_to_a_top_node() {
         rb.public_output.len()
     );
 
-    // ---- the partition: §12.2's lists are the constant for the block they were
-    // written for (137 instances, MEMW[0] at 42 and MEMW_R[0] at 100); the rule
-    // otherwise, or under `NOEPOCH_PARTITION=rule`.
-    let ruled = rb.partition(leaves_knob());
-    let d12_block =
-        rb.num_instances() == 137 && rb.names[42] == "MEMW[0]" && rb.names[100] == "MEMW_R[0]";
-    let use_rule = std::env::var("NOEPOCH_PARTITION").is_ok_and(|v| v == "rule");
-    let partition = if d12_block && !use_rule && leaves_knob().is_none() {
-        BlockPartition::new(D12_LEAVES.iter().map(|l| l.to_vec()).collect(), 137)
-            .expect("§12.2's lists partition the block")
-    } else {
-        ruled.clone()
-    };
+    // ---- the partition: the plan's — the rule over the closed-form costs, a
+    // pure function of the block's shape. `NOEPOCH_LEAVES` forces another leaf
+    // count: another tree, which the final check then derives over.
+    let forced = leaves_knob();
+    if let Some(k) = forced {
+        let p = rb.partition_over(k);
+        rb.plan = rb.plan.with_partition(p);
+    }
+    let partition = rb.plan.partition().clone();
+    let names = rb.names();
+    let d12_block = names.len() == 137 && names[42] == "MEMW[0]" && names[100] == "MEMW_R[0]";
     println!(
-        "   BLOCK PARTITION SOURCE: {} (the rule {} §12.2)",
-        if partition == ruled && !d12_block {
-            "the rule"
-        } else if d12_block && !use_rule && leaves_knob().is_none() {
-            "D-NOEPOCH §12.2's constant lists"
+        "   BLOCK PARTITION SOURCE: {} · D-NOEPOCH §12.2's lists (legmodel.py costs): {}",
+        if forced.is_some() {
+            "NOEPOCH_LEAVES (forced: NOT the plan's tree)"
         } else {
-            "the rule (forced)"
+            "the plan (the rule)"
         },
-        if d12_block {
-            if ruled
-                .leaves()
-                .iter()
-                .zip(D12_LEAVES)
-                .all(|(a, b)| a[..] == b[..])
-            {
-                "reproduces"
-            } else {
-                "DIFFERS from"
-            }
+        if !d12_block {
+            "n/a (not the 137-instance block)"
+        } else if partition
+            .leaves()
+            .iter()
+            .map(Vec::as_slice)
+            .eq(D12_LEAVES.iter().copied())
+        {
+            "equal"
         } else {
-            "has no constant to match on this block, unlike"
+            "differ (reported, not used)"
         }
     );
-    let costs = rb.leg_costs();
+    let costs = rb.plan.costs();
     let k = partition.num_leaves();
     for (j, leaf) in partition.leaves().iter().enumerate() {
         let perms: usize = leaf.iter().map(|&i| costs[i]).sum();
@@ -1468,22 +1716,15 @@ fn the_block_tree_composes_to_a_top_node() {
         );
     }
     println!(
-        "   BLOCK PARTITION: {k} leaves, Σ {} perms; = D-NOEPOCH §12.2: {}",
+        "   BLOCK PARTITION: {k} leaves, Σ {} perms, heaviest {} (cap {})",
         costs.iter().sum::<usize>(),
-        if rb.num_instances() == 137 && k == D12_LEAVES.len() {
-            if partition
-                .leaves()
-                .iter()
-                .zip(D12_LEAVES)
-                .all(|(a, b)| a[..] == b[..])
-            {
-                "yes".to_string()
-            } else {
-                "NO (the rule's costs differ from legmodel's)".to_string()
-            }
-        } else {
-            "n/a (not the 137-instance block)".to_string()
-        }
+        partition
+            .leaves()
+            .iter()
+            .map(|l| l.iter().map(|&i| costs[i]).sum::<usize>())
+            .max()
+            .unwrap_or(0),
+        super::block_plan::LEAF_PERMS_CAP
     );
 
     // ---- level 0: the leaves.
@@ -1495,7 +1736,7 @@ fn the_block_tree_composes_to_a_top_node() {
     let leaves = in_index_order(k, l0, |j| {
         let label = format!("BLOCK L0 leaf {j}");
         let te = Instant::now();
-        let program = block_leaf_program(&rb, &partition, j, 0);
+        let program = block_leaf_program(&rb, j);
         let arenas = block_leaf_arenas(&rb, &partition, j);
         println!(
             "   {label}: emitted + arenas in {:.2}s",
@@ -1510,7 +1751,7 @@ fn the_block_tree_composes_to_a_top_node() {
         let words: Vec<LfmWord> = child.public_words.iter().map(|(_, w)| *w).collect();
         assert_eq!(
             words,
-            rb.expected_leaf_publics(&partition, j, 0),
+            rb.expected_leaf_publics(&partition, j, j == rb.plan.carrier()),
             "{label} publishes the host's id, state, output and share"
         );
         child
@@ -1527,8 +1768,7 @@ fn the_block_tree_composes_to_a_top_node() {
     println!("   ★ SIBLING CONCURRENCY: {siblings} node proof(s) at once (LFM_TREE_SIBLINGS)");
     super::device_permit::arm(siblings);
     let t = Instant::now();
-    let (top, top_proof, walls) =
-        compose_block_tree(leaves, child_layout(&rb), &wrap_opts, siblings);
+    let (top, top_proof, walls) = compose_block_tree(&rb.plan, leaves, &wrap_opts, siblings);
     super::device_permit::arm(1);
     let interior = t.elapsed().as_secs_f64();
     // The verify beside level 0 must have accepted the block, over the same
@@ -1555,10 +1795,10 @@ fn the_block_tree_composes_to_a_top_node() {
     let t = Instant::now();
     assert!(
         verify_block_top(&top.artifacts, &top_proof, &wrap_opts),
-        "the top proof must verify against the top program derived from the partition"
+        "the top proof must verify against the top program the harness emitted"
     );
     println!(
-        "   BLOCK FINAL CHECK: the top verifies against the program derived from the partition \
+        "   BLOCK FINAL CHECK (harness): the top verifies against its emitted program \
          ({:.2}s, program id {})",
         t.elapsed().as_secs_f64(),
         top.artifacts
@@ -1581,4 +1821,39 @@ fn the_block_tree_composes_to_a_top_node() {
         harvest + level0 + interior
     );
     println!("★★★ WHOLE RUN: host peak {peak:.3} GiB at t={at:.1}, {total:.1}s total");
+
+    // ---- the block VERIFIER, outside the whole run (a consumer's work, not the
+    // prover's): the plan and the top program derived from the ELF, the options
+    // and the claimed shape with no proof read, the top proof verified against
+    // that program, its words against the ELF's id and the output.
+    let t = Instant::now();
+    let derived = match forced {
+        None => super::block_plan::derive_block_top(&elf_bytes, &inner, &wrap_opts, &shape)
+            .map(|(_, top)| top),
+        Some(_) => rb.plan.derive_top(&wrap_opts),
+    }
+    .expect("the verifier derives the top program");
+    let derive_secs = t.elapsed().as_secs_f64();
+    assert_eq!(
+        derived.program_id, top.artifacts.program_id,
+        "the verifier derives, with no proof, the top program the harness proved"
+    );
+    assert!(
+        verify_block_top(&derived, &top_proof, &wrap_opts),
+        "the top proof verifies against the derived top program"
+    );
+    assert!(
+        top_claims(&rb.plan, &top_proof.public_words, &rb.public_output),
+        "the top proof claims the trusted ELF's id and the block's output"
+    );
+    println!(
+        "   BLOCK VERIFIER: {} plan + top program derived in {derive_secs:.2}s (no proof read) · \
+         the top proof verifies against it and claims the block · {:.2}s in all",
+        if forced.is_some() {
+            "forced-partition"
+        } else {
+            "production"
+        },
+        t.elapsed().as_secs_f64()
+    );
 }

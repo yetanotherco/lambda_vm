@@ -16,10 +16,11 @@
 //!    across children.
 //! 3. **The bus** — the children's sums added; a non-top node publishes the
 //!    total, the TOP node asserts it is zero: Σ over every instance of its bus
-//!    contribution equals the COMMIT-bus target, which one leaf subtracted
-//!    (`block_leaf::BlockLeafInputs::carries_commit_target`). This is the
-//!    monolithic verifier's bus check (`verifier.rs`, "Σ table_contribution =
-//!    expected_bus_balance"), moved to where every contribution is in scope.
+//!    contribution equals the COMMIT-bus target, which exactly one leaf
+//!    subtracted (the plan's carrier, `block_plan::BlockTreePlan::carrier`).
+//!    This is the monolithic verifier's bus check (`verifier.rs`, "Σ
+//!    table_contribution = expected_bus_balance"), moved to where every
+//!    contribution is in scope.
 //!
 //! Coverage is not a check here: the children's ids are constants of this
 //! program, a leaf's id commits to its instance list, and the lists were
@@ -86,19 +87,20 @@ impl BlockLayout {
 }
 
 /// Which of the cross-child checks a node emits. Production emits all of them
-/// ([`BlockBindings::ALL`]); the weakened sets exist so each negative test can
-/// show its check is the one doing the refusing.
+/// ([`BlockBindings::ALL`]) and no production signature takes another set; the
+/// weakened sets exist so each negative test can show its check is the one doing
+/// the refusing ([`emit_block_node_with`], [`bind_and_publish_with`], test-only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockBindings {
-    pub(crate) id: bool,
-    pub(crate) state: bool,
-    pub(crate) out: bool,
+pub(crate) struct BlockBindings {
+    id: bool,
+    state: bool,
+    out: bool,
     /// The top node's zero assert on the bus sum.
-    pub(crate) bus: bool,
+    bus: bool,
 }
 
 impl BlockBindings {
-    pub const ALL: Self = Self {
+    pub(crate) const ALL: Self = Self {
         id: true,
         state: true,
         out: true,
@@ -131,7 +133,7 @@ fn hinted_ext(b: &mut LfmBuilder, w: &HintedPublicWord) -> Ext {
 
 /// The cross-child checks on verified children's published words, and the sum of
 /// their bus shares.
-pub fn emit_block_bindings(
+fn emit_block_bindings(
     b: &mut LfmBuilder,
     legs: &[LegCells],
     layout: &BlockLayout,
@@ -184,17 +186,29 @@ pub struct BlockNodeInputs<'a> {
     pub layout: BlockLayout,
     /// Whether this node closes the bus and publishes the block's claim.
     pub top: bool,
-    pub checks: BlockBindings,
 }
 
 /// Declare every child's arenas (in child order), verify every child, bind them,
 /// publish.
 pub fn emit_block_node(b: &mut LfmBuilder, inputs: &BlockNodeInputs<'_>) {
+    emit_node(b, inputs, BlockBindings::ALL);
+}
+
+/// [`emit_block_node`] under a weakened binding set — a mutation, test-only.
+#[cfg(test)]
+pub(crate) fn emit_block_node_with(
+    b: &mut LfmBuilder,
+    inputs: &BlockNodeInputs<'_>,
+    checks: BlockBindings,
+) {
+    emit_node(b, inputs, checks);
+}
+
+fn emit_node(b: &mut LfmBuilder, inputs: &BlockNodeInputs<'_>, checks: BlockBindings) {
     let BlockNodeInputs {
         children,
         layout,
         top,
-        checks,
     } = *inputs;
     assert!(!children.is_empty(), "a node verifies at least one child");
     for child in children {
@@ -213,12 +227,28 @@ pub fn emit_block_node(b: &mut LfmBuilder, inputs: &BlockNodeInputs<'_>) {
         .zip(&arenas)
         .map(|(child, a)| emit_leg(b, child, a))
         .collect();
-    bind_and_publish(b, &legs, &layout, top, checks);
+    bind(b, &legs, &layout, top, checks);
 }
 
 /// Everything a node does after verifying its children: the cross-child checks,
 /// the top node's bus close, and the publishes.
-pub fn bind_and_publish(
+pub fn bind_and_publish(b: &mut LfmBuilder, legs: &[LegCells], layout: &BlockLayout, top: bool) {
+    bind(b, legs, layout, top, BlockBindings::ALL);
+}
+
+/// [`bind_and_publish`] under a weakened binding set — a mutation, test-only.
+#[cfg(test)]
+pub(crate) fn bind_and_publish_with(
+    b: &mut LfmBuilder,
+    legs: &[LegCells],
+    layout: &BlockLayout,
+    top: bool,
+    checks: BlockBindings,
+) {
+    bind(b, legs, layout, top, checks);
+}
+
+fn bind(
     b: &mut LfmBuilder,
     legs: &[LegCells],
     layout: &BlockLayout,
