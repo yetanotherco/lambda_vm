@@ -3612,6 +3612,12 @@ pub struct StreamSkip {
     pub lt: usize,
     pub shift: usize,
     pub store: usize,
+    /// Rows per KECCAK_RND chunk, when the build cuts KECCAK_RND into chunks of
+    /// that many rows (the split a block proof makes); zero builds it whole, as
+    /// every build but the block's.
+    pub keccak_rnd_rows: usize,
+    /// KECCAK_RND chunks already handed out (with `keccak_rnd_rows`).
+    pub keccak_rnd: usize,
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -3624,6 +3630,53 @@ pub(crate) struct PreCounted {
     pub(crate) histogram: bitwise::BitwiseHistogram,
     pub(crate) bitwise_ops: usize,
     pub(crate) memw_register_rows: usize,
+}
+
+/// KECCAK_RND cut into tables of `rows` rows, the first `streamed` of them left
+/// as placeholders: the tables `split_rows` makes of the whole table
+/// ([`keccak_rnd::generate_keccak_rnd_trace`]), each built from the ops that
+/// reach it. A table no taller than `rows` stays one table, as the split leaves
+/// it.
+pub(crate) fn keccak_rnd_chunks(
+    ops: &[KeccakRoundOperation],
+    rows: usize,
+    streamed: usize,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total = (ops.len() * 24).next_power_of_two().max(4);
+    if total <= rows {
+        if streamed > 0 {
+            return Err(Error::Prover(format!(
+                "{streamed} KECCAK_RND chunks were streamed but the table is one of {total} rows"
+            )));
+        }
+        return Ok(vec![keccak_rnd::generate_keccak_rnd_trace(ops)]);
+    }
+    let chunks = total / rows;
+    if streamed > chunks {
+        return Err(Error::Prover(format!(
+            "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"
+        )));
+    }
+    Ok((0..chunks)
+        .map(|c| {
+            if c < streamed {
+                return streamed_placeholder();
+            }
+            let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
+            keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows)
+        })
+        .collect())
+}
+
+/// The ops whose rows reach KECCAK_RND chunk `chunk` of `rows` rows (24 rows an
+/// op), clamped to the `len` ops there are.
+pub(crate) fn keccak_rnd_op_range(chunk: usize, rows: usize, len: usize) -> (usize, usize) {
+    let first = (chunk * rows / 24).min(len);
+    let end = ((chunk + 1) * rows).div_ceil(24).min(len);
+    (first, end)
 }
 
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
@@ -4496,12 +4549,15 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
-        generate_optional(
-            &keccak_rnd_ops,
-            keccak_rnd::generate_keccak_rnd_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if skip.keccak_rnd_rows == 0 {
+            return generate_optional(
+                &keccak_rnd_ops,
+                keccak_rnd::generate_keccak_rnd_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            );
+        }
+        keccak_rnd_chunks(&keccak_rnd_ops, skip.keccak_rnd_rows, skip.keccak_rnd)
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
     let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);

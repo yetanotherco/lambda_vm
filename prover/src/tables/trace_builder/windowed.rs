@@ -55,7 +55,9 @@ use super::{
     collect_halt_ops, collect_ops_from_cpu_into, route_ops,
 };
 use crate::Error;
-use crate::tables::{cpu, load, lt, memw, memw_aligned, memw_register, register, shift, store};
+use crate::tables::{
+    cpu, keccak_rnd, load, lt, memw, memw_aligned, memw_register, register, shift, store,
+};
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
@@ -71,10 +73,13 @@ pub enum StreamTable {
     Lt,
     Shift,
     Store,
+    /// Only when the builder cuts KECCAK_RND into chunks
+    /// ([`WindowedTraceBuilder::keccak_rnd_chunks`]).
+    KeccakRnd,
 }
 
 impl StreamTable {
-    pub const ALL: [StreamTable; 8] = [
+    pub const ALL: [StreamTable; 9] = [
         StreamTable::Cpu,
         StreamTable::MemwRegister,
         StreamTable::MemwAligned,
@@ -83,6 +88,7 @@ impl StreamTable {
         StreamTable::Lt,
         StreamTable::Shift,
         StreamTable::Store,
+        StreamTable::KeccakRnd,
     ];
 }
 
@@ -183,6 +189,20 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (mut walker, mut accumulator) = self.split();
         let walked = walker.walk(logs)?;
         Ok(accumulator.absorb(walked))
+    }
+
+    /// Cut KECCAK_RND into tables of `rows` rows — the split a block proof makes
+    /// — and hand each full one out as its ops arrive (24 rows an op; the rows
+    /// of an op depend on that op alone). `rows` is a power of two, at least 32.
+    /// Without this call KECCAK_RND is one table, built by `finish`.
+    pub fn keccak_rnd_chunks(mut self, rows: usize) -> Result<Self, Error> {
+        if !rows.is_power_of_two() || rows < 32 {
+            return Err(Error::Prover(format!(
+                "KECCAK_RND chunks of {rows} rows: a power of two of at least 32 is needed"
+            )));
+        }
+        self.emitted.keccak_rnd_rows = rows;
+        Ok(self)
     }
 
     /// The time the windows took so far.
@@ -392,6 +412,9 @@ fn list_lt(w: &WalkedWindow) -> &[super::LtOperation] {
 fn list_shift(w: &WalkedWindow) -> &[super::ShiftOperation] {
     &w.walk.shift_ops
 }
+fn list_keccak(w: &WalkedWindow) -> &[super::keccak::KeccakOperation] {
+    &w.walk.keccak_ops
+}
 
 /// Every full chunk the run's lists hold that was not handed out yet, its ops
 /// gathered out of the windows.
@@ -437,6 +460,26 @@ fn chunk_jobs(
     full_chunks!(StreamTable::Load, Load, list_load, m.load, e.load);
     full_chunks!(StreamTable::Lt, Lt, list_lt, m.lt, e.lt);
     full_chunks!(StreamTable::Shift, Shift, list_shift, m.shift, e.shift);
+    // KECCAK_RND, cut at `keccak_rnd_rows` rows: a chunk is out once the ops so
+    // far cover all of its rows (the run's padding rows only reach its last).
+    if e.keccak_rnd_rows > 0 {
+        let rows = e.keccak_rnd_rows;
+        let len: usize = windows.iter().map(|w| list_keccak(w).len()).sum();
+        while (e.keccak_rnd + 1) * rows <= len * 24 {
+            let index = e.keccak_rnd;
+            let (first, end) = super::keccak_rnd_op_range(index, rows, len);
+            jobs.push(ChunkJob {
+                table: StreamTable::KeccakRnd,
+                index,
+                ops: ChunkOps::KeccakRnd {
+                    ops: gather(windows, list_keccak, first..end),
+                    skip: index * rows - first * 24,
+                    rows,
+                },
+            });
+            e.keccak_rnd += 1;
+        }
+    }
     // STORE's ops are a routing segment, already one list.
     let store = &segments.store_ops;
     while (e.store + 1) * m.store <= store.len() {
@@ -596,6 +639,11 @@ enum ChunkOps {
     Lt(Vec<super::LtOperation>),
     Shift(Vec<super::ShiftOperation>),
     Store(Vec<store::StoreOperation>),
+    KeccakRnd {
+        ops: Vec<super::keccak::KeccakOperation>,
+        skip: usize,
+        rows: usize,
+    },
 }
 
 impl ChunkJob {
@@ -611,6 +659,17 @@ impl ChunkJob {
             ChunkOps::Lt(ops) => lt::generate_lt_trace(ops),
             ChunkOps::Shift(ops) => shift::generate_shift_trace(ops),
             ChunkOps::Store(ops) => store::generate_store_trace(ops),
+            ChunkOps::KeccakRnd { ops, skip, rows } => {
+                let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
+                    .iter()
+                    .map(|op| keccak_rnd::KeccakRoundOperation {
+                        timestamp: op.timestamp,
+                        input: op.input,
+                        output: op.output,
+                    })
+                    .collect();
+                keccak_rnd::generate_keccak_rnd_rows(&ops, *skip, *rows)
+            }
         };
         StreamedChunk {
             table: self.table,
@@ -726,6 +785,7 @@ impl Traces {
                 StreamTable::Lt => &mut self.lts,
                 StreamTable::Shift => &mut self.shifts,
                 StreamTable::Store => &mut self.stores,
+                StreamTable::KeccakRnd => &mut self.keccak_rnds,
             };
             let len = slots.len();
             let slot = slots.get_mut(chunk.index).ok_or_else(|| {
