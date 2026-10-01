@@ -109,6 +109,7 @@ pub mod rpx_two_implementations;
 #[cfg(feature = "shape-profile")]
 pub mod shape_profile_tests;
 pub mod transcript_counts;
+pub mod windowed_builder_tests;
 
 pub mod shift_tests;
 
@@ -126,6 +127,7 @@ pub mod store_tests;
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+pub mod trace_digest_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
 #[cfg(test)]

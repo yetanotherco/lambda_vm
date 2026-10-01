@@ -71,6 +71,9 @@ use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
+mod windowed;
+pub use windowed::{StreamTable, StreamedChunk, WindowedTraceBuilder};
+
 // =============================================================================
 // Memory and Register State Tracking
 // =============================================================================
@@ -338,6 +341,17 @@ fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Result<Vec<CpuOperation>, Error> {
+    collect_cpu_ops_from(logs, instructions, 0)
+}
+
+/// [`collect_cpu_ops`] for logs that start at cycle `first` of the run: the
+/// timestamps are the run's, so a run collected window by window gets the ops a
+/// whole-run collect would.
+fn collect_cpu_ops_from(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    first: usize,
+) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
@@ -346,7 +360,7 @@ fn collect_cpu_ops(
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = ((first + i) as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -3470,6 +3484,7 @@ pub struct Traces {
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
 /// Phases 3-5 (LT extension, bitwise, trace generation).
+#[derive(Default)]
 struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
@@ -3497,6 +3512,76 @@ struct CollectedOps {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
+}
+
+/// How many leading chunks of each streamed table a windowed build already
+/// generated and handed out (`WindowedTraceBuilder`). Those chunks are the
+/// same op slices a whole-run build would chunk; the final build leaves an
+/// empty placeholder in their slots ([`Traces::insert_streamed`] puts them
+/// back). All zero — every build but the windowed one — changes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamSkip {
+    pub cpu: usize,
+    pub memw_register: usize,
+    pub memw_aligned: usize,
+    pub memw: usize,
+    pub load: usize,
+    pub lt: usize,
+    pub shift: usize,
+    pub store: usize,
+}
+
+/// The slot a streamed chunk leaves in the final build: no rows, no columns.
+pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    TraceTable::from_columns_main(Vec::new(), 1)
+}
+
+/// [`chunk_and_generate`] / [`chunk_and_generate_optional`] (`optional`) with
+/// the first `skip` chunks already handed out: those slots get placeholders
+/// and are not generated again. `skip == 0` is the plain call.
+fn chunk_and_generate_skipping<T: Sync>(
+    ops: &[T],
+    max_rows: usize,
+    skip: usize,
+    optional: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    if skip == 0 {
+        return if optional {
+            chunk_and_generate_optional(
+                ops,
+                max_rows,
+                generate,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            chunk_and_generate(
+                ops,
+                max_rows,
+                generate,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        };
+    }
+    let chunks: Vec<&[T]> = ops.chunks(max_rows).collect();
+    if skip > chunks.len() {
+        return Err(Error::Prover(format!(
+            "{skip} chunks were streamed but the run has {} of this table",
+            chunks.len()
+        )));
+    }
+    let rest = chunks[skip..].to_vec();
+    let mut tables: Vec<_> = (0..skip).map(|_| streamed_placeholder()).collect();
+    tables.extend(generate_chunks(
+        rest,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?);
+    Ok(tables)
 }
 
 /// Chunk raw ops and generate one trace table per chunk, padding an empty `ops`
@@ -3602,49 +3687,52 @@ fn generate_chunks<T: Sync>(
     Ok(tables)
 }
 
-/// Phase 2: Collect and route all operations from CPU ops.
-///
-/// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
-/// (for HALT finalization), and returns fully-routed ops ready for Phase 3+.
-#[allow(clippy::too_many_arguments)]
-fn collect_all_ops(
-    cpu_ops: Vec<CpuOperation>,
-    mut memw: MemwBuckets,
-    load_ops: Vec<LoadOperation>,
-    mut lt_ops: Vec<LtOperation>,
-    mut shift_ops: Vec<ShiftOperation>,
-    mut bitwise_ops: Vec<BitwiseOperation>,
-    commit_ops: Vec<CommitOperation>,
-    keccak_ops: Vec<KeccakOperation>,
-    blake3_ops: Vec<Blake3Operation>,
-    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
-    cpu32_ops: Vec<cpu32::Cpu32Operation>,
-    ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ecdas_ops: Vec<ecdas::EcdasOperation>,
-    hint_ops: Vec<hint::HintOperation>,
-    register_state: &mut RegisterState,
-    is_final: bool,
-) -> CollectedOps {
-    // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
-    // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
-    // Only the final epoch terminates; intermediate epochs keep their boundary
-    // register state (no zeroizing) so it can seed the next epoch.
-    if is_final {
-        // Route halt ops through the same classifier; they append to the end of their
-        // buckets.
-        memw.extend_ops(collect_halt_ops(register_state));
+/// What [`collect_all_ops`] derives from the CPU ops, kept as the SEGMENTS its
+/// lists are concatenations of: a filter over every CPU op, then what CPU32
+/// dispatches, then what the DVRM ops imply (over the filter's DVRM ops, then
+/// CPU32's). A run routed window by window appends each segment per window and
+/// concatenates the segments at the end, which gives exactly the lists a
+/// whole-run routing gives (the windowed builder).
+#[derive(Default)]
+struct RoutedSegments {
+    branch_ops: Vec<BranchOperation>,
+    mul_filter: Vec<(MulOperation, bool)>,
+    dvrm_filter: Vec<(DvrmOperation, bool)>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    shift_cpu32: Vec<ShiftOperation>,
+    mul_cpu32: Vec<(MulOperation, bool)>,
+    dvrm_cpu32: Vec<(DvrmOperation, bool)>,
+    bitwise_cpu32: Vec<BitwiseOperation>,
+    lt_dvrm_filter: Vec<LtOperation>,
+    lt_dvrm_cpu32: Vec<LtOperation>,
+    mul_dvrm_filter: Vec<(MulOperation, bool)>,
+    mul_dvrm_cpu32: Vec<(MulOperation, bool)>,
+}
+
+impl RoutedSegments {
+    /// Appends a later window's segments, segment by segment.
+    fn append(&mut self, other: Self) {
+        self.branch_ops.extend(other.branch_ops);
+        self.mul_filter.extend(other.mul_filter);
+        self.dvrm_filter.extend(other.dvrm_filter);
+        self.eq_ops.extend(other.eq_ops);
+        self.bytewise_ops.extend(other.bytewise_ops);
+        self.store_ops.extend(other.store_ops);
+        self.shift_cpu32.extend(other.shift_cpu32);
+        self.mul_cpu32.extend(other.mul_cpu32);
+        self.dvrm_cpu32.extend(other.dvrm_cpu32);
+        self.bitwise_cpu32.extend(other.bitwise_cpu32);
+        self.lt_dvrm_filter.extend(other.lt_dvrm_filter);
+        self.lt_dvrm_cpu32.extend(other.lt_dvrm_cpu32);
+        self.mul_dvrm_filter.extend(other.mul_dvrm_filter);
+        self.mul_dvrm_cpu32.extend(other.mul_dvrm_cpu32);
     }
+}
 
-    // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
-    // creation via `MemwBuckets`, so there is no separate routing pass here: the ops are not
-    // moved a second time. Order within each bucket is the walk's insertion order, which the
-    // multiplicity counts depend on being deterministic.
-    let MemwBuckets {
-        register_rows: memw_register_rows,
-        aligned: memw_aligned_ops,
-        general: memw_ops,
-    } = memw;
-
+/// The routing of [`collect_all_ops`], segment by segment ([`RoutedSegments`]).
+fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> RoutedSegments {
     // Collect BRANCH operations from CPU ops where branch_cond = true
     let branch_ops: Vec<BranchOperation> = cpu_ops
         .iter()
@@ -3661,7 +3749,7 @@ fn collect_all_ops(
 
     // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
     // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
-    let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+    let mul_filter: Vec<(MulOperation, bool)> = cpu_ops
         .iter()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
         .map(|op| {
@@ -3674,7 +3762,7 @@ fn collect_all_ops(
         .collect();
 
     // Collect DVRM operations from non-word DIV/REM instructions.
-    let mut dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+    let dvrm_filter: Vec<(DvrmOperation, bool)> = cpu_ops
         .iter()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
         .map(|op| {
@@ -3723,26 +3811,130 @@ fn collect_all_ops(
     // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
     // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
     // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
-    for c in &cpu32_ops {
-        cpu32_chip_op(c, &mut shift_ops, &mut mul_ops, &mut dvrm_ops);
-        bitwise_ops.extend(collect_cpu32_bitwise(c));
+    let mut shift_cpu32 = Vec::new();
+    let mut mul_cpu32 = Vec::new();
+    let mut dvrm_cpu32 = Vec::new();
+    let mut bitwise_cpu32 = Vec::new();
+    for c in cpu32_ops {
+        cpu32_chip_op(c, &mut shift_cpu32, &mut mul_cpu32, &mut dvrm_cpu32);
+        bitwise_cpu32.extend(collect_cpu32_bitwise(c));
     }
 
     // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
-    for (op, _wants_remainder) in &dvrm_ops {
-        lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
-    }
+    let lt_of = |dvrm: &[(DvrmOperation, bool)]| -> Vec<LtOperation> {
+        dvrm.iter()
+            .map(|(op, _wants_remainder)| LtOperation::new(op.abs_r(), op.abs_d(), false))
+            .collect()
+    };
+    let lt_dvrm_filter = lt_of(&dvrm_filter);
+    let lt_dvrm_cpu32 = lt_of(&dvrm_cpu32);
 
     // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
-    for (op, _wants_remainder) in &dvrm_ops {
-        let d = op.d;
-        let d_signed = op.signed;
-        let q = op.compute_quotient();
-        let q_signed = op.sign_q();
-        let mul_op = MulOperation::new(d, d_signed, q, q_signed);
-        mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
-        mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+    let mul_of = |dvrm: &[(DvrmOperation, bool)]| -> Vec<(MulOperation, bool)> {
+        let mut out = Vec::with_capacity(2 * dvrm.len());
+        for (op, _wants_remainder) in dvrm {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            out.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            out.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+        out
+    };
+    let mul_dvrm_filter = mul_of(&dvrm_filter);
+    let mul_dvrm_cpu32 = mul_of(&dvrm_cpu32);
+
+    RoutedSegments {
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        shift_cpu32,
+        mul_cpu32,
+        dvrm_cpu32,
+        bitwise_cpu32,
+        lt_dvrm_filter,
+        lt_dvrm_cpu32,
+        mul_dvrm_filter,
+        mul_dvrm_cpu32,
     }
+}
+
+/// Phase 2: Collect and route all operations from CPU ops.
+///
+/// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
+/// (for HALT finalization), and returns fully-routed ops ready for Phase 3+.
+#[allow(clippy::too_many_arguments)]
+fn collect_all_ops(
+    cpu_ops: Vec<CpuOperation>,
+    mut memw: MemwBuckets,
+    load_ops: Vec<LoadOperation>,
+    mut lt_ops: Vec<LtOperation>,
+    mut shift_ops: Vec<ShiftOperation>,
+    mut bitwise_ops: Vec<BitwiseOperation>,
+    commit_ops: Vec<CommitOperation>,
+    keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    ecsm_ops: Vec<ecsm::EcsmOperation>,
+    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    hint_ops: Vec<hint::HintOperation>,
+    register_state: &mut RegisterState,
+    is_final: bool,
+) -> CollectedOps {
+    // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+    // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
+    // Only the final epoch terminates; intermediate epochs keep their boundary
+    // register state (no zeroizing) so it can seed the next epoch.
+    if is_final {
+        // Route halt ops through the same classifier; they append to the end of their
+        // buckets.
+        memw.extend_ops(collect_halt_ops(register_state));
+    }
+
+    // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
+    // creation via `MemwBuckets`, so there is no separate routing pass here: the ops are not
+    // moved a second time. Order within each bucket is the walk's insertion order, which the
+    // multiplicity counts depend on being deterministic.
+    let MemwBuckets {
+        register_rows: memw_register_rows,
+        aligned: memw_aligned_ops,
+        general: memw_ops,
+    } = memw;
+
+    let RoutedSegments {
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        shift_cpu32,
+        mul_cpu32,
+        dvrm_cpu32,
+        bitwise_cpu32,
+        lt_dvrm_filter,
+        lt_dvrm_cpu32,
+        mul_dvrm_filter,
+        mul_dvrm_cpu32,
+    } = route_ops(&cpu_ops, &cpu32_ops);
+    // The lists are the segments in the order the routing always produced them:
+    // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies.
+    shift_ops.extend(shift_cpu32);
+    bitwise_ops.extend(bitwise_cpu32);
+    let mut mul_ops = mul_filter;
+    mul_ops.extend(mul_cpu32);
+    mul_ops.extend(mul_dvrm_filter);
+    mul_ops.extend(mul_dvrm_cpu32);
+    let mut dvrm_ops = dvrm_filter;
+    dvrm_ops.extend(dvrm_cpu32);
+    lt_ops.extend(lt_dvrm_filter);
+    lt_ops.extend(lt_dvrm_cpu32);
 
     CollectedOps {
         cpu_ops,
@@ -3789,6 +3981,7 @@ fn build_traces<I: ImageSource + Sync>(
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
+    skip: &StreamSkip,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -4016,27 +4209,33 @@ fn build_traces<I: ImageSource + Sync>(
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
     let gen_cpus = || {
-        chunk_and_generate(
+        chunk_and_generate_skipping(
             cpu_ops_ref,
             max_rows.cpu,
+            skip.cpu,
+            false,
             cpu::generate_cpu_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_memws = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &memw_ops,
             max_rows.memw,
+            skip.memw,
+            true,
             memw::generate_memw_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_memw_aligneds = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &memw_aligned_ops,
             max_rows.memw_aligned,
+            skip.memw_aligned,
+            true,
             memw_aligned::generate_memw_aligned_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -4045,36 +4244,44 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_memw_registers = || {
         // Direct-to-column fill from compact RegRows — the register fast path never
         // materializes a `Vec<MemwOperation>`.
-        chunk_and_generate(
+        chunk_and_generate_skipping(
             &memw_register_rows,
             max_rows.memw_register,
+            skip.memw_register,
+            false,
             memw_register::generate_memw_register_trace_from_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_loads = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &load_ops,
             max_rows.load,
+            skip.load,
+            true,
             load::generate_load_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_lts = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &lt_ops,
             max_rows.lt,
+            skip.lt,
+            true,
             lt::generate_lt_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_shifts = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &shift_ops,
             max_rows.shift,
+            skip.shift,
+            true,
             shift::generate_shift_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -4128,9 +4335,11 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_stores = || {
-        chunk_and_generate_optional::<store::StoreOperation>(
+        chunk_and_generate_skipping(
             &store_ops,
             max_rows.store,
+            skip.store,
+            true,
             store::generate_store_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5518,6 +5727,7 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
+            &StreamSkip::default(),
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5596,6 +5806,7 @@ impl Traces {
             &[],
             true,
             false,
+            &StreamSkip::default(),
         )
     }
 }
