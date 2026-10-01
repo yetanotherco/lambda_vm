@@ -50,8 +50,8 @@ use stark::trace::TraceTable;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, RegisterState, RoutedSegments,
-    StreamSkip, Traces, build_initial_image, build_traces, collect_cpu_ops_from, collect_halt_ops,
-    collect_ops_from_cpu, route_ops,
+    StreamSkip, Traces, WalkOutputs, build_initial_image, build_traces, collect_cpu_ops_into,
+    collect_halt_ops, collect_ops_from_cpu_into, route_ops,
 };
 use crate::Error;
 use crate::tables::{cpu, load, lt, memw, memw_aligned, memw_register, register, shift, store};
@@ -104,10 +104,24 @@ pub struct WindowedTraceBuilder<'a> {
     register_state: RegisterState,
     /// Cycles collected so far: the next window's first cycle.
     cycles: usize,
-    /// The walk's lists, whole-run so far (the routing's are in `segments`).
-    walk: CollectedOps,
+    /// The run's CPU ops and the walk's lists so far, appended in place (the
+    /// routing's are in `segments`).
+    cpu_ops: Vec<super::CpuOperation>,
+    walk: WalkOutputs,
     segments: RoutedSegments,
     emitted: StreamSkip,
+    stamps: WindowStamps,
+}
+
+/// Where a windowed build spent its time, seconds summed over the windows:
+/// the CPU-op collection and the walk, the routing, and the streamed chunks'
+/// generation (`finish` is timed by its caller).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowStamps {
+    pub windows: usize,
+    pub walk: f64,
+    pub route: f64,
+    pub generate: f64,
 }
 
 impl<'a> WindowedTraceBuilder<'a> {
@@ -131,9 +145,11 @@ impl<'a> WindowedTraceBuilder<'a> {
             memory_state,
             register_state,
             cycles: 0,
-            walk: CollectedOps::default(),
+            cpu_ops: Vec::new(),
+            walk: WalkOutputs::with_capacity(0),
             segments: RoutedSegments::default(),
             emitted: StreamSkip::default(),
+            stamps: WindowStamps::default(),
         })
     }
 
@@ -148,7 +164,15 @@ impl<'a> WindowedTraceBuilder<'a> {
             return Err(Error::HaltInNonFinalEpoch);
         }
         self.collect(logs)?;
-        Ok(self.stream())
+        let t = std::time::Instant::now();
+        let chunks = self.stream();
+        self.stamps.generate += t.elapsed().as_secs_f64();
+        Ok(chunks)
+    }
+
+    /// The time the windows took so far.
+    pub fn stamps(&self) -> WindowStamps {
+        self.stamps
     }
 
     /// Collects the run's last window and builds every table the windows did
@@ -164,12 +188,13 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             memory_state,
             mut register_state,
+            cpu_ops,
             walk,
             segments,
             emitted,
             ..
         } = self;
-        let ops = assemble(walk, segments, &mut register_state);
+        let ops = assemble(cpu_ops, walk, segments, &mut register_state);
         build_traces(
             ops,
             Some(&image),
@@ -193,43 +218,33 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.emitted
     }
 
-    /// The walk and the routing over one window, appended to the run's lists.
+    /// The walk and the routing over one window, appended to the run's lists
+    /// in place.
     fn collect(&mut self, logs: &[Log]) -> Result<(), Error> {
-        let cpu_ops = collect_cpu_ops_from(logs, &self.artifacts.instructions, self.cycles)?;
+        let t = std::time::Instant::now();
+        let cpu_from = self.cpu_ops.len();
+        let cpu32_from = self.walk.cpu32_ops.len();
+        collect_cpu_ops_into(
+            logs,
+            &self.artifacts.instructions,
+            self.cycles,
+            &mut self.cpu_ops,
+        )?;
         self.cycles += logs.len();
-        let (
-            memw,
-            load_ops,
-            lt_ops,
-            shift_ops,
-            bitwise_ops,
-            commit_ops,
-            keccak_ops,
-            blake3_ops,
-            blake3_absorb_ops,
-            cpu32_ops,
-            ecsm_ops,
-            ecdas_ops,
-            hint_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut self.memory_state, &mut self.register_state);
-        self.segments.append(route_ops(&cpu_ops, &cpu32_ops));
-        let w = &mut self.walk;
-        w.cpu_ops.extend(cpu_ops);
-        w.memw_register_rows.extend(memw.register_rows);
-        w.memw_aligned_ops.extend(memw.aligned);
-        w.memw_ops.extend(memw.general);
-        w.load_ops.extend(load_ops);
-        w.lt_ops.extend(lt_ops);
-        w.shift_ops.extend(shift_ops);
-        w.bitwise_ops.extend(bitwise_ops);
-        w.commit_ops.extend(commit_ops);
-        w.keccak_ops.extend(keccak_ops);
-        w.blake3_ops.extend(blake3_ops);
-        w.blake3_absorb_ops.extend(blake3_absorb_ops);
-        w.cpu32_ops.extend(cpu32_ops);
-        w.ecsm_ops.extend(ecsm_ops);
-        w.ecdas_ops.extend(ecdas_ops);
-        w.hint_ops.extend(hint_ops);
+        collect_ops_from_cpu_into(
+            &self.cpu_ops[cpu_from..],
+            &mut self.memory_state,
+            &mut self.register_state,
+            &mut self.walk,
+        );
+        self.stamps.walk += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        self.segments.append(route_ops(
+            &self.cpu_ops[cpu_from..],
+            &self.walk.cpu32_ops[cpu32_from..],
+        ));
+        self.stamps.route += t.elapsed().as_secs_f64();
+        self.stamps.windows += 1;
         Ok(())
     }
 
@@ -238,6 +253,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     fn stream(&mut self) -> Vec<StreamedChunk> {
         let m = &self.max_rows;
         let w = &self.walk;
+        let cpu_ops = &self.cpu_ops;
         let e = &mut self.emitted;
         let mut jobs: Vec<Box<dyn Fn() -> StreamedChunk + Send + Sync + '_>> = Vec::new();
         macro_rules! full_chunks {
@@ -257,28 +273,28 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         full_chunks!(
             StreamTable::Cpu,
-            w.cpu_ops,
+            *cpu_ops,
             m.cpu,
             e.cpu,
             cpu::generate_cpu_trace
         );
         full_chunks!(
             StreamTable::MemwRegister,
-            w.memw_register_rows,
+            w.memw.register_rows,
             m.memw_register,
             e.memw_register,
             memw_register::generate_memw_register_trace_from_rows
         );
         full_chunks!(
             StreamTable::MemwAligned,
-            w.memw_aligned_ops,
+            w.memw.aligned,
             m.memw_aligned,
             e.memw_aligned,
             memw_aligned::generate_memw_aligned_trace
         );
         full_chunks!(
             StreamTable::Memw,
-            w.memw_ops,
+            w.memw.general,
             m.memw,
             e.memw,
             memw::generate_memw_trace
@@ -313,15 +329,13 @@ impl<'a> WindowedTraceBuilder<'a> {
 /// [`collect_all_ops`](super::collect_all_ops) returns them, HALT finalization
 /// included (the run's end).
 fn assemble(
-    walk: CollectedOps,
+    cpu_ops: Vec<super::CpuOperation>,
+    walk: WalkOutputs,
     segments: RoutedSegments,
     register_state: &mut RegisterState,
 ) -> CollectedOps {
-    let CollectedOps {
-        cpu_ops,
-        mut memw_ops,
-        mut memw_aligned_ops,
-        mut memw_register_rows,
+    let WalkOutputs {
+        memw,
         load_ops,
         mut lt_ops,
         mut shift_ops,
@@ -334,8 +348,12 @@ fn assemble(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
-        ..
     } = walk;
+    let MemwBuckets {
+        register_rows: mut memw_register_rows,
+        aligned: mut memw_aligned_ops,
+        general: mut memw_ops,
+    } = memw;
     // HALT's register ops land at the end of their buckets, as in
     // `collect_all_ops`.
     let mut halt = MemwBuckets::with_register_capacity(0);
