@@ -68,6 +68,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             stream_keccak_rnd: false,
             stream_memw_lt: false,
             layout_workers: 0,
+            pack_rest_as_laid_out: false,
         },
     )
     .expect("the block proves")
@@ -350,6 +351,7 @@ fn dense_block_with(
             stream_keccak_rnd: false,
             stream_memw_lt: false,
             layout_workers: 0,
+            pack_rest_as_laid_out: false,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1082,19 +1084,33 @@ fn the_whir_block_tree_on_a_real_block() {
     // `BLOCK_WHIR_STREAM_MEMW_LT=1`: the MEMW-derived LT ops streamed per window.
     options.stream_memw_lt =
         std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
-    // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads.
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads
+    // (production 3; 0 is the inline layout).
     if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
         options.layout_workers = n;
     }
+    // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
+    options.pack_rest_as_laid_out =
+        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
     println!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {}",
-        options.stream_keccak_rnd, options.stream_memw_lt, options.layout_workers
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} · rest packed as laid out {}",
+        options.stream_keccak_rnd,
+        options.stream_memw_lt,
+        options.layout_workers,
+        options.pack_rest_as_laid_out
     );
 
     let t0 = std::time::Instant::now();
+    // The wall clock at the prove's start, to place a box's memory samples.
+    println!(
+        "W3 PROVE START: unix {:.3}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    );
     let sender = std::sync::Mutex::new(None::<std::sync::mpsc::Sender<_>>);
     let (tx, rx) = std::sync::mpsc::channel::<(
         block_whir::OwnedBlockStatement,

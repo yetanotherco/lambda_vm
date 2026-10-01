@@ -130,8 +130,12 @@ pub struct BlockOptions {
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
     /// order all the same, while the layout thread lays out the rest of the
-    /// run as soon as it is built.
+    /// run as soon as it is built. Production: 3 (FAST 421, base −0.54 s).
     pub layout_workers: usize,
+    /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
+    /// in AIR order, so a group closes once its own tables are ready instead
+    /// of after all of them; the packing order is the same.
+    pub pack_rest_as_laid_out: bool,
 }
 
 impl BlockOptions {
@@ -145,7 +149,8 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
-            layout_workers: 0,
+            layout_workers: 3,
+            pack_rest_as_laid_out: false,
         }
     }
 }
@@ -1344,13 +1349,19 @@ fn lay_out_chunk<'a>(airs: &'a StreamAirs, job: ChunkJob) -> Result<LaidChunk<'a
 
 /// The streamed chunks, packed in arrival order: the packer, each chunk's
 /// shape, the seconds laying them out (summed over threads) and when the last
-/// was placed.
+/// was placed; and the rest's tables it packed as they were laid out, by AIR
+/// index ([`BlockOptions::pack_rest_as_laid_out`]).
 struct StreamLaid<'a> {
     packer: Packer<'a>,
     shapes: Vec<(StreamTable, usize, (usize, usize))>,
     chunks: f64,
     placed_at: f64,
+    rest: Vec<(usize, (usize, usize))>,
 }
+
+/// A table of the rest laid out, sent to the packer: its position in AIR order
+/// among the rest, the seconds laying it out, and the table.
+type RestDone<'a> = (usize, f64, Result<Placed<'a>, Error>);
 
 /// Each chunk laid out and packed on this thread as it arrives; hands back
 /// the run once it is built.
@@ -1377,6 +1388,7 @@ fn stream_inline<'a>(
                     shapes,
                     chunks,
                     placed_at,
+                    rest: Vec::new(),
                 };
                 return Ok((streamed, traces));
             }
@@ -1390,13 +1402,18 @@ fn stream_inline<'a>(
 /// The chunks laid out on `workers` threads and packed on one more, in
 /// arrival order all the same, so a waiting phase A holds back only the
 /// packing; this thread hands them out and, once the run is built, lays out
-/// the rest of it (`rest`) while the last chunks are packed.
+/// the rest of it (`rest`) while the last chunks are packed. With
+/// `pack_rest`, `rest` sends the rest's tables to the packer as they are laid
+/// out, and it packs them after the chunks, in AIR order. Their channel is
+/// unbounded: the rest is already in memory, and a full channel would park
+/// the rayon threads phase A's commits need.
 fn stream_pipelined<'a, R>(
     brx: std::sync::mpsc::Receiver<Built>,
     airs: &'a StreamAirs,
     mut packer: Packer<'a>,
     workers: usize,
-    rest: impl FnOnce(Box<Traces>) -> Result<R, Error>,
+    pack_rest: bool,
+    rest: impl FnOnce(Box<Traces>, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
     std::thread::scope(|scope| {
@@ -1427,6 +1444,8 @@ fn stream_pipelined<'a, R>(
         // handing out fails and the packer's loop ends.
         drop(jrx);
         drop(dtx);
+        let (rtx, rrx) = std::sync::mpsc::channel::<RestDone<'a>>();
+        let rtx = pack_rest.then_some(rtx);
         let placer = scope.spawn(move || -> Result<StreamLaid<'a>, Error> {
             let mut pending = std::collections::BTreeMap::new();
             let mut next = 0usize;
@@ -1448,11 +1467,30 @@ fn stream_pipelined<'a, R>(
                 )));
             }
             let placed_at = packer.start.elapsed().as_secs_f64();
+            // The rest's tables, after every chunk, in AIR order.
+            let mut placed = Vec::new();
+            let mut waiting = std::collections::BTreeMap::new();
+            let mut next = 0usize;
+            for (k, _, laid) in rrx {
+                waiting.insert(k, laid);
+                while let Some(laid) = waiting.remove(&next) {
+                    let (i, shape, table) = laid?;
+                    placed.push((i, shape));
+                    packer.place(Key::Air(i), shape, table)?;
+                    next += 1;
+                }
+            }
+            if !waiting.is_empty() {
+                return Err(Error::Prover(format!(
+                    "table {next} of the rest was never laid out"
+                )));
+            }
             Ok(StreamLaid {
                 packer,
                 shapes,
                 chunks,
                 placed_at,
+                rest: placed,
             })
         });
         let mut handed = 0usize;
@@ -1472,7 +1510,13 @@ fn stream_pipelined<'a, R>(
             }
         }
         drop(jtx);
-        let rest = traces.map(rest);
+        let rest = match traces {
+            Some(traces) => Some(rest(traces, rtx)),
+            None => {
+                drop(rtx);
+                None
+            }
+        };
         let streamed = placer
             .join()
             .map_err(|_| Error::Prover("the block's packer panicked".into()))??;
@@ -1508,7 +1552,9 @@ struct RestLaid<'a> {
 
 /// `prepared_now`: derive the prepared columns here, before the tables are
 /// laid out; otherwise the caller derives them once the groups are sent (phase
-/// A reads none of them).
+/// A reads none of them). `sink`: send each table to the packer as it is laid
+/// out, the first in AIR order first, and hand back none.
+#[allow(clippy::too_many_arguments)]
 fn lay_out_rest<'a>(
     mut traces: Box<Traces>,
     program: &Elf,
@@ -1517,6 +1563,7 @@ fn lay_out_rest<'a>(
     run_airs: &'a std::sync::OnceLock<VmAirs>,
     start: Instant,
     prepared_now: bool,
+    sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
     let at = || start.elapsed().as_secs_f64();
@@ -1555,21 +1602,41 @@ fn lay_out_rest<'a>(
     let page_configs = traces.page_configs.clone();
     let refs = airs.air_refs();
     let pairs = airs.air_trace_pairs(&mut traces);
-    let tables: Vec<Placed<'a>> = pairs
+    let built: Vec<_> = pairs
         .into_iter()
         .zip(refs.iter().copied())
         .enumerate()
         .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|(i, ((_, trace, _), air))| {
-            let shape = (
-                trace.main_table.width,
-                trace.main_table.height.trailing_zeros() as usize,
-            );
-            table_of(air, trace, shape, true).map(|table| (i, shape, table))
-        })
-        .collect::<Result<_, Error>>()?;
+        .collect();
+    let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
+        let shape = (
+            trace.main_table.width,
+            trace.main_table.height.trailing_zeros() as usize,
+        );
+        table_of(air, trace, shape, true).map(|table| (i, shape, table))
+    };
+    let tables: Vec<Placed<'a>> = match sink {
+        None => built
+            .into_par_iter()
+            .map(lay_out)
+            .collect::<Result<_, Error>>()?,
+        Some(sink) => {
+            // FIFO: the tables that close the next group are laid out first.
+            rayon::scope_fifo(|scope| {
+                for (k, table) in built.into_iter().enumerate() {
+                    let sink = sink.clone();
+                    let lay_out = &lay_out;
+                    scope.spawn_fifo(move |_| {
+                        let t = Instant::now();
+                        let laid = lay_out(table);
+                        // A packer that stopped has its own error to report.
+                        let _ = sink.send((k, t.elapsed().as_secs_f64(), laid));
+                    });
+                }
+            });
+            Vec::new()
+        }
+    };
     marks.push(("rest laid out", at()));
     Ok(RestLaid {
         table_counts,
@@ -1741,13 +1808,21 @@ fn prove_streamed(
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
                 let inline = options.layout_workers == 0;
-                let rest_of =
-                    |traces| lay_out_rest(traces, program, opts, format, run_airs, start, inline);
+                let rest_of = |traces, sink| {
+                    lay_out_rest(traces, program, opts, format, run_airs, start, inline, sink)
+                };
                 let (streamed, rest) = if inline {
                     let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
-                    (streamed, rest_of(traces)?)
+                    (streamed, rest_of(traces, None)?)
                 } else {
-                    stream_pipelined(brx, stream_airs, packer, options.layout_workers, rest_of)?
+                    stream_pipelined(
+                        brx,
+                        stream_airs,
+                        packer,
+                        options.layout_workers,
+                        options.pack_rest_as_laid_out,
+                        rest_of,
+                    )?
                 };
                 let t = Instant::now();
                 let StreamLaid {
@@ -1755,6 +1830,7 @@ fn prove_streamed(
                     shapes: streamed_shapes,
                     chunks,
                     placed_at,
+                    rest: rest_packed,
                 } = streamed;
                 let RestLaid {
                     table_counts,
@@ -1782,7 +1858,13 @@ fn prove_streamed(
                     shapes[at] = Some(shape);
                 }
                 // The tables the windows did not stream, packed in AIR order
-                // after every streamed chunk.
+                // after every streamed chunk (or already, as they were laid
+                // out).
+                for &(i, shape) in &rest_packed {
+                    if shapes[i].replace(shape).is_some() {
+                        return Err(Error::Prover(format!("table {i} built twice")));
+                    }
+                }
                 for (i, shape, table) in rest_tables {
                     if shapes[i].replace(shape).is_some() {
                         return Err(Error::Prover(format!("table {i} built twice")));

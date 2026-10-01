@@ -45,6 +45,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         stream_keccak_rnd: false,
         stream_memw_lt: false,
         layout_workers: 0,
+        pack_rest_as_laid_out: false,
     }
 }
 
@@ -299,24 +300,28 @@ fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
-/// The streamed chunks laid out on three threads are packed in arrival order
-/// all the same: the same groups and table counts as laid out on one, and the
-/// proof verifies.
+/// The streamed chunks laid out on three threads, and the rest of the run
+/// packed as it is laid out, are packed in the inline order all the same: the
+/// same groups and table counts as laid out on one thread, and the proofs
+/// verify.
 #[test]
 fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
     let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
-    o.layout_workers = 3;
-    let proof = prove(&elf, &format, &o);
-    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
-    assert_eq!(proof.groups, inline.groups);
-    assert_eq!(
-        format!("{:?}", proof.table_counts),
-        format!("{:?}", inline.table_counts)
-    );
-    assert!(verify(&proof, &elf, &format));
+    for pack_rest in [false, true] {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.layout_workers = 3;
+        o.pack_rest_as_laid_out = pack_rest;
+        let proof = prove(&elf, &format, &o);
+        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+        assert_eq!(proof.groups, inline.groups, "pack_rest {pack_rest}");
+        assert_eq!(
+            format!("{:?}", proof.table_counts),
+            format!("{:?}", inline.table_counts)
+        );
+        assert!(verify(&proof, &elf, &format));
+    }
 }
 
 /// The partition is part of the statement: a table named twice, two tables
