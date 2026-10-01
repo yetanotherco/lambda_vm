@@ -470,7 +470,7 @@ figure[data-kind="highlight"] figcaption {
 
   /* Colors are provided through typst */
   padding: 0.4em 1em;
-  font-weight: 600;
+  font-weight: bold;
   display: block;
   text-align: center;
 }
@@ -618,7 +618,6 @@ math {
 }
 
 math[display="block"] {
-  display: block;
   text-align: center;
   font-size: 1.12em;
   margin: 1.2em 0;

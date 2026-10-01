@@ -109,7 +109,11 @@
       width: 100% + 1em,
       fill: highlights.at(it.kind).at(1),
       stroke: rgb("#d7d5cd"),
-      align(center, strong(text(fill: highlights.at(it.kind).at(2), cap)))
+      sticky: true,
+      {
+        set text(weight: "bold")
+        align(center, cap)
+      }
     )
     block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: rgb("#d7d5cd"), breakable: false, align(left, it))
   }

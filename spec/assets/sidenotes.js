@@ -21,7 +21,17 @@
       // incomplete selector, but could be extended if anything becomes relevant, ever
       aside.querySelectorAll("a, summary, iframe, [tabindex]").forEach(el => el.setAttribute("tabindex", "-1"));
 
-      sup.after(aside);
+      let container = null;
+      for (let parent = sup; parent.tagName != "MAIN"; parent = parent.parentElement) {
+        if (parent.matches("figure,math,table,pre,dl")) container = parent;
+      }
+      if (container !== null) {
+        // before so we align along the top of the container instead of from the end
+        container.before(aside);
+      } else {
+        // after for the common case, since it makes more semantic sense
+        sup.after(aside);
+      }
     }
   }
 })();
