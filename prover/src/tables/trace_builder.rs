@@ -72,7 +72,7 @@ use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod windowed;
-pub use windowed::{StreamTable, StreamedChunk, WindowedTraceBuilder};
+pub use windowed::{StreamTable, StreamedChunk, WindowStamps, WindowedTraceBuilder};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -353,7 +353,17 @@ fn collect_cpu_ops_from(
     first: usize,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
+    collect_cpu_ops_into(logs, instructions, first, &mut cpu_ops)?;
+    Ok(cpu_ops)
+}
 
+/// [`collect_cpu_ops_from`], appending to `cpu_ops`.
+fn collect_cpu_ops_into(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    first: usize,
+    cpu_ops: &mut Vec<CpuOperation>,
+) -> Result<(), Error> {
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location. The +4 stride reserves
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
@@ -369,7 +379,7 @@ fn collect_cpu_ops_from(
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
     }
-    Ok(cpu_ops)
+    Ok(())
 }
 
 // =============================================================================
@@ -569,19 +579,105 @@ fn collect_ops_from_cpu(
     Vec<ecdas::EcdasOperation>,
     Vec<hint::HintOperation>,
 ) {
-    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
-    let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
-    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
-    let mut commit_ops = Vec::new();
-    let mut keccak_ops = Vec::new();
-    let mut blake3_ops = Vec::new();
-    let mut blake3_absorb_ops = Vec::new();
-    let mut cpu32_ops = Vec::new();
-    let mut ecsm_ops = Vec::new();
-    let mut ecdas_ops = Vec::new();
-    let mut hint_ops = Vec::new();
+    let mut out = WalkOutputs::with_capacity(cpu_ops.len());
+    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out);
+    let WalkOutputs {
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    } = out;
+    (
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    )
+}
+
+/// Everything the walk emits. [`collect_ops_from_cpu_into`] APPENDS to one of
+/// these, so a run walked a window at a time into the same accumulator gets the
+/// lists a single walk over the run gets: the walk is a left fold over the CPU
+/// ops that reads and advances only the state its caller carries.
+pub(crate) struct WalkOutputs {
+    memw: MemwBuckets,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    commit_ops: Vec<CommitOperation>,
+    keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    ecsm_ops: Vec<ecsm::EcsmOperation>,
+    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    hint_ops: Vec<hint::HintOperation>,
+}
+
+impl WalkOutputs {
+    /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it.
+    fn with_capacity(cpu_ops: usize) -> Self {
+        Self {
+            memw: MemwBuckets::with_register_capacity(cpu_ops * 3),
+            load_ops: Vec::with_capacity(cpu_ops / 8 + 1),
+            lt_ops: Vec::with_capacity(cpu_ops / 10 + 1),
+            shift_ops: Vec::with_capacity(cpu_ops / 10 + 1),
+            bitwise_ops: Vec::with_capacity(cpu_ops * 4),
+            commit_ops: Vec::new(),
+            keccak_ops: Vec::new(),
+            blake3_ops: Vec::new(),
+            blake3_absorb_ops: Vec::new(),
+            cpu32_ops: Vec::new(),
+            ecsm_ops: Vec::new(),
+            ecdas_ops: Vec::new(),
+            hint_ops: Vec::new(),
+        }
+    }
+}
+
+/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]).
+fn collect_ops_from_cpu_into(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    out: &mut WalkOutputs,
+) {
+    let WalkOutputs {
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    } = out;
+    // This call's commit rows start here; earlier calls' are already in the list.
+    let commit_ops_before = commit_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -612,7 +708,7 @@ fn collect_ops_from_cpu(
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, &mut memw);
+        collect_register_ops_from_cpu(op, register_state, memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -792,28 +888,12 @@ fn collect_ops_from_cpu(
     }
 
     // Each ecall generates count+1 operations (count real rows + 1 end row).
-    // Count only this epoch's rows, so subtract the carried start index.
+    // Count only this call's rows, so subtract the carried start index.
     debug_assert_eq!(
-        commit_ops.len(),
+        commit_ops.len() - commit_ops_before,
         (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
-
-    (
-        memw,
-        load_ops,
-        lt_ops,
-        shift_ops,
-        bitwise_ops,
-        commit_ops,
-        keccak_ops,
-        blake3_ops,
-        blake3_absorb_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ecdas_ops,
-        hint_ops,
-    )
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
