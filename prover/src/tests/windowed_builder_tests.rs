@@ -1,0 +1,200 @@
+//! The windowed trace builder builds the whole-run tables
+//! (`tables::trace_builder::WindowedTraceBuilder`).
+
+use executor::elf::Elf;
+use executor::vm::execution::Executor;
+use executor::vm::logs::Log;
+use math::field::element::FieldElement;
+use stark::trace::TraceTable;
+
+use crate::tables::MaxRowsConfig;
+use crate::tables::trace_builder::{StreamTable, Traces, WindowedTraceBuilder};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::test_utils::asm_elf_bytes;
+
+type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+fn run(name: &str) -> (Elf, Vec<Log>) {
+    let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    (program, logs)
+}
+
+fn whole(program: &Elf, logs: &[Log], max_rows: &MaxRowsConfig) -> Traces {
+    Traces::from_elf_and_logs(
+        program,
+        logs,
+        max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the whole-run build")
+}
+
+/// The windowed build over windows of `window` cycles (the last window is the
+/// rest, at least one cycle), with its streamed chunks put back; and how many
+/// chunks it streamed.
+fn windowed(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+) -> (Traces, usize) {
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows).expect("the builder");
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        chunks.extend(builder.push(w).expect("a window"));
+    }
+    let streamed = chunks.len();
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    (traces, streamed)
+}
+
+fn rows(t: &Table) -> Vec<Vec<FieldElement<GoldilocksField>>> {
+    (0..t.main_table.height)
+        .map(|r| t.main_table.get_row(r).to_vec())
+        .collect()
+}
+
+/// Equal tables — row for row, or as row multisets for the tables that lay
+/// their rows out in `HashMap` order.
+fn same(what: &str, a: &Table, b: &Table, hashed: bool) {
+    assert_eq!(
+        (a.main_table.width, a.main_table.height),
+        (b.main_table.width, b.main_table.height),
+        "{what}: shape"
+    );
+    let (mut ra, mut rb) = (rows(a), rows(b));
+    if hashed {
+        let key = |r: &Vec<FieldElement<GoldilocksField>>| {
+            r.iter().map(|v| v.canonical()).collect::<Vec<u64>>()
+        };
+        ra.sort_by_key(key);
+        rb.sort_by_key(key);
+    }
+    assert!(ra == rb, "{what}: rows differ");
+}
+
+fn same_list(what: &str, a: &[Table], b: &[Table], hashed: bool) {
+    assert_eq!(a.len(), b.len(), "{what}: table count");
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        same(&format!("{what}[{i}]"), x, y, hashed);
+    }
+}
+
+fn same_traces(a: &Traces, b: &Traces) {
+    same_list("CPU", &a.cpus, &b.cpus, false);
+    same_list("MEMW_R", &a.memw_registers, &b.memw_registers, false);
+    same_list("MEMW_A", &a.memw_aligneds, &b.memw_aligneds, false);
+    same_list("MEMW", &a.memws, &b.memws, false);
+    same_list("LOAD", &a.loads, &b.loads, false);
+    same_list("STORE", &a.stores, &b.stores, false);
+    same_list("SHIFT", &a.shifts, &b.shifts, false);
+    same_list("CPU32", &a.cpu32s, &b.cpu32s, false);
+    same_list("COMMIT", &a.commits, &b.commits, false);
+    same_list("KECCAK", &a.keccaks, &b.keccaks, false);
+    same_list("KECCAK_RND", &a.keccak_rnds, &b.keccak_rnds, false);
+    same_list("ECSM", &a.ecsms, &b.ecsms, false);
+    same_list("ECDAS", &a.ecdases, &b.ecdases, false);
+    same_list("HINT", &a.hints, &b.hints, false);
+    same_list("PAGE", &a.pages, &b.pages, false);
+    same_list("LT", &a.lts, &b.lts, true);
+    same_list("MUL", &a.muls, &b.muls, true);
+    same_list("DVRM", &a.dvrms, &b.dvrms, true);
+    same_list("BRANCH", &a.branches, &b.branches, true);
+    same_list("EQ", &a.eqs, &b.eqs, true);
+    same_list("BYTEWISE", &a.bytewises, &b.bytewises, true);
+    same("BITWISE", &a.bitwise, &b.bitwise, false);
+    same("DECODE", &a.decode, &b.decode, false);
+    same("REGISTER", &a.register, &b.register, false);
+    same("HALT", &a.halt, &b.halt, false);
+    same("KECCAK_RC", &a.keccak_rc, &b.keccak_rc, false);
+    same("BLAKE3", &a.blake3, &b.blake3, false);
+    assert_eq!(a.public_output_bytes, b.public_output_bytes);
+    assert_eq!(a.num_blake3_ops, b.num_blake3_ops);
+    assert_eq!(a.page_configs.len(), b.page_configs.len());
+    assert_eq!(
+        format!("{:?}", a.table_counts()),
+        format!("{:?}", b.table_counts())
+    );
+}
+
+/// ★ The builder is a schedule: at every window length — one cycle, less than a
+/// chunk, exactly a chunk, not a divisor of it, longer than the run — the
+/// windowed build is the whole-run build, table for table, and it did stream.
+#[test]
+fn windowed_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "sub",
+        "all_instructions_64",
+        "test_keccak",
+        "test_keccak_multi",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 32, 33, 1000, logs.len()] {
+            let (traces, streamed) = windowed(&program, &logs, &max_rows, window.max(1));
+            same_traces(&reference, &traces);
+            if logs.len() > 2 * max_rows.cpu && window < logs.len() / 2 {
+                assert!(streamed > 0, "{name}, window {window}: nothing streamed");
+            }
+        }
+    }
+}
+
+/// And at the production chunk sizes, where a small program streams nothing
+/// and the builder is the whole-run build over windows.
+#[test]
+fn windowed_builds_the_whole_run_tables_at_production_sizes() {
+    let max_rows = MaxRowsConfig::default();
+    let (program, logs) = run("all_instructions_64");
+    let reference = whole(&program, &logs, &max_rows);
+    let (traces, _) = windowed(&program, &logs, &max_rows, 64);
+    same_traces(&reference, &traces);
+}
+
+/// A non-final window may not halt, as a whole-run build refuses an epoch that
+/// halts early.
+#[test]
+fn a_window_that_halts_before_the_end_is_refused() {
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("sub");
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    assert!(builder.push(&logs).is_err());
+}
+
+/// A streamed chunk only goes back into a placeholder.
+#[test]
+fn a_chunk_is_only_put_back_into_its_placeholder() {
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("all_instructions_64");
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    let chunks = builder.push(&logs[..logs.len() - 1]).expect("a window");
+    assert!(
+        chunks.iter().any(|c| c.table == StreamTable::Cpu),
+        "a CPU chunk streams"
+    );
+    let mut traces = builder.finish(&logs[logs.len() - 1..]).expect("the rest");
+    let again: Vec<_> = chunks
+        .iter()
+        .filter(|c| c.table == StreamTable::Cpu)
+        .map(|c| crate::tables::trace_builder::StreamedChunk {
+            table: c.table,
+            index: c.index,
+            trace: c.trace.clone(),
+        })
+        .collect();
+    traces.insert_streamed(chunks).expect("first time");
+    assert!(traces.insert_streamed(again).is_err());
+}
