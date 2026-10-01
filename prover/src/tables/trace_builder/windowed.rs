@@ -275,54 +275,164 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// Every full chunk the lists now hold that was not handed out yet, its
     /// ops copied out of the run's lists.
     fn chunk_jobs(&mut self) -> Vec<ChunkJob> {
-        let m = &self.max_rows;
-        let w = &self.walk;
-        let cpu_ops = &self.cpu_ops;
-        let e = &mut self.emitted;
-        let mut jobs = Vec::new();
-        macro_rules! full_chunks {
-            ($table:expr, $variant:ident, $list:expr, $max:expr, $done:expr) => {{
-                let list = &$list;
-                let max = $max;
-                while ($done + 1) * max <= list.len() {
-                    let index = $done;
-                    jobs.push(ChunkJob {
-                        table: $table,
-                        index,
-                        ops: ChunkOps::$variant(list[index * max..(index + 1) * max].to_vec()),
-                    });
-                    $done += 1;
-                }
-            }};
+        chunk_jobs(
+            &self.max_rows,
+            &self.cpu_ops,
+            &self.walk,
+            &self.segments,
+            &mut self.emitted,
+        )
+    }
+
+    /// The builder in its two halves, to run on two threads: the [`Walker`]
+    /// walks each window (the state it carries is the walk's), the
+    /// [`Accumulator`] appends each walked window to the run's lists, routes it
+    /// and hands out the chunks it completed. Fed the windows in order, the two
+    /// build exactly what [`push_jobs`](Self::push_jobs) builds; afterwards
+    /// [`finish`](Self::finish) takes the last window as usual.
+    pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
+        (
+            Walker {
+                artifacts: &self.artifacts,
+                memory_state: &mut self.memory_state,
+                register_state: &mut self.register_state,
+                cycles: &mut self.cycles,
+                windows: &mut self.stamps.windows,
+                walk_secs: &mut self.stamps.walk,
+            },
+            Accumulator {
+                max_rows: &self.max_rows,
+                cpu_ops: &mut self.cpu_ops,
+                walk: &mut self.walk,
+                segments: &mut self.segments,
+                emitted: &mut self.emitted,
+                route_secs: &mut self.stamps.route,
+                handout_secs: &mut self.stamps.generate,
+            },
+        )
+    }
+}
+
+/// One window, walked: its CPU ops and what the walk emitted for them.
+pub struct WalkedWindow {
+    cpu_ops: Vec<super::CpuOperation>,
+    walk: WalkOutputs,
+}
+
+/// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
+pub struct Walker<'b> {
+    artifacts: &'b DecodeArtifacts,
+    memory_state: &'b mut MemoryState,
+    register_state: &'b mut RegisterState,
+    cycles: &'b mut usize,
+    windows: &'b mut usize,
+    walk_secs: &'b mut f64,
+}
+
+impl Walker<'_> {
+    /// Walks the next window (not the run's last) into fresh lists.
+    pub fn walk(&mut self, logs: &[Log]) -> Result<WalkedWindow, Error> {
+        if logs.iter().any(|log| log.next_pc == 0) {
+            return Err(Error::HaltInNonFinalEpoch);
         }
-        full_chunks!(StreamTable::Cpu, Cpu, *cpu_ops, m.cpu, e.cpu);
-        full_chunks!(
-            StreamTable::MemwRegister,
-            MemwRegister,
-            w.memw.register_rows,
-            m.memw_register,
-            e.memw_register
+        let t = std::time::Instant::now();
+        let cpu_ops =
+            super::collect_cpu_ops_from(logs, &self.artifacts.instructions, *self.cycles)?;
+        *self.cycles += logs.len();
+        let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
+        collect_ops_from_cpu_into(&cpu_ops, self.memory_state, self.register_state, &mut walk);
+        *self.walk_secs += t.elapsed().as_secs_f64();
+        *self.windows += 1;
+        Ok(WalkedWindow { cpu_ops, walk })
+    }
+}
+
+/// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
+pub struct Accumulator<'b> {
+    max_rows: &'b crate::tables::MaxRowsConfig,
+    cpu_ops: &'b mut Vec<super::CpuOperation>,
+    walk: &'b mut WalkOutputs,
+    segments: &'b mut RoutedSegments,
+    emitted: &'b mut StreamSkip,
+    route_secs: &'b mut f64,
+    handout_secs: &'b mut f64,
+}
+
+impl Accumulator<'_> {
+    /// Routes a walked window, appends it to the run's lists and hands out
+    /// the chunks it completed. Windows must come in run order.
+    pub fn absorb(&mut self, window: WalkedWindow) -> Vec<ChunkJob> {
+        let t = std::time::Instant::now();
+        self.segments
+            .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
+        self.cpu_ops.extend(window.cpu_ops);
+        self.walk.append(window.walk);
+        *self.route_secs += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let jobs = chunk_jobs(
+            self.max_rows,
+            self.cpu_ops,
+            self.walk,
+            self.segments,
+            self.emitted,
         );
-        full_chunks!(
-            StreamTable::MemwAligned,
-            MemwAligned,
-            w.memw.aligned,
-            m.memw_aligned,
-            e.memw_aligned
-        );
-        full_chunks!(StreamTable::Memw, Memw, w.memw.general, m.memw, e.memw);
-        full_chunks!(StreamTable::Load, Load, w.load_ops, m.load, e.load);
-        full_chunks!(StreamTable::Lt, Lt, w.lt_ops, m.lt, e.lt);
-        full_chunks!(StreamTable::Shift, Shift, w.shift_ops, m.shift, e.shift);
-        full_chunks!(
-            StreamTable::Store,
-            Store,
-            self.segments.store_ops,
-            m.store,
-            e.store
-        );
+        *self.handout_secs += t.elapsed().as_secs_f64();
         jobs
     }
+}
+
+/// Every full chunk the lists hold that was not handed out yet, its ops copied
+/// out of the run's lists.
+fn chunk_jobs(
+    m: &crate::tables::MaxRowsConfig,
+    cpu_ops: &[super::CpuOperation],
+    w: &WalkOutputs,
+    segments: &RoutedSegments,
+    e: &mut StreamSkip,
+) -> Vec<ChunkJob> {
+    let mut jobs = Vec::new();
+    macro_rules! full_chunks {
+        ($table:expr, $variant:ident, $list:expr, $max:expr, $done:expr) => {{
+            let list = &$list;
+            let max = $max;
+            while ($done + 1) * max <= list.len() {
+                let index = $done;
+                jobs.push(ChunkJob {
+                    table: $table,
+                    index,
+                    ops: ChunkOps::$variant(list[index * max..(index + 1) * max].to_vec()),
+                });
+                $done += 1;
+            }
+        }};
+    }
+    full_chunks!(StreamTable::Cpu, Cpu, *cpu_ops, m.cpu, e.cpu);
+    full_chunks!(
+        StreamTable::MemwRegister,
+        MemwRegister,
+        w.memw.register_rows,
+        m.memw_register,
+        e.memw_register
+    );
+    full_chunks!(
+        StreamTable::MemwAligned,
+        MemwAligned,
+        w.memw.aligned,
+        m.memw_aligned,
+        e.memw_aligned
+    );
+    full_chunks!(StreamTable::Memw, Memw, w.memw.general, m.memw, e.memw);
+    full_chunks!(StreamTable::Load, Load, w.load_ops, m.load, e.load);
+    full_chunks!(StreamTable::Lt, Lt, w.lt_ops, m.lt, e.lt);
+    full_chunks!(StreamTable::Shift, Shift, w.shift_ops, m.shift, e.shift);
+    full_chunks!(
+        StreamTable::Store,
+        Store,
+        segments.store_ops,
+        m.store,
+        e.store
+    );
+    jobs
 }
 
 /// A completed chunk not generated yet: which chunk it is, and its ops.
