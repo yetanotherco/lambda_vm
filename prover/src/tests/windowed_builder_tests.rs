@@ -288,3 +288,181 @@ fn a_chunk_is_only_put_back_into_its_placeholder() {
     traces.insert_streamed(chunks).expect("first time");
     assert!(traces.insert_streamed(again).is_err());
 }
+
+/// One digest per table: its width and its rows (sorted for the six tables
+/// that lay their rows out in `HashMap` order, whose row order no two builds
+/// share).
+fn table_digests(t: &Traces) -> Vec<(String, String)> {
+    use rayon::prelude::*;
+    let mut tables: Vec<(String, &Table, bool)> = Vec::new();
+    let lists: [(&str, &Vec<Table>, bool); 21] = [
+        ("CPU", &t.cpus, false),
+        ("MEMW_R", &t.memw_registers, false),
+        ("MEMW_A", &t.memw_aligneds, false),
+        ("MEMW", &t.memws, false),
+        ("LOAD", &t.loads, false),
+        ("STORE", &t.stores, false),
+        ("SHIFT", &t.shifts, false),
+        ("CPU32", &t.cpu32s, false),
+        ("COMMIT", &t.commits, false),
+        ("KECCAK", &t.keccaks, false),
+        ("KECCAK_RND", &t.keccak_rnds, false),
+        ("ECSM", &t.ecsms, false),
+        ("ECDAS", &t.ecdases, false),
+        ("HINT", &t.hints, false),
+        ("PAGE", &t.pages, false),
+        ("LT", &t.lts, true),
+        ("MUL", &t.muls, true),
+        ("DVRM", &t.dvrms, true),
+        ("BRANCH", &t.branches, true),
+        ("EQ", &t.eqs, true),
+        ("BYTEWISE", &t.bytewises, true),
+    ];
+    for (name, list, hashed) in lists {
+        for (i, table) in list.iter().enumerate() {
+            tables.push((format!("{name}[{i}]"), table, hashed));
+        }
+    }
+    for (name, table) in [
+        ("BITWISE", &t.bitwise),
+        ("DECODE", &t.decode),
+        ("REGISTER", &t.register),
+        ("HALT", &t.halt),
+        ("KECCAK_RC", &t.keccak_rc),
+        ("BLAKE3", &t.blake3),
+    ] {
+        tables.push((name.to_string(), table, false));
+    }
+    tables
+        .into_par_iter()
+        .map(|(name, table, hashed)| {
+            let mut rows: Vec<Vec<u64>> = (0..table.main_table.height)
+                .map(|r| {
+                    table
+                        .main_table
+                        .get_row(r)
+                        .iter()
+                        .map(|v| v.canonical())
+                        .collect()
+                })
+                .collect();
+            if hashed {
+                rows.sort_unstable();
+            }
+            let mut h = blake3::Hasher::new();
+            h.update(&(table.main_table.width as u64).to_le_bytes());
+            h.update(&(table.main_table.height as u64).to_le_bytes());
+            for row in rows {
+                for v in row {
+                    h.update(&v.to_le_bytes());
+                }
+            }
+            (name, h.finalize().to_hex()[..16].to_string())
+        })
+        .collect()
+}
+
+/// ★ Box only (`--ignored`): on a real block, the windowed build — split across
+/// a walker and an accumulator thread, its chunks generated on a third, beside a
+/// thread that keeps the host's memory busy — gives the whole-run build's
+/// tables, twice. Reads `BLOCK_WHIR_ELF` and `BLOCK_WHIR_INPUT`; prints
+/// `DETERMINISM` lines.
+#[test]
+#[ignore = "a real block: box only"]
+fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).unwrap();
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).unwrap();
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let max_rows = MaxRowsConfig::uniform(1 << 21);
+    let logs = Executor::new(&program, input.clone())
+        .expect("the executor starts")
+        .run()
+        .expect("the block runs")
+        .logs;
+    let reference = {
+        let t = Traces::from_elf_and_logs(
+            &program,
+            &logs,
+            &max_rows,
+            &input,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("the whole-run build");
+        table_digests(&t)
+    };
+    println!("DETERMINISM whole-run: {} tables", reference.len());
+    let window = 1usize << 20;
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut runs_equal = 0usize;
+    for run_index in 0..2 {
+        let stop = AtomicBool::new(false);
+        let digests = std::thread::scope(|scope| {
+            // The contention: a thread copying a GiB back and forth.
+            let busy = scope.spawn(|| {
+                let mut a = vec![1u8; 1 << 30];
+                let mut b = vec![0u8; 1 << 30];
+                while !stop.load(Ordering::Relaxed) {
+                    b.copy_from_slice(&a);
+                    a.copy_from_slice(&b);
+                }
+            });
+            let mut builder =
+                WindowedTraceBuilder::new(&program, &input, &max_rows).expect("the builder");
+            let chunks = {
+                let (mut walker, mut accumulator) = builder.split();
+                std::thread::scope(|inner| {
+                    let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
+                    let (jtx, jrx) = std::sync::mpsc::sync_channel(64);
+                    let logs = &logs;
+                    inner.spawn(move || {
+                        for w in logs[..cut].chunks(window) {
+                            wtx.send(walker.walk(w).expect("a window"))
+                                .expect("accumulator");
+                        }
+                    });
+                    let generator = inner.spawn(move || {
+                        jrx.into_iter()
+                            .map(crate::tables::trace_builder::ChunkJob::generate)
+                            .collect::<Vec<_>>()
+                    });
+                    for walked in wrx {
+                        for job in accumulator.absorb(walked) {
+                            jtx.send(job).expect("generator");
+                        }
+                    }
+                    drop(jtx);
+                    generator.join().expect("the generator")
+                })
+            };
+            let streamed = chunks.len();
+            let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+            traces.insert_streamed(chunks).expect("placeholders");
+            stop.store(true, Ordering::Relaxed);
+            busy.join().expect("the busy thread");
+            println!("DETERMINISM windowed run {run_index}: {streamed} chunks streamed");
+            table_digests(&traces)
+        });
+        let differing: Vec<&String> = reference
+            .iter()
+            .zip(&digests)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| &a.0)
+            .collect();
+        println!(
+            "DETERMINISM windowed run {run_index}: {} tables, {} differ from the whole-run build {:?}",
+            digests.len(),
+            differing.len(),
+            differing
+        );
+        if digests.len() == reference.len() && differing.is_empty() {
+            runs_equal += 1;
+        }
+    }
+    println!("DETERMINISM RESULT: {runs_equal}/2 windowed runs equal the whole-run build");
+    assert_eq!(runs_equal, 2);
+}
