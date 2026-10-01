@@ -19,6 +19,7 @@ fn one_group() -> BlockFormat {
         zf: ZfFormat::DEFAULT,
         group_polys: block_whir::BLOCK_GROUP_POLYS,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
     }
 }
 
@@ -31,6 +32,7 @@ fn many_groups() -> BlockFormat {
         zf,
         group_polys: 2,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
     }
 }
 
@@ -427,7 +429,8 @@ fn the_prepared_set_is_decode_and_the_dense_pages() {
     let airs = crate::VmAirs::new(
         &program, &opts, false, &configs, &counts, None, true, None, None, None,
     );
-    let prepared = block_whir::prepared_tables(&airs, &configs).expect("the prepared set");
+    let prepared =
+        block_whir::prepared_tables(&airs, &configs, &one_group()).expect("the prepared set");
     let refs = airs.air_refs();
     let decode = refs
         .iter()
@@ -530,6 +533,165 @@ fn the_statement_bytes_are_what_absorb_block_appends() {
     assert_eq!(bytes.len() % 8, 0, "the run ends on a felt boundary");
 }
 
+// ======== prepared openings on two dense pages (test_dense_pages) ========
+
+/// The prepared tables of `proof`'s statement, in AIR order, as the verifier
+/// derives them: `(AIR index, position in the proof's table order)`.
+fn prepared_of(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> Vec<(usize, usize)> {
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(proof.statement(), elf, &opts, format).expect("frame");
+    let order: Vec<usize> = proof.groups.iter().flatten().map(|&t| t as usize).collect();
+    block_whir::prepared_tables(&frame.airs, &frame.page_configs, format)
+        .expect("the prepared set")
+        .into_iter()
+        .map(|(table, _)| {
+            let position = order.iter().position(|&t| t == table).expect("in a group");
+            (table, position)
+        })
+        .collect()
+}
+
+/// `proof.prepared`'s index of the opening at proof position `position`.
+fn opening_index(prepared: &[(usize, usize)], position: usize) -> usize {
+    let mut positions: Vec<usize> = prepared.iter().map(|&(_, p)| p).collect();
+    positions.sort_unstable();
+    positions
+        .iter()
+        .position(|&p| p == position)
+        .expect("a prepared position")
+}
+
+fn verify_skipping_prepared(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {
+    block_whir::verify_block_whir_with(
+        proof,
+        elf,
+        &ProofOptions::default_test_options(),
+        format,
+        true,
+    )
+    .unwrap_or(false)
+}
+
+fn dense_block(deviations: &Deviations) -> (Vec<u8>, BlockWhirProof) {
+    let elf = asm_elf_bytes("test_dense_pages");
+    let proof = prove_with(
+        &elf,
+        &one_group(),
+        &options(MaxRowsConfig::default(), 16),
+        deviations,
+    );
+    (elf, proof)
+}
+
+/// The fixture is what the negatives below need: DECODE and at least two dense
+/// genesis pages prepared, and an honest proof of it verifies.
+#[test]
+fn the_dense_fixture_prepares_decode_and_two_pages() {
+    let (elf, proof) = dense_block(&Deviations::default());
+    let prepared = prepared_of(&elf, &proof, &one_group());
+    assert!(prepared.len() >= 3, "DECODE and two pages: {prepared:?}");
+    assert_eq!(proof.prepared.len(), prepared.len());
+    assert!(verify(&proof, &elf, &one_group()));
+}
+
+/// Two pages' openings swapped in the proof: each now opens against the other
+/// page's derived root at the wrong point, and is refused. With the openings
+/// left unchecked (the mutation) the swap verifies: the openings are what
+/// refuse it.
+#[test]
+fn a_swapped_page_opening_is_refused() {
+    let (elf, mut proof) = dense_block(&Deviations::default());
+    let prepared = prepared_of(&elf, &proof, &one_group());
+    let (a, b) = (
+        opening_index(&prepared, prepared[1].1),
+        opening_index(&prepared, prepared[2].1),
+    );
+    proof.prepared.swap(a, b);
+    assert!(!verify(&proof, &elf, &one_group()));
+    assert!(verify_skipping_prepared(&proof, &elf, &one_group()));
+}
+
+/// A page opened at another table's point (one of its height, in its group) —
+/// a valid opening of its own commitment, of the wrong claim — is refused; the
+/// mutation admits it.
+#[test]
+fn a_page_opened_at_another_tables_point_is_refused() {
+    let (elf, honest) = dense_block(&Deviations::default());
+    let prepared = prepared_of(&elf, &honest, &one_group());
+    let page = prepared[1].0;
+    // Another table of the page's group at the page's height, so the point
+    // has the commitment's variable count.
+    let height = honest.table_num_vars[page];
+    let other = honest
+        .groups
+        .iter()
+        .find(|g| g.contains(&(page as u32)))
+        .and_then(|g| {
+            g.iter()
+                .map(|&t| t as usize)
+                .find(|&t| t != page && honest.table_num_vars[t] == height)
+        })
+        .expect("the page shares its group with a table of its height");
+    let (_, wrong) = dense_block(&Deviations {
+        prepared_openings: vec![block_whir::PreparedTamper {
+            open: 1,
+            at_table: Some(other),
+            with: None,
+        }],
+        ..Default::default()
+    });
+    assert!(!verify(&wrong, &elf, &one_group()));
+    assert!(verify_skipping_prepared(&wrong, &elf, &one_group()));
+}
+
+/// A page opened against the other page's commitment — a valid opening of that
+/// commitment at this page's point — is refused; the mutation admits it.
+#[test]
+fn a_page_opened_against_another_pages_commitment_is_refused() {
+    let (elf, wrong) = dense_block(&Deviations {
+        prepared_openings: vec![block_whir::PreparedTamper {
+            open: 1,
+            at_table: None,
+            with: Some(2),
+        }],
+        ..Default::default()
+    });
+    assert!(!verify(&wrong, &elf, &one_group()));
+    assert!(verify_skipping_prepared(&wrong, &elf, &one_group()));
+}
+
+/// A prover that commits DECODE's prepared columns for another program is
+/// refused at the roots block: the verifier absorbs the root it derives itself,
+/// so even with the openings unchecked the transcripts part. (The leaf's form
+/// of this negative, with its mutation, is in `lfm::whir_block_tests`.)
+#[test]
+fn a_tampered_decode_prepared_root_is_refused() {
+    let (elf, wrong) = dense_block(&Deviations {
+        other_prepared: true,
+        ..Default::default()
+    });
+    assert!(!verify(&wrong, &elf, &one_group()));
+    assert!(!verify_skipping_prepared(&wrong, &elf, &one_group()));
+}
+
+/// With the openings off (`BlockFormat::prepared`, the measurement arm) the
+/// block carries none and the host verifier evaluates the columns itself.
+#[test]
+fn a_block_without_prepared_openings_verifies_on_the_host() {
+    let format = BlockFormat {
+        prepared: false,
+        ..one_group()
+    };
+    let elf = asm_elf_bytes("test_dense_pages");
+    let proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    assert!(proof.prepared.is_empty());
+    assert!(verify(&proof, &elf, &format));
+    assert!(
+        !verify(&proof, &elf, &one_group()),
+        "the formats are not interchangeable"
+    );
+}
+
 /// The KECCAK_RND count is bounded before the verifier builds an AIR off it.
 #[test]
 fn an_inflated_keccak_rnd_count_is_refused() {
@@ -559,14 +721,20 @@ fn block_whir_on_a_real_block() {
     let input_path = std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT");
     let elf = std::fs::read(&elf_path).expect("read the ELF");
     let input = std::fs::read(&input_path).expect("read the input");
-    let format = BlockFormat::production();
+    // `BLOCK_WHIR_PREPARED=0`: the openings off, for the arm that prices them.
+    let prepared = std::env::var("BLOCK_WHIR_PREPARED").map_or(true, |v| v.trim() != "0");
+    let format = BlockFormat {
+        prepared,
+        ..BlockFormat::production()
+    };
     let options = BlockOptions::production();
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
         options.drop_levels,
+        if prepared { "on" } else { "off" },
         format.zf.banner(),
     );
     // The options #1010's base proves its epochs under.

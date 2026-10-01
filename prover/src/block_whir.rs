@@ -80,6 +80,11 @@ pub struct BlockFormat {
     /// The most groups a block statement may declare (the verifier refuses
     /// more). The proven bits are quoted at this count (I-NOEPOCH-W.md §8).
     pub max_groups: usize,
+    /// Whether DECODE's and the dense genesis pages' columns are settled by
+    /// prepared openings ([`prepared_tables`]) — the production format, which
+    /// the recursion needs — or evaluated by the host verifier. Off exists to
+    /// measure what the openings cost the base.
+    pub prepared: bool,
 }
 
 /// The most groups a block statement may declare. The block has 9; the bound
@@ -95,6 +100,7 @@ impl BlockFormat {
             zf: *ZfFormat::global(),
             group_polys: BLOCK_GROUP_POLYS,
             max_groups: BLOCK_MAX_GROUPS,
+            prepared: true,
         }
     }
 }
@@ -441,7 +447,11 @@ pub(crate) struct TablePrepared<H: multilinear::whir_hash::WhirHash> {
 pub(crate) fn prepared_tables(
     airs: &VmAirs,
     page_configs: &[crate::tables::page::PageConfig],
+    format: &BlockFormat,
 ) -> Result<Vec<PreparedColumns>, Error> {
+    if !format.prepared {
+        return Ok(Vec::new());
+    }
     let refs = airs.air_refs();
     if page_configs.len() != airs.pages.len() {
         return Err(Error::Prover(format!(
@@ -609,6 +619,56 @@ pub(crate) struct Deviations {
     /// Commit and open the first prepared table over columns that differ from
     /// the program's in one entry, as a prover of another program would.
     pub other_prepared: bool,
+    /// Open prepared tables wrongly ([`PreparedTamper`]).
+    pub prepared_openings: Vec<PreparedTamper>,
+}
+
+/// One prepared opening made wrongly, every index in AIR order: open prepared
+/// table `open` (its index in [`prepared_tables`]' list) at table `at_table`'s
+/// point, and/or with prepared table `with`'s commitment. Each such opening is
+/// internally consistent (the columns opened, evaluated at the point opened),
+/// so only the verifier's binding of the opening to its table refuses it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PreparedTamper {
+    pub open: usize,
+    pub at_table: Option<usize>,
+    pub with: Option<usize>,
+}
+
+/// [`PreparedTamper`]s in the block prover's terms: the openings and the tables
+/// by their positions in the proof's table order.
+fn prepared_deviations<H: multilinear::whir_hash::WhirHash>(
+    tampers: &[PreparedTamper],
+    prepared: &[TablePrepared<H>],
+    positions: &[(usize, usize)],
+    groups: &[Vec<u32>],
+) -> Result<Vec<multilinear_block::PreparedDeviation>, Error> {
+    let opening_of = |k: usize| {
+        positions
+            .iter()
+            .position(|&(_, at)| at == k)
+            .ok_or_else(|| Error::Prover(format!("no prepared table {k}")))
+    };
+    let position_of = |table: usize| {
+        groups
+            .iter()
+            .flatten()
+            .position(|&t| t as usize == table)
+            .ok_or_else(|| Error::Prover(format!("table {table} is in no group")))
+    };
+    tampers
+        .iter()
+        .map(|t| {
+            let _ = prepared
+                .get(t.open)
+                .ok_or_else(|| Error::Prover("no such prepared".into()))?;
+            Ok(multilinear_block::PreparedDeviation {
+                open: opening_of(t.open)?,
+                at_table: t.at_table.map(position_of).transpose()?,
+                with: t.with.map(opening_of).transpose()?,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn prove_block_whir_with(
@@ -655,6 +715,28 @@ pub fn prove_block_whir_observed(
         format,
         options,
         &Deviations::default(),
+        on_statement,
+    )
+}
+
+/// [`prove_block_whir_observed`] with a test's deviations.
+#[cfg(test)]
+pub(crate) fn prove_block_whir_observed_with(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    on_statement: StatementObserver<'_>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        deviations,
         on_statement,
     )
 }
@@ -779,7 +861,7 @@ pub(crate) fn prove_traces(
         None,
     );
 
-    let prepared_columns = prepared_tables(&airs, &traces.page_configs)?;
+    let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
     let shapes = shapes_of(&pairs)?;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
@@ -894,12 +976,19 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
+        let tampered = prepared_deviations(
+            &deviations.prepared_openings,
+            &prepared,
+            &positions,
+            &groups,
+        )?;
         let (proof, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
                 &config,
                 &mut transcript,
                 &openings,
+                &tampered,
                 fork_of,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
@@ -1252,7 +1341,7 @@ fn prove_streamed(
                         None,
                     )
                 });
-                let prepared = prepared_tables(airs, &traces.page_configs)?;
+                let prepared = prepared_tables(airs, &traces.page_configs, format)?;
                 let refs = airs.air_refs();
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
@@ -1415,12 +1504,19 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
+        let tampered = prepared_deviations(
+            &deviations.prepared_openings,
+            &prepared,
+            &positions,
+            &laid.groups,
+        )?;
         let (proof, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
                 &config,
                 &mut transcript,
                 &openings,
+                &tampered,
                 fork_of,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
@@ -1689,6 +1785,19 @@ pub fn verify_block_whir(
     proof_options: &ProofOptions,
     format: &BlockFormat,
 ) -> Result<bool, Error> {
+    verify_block_whir_with(proof, elf_bytes, proof_options, format, false)
+}
+
+/// [`verify_block_whir`] with the prepared openings left unchecked when
+/// `skip_prepared` — a mutation, for the tests that show the openings are what
+/// refuses a wrongly opened prepared table.
+pub(crate) fn verify_block_whir_with(
+    proof: &BlockWhirProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    skip_prepared: bool,
+) -> Result<bool, Error> {
     if proof.proof.tables.len() != proof.table_num_vars.len() {
         return Err(Error::InvalidTableCounts(format!(
             "the proof carries {} table arguments and {} heights",
@@ -1729,7 +1838,7 @@ pub fn verify_block_whir(
     // The proof's tables are in group order, so the statements are taken in
     // that order too.
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
-    let prepared_columns = prepared_tables(airs, page_configs)?;
+    let prepared_columns = prepared_tables(airs, page_configs, format)?;
 
     Ok(crate::with_whir_hash!(|H| {
         let mut transcript =
@@ -1781,7 +1890,7 @@ pub fn verify_block_whir(
         else {
             return Ok(false);
         };
-        multilinear_block::block_verify::<_, _, _, H>(
+        multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
             &proof.prepared,
             &checks,
@@ -1792,6 +1901,7 @@ pub fn verify_block_whir(
             &owed,
             config,
             &mut transcript,
+            skip_prepared,
         )
         .is_ok()
     }))

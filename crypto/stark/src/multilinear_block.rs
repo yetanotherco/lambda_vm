@@ -176,6 +176,23 @@ fn prepared_order(tables: impl Iterator<Item = usize>, num_tables: usize) -> Res
     Ok(())
 }
 
+/// How a test makes the prover open a prepared table wrongly, for the verifier
+/// to refuse. Each opening it makes is internally consistent — the columns it
+/// opens, evaluated at the point it opens them — so only the verifier's own
+/// binding of the opening to the table can refuse it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreparedDeviation {
+    /// Which opening, by its index in the `prepared` list.
+    pub open: usize,
+    /// Open at this table's point (its position in the proof's table order,
+    /// in the same group) instead of the prepared table's own.
+    pub at_table: Option<usize>,
+    /// Open this prepared entry's commitment and columns (an index in the
+    /// `prepared` list) instead of its own.
+    pub with: Option<usize>,
+}
+
 /// The block after phase A: every table, the groups' roots and the tops of
 /// their trees. The codewords are gone.
 pub struct BlockCommitted<'a, F, E>
@@ -391,7 +408,7 @@ where
         + Clone,
 {
     let (proof, _, stamps) =
-        block_prove_on_forks::<F, E, T, H>(committed, config, transcript, &[], &|g| g)?;
+        block_prove_on_forks::<F, E, T, H>(committed, config, transcript, &[], &[], &|g| g)?;
     Ok((proof, stamps))
 }
 
@@ -408,6 +425,7 @@ pub fn block_prove_on_forks<F, E, T, H>(
     config: &ChainConfig,
     transcript: &mut T,
     prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
     fork_of: &dyn Fn(usize) -> usize,
 ) -> Result<(MultiProof<F, E>, Vec<StackedProof<F, E>>, Vec<GroupStamps>), MlError>
 where
@@ -521,11 +539,22 @@ where
         )?);
         // The group's prepared tables, in table order: each opened at its own
         // point for its own prefix, on this fork.
-        let mut first = 0usize;
-        for (index, table) in group.iter().enumerate() {
-            if let Some(p) = prepared.iter().find(|p| p.table == at + index) {
-                let n = p.columns.len();
-                prepared_openings.push(stacked_eval::prove::<F, E, T, H>(
+        let firsts: Vec<usize> = group
+            .iter()
+            .scan(0usize, |first, table| {
+                let at = *first;
+                *first += table.num_committed_columns();
+                Some(at)
+            })
+            .collect();
+        for (index, &first) in firsts.iter().enumerate() {
+            let Some(k) = prepared.iter().position(|p| p.table == at + index) else {
+                continue;
+            };
+            let p = &prepared[k];
+            let n = p.columns.len();
+            let opening = match deviations.iter().find(|d| d.open == k) {
+                None => stacked_eval::prove::<F, E, T, H>(
                     p.commitment,
                     p.columns,
                     None,
@@ -533,9 +562,40 @@ where
                     &values[first..first + n],
                     config,
                     &mut fork,
-                )?);
-            }
-            first += table.num_committed_columns();
+                )?,
+                Some(d) => {
+                    let other = &prepared[d.with.unwrap_or(k)];
+                    let point = match d.at_table {
+                        Some(t) => {
+                            let local = t.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
+                                MlError::UnknownPolynomial {
+                                    index: t,
+                                    len: firsts.len(),
+                                },
+                            )?;
+                            points[firsts[local]].clone()
+                        }
+                        None => points[first].clone(),
+                    };
+                    let claims: Vec<Vec<FieldElement<E>>> =
+                        vec![point.clone(); other.columns.len()];
+                    let opened: Vec<FieldElement<E>> = other
+                        .columns
+                        .iter()
+                        .map(|column| column.evaluate_in(&point))
+                        .collect::<Result<_, _>>()?;
+                    stacked_eval::prove::<F, E, T, H>(
+                        other.commitment,
+                        other.columns,
+                        None,
+                        &Claimed::PerColumn(&claims),
+                        &opened,
+                        config,
+                        &mut fork,
+                    )?
+                }
+            };
+            prepared_openings.push(opening);
         }
         stamps[g].open = t.elapsed().as_secs_f64();
         drop(stacked);
@@ -577,6 +637,50 @@ pub fn block_verify<F, E, T, H>(
     expected: &FieldElement<E>,
     config: &ChainConfig,
     transcript: &mut T,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone,
+{
+    block_verify_with::<F, E, T, H>(
+        proof,
+        prepared_openings,
+        prepared,
+        statements,
+        layouts,
+        domains,
+        sizes,
+        expected,
+        config,
+        transcript,
+        false,
+    )
+}
+
+/// [`block_verify`] with the prepared openings left unchecked when
+/// `skip_prepared` — their prefixes still skipped by `check_preprocessed` — a
+/// mutation: a test shows the openings are what refuses a prover that opens a
+/// prepared table wrongly.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn block_verify_with<F, E, T, H>(
+    proof: &MultiProof<F, E>,
+    prepared_openings: &[StackedProof<F, E>],
+    prepared: &[BlockPreparedCheck<'_, F>],
+    statements: &[TableStatement<'_, F, E>],
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    sizes: &[usize],
+    expected: &FieldElement<E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    skip_prepared: bool,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -695,6 +799,7 @@ where
             if let Some(k) = prepared
                 .iter()
                 .position(|p| p.table == statement_at + index)
+                .filter(|_| !skip_prepared)
             {
                 let (p, n) = (&prepared[k], settled[statement_at + index]);
                 stacked_eval::verify::<F, E, T, H>(
