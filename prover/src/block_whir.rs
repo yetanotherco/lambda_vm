@@ -34,7 +34,9 @@ use crate::multilinear_prove::{
     absorb_tagged, chain_config_under, layout_of, preprocessed_mles, shapes_of, stacks,
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
-use crate::tables::trace_builder::{StreamTable, StreamedChunk, Traces, WindowedTraceBuilder};
+use crate::tables::trace_builder::{
+    StreamTable, StreamedChunk, Traces, WindowStamps, WindowedTraceBuilder,
+};
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
 use crate::{
@@ -155,6 +157,9 @@ pub struct BlockStamps {
     /// A streamed build: when its windows were all collected (seconds since
     /// the build started) and how many chunks they handed out.
     pub streamed: (f64, usize),
+    /// A streamed build's windows: the walk, the routing and the streamed
+    /// chunks' generation, summed.
+    pub windows: WindowStamps,
 }
 
 impl BlockStamps {
@@ -200,6 +205,14 @@ impl BlockStamps {
             out.push_str(&format!(
                 "BLOCK STREAM: windows collected at {:.2}s · run built at {:.2}s · {} chunks streamed · layout busy {:.2}s · phase A ended at {:.2}s (all since the build started)\n",
                 self.streamed.0, self.build, self.streamed.1, self.prep, self.phase_a,
+            ));
+            out.push_str(&format!(
+                "BLOCK WINDOWS: {} windows · walk {:.2}s · route {:.2}s · generate {:.2}s · finish {:.2}s\n",
+                self.windows.windows,
+                self.windows.walk,
+                self.windows.route,
+                self.windows.generate,
+                self.build - self.streamed.0,
             ));
         }
         out.push_str(&format!(
@@ -812,7 +825,7 @@ fn prove_streamed(
     crate::with_whir_hash!(|H| {
         let (block, built, laid) = std::thread::scope(|scope| {
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
-            let builder = scope.spawn(move || -> Result<(f64, f64, usize), Error> {
+            let builder = scope.spawn(move || -> Result<(f64, f64, usize, WindowStamps), Error> {
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 let body = logs.len() - 1;
@@ -827,6 +840,7 @@ fn prove_streamed(
                     }
                 }
                 let windows_done = start.elapsed().as_secs_f64();
+                let window_stamps = builder.stamps();
                 let mut rest = builder.finish(&logs[cut..])?;
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
@@ -834,7 +848,7 @@ fn prove_streamed(
                 }
                 let finished = start.elapsed().as_secs_f64();
                 let _ = btx.send(Built::Rest(Box::new(rest)));
-                Ok((windows_done, finished, streamed))
+                Ok((windows_done, finished, streamed, window_stamps))
             });
 
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
@@ -994,8 +1008,9 @@ fn prove_streamed(
         });
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did.
-        let (windows_done, finished, streamed) =
+        let (windows_done, finished, streamed, window_stamps) =
             built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
+        stamps.windows = window_stamps;
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
         let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
