@@ -18,17 +18,18 @@
 #      probe; ERR_NVGPUCTRPERM gets the fix printed); RAM (the no-epoch run peaks at 43.9 GiB on the
 #      host) and disk; the Rust toolchain.
 #   2. Clones https://github.com/yetanotherco/lambda_vm (public, HTTPS) into its own work directory and
-#      checks out PIN_SHA below: noepoch/stark @ 199ff359b (the no-epoch prover: KECCAK_RND chunked to
+#      checks out PIN_SHA below: noepoch/stark @ 3a5d02d30 (the no-epoch prover: KECCAK_RND chunked to
 #      2^16, the data pages' roots derived on the device and phase A streamed, all default-on; packing
 #      admission and kept top levels (LAMBDA_VM_RECOMMIT_TOP_LEVELS) behind knobs) plus two
 #      instruments-only commits, NVTX ranges around the device recommit and around the streamed CPU
-#      precommits. That branch sits 9 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
-#      as a control test, so ONE build runs both workloads:
+#      precommits. That branch sits 10 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries
+#      #1009's base as a control test, so ONE build runs both workloads:
 #        epoch    tests::noepoch_block_tests::noepoch_epoch_base_reference   (#1009's base: 15 epochs of
 #                 2^21 rows and the global proof, continuation::prove_continuation; no recursion, no verify)
 #        noepoch  tests::noepoch_block_tests::noepoch_block_prove_and_verify (prove_block with
-#                 LAMBDA_VM_GATE_PACKING=1, then the monolithic verifier)
-#      both in the FAST 351/352 posture (i-noepoch's nm-ab.sh): TABLE_PARALLELISM=4, a 24000 MiB VRAM
+#                 LAMBDA_VM_GATE_PACKING=1 and TABLE_PARALLELISM=8, as i-noepoch's latest arms, then the
+#                 block verifier)
+#      both in i-noepoch's nm-ab.sh posture: TABLE_PARALLELISM=4 (8 for the no-epoch arm), a 24000 MiB VRAM
 #      budget, 2^21-row caps, the PROVE SPLIT line and the per-table timeline on. NP_NOEPOCH_KNOBS adds
 #      knobs to the no-epoch arm only (e.g. LAMBDA_VM_RECOMMIT_TOP_LEVELS=10 once that lever lands).
 #   3. Fetches block 25368371 from the public release (the Makefile's ETHREX_REAL_BLOCK_FIXTURE_URL) and
@@ -126,10 +127,10 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION=iprof-2026-10-01a
+SCRIPT_VERSION=iprof-2026-10-01b
 REPO_URL_DEFAULT=https://github.com/yetanotherco/lambda_vm
-PIN_SHA=19ef394ece27379faa580b0b119e672c95778e2f            # profile/noepoch-counters: noepoch/stark + two NVTX spans
-NOEPOCH_SHA=199ff359b7c974ee9708dd83aa7be6eb56d486de        # noepoch/stark (PR #1013), PIN_SHA's parent
+PIN_SHA=0dfc743d5e9612c5a35c83a61c30f78ee829d8c5            # profile/noepoch-counters: noepoch/stark + two NVTX spans
+NOEPOCH_SHA=3a5d02d30d542be707e909f26ea16ddf843014a9        # noepoch/stark (PR #1013), PIN_SHA's parent
 EPOCH_SHA=cc411aa2c7a779464b577b5751eb846cf755b3d6          # stark-recursion-rpx (#1009), an ancestor of both
 ELF_COMMIT=da2a423b137b87e04213ecafbfd5d16e98a1f4a3         # whir/profile-rpx, where the record ELF is committed
 ELF_REPO_PATH=scripts/profile/fixtures/ethrex_8f826601.elf
@@ -215,7 +216,8 @@ prereg_text() {
 Pre-registered 2026-09-30 (lane I-PROF), before any run of this script. Sources: FAST 351 (ds1002, i-noepoch
 I-NOEPOCH.md §5), FAST 352 (ds1003, packing: -0.64 s), the later FAST arms (KECCAK_RND chunking -3.23 s,
 device page roots -1.43 s, FAST 355; streamed phase A -2.76 s to 27.98 s, FAST 356 at cea6a10dd; the kept
-top levels at 199ff359b are off by default, so the default arm is cea6a10dd's) and this
+top levels at 199ff359b/3a5d02d30 are off by default, so the default arm is cea6a10dd's; i-noepoch's arms run
+it at TABLE_PARALLELISM=8, as this script's no-epoch arm now does) and this
 script's own dry runs FAST 370/371 at fe3f6bf05 (ds1100/ds1101: no-epoch base 30.62 s, 130 device recommits,
 host peak 35.5 GiB; epoch base 25.74 s). Mauro's machine is not FAST (another CPU), so the
 walls get wide bands; the structural checks are exact.
@@ -2697,6 +2699,8 @@ wl_env() { # wl_env epoch|noepoch record|runb: the workload's knobs, as i-noepoc
   case "$1" in
     epoch) WL_TEST="$EPOCH_TEST" ;;
     noepoch)
+      # i-noepoch's latest arms: nm-ab.sh's base env with TABLE_PARALLELISM=8 and packing admission
+      WL_ENV=("${WL_ENV[@]/#TABLE_PARALLELISM=4/TABLE_PARALLELISM=8}")
       WL_ENV+=("LAMBDA_VM_GATE_PACKING=1")
       # shellcheck disable=SC2206 # blank-separated NAME=VALUE words, validated in knob_defaults
       WL_ENV+=($NP_NOEPOCH_KNOBS)
