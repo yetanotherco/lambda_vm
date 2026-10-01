@@ -82,6 +82,20 @@ pub fn nvtx_range_fmt<F: FnOnce() -> String>(label: F) -> math_cuda::nvtx::Range
     math_cuda::nvtx::Range::fmt(label)
 }
 
+/// A process-wide NVTX range (start/end, on no thread's stack), for a phase
+/// whose kernels launch from worker threads: every launch while it is open
+/// falls inside it on an Nsight Systems timeline, and `ncu --nvtx
+/// --nvtx-include "<label>"` profiles only those. Ends when dropped.
+#[cfg(feature = "nvtx")]
+pub use math_cuda::nvtx::ProcessRange as NvtxProcessRange;
+
+/// [`NvtxProcessRange`] with a runtime-formatted name; the closure only runs
+/// when a profiler-visible NVTX library is loaded.
+#[cfg(feature = "nvtx")]
+pub fn nvtx_process_range<F: FnOnce() -> String>(label: F) -> NvtxProcessRange {
+    NvtxProcessRange::fmt(label)
+}
+
 /// Open a wall-clock span; records elapsed time when the guard drops.
 /// Under the `nvtx` feature the span is mirrored as an NVTX range so Nsight
 /// timelines carry the same phase names as the instruments tree.
