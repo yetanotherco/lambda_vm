@@ -1103,8 +1103,8 @@ pub(super) fn prove_program_with(
     (child, proved)
 }
 
-/// Child proofs verified on helper threads beside the timed path
-/// (`NOEPOCH_CHILD_VERIFY=beside`): production's verify of each, every one
+/// Child proofs verified on helper threads beside the timed path (the default;
+/// `NOEPOCH_CHILD_VERIFY=inline` is the old order): production's verify of each, every one
 /// joined, a refusal failing the run, before anything is reported.
 #[derive(Default)]
 pub(super) struct BesideVerifies(std::sync::Mutex<Vec<(String, std::thread::JoinHandle<bool>)>>);
@@ -1150,10 +1150,11 @@ impl BesideVerifies {
     }
 }
 
-/// `NOEPOCH_CHILD_VERIFY=beside`: the tree's child proofs verified beside the
-/// timed path.
+/// The tree's child proofs verified beside the timed path, by default (FAST
+/// 398: −0.62 s on level 0 + interior, the join waiting 0.00 s);
+/// `NOEPOCH_CHILD_VERIFY=inline` verifies each before its parent, as before.
 fn child_verify_beside_knob() -> bool {
-    std::env::var("NOEPOCH_CHILD_VERIFY").is_ok_and(|v| v == "beside")
+    std::env::var("NOEPOCH_CHILD_VERIFY").map_or(true, |v| v != "inline")
 }
 
 /// ★ The block tree's FINAL check over the plan the harness holds: the top
