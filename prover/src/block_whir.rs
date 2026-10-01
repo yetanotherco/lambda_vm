@@ -524,6 +524,16 @@ pub(crate) fn commit_prepared<H: multilinear::whir_hash::WhirHash>(
     })
 }
 
+/// The prepared commitments' roots by table, in their order.
+fn prepared_roots<H: multilinear::whir_hash::WhirHash>(
+    prepared: &[TablePrepared<H>],
+) -> Vec<PreparedRoots> {
+    prepared
+        .iter()
+        .map(|p| (p.table, p.roots.clone()))
+        .collect()
+}
+
 /// Each prepared table's position in the proof's table order (the groups
 /// concatenated), with its index in `prepared`, sorted by position.
 pub(crate) fn prepared_positions<H: multilinear::whir_hash::WhirHash>(
@@ -609,6 +619,55 @@ pub(crate) fn prove_block_whir_with(
     options: &BlockOptions,
     deviations: &Deviations,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        deviations,
+        &|_, _| {},
+    )
+}
+
+/// What a caller is handed when the statement is final — after phase A,
+/// before phase B: everything the recursion's programs are a function of, and
+/// the prover's own prepared roots by table ([`prepared_tables`] order).
+pub type StatementObserver<'a> = &'a (dyn Fn(BlockStatement<'_>, &[PreparedRoots]) + Sync);
+
+/// A prepared table's index in [`VmAirs::air_refs`] order and its roots.
+pub type PreparedRoots = (usize, Vec<multilinear::whir_commit::Commitment>);
+
+/// [`prove_block_whir`], calling `on_statement` as soon as the statement is
+/// final, so a caller can derive the recursion's programs while phase B runs.
+pub fn prove_block_whir_observed(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        &Deviations::default(),
+        on_statement,
+    )
+}
+
+fn prove_block_whir_inner(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    on_statement: StatementObserver<'_>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
@@ -622,6 +681,7 @@ pub(crate) fn prove_block_whir_with(
             format,
             options,
             deviations,
+            on_statement,
             &mut stamps,
         )?;
         return Ok((proof, stamps));
@@ -663,6 +723,7 @@ pub(crate) fn prove_block_whir_with(
         options,
         deviations,
         true,
+        on_statement,
         &mut stamps,
     )?;
     Ok((proof, stamps))
@@ -691,6 +752,7 @@ pub(crate) fn prove_traces(
     options: &BlockOptions,
     deviations: &Deviations,
     release_rows: bool,
+    on_statement: StatementObserver<'_>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
     let t = Instant::now();
@@ -801,6 +863,17 @@ pub(crate) fn prove_traces(
         stamps.phase_a = t.elapsed().as_secs_f64();
         let (prepared, derive) = prover_prepared::<H>(prepared_columns, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
+        on_statement(
+            BlockStatement {
+                table_num_vars: &table_num_vars,
+                runtime_page_ranges: &runtime_page_ranges,
+                table_counts: &table_counts,
+                public_output: &public_output,
+                num_private_input_pages,
+                groups: &groups,
+            },
+            &prepared_roots(&prepared),
+        );
         let positions = prepared_positions(&prepared, &groups)?;
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
@@ -1019,6 +1092,7 @@ fn prove_streamed(
     format: &BlockFormat,
     options: &BlockOptions,
     deviations: &Deviations,
+    on_statement: StatementObserver<'_>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
     let stream_airs = StreamAirs::new(opts);
@@ -1310,6 +1384,17 @@ fn prove_streamed(
         );
         let (prepared, derive) = prover_prepared::<H>(laid.prepared, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
+        on_statement(
+            BlockStatement {
+                table_num_vars: &table_num_vars,
+                runtime_page_ranges: &laid.runtime_page_ranges,
+                table_counts: &laid.table_counts,
+                public_output: &laid.public_output,
+                num_private_input_pages: laid.num_private_input_pages,
+                groups: &laid.groups,
+            },
+            &prepared_roots(&prepared),
+        );
         let positions = prepared_positions(&prepared, &laid.groups)?;
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
@@ -1412,6 +1497,44 @@ pub struct BlockStatement<'a> {
     pub public_output: &'a [u8],
     pub num_private_input_pages: usize,
     pub groups: &'a [Vec<u32>],
+}
+
+/// A [`BlockStatement`] owned: what a statement observer keeps
+/// ([`prove_block_whir_observed`]).
+#[derive(Clone, Debug)]
+pub struct OwnedBlockStatement {
+    pub table_num_vars: Vec<u8>,
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
+    pub table_counts: TableCounts,
+    pub public_output: Vec<u8>,
+    pub num_private_input_pages: usize,
+    pub groups: Vec<Vec<u32>>,
+}
+
+impl OwnedBlockStatement {
+    pub fn view(&self) -> BlockStatement<'_> {
+        BlockStatement {
+            table_num_vars: &self.table_num_vars,
+            runtime_page_ranges: &self.runtime_page_ranges,
+            table_counts: &self.table_counts,
+            public_output: &self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: &self.groups,
+        }
+    }
+}
+
+impl BlockStatement<'_> {
+    pub fn to_owned(&self) -> OwnedBlockStatement {
+        OwnedBlockStatement {
+            table_num_vars: self.table_num_vars.to_vec(),
+            runtime_page_ranges: self.runtime_page_ranges.to_vec(),
+            table_counts: self.table_counts.clone(),
+            public_output: self.public_output.to_vec(),
+            num_private_input_pages: self.num_private_input_pages,
+            groups: self.groups.to_vec(),
+        }
+    }
 }
 
 impl BlockWhirProof {

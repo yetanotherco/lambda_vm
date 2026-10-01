@@ -151,6 +151,7 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
             &o,
             &Deviations::default(),
             false,
+            &|_, _| {},
             &mut Default::default(),
         )
         .expect("prove");
