@@ -129,6 +129,27 @@ pub fn input_columns_trees() -> u64 {
     INPUT_COLUMNS_TREES.load(Ordering::Relaxed)
 }
 
+/// Tables whose factors were set up as base columns, with no lift
+/// (`LAMBDA_VM_ARGUE_NO_LIFT`).
+static COLUMN_FACTOR_TABLES: AtomicU64 = AtomicU64::new(0);
+
+pub fn column_factor_tables() -> u64 {
+    COLUMN_FACTOR_TABLES.load(Ordering::Relaxed)
+}
+
+/// Tables the no-lift path lifted after all: the fused rounds declined and
+/// today's rounds need the lifted factors.
+static LATE_LIFTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn late_lifts() -> u64 {
+    LATE_LIFTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_late_lift() {
+    LATE_LIFTS.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::LATE_LIFT);
+}
+
 /// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the stream's
 /// kernels so the tree's split charges each part its own card time.
 #[cfg(feature = "cuda")]
@@ -2118,6 +2139,50 @@ pub fn argue_gkr_input() -> bool {
 
 static ARGUE_GKR_INPUT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Whether a table's factors stay base columns on the card, with no lift
+/// (`LAMBDA_VM_ARGUE_NO_LIFT`; D-BATCH M1-2, its second half). The input layer
+/// is written from the columns ([`argue_gkr_input`], which this needs) and the
+/// fused zerocheck's first pass reads them where they lie, so the `W·rows·24 B`
+/// lift is made only when today's rounds need it. The same rounds and proof.
+/// Off by default until its A/B.
+pub fn argue_no_lift() -> bool {
+    let on = match ARGUE_NO_LIFT_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                let on = env_on("LAMBDA_VM_ARGUE_NO_LIFT");
+                eprintln!(
+                    "★ ARGUE NO LIFT: {}",
+                    if on {
+                        "on (LAMBDA_VM_ARGUE_NO_LIFT=1; with LAMBDA_VM_ARGUE_GKR_INPUT=1)"
+                    } else {
+                        "off (the factors are lifted, today's)"
+                    }
+                );
+                on
+            })
+        }
+    };
+    on && argue_gkr_input()
+}
+
+static ARGUE_NO_LIFT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_NO_LIFT` for the whole process; `None` restores it.
+#[doc(hidden)]
+pub fn force_argue_no_lift(on: Option<bool>) {
+    ARGUE_NO_LIFT_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Overrides `LAMBDA_VM_ARGUE_GKR_INPUT` for the whole process — for a test
 /// that proves both ways in one binary. `None` restores the environment's.
 #[doc(hidden)]
@@ -3302,6 +3367,121 @@ impl DeviceFactors {
     }
 }
 
+/// A table's factors as its base columns on the card, with no lift (D-BATCH
+/// M1-2, `LAMBDA_VM_ARGUE_NO_LIFT`): the fused zerocheck's rounds 0 and 1 read
+/// a committed factor where the epoch's columns reside, and a public one from a
+/// base copy. Keeps the columns alive for as long as it lives.
+#[cfg(feature = "cuda")]
+pub struct ColumnFactors {
+    inner: math_cuda::sumcheck::ColumnFactors,
+    _columns: std::sync::Arc<ResidentColumns>,
+}
+
+#[cfg(feature = "cuda")]
+impl ColumnFactors {
+    pub(crate) fn view(&self) -> math_cuda::sumcheck::FactorView<'_> {
+        self.inner.view()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for ColumnFactors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnFactors").finish()
+    }
+}
+
+/// Column factors a build cannot make. Never constructed.
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+pub struct ColumnFactors(std::convert::Infallible);
+
+/// The table's factors as [`ColumnFactors`], or `None` — then the caller lifts
+/// them as today. `None` unless every committed factor reads its column
+/// unshifted from a resident run (a cyclic shift is not an address), every
+/// public table is base-valued, and the device would take the lifted factors.
+#[cfg(feature = "cuda")]
+pub fn column_factors<F, E>(
+    columns: &[crate::mle::Mle<F>],
+    kinds: &[crate::constraint_argument::FactorKind],
+    public: &[crate::mle::Mle<E>],
+    resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
+) -> Option<ColumnFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let (store, first) = resident?;
+    let rows = columns.first()?.len();
+    if kinds.is_empty()
+        || !worth_the_device(kinds.len(), rows)
+        || !store.0.is_run(first, columns.len())
+    {
+        return None;
+    }
+    // A public table's base values, when nothing sits above them.
+    let mut public_base: Vec<Vec<u64>> = Vec::new();
+    for table in public {
+        let mut base = Vec::with_capacity(rows);
+        for value in table.evals() {
+            let [lo, hi1, hi2] = ext3_raw(value)?;
+            let canonical = ext3_raw(&math::field::element::FieldElement::<E>::from(lo))?;
+            if [lo, hi1, hi2] != canonical {
+                return None;
+            }
+            base.push(lo);
+        }
+        public_base.push(base);
+    }
+    let mut slots = Vec::with_capacity(kinds.len());
+    let mut next_public = 0usize;
+    for kind in kinds {
+        match kind.source() {
+            Some(source) if source.offset % rows == 0 && source.column < columns.len() => {
+                slots.push(math_cuda::sumcheck::ColumnSlot::Column(source.column));
+            }
+            Some(_) => return None,
+            None => {
+                slots.push(math_cuda::sumcheck::ColumnSlot::Public(
+                    public_base.get(next_public)?,
+                ));
+                next_public += 1;
+            }
+        }
+    }
+    let inner = {
+        let run = store.0.view(first, columns.len());
+        math_cuda::sumcheck::ColumnFactors::new(&run, rows, &slots).ok()?
+    };
+    COLUMN_FACTOR_TABLES.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::NO_LIFT);
+    Some(ColumnFactors {
+        inner,
+        _columns: store,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn column_factors<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _kinds: &[crate::constraint_argument::FactorKind],
+    _public: &[crate::mle::Mle<E>],
+    _resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
+) -> Option<ColumnFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 /// A table's factors, built on the device out of its base columns.
 ///
 /// A committed factor is a column read at a frame-step offset and lifted, so
@@ -3561,6 +3741,7 @@ pub fn input_layer_tree_from_columns(
     });
     let tree = input_layer_tree_impl(stream, rows, interactions, write, false)?;
     INPUT_COLUMNS_TREES.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::TREE_FROM_COLUMNS);
     Some(tree)
 }
 

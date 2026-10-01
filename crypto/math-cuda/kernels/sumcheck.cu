@@ -640,14 +640,16 @@ extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_fa
 #define NO_SELECTOR 0xFFFFFFFFu
 
 // A factor's value on the grid point `(a, b)` of group `x`, from its four rows
-// — base limbs of the lifted ext3 factor, whose upper limbs are zero before
-// the first fold (the base-field precondition). Bilinear, exact.
+// — base limbs of the lifted ext3 factor (`stride` 3), whose upper limbs are
+// zero before the first fold (the base-field precondition), or the base column
+// itself (`stride` 1, D-BATCH M1-2: no lift). Bilinear, exact.
 __device__ __forceinline__ uint64_t grid_value(const uint64_t *__restrict__ column, uint64_t x,
-                                               uint64_t q, uint64_t a, uint64_t b) {
-    uint64_t f00 = column[x * 3];
-    uint64_t f01 = column[(x + q) * 3];
-    uint64_t f10 = column[(x + 2 * q) * 3];
-    uint64_t f11 = column[(x + 3 * q) * 3];
+                                               uint64_t q, uint64_t a, uint64_t b,
+                                               uint64_t stride) {
+    uint64_t f00 = column[x * stride];
+    uint64_t f01 = column[(x + q) * stride];
+    uint64_t f10 = column[(x + 2 * q) * stride];
+    uint64_t f11 = column[(x + 3 * q) * stride];
     uint64_t da = goldilocks::sub(f10, f00);
     uint64_t db = goldilocks::sub(f01, f00);
     uint64_t dab = goldilocks::sub(goldilocks::sub(f11, f10), db);
@@ -672,7 +674,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_grid01(
     const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
     const uint64_t *__restrict__ d_points, const uint64_t *__restrict__ d_eq_r,
     uint64_t *__restrict__ d_slots, uint64_t *__restrict__ d_partials,
-    unsigned long long *__restrict__ d_violation, uint32_t keep_corners) {
+    unsigned long long *__restrict__ d_violation, uint32_t keep_corners, uint64_t stride) {
     uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
     uint64_t num_threads = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
     uint64_t *slots = d_slots + tid;
@@ -690,7 +692,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_grid01(
             uint64_t *out = slots + (uint64_t)nd.res * num_threads;
             switch (nd.op) {
             case OP_VAR:
-                *out = grid_value(d_factors[nd.a], x, q, a, b);
+                *out = grid_value(d_factors[nd.a], x, q, a, b, stride);
                 break;
             case OP_FIXED:
                 *out = d_consts[nd.a];
@@ -713,7 +715,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_grid01(
             case OP_ACC: {
                 uint64_t v = slots[(uint64_t)nd.a * num_threads];
                 if (nd.b != NO_SELECTOR) {
-                    v = goldilocks::mul(v, grid_value(d_factors[nd.b], x, q, a, b));
+                    v = goldilocks::mul(v, grid_value(d_factors[nd.b], x, q, a, b, stride));
                 }
                 c = ext3::add(c, ext3::mul_base(load_ext(d_betas + (uint64_t)nd.res * 3), v));
                 break;
@@ -762,7 +764,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_bus_u(
     const uint64_t *const *__restrict__ d_factors, uint64_t q,
     const uint32_t *__restrict__ d_term_slots, const uint64_t *__restrict__ d_term_coeffs,
     uint64_t num_terms, const uint64_t *__restrict__ d_constant,
-    const uint64_t *__restrict__ d_eq_rho, uint64_t *__restrict__ d_partials) {
+    const uint64_t *__restrict__ d_eq_rho, uint64_t *__restrict__ d_partials, uint64_t stride) {
     Fe3 u[4] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
     Fe3 a0 = load_ext(d_constant);
     for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < q;
@@ -772,7 +774,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_bus_u(
             const uint64_t *column = d_factors[d_term_slots[k]];
             Fe3 coeff = load_ext(d_term_coeffs + k * 3);
             for (uint32_t bc = 0; bc < 4; bc++) {
-                l[bc] = ext3::add(l[bc], ext3::mul_base(coeff, column[(x + bc * q) * 3]));
+                l[bc] = ext3::add(l[bc], ext3::mul_base(coeff, column[(x + bc * q) * stride]));
             }
         }
         Fe3 w = load_ext(d_eq_rho + x * 3);
@@ -811,7 +813,7 @@ extern "C" __global__ __launch_bounds__(256) void zc_bus_u(
 // One thread per (factor, group).
 extern "C" __global__ void zc_fold2(const uint64_t *const *__restrict__ d_factors, uint64_t q,
                                     uint64_t width, const uint64_t *__restrict__ d_w,
-                                    uint64_t *__restrict__ out) {
+                                    uint64_t *__restrict__ out, uint64_t stride) {
     Fe3 w0 = load_ext(d_w), w1 = load_ext(d_w + 3), w2 = load_ext(d_w + 6),
         w3 = load_ext(d_w + 9);
     uint64_t total = width * q;
@@ -820,10 +822,10 @@ extern "C" __global__ void zc_fold2(const uint64_t *const *__restrict__ d_factor
         uint64_t k = task / q;
         uint64_t x = task - k * q;
         const uint64_t *column = d_factors[k];
-        Fe3 v = ext3::mul_base(w0, column[x * 3]);
-        v = ext3::add(v, ext3::mul_base(w1, column[(x + q) * 3]));
-        v = ext3::add(v, ext3::mul_base(w2, column[(x + 2 * q) * 3]));
-        v = ext3::add(v, ext3::mul_base(w3, column[(x + 3 * q) * 3]));
+        Fe3 v = ext3::mul_base(w0, column[x * stride]);
+        v = ext3::add(v, ext3::mul_base(w1, column[(x + q) * stride]));
+        v = ext3::add(v, ext3::mul_base(w2, column[(x + 2 * q) * stride]));
+        v = ext3::add(v, ext3::mul_base(w3, column[(x + 3 * q) * stride]));
         uint64_t *at = out + task * 3;
         at[0] = v.a;
         at[1] = v.b;

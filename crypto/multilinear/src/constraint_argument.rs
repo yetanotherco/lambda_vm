@@ -186,6 +186,17 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
+    /// The table's factors as its resident base columns, with no lift
+    /// ([`crate::gpu::column_factors`]), or `None`.
+    pub fn column_factors(&self) -> Option<crate::gpu::ColumnFactors> {
+        crate::gpu::column_factors(
+            &self.columns,
+            &self.kinds,
+            &self.public,
+            self.resident_shared(),
+        )
+    }
+
     /// The same, shared: for a device tree that writes its input layer again
     /// from the columns after this borrow is gone.
     pub fn resident_shared(&self) -> Option<(std::sync::Arc<crate::gpu::ResidentColumns>, usize)> {
@@ -622,9 +633,12 @@ where
     // down.
     let resident = trace.device_factors();
     let t = crate::whir_split::tick();
-    let (sumcheck, point, bound) = batch::prove_resident_with(
+    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`) the factors are lifted here
+    // only if today's rounds need them.
+    let (sumcheck, point, bound) = batch::prove_resident_lazy(
         weights,
         resident,
+        || trace.reside_from_columns(),
         || trace.factors(),
         rules,
         claims,

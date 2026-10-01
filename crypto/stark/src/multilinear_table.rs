@@ -1078,7 +1078,17 @@ where
     // Under `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) the input layer is
     // written from the resident base columns; the factors are still lifted, for
     // the zerocheck.
+    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`, M1-2's second half) a tree written
+    // from the columns needs no factors at all: they are lifted later only if
+    // the zerocheck needs them.
+    let no_lift = multilinear::gpu::argue_no_lift();
     let resident_tree = || {
+        if no_lift
+            && table.trace.device_factors().is_none()
+            && let Some(tree) = logup::resident_tree_from_columns(&interactions, &table.trace)
+        {
+            return Some(tree);
+        }
         let lift = tick();
         let resident = table.trace.reside_from_columns();
         if let Some(factors) = resident.as_ref() {
@@ -1155,6 +1165,20 @@ where
         .ok()
     })
     .flatten();
+    // With no lift, the fused rounds read the base columns; a table they cannot
+    // read that way (a shifted factor, a public table above the base field, no
+    // fused description) is lifted here, as it would have been.
+    let column_factors = if no_lift && table.trace.device_factors().is_none() {
+        let made = constraints
+            .as_ref()
+            .and_then(|_| table.trace.column_factors());
+        if made.is_none() {
+            let _ = table.trace.reside_from_columns();
+        }
+        made
+    } else {
+        None
+    };
     let fused = constraints
         .as_ref()
         .map(|constraints| multilinear::gpu_fused::FusedInput {
@@ -1163,6 +1187,7 @@ where
             interactions: &interactions,
             claim_point: &gkr_out.claim.point,
             r: &r,
+            columns: column_factors.as_ref(),
         });
     lap(&split::REST_SETUP, t);
     let t = tick();
@@ -2489,6 +2514,8 @@ mod tests {
         gruen: u64,
         /// Fraction trees whose input layer was written from the base columns.
         input: u64,
+        /// Tables whose zerocheck read the base columns with no lift.
+        nolift: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
@@ -2512,6 +2539,7 @@ mod tests {
         fused: bool,
         gruen: bool,
         input: bool,
+        nolift: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2523,6 +2551,7 @@ mod tests {
         fused: false,
         gruen: false,
         input: false,
+        nolift: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2560,9 +2589,11 @@ mod tests {
         math_cuda::sumcheck::force_int_nodes(Some(knobs.fused));
         multilinear::gkr_gruen::force_argue_gkr_gruen(Some(knobs.gruen));
         multilinear::gpu::force_argue_gkr_input(Some(knobs.input));
+        multilinear::gpu::force_argue_no_lift(Some(knobs.nolift));
         let fused = multilinear::gpu_fused::fused_sessions();
         let gruen = multilinear::gkr_gruen::gruen_layers();
         let input = multilinear::gpu::input_columns_trees();
+        let nolift = multilinear::gpu::column_factor_tables();
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2592,9 +2623,11 @@ mod tests {
             fused: multilinear::gpu_fused::fused_sessions() - fused,
             gruen: multilinear::gkr_gruen::gruen_layers() - gruen,
             input: multilinear::gpu::input_columns_trees() - input,
+            nolift: multilinear::gpu::column_factor_tables() - nolift,
         });
         multilinear::gkr_gruen::force_argue_gkr_gruen(None);
         multilinear::gpu::force_argue_gkr_input(None);
+        multilinear::gpu::force_argue_no_lift(None);
         multilinear::gpu_fused::force_argue_fused(None);
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(None);
@@ -3804,6 +3837,14 @@ mod tests {
                     ..production
                 },
             ),
+            (
+                production,
+                Knobs {
+                    input: true,
+                    nolift: true,
+                    ..production
+                },
+            ),
         ] {
             let mut today = prove_tall(&airs, &columns, base);
             verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
@@ -3816,9 +3857,15 @@ mod tests {
                     got.input > 0,
                     "{arm:?}: the trees were written from the columns"
                 );
+                if arm.nolift {
+                    assert!(
+                        got.nolift > 0,
+                        "{arm:?}: the zerocheck read the columns, no lift"
+                    );
+                }
                 eprintln!(
-                    "argue gkr input: {arm:?}: {} trees from the columns",
-                    got.input
+                    "argue gkr input: {arm:?}: {} trees from the columns, {} tables with no lift",
+                    got.input, got.nolift
                 );
             } else {
                 assert_eq!(got.input, 0, "{arm:?}: no device, no tree from the columns");
@@ -3979,6 +4026,7 @@ mod tests {
             fused: false,
             gruen: false,
             input: false,
+            nolift: false,
         };
         for knobs in [
             Knobs {

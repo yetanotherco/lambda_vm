@@ -550,6 +550,13 @@ pub static TREE_WRITE: Slot = Slot::new();
 pub static TREE_FOLD: Slot = Slot::new();
 /// The output fraction read back.
 pub static TREE_OUTPUT: Slot = Slot::new();
+/// Trees whose input layer was written from the base columns
+/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+pub static TREE_FROM_COLUMNS: Counter = Counter::new();
+/// Tables whose factors stayed base columns, with no lift
+/// (`LAMBDA_VM_ARGUE_NO_LIFT`), and of them the ones lifted after all.
+pub static NO_LIFT: Counter = Counter::new();
+pub static LATE_LIFT: Counter = Counter::new();
 
 /// Whether the tree's parts wait for their own kernels
 /// (`LAMBDA_VM_ARGUE_TREE_SYNC`, with the split on): a diagnostic.
@@ -569,6 +576,9 @@ pub struct TreeSplit {
     pub write: f64,
     pub fold: f64,
     pub output: f64,
+    pub from_columns: u64,
+    pub no_lift: u64,
+    pub late_lift: u64,
 }
 
 impl TreeSplit {
@@ -579,6 +589,9 @@ impl TreeSplit {
             write: TREE_WRITE.take(),
             fold: TREE_FOLD.take(),
             output: TREE_OUTPUT.take(),
+            from_columns: TREE_FROM_COLUMNS.take(),
+            no_lift: NO_LIFT.take(),
+            late_lift: LATE_LIFT.take(),
         }
     }
 }
@@ -1353,7 +1366,8 @@ impl ProverSplit {
         let ms = |secs: f64| secs * 1e3;
         format!(
             "ARGUE TREE {who}{tainted}: lift {lift:.2} · write {write:.2} (lower {lower:.2}) · fold \
-             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || sync {sync}",
+             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || sync {sync} || from the \
+             columns {from_columns} · no lift {no_lift} (late {late_lift})",
             who = self.who(),
             tainted = if self.overlapped {
                 " ⛔OVERLAPPED"
@@ -1367,6 +1381,9 @@ impl ProverSplit {
             output = ms(t.output),
             tree = ms(self.rest.tree),
             sync = if self.tree_sync { "on" } else { "off" },
+            from_columns = t.from_columns,
+            no_lift = t.no_lift,
+            late_lift = t.late_lift,
         )
     }
 
@@ -2246,13 +2263,14 @@ mod tests {
                 write: 0.050,
                 fold: 0.040,
                 output: 0.001,
+                ..Default::default()
             },
             ..Default::default()
         };
         assert_eq!(
             epoch.tree_line(),
             "ARGUE TREE #3: lift 10.00 · write 50.00 (lower 20.00) · fold 40.00 · output 1.00 · of \
-             tree 120.00 (ms) || sync off"
+             tree 120.00 (ms) || sync off || from the columns 0 · no lift 0 (late 0)"
         );
     }
 
