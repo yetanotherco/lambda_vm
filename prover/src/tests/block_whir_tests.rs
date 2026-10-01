@@ -571,16 +571,6 @@ fn prepared_of(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> Vec<
         .collect()
 }
 
-/// `proof.prepared`'s index of the opening at proof position `position`.
-fn opening_index(prepared: &[(usize, usize)], position: usize) -> usize {
-    let mut positions: Vec<usize> = prepared.iter().map(|&(_, p)| p).collect();
-    positions.sort_unstable();
-    positions
-        .iter()
-        .position(|&p| p == position)
-        .expect("a prepared position")
-}
-
 fn verify_skipping_prepared(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {
     block_whir::verify_block_whir_with(
         proof,
@@ -592,106 +582,111 @@ fn verify_skipping_prepared(proof: &BlockWhirProof, elf: &[u8], format: &BlockFo
     .unwrap_or(false)
 }
 
-fn dense_block(deviations: &Deviations) -> (Vec<u8>, BlockWhirProof) {
+fn dense_block_in(format: &BlockFormat, deviations: &Deviations) -> (Vec<u8>, BlockWhirProof) {
     let elf = asm_elf_bytes("test_dense_pages");
     let proof = prove_with(
         &elf,
-        &one_group(),
+        format,
         &options(MaxRowsConfig::default(), 16),
         deviations,
     );
     (elf, proof)
 }
 
+fn dense_block(deviations: &Deviations) -> (Vec<u8>, BlockWhirProof) {
+    dense_block_in(&one_group(), deviations)
+}
+
+/// The group holding AIR table `table` in `proof`'s partition.
+fn group_of(proof: &BlockWhirProof, table: usize) -> usize {
+    proof
+        .groups
+        .iter()
+        .position(|g| g.contains(&(table as u32)))
+        .expect("in a group")
+}
+
 /// The fixture is what the negatives below need: DECODE and at least two dense
-/// genesis pages prepared, and an honest proof of it verifies.
+/// genesis pages prepared, one stack a group that holds any, and an honest
+/// proof of it verifies.
 #[test]
 fn the_dense_fixture_prepares_decode_and_two_pages() {
     let (elf, proof) = dense_block(&Deviations::default());
     let prepared = prepared_of(&elf, &proof, &one_group());
     assert!(prepared.len() >= 3, "DECODE and two pages: {prepared:?}");
-    assert_eq!(proof.prepared.len(), prepared.len());
+    let mut groups: Vec<usize> = prepared.iter().map(|&(t, _)| group_of(&proof, t)).collect();
+    groups.dedup();
+    assert_eq!(proof.prepared.len(), groups.len(), "one opening a group");
     assert!(verify(&proof, &elf, &one_group()));
 }
 
-/// Two pages' openings swapped in the proof: each now opens against the other
-/// page's derived root at the wrong point, and is refused. With the openings
-/// left unchecked (the mutation) the swap verifies: the openings are what
-/// refuse it.
+/// Two groups' prepared openings swapped in the proof: each opens against the
+/// other group's derived roots, and is refused. With the openings left
+/// unchecked (the mutation) the swap verifies: the openings are what refuse it.
 #[test]
-fn a_swapped_page_opening_is_refused() {
-    let (elf, mut proof) = dense_block(&Deviations::default());
-    let prepared = prepared_of(&elf, &proof, &one_group());
-    let (a, b) = (
-        opening_index(&prepared, prepared[1].1),
-        opening_index(&prepared, prepared[2].1),
-    );
-    proof.prepared.swap(a, b);
-    assert!(!verify(&proof, &elf, &one_group()));
-    assert!(verify_skipping_prepared(&proof, &elf, &one_group()));
+fn two_groups_prepared_openings_swapped_are_refused() {
+    let format = many_groups();
+    let (elf, mut proof) = dense_block_in(&format, &Deviations::default());
+    assert!(proof.prepared.len() >= 2, "{} stacks", proof.prepared.len());
+    assert!(verify(&proof, &elf, &format));
+    proof.prepared.swap(0, 1);
+    assert!(!verify(&proof, &elf, &format));
+    assert!(verify_skipping_prepared(&proof, &elf, &format));
 }
 
-/// A page opened at another table's point (one of its height, in its group) —
-/// a valid opening of its own commitment, of the wrong claim — is refused; the
-/// mutation admits it.
+/// A page's block opened at another table's point (a table of its group and its
+/// height) — a valid opening of its own stack, of the wrong claim — is refused;
+/// the mutation admits it.
 #[test]
 fn a_page_opened_at_another_tables_point_is_refused() {
     let (elf, honest) = dense_block(&Deviations::default());
     let prepared = prepared_of(&elf, &honest, &one_group());
     let page = prepared[1].0;
-    // Another table of the page's group at the page's height, so the point
-    // has the commitment's variable count.
     let height = honest.table_num_vars[page];
-    let other = honest
-        .groups
+    let other = honest.groups[group_of(&honest, page)]
         .iter()
-        .find(|g| g.contains(&(page as u32)))
-        .and_then(|g| {
-            g.iter()
-                .map(|&t| t as usize)
-                .find(|&t| t != page && honest.table_num_vars[t] == height)
-        })
+        .map(|&t| t as usize)
+        .find(|&t| t != page && honest.table_num_vars[t] == height)
         .expect("the page shares its group with a table of its height");
     let (_, wrong) = dense_block(&Deviations {
-        prepared_openings: vec![block_whir::PreparedTamper {
-            open: 1,
-            at_table: Some(other),
-            with: None,
-        }],
+        prepared_points: vec![(page, other)],
         ..Default::default()
     });
     assert!(!verify(&wrong, &elf, &one_group()));
     assert!(verify_skipping_prepared(&wrong, &elf, &one_group()));
 }
 
-/// A page opened against the other page's commitment — a valid opening of that
-/// commitment at this page's point — is refused; the mutation admits it.
+/// Stacks committed wrongly — two pages' blocks swapped in their stack, a page's
+/// block holding the other page's columns, DECODE's block another program's —
+/// each opened consistently: refused at the roots block, since the verifier
+/// absorbs the stacks it derives from the program and the partition, so even
+/// with the openings unchecked. (The leaf's form, whose mutation trusts the
+/// prover's roots, is in `lfm::whir_block_tests`.)
 #[test]
-fn a_page_opened_against_another_pages_commitment_is_refused() {
-    let (elf, wrong) = dense_block(&Deviations {
-        prepared_openings: vec![block_whir::PreparedTamper {
-            open: 1,
-            at_table: None,
-            with: Some(2),
-        }],
+fn a_wrongly_committed_prepared_stack_is_refused() {
+    use crate::block_whir::StackTamper;
+    let (elf, honest) = dense_block(&Deviations::default());
+    let prepared = prepared_of(&elf, &honest, &one_group());
+    let (a, b) = (prepared[1].0, prepared[2].0);
+    let mut tampers = vec![Deviations {
+        prepared_stack: vec![StackTamper::ColumnsOf { table: a, from: b }],
         ..Default::default()
-    });
-    assert!(!verify(&wrong, &elf, &one_group()));
-    assert!(verify_skipping_prepared(&wrong, &elf, &one_group()));
-}
-
-/// A prover that commits DECODE's prepared columns for another program is
-/// refused at the roots block: the verifier absorbs the root it derives itself,
-/// so even with the openings unchecked the transcripts part. (The leaf's form
-/// of this negative, with its mutation, is in `lfm::whir_block_tests`.)
-#[test]
-fn a_tampered_decode_prepared_root_is_refused() {
-    let (elf, wrong) = dense_block(&Deviations {
+    }];
+    if group_of(&honest, a) == group_of(&honest, b) {
+        tampers.push(Deviations {
+            prepared_stack: vec![StackTamper::Swap(a, b)],
+            ..Default::default()
+        });
+    }
+    tampers.push(Deviations {
         other_prepared: true,
         ..Default::default()
     });
-    assert!(!verify(&wrong, &elf, &one_group()));
-    assert!(!verify_skipping_prepared(&wrong, &elf, &one_group()));
+    for deviations in &tampers {
+        let (_, wrong) = dense_block(deviations);
+        assert!(!verify(&wrong, &elf, &one_group()));
+        assert!(!verify_skipping_prepared(&wrong, &elf, &one_group()));
+    }
 }
 
 /// With the openings off (`BlockFormat::prepared`, the measurement arm) the

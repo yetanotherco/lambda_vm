@@ -15,9 +15,10 @@
 //! balance is checked once, over every table of the block.
 //!
 //! The columns an in-guest verifier cannot evaluate — DECODE's, and the dense
-//! genesis pages' — are settled by PREPARED openings ([`prepared_tables`]):
-//! commitments both sides derive from the program, absorbed after the groups'
-//! roots and opened on the table's group fork, as an epoch settles DECODE.
+//! genesis pages' — are settled by PREPARED openings ([`prepared_tables`]): one
+//! stack a group, which both sides derive from the program and the partition,
+//! absorbed after the groups' roots and opened on the group's fork, as an epoch
+//! settles DECODE.
 //!
 //! ★ #1010's epoch pipeline is untouched: this is a separate entry point with a
 //! statement tag of its own ([`statement::MULTILINEAR_BLOCK_TAG`]).
@@ -161,8 +162,8 @@ pub struct BlockWhirProof {
     /// each group's stack from it under its own stack cap. The proof's tables
     /// are in this order.
     pub groups: Vec<Vec<u32>>,
-    /// The prepared openings ([`prepared_tables`]), one per prepared table, in
-    /// the proof's table order.
+    /// The prepared openings ([`group_stacks`]), one per group that holds a
+    /// prepared table, in group order.
     pub prepared: Vec<multilinear::stacked_eval::StackedProof<F, E>>,
 }
 
@@ -426,16 +427,85 @@ fn table_of<'a>(
 /// opening settles.
 pub(crate) type PreparedColumns = (usize, Vec<Vec<FieldElement<F>>>);
 
-/// One table's PREPARED commitment ([`multilinear_block::BlockPrepared`]): its
-/// leading preprocessed columns, committed under the block's parameters. Both
-/// sides derive it from the program — the prover opens it, the verifier absorbs
-/// its roots and checks the opening — and no proof carries it.
-pub(crate) struct TablePrepared<H: multilinear::whir_hash::WhirHash> {
-    /// The table's index in [`VmAirs::air_refs`] order.
-    pub(crate) table: usize,
+/// One group's PREPARED commitment ([`multilinear_block::BlockPrepared`]): the
+/// leading preprocessed columns of the group's prepared tables, stacked in the
+/// group's order and committed under the block's parameters. Both sides derive
+/// it from the program and the partition — the prover opens it, the verifier
+/// absorbs its roots and checks the opening — and no proof carries it.
+pub(crate) struct GroupPrepared<H: multilinear::whir_hash::WhirHash> {
+    pub(crate) group: usize,
+    /// `(position in the proof's table order, prefix length)`, in stack order.
+    pub(crate) tables: Vec<(usize, usize)>,
     pub(crate) columns: Vec<Mle<F>>,
     pub(crate) roots: Vec<multilinear::whir_commit::Commitment>,
     pub(crate) commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+}
+
+/// One group's prepared stack before its commitment: which tables, and their
+/// prefixes' columns concatenated in the group's order.
+pub(crate) struct GroupStack {
+    pub(crate) group: usize,
+    /// `(position in the proof's table order, AIR index, prefix length)`.
+    pub(crate) tables: Vec<(usize, usize, usize)>,
+    pub(crate) columns: Vec<Vec<FieldElement<F>>>,
+}
+
+impl GroupStack {
+    /// The stack's shapes, one `(columns, variables)` per table: what its layout
+    /// is built from.
+    pub(crate) fn shapes(&self) -> Vec<(usize, usize)> {
+        let mut at = 0usize;
+        self.tables
+            .iter()
+            .map(|&(_, _, n)| {
+                let vars = self.columns[at].len().trailing_zeros() as usize;
+                at += n;
+                (n, vars)
+            })
+            .collect()
+    }
+}
+
+/// The groups' prepared stacks, in group order: each group's prepared tables
+/// ([`prepared_tables`]) in the group's table order. A pure function of the
+/// prepared set and the partition — what both sides commit.
+pub(crate) fn group_stacks(
+    prepared: Vec<PreparedColumns>,
+    groups: &[Vec<u32>],
+) -> Result<Vec<GroupStack>, Error> {
+    let mut by_table: Vec<Option<Vec<Vec<FieldElement<F>>>>> = Vec::new();
+    for (table, columns) in prepared {
+        if by_table.len() <= table {
+            by_table.resize_with(table + 1, || None);
+        }
+        by_table[table] = Some(columns);
+    }
+    let mut stacks = Vec::new();
+    let mut position = 0usize;
+    for (g, group) in groups.iter().enumerate() {
+        let mut stack = GroupStack {
+            group: g,
+            tables: Vec::new(),
+            columns: Vec::new(),
+        };
+        for &table in group {
+            let table = table as usize;
+            if let Some(columns) = by_table.get_mut(table).and_then(Option::take) {
+                stack.tables.push((position, table, columns.len()));
+                stack.columns.extend(columns);
+            }
+            position += 1;
+        }
+        if !stack.tables.is_empty() {
+            stacks.push(stack);
+        }
+    }
+    if let Some(table) = by_table.iter().position(Option::is_some) {
+        return Err(Error::Prover(format!(
+            "prepared table {table} is in no group"
+        )));
+    }
+    Ok(stacks)
 }
 
 /// The tables a block opens out of band, in [`VmAirs::air_refs`] order, with
@@ -502,95 +572,173 @@ pub(crate) fn first_page_index(airs: &VmAirs) -> Result<usize, Error> {
     }
 }
 
-/// Commits one prepared table's columns under `config`.
-pub(crate) fn commit_prepared<H: multilinear::whir_hash::WhirHash>(
-    table: usize,
-    columns: Vec<Vec<FieldElement<F>>>,
+/// Commits one group's prepared stack under `config`.
+pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
+    stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
-) -> Result<TablePrepared<H>, Error> {
-    let columns: Vec<Mle<F>> = columns
+) -> Result<GroupPrepared<H>, Error> {
+    let shapes = stack.shapes();
+    let group = stack.group;
+    let columns: Vec<Mle<F>> = stack
+        .columns
         .into_iter()
-        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("table {table}: {e:?}"))))
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("group {group}: {e:?}"))))
         .collect::<Result<_, _>>()?;
-    let num_vars = columns
-        .first()
-        .ok_or_else(|| Error::Prover(format!("table {table} has no prepared column")))?
-        .num_vars();
-    if columns.iter().any(|c| c.num_vars() != num_vars) {
-        return Err(Error::Prover(format!(
-            "table {table}: prepared columns of different heights"
-        )));
-    }
-    let layout =
-        stark::multilinear_table::global_layout(&[(columns.len(), num_vars)], config.format.stack)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
         None,
         config,
     )
-    .map_err(|e| Error::Prover(format!("table {table}: {e:?}")))?;
+    .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
     let roots = commitment.roots();
-    Ok(TablePrepared {
-        table,
+    Ok(GroupPrepared {
+        group,
+        tables: stack.tables.iter().map(|&(p, _, n)| (p, n)).collect(),
         columns,
         roots,
         commitment,
     })
 }
 
-/// The prepared commitments' roots by table, in their order.
-fn prepared_roots<H: multilinear::whir_hash::WhirHash>(
-    prepared: &[TablePrepared<H>],
-) -> Vec<PreparedRoots> {
-    prepared
-        .iter()
-        .map(|p| (p.table, p.roots.clone()))
+/// Every group's prepared commitment, in group order.
+pub(crate) fn commit_groups<H: multilinear::whir_hash::WhirHash>(
+    stacks: Vec<GroupStack>,
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<Vec<GroupPrepared<H>>, Error> {
+    stacks
+        .into_iter()
+        .map(|stack| commit_group::<H>(stack, config))
         .collect()
 }
 
-/// Each prepared table's position in the proof's table order (the groups
-/// concatenated), with its index in `prepared`, sorted by position.
-pub(crate) fn prepared_positions<H: multilinear::whir_hash::WhirHash>(
-    prepared: &[TablePrepared<H>],
-    groups: &[Vec<u32>],
-) -> Result<Vec<(usize, usize)>, Error> {
-    let mut out = prepared
+/// The prepared commitments' roots by group, in group order.
+fn prepared_roots<H: multilinear::whir_hash::WhirHash>(
+    prepared: &[GroupPrepared<H>],
+) -> Vec<PreparedRoots> {
+    prepared
         .iter()
-        .enumerate()
-        .map(|(k, p)| {
-            groups
-                .iter()
-                .flatten()
-                .position(|&t| t as usize == p.table)
-                .map(|position| (position, k))
-                .ok_or_else(|| Error::Prover(format!("prepared table {} is in no group", p.table)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    out.sort_unstable();
-    Ok(out)
+        .map(|p| (p.group, p.roots.clone()))
+        .collect()
 }
 
-/// The prover's prepared commitments over `columns` ([`prepared_tables`]),
-/// with the deviation applied, and the seconds they took.
+/// The prover's prepared commitments over `columns` ([`prepared_tables`]) for
+/// the partition `groups`, the deviations applied, the deviations in the block
+/// prover's terms, and the seconds they took.
+#[allow(clippy::type_complexity)]
 fn prover_prepared<H: multilinear::whir_hash::WhirHash>(
     columns: Vec<PreparedColumns>,
+    groups: &[Vec<u32>],
     config: &multilinear::whir_chain::ChainConfig,
     deviations: &Deviations,
-) -> Result<(Vec<TablePrepared<H>>, f64), Error> {
+) -> Result<
+    (
+        Vec<GroupPrepared<H>>,
+        Vec<multilinear_block::PreparedDeviation>,
+        f64,
+    ),
+    Error,
+> {
     let t = Instant::now();
-    let prepared = columns
-        .into_iter()
-        .enumerate()
-        .map(|(k, (table, mut columns))| {
-            if k == 0 && deviations.other_prepared {
-                columns[0][0] += FieldElement::<F>::one();
+    let originals: Vec<PreparedColumns> = if deviations.prepared_stack.is_empty() {
+        Vec::new()
+    } else {
+        columns.clone()
+    };
+    let mut stacks = group_stacks(columns, groups)?;
+    let mut touched: Vec<usize> = Vec::new();
+    // Where table `air`'s block sits: its stack, and its columns' range there.
+    let block_of = |stacks: &[GroupStack], air: usize| -> Option<(usize, std::ops::Range<usize>)> {
+        stacks.iter().enumerate().find_map(|(k, stack)| {
+            let mut at = 0usize;
+            for &(_, table, n) in &stack.tables {
+                if table == air {
+                    return Some((k, at..at + n));
+                }
+                at += n;
             }
-            commit_prepared::<H>(table, columns, config)
+            None
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((prepared, t.elapsed().as_secs_f64()))
+    };
+    if deviations.other_prepared
+        && let Some(stack) = stacks.first_mut()
+    {
+        stack.columns[0][0] += FieldElement::<F>::one();
+        touched.push(stack.group);
+    }
+    for tamper in &deviations.prepared_stack {
+        match *tamper {
+            StackTamper::Swap(a, b) => {
+                let (ka, ra) = block_of(&stacks, a)
+                    .ok_or_else(|| Error::Prover(format!("{a} is not prepared")))?;
+                let (kb, rb) = block_of(&stacks, b)
+                    .ok_or_else(|| Error::Prover(format!("{b} is not prepared")))?;
+                if ka != kb || ra.len() != rb.len() {
+                    return Err(Error::Prover(
+                        "a swap within one stack, of equal blocks".into(),
+                    ));
+                }
+                for (i, j) in ra.zip(rb) {
+                    stacks[ka].columns.swap(i, j);
+                }
+                touched.push(stacks[ka].group);
+            }
+            StackTamper::ColumnsOf { table, from } => {
+                let (k, range) = block_of(&stacks, table)
+                    .ok_or_else(|| Error::Prover(format!("{table} is not prepared")))?;
+                let source = &originals
+                    .iter()
+                    .find(|(t, _)| *t == from)
+                    .ok_or_else(|| Error::Prover(format!("{from} is not prepared")))?
+                    .1;
+                if source.len() != range.len() {
+                    return Err(Error::Prover("blocks of different widths".into()));
+                }
+                for (i, column) in range.zip(source) {
+                    stacks[k].columns[i] = column.clone();
+                }
+                touched.push(stacks[k].group);
+            }
+        }
+    }
+    let position_of = |air: usize| {
+        groups
+            .iter()
+            .flatten()
+            .position(|&t| t as usize == air)
+            .ok_or_else(|| Error::Prover(format!("table {air} is in no group")))
+    };
+    let mut points: Vec<(usize, (usize, usize))> = Vec::new();
+    for &(table, other) in &deviations.prepared_points {
+        let (k, _) = block_of(&stacks, table)
+            .ok_or_else(|| Error::Prover(format!("{table} is not prepared")))?;
+        points.push((stacks[k].group, (position_of(table)?, position_of(other)?)));
+        touched.push(stacks[k].group);
+    }
+    let prepared = commit_groups::<H>(stacks, config)?;
+    touched.sort_unstable();
+    touched.dedup();
+    let tampered = touched
+        .into_iter()
+        .map(|group| {
+            let open = prepared
+                .iter()
+                .position(|p| p.group == group)
+                .expect("a touched group holds a stack");
+            multilinear_block::PreparedDeviation {
+                open,
+                at_point_of: points
+                    .iter()
+                    .filter(|(g, _)| *g == group)
+                    .map(|&(_, pair)| pair)
+                    .collect(),
+                consistent: true,
+            }
+        })
+        .collect();
+    Ok((prepared, tampered, t.elapsed().as_secs_f64()))
 }
 
 /// Proves a block in one proof.
@@ -622,59 +770,26 @@ pub(crate) struct Deviations {
     pub omit_first_keccak_rnd: bool,
     /// Prove group `g` on the fork of this index instead of `g`.
     pub fork_of: Option<fn(usize) -> usize>,
-    /// Commit and open the first prepared table over columns that differ from
-    /// the program's in one entry, as a prover of another program would.
+    /// Commit the first prepared stack over columns that differ from the
+    /// program's in one entry (DECODE's, the first prepared table), as a prover
+    /// of another program would, and open it consistently.
     pub other_prepared: bool,
-    /// Open prepared tables wrongly ([`PreparedTamper`]).
-    pub prepared_openings: Vec<PreparedTamper>,
+    /// Commit the prepared stacks wrongly ([`StackTamper`]), opening each
+    /// consistently.
+    pub prepared_stack: Vec<StackTamper>,
+    /// `(table, other)`, AIR indices: open `table`'s prepared block at `other`'s
+    /// point (a table of its group and its height), consistently.
+    pub prepared_points: Vec<(usize, usize)>,
 }
 
-/// One prepared opening made wrongly, every index in AIR order: open prepared
-/// table `open` (its index in [`prepared_tables`]' list) at table `at_table`'s
-/// point, and/or with prepared table `with`'s commitment. Each such opening is
-/// internally consistent (the columns opened, evaluated at the point opened),
-/// so only the verifier's binding of the opening to its table refuses it.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct PreparedTamper {
-    pub open: usize,
-    pub at_table: Option<usize>,
-    pub with: Option<usize>,
-}
-
-/// [`PreparedTamper`]s in the block prover's terms: the openings and the tables
-/// by their positions in the proof's table order.
-fn prepared_deviations<H: multilinear::whir_hash::WhirHash>(
-    tampers: &[PreparedTamper],
-    prepared: &[TablePrepared<H>],
-    positions: &[(usize, usize)],
-    groups: &[Vec<u32>],
-) -> Result<Vec<multilinear_block::PreparedDeviation>, Error> {
-    let opening_of = |k: usize| {
-        positions
-            .iter()
-            .position(|&(_, at)| at == k)
-            .ok_or_else(|| Error::Prover(format!("no prepared table {k}")))
-    };
-    let position_of = |table: usize| {
-        groups
-            .iter()
-            .flatten()
-            .position(|&t| t as usize == table)
-            .ok_or_else(|| Error::Prover(format!("table {table} is in no group")))
-    };
-    tampers
-        .iter()
-        .map(|t| {
-            let _ = prepared
-                .get(t.open)
-                .ok_or_else(|| Error::Prover("no such prepared".into()))?;
-            Ok(multilinear_block::PreparedDeviation {
-                open: opening_of(t.open)?,
-                at_table: t.at_table.map(position_of).transpose()?,
-                with: t.with.map(opening_of).transpose()?,
-            })
-        })
-        .collect()
+/// A prepared stack committed wrongly, tables by AIR index.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum StackTamper {
+    /// Two tables' blocks exchanged in their (common) group's stack.
+    Swap(usize, usize),
+    /// `table`'s block holds `from`'s prepared columns instead of its own.
+    ColumnsOf { table: usize, from: usize },
 }
 
 pub(crate) fn prove_block_whir_with(
@@ -698,10 +813,10 @@ pub(crate) fn prove_block_whir_with(
 
 /// What a caller is handed when the statement is final — after phase A,
 /// before phase B: everything the recursion's programs are a function of, and
-/// the prover's own prepared roots by table ([`prepared_tables`] order).
+/// the prover's own prepared roots by group, in group order.
 pub type StatementObserver<'a> = &'a (dyn Fn(BlockStatement<'_>, &[PreparedRoots]) + Sync);
 
-/// A prepared table's index in [`VmAirs::air_refs`] order and its roots.
+/// A group with a prepared stack, and its stack's roots.
 pub type PreparedRoots = (usize, Vec<multilinear::whir_commit::Commitment>);
 
 /// [`prove_block_whir`], calling `on_statement` as soon as the statement is
@@ -949,7 +1064,8 @@ pub(crate) fn prove_traces(
         let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.prep += produced;
         stamps.phase_a = t.elapsed().as_secs_f64();
-        let (prepared, derive) = prover_prepared::<H>(prepared_columns, &config, deviations)?;
+        let (prepared, tampered, derive) =
+            prover_prepared::<H>(prepared_columns, &groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
         on_statement(
             BlockStatement {
@@ -962,17 +1078,18 @@ pub(crate) fn prove_traces(
             },
             &prepared_roots(&prepared),
         );
-        let positions = prepared_positions(&prepared, &groups)?;
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
             .map(|p| multilinear::stacking::borrow(&p.columns))
             .collect();
-        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = positions
+        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = prepared
             .iter()
-            .map(|&(table, k)| multilinear_block::BlockPrepared {
-                table,
-                commitment: &prepared[k].commitment,
-                columns: &borrowed[k],
+            .zip(&borrowed)
+            .map(|(p, columns)| multilinear_block::BlockPrepared {
+                group: p.group,
+                tables: p.tables.clone(),
+                commitment: &p.commitment,
+                columns,
             })
             .collect();
         let t = Instant::now();
@@ -982,12 +1099,6 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
-        let tampered = prepared_deviations(
-            &deviations.prepared_openings,
-            &prepared,
-            &positions,
-            &groups,
-        )?;
         let (proof, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
@@ -1491,7 +1602,8 @@ fn prove_streamed(
             &config,
             &laid.groups,
         );
-        let (prepared, derive) = prover_prepared::<H>(laid.prepared, &config, deviations)?;
+        let (prepared, tampered, derive) =
+            prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
         on_statement(
             BlockStatement {
@@ -1504,17 +1616,18 @@ fn prove_streamed(
             },
             &prepared_roots(&prepared),
         );
-        let positions = prepared_positions(&prepared, &laid.groups)?;
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
             .map(|p| multilinear::stacking::borrow(&p.columns))
             .collect();
-        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = positions
+        let openings: Vec<multilinear_block::BlockPrepared<'_, F, H>> = prepared
             .iter()
-            .map(|&(table, k)| multilinear_block::BlockPrepared {
-                table,
-                commitment: &prepared[k].commitment,
-                columns: &borrowed[k],
+            .zip(&borrowed)
+            .map(|(p, columns)| multilinear_block::BlockPrepared {
+                group: p.group,
+                tables: p.tables.clone(),
+                commitment: &p.commitment,
+                columns,
             })
             .collect();
         let t = Instant::now();
@@ -1524,12 +1637,6 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
-        let tampered = prepared_deviations(
-            &deviations.prepared_openings,
-            &prepared,
-            &positions,
-            &laid.groups,
-        )?;
         let (proof, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
@@ -1876,24 +1983,20 @@ pub(crate) fn verify_block_whir_with(
         );
         // The prepared commitments, derived here from the program: their roots
         // are the verifier's, never the proof's.
-        let prepared: Vec<TablePrepared<H>> = match prepared_columns
-            .into_iter()
-            .map(|(table, columns)| commit_prepared::<H>(table, columns, config))
-            .collect::<Result<Vec<_>, _>>()
+        let prepared: Vec<GroupPrepared<H>> = match group_stacks(prepared_columns, &proof.groups)
+            .and_then(|stacks| commit_groups::<H>(stacks, config))
         {
             Ok(prepared) => prepared,
             Err(_) => return Ok(false),
         };
-        let Ok(positions) = prepared_positions(&prepared, &proof.groups) else {
-            return Ok(false);
-        };
-        let checks: Vec<multilinear_block::BlockPreparedCheck<'_, F>> = positions
+        let checks: Vec<multilinear_block::BlockPreparedCheck<'_, F>> = prepared
             .iter()
-            .map(|&(table, k)| multilinear_block::BlockPreparedCheck {
-                table,
-                roots: &prepared[k].roots,
-                layout: prepared[k].commitment.layout(),
-                domain: prepared[k].commitment.domain(),
+            .map(|p| multilinear_block::BlockPreparedCheck {
+                group: p.group,
+                tables: p.tables.clone(),
+                roots: &p.roots,
+                layout: p.commitment.layout(),
+                domain: p.commitment.domain(),
             })
             .collect();
         let derived: Vec<multilinear::whir_commit::Commitment> = checks

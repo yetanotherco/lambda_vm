@@ -19,10 +19,10 @@
 //!    top is kept — and its stack is opened at the tables' points
 //!    ([`stacked_eval::prove`]).
 //!
-//! A table whose leading preprocessed columns are settled out of band
-//! ([`BlockPrepared`]) has its derived commitment's roots absorbed after the
-//! groups' roots, and its opening proved on its group's fork after the group's
-//! own opening.
+//! The tables whose leading preprocessed columns are settled out of band are
+//! stacked per group ([`BlockPrepared`]): each such stack's derived roots are
+//! absorbed after the groups' roots, and its opening proved on its group's fork
+//! after the group's own opening.
 //!
 //! The verifier mirrors it and checks the bus balance ONCE, over every table of
 //! the block: the LogUp challenges are shared, so the block's fractions sum to
@@ -121,27 +121,30 @@ pub struct GroupStamps {
     pub committed_at: f64,
 }
 
-/// A table's PREPARED opening in a block: a commitment both sides derive from
-/// the program, over the table's leading preprocessed columns, opened at the
-/// table's own point on its group's fork, after the group's own opening.
+/// A group's PREPARED opening in a block: one commitment, which both sides
+/// derive from the program, over the leading preprocessed columns of the
+/// group's prepared tables, opened on the group's fork after the group's own
+/// opening — each table's columns at that table's point.
 ///
 /// It is the epoch's prepared opening ([`crate::multilinear_table::Prepared`])
-/// at the granularity of one table: the root is DERIVED by the verifier and
-/// absorbed after the group roots, before `z`; the columns stay in the group's
-/// stack too, and the opening proves the derived commitment takes the values
-/// the table's own argument settled on, at that table's point. One commitment
-/// per table keeps every derived root independent of the grouping.
+/// per group: its roots are DERIVED by the verifier and absorbed after the group
+/// roots, before `z`; the columns stay in the group's stack too, and the opening
+/// proves the derived commitment takes the values each table's own argument
+/// settled on, at that table's point. One stack a group pays one chain for all
+/// of its prepared tables.
 pub struct BlockPrepared<'a, F, H>
 where
     F: IsFFTField + IsPrimeField + 'static,
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    /// The table's position in the proof's table order.
-    pub table: usize,
+    /// The group whose fork opens it.
+    pub group: usize,
+    /// The tables it settles, in stack order: each table's position in the
+    /// proof's table order and the length of its leading prefix.
+    pub tables: Vec<(usize, usize)>,
     pub commitment: &'a StackedCommitment<F, H>,
-    /// The table's leading preprocessed columns, in order: the prefix the
-    /// opening settles.
+    /// The tables' prefixes, concatenated in `tables`' order.
     pub columns: &'a [&'a Mle<F>],
 }
 
@@ -150,47 +153,109 @@ pub struct BlockPreparedCheck<'a, F>
 where
     F: IsFFTField + IsPrimeField + 'static,
 {
-    /// The table's position in the proof's table order.
-    pub table: usize,
+    pub group: usize,
+    /// As [`BlockPrepared::tables`]: the prefixes `check_preprocessed` skips.
+    pub tables: Vec<(usize, usize)>,
     /// Derived from the program by the verifier, never read from the proof.
     pub roots: &'a [Commitment],
-    /// Its columns are the table's leading preprocessed columns, so their count
-    /// is the prefix `check_preprocessed` skips.
     pub layout: &'a StackedLayout,
     pub domain: &'a Domain<F>,
 }
 
-/// Prepared tables must name distinct tables in increasing order, so each
-/// table has at most one opening and the derived roots have one order.
-fn prepared_order(tables: impl Iterator<Item = usize>, num_tables: usize) -> Result<(), MlError> {
-    let mut last: Option<usize> = None;
-    for table in tables {
-        if table >= num_tables || last.is_some_and(|l| table <= l) {
+/// The prepared openings' shape, checked the same way by both sides: at most one
+/// per group, in group order; each settles distinct tables of its own group in
+/// increasing order, each prefix at least one column and at most `max_prefix` of
+/// the table's; and the stack holds exactly those columns (`columns`, when the
+/// caller knows them).
+/// One prepared opening's shape: its group, its `(table, prefix)` list, and the
+/// stack's column count when the caller knows it.
+type PreparedEntry<'a> = (usize, &'a [(usize, usize)], Option<usize>);
+
+fn prepared_shape(
+    entries: &[PreparedEntry<'_>],
+    starts: &[usize],
+    num_tables: usize,
+    max_prefix: &dyn Fn(usize) -> usize,
+) -> Result<(), MlError> {
+    let mut last_group: Option<usize> = None;
+    for &(group, tables, columns) in entries {
+        let range = starts
+            .get(group)
+            .copied()
+            .zip(starts.get(group + 1).copied().or(Some(num_tables)))
+            .ok_or(MlError::UnknownPolynomial {
+                index: group,
+                len: starts.len(),
+            })?;
+        if last_group.is_some_and(|l| group <= l) || tables.is_empty() {
             return Err(MlError::UnknownPolynomial {
-                index: table,
-                len: num_tables,
+                index: group,
+                len: starts.len(),
             });
         }
-        last = Some(table);
+        last_group = Some(group);
+        let mut last: Option<usize> = None;
+        for &(table, n) in tables {
+            if table < range.0 || table >= range.1 || last.is_some_and(|l| table <= l) {
+                return Err(MlError::UnknownPolynomial {
+                    index: table,
+                    len: num_tables,
+                });
+            }
+            if n == 0 || n > max_prefix(table) {
+                return Err(MlError::QueryCountMismatch {
+                    expected: max_prefix(table),
+                    got: n,
+                });
+            }
+            last = Some(table);
+        }
+        let total: usize = tables.iter().map(|&(_, n)| n).sum();
+        if columns.is_some_and(|c| c != total) {
+            return Err(MlError::QueryCountMismatch {
+                expected: total,
+                got: columns.unwrap_or(0),
+            });
+        }
     }
     Ok(())
 }
 
-/// How a test makes the prover open a prepared table wrongly, for the verifier
-/// to refuse. Each opening it makes is internally consistent — the columns it
-/// opens, evaluated at the point it opens them — so only the verifier's own
-/// binding of the opening to the table can refuse it.
+/// A group's prepared claims: per table of `tables`, its prefix's columns at the
+/// table's point (one point per column) and the values its argument settled on.
+/// `firsts` are the group's tables' first columns, `start` its first table.
+#[allow(clippy::type_complexity)]
+fn prepared_claims<E: IsField>(
+    tables: &[(usize, usize)],
+    start: usize,
+    firsts: &[usize],
+    points: &[Vec<FieldElement<E>>],
+    values: &[FieldElement<E>],
+) -> (Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>) {
+    let mut at_points = Vec::new();
+    let mut at_values = Vec::new();
+    for &(table, n) in tables {
+        let first = firsts[table - start];
+        at_points.extend_from_slice(&points[first..first + n]);
+        at_values.extend_from_slice(&values[first..first + n]);
+    }
+    (at_points, at_values)
+}
+
+/// How a test makes the prover open a group's prepared stack wrongly, for the
+/// verifier to refuse.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PreparedDeviation {
     /// Which opening, by its index in the `prepared` list.
     pub open: usize,
-    /// Open at this table's point (its position in the proof's table order,
-    /// in the same group) instead of the prepared table's own.
-    pub at_table: Option<usize>,
-    /// Open this prepared entry's commitment and columns (an index in the
-    /// `prepared` list) instead of its own.
-    pub with: Option<usize>,
+    /// `(table, other)`: open `table`'s block at `other`'s point (both positions
+    /// in the proof's table order, in the opening's group).
+    pub at_point_of: Vec<(usize, usize)>,
+    /// Claim every value as the committed column evaluated at its claimed point,
+    /// so the opening is internally consistent and only the verifier's binding
+    /// of it to the tables (and to its derived roots) refuses it.
+    pub consistent: bool,
 }
 
 /// The block after phase A: every table, the groups' roots and the tops of
@@ -445,15 +510,21 @@ where
         roots,
         mut stamps,
     } = committed;
-    prepared_order(prepared.iter().map(|p| p.table), tables.len())?;
-    for p in prepared {
-        if p.columns.is_empty() || p.columns.len() > tables[p.table].num_committed_columns() {
-            return Err(MlError::QueryCountMismatch {
-                expected: tables[p.table].num_committed_columns(),
-                got: p.columns.len(),
-            });
-        }
-    }
+    let starts: Vec<usize> = sizes
+        .iter()
+        .scan(0usize, |at, &size| {
+            let start = *at;
+            *at += size;
+            Some(start)
+        })
+        .collect();
+    let entries: Vec<PreparedEntry<'_>> = prepared
+        .iter()
+        .map(|p| (p.group, p.tables.as_slice(), Some(p.columns.len())))
+        .collect();
+    prepared_shape(&entries, &starts, tables.len(), &|t| {
+        tables[t].num_committed_columns()
+    })?;
     let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
     let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
 
@@ -547,55 +618,45 @@ where
                 Some(at)
             })
             .collect();
-        for (index, &first) in firsts.iter().enumerate() {
-            let Some(k) = prepared.iter().position(|p| p.table == at + index) else {
-                continue;
-            };
+        if let Some(k) = prepared.iter().position(|p| p.group == g) {
             let p = &prepared[k];
-            let n = p.columns.len();
-            let opening = match deviations.iter().find(|d| d.open == k) {
-                None => stacked_eval::prove::<F, E, T, H>(
-                    p.commitment,
-                    p.columns,
-                    None,
-                    &Claimed::PerColumn(&points[first..first + n]),
-                    &values[first..first + n],
-                    config,
-                    &mut fork,
-                )?,
-                Some(d) => {
-                    let other = &prepared[d.with.unwrap_or(k)];
-                    let point = match d.at_table {
-                        Some(t) => {
-                            let local = t.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
-                                MlError::UnknownPolynomial {
-                                    index: t,
-                                    len: firsts.len(),
-                                },
-                            )?;
-                            points[firsts[local]].clone()
+            let (mut at_points, mut at_values) =
+                prepared_claims(&p.tables, at, &firsts, &points, &values);
+            if let Some(d) = deviations.iter().find(|d| d.open == k) {
+                // Each block's columns sit at its table's place in the stack.
+                let mut column = 0usize;
+                for &(table, n) in &p.tables {
+                    if let Some(&(_, other)) = d.at_point_of.iter().find(|(t, _)| *t == table) {
+                        let local = other.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
+                            MlError::UnknownPolynomial {
+                                index: other,
+                                len: firsts.len(),
+                            },
+                        )?;
+                        for point in &mut at_points[column..column + n] {
+                            *point = points[firsts[local]].clone();
                         }
-                        None => points[first].clone(),
-                    };
-                    let claims: Vec<Vec<FieldElement<E>>> =
-                        vec![point.clone(); other.columns.len()];
-                    let opened: Vec<FieldElement<E>> = other
+                    }
+                    column += n;
+                }
+                if d.consistent {
+                    at_values = p
                         .columns
                         .iter()
-                        .map(|column| column.evaluate_in(&point))
+                        .zip(&at_points)
+                        .map(|(c, point)| c.evaluate_in(point))
                         .collect::<Result<_, _>>()?;
-                    stacked_eval::prove::<F, E, T, H>(
-                        other.commitment,
-                        other.columns,
-                        None,
-                        &Claimed::PerColumn(&claims),
-                        &opened,
-                        config,
-                        &mut fork,
-                    )?
                 }
-            };
-            prepared_openings.push(opening);
+            }
+            prepared_openings.push(stacked_eval::prove::<F, E, T, H>(
+                p.commitment,
+                p.columns,
+                None,
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                config,
+                &mut fork,
+            )?);
         }
         stamps[g].open = t.elapsed().as_secs_f64();
         drop(stacked);
@@ -723,26 +784,42 @@ where
             got: 1,
         });
     }
-    // One opening per prepared table, each table at most once, and each
-    // settling a prefix of the table's preprocessed columns — never more than
-    // the table has, which would skip a check nothing replaced.
+    // One opening per group with a prepared stack, each table settled at most
+    // once and by its own group, each prefix within the table's preprocessed
+    // columns — never more than it has, which would skip a check nothing
+    // replaced — and the stack holding exactly those columns.
     if prepared_openings.len() != prepared.len() {
         return Err(MlError::QueryCountMismatch {
             expected: prepared.len(),
             got: prepared_openings.len(),
         });
     }
-    prepared_order(prepared.iter().map(|p| p.table), statements.len())?;
+    let starts: Vec<usize> = sizes
+        .iter()
+        .scan(0usize, |at, &size| {
+            let start = *at;
+            *at += size;
+            Some(start)
+        })
+        .collect();
+    let entries: Vec<PreparedEntry<'_>> = prepared
+        .iter()
+        .map(|p| {
+            (
+                p.group,
+                p.tables.as_slice(),
+                Some(p.layout.placements().len()),
+            )
+        })
+        .collect();
+    prepared_shape(&entries, &starts, statements.len(), &|t| {
+        statements[t].num_preprocessed
+    })?;
     let mut settled = vec![0usize; statements.len()];
     for p in prepared {
-        let n = p.layout.placements().len();
-        if n == 0 || n > statements[p.table].num_preprocessed {
-            return Err(MlError::QueryCountMismatch {
-                expected: statements[p.table].num_preprocessed,
-                got: n,
-            });
+        for &(table, n) in &p.tables {
+            settled[table] = n;
         }
-        settled[p.table] = n;
     }
     let derived: Vec<Commitment> = prepared
         .iter()
@@ -788,32 +865,34 @@ where
             config,
             &mut fork,
         )?;
-        // The group's prepared tables, in table order, on this fork: each
-        // derived commitment must take the values the table settled on, at the
-        // table's point.
-        let mut first = 0usize;
-        for (index, statement) in statements[statement_at..statement_at + size]
+        // The group's prepared stack, on this fork: the derived commitment must
+        // take the values each table settled on, at that table's point.
+        if let Some(k) = prepared
             .iter()
-            .enumerate()
+            .position(|p| p.group == g)
+            .filter(|_| !skip_prepared)
         {
-            if let Some(k) = prepared
+            let firsts: Vec<usize> = statements[statement_at..statement_at + size]
                 .iter()
-                .position(|p| p.table == statement_at + index)
-                .filter(|_| !skip_prepared)
-            {
-                let (p, n) = (&prepared[k], settled[statement_at + index]);
-                stacked_eval::verify::<F, E, T, H>(
-                    &prepared_openings[k],
-                    p.layout,
-                    p.roots,
-                    &Claimed::PerColumn(&points[first..first + n]),
-                    &values[first..first + n],
-                    p.domain,
-                    config,
-                    &mut fork,
-                )?;
-            }
-            first += statement.slot_of.len();
+                .scan(0usize, |first, s| {
+                    let at = *first;
+                    *first += s.slot_of.len();
+                    Some(at)
+                })
+                .collect();
+            let p = &prepared[k];
+            let (at_points, at_values) =
+                prepared_claims(&p.tables, statement_at, &firsts, &points, &values);
+            stacked_eval::verify::<F, E, T, H>(
+                &prepared_openings[k],
+                p.layout,
+                p.roots,
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                p.domain,
+                config,
+                &mut fork,
+            )?;
         }
         statement_at += size;
         root_at += layout.num_polys();

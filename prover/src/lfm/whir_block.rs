@@ -47,7 +47,7 @@ use stark::multilinear_table::TableLayout;
 
 use crate::block_whir::{
     BlockFormat, BlockFrame, BlockStatement, BlockWhirProof, block_frame, block_statement_bytes,
-    commit_prepared, first_page_index, prepared_tables,
+    commit_group, first_page_index, group_stacks, prepared_tables,
 };
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -59,9 +59,9 @@ use super::registry::LfmArtifacts;
 use super::whir_chain::ChainShape;
 use super::whir_epoch::{
     BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
-    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_prepared_group,
-    emit_roots_block, emit_table_walk, fresh_schedule, group_columns, hint_group_chains_shaped,
-    hint_table_wires_shaped, prepared_cost, push_table_words, table_words,
+    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_roots_block, emit_table_walk,
+    fresh_schedule, group_columns, hint_group_chains_shaped, hint_table_wires_shaped,
+    push_table_words, table_words,
 };
 use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
 use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
@@ -170,19 +170,26 @@ pub fn partition_groups(costs: &[usize], num_leaves: usize) -> BlockPartition {
 
 // ================================= the plan ===============================
 
-/// One prepared table, as the plan derived it.
+/// One group's prepared stack, as the plan derived it.
 pub struct PlannedPrepared {
-    /// The table's index in `VmAirs::air_refs` order.
-    pub table: usize,
-    /// Its group, and its place in that group's table order.
     pub group: usize,
-    pub slot: usize,
-    /// The leading preprocessed columns its opening settles.
-    pub settled: usize,
-    /// Derived from the program, never read from a proof.
+    /// `(slot in the group's table order, AIR index, prefix length)`, in stack
+    /// order.
+    pub tables: Vec<(usize, usize, usize)>,
+    /// Derived from the program and the partition, never read from a proof.
     pub roots: Vec<Commitment>,
     pub layout: StackedLayout,
     pub domain: Domain<GoldilocksField>,
+}
+
+impl PlannedPrepared {
+    /// The prefix the stack settles of table `air`, when it holds it.
+    pub fn settles(&self, air: usize) -> Option<usize> {
+        self.tables
+            .iter()
+            .find(|&&(_, table, _)| table == air)
+            .map(|&(_, _, n)| n)
+    }
 }
 
 /// Every program of a block's tree, derived from the trusted ELF, the options,
@@ -287,64 +294,53 @@ impl WhirBlockPlan {
         let columns = prepared_tables(&frame.airs, &frame.page_configs, format)
             .map_err(|e| format!("prepared tables: {e:?}"))?;
         let config = &frame.config;
+        let stacks = group_stacks(columns, statement.groups)
+            .map_err(|e| format!("prepared stacks: {e:?}"))?;
         if let Some(roots) = prepared_roots
             && roots
                 .iter()
-                .map(|(t, _)| *t)
-                .ne(columns.iter().map(|(t, _)| *t))
+                .map(|(g, _)| *g)
+                .ne(stacks.iter().map(|s| s.group))
         {
-            return Err("the supplied prepared roots are for other tables".to_string());
+            return Err("the supplied prepared roots are for other groups".to_string());
         }
-        let mut prepared = Vec::with_capacity(columns.len());
-        for (index, (table, columns)) in columns.into_iter().enumerate() {
-            let settled = columns.len();
-            let num_vars = columns
-                .first()
-                .map(|c| c.len().trailing_zeros() as usize)
-                .ok_or_else(|| format!("prepared table {table} has no column"))?;
-            let layout = stark::multilinear_table::global_layout(
-                &[(settled, num_vars)],
-                config.format.stack,
-            )
-            .map_err(|e| format!("prepared table {table}: {e:?}"))?;
+        let mut prepared = Vec::with_capacity(stacks.len());
+        for (index, stack) in stacks.into_iter().enumerate() {
+            let group = stack.group;
+            let start = groups[..group].iter().map(Vec::len).sum::<usize>();
+            let tables: Vec<(usize, usize, usize)> = stack
+                .tables
+                .iter()
+                .map(|&(position, air, n)| (position - start, air, n))
+                .collect();
+            let layout =
+                stark::multilinear_table::global_layout(&stack.shapes(), config.format.stack)
+                    .map_err(|e| format!("prepared group {group}: {e:?}"))?;
             let domain = Domain::<GoldilocksField>::new(layout.n_stack() + config.log_blowup)
-                .map_err(|e| format!("prepared table {table}: {e:?}"))?;
+                .map_err(|e| format!("prepared group {group}: {e:?}"))?;
             let roots = match prepared_roots {
                 Some(roots) => roots[index].1.clone(),
                 None => crate::with_whir_hash!(|H| {
-                    commit_prepared::<H>(table, columns, config)
-                        .map_err(|e| format!("prepared table {table}: {e:?}"))?
+                    commit_group::<H>(stack, config)
+                        .map_err(|e| format!("prepared group {group}: {e:?}"))?
                         .roots
                 }),
             };
             if roots.len() != layout.num_polys() {
                 return Err(format!(
-                    "prepared table {table}: {} roots for {} polynomials",
+                    "prepared group {group}: {} roots for {} polynomials",
                     roots.len(),
                     layout.num_polys()
                 ));
             }
-            let (group, slot) = groups
-                .iter()
-                .enumerate()
-                .find_map(|(g, list)| list.iter().position(|&t| t == table).map(|s| (g, s)))
-                .ok_or_else(|| format!("prepared table {table} is in no group"))?;
-            let position: usize = groups[..group].iter().map(Vec::len).sum::<usize>() + slot;
-            prepared.push((
-                position,
-                PlannedPrepared {
-                    table,
-                    group,
-                    slot,
-                    settled,
-                    roots,
-                    layout,
-                    domain,
-                },
-            ));
+            prepared.push(PlannedPrepared {
+                group,
+                tables,
+                roots,
+                layout,
+                domain,
+            });
         }
-        prepared.sort_by_key(|(position, _)| *position);
-        let prepared: Vec<PlannedPrepared> = prepared.into_iter().map(|(_, p)| p).collect();
 
         // Each group's cost: its tables' legs, its opening, its prepared ones.
         let refs = frame.airs.air_refs();
@@ -365,7 +361,16 @@ impl WhirBlockPlan {
             let prepared_perms: usize = prepared
                 .iter()
                 .filter(|p| p.group == g)
-                .map(|p| prepared_cost(&p.layout, config, entry).perms())
+                .map(|p| {
+                    let group_of: Vec<usize> = p
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(k, &(_, _, n))| std::iter::repeat_n(k, n))
+                        .collect();
+                    let chain = ChainShape::new(config, p.layout.n_stack());
+                    stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
+                })
                 .sum();
             costs.push(tables + opening + prepared_perms);
         }
@@ -779,8 +784,8 @@ fn route_of(
     table: usize,
     first_page: usize,
 ) -> Result<Route, String> {
-    if let Some(p) = plan.prepared.iter().find(|p| p.table == table) {
-        return Ok(Route::Prepared(p.settled));
+    if let Some(n) = plan.prepared.iter().find_map(|p| p.settles(table)) {
+        return Ok(Route::Prepared(n));
     }
     let pages = first_page..first_page + plan.frame.page_configs.len();
     if pages.contains(&table) {
@@ -1045,7 +1050,8 @@ fn emit_leaf(
             &walk,
         );
 
-        // Its prepared tables, in table order, against the derived roots.
+        // Its prepared stack, against the derived roots: each table's block at
+        // that table's point.
         for p in plan.prepared.iter().filter(|p| p.group == g) {
             let shape = ChainShape::new(config, p.layout.n_stack());
             let held = hint_group_chains_shaped(b, arena, &mut at, p.layout.num_polys(), &shape);
@@ -1078,16 +1084,15 @@ fn emit_leaf(
             if !checks.prepared {
                 continue;
             }
-            let column_at = walk.column_at(p.slot);
-            emit_prepared_group(
-                b,
-                &mut fork,
-                &p.layout,
-                &polys,
-                &shape,
-                &p.domain,
-                &walk.points[p.slot],
-                &walk.values[column_at..column_at + p.settled],
+            let mut points: Vec<&[Ext]> = Vec::new();
+            let mut values: Vec<Ext> = Vec::new();
+            for &(slot, _, n) in &p.tables {
+                let column_at = walk.column_at(slot);
+                points.extend(std::iter::repeat_n(walk.points[slot].as_slice(), n));
+                values.extend_from_slice(&walk.values[column_at..column_at + n]);
+            }
+            super::whir_stacked::emit_stacked_verify(
+                b, &mut fork, &p.layout, &polys, &points, &values, &shape, &p.domain,
             );
         }
         outputs.extend(walk.outputs.iter().copied());

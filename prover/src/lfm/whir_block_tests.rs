@@ -356,124 +356,119 @@ fn dense_block_with(
     (elf, proof, roots)
 }
 
-/// ★ A leaf refuses a prepared table opened wrongly — two pages' openings
-/// swapped, a page opened at another table's point, a page opened against the
-/// other page's commitment — and with the prepared openings left out (the
-/// mutation) each executes. Then DECODE's prepared commitment over another
-/// program's columns: refused by a leaf of the verifier's plan (it absorbs the
-/// root it derives), and by a leaf of a plan given the prover's own roots; with
-/// those roots AND the openings left out, it executes — the two together are
-/// what bind DECODE to the program.
+/// ★ A leaf refuses a prepared block opened at another table's point (a valid
+/// opening of its stack, of the wrong claim), and with the prepared openings
+/// left out (the mutation) it executes.
+///
+/// Then stacks committed wrongly, each opened consistently — two pages' blocks
+/// swapped, a page's block holding the other page's columns, DECODE's block
+/// another program's:
+/// - refused by a leaf of the verifier's plan (it absorbs the stacks it
+///   derives);
+/// - refused by a leaf of a plan given the prover's own roots (the opening no
+///   longer matches the tables' claims);
+/// - executing only with those roots trusted AND the openings left out — the
+///   two together bind the prepared columns to the program.
 #[test]
 #[ignore = "proves the dense fixture under RPX and executes its leaf; box tier"]
 fn a_block_leaf_refuses_wrong_prepared_openings() {
-    use block_whir::{Deviations, PreparedTamper};
+    use block_whir::{Deviations, StackTamper};
     let format = dense_format();
+    let opts = ProofOptions::default_test_options();
     let skip = LeafChecks {
         prepared: false,
         ..LeafChecks::ALL
     };
     let (elf, honest, _) = dense_block_with(&Deviations::default());
     let plan = plan_of(&elf, &honest, &format, Some(1));
-    assert!(plan.prepared().len() >= 3, "DECODE and two pages");
+    let tables: Vec<usize> = plan
+        .prepared()
+        .iter()
+        .flat_map(|p| p.tables.iter().map(|&(_, air, _)| air))
+        .collect();
+    assert!(tables.len() >= 3, "DECODE and two pages: {tables:?}");
     run_leaf(&plan, &honest, 0, LeafChecks::ALL).expect("the honest leaf executes");
 
-    // The openings in the proof's order (the plan's), and two pages' places in
-    // it: a page settles its two columns, DECODE its five.
-    let pages: Vec<usize> = plan
-        .prepared()
+    // AIR indices: DECODE is the lowest prepared table, then the pages.
+    let mut pages: Vec<usize> = tables.clone();
+    pages.sort_unstable();
+    let (a, b) = (pages[1], pages[2]);
+    let group = |t: usize| {
+        honest
+            .groups
+            .iter()
+            .position(|g| g.contains(&(t as u32)))
+            .expect("in a group")
+    };
+    let height = honest.table_num_vars[a];
+    let other = honest.groups[group(a)]
         .iter()
-        .enumerate()
-        .filter(|(_, p)| p.settled == 2)
-        .map(|(i, _)| i)
-        .take(2)
-        .collect();
-    assert_eq!(pages.len(), 2);
-    let mut swapped = honest.clone();
-    swapped.prepared.swap(pages[0], pages[1]);
-    assert!(
-        run_leaf(&plan, &swapped, 0, LeafChecks::ALL).is_err(),
-        "swapped"
-    );
-    assert!(
-        run_leaf(&plan, &swapped, 0, skip).is_ok(),
-        "swapped, mutation"
-    );
-
-    // AIR-order indices for the prover's tampers: 0 is DECODE, then the pages.
-    let page = plan
-        .prepared()
-        .iter()
-        .map(|p| p.table)
-        .filter(|&t| t != plan.prepared()[0].table)
-        .min()
-        .expect("a page");
-    let height = honest.table_num_vars[page];
-    let other = honest
-        .groups
-        .iter()
-        .find(|g| g.contains(&(page as u32)))
-        .and_then(|g| {
-            g.iter()
-                .map(|&t| t as usize)
-                .find(|&t| t != page && honest.table_num_vars[t] == height)
-        })
+        .map(|&t| t as usize)
+        .find(|&t| t != a && honest.table_num_vars[t] == height)
         .expect("a table of the page's height in its group");
-    for (name, tamper) in [
-        (
-            "wrong point",
-            PreparedTamper {
-                open: 1,
-                at_table: Some(other),
-                with: None,
-            },
-        ),
-        (
-            "wrong commitment",
-            PreparedTamper {
-                open: 1,
-                at_table: None,
-                with: Some(2),
-            },
-        ),
-    ] {
-        let (_, wrong, _) = dense_block_with(&Deviations {
-            prepared_openings: vec![tamper],
-            ..Default::default()
-        });
-        assert!(
-            run_leaf(&plan, &wrong, 0, LeafChecks::ALL).is_err(),
-            "{name}"
-        );
-        assert!(run_leaf(&plan, &wrong, 0, skip).is_ok(), "{name}, mutation");
-    }
-
-    let (_, other_program, prover_roots) = dense_block_with(&Deviations {
-        other_prepared: true,
+    let (_, wrong, _) = dense_block_with(&Deviations {
+        prepared_points: vec![(a, other)],
         ..Default::default()
     });
     assert!(
-        run_leaf(&plan, &other_program, 0, LeafChecks::ALL).is_err(),
-        "verifier's roots"
-    );
-    let trusting = WhirBlockPlan::derive_with(
-        &elf,
-        &ProofOptions::default_test_options(),
-        &format,
-        other_program.statement(),
-        Some(1),
-        BLOCK_FAN_IN,
-        Some(&prover_roots),
-    )
-    .expect("a plan over the prover's roots");
-    assert!(
-        run_leaf(&trusting, &other_program, 0, LeafChecks::ALL).is_err(),
-        "prover's roots"
+        run_leaf(&plan, &wrong, 0, LeafChecks::ALL).is_err(),
+        "wrong point"
     );
     assert!(
-        run_leaf(&trusting, &other_program, 0, skip).is_ok(),
-        "the prover's roots trusted and the openings left out admit another program's DECODE"
+        run_leaf(&plan, &wrong, 0, skip).is_ok(),
+        "wrong point, mutation"
     );
+
+    let mut stack_tampers = vec![
+        (
+            "columns of another page",
+            Deviations {
+                prepared_stack: vec![StackTamper::ColumnsOf { table: a, from: b }],
+                ..Default::default()
+            },
+        ),
+        (
+            "another program's DECODE",
+            Deviations {
+                other_prepared: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    if group(a) == group(b) {
+        stack_tampers.push((
+            "two pages swapped",
+            Deviations {
+                prepared_stack: vec![StackTamper::Swap(a, b)],
+                ..Default::default()
+            },
+        ));
+    }
+    for (name, deviations) in &stack_tampers {
+        let (_, wrong, prover_roots) = dense_block_with(deviations);
+        assert!(
+            run_leaf(&plan, &wrong, 0, LeafChecks::ALL).is_err(),
+            "{name}: verifier's roots"
+        );
+        let trusting = WhirBlockPlan::derive_with(
+            &elf,
+            &opts,
+            &format,
+            wrong.statement(),
+            Some(1),
+            BLOCK_FAN_IN,
+            Some(&prover_roots),
+        )
+        .expect("a plan over the prover's roots");
+        assert!(
+            run_leaf(&trusting, &wrong, 0, LeafChecks::ALL).is_err(),
+            "{name}: prover's roots"
+        );
+        assert!(
+            run_leaf(&trusting, &wrong, 0, skip).is_ok(),
+            "{name}: the prover's roots trusted and the openings left out admit it"
+        );
+    }
 }
 
 // ================================= the nodes ==============================
@@ -742,7 +737,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     let roots: Vec<block_whir::PreparedRoots> = plan
         .prepared()
         .iter()
-        .map(|p| (p.table, p.roots.clone()))
+        .map(|p| (p.group, p.roots.clone()))
         .collect();
     let mut tampered = roots.clone();
     tampered[0].1[0][0] ^= 1;
