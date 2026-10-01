@@ -1201,6 +1201,71 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
          program, derived by the verifier from the partition constant, is what refuses it"
     );
     println!("BLOCK FIXTURE TREE: another partition's tree is refused at the final check");
+
+    // ---- the dangerous trees: one that SKIPS an instance (its constraints are
+    // never verified) and one that verifies an instance TWICE. `BlockPartition::new`
+    // refuses both list sets, but nothing binds a prover to it. The instance has a
+    // zero bus contribution, so leaving it out or counting it twice keeps the bus
+    // closed: every in-circuit check passes, the tree proves, and its top claims
+    // the same block. Only the final check's program, derived from the verifier's
+    // own partition, refuses it.
+    let n = a.num_instances();
+    let lists = partition.leaves().to_vec();
+    let (k_leaf, skipped) = lists
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.len() > 1)
+        .flat_map(|(j, l)| l.iter().map(move |&i| (j, i)))
+        .find(|&(_, i)| a.tables[i].contribution.is_none_or(|c| c == FEE::zero()))
+        .expect(
+            "the skip/duplicate negatives need an instance with a zero bus contribution in a \
+             leaf of two or more",
+        );
+    println!(
+        "BLOCK FIXTURE TREE: instance {skipped} ({}) of leaf {k_leaf} has a zero bus contribution",
+        a.names[skipped]
+    );
+    let mut skip = lists.clone();
+    skip[k_leaf].retain(|&i| i != skipped);
+    let mut twice = lists.clone();
+    let other_leaf = (k_leaf + 1) % twice.len();
+    twice[other_leaf].push(skipped);
+    twice[other_leaf].sort_unstable();
+    for (what, lists) in [("skips", skip), ("verifies twice", twice)] {
+        assert!(
+            BlockPartition::new(lists.clone(), n).is_err(),
+            "the emitter's partition refuses a tree that {what} an instance"
+        );
+        let bad = BlockPartition::unvalidated(lists, n);
+        let bad_leaves: Vec<RealChild> = (0..bad.num_leaves())
+            .map(|k| {
+                prove_as_child(
+                    &format!("A tree that {what} instance {skipped}, leaf {k}"),
+                    &block_leaf_program(&a, &bad, k, 0),
+                    &block_leaf_arenas(&a, &bad, k),
+                    &wrap_opts,
+                )
+            })
+            .collect();
+        let (bad_top, bad_proof, _) = compose_block_tree(bad_leaves, layout, &wrap_opts, 1);
+        assert_eq!(
+            bad_top.public_words, top.public_words,
+            "a tree that {what} an instance claims the same block"
+        );
+        assert_ne!(bad_top.artifacts.program_id, top.artifacts.program_id);
+        assert!(
+            !verify_block_top(&top.artifacts, &bad_proof, &wrap_opts),
+            "a tree that {what} an instance must be refused at the final check"
+        );
+        assert!(
+            verify_block_top(&bad_top.artifacts, &bad_proof, &wrap_opts),
+            "checked against the program its own prover built, a tree that {what} an \
+             instance verifies: the derived top program is what refuses it"
+        );
+        println!(
+            "BLOCK FIXTURE TREE: a tree that {what} instance {skipped} is refused at the final check"
+        );
+    }
 }
 
 // ============================ production scale ============================

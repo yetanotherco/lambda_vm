@@ -82,6 +82,18 @@ impl BlockPartition {
         })
     }
 
+    /// Lists taken as given, with none of [`Self::new`]'s checks: what an
+    /// adversarial prover may emit leaves over, since nothing binds a prover to
+    /// `new`. Only the tests that show such a tree is refused at the final check
+    /// build one.
+    #[cfg(test)]
+    pub(crate) fn unvalidated(leaves: Vec<Vec<usize>>, num_instances: usize) -> Self {
+        Self {
+            leaves,
+            num_instances,
+        }
+    }
+
     pub fn num_leaves(&self) -> usize {
         self.leaves.len()
     }
