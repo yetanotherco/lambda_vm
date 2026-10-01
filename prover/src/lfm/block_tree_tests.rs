@@ -518,6 +518,19 @@ pub(super) fn harvest_block(
     elf_bytes: &[u8],
     proof: &crate::VmProof,
 ) -> Result<(RealBlock, f64, f64), String> {
+    harvest_block_with(opts, elf_bytes, proof, true)
+}
+
+/// [`harvest_block`], with the host verify run or skipped. Skipping it is for a
+/// caller that runs the verifying harvest beside its own work and joins it
+/// before it reports anything (`the_block_tree_composes_to_a_top_node`): the
+/// assert still decides whether the run counts, it only stops gating the leaves.
+pub(super) fn harvest_block_with(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    proof: &crate::VmProof,
+    verify: bool,
+) -> Result<(RealBlock, f64, f64), String> {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use rayon::prelude::*;
     use stark::verifier::IsStarkVerifier;
@@ -579,12 +592,14 @@ pub(super) fn harvest_block(
         &mut seed(),
     )
     .ok_or("the COMMIT bus target must compute")?;
-    if !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
-        &refs,
-        view,
-        &mut seed(),
-        &expected,
-    ) {
+    if verify
+        && !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+            &refs,
+            view,
+            &mut seed(),
+            &expected,
+        )
+    {
         return Err("production's verifier rejects the block".to_string());
     }
     let verify_secs = t_verify.elapsed().as_secs_f64();
@@ -1301,14 +1316,39 @@ fn the_block_tree_composes_to_a_top_node() {
         pct(base_peak)
     );
 
-    // ---- the harvest.
+    // ---- the harvest. Production's verify of the base is a harness assert, not
+    // work a driver does, so by default it runs on a helper thread beside level 0
+    // and is joined before anything is reported: a refused block still fails the
+    // run, it only stops delaying the leaves (the epoch tree's per-epoch verifies
+    // likewise run beside its other wraps). `NOEPOCH_HARVEST_VERIFY=inline`
+    // verifies first, as before.
+    let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
     let t = Instant::now();
-    let (rb, verify, replay) = harvest_block(&inner, &elf_bytes, &proof).expect("harvest");
-    drop(proof);
-    let harvest = t.elapsed().as_secs_f64();
+    let (rb, verify, replay, beside) = if inline_verify {
+        let (rb, verify, replay) = harvest_block(&inner, &elf_bytes, &proof).expect("harvest");
+        drop(proof);
+        (rb, Some(verify), replay, None)
+    } else {
+        let proof = std::sync::Arc::new(proof);
+        let beside = {
+            let (proof, opts, elf) = (proof.clone(), inner.clone(), elf_bytes.clone());
+            std::thread::spawn(move || {
+                harvest_block(&opts, &elf, &proof).map(|(rb, verify, _)| (rb.state, verify))
+            })
+        };
+        let (rb, _, replay) =
+            harvest_block_with(&inner, &elf_bytes, &proof, false).expect("harvest");
+        drop(proof);
+        (rb, None, replay, Some(beside))
+    };
+    let mut harvest = t.elapsed().as_secs_f64();
     println!(
-        "   harvest: {harvest:.2}s (production verify {verify:.2}s, harness-only · replay \
-         {replay:.2}s) · {} instances · public output {} bytes",
+        "   harvest: {harvest:.2}s (production verify {}, harness-only · replay {replay:.2}s) · \
+         {} instances · public output {} bytes",
+        match verify {
+            Some(v) => format!("{v:.2}s inline"),
+            None => "beside level 0".to_string(),
+        },
         rb.num_instances(),
         rb.public_output.len()
     );
@@ -1423,6 +1463,26 @@ fn the_block_tree_composes_to_a_top_node() {
         compose_block_tree(leaves, child_layout(&rb), &wrap_opts, siblings);
     super::device_permit::arm(1);
     let interior = t.elapsed().as_secs_f64();
+    // The verify beside level 0 must have accepted the block, over the same
+    // reconstruction the leaves read (one state word), before anything counts.
+    // What the join waits is on the critical path, so it is the harvest's.
+    if let Some(beside) = beside {
+        let t = Instant::now();
+        let (state, verify) = beside
+            .join()
+            .expect("the harvest verify beside level 0 panicked")
+            .expect("harvest (verified beside level 0)");
+        assert_eq!(
+            state, rb.state,
+            "the verified harvest and the leaves' harvest read one transcript"
+        );
+        let waited = t.elapsed().as_secs_f64();
+        harvest += waited;
+        println!(
+            "   harvest verify beside level 0: production verify {verify:.2}s, harness-only · \
+             joined after the top, waited {waited:.2}s (counted in the harvest)"
+        );
+    }
     assert_top_claims_the_block(&top, &rb);
     let t = Instant::now();
     assert!(
