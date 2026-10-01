@@ -416,10 +416,15 @@ where
 /// Returns `None` to fall back (non Goldilocks, below threshold, no GPU, GPU
 /// error). This is the residency path that avoids the term-column download.
 pub fn try_build_aux_resident_gpu<'a, F, E>(
+    table: &str,
     interactions: &[BusInteraction],
     num_cols: usize,
     main_cols: impl FnOnce() -> &'a [Vec<FieldElement<F>>],
-    main_dev: Option<(&math_cuda::CudaSlice<u64>, usize)>,
+    main_dev: Option<(
+        &math_cuda::CudaSlice<u64>,
+        usize,
+        Option<&math_cuda::device::PooledEvent>,
+    )>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
 ) -> Option<math_cuda::logup::ResidentAux>
@@ -450,7 +455,7 @@ where
     // host columns. The resident buffer skips both the host transpose and the
     // ~3 GB main re-upload.
     let resident_main =
-        main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
+        main_dev.filter(|&(buf, rows, _)| rows == trace_len && buf.len() == num_cols * trace_len);
     let mut main_flat = Vec::new();
     if resident_main.is_none() {
         main_flat = vec![0u64; num_cols * trace_len];
@@ -476,9 +481,23 @@ where
     let stream = be.next_stream();
     let md = desc.as_cuda();
     let main = match resident_main {
-        Some((buf, _)) => math_cuda::logup::ResidentMain::Dev(buf),
+        Some((buf, _, _)) => math_cuda::logup::ResidentMain::Dev(buf),
         None => math_cuda::logup::ResidentMain::Host(&main_flat),
     };
+    // The resident main is written on its producer's stream, and nothing else
+    // orders this one after it: event tracking is off, and the kept-top-levels
+    // recompute (`coset_lde_row_major_keep_no_tree`) returns with the snapshot
+    // still queued — unlike the tree-building commits, whose root download
+    // host-blocks behind it. Reading it unordered computes the aux columns
+    // from stale rows, and the table's proof is refused. Wait device-side.
+    let producer = resident_main.and_then(|(_, _, ready)| ready);
+    let probe =
+        crate::gpu_lde::gpu_xcheck() && producer.is_some_and(|ev| !ev.event().is_complete());
+    if let Some(ev) = producer
+        && crate::gpu_lde::aux_waits_for_resident_main()
+    {
+        stream.wait(ev.event()).ok()?;
+    }
     let ra = math_cuda::logup::logup_aux_resident(
         main,
         trace_len,
@@ -489,6 +508,27 @@ where
         &stream,
     )
     .ok()?;
+    // Diagnostic: the producer had not finished when this build was queued.
+    // Rebuild once it has; a different contribution means the first build
+    // read the snapshot before it was written.
+    if probe && let Some(ev) = producer {
+        ev.event().synchronize().ok()?;
+        let again = math_cuda::logup::logup_aux_resident(
+            main,
+            trace_len,
+            &md,
+            &alpha_flat,
+            z_arr,
+            inv_n,
+            &be.next_stream(),
+        )
+        .ok()?;
+        let stale = again.table_contribution != ra.table_contribution;
+        eprintln!(
+            "[xcheck] aux build queued before its resident main was written: table={table} \
+             rows={trace_len} stale={stale}"
+        );
+    }
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(ra)
 }
@@ -1129,6 +1169,87 @@ mod tests {
             canon(&gpu_dev),
             canon(&expected),
             "resident-main aux buffer mismatch CPU reference"
+        );
+    }
+
+    // The resident aux build reads a main snapshot still being written on its
+    // producer's stream (the kept-top-levels recompute returns without a host
+    // barrier). With the producer's event passed it waits and matches the CPU
+    // reference; without it (the control) it reads the zeroed buffer and does
+    // not — so the wait is what makes the first arm pass. Runs on the GPU box.
+    #[test]
+    #[ignore = "requires GPU; run with --ignored"]
+    fn gpu_aux_resident_waits_for_the_producer_of_its_main() {
+        let interactions = term_test_interactions();
+        let num_cols = 8;
+        let num_rows = GPU_LOGUP_MIN_ROWS;
+        let mut st = 0x1319_8a2e_0370_7344u64;
+        let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
+            .collect();
+        let alpha = mk_ext3(&mut st);
+        let z = mk_ext3(&mut st);
+        let mut challenges = vec![z; LOGUP_CHALLENGE_ALPHA + 1];
+        challenges[LOGUP_CHALLENGE_ALPHA] = alpha;
+        let shifts = PackingShifts::<F>::new();
+        let desc = build_fingerprint_descriptor(&interactions);
+        let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
+        let groups: [Vec<&BusInteraction>; 3] = [
+            vec![&interactions[0], &interactions[1]],
+            vec![&interactions[2], &interactions[3]],
+            vec![&interactions[4]],
+        ];
+        let cols: Vec<Vec<FieldElement<E>>> = groups
+            .iter()
+            .map(|g| reference_term_column(g, &main, num_rows, &alpha_powers, &z, &shifts))
+            .collect();
+        let (_, total) = reference_accumulate(&cols, num_rows);
+
+        let mut main_flat = vec![0u64; num_cols * num_rows];
+        for c in 0..num_cols {
+            for r in 0..num_rows {
+                main_flat[c * num_rows + r] = *main[c][r].value();
+            }
+        }
+        let be = math_cuda::device::backend().unwrap();
+        // One arm: the snapshot zeroed, then written on a producer stream held
+        // for 300 ms, its event recorded behind the write; the build queued at
+        // once on its own stream.
+        let build = |pass_event: bool| -> [u64; 3] {
+            let producer = be.next_stream();
+            let src = producer.clone_htod(&main_flat).unwrap();
+            let mut snap = producer.alloc_zeros::<u64>(main_flat.len()).unwrap();
+            producer.synchronize().unwrap();
+            math_cuda::device::stall_stream_for_test(&producer, 300).unwrap();
+            producer.memcpy_dtod(&src, &mut snap).unwrap();
+            let ready = be.take_event().unwrap();
+            ready.event().record(&producer).unwrap();
+            let ra = try_build_aux_resident_gpu::<F, E>(
+                "producer-wait-test",
+                &interactions,
+                num_cols,
+                || main.as_slice(),
+                Some((&snap, num_rows, pass_event.then_some(&ready))),
+                num_rows,
+                &challenges,
+            )
+            .expect("the resident aux build runs");
+            producer.synchronize().unwrap();
+            ra.table_contribution
+        };
+        assert_eq!(
+            canon(&build(true)),
+            canon(&limbs(&total)),
+            "the build waited on its producer's event and still differs from the CPU reference"
+        );
+        assert_ne!(
+            canon(&build(false)),
+            canon(&limbs(&total)),
+            "control: without the event the build should read the zeroed snapshot"
         );
     }
 }

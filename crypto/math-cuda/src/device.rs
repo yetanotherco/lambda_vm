@@ -2222,6 +2222,28 @@ impl Backend {
     }
 }
 
+/// Test hook: queue a host callback on `stream` that sleeps `ms` milliseconds,
+/// so every later operation on the stream waits behind it. Opens a
+/// cross-stream ordering window on purpose, for tests that check a consumer
+/// on another stream waits for its producer.
+#[doc(hidden)]
+pub fn stall_stream_for_test(stream: &CudaStream, ms: u64) -> Result<()> {
+    unsafe extern "C" fn sleep_ms(user: *mut core::ffi::c_void) {
+        std::thread::sleep(std::time::Duration::from_millis(user as usize as u64));
+    }
+    stream.context().bind_to_thread()?;
+    // SAFETY: the callback makes no CUDA call; its argument is the duration
+    // carried in the pointer value, never dereferenced.
+    unsafe {
+        cudarc::driver::sys::cuLaunchHostFunc(
+            stream.cu_stream(),
+            Some(sleep_ms),
+            ms as usize as *mut core::ffi::c_void,
+        )
+        .result()
+    }
+}
+
 #[cfg(test)]
 mod device_fallback_counter_tests {
     use super::{
