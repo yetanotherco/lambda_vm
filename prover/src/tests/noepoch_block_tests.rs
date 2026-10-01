@@ -71,6 +71,17 @@ impl OneBuild {
         residency: ResidencyMode,
         derive_decode: bool,
     ) -> Result<VmProof, crate::Error> {
+        self.prove_these(&self.traces, opts, residency, derive_decode)
+    }
+
+    /// [`Self::prove`] on a copy of `traces` (this build's, tampered).
+    fn prove_these(
+        &self,
+        traces: &Traces,
+        opts: &ProofOptions,
+        residency: ResidencyMode,
+        derive_decode: bool,
+    ) -> Result<VmProof, crate::Error> {
         let decode = derive_decode.then(|| {
             crate::tables::decode::commitment_from_elf_device_or_host(&self.program, opts)
                 .expect("DECODE commitment")
@@ -78,7 +89,7 @@ impl OneBuild {
         prove_block_traces(
             &self.elf_bytes,
             &self.program,
-            &mut self.traces.clone(),
+            &mut traces.clone(),
             opts,
             decode,
             residency,
@@ -335,11 +346,7 @@ fn a_chunked_keccak_rnd_is_accepted_only_by_the_block_shape() {
     assert_eq!(honest.keccak_rnd, 1);
     let mut chunked = honest.clone();
     chunked.keccak_rnd = 4;
-    assert!(
-        chunked
-            .validate_for(AcceleratorShape::KeccakRndChunked)
-            .is_ok()
-    );
+    assert!(chunked.validate_for(AcceleratorShape::BlockChunked).is_ok());
     assert!(
         chunked.validate().is_err(),
         "the single shape refuses 4 KECCAK_RND tables"
@@ -348,7 +355,7 @@ fn a_chunked_keccak_rnd_is_accepted_only_by_the_block_shape() {
     two_keccak.keccak = 2;
     assert!(
         two_keccak
-            .validate_for(AcceleratorShape::KeccakRndChunked)
+            .validate_for(AcceleratorShape::BlockChunked)
             .is_err(),
         "KECCAK (the permutation table) stays one table under the block shape"
     );
@@ -391,6 +398,357 @@ fn noepoch_keccak_rnd_chunked_proves_and_verifies() {
     println!(
         "NOEPOCH KECCAK_RND CHUNKED: 3 instances, block verifier accepts, single shape refuses, bytes equal"
     );
+}
+
+/// Every accelerator present, KECCAK_RND in two chunks and ECDAS in three: in
+/// proof order (`VmAirs::air_refs`) the five fixed tables, COMMIT 5, KECCAK 6,
+/// KECCAK_RND 7–8, ECSM 9, ECDAS 10–12, HINT 13, CPU 14–15, MEMW_R 16.
+fn chunked_counts() -> crate::TableCounts {
+    crate::TableCounts {
+        cpu: 2,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 1,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 1,
+        keccak_rnd: 2,
+        ecsm: 1,
+        ecdas: 3,
+        hint: 1,
+        commit: 1,
+        blake3: 0,
+    }
+}
+
+/// The block shape's accelerator rule for ECDAS, host only: three ECDAS tables
+/// pass the block shape and are refused by the single shape every other
+/// verifier uses; ECSM (the call table) stays at one table under both.
+#[test]
+fn a_chunked_ecdas_is_accepted_only_by_the_block_shape() {
+    use crate::AcceleratorShape;
+    let counts = chunked_counts();
+    assert!(counts.validate_for(AcceleratorShape::BlockChunked).is_ok());
+    let mut ecdas_only = counts.clone();
+    ecdas_only.keccak_rnd = 1;
+    assert!(
+        ecdas_only.validate().is_err(),
+        "the single shape refuses 3 ECDAS tables"
+    );
+    let mut one_ecdas = ecdas_only.clone();
+    one_ecdas.ecdas = 1;
+    assert!(one_ecdas.validate().is_ok(), "the control: one of each");
+    let mut two_ecsm = counts.clone();
+    two_ecsm.ecsm = 2;
+    assert!(
+        two_ecsm
+            .validate_for(AcceleratorShape::BlockChunked)
+            .is_err(),
+        "ECSM stays one table under the block shape"
+    );
+}
+
+/// ★ The block shape caps the chunked tables' heights, and only theirs: an
+/// ECDAS instance over [`crate::BLOCK_ECDAS_MAX_ROWS`] and a KECCAK_RND
+/// instance over [`crate::BLOCK_KECCAK_RND_MAX_ROWS`] are refused by the block
+/// shape and accepted by the single shape (which bounds no height); every
+/// other table at a height far over both caps is accepted. The controls next
+/// to each range (ECSM before ECDAS, HINT after it, KECCAK before KECCAK_RND)
+/// are what an off-by-one in the instance ranges would cap instead.
+#[test]
+fn the_block_shape_caps_the_chunked_tables_heights() {
+    use crate::AcceleratorShape::{BlockChunked, Single};
+    let counts = chunked_counts();
+    let n = counts.total().expect("fits") + crate::FIXED_TABLE_COUNT;
+    assert_eq!(n, 17);
+    let check = |shape, lengths: &[usize]| counts.check_heights_for(shape, |i| lengths[i]);
+    let honest = vec![1usize << 10; n];
+    assert!(check(BlockChunked, &honest).is_ok());
+
+    let mut at_caps = honest.clone();
+    at_caps[7..9].fill(crate::BLOCK_KECCAK_RND_MAX_ROWS);
+    at_caps[10..13].fill(crate::BLOCK_ECDAS_MAX_ROWS);
+    assert!(
+        check(BlockChunked, &at_caps).is_ok(),
+        "an instance at its cap passes"
+    );
+
+    for (what, idx, rows) in [
+        ("ECDAS[2] over its cap", 12, crate::BLOCK_ECDAS_MAX_ROWS * 2),
+        ("ECDAS[0] over its cap", 10, crate::BLOCK_ECDAS_MAX_ROWS * 2),
+        (
+            "KECCAK_RND[1] over its cap",
+            8,
+            crate::BLOCK_KECCAK_RND_MAX_ROWS * 2,
+        ),
+        (
+            "KECCAK_RND[0] over its cap",
+            7,
+            crate::BLOCK_KECCAK_RND_MAX_ROWS * 2,
+        ),
+    ] {
+        let mut lengths = honest.clone();
+        lengths[idx] = rows;
+        let refused = check(BlockChunked, &lengths);
+        assert!(refused.is_err(), "the block shape must refuse {what}");
+        assert!(
+            check(Single, &lengths).is_ok(),
+            "the single shape bounds no height ({what})"
+        );
+        println!("BLOCK SHAPE refuses {what}: {:?}", refused.err());
+    }
+
+    for (what, idx) in [
+        ("COMMIT", 5),
+        ("KECCAK", 6),
+        ("ECSM", 9),
+        ("HINT", 13),
+        ("CPU[0]", 14),
+        ("MEMW_R[0]", 16),
+    ] {
+        let mut lengths = honest.clone();
+        lengths[idx] = 1 << 22;
+        assert!(
+            check(BlockChunked, &lengths).is_ok(),
+            "{what} is not a chunked table: its height is not the shape's"
+        );
+    }
+}
+
+/// The instance ranges the height caps read are the chunked AIRs' positions in
+/// [`crate::VmAirs::air_refs`] — the proof's order — and nothing next to them.
+#[test]
+fn block_chunked_ranges_name_the_chunked_airs() {
+    let elf_bytes = asm_elf_bytes("poc_rodata_commit");
+    let program = Elf::load(&elf_bytes).expect("load the ELF");
+    let page_configs = Traces::page_configs_from_elf(&program);
+    let counts = chunked_counts();
+    let opts = bytes_options();
+    let airs = crate::VmAirs::new(
+        &program,
+        &opts,
+        false,
+        &page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let names: Vec<String> = airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    assert_eq!(
+        names.len(),
+        counts.total().unwrap() + crate::FIXED_TABLE_COUNT + page_configs.len()
+    );
+    for (table, range, _) in counts.block_chunked_ranges() {
+        assert!(!range.is_empty());
+        for (k, idx) in range.clone().enumerate() {
+            assert_eq!(names[idx], format!("{table}[{k}]"));
+        }
+        let prefix = format!("{table}[");
+        assert!(!names[range.start - 1].starts_with(&prefix));
+        assert!(!names[range.end].starts_with(&prefix));
+    }
+}
+
+/// The ECDAS chunk height of the box tests: test_ecsm_multi's three calls
+/// (k = 1, 5, 0xABCDEF) make 0 + 3 + 39 = 42 double/add steps, so 16-row chunks
+/// give three ECDAS instances (16, 16, 10 + padding) and the 0xABCDEF call runs
+/// through all three.
+const ECSM_MULTI_ECDAS_CHUNK: usize = 16;
+
+fn ecsm_multi_chunked() -> OneBuild {
+    let max_rows = MaxRowsConfig {
+        ecdas: ECSM_MULTI_ECDAS_CHUNK,
+        ..MaxRowsConfig::default()
+    };
+    let build = OneBuild::new("test_ecsm_multi", &max_rows);
+    let heights: Vec<usize> = build.traces.ecdases.iter().map(|t| t.num_rows()).collect();
+    assert_eq!(heights, [16, 16, 16], "three 16-row ECDAS chunks");
+    build
+}
+
+/// ★ ECDAS chunked: test_ecsm_multi's 42 steps at 16 rows a chunk give three
+/// ECDAS instances, one scalar multiplication running through all three. The
+/// block verifier accepts the proof; the single-shape verifier refuses the
+/// same bytes (the shape is the verifier's constant). Retain and
+/// RecomputeLdeDevice agree byte for byte.
+#[test]
+#[ignore = "proves a VM program twice at blowup 4; GPU box gate (cuda)"]
+fn noepoch_ecdas_chunked_proves_and_verifies() {
+    let build = ecsm_multi_chunked();
+    assert_eq!(build.traces.table_counts().ecdas, 3);
+    let opts = bytes_options();
+    let retained = build
+        .prove(&opts, ResidencyMode::Retain, false)
+        .expect("prove under Retain");
+    let recommitted = build
+        .prove(&opts, ResidencyMode::RecomputeLdeDevice, true)
+        .expect("prove under RecomputeLdeDevice");
+    assert!(
+        build.verifies(&recommitted, &opts),
+        "the block verifier accepts it"
+    );
+    assert!(
+        !build.verifies_single_shape(&recommitted, &opts),
+        "the single-shape verifier must refuse 3 ECDAS tables"
+    );
+    assert!(proof_bytes(&retained) == proof_bytes(&recommitted));
+    println!(
+        "NOEPOCH ECDAS CHUNKED: 3 instances, block verifier accepts, single shape refuses, bytes equal"
+    );
+}
+
+/// Whether a prove of `traces` gives a proof the block verifier accepts (a
+/// prover refusal counts as not accepted).
+fn block_accepts(build: &OneBuild, traces: &Traces, opts: &ProofOptions) -> bool {
+    match build.prove_these(traces, opts, ResidencyMode::Retain, false) {
+        Ok(proof) => build.verifies(&proof, opts),
+        Err(e) => {
+            println!("    (the prover refused: {e:?})");
+            false
+        }
+    }
+}
+
+/// ★ A call split across ECDAS chunks is held together by the Ecdas bus alone,
+/// keyed by the call's timestamp and the step's `(round, op)`.
+///
+/// - Control: two whole rows swapped between chunk 0 and chunk 1 (a step of
+///   the 5·G call and a step of the 0xABCDEF call) is the same multiset of
+///   rows, and verifies: a chunk boundary carries nothing a bus does not.
+/// - Negative: the same two rows swap only their timestamps, so each claims
+///   the other's call. Their constraints still hold (no constraint reads the
+///   timestamp), no range check reads it, and both rows have `NEXT_OP = 0`, so
+///   their `Bit` sends are off: only the Ecdas tuples moved, and the block is
+///   refused.
+///
+/// Mutation (box script): drop the timestamp from `ecsm::ecdas_tuple` and the
+/// negative verifies — the call key is what refuses it.
+#[test]
+#[ignore = "proves a VM program three times at blowup 4; GPU box gate (cuda)"]
+fn noepoch_ecdas_split_call_is_keyed_on_the_bus() {
+    use crate::tables::ecdas::cols;
+    let build = ecsm_multi_chunked();
+    let opts = bytes_options();
+    let ts = |t: &stark::trace::TraceTable<_, _>, r: usize| {
+        (
+            *t.main_table.get(r, cols::TIMESTAMP_0),
+            *t.main_table.get(r, cols::TIMESTAMP_1),
+        )
+    };
+    let next_op_off = |t: &stark::trace::TraceTable<_, _>, r: usize| {
+        *t.main_table.get(r, cols::NEXT_OP) == crate::tables::types::FE::zero()
+    };
+    // Row a: chunk 0, the 5·G call (rows 0–2); row b: chunk 1, the 0xABCDEF
+    // call. Both real rows with NEXT_OP = 0, from different calls.
+    let (c0, c1) = (&build.traces.ecdases[0], &build.traces.ecdases[1]);
+    let a = (0..3)
+        .find(|&r| next_op_off(c0, r))
+        .expect("a 5·G step with NEXT_OP = 0");
+    let b = (0..16)
+        .find(|&r| next_op_off(c1, r))
+        .expect("a 0xABCDEF step with NEXT_OP = 0");
+    assert_ne!(ts(c0, a), ts(c1, b), "two different calls");
+    let one = crate::tables::types::FE::one();
+    assert_eq!(*c0.main_table.get(a, cols::MU), one);
+    assert_eq!(*c1.main_table.get(b, cols::MU), one);
+
+    assert!(
+        block_accepts(&build, &build.traces, &opts),
+        "the honest chunked build verifies"
+    );
+
+    let mut swapped = build.traces.clone();
+    for col in 0..cols::NUM_COLUMNS {
+        let x = *swapped.ecdases[0].main_table.get(a, col);
+        let y = *swapped.ecdases[1].main_table.get(b, col);
+        swapped.ecdases[0].main_table.set(a, col, y);
+        swapped.ecdases[1].main_table.set(b, col, x);
+    }
+    assert!(
+        block_accepts(&build, &swapped, &opts),
+        "whole rows swapped across chunks are the same steps: accepted"
+    );
+    println!("NOEPOCH ECDAS SPLIT CONTROL: whole rows swapped across chunks, accepted");
+
+    let mut rekeyed = build.traces.clone();
+    for col in [cols::TIMESTAMP_0, cols::TIMESTAMP_1] {
+        let x = *rekeyed.ecdases[0].main_table.get(a, col);
+        let y = *rekeyed.ecdases[1].main_table.get(b, col);
+        rekeyed.ecdases[0].main_table.set(a, col, y);
+        rekeyed.ecdases[1].main_table.set(b, col, x);
+    }
+    assert!(
+        !block_accepts(&build, &rekeyed, &opts),
+        "a continuation row reattached to another call must be refused"
+    );
+    println!(
+        "NOEPOCH ECDAS SPLIT NEGATIVE: chunk 0 row {a} and chunk 1 row {b} swapped calls, refused"
+    );
+}
+
+/// ★ The ECDAS height cap end to end: test_ecsm_multi's one ECDAS table padded
+/// to 2^18 rows (a valid table: the extra rows are padding) proves; the block
+/// verifier refuses it (an instance over [`crate::BLOCK_ECDAS_MAX_ROWS`]) and
+/// the single-shape verifier, which bounds no height, accepts the same bytes.
+///
+/// Mutation (box script): `check_heights_for` returning `Ok(())` and the block
+/// verifier accepts.
+#[test]
+#[ignore = "proves a VM program with a 2^18-row ECDAS at blowup 4; GPU box gate (cuda)"]
+fn noepoch_ecdas_over_its_cap_is_refused() {
+    let build = OneBuild::new("test_ecsm_multi", &MaxRowsConfig::default());
+    let mut traces = build.traces.clone();
+    assert_eq!(
+        traces.ecdases.len(),
+        1,
+        "one ECDAS table at the default caps"
+    );
+    let table = &traces.ecdases[0];
+    let (rows, width) = (table.num_rows(), table.main_table.width);
+    assert!(rows < crate::BLOCK_ECDAS_MAX_ROWS);
+    let padding = table.main_table.get_row(rows - 1).to_vec();
+    assert_eq!(
+        padding[crate::tables::ecdas::cols::MU],
+        crate::tables::types::FE::zero(),
+        "the last row is padding"
+    );
+    let tall = 2 * crate::BLOCK_ECDAS_MAX_ROWS;
+    let mut data = Vec::with_capacity(tall * width);
+    for r in 0..rows {
+        data.extend_from_slice(table.main_table.get_row(r));
+    }
+    for _ in rows..tall {
+        data.extend_from_slice(&padding);
+    }
+    traces.ecdases[0] = stark::trace::TraceTable::new_main(data, width, 1);
+    let opts = bytes_options();
+    let proof = build
+        .prove_these(&traces, &opts, ResidencyMode::Retain, false)
+        .expect("a padded ECDAS is a valid table");
+    assert!(
+        build.verifies_single_shape(&proof, &opts),
+        "the single shape bounds no height: the proof itself is sound"
+    );
+    assert!(
+        !build.verifies(&proof, &opts),
+        "the block verifier must refuse an ECDAS instance over its cap"
+    );
+    println!("NOEPOCH ECDAS OVER CAP: 2^18 rows, single shape accepts, block verifier refuses");
 }
 
 /// The data-page record returns the root recorded for the same INIT column

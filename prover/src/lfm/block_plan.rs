@@ -602,10 +602,11 @@ pub fn block_fan_in() -> usize {
 }
 
 /// `verify_proof_parts`' pre-checks on a claimed shape, before any AIR is
-/// built: the accelerator shape (`KeccakRndChunked`, the block verifier's), the
+/// built: the accelerator shape (`BlockChunked`, the block verifier's), the
 /// private-input-page bound, the page configs (ELF pages plus the runtime
 /// ranges: aligned, non-empty, disjoint from the ELF's), the instance count
-/// against the trace lengths, and each trace length (a power of two inside the
+/// against the trace lengths, the chunked tables' heights (KECCAK_RND and
+/// ECDAS under their caps) and each trace length (a power of two inside the
 /// field's two-adicity). Returns the page configs.
 pub fn check_shape(
     elf: &executor::elf::Elf,
@@ -615,7 +616,7 @@ pub fn check_shape(
     let n = shape.trace_lengths.len();
     shape
         .table_counts
-        .validate_for(crate::AcceleratorShape::KeccakRndChunked)
+        .validate_for(crate::AcceleratorShape::BlockChunked)
         .map_err(|e| format!("table counts: {e:?}"))?;
     let max_pages = crate::tables::page::max_private_input_pages();
     if shape.num_private_input_pages > max_pages {
@@ -640,6 +641,12 @@ pub fn check_shape(
     if expected != n {
         return Err(format!("{expected} instances declared, {n} trace lengths"));
     }
+    shape
+        .table_counts
+        .check_heights_for(crate::AcceleratorShape::BlockChunked, |i| {
+            shape.trace_lengths[i]
+        })
+        .map_err(|e| format!("table heights: {e:?}"))?;
     let log2_blowup = (opts.blowup_factor as usize).trailing_zeros();
     for (i, &rows) in shape.trace_lengths.iter().enumerate() {
         if !rows.is_power_of_two() || rows.trailing_zeros() + log2_blowup > MAX_LOG2_LDE {

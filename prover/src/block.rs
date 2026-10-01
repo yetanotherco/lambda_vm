@@ -48,45 +48,57 @@ fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// instances of `2^BLOCK_ROWS_LOG2` rows (the tail padded to its power of two).
 pub const BLOCK_ROWS_LOG2: u32 = 21;
 
-/// KECCAK_RND rows per instance: 2^16, so the batching phase keeps its 128
-/// bits (D-NOEPOCH §6) and no instance outweighs the VRAM gate.
-pub const BLOCK_KECCAK_RND_ROWS_LOG2: u32 = 16;
+/// KECCAK_RND rows per instance: the block format's cap
+/// ([`crate::BLOCK_KECCAK_RND_MAX_ROWS`], 2^16), so the batching phase keeps
+/// its 128 bits (D-NOEPOCH §6) and no instance outweighs the VRAM gate.
+pub const BLOCK_KECCAK_RND_ROWS_LOG2: u32 = crate::BLOCK_KECCAK_RND_MAX_ROWS.trailing_zeros();
 
-/// `LAMBDA_VM_BLOCK_KECCAK_RND_LOG2`: `off` proves KECCAK_RND as one table (the
-/// A arm of the chunking A/B), `5..=26` sets its cap; unset is
-/// [`BLOCK_KECCAK_RND_ROWS_LOG2`]. Anything else aborts.
+/// ECDAS rows per instance: the block format's cap
+/// ([`crate::BLOCK_ECDAS_MAX_ROWS`], 2^17).
+pub const BLOCK_ECDAS_ROWS_LOG2: u32 = crate::BLOCK_ECDAS_MAX_ROWS.trailing_zeros();
+
+/// `LAMBDA_VM_BLOCK_KECCAK_RND_LOG2`: `5..=16` sets KECCAK_RND's chunk height;
+/// unset is [`BLOCK_KECCAK_RND_ROWS_LOG2`]. Anything else aborts: the block
+/// verifiers refuse a KECCAK_RND instance above
+/// [`crate::BLOCK_KECCAK_RND_MAX_ROWS`], so one table (`off`, the A arm of the
+/// chunking A/B) or a taller chunk no longer makes a verifiable block.
 fn block_keccak_rnd_rows() -> usize {
     match std::env::var("LAMBDA_VM_BLOCK_KECCAK_RND_LOG2")
         .ok()
         .as_deref()
     {
         None => 1 << BLOCK_KECCAK_RND_ROWS_LOG2,
-        Some("off") => crate::tables::KECCAK_RND_UNCHUNKED,
         Some(v) => {
             let n: u32 = v
                 .parse()
                 .ok()
-                .filter(|n| (5..=26).contains(n))
+                .filter(|n| (5..=BLOCK_KECCAK_RND_ROWS_LOG2).contains(n))
                 .unwrap_or_else(|| {
-                    panic!("LAMBDA_VM_BLOCK_KECCAK_RND_LOG2 must be `off` or 5..=26, got `{v}`")
+                    panic!(
+                        "LAMBDA_VM_BLOCK_KECCAK_RND_LOG2 must be 5..={BLOCK_KECCAK_RND_ROWS_LOG2}, \
+                         got `{v}`"
+                    )
                 });
             1 << n
         }
     }
 }
 
-/// The block's table caps: [`BLOCK_ROWS_LOG2`] for every splittable table and
-/// KECCAK_RND chunked (see [`block_keccak_rnd_rows`]).
+/// The block's table caps: [`BLOCK_ROWS_LOG2`] for every splittable table,
+/// KECCAK_RND chunked (see [`block_keccak_rnd_rows`]) and ECDAS chunked at
+/// [`BLOCK_ECDAS_ROWS_LOG2`].
 pub fn block_max_rows() -> MaxRowsConfig {
     MaxRowsConfig {
         keccak_rnd: block_keccak_rnd_rows(),
+        ecdas: 1 << BLOCK_ECDAS_ROWS_LOG2,
         ..MaxRowsConfig::uniform(1 << BLOCK_ROWS_LOG2)
     }
 }
 
-/// The block verifier: [`crate::verify_with_options`] that also accepts a
-/// chunked KECCAK_RND ([`AcceleratorShape::KeccakRndChunked`]), the shape
-/// [`prove_block`] proves. Every other verifier keeps KECCAK_RND to one table.
+/// The block verifier: [`crate::verify_with_options`] under
+/// [`AcceleratorShape::BlockChunked`], the shape [`prove_block`] proves —
+/// KECCAK_RND and ECDAS chunked, each instance under its cap. Every other
+/// verifier keeps both to one table.
 pub fn verify_block(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
@@ -101,7 +113,7 @@ pub fn verify_block(
         opts,
         None,
         None,
-        AcceleratorShape::KeccakRndChunked,
+        AcceleratorShape::BlockChunked,
     )
 }
 

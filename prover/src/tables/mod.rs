@@ -131,11 +131,22 @@ pub struct MaxRowsConfig {
     /// (every configuration but the no-epoch block's). A chunk holds whole
     /// permutations: `keccak_rnd / 24` of them, at least one.
     pub keccak_rnd: usize,
+    /// ECDAS rows per table, or [`ECDAS_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). An ECDAS row is one
+    /// double/add step, so a chunk holds `ecdas` steps and a scalar
+    /// multiplication may continue in the next chunk: its steps chain through
+    /// the Ecdas bus, keyed by the call's timestamp and the step's
+    /// `(round, op)`, never through a row-to-row constraint.
+    pub ecdas: usize,
 }
 
 /// [`MaxRowsConfig::keccak_rnd`]'s "one table", the value every constructor
 /// here sets: a chunked KECCAK_RND is accepted only by the block verifier.
 pub const KECCAK_RND_UNCHUNKED: usize = usize::MAX;
+
+/// [`MaxRowsConfig::ecdas`]'s "one table", the value every constructor here
+/// sets: a chunked ECDAS is accepted only by the block verifier.
+pub const ECDAS_UNCHUNKED: usize = usize::MAX;
 
 /// The uniform table cap this process proves at, or `None` for the production
 /// per-table values.
@@ -191,6 +202,7 @@ impl Default for MaxRowsConfig {
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
         }
     }
 }
@@ -214,6 +226,7 @@ impl MaxRowsConfig {
             store: rows,
             cpu32: rows,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
         }
     }
 
@@ -236,6 +249,7 @@ impl MaxRowsConfig {
             store: 1 << 5,
             cpu32: 1 << 5,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
         }
     }
 }

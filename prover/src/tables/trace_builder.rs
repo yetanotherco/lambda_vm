@@ -4548,12 +4548,24 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_ecdases = || {
-        generate_optional(
-            &ecdas_ops,
-            ecdas::generate_ecdas_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.ecdas == super::ECDAS_UNCHUNKED {
+            generate_optional(
+                &ecdas_ops,
+                ecdas::generate_ecdas_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // One row per step; a call's steps may straddle two chunks (they
+            // chain through the Ecdas bus, see `MaxRowsConfig::ecdas`).
+            chunk_and_generate_optional(
+                &ecdas_ops,
+                max_rows.ecdas.max(1),
+                ecdas::generate_ecdas_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     // HINT table. Absent entirely for programs that make no hint ecalls.
     let gen_hints = || {

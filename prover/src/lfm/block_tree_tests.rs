@@ -404,8 +404,9 @@ fn honest_fixture_shape(elf: &executor::elf::Elf) -> BlockShape {
 /// builds an AIR ([`super::block_plan::check_shape`], `verify_proof_parts`'
 /// pre-checks): a non-chunked accelerator counted twice, a KECCAK_RND count the
 /// trace lengths do not cover, more private-input pages than the bound, a
-/// runtime page range over an ELF page, and a trace length that is not a power
-/// of two. Each tamper is the only change to a shape the checks accept.
+/// runtime page range over an ELF page, a trace length that is not a power of
+/// two, and an ECDAS or KECCAK_RND instance over its cap. Each tamper is the
+/// only change to a shape the checks accept.
 #[test]
 fn the_plan_refuses_a_shape_the_host_refuses() {
     use super::block_plan::check_shape;
@@ -454,6 +455,23 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
             "a trace length that is not a power of two",
             Box::new(|s| s.trace_lengths[0] = 48),
         ),
+        (
+            "an ECDAS instance over its cap",
+            Box::new(|s| {
+                // ECDAS[1] is instance 6: the five fixed tables, then ECDAS[0].
+                s.table_counts.ecdas = 2;
+                s.trace_lengths.extend([32, 32]);
+                s.trace_lengths[6] = 2 * crate::BLOCK_ECDAS_MAX_ROWS;
+            }),
+        ),
+        (
+            "a KECCAK_RND instance over its cap",
+            Box::new(|s| {
+                s.table_counts.keccak_rnd = 2;
+                s.trace_lengths.extend([32, 32]);
+                s.trace_lengths[5] = 2 * crate::BLOCK_KECCAK_RND_MAX_ROWS;
+            }),
+        ),
     ];
     for (what, tamper) in tampers {
         let mut shape = honest.clone();
@@ -472,6 +490,14 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
     let mut chunked = honest.clone();
     chunked.table_counts.keccak_rnd = 3;
     chunked.trace_lengths.extend([32, 32, 32]);
+    assert!(check_shape(&elf, &opts, &chunked).is_ok());
+    // So is ECDAS, each instance at its cap at most.
+    chunked.table_counts.ecdas = 2;
+    chunked.trace_lengths.extend([32, 32]);
+    assert!(check_shape(&elf, &opts, &chunked).is_ok());
+    // The instance after the last ECDAS (CPU[0], index 5 + 3 + 2) is not
+    // capped: an off-by-one in the ranges would refuse it.
+    chunked.trace_lengths[10] = 1 << 22;
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
