@@ -247,6 +247,8 @@ fn vm_hwm_gib() -> Option<f64> {
 #[test]
 #[ignore = "proves a whole block; GPU box only (NOEPOCH_ELF, NOEPOCH_INPUT)"]
 fn noepoch_block_prove_and_verify() {
+    // A refusal names its table and its check: the verifier's `error!` lines.
+    let _ = env_logger::builder().is_test(true).try_init();
     let elf_path = std::env::var("NOEPOCH_ELF").expect("NOEPOCH_ELF=<guest ELF>");
     let input_path = std::env::var("NOEPOCH_INPUT").expect("NOEPOCH_INPUT=<private input>");
     let elf_bytes = std::fs::read(&elf_path).expect("read NOEPOCH_ELF");

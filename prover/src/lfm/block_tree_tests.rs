@@ -1265,6 +1265,9 @@ fn the_block_tree_composes_to_a_top_node() {
     };
     use std::time::Instant;
 
+    // A refused harvest names its table and its check: the verifier's `error!` lines.
+    let _ = env_logger::builder().is_test(true).try_init();
+
     if !cfg!(feature = "cuda") {
         panic!("the production block tree requires `--features cuda`");
     }
