@@ -67,20 +67,12 @@ iters = [["x", 0, 4], ["y", 0, 4]]
 ref = "keccak:c:state_ptr"
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 0]]
+kind = "template"
+tag = "IS_WHH"
+input = [["idx", ["idx", "state_ptr", "x"], "y"]]
 iters = [["x", 0, 4], ["y", 0, 4]]
-multiplicity = "μ"
-ref = "keccak:c:range_state_ptr_lo"
-
-[[constraints.mem]]
-kind = "interaction"
-tag = "IS_WH"
-input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 2], ["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 1]]
-iters = [["x", 0, 4], ["y", 0, 4]]
-multiplicity = "μ"
-ref = "keccak:c:range_state_ptr_hi"
+cond = "μ"
+ref = "keccak:c:range_state_ptr"
 
 [[constraints.mem]]
 kind = "interaction"

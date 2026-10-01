@@ -1,0 +1,28 @@
+name = "IS_WHH"
+code = "WHH"
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = "the multiplicity with which to apply the interactions"
+
+[[variables.input]]
+name = "double_word"
+type = "DWordWHH"
+desc = "the double word being range checked"
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_WH"
+input = [["idx", "double_word", 2], ["idx", "double_word", 1]]
+multiplicity = "cond"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "double_word", 0]]
+multiplicity = "cond"
