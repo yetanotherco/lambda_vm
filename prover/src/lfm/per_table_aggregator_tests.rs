@@ -4172,9 +4172,10 @@ fn tree_top_overlap(default: bool) -> bool {
     }
 }
 
-/// `LFM_TREE_GLOBAL_AFTER_LAST=1`: in a wide level 1 whose pool runs the WHIR
-/// global child, the global's `multi_prove` waits until the last wide node has
-/// built its artifacts. Unset or `0`: the card is first come, first served.
+/// `LFM_TREE_GLOBAL_AFTER_LAST`, on by default: in a wide level 1 whose pool
+/// runs the WHIR global child, the global's `multi_prove` waits until the last
+/// wide node has built its artifacts. `0`: the card is first come, first
+/// served.
 ///
 /// ★ Why: level 1 ends when its last node proves, and that node's chain is its
 /// prologue, its artifacts, its host prep and its prove. The global's prove
@@ -4186,17 +4187,48 @@ fn tree_top_overlap(default: bool) -> bool {
 /// global's host prep where it is and moves only its card request. Read once
 /// per level; anything but `0` or `1` stops the run.
 fn tree_global_after_last() -> bool {
-    match std::env::var("LFM_TREE_GLOBAL_AFTER_LAST").ok().as_deref() {
-        None | Some("") | Some("0") => false,
+    global_after_last_from(std::env::var("LFM_TREE_GLOBAL_AFTER_LAST").ok().as_deref())
+}
+
+/// The latch. Job 255 (A B B A on the block at #1010's head): level 1 −0.40 s,
+/// the whole run −0.43 s, the base −0.05 s, the same program ids; the global
+/// took the card first in 3 of 4 arms without the latch and in none with it.
+const GLOBAL_AFTER_LAST_DEFAULT: bool = true;
+
+/// [`tree_global_after_last`] with its variable supplied, so the default and
+/// the opt-out are testable without mutating process state. Unset or empty is
+/// the default.
+fn global_after_last_from(value: Option<&str>) -> bool {
+    match value {
+        None | Some("") => GLOBAL_AFTER_LAST_DEFAULT,
+        Some("0") => false,
         Some("1") => true,
         Some(other) => panic!("LFM_TREE_GLOBAL_AFTER_LAST must be `0` or `1`, got `{other}`"),
     }
 }
 
+/// ★ The default is on (job 255), and `0` is the only way off. A change here
+/// moves every run's level 1, and must fail this first.
+#[test]
+fn global_after_last_is_on_unless_its_variable_is_zero() {
+    let default = GLOBAL_AFTER_LAST_DEFAULT;
+    assert!(default, "the latch must be on by default");
+    assert!(global_after_last_from(None));
+    assert!(global_after_last_from(Some("")));
+    assert!(global_after_last_from(Some("1")));
+    assert!(!global_after_last_from(Some("0")));
+}
+
+#[test]
+#[should_panic(expected = "LFM_TREE_GLOBAL_AFTER_LAST must be `0` or `1`, got `on`")]
+fn global_after_last_refuses_any_other_value() {
+    global_after_last_from(Some("on"));
+}
+
 /// What [`tree_global_after_last`] does on one level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlobalAfterLast {
-    /// Unset or `0`.
+    /// `LFM_TREE_GLOBAL_AFTER_LAST=0`.
     Off,
     /// The global child's prove waits for the last wide node's artifacts.
     Active,
@@ -8921,22 +8953,23 @@ where
     match mode {
         GlobalAfterLast::Active => println!(
             "   ★ GLOBAL AFTER LAST: the WHIR GLOBAL child's prove waits until L1N{} has built \
-             its artifacts (LFM_TREE_GLOBAL_AFTER_LAST=1)",
+             its artifacts (on by default; LFM_TREE_GLOBAL_AFTER_LAST=0 turns it off)",
             groups.len() - 1
         ),
         GlobalAfterLast::TooFewWorkers => println!(
             "   ★ GLOBAL AFTER LAST requested but INACTIVE: {siblings} worker(s) for {tasks} \
              tasks, so the global could wait for a node no worker has taken \
-             (LFM_TREE_GLOBAL_AFTER_LAST=1)"
+             (on by default; LFM_TREE_GLOBAL_AFTER_LAST=0 turns it off)"
         ),
         GlobalAfterLast::NoGlobalInThePool => println!(
             "   ★ GLOBAL AFTER LAST requested but INACTIVE: the global child is not a task of \
-             this level's pool, so there is nothing to order (LFM_TREE_GLOBAL_AFTER_LAST=1)"
+             this level's pool, so there is nothing to order (on by default; \
+             LFM_TREE_GLOBAL_AFTER_LAST=0 turns it off)"
         ),
         // Said only where the lever could act, so a tree of wraps prints nothing new.
         GlobalAfterLast::Off if wide && top_overlap => println!(
             "   ★ GLOBAL AFTER LAST OFF: the card is first come, first served \
-             (unset or LFM_TREE_GLOBAL_AFTER_LAST=0)"
+             (LFM_TREE_GLOBAL_AFTER_LAST=0)"
         ),
         GlobalAfterLast::Off => {}
     }
