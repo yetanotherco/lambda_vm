@@ -538,6 +538,31 @@ fn dropping_the_streamed_ops_keeps_keccak_rnd_chunked_the_same() {
     }
 }
 
+/// The same with ECDAS cut into chunks (the block's split, built by `finish`
+/// from the run's ECDAS ops, which dropping appends window by window):
+/// test_ecsm_multi's 42 steps at 16 and 8 rows a chunk, one call running
+/// through several chunks.
+#[test]
+fn dropping_the_streamed_ops_keeps_ecdas_chunked_the_same() {
+    let (program, logs) = run("test_ecsm_multi");
+    for per in [16usize, 8] {
+        let max_rows = MaxRowsConfig {
+            ecdas: per,
+            ..MaxRowsConfig::small()
+        };
+        let reference = whole(&program, &logs, &max_rows);
+        assert!(reference.ecdases.len() >= 3, "{per}: ECDAS chunked");
+        for window in [1, 7, 33] {
+            for split in [false, true] {
+                let (dropping, _) = windowed_with(&program, &logs, &max_rows, window, split, |b| {
+                    b.drop_streamed_ops().expect("before any window")
+                });
+                same_traces(&reference, &dropping);
+            }
+        }
+    }
+}
+
 /// ★ Dropping bounds what the builder holds: after every window each streamed
 /// table holds less than a chunk of ops not handed out, and its lists take room
 /// for at most a window's part more — however long the run. Keeping every
