@@ -900,6 +900,7 @@ fn the_card_proves_the_host_references_bytes() {
             let committed = commit(tables(&airs, &cols, false), &cfg);
             let fused = multilinear::gpu_fused::fused_sessions();
             let rounds = multilinear::gpu::sumcheck_rounds();
+            let gruen = multilinear::gkr_gruen::gruen_layers();
             let mut transcript = DefaultTranscript::<Ext>::new(SEED);
             let proof = prove_batched_on(
                 &committed,
@@ -913,16 +914,28 @@ fn the_card_proves_the_host_references_bytes() {
             verify(&committed, &proof, &cfg).unwrap_or_else(|e| panic!("{at:?}: {e:?}"));
             let fused = multilinear::gpu_fused::fused_sessions() - fused;
             let rounds = multilinear::gpu::sumcheck_rounds() - rounds;
+            let gruen = multilinear::gkr_gruen::gruen_layers() - gruen;
             (
                 bincode::serialize(&proof).expect("bytes"),
                 transcript.state(),
                 transcript.sample_field_element(),
                 fused,
                 rounds,
+                gruen,
             )
         };
         let host = run(Where::Host);
         let card = run(Where::Device);
+        // The ladder on today's generic layer rounds, not Gruen's: the same
+        // bytes again. (Its Gruen count is not asserted: the switch and the
+        // counter are the process's, and a test beside this one moves both.)
+        multilinear::gkr_gruen::force_argue_gkr_gruen(Some(false));
+        let generic = run(Where::Device);
+        multilinear::gkr_gruen::force_argue_gkr_gruen(None);
+        assert!(
+            host.0 == generic.0,
+            "a={a} cap={cap}: the generic ladder's bytes differ"
+        );
         // A refusal on the card is the host's rounds, never another proof: the
         // fused rounds switched off leave the ladder on the card and the
         // constraint rounds here.
@@ -936,14 +949,17 @@ fn the_card_proves_the_host_references_bytes() {
         );
         assert_eq!(host.3, 0, "the host reference ran no fused session");
         eprintln!(
-            "batched argue B-3 a={a} pad={pad} cap={cap}: device {} fused sessions, {} device rounds; {} bytes",
+            "batched argue B-3 a={a} pad={pad} cap={cap}: device {} fused sessions, {} device rounds, {} \
+             Gruen ladder layers; {} bytes",
             card.3,
             card.4,
+            card.5,
             card.0.len()
         );
         if a_device() && a >= 7 {
             assert!(card.3 > 0, "a={a}: the card ran fused sessions");
             assert!(card.4 > 0, "a={a}: the card ran rounds");
+            assert!(card.5 > 0, "a={a}: the ladder ran Gruen's rounds");
         }
         assert!(
             host.0 == card.0,

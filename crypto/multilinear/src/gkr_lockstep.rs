@@ -194,12 +194,14 @@ pub trait LadderTree<F: IsField> {
     /// The output fraction.
     fn output(&self) -> (FieldElement<F>, FieldElement<F>);
     /// Layer `layer`'s step (`layer ≥ 1`), at `point` (`layer − 1`
-    /// coordinates), weighted `[w_p, w_q]`.
+    /// coordinates), weighted `[w_p, w_q]`, from the tree's claim `(p, q)` on
+    /// the layer above.
     fn step(
         &self,
         layer: usize,
         point: &[FieldElement<F>],
         weights: [FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error>;
 }
 
@@ -280,6 +282,7 @@ where
         layer: usize,
         point: &[FieldElement<F>],
         weights: [FieldElement<F>; 2],
+        _claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
         let next = self.0.get(layer).ok_or(Error::NoVariablesLeft)?;
         Ok(Box::new(HostStep::over(next, point, weights)?))
@@ -392,6 +395,227 @@ where
     }
 }
 
+/// What a [`GruenStep`] needs of the card: Gruen's rounds over one layer's
+/// halves ([`crate::gpu::GruenSession`]).
+trait GruenCard<F: IsField> {
+    /// The rounds it runs, `J`.
+    fn rounds(&self) -> usize;
+    /// Queues the next round, folding by `previous`, without waiting for it.
+    fn enqueue(&mut self, previous: Option<&FieldElement<F>>, want_h0: bool) -> Result<(), Error>;
+    /// The round's `H(1)`, `H(2)` — and `H(0)` with `want_h0`.
+    fn sums(
+        &mut self,
+        previous: Option<&FieldElement<F>>,
+        want_h0: bool,
+    ) -> Result<Vec<FieldElement<F>>, Error>;
+    /// After the last round: `p_lo, p_hi, q_lo, q_hi` bound to it.
+    fn finish(&mut self, previous: Option<&FieldElement<F>>) -> Result<Vec<Mle<F>>, Error>;
+}
+
+impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
+    fn rounds(&self) -> usize {
+        crate::gpu::GruenSession::rounds(self)
+    }
+
+    fn enqueue(&mut self, previous: Option<&FieldElement<F>>, want_h0: bool) -> Result<(), Error> {
+        crate::gpu::GruenSession::enqueue(self, previous, want_h0)
+    }
+
+    fn sums(
+        &mut self,
+        previous: Option<&FieldElement<F>>,
+        want_h0: bool,
+    ) -> Result<Vec<FieldElement<F>>, Error> {
+        crate::gpu::GruenSession::sums(self, previous, want_h0)
+    }
+
+    fn finish(&mut self, previous: Option<&FieldElement<F>>) -> Result<Vec<Mle<F>>, Error> {
+        crate::gpu::GruenSession::finish(self, previous)
+    }
+}
+
+/// The step over a device layer on Gruen's rounds ([`crate::gkr_gruen`], on
+/// with `LAMBDA_VM_ARGUE_GKR_GRUEN` as today's per-table layers are): the
+/// tree's relation is `w_p·eq·(p_lo q_hi + p_hi q_lo + λ'·q_lo q_hi)` with
+/// `λ' = w_q/w_p`, so the card sums its `H(1)`, `H(2)` under `λ'`, the tree's
+/// own chain (from its claim `p + λ'·q`) makes the message a per-table layer
+/// would send, and the step sends it times `w_p` — the field elements
+/// [`HostStep`] sums. At the card's tail it hands the host today's five
+/// factors, `eq` included, and steps on there.
+struct GruenStep<F: IsField, C> {
+    session: Option<C>,
+    chain: crate::gkr_gruen::Chain<F>,
+    /// The layer's point `u`, one coordinate a round.
+    point: Vec<FieldElement<F>>,
+    /// `1/(1 − u_j)` for each card round; `None` sums `H(0)` on the card.
+    lefts: Vec<Option<FieldElement<F>>>,
+    /// The card rounds run so far.
+    round: usize,
+    /// This round's message, unscaled, until its challenge binds it.
+    message: Option<crate::gkr_gruen::Message<F>>,
+    /// The last round's challenge, which the next card pass folds by.
+    previous: Option<FieldElement<F>>,
+    host: Option<HostStep<F>>,
+    weights: [FieldElement<F>; 2],
+}
+
+/// `λ' = w_q/w_p`, or `None` when `w_p` has no inverse.
+fn gruen_lambda<F: IsField>(weights: &[FieldElement<F>; 2]) -> Option<FieldElement<F>> {
+    weights[0].inv().ok().map(|inverse| &weights[1] * &inverse)
+}
+
+impl<F: IsField + 'static> GruenStep<F, crate::gpu::GruenSession>
+where
+    FieldElement<F>: Send + Sync,
+{
+    /// `None` when the step cannot run this way — `w_p` with no inverse, or a
+    /// card that declines the session — and before anything moves, so the
+    /// caller opens today's session instead.
+    fn open(
+        device: &crate::gpu::DeviceTree,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: &[FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+    ) -> Result<Option<Self>, Error> {
+        let Some(lambda) = gruen_lambda(weights) else {
+            return Ok(None);
+        };
+        let tail = crate::gkr_gruen::gkr_gruen_tail();
+        let Some(session) = device.gruen_session(layer, point, &lambda, tail) else {
+            return Ok(None);
+        };
+        Self::over(session, point, weights, claim)
+    }
+}
+
+impl<F: IsField + 'static, C: GruenCard<F>> GruenStep<F, C>
+where
+    FieldElement<F>: Send + Sync,
+{
+    /// The step over `session`, opened under `λ' = w_q/w_p` at `point`.
+    fn over(
+        session: C,
+        point: &[FieldElement<F>],
+        weights: &[FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+    ) -> Result<Option<Self>, Error> {
+        let Some(lambda) = gruen_lambda(weights) else {
+            return Ok(None);
+        };
+        let Some(chain) = crate::gkr_gruen::Chain::new(&claim.0 + &lambda * &claim.1) else {
+            return Ok(None);
+        };
+        let lefts = crate::gkr_gruen::inverse_lefts(&point[..session.rounds()]);
+        let mut step = Self {
+            session: Some(session),
+            chain,
+            point: point.to_vec(),
+            lefts,
+            round: 0,
+            message: None,
+            previous: None,
+            host: None,
+            weights: weights.clone(),
+        };
+        if step.lefts.is_empty() {
+            step.hand_over()?;
+        }
+        Ok(Some(step))
+    }
+
+    /// After the card's last round: its halves, and `κ·eq(u_{J..})` for the
+    /// weight, as the host's relation.
+    fn hand_over(&mut self) -> Result<(), Error> {
+        let Some(mut session) = self.session.take() else {
+            return Ok(());
+        };
+        let halves = session.finish(self.previous.as_ref())?;
+        let rounds = self.lefts.len();
+        let eq: Vec<FieldElement<F>> = crate::eq::eq_evals(&self.point[rounds..])
+            .iter()
+            .map(|v| self.chain.kappa() * v)
+            .collect();
+        let mut polys = Vec::with_capacity(5);
+        polys.push(Mle::new(eq)?);
+        polys.extend(halves);
+        if polys.len() != 5 {
+            return Err(Error::DeviceFailed {
+                stage: "layer factors",
+            });
+        }
+        crate::gkr_gruen::note_layer(rounds as u64, false);
+        self.host = Some(HostStep(LockstepRelation {
+            polys,
+            weights: self.weights.to_vec(),
+        }));
+        Ok(())
+    }
+}
+
+impl<F: IsField + 'static, C: GruenCard<F>> TreeStep<F> for GruenStep<F, C>
+where
+    FieldElement<F>: Send + Sync,
+{
+    fn round(&mut self) -> Result<Vec<FieldElement<F>>, Error> {
+        let Some(session) = self.session.as_mut() else {
+            return self.host.as_mut().ok_or(Error::NoVariablesLeft)?.round();
+        };
+        let left = self.lefts[self.round].as_ref();
+        let sums = session.sums(self.previous.as_ref(), left.is_none())?;
+        if left.is_none() {
+            crate::gkr_gruen::note_direct_h0();
+        }
+        let message = self
+            .chain
+            .message(
+                &self.point[self.round],
+                left,
+                &sums[0],
+                &sums[1],
+                sums.get(2).filter(|_| left.is_none()),
+            )
+            .ok_or(Error::DeviceFailed {
+                stage: "gruen message",
+            })?;
+        let sent = message.sent.iter().map(|v| v * &self.weights[0]).collect();
+        self.message = Some(message);
+        Ok(sent)
+    }
+
+    fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        if self.session.is_none() {
+            return self.host.as_mut().ok_or(Error::NoVariablesLeft)?.bind(r);
+        }
+        let message = self.message.take().ok_or(Error::DeviceFailed {
+            stage: "gruen message",
+        })?;
+        self.chain.advance(&self.point[self.round], &message, r);
+        self.previous = Some(r.clone());
+        self.round += 1;
+        if self.round == self.lefts.len() {
+            self.hand_over()?;
+        }
+        Ok(())
+    }
+
+    fn halves(&self) -> Result<TreeHalves<F>, Error> {
+        self.host.as_ref().ok_or(Error::NoVariablesLeft)?.halves()
+    }
+
+    fn prefetch(&mut self) -> Result<(), Error> {
+        let want_h0 = self.lefts.get(self.round).is_some_and(Option::is_none);
+        match self.session.as_mut() {
+            Some(session) => session.enqueue(self.previous.as_ref(), want_h0),
+            None => Ok(()),
+        }
+    }
+
+    // `device_cube` stays zero and `to_host` does nothing: a Gruen step leaves
+    // the card at its own tail (`LAMBDA_VM_ARGUE_GKR_GRUEN_TAIL`), the cube
+    // today's per-table layers leave it at.
+}
+
 /// `eq·(w_p·(p_lo q_hi + p_hi q_lo) + w_q·q_lo q_hi)` as the device's program:
 /// the batched step's relation for one tree.
 fn tree_program<F: IsField + 'static>(
@@ -435,6 +659,7 @@ where
         layer: usize,
         point: &[FieldElement<F>],
         weights: [FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
         let Some(device) = self.device() else {
             return Ok(Box::new(HostStep::over(self.layer(layer), point, weights)?));
@@ -451,6 +676,11 @@ where
                 })?;
             let next = FractionLayer::new(p, q)?;
             return Ok(Box::new(HostStep::over(&next, point, weights)?));
+        }
+        if crate::gkr_gruen::argue_gkr_gruen()
+            && let Some(step) = GruenStep::open(device, layer, point, &weights, claim)?
+        {
+            return Ok(Box::new(step));
         }
         let program = tree_program(&weights)?;
         let session =
@@ -533,7 +763,7 @@ where
         let mut stepping: Vec<Box<dyn TreeStep<F> + '_>> = active
             .iter()
             .zip(weights.chunks(2))
-            .map(|(&t, w)| trees[t].step(i + 1, &point, [w[0].clone(), w[1].clone()]))
+            .map(|(&t, w)| trees[t].step(i + 1, &point, [w[0].clone(), w[1].clone()], &claims[t]))
             .collect::<Result<_, _>>()?;
 
         let mut rounds = Vec::with_capacity(i);
@@ -932,5 +1162,170 @@ mod tests {
             assert!(a.point == b.point && a.p == b.p && a.q == b.q);
         }
         assert_eq!(got.len(), claims.len());
+    }
+
+    /// The card's Gruen rounds on the host, value for value — the arithmetic
+    /// of `gkr_gruen::host_rounds`: the halves folded by the previous
+    /// challenge on the way in, `H` summed under the split weight.
+    struct HostGruen {
+        /// `p_lo, p_hi, q_lo, q_hi`, `2^m` cells each.
+        f: [Vec<FE>; 4],
+        m: usize,
+        low: usize,
+        e_lo: Vec<FE>,
+        e_hi: Vec<Vec<FE>>,
+        lambda: FE,
+        done: usize,
+        pending: Option<Vec<FE>>,
+    }
+
+    impl HostGruen {
+        fn new(next: &FractionLayer<F>, point: &[FE], lambda: FE, low: usize) -> Self {
+            let half = next.p.len() / 2;
+            let (p, q) = (next.p.evals(), next.q.evals());
+            let m = point.len();
+            let low = low.min(m);
+            let rounds = m - low;
+            Self {
+                f: [
+                    p[..half].to_vec(),
+                    p[half..].to_vec(),
+                    q[..half].to_vec(),
+                    q[half..].to_vec(),
+                ],
+                m,
+                low,
+                e_lo: crate::eq::eq_evals(&point[rounds..]),
+                e_hi: (0..rounds)
+                    .map(|j| crate::eq::eq_evals(&point[j + 1..rounds]))
+                    .collect(),
+                lambda,
+                done: 0,
+                pending: None,
+            }
+        }
+
+        /// Binds the last round's variable: `2·width` live cells to `width`.
+        fn fold(&mut self, previous: Option<&FE>, width: usize) {
+            if let Some(s) = previous {
+                for g in self.f.iter_mut() {
+                    for x in 0..width {
+                        g[x] = g[x] + s * &(g[x + width] - g[x]);
+                    }
+                }
+            }
+        }
+    }
+
+    impl GruenCard<F> for HostGruen {
+        fn rounds(&self) -> usize {
+            self.m - self.low
+        }
+
+        fn enqueue(&mut self, previous: Option<&FE>, want_h0: bool) -> Result<(), Error> {
+            if self.pending.is_some() {
+                return Ok(());
+            }
+            let j = self.done;
+            let quarter = 1usize << (self.m - j - 1);
+            self.fold(previous, 2 * quarter);
+            let h = |v: [&FE; 4]| v[0] * v[3] + v[1] * v[2] + self.lambda * (v[2] * v[3]);
+            let mut sums = vec![FE::zero(); if want_h0 { 3 } else { 2 }];
+            for x in 0..quarter {
+                let w = self.e_hi[j][x >> self.low] * self.e_lo[x & ((1 << self.low) - 1)];
+                let lo: [&FE; 4] = std::array::from_fn(|k| &self.f[k][x]);
+                let hi: [&FE; 4] = std::array::from_fn(|k| &self.f[k][x + quarter]);
+                let two: [FE; 4] = std::array::from_fn(|k| hi[k] + hi[k] - lo[k]);
+                sums[0] += w * h(hi);
+                sums[1] += w * h([&two[0], &two[1], &two[2], &two[3]]);
+                if want_h0 {
+                    sums[2] += w * h(lo);
+                }
+            }
+            self.pending = Some(sums);
+            self.done += 1;
+            Ok(())
+        }
+
+        fn sums(&mut self, previous: Option<&FE>, want_h0: bool) -> Result<Vec<FE>, Error> {
+            self.enqueue(previous, want_h0)?;
+            self.pending.take().ok_or(Error::NoVariablesLeft)
+        }
+
+        fn finish(&mut self, previous: Option<&FE>) -> Result<Vec<Mle<F>>, Error> {
+            let cells = 1usize << self.low;
+            self.fold(previous, cells);
+            self.f
+                .iter()
+                .map(|g| Mle::new(g[..cells].to_vec()))
+                .collect()
+        }
+    }
+
+    /// A host tree whose steps run Gruen's rounds down to a cube of `2^low`,
+    /// as a device tree's steps do on the card.
+    struct GruenHostTree<'a> {
+        layers: &'a [FractionLayer<F>],
+        low: usize,
+    }
+
+    impl LadderTree<F> for GruenHostTree<'_> {
+        fn input_vars(&self) -> usize {
+            self.layers.len() - 1
+        }
+
+        fn output(&self) -> (FE, FE) {
+            (self.layers[0].p.evals()[0], self.layers[0].q.evals()[0])
+        }
+
+        fn step(
+            &self,
+            layer: usize,
+            point: &[FE],
+            weights: [FE; 2],
+            claim: &(FE, FE),
+        ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
+            let next = &self.layers[layer];
+            let lambda = gruen_lambda(&weights).expect("μ ≠ 0 in these runs");
+            let card = HostGruen::new(next, point, lambda, self.low);
+            let step = GruenStep::over(card, point, &weights, claim)?.expect("a Gruen step");
+            Ok(Box::new(step))
+        }
+    }
+
+    /// ★ The ladder's Gruen steps send the host reference's bytes: every tree
+    /// at every step, with `w_p = μ^{2a}` scaling its own chain's messages,
+    /// from tails of one cell up to the whole layer, and through the rounds
+    /// that sum `H(0)` instead of deriving it.
+    #[test]
+    fn gruen_steps_send_the_host_references_bytes() {
+        let heights = [6usize, 3, 0, 6, 4, 1];
+        let trees: Vec<Vec<FractionLayer<F>>> = heights
+            .iter()
+            .enumerate()
+            .map(|(t, &k)| layers(random_layer(k, 41 + t as u64)))
+            .collect();
+        let refs: Vec<&[FractionLayer<F>]> = trees.iter().map(|t| t.as_slice()).collect();
+        let mut host = transcript();
+        let (want, want_claims) = prove(&refs, &mut host).unwrap();
+        for direct_h0 in [false, true] {
+            crate::gkr_gruen::force_gkr_gruen_direct_h0(direct_h0);
+            for low in [0usize, 1, 2, 6] {
+                let gruen: Vec<GruenHostTree<'_>> = trees
+                    .iter()
+                    .map(|layers| GruenHostTree { layers, low })
+                    .collect();
+                let dyns: Vec<&dyn LadderTree<F>> =
+                    gruen.iter().map(|t| t as &dyn LadderTree<F>).collect();
+                let mut prover = transcript();
+                let (got, claims) = prove_trees(&dyns, &mut prover).unwrap();
+                assert!(
+                    got == want && claims == want_claims,
+                    "low {low}, direct H(0) {direct_h0}: the Gruen ladder moved a byte"
+                );
+                assert_eq!(prover.state(), host.state());
+            }
+        }
+        crate::gkr_gruen::force_gkr_gruen_direct_h0(false);
     }
 }

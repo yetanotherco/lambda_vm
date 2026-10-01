@@ -70,7 +70,7 @@ pub(crate) fn active() -> Result<bool, Error> {
 /// `LAMBDA_VM_ARGUE_BATCHED_MEASURE_CAP`: the bin cap (`log2` cells) the
 /// measurement argues under — so a ledger run can read a bin's peak at 26 and
 /// at 27 (D-BATCH's own fallback rule). Measurement only, like the knob: the
-/// placeholder proofs it shapes are never verified. Unset is the format's 27.
+/// placeholder proofs it shapes are never verified. Unset is the format's cap.
 pub const CAP_ENV: &str = "LAMBDA_VM_ARGUE_BATCHED_MEASURE_CAP";
 
 /// The measurement's bin cap.
@@ -78,7 +78,7 @@ pub(crate) fn bin_log_cells() -> Result<u8, Error> {
     match std::env::var(CAP_ENV) {
         Err(_) => match multilinear::whir_chain::ArgueFormat::BATCHED {
             multilinear::whir_chain::ArgueFormat::Batched { bin_log_cells } => Ok(bin_log_cells),
-            multilinear::whir_chain::ArgueFormat::PerTable => Ok(27),
+            multilinear::whir_chain::ArgueFormat::PerTable => Ok(26),
         },
         Ok(v) => v
             .parse::<u8>()

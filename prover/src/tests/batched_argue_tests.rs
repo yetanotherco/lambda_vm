@@ -688,9 +688,11 @@ fn the_card_proves_the_host_references_bytes_on_real_tables() {
     for name in ["test_keccak", "test_ecsm", "all_instructions_64"] {
         let elf = crate::test_utils::asm_elf_bytes(name);
         let fused = multilinear::gpu_fused::fused_sessions();
+        let gruen = multilinear::gkr_gruen::gruen_layers();
         let (verdict, names, bytes) =
             vm_round_trip_elf(name, &elf, None, &[Where::Host, Where::Device]);
         let fused = multilinear::gpu_fused::fused_sessions() - fused;
+        let gruen = multilinear::gkr_gruen::gruen_layers() - gruen;
         verdict.unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let (host_bytes, card_bytes) = (&bytes[0], &bytes[1]);
         assert!(
@@ -698,7 +700,8 @@ fn the_card_proves_the_host_references_bytes_on_real_tables() {
             "{name}: the card's argue is not the host reference's bytes"
         );
         eprintln!(
-            "batched argue B-3 {name}: {} tables, {fused} fused sessions on the card, {} argue bytes == the host's",
+            "batched argue B-3 {name}: {} tables, {fused} fused sessions and {gruen} Gruen ladder layers on \
+             the card, {} argue bytes == the host's",
             names.len(),
             card_bytes.len()
         );

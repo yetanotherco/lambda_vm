@@ -772,6 +772,30 @@ where
             split.zc_rounds,
             split.reduce
         );
+        // The inputs of D-BATCH §3.2's error terms, measured on this argue.
+        eprintln!(
+            "BATCHED ARGUE BITS INPUTS: tables {} · trees a bin max {} · log2 cells {:.2} · \
+             len_max {} · N_C max {} · D_max {} · n_max {}",
+            tables.len(),
+            plan.bins.iter().map(Vec::len).max().unwrap_or(0),
+            plan.shapes
+                .iter()
+                .map(|shape| (shape.input_vars as f64).exp2())
+                .sum::<f64>()
+                .log2(),
+            statements
+                .iter()
+                .flat_map(|s| s.interactions.iter().map(BusInteraction::num_bus_elements))
+                .max()
+                .unwrap_or(0),
+            statements
+                .iter()
+                .map(|s| s.shape.num_roots())
+                .max()
+                .unwrap_or(0),
+            plan.degree,
+            plan.num_vars
+        );
     }
     Ok((
         BatchedArgue {

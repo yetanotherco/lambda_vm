@@ -317,8 +317,11 @@ pub enum ArgueFormat {
 }
 
 impl ArgueFormat {
-    /// D-BATCH's production cap: `2^27` input cells a bin (§4.4).
-    pub const BATCHED: Self = Self::Batched { bin_log_cells: 27 };
+    /// The production cap: `2^26` input cells a bin. D-BATCH §4.4 planned
+    /// `2^27` with `2^26` its fallback (§8.2); on the block's 15 epochs bins of
+    /// `2^27` overran the card (12 tree builds refused, FAST 347) and bins of
+    /// `2^26` refused none.
+    pub const BATCHED: Self = Self::Batched { bin_log_cells: 26 };
 }
 
 /// Which proof-of-work nonces a round's encoding carries (P2's format half).
