@@ -453,13 +453,12 @@ impl BlockTreePlan {
         finish(b)
     }
 
-    /// The levels above the leaves: fan-in
-    /// [`super::per_table_aggregator::FAN_IN`], leftovers in arity-1 nodes, the
-    /// last level's single node the top. A one-leaf block still gets a top
-    /// node: the bus closes there.
+    /// The levels above the leaves: fan-in [`block_fan_in`], the last node of a
+    /// level taking what is left, the last level's single node the top. A
+    /// one-leaf block still gets a top node: the bus closes there.
     pub fn levels(&self) -> Vec<super::per_table_aggregator::Level> {
-        use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
-        let mut shape = tree_shape(self.partition.num_leaves(), FAN_IN);
+        use super::per_table_aggregator::{Level, tree_shape};
+        let mut shape = tree_shape(self.partition.num_leaves(), block_fan_in());
         if shape.is_empty() {
             shape.push(Level { arities: vec![1] });
         }
@@ -580,6 +579,26 @@ impl BlockTreePlan {
         self.partition = partition;
         self
     }
+}
+
+/// The block tree's fan-in: children per interior node. The epoch tree's
+/// [`super::per_table_aggregator::FAN_IN`] is a separate constant.
+pub const BLOCK_FAN_IN: usize = 2;
+
+/// The fan-in the plan derives under: [`BLOCK_FAN_IN`], or
+/// `NOEPOCH_BLOCK_FAN_IN` (2 to 8) for a measurement. It is a tree-format
+/// parameter: every node program, and so the top, depends on it. A verifier
+/// configured otherwise than the prover derives another top and refuses
+/// (completeness, never soundness), as with the presets' `ZfFormat`.
+pub fn block_fan_in() -> usize {
+    static FAN_IN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FAN_IN.get_or_init(|| match std::env::var("NOEPOCH_BLOCK_FAN_IN") {
+        Err(_) => BLOCK_FAN_IN,
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if (2..=8).contains(&n) => n,
+            _ => panic!("NOEPOCH_BLOCK_FAN_IN must be 2 to 8, got `{v}`"),
+        },
+    })
 }
 
 /// `verify_proof_parts`' pre-checks on a claimed shape, before any AIR is

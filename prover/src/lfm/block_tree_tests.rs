@@ -496,6 +496,11 @@ fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
         "constants computed under other options are refused"
     );
     let plan = BlockTreePlan::derive_with(&a, &opts, &shape, &consts).expect("the plan derives");
+    assert_eq!(
+        super::block_plan::BLOCK_FAN_IN,
+        super::per_table_aggregator::FAN_IN,
+        "the block tree's default fan-in is today's tree"
+    );
     let inline = BlockTreePlan::derive(&a, &opts, &shape).expect("the plan derives");
     assert_eq!(
         plan.attested(),
@@ -1167,9 +1172,10 @@ pub(super) fn verify_block_top(
     super::proof::verify_against_artifacts(expected, &top.proof, &top.public_words, opts)
 }
 
-/// Levels above the leaves: fan-in [`super::per_table_aggregator::FAN_IN`],
-/// leftovers wrapped in arity-1 nodes (`tree_shape`), the last level's single
-/// node the top. A one-leaf block still gets a top node: the bus closes there.
+/// Levels above the leaves, as the plan lays them out
+/// ([`BlockTreePlan::levels`], fan-in [`super::block_plan::block_fan_in`]), the
+/// last level's single node the top. A one-leaf block still gets a top node:
+/// the bus closes there.
 /// Returns the top child, its proof and each level's wall.
 pub(super) fn compose_block_tree(
     plan: &BlockTreePlan,
@@ -1208,11 +1214,8 @@ pub(super) fn compose_block_tree_with(
     ahead: Option<&[Vec<AheadSlot>]>,
     beside: Option<&BesideVerifies>,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
-    use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
-    let mut shape = tree_shape(leaves.len(), FAN_IN);
-    if shape.is_empty() {
-        shape.push(Level { arities: vec![1] });
-    }
+    let fan_in = super::block_plan::block_fan_in();
+    let shape = plan.levels();
     let mut level = leaves;
     let mut top_proof = None;
     let mut walls = Vec::with_capacity(shape.len());
@@ -1252,7 +1255,7 @@ pub(super) fn compose_block_tree_with(
                 },
                 te.elapsed().as_secs_f64()
             );
-            super::per_table_aggregator_tests::census_and_panel(&program, &label, FAN_IN);
+            super::per_table_aggregator_tests::census_and_panel(&program, &label, fan_in);
             let inline = top || beside.is_none();
             let (child, proof) = prove_program_with(
                 &label,
@@ -2273,7 +2276,7 @@ fn the_block_tree_composes_to_a_top_node() {
         super::per_table_aggregator_tests::census_and_panel(
             &program,
             &label,
-            super::per_table_aggregator::FAN_IN,
+            super::block_plan::block_fan_in(),
         );
         let (child, proof) = prove_program_with(
             &label,
