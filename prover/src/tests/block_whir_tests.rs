@@ -454,3 +454,33 @@ fn host_peak_gib() -> f64 {
         .map(|kb| kb / (1u64 << 20) as f64)
         .unwrap_or(0.0)
 }
+
+/// KECCAK_RND's split takes whole rows: each piece is rows `[k·r, (k+1)·r)` of
+/// the table, column for column.
+#[test]
+fn a_split_table_is_its_rows_in_order() {
+    use crate::test_utils::{E, F};
+    use math::field::element::FieldElement as FE;
+    let width = 5usize;
+    let height = 32usize;
+    let columns: Vec<Vec<FE<F>>> = (0..width)
+        .map(|c| {
+            (0..height)
+                .map(|r| FE::<F>::from((r * 100 + c) as u64))
+                .collect()
+        })
+        .collect();
+    let table = stark::trace::TraceTable::<F, E>::from_columns_main(columns.clone(), 1);
+    let pieces = block_whir::split_rows(table, 8);
+    assert_eq!(pieces.len(), 4);
+    for (k, piece) in pieces.iter().enumerate() {
+        let got = piece.columns_main();
+        for (c, column) in columns.iter().enumerate() {
+            assert_eq!(
+                got[c],
+                column[k * 8..(k + 1) * 8].to_vec(),
+                "piece {k} column {c}"
+            );
+        }
+    }
+}

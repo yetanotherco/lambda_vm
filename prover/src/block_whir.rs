@@ -333,23 +333,24 @@ pub fn validate_groups(groups: &[Vec<u32>], tables: usize) -> Result<Vec<usize>,
 /// A table cut into tables of `rows` rows each, in row order. Every VM table's
 /// constraints read one row (no shifted reads), so each piece is a table of
 /// the same AIR, and the bus sums over the pieces are the sum over the whole.
-fn split_rows(table: TraceTable<F, E>, rows: usize) -> Vec<TraceTable<F, E>> {
+pub(crate) fn split_rows(table: TraceTable<F, E>, rows: usize) -> Vec<TraceTable<F, E>> {
     let height = table.main_table.height;
     if height <= rows {
         return vec![table];
     }
     let step = table.step_size;
-    let columns = table.columns_main();
-    drop(table);
+    let width = table.main_table.width;
+    // Row-major in, row-major out: each piece is a run of whole rows, copied
+    // as they lie (a transposition of KECCAK_RND's 1,480 columns is what this
+    // used to cost).
     (0..height / rows)
+        .into_par_iter()
         .map(|k| {
-            TraceTable::from_columns_main(
-                columns
-                    .iter()
-                    .map(|column| column[k * rows..(k + 1) * rows].to_vec())
-                    .collect(),
-                step,
-            )
+            let mut data = Vec::with_capacity(rows * width);
+            for row in k * rows..(k + 1) * rows {
+                data.extend_from_slice(table.main_table.get_row(row));
+            }
+            TraceTable::new_main(data, width, step)
         })
         .collect()
 }
