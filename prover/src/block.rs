@@ -28,7 +28,8 @@ use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    DecodeArtifacts, StreamTable, StreamedChunk, Traces, WindowedTraceBuilder, build_initial_image,
+    ChunkJob, DecodeArtifacts, StreamTable, StreamedChunk, Traces, WindowedTraceBuilder,
+    build_initial_image,
 };
 use crate::test_utils::{
     VmAir, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
@@ -317,8 +318,23 @@ fn stream_phase_a() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_STREAM").map_or(true, |v| v != "0")
 }
 
+/// `LAMBDA_VM_BLOCK_STREAM=push` streams phase A with the builder's first
+/// schedule (a measurement arm): one thread walks, routes and generates each
+/// window's chunks in turn ([`WindowedTraceBuilder::push`]). Otherwise the walk
+/// has a thread of its own, the producer routes, and the committers generate.
+fn stream_by_push() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_STREAM").is_ok_and(|v| v == "push")
+}
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
+
+/// A streamed chunk on its way to a committer: a job the committer generates,
+/// or (the `push` arm) a chunk the producer generated.
+enum Streamed {
+    Job(ChunkJob),
+    Chunk(StreamedChunk),
+}
 
 /// The AIR a streamed chunk is proved under, named as [`VmAirs::new`] names it.
 fn stream_air(table: StreamTable, index: usize, opts: &ProofOptions) -> VmAir {
@@ -346,10 +362,13 @@ fn stream_air(table: StreamTable, index: usize, opts: &ProofOptions) -> VmAir {
 /// `max_rows.cpu` cycles on its own thread; the shared windowed builder
 /// ([`WindowedTraceBuilder`]) collects each window and hands out every full
 /// chunk of the eight tables whose rows grow in execution order; committer
-/// threads make each chunk's Round-1 commit on the device
+/// threads generate each chunk and make its Round-1 commit on the device
 /// ([`IsStarkProver::precommit_main`]) while the run is still being executed and
-/// collected. A window is pushed once the next one arrives (the last goes to
-/// `finish`). The traces are a whole-run build's (the builder's own tests).
+/// collected. The builder is split ([`WindowedTraceBuilder::split`]): a walker
+/// thread does nothing but walk, so the executor waits on the walk alone, and
+/// this thread keeps, routes and hands out each walked window. A window is
+/// walked once the next one arrives (the last goes to `finish`). The traces are
+/// a whole-run build's (the builder's own tests).
 fn build_streamed(
     program: &Elf,
     private_input: &[u8],
@@ -358,18 +377,19 @@ fn build_streamed(
     residency: ResidencyMode,
     times: &mut BlockTimes,
 ) -> Result<Produced, Error> {
+    use std::sync::Mutex;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
 
     let window = max_rows.cpu;
     let t = Instant::now();
-    let (job_tx, job_rx) = mpsc::channel::<StreamedChunk>();
+    let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
+    let generate_secs = Mutex::new(0.0f64);
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
-        let (log_tx, log_rx) = mpsc::sync_channel::<Arc<Vec<executor::vm::logs::Log>>>(2);
+        let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
         let exec = s.spawn(move || -> Result<f64, Error> {
             let t = Instant::now();
             let mut executor = Executor::new(program, private_input.to_vec())
@@ -378,7 +398,7 @@ fn build_streamed(
                 .resume_with_limit(window)
                 .map_err(|e| Error::Execution(format!("{e}")))?
             {
-                if log_tx.send(Arc::new(logs.to_vec())).is_err() {
+                if log_tx.send(logs.to_vec()).is_err() {
                     break;
                 }
             }
@@ -392,16 +412,23 @@ fn build_streamed(
             s.spawn(|| warm_data_page_commitments(program, opts));
         }
 
-        // Committers: each streamed chunk's Round-1 commit, as chunks arrive.
+        // Committers: each streamed chunk generated and Round-1 committed, as
+        // the chunks complete.
         let mut committers = Vec::new();
         for _ in 0..STREAM_COMMITTERS {
             committers.push(s.spawn(|| -> Result<(), Error> {
                 loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                    let Ok(chunk) = job else {
+                    let Ok(job) = job else {
                         return Ok(());
                     };
                     let t = Instant::now();
+                    let chunk = match job {
+                        Streamed::Job(job) => job.generate(),
+                        Streamed::Chunk(chunk) => chunk,
+                    };
+                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                        t.elapsed().as_secs_f64();
                     let air = stream_air(chunk.table, chunk.index, opts);
                     let name = air.name().to_string();
                     let pre = crate::hash_pin::BlockProver::precommit_main(
@@ -425,21 +452,55 @@ fn build_streamed(
         let produce = || -> Result<(Traces, f64), Error> {
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             let mut collect_secs = 0.0;
-            let mut held: Option<Arc<Vec<executor::vm::logs::Log>>> = None;
-            for logs in log_rx.iter() {
-                if let Some(prev) = held.replace(logs) {
-                    let t = Instant::now();
-                    for chunk in builder.push(&prev)? {
-                        let _ = job_tx.send(chunk);
+            let last = if stream_by_push() {
+                let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                for logs in log_rx.iter() {
+                    if let Some(prev) = held.replace(logs) {
+                        let t = Instant::now();
+                        for chunk in builder.push(&prev)? {
+                            let _ = job_tx.send(Streamed::Chunk(chunk));
+                        }
+                        collect_secs += t.elapsed().as_secs_f64();
                     }
-                    collect_secs += t.elapsed().as_secs_f64();
                 }
-            }
+                held.unwrap_or_default()
+            } else {
+                let (mut walker, mut accumulator) = builder.split();
+                std::thread::scope(|inner| -> Result<_, Error> {
+                    let (walked_tx, walked_rx) = mpsc::sync_channel(2);
+                    let walking = inner.spawn(move || -> Result<_, Error> {
+                        // One window held back: the run's last is `finish`'s.
+                        let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                        for logs in log_rx.iter() {
+                            if let Some(prev) = held.replace(logs)
+                                && walked_tx.send(walker.walk(&prev)?).is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(held.unwrap_or_default())
+                    });
+                    for walked in walked_rx {
+                        let t = Instant::now();
+                        for job in accumulator.absorb(walked) {
+                            let _ = job_tx.send(Streamed::Job(job));
+                        }
+                        collect_secs += t.elapsed().as_secs_f64();
+                    }
+                    join(walking)
+                })?
+            };
             drop(job_tx);
-            let last = held.unwrap_or_default();
+            let windows = builder.stamps();
             let t = Instant::now();
             let traces = builder.finish(&last)?;
-            collect_secs += t.elapsed().as_secs_f64();
+            let finish_secs = t.elapsed().as_secs_f64();
+            eprintln!(
+                "BLOCK STREAM builder: {} windows · walk {:.2} · route {:.2} · hand-out {:.2} · \
+                 finish {finish_secs:.2} (s)",
+                windows.windows, windows.walk, windows.route, windows.generate,
+            );
+            collect_secs += finish_secs;
             Ok((traces, collect_secs))
         };
         let produced = produce();
@@ -470,9 +531,10 @@ fn build_streamed(
         times.build = total - times.execute;
         eprintln!(
             "BLOCK PHASE stream {total:.2}s (execute {:.2} on its thread · collect+build {collect_secs:.2} · \
-             build+commit of {n} streamed instances {:.2} on {STREAM_COMMITTERS} threads)",
+             build+commit of {n} streamed instances {:.2} on {STREAM_COMMITTERS} threads, generate {:.2} of it)",
             times.execute,
             *commit_secs.lock().unwrap_or_else(|e| e.into_inner()),
+            *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
         );
         Ok((traces, decode_commitment, precommits))
     })
