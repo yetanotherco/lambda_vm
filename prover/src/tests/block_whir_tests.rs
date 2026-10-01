@@ -34,6 +34,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         max_rows,
         keccak_rnd_rows_log2,
         drop_levels: 3,
+        window_log2: None,
     }
 }
 
@@ -217,7 +218,72 @@ fn a_block_missing_an_instance_is_refused_on_the_bus() {
     assert!(!verify(&short, &elf, &format));
 }
 
-/// One table's claimed column value moved: its group's opening refuses it.
+fn streamed(
+    max_rows: MaxRowsConfig,
+    keccak_rnd_rows_log2: usize,
+    window_log2: usize,
+) -> BlockOptions {
+    let mut o = options(max_rows, keccak_rnd_rows_log2);
+    o.window_log2 = Some(window_log2);
+    o
+}
+
+/// ★ The build streamed into phase A: tables are packed into groups as their
+/// chunks complete, the partition rides the statement, and the proof verifies.
+#[test]
+fn a_streamed_block_proves_and_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    // Streaming packs in arrival order, not table order.
+    let order: Vec<u32> = proof.groups.iter().flatten().copied().collect();
+    assert!(
+        order.windows(2).any(|w| w[0] > w[1]),
+        "the groups are table order"
+    );
+    assert!(verify(&proof, &elf, &format));
+}
+
+#[test]
+fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak");
+    let format = many_groups();
+    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 3, 4));
+    assert!(proof.table_counts.keccak_rnd >= 2);
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// The partition is part of the statement: a table named twice, two tables
+/// swapped inside a group, or a table moved to another group is refused.
+#[test]
+fn a_tampered_partition_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    assert!(verify(&proof, &elf, &format));
+
+    let mut twice = proof.clone();
+    let first = twice.groups[0][0];
+    twice.groups[1][0] = first;
+    assert!(!verify(&twice, &elf, &format));
+
+    let mut swapped = proof.clone();
+    let g = swapped
+        .groups
+        .iter()
+        .position(|g| g.len() >= 2)
+        .expect("a group of two");
+    swapped.groups[g].swap(0, 1);
+    assert!(!verify(&swapped, &elf, &format));
+
+    let mut moved = proof.clone();
+    let table = moved.groups[0].pop().expect("a table");
+    moved.groups[1].insert(0, table);
+    assert!(!verify(&moved, &elf, &format));
+}
+
+/// One table's claimed column value moved: its group's opening refuses it./// One table's claimed column value moved: its group's opening refuses it.
 #[test]
 fn a_tampered_column_claim_is_refused() {
     let elf = asm_elf_bytes("all_instructions_64");

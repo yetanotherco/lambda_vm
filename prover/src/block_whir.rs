@@ -34,7 +34,7 @@ use crate::multilinear_prove::{
     absorb_tagged, chain_config_under, layout_of, preprocessed_mles, shapes_of, stacks,
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
-use crate::tables::trace_builder::Traces;
+use crate::tables::trace_builder::{StreamTable, StreamedChunk, Traces, WindowedTraceBuilder};
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
 use crate::{
@@ -87,18 +87,28 @@ pub struct BlockOptions {
     pub max_rows: MaxRowsConfig,
     pub keccak_rnd_rows_log2: usize,
     pub drop_levels: usize,
+    /// `Some(k)`: build the traces in windows of 2^k cycles and commit each
+    /// table as its chunk completes ([`WindowedTraceBuilder`]); `None`: build
+    /// the whole run, then commit.
+    pub window_log2: Option<usize>,
 }
 
 impl BlockOptions {
-    /// Every chunked table at 2^21 rows, KECCAK_RND at 2^16.
+    /// Every chunked table at 2^21 rows, KECCAK_RND at 2^16, windows of 2^20
+    /// cycles.
     pub fn production() -> Self {
         Self {
             max_rows: MaxRowsConfig::uniform(1 << 21),
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             drop_levels: BLOCK_TREE_DROP_LEVELS,
+            window_log2: Some(BLOCK_WINDOW_LOG2),
         }
     }
 }
+
+/// Cycles a streamed prove collects at a time: half a CPU instance at 2^21, so
+/// every chunk is handed to phase A within a window of completing.
+pub const BLOCK_WINDOW_LOG2: usize = 20;
 
 /// A block proved in one proof.
 ///
@@ -114,6 +124,13 @@ pub struct BlockWhirProof {
     pub table_counts: TableCounts,
     pub public_output: Vec<u8>,
     pub num_private_input_pages: usize,
+    /// The groups, each its tables' indices in [`VmAirs::air_refs`] order, in
+    /// the order the group stacks them. The prover's choice — a streamed prove
+    /// packs tables as they arrive — bound in the statement before any root
+    /// ([`absorb_block`]); the verifier checks it is a partition and rebuilds
+    /// each group's stack from it under its own stack cap. The proof's tables
+    /// are in this order.
+    pub groups: Vec<Vec<u32>>,
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -135,6 +152,9 @@ pub struct BlockStamps {
     /// tops and the leaves re-hashed for them. A revived commitment never
     /// builds a device tree, so nothing re-commits.
     pub top_paths: (u64, u64),
+    /// A streamed build: when its windows were all collected (seconds since
+    /// the build started) and how many chunks they handed out.
+    pub streamed: (f64, usize),
 }
 
 impl BlockStamps {
@@ -153,7 +173,7 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} commit {:.3} retire {:.3} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} commit {:.3} retire {:.3} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
@@ -161,6 +181,7 @@ impl BlockStamps {
                 s.upload_a,
                 s.commit,
                 s.retire,
+                s.committed_at,
                 s.upload_b,
                 s.argue,
                 s.encode,
@@ -174,6 +195,12 @@ impl BlockStamps {
                 .map(|(label, at)| format!("{label} {at:.2}"))
                 .collect();
             out.push_str(&format!("BLOCK BUILD MARKS: {}\n", marks.join(" · ")));
+        }
+        if self.streamed.1 > 0 || self.streamed.0 > 0.0 {
+            out.push_str(&format!(
+                "BLOCK STREAM: windows collected at {:.2}s · run built at {:.2}s · {} chunks streamed · layout busy {:.2}s · phase A ended at {:.2}s (all since the build started)\n",
+                self.streamed.0, self.build, self.streamed.1, self.prep, self.phase_a,
+            ));
         }
         out.push_str(&format!(
             "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed on the host · phase B on one thread + one upload helper\n",
@@ -215,6 +242,79 @@ pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
     let mut rest = counts.clone();
     rest.keccak_rnd = rest.keccak_rnd.min(1);
     rest.validate()
+}
+
+/// The block statement: the monolithic multilinear one under
+/// [`MULTILINEAR_BLOCK_TAG`], then the group partition — the count, then per
+/// group its size and its tables' indices, every value a little-endian `u64`
+/// (so the roots that follow stay on a field-element boundary).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_block(
+    t: &mut impl IsTranscript<E>,
+    elf_bytes: &[u8],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    table_num_vars: &[u8],
+    config: &multilinear::whir_chain::ChainConfig,
+    groups: &[Vec<u32>],
+) {
+    absorb_tagged(
+        t,
+        MULTILINEAR_BLOCK_TAG,
+        "block",
+        &statement::elf_digest(elf_bytes),
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        table_num_vars,
+        config,
+    );
+    t.append_bytes(&(groups.len() as u64).to_le_bytes());
+    for group in groups {
+        t.append_bytes(&(group.len() as u64).to_le_bytes());
+        for &index in group {
+            t.append_bytes(&u64::from(index).to_le_bytes());
+        }
+    }
+}
+
+/// A partition of `tables` tables into non-empty groups: every index below
+/// `tables`, each exactly once. Returns the indices in proof order.
+pub fn validate_groups(groups: &[Vec<u32>], tables: usize) -> Result<Vec<usize>, Error> {
+    let mut seen = vec![false; tables];
+    let mut order = Vec::with_capacity(tables);
+    for group in groups {
+        if group.is_empty() {
+            return Err(Error::InvalidTableCounts("an empty group".to_string()));
+        }
+        for &index in group {
+            let index = index as usize;
+            match seen.get_mut(index) {
+                Some(slot) if !*slot => *slot = true,
+                Some(_) => {
+                    return Err(Error::InvalidTableCounts(format!(
+                        "table {index} is in two groups"
+                    )));
+                }
+                None => {
+                    return Err(Error::InvalidTableCounts(format!(
+                        "group names table {index} of {tables}"
+                    )));
+                }
+            }
+            order.push(index);
+        }
+    }
+    if order.len() != tables {
+        return Err(Error::InvalidTableCounts(format!(
+            "the groups cover {} of {tables} tables",
+            order.len()
+        )));
+    }
+    Ok(order)
 }
 
 /// A table cut into tables of `rows` rows each, in row order. Every VM table's
@@ -319,6 +419,22 @@ pub(crate) fn prove_block_whir_with(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
     stamps.execute = t.elapsed().as_secs_f64();
+
+    if let Some(window_log2) = options.window_log2 {
+        let proof = prove_streamed(
+            &program,
+            elf_bytes,
+            private_inputs,
+            &result.logs,
+            1usize << window_log2,
+            proof_options,
+            format,
+            options,
+            deviations,
+            &mut stamps,
+        )?;
+        return Ok((proof, stamps));
+    }
 
     crate::tables::trace_builder::build_stamps::start();
     let t = Instant::now();
@@ -425,20 +541,31 @@ pub(crate) fn prove_traces(
             groups_of_pairs.push(pairs.by_ref().take(size).collect());
         }
     }
+    // The groups are contiguous runs in table order here.
+    let groups: Vec<Vec<u32>> = {
+        let mut at = 0u32;
+        sizes
+            .iter()
+            .map(|&size| {
+                let group = (at..at + size as u32).collect();
+                at += size as u32;
+                group
+            })
+            .collect()
+    };
     let proof = crate::with_whir_hash!(|H| {
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_tagged(
+        absorb_block(
             &mut transcript,
-            MULTILINEAR_BLOCK_TAG,
-            "block",
-            &statement::elf_digest(elf_bytes),
+            elf_bytes,
             &public_output,
             &table_counts,
             num_private_input_pages,
             &runtime_page_ranges,
             &table_num_vars,
             &config,
+            &groups,
         );
         let t = Instant::now();
         let (block, produced) = std::thread::scope(|scope| {
@@ -504,6 +631,434 @@ pub(crate) fn prove_traces(
         table_counts,
         public_output,
         num_private_input_pages,
+        groups,
+    })
+}
+
+/// One AIR per streamed table type, alive for the whole prove: a streamed
+/// chunk is laid out (and its layout borrows its AIR) before the run's AIR set
+/// exists. Every chunk of a type has the same AIR as the run's `TYPE[i]` — the
+/// set builds them all with the same constructor — and the verifier checks the
+/// result against its own set.
+struct StreamAirs {
+    cpu: crate::VmAir,
+    memw_register: crate::VmAir,
+    memw_aligned: crate::VmAir,
+    memw: crate::VmAir,
+    load: crate::VmAir,
+    lt: crate::VmAir,
+    shift: crate::VmAir,
+    store: crate::VmAir,
+}
+
+type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
+
+impl StreamAirs {
+    fn new(opts: &ProofOptions) -> Self {
+        use crate::test_utils::*;
+        Self {
+            cpu: Box::new(create_cpu_air(opts)),
+            memw_register: Box::new(create_memw_register_air(opts)),
+            memw_aligned: Box::new(create_memw_aligned_air(opts)),
+            memw: Box::new(create_memw_air(opts)),
+            load: Box::new(create_load_air(opts)),
+            lt: Box::new(create_lt_air(opts)),
+            shift: Box::new(create_shift_air(opts)),
+            store: Box::new(create_store_air(opts)),
+        }
+    }
+
+    fn of(&self, table: StreamTable) -> &DynAir {
+        match table {
+            StreamTable::Cpu => self.cpu.as_ref(),
+            StreamTable::MemwRegister => self.memw_register.as_ref(),
+            StreamTable::MemwAligned => self.memw_aligned.as_ref(),
+            StreamTable::Memw => self.memw.as_ref(),
+            StreamTable::Load => self.load.as_ref(),
+            StreamTable::Lt => self.lt.as_ref(),
+            StreamTable::Shift => self.shift.as_ref(),
+            StreamTable::Store => self.store.as_ref(),
+        }
+    }
+}
+
+/// The name the run's AIR set gives chunk `index` of a streamed table.
+fn stream_name(table: StreamTable, index: usize) -> String {
+    let base = match table {
+        StreamTable::Cpu => "CPU",
+        StreamTable::MemwRegister => "MEMW_R",
+        StreamTable::MemwAligned => "MEMW_A",
+        StreamTable::Memw => "MEMW",
+        StreamTable::Load => "LOAD",
+        StreamTable::Lt => "LT",
+        StreamTable::Shift => "SHIFT",
+        StreamTable::Store => "STORE",
+    };
+    format!("{base}[{index}]")
+}
+
+/// What the builder thread hands the layout thread.
+enum Built {
+    Chunk(Box<StreamedChunk>),
+    Rest(Box<Traces>),
+}
+
+/// A table before the run's AIR order exists: a streamed chunk, or a table of
+/// the final build by its AIR index.
+#[derive(Clone, Copy)]
+enum Key {
+    Streamed(StreamTable, usize),
+    Air(usize),
+}
+
+/// A table of the final build, laid out: its AIR index, shape and table.
+type Placed<'a> = (usize, (usize, usize), CommittedTable<'a, F, E>);
+
+/// Packs tables, in the order they come, into groups of at most `max_polys`
+/// stacked polynomials, and sends each group to phase A as it closes.
+struct Packer<'a> {
+    open: Vec<CommittedTable<'a, F, E>>,
+    open_shapes: Vec<(usize, usize)>,
+    open_keys: Vec<Key>,
+    group_keys: Vec<Vec<Key>>,
+    out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
+    cap: multilinear::whir_chain::StackVars,
+    max_polys: usize,
+}
+
+impl<'a> Packer<'a> {
+    /// A group closes, and goes to the card, when the next table would take
+    /// it past its polynomial budget.
+    fn place(
+        &mut self,
+        key: Key,
+        shape: (usize, usize),
+        table: CommittedTable<'a, F, E>,
+    ) -> Result<(), Error> {
+        self.open_shapes.push(shape);
+        let polys = stark::multilinear_table::global_layout(&self.open_shapes, self.cap)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?
+            .num_polys();
+        if polys > self.max_polys && !self.open.is_empty() {
+            self.open_shapes.clear();
+            self.open_shapes.push(shape);
+            self.close()?;
+        }
+        self.open.push(table);
+        self.open_keys.push(key);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), Error> {
+        self.group_keys.push(std::mem::take(&mut self.open_keys));
+        self.out
+            .send(std::mem::take(&mut self.open))
+            .map_err(|_| Error::Prover("phase A stopped".into()))
+    }
+
+    /// Sends the last group; hands back every group's tables.
+    fn finish(mut self) -> Result<Vec<Vec<Key>>, Error> {
+        if !self.open.is_empty() {
+            self.close()?;
+        }
+        Ok(self.group_keys)
+    }
+}
+
+/// What the layout thread knows once the run is built: the statement, the AIR
+/// order's shapes, and each group's tables as AIR indices.
+struct Laid {
+    table_counts: TableCounts,
+    runtime_page_ranges: Vec<RuntimePageRange>,
+    num_private_input_pages: usize,
+    public_output: Vec<u8>,
+    shapes: Vec<(usize, usize)>,
+    groups: Vec<Vec<u32>>,
+    busy: f64,
+}
+
+/// The block's proof with the build streamed into phase A: a builder thread
+/// collects the run in windows of `window` cycles ([`WindowedTraceBuilder`])
+/// and hands each full chunk over as it completes; a layout thread lays each
+/// one out and packs the tables, in arrival order, into groups of at most
+/// `format.group_polys` stacked polynomials; this thread commits each group as
+/// it closes. When the run is built the rest of its tables join the packing.
+/// The groups are the statement's ([`BlockWhirProof::groups`]).
+#[allow(clippy::too_many_arguments)]
+fn prove_streamed(
+    program: &Elf,
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    logs: &[executor::vm::logs::Log],
+    window: usize,
+    opts: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    stamps: &mut BlockStamps,
+) -> Result<BlockWhirProof, Error> {
+    if logs.is_empty() {
+        return Err(Error::Execution("the run executed no cycle".to_string()));
+    }
+    let stream_airs = StreamAirs::new(opts);
+    let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
+    // Phase A's commits read the blowup, the fold schedule and the format of
+    // the config and nothing else; the full config (its query count reads every
+    // shape) is built when the shapes are known, and must agree on those.
+    let commit_config = chain_config_under(&format.zf, &[]);
+    let cap = commit_config.format.stack;
+    let start = Instant::now();
+
+    crate::with_whir_hash!(|H| {
+        let (block, built, laid) = std::thread::scope(|scope| {
+            let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
+            let builder = scope.spawn(move || -> Result<(f64, f64, usize), Error> {
+                let mut builder =
+                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
+                let body = logs.len() - 1;
+                let cut = body - body % window;
+                let mut streamed = 0usize;
+                for w in logs[..cut].chunks(window) {
+                    for chunk in builder.push(w)? {
+                        streamed += 1;
+                        if btx.send(Built::Chunk(Box::new(chunk))).is_err() {
+                            return Err(Error::Prover("the layout thread stopped".into()));
+                        }
+                    }
+                }
+                let windows_done = start.elapsed().as_secs_f64();
+                let mut rest = builder.finish(&logs[cut..])?;
+                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
+                if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
+                    rest.keccak_rnds.remove(0);
+                }
+                let finished = start.elapsed().as_secs_f64();
+                let _ = btx.send(Built::Rest(Box::new(rest)));
+                Ok((windows_done, finished, streamed))
+            });
+
+            let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
+            let stream_airs = &stream_airs;
+            let run_airs = &run_airs;
+            let layout = scope.spawn(move || -> Result<Laid, Error> {
+                let mut busy = 0.0;
+                let mut packer = Packer {
+                    open: Vec::new(),
+                    open_shapes: Vec::new(),
+                    open_keys: Vec::new(),
+                    group_keys: Vec::new(),
+                    out: gtx,
+                    cap,
+                    max_polys: format.group_polys,
+                };
+                let mut streamed_shapes: Vec<(StreamTable, usize, (usize, usize))> = Vec::new();
+                let mut rest = None;
+                for item in brx {
+                    match item {
+                        Built::Chunk(mut chunk) => {
+                            let t = Instant::now();
+                            let height = chunk.trace.main_table.height;
+                            let shape = (
+                                chunk.trace.main_table.width,
+                                height.trailing_zeros() as usize,
+                            );
+                            let table = table_of(
+                                stream_airs.of(chunk.table),
+                                &mut chunk.trace,
+                                shape,
+                                true,
+                            )?;
+                            streamed_shapes.push((chunk.table, chunk.index, shape));
+                            packer.place(Key::Streamed(chunk.table, chunk.index), shape, table)?;
+                            busy += t.elapsed().as_secs_f64();
+                        }
+                        Built::Rest(traces) => {
+                            rest = Some(traces);
+                            break;
+                        }
+                    }
+                }
+                let mut traces = *rest.ok_or_else(|| {
+                    Error::Prover("the builder stopped before the run was built".into())
+                })?;
+                let t = Instant::now();
+                let table_counts = traces.table_counts();
+                validate_block_counts(&table_counts)?;
+                let runtime_page_ranges = traces.runtime_page_ranges();
+                let num_private_input_pages = traces
+                    .page_configs
+                    .iter()
+                    .filter(|c| c.is_private_input)
+                    .count();
+                let public_output = traces.public_output_bytes.clone();
+                let airs = run_airs.get_or_init(|| {
+                    VmAirs::new(
+                        program,
+                        opts,
+                        false,
+                        &traces.page_configs,
+                        &table_counts,
+                        None,
+                        true,
+                        None,
+                        None,
+                        None,
+                    )
+                });
+                let refs = airs.air_refs();
+                let names: std::collections::HashMap<String, usize> = refs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, air)| (air.name().to_string(), i))
+                    .collect();
+                let mut shapes: Vec<Option<(usize, usize)>> = vec![None; refs.len()];
+                for &(table, index, shape) in &streamed_shapes {
+                    let at = *names.get(&stream_name(table, index)).ok_or_else(|| {
+                        Error::Prover(format!("no AIR for {}", stream_name(table, index)))
+                    })?;
+                    shapes[at] = Some(shape);
+                }
+                // The tables the windows did not stream, laid out in parallel
+                // and packed in AIR order.
+                let pairs = airs.air_trace_pairs(&mut traces);
+                let rest_tables: Vec<Placed<'_>> = pairs
+                    .into_iter()
+                    .zip(refs.iter().copied())
+                    .enumerate()
+                    .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .map(|(i, ((_, trace, _), air))| {
+                        let shape = (
+                            trace.main_table.width,
+                            trace.main_table.height.trailing_zeros() as usize,
+                        );
+                        table_of(air, trace, shape, true).map(|table| (i, shape, table))
+                    })
+                    .collect::<Result<_, Error>>()?;
+                for (i, shape, table) in rest_tables {
+                    if shapes[i].replace(shape).is_some() {
+                        return Err(Error::Prover(format!("table {i} built twice")));
+                    }
+                    packer.place(Key::Air(i), shape, table)?;
+                }
+                let group_keys = packer.finish()?;
+                let shapes: Vec<(usize, usize)> = shapes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, s)| s.ok_or_else(|| Error::Prover(format!("table {i} never built"))))
+                    .collect::<Result<_, _>>()?;
+                for (air, &(width, _)) in refs.iter().zip(&shapes) {
+                    if air.trace_layout().0 != width {
+                        return Err(Error::Prover(format!(
+                            "{}: {width} columns, the AIR declares {}",
+                            air.name(),
+                            air.trace_layout().0
+                        )));
+                    }
+                }
+                let groups = group_keys
+                    .into_iter()
+                    .map(|keys| {
+                        keys.into_iter()
+                            .map(|key| match key {
+                                Key::Air(i) => Ok(i as u32),
+                                Key::Streamed(table, index) => names
+                                    .get(&stream_name(table, index))
+                                    .map(|&i| i as u32)
+                                    .ok_or_else(|| {
+                                        Error::Prover(format!(
+                                            "no AIR for {}",
+                                            stream_name(table, index)
+                                        ))
+                                    }),
+                            })
+                            .collect::<Result<Vec<u32>, Error>>()
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                busy += t.elapsed().as_secs_f64();
+                Ok(Laid {
+                    table_counts,
+                    runtime_page_ranges,
+                    num_private_input_pages,
+                    public_output,
+                    shapes,
+                    groups,
+                    busy,
+                })
+            });
+
+            let block =
+                BlockCommitted::commit_groups::<H>(grx.iter(), &commit_config, options.drop_levels);
+            (block, builder.join(), layout.join())
+        });
+        // A thread's error names the cause; a commit that ran out of groups only
+        // says that it did.
+        let (windows_done, finished, streamed) =
+            built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
+        let laid =
+            laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
+        let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        stamps.build = finished;
+        stamps.streamed = (windows_done, streamed);
+        stamps.prep = laid.busy;
+        stamps.phase_a = start.elapsed().as_secs_f64();
+        stamps.tables = laid.shapes.len();
+        stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
+
+        let config = chain_config_under(&format.zf, &laid.shapes);
+        if config.log_blowup != commit_config.log_blowup
+            || config.log_folding != commit_config.log_folding
+            || config.format != commit_config.format
+        {
+            return Err(Error::Prover(
+                "phase A committed under a config the block's shapes do not give".into(),
+            ));
+        }
+        let table_num_vars: Vec<u8> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_block(
+            &mut transcript,
+            elf_bytes,
+            &laid.public_output,
+            &laid.table_counts,
+            laid.num_private_input_pages,
+            &laid.runtime_page_ranges,
+            &table_num_vars,
+            &config,
+            &laid.groups,
+        );
+        let t = Instant::now();
+        let paths_before = multilinear::whir_commit::top_path_counts();
+        let identity = |g: usize| g;
+        let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
+            Some(f) => f,
+            None => &identity,
+        };
+        let (proof, groups) = multilinear_block::block_prove_on_forks::<_, _, _, H>(
+            block,
+            &config,
+            &mut transcript,
+            fork_of,
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        stamps.phase_b = t.elapsed().as_secs_f64();
+        let paths_after = multilinear::whir_commit::top_path_counts();
+        stamps.top_paths = (
+            paths_after.0 - paths_before.0,
+            paths_after.1 - paths_before.1,
+        );
+        stamps.groups = groups;
+        Ok(BlockWhirProof {
+            proof,
+            table_num_vars,
+            runtime_page_ranges: laid.runtime_page_ranges,
+            table_counts: laid.table_counts,
+            public_output: laid.public_output,
+            num_private_input_pages: laid.num_private_input_pages,
+            groups: laid.groups,
+        })
     })
 }
 
@@ -594,25 +1149,28 @@ pub fn verify_block_whir(
         .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
         .collect();
 
-    // The groups and their stacks, from the shapes and the format alone.
-    let sizes = block_groups(&shapes, config.format.stack, format.group_polys)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let (stack_layouts, domains) = stacks(&shapes, &sizes, &config)?;
+    // The groups are the statement's; their stacks are built here, from the
+    // shapes and the verifier's stack cap. The proof's tables are in group
+    // order, so the statements are taken in that order too.
+    let order = validate_groups(&proof.groups, shapes.len())?;
+    let sizes: Vec<usize> = proof.groups.iter().map(Vec::len).collect();
+    let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();
+    let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
+    let (stack_layouts, domains) = stacks(&group_shapes, &sizes, &config)?;
 
     Ok(crate::with_whir_hash!(|H| {
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_tagged(
+        absorb_block(
             &mut transcript,
-            MULTILINEAR_BLOCK_TAG,
-            "block",
-            &statement::elf_digest(elf_bytes),
+            elf_bytes,
             &proof.public_output,
             &proof.table_counts,
             proof.num_private_input_pages,
             &proof.runtime_page_ranges,
             &proof.table_num_vars,
             &config,
+            &proof.groups,
         );
         // What the tables owe: the COMMIT bus's counterparty, at the block's
         // challenges — replayed on a fork through the roots block itself.

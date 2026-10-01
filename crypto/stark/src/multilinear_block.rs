@@ -112,6 +112,8 @@ pub struct GroupStamps {
     pub open: f64,
     /// Host bytes kept of the group's trees between the phases.
     pub tree_bytes: usize,
+    /// When the group's commit ended, seconds since phase A started.
+    pub committed_at: f64,
 }
 
 /// The block after phase A: every table, the groups' roots and the tops of
@@ -173,23 +175,45 @@ where
         config: &ChainConfig,
         drop_levels: usize,
     ) -> Result<Self, MlError> {
-        let mut tables = Vec::with_capacity(sizes.iter().sum());
-        let mut retired_groups = Vec::with_capacity(sizes.len());
-        let mut roots = Vec::new();
-        let mut stamps = Vec::with_capacity(sizes.len());
-        let mut incoming = groups.into_iter();
-        for &size in sizes {
-            let waited = Instant::now();
-            let group = incoming.next().ok_or(MlError::QueryCountMismatch {
+        let block =
+            Self::commit_groups::<H>(groups.into_iter().take(sizes.len()), config, drop_levels)?;
+        if block.sizes != sizes {
+            return Err(MlError::QueryCountMismatch {
                 expected: sizes.len(),
-                got: stamps.len(),
-            })?;
-            if group.len() != size {
+                got: block.sizes.len(),
+            });
+        }
+        Ok(block)
+    }
+
+    /// Phase A over whatever groups arrive, in arrival order, until the
+    /// producer stops: the groups (and so their sizes) are the prover's, and the
+    /// statement carries them. Each group's wait for its tables is stamped.
+    pub fn commit_groups<H: WhirHash>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: usize,
+    ) -> Result<Self, MlError> {
+        let mut tables = Vec::new();
+        let mut sizes = Vec::new();
+        let mut retired_groups = Vec::new();
+        let mut roots = Vec::new();
+        let mut stamps = Vec::new();
+        let mut incoming = groups.into_iter();
+        let started = Instant::now();
+        loop {
+            let waited = Instant::now();
+            let Some(group) = incoming.next() else {
+                break;
+            };
+            let size = group.len();
+            if size == 0 {
                 return Err(MlError::QueryCountMismatch {
-                    expected: size,
-                    got: group.len(),
+                    expected: 1,
+                    got: 0,
                 });
             }
+            sizes.push(size);
             let mut stamp = GroupStamps {
                 tables: size,
                 wait_a: waited.elapsed().as_secs_f64(),
@@ -223,13 +247,14 @@ where
             drop(columns);
             stamp.retire = t.elapsed().as_secs_f64();
             stamp.tree_bytes = retired.tree_bytes();
+            stamp.committed_at = started.elapsed().as_secs_f64();
             retired_groups.push(retired);
             stamps.push(stamp);
             tables.extend(group);
         }
         Ok(Self {
             tables,
-            sizes: sizes.to_vec(),
+            sizes,
             groups: retired_groups,
             roots,
             stamps,
