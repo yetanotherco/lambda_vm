@@ -44,6 +44,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
+        layout_workers: 0,
     }
 }
 
@@ -295,6 +296,26 @@ fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
     o.stream_memw_lt = true;
     let proof = prove(&elf, &format, &o);
     assert_eq!(proof.table_counts.lt, plain.table_counts.lt);
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// The streamed chunks laid out on three threads are packed in arrival order
+/// all the same: the same groups and table counts as laid out on one, and the
+/// proof verifies.
+#[test]
+fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+    o.layout_workers = 3;
+    let proof = prove(&elf, &format, &o);
+    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert_eq!(proof.groups, inline.groups);
+    assert_eq!(
+        format!("{:?}", proof.table_counts),
+        format!("{:?}", inline.table_counts)
+    );
     assert!(verify(&proof, &elf, &format));
 }
 

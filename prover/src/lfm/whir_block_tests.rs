@@ -67,6 +67,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             window_log2: None,
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            layout_workers: 0,
         },
     )
     .expect("the block proves")
@@ -348,6 +349,7 @@ fn dense_block_with(
             window_log2: None,
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            layout_workers: 0,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1080,12 +1082,16 @@ fn the_whir_block_tree_on_a_real_block() {
     // `BLOCK_WHIR_STREAM_MEMW_LT=1`: the MEMW-derived LT ops streamed per window.
     options.stream_memw_lt =
         std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads.
+    if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
+        options.layout_workers = n;
+    }
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
     println!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {}",
-        options.stream_keccak_rnd, options.stream_memw_lt
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {}",
+        options.stream_keccak_rnd, options.stream_memw_lt, options.layout_workers
     );
 
     let t0 = std::time::Instant::now();

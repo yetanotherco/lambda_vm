@@ -124,8 +124,14 @@ pub struct BlockOptions {
     /// With windows: derive each window's MEMW-derived LT ops as it arrives, so
     /// LT's full chunks stream with them
     /// ([`WindowedTraceBuilder::stream_memw_lt`]: other chunks than the
-    /// whole-run build's, the same LT multiplicities).
+    /// whole-run build's, the same LT multiplicities). Off by default: the
+    /// extra chunks bind the layout thread, a REGRESSION (FAST 420).
     pub stream_memw_lt: bool,
+    /// With windows: `0` lays each streamed chunk out on the layout thread as
+    /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
+    /// order all the same, while the layout thread lays out the rest of the
+    /// run as soon as it is built.
+    pub layout_workers: usize,
 }
 
 impl BlockOptions {
@@ -139,6 +145,7 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            layout_workers: 0,
         }
     }
 }
@@ -200,6 +207,20 @@ pub struct BlockStamps {
     pub windows: WindowStamps,
     /// The prepared commitments: how many, and the seconds deriving them.
     pub prepared: (usize, f64),
+    /// A streamed build's layout: its threads, its marks (seconds since the
+    /// prove started), when each group closed, the seconds the packer waited
+    /// on phase A and the seconds laying out chunks, summed over threads.
+    pub layout: LayoutStamps,
+}
+
+/// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
+#[derive(Clone, Debug, Default)]
+pub struct LayoutStamps {
+    pub workers: usize,
+    pub marks: Vec<(&'static str, f64)>,
+    pub closed_at: Vec<f64>,
+    pub blocked: f64,
+    pub chunks: f64,
 }
 
 impl BlockStamps {
@@ -253,6 +274,21 @@ impl BlockStamps {
                 self.windows.route,
                 self.windows.generate,
                 self.build - self.streamed.0,
+            ));
+            let l = &self.layout;
+            let marks: Vec<String> = l
+                .marks
+                .iter()
+                .map(|(label, at)| format!("{label} {at:.2}"))
+                .collect();
+            let closed: Vec<String> = l.closed_at.iter().map(|at| format!("{at:.2}")).collect();
+            out.push_str(&format!(
+                "BLOCK LAYOUT: {} worker(s) · {} · groups closed at [{}] · packer waited on phase A {:.2}s · chunks laid out {:.2}s (summed)\n",
+                l.workers,
+                marks.join(" · "),
+                closed.join(", "),
+                l.blocked,
+                l.chunks,
             ));
         }
         out.push_str(&format!(
@@ -1236,6 +1272,11 @@ struct Packer<'a> {
     out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
     cap: multilinear::whir_chain::StackVars,
     max_polys: usize,
+    /// The prove's clock, when each group closed, and the seconds spent
+    /// waiting for phase A to take one.
+    start: Instant,
+    closed_at: Vec<f64>,
+    blocked: f64,
 }
 
 impl<'a> Packer<'a> {
@@ -1263,18 +1304,272 @@ impl<'a> Packer<'a> {
 
     fn close(&mut self) -> Result<(), Error> {
         self.group_keys.push(std::mem::take(&mut self.open_keys));
-        self.out
+        self.closed_at.push(self.start.elapsed().as_secs_f64());
+        let t = Instant::now();
+        let sent = self
+            .out
             .send(std::mem::take(&mut self.open))
-            .map_err(|_| Error::Prover("phase A stopped".into()))
+            .map_err(|_| Error::Prover("phase A stopped".into()));
+        self.blocked += t.elapsed().as_secs_f64();
+        sent
     }
 
-    /// Sends the last group; hands back every group's tables.
-    fn finish(mut self) -> Result<Vec<Vec<Key>>, Error> {
+    /// Sends the last group; hands back every group's tables, when each
+    /// closed and the seconds spent waiting on phase A.
+    fn finish(mut self) -> Result<Packed, Error> {
         if !self.open.is_empty() {
             self.close()?;
         }
-        Ok(self.group_keys)
+        Ok((self.group_keys, self.closed_at, self.blocked))
     }
+}
+
+/// Every group's tables, when each group closed, and the seconds the packer
+/// waited on phase A ([`Packer::finish`]).
+type Packed = (Vec<Vec<Key>>, Vec<f64>, f64);
+
+/// A streamed chunk laid out: its table, its index, its shape and the table.
+type LaidChunk<'a> = (StreamTable, usize, (usize, usize), CommittedTable<'a, F, E>);
+
+fn lay_out_chunk<'a>(airs: &'a StreamAirs, job: ChunkJob) -> Result<LaidChunk<'a>, Error> {
+    let mut chunk = job.generate();
+    let height = chunk.trace.main_table.height;
+    let shape = (
+        chunk.trace.main_table.width,
+        height.trailing_zeros() as usize,
+    );
+    let table = table_of(airs.of(chunk.table), &mut chunk.trace, shape, true)?;
+    Ok((chunk.table, chunk.index, shape, table))
+}
+
+/// The streamed chunks, packed in arrival order: the packer, each chunk's
+/// shape, the seconds laying them out (summed over threads) and when the last
+/// was placed.
+struct StreamLaid<'a> {
+    packer: Packer<'a>,
+    shapes: Vec<(StreamTable, usize, (usize, usize))>,
+    chunks: f64,
+    placed_at: f64,
+}
+
+/// Each chunk laid out and packed on this thread as it arrives; hands back
+/// the run once it is built.
+fn stream_inline<'a>(
+    brx: std::sync::mpsc::Receiver<Built>,
+    airs: &'a StreamAirs,
+    mut packer: Packer<'a>,
+) -> Result<(StreamLaid<'a>, Box<Traces>), Error> {
+    let mut shapes = Vec::new();
+    let mut chunks = 0.0;
+    for item in brx {
+        match item {
+            Built::Job(job) => {
+                let t = Instant::now();
+                let (table, index, shape, laid) = lay_out_chunk(airs, *job)?;
+                chunks += t.elapsed().as_secs_f64();
+                shapes.push((table, index, shape));
+                packer.place(Key::Streamed(table, index), shape, laid)?;
+            }
+            Built::Rest(traces) => {
+                let placed_at = packer.start.elapsed().as_secs_f64();
+                let streamed = StreamLaid {
+                    packer,
+                    shapes,
+                    chunks,
+                    placed_at,
+                };
+                return Ok((streamed, traces));
+            }
+        }
+    }
+    Err(Error::Prover(
+        "the builder stopped before the run was built".into(),
+    ))
+}
+
+/// The chunks laid out on `workers` threads and packed on one more, in
+/// arrival order all the same, so a waiting phase A holds back only the
+/// packing; this thread hands them out and, once the run is built, lays out
+/// the rest of it (`rest`) while the last chunks are packed.
+fn stream_pipelined<'a, R>(
+    brx: std::sync::mpsc::Receiver<Built>,
+    airs: &'a StreamAirs,
+    mut packer: Packer<'a>,
+    workers: usize,
+    rest: impl FnOnce(Box<Traces>) -> Result<R, Error>,
+) -> Result<(StreamLaid<'a>, R), Error> {
+    type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
+    std::thread::scope(|scope| {
+        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Box<ChunkJob>)>(workers);
+        let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
+        let (dtx, drx) = std::sync::mpsc::sync_channel::<Done<'a>>(workers);
+        for _ in 0..workers {
+            let jrx = std::sync::Arc::clone(&jrx);
+            let dtx = dtx.clone();
+            scope.spawn(move || {
+                loop {
+                    // The lock is held for the receive alone. A poisoned lock
+                    // means a sibling panicked, which the scope reports.
+                    let next = match jrx.lock() {
+                        Ok(jobs) => jobs.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok((seq, job)) = next else { return };
+                    let t = Instant::now();
+                    let laid = lay_out_chunk(airs, *job);
+                    if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        // The workers hold the only receivers and senders: once they stop,
+        // handing out fails and the packer's loop ends.
+        drop(jrx);
+        drop(dtx);
+        let placer = scope.spawn(move || -> Result<StreamLaid<'a>, Error> {
+            let mut pending = std::collections::BTreeMap::new();
+            let mut next = 0usize;
+            let mut shapes = Vec::new();
+            let mut chunks = 0.0;
+            for (seq, secs, laid) in drx {
+                chunks += secs;
+                pending.insert(seq, laid);
+                while let Some(laid) = pending.remove(&next) {
+                    let (table, index, shape, laid) = laid?;
+                    shapes.push((table, index, shape));
+                    packer.place(Key::Streamed(table, index), shape, laid)?;
+                    next += 1;
+                }
+            }
+            if !pending.is_empty() {
+                return Err(Error::Prover(format!(
+                    "streamed chunk {next} was never laid out"
+                )));
+            }
+            let placed_at = packer.start.elapsed().as_secs_f64();
+            Ok(StreamLaid {
+                packer,
+                shapes,
+                chunks,
+                placed_at,
+            })
+        });
+        let mut handed = 0usize;
+        let mut traces = None;
+        for item in brx {
+            match item {
+                Built::Job(job) => {
+                    if jtx.send((handed, job)).is_err() {
+                        break;
+                    }
+                    handed += 1;
+                }
+                Built::Rest(built) => {
+                    traces = Some(built);
+                    break;
+                }
+            }
+        }
+        drop(jtx);
+        let rest = traces.map(rest);
+        let streamed = placer
+            .join()
+            .map_err(|_| Error::Prover("the block's packer panicked".into()))??;
+        if streamed.shapes.len() != handed {
+            return Err(Error::Prover(format!(
+                "{} of {handed} streamed chunks packed",
+                streamed.shapes.len()
+            )));
+        }
+        let rest = rest.ok_or_else(|| {
+            Error::Prover("the builder stopped before the run was built".into())
+        })??;
+        Ok((streamed, rest))
+    })
+}
+
+/// The run's tables the windows did not stream, laid out in parallel, and what
+/// the statement reads off the run; `marks` are seconds since the prove
+/// started.
+struct RestLaid<'a> {
+    table_counts: TableCounts,
+    runtime_page_ranges: Vec<RuntimePageRange>,
+    num_private_input_pages: usize,
+    public_output: Vec<u8>,
+    refs: Vec<&'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+    prepared: Vec<PreparedColumns>,
+    tables: Vec<Placed<'a>>,
+    marks: Vec<(&'static str, f64)>,
+    busy: f64,
+}
+
+fn lay_out_rest<'a>(
+    mut traces: Box<Traces>,
+    program: &Elf,
+    opts: &ProofOptions,
+    format: &BlockFormat,
+    run_airs: &'a std::sync::OnceLock<VmAirs>,
+    start: Instant,
+) -> Result<RestLaid<'a>, Error> {
+    let t = Instant::now();
+    let at = || start.elapsed().as_secs_f64();
+    let mut marks = vec![("rest received", at())];
+    let table_counts = traces.table_counts();
+    validate_block_counts(&table_counts)?;
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let public_output = traces.public_output_bytes.clone();
+    let airs = run_airs.get_or_init(|| {
+        VmAirs::new(
+            program,
+            opts,
+            false,
+            &traces.page_configs,
+            &table_counts,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+    });
+    marks.push(("airs", at()));
+    let prepared = prepared_tables(airs, &traces.page_configs, format)?;
+    marks.push(("prepared", at()));
+    let refs = airs.air_refs();
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let tables: Vec<Placed<'a>> = pairs
+        .into_iter()
+        .zip(refs.iter().copied())
+        .enumerate()
+        .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(i, ((_, trace, _), air))| {
+            let shape = (
+                trace.main_table.width,
+                trace.main_table.height.trailing_zeros() as usize,
+            );
+            table_of(air, trace, shape, true).map(|table| (i, shape, table))
+        })
+        .collect::<Result<_, Error>>()?;
+    marks.push(("rest laid out", at()));
+    Ok(RestLaid {
+        table_counts,
+        runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        refs,
+        prepared,
+        tables,
+        marks,
+        busy: t.elapsed().as_secs_f64(),
+    })
 }
 
 /// What the layout thread knows once the run is built: the statement, the AIR
@@ -1289,6 +1584,7 @@ struct Laid {
     /// The prepared tables' columns ([`prepared_tables`]).
     prepared: Vec<PreparedColumns>,
     busy: f64,
+    layout: LayoutStamps,
 }
 
 /// The block's proof with the build streamed into phase A: a builder thread
@@ -1416,8 +1712,7 @@ fn prove_streamed(
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
-                let mut busy = 0.0;
-                let mut packer = Packer {
+                let packer = Packer {
                     open: Vec::new(),
                     open_shapes: Vec::new(),
                     open_keys: Vec::new(),
@@ -1425,64 +1720,35 @@ fn prove_streamed(
                     out: gtx,
                     cap,
                     max_polys: format.group_polys,
+                    start,
+                    closed_at: Vec::new(),
+                    blocked: 0.0,
                 };
-                let mut streamed_shapes: Vec<(StreamTable, usize, (usize, usize))> = Vec::new();
-                let mut rest = None;
-                for item in brx {
-                    match item {
-                        Built::Job(job) => {
-                            let t = Instant::now();
-                            let mut chunk = job.generate();
-                            let height = chunk.trace.main_table.height;
-                            let shape = (
-                                chunk.trace.main_table.width,
-                                height.trailing_zeros() as usize,
-                            );
-                            let table = table_of(
-                                stream_airs.of(chunk.table),
-                                &mut chunk.trace,
-                                shape,
-                                true,
-                            )?;
-                            streamed_shapes.push((chunk.table, chunk.index, shape));
-                            packer.place(Key::Streamed(chunk.table, chunk.index), shape, table)?;
-                            busy += t.elapsed().as_secs_f64();
-                        }
-                        Built::Rest(traces) => {
-                            rest = Some(traces);
-                            break;
-                        }
-                    }
-                }
-                let mut traces = *rest.ok_or_else(|| {
-                    Error::Prover("the builder stopped before the run was built".into())
-                })?;
+                let rest_of = |traces| lay_out_rest(traces, program, opts, format, run_airs, start);
+                let (streamed, rest) = if options.layout_workers == 0 {
+                    let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
+                    (streamed, rest_of(traces)?)
+                } else {
+                    stream_pipelined(brx, stream_airs, packer, options.layout_workers, rest_of)?
+                };
                 let t = Instant::now();
-                let table_counts = traces.table_counts();
-                validate_block_counts(&table_counts)?;
-                let runtime_page_ranges = traces.runtime_page_ranges();
-                let num_private_input_pages = traces
-                    .page_configs
-                    .iter()
-                    .filter(|c| c.is_private_input)
-                    .count();
-                let public_output = traces.public_output_bytes.clone();
-                let airs = run_airs.get_or_init(|| {
-                    VmAirs::new(
-                        program,
-                        opts,
-                        false,
-                        &traces.page_configs,
-                        &table_counts,
-                        None,
-                        true,
-                        None,
-                        None,
-                        None,
-                    )
-                });
-                let prepared = prepared_tables(airs, &traces.page_configs, format)?;
-                let refs = airs.air_refs();
+                let StreamLaid {
+                    mut packer,
+                    shapes: streamed_shapes,
+                    chunks,
+                    placed_at,
+                } = streamed;
+                let RestLaid {
+                    table_counts,
+                    runtime_page_ranges,
+                    num_private_input_pages,
+                    public_output,
+                    refs,
+                    prepared,
+                    tables: rest_tables,
+                    marks: rest_marks,
+                    busy: rest_busy,
+                } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
                     .enumerate()
@@ -1495,31 +1761,18 @@ fn prove_streamed(
                     })?;
                     shapes[at] = Some(shape);
                 }
-                // The tables the windows did not stream, laid out in parallel
-                // and packed in AIR order.
-                let pairs = airs.air_trace_pairs(&mut traces);
-                let rest_tables: Vec<Placed<'_>> = pairs
-                    .into_iter()
-                    .zip(refs.iter().copied())
-                    .enumerate()
-                    .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
-                    .collect::<Vec<_>>()
-                    .into_par_iter()
-                    .map(|(i, ((_, trace, _), air))| {
-                        let shape = (
-                            trace.main_table.width,
-                            trace.main_table.height.trailing_zeros() as usize,
-                        );
-                        table_of(air, trace, shape, true).map(|table| (i, shape, table))
-                    })
-                    .collect::<Result<_, Error>>()?;
+                // The tables the windows did not stream, packed in AIR order
+                // after every streamed chunk.
                 for (i, shape, table) in rest_tables {
                     if shapes[i].replace(shape).is_some() {
                         return Err(Error::Prover(format!("table {i} built twice")));
                     }
                     packer.place(Key::Air(i), shape, table)?;
                 }
-                let group_keys = packer.finish()?;
+                let (group_keys, closed_at, blocked) = packer.finish()?;
+                let mut marks = vec![("streamed placed", placed_at)];
+                marks.extend(rest_marks);
+                marks.push(("groups closed", start.elapsed().as_secs_f64()));
                 let shapes: Vec<(usize, usize)> = shapes
                     .into_iter()
                     .enumerate()
@@ -1553,7 +1806,7 @@ fn prove_streamed(
                             .collect::<Result<Vec<u32>, Error>>()
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                busy += t.elapsed().as_secs_f64();
+                let busy = chunks + rest_busy + t.elapsed().as_secs_f64();
                 Ok(Laid {
                     table_counts,
                     runtime_page_ranges,
@@ -1563,6 +1816,13 @@ fn prove_streamed(
                     groups,
                     prepared,
                     busy,
+                    layout: LayoutStamps {
+                        workers: options.layout_workers,
+                        marks,
+                        closed_at,
+                        blocked,
+                        chunks,
+                    },
                 })
             });
 
@@ -1584,6 +1844,7 @@ fn prove_streamed(
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);
         stamps.prep = laid.busy;
+        stamps.layout = laid.layout.clone();
         stamps.phase_a = start.elapsed().as_secs_f64();
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
