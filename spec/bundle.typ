@@ -106,7 +106,7 @@
       html.link(href: "/style.css", rel: "stylesheet")
       html.link(href: "/fonts.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
-      html.script(src: "/defered.js", defer: true)
+      html.script(src: "/deferred.js", defer: true)
       html.div(class: "headerButtons")
       html.script(src: "/instant.js")
       html.header(title(link(<doc:index>, vistitle)))
@@ -117,7 +117,7 @@
 ]
 
 #asset("/style.css", read("/assets/style.css") + read("/assets/fonts.css") + read("/assets/sidenotes.css"))
-#asset("/defered.js", read("/assets/sidenotes.js") + read("/assets/mathml_cleanup.js"))
+#asset("/deferred.js", read("/assets/sidenotes.js") + read("/assets/mathml_cleanup.js"))
 #asset("/instant.js", read("/assets/themetoggle.js"))
 
 // Bundled fonts
