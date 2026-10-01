@@ -69,16 +69,27 @@ pub const BLOCK_TREE_DROP_LEVELS: usize = 4;
 #[derive(Clone, Copy, Debug)]
 pub struct BlockFormat {
     pub zf: ZfFormat,
+    /// The most stacked polynomials a group may take: the prover packs to it,
+    /// and the verifier refuses a group whose stack needs more.
     pub group_polys: usize,
+    /// The most groups a block statement may declare (the verifier refuses
+    /// more). The proven bits are quoted at this count (I-NOEPOCH-W.md §8).
+    pub max_groups: usize,
 }
+
+/// The most groups a block statement may declare. The block has 9; the bound
+/// leaves room for larger blocks and caps what a statement can make the
+/// verifier build.
+pub const BLOCK_MAX_GROUPS: usize = 64;
 
 impl BlockFormat {
     /// The process's WHIR format (as [`crate::multilinear_prove::chain_config`]
-    /// reads it) and [`BLOCK_GROUP_POLYS`].
+    /// reads it), [`BLOCK_GROUP_POLYS`] and [`BLOCK_MAX_GROUPS`].
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
             group_polys: BLOCK_GROUP_POLYS,
+            max_groups: BLOCK_MAX_GROUPS,
         }
     }
 }
@@ -1223,11 +1234,32 @@ pub fn verify_block_whir(
     // The groups are the statement's; their stacks are built here, from the
     // shapes and the verifier's stack cap. The proof's tables are in group
     // order, so the statements are taken in that order too.
+    if proof.groups.len() > format.max_groups {
+        return Err(Error::InvalidTableCounts(format!(
+            "{} groups — a block takes at most {}",
+            proof.groups.len(),
+            format.max_groups
+        )));
+    }
     let order = validate_groups(&proof.groups, shapes.len())?;
     let sizes: Vec<usize> = proof.groups.iter().map(Vec::len).collect();
     let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
     let (stack_layouts, domains) = stacks(&group_shapes, &sizes, &config)?;
+    // Every group within the stack budget — the verifier's constant, not the
+    // prover's packing — except a table that alone needs more: it cannot be
+    // split, so it is a group of its own (the packing's rule too).
+    if let Some((g, layout)) = stack_layouts
+        .iter()
+        .enumerate()
+        .find(|(g, layout)| layout.num_polys() > format.group_polys && sizes[*g] > 1)
+    {
+        return Err(Error::InvalidTableCounts(format!(
+            "group {g} stacks into {} polynomials — a group takes at most {}",
+            layout.num_polys(),
+            format.group_polys
+        )));
+    }
 
     Ok(crate::with_whir_hash!(|H| {
         let mut transcript =

@@ -18,6 +18,7 @@ fn one_group() -> BlockFormat {
     BlockFormat {
         zf: ZfFormat::DEFAULT,
         group_polys: block_whir::BLOCK_GROUP_POLYS,
+        max_groups: block_whir::BLOCK_MAX_GROUPS,
     }
 }
 
@@ -26,7 +27,11 @@ fn one_group() -> BlockFormat {
 fn many_groups() -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT;
     zf.whir_stack = StackVars::new(10).expect("a valid stack");
-    BlockFormat { zf, group_polys: 2 }
+    BlockFormat {
+        zf,
+        group_polys: 2,
+        max_groups: block_whir::BLOCK_MAX_GROUPS,
+    }
 }
 
 fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions {
@@ -283,7 +288,62 @@ fn a_tampered_partition_is_refused() {
     assert!(!verify(&moved, &elf, &format));
 }
 
-/// One table's claimed column value moved: its group's opening refuses it./// One table's claimed column value moved: its group's opening refuses it.
+/// A table missing from the partition is refused.
+#[test]
+fn a_partition_missing_a_table_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let g = proof
+        .groups
+        .iter()
+        .position(|g| g.len() >= 2)
+        .expect("a group of two");
+    proof.groups[g].pop();
+    assert!(!verify(&proof, &elf, &format));
+}
+
+/// ★ A group over the verifier's polynomial budget is refused — by that check
+/// alone: the same honest proof verifies under a budget that admits it.
+#[test]
+fn a_group_over_the_stack_budget_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let mut wide = many_groups();
+    wide.group_polys = 4;
+    let proof = prove(&elf, &wide, &streamed(MaxRowsConfig::small(), 16, 3));
+    assert!(
+        verify(&proof, &elf, &wide),
+        "the honest proof under its own budget"
+    );
+    let narrow = BlockFormat {
+        group_polys: 2,
+        ..wide
+    };
+    assert!(!verify(&proof, &elf, &narrow));
+}
+
+/// ★ More groups than the verifier's maximum is refused — by that check alone:
+/// the same honest proof verifies under a maximum that admits it.
+#[test]
+fn a_partition_over_the_group_maximum_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let n = proof.groups.len();
+    assert!(n >= 3 && verify(&proof, &elf, &format));
+    let tight = BlockFormat {
+        max_groups: n - 1,
+        ..format
+    };
+    assert!(!verify(&proof, &elf, &tight));
+    let exact = BlockFormat {
+        max_groups: n,
+        ..format
+    };
+    assert!(verify(&proof, &elf, &exact));
+}
+
+/// One table's claimed column value moved: its group's opening refuses it.
 #[test]
 fn a_tampered_column_claim_is_refused() {
     let elf = asm_elf_bytes("all_instructions_64");
