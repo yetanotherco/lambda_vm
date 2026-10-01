@@ -44,6 +44,7 @@ use std::collections::HashMap;
 
 use executor::elf::Elf;
 use executor::vm::logs::Log;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use stark::trace::TraceTable;
 
@@ -166,11 +167,12 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// A window may be any length; the chunks do not depend on where the
     /// windows fall.
     pub fn push(&mut self, logs: &[Log]) -> Result<Vec<StreamedChunk>, Error> {
-        Ok(self
-            .push_jobs(logs)?
-            .into_par_iter()
-            .map(ChunkJob::generate)
-            .collect())
+        let jobs = self.push_jobs(logs)?;
+        #[cfg(feature = "parallel")]
+        let jobs = jobs.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let jobs = jobs.into_iter();
+        Ok(jobs.map(ChunkJob::generate).collect())
     }
 
     /// Like [`push`](Self::push), but hands back each completed chunk as a
@@ -449,6 +451,19 @@ fn chunk_jobs(
     jobs
 }
 
+/// `rayon::join` under the `parallel` feature, the two calls in order without
+/// it (the prover's guests take it without rayon).
+fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::join(a, b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (a(), b())
+    }
+}
+
 /// The windows' lists concatenated into the run's, once: list by list in
 /// parallel, each window's list freed as it is copied.
 fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOutputs) {
@@ -495,17 +510,12 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
         ecdas.push(walk.ecdas_ops);
         hint.push(walk.hint_ops);
     }
-    let ((cpu, (register_rows, aligned)), ((general, bitwise), (load, (lt, shift)))) = rayon::join(
+    let ((cpu, (register_rows, aligned)), ((general, bitwise), (load, (lt, shift)))) = join(
+        || (cat(cpu), join(|| cat(register_rows), || cat(aligned))),
         || {
-            (
-                cat(cpu),
-                rayon::join(|| cat(register_rows), || cat(aligned)),
-            )
-        },
-        || {
-            rayon::join(
-                || rayon::join(|| cat(general), || cat(bitwise)),
-                || rayon::join(|| cat(load), || rayon::join(|| cat(lt), || cat(shift))),
+            join(
+                || join(|| cat(general), || cat(bitwise)),
+                || join(|| cat(load), || join(|| cat(lt), || cat(shift))),
             )
         },
     );
