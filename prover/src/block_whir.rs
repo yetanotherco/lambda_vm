@@ -835,7 +835,7 @@ fn prove_streamed(
                 Ok(start.elapsed().as_secs_f64())
             });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
-            let builder = scope.spawn(move || -> Result<(f64, f64, usize, WindowStamps), Error> {
+            let builder = scope.spawn(move || -> Result<(f64, f64, usize, WindowStamps, Vec<(String, f64)>), Error> {
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 let mut streamed = 0usize;
@@ -858,14 +858,17 @@ fn prove_streamed(
                     held.ok_or_else(|| Error::Execution("the run executed no cycle".to_string()))?;
                 let windows_done = start.elapsed().as_secs_f64();
                 let window_stamps = builder.stamps();
+                // The table phase's marks, for `finish` alone.
+                crate::tables::trace_builder::build_stamps::start();
                 let mut rest = builder.finish(&last)?;
+                let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
                     rest.keccak_rnds.remove(0);
                 }
                 let finished = start.elapsed().as_secs_f64();
                 let _ = btx.send(Built::Rest(Box::new(rest)));
-                Ok((windows_done, finished, streamed, window_stamps))
+                Ok((windows_done, finished, streamed, window_stamps, finish_marks))
             });
 
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
@@ -1028,9 +1031,10 @@ fn prove_streamed(
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did.
-        let (windows_done, finished, streamed, window_stamps) =
+        let (windows_done, finished, streamed, window_stamps, finish_marks) =
             built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
         stamps.windows = window_stamps;
+        stamps.build_marks = finish_marks;
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
         let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
