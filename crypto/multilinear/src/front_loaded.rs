@@ -127,7 +127,8 @@ where
     E: IsField + 'static,
     FieldElement<E>: Send + Sync,
 {
-    /// A table's rounds, on its device factors when the fused rounds take
+    /// A table's rounds, on its device factors — or its base columns on the
+    /// card, `columns`, when nothing was lifted — when the fused rounds take
     /// them, else on the host over `factors()` and the two weights built from
     /// their points.
     ///
@@ -142,6 +143,7 @@ where
         weights: [&[FieldElement<E>]; 2],
         num_vars: usize,
         device: Option<&'a crate::gpu::DeviceFactors>,
+        columns: Option<&'a crate::gpu::ColumnFactors>,
         fused: Option<crate::gpu_fused::FusedInput<'_, B, E>>,
         factors: P,
     ) -> Result<Self, Error>
@@ -149,8 +151,16 @@ where
         B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
         P: FnOnce() -> Result<Vec<crate::mle::Mle<E>>, Error>,
     {
+        // The fused rounds read the lifted factors when a device holds them,
+        // else the table's base columns where they lie (no lift, D-BATCH M1-2).
         #[cfg(feature = "cuda")]
-        if let (Some(device), Some(input)) = (device, fused.as_ref())
+        let source = fused.as_ref().and_then(|_| {
+            device
+                .map(crate::gpu_fused::FusedSource::Lifted)
+                .or(columns.map(crate::gpu_fused::FusedSource::Columns))
+        });
+        #[cfg(feature = "cuda")]
+        if let (Some(source), Some(input)) = (source, fused.as_ref())
             && crate::gpu_fused::argue_fused()
         {
             let degree = rules
@@ -160,7 +170,7 @@ where
                 .unwrap_or(0)
                 .max(1);
             let check = crate::gpu_fused::argue_fused_xcheck();
-            match crate::gpu_fused::FusedStepper::new(device, input, &lambdas, claim, degree, check)
+            match crate::gpu_fused::FusedStepper::new(source, input, &lambdas, claim, degree, check)
             {
                 Some(Ok(stepper)) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
@@ -178,7 +188,7 @@ where
                 }
             }
         }
-        let _ = (device, &fused, claim, num_vars);
+        let _ = (device, columns, &fused, claim, num_vars);
         let mut polys = factors()?;
         polys.push(crate::eq::eq_mle(weights[0])?);
         polys.push(crate::eq::eq_mle(weights[1])?);

@@ -509,6 +509,7 @@ where
         })
         .collect::<Result<_, _>>()?;
 
+    let mut split = ArgueSplit::default();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; tables.len()];
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
@@ -521,12 +522,25 @@ where
                 if at == Where::Host {
                     return Ok(BinTree::Host(host_tree(interactions, trace)?));
                 }
-                // Where today's argue builds it: from the factors on the card,
-                // else here — and a big host tree still folds on a device.
-                let tree = match trace
-                    .reside_from_columns()
-                    .and_then(|resident| logup::resident_tree(interactions, resident))
-                {
+                // Where today's argue builds it: written from the base columns
+                // with no lift (`LAMBDA_VM_ARGUE_NO_LIFT`), else from the
+                // lifted factors on the card, else here — and a big host tree
+                // still folds on a device. The same tree every way.
+                let started = std::time::Instant::now();
+                let on_card = (multilinear::gpu::argue_no_lift()
+                    && trace.device_factors().is_none())
+                .then(|| logup::resident_tree_from_columns(interactions, trace))
+                .flatten()
+                .or_else(|| {
+                    let resident = trace.reside_from_columns();
+                    let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
+                        .then(|| logup::resident_tree_from_columns(interactions, trace))
+                        .flatten();
+                    from_columns.or_else(|| {
+                        resident.and_then(|resident| logup::resident_tree(interactions, resident))
+                    })
+                });
+                let tree = match on_card {
                     Some(tree) => tree,
                     None => {
                         let factors = trace.factors()?;
@@ -536,6 +550,7 @@ where
                         )?)?
                     }
                 };
+                split.trees += started.elapsed().as_secs_f64();
                 Ok(BinTree::Built(Box::new(tree)))
             })
             .collect::<Result<_, _>>()?;
@@ -561,7 +576,9 @@ where
             transcript.append_field_element(&output.1);
             bus_outputs[t] = Some(output);
         }
+        let started = std::time::Instant::now();
         let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
+        split.ladders += started.elapsed().as_secs_f64();
         for (&t, claim) in bin.iter().zip(inputs) {
             claims[t] = Some(claim);
         }
@@ -595,8 +612,41 @@ where
     }
     let lambdas = vec![FieldElement::one(), lambda.clone(), &lambda * &lambda];
     let lambda2 = &lambda * &lambda;
-    // The factors each table's fused rounds would read, held for as long as
-    // the rounds do.
+    let started = std::time::Instant::now();
+    // What each table's fused rounds read, held for as long as the rounds do:
+    // the base columns on the card with no lift (`LAMBDA_VM_ARGUE_NO_LIFT`), the
+    // lifted factors for a table they cannot read that way (lifted here, as the
+    // per-table argue lifts it), or nothing, on the host.
+    let mut constraints: Vec<Option<multilinear::fused::Constraints<F>>> =
+        Vec::with_capacity(tables.len());
+    let mut columns: Vec<Option<multilinear::gpu::ColumnFactors>> =
+        Vec::with_capacity(tables.len());
+    for table in tables {
+        let shape = table.shape();
+        let made = (at == Where::Device
+            && multilinear::gpu_fused::argue_fused()
+            && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns()))
+        .then(|| {
+            multilinear::fused::Constraints::<F>::from_extension(
+                &shape.steps_as_ops(),
+                shape.root_steps(),
+                shape.selector_of_root(),
+                shape.degree(),
+            )
+            .ok()
+        })
+        .flatten();
+        let column = (at == Where::Device
+            && multilinear::gpu::argue_no_lift()
+            && table.trace.device_factors().is_none())
+        .then(|| made.as_ref().and_then(|_| table.trace.column_factors()))
+        .flatten();
+        if at == Where::Device && made.is_some() && column.is_none() {
+            let _ = table.trace.reside_from_columns();
+        }
+        constraints.push(made);
+        columns.push(column);
+    }
     let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
         .iter()
         .map(|table| match at {
@@ -614,24 +664,8 @@ where
         } else {
             &xi[..n]
         };
-        let shape = table.shape();
-        let constraints = device[t]
-            .as_ref()
-            .filter(|_| {
-                multilinear::gpu_fused::argue_fused()
-                    && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns())
-            })
-            .and_then(|_| {
-                multilinear::fused::Constraints::<F>::from_extension(
-                    &shape.steps_as_ops(),
-                    shape.root_steps(),
-                    shape.selector_of_root(),
-                    shape.degree(),
-                )
-                .ok()
-            });
-        let betas = multilinear_air::beta_powers(&beta, shape.num_roots());
-        let fused = constraints
+        let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
+        let fused = constraints[t]
             .as_ref()
             .map(|constraints| multilinear::gpu_fused::FusedInput {
                 constraints,
@@ -639,6 +673,7 @@ where
                 interactions: &interactions[t],
                 claim_point: &claims[t].point,
                 r: xi_t,
+                columns: columns[t].as_ref(),
             });
         let claim = &lambda * &claims[t].p + &lambda2 * &claims[t].q;
         polys.push(front_loaded::TableRounds::new(
@@ -648,10 +683,13 @@ where
             [xi_t, &row_point],
             n,
             device[t].as_deref(),
+            columns[t].as_ref(),
             fused,
             || table.trace.factors(),
         )?);
     }
+    split.zc_setup += started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
     let (constraint, point) = front_loaded::prove_with(
         &mut polys,
         &weights,
@@ -661,6 +699,7 @@ where
             scaled: faults.scaled_padding,
         },
     )?;
+    split.zc_rounds += started.elapsed().as_secs_f64();
     let mut factor_values = Vec::with_capacity(tables.len());
     for (table, poly) in tables.iter().zip(&polys) {
         let values = table
@@ -675,6 +714,7 @@ where
     }
     drop(polys);
     drop(device);
+    drop(columns);
     for table in tables {
         table.trace.release_device();
     }
@@ -685,6 +725,7 @@ where
     }
 
     // ── Rd: a shifted table's reduction; the others read their columns ────
+    let started = std::time::Instant::now();
     let mut reduces = Vec::with_capacity(tables.len());
     let mut reduced = Vec::with_capacity(tables.len());
     for (t, table) in tables.iter().enumerate() {
@@ -718,6 +759,20 @@ where
         });
         reduces.push(reduce);
     }
+    split.reduce += started.elapsed().as_secs_f64();
+    if multilinear::whir_split::enabled() {
+        eprintln!(
+            "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
+             {:.3}s · zc rounds {:.3}s · reduce {:.3}s",
+            tables.len(),
+            plan.bins.len(),
+            split.trees,
+            split.ladders,
+            split.zc_setup,
+            split.zc_rounds,
+            split.reduce
+        );
+    }
     Ok((
         BatchedArgue {
             bus_outputs,
@@ -728,6 +783,16 @@ where
         },
         reduced,
     ))
+}
+
+/// Where a batched argue's time goes, printed under `LAMBDA_VM_BASE_SPLIT=1`.
+#[derive(Default)]
+struct ArgueSplit {
+    trees: f64,
+    ladders: f64,
+    zc_setup: f64,
+    zc_rounds: f64,
+    reduce: f64,
 }
 
 /// Verifies a batched proof: every table, the bus balance across them, and

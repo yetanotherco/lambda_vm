@@ -267,6 +267,7 @@ where
     E: IsField + 'static,
     T: IsTranscript<E>,
 {
+    let t = crate::whir_split::tick();
     check_shape(sources, factor_values, columns.len())?;
     for column in columns {
         if column.num_vars() != alpha.len() {
@@ -344,8 +345,11 @@ where
         }
     };
 
+    crate::whir_split::add_tick(&crate::whir_split::REST_REDUCE, t);
+
     // All at the same point, so they fold together: one upload and one launch
     // per level for the table instead of per column.
+    let t = crate::whir_split::tick();
     let column_values = match crate::gpu::evaluate_many_base(columns, &point, resident) {
         Some(values) => {
             if crate::gpu::argue_xcheck() {
@@ -358,6 +362,7 @@ where
     for value in &column_values {
         transcript.append_field_element(value);
     }
+    crate::whir_split::add_tick(&crate::whir_split::REST_COLUMNS, t);
 
     Ok((
         ReduceProof {

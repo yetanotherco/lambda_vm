@@ -1993,7 +1993,9 @@ where
 {
     if crate::argue_measure::active()? {
         let mut batched = *config;
-        batched.format.argue = multilinear::whir_chain::ArgueFormat::BATCHED;
+        batched.format.argue = multilinear::whir_chain::ArgueFormat::Batched {
+            bin_log_cells: crate::argue_measure::bin_log_cells()?,
+        };
         let proof =
             multilinear_table::multi_prove_batched(committed, &batched, transcript, prepared)
                 .map_err(|e| Error::Prover(format!("{e:?}")))?;

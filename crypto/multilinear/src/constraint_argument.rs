@@ -190,6 +190,25 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
+    /// The table's factors as its resident base columns, with no lift
+    /// ([`crate::gpu::column_factors`]), or `None`.
+    pub fn column_factors(&self) -> Option<crate::gpu::ColumnFactors> {
+        crate::gpu::column_factors(
+            &self.columns,
+            &self.kinds,
+            &self.public,
+            self.resident_shared(),
+        )
+    }
+
+    /// The same, shared: for a device tree that writes its input layer again
+    /// from the columns after this borrow is gone.
+    pub fn resident_shared(&self) -> Option<(std::sync::Arc<crate::gpu::ResidentColumns>, usize)> {
+        self.resident
+            .as_ref()
+            .map(|(store, first)| (store.clone(), *first))
+    }
+
     /// The epoch's columns on the card, and where this table's start.
     pub fn resident(&self) -> Option<(&crate::gpu::ResidentColumns, usize)> {
         self.resident
@@ -617,20 +636,26 @@ where
     // reads it. The closure is what makes them if the device turns the rounds
     // down.
     let resident = trace.device_factors();
-    let (sumcheck, point, bound) = batch::prove_resident_with(
+    let t = crate::whir_split::tick();
+    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`) the factors are lifted here
+    // only if today's rounds need them.
+    let (sumcheck, point, bound) = batch::prove_resident_lazy(
         weights,
         resident,
+        || trace.reside_from_columns(),
         || trace.factors(),
         rules,
         claims,
         fused,
         transcript,
     )?;
+    crate::whir_split::add_tick(&crate::whir_split::REST_BATCH, t);
 
     // The sumcheck leaves a claim about the factors at its point. Settle it in
     // two steps: reduce every committed factor's value there to a claim about
     // the column it reads, then open each column once. The public factors need
     // neither step.
+    let t = crate::whir_split::tick();
     let factor_values = if bound.len() >= trace.kinds.len() {
         // The rounds folded every factor to exactly this, so reading it back is
         // the whole of it. Slot order is `kinds` order, and the weight tables
@@ -654,6 +679,7 @@ where
             .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
             .collect::<Result<Vec<_>, _>>()?
     };
+    crate::whir_split::add_tick(&crate::whir_split::REST_VALUES, t);
 
     let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(
         &trace.columns,

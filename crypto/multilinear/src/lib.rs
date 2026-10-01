@@ -12,6 +12,7 @@ pub mod eq;
 pub mod front_loaded;
 pub mod fused;
 pub mod gkr;
+pub mod gkr_gruen;
 pub mod gkr_lockstep;
 pub mod gpu;
 pub mod gpu_fused;

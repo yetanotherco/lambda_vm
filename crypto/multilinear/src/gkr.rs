@@ -195,7 +195,7 @@ const HOST_LAYER_VARS: usize = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize
 
 /// The layer relation: `Σ_x eq(r,x)·[p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi]`,
 /// which equals `p_out(r) + λ·q_out(r)` when the layer really is the fold.
-struct LayerRelation<F: IsField> {
+pub(crate) struct LayerRelation<F: IsField> {
     /// `[eq, p_lo, p_hi, q_lo, q_hi]`.
     polys: Vec<Mle<F>>,
     lambda: FieldElement<F>,
@@ -238,7 +238,7 @@ impl<F: IsField + 'static> LayerRelation<F> {
 
     /// The same relation over factors a device already folded: the weight and
     /// the four halves as its last round left them.
-    fn from_factors(polys: Vec<Mle<F>>, lambda: FieldElement<F>) -> Result<Self, Error> {
+    pub(crate) fn from_factors(polys: Vec<Mle<F>>, lambda: FieldElement<F>) -> Result<Self, Error> {
         if polys.len() != 5 {
             return Err(Error::VariableCountMismatch {
                 expected: 5,
@@ -250,6 +250,12 @@ impl<F: IsField + 'static> LayerRelation<F> {
             program: None,
             lambda,
         })
+    }
+
+    /// The five factors as the rounds left them, for a test to compare.
+    #[cfg(test)]
+    pub(crate) fn polys_for_tests(&self) -> &[Mle<F>] {
+        &self.polys
     }
 
     /// `eq·(p_lo·q_hi + p_hi·q_lo + lambda·q_lo·q_hi)`, the same expression
@@ -404,13 +410,13 @@ struct DeviceStart<'a, F: IsField> {
 /// Values at `0, 1, 2, 3` interpolated at a point: [`sumcheck::interpolate`] for
 /// a cubic, with the four Lagrange denominators inverted once rather than on
 /// every call.
-struct Cubic<F: IsField> {
+pub(crate) struct Cubic<F: IsField> {
     /// `1 / Π_{j≠i} (i − j)` for `i = 0..4`: `−1/6, 1/2, −1/2, 1/6`.
     inverse: [FieldElement<F>; 4],
 }
 
 impl<F: IsField> Cubic<F> {
-    fn new() -> Option<Self> {
+    pub(crate) fn new() -> Option<Self> {
         let six = FieldElement::<F>::from(6u64);
         let two = FieldElement::<F>::from(2u64);
         let mut inverse = [-six.clone(), two.clone(), -two, six];
@@ -418,7 +424,7 @@ impl<F: IsField> Cubic<F> {
         Some(Self { inverse })
     }
 
-    fn at(&self, values: [&FieldElement<F>; 4], x: &FieldElement<F>) -> FieldElement<F> {
+    pub(crate) fn at(&self, values: [&FieldElement<F>; 4], x: &FieldElement<F>) -> FieldElement<F> {
         let d: [FieldElement<F>; 4] =
             std::array::from_fn(|j| x - FieldElement::<F>::from(j as u64));
         let low = &d[0] * &d[1];
@@ -683,7 +689,9 @@ where
     let (mut p_claim, mut q_claim) = tree.output();
     // The levels near the output, fetched once. Their rounds are over cubes a
     // core walks in microseconds, and a device pays a launch for each.
+    let t = whir_split::tick();
     let prefix = tree.host_prefix();
+    whir_split::add_tick(&whir_split::REST_PREFIX, t);
 
     for i in 0..tree.num_layers() - 1 {
         // A layer the device runs, whose host work the instrument splits
@@ -706,6 +714,36 @@ where
                 LayerRelation::new(here, &point, lambda, false)?,
             ),
             None => match tree.device() {
+                // D-ARGUE S1-3: the same rounds, from the card's `H(1), H(2)`.
+                Some(device) if crate::gkr_gruen::argue_gkr_gruen() => {
+                    let t = clock();
+                    // Today's program, only for the cross-check to walk beside.
+                    let today = crate::gkr_gruen::argue_gkr_gruen_xcheck()
+                        .then(|| LayerRelation::program_for(&lambda))
+                        .transpose()?;
+                    whir_split::add_tick(&whir_split::GKR_PROGRAM, t);
+                    let attempt = device.prove_layer_gruen(
+                        i + 1,
+                        &point,
+                        &lambda,
+                        &p_claim + &lambda * &q_claim,
+                        crate::gkr_gruen::gkr_gruen_tail(),
+                        today.as_ref(),
+                        |sent| {
+                            for value in sent {
+                                transcript.append_field_element(value);
+                            }
+                            transcript.sample_field_element()
+                        },
+                    );
+                    let Some(outcome) = attempt else {
+                        return Err(Error::DeviceFailed {
+                            stage: "layer sumcheck",
+                        });
+                    };
+                    let (rounds, z, factors) = outcome?;
+                    (rounds, z, LayerRelation::from_factors(factors, lambda)?)
+                }
                 Some(device) => {
                     let t = clock();
                     let program = LayerRelation::program_for(&lambda)?;

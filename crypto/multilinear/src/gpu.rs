@@ -120,6 +120,46 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// factors and tree. See [`note_gkr_tree_refusal`]; each one is also a
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Fraction trees whose input layer was written from the base columns
+/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+static INPUT_COLUMNS_TREES: AtomicU64 = AtomicU64::new(0);
+
+/// Fraction trees whose input layer was written from the base columns.
+pub fn input_columns_trees() -> u64 {
+    INPUT_COLUMNS_TREES.load(Ordering::Relaxed)
+}
+
+/// Tables whose factors were set up as base columns, with no lift
+/// (`LAMBDA_VM_ARGUE_NO_LIFT`).
+static COLUMN_FACTOR_TABLES: AtomicU64 = AtomicU64::new(0);
+
+pub fn column_factor_tables() -> u64 {
+    COLUMN_FACTOR_TABLES.load(Ordering::Relaxed)
+}
+
+/// Tables the no-lift path lifted after all: the fused rounds declined and
+/// today's rounds need the lifted factors.
+static LATE_LIFTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn late_lifts() -> u64 {
+    LATE_LIFTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_late_lift() {
+    LATE_LIFTS.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::LATE_LIFT);
+}
+
+/// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the stream's
+/// kernels so the tree's split charges each part its own card time.
+#[cfg(feature = "cuda")]
+macro_rules! tree_sync {
+    ($stream:expr) => {
+        if crate::whir_split::tree_sync() {
+            let _ = $stream.synchronize();
+        }
+    };
+}
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -789,6 +829,17 @@ static HAND_BACK_FOR_TESTS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[doc(hidden)]
 pub fn set_hand_back_threshold_for_tests(bytes: Option<u64>) {
     HAND_BACK_FOR_TESTS.store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Tests only: every tree built from here on hands its input layer back and
+/// writes it again for its last sumcheck, as the widest precompiles do when the
+/// card cannot carry it — so a test can reach the rewrite on any table.
+/// Process-wide: a test that sets it runs alone.
+static HAND_BACK_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_hand_back_for_tests(on: bool) {
+    HAND_BACK_FORCED.store(on, Ordering::Relaxed);
 }
 
 /// Cells — factors times rows — below which the host wins.
@@ -2058,6 +2109,108 @@ pub fn argue_lean_tail() -> bool {
 
 static ARGUE_LEAN_TAIL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Whether a table's GKR input layer is written straight from its resident
+/// base columns (D-BATCH M1-2): one launch for every interaction, base × ext3,
+/// where the old path runs two programs an interaction over the lifted factors.
+/// The same cells, so the same tree and proof. On by default;
+/// `LAMBDA_VM_ARGUE_GKR_INPUT=0` is the old path exactly. Read once, with a
+/// banner.
+///
+/// Turned on by its A/B on the block (FAST job 333, 4 + 4 arms): base −0.75 s,
+/// the argue −0.97 s, the whole run −0.73 s, the tree region 1.98 → 1.11 s,
+/// every arm on the record's program ids.
+pub fn argue_gkr_input() -> bool {
+    match ARGUE_GKR_INPUT_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                let on = env_not_off("LAMBDA_VM_ARGUE_GKR_INPUT");
+                eprintln!(
+                    "★ ARGUE GKR INPUT: {}",
+                    if on {
+                        "from the base columns (the default; LAMBDA_VM_ARGUE_GKR_INPUT=0 is the lifted \
+                         factors)"
+                    } else {
+                        "from the lifted factors (LAMBDA_VM_ARGUE_GKR_INPUT=0)"
+                    }
+                );
+                on
+            })
+        }
+    }
+}
+
+static ARGUE_GKR_INPUT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a table's factors stay base columns on the card, with no lift
+/// (D-BATCH M1-2, its second half). The input layer is written from the columns
+/// ([`argue_gkr_input`], which this needs) and the fused zerocheck's first pass
+/// reads them where they lie, so the `W·rows·24 B` lift is made only when the
+/// old rounds need it. The same rounds and proof. On by default;
+/// `LAMBDA_VM_ARGUE_NO_LIFT=0` lifts every table's factors as before.
+///
+/// Turned on by its A/B on the block (FAST job 335, 4 + 4 arms over the input
+/// from the columns): base −0.90 s, the whole run −1.55 s, the argue's
+/// reserved peak −1.5 GiB, kept WHIR trees evicted 13 → 2 a run and the
+/// openings' tree rebuilds 0.74 → 0.04 s, every arm on the record's program
+/// ids.
+pub fn argue_no_lift() -> bool {
+    match ARGUE_NO_LIFT_FORCED.load(Ordering::Relaxed) {
+        1 => argue_gkr_input(),
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                let wanted = env_not_off("LAMBDA_VM_ARGUE_NO_LIFT");
+                let input = argue_gkr_input();
+                eprintln!(
+                    "★ ARGUE NO LIFT: {}",
+                    match (wanted, input) {
+                        (true, true) => {
+                            "on (the default, with the input from the columns; \
+                             LAMBDA_VM_ARGUE_NO_LIFT=0 lifts the factors)"
+                        }
+                        (false, _) => "off (LAMBDA_VM_ARGUE_NO_LIFT=0)",
+                        (true, false) => "off (it needs the input from the columns)",
+                    }
+                );
+                wanted && input
+            })
+        }
+    }
+}
+
+static ARGUE_NO_LIFT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_NO_LIFT` for the whole process; `None` restores it.
+#[doc(hidden)]
+pub fn force_argue_no_lift(on: Option<bool>) {
+    ARGUE_NO_LIFT_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Overrides `LAMBDA_VM_ARGUE_GKR_INPUT` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's.
+#[doc(hidden)]
+pub fn force_argue_gkr_input(on: Option<bool>) {
+    ARGUE_GKR_INPUT_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Overrides `LAMBDA_VM_ARGUE_LEAN_TAIL` for the whole process — for a test that
 /// proves both ways in one binary. `None` restores the environment's setting.
 /// Not for production callers.
@@ -2597,6 +2750,25 @@ impl DeviceTree {
         match self.0 {}
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_layer_gruen<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _lambda: &math::field::element::FieldElement<E>,
+        _claim: math::field::element::FieldElement<E>,
+        _tail: usize,
+        _today: Option<&crate::program::Program<E>>,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
     pub(crate) fn layer_to_host<E>(
         &self,
         _layer: usize,
@@ -2858,6 +3030,228 @@ impl DeviceTree {
         };
         add_tick(&whir_split::GKR_FACTORS, t);
         whir_split::bump(&whir_split::GKR_LAYERS);
+        SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+        Some(Ok((rounds, challenges, factors)))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// [`prove_layer`](Self::prove_layer) with Gruen's rounds
+    /// ([`crate::gkr_gruen`]): the same rounds, challenges and factors, from a
+    /// pass that sums `H(1)` and `H(2)` and folds the previous challenge on the
+    /// way in. `claim` is `p + λ·q` of the level above, the value round 0's
+    /// `s(0) + s(1)` has to meet; `tail` the cube the host finishes from.
+    ///
+    /// With `today` (`LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK`), today's program walks
+    /// the same folded halves every round beside these, and the prove fails
+    /// where the two disagree — rounds or factors.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_layer_gruen<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        lambda: &math::field::element::FieldElement<E>,
+        claim: math::field::element::FieldElement<E>,
+        tail: usize,
+        today: Option<&crate::program::Program<E>>,
+        mut challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        use crate::gkr_gruen::{self as gruen, Chain};
+        use crate::whir_split::{self, add_tick, tick};
+        use math::field::element::FieldElement;
+
+        let t = tick();
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let raw_lambda: [u64; 3] = ext3_raw(lambda)?;
+        let lowered = match today {
+            Some(program) => Some(lower(program)?),
+            None => None,
+        };
+        let low = tail.max(1).trailing_zeros() as usize;
+        add_tick(&whir_split::GKR_LOWER, t);
+        let input_layer = layer + 1 == self.num_layers;
+        let rebuilds = input_layer && self.rebuild.is_some();
+        let t = tick();
+        let session = if rebuilds {
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            rebuilt.gruen(&raw_point, low)
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_gruen(layer, &raw_point, low)
+        };
+        let Ok(mut session) = session else {
+            return None;
+        };
+        // Today's session beside it, when the card has room for its `eq` table.
+        let shadow = match lowered.as_ref() {
+            Some(lowered) => {
+                let room = math_cuda::device::reserve(session.shadow_bytes(lowered.num_slots));
+                let made = room.as_ref().and_then(|_| {
+                    session
+                        .shadow(
+                            &lowered.nodes,
+                            &lowered.consts,
+                            lowered.num_slots,
+                            lowered.root_slot,
+                        )
+                        .ok()
+                });
+                if made.is_none() {
+                    gruen::note_xcheck_skipped();
+                }
+                made.map(|shadow| (shadow, room))
+            }
+            None => None,
+        };
+        if rebuilds {
+            add_tick(&whir_split::GKR_REBUILD, t);
+            whir_split::bump(&whir_split::GKR_REBUILDS);
+        } else {
+            add_tick(&whir_split::GKR_SESSION, t);
+        }
+        let rounds_here = session.rounds();
+        let lefts = gruen::inverse_lefts(&point[..rounds_here]);
+        let chain = Chain::new(claim);
+        let mut nodes = Vec::with_capacity(9);
+        for node in 1..=3u64 {
+            nodes.extend_from_slice(&ext3_raw(&FieldElement::<E>::from(node))?);
+        }
+
+        // Past here the transcript moves: the host path is no longer an option.
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let mut shadow = shadow;
+        let t = tick();
+        let outcome = (|| -> Result<_, crate::Error> {
+            let mut chain = chain.ok_or(failed("gruen chain"))?;
+            let mut rounds = Vec::with_capacity(rounds_here);
+            let mut challenges: Vec<FieldElement<E>> = Vec::with_capacity(rounds_here);
+            let mut previous: Option<[u64; 3]> = None;
+            for (j, left) in lefts.iter().enumerate() {
+                let want_h0 = left.is_none();
+                let sums = session
+                    .round(previous.as_ref(), &raw_lambda, want_h0)
+                    .map_err(|_| failed("gruen round"))?;
+                let sum = |k: usize| ext3_from_raw::<E>(&sums[k * 3..k * 3 + 3]);
+                let h0 = want_h0.then(|| sum(2));
+                if want_h0 {
+                    gruen::note_direct_h0();
+                }
+                let mut message = chain
+                    .message(&point[j], left.as_ref(), &sum(0), &sum(1), h0.as_ref())
+                    .ok_or(failed("gruen message"))?;
+                if j == 0 && gruen::gkr_gruen_fault() {
+                    // `s(0) = claim − s(1)`: what the claim then implies.
+                    message.sent[0] += FieldElement::<E>::one();
+                    message.s0 = &message.s0 - FieldElement::<E>::one();
+                }
+                if let Some((shadow, _)) = shadow.as_mut() {
+                    if let Some(r) = previous.as_ref() {
+                        shadow
+                            .fold_first(1, r)
+                            .map_err(|_| failed("gruen shadow"))?;
+                    }
+                    let want: Vec<FieldElement<E>> = shadow
+                        .round(&nodes)
+                        .map_err(|_| failed("gruen shadow"))?
+                        .chunks_exact(3)
+                        .map(ext3_from_raw::<E>)
+                        .collect();
+                    let parted = want != message.sent; // XCHECK-COMPARE
+                    if parted {
+                        return Err(failed("gkr gruen xcheck"));
+                    }
+                }
+                let z = challenge(&message.sent);
+                chain.advance(&point[j], &message, &z);
+                previous = Some(ext3_raw(&z).ok_or(failed("challenge"))?);
+                rounds.push(crate::sumcheck::RoundProof {
+                    evaluations: message.sent,
+                });
+                challenges.push(z);
+                SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok((rounds, challenges, chain, previous))
+        })();
+        add_tick(&whir_split::GKR_ROUNDS, t);
+        let (rounds, challenges, chain, previous) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+        let t = tick();
+        let Ok(values) = session.finish(previous.as_ref()) else {
+            return Some(Err(failed("layer values")));
+        };
+        add_tick(&whir_split::GKR_VALUES, t);
+        let t = tick();
+        let cells = 1usize << session.low();
+        if values.len() != 4 * cells * 3 {
+            return Some(Err(failed("layer factors")));
+        }
+        let e_lo = crate::eq::eq_evals(&point[rounds_here..]);
+        let mut factors = Vec::with_capacity(5);
+        let eq: Vec<FieldElement<E>> = e_lo.iter().map(|v| chain.kappa() * v).collect();
+        let Ok(eq) = crate::mle::Mle::new(eq) else {
+            return Some(Err(failed("layer factors")));
+        };
+        factors.push(eq);
+        for half in values.chunks_exact(cells * 3) {
+            let Ok(table) =
+                crate::mle::Mle::new(half.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            else {
+                return Some(Err(failed("layer factors")));
+            };
+            factors.push(table);
+        }
+        add_tick(&whir_split::GKR_FACTORS, t);
+        let checked = match shadow.as_mut() {
+            Some((shadow, _)) => {
+                if let Some(r) = previous.as_ref()
+                    && shadow.fold_first(1, r).is_err()
+                {
+                    return Some(Err(failed("gruen shadow")));
+                }
+                let Ok(want) = shadow.values_gathered() else {
+                    return Some(Err(failed("gruen shadow")));
+                };
+                let same = want.len() == 5
+                    && want.iter().zip(&factors).all(|(raw, table)| {
+                        raw.len() == table.len() * 3
+                            && raw
+                                .chunks_exact(3)
+                                .zip(table.evals())
+                                .all(|(cell, value)| ext3_from_raw::<E>(cell) == *value)
+                    });
+                if !same {
+                    return Some(Err(failed("gkr gruen xcheck")));
+                }
+                true
+            }
+            None => false,
+        };
+        gruen::note_layer(rounds_here as u64, checked);
+        whir_split::bump(&whir_split::GKR_LAYERS);
+        whir_split::bump(&whir_split::GKR_GRUEN);
+        if checked {
+            whir_split::bump(&whir_split::GKR_GRUEN_XCHECKED);
+        }
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Ok((rounds, challenges, factors)))
     }
@@ -3160,6 +3554,13 @@ impl std::fmt::Debug for DeviceFactors {
 
 #[cfg(feature = "cuda")]
 impl DeviceFactors {
+    /// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the kernels
+    /// that built the factors, so the tree's split charges the lift its own
+    /// card time.
+    pub fn tree_sync(&self) {
+        tree_sync!(self.0.stream());
+    }
+
     /// The card's handle, for the fused rounds (`gpu_fused`).
     pub(crate) fn inner(&self) -> &math_cuda::sumcheck::DeviceFactors {
         &self.0
@@ -3184,6 +3585,128 @@ impl DeviceFactors {
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceFactors {
+    pub fn tree_sync(&self) {
+        match self.0 {}
+    }
+}
+
+/// A table's factors as its base columns on the card, with no lift (D-BATCH
+/// M1-2, `LAMBDA_VM_ARGUE_NO_LIFT`): the fused zerocheck's rounds 0 and 1 read
+/// a committed factor where the epoch's columns reside, and a public one from a
+/// base copy. Keeps the columns alive for as long as it lives.
+#[cfg(feature = "cuda")]
+pub struct ColumnFactors {
+    inner: math_cuda::sumcheck::ColumnFactors,
+    _columns: std::sync::Arc<ResidentColumns>,
+}
+
+#[cfg(feature = "cuda")]
+impl ColumnFactors {
+    pub(crate) fn view(&self) -> math_cuda::sumcheck::FactorView<'_> {
+        self.inner.view()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for ColumnFactors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnFactors").finish()
+    }
+}
+
+/// Column factors a build cannot make. Never constructed.
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+pub struct ColumnFactors(std::convert::Infallible);
+
+/// The table's factors as [`ColumnFactors`], or `None` — then the caller lifts
+/// them as today. `None` unless every committed factor reads its column
+/// unshifted from a resident run (a cyclic shift is not an address), every
+/// public table is base-valued, and the device would take the lifted factors.
+#[cfg(feature = "cuda")]
+pub fn column_factors<F, E>(
+    columns: &[crate::mle::Mle<F>],
+    kinds: &[crate::constraint_argument::FactorKind],
+    public: &[crate::mle::Mle<E>],
+    resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
+) -> Option<ColumnFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let (store, first) = resident?;
+    let rows = columns.first()?.len();
+    if kinds.is_empty()
+        || !worth_the_device(kinds.len(), rows)
+        || !store.0.is_run(first, columns.len())
+    {
+        return None;
+    }
+    // A public table's base values, when nothing sits above them.
+    let mut public_base: Vec<Vec<u64>> = Vec::new();
+    for table in public {
+        let mut base = Vec::with_capacity(rows);
+        for value in table.evals() {
+            let [lo, hi1, hi2] = ext3_raw(value)?;
+            let canonical = ext3_raw(&math::field::element::FieldElement::<E>::from(lo))?;
+            if [lo, hi1, hi2] != canonical {
+                return None;
+            }
+            base.push(lo);
+        }
+        public_base.push(base);
+    }
+    let mut slots = Vec::with_capacity(kinds.len());
+    let mut next_public = 0usize;
+    for kind in kinds {
+        match kind.source() {
+            Some(source) if source.offset % rows == 0 && source.column < columns.len() => {
+                slots.push(math_cuda::sumcheck::ColumnSlot::Column(source.column));
+            }
+            Some(_) => return None,
+            None => {
+                slots.push(math_cuda::sumcheck::ColumnSlot::Public(
+                    public_base.get(next_public)?,
+                ));
+                next_public += 1;
+            }
+        }
+    }
+    let inner = {
+        let run = store.0.view(first, columns.len());
+        math_cuda::sumcheck::ColumnFactors::new(&run, rows, &slots).ok()?
+    };
+    COLUMN_FACTOR_TABLES.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::NO_LIFT);
+    Some(ColumnFactors {
+        inner,
+        _columns: store,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn column_factors<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _kinds: &[crate::constraint_argument::FactorKind],
+    _public: &[crate::mle::Mle<E>],
+    _resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
+) -> Option<ColumnFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
 
 /// A table's factors, built on the device out of its base columns.
 ///
@@ -3328,7 +3851,9 @@ where
 
     for (i, (numerator, denominator)) in numerators.iter().zip(denominators).enumerate() {
         for (program, out) in [(numerator, &mut p), (denominator, &mut q)] {
+            let t = crate::whir_split::tick();
             let lowered = lower(program)?;
+            crate::whir_split::add_tick(&crate::whir_split::TREE_LOWER, t);
             factors
                 .0
                 .map_program(
@@ -3368,7 +3893,82 @@ pub fn input_layer_tree<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
-    input_layer_tree_impl(factors, numerators, denominators, false)
+    let rows = factors.0.len();
+    let interactions = numerators.len();
+    let stream = factors.0.stream().clone();
+    input_layer_tree_impl(
+        stream,
+        rows,
+        interactions,
+        lifted_writer(factors, numerators, denominators),
+        false,
+    )
+}
+
+/// Writes a tree's input layer, padded to a power of two or not — the call a
+/// tree makes at its build and, when it gave the layer back, for its last
+/// sumcheck.
+#[cfg(feature = "cuda")]
+type InputWriter = std::sync::Arc<dyn Fn(bool) -> Option<math_cuda::gkr::Halves> + Send + Sync>;
+
+/// The writer that runs each interaction's two programs over the lifted
+/// factors (`write_input_layer`).
+#[cfg(feature = "cuda")]
+fn lifted_writer<E>(
+    factors: std::sync::Arc<DeviceFactors>,
+    numerators: Vec<crate::program::Program<E>>,
+    denominators: Vec<crate::program::Program<E>>,
+) -> InputWriter
+where
+    E: math::field::traits::IsField + 'static,
+{
+    std::sync::Arc::new(move |padding| {
+        write_input_layer(&factors, &numerators, &denominators, padding)
+    })
+}
+
+/// The tree over a table's input layer written straight from its base
+/// columns (D-BATCH M1-2, `LAMBDA_VM_ARGUE_GKR_INPUT`): one launch writes
+/// every interaction's two sides from the epoch's resident columns, where
+/// [`input_layer_tree`] runs two programs an interaction over the lifted
+/// factors. The same cells, so the same tree, output and GKR proof.
+///
+/// `plan` is [`crate::logup::input_plan`]'s, over the table's run of `width`
+/// columns from `first`. `None` when that run is not resident or the card
+/// declines, before anything is written.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree_from_columns(
+    resident: std::sync::Arc<ResidentColumns>,
+    first: usize,
+    width: usize,
+    rows: usize,
+    plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
+    if !resident.0.is_run(first, width) || plan.interactions() == 0 {
+        return None;
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    let uploaded = std::sync::Arc::new(
+        math_cuda::gkr::InputPlan::upload(
+            &stream,
+            &plan.side_start,
+            &plan.terms,
+            &plan.coeffs,
+            &plan.constants,
+        )
+        .ok()?,
+    );
+    let interactions = plan.interactions();
+    let writer_stream = stream.clone();
+    let write: InputWriter = std::sync::Arc::new(move |padding| {
+        let view = resident.0.view(first, width);
+        math_cuda::gkr::input_from_columns(&writer_stream, &view, rows, &uploaded, padding).ok()
+    });
+    let tree = input_layer_tree_impl(stream, rows, interactions, write, false)?;
+    INPUT_COLUMNS_TREES.fetch_add(1, Ordering::Relaxed);
+    crate::whir_split::bump(&crate::whir_split::TREE_FROM_COLUMNS);
+    Some(tree)
 }
 
 /// The prefetch sibling of [`input_layer_tree`]: builds the tree WITHOUT
@@ -3400,7 +4000,15 @@ where
     if be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < need {
         return None;
     }
-    input_layer_tree_impl(factors, numerators, denominators, true)
+    let interactions = numerators.len();
+    let stream = factors.0.stream().clone();
+    input_layer_tree_impl(
+        stream,
+        rows,
+        interactions,
+        lifted_writer(factors, numerators, denominators),
+        true,
+    )
 }
 
 /// Count a GKR tree whose whole-tree promise the budget refused on the consume
@@ -3422,20 +4030,16 @@ fn note_gkr_tree_refusal(bytes: u64, cells: usize) {
 /// site; everything else is identical, so the eager caller is byte-for-byte the
 /// path it always was.
 #[cfg(feature = "cuda")]
-fn input_layer_tree_impl<E>(
-    factors: std::sync::Arc<DeviceFactors>,
-    numerators: Vec<crate::program::Program<E>>,
-    denominators: Vec<crate::program::Program<E>>,
+fn input_layer_tree_impl(
+    stream: std::sync::Arc<math_cuda::CudaStream>,
+    rows: usize,
+    interactions: usize,
+    write: InputWriter,
     defer: bool,
-) -> Option<DeviceTree>
-where
-    E: math::field::traits::IsField + 'static,
-{
-    let rows = factors.0.len();
-    let slots = numerators.len().next_power_of_two();
+) -> Option<DeviceTree> {
+    let slots = interactions.next_power_of_two();
     let full = slots * rows;
-    let real = numerators.len() * rows;
-    let stream = factors.0.stream().clone();
+    let real = interactions * rows;
 
     // Carrying the layer cannot fail late; handing it back can, and by then
     // the transcript has moved and there is no host path left. So it is
@@ -3445,14 +4049,24 @@ where
     // gigabytes, and nothing else.
     let eager = (4 * full) as u64 * 24;
     let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
-    let carried = math_cuda::device::reserve(eager);
-    if carried.is_some() || eager - lazy < worth_handing_back() {
+    let carried =
+        math_cuda::device::reserve(eager).filter(|_| !HAND_BACK_FORCED.load(Ordering::Relaxed));
+    let hand_back = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    if !hand_back && (carried.is_some() || eager - lazy < worth_handing_back()) {
         drop(carried);
-        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
-        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
+        let t = crate::whir_split::tick();
+        let (p, q) = write(true)?;
+        tree_sync!(stream);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
+        let t = crate::whir_split::tick();
+        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream.clone(), p, q).ok()?;
+        tree_sync!(stream);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
         let output = std::sync::OnceLock::new();
         if !defer {
+            let t = crate::whir_split::tick();
             let _ = output.set(tree.output().ok()?);
+            crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
         }
         let num_layers = tree.num_layers();
         let input_num_vars = tree.layer_num_vars(num_layers - 1);
@@ -3483,19 +4097,27 @@ where
         return None;
     };
 
-    let (p, q) = write_input_layer(&factors, &numerators, &denominators, false)?;
+    let t = crate::whir_split::tick();
+    let (p, q) = write(false)?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let num_vars = full.trailing_zeros() as usize;
+    let t = crate::whir_split::tick();
     let tree =
         math_cuda::gkr::DeviceFractionTree::from_padded_input(stream.clone(), p, q, real, num_vars)
             .ok()?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
     if !defer {
+        let t = crate::whir_split::tick();
         let _ = output.set(tree.output().ok()?);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
     }
     let num_layers = tree.num_layers();
 
     let rebuild = move || {
-        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
+        let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
             p,
@@ -3524,6 +4146,17 @@ pub fn input_layer_tree<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn input_layer_tree_from_columns(
+    _resident: std::sync::Arc<ResidentColumns>,
+    _first: usize,
+    _width: usize,
+    _rows: usize,
+    _plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
     None
 }
 
@@ -4612,6 +5245,27 @@ mod tests {
         assert!(not_off(Some("")), "empty is not the opt-out");
         assert!(not_off(Some("1")));
         assert!(!not_off(Some("0")), "`0` is the opt-out");
+    }
+
+    /// The GKR input knob reads its variable the default-on way, whatever the
+    /// environment sets. ⚠ No test in this binary forces the knob, which is
+    /// what makes the reading the environment's.
+    #[test]
+    fn the_gkr_input_knob_is_on_unless_its_variable_is_zero() {
+        let variable = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
+        assert_eq!(argue_gkr_input(), not_off(variable.as_deref()));
+    }
+
+    /// No lift reads its variable the default-on way, and needs the input
+    /// from the columns.
+    #[test]
+    fn the_no_lift_knob_is_on_unless_either_variable_is_zero() {
+        let input = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
+        let variable = std::env::var("LAMBDA_VM_ARGUE_NO_LIFT").ok();
+        assert_eq!(
+            argue_no_lift(),
+            not_off(variable.as_deref()) && not_off(input.as_deref())
+        );
     }
 
     /// The tables knob reads its variable the default-on way, whatever the

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::device::{DeviceReservation, alloc_or_trim, alloc_zeros_or_trim, backend, htod_or_trim};
-use crate::sumcheck::{DeviceFactors, eq_table_ext3, launch_shape};
+use crate::sumcheck::{FactorView, eq_table_ext3, launch_shape};
 
 const BLOCK_DIM: u32 = 256;
 const MAX_GRID: u32 = 4096;
@@ -50,7 +50,7 @@ pub struct FusedBus<'a> {
 /// One table's fused zerocheck on the card.
 pub struct FusedZerocheck<'f> {
     stream: Arc<CudaStream>,
-    source: &'f DeviceFactors,
+    source: FactorView<'f>,
     width: usize,
     /// The cube the lifted factors span.
     rows: usize,
@@ -154,7 +154,7 @@ impl<'f> FusedZerocheck<'f> {
     /// `r_tail` and `rho_tail` are `r[2..]` and `ρ[2..]` (three u64 a
     /// coordinate): the grid pass's weights.
     pub fn new(
-        source: &'f DeviceFactors,
+        source: FactorView<'f>,
         program: FusedProgram<'_>,
         bus: FusedBus<'_>,
         r_tail: &[u64],
@@ -162,8 +162,8 @@ impl<'f> FusedZerocheck<'f> {
         grid_rows: usize,
         gruen_rows: usize,
     ) -> Result<Option<Self>> {
-        let rows = source.len();
-        let width = source.width();
+        let rows = source.rows;
+        let width = source.width;
         assert!(
             rows >= 8 && rows.is_power_of_two(),
             "the grid needs four rows a group"
@@ -197,7 +197,7 @@ impl<'f> FusedZerocheck<'f> {
         )) else {
             return Ok(None);
         };
-        let stream = source.stream().clone();
+        let stream = source.stream.clone();
         let q = rows / 4;
         let nonempty = |v: &[u64]| -> Vec<u64> { if v.is_empty() { vec![0] } else { v.to_vec() } };
         let nodes = htod_or_trim(&stream, &nonempty(program.nodes))?;
@@ -330,7 +330,7 @@ impl<'f> FusedZerocheck<'f> {
             q.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32,
             BLOCK_DIM,
         );
-        let factors = self.source.factor_ptrs();
+        let factors = self.source.ptrs;
         unsafe {
             self.stream
                 .launch_builder(&be.zc_bus_u)
@@ -342,6 +342,7 @@ impl<'f> FusedZerocheck<'f> {
                 .arg(&self.constant)
                 .arg(&self.eq_rho)
                 .arg(&mut self.partials)
+                .arg(&self.source.stride)
                 .launch(LaunchConfig {
                     grid_dim: (grid, 1, 1),
                     block_dim: (block, 1, 1),
@@ -371,7 +372,7 @@ impl<'f> FusedZerocheck<'f> {
         }
         self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
         let (grid, block) = self.shape(q, points.len(), self.num_slots as u64)?;
-        let factors = self.source.factor_ptrs();
+        let factors = self.source.ptrs;
         unsafe {
             self.stream
                 .launch_builder(&be.zc_grid01)
@@ -387,6 +388,7 @@ impl<'f> FusedZerocheck<'f> {
                 .arg(&mut self.partials)
                 .arg(&mut self.violation)
                 .arg(&u32::from(keep_corners))
+                .arg(&self.source.stride)
                 .launch(LaunchConfig {
                     grid_dim: (grid, points.len() as u32, 1),
                     block_dim: (block, 1, 1),
@@ -410,7 +412,7 @@ impl<'f> FusedZerocheck<'f> {
         let width = self.width as u64;
         let total = width * q;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
-        let factors = self.source.factor_ptrs();
+        let factors = self.source.ptrs;
         unsafe {
             self.stream
                 .launch_builder(&be.zc_fold2)
@@ -419,6 +421,7 @@ impl<'f> FusedZerocheck<'f> {
                 .arg(&width)
                 .arg(&self.scratch)
                 .arg(&mut self.folded)
+                .arg(&self.source.stride)
                 .launch(LaunchConfig {
                     grid_dim: (grid, 1, 1),
                     block_dim: (BLOCK_DIM, 1, 1),
