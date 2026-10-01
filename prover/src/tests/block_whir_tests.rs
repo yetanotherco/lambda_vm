@@ -43,6 +43,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         drop_levels: 3,
         window_log2: None,
         stream_keccak_rnd: false,
+        stream_memw_lt: false,
     }
 }
 
@@ -279,6 +280,21 @@ fn a_streamed_block_with_keccak_rnd_streamed_proves_and_verifies() {
         proof.table_counts.keccak_rnd,
         at_end.table_counts.keccak_rnd
     );
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// The same with each window's MEMW-derived LT ops streamed (the block path's
+/// other LT chunking): the same LT chunk count as without, and the proof
+/// verifies — every LT constraint and the bus hold over the chunks.
+#[test]
+fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let plain = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+    o.stream_memw_lt = true;
+    let proof = prove(&elf, &format, &o);
+    assert_eq!(proof.table_counts.lt, plain.table_counts.lt);
     assert!(verify(&proof, &elf, &format));
 }
 

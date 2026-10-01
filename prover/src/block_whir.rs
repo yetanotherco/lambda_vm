@@ -121,6 +121,11 @@ pub struct BlockOptions {
     /// default: on block 25368371 the keccak work sits at the run's end, and
     /// streaming it read NO EFFECT (FAST 418).
     pub stream_keccak_rnd: bool,
+    /// With windows: derive each window's MEMW-derived LT ops as it arrives, so
+    /// LT's full chunks stream with them
+    /// ([`WindowedTraceBuilder::stream_memw_lt`]: other chunks than the
+    /// whole-run build's, the same LT multiplicities).
+    pub stream_memw_lt: bool,
 }
 
 impl BlockOptions {
@@ -133,6 +138,7 @@ impl BlockOptions {
             drop_levels: BLOCK_TREE_DROP_LEVELS,
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
+            stream_memw_lt: false,
         }
     }
 }
@@ -1337,6 +1343,9 @@ fn prove_streamed(
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 if options.stream_keccak_rnd {
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                }
+                if options.stream_memw_lt {
+                    builder = builder.stream_memw_lt();
                 }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this

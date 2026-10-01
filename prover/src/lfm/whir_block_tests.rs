@@ -66,6 +66,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             drop_levels: 3,
             window_log2: None,
             stream_keccak_rnd: false,
+            stream_memw_lt: false,
         },
     )
     .expect("the block proves")
@@ -346,6 +347,7 @@ fn dense_block_with(
             drop_levels: 3,
             window_log2: None,
             stream_keccak_rnd: false,
+            stream_memw_lt: false,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1075,12 +1077,15 @@ fn the_whir_block_tree_on_a_real_block() {
     // default: NO EFFECT on this block, FAST 418).
     options.stream_keccak_rnd =
         std::env::var("BLOCK_WHIR_STREAM_KECCAK_RND").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_STREAM_MEMW_LT=1`: the MEMW-derived LT ops streamed per window.
+    options.stream_memw_lt =
+        std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
     println!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {}",
-        options.stream_keccak_rnd
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {}",
+        options.stream_keccak_rnd, options.stream_memw_lt
     );
 
     let t0 = std::time::Instant::now();
