@@ -4154,7 +4154,9 @@ fn build_traces<I: ImageSource + Sync>(
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
+    build_stamps::mark("p3a lt from memw");
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    build_stamps::mark("p3b lt from memw_a");
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.

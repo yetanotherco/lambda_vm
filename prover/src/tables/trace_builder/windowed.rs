@@ -209,6 +209,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         );
         self.segments.append(route_ops(&cpu_ops, &walk.cpu32_ops));
         self.windows.push(WalkedWindow { cpu_ops, walk });
+        super::build_stamps::mark("p0 last window");
         let Self {
             artifacts,
             image,
@@ -224,7 +225,9 @@ impl<'a> WindowedTraceBuilder<'a> {
             ..
         } = self;
         let (cpu_ops, walk) = concatenate(windows);
+        super::build_stamps::mark("p0 concatenate");
         let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+        super::build_stamps::mark("p0 assemble");
         build_traces(
             ops,
             Some(&image),
