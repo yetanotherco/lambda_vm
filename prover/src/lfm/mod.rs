@@ -142,6 +142,8 @@ mod blake3_socket_kats;
 #[cfg(test)]
 mod blake3_socket_tests;
 #[cfg(test)]
+mod block_tree_pipeline;
+#[cfg(test)]
 mod block_tree_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod c5_probe;

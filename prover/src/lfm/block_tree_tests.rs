@@ -23,6 +23,7 @@ use super::block_node::{
 };
 use super::block_plan::{BlockShape, BlockTreePlan, le_halves, top_claims};
 use super::block_replay::{BlockStatementShape, replay_block_front};
+use super::block_tree_pipeline::Pipe;
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::edsl::WrapHash;
@@ -1187,21 +1188,23 @@ pub(super) fn compose_block_tree(
     compose_block_tree_with(plan, leaves, opts, siblings, None, None)
 }
 
-/// One program derived ahead, with its artifacts, in the slot its prover takes
-/// it from.
-type AheadSlot = std::sync::Mutex<Option<(LfmProgram, LfmArtifacts)>>;
-
-/// Take a program derived ahead from its slot (each is proved once).
-fn take_ahead(slot: &AheadSlot, label: &str) -> (LfmProgram, LfmArtifacts) {
-    slot.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_else(|| panic!("{label}: no program ahead"))
+/// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`): `1` derives every
+/// program and its artifacts beside the base on the host; `pipe` emits the leaf
+/// programs there and builds the artifacts on the card during level 0, each
+/// node program emitted as its children's artifacts exist
+/// ([`super::block_tree_pipeline`]).
+#[derive(Clone, Copy)]
+enum AheadMode {
+    Host,
+    Pipe,
 }
 
-/// `NOEPOCH_TREE_AHEAD=1`: the tree's programs derived beside the base.
-fn tree_ahead_knob() -> bool {
-    std::env::var("NOEPOCH_TREE_AHEAD").is_ok_and(|v| v == "1")
+fn tree_ahead_mode() -> Option<AheadMode> {
+    match std::env::var("NOEPOCH_TREE_AHEAD").ok().as_deref() {
+        Some("1") => Some(AheadMode::Host),
+        Some("pipe") => Some(AheadMode::Pipe),
+        _ => None,
+    }
 }
 
 /// [`compose_block_tree`], each node proved from the program and artifacts
@@ -1212,7 +1215,7 @@ pub(super) fn compose_block_tree_with(
     leaves: Vec<RealChild>,
     opts: &crate::ProofOptions,
     siblings: usize,
-    ahead: Option<&[Vec<AheadSlot>]>,
+    ahead: Option<&Pipe>,
     beside: Option<&BesideVerifies>,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
     let fan_in = super::block_plan::block_fan_in();
@@ -1241,8 +1244,8 @@ pub(super) fn compose_block_tree_with(
             );
             let te = std::time::Instant::now();
             let (program, built) = match ahead {
-                Some(levels) => {
-                    let (program, artifacts) = take_ahead(&levels[lv][j], &label);
+                Some(p) => {
+                    let (program, artifacts) = p.take_node(lv, j, &label);
                     (program, Some(artifacts))
                 }
                 None => (block_node_program(plan, &kids, top), None),
@@ -2039,8 +2042,12 @@ fn the_block_tree_composes_to_a_top_node() {
     // `NOEPOCH_TREE_AHEAD=1`: the same pool then derives every tree program and
     // its artifacts from the shape the base hands out before its prove, on the
     // host (the base owns the card), and the levels prove from them.
-    let tree_ahead = elf_beside.is_some() && tree_ahead_knob();
+    let tree_ahead = elf_beside.and(tree_ahead_mode());
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
+    // The thread hands its results back on `ready` and, in the pipeline mode,
+    // stays on as the tree's builder once `go` says the base is done.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let t_base0 = Instant::now();
     let consts_beside = elf_beside.map(|threads| {
         let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
@@ -2054,17 +2061,41 @@ fn the_block_tree_composes_to_a_top_node() {
                 .expect("the ELF constants pool builds");
             let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
             let secs = t.elapsed().as_secs_f64();
+            let mut job = None;
             let ahead = match (&consts, tree_ahead) {
-                (Ok(c), true) => shape_rx.recv().ok().map(|shape| {
+                (Ok(c), Some(mode)) => shape_rx.recv().ok().map(|shape| {
                     let t = Instant::now();
-                    let derived = pool.install(|| {
+                    let derived = pool.install(|| -> Result<_, String> {
                         let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
-                        plan.derive_tree(&wrap, &|program| {
-                            super::registry::build_artifacts_with_hasher(
-                                program,
-                                &wrap,
-                                crate::hash_pin::BLOCK_HASHER,
-                            )
+                        Ok(match mode {
+                            AheadMode::Host => {
+                                let (tree, phases) = plan.derive_tree(&wrap, &|program| {
+                                    super::registry::build_artifacts_with_hasher(
+                                        program,
+                                        &wrap,
+                                        crate::hash_pin::BLOCK_HASHER,
+                                    )
+                                })?;
+                                (std::sync::Arc::new(Pipe::filled(tree)), phases)
+                            }
+                            AheadMode::Pipe => {
+                                use rayon::prelude::*;
+                                let te = Instant::now();
+                                let leaves = (0..plan.partition().num_leaves())
+                                    .into_par_iter()
+                                    .map(|k| plan.leaf_program(k))
+                                    .collect::<Result<Vec<_>, String>>()?;
+                                let pipe =
+                                    std::sync::Arc::new(Pipe::new(leaves.len(), &plan.levels()));
+                                let emitted = super::block_plan::PhaseTimes {
+                                    programs: leaves.len(),
+                                    wall: te.elapsed().as_secs_f64(),
+                                    emit: te.elapsed().as_secs_f64(),
+                                    build: 0.0,
+                                };
+                                job = Some((pipe.clone(), plan, leaves));
+                                (pipe, vec![emitted])
+                            }
                         })
                     });
                     (
@@ -2076,7 +2107,10 @@ fn the_block_tree_composes_to_a_top_node() {
                 }),
                 _ => None,
             };
-            (consts, secs, ahead)
+            let _ = ready_tx.send((consts, secs, ahead));
+            let (pipe, plan, leaves) = job?;
+            go_rx.recv().ok()?;
+            Some(pipe.run_builder(&plan, leaves, &wrap))
         })
     });
 
@@ -2111,10 +2145,10 @@ fn the_block_tree_composes_to_a_top_node() {
     // verifies first, as before.
     let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
     let t = Instant::now();
-    let mut ahead_tree = None;
-    let consts = consts_beside.map(|handle| {
+    let mut pipe = None;
+    let consts = consts_beside.as_ref().map(|_| {
         let tj = Instant::now();
-        let (consts, secs, ahead) = handle.join().expect("the ELF constants thread panicked");
+        let (consts, secs, ahead) = ready_rx.recv().expect("the ELF constants thread stopped");
         println!(
             "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
              waited {:.2}s (counted in the harvest)",
@@ -2122,7 +2156,7 @@ fn the_block_tree_composes_to_a_top_node() {
             tj.elapsed().as_secs_f64()
         );
         if let Some((shape, derived, secs, done_at)) = ahead {
-            let (tree, phases) = derived.expect("the tree derives ahead");
+            let (filled, phases) = derived.expect("the tree derives ahead");
             assert_eq!(
                 format!("{shape:?}"),
                 format!("{:?}", BlockShape::of_proof(&proof)),
@@ -2135,30 +2169,18 @@ fn the_block_tree_composes_to_a_top_node() {
             println!(
                 "   TREE AHEAD: {} programs derived beside the base in {secs:.2}s on the host (shape at \
                  {:.2}s, done at {done_at:.2}s of a {base:.2}s base) · {}",
-                tree.iter().map(Vec::len).sum::<usize>(),
+                phases.iter().map(|p| p.programs).sum::<usize>(),
                 shape_at.unwrap_or(f64::NAN),
                 split.join(" · ")
             );
-            ahead_tree = Some(tree);
+            pipe = Some(filled);
         }
         std::sync::Arc::new(consts.expect("the ELF constants compute"))
     });
     assert!(
-        !tree_ahead || ahead_tree.is_some(),
-        "NOEPOCH_TREE_AHEAD=1 derived no tree"
+        tree_ahead.is_none() || pipe.is_some(),
+        "NOEPOCH_TREE_AHEAD derived no tree"
     );
-    // Each program ahead in a slot its prover takes it from.
-    let mut ahead_levels: Vec<Vec<AheadSlot>> = ahead_tree
-        .unwrap_or_default()
-        .into_iter()
-        .map(|level| {
-            level
-                .into_iter()
-                .map(|p| std::sync::Mutex::new(Some(p)))
-                .collect()
-        })
-        .collect();
-    let ahead_leaves = (!ahead_levels.is_empty()).then(|| ahead_levels.remove(0));
     let shape = BlockShape::of_proof(&proof);
     let (mut rb, verify, replay, beside) = if inline_verify {
         let (rb, verify, replay) =
@@ -2252,14 +2274,16 @@ fn the_block_tree_composes_to_a_top_node() {
     let l0 = tree_siblings_l0().min(k);
     println!("   ★ LEVEL-0 CONCURRENCY: {l0} leaf proof(s) at once (LFM_TREE_SIBLINGS_L0)");
     super::device_permit::arm(l0);
+    // The pipeline's builder starts on the card now that the base is done.
+    let _ = go_tx.send(());
     let l0_sampler = HostSampler::start();
     let t = Instant::now();
     let leaves = in_index_order(k, l0, |j| {
         let label = format!("BLOCK L0 leaf {j}");
         let te = Instant::now();
-        let (program, built) = match &ahead_leaves {
-            Some(slots) => {
-                let (program, artifacts) = take_ahead(&slots[j], &label);
+        let (program, built) = match &pipe {
+            Some(p) => {
+                let (program, artifacts) = p.take_leaf(j, &label);
                 (program, Some(artifacts))
             }
             None => (block_leaf_program(&rb, j), None),
@@ -2315,9 +2339,21 @@ fn the_block_tree_composes_to_a_top_node() {
         leaves,
         &wrap_opts,
         siblings,
-        (!ahead_levels.is_empty()).then_some(&ahead_levels[..]),
+        pipe.as_deref(),
         beside_verifies.as_ref(),
     );
+    // The pipeline's builder is done by now (every node took its program).
+    if let Some(handle) = consts_beside {
+        let built = handle.join().expect("the ELF constants thread panicked");
+        if let Some(times) = built {
+            let times = times.expect("the tree's builder");
+            println!(
+                "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
+                 emission Σ {:.2}s · artifact builds Σ {:.2}s (holding the card permit)",
+                times.leaves, times.levels, times.emit, times.build
+            );
+        }
+    }
     super::device_permit::arm(1);
     // Every child verified beside is joined here, inside the interior's time: a
     // refusal fails the run before anything is reported.
