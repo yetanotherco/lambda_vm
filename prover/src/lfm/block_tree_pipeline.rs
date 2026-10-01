@@ -47,6 +47,8 @@ pub(super) struct BuilderTimes {
     /// (leaves and nodes, each holding the card permit).
     pub emit: f64,
     pub build: f64,
+    /// Of `build`, the seconds the builder waited for the card.
+    pub waited: f64,
 }
 
 impl Pipe {
@@ -123,13 +125,16 @@ impl Pipe {
     /// order, then each node level's programs (emitted in parallel on the host
     /// from the children's derived shapes) and their artifacts, each put in its
     /// slot as soon as it exists. A failure marks the pipe failed, so no prover
-    /// waits forever.
+    /// waits forever. With `first`, the builder takes the card permit ahead of
+    /// every other waiter ([`super::device_permit::go_first_here`]).
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
+        first: bool,
     ) -> Result<BuilderTimes, String> {
+        let _first = first.then(super::device_permit::go_first_here);
         let run = std::panic::AssertUnwindSafe(|| self.build(plan, leaf_programs, wrap_opts));
         let outcome = std::panic::catch_unwind(run);
         if !matches!(outcome, Ok(Ok(_))) {
@@ -148,6 +153,7 @@ impl Pipe {
         wrap_opts: &crate::ProofOptions,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
+        let waited_from = super::device_permit::waited_secs();
         let words = plan.child_layout().total();
         let mut build_secs = 0.0;
         let mut built = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
@@ -218,6 +224,7 @@ impl Pipe {
             levels: level_at,
             emit,
             build: build_secs,
+            waited: super::device_permit::waited_secs() - waited_from,
         })
     }
 }

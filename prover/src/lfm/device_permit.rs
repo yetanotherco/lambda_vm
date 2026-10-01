@@ -52,8 +52,8 @@
 //! nothing that ships sets `LAMBDA_VM_TREE_BUSY_PROBE`.
 
 use std::cell::Cell;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 /// How many sibling proofs the driver intends to run at once. 1 = the serial
@@ -75,6 +75,16 @@ static HELD_NANOS: AtomicU64 = AtomicU64::new(0);
 /// Holds since the process started, armed or not — the number the trace line
 /// carries. Separate from `ACQUISITIONS`, which a level clears.
 static TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Threads that go first ([`go_first_here`]) blocked on the card right now.
+/// While one waits, every other waiter stands aside, so the card passes to it
+/// at the current holder's release. Zero, and nobody stands aside, unless a
+/// thread opted in.
+static FIRST_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// Where the other waiters stand aside. `FIRST_WAITING` only falls under it, so
+/// a waiter that read it non-zero cannot miss the wake-up.
+static TURN: Mutex<()> = Mutex::new(());
+static TURN_FREED: Condvar = Condvar::new();
 
 /// `LFM_CARD_TRACE=1` prints one line per hold: the phase, what it waited, what
 /// it held, and the two wall-clock stamps that bracket the window.
@@ -112,6 +122,66 @@ thread_local! {
     /// exactly how the census memo cost twelve minutes of a test binary sitting
     /// at 0% CPU with nothing printed. A panic names it instead.
     static HELD_HERE: Cell<bool> = const { Cell::new(false) };
+    /// [`go_first_here`]: this thread's holds go ahead of every other waiter.
+    static FIRST_HERE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This thread's holds go ahead of every other waiter, until the guard drops.
+///
+/// For a thread whose device work gates other proofs (the block tree's pipeline
+/// builder: a node level cannot start before its artifacts exist). It does not
+/// pre-empt: it takes the card at the current holder's release, so the permit
+/// stays mutual exclusion. Inert while the permit is.
+pub fn go_first_here() -> GoFirst {
+    FIRST_HERE.with(|f| f.set(true));
+    GoFirst {
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// Ends [`go_first_here`] when dropped, on the thread that started it.
+pub struct GoFirst {
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for GoFirst {
+    fn drop(&mut self) {
+        FIRST_HERE.with(|f| f.set(false));
+    }
+}
+
+// A poisoned card is a panic already being reported: both locks take it
+// through the poison rather than turning one failure into two.
+
+/// The card for a thread that goes first: counted as waiting, so the others
+/// stand aside, until it holds it.
+fn lock_first() -> std::sync::MutexGuard<'static, ()> {
+    FIRST_WAITING.fetch_add(1, Ordering::SeqCst);
+    let guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        FIRST_WAITING.fetch_sub(1, Ordering::SeqCst);
+    }
+    TURN_FREED.notify_all();
+    guard
+}
+
+/// The card for every other thread: it stands aside while a thread that goes
+/// first waits, and hands the card back if one arrived while it queued. With
+/// nobody going first this is the plain lock and two loads.
+fn lock_in_turn() -> std::sync::MutexGuard<'static, ()> {
+    loop {
+        if FIRST_WAITING.load(Ordering::SeqCst) > 0 {
+            let mut turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+            while FIRST_WAITING.load(Ordering::SeqCst) > 0 {
+                turn = TURN_FREED.wait(turn).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+        if FIRST_WAITING.load(Ordering::SeqCst) == 0 {
+            return guard;
+        }
+    }
 }
 
 /// Arm the permit for `workers` concurrent proofs. `workers <= 1` leaves it
@@ -266,10 +336,12 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         "the card permit is not reentrant and this thread already holds it; \
          taking it twice without releasing parks the thread forever"
     );
-    // A poisoned card is a panic already being reported: take it through the
-    // poison rather than turning one failure into two.
     let blocked_from = Instant::now();
-    let guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = if FIRST_HERE.with(Cell::get) {
+        lock_first()
+    } else {
+        lock_in_turn()
+    };
     // Read ONCE. The trace line and `WAITED_NANOS` must carry the same wait, or
     // a level's accounting and its per-hold log disagree by the bookkeeping
     // below them.
@@ -416,6 +488,66 @@ mod tests {
             "both workers must have taken it: {stats:?}"
         );
         assert!(stats.held_nanos > 0, "and the held time was accumulated");
+        disarm(&g);
+    }
+
+    /// ★ A thread that goes first takes the card before a waiter that queued
+    /// ahead of it, and its guard ends that on its own thread. Without the
+    /// priority the earlier waiter is woken first and keeps the card.
+    #[test]
+    fn armed_a_thread_that_goes_first_takes_the_card_before_earlier_waiters() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+        const STAGGER: std::time::Duration = std::time::Duration::from_millis(60);
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(3);
+
+        let order = AtomicUsize::new(0);
+        let first_at = AtomicUsize::new(usize::MAX);
+        let other_at = AtomicUsize::new(usize::MAX);
+        let first_ended = std::sync::atomic::AtomicBool::new(false);
+        let holder_is_in = std::sync::Barrier::new(3);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _card = hold();
+                holder_is_in.wait();
+                std::thread::sleep(HOLD);
+            });
+            s.spawn(|| {
+                holder_is_in.wait();
+                std::thread::sleep(STAGGER);
+                let _card = hold();
+                other_at.store(order.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            });
+            s.spawn(|| {
+                holder_is_in.wait();
+                std::thread::sleep(2 * STAGGER);
+                {
+                    let _first = go_first_here();
+                    let _card = hold();
+                    first_at.store(order.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+                }
+                first_ended.store(!FIRST_HERE.with(Cell::get), Ordering::SeqCst);
+            });
+        });
+
+        assert_eq!(
+            (
+                first_at.load(Ordering::SeqCst),
+                other_at.load(Ordering::SeqCst)
+            ),
+            (0, 1),
+            "the thread that goes first must take the card before the earlier waiter"
+        );
+        assert!(
+            first_ended.load(Ordering::SeqCst),
+            "the guard must end the priority on its thread"
+        );
+        assert_eq!(
+            take_stats().peak_holders,
+            1,
+            "★ THE FALSIFIER: two holders on the card at once"
+        );
         disarm(&g);
     }
 
