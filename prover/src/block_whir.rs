@@ -160,7 +160,9 @@ pub struct BlockOptions {
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
     /// order all the same, while the layout thread lays out the rest of the
-    /// run as soon as it is built. Production: 3 (FAST 421, base −0.54 s).
+    /// run as soon as it is built. Production: 0. Three read −0.54 / −0.22 s of
+    /// base (FAST 421 / 422), but their extra host memory grows with the block
+    /// (BIG 390: +2.2 / +4.2 / +8.7 GiB at 1.0 / 1.3 / 1.8×).
     pub layout_workers: usize,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
@@ -180,7 +182,7 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
-            layout_workers: 3,
+            layout_workers: 0,
             pack_rest_as_laid_out: false,
         }
     }

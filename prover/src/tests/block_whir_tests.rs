@@ -1107,7 +1107,7 @@ fn block_whir_on_a_real_block() {
         ..BlockFormat::production()
     };
     let mut options = BlockOptions::production();
-    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 3; 0 is the inline layout) and
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
     // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them.
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
