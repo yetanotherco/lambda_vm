@@ -85,6 +85,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 
@@ -1943,12 +1944,12 @@ def cmd_cargo_artifact(a):
 
 
 def proc_stat(path):
-    """(comm, utime + stime ticks, threads, rss pages) from a /proc stat file."""
+    """(comm, utime + stime ticks, threads, rss pages, state) from a /proc stat file."""
     with open(path) as f:
         t = f.read()
     left, right = t.index("("), t.rindex(")")
     rest = t[right + 2:].split()
-    return t[left + 1:right], int(rest[11]) + int(rest[12]), int(rest[17]), int(rest[21])
+    return t[left + 1:right], int(rest[11]) + int(rest[12]), int(rest[17]), int(rest[21]), rest[0]
 
 
 def mem_avail_mib():
@@ -2001,9 +2002,11 @@ def cmd_cpu_sample(a):
         while True:
             now = time.time_ns()
             try:
-                _comm, ticks, nth, rss = proc_stat(f"/proc/{pid}/stat")
+                _comm, ticks, nth, rss, state = proc_stat(f"/proc/{pid}/stat")
             except (OSError, ValueError, IndexError):
                 break
+            if state in ("Z", "X"):
+                break  # exited, not yet reaped by its parent
             avail = mem_avail_mib()
             fp.write(f"{now}\t{pid}\t{ticks}\t{rss * page_kb}\t{nth}\t{avail}\n")
             try:
@@ -2012,7 +2015,7 @@ def cmd_cpu_sample(a):
                 tids = []
             for t in tids:
                 try:
-                    tc, tt, _, _ = proc_stat(f"/proc/{pid}/task/{t}/stat")
+                    tc, tt, _, _, _ = proc_stat(f"/proc/{pid}/task/{t}/stat")
                 except (OSError, ValueError, IndexError):
                     continue
                 if last.get(t) != tt:
@@ -2651,8 +2654,14 @@ def selftest():
                 shutil.copy(sl, exe)
                 child = subprocess.Popen([exe, "1.2"])
                 pre = os.path.join(d, "live")
-                rc, _ = run(cmd_cpu_sample, argparse.Namespace(exe=exe, out=pre, interval_ms=100.0, mem_floor_mib=0,
-                                                               wait_s=10.0))
+                # the child stays a zombie until wait() below: the sampler must take that as an exit, not hang
+                guard = threading.Timer(30.0, lambda: os.kill(os.getpid(), signal.SIGALRM))
+                guard.start()
+                try:
+                    rc, _ = run(cmd_cpu_sample, argparse.Namespace(exe=exe, out=pre, interval_ms=100.0,
+                                                                   mem_floor_mib=0, wait_s=10.0))
+                finally:
+                    guard.cancel()
                 child.wait()
                 live = read_cpu(pre, 0)
                 ok(rc == 0 and live is not None and len(live["proc"]) >= 3 and live["tid"],

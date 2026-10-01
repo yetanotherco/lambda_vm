@@ -550,6 +550,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 
@@ -2408,12 +2409,12 @@ def cmd_cargo_artifact(a):
 
 
 def proc_stat(path):
-    """(comm, utime + stime ticks, threads, rss pages) from a /proc stat file."""
+    """(comm, utime + stime ticks, threads, rss pages, state) from a /proc stat file."""
     with open(path) as f:
         t = f.read()
     left, right = t.index("("), t.rindex(")")
     rest = t[right + 2:].split()
-    return t[left + 1:right], int(rest[11]) + int(rest[12]), int(rest[17]), int(rest[21])
+    return t[left + 1:right], int(rest[11]) + int(rest[12]), int(rest[17]), int(rest[21]), rest[0]
 
 
 def mem_avail_mib():
@@ -2466,9 +2467,11 @@ def cmd_cpu_sample(a):
         while True:
             now = time.time_ns()
             try:
-                _comm, ticks, nth, rss = proc_stat(f"/proc/{pid}/stat")
+                _comm, ticks, nth, rss, state = proc_stat(f"/proc/{pid}/stat")
             except (OSError, ValueError, IndexError):
                 break
+            if state in ("Z", "X"):
+                break  # exited, not yet reaped by its parent
             avail = mem_avail_mib()
             fp.write(f"{now}\t{pid}\t{ticks}\t{rss * page_kb}\t{nth}\t{avail}\n")
             try:
@@ -2477,7 +2480,7 @@ def cmd_cpu_sample(a):
                 tids = []
             for t in tids:
                 try:
-                    tc, tt, _, _ = proc_stat(f"/proc/{pid}/task/{t}/stat")
+                    tc, tt, _, _, _ = proc_stat(f"/proc/{pid}/task/{t}/stat")
                 except (OSError, ValueError, IndexError):
                     continue
                 if last.get(t) != tt:
@@ -3116,8 +3119,14 @@ def selftest():
                 shutil.copy(sl, exe)
                 child = subprocess.Popen([exe, "1.2"])
                 pre = os.path.join(d, "live")
-                rc, _ = run(cmd_cpu_sample, argparse.Namespace(exe=exe, out=pre, interval_ms=100.0, mem_floor_mib=0,
-                                                               wait_s=10.0))
+                # the child stays a zombie until wait() below: the sampler must take that as an exit, not hang
+                guard = threading.Timer(30.0, lambda: os.kill(os.getpid(), signal.SIGALRM))
+                guard.start()
+                try:
+                    rc, _ = run(cmd_cpu_sample, argparse.Namespace(exe=exe, out=pre, interval_ms=100.0,
+                                                                   mem_floor_mib=0, wait_s=10.0))
+                finally:
+                    guard.cancel()
                 child.wait()
                 live = read_cpu(pre, 0)
                 ok(rc == 0 and live is not None and len(live["proc"]) >= 3 and live["tid"],
@@ -3423,13 +3432,14 @@ preflight() {
   else chk INFO "PREFLIGHT: FAIL ($PF_FAILS failure(s), $PF_WARNS warning(s)): fix the FAIL lines above and run again"; fi
 }
 
-build_probe() { # the CUDA probe: two kernels, two shapes, and one launch inside a process-wide NVTX range
+build_probe() { # the CUDA probe: two kernels, two shapes, and one launch inside a process-wide NVTX range, from another thread
   local cc="${GPU_CC//./}"
   cat > "$W/probe/ncuprobe.cu" <<'CU'
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <thread>
 extern "C" __global__ void ncuprobe_a(float *x) { x[threadIdx.x] += 1.0f; }
 extern "C" __global__ void ncuprobe_b(float *x) { x[threadIdx.x] += 2.0f; }
 typedef uint64_t (*range_start_t)(const char *);
@@ -3450,9 +3460,14 @@ int main() {
   if (cudaMalloc(&d, 1024 * sizeof(float)) != cudaSuccess) { std::printf("ncuprobe: cudaMalloc failed\n"); return 2; }
   cudaMemset(d, 0, 1024 * sizeof(float));
   ncuprobe_a<<<1, 64>>>(d);
+  // The range opens on this thread and the launch inside it comes from another, as a card hold's kernels
+  // come from the holder's table threads.
   uint64_t id = (start && end) ? start("np_probe_range") : 0;
-  ncuprobe_b<<<1, 64>>>(d);
-  cudaDeviceSynchronize();
+  std::thread inside([d]() {
+    ncuprobe_b<<<1, 64>>>(d);
+    cudaDeviceSynchronize();
+  });
+  inside.join();
   if (start && end) end(id);
   ncuprobe_a<<<2, 64>>>(d);
   ncuprobe_a<<<1, 64>>>(d);
@@ -3462,7 +3477,7 @@ int main() {
 }
 CU
   build_env
-  env -i "${BUILD_ENV[@]}" timeout 300 "$NVCC" -O2 -arch="sm_$cc" -o "$W/probe/ncuprobe" "$W/probe/ncuprobe.cu" -ldl \
+  env -i "${BUILD_ENV[@]}" timeout 300 "$NVCC" -O2 -std=c++17 -arch="sm_$cc" -o "$W/probe/ncuprobe" "$W/probe/ncuprobe.cu" -ldl -lpthread \
     > "$W/probe/build.log" 2>&1
 }
 
@@ -3537,7 +3552,7 @@ probe_counters() {
   nb="$(grep -c '^==PROF== Profiling "ncuprobe_b' "$W/probe/window.log" || true)"
   if [ "$res" = unlocked ] && [ -s "$W/probe/window.ncu-rep" ] && [ "$nb" = 1 ] && [ "$na" = 0 ]; then
     NVTX_FILTER="works (only the launch inside the range was profiled)"
-    chk PASS "ncu: the window passes' exact flags (--nvtx --nvtx-include <range>, --clock-control $NP_CLOCK) profile exactly the probe launch inside its NVTX range"
+    chk PASS "ncu: the window passes' exact flags (--nvtx --nvtx-include <range>, --clock-control $NP_CLOCK) profile exactly the probe launch inside its process-wide NVTX range, made from another thread than the one that opened it"
   else
     NVTX_FILTER="FAILED ($res; inside $nb, outside $na)"
     NVTX_FILTER_OK=0
