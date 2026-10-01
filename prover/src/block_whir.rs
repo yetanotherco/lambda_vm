@@ -257,6 +257,8 @@ pub struct LayoutStamps {
     pub closed_at: Vec<f64>,
     pub blocked: f64,
     pub chunks: f64,
+    /// The rest's five slowest tables to lay out and its first in AIR order.
+    pub slowest: Vec<(String, f64)>,
 }
 
 impl BlockStamps {
@@ -325,6 +327,15 @@ impl BlockStamps {
                 closed.join(", "),
                 l.blocked,
                 l.chunks,
+            ));
+            let slowest: Vec<String> = l
+                .slowest
+                .iter()
+                .map(|(name, secs)| format!("{name} {secs:.3}"))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK REST LAYOUT: slowest tables (s) {}\n",
+                slowest.join(" · ")
             ));
         }
         out.push_str(&format!(
@@ -1639,6 +1650,8 @@ struct RestLaid<'a> {
     prepared: Option<Vec<PreparedColumns>>,
     tables: Vec<Placed<'a>>,
     marks: Vec<(&'static str, f64)>,
+    /// The five slowest tables to lay out and the first in AIR order, seconds.
+    slowest: Vec<(String, f64)>,
     busy: f64,
 }
 
@@ -1700,17 +1713,24 @@ fn lay_out_rest<'a>(
         .enumerate()
         .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
         .collect();
+    // Each table's seconds, for the readout.
+    let timed = std::sync::Mutex::new(Vec::with_capacity(built.len()));
     let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
+        let t = Instant::now();
         let shape = (
             trace.main_table.width,
             trace.main_table.height.trailing_zeros() as usize,
         );
-        table_of(air, trace, shape, true).map(|table| (i, shape, table))
+        let laid = table_of(air, trace, shape, true).map(|table| (i, shape, table));
+        if let Ok(mut timed) = timed.lock() {
+            timed.push((i, t.elapsed().as_secs_f64()));
+        }
+        laid
     };
     let tables: Vec<Placed<'a>> = match sink {
         None => built
             .into_par_iter()
-            .map(lay_out)
+            .map(&lay_out)
             .collect::<Result<_, Error>>()?,
         Some(sink) => {
             // FIFO: the tables that close the next group are laid out first.
@@ -1730,6 +1750,17 @@ fn lay_out_rest<'a>(
         }
     };
     marks.push(("rest laid out", at()));
+    let mut timed = timed.into_inner().unwrap_or_default();
+    let first = timed.iter().map(|&(i, _)| i).min();
+    timed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut slowest: Vec<(String, f64)> = timed
+        .iter()
+        .take(5)
+        .map(|&(i, secs)| (refs[i].name().to_string(), secs))
+        .collect();
+    if let Some(&(i, secs)) = first.and_then(|f| timed.iter().find(|&&(i, _)| i == f)) {
+        slowest.push((format!("first in AIR order: {}", refs[i].name()), secs));
+    }
     Ok(RestLaid {
         table_counts,
         runtime_page_ranges,
@@ -1741,6 +1772,7 @@ fn lay_out_rest<'a>(
         prepared,
         tables,
         marks,
+        slowest,
         busy: t.elapsed().as_secs_f64(),
     })
 }
@@ -1936,6 +1968,7 @@ fn prove_streamed(
                     prepared,
                     tables: rest_tables,
                     marks: rest_marks,
+                    slowest,
                     busy: rest_busy,
                 } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
@@ -2025,6 +2058,7 @@ fn prove_streamed(
                         closed_at,
                         blocked,
                         chunks,
+                        slowest,
                     },
                 })
             });
