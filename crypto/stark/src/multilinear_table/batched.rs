@@ -510,6 +510,7 @@ where
         .collect::<Result<_, _>>()?;
 
     let mut split = ArgueSplit::default();
+    let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; tables.len()];
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
@@ -761,16 +762,19 @@ where
     }
     split.reduce += started.elapsed().as_secs_f64();
     if multilinear::whir_split::enabled() {
+        // The Gruen count is the process's: an argue running beside this one
+        // adds its layers too.
         eprintln!(
             "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
-             {:.3}s · zc rounds {:.3}s · reduce {:.3}s",
+             {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{}",
             tables.len(),
             plan.bins.len(),
             split.trees,
             split.ladders,
             split.zc_setup,
             split.zc_rounds,
-            split.reduce
+            split.reduce,
+            multilinear::gkr_gruen::gruen_layers() - gruen_layers
         );
         // The inputs of D-BATCH §3.2's error terms, measured on this argue.
         eprintln!(
