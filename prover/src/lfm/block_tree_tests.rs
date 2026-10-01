@@ -2142,11 +2142,18 @@ fn the_block_tree_composes_to_a_top_node() {
     let base_sampler = HostSampler::start();
     let t = Instant::now();
     let mut shape_at = None;
+    // Profiling builds: the base, the harvest, level 0, the interior and the
+    // harness's checks as process-wide NVTX ranges (the windows a counter run
+    // is cut by).
+    #[cfg(feature = "nvtx")]
+    let nvtx = stark::instruments::nvtx_process_range(|| "blk_base".into());
     let (proof, times) = crate::block::prove_block_observed(&elf_bytes, &input, &inner, &mut |s| {
         shape_at = Some(t.elapsed().as_secs_f64());
         let _ = shape_tx.send(s.clone());
     })
     .expect("the block must prove");
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     drop(shape_tx);
     let base = t.elapsed().as_secs_f64();
     let (base_peak, _) = base_sampler.stop();
@@ -2168,6 +2175,8 @@ fn the_block_tree_composes_to_a_top_node() {
     // likewise run beside its other wraps). `NOEPOCH_HARVEST_VERIFY=inline`
     // verifies first, as before.
     let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
+    #[cfg(feature = "nvtx")]
+    let nvtx = stark::instruments::nvtx_process_range(|| "tree_harvest".into());
     let t = Instant::now();
     let mut pipe = None;
     let consts = consts_beside.as_ref().map(|_| {
@@ -2229,6 +2238,8 @@ fn the_block_tree_composes_to_a_top_node() {
         (rb, None, replay, Some(beside))
     };
     let mut harvest = t.elapsed().as_secs_f64();
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     println!(
         "   harvest: {harvest:.2}s (production verify {}, harness-only · replay {replay:.2}s) · \
          {} instances · public output {} bytes",
@@ -2301,6 +2312,8 @@ fn the_block_tree_composes_to_a_top_node() {
     // The pipeline's builder starts on the card now that the base is done.
     let _ = go_tx.send(());
     let l0_sampler = HostSampler::start();
+    #[cfg(feature = "nvtx")]
+    let nvtx = stark::instruments::nvtx_process_range(|| "tree_level0".into());
     let t = Instant::now();
     let leaves = in_index_order(k, l0, |j| {
         let label = format!("BLOCK L0 leaf {j}");
@@ -2347,6 +2360,8 @@ fn the_block_tree_composes_to_a_top_node() {
         child
     });
     let level0 = t.elapsed().as_secs_f64();
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     let (l0_peak, _) = l0_sampler.stop();
     println!(
         "   BLOCK LEVEL 0: {k} leaves in {level0:.2}s · host peak {l0_peak:.3} GiB{}",
@@ -2357,6 +2372,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let siblings = tree_siblings();
     println!("   ★ SIBLING CONCURRENCY: {siblings} node proof(s) at once (LFM_TREE_SIBLINGS)");
     super::device_permit::arm(siblings);
+    #[cfg(feature = "nvtx")]
+    let nvtx = stark::instruments::nvtx_process_range(|| "tree_interior".into());
     let t = Instant::now();
     let (top, top_proof, walls) = compose_block_tree_with(
         &rb.plan,
@@ -2397,6 +2414,8 @@ fn the_block_tree_composes_to_a_top_node() {
         );
     }
     let interior = t.elapsed().as_secs_f64();
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     // The verify beside level 0 must have accepted the block, over the same
     // reconstruction the leaves read (one state word), before anything counts.
     // What the join waits is on the critical path, so it is the harvest's.
@@ -2418,6 +2437,8 @@ fn the_block_tree_composes_to_a_top_node() {
         );
     }
     assert_top_claims_the_block(&top, &rb);
+    #[cfg(feature = "nvtx")]
+    let _nvtx = stark::instruments::nvtx_process_range(|| "harness_verify".into());
     let t = Instant::now();
     assert!(
         verify_block_top(&top.artifacts, &top_proof, &wrap_opts),
