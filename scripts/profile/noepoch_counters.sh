@@ -4,8 +4,8 @@
 #
 # WHAT IT ANSWERS
 #   Why the no-epoch STARK base (the whole block 25368371 as ONE proof, prove_block, PR #1013) runs
-#   ~31 s where #1009's epoch base runs ~26 s on the same card (FAST, after packing admission, KECCAK_RND
-#   chunking and device page roots). Both run on one binary, so every difference is the schedule and the instance sizes:
+#   ~28 s where #1009's epoch base runs ~26 s on the same card (FAST, after packing admission, KECCAK_RND
+#   chunking, device page roots and the streamed phase A). Both run on one binary, so every difference is the schedule and the instance sizes:
 #   (a) is the card saturated or idle in each stage (head, main commit, fused, the recommit)?
 #   (b) are the kernels that carry the fused and recommit time compute-, memory- or latency-bound, and
 #       do the block-wide instances run them worse than the epoch-sized ones?
@@ -18,10 +18,10 @@
 #      probe; ERR_NVGPUCTRPERM gets the fix printed); RAM (the no-epoch run peaks at 43.9 GiB on the
 #      host) and disk; the Rust toolchain.
 #   2. Clones https://github.com/yetanotherco/lambda_vm (public, HTTPS) into its own work directory and
-#      checks out PIN_SHA below: noepoch/stark @ fe3f6bf05 (the no-epoch prover: packing admission
-#      behind a knob; KECCAK_RND chunked to 2^16 and the data pages' roots derived on the device, both
-#      default-on) plus one instruments-only commit, an NVTX range around the device recommit. That
-#      branch sits 7 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
+#      checks out PIN_SHA below: noepoch/stark @ cea6a10dd (the no-epoch prover: packing admission
+#      behind a knob; KECCAK_RND chunked to 2^16, the data pages' roots derived on the device and phase A
+#      streamed, all default-on) plus two instruments-only commits, NVTX ranges around the device
+#      recommit and around the streamed CPU precommits. That branch sits 8 commits on #1009's head (stark-recursion-rpx @ cc411aa2c) and carries #1009's base
 #      as a control test, so ONE build runs both workloads:
 #        epoch    tests::noepoch_block_tests::noepoch_epoch_base_reference   (#1009's base: 15 epochs of
 #                 2^21 rows and the global proof, continuation::prove_continuation; no recursion, no verify)
@@ -122,10 +122,10 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION=iprof-2026-09-30c
+SCRIPT_VERSION=iprof-2026-09-30d
 REPO_URL_DEFAULT=https://github.com/yetanotherco/lambda_vm
-PIN_SHA=80e6aa89f841950c46a76d66c6b87f83e44290b8            # profile/noepoch-counters: noepoch/stark + the recommit span
-NOEPOCH_SHA=fe3f6bf0538936ad8c1b4dc015d42ff383c90e2c        # noepoch/stark (PR #1013), PIN_SHA's parent
+PIN_SHA=ca89d301cfef90c6252f4b9f662426602b0b9eb8            # profile/noepoch-counters: noepoch/stark + two NVTX spans
+NOEPOCH_SHA=cea6a10dd6d775179a3f8ed7945d0382a8fcfba6        # noepoch/stark (PR #1013), PIN_SHA's parent
 EPOCH_SHA=cc411aa2c7a779464b577b5751eb846cf755b3d6          # stark-recursion-rpx (#1009), an ancestor of both
 ELF_COMMIT=da2a423b137b87e04213ecafbfd5d16e98a1f4a3         # whir/profile-rpx, where the record ELF is committed
 ELF_REPO_PATH=scripts/profile/fixtures/ethrex_8f826601.elf
@@ -209,8 +209,10 @@ default_plan() {
 prereg_text() {
   cat <<'PREREG'
 Pre-registered 2026-09-30 (lane I-PROF), before any run of this script. Sources: FAST 351 (ds1002, i-noepoch
-I-NOEPOCH.md §5), FAST 352 (ds1003, packing: -0.64 s) and the later FAST arms at fe3f6bf05 (KECCAK_RND
-chunking -3.23 s, device page roots -1.43 s: base 30.9 s, per the lead). Mauro's machine is not FAST (another CPU), so the
+I-NOEPOCH.md §5), FAST 352 (ds1003, packing: -0.64 s), the later FAST arms (KECCAK_RND chunking -3.23 s,
+device page roots -1.43 s, FAST 355; streamed phase A -2.76 s to 27.98 s, FAST 356 at cea6a10dd) and this
+script's own dry runs FAST 370/371 at fe3f6bf05 (ds1100/ds1101: no-epoch base 30.62 s, 130 device recommits,
+host peak 35.5 GiB; epoch base 25.74 s). Mauro's machine is not FAST (another CPU), so the
 walls get wide bands; the structural checks are exact.
 
 Gates (a miss makes the VERDICT PARTIAL or FAILED):
@@ -218,14 +220,14 @@ Gates (a miss makes the VERDICT PARTIAL or FAILED):
   - the no-epoch log carries the packing banner (LAMBDA_VM_GATE_PACKING=1) and a PROVE SPLIT line with a
     recommit[Σ] field; the epoch log carries PROVE SPLIT lines (16 on FAST 351: 15 epochs and the global proof);
   - run A's stages come from NVTX ranges (needs LAMBDA_VM_NVTX_LIB), and the no-epoch trace has exactly as
-    many r1_main_recommit_table ranges as the log's `device recommits` (127 on FAST 351, before chunking); the epoch trace 0;
+    many r1_main_recommit_table ranges as the log's `device recommits` (130 in FAST 371 at fe3f6bf05); the epoch trace 0;
   - every run-B pass profiles at least one launch.
 Expected (reported, not gated):
-  - reference walls: epoch base 23-30 s (FAST 26.05), no-epoch base 27-36 s (FAST 30.9 at fe3f6bf05);
-    nsys run A within +15 % of the reference; host peak of the no-epoch run 35-50 GiB (FAST 43.9 at ae11e232e);
-  - run A, no-epoch fused stage 13-24 s (FAST 22.7 at ae11e232e, before packing and chunking), with recommit
-    ranges covering 3-12 s of it;
-    VRAM max near the card's 32 GB in fused (FAST 32,110 MiB);
+  - reference walls: epoch base 23-30 s (FAST 26.05), no-epoch base 24-33 s (FAST 27.98 at cea6a10dd);
+    nsys run A within +15 % of the reference; host peak of the no-epoch run 30-48 GiB (FAST 371: 35.5);
+  - run A, no-epoch fused stage 13-21 s (FAST 371: 16.9 at fe3f6bf05), with recommit ranges covering 8-15 s of
+    it (FAST 371: 12.3, 6.7 kernel-s launched from them);
+    VRAM max in fused 22-30 GB (FAST 371: 25,072 MiB);
   - if the fused stage is card-bound, its SM active % is within 10 points of the epoch base's fused stage; a
     no-epoch fused SM active % 15 or more points lower, with fewer than 2.5 open tasks on average, reads as
     host/admission starvation, not a kernel problem.
@@ -478,7 +480,8 @@ r1_aux_commit_table and rounds_2to4_table. The disjoint stages are: head = the t
 first prepass; prepass, main_commit, fused = the unions of those ranges; between = the rest of
 [first prepass, last fused end] (the absorb, and in the epoch base the waits between epochs);
 tail = after the last fused range (the no-epoch arm's verify). recommit = the union of the
-recommit ranges, a part of fused, reported as its own row. Without NVTX ranges (no libnvToolsExt)
+recommit ranges, a part of fused, and precommit = the union of r1_precommit_table (the streamed
+block's CPU commits, made on builder threads during the head), each reported as its own row. Without NVTX ranges (no libnvToolsExt)
 the stages come from the log's PROVE SPLIT lines (t=[..] plus the phase walls, the `other`
 remainder unplaced) and there is no recommit row.
 
@@ -1424,6 +1427,7 @@ def base_line(lg):
 
 STAGES = ("head", "prepass", "main_commit", "between", "fused", "tail")
 RECOMMIT_LABEL = "r1_main_recommit_table"
+PRECOMMIT_LABEL = "r1_precommit_table"
 TASK_LABELS = ("r1_main_recommit_table", "r1_aux_build_table", "r1_aux_commit_table", "rounds_2to4_table")
 
 
@@ -1434,6 +1438,7 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
         by.setdefault(lab, []).append((s, e))
     pre, mc, fu = union(by.get("r1_prepass", [])), union(by.get("r1_main_commit", [])), union(by.get("rounds_2to4", []))
     rc = union(by.get(RECOMMIT_LABEL, []))
+    pc = union(by.get(PRECOMMIT_LABEL, []))
     src = "NVTX ranges"
     if not (pre or mc or fu) and lg["splits"] and t0_ns is not None:
         src = "the log's PROVE SPLIT lines (no NVTX ranges; `other` unplaced, no recommit row)"
@@ -1444,7 +1449,7 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
             mc.append((a + sp["prepass"] * 1e9, a + (sp["prepass"] + sp["main_commit"]) * 1e9))
             fu.append((b - sp["fused"] * 1e9, b))
         pre, mc, fu = union(pre), union(mc), union(fu)
-        rc = []
+        rc, pc = [], []
     if not (pre or mc or fu):
         return {"whole": [(0, end_ns)]}, "no NVTX ranges and no PROVE SPLIT line: one window only"
     allp = union(pre + mc + fu)
@@ -1453,9 +1458,11 @@ def trace_windows(nvtx, lg, t0_ns, end_ns):
     fu = subtract(fu, union(pre + mc))
     w = {"head": [(0, first)] if first > 0 else [], "prepass": pre, "main_commit": mc, "fused": fu,
          "between": subtract([(first, last)], union(pre + mc + fu)),
-         "tail": [(last, end_ns)] if end_ns > last else [], "recommit": rc, "whole": [(0, end_ns)]}
-    if not rc:
-        w.pop("recommit")
+         "tail": [(last, end_ns)] if end_ns > last else [], "precommit": pc, "recommit": rc,
+         "whole": [(0, end_ns)]}
+    for k, v in (("precommit", pc), ("recommit", rc)):
+        if not v:
+            w.pop(k)
     return w, src
 
 
@@ -1557,7 +1564,7 @@ def cmd_runa(a):
                         nl += 1
         return ksum, nl, kk
 
-    order = [s for s in STAGES if s in w] + [s for s in ("recommit", "whole") if s in w]
+    order = [s for s in STAGES if s in w] + [s for s in ("precommit", "recommit", "whole") if s in w]
     stages, per_kernel = [], {}
     for name in order:
         ivs = w[name]
@@ -1726,7 +1733,7 @@ def cmd_runa(a):
             "driver thread at a time); recommits = the mean open recommit ranges. VRAM = the nvidia-smi maximum in "
             "the stage (200 ms samples). GPU metrics are nsys's samples averaged over the stage "
             f"({mets.why or 'collected'}): warps = Compute Warps in Flight, % of the card's warp slots (an "
-            "occupancy proxy over time). `recommit` overlaps `fused`; `whole` is the run.\n\n")
+            "occupancy proxy over time). `precommit` overlaps `head`, `recommit` overlaps `fused`; `whole` is the run.\n\n")
     o.write("| stage | wall s | busy % | kernel busy % | copy busy % | Σ kernel s | launches | tasks | recommits | "
             "VRAM MiB | SM active % | SM issue % | warps % | DRAM rd % | DRAM wr % | PCIe rx % | PCIe tx % | "
             "top kernels (Σ s in the stage) |\n")
@@ -1759,10 +1766,9 @@ def cmd_runa(a):
                 "|---|---|---|---|---|---|---|\n")
         for r in arows[1:]:
             o.write("| " + " | ".join(str(x) for x in r) + " |\n")
-        unattr = sum((e - s) for s, e, *_ in kernels) / 1e9 - (attr.get("r1_main_commit", {}).get("kernel_s", 0.0)
-                                                               + sum(attr.get(l, {}).get("kernel_s", 0.0)
-                                                                     for l in TASK_LABELS))
-        o.write(f"\nΣ kernel time not launched from r1_main_commit or a fused-task range: {unattr:.2f} s "
+        unattr = sum((e - s) for s, e, *_ in kernels) / 1e9 - sum(attr.get(l, {}).get("kernel_s", 0.0) for l in
+                                                                   ("r1_main_commit", PRECOMMIT_LABEL) + TASK_LABELS)
+        o.write(f"\nΣ kernel time not launched from r1_main_commit, a precommit or a fused-task range: {unattr:.2f} s "
                 "(the main commits' own drivers, the head, rayon workers).\n")
     if api:
         o.write("\n## CUDA API time (calls x duration on the calling thread, by the call's start)\n\n")
@@ -2277,6 +2283,7 @@ def build_synth_sqlite(path):
         db.execute("INSERT INTO NVTX_EVENTS VALUES (?, ?, 59, 0, 0, 0, ?, ?, ?, ?, 0)",
                    (int(a * sec), int(b * sec), text, tid, tid, text_id))
 
+    rng(0.5, 1.5, "r1_precommit_table", DRV_TID)
     rng(2.0, 2.5, "r1_prepass", MAIN_TID)
     rng(2.5, 5.0, None, MAIN_TID, 11)        # a registered string: the text through StringIds
     rng(5.2, 9.0, "rounds_2to4", MAIN_TID)
@@ -2459,8 +2466,10 @@ def selftest():
         ok(rc == 0 and "| fused | 3.80 |" in printed and "Stages from NVTX ranges" in printed,
            f"runa exits 0 with a 3.8 s fused stage ({printed[:600]!r})")
         srows = {r["stage"]: r for r in read_tsv(os.path.join(rout, "runa-noepoch-stages.tsv"))}
-        ok(set(srows) == {"head", "prepass", "main_commit", "between", "fused", "tail", "recommit", "whole"},
+        ok(set(srows) == {"head", "prepass", "main_commit", "between", "fused", "tail", "precommit", "recommit", "whole"},
            f"runa's stages ({sorted(srows)})")
+        ok(abs(fnum(srows["precommit"]["wall_s"]) - 1.0) < 1e-6 and abs(fnum(srows["precommit"]["copy_busy_pct"]) - 50.0) < 1e-6,
+           f"runa's precommit row ({srows.get('precommit')})")
         ok(abs(fnum(srows["main_commit"]["wall_s"]) - 2.5) < 1e-6 and abs(fnum(srows["between"]["wall_s"]) - 0.2) < 1e-6
            and abs(fnum(srows["recommit"]["wall_s"]) - 0.8) < 1e-6 and abs(fnum(srows["head"]["wall_s"]) - 2.0) < 1e-6,
            "runa's stage walls")
@@ -2498,7 +2507,7 @@ def selftest():
         rc, printed = run(cmd_runa, argparse.Namespace(sqlite=db2, log=rlog, workload="noepoch", out=os.path.join(d, "r2"),
                                                        smi=None, bin_ms=1000))
         s2 = {r["stage"]: r for r in read_tsv(os.path.join(d, "r2", "runa-noepoch-stages.tsv"))}
-        ok(rc == 0 and "PROVE SPLIT lines" in printed and "recommit" not in s2
+        ok(rc == 0 and "PROVE SPLIT lines" in printed and "recommit" not in s2 and "precommit" not in s2
            and abs(fnum(s2["fused"]["wall_s"]) - 3.8) < 1e-3 and abs(fnum(s2["main_commit"]["wall_s"]) - 2.5) < 1e-3,
            f"runa's log fallback ({sorted(s2)})")
         # dry against the synthetic trace
