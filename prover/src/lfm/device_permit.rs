@@ -339,10 +339,23 @@ impl PermitStats {
     }
 }
 
+/// Profiling builds (`nvtx`): every hold, armed or not, is a process-wide NVTX
+/// range `cardhold_<phase>` — on no thread's stack, so each kernel of the device
+/// phase, from any of the holder's threads, falls inside it. `ncu --nvtx
+/// --nvtx-include "cardhold_multi_prove"` profiles exactly those.
+#[cfg(feature = "nvtx")]
+fn hold_range(phase: &'static str) -> stark::instruments::NvtxProcessRange {
+    stark::instruments::nvtx_process_range(|| format!("cardhold_{phase}"))
+}
+
 /// Exclusive use of the card, for as long as it is held.
 pub struct CardPermit {
     guard: Option<std::sync::MutexGuard<'static, ()>>,
     since: Instant,
+    /// Profiling builds only: the hold as a process-wide NVTX range, ended in
+    /// `drop` before the card is released.
+    #[cfg(feature = "nvtx")]
+    nvtx: Option<stark::instruments::NvtxProcessRange>,
     /// ⛔ ROUND-3 TREE PROBE ONLY, `None` unless `LAMBDA_VM_TREE_BUSY_PROBE` is
     /// set: which device phase this hold is, and the nanoseconds its holder
     /// queued for the card.
@@ -363,6 +376,8 @@ pub struct CardPermit {
 
 impl Drop for CardPermit {
     fn drop(&mut self) {
+        #[cfg(feature = "nvtx")]
+        drop(self.nvtx.take());
         if self.guard.is_some() {
             HELD_NANOS.fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
             IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -419,6 +434,8 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         return CardPermit {
             guard: None,
             since: Instant::now(),
+            #[cfg(feature = "nvtx")]
+            nvtx: Some(hold_range(phase)),
             probe: None,
             trace: None,
             who: String::new(),
@@ -433,6 +450,8 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         return CardPermit {
             guard: None,
             since: Instant::now(),
+            #[cfg(feature = "nvtx")]
+            nvtx: Some(hold_range(phase)),
             probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
             who: if traced {
@@ -473,6 +492,8 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     CardPermit {
         guard: Some(guard),
         since: Instant::now(),
+        #[cfg(feature = "nvtx")]
+        nvtx: Some(hold_range(phase)),
         // ⚠ The SAME `waited` the trace line and `WAITED_NANOS` carry, not a
         // second reading of the clock — three accountings of one wait that
         // disagreed would be worse than two that do not exist.

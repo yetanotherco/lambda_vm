@@ -666,7 +666,11 @@ where
                     let t = Instant::now();
                     // Held in an `Arc` like phase B's: once the tree tops are
                     // home it goes to the group's packer, or is dropped.
+                    #[cfg(feature = "nvtx")]
+                    let nvtx = crate::instruments::nvtx_process_range(|| "blk_a_upload".into());
                     let store = upload_for_commit(&group);
+                    #[cfg(feature = "nvtx")]
+                    drop(nvtx);
                     stamp.upload_a = t.elapsed().as_secs_f64();
                     stamp.upload_paid = stamp.upload_a;
                     (group, stamp, store, wide)
@@ -727,7 +731,12 @@ where
                         });
                         let _ = room_rx.recv();
                         let t = Instant::now();
+                        #[cfg(feature = "nvtx")]
+                        let nvtx =
+                            crate::instruments::nvtx_range_fmt(|| "blk_a_upload_ahead".into());
                         let store = upload_for_commit(&group);
+                        #[cfg(feature = "nvtx")]
+                        drop(nvtx);
                         (
                             group,
                             store,
@@ -906,6 +915,8 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let t = Instant::now();
+    #[cfg(feature = "nvtx")]
+    let nvtx = crate::instruments::nvtx_process_range(|| "blk_a_commit".into());
     let stacked = StackedCommitment::<F, H>::commit_signalled(
         layout,
         columns,
@@ -914,9 +925,15 @@ where
         on_room,
     )?;
     let roots = stacked.roots();
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     let commit = t.elapsed().as_secs_f64();
     let t = Instant::now();
+    #[cfg(feature = "nvtx")]
+    let nvtx = crate::instruments::nvtx_process_range(|| "blk_a_retire".into());
     let retired = stacked.retire(drop_levels, config)?;
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     Ok((roots, retired, commit, t.elapsed().as_secs_f64()))
 }
 
@@ -1278,10 +1295,14 @@ where
         let next = sizes.get(g + 1).map(|&n| &tail[..n]);
 
         let t = Instant::now();
+        #[cfg(feature = "nvtx")]
+        let nvtx = crate::instruments::nvtx_process_range(|| "blk_b_upload".into());
         let store = match pre_uploaded.take() {
             Some(store) => store,
             None => upload_group(group),
         };
+        #[cfg(feature = "nvtx")]
+        drop(nvtx);
         if let Some(store) = &store {
             let mut first = 0usize;
             for table in group.iter_mut() {
@@ -1300,8 +1321,16 @@ where
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
         let group_ref: &[CommittedTable<'_, F, E>] = group;
+        #[cfg(feature = "nvtx")]
+        let nvtx = crate::instruments::nvtx_process_range(|| "blk_b_argue".into());
         let (argued, next_store, joined) = std::thread::scope(|scope| {
-            let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
+            let uploader = next.map(|next| {
+                scope.spawn(move || {
+                    #[cfg(feature = "nvtx")]
+                    let _nvtx = crate::instruments::nvtx_range_fmt(|| "blk_b_upload_next".into());
+                    upload_group(next)
+                })
+            });
             let argued = (|| -> Result<(), MlError> {
                 match config.format.argue {
                     ArgueFormat::PerTable => {
@@ -1344,6 +1373,8 @@ where
             let next_store = uploader.map(|handle| handle.join());
             (argued, next_store, argue_end.elapsed().as_secs_f64())
         });
+        #[cfg(feature = "nvtx")]
+        drop(nvtx);
         argued?;
         stamps[g].argue = t.elapsed().as_secs_f64() - joined;
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
@@ -1360,6 +1391,8 @@ where
         let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
         let tree_tops = retired.tree_bytes();
         let t = Instant::now();
+        #[cfg(feature = "nvtx")]
+        let nvtx = crate::instruments::nvtx_process_range(|| "blk_b_encode".into());
         multilinear::gpu::reset_reserved_window();
         let before_revive = multilinear::gpu::ledger_reserved();
         let stacked = retired.revive::<H, _>(
@@ -1367,9 +1400,13 @@ where
             store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
             config,
         )?;
+        #[cfg(feature = "nvtx")]
+        drop(nvtx);
         stamps[g].encode = t.elapsed().as_secs_f64();
         stamps[g].open_room = multilinear::gpu::ledger_reserved().saturating_sub(before_revive);
         let t = Instant::now();
+        #[cfg(feature = "nvtx")]
+        let nvtx = crate::instruments::nvtx_process_range(|| "blk_b_open".into());
         openings.push(stacked_eval::prove::<F, E, T, H, _>(
             &stacked,
             &columns,
@@ -1429,6 +1466,8 @@ where
                 &mut fork,
             )?);
         }
+        #[cfg(feature = "nvtx")]
+        drop(nvtx);
         stamps[g].open = t.elapsed().as_secs_f64();
         stamps[g].open_reserved = multilinear::gpu::reserved_window_peak();
         if let Some(opening) = openings.last() {

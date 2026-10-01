@@ -2631,11 +2631,18 @@ fn prove_streamed(
     }
 
     crate::with_whir_hash!(|H| {
+        // Profiling builds: phase A as one process-wide range (its uploads and
+        // commits run on this thread, the builders on their own), and each
+        // thread's role as a range on its own stack.
+        #[cfg(feature = "nvtx")]
+        let nvtx_phase = stark::instruments::nvtx_process_range(|| "blk_phase_a".into());
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk.
             let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
             let executor = scope.spawn(move || -> Result<f64, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_executor".into());
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
                 }
@@ -2669,6 +2676,8 @@ fn prove_streamed(
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
             let finish_ledger = logged.clone();
             let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_builder".into());
                 if let Some(ledger) = ledger {
                     ledger.thread("builder");
                 }
@@ -2702,6 +2711,8 @@ fn prove_streamed(
                     std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
                         let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
                         let walking = inner.spawn(move || -> Result<_, Error> {
+                            #[cfg(feature = "nvtx")]
+                            let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_walker".into());
                             if let Some(ledger) = ledger {
                                 ledger.thread("walker");
                             }
@@ -2764,7 +2775,11 @@ fn prove_streamed(
                         }),
                     ));
                 }
+                #[cfg(feature = "nvtx")]
+                let nvtx_finish = stark::instruments::nvtx_range_fmt(|| "blk_finish".into());
                 let built_rest = builder.finish(&last);
+                #[cfg(feature = "nvtx")]
+                drop(nvtx_finish);
                 if let Some(ledger) = ledger {
                     crate::tables::trace_builder::build_stamps::set_hook(None);
                     ledger.builder.store(0, Relaxed);
@@ -2810,6 +2825,8 @@ fn prove_streamed(
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
+                #[cfg(feature = "nvtx")]
+                let _nvtx = stark::instruments::nvtx_range_fmt(|| "blk_layout".into());
                 if let Some(ledger) = ledger {
                     ledger.thread("layout");
                 }
@@ -3007,6 +3024,8 @@ fn prove_streamed(
             );
             (block, builder.join(), layout.join(), executor.join())
         });
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_phase);
         stamps.execute =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
@@ -3055,8 +3074,12 @@ fn prove_streamed(
             &config,
             &laid.groups,
         );
+        #[cfg(feature = "nvtx")]
+        let nvtx_prepared = stark::instruments::nvtx_process_range(|| "blk_prepared".into());
         let (prepared, tampered, derive) =
             prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_prepared);
         stamps.prepared = (prepared.len(), derive);
         if let Some(ledger) = ledger {
             ledger.line("prepared committed");
@@ -3086,6 +3109,8 @@ fn prove_streamed(
                 columns,
             })
             .collect();
+        #[cfg(feature = "nvtx")]
+        let nvtx_phase = stark::instruments::nvtx_process_range(|| "blk_phase_b".into());
         let _ = multilinear::whir_split::take_chain();
         let top_secs_before = multilinear::whir_commit::top_path_secs();
         let t = Instant::now();
@@ -3109,6 +3134,8 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        #[cfg(feature = "nvtx")]
+        drop(nvtx_phase);
         if multilinear::whir_split::enabled() {
             let chain = multilinear::whir_split::take_chain();
             let top_secs = multilinear::whir_commit::top_path_secs();
