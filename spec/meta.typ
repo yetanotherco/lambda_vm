@@ -49,7 +49,6 @@
     ("ECALLS", (
       ("about_ecalls", [About `ECALL`], <ecall>),
       ("halt", [`HALT` chip], <halt>),
-      ("commit", [`COMMIT` chip], <commit>),
       ("sha256", [`SHA256` accelerator], <sha256>),
       ("keccak", [`KECCAK` accelerator], <keccak>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
