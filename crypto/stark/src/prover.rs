@@ -1170,24 +1170,48 @@ mod vram_gate_packing_tests {
 /// plain table's Round 1 keeps its tree's top levels (all but the bottom `k`)
 /// on the host, and its fused task recomputes the LDE alone on the device —
 /// no second hash; the openings rebuild each queried `2^k`-leaf subtree from the
-/// recomputed rows and check it against the kept node. Unset or 0: the full
-/// device recommit with its root check.
+/// recomputed rows and check it against the kept node. 0: the full device
+/// recommit with its root check. Unset: [`set_default_recommit_top_levels`]'s
+/// value (0 unless a caller set one).
 #[cfg(feature = "cuda")]
 fn recommit_top_levels() -> Option<usize> {
-    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        let k = std::env::var("LAMBDA_VM_RECOMMIT_TOP_LEVELS")
+    // The environment, when set, decides (0 = off); else the caller's default.
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var("LAMBDA_VM_RECOMMIT_TOP_LEVELS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&k| k > 0);
-        if let Some(k) = k {
-            eprintln!(
-                "[prover] RecomputeLdeDevice: tree top levels kept, subtrees of 2^{k} leaves \
-                 rebuilt at the openings (LAMBDA_VM_RECOMMIT_TOP_LEVELS)"
-            );
-        }
-        k
-    })
+    });
+    let k = env.unwrap_or_else(|| TOP_LEVELS_DEFAULT.load(std::sync::atomic::Ordering::Relaxed));
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "[prover] RecomputeLdeDevice: {} ({})",
+            if k > 0 {
+                format!("tree top levels kept, subtrees of 2^{k} leaves rebuilt at the openings")
+            } else {
+                "full device recommit".to_string()
+            },
+            if env.is_some() {
+                "LAMBDA_VM_RECOMMIT_TOP_LEVELS"
+            } else {
+                "the caller's default"
+            }
+        );
+    });
+    (k > 0).then_some(k)
+}
+
+/// The kept-top-levels policy when `LAMBDA_VM_RECOMMIT_TOP_LEVELS` is unset:
+/// 0 (the default) is the full device recommit.
+static TOP_LEVELS_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the kept-top-levels policy `RecomputeLdeDevice` uses when
+/// `LAMBDA_VM_RECOMMIT_TOP_LEVELS` is unset: `k` ≥ 1 keeps all but the bottom
+/// `k` levels of each plain table's tree (see `recommit_top_levels`), 0 is the
+/// full recommit. Proofs are the same bytes either way.
+pub fn set_default_recommit_top_levels(k: usize) {
+    TOP_LEVELS_DEFAULT.store(k, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Tables whose fused task recomputed the LDE alone against kept top levels.

@@ -503,19 +503,23 @@ fn rows_of(
     rows
 }
 
-/// The streamed phase A's traces are the serial build's: the windowed
-/// collector walks the run a window at a time and each window's CPU table is
-/// generated from that window's logs alone, and the result equals
-/// `Traces::from_elf_and_logs` over the whole run — table by table and chunk by
-/// chunk for every table laid out in op order, and row multiset by row multiset
-/// for the six that lay rows out in `HashMap` order (LT, BRANCH, MUL, DVRM, EQ,
-/// BYTEWISE). Host only, small programs.
+/// The streamed phase A's traces are the serial build's under the block's own
+/// caps (KECCAK_RND chunked, which the shared builder's tests do not cover):
+/// windows of one CPU instance fed to [`WindowedTraceBuilder`], the last to
+/// `finish`, the chunks put back with `insert_streamed`, equal
+/// `Traces::from_elf_and_logs` — table by table and chunk by chunk for every
+/// table laid out in op order, and row multiset by row multiset for the six
+/// that lay rows out in `HashMap` order. Host only, small programs.
 #[test]
 fn windowed_collection_builds_the_serial_traces() {
-    use crate::tables::trace_builder::{DecodeArtifacts, WindowedCollector, generate_cpu_window};
+    use crate::tables::trace_builder::WindowedTraceBuilder;
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
     for (name, max_rows) in [
         ("all_instructions_64", MaxRowsConfig::small()),
-        ("test_keccak_multi", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
         ("fib_iterative_160k", MaxRowsConfig::uniform(1 << 14)),
     ] {
         let elf_bytes = asm_elf_bytes(name);
@@ -534,34 +538,16 @@ fn windowed_collection_builds_the_serial_traces() {
         )
         .expect("serial build");
 
-        let artifacts = DecodeArtifacts::from_elf(&program).expect("artifacts");
-        let image = crate::tables::trace_builder::build_initial_image(&program, &[]);
-        let register_init =
-            crate::tables::register::register_init_from_entry_point(program.entry_point);
-        let mut collector = WindowedCollector::new(&artifacts, &image, &register_init, 0);
-        let mut cpus = Vec::new();
-        for window in run.logs.chunks(max_rows.cpu) {
-            cpus.push(generate_cpu_window(window, &artifacts, collector.cycles()).expect("cpu"));
-            collector.push_window(window).expect("window");
+        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("builder");
+        let windows: Vec<&[executor::vm::logs::Log]> = run.logs.chunks(max_rows.cpu).collect();
+        let (last, rest) = windows.split_last().expect("a run has a window");
+        let mut chunks = Vec::new();
+        for window in rest {
+            chunks.extend(builder.push(window).expect("window"));
         }
-        let mut streamed = Traces::build_from_collected(
-            &artifacts,
-            collector.finish(true),
-            Some(&image),
-            &register_init,
-            &max_rows,
-            &[],
-            true,
-            false,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )
-        .expect("streamed build");
-        assert!(
-            streamed.cpus.is_empty(),
-            "{name}: the build left the CPU tables to the caller"
-        );
-        streamed.cpus = cpus;
+        let mut streamed = builder.finish(last).expect("finish");
+        let n_streamed = chunks.len();
+        streamed.insert_streamed(chunks).expect("insert");
 
         macro_rules! same {
             ($($field:ident),*) => {$(
@@ -603,9 +589,11 @@ fn windowed_collection_builds_the_serial_traces() {
         same_rows!(lts, branches, muls, dvrms, eqs, bytewises);
         assert_eq!(serial.public_output_bytes, streamed.public_output_bytes);
         assert_eq!(serial.table_counts().cpu, streamed.table_counts().cpu);
+        assert!(n_streamed > 0, "{name}: no chunk was streamed");
         println!(
-            "{name}: windowed = serial ({} CPU windows)",
-            streamed.cpus.len()
+            "{name}: windowed = serial ({} windows, {n_streamed} streamed chunks, {} KECCAK_RND)",
+            windows.len(),
+            streamed.keccak_rnds.len()
         );
     }
 }
