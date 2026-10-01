@@ -378,6 +378,14 @@ fn stream_by_push() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_STREAM").is_ok_and(|v| v == "push")
 }
 
+/// `LAMBDA_VM_BLOCK_DROP_OPS=1`: the builder drops each streamed chunk's ops as
+/// the chunk leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so phase A
+/// does not hold the run's op lists to its end; the traces are the same. Off by
+/// default until its box gate (D-MEMORY M1).
+fn drop_streamed_ops() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").is_ok_and(|v| v.trim() == "1")
+}
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
@@ -503,6 +511,9 @@ fn build_streamed(
 
         let produce = || -> Result<(Traces, f64), Error> {
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
+            if drop_streamed_ops() {
+                builder = builder.drop_streamed_ops()?;
+            }
             let mut collect_secs = 0.0;
             let last = if stream_by_push() {
                 let mut held: Option<Vec<executor::vm::logs::Log>> = None;
@@ -549,8 +560,12 @@ fn build_streamed(
             let finish_secs = t.elapsed().as_secs_f64();
             eprintln!(
                 "BLOCK STREAM builder: {} windows · walk {:.2} · route {:.2} · hand-out {:.2} · \
-                 finish {finish_secs:.2} (s)",
-                windows.windows, windows.walk, windows.route, windows.generate,
+                 finish {finish_secs:.2} (s) · streamed ops dropped {}",
+                windows.windows,
+                windows.walk,
+                windows.route,
+                windows.generate,
+                if drop_streamed_ops() { "on" } else { "off" },
             );
             collect_secs += finish_secs;
             Ok((traces, collect_secs))
