@@ -71,7 +71,7 @@ pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
 
 /// Under `blake3-pin` the blessed roots are RPX roots, so every static
 /// preprocessed root is recomputed once per `(table, blowup, coset, layout)`.
-#[cfg(feature = "blake3-pin")]
+#[cfg(any(feature = "blake3-pin", feature = "keccak-pin"))]
 pub(crate) fn pinned_root(
     table: &'static str,
     options: &crate::ProofOptions,

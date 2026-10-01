@@ -24,3 +24,5 @@ instruments = ["prover/instruments", "stark/instruments"]
 shape-profile = ["prover/shape-profile"]
 # GPU profiling build (Nsight): CUDA prover + instruments spans + NVTX ranges.
 nvtx = ["prover/nvtx", "instruments"]
+blake3-pin = ["prover/blake3-pin"]
+keccak-pin = ["prover/keccak-pin"]
