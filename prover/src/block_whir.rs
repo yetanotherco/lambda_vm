@@ -203,7 +203,7 @@ impl BlockStamps {
         }
         if self.streamed.1 > 0 || self.streamed.0 > 0.0 {
             out.push_str(&format!(
-                "BLOCK STREAM: windows collected at {:.2}s · run built at {:.2}s · {} chunks streamed · layout busy {:.2}s · phase A ended at {:.2}s (all since the build started)\n",
+                "BLOCK STREAM: windows collected at {:.2}s · run built at {:.2}s · {} chunks streamed · layout busy {:.2}s · phase A ended at {:.2}s (all since the streamed prove started, execution included)\n",
                 self.streamed.0, self.build, self.streamed.1, self.prep, self.phase_a,
             ));
             out.push_str(&format!(
@@ -426,19 +426,11 @@ pub(crate) fn prove_block_whir_with(
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
-    let t = Instant::now();
-    let result = Executor::new(&program, private_inputs.to_vec())
-        .map_err(|e| Error::Execution(format!("{e}")))?
-        .run()
-        .map_err(|e| Error::Execution(format!("{e}")))?;
-    stamps.execute = t.elapsed().as_secs_f64();
-
     if let Some(window_log2) = options.window_log2 {
         let proof = prove_streamed(
             &program,
             elf_bytes,
             private_inputs,
-            &result.logs,
             1usize << window_log2,
             proof_options,
             format,
@@ -448,6 +440,13 @@ pub(crate) fn prove_block_whir_with(
         )?;
         return Ok((proof, stamps));
     }
+
+    let t = Instant::now();
+    let result = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    stamps.execute = t.elapsed().as_secs_f64();
 
     crate::tables::trace_builder::build_stamps::start();
     let t = Instant::now();
@@ -802,7 +801,6 @@ fn prove_streamed(
     program: &Elf,
     elf_bytes: &[u8],
     private_inputs: &[u8],
-    logs: &[executor::vm::logs::Log],
     window: usize,
     opts: &ProofOptions,
     format: &BlockFormat,
@@ -810,9 +808,6 @@ fn prove_streamed(
     deviations: &Deviations,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
-    if logs.is_empty() {
-        return Err(Error::Execution("the run executed no cycle".to_string()));
-    }
     let stream_airs = StreamAirs::new(opts);
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
@@ -823,27 +818,47 @@ fn prove_streamed(
     let start = Instant::now();
 
     crate::with_whir_hash!(|H| {
-        let (block, built, laid) = std::thread::scope(|scope| {
+        let (block, built, laid, executed) = std::thread::scope(|scope| {
+            // The executor, a window at a time, two windows ahead of the walk.
+            let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
+            let executor = scope.spawn(move || -> Result<f64, Error> {
+                let mut executor = Executor::new(program, private_inputs.to_vec())
+                    .map_err(|e| Error::Execution(format!("{e}")))?;
+                while let Some(logs) = executor
+                    .resume_with_limit(window)
+                    .map_err(|e| Error::Execution(format!("{e}")))?
+                {
+                    if ltx.send(logs.to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Ok(start.elapsed().as_secs_f64())
+            });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
             let builder = scope.spawn(move || -> Result<(f64, f64, usize, WindowStamps), Error> {
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
-                let body = logs.len() - 1;
-                let cut = body - body % window;
                 let mut streamed = 0usize;
-                for w in logs[..cut].chunks(window) {
-                    // The chunks leave as jobs: the layout thread generates
-                    // them, so this thread goes straight to the next window.
-                    for job in builder.push_jobs(w)? {
-                        streamed += 1;
-                        if btx.send(Built::Job(Box::new(job))).is_err() {
-                            return Err(Error::Prover("the layout thread stopped".into()));
+                // One window held back: only the run's last window is
+                // `finish`'s, and it is the last only once the executor stops.
+                let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                for logs in lrx {
+                    if let Some(w) = held.replace(logs) {
+                        // The chunks leave as jobs: the layout thread
+                        // generates them, so this thread walks on.
+                        for job in builder.push_jobs(&w)? {
+                            streamed += 1;
+                            if btx.send(Built::Job(Box::new(job))).is_err() {
+                                return Err(Error::Prover("the layout thread stopped".into()));
+                            }
                         }
                     }
                 }
+                let last =
+                    held.ok_or_else(|| Error::Execution("the run executed no cycle".to_string()))?;
                 let windows_done = start.elapsed().as_secs_f64();
                 let window_stamps = builder.stamps();
-                let mut rest = builder.finish(&logs[cut..])?;
+                let mut rest = builder.finish(&last)?;
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
                     rest.keccak_rnds.remove(0);
@@ -1007,8 +1022,10 @@ fn prove_streamed(
 
             let block =
                 BlockCommitted::commit_groups::<H>(grx.iter(), &commit_config, options.drop_levels);
-            (block, builder.join(), layout.join())
+            (block, builder.join(), layout.join(), executor.join())
         });
+        stamps.execute =
+            executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did.
         let (windows_done, finished, streamed, window_stamps) =
