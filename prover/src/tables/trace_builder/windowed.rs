@@ -121,6 +121,8 @@ pub struct WindowedTraceBuilder<'a> {
     /// rows, counted as the windows arrive.
     counted: PreCounted,
     stamps: WindowStamps,
+    /// [`Self::stream_memw_lt`].
+    stream_memw_lt: bool,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -164,6 +166,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 memw_register_rows: 0,
             },
             stamps: WindowStamps::default(),
+            stream_memw_lt: false,
         })
     }
 
@@ -203,6 +206,23 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         self.emitted.keccak_rnd_rows = rows;
         Ok(self)
+    }
+
+    /// Derive each window's phase-3 LT ops (from its MEMW and MEMW_A ops) as the
+    /// window arrives, into the window's LT list, so LT's full chunks stream with
+    /// them instead of waiting for the run's end.
+    ///
+    /// ⚠ BLOCK PATH ONLY. The LT ops are the whole-run build's, but in another
+    /// order — each window's MEMW-derived ops follow its walk's — so a chunk
+    /// holds other ops than the whole-run build's chunk at that index, and LT
+    /// deduplicates per chunk. Every LT op is in exactly one chunk with its
+    /// whole-run multiplicity summed over the chunks, which is what LT's
+    /// constraints and the bus see; the whole-run order (and so every epoch
+    /// proof) is untouched. The chunks are a function of the run and the window
+    /// length.
+    pub fn stream_memw_lt(mut self) -> Self {
+        self.stream_memw_lt = true;
+        self
     }
 
     /// The time the windows took so far.
@@ -283,6 +303,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 walk_secs: &mut self.stamps.walk,
             },
             Accumulator {
+                stream_memw_lt: self.stream_memw_lt,
                 max_rows: &self.max_rows,
                 windows: &mut self.windows,
                 segments: &mut self.segments,
@@ -332,6 +353,7 @@ impl Walker<'_> {
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Accumulator<'b> {
+    stream_memw_lt: bool,
     max_rows: &'b crate::tables::MaxRowsConfig,
     windows: &'b mut Vec<WalkedWindow>,
     segments: &'b mut RoutedSegments,
@@ -344,8 +366,17 @@ pub struct Accumulator<'b> {
 impl Accumulator<'_> {
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
-    pub fn absorb(&mut self, window: WalkedWindow) -> Vec<ChunkJob> {
+    pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
+        if self.stream_memw_lt {
+            let walk = &mut window.walk;
+            walk.lt_ops
+                .extend(super::collect_lt_from_memw(&walk.memw.general));
+            walk.lt_ops
+                .extend(super::collect_lt_from_memw_aligned(&walk.memw.aligned));
+            self.emitted.memw_lt_done += walk.memw.general.len();
+            self.emitted.memw_aligned_lt_done += walk.memw.aligned.len();
+        }
         self.segments
             .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
         // The table phase's two dominant BITWISE sources, counted now.
