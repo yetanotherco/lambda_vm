@@ -709,17 +709,6 @@ fn compose(
     Ok((top.proof, walls))
 }
 
-/// ★ The tree over a small block proves to a top, and the block's verifier —
-/// which derives the top program from the ELF and the statement, never from
-/// the proof — accepts it.
-///
-/// Two trees the plan would not derive:
-/// - the same groups with the leaves' lists swapped (the carrier now holds the
-///   other half): every group once and the bus closes, so it proves, and the
-///   verifier refuses it; checked against its OWN top program it is accepted,
-///   so the refusal is the derived program's identity;
-/// - a group verified twice and another never: refused, at the latest by the
-///   verifier.
 /// ★ ECDAS cut through the block's recursion: test_ecsm_multi with ECDAS in
 /// 16-row tables (four; the 0xABCDEF call through three) proves as a block
 /// whose tree the verifier accepts. The same statement with one ECDAS table
@@ -766,6 +755,17 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
     );
 }
 
+/// ★ The tree over a small block proves to a top, and the block's verifier —
+/// which derives the top program from the ELF and the statement, never from
+/// the proof — accepts it.
+///
+/// Two trees the plan would not derive:
+/// - the same groups with the leaves' lists swapped (the carrier now holds the
+///   other half): every group once and the bus closes, so it proves, and the
+///   verifier refuses it; checked against its OWN top program it is accepted,
+///   so the refusal is the derived program's identity;
+/// - a group verified twice and another never: refused, at the latest by the
+///   verifier.
 #[test]
 #[ignore = "proves block leaves and nodes over a small block; box tier"]
 fn the_whir_block_tree_proves_to_the_derived_top() {
