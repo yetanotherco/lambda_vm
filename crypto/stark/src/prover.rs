@@ -5467,7 +5467,11 @@ pub trait IsStarkProver<
             if let Some(handle) = gpu_main
                 && let Some(td) = &handle.trace_dev
             {
-                trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                trace.set_main_trace_dev(
+                    std::sync::Arc::clone(td),
+                    handle.trace_rows,
+                    handle.ready.clone(),
+                );
             }
         }
 
@@ -5613,7 +5617,11 @@ pub trait IsStarkProver<
                 };
                 if let Some((handle, cached_main)) = relde {
                     if let Some(td) = &handle.trace_dev {
-                        trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                        trace.set_main_trace_dev(
+                            std::sync::Arc::clone(td),
+                            handle.trace_rows,
+                            handle.ready.clone(),
+                        );
                     }
                     *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
                     *gpu_main_cells[idx].lock().unwrap() = Some(handle);
@@ -5646,7 +5654,11 @@ pub trait IsStarkProver<
                     if let Some(handle) = &gpu_main
                         && let Some(td) = &handle.trace_dev
                     {
-                        trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+                        trace.set_main_trace_dev(
+                            std::sync::Arc::clone(td),
+                            handle.trace_rows,
+                            handle.ready.clone(),
+                        );
                     }
                     *main_commit_cells[idx].lock().unwrap() = Some(commit);
                     *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));

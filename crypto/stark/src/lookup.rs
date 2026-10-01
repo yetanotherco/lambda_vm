@@ -1444,6 +1444,7 @@ where
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         if trace.resident_aux_ok()
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
+                _table_name,
                 interactions,
                 trace.num_main_columns,
                 || {
@@ -1451,7 +1452,9 @@ where
                         .get_or_init(|| trace.columns_main())
                         .as_slice()
                 },
-                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
+                resident_main
+                    .as_ref()
+                    .map(|r| (r.buf.as_ref(), r.rows, r.ready.as_deref())),
                 trace_len,
                 challenges,
             )

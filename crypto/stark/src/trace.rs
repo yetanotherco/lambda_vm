@@ -137,6 +137,10 @@ where
 pub(crate) struct ResidentMainTrace {
     pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
     pub(crate) rows: usize,
+    /// Fires once the producer's stream has written `buf` (the LDE handle's
+    /// `ready`). The aux build reads `buf` on a stream of its own and waits on
+    /// it device-side; `None` means the producer synchronized before returning.
+    pub(crate) ready: Option<std::sync::Arc<math_cuda::device::PooledEvent>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -274,14 +278,17 @@ where
 
     /// Stash the device-resident trace-domain main columns from the R1 main LDE
     /// (column-major `[col*rows + row]`) so the aux fingerprint kernel reads them
-    /// in place.
+    /// in place. `ready` is the producer's completion event (the LDE handle's):
+    /// a producer that returns without synchronizing leaves `buf` still being
+    /// written on its stream, and the aux build must wait on it.
     #[cfg(feature = "cuda")]
     pub fn set_main_trace_dev(
         &mut self,
         buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
         rows: usize,
+        ready: Option<std::sync::Arc<math_cuda::device::PooledEvent>>,
     ) {
-        self.main_trace_dev = Some(ResidentMainTrace { buf, rows });
+        self.main_trace_dev = Some(ResidentMainTrace { buf, rows, ready });
     }
 
     /// The device-resident main trace `(buffer, rows)`, if retained by R1.
