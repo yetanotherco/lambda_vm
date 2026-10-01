@@ -40,6 +40,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
     BlockOptions {
         max_rows,
         keccak_rnd_rows_log2,
+        ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         drop_levels: 3,
         window_log2: None,
         stream_keccak_rnd: false,
@@ -738,6 +739,314 @@ fn an_inflated_keccak_rnd_count_is_refused() {
     assert!(block_whir::validate_block_counts(&counts).is_ok());
     counts.keccak = 2;
     assert!(block_whir::validate_block_counts(&counts).is_err());
+}
+
+/// Every accelerator present, KECCAK_RND in two tables and ECDAS in three: in
+/// proof order (`VmAirs::air_refs`) the five fixed tables, COMMIT 5, KECCAK 6,
+/// KECCAK_RND 7–8, ECSM 9, ECDAS 10–12, HINT 13, CPU 14–15, MEMW_R 16.
+fn chunked_counts() -> crate::TableCounts {
+    crate::TableCounts {
+        cpu: 2,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 1,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 1,
+        keccak_rnd: 2,
+        ecsm: 1,
+        ecdas: 3,
+        hint: 1,
+        commit: 1,
+        blake3: 0,
+    }
+}
+
+/// The ECDAS count is bounded before the verifier builds an AIR off it, and
+/// ECSM (the call table) stays one table.
+#[test]
+fn an_inflated_ecdas_count_is_refused() {
+    let mut counts = chunked_counts();
+    assert!(block_whir::validate_block_counts(&counts).is_ok());
+    counts.ecdas = block_whir::BLOCK_MAX_ECDAS + 1;
+    assert!(block_whir::validate_block_counts(&counts).is_err());
+    counts.ecdas = block_whir::BLOCK_MAX_ECDAS;
+    assert!(block_whir::validate_block_counts(&counts).is_ok());
+    counts.ecsm = 2;
+    assert!(block_whir::validate_block_counts(&counts).is_err());
+}
+
+/// ★ The statement's heights are capped for the chunked tables, and only
+/// theirs: an ECDAS table over [`block_whir::BLOCK_ECDAS_MAX_VARS`] and a
+/// KECCAK_RND table over [`block_whir::BLOCK_KECCAK_RND_MAX_VARS`] are refused;
+/// every other table far over both caps passes. The controls next to each
+/// range (ECSM before ECDAS, HINT after it, KECCAK before KECCAK_RND) are what
+/// an off-by-one in the ranges would cap instead.
+#[test]
+fn the_block_caps_the_chunked_tables_heights() {
+    let counts = chunked_counts();
+    let n = counts.total().expect("fits") + crate::FIXED_TABLE_COUNT;
+    assert_eq!(n, 17);
+    let check = |vars: &[u8]| block_whir::check_chunked_heights(&counts, vars);
+    let honest = vec![10u8; n];
+    assert!(check(&honest).is_ok());
+    let (keccak_cap, ecdas_cap) = (
+        block_whir::BLOCK_KECCAK_RND_MAX_VARS as u8,
+        block_whir::BLOCK_ECDAS_MAX_VARS as u8,
+    );
+    let mut at_caps = honest.clone();
+    at_caps[7..9].fill(keccak_cap);
+    at_caps[10..13].fill(ecdas_cap);
+    assert!(check(&at_caps).is_ok(), "a table at its cap passes");
+    for (what, idx, vars) in [
+        ("ECDAS[2] over its cap", 12, ecdas_cap + 1),
+        ("ECDAS[0] over its cap", 10, ecdas_cap + 1),
+        ("KECCAK_RND[1] over its cap", 8, keccak_cap + 1),
+        ("KECCAK_RND[0] over its cap", 7, keccak_cap + 1),
+    ] {
+        let mut stated = honest.clone();
+        stated[idx] = vars;
+        let refused = check(&stated);
+        assert!(refused.is_err(), "the block must refuse {what}");
+        println!("BLOCK WHIR refuses {what}: {:?}", refused.err());
+    }
+    for (what, idx) in [
+        ("COMMIT", 5),
+        ("KECCAK", 6),
+        ("ECSM", 9),
+        ("HINT", 13),
+        ("CPU[0]", 14),
+        ("MEMW_R[0]", 16),
+    ] {
+        let mut stated = honest.clone();
+        stated[idx] = 22;
+        assert!(
+            check(&stated).is_ok(),
+            "{what} is not a chunked table: its height is not capped"
+        );
+    }
+}
+
+/// The ranges the caps read are the chunked AIRs' positions in
+/// [`crate::VmAirs::air_refs`] — the statement's table order — and nothing
+/// next to them.
+#[test]
+fn chunked_table_ranges_name_the_chunked_airs() {
+    use executor::elf::Elf;
+    let elf = asm_elf_bytes("poc_rodata_commit");
+    let program = Elf::load(&elf).expect("load the ELF");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf(&program);
+    let counts = chunked_counts();
+    let airs = crate::VmAirs::new(
+        &program,
+        &ProofOptions::default_test_options(),
+        false,
+        &page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let names: Vec<String> = airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    for (table, range, _) in block_whir::chunked_table_ranges(&counts) {
+        assert!(!range.is_empty());
+        for (k, idx) in range.clone().enumerate() {
+            assert_eq!(names[idx], format!("{table}[{k}]"));
+        }
+        let prefix = format!("{table}[");
+        assert!(!names[range.start - 1].starts_with(&prefix));
+        assert!(!names[range.end].starts_with(&prefix));
+    }
+}
+
+/// ECDAS cut into tables of 2^4 rows: test_ecsm_multi's 42 double/add steps
+/// (calls k = 1, 5, 0xABCDEF) over four tables, the 0xABCDEF call through
+/// three of them; their bus sums add up to the whole table's.
+#[test]
+fn ecdas_split_into_chunks_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_ecsm_multi");
+    let mut o = options(MaxRowsConfig::default(), 16);
+    o.ecdas_rows_log2 = 4;
+    let proof = prove(&elf, &many_groups(), &o);
+    assert_eq!(proof.table_counts.ecdas, 4, "64 rows in 16-row tables");
+    assert!(verify(&proof, &elf, &many_groups()));
+    // The production cut leaves the same program one table.
+    let one = prove(&elf, &many_groups(), &options(MaxRowsConfig::default(), 16));
+    assert_eq!(one.table_counts.ecdas, 1);
+    assert!(verify(&one, &elf, &many_groups()));
+}
+
+/// test_ecsm_multi's traces with ECDAS cut at 16 rows, built once.
+fn ecsm_multi_split() -> (
+    executor::elf::Elf,
+    Vec<u8>,
+    crate::tables::trace_builder::Traces,
+) {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    let elf = asm_elf_bytes("test_ecsm_multi");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &MaxRowsConfig::default(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the traces build");
+    block_whir::split_keccak_rnd(&mut traces, 16);
+    block_whir::split_ecdas(&mut traces, 4);
+    assert_eq!(traces.ecdases.len(), 4);
+    (program, elf, traces)
+}
+
+/// Whether test_ecsm_multi's split traces, after `tamper`, prove into a block
+/// the verifier accepts (a prover refusal counts as not accepted). The traces
+/// are built afresh for each prove.
+fn split_block_accepts(tamper: impl Fn(&mut crate::tables::trace_builder::Traces)) -> bool {
+    let format = many_groups();
+    let (program, elf, mut traces) = ecsm_multi_split();
+    tamper(&mut traces);
+    match block_whir::prove_traces(
+        &program,
+        &elf,
+        &mut traces,
+        &ProofOptions::default_test_options(),
+        &format,
+        &options(MaxRowsConfig::default(), 16),
+        &Deviations::default(),
+        false,
+        &|_, _| {},
+        &mut Default::default(),
+    ) {
+        Ok(proof) => verify(&proof, &elf, &format),
+        Err(e) => {
+            println!("    (the prover refused: {e:?})");
+            false
+        }
+    }
+}
+
+/// ★ A call split across ECDAS tables is held together by the Ecdas bus alone,
+/// keyed by the call's timestamp and the step's `(round, op)`.
+///
+/// - Control: two whole rows swapped between table 0 and table 1 (a step of
+///   the 5·G call and a step of the 0xABCDEF call) is the same multiset of
+///   rows, and verifies.
+/// - Negative: the same two rows swap only their timestamps, so each claims
+///   the other's call. No constraint and no range check reads the timestamp,
+///   and both rows have `NEXT_OP = 0` (their `Bit` sends are off): only the
+///   Ecdas tuples moved, and the block is refused.
+///
+/// Mutation (box script): drop the timestamp from `ecsm::ecdas_tuple` and the
+/// negative verifies — the call key is what refuses it.
+#[test]
+fn a_split_ecdas_call_is_keyed_on_the_bus() {
+    use crate::tables::ecdas::cols;
+    use crate::tables::types::FE;
+    let (a, b) = {
+        let (_, _, traces) = ecsm_multi_split();
+        let next_op_off =
+            |t: usize, r: usize| *traces.ecdases[t].main_table.get(r, cols::NEXT_OP) == FE::zero();
+        let ts = |t: usize, r: usize| {
+            (
+                *traces.ecdases[t].main_table.get(r, cols::TIMESTAMP_0),
+                *traces.ecdases[t].main_table.get(r, cols::TIMESTAMP_1),
+            )
+        };
+        let a = (0..3).find(|&r| next_op_off(0, r)).expect("a 5·G step");
+        let b = (0..16)
+            .find(|&r| next_op_off(1, r))
+            .expect("a 0xABCDEF step");
+        assert_ne!(ts(0, a), ts(1, b), "two different calls");
+        assert_eq!(*traces.ecdases[0].main_table.get(a, cols::MU), FE::one());
+        assert_eq!(*traces.ecdases[1].main_table.get(b, cols::MU), FE::one());
+        (a, b)
+    };
+    let swap = |cols_to_swap: Vec<usize>| {
+        move |t: &mut crate::tables::trace_builder::Traces| {
+            for &col in &cols_to_swap {
+                let x = *t.ecdases[0].main_table.get(a, col);
+                let y = *t.ecdases[1].main_table.get(b, col);
+                t.ecdases[0].main_table.set(a, col, y);
+                t.ecdases[1].main_table.set(b, col, x);
+            }
+        }
+    };
+    assert!(split_block_accepts(|_| {}), "the honest split verifies");
+    assert!(
+        split_block_accepts(swap((0..cols::NUM_COLUMNS).collect())),
+        "whole rows swapped across tables are the same steps: accepted"
+    );
+    println!("BLOCK WHIR ECDAS SPLIT CONTROL: whole rows swapped across tables, accepted");
+    assert!(
+        !split_block_accepts(swap(vec![cols::TIMESTAMP_0, cols::TIMESTAMP_1])),
+        "a continuation row reattached to another call must be refused"
+    );
+    println!(
+        "BLOCK WHIR ECDAS SPLIT NEGATIVE: table 0 row {a} and table 1 row {b} swapped calls, refused"
+    );
+}
+
+/// ★ The verifier refuses a statement that gives an ECDAS or a KECCAK_RND
+/// table a height over its cap, at the frame (before any AIR is built), with
+/// the cap's own error; the honest proofs verify.
+///
+/// Mutation (box script): `check_chunked_heights` returning `Ok(())` and the
+/// errors are no longer the cap's.
+#[test]
+fn a_chunked_table_stated_over_its_cap_is_refused() {
+    let format = many_groups();
+    for (name, program, cap) in [
+        ("ECDAS", "test_ecsm_multi", block_whir::BLOCK_ECDAS_MAX_VARS),
+        (
+            "KECCAK_RND",
+            "test_keccak",
+            block_whir::BLOCK_KECCAK_RND_MAX_VARS,
+        ),
+    ] {
+        let elf = asm_elf_bytes(program);
+        let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+        assert!(verify(&proof, &elf, &format), "{program} verifies");
+        let (_, range, _) = block_whir::chunked_table_ranges(&proof.table_counts)
+            .into_iter()
+            .find(|(n, ..)| *n == name)
+            .expect("the table's range");
+        assert!(!range.is_empty(), "{program} has a {name} table");
+        proof.table_num_vars[range.start] = (cap + 1) as u8;
+        let refused = block_whir::verify_block_whir(
+            &proof,
+            &elf,
+            &ProofOptions::default_test_options(),
+            &format,
+        );
+        let msg = format!("{refused:?}");
+        assert!(
+            msg.contains(&format!("{name}[0]")) && msg.contains(&format!("at most 2^{cap}")),
+            "the frame must refuse {name} over its cap with the cap's error, got {msg}"
+        );
+        println!("BLOCK WHIR {name} OVER CAP: refused at the frame: {msg}");
+    }
 }
 
 /// ★ W1's readout on a real block (box only, `--ignored`): the block proved
