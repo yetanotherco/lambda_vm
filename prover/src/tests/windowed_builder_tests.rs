@@ -254,6 +254,110 @@ fn windowed_builds_the_whole_run_tables_at_production_sizes() {
     same_traces(&reference, &traces);
 }
 
+/// The whole-run KECCAK_RND table cut into tables of `rows` rows — rows
+/// `[k·rows, (k+1)·rows)`, as the block proof splits it.
+fn split_keccak_rnd(t: &Traces, per: usize) -> Vec<Table> {
+    t.keccak_rnds
+        .iter()
+        .flat_map(|table| {
+            let width = table.main_table.width;
+            let all = rows(table);
+            if all.len() <= per {
+                return vec![rebuild(&all, width)];
+            }
+            all.chunks(per).map(|chunk| rebuild(chunk, width)).collect()
+        })
+        .collect()
+}
+
+fn rebuild(rows: &[Vec<FieldElement<GoldilocksField>>], width: usize) -> Table {
+    TraceTable::new_main(rows.iter().flatten().copied().collect(), width, 1)
+}
+
+/// A slice of KECCAK_RND rows built from the ops that reach it is that slice of
+/// the whole table, wherever the slice cuts an op's 24 rows.
+#[test]
+fn keccak_rnd_rows_are_slices_of_the_whole_table() {
+    use crate::tables::keccak_rnd::{
+        KeccakRoundOperation, generate_keccak_rnd_rows, generate_keccak_rnd_trace,
+    };
+    let ops: Vec<KeccakRoundOperation> = (0..11u64)
+        .map(|i| KeccakRoundOperation {
+            timestamp: 100 + 3 * i,
+            input: core::array::from_fn(|j| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ j as u64),
+            output: [0; 25],
+        })
+        .collect();
+    let whole = rows(&generate_keccak_rnd_trace(&ops));
+    for (skip, len) in [
+        (0, 32),
+        (32, 32),
+        (50, 64),
+        (23, 1),
+        (100, 156),
+        (256, 0),
+        (200, 56),
+    ] {
+        let slice = rows(&generate_keccak_rnd_rows(&ops, skip, len));
+        assert_eq!(slice.len(), len);
+        assert!(
+            slice[..] == whole[skip..skip + len],
+            "rows {skip}..{}",
+            skip + len
+        );
+    }
+}
+
+/// ★ With KECCAK_RND cut into chunks, the windowed build streams them and is the
+/// whole-run build with KECCAK_RND split the same way, table for table; at
+/// one-cycle windows it did stream some.
+#[test]
+fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
+    let max_rows = MaxRowsConfig::small();
+    for name in ["test_keccak", "test_keccak_multi"] {
+        let (program, logs) = run(name);
+        let mut reference = whole(&program, &logs, &max_rows);
+        for per in [32usize, 64, 128] {
+            let split = split_keccak_rnd(&reference, per);
+            for window in [1, 7, 33] {
+                let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                    .expect("the builder")
+                    .keccak_rnd_chunks(per)
+                    .expect("a chunk size");
+                let body = logs.len() - 1;
+                let cut = body - body % window;
+                let mut chunks = Vec::new();
+                for w in logs[..cut].chunks(window) {
+                    chunks.extend(builder.push(w).expect("a window"));
+                }
+                let streamed = chunks
+                    .iter()
+                    .filter(|c| c.table == StreamTable::KeccakRnd)
+                    .count();
+                let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+                traces.insert_streamed(chunks).expect("placeholders");
+                same_list(
+                    &format!("{name} KECCAK_RND/{per} window {window}"),
+                    &split,
+                    &traces.keccak_rnds,
+                    false,
+                );
+                // One-cycle windows push every cycle but the last, so every
+                // chunk the ops fill before the run ends streams.
+                let full = split.iter().filter(|t| t.main_table.height == per).count();
+                if window == 1 && full > 1 {
+                    assert!(streamed > 0, "{name}, rows {per}: none streamed");
+                }
+                // Every other table is the whole-run one.
+                let keccak =
+                    std::mem::replace(&mut reference.keccak_rnds, traces.keccak_rnds.clone());
+                same_traces(&reference, &traces);
+                reference.keccak_rnds = keccak;
+            }
+        }
+    }
+}
+
 /// A non-final window may not halt, as a whole-run build refuses an epoch that
 /// halts early.
 #[test]
