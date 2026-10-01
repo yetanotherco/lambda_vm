@@ -1644,17 +1644,21 @@ const D12_LEAVES: [&[usize]; 8] = [
     ],
 ];
 
-/// `NOEPOCH_ELF_BESIDE`: threads for the ELF constants beside the base; unset or
-/// zero computes them inline in the harvest.
+/// Threads for the ELF constants beside the base by default: FAST 393 measured
+/// the harvest −1.87 s and the whole −1.80 s at four, the base +0.02 s.
+const ELF_BESIDE_THREADS: usize = 4;
+
+/// `NOEPOCH_ELF_BESIDE`: threads for the ELF constants beside the base, unset
+/// meaning [`ELF_BESIDE_THREADS`]; `0` computes them inline in the harvest.
 fn elf_beside_knob() -> Option<usize> {
-    std::env::var("NOEPOCH_ELF_BESIDE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| {
+    match std::env::var("NOEPOCH_ELF_BESIDE") {
+        Ok(v) if !v.is_empty() => Some(
             v.parse::<usize>()
-                .unwrap_or_else(|_| panic!("NOEPOCH_ELF_BESIDE must be a thread count, got `{v}`"))
-        })
-        .filter(|&t| t > 0)
+                .unwrap_or_else(|_| panic!("NOEPOCH_ELF_BESIDE must be a thread count, got `{v}`")),
+        ),
+        _ => Some(ELF_BESIDE_THREADS),
+    }
+    .filter(|&t| t > 0)
 }
 
 /// `NOEPOCH_LEAVES`: the leaf count; unset is the rule's `⌈Σ cost / 279 000⌉`.
@@ -1723,10 +1727,10 @@ fn the_block_tree_composes_to_a_top_node() {
     let whole = HostSampler::start();
     let t_all = Instant::now();
 
-    // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`): the
-    // plan's ELF-only input (DECODE's root, recomputed on the host) computed on a
-    // pool of its own while the base proves, joined by the harvest. Unset: the
-    // harvest computes it inline, as before.
+    // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`, four
+    // by default): the plan's ELF-only input (DECODE's root, recomputed on the
+    // host) computed on a pool of its own while the base proves, joined by the
+    // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline.
     let elf_beside = elf_beside_knob();
     let consts_beside = elf_beside.map(|threads| {
         let (elf, opts) = (elf_bytes.clone(), inner.clone());
