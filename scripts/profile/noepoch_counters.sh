@@ -22,7 +22,7 @@
 #   --full  ~45-60 min after the build, same peak. Adds a reference run of each workload without a
 #       profiler (its walls), and every Nsight Compute pass of the plan (one launch of each shape for
 #       the kernels that carry each phase and each hold). Answers Q1 and Q2's roofs kernel by kernel.
-#   The build is a few minutes in a fresh work directory (two checkouts, one target directory) and is
+#   The build is a few minutes in a fresh work directory (two checkouts, two target directories) and is
 #   reused by a re-run.
 #
 # WHAT IT RUNS  (the structure of lane I-PROF's noepoch_counters.sh, 09-30, and mauro-ncu.sh, 09-28)
@@ -40,8 +40,8 @@
 #               concatenation) + the same card-hold ranges and the tree test's level windows
 #   3. Fetches block 25368371 from the public release and the record's guest ELF from the public
 #      repository, both checked by sha256. No guest is built.
-#   4. Builds each pin's test binary with --features cuda,nvtx into one target directory (line tables
-#      in the cubins, codegen unchanged).
+#   4. Builds each pin's test binary with --features cuda,nvtx, each in its own target directory (line
+#      tables in the cubins, codegen unchanged).
 #   5. (--full) Reference: each workload once with no profiler.
 #   6. Run A, Nsight Systems: each workload once with CUDA API + NVTX tracing and GPU metrics (2 kHz),
 #      nvidia-smi every 200 ms and the CPU sampler every 100 ms. Per stage: wall, card busy %, kernel
@@ -58,13 +58,13 @@
 # MEMORY  The WHIR run peaks near 45 GiB of host RAM, the STARK run near 43 (FAST); the checks require
 #   NP_MIN_AVAIL_GIB (48) available before every run, and a watchdog ends a run whose host MemAvailable
 #   falls under NP_MEM_FLOOR_MIB (2048 MiB) rather than letting the machine swap. VRAM: up to the card.
-# DISK  about 20-30 GiB in the work directory: the clone, two worktrees and the cargo cache (~4 GiB), the
-#   release CUDA builds (~10-15 GiB), run A's reports and exports (~3-10 GiB). The file to send back is a
+# DISK  about 10-20 GiB in the work directory: the clone, two worktrees and the cargo cache (~0.3 GiB), the
+#   two release CUDA builds (~2 GiB), run A's reports and exports (~3-10 GiB with GPU metrics). The file to send back is a
 #   few MB; keep/ can be deleted once it is sent.
 #
 # NEEDS  Linux; an NVIDIA GPU with nothing else running on it (the record's card is an RTX 5090, 32 GB);
 #   CUDA toolkit >= 12.8 with nvcc at $CUDA_HOME/bin (default /usr/local/cuda); Nsight Systems and Nsight
-#   Compute >= 2025.1; GPU performance counters open to this user; 48 GiB of RAM available; >= 30 GiB
+#   Compute >= 2025.1; GPU performance counters open to this user; 48 GiB of RAM available; >= 20 GiB
 #   free in the work directory; rustup with the toolchain 1.94.0; git, curl, python3 >= 3.8 with sqlite3;
 #   internet (GitHub, crates.io, files.pythonhosted.org). The NVTX ranges need a libnvToolsExt (CUDA 12.9
 #   and later ship none): LAMBDA_VM_NVTX_LIB=/path/to/libnvToolsExt.so.1 when you have one; otherwise the
@@ -3222,9 +3222,10 @@ load_plan() {
 
 BUILD_ENV=() RUN_ENV=() WL_ENV=() WL_TEST="" WL_BIN="" WL_REPO="" ARCH_ENV=() NVTX_LIB=""
 BIN_W="" BIN_S=""
-build_env() {
+build_env() { # build_env [whir|stark]: each pin builds into its own target directory (cargo's metadata hash of a path
+  # package is workspace-relative, so two checkouts in one target directory reuse each other's build-script output)
   BUILD_ENV=("PATH=$PATH" "HOME=$W/home" "RUSTUP_HOME=$RUSTUP_HOME_REAL" "RUSTUP_AUTO_INSTALL=0"
-    "CARGO_HOME=$W/cargo-home" "CARGO_TARGET_DIR=$TARGET" "TMPDIR=$W/tmp" "LC_ALL=C" "LANG=C" "RUSTC_WRAPPER="
+    "CARGO_HOME=$W/cargo-home" "CARGO_TARGET_DIR=$TARGET/${1:-whir}" "TMPDIR=$W/tmp" "LC_ALL=C" "LANG=C" "RUSTC_WRAPPER="
     "RUSTC_WORKSPACE_WRAPPER=" "CARGO_TERM_COLOR=never" "CARGO_TERM_PROGRESS_WHEN=never" "LAMBDA_VM_NVCC_LINEINFO=1")
   local v
   for v in CUDA_HOME CUDA_PATH LD_LIBRARY_PATH; do
@@ -3407,8 +3408,8 @@ preflight() {
   else chk PASS "ram: $av GiB available (MemTotal $mt GiB, cgroup limit ${cg:-none}); need >= $NP_MIN_AVAIL_GIB before every run"; fi
   fr="$(free_gib "$W")"
   if [ -z "$fr" ]; then chk WARN "disk: cannot read the free space in $W"
-  elif ! num_ge "$fr" 20; then chk FAIL "disk: $fr GiB free in $W; need >= 30 (clone, cargo cache, two release CUDA builds, the traces)"
-  elif ! num_ge "$fr" 30; then chk WARN "disk: $fr GiB free in $W; 30 recommended"
+  elif ! num_ge "$fr" 12; then chk FAIL "disk: $fr GiB free in $W; need >= 20 (clone, cargo cache, two release CUDA builds, the traces)"
+  elif ! num_ge "$fr" 20; then chk WARN "disk: $fr GiB free in $W; 20 recommended"
   else chk PASS "disk: $fr GiB free in $W"; fi
 
   # -- Rust: the prover's toolchain, checked in the build's own environment (no guest is built)
@@ -3645,7 +3646,7 @@ pass_est() { # pass_est WORKLOAD MODE COUNT: seconds, a guide (the FAST dry run'
 
 estimate() { # a guide, printed before the long steps
   local b r=0 a=0 p=0 pass wl modes mode skip count nw
-  if [ -d "$TARGET/release/deps" ]; then b=2; else b=6; fi
+  if [ -d "$TARGET/whir/release/deps" ]; then b=2; else b=6; fi
   # shellcheck disable=SC2086 # the workload list, split on blanks
   nw="$(printf '%s\n' $NP_WORKLOADS | awk 'NF { n++ } END { print n + 0 }')"
   if [ "$NP_REFERENCE" = 1 ]; then r=$((nw * 80)); fi
@@ -3751,6 +3752,7 @@ build_one() { # build_one whir|stark: that pin's test binary into the shared tar
   local wl="$1" repo rc f n=0 empty=0 li=0 cdir test
   if [ "$wl" = whir ]; then repo="$REPO" test="$WHIR_TEST"; else repo="$REPO_S" test="$STARK_TEST"; fi
   step_begin "build $wl: cargo test --release -p lambda-vm-prover --features $FEATURES --lib --no-run (in $repo, lineinfo cubins)"
+  build_env "$wl"
   rc=0
   (cd "$repo" && exec env -i "${BUILD_ENV[@]}" ${ARCH_ENV[@]+"${ARCH_ENV[@]}"} timeout "$NP_BUILD_TIMEOUT" \
     cargo test --release -p lambda-vm-prover --features "$FEATURES" --lib --no-run --message-format=json-render-diagnostics) \
@@ -3787,7 +3789,6 @@ build_one() { # build_one whir|stark: that pin's test binary into the shared tar
 
 build_all() {
   local w
-  build_env
   for w in $NP_WORKLOADS; do
     BUILT_BIN=""
     build_one "$w"
@@ -3806,7 +3807,7 @@ write_env_facts() { # an allowlist of run facts (this file leaves the machine; t
     echo "tracked_files_modified_after_build=whir $(git -C "$REPO" status --porcelain --untracked-files=no | awk 'END { print NR }') stark $(git -C "$REPO_S" status --porcelain --untracked-files=no 2>/dev/null | awk 'END { print NR }')"
     echo "guest_elf=ethrex_8f826601.elf sha256 $ELF_SHA256 (from $ELF_COMMIT:$ELF_REPO_PATH)"
     echo "block_input=ethrex_mainnet_25368371 sha256 $INPUT_SHA256"
-    echo "build=cargo test --release -p lambda-vm-prover --features $FEATURES --lib, LAMBDA_VM_NVCC_LINEINFO=1, one target directory"
+    echo "build=cargo test --release -p lambda-vm-prover --features $FEATURES --lib, LAMBDA_VM_NVCC_LINEINFO=1, a target directory per pin"
     echo "test_binary_sha256=whir ${BIN_W:+$(sha256_of "$BIN_W")} stark ${BIN_S:+$(sha256_of "$BIN_S")}"
     echo "cubins=${CUBIN_NOTE:-?}"
     echo "gpu_index=$NP_GPU of $NGPUS"
@@ -4055,16 +4056,17 @@ run_passes() { # run B under ncu
 print_commands() {
   local w pass wl modes mode skip count nvtx kernels
   W="$NP_WORKDIR" REPO="$NP_WORKDIR/lambda_vm" REPO_S="$NP_WORKDIR/lambda_vm-stark" TARGET="$NP_WORKDIR/target"
-  BIN_W="<W>/target/release/deps/lambda_vm_prover-<hash-whir>" BIN_S="<W>/target/release/deps/lambda_vm_prover-<hash-stark>"
+  BIN_W="<W>/target/whir/release/deps/lambda_vm_prover-<hash>" BIN_S="<W>/target/stark/release/deps/lambda_vm_prover-<hash>"
   NSYS_BIN=nsys NCU_BIN=ncu NSYS_METRICS_FLAG=--gpu-metrics-devices NCU_HAS_KILL=1 NCU_METRICS_OK="<the metrics this ncu can collect>"
   WANT_METRICS=$([ "$NP_DRY" = 1 ] && echo 0 || echo 1)
   NVTX_LIB="$(find_nvtx_lib || true)"
   if [ -z "$NVTX_LIB" ]; then NVTX_LIB="<LAMBDA_VM_NVTX_LIB>"; fi
-  build_env
   echo "# noepoch_counters.sh $SCRIPT_VERSION --print-commands ($NP_MODE): nothing is run. Work directory $W"
   echo "# checkout: git clone $NP_REPO_URL $REPO; git checkout --detach $PIN_W; git worktree add --detach $REPO_S $PIN_S"
   echo "# fixtures: $NP_INPUT_URL (sha256 $INPUT_SHA256); $ELF_COMMIT:$ELF_REPO_PATH (sha256 $ELF_SHA256)"
+  build_env whir
   echo "build whir: (cd $REPO && env -i ${BUILD_ENV[*]} cargo test --release -p lambda-vm-prover --features $FEATURES --lib --no-run)"
+  build_env stark
   echo "build stark: (cd $REPO_S && env -i ${BUILD_ENV[*]} cargo test --release -p lambda-vm-prover --features $FEATURES --lib --no-run)"
   for w in $NP_WORKLOADS; do
     wl_env "$w" record
