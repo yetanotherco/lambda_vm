@@ -282,8 +282,8 @@ FAMILIES = [  # the summary's family of a kernel, by name
     (r"rpx_merkle_[a-z_]+", "merkle"),
     (r"rpx_grind_[a-z_]+", "grind"),
     (r"rpx_[a-z0-9_]*leaves[a-z0-9_]*", "leaves"),
-    (r"sumcheck_[a-z0-9_]+|program_map_ext3|eq_[a-z_]+|fraction_fold[a-z_]*|mle_[a-z0-9_]+|factors_from_columns_ext3"
-     r"|sum_partials_ext3|add_scaled_ext3|fill_ext3", "sumcheck"),
+    (r"sumcheck_[a-z0-9_]+|program_map_ext3|eq_[a-z0-9_]+|fraction_fold[a-z0-9_]*|mle_[a-z0-9_]+|factors_from_columns_ext3"
+     r"|sum_partials_ext3|add_scaled_ext3|fill_ext3|gkr_[a-z0-9_]+|zc_[a-z0-9_]+|batched_column_ext3", "argue"),
     (r"constraint_[a-z_]+|ccomp_[0-9a-f]+|comp_h_to_slabs_ext3|decompose_d2_ext3", "quotient"),
     (r"logup_[a-z0-9_]+", "logup"),
     (r"deep_[a-z0-9_]+|bit_reverse_ext3_interleaved|invert_[a-z0-9_]+|compute_denoms_ext3|batch_inverse_[a-z0-9_]+"
@@ -2391,7 +2391,9 @@ def selftest():
        and api_cat("cuModuleLoadData") == "module" and api_cat("cuWeird") == "other", "API categories")
     ok(norm_label(":rounds_2to4_table") == "rounds_2to4_table" and norm_label("epoch_prove[i=3]") == "epoch_prove",
        "NVTX labels")
-    ok(family_of("sumcheck_round_ext3") == "sumcheck" and family_of("whir_fold_ext3") == "whir-fold"
+    ok(family_of("sumcheck_round_ext3") == "argue" and family_of("gkr_round_gruen") == "argue"
+       and family_of("fraction_fold_ext3") == "argue" and family_of("zc_grid01") == "argue"
+       and family_of("whir_fold_ext3") == "whir-fold"
        and family_of("ccomp_0b8d15837e1e77a3") == "quotient" and family_of("rpx_leaves_base_coset") == "leaves",
        "kernel families")
     ok(comm_family("elf-beside-3") == "elf-beside" and comm_family("rayon-worker-12") == "rayon-worker",
@@ -2519,7 +2521,7 @@ def selftest():
         ok(abs(fnum(srows["phase_a"]["cpu_cores"]) - 2.0) < 1e-6 and abs(fnum(srows["setup"]["cpu_cores"]) - 0.5) < 1e-6,
            f"runa's cores per stage ({srows['phase_a']['cpu_cores']}, {srows['setup']['cpu_cores']})")
         fam = {r["stage"]: r for r in read_tsv(os.path.join(rout, "runa-whir-stage-families.tsv"))}
-        ok(abs(fnum(fam["phase_b"]["sumcheck_s"]) - 0.3) < 1e-6 and abs(fnum(fam["phase_b"]["whir-fold_s"]) - 0.4) < 1e-6
+        ok(abs(fnum(fam["phase_b"]["argue_s"]) - 0.3) < 1e-6 and abs(fnum(fam["phase_b"]["whir-fold_s"]) - 0.4) < 1e-6
            and abs(fnum(fam["phase_b"]["lde_s"]) - 0.05) < 1e-6, f"kernel families per stage ({fam.get('phase_b')})")
         hold = read_tsv(os.path.join(rout, "runa-whir-holds.tsv"))
         ok(len(hold) == 1 and hold[0]["phase"] == "multi_prove" and hold[0]["stage"] == "recursion"

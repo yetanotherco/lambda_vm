@@ -15,9 +15,9 @@
 #       CPU, from a /proc sampler beside the same runs.
 #
 # MODES  (one prover at a time; each step bounded by `timeout`; a deadline skips what would overrun)
-#   --quick (the default)  ~15 min after the build, peak host ~46 GiB. Run A (Nsight Systems with GPU metrics
-#       and the CPU sampler) on both workloads, then a few Nsight Compute passes on the top kernels: the
-#       WHIR phase-B and phase-A leaders and the LFM multi_prove leaders. Answers Q1's busy/idle, families
+#   --quick (the default)  ~15 min after the build, peak host ~48 GiB. Run A (Nsight Systems with GPU metrics
+#       and the CPU sampler) on both workloads, then five Nsight Compute passes on the top kernels: the WHIR
+#       phase-A coset leaves, the phase-B GKR and lean rounds, and the LFM multi_prove leaves and Merkle levels. Answers Q1's busy/idle, families
 #       and GPU-metric means per phase, Q2's per-hold busy and families, Q3, and a first roof reading.
 #   --full  ~45-60 min after the build, same peak. Adds a reference run of each workload without a
 #       profiler (its walls), and every Nsight Compute pass of the plan (one launch of each shape for
@@ -102,7 +102,7 @@
 #                      what this ncu and GPU can collect, since one unknown name makes ncu profile nothing)
 #   NP_CLOCK           ncu --clock-control: base (default, as on 09-25 and 09-28), boost or none
 #   NP_GPU_METRICS_HZ  run A's GPU-metrics sampling rate (default 2000)
-#   NP_NCU_VRAM_MB     run B's VRAM budget in MiB (default: each workload's own, as in run A)
+#   NP_NCU_VRAM_MB     run B's VRAM budget in MiB (default: WHIR its record's, STARK 16000 as on 09-28)
 #   NP_DEADLINE_MIN    minutes from the start after which nothing new starts (quick 35, full 80)
 #   NP_PASS_TIMEOUT    seconds per run-B pass (900) · NP_RUN_TIMEOUT per reference / run-A run (900)
 #   NP_BUILD_TIMEOUT   seconds for each build (2400)
@@ -183,28 +183,29 @@ l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_gl
 # PLAN_ROWS_BEGIN
 plan_rows() {
   printf '%s\n' \
-    "whir_b_sumcheck	whir	quick,full	config	0	1	blk_phase_b	sumcheck_round_ext3	sumcheck	phase B, the zerocheck/GKR sumcheck rounds: one launch of each shape" \
-    "whir_a_leaves	whir	quick,full	config	0	1	blk_phase_a	rpx_leaves_base_coset	leaves	phase A, the round-0 coset leaves of the group commits: one launch of each shape" \
-    "whir_a_merkle	whir	full	config	0	1	blk_phase_a	rpx_merkle_level	merkle	phase A, Merkle internal levels: one launch of each width" \
-    "whir_a_lde	whir	full	window	0	12	blk_phase_a	ntt_cm_di[ft]_k[4-8]|mobius_(tile|low_levels|level)	lde	phase A, the encoding (column-major NTT, Mobius): the first 12" \
-    "whir_b_argue	whir	full	window	0	24	blk_phase_b	sumcheck_fold_ext3|fraction_fold(_padded)?_ext3|eq_expand_level(_shares)?_ext3|eq_seed_shares_ext3|factors_from_columns_ext3|mle_lift_base_ext3|mle_fold_base_ext3(_many)?|sum_partials_ext3	sumcheck	phase B, the GKR layers and folds: the first 24" \
-    "whir_b_program_map	whir	full	config	0	1	blk_phase_b	program_map_ext3	sumcheck	phase B, the zerocheck's constraint program map: one launch of each shape" \
-    "whir_b_open	whir	full	window	0	16	blk_phase_b	whir_lean_(round|materialize|colmap)|whir_fold_(k_)?(base_)?ext3|gather_cosets|rpx_leaves_ext3_coset	whir-fold	phase B, the opening (lean rounds, k-folds, folded leaves): the first 16" \
-    "whir_b_encode	whir	full	window	0	12	blk_b_encode	ntt_cm_di[ft]_k[4-8]|mobius_(tile|low_levels|level)|rpx_leaves_base_coset	lde	phase B, the re-encode before each opening: the first 12" \
-    "whir_b_merkle	whir	full	config	0	1	blk_phase_b	rpx_merkle_level	merkle	phase B, Merkle internal levels: one launch of each width" \
-    "whir_b_grind	whir	full	window	0	5	blk_phase_b	rpx_grind_search_queue	grind	phase B, grinding: the first 5" \
-    "stark_lfm_leaves	stark	quick,full	config	0	1	cardhold_multi_prove	rpx_leaves_base_row_pair_batched	leaves	LFM multi_prove, main-trace leaves: one launch of each shape" \
-    "stark_lfm_quotient	stark	quick,full	window	0	24	cardhold_multi_prove	ccomp_[0-9a-f]+|constraint_composition_kernel	quotient	LFM multi_prove, the compiled constraint kernels: the first 24" \
-    "stark_lfm_merkle	stark	full	config	0	1	cardhold_multi_prove	rpx_merkle_level	merkle	LFM multi_prove, Merkle internal levels: one launch of each width" \
-    "stark_lfm_ntt7	stark	full	config	0	1	cardhold_multi_prove	ntt_cm_dit_k7	lde	LFM multi_prove, the column-major NTT k7: one launch of each shape" \
-    "stark_lfm_ntt8	stark	full	config	0	1	cardhold_multi_prove	ntt_cm_dit_k8	lde	LFM multi_prove, the column-major NTT k8: one launch of each shape" \
-    "stark_lfm_ext3_leaves	stark	full	config	0	1	cardhold_multi_prove	rpx_leaves_ext3_batched	leaves	LFM multi_prove, aux-trace leaves: one launch of each shape" \
-    "stark_lfm_comp_poly	stark	full	config	0	1	cardhold_multi_prove	rpx_comp_poly_leaves_ext3	leaves	LFM multi_prove, composition-polynomial leaves: one launch of each shape" \
-    "stark_lfm_deep	stark	full	config	0	1	cardhold_multi_prove	deep_composition_ext3_fused_m3	deep	LFM multi_prove, DEEP composition: one launch of each shape" \
-    "stark_lfm_fri	stark	full	config	0	1	cardhold_multi_prove	rpx_fri_group_leaves_ext3	leaves	LFM multi_prove, FRI layer leaves: one launch of each shape" \
-    "stark_lfm_logup	stark	full	window	0	8	cardhold_multi_prove	logup_[a-z0-9_]+	logup	LFM multi_prove, LogUp aux columns: the first 8" \
-    "stark_lfm_grind	stark	full	window	0	5	cardhold_multi_prove	rpx_grind_search_queue	grind	LFM multi_prove, grinding: the first 5" \
-    "stark_art_commit	stark	full	window	0	16	cardhold_build_artifacts	ntt_cm_di[ft]_k[4-8]|rpx_leaves_[a-z0-9_]+|rpx_merkle_level(_warp)?	lde	LFM artifact builds, the preprocessed commits: the first 16"
+    "whir_a_leaves	whir	quick,full	config	0	1	blk_phase_a	rpx_leaves_base_coset	leaves	phase A, the round-0 coset leaves (4.13 of 5.53 kernel-s on FAST 492): one launch of each shape" \
+    "whir_a_merkle	whir	full	config	0	1	blk_phase_a	rpx_merkle_level	merkle	phase A, Merkle internal levels (0.59 s): one launch of each width" \
+    "whir_a_lde	whir	full	window	0	12	blk_phase_a	ntt_cm_dit_k[678]|mobius_(tile|low_levels|level)	lde	phase A, the encoding (NTT k7/k8 0.61 s, Mobius 0.19 s): the first 12" \
+    "whir_b_gkr	whir	quick,full	config	0	1	blk_phase_b	gkr_round_gruen	argue	phase B, the GKR rounds (0.85 s, 17219 launches): one launch of each shape" \
+    "whir_b_lean	whir	quick,full	config	0	1	blk_phase_b	whir_lean_round	whir-fold	phase B, the opening's lean rounds (0.78 s): one launch of each shape" \
+    "whir_b_grind	whir	full	window	0	5	blk_phase_b	rpx_grind_search_queue	grind	phase B, grinding (0.52 s): the first 5" \
+    "whir_b_fold	whir	full	config	0	1	blk_phase_b	whir_fold_k_base_ext3	whir-fold	phase B, the k-folds (0.43 s): one launch of each shape" \
+    "whir_b_leaves	whir	full	config	0	1	blk_phase_b	rpx_leaves_ext3_coset	leaves	phase B, the folded codewords' leaves (0.26 s): one launch of each shape" \
+    "whir_b_zc	whir	full	window	0	24	blk_phase_b	fraction_fold_ext3|zc_round_gruen|zc_grid01|gkr_input_from_columns|zc_fold2|zc_bus_u|batched_column_ext3|whir_lean_materialize	argue	phase B, the zerocheck and GKR glue (fraction folds 0.28, zc rounds 0.18, grid 0.15, GKR input 0.13 s): the first 24" \
+    "whir_b_small	whir	full	window	0	24	blk_phase_b	sumcheck_fold_ext3|sum_partials_ext3|eq_expand_level_ext3|sumcheck_round_ext3_int	argue	phase B, the narrow sumcheck launches (57k launches, 0.2 s): the first 24" \
+    "whir_b_encode	whir	full	window	0	12	blk_b_encode	ntt_cm_dit_k[678]|mobius_(tile|low_levels|level)	lde	phase B, the re-encode before each opening (0.80 s): the first 12" \
+    "whir_rec_rowpair	whir	full	config	0	1	cardhold_multi_prove	rpx_leaves_base_row_pair_batched	leaves	the WHIR tree's LFM proofs, main-trace row-pair leaves (1.05 of 2.79 held kernel-s): one launch of each shape" \
+    "stark_lfm_leaves	stark	quick,full	config	0	1	cardhold_multi_prove	rpx_leaves_base_batched	leaves	LFM multi_prove, batched main-trace leaves (1.65 of 8.06 kernel-s): one launch of each shape" \
+    "stark_lfm_merkle	stark	quick,full	config	0	1	cardhold_multi_prove	rpx_merkle_level	merkle	LFM multi_prove, Merkle internal levels (1.56 s): one launch of each width" \
+    "stark_lfm_rowpair	stark	full	config	0	1	cardhold_multi_prove	rpx_leaves_base_row_pair_batched	leaves	LFM multi_prove, row-pair leaves (1.25 s): one launch of each shape" \
+    "stark_lfm_grind	stark	full	window	0	5	cardhold_multi_prove	rpx_grind_search_queue	grind	LFM multi_prove, grinding (0.50 s): the first 5" \
+    "stark_lfm_warp	stark	full	window	0	16	cardhold_multi_prove	rpx_merkle_level_warp|rpx_merkle_tail_warp	merkle	LFM multi_prove, the narrow Merkle levels (0.51 s, 6196 launches): the first 16" \
+    "stark_lfm_comp_poly	stark	full	config	0	1	cardhold_multi_prove	rpx_comp_poly_leaves_ext3	leaves	LFM multi_prove, composition-polynomial leaves (0.37 s): one launch of each shape" \
+    "stark_lfm_deep	stark	full	config	0	1	cardhold_multi_prove	deep_composition_ext3_fused_m3	deep	LFM multi_prove, DEEP composition (0.32 s): one launch of each shape" \
+    "stark_lfm_fri	stark	full	config	0	1	cardhold_multi_prove	rpx_fri_group_leaves_ext3	leaves	LFM multi_prove, FRI layer leaves (0.27 s): one launch of each shape" \
+    "stark_lfm_ntt	stark	full	window	0	24	cardhold_multi_prove	ntt_cm_di[ft]_k[4-8]|ntt_dit_level_row_major|matrix_transpose_strided	lde	LFM multi_prove, the NTTs (0.79 s, 15k launches): the first 24" \
+    "stark_lfm_quotient	stark	full	window	0	16	cardhold_multi_prove	ccomp_[0-9a-f]+|constraint_composition_kernel	quotient	LFM multi_prove, the compiled constraint kernels (0.11 s): the first 16" \
+    "stark_art_commit	stark	full	window	0	16	cardhold_build_artifacts	rpx_leaves_base_batched|rpx_leaves_base_row_pair_batched|rpx_merkle_level|ntt_cm_dit_k7	leaves	LFM artifact builds, the preprocessed commits (2.33 s held in the tree): the first 16"
 }
 # PLAN_ROWS_END
 default_plan() {
@@ -747,8 +748,8 @@ FAMILIES = [  # the summary's family of a kernel, by name
     (r"rpx_merkle_[a-z_]+", "merkle"),
     (r"rpx_grind_[a-z_]+", "grind"),
     (r"rpx_[a-z0-9_]*leaves[a-z0-9_]*", "leaves"),
-    (r"sumcheck_[a-z0-9_]+|program_map_ext3|eq_[a-z_]+|fraction_fold[a-z_]*|mle_[a-z0-9_]+|factors_from_columns_ext3"
-     r"|sum_partials_ext3|add_scaled_ext3|fill_ext3", "sumcheck"),
+    (r"sumcheck_[a-z0-9_]+|program_map_ext3|eq_[a-z0-9_]+|fraction_fold[a-z0-9_]*|mle_[a-z0-9_]+|factors_from_columns_ext3"
+     r"|sum_partials_ext3|add_scaled_ext3|fill_ext3|gkr_[a-z0-9_]+|zc_[a-z0-9_]+|batched_column_ext3", "argue"),
     (r"constraint_[a-z_]+|ccomp_[0-9a-f]+|comp_h_to_slabs_ext3|decompose_d2_ext3", "quotient"),
     (r"logup_[a-z0-9_]+", "logup"),
     (r"deep_[a-z0-9_]+|bit_reverse_ext3_interleaved|invert_[a-z0-9_]+|compute_denoms_ext3|batch_inverse_[a-z0-9_]+"
@@ -2856,7 +2857,9 @@ def selftest():
        and api_cat("cuModuleLoadData") == "module" and api_cat("cuWeird") == "other", "API categories")
     ok(norm_label(":rounds_2to4_table") == "rounds_2to4_table" and norm_label("epoch_prove[i=3]") == "epoch_prove",
        "NVTX labels")
-    ok(family_of("sumcheck_round_ext3") == "sumcheck" and family_of("whir_fold_ext3") == "whir-fold"
+    ok(family_of("sumcheck_round_ext3") == "argue" and family_of("gkr_round_gruen") == "argue"
+       and family_of("fraction_fold_ext3") == "argue" and family_of("zc_grid01") == "argue"
+       and family_of("whir_fold_ext3") == "whir-fold"
        and family_of("ccomp_0b8d15837e1e77a3") == "quotient" and family_of("rpx_leaves_base_coset") == "leaves",
        "kernel families")
     ok(comm_family("elf-beside-3") == "elf-beside" and comm_family("rayon-worker-12") == "rayon-worker",
@@ -2984,7 +2987,7 @@ def selftest():
         ok(abs(fnum(srows["phase_a"]["cpu_cores"]) - 2.0) < 1e-6 and abs(fnum(srows["setup"]["cpu_cores"]) - 0.5) < 1e-6,
            f"runa's cores per stage ({srows['phase_a']['cpu_cores']}, {srows['setup']['cpu_cores']})")
         fam = {r["stage"]: r for r in read_tsv(os.path.join(rout, "runa-whir-stage-families.tsv"))}
-        ok(abs(fnum(fam["phase_b"]["sumcheck_s"]) - 0.3) < 1e-6 and abs(fnum(fam["phase_b"]["whir-fold_s"]) - 0.4) < 1e-6
+        ok(abs(fnum(fam["phase_b"]["argue_s"]) - 0.3) < 1e-6 and abs(fnum(fam["phase_b"]["whir-fold_s"]) - 0.4) < 1e-6
            and abs(fnum(fam["phase_b"]["lde_s"]) - 0.05) < 1e-6, f"kernel families per stage ({fam.get('phase_b')})")
         hold = read_tsv(os.path.join(rout, "runa-whir-holds.tsv"))
         ok(len(hold) == 1 and hold[0]["phase"] == "multi_prove" and hold[0]["stage"] == "recursion"
@@ -3257,13 +3260,16 @@ wl_env() { # wl_env whir|stark record|runb: the workload's knobs, as its FAST re
       WL_ENV+=($NP_WHIR_KNOBS)
       WL_TEST="$WHIR_TEST" WL_BIN="$BIN_W" WL_REPO="$REPO" ;;
     stark)
-      # s3-cj.sh's tree arm env (FAST 456, the 31.78 s record): BLOCK_ENV + B2, LFM_CARD_TRACE for the hold lines
+      # s3-cj.sh's tree arm env (FAST 456, the 31.78 s record): BLOCK_ENV + B2, LFM_CARD_TRACE for the hold lines.
+      # Run B: a 16000 MiB budget and no pool retention (as mauro-ncu.sh 09-28), so ncu's save-and-restore keeps
+      # room on the card; the LFM proofs' kernel shapes do not depend on the budget.
       local budget="$STARK_VRAM_MB"
-      if [ "$2" = runb ] && [ -n "$NP_NCU_VRAM_MB" ]; then budget="$NP_NCU_VRAM_MB"; fi
+      if [ "$2" = runb ]; then budget="${NP_NCU_VRAM_MB:-16000}"; fi
       WL_ENV=("NOEPOCH_ELF=$elf" "NOEPOCH_INPUT=$input" "TABLE_PARALLELISM=8" "LAMBDA_VM_VRAM_BUDGET_MB=$budget"
         "LAMBDA_VM_MAX_ROWS_LOG2=21" "LFM_PROVE_SPLIT=1" "LAMBDA_VM_BASE_SPLIT=1" "LFM_EXEC_PARALLEL=1"
         "LFM_PRECOMPUTED_TREE_CACHE_CAP=64" "$jem" "LFM_TREE_SIBLINGS_L0=8" "LFM_TREE_SIBLINGS=4"
         "LAMBDA_VM_GATE_PACKING=1" "LFM_CARD_TRACE=1" "CARGO_MANIFEST_DIR=$REPO_S/prover")
+      if [ "$2" = runb ]; then WL_ENV+=("LAMBDA_VM_MEMPOOL_RELEASE_MB=0"); fi
       # shellcheck disable=SC2206 # as above
       WL_ENV+=($NP_STARK_KNOBS)
       WL_TEST="$STARK_TEST" WL_BIN="$BIN_S" WL_REPO="$REPO_S" ;;
