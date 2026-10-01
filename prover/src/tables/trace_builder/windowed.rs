@@ -513,14 +513,15 @@ fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + 
 /// The windows' lists concatenated into the run's, once: list by list in
 /// parallel, each window's list freed as it is copied.
 /// Whether [`concatenate`] copies each list's windows one after another on one
-/// thread — the default — or in parallel (`LAMBDA_VM_BUILDER_CONCAT=parallel`).
-/// The parallel copy stays off until its gain replicates (FAST 417 read it at
-/// −0.52 s of base, short of its band). Read once. The two give the same lists.
+/// thread (`LAMBDA_VM_BUILDER_CONCAT=serial`), the control for the parallel copy
+/// that is the default: on block 25368371 it read −0.52 s of base (FAST 417) and
+/// replicated in its re-registered band at −0.21 s (FAST 419). Read once. The
+/// two give the same lists.
 #[cfg(feature = "parallel")]
 fn serial_concat() -> bool {
     static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SERIAL.get_or_init(|| {
-        !std::env::var("LAMBDA_VM_BUILDER_CONCAT").is_ok_and(|v| v.trim() == "parallel")
+        std::env::var("LAMBDA_VM_BUILDER_CONCAT").is_ok_and(|v| v.trim() == "serial")
     })
 }
 
