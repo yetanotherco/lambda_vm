@@ -1375,6 +1375,16 @@ fn fixture_block_options() -> crate::ProofOptions {
 /// A small guest proved as one no-epoch block on the host: every table cut at
 /// 2^5 rows (`MaxRowsConfig::small`), so most types run several instances.
 fn small_block(name: &str, input: &[u8], opts: &crate::ProofOptions) -> (Vec<u8>, crate::VmProof) {
+    small_block_at(name, input, opts, &crate::tables::MaxRowsConfig::small())
+}
+
+/// [`small_block`] at other table caps.
+fn small_block_at(
+    name: &str,
+    input: &[u8],
+    opts: &crate::ProofOptions,
+    max_rows: &crate::tables::MaxRowsConfig,
+) -> (Vec<u8>, crate::VmProof) {
     use executor::vm::execution::Executor;
     let elf_bytes = crate::test_utils::asm_elf_bytes(name);
     let program = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
@@ -1385,7 +1395,7 @@ fn small_block(name: &str, input: &[u8], opts: &crate::ProofOptions) -> (Vec<u8>
     let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
         &program,
         &run.logs,
-        &crate::tables::MaxRowsConfig::small(),
+        max_rows,
         input,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
@@ -1962,6 +1972,69 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
     println!(
         "BLOCK VERIFIER FIXTURE: cached ELF constants accepted; another ELF's constants refused \
          ({})",
+        refused.err().unwrap_or_default()
+    );
+}
+
+/// ★ ECDAS chunked through the block's recursion: test_ecsm_multi's 42 ECDAS
+/// steps at 16 rows a chunk (three instances; the 0xABCDEF call runs through
+/// all three) prove as a block whose tree the block verifier derives and
+/// accepts. The same proof's shape with one ECDAS instance declared over
+/// [`crate::BLOCK_ECDAS_MAX_ROWS`] is refused before any program is derived.
+#[test]
+#[ignore = "proves a VM block and its tree; box tier"]
+fn the_block_tree_verifies_a_chunked_ecdas() {
+    let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let max_rows = crate::tables::MaxRowsConfig {
+        ecdas: 16,
+        ..crate::tables::MaxRowsConfig::small()
+    };
+    let (elf_bytes, proof) = small_block_at("test_ecsm_multi", &[], &opts, &max_rows);
+    let shape = BlockShape::of_proof(&proof);
+    assert_eq!(shape.table_counts.ecdas, 3, "three ECDAS instances");
+    let (rb, ..) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
+    let partition = rb.plan.partition().clone();
+    let leaves: Vec<RealChild> = (0..partition.num_leaves())
+        .map(|k| {
+            prove_as_child(
+                &format!("plan leaf {k}"),
+                &block_leaf_program(&rb, k),
+                &block_leaf_arenas(&rb, &partition, k),
+                &wrap_opts,
+            )
+        })
+        .collect();
+    let (top, top_proof, _) = compose_block_tree(&rb.plan, leaves, &wrap_opts, 1);
+    assert_top_claims_the_block(&top, &rb);
+    let verify = |shape: &BlockShape| {
+        super::block_plan::verify_block_tree_under(
+            &elf_bytes,
+            &opts,
+            &wrap_opts,
+            None,
+            shape,
+            &proof.public_output,
+            &top_proof,
+        )
+    };
+    let derived = verify(&shape).expect("the verifier accepts the chunked block");
+    assert_eq!(derived, top.artifacts.program_id);
+
+    let c = &shape.table_counts;
+    let first_ecdas = crate::FIXED_TABLE_COUNT + c.commit + c.keccak + c.keccak_rnd + c.ecsm;
+    assert!(rb.plan.instance(first_ecdas).name.starts_with("ECDAS["));
+    let mut tall = shape.clone();
+    tall.trace_lengths[first_ecdas] = 2 * crate::BLOCK_ECDAS_MAX_ROWS;
+    let refused = verify(&tall);
+    assert!(
+        refused.is_err(),
+        "an ECDAS instance declared over its cap must be refused"
+    );
+    println!(
+        "BLOCK TREE ECDAS CHUNKED: {} leaf(s), 3 ECDAS instances, accepted; an ECDAS over its cap \
+         refused ({})",
+        partition.num_leaves(),
         refused.err().unwrap_or_default()
     );
 }
