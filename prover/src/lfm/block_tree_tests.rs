@@ -1637,7 +1637,9 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
 /// read — and accepts the honest tree's top proof over the plan's OWN partition
 /// and carrier. It refuses the same top proof under another ELF, another
 /// claimed output, and a shape that lies about one trace length (each derives
-/// another top or another claim).
+/// another top or another claim). Over ELF constants computed ahead
+/// ([`super::block_plan::verify_block_tree_with`]'s path) it accepts the same
+/// top, and refuses another ELF's constants.
 #[test]
 #[ignore = "proves a VM block and its tree; box tier"]
 fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
@@ -1667,7 +1669,7 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
 
     let verify = |elf: &[u8], shape: &BlockShape, output: &[u8]| {
         super::block_plan::verify_block_tree_under(
-            elf, &opts, &wrap_opts, shape, output, &top_proof,
+            elf, &opts, &wrap_opts, None, shape, output, &top_proof,
         )
     };
     let derived =
@@ -1702,6 +1704,32 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
         "BLOCK VERIFIER FIXTURE: accepts the plan's tree; refuses another ELF ({}), another \
          output, a trace-length lie",
         other.err().unwrap_or_default()
+    );
+
+    let with = |consts: &super::block_plan::ElfConstants| {
+        super::block_plan::verify_block_tree_under(
+            &elf_bytes,
+            &opts,
+            &wrap_opts,
+            Some(consts),
+            &shape,
+            &proof.public_output,
+            &top_proof,
+        )
+    };
+    let consts = super::block_plan::ElfConstants::compute(&elf_bytes, &opts).expect("constants");
+    assert_eq!(
+        with(&consts).expect("the verifier accepts the block over cached constants"),
+        derived,
+        "cached constants derive the same top"
+    );
+    let theirs = super::block_plan::ElfConstants::compute(&other_elf, &opts).expect("constants");
+    let refused = with(&theirs);
+    assert!(refused.is_err(), "another ELF's constants must be refused");
+    println!(
+        "BLOCK VERIFIER FIXTURE: cached ELF constants accepted; another ELF's constants refused \
+         ({})",
+        refused.err().unwrap_or_default()
     );
 }
 
@@ -2067,10 +2095,19 @@ fn the_block_tree_composes_to_a_top_node() {
     // the ELF's id and the output. A forced partition is another tree: then the
     // harness's own plan derives its top instead.
     let t = Instant::now();
+    let mut split = None;
     let derived = match forced {
         None => {
-            super::block_plan::verify_block_tree(&elf_bytes, &shape, &rb.public_output, &top_proof)
-                .expect("the block verifier accepts the tree")
+            let (id, times) = super::block_plan::verify_block_tree_timed(
+                &elf_bytes,
+                None,
+                &shape,
+                &rb.public_output,
+                &top_proof,
+            )
+            .expect("the block verifier accepts the tree");
+            split = Some(times);
+            id
         }
         Some(_) => {
             let top = rb
@@ -2100,4 +2137,25 @@ fn the_block_tree_composes_to_a_top_node() {
         },
         t.elapsed().as_secs_f64()
     );
+    if let Some(split) = split {
+        println!("   BLOCK VERIFIER split (cold): {split}");
+    }
+    // Warm: the ELF constants a consumer caches per ELF (the harness's, computed
+    // beside the base under the same options).
+    if let (None, Some(consts)) = (forced, consts.as_deref()) {
+        let t = Instant::now();
+        let (id, warm) = super::block_plan::verify_block_tree_timed(
+            &elf_bytes,
+            Some(consts),
+            &shape,
+            &rb.public_output,
+            &top_proof,
+        )
+        .expect("the block verifier accepts the tree over cached constants");
+        assert_eq!(id, derived, "cached constants derive the same top");
+        println!(
+            "   BLOCK VERIFIER warm (ELF constants cached): {:.2}s ({warm})",
+            t.elapsed().as_secs_f64()
+        );
+    }
 }

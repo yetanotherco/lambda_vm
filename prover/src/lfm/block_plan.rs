@@ -36,6 +36,8 @@
 //! another partition, another carrier, a weakened shape — has another top, and
 //! its proof is refused there.
 
+use std::time::Instant;
+
 use stark::config::Commitment;
 
 use crate::tables::types::FE;
@@ -468,44 +470,51 @@ impl BlockTreePlan {
     /// artifacts built, each node emitted over its children's derived shapes —
     /// level by level, under the tree's options `wrap_opts`.
     pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
+        self.derive_top_timed(wrap_opts).map(|(top, _)| top)
+    }
+
+    /// [`Self::derive_top`] and its stopwatch, one [`PhaseTimes`] per level (the
+    /// leaves, then each node level). A level's programs are emitted and built
+    /// in parallel.
+    pub(crate) fn derive_top_timed(
+        &self,
+        wrap_opts: &crate::ProofOptions,
+    ) -> Result<(LfmArtifacts, Vec<PhaseTimes>), String> {
         let words = self.child_layout().total();
-        let child = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
-            let artifacts = artifacts_of(program, wrap_opts);
-            let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
-            Ok((artifacts, derived))
-        };
-        let leaf = |k: usize| child(&self.leaf_program(k)?);
-        #[cfg(feature = "parallel")]
-        let mut level: Vec<(LfmArtifacts, DerivedChild)> = {
-            use rayon::prelude::*;
-            (0..self.partition.num_leaves())
-                .into_par_iter()
-                .map(leaf)
-                .collect::<Result<_, String>>()?
-        };
-        #[cfg(not(feature = "parallel"))]
-        let mut level: Vec<(LfmArtifacts, DerivedChild)> = (0..self.partition.num_leaves())
-            .map(leaf)
-            .collect::<Result<_, String>>()?;
+        let mut phases = Vec::new();
+        let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
+        let mut level = derive_level(
+            &leaves,
+            |&k| self.leaf_program(k),
+            wrap_opts,
+            words,
+            &mut phases,
+        )?;
         let levels = self.levels();
         for (lv, arities) in levels.iter().enumerate() {
             let top = lv + 1 == levels.len();
-            let mut next = Vec::with_capacity(arities.arities.len());
+            let mut groups = Vec::with_capacity(arities.arities.len());
             let mut rest = level.into_iter();
             for &a in &arities.arities {
                 let kids: Vec<DerivedChild> = rest.by_ref().take(a).map(|(_, d)| d).collect();
                 if kids.len() != a {
                     return Err(format!("level {}: arities overrun the children", lv + 1));
                 }
-                next.push(child(&self.node_program(&kids, top)?)?);
+                groups.push(kids);
             }
             if rest.next().is_some() {
                 return Err(format!("level {}: arities leave children over", lv + 1));
             }
-            level = next;
+            level = derive_level(
+                &groups,
+                |kids| self.node_program(kids, top),
+                wrap_opts,
+                words,
+                &mut phases,
+            )?;
         }
         match <[_; 1]>::try_from(level) {
-            Ok([(artifacts, _)]) => Ok(artifacts),
+            Ok([(artifacts, _)]) => Ok((artifacts, phases)),
             Err(level) => Err(format!("the tree closes to {} nodes", level.len())),
         }
     }
@@ -622,6 +631,93 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
     )
 }
 
+/// One level of a tree's derivation: each item's program emitted, its artifacts
+/// built and its shape as a child derived, in parallel and in order. Pushes the
+/// level's stopwatch onto `phases`.
+fn derive_level<T: Sync>(
+    items: &[T],
+    emit: impl Fn(&T) -> Result<LfmProgram, String> + Sync,
+    wrap_opts: &crate::ProofOptions,
+    words: usize,
+    phases: &mut Vec<PhaseTimes>,
+) -> Result<Vec<(LfmArtifacts, DerivedChild)>, String> {
+    let t = Instant::now();
+    let one = |item: &T| -> Result<(LfmArtifacts, DerivedChild, f64, f64), String> {
+        let t = Instant::now();
+        let program = emit(item)?;
+        let emitted = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let artifacts = artifacts_of(&program, wrap_opts);
+        let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+        Ok((artifacts, derived, emitted, t.elapsed().as_secs_f64()))
+    };
+    #[cfg(feature = "parallel")]
+    let done: Vec<_> = {
+        use rayon::prelude::*;
+        items.par_iter().map(one).collect::<Result<_, String>>()?
+    };
+    #[cfg(not(feature = "parallel"))]
+    let done: Vec<_> = items.iter().map(one).collect::<Result<_, String>>()?;
+    let mut phase = PhaseTimes {
+        programs: done.len(),
+        ..PhaseTimes::default()
+    };
+    let level = done
+        .into_iter()
+        .map(|(artifacts, derived, emitted, built)| {
+            phase.emit += emitted;
+            phase.build += built;
+            (artifacts, derived)
+        })
+        .collect();
+    phase.wall = t.elapsed().as_secs_f64();
+    phases.push(phase);
+    Ok(level)
+}
+
+/// One level of a tree's derivation, in seconds: its wall time, and its
+/// programs' emit and build summed (they run in parallel).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PhaseTimes {
+    pub programs: usize,
+    pub wall: f64,
+    pub emit: f64,
+    pub build: f64,
+}
+
+/// The block verifier's stopwatch, in seconds.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VerifyTimes {
+    /// The ELF constants (zero when the caller supplied them).
+    pub constants: f64,
+    /// The plan, past its constants.
+    pub plan: f64,
+    /// The top program's derivation, level by level (the leaves first).
+    pub levels: Vec<PhaseTimes>,
+    /// The top proof verified against the derived program, and its words
+    /// checked against the block.
+    pub check: f64,
+}
+
+impl std::fmt::Display for VerifyTimes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "constants {:.2} · plan {:.2}", self.constants, self.plan)?;
+        for (i, l) in self.levels.iter().enumerate() {
+            let name = if i == 0 {
+                "leaves".to_string()
+            } else {
+                format!("L{i}")
+            };
+            write!(
+                f,
+                " · {name} {} in {:.2} (emit Σ {:.2}, build Σ {:.2})",
+                l.programs, l.wall, l.emit, l.build
+            )?;
+        }
+        write!(f, " · check {:.2}", self.check)
+    }
+}
+
 /// The public output as the statement's 32-bit halves, little-endian, the last
 /// one zero-padded.
 pub fn le_halves(bytes: &[u8]) -> Vec<FE> {
@@ -658,21 +754,9 @@ pub fn top_claims(plan: &BlockTreePlan, words: &[(u32, LfmWord)], public_output:
             .all(|(i, v)| words[layout.out_half(i)].1 == base_word(*v))
 }
 
-/// The plan and its top program's artifacts, from the trusted ELF, the base
-/// options, the tree's options and the claimed shape — no proof read.
-pub(crate) fn derive_block_top(
-    elf_bytes: &[u8],
-    opts: &crate::ProofOptions,
-    wrap_opts: &crate::ProofOptions,
-    shape: &BlockShape,
-) -> Result<(BlockTreePlan, LfmArtifacts), String> {
-    let plan = BlockTreePlan::derive(elf_bytes, opts, shape)?;
-    let top = plan.derive_top(wrap_opts)?;
-    Ok((plan, top))
-}
-
 /// ★ The no-epoch block's verifier, over its tree's top proof: derive the plan
-/// and the top program ([`derive_block_top`]) under the block presets — the base
+/// ([`BlockTreePlan::derive`]) and the top program
+/// ([`BlockTreePlan::derive_top`]) under the block presets — the base
 /// under [`super::proof::block_base_options`], the tree under
 /// [`super::proof::aggregation_wrap_options`], verifier constants, never a
 /// caller's or a prover's — verify `top` against that program, and check that it
@@ -689,10 +773,37 @@ pub fn verify_block_tree(
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
+    verify_block_tree_timed(elf_bytes, None, shape, public_output, top).map(|(id, _)| id)
+}
+
+/// [`verify_block_tree`] over ELF constants computed ahead
+/// ([`ElfConstants::compute`] under [`super::proof::block_base_options`]), so a
+/// consumer verifying many blocks of one ELF computes them once. Refuses
+/// constants of another ELF or other options, as [`BlockTreePlan::derive_with`]
+/// does.
+pub fn verify_block_tree_with(
+    elf_bytes: &[u8],
+    consts: &ElfConstants,
+    shape: &BlockShape,
+    public_output: &[u8],
+    top: &super::proof::LfmProof,
+) -> Result<Commitment, String> {
+    verify_block_tree_timed(elf_bytes, Some(consts), shape, public_output, top).map(|(id, _)| id)
+}
+
+/// [`verify_block_tree`], over `consts` when given, and its stopwatch.
+pub(crate) fn verify_block_tree_timed(
+    elf_bytes: &[u8],
+    consts: Option<&ElfConstants>,
+    shape: &BlockShape,
+    public_output: &[u8],
+    top: &super::proof::LfmProof,
+) -> Result<(Commitment, VerifyTimes), String> {
     verify_under(
         elf_bytes,
         &super::proof::block_base_options(),
         &super::proof::aggregation_wrap_options(),
+        consts,
         shape,
         public_output,
         top,
@@ -706,22 +817,49 @@ pub(crate) fn verify_block_tree_under(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
     wrap_opts: &crate::ProofOptions,
+    consts: Option<&ElfConstants>,
     shape: &BlockShape,
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
-    verify_under(elf_bytes, opts, wrap_opts, shape, public_output, top)
+    verify_under(
+        elf_bytes,
+        opts,
+        wrap_opts,
+        consts,
+        shape,
+        public_output,
+        top,
+    )
+    .map(|(id, _)| id)
 }
 
 fn verify_under(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
     wrap_opts: &crate::ProofOptions,
+    consts: Option<&ElfConstants>,
     shape: &BlockShape,
     public_output: &[u8],
     top: &super::proof::LfmProof,
-) -> Result<Commitment, String> {
-    let (plan, artifacts) = derive_block_top(elf_bytes, opts, wrap_opts, shape)?;
+) -> Result<(Commitment, VerifyTimes), String> {
+    let mut times = VerifyTimes::default();
+    let computed;
+    let consts = match consts {
+        Some(consts) => consts,
+        None => {
+            let t = Instant::now();
+            computed = ElfConstants::compute(elf_bytes, opts)?;
+            times.constants = t.elapsed().as_secs_f64();
+            &computed
+        }
+    };
+    let t = Instant::now();
+    let plan = BlockTreePlan::derive_with(elf_bytes, opts, shape, consts)?;
+    times.plan = t.elapsed().as_secs_f64();
+    let (artifacts, levels) = plan.derive_top_timed(wrap_opts)?;
+    times.levels = levels;
+    let t = Instant::now();
     if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
     {
         return Err("the top proof does not verify against the derived top program".to_string());
@@ -729,5 +867,6 @@ fn verify_under(
     if !top_claims(&plan, &top.public_words, public_output) {
         return Err("the top proof does not claim this ELF's id and this output".to_string());
     }
-    Ok(artifacts.program_id)
+    times.check = t.elapsed().as_secs_f64();
+    Ok((artifacts.program_id, times))
 }
