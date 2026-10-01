@@ -35,7 +35,7 @@ use crate::multilinear_prove::{
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::trace_builder::{
-    StreamTable, StreamedChunk, Traces, WindowStamps, WindowedTraceBuilder,
+    ChunkJob, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -207,7 +207,7 @@ impl BlockStamps {
                 self.streamed.0, self.build, self.streamed.1, self.prep, self.phase_a,
             ));
             out.push_str(&format!(
-                "BLOCK WINDOWS: {} windows · walk {:.2}s · route {:.2}s · generate {:.2}s · finish {:.2}s\n",
+                "BLOCK WINDOWS: {} windows · walk {:.2}s · route {:.2}s · chunk handout {:.2}s · finish {:.2}s\n",
                 self.windows.windows,
                 self.windows.walk,
                 self.windows.route,
@@ -712,7 +712,7 @@ fn stream_name(table: StreamTable, index: usize) -> String {
 
 /// What the builder thread hands the layout thread.
 enum Built {
-    Chunk(Box<StreamedChunk>),
+    Job(Box<ChunkJob>),
     Rest(Box<Traces>),
 }
 
@@ -832,9 +832,11 @@ fn prove_streamed(
                 let cut = body - body % window;
                 let mut streamed = 0usize;
                 for w in logs[..cut].chunks(window) {
-                    for chunk in builder.push(w)? {
+                    // The chunks leave as jobs: the layout thread generates
+                    // them, so this thread goes straight to the next window.
+                    for job in builder.push_jobs(w)? {
                         streamed += 1;
-                        if btx.send(Built::Chunk(Box::new(chunk))).is_err() {
+                        if btx.send(Built::Job(Box::new(job))).is_err() {
                             return Err(Error::Prover("the layout thread stopped".into()));
                         }
                     }
@@ -869,8 +871,9 @@ fn prove_streamed(
                 let mut rest = None;
                 for item in brx {
                     match item {
-                        Built::Chunk(mut chunk) => {
+                        Built::Job(job) => {
                             let t = Instant::now();
+                            let mut chunk = job.generate();
                             let height = chunk.trace.main_table.height;
                             let shape = (
                                 chunk.trace.main_table.width,
