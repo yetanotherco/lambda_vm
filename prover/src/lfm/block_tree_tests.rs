@@ -217,6 +217,79 @@ fn the_block_front_replays_the_hosts_transcript() {
         program.instrs.len(),
         prep.iter().flatten().count()
     );
+
+    // ---- what the front does NOT check: it absorbs each half's LIVE bytes only
+    // (`bit_dec(half, 8·live)` reads the low bits of a row that recomposes all
+    // 64), so a nonzero pad byte, or a half at or over 2^32, executes and draws
+    // the same z, α and state. The halves' canonicity is pinned elsewhere: the
+    // carrier leaf's COMMIT-bus target (`emit_output_bytes`, refused in
+    // `the_commit_target_pins_every_output_half_to_its_bytes`), carried to every
+    // leaf by the nodes' `out` binding, and the verifier's exact `top_claims`.
+    let last = arenas[0].len() - 1;
+    let live = OUTPUT_LEN % 4;
+    let v: u64 = arenas[0][last][0].canonical();
+    let first: u64 = arenas[0][0][0].canonical();
+    let mut padded = arenas.clone();
+    padded[0][last] = base_word(FE::from(v | (1u64 << (8 * live))));
+    let mut over = arenas.clone();
+    over[0][0] = base_word(FE::from(first + (1u64 << 32)));
+    for (what, tampered) in [("a nonzero pad byte", padded), ("a half over 2^32", over)] {
+        let e = execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER)
+            .unwrap_or_else(|e| panic!("the front alone takes {what}: {e:?}"));
+        let words: Vec<LfmWord> = e.public_words.iter().map(|(_, w)| *w).collect();
+        let honest: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
+        assert_eq!(
+            words, honest,
+            "{what} is not absorbed: the front draws the same z, α, state"
+        );
+    }
+}
+
+/// ★ The output halves' canonicity is the COMMIT-bus target's check
+/// (`epoch::emit_output_bytes`, run by the carrier leaf): each half must equal
+/// the recomposition of its four bytes and every pad byte must be zero, so a
+/// nonzero pad byte and a half at or over 2^32 are refused. The block front does
+/// not check it (`the_block_front_replays_the_hosts_transcript`); the nodes'
+/// `out` binding carries the carrier's halves to every leaf.
+#[test]
+fn the_commit_target_pins_every_output_half_to_its_bytes() {
+    const LEN: usize = 37;
+    let output: Vec<u8> = (0..LEN)
+        .map(|i| 0x5a ^ (i as u8).wrapping_mul(13))
+        .collect();
+    let halves = le_halves(&output);
+    let mut b = production_builder();
+    let a_out = b.declare_arena(halves.len() as u32);
+    let hinted: Vec<_> = (0..halves.len() as u32)
+        .map(|i| b.hint_felt(a_out, i))
+        .collect();
+    let bytes = super::epoch::emit_output_bytes(&mut b, &hinted, LEN);
+    for byte in bytes {
+        b.public(byte.as_cell());
+    }
+    let program = compile(b.finish());
+    let honest: Vec<Vec<LfmWord>> = vec![halves.iter().copied().map(base_word).collect()];
+    let exec = execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
+        .expect("canonical halves execute");
+    let got: Vec<u8> = exec
+        .public_words
+        .iter()
+        .map(|(_, w)| w[0].canonical() as u8)
+        .collect();
+    assert_eq!(got, output, "the target's bytes are the output");
+    let last = halves.len() - 1;
+    let v: u64 = halves[last].canonical();
+    let first: u64 = halves[0].canonical();
+    let mut padded = honest.clone();
+    padded[0][last] = base_word(FE::from(v | (1u64 << (8 * (LEN % 4)))));
+    let mut over = honest.clone();
+    over[0][0] = base_word(FE::from(first + (1u64 << 32)));
+    for (what, tampered) in [("a nonzero pad byte", padded), ("a half over 2^32", over)] {
+        assert!(
+            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "{what} must not execute"
+        );
+    }
 }
 
 // ============================== (b) the partition =========================
@@ -430,10 +503,29 @@ fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
     );
 }
 
-/// m5: a nonzero pad byte in the public output's last half is refused.
-/// `test_commit_3` commits three bytes, so the last half carries one pad byte,
-/// which the statement's `bit_dec(half, 8·live)` keeps zero; the honest arenas
-/// execute.
+/// The partition's cost model is part of the verifier's identity (it decides
+/// every leaf's instance list), so its output is pinned to its version: a change
+/// to the closed form, the fork constant or the cap fails here until
+/// `PARTITION_COST_MODEL` is bumped with it.
+#[test]
+fn the_partition_cost_model_is_pinned_to_its_version() {
+    // The block base's preset without the environment's format knobs, so the
+    // queries — the closed form's main term — are production's.
+    let opts = crate::recursion::Preset::Blowup4.options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let shape = honest_fixture_shape(&executor::elf::Elf::load(&elf_bytes).expect("load the ELF"));
+    let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
+    assert_eq!(
+        (plan.cost_model(), plan.costs()),
+        (1, vec![4654, 3884, 3994, 3884, 4544, 4874, 3994, 3554]),
+        "the cost model's output moved: bump PARTITION_COST_MODEL with it"
+    );
+}
+
+/// m5: a nonzero pad byte in the public output's last half is refused, over a
+/// real block. `test_commit_3` commits three bytes, so the last half carries one
+/// pad byte, which the carrier leaf's COMMIT-bus target (`emit_output_bytes`)
+/// keeps zero; the honest arenas execute.
 #[test]
 #[ignore = "proves a VM block (BITWISE is 2^20 rows); box tier"]
 fn a_nonzero_pad_byte_in_the_output_is_refused() {
@@ -1230,8 +1322,9 @@ fn block_leaves_execute_over_a_real_block_proof() {
     }
     assert_eq!(total, FEE::zero(), "the leaves' shares close the bus");
 
-    // ---- a non-canonical output half: the statement decomposes each half into
-    // its live bytes, so a half at or over 2^32, or a nonzero pad byte, is refused.
+    // ---- a non-canonical output half in the carrier leaf (leaf 0): its COMMIT-bus
+    // target pins each half to its four bytes and every pad byte to zero, so a
+    // half at or over 2^32, or a nonzero pad byte, is refused.
     let program = block_leaf_program(&rb, 0);
     let arenas = block_leaf_arenas(&rb, &partition, 0);
     let half0: u64 = arenas[0][0][0].canonical();
@@ -1573,13 +1666,14 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
     assert_top_claims_the_block(&top, &rb);
 
     let verify = |elf: &[u8], shape: &BlockShape, output: &[u8]| {
-        super::block_plan::verify_block_tree(elf, &opts, &wrap_opts, shape, output, &top_proof)
+        super::block_plan::verify_block_tree_under(
+            elf, &opts, &wrap_opts, shape, output, &top_proof,
+        )
     };
-    verify(&elf_bytes, &shape, &proof.public_output).expect("the verifier accepts the block");
-    let (_, derived) = super::block_plan::derive_block_top(&elf_bytes, &opts, &wrap_opts, &shape)
-        .expect("derives");
+    let derived =
+        verify(&elf_bytes, &shape, &proof.public_output).expect("the verifier accepts the block");
     assert_eq!(
-        derived.program_id, top.artifacts.program_id,
+        derived, top.artifacts.program_id,
         "the verifier's top is the program the harness proved"
     );
 
@@ -1859,7 +1953,7 @@ fn the_block_tree_composes_to_a_top_node() {
         );
     }
     println!(
-        "   BLOCK PARTITION: {k} leaves, Σ {} perms, heaviest {} (cap {})",
+        "   BLOCK PARTITION: {k} leaves, Σ {} perms, heaviest {} (cap {}, cost model v{})",
         costs.iter().sum::<usize>(),
         partition
             .leaves()
@@ -1867,7 +1961,8 @@ fn the_block_tree_composes_to_a_top_node() {
             .map(|l| l.iter().map(|&i| costs[i]).sum::<usize>())
             .max()
             .unwrap_or(0),
-        super::block_plan::LEAF_PERMS_CAP
+        super::block_plan::LEAF_PERMS_CAP,
+        rb.plan.cost_model()
     );
 
     // ---- level 0: the leaves.
@@ -1966,36 +2061,42 @@ fn the_block_tree_composes_to_a_top_node() {
     println!("★★★ WHOLE RUN: host peak {peak:.3} GiB at t={at:.1}, {total:.1}s total");
 
     // ---- the block VERIFIER, outside the whole run (a consumer's work, not the
-    // prover's): the plan and the top program derived from the ELF, the options
-    // and the claimed shape with no proof read, the top proof verified against
-    // that program, its words against the ELF's id and the output.
+    // prover's): `verify_block_tree` under the block presets derives the plan and
+    // the top program from the ELF and the claimed shape with no proof read,
+    // verifies the top proof against that program, and checks its words against
+    // the ELF's id and the output. A forced partition is another tree: then the
+    // harness's own plan derives its top instead.
     let t = Instant::now();
     let derived = match forced {
-        None => super::block_plan::derive_block_top(&elf_bytes, &inner, &wrap_opts, &shape)
-            .map(|(_, top)| top),
-        Some(_) => rb.plan.derive_top(&wrap_opts),
-    }
-    .expect("the verifier derives the top program");
-    let derive_secs = t.elapsed().as_secs_f64();
+        None => {
+            super::block_plan::verify_block_tree(&elf_bytes, &shape, &rb.public_output, &top_proof)
+                .expect("the block verifier accepts the tree")
+        }
+        Some(_) => {
+            let top = rb
+                .plan
+                .derive_top(&wrap_opts)
+                .expect("the forced top derives");
+            assert!(verify_block_top(&top, &top_proof, &wrap_opts));
+            assert!(top_claims(
+                &rb.plan,
+                &top_proof.public_words,
+                &rb.public_output
+            ));
+            top.program_id
+        }
+    };
     assert_eq!(
-        derived.program_id, top.artifacts.program_id,
+        derived, top.artifacts.program_id,
         "the verifier derives, with no proof, the top program the harness proved"
     );
-    assert!(
-        verify_block_top(&derived, &top_proof, &wrap_opts),
-        "the top proof verifies against the derived top program"
-    );
-    assert!(
-        top_claims(&rb.plan, &top_proof.public_words, &rb.public_output),
-        "the top proof claims the trusted ELF's id and the block's output"
-    );
     println!(
-        "   BLOCK VERIFIER: {} plan + top program derived in {derive_secs:.2}s (no proof read) · \
-         the top proof verifies against it and claims the block · {:.2}s in all",
+        "   BLOCK VERIFIER: {} (plan + top program derived, no proof read; the top proof \
+         verifies against it and claims the block) in {:.2}s",
         if forced.is_some() {
             "forced-partition"
         } else {
-            "production"
+            "verify_block_tree under the block presets"
         },
         t.elapsed().as_secs_f64()
     );

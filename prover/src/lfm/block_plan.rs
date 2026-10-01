@@ -61,6 +61,15 @@ pub const FORK_PERMS: usize = 694;
 /// headroom wrap 2 runs at (D-NOEPOCH §12.2).
 pub const LEAF_PERMS_CAP: usize = 279_000;
 
+/// The partition's cost model, versioned: per instance the legs' closed form
+/// (`table_permutations_for` under the production wrap hash) plus
+/// [`FORK_PERMS`], leaves filled under [`LEAF_PERMS_CAP`]. The partition — and so
+/// every leaf's program and the top id — is a function of it, so prover and
+/// verifier builds must agree on it: bump this with any change to the closed
+/// form, the fork constant or the cap, as with a format change.
+/// `the_partition_cost_model_is_pinned_to_its_version` pins its output.
+pub const PARTITION_COST_MODEL: u32 = 1;
+
 /// The leaf that subtracts the COMMIT-bus target.
 const CARRIER: usize = 0;
 
@@ -107,8 +116,9 @@ pub struct PlannedInstance {
 }
 
 /// The plan's inputs that are a function of the ELF and the options alone —
-/// DECODE's preprocessed root, recomputed on the host from the ELF (never a
-/// prover's or a device's copy) — so a caller can compute them before the
+/// DECODE's and the ELF data pages' preprocessed roots, recomputed on the host
+/// from the ELF (never a prover's or a device's copy, and never the
+/// process-wide record of one) — so a caller can compute them before the
 /// block's shape exists. Constructed only by [`Self::compute`], and tied to the
 /// ELF digest and the options it was computed under.
 pub struct ElfConstants {
@@ -116,6 +126,8 @@ pub struct ElfConstants {
     /// The options, as their `Debug` rendering: every field the roots depend on.
     opts: String,
     decode: Commitment,
+    /// `(page base, row-pair root)` of each ELF data page.
+    pages: Vec<(u64, Commitment)>,
 }
 
 impl ElfConstants {
@@ -124,10 +136,23 @@ impl ElfConstants {
         let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
         let decode = crate::tables::decode::commitment_from_elf(&elf, opts)
             .map_err(|e| format!("DECODE commitment: {e:?}"))?;
+        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf(&elf)
+            .iter()
+            .filter(|c| c.init_values.is_some() && !c.is_private_input)
+            .map(|c| {
+                let root = crate::tables::page::compute_precomputed_commitment_with(
+                    c,
+                    opts,
+                    stark::leaf_layout::LeafLayout::RowPair,
+                );
+                (c.page_base, root)
+            })
+            .collect();
         Ok(Self {
             elf_digest: crate::statement::elf_digest(elf_bytes),
             opts: format!("{opts:?}"),
             decode,
+            pages,
         })
     }
 }
@@ -196,7 +221,7 @@ impl BlockTreePlan {
             Some(decode),
             true,
             None,
-            None,
+            Some(&consts.pages),
             None,
         );
         let refs = airs.air_refs();
@@ -256,8 +281,27 @@ impl BlockTreePlan {
                     .ok_or("more PAGE instances than configs")?;
                 page += 1;
                 if config.init_values.is_some() && !config.is_private_input {
-                    if inst.precomputed_root.is_none() {
-                        return Err(format!("data page {idx} is not preprocessed"));
+                    // The root is the host's recompute from the ELF, never the
+                    // process-wide record a prover's device wrote: the row-pair
+                    // root was supplied from `consts`; any other layout's is
+                    // recomputed here and must agree with the AIR's.
+                    let layout =
+                        stark::leaf_layout::table_leaf_layout(refs[idx], shape.trace_lengths[idx]);
+                    let host = match layout {
+                        stark::leaf_layout::LeafLayout::RowPair => consts
+                            .pages
+                            .iter()
+                            .find(|(base, _)| *base == config.page_base)
+                            .map(|(_, root)| *root),
+                        other => Some(crate::tables::page::compute_precomputed_commitment_with(
+                            config, opts, other,
+                        )),
+                    };
+                    if host.is_none() || inst.precomputed_root != host {
+                        return Err(format!(
+                            "data page {idx} at 0x{:x}: its root is not the host's recompute",
+                            config.page_base
+                        ));
                     }
                     data_pages.push((config.page_base, idx));
                 }
@@ -345,6 +389,11 @@ impl BlockTreePlan {
 
     pub fn partition(&self) -> &BlockPartition {
         &self.partition
+    }
+
+    /// The partition's cost-model version ([`PARTITION_COST_MODEL`]).
+    pub fn cost_model(&self) -> u32 {
+        PARTITION_COST_MODEL
     }
 
     /// The one leaf that subtracts the COMMIT-bus target.
@@ -611,7 +660,7 @@ pub fn top_claims(plan: &BlockTreePlan, words: &[(u32, LfmWord)], public_output:
 
 /// The plan and its top program's artifacts, from the trusted ELF, the base
 /// options, the tree's options and the claimed shape — no proof read.
-pub fn derive_block_top(
+pub(crate) fn derive_block_top(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
     wrap_opts: &crate::ProofOptions,
@@ -623,17 +672,55 @@ pub fn derive_block_top(
 }
 
 /// ★ The no-epoch block's verifier, over its tree's top proof: derive the plan
-/// and the top program ([`derive_block_top`]); verify `top` against that
-/// program; check that it publishes the ELF's attestation id and
-/// `public_output`.
+/// and the top program ([`derive_block_top`]) under the block presets — the base
+/// under [`super::proof::block_base_options`], the tree under
+/// [`super::proof::aggregation_wrap_options`], verifier constants, never a
+/// caller's or a prover's — verify `top` against that program, and check that it
+/// publishes the ELF's attestation id and `public_output`. Returns the id of the
+/// top program the proof verified against.
+///
+/// Both presets stamp the process's `ZfFormat`, which environment knobs set, so
+/// the verifier's environment is part of the derived identity: a verifier
+/// configured otherwise than the prover derives another top and refuses
+/// (completeness, never soundness).
 pub fn verify_block_tree(
+    elf_bytes: &[u8],
+    shape: &BlockShape,
+    public_output: &[u8],
+    top: &super::proof::LfmProof,
+) -> Result<Commitment, String> {
+    verify_under(
+        elf_bytes,
+        &super::proof::block_base_options(),
+        &super::proof::aggregation_wrap_options(),
+        shape,
+        public_output,
+        top,
+    )
+}
+
+/// [`verify_block_tree`] under other presets — the fixture blocks', whose base
+/// runs smaller options.
+#[cfg(test)]
+pub(crate) fn verify_block_tree_under(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
     wrap_opts: &crate::ProofOptions,
     shape: &BlockShape,
     public_output: &[u8],
     top: &super::proof::LfmProof,
-) -> Result<(), String> {
+) -> Result<Commitment, String> {
+    verify_under(elf_bytes, opts, wrap_opts, shape, public_output, top)
+}
+
+fn verify_under(
+    elf_bytes: &[u8],
+    opts: &crate::ProofOptions,
+    wrap_opts: &crate::ProofOptions,
+    shape: &BlockShape,
+    public_output: &[u8],
+    top: &super::proof::LfmProof,
+) -> Result<Commitment, String> {
     let (plan, artifacts) = derive_block_top(elf_bytes, opts, wrap_opts, shape)?;
     if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
     {
@@ -642,5 +729,5 @@ pub fn verify_block_tree(
     if !top_claims(&plan, &top.public_words, public_output) {
         return Err("the top proof does not claim this ELF's id and this output".to_string());
     }
-    Ok(())
+    Ok(artifacts.program_id)
 }
