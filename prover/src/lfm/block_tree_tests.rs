@@ -1210,15 +1210,22 @@ fn tree_ahead_mode() -> Option<AheadMode> {
     }
 }
 
+/// Threads of the pipeline builder's own pool for the node emission, by
+/// default: one per level-1 node of the block's 8 leaves at fan-in 2 (FAST 455:
+/// level 0 −0.40 s, recursion −0.29 s; on the global pool a leaf proof's join
+/// could steal an emission and hold the card idle).
+const EMIT_POOL_THREADS: usize = 4;
+
 /// `NOEPOCH_EMIT_POOL=<threads>`: the pipeline's builder emits the node
-/// programs on a host-only pool of its own with that many threads; unset or `0`,
-/// on the global pool the provers use.
+/// programs on a host-only pool of its own with that many threads, unset
+/// meaning [`EMIT_POOL_THREADS`]; `0` emits them on the global pool the provers
+/// use.
 fn emit_pool_knob() -> usize {
     match std::env::var("NOEPOCH_EMIT_POOL") {
         Ok(v) if !v.is_empty() => v
             .parse::<usize>()
             .unwrap_or_else(|_| panic!("NOEPOCH_EMIT_POOL must be a thread count, got `{v}`")),
-        _ => 0,
+        _ => EMIT_POOL_THREADS,
     }
 }
 
