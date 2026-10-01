@@ -814,3 +814,69 @@ fn epoch_hash_chip_rejects_tampering() {
     bump(&mut extra[0], out, bridge::cols::V0 + 3);
     assert!(hy.prove(&mut traces, &mut extra, &opts).is_none(), "fourth lane set");
 }
+
+/// The LFM wrap of one epoch verifier under the block pin's hash: run it once
+/// per build (RPX by default, `blake3-pin`, `keccak-pin`) and compare.
+/// `FVM_WRAP_BLOWUPS` (default `2`) lists the wrap blowups.
+#[test]
+#[ignore]
+fn epoch_lfm_wrap_hash() {
+    let t = Instant::now();
+    let e = super::epoch_tests::real_epoch_from(
+        inner_options(),
+        super::epoch_tests::EpochInputs::fixture(),
+    );
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let (mut hash, mut blake3, mut keccak) = (0usize, 0usize, 0usize);
+    for i in &program.instrs {
+        match i {
+            super::instr::Instr::Hash { .. } => hash += 1,
+            super::instr::Instr::Blake3(_) => blake3 += 1,
+            super::instr::Instr::KeccakF(_) => keccak += 1,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "wrap hash={:?} epoch verifier: {} instrs (hash {hash}, blake3 {blake3}, keccakf {keccak}), built in {:.1}s",
+        crate::hash_pin::BLOCK_COMMITMENT_HASH,
+        program.instrs.len(),
+        t.elapsed().as_secs_f64()
+    );
+    let hasher = crate::hash_pin::BLOCK_HASHER;
+    let blowups: Vec<u8> = std::env::var("FVM_WRAP_BLOWUPS")
+        .unwrap_or_else(|_| "2".into())
+        .split(',')
+        .map(|s| s.trim().parse().expect("a blowup"))
+        .collect();
+    for b in blowups {
+        let opts = blowup(b);
+        let artifacts = super::registry::build_artifacts_with_hasher(&program, &opts, hasher);
+        let (mut p, mut v, mut bytes, mut shape) = (Vec::new(), Vec::new(), 0, (0, 0));
+        for _ in 0..runs() {
+            let s = Instant::now();
+            let proof =
+                super::proof::lfm_prove(&program, &artifacts, &arenas, &opts).expect("LFM proves");
+            p.push(s.elapsed().as_secs_f64() * 1e3);
+            let s = Instant::now();
+            assert!(super::proof::verify_against_artifacts(
+                &artifacts,
+                &proof.proof,
+                &proof.public_words,
+                &opts
+            ));
+            v.push(s.elapsed().as_secs_f64() * 1e3);
+            bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof.proof)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            shape = census(&proof.proof);
+        }
+        eprintln!(
+            "  wrap blowup={b} rows={} cells={} prove_ms={} verify_ms={} proof_bytes={bytes} raw_prove={p:?}",
+            shape.0,
+            shape.1,
+            stats(p.clone()),
+            stats(v)
+        );
+    }
+}
