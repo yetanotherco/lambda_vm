@@ -1188,11 +1188,13 @@ pub(super) fn compose_block_tree(
     compose_block_tree_with(plan, leaves, opts, siblings, None, None)
 }
 
-/// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`): `1` derives every
-/// program and its artifacts beside the base on the host; `pipe` emits the leaf
-/// programs there and builds the artifacts on the card during level 0, each
-/// node program emitted as its children's artifacts exist
-/// ([`super::block_tree_pipeline`]).
+/// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`). Unset or `pipe`,
+/// the default (FAST 451: recursion −2.56 s): the leaf programs are emitted
+/// beside the base on the host and the artifacts built on the card during level
+/// 0, each node program emitted as its children's artifacts exist
+/// ([`super::block_tree_pipeline`]). `1` derives every program and its
+/// artifacts beside the base on the host; `0` derives each inline, before it
+/// proves.
 #[derive(Clone, Copy)]
 enum AheadMode {
     Host,
@@ -1201,9 +1203,10 @@ enum AheadMode {
 
 fn tree_ahead_mode() -> Option<AheadMode> {
     match std::env::var("NOEPOCH_TREE_AHEAD").ok().as_deref() {
+        Some("0") => None,
         Some("1") => Some(AheadMode::Host),
-        Some("pipe") => Some(AheadMode::Pipe),
-        _ => None,
+        None | Some("" | "pipe") => Some(AheadMode::Pipe),
+        Some(v) => panic!("NOEPOCH_TREE_AHEAD must be 0, 1 or pipe, got `{v}`"),
     }
 }
 
@@ -2039,9 +2042,10 @@ fn the_block_tree_composes_to_a_top_node() {
     // host) computed on a pool of its own while the base proves, joined by the
     // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline.
     let elf_beside = elf_beside_knob();
-    // `NOEPOCH_TREE_AHEAD=1`: the same pool then derives every tree program and
-    // its artifacts from the shape the base hands out before its prove, on the
-    // host (the base owns the card), and the levels prove from them.
+    // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
+    // leaf programs (with `1`, every tree program and its artifacts, on the host)
+    // from the shape the base hands out before its prove, and the levels prove
+    // from them.
     let tree_ahead = elf_beside.and(tree_ahead_mode());
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,

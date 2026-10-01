@@ -4,7 +4,8 @@
 //!
 //! - `1`: every program and its artifacts derived beside the base, on the host
 //!   ([`super::block_plan::BlockTreePlan::derive_tree`]); [`Pipe::filled`].
-//! - `pipe`: the leaf programs emitted beside the base (host, no artifacts);
+//! - `pipe`, the default (`0` derives each program inline, before it proves):
+//!   the leaf programs emitted beside the base (host, no artifacts);
 //!   once the base is done, [`Pipe::run_builder`] builds each leaf's artifacts on
 //!   the card, then emits each node program as soon as its children's ARTIFACTS
 //!   exist (a node reads its children's shapes, not their proofs) and builds its
