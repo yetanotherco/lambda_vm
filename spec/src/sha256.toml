@@ -61,17 +61,10 @@ output = ["cast", ["idx", "m_addr", 0], "DWordWL"]
 cond = "μ"
 
 [[constraints.memory]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", ["idx", "m_addr", "i"], 0]]
-multiplicity = "μ"
-iter = ["i", 0, 7]
-
-[[constraints.memory]]
-kind = "interaction"
-tag = "IS_WH"
-input = [["idx", ["idx", "m_addr", "i"], 2], ["idx", ["idx", "m_addr", "i"], 1]]
-multiplicity = "μ"
+kind = "template"
+tag = "IS_WHH"
+input = [["idx", "m_addr", "i"]]
+cond = "μ"
 iter = ["i", 0, 7]
 
 [[constraints.memory]]
@@ -115,17 +108,10 @@ output = ["cast", ["idx", "h_addr", 0], "DWordWL"]
 cond = "μ"
 
 [[constraints.memory]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", ["idx", "h_addr", "i"], 0]]
-multiplicity = "μ"
-iter = ["i", 0, 3]
-
-[[constraints.memory]]
-kind = "interaction"
-tag = "IS_WH"
-input = [["idx", ["idx", "h_addr", "i"], 2], ["idx", ["idx", "h_addr", "i"], 1]]
-multiplicity = "μ"
+kind = "template"
+tag = "IS_WHH"
+input = [["idx", "h_addr", "i"]]
+cond = "μ"
 iter = ["i", 0, 3]
 
 [[constraints.memory]]
