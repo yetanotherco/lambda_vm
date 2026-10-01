@@ -818,6 +818,16 @@ pub(super) fn prove_as_child(
     arenas: &[Vec<LfmWord>],
     opts: &crate::ProofOptions,
 ) -> RealChild {
+    prove_program(label, program, arenas, opts).0
+}
+
+/// [`prove_as_child`], keeping the proof — what the tree's final check reads.
+pub(super) fn prove_program(
+    label: &str,
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+) -> (RealChild, super::proof::LfmProof) {
     let t = std::time::Instant::now();
     let artifacts = super::program_census::build_artifacts_counted(
         program,
@@ -839,25 +849,46 @@ pub(super) fn prove_as_child(
         program.instrs.len(),
         t.elapsed().as_secs_f64()
     );
-    child
+    (child, proved)
+}
+
+/// ★ The block tree's FINAL check — what the block's verifier runs on the top
+/// proof.
+///
+/// It mirrors the epoch tree's (`per_table_aggregator_tests`, the block-artifact
+/// root's `verify_against_artifacts` against the root program the harness itself
+/// emitted; SOUNDNESS.md §6.9): the top proof is checked against `expected`, the
+/// artifacts of the top program the VERIFIER derived from the ELF it trusts, the
+/// block's shape and the partition constant — never against a program named by
+/// whoever produced the proof. The partition is bound only through program
+/// identity (a leaf's id commits to its list, each node interns its children's
+/// ids), so this is where a tree over any other partition is refused: its top is
+/// another program, and its proof fails here.
+pub(super) fn verify_block_top(
+    expected: &super::registry::LfmArtifacts,
+    top: &super::proof::LfmProof,
+    opts: &crate::ProofOptions,
+) -> bool {
+    super::proof::verify_against_artifacts(expected, &top.proof, &top.public_words, opts)
 }
 
 /// Levels above the leaves: fan-in [`super::per_table_aggregator::FAN_IN`],
 /// leftovers wrapped in arity-1 nodes (`tree_shape`), the last level's single
 /// node the top. A one-leaf block still gets a top node: the bus closes there.
-/// Returns the top child and each level's wall.
+/// Returns the top child, its proof and each level's wall.
 pub(super) fn compose_block_tree(
     leaves: Vec<RealChild>,
     layout: BlockLayout,
     opts: &crate::ProofOptions,
     siblings: usize,
-) -> (RealChild, Vec<f64>) {
+) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
     use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
     let mut shape = tree_shape(leaves.len(), FAN_IN);
     if shape.is_empty() {
         shape.push(Level { arities: vec![1] });
     }
     let mut level = leaves;
+    let mut top_proof = None;
     let mut walls = Vec::with_capacity(shape.len());
     for (lv, arities) in shape.iter().enumerate() {
         let top = lv + 1 == shape.len();
@@ -882,8 +913,14 @@ pub(super) fn compose_block_tree(
             let program = block_node_program(&kids, layout, top, BlockBindings::ALL);
             println!("   {label}: emitted in {:.2}s", te.elapsed().as_secs_f64());
             super::per_table_aggregator_tests::census_and_panel(&program, &label, FAN_IN);
-            prove_as_child(&label, &program, &block_node_arenas(&kids), opts)
+            let (child, proof) = prove_program(&label, &program, &block_node_arenas(&kids), opts);
+            (child, top.then_some(proof))
         });
+        let (next, mut proofs): (Vec<RealChild>, Vec<Option<super::proof::LfmProof>>) =
+            next.into_iter().unzip();
+        if top {
+            top_proof = proofs.pop().flatten();
+        }
         let wall = t.elapsed().as_secs_f64();
         println!(
             "   BLOCK LEVEL {}: {} node(s) in {wall:.2}s{}",
@@ -895,7 +932,11 @@ pub(super) fn compose_block_tree(
         level = next;
     }
     assert_eq!(level.len(), 1, "the tree closes to one node");
-    (level.pop().expect("one"), walls)
+    (
+        level.pop().expect("one"),
+        top_proof.expect("the top level keeps its proof"),
+        walls,
+    )
 }
 
 /// The top node's published words, against the host's: the id, the state, the
@@ -1104,10 +1145,47 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         "with the bus assert removed it executes: the bus assert is what refuses it"
     );
 
-    // ---- the honest tree over A.
-    let (top, walls) = compose_block_tree(leaves_a, layout, &wrap_opts, 1);
+    // ---- the honest tree over A, and the final check against the top program
+    // the verifier derives from the partition.
+    let (top, top_proof, walls) = compose_block_tree(leaves_a, layout, &wrap_opts, 1);
     assert_top_claims_the_block(&top, &a);
+    assert!(verify_block_top(&top.artifacts, &top_proof, &wrap_opts));
     println!("BLOCK FIXTURE TREE: levels {walls:?}, the top claims block A");
+
+    // ---- a tree over ANOTHER partition of the same block: one instance moved from
+    // leaf 1 to leaf 2. Every proof in it is honest and its top claims the same
+    // block — only its program identity differs, and the final check refuses it.
+    let mut lists = partition.leaves().to_vec();
+    let moved = lists[1].pop().expect("leaf 1 has instances");
+    assert!(!lists[1].is_empty(), "leaf 1 keeps an instance");
+    lists[2].push(moved);
+    let other = BlockPartition::new(lists, a.num_instances()).expect("still a partition");
+    let other_leaves: Vec<RealChild> = (0..other.num_leaves())
+        .map(|k| {
+            prove_as_child(
+                &format!("A other-partition leaf {k}"),
+                &block_leaf_program(&a, &other, k, 0),
+                &block_leaf_arenas(&a, &other, k),
+                &wrap_opts,
+            )
+        })
+        .collect();
+    let (other_top, other_proof, _) = compose_block_tree(other_leaves, layout, &wrap_opts, 1);
+    assert_eq!(
+        other_top.public_words, top.public_words,
+        "the other partition's top claims the same block"
+    );
+    assert_ne!(other_top.artifacts.program_id, top.artifacts.program_id);
+    assert!(
+        !verify_block_top(&top.artifacts, &other_proof, &wrap_opts),
+        "a tree over another partition must be refused at the final check"
+    );
+    assert!(
+        verify_block_top(&other_top.artifacts, &other_proof, &wrap_opts),
+        "checked against the program its own prover built, it verifies: the final check's \
+         program, derived by the verifier from the partition constant, is what refuses it"
+    );
+    println!("BLOCK FIXTURE TREE: another partition's tree is refused at the final check");
 }
 
 // ============================ production scale ============================
@@ -1235,8 +1313,43 @@ fn the_block_tree_composes_to_a_top_node() {
         rb.public_output.len()
     );
 
-    // ---- the partition.
-    let partition = rb.partition(leaves_knob());
+    // ---- the partition: §12.2's lists are the constant for the block they were
+    // written for (137 instances, MEMW[0] at 42 and MEMW_R[0] at 100); the rule
+    // otherwise, or under `NOEPOCH_PARTITION=rule`.
+    let ruled = rb.partition(leaves_knob());
+    let d12_block =
+        rb.num_instances() == 137 && rb.names[42] == "MEMW[0]" && rb.names[100] == "MEMW_R[0]";
+    let use_rule = std::env::var("NOEPOCH_PARTITION").is_ok_and(|v| v == "rule");
+    let partition = if d12_block && !use_rule && leaves_knob().is_none() {
+        BlockPartition::new(D12_LEAVES.iter().map(|l| l.to_vec()).collect(), 137)
+            .expect("§12.2's lists partition the block")
+    } else {
+        ruled.clone()
+    };
+    println!(
+        "   BLOCK PARTITION SOURCE: {} (the rule {} §12.2)",
+        if partition == ruled && !d12_block {
+            "the rule"
+        } else if d12_block && !use_rule && leaves_knob().is_none() {
+            "D-NOEPOCH §12.2's constant lists"
+        } else {
+            "the rule (forced)"
+        },
+        if d12_block {
+            if ruled
+                .leaves()
+                .iter()
+                .zip(D12_LEAVES)
+                .all(|(a, b)| a[..] == b[..])
+            {
+                "reproduces"
+            } else {
+                "DIFFERS from"
+            }
+        } else {
+            "has no constant to match on this block, unlike"
+        }
+    );
     let costs = rb.leg_costs();
     let k = partition.num_leaves();
     for (j, leaf) in partition.leaves().iter().enumerate() {
@@ -1306,10 +1419,26 @@ fn the_block_tree_composes_to_a_top_node() {
     println!("   ★ SIBLING CONCURRENCY: {siblings} node proof(s) at once (LFM_TREE_SIBLINGS)");
     super::device_permit::arm(siblings);
     let t = Instant::now();
-    let (top, walls) = compose_block_tree(leaves, child_layout(&rb), &wrap_opts, siblings);
+    let (top, top_proof, walls) =
+        compose_block_tree(leaves, child_layout(&rb), &wrap_opts, siblings);
     super::device_permit::arm(1);
     let interior = t.elapsed().as_secs_f64();
     assert_top_claims_the_block(&top, &rb);
+    let t = Instant::now();
+    assert!(
+        verify_block_top(&top.artifacts, &top_proof, &wrap_opts),
+        "the top proof must verify against the top program derived from the partition"
+    );
+    println!(
+        "   BLOCK FINAL CHECK: the top verifies against the program derived from the partition \
+         ({:.2}s, program id {})",
+        t.elapsed().as_secs_f64(),
+        top.artifacts
+            .program_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 
     let total = t_all.elapsed().as_secs_f64();
     let (peak, at) = whole.stop();
