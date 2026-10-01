@@ -251,77 +251,119 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// Every full chunk the lists now hold that was not handed out yet,
     /// generated in parallel.
     fn stream(&mut self) -> Vec<StreamedChunk> {
+        self.chunk_jobs()
+            .into_par_iter()
+            .map(ChunkJob::generate)
+            .collect()
+    }
+
+    /// Like [`push`](Self::push), but hands back each completed chunk as a
+    /// [`ChunkJob`] — its op slice, copied — instead of generating it here, so
+    /// the caller can generate it on another thread while this one walks the
+    /// next window. The chunks are the same.
+    pub fn push_jobs(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
+        if logs.iter().any(|log| log.next_pc == 0) {
+            return Err(Error::HaltInNonFinalEpoch);
+        }
+        self.collect(logs)?;
+        let t = std::time::Instant::now();
+        let jobs = self.chunk_jobs();
+        self.stamps.generate += t.elapsed().as_secs_f64();
+        Ok(jobs)
+    }
+
+    /// Every full chunk the lists now hold that was not handed out yet, its
+    /// ops copied out of the run's lists.
+    fn chunk_jobs(&mut self) -> Vec<ChunkJob> {
         let m = &self.max_rows;
         let w = &self.walk;
         let cpu_ops = &self.cpu_ops;
         let e = &mut self.emitted;
-        let mut jobs: Vec<Box<dyn Fn() -> StreamedChunk + Send + Sync + '_>> = Vec::new();
+        let mut jobs = Vec::new();
         macro_rules! full_chunks {
-            ($table:expr, $list:expr, $max:expr, $done:expr, $generate:expr) => {{
+            ($table:expr, $variant:ident, $list:expr, $max:expr, $done:expr) => {{
                 let list = &$list;
                 let max = $max;
                 while ($done + 1) * max <= list.len() {
                     let index = $done;
-                    jobs.push(Box::new(move || StreamedChunk {
+                    jobs.push(ChunkJob {
                         table: $table,
                         index,
-                        trace: $generate(&list[index * max..(index + 1) * max]),
-                    }));
+                        ops: ChunkOps::$variant(list[index * max..(index + 1) * max].to_vec()),
+                    });
                     $done += 1;
                 }
             }};
         }
-        full_chunks!(
-            StreamTable::Cpu,
-            *cpu_ops,
-            m.cpu,
-            e.cpu,
-            cpu::generate_cpu_trace
-        );
+        full_chunks!(StreamTable::Cpu, Cpu, *cpu_ops, m.cpu, e.cpu);
         full_chunks!(
             StreamTable::MemwRegister,
+            MemwRegister,
             w.memw.register_rows,
             m.memw_register,
-            e.memw_register,
-            memw_register::generate_memw_register_trace_from_rows
+            e.memw_register
         );
         full_chunks!(
             StreamTable::MemwAligned,
+            MemwAligned,
             w.memw.aligned,
             m.memw_aligned,
-            e.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace
+            e.memw_aligned
         );
-        full_chunks!(
-            StreamTable::Memw,
-            w.memw.general,
-            m.memw,
-            e.memw,
-            memw::generate_memw_trace
-        );
-        full_chunks!(
-            StreamTable::Load,
-            w.load_ops,
-            m.load,
-            e.load,
-            load::generate_load_trace
-        );
-        full_chunks!(StreamTable::Lt, w.lt_ops, m.lt, e.lt, lt::generate_lt_trace);
-        full_chunks!(
-            StreamTable::Shift,
-            w.shift_ops,
-            m.shift,
-            e.shift,
-            shift::generate_shift_trace
-        );
+        full_chunks!(StreamTable::Memw, Memw, w.memw.general, m.memw, e.memw);
+        full_chunks!(StreamTable::Load, Load, w.load_ops, m.load, e.load);
+        full_chunks!(StreamTable::Lt, Lt, w.lt_ops, m.lt, e.lt);
+        full_chunks!(StreamTable::Shift, Shift, w.shift_ops, m.shift, e.shift);
         full_chunks!(
             StreamTable::Store,
+            Store,
             self.segments.store_ops,
             m.store,
-            e.store,
-            store::generate_store_trace
+            e.store
         );
-        jobs.into_par_iter().map(|job| job()).collect()
+        jobs
+    }
+}
+
+/// A completed chunk not generated yet: which chunk it is, and its ops.
+/// [`generate`](Self::generate) builds the table a whole-run build puts in that
+/// slot, with the same function.
+pub struct ChunkJob {
+    pub table: StreamTable,
+    pub index: usize,
+    ops: ChunkOps,
+}
+
+enum ChunkOps {
+    Cpu(Vec<super::CpuOperation>),
+    MemwRegister(Vec<super::RegRow>),
+    MemwAligned(Vec<super::MemwOperation>),
+    Memw(Vec<super::MemwOperation>),
+    Load(Vec<super::LoadOperation>),
+    Lt(Vec<super::LtOperation>),
+    Shift(Vec<super::ShiftOperation>),
+    Store(Vec<store::StoreOperation>),
+}
+
+impl ChunkJob {
+    pub fn generate(self) -> StreamedChunk {
+        let trace = match &self.ops {
+            ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(ops),
+            ChunkOps::MemwRegister(ops) => {
+                memw_register::generate_memw_register_trace_from_rows(ops)
+            }
+            ChunkOps::MemwAligned(ops) => memw_aligned::generate_memw_aligned_trace(ops),
+            ChunkOps::Memw(ops) => memw::generate_memw_trace(ops),
+            ChunkOps::Load(ops) => load::generate_load_trace(ops),
+            ChunkOps::Lt(ops) => lt::generate_lt_trace(ops),
+            ChunkOps::Shift(ops) => shift::generate_shift_trace(ops),
+            ChunkOps::Store(ops) => store::generate_store_trace(ops),
+        };
+        StreamedChunk {
+            table: self.table,
+            index: self.index,
+            trace,
+        }
     }
 }
 

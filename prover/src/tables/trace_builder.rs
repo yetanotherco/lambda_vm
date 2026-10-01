@@ -72,7 +72,7 @@ use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod windowed;
-pub use windowed::{StreamTable, StreamedChunk, WindowStamps, WindowedTraceBuilder};
+pub use windowed::{ChunkJob, StreamTable, StreamedChunk, WindowStamps, WindowedTraceBuilder};
 
 // =============================================================================
 // Memory and Register State Tracking
