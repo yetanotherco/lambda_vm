@@ -3617,6 +3617,12 @@ pub struct StreamSkip {
     pub lt: usize,
     pub shift: usize,
     pub store: usize,
+    /// MEMW (general) and MEMW_A ops whose phase-3 LT ops a windowed build has
+    /// already put into the windows' LT lists (block path only, which may chunk
+    /// LT differently from the whole-run build): the table phase derives LT
+    /// only from the ops past these. Zero everywhere else.
+    pub memw_lt_done: usize,
+    pub memw_aligned_lt_done: usize,
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -4112,8 +4118,12 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    lt_ops.extend(collect_lt_from_memw(&memw_ops));
-    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    lt_ops.extend(collect_lt_from_memw(
+        &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
+    ));
+    lt_ops.extend(collect_lt_from_memw_aligned(
+        &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
+    ));
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.

@@ -254,6 +254,110 @@ fn windowed_builds_the_whole_run_tables_at_production_sizes() {
     same_traces(&reference, &traces);
 }
 
+/// Every LT op with its multiplicity summed over all of `lts`' chunks: what LT's
+/// constraints and the bus see, whichever chunk holds an op.
+fn lt_multiplicities(lts: &[Table]) -> std::collections::BTreeMap<Vec<u64>, u64> {
+    let mu = crate::tables::lt::cols::MU;
+    let mut out = std::collections::BTreeMap::new();
+    for table in lts {
+        for row in rows(table) {
+            let m = row[mu].canonical();
+            if m == 0 {
+                continue;
+            }
+            let key: Vec<u64> = row
+                .iter()
+                .enumerate()
+                .filter(|(c, _)| *c != mu)
+                .map(|(_, v)| v.canonical())
+                .collect();
+            *out.entry(key).or_insert(0) += m;
+        }
+    }
+    out
+}
+
+/// ★ With each window's MEMW-derived LT ops streamed (the block path), every
+/// table but LT is the whole-run build's, LT has as many chunks, and every LT
+/// op carries its whole-run multiplicity summed over the chunks — though the
+/// chunks hold other ops. Dropping one row of one chunk breaks that equality,
+/// so it is what the test checks. And it streams more LT chunks than without.
+#[test]
+fn windowed_streams_memw_lt_with_the_whole_run_lt_multiplicities() {
+    let max_rows = MaxRowsConfig::small();
+    let mut more_streamed = false;
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let (program, logs) = run(name);
+        let mut reference = whole(&program, &logs, &max_rows);
+        let want = lt_multiplicities(&reference.lts);
+        for window in [1, 7, 33] {
+            let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                .expect("the builder")
+                .stream_memw_lt();
+            let body = logs.len() - 1;
+            let cut = body - body % window;
+            let mut chunks = Vec::new();
+            for w in logs[..cut].chunks(window) {
+                chunks.extend(builder.push(w).expect("a window"));
+            }
+            let lt_streamed = chunks.iter().filter(|c| c.table == StreamTable::Lt).count();
+            let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+            traces.insert_streamed(chunks).expect("placeholders");
+            assert_eq!(
+                traces.lts.len(),
+                reference.lts.len(),
+                "{name}/{window}: LT chunks"
+            );
+            assert!(
+                lt_multiplicities(&traces.lts) == want,
+                "{name}/{window}: LT multiplicities"
+            );
+            let plain_lt = {
+                let mut builder =
+                    WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+                logs[..cut]
+                    .chunks(window)
+                    .flat_map(|w| builder.push(w).expect("a window"))
+                    .filter(|c| c.table == StreamTable::Lt)
+                    .count()
+            };
+            assert!(
+                lt_streamed >= plain_lt,
+                "{name}/{window}: fewer LT chunks streamed"
+            );
+            more_streamed |= lt_streamed > plain_lt;
+            // Every other table is the whole-run one.
+            let lts = std::mem::replace(&mut reference.lts, traces.lts.clone());
+            same_traces(&reference, &traces);
+            reference.lts = lts;
+
+            // The mutation: one row of one chunk dropped (its multiplicity zeroed).
+            let mut dropped = traces.lts.clone();
+            let mu = crate::tables::lt::cols::MU;
+            let (k, row) = dropped
+                .iter()
+                .enumerate()
+                .find_map(|(k, t)| {
+                    (0..t.main_table.height)
+                        .find(|&r| t.main_table.get(r, mu).canonical() != 0)
+                        .map(|r| (k, r))
+                })
+                .expect("a real LT row");
+            dropped[k]
+                .main_table
+                .set(row, mu, FieldElement::<GoldilocksField>::zero());
+            assert!(
+                lt_multiplicities(&dropped) != want,
+                "{name}/{window}: a dropped row must change the multiplicities"
+            );
+        }
+    }
+    assert!(
+        more_streamed,
+        "the MEMW-derived LT ops never streamed a chunk more"
+    );
+}
+
 /// A non-final window may not halt, as a whole-run build refuses an epoch that
 /// halts early.
 #[test]
