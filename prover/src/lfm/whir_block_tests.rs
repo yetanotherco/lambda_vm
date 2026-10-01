@@ -1456,8 +1456,14 @@ fn the_whir_block_tree_on_a_real_block() {
                 Ok((plan, programs, at, t0.elapsed().as_secs_f64()))
             },
         );
+        // Profiling builds: the base, the tree and the harness's checks as
+        // process-wide NVTX ranges (the windows a counter run is cut by).
+        #[cfg(feature = "nvtx")]
+        let nvtx = stark::instruments::nvtx_process_range(|| "blk_base".into());
         let proved =
             block_whir::prove_block_whir_observed(&elf, &input, &opts, &format, &options, &observe);
+        #[cfg(feature = "nvtx")]
+        drop(nvtx);
         // A prover that failed before stating must not leave the planner waiting.
         *sender.lock().expect("lock") = None;
         (proved, pre.join())
@@ -1526,8 +1532,12 @@ fn the_whir_block_tree_on_a_real_block() {
     );
 
     let t = std::time::Instant::now();
+    #[cfg(feature = "nvtx")]
+    let nvtx = stark::instruments::nvtx_process_range(|| "lfm_tree".into());
     let (timings, proofs) =
         prove_tree_pipelined(&plan, &proof, programs, siblings).expect("the tree proves");
+    #[cfg(feature = "nvtx")]
+    drop(nvtx);
     let top = &proofs.last().expect("a top").1;
     let tree = t.elapsed().as_secs_f64();
     let whole = t0.elapsed().as_secs_f64();
@@ -1549,6 +1559,8 @@ fn the_whir_block_tree_on_a_real_block() {
     );
 
     // Off the clock: the harness's checks.
+    #[cfg(feature = "nvtx")]
+    let _nvtx = stark::instruments::nvtx_process_range(|| "harness_verify".into());
     let t = std::time::Instant::now();
     for (i, (artifacts, lfm)) in proofs.iter().enumerate() {
         assert!(
