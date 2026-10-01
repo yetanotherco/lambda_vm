@@ -1074,9 +1074,6 @@ pub(super) fn real_child_timed(
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> (RealChild, f64) {
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
-    use stark::proof::view::MultiProofView;
-
     let t_verify = std::time::Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
@@ -1088,6 +1085,20 @@ pub(super) fn real_child_timed(
         "the harness only reads children production accepts"
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
+    (harvest_child(artifacts, opts, proved), verify_secs)
+}
+
+/// [`real_child_timed`]'s harvest without its verify: for a driver that runs
+/// the verify beside its own work and joins it before it reports anything —
+/// the assert still decides whether the run counts, it only stops sitting on
+/// the critical path.
+pub(super) fn harvest_child(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> RealChild {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use stark::proof::view::MultiProofView;
 
     // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
     // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
@@ -1151,17 +1162,14 @@ pub(super) fn real_child_timed(
         .map(|(idx, air)| super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup))
         .collect();
 
-    (
-        RealChild {
-            artifacts,
-            opts,
-            public_words: proved.public_words.clone(),
-            tables,
-            legs,
-            z_alpha: (lookup[0], lookup[1]),
-        },
-        verify_secs,
-    )
+    RealChild {
+        artifacts,
+        opts,
+        public_words: proved.public_words.clone(),
+        tables,
+        legs,
+        z_alpha: (lookup[0], lookup[1]),
+    }
 }
 
 /// The child's shape, as the node's emitter reads it.
@@ -3781,7 +3789,11 @@ fn cgroup_limit_gib() -> Result<f64, String> {
 /// libtest's global hook files a spawned thread's own message against no test
 /// and drops it on the floor. The prover's `run_admitted` learned that the
 /// expensive way — eleven anonymous failures in one suite run.
-fn in_index_order<T: Send>(n: usize, workers: usize, task: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub(super) fn in_index_order<T: Send>(
+    n: usize,
+    workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
     let slots: Vec<std::sync::Mutex<Option<T>>> =
         (0..n).map(|_| std::sync::Mutex::new(None)).collect();
     if workers <= 1 {

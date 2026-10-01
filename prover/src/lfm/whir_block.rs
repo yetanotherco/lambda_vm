@@ -76,6 +76,10 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
 
+/// Children a node verifies: three, so the block's three leaves close in ONE
+/// node, the top, instead of two levels.
+pub const BLOCK_FAN_IN: usize = 3;
+
 // =============================== the partition ============================
 
 /// Which groups each leaf verifies: lists of group indices that together cover
@@ -195,9 +199,24 @@ pub struct WhirBlockPlan {
     /// Each group's in-guest cost, in permutations.
     costs: Vec<usize>,
     partition: BlockPartition,
+    /// Children a node verifies.
+    fan_in: usize,
     /// A digest of the statement run: the block's identity, published by every
     /// leaf and node.
     id: [u8; 32],
+}
+
+/// Every program of a block's tree with its artifacts and derived shape, level
+/// by level (the leaves first, the top last): what a prover proves and a
+/// verifier derives, built from the plan alone.
+pub struct TreePrograms {
+    pub levels: Vec<Vec<TreeProgram>>,
+}
+
+pub struct TreeProgram {
+    pub program: LfmProgram,
+    pub artifacts: LfmArtifacts,
+    pub derived: DerivedChild,
 }
 
 impl WhirBlockPlan {
@@ -210,6 +229,34 @@ impl WhirBlockPlan {
         statement: BlockStatement<'_>,
         num_leaves: Option<usize>,
     ) -> Result<Self, String> {
+        Self::derive_with(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            num_leaves,
+            BLOCK_FAN_IN,
+            None,
+        )
+    }
+
+    /// [`Self::derive`] with the nodes' fan-in named, and optionally the
+    /// prepared tables' roots in `prepared_tables` order — a PROVER's own,
+    /// computed by the same function from the same program, so it need not
+    /// commit them twice. A verifier passes `None` and derives them itself;
+    /// wrong roots give other leaf programs, and another top.
+    pub fn derive_with(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: Option<usize>,
+        fan_in: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+    ) -> Result<Self, String> {
+        if fan_in < 2 {
+            return Err(format!("a fan-in of {fan_in} closes no tree"));
+        }
         // The machine replays the algebraic transcript: it verifies a block
         // proved over RPX, and nothing else.
         if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
@@ -228,43 +275,68 @@ impl WhirBlockPlan {
             .map(|g| g.iter().map(|&t| t as usize).collect())
             .collect();
 
-        // The prepared tables and their derived commitments.
+        // The prepared tables: their layouts and domains from their shapes,
+        // their roots committed here (or the prover's own, see
+        // [`Self::derive_with`]).
         let columns = prepared_tables(&frame.airs, &frame.page_configs)
             .map_err(|e| format!("prepared tables: {e:?}"))?;
         let config = &frame.config;
-        let mut prepared: Vec<(usize, PlannedPrepared)> = crate::with_whir_hash!(|H| {
-            columns
-                .into_iter()
-                .map(
-                    |(table, columns)| -> Result<(usize, PlannedPrepared), String> {
-                        let settled = columns.len();
-                        let p = commit_prepared::<H>(table, columns, config)
-                            .map_err(|e| format!("prepared table {table}: {e:?}"))?;
-                        let (group, slot) = groups
-                            .iter()
-                            .enumerate()
-                            .find_map(|(g, list)| {
-                                list.iter().position(|&t| t == table).map(|s| (g, s))
-                            })
-                            .ok_or_else(|| format!("prepared table {table} is in no group"))?;
-                        let position: usize =
-                            groups[..group].iter().map(Vec::len).sum::<usize>() + slot;
-                        Ok((
-                            position,
-                            PlannedPrepared {
-                                table,
-                                group,
-                                slot,
-                                settled,
-                                roots: p.roots,
-                                layout: p.commitment.layout().clone(),
-                                domain: p.commitment.domain().clone(),
-                            },
-                        ))
-                    },
-                )
-                .collect::<Result<Vec<_>, String>>()
-        })?;
+        if let Some(roots) = prepared_roots
+            && roots
+                .iter()
+                .map(|(t, _)| *t)
+                .ne(columns.iter().map(|(t, _)| *t))
+        {
+            return Err("the supplied prepared roots are for other tables".to_string());
+        }
+        let mut prepared = Vec::with_capacity(columns.len());
+        for (index, (table, columns)) in columns.into_iter().enumerate() {
+            let settled = columns.len();
+            let num_vars = columns
+                .first()
+                .map(|c| c.len().trailing_zeros() as usize)
+                .ok_or_else(|| format!("prepared table {table} has no column"))?;
+            let layout = stark::multilinear_table::global_layout(
+                &[(settled, num_vars)],
+                config.format.stack,
+            )
+            .map_err(|e| format!("prepared table {table}: {e:?}"))?;
+            let domain = Domain::<GoldilocksField>::new(layout.n_stack() + config.log_blowup)
+                .map_err(|e| format!("prepared table {table}: {e:?}"))?;
+            let roots = match prepared_roots {
+                Some(roots) => roots[index].1.clone(),
+                None => crate::with_whir_hash!(|H| {
+                    commit_prepared::<H>(table, columns, config)
+                        .map_err(|e| format!("prepared table {table}: {e:?}"))?
+                        .roots
+                }),
+            };
+            if roots.len() != layout.num_polys() {
+                return Err(format!(
+                    "prepared table {table}: {} roots for {} polynomials",
+                    roots.len(),
+                    layout.num_polys()
+                ));
+            }
+            let (group, slot) = groups
+                .iter()
+                .enumerate()
+                .find_map(|(g, list)| list.iter().position(|&t| t == table).map(|s| (g, s)))
+                .ok_or_else(|| format!("prepared table {table} is in no group"))?;
+            let position: usize = groups[..group].iter().map(Vec::len).sum::<usize>() + slot;
+            prepared.push((
+                position,
+                PlannedPrepared {
+                    table,
+                    group,
+                    slot,
+                    settled,
+                    roots,
+                    layout,
+                    domain,
+                },
+            ));
+        }
         prepared.sort_by_key(|(position, _)| *position);
         let prepared: Vec<PlannedPrepared> = prepared.into_iter().map(|(_, p)| p).collect();
 
@@ -305,6 +377,7 @@ impl WhirBlockPlan {
             prepared,
             costs,
             partition,
+            fan_in,
             id,
         })
     }
@@ -357,8 +430,12 @@ impl WhirBlockPlan {
     }
 
     /// The node over `children`, the top when `top`, emitted and validated.
-    pub fn node_program(&self, children: &[DerivedChild], top: bool) -> Result<LfmProgram, String> {
-        let shapes: Vec<_> = children.iter().map(DerivedChild::shape).collect();
+    pub fn node_program(
+        &self,
+        children: &[&DerivedChild],
+        top: bool,
+    ) -> Result<LfmProgram, String> {
+        let shapes: Vec<_> = children.iter().map(|c| c.shape()).collect();
         let mut b = builder();
         super::block_node::emit_block_node(
             &mut b,
@@ -371,53 +448,81 @@ impl WhirBlockPlan {
         finish(b)
     }
 
-    /// The levels above the leaves: fan-in
-    /// [`super::per_table_aggregator::FAN_IN`], leftovers in arity-1 nodes, the
-    /// last level's single node the top. A one-leaf block still gets a top node:
-    /// the bus closes there.
+    /// The levels above the leaves: the plan's fan-in, leftovers in arity-1
+    /// nodes, the last level's single node the top. A one-leaf block still gets
+    /// a top node: the bus closes there.
     pub fn levels(&self) -> Vec<super::per_table_aggregator::Level> {
-        use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
-        let mut shape = tree_shape(self.partition.num_leaves(), FAN_IN);
+        use super::per_table_aggregator::{Level, tree_shape};
+        let mut shape = tree_shape(self.partition.num_leaves(), self.fan_in);
         if shape.is_empty() {
             shape.push(Level { arities: vec![1] });
         }
         shape
     }
 
-    /// The top program's artifacts, with no proof: every leaf emitted and its
-    /// artifacts built, each node emitted over its children's derived shapes,
-    /// level by level, under the tree's options.
-    pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
+    /// Every program of the tree with its artifacts and derived shape, with no
+    /// proof: every leaf emitted (in parallel) and its artifacts built, each
+    /// node emitted over its children's derived shapes, level by level, under
+    /// the tree's options.
+    pub fn programs(&self, wrap_opts: &crate::ProofOptions) -> Result<TreePrograms, String> {
         let words = self.child_layout().total();
-        let child = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
-            let artifacts = artifacts_of(program, wrap_opts);
+        let build = |program: LfmProgram| -> Result<TreeProgram, String> {
+            let artifacts = artifacts_of(&program, wrap_opts);
             let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
-            Ok((artifacts, derived))
+            Ok(TreeProgram {
+                program,
+                artifacts,
+                derived,
+            })
         };
-        let mut level: Vec<(LfmArtifacts, DerivedChild)> = (0..self.partition.num_leaves())
-            .map(|k| child(&self.leaf_program(k)?))
+        let leaf = |k: usize| build(self.leaf_program(k)?);
+        #[cfg(feature = "parallel")]
+        let first: Vec<TreeProgram> = {
+            use rayon::prelude::*;
+            (0..self.partition.num_leaves())
+                .into_par_iter()
+                .map(leaf)
+                .collect::<Result<_, String>>()?
+        };
+        #[cfg(not(feature = "parallel"))]
+        let first: Vec<TreeProgram> = (0..self.partition.num_leaves())
+            .map(leaf)
             .collect::<Result<_, String>>()?;
-        let levels = self.levels();
-        for (lv, arities) in levels.iter().enumerate() {
-            let top = lv + 1 == levels.len();
+        let mut levels = vec![first];
+        let shape = self.levels();
+        for (lv, arities) in shape.iter().enumerate() {
+            let top = lv + 1 == shape.len();
+            let below = levels.last().expect("the leaves");
+            let mut at = 0usize;
             let mut next = Vec::with_capacity(arities.arities.len());
-            let mut rest = level.into_iter();
             for &a in &arities.arities {
-                let kids: Vec<DerivedChild> = rest.by_ref().take(a).map(|(_, d)| d).collect();
-                if kids.len() != a {
-                    return Err(format!("level {}: arities overrun the children", lv + 1));
-                }
-                next.push(child(&self.node_program(&kids, top)?)?);
+                let kids = below
+                    .get(at..at + a)
+                    .ok_or_else(|| format!("level {}: arities overrun the children", lv + 1))?;
+                let derived: Vec<&DerivedChild> = kids.iter().map(|k| &k.derived).collect();
+                next.push(build(self.node_program(&derived, top)?)?);
+                at += a;
             }
-            if rest.next().is_some() {
+            if at != below.len() {
                 return Err(format!("level {}: arities leave children over", lv + 1));
             }
-            level = next;
+            levels.push(next);
         }
-        match <[_; 1]>::try_from(level) {
-            Ok([(artifacts, _)]) => Ok(artifacts),
-            Err(level) => Err(format!("the tree closes to {} nodes", level.len())),
+        match levels.last().map(Vec::len) {
+            Some(1) => Ok(TreePrograms { levels }),
+            other => Err(format!("the tree closes to {other:?} nodes")),
         }
+    }
+
+    /// The top program's artifacts, with no proof ([`Self::programs`]).
+    pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
+        let mut programs = self.programs(wrap_opts)?;
+        let top = programs
+            .levels
+            .pop()
+            .and_then(|mut level| level.pop())
+            .ok_or("no top")?;
+        Ok(top.artifacts)
     }
 
     /// Replace the partition — another tree, test-only: what a prover may emit
@@ -512,10 +617,19 @@ pub fn verify_block_tree(
     format: &BlockFormat,
     statement: BlockStatement<'_>,
     num_leaves: Option<usize>,
+    fan_in: usize,
     wrap_opts: &crate::ProofOptions,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
-    let plan = WhirBlockPlan::derive(elf_bytes, proof_options, format, statement, num_leaves)?;
+    let plan = WhirBlockPlan::derive_with(
+        elf_bytes,
+        proof_options,
+        format,
+        statement,
+        num_leaves,
+        fan_in,
+        None,
+    )?;
     let artifacts = plan.derive_top(wrap_opts)?;
     if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
     {

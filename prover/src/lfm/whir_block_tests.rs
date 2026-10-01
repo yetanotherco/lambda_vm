@@ -24,8 +24,8 @@ use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, pub
 use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child_timed};
 use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
 use super::whir_block::{
-    BlockPartition, LeafChecks, WhirBlockPlan, artifacts_of, block_leaf_arena, id_words,
-    leaf_program_with, out_halves, partition_groups, verify_block_tree,
+    BLOCK_FAN_IN, BlockPartition, LeafChecks, WhirBlockPlan, artifacts_of, block_leaf_arena,
+    id_words, leaf_program_with, out_halves, partition_groups, verify_block_tree,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -490,12 +490,12 @@ fn compose(
         let mut next = Vec::with_capacity(arities.arities.len());
         let mut rest = level.into_iter();
         for (j, &a) in arities.arities.iter().enumerate() {
-            let mut derived = Vec::with_capacity(a);
-            let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
-            for kid in rest.by_ref().take(a) {
-                arenas.extend(child_arena_words(&kid.child));
-                derived.push(kid.derived);
-            }
+            let kids: Vec<Proved> = rest.by_ref().take(a).collect();
+            let arenas: Vec<Vec<LfmWord>> = kids
+                .iter()
+                .flat_map(|k| child_arena_words(&k.child))
+                .collect();
+            let derived: Vec<&DerivedChild> = kids.iter().map(|k| &k.derived).collect();
             let program = plan.node_program(&derived, top)?;
             let (proved, secs) = prove_tree_program(
                 &format!("{tag} L{}N{j}{}", lv + 1, if top { " TOP" } else { "" }),
@@ -546,6 +546,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
         &format,
         proof.statement(),
         Some(2),
+        BLOCK_FAN_IN,
         &wrap,
         &top,
     )
@@ -567,6 +568,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
             &format,
             proof.statement(),
             Some(2),
+            BLOCK_FAN_IN,
             &wrap,
             &other
         )
@@ -644,6 +646,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
                 &format,
                 proof.statement(),
                 Some(2),
+                BLOCK_FAN_IN,
                 &wrap,
                 &bad
             )
@@ -655,50 +658,281 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
 
 // ============================== the real block ============================
 
+/// A node program built ahead of the proofs below it.
+struct TreeNode {
+    program: LfmProgram,
+    artifacts: super::registry::LfmArtifacts,
+    derived: DerivedChild,
+    /// Seconds emitting it and building its artifacts.
+    built: f64,
+}
+
+/// One level's readout: its wall, and per program (artifacts, prove) seconds.
+struct LevelTiming {
+    wall: f64,
+    programs: Vec<(f64, f64)>,
+}
+
+/// The tree proved the way a prover would run it, with the leaves' programs
+/// emitted beforehand (`leaves`, while phase B ran):
+/// 1. the leaves' artifacts, in parallel;
+/// 2. the nodes' programs and artifacts — functions of the leaves' artifacts,
+///    not of any proof — on a thread of their own, beside
+/// 3. the leaves proved `siblings` at a time, each harvested without its
+///    verify;
+/// 4. each level above proved over the harvested children.
+///
+/// Returns each level's timing and every proof with its artifacts, level by
+/// level, the top last — for the harness to verify off the clock.
+#[allow(clippy::type_complexity)]
+fn prove_tree_pipelined(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    leaves: Vec<LfmProgram>,
+    siblings: usize,
+) -> Result<
+    (
+        Vec<LevelTiming>,
+        Vec<(super::registry::LfmArtifacts, LfmProof)>,
+    ),
+    String,
+> {
+    use super::per_table_aggregator_tests::{harvest_child, in_index_order};
+    let wrap = aggregation_wrap_options();
+    let words = plan.child_layout().total();
+    let t_level = std::time::Instant::now();
+
+    // 1. the leaves' artifacts.
+    let leaf_built: Vec<(super::registry::LfmArtifacts, DerivedChild, f64)> = {
+        use rayon::prelude::*;
+        leaves
+            .par_iter()
+            .map(|program| -> Result<_, String> {
+                let t = std::time::Instant::now();
+                let artifacts = artifacts_of(program, &wrap);
+                let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                Ok((artifacts, derived, t.elapsed().as_secs_f64()))
+            })
+            .collect::<Result<_, String>>()?
+    };
+    let shape = plan.levels();
+    let mut timings = Vec::with_capacity(shape.len() + 1);
+    let mut proofs = Vec::new();
+
+    let (leaf_proved, nodes) = std::thread::scope(|scope| {
+        // 2. the nodes' programs, from the leaves' derived shapes.
+        let nodes = scope.spawn(|| -> Result<Vec<Vec<TreeNode>>, String> {
+            let mut owned: Vec<Vec<TreeNode>> = Vec::with_capacity(shape.len());
+            for (lv, arities) in shape.iter().enumerate() {
+                let top = lv + 1 == shape.len();
+                let level = {
+                    let below: Vec<&DerivedChild> = match lv {
+                        0 => leaf_built.iter().map(|(_, d, _)| d).collect(),
+                        _ => owned[lv - 1].iter().map(|n| &n.derived).collect(),
+                    };
+                    let mut at = 0usize;
+                    let mut level = Vec::with_capacity(arities.arities.len());
+                    for &a in &arities.arities {
+                        let t = std::time::Instant::now();
+                        let program = plan.node_program(&below[at..at + a], top)?;
+                        let artifacts = artifacts_of(&program, &wrap);
+                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                        level.push(TreeNode {
+                            program,
+                            artifacts,
+                            derived,
+                            built: t.elapsed().as_secs_f64(),
+                        });
+                        at += a;
+                    }
+                    level
+                };
+                owned.push(level);
+            }
+            Ok(owned)
+        });
+        // 3. the leaves, `siblings` at a time.
+        let proved = in_index_order(leaves.len(), siblings, |k| -> Result<_, String> {
+            let arenas = block_leaf_arena(plan, proof, k)?;
+            let t = std::time::Instant::now();
+            let lfm = lfm_prove(&leaves[k], &leaf_built[k].0, &arenas, &wrap)
+                .map_err(|e| format!("leaf {k}: {e:?}"))?;
+            let prove = t.elapsed().as_secs_f64();
+            let child = harvest_child(leaf_built[k].0.clone(), wrap.clone(), &lfm);
+            Ok((lfm, child, prove))
+        });
+        (proved, nodes.join())
+    });
+    let leaf_proved: Vec<(LfmProof, RealChild, f64)> =
+        leaf_proved.into_iter().collect::<Result<_, String>>()?;
+    let nodes = nodes.map_err(|_| "the node builder panicked".to_string())??;
+    timings.push(LevelTiming {
+        wall: t_level.elapsed().as_secs_f64(),
+        programs: leaf_built
+            .iter()
+            .zip(&leaf_proved)
+            .map(|((_, _, built), (_, _, prove))| (*built, *prove))
+            .collect(),
+    });
+    let mut children: Vec<RealChild> = Vec::with_capacity(leaf_proved.len());
+    for ((lfm, child, _), (artifacts, _, _)) in leaf_proved.into_iter().zip(leaf_built) {
+        proofs.push((artifacts, lfm));
+        children.push(child);
+    }
+
+    // 4. the levels above.
+    for (lv, (arities, level)) in shape.iter().zip(nodes).enumerate() {
+        let t_level = std::time::Instant::now();
+        let mut at = 0usize;
+        let mut starts = Vec::with_capacity(arities.arities.len());
+        for &a in &arities.arities {
+            starts.push(at..at + a);
+            at += a;
+        }
+        let proved = in_index_order(level.len(), siblings, |j| -> Result<_, String> {
+            let arenas: Vec<Vec<LfmWord>> = children[starts[j].clone()]
+                .iter()
+                .flat_map(child_arena_words)
+                .collect();
+            let t = std::time::Instant::now();
+            let lfm = lfm_prove(&level[j].program, &level[j].artifacts, &arenas, &wrap)
+                .map_err(|e| format!("level {} node {j}: {e:?}", lv + 1))?;
+            let prove = t.elapsed().as_secs_f64();
+            let child = harvest_child(level[j].artifacts.clone(), wrap.clone(), &lfm);
+            Ok((lfm, child, prove))
+        });
+        let proved: Vec<(LfmProof, RealChild, f64)> =
+            proved.into_iter().collect::<Result<_, String>>()?;
+        timings.push(LevelTiming {
+            wall: t_level.elapsed().as_secs_f64(),
+            programs: level
+                .iter()
+                .zip(&proved)
+                .map(|(n, (_, _, prove))| (n.built, *prove))
+                .collect(),
+        });
+        children = Vec::with_capacity(proved.len());
+        for ((lfm, child, _), node) in proved.into_iter().zip(level) {
+            proofs.push((node.artifacts, lfm));
+            children.push(child);
+        }
+    }
+    if children.len() != 1 {
+        return Err(format!("the tree closes to {} nodes", children.len()));
+    }
+    Ok((timings, proofs))
+}
+
 /// ★ W3's readout on a real block (box only, `--ignored`, `--features cuda`,
-/// `LAMBDA_VM_WHIR_HASH=rpx`): the block proved in one proof at the production
-/// format and verified on the host; the plan derived from the ELF and the
-/// statement; every leaf emitted, proved and harvested, the nodes to the top;
-/// the top checked by the block's verifier against the top program it derives.
-/// Reads `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT` and `W3_LEAVES` (the leaf count;
-/// the plan's rule when unset). Prints `W3 …` lines.
+/// `LAMBDA_VM_WHIR_HASH=rpx`), run the way a prover would:
+/// - the block proved in one proof at the production format;
+/// - the moment its statement is final (after phase A), the plan derived and
+///   the leaves' programs emitted on threads of their own, beside phase B;
+/// - then the tree ([`prove_tree_pipelined`]): the leaves `W3_SIBLINGS` at a
+///   time (3 by default), the nodes' programs built beside them.
+///
+/// Off the clock, after the whole block: every proof verified against its
+/// artifacts, the base verified on the host, and the top checked by the block's
+/// verifier against the top program it derives from the ELF and the statement.
+/// Reads `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`, `W3_LEAVES` (the rule's count
+/// when unset), `W3_SIBLINGS` and `W3_FAN_IN` ([`BLOCK_FAN_IN`] when unset).
+/// Prints `W3 …` lines.
 #[test]
 #[ignore = "a real block and its recursion: box only"]
 fn the_whir_block_tree_on_a_real_block() {
-    let elf_path = std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF");
-    let input_path = std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT");
-    let elf = std::fs::read(&elf_path).expect("read the ELF");
-    let input = std::fs::read(&input_path).expect("read the input");
-    let leaves: Option<usize> = std::env::var("W3_LEAVES")
-        .ok()
-        .map(|v| v.trim().parse().expect("W3_LEAVES is a count"));
+    let knob = |name: &str| -> Option<usize> {
+        std::env::var(name).ok().map(|v| {
+            v.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is a count"))
+        })
+    };
+    let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
+        .expect("read the ELF");
+    let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
+        .expect("read the input");
+    let leaves = knob("W3_LEAVES");
+    let siblings = knob("W3_SIBLINGS").unwrap_or(3);
+    let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
     let format = BlockFormat::production();
     let options = BlockOptions::production();
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
-    super::device_permit::arm(1);
+    super::device_permit::arm(siblings);
+    println!("W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in}");
 
-    let t = std::time::Instant::now();
-    let (proof, stamps) =
-        prove_block_whir(&elf, &input, &opts, &format, &options).expect("the block proves");
-    let base = t.elapsed().as_secs_f64();
+    let t0 = std::time::Instant::now();
+    let sender = std::sync::Mutex::new(None::<std::sync::mpsc::Sender<_>>);
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        block_whir::OwnedBlockStatement,
+        Vec<block_whir::PreparedRoots>,
+    )>();
+    *sender.lock().expect("lock") = Some(tx);
+    let observe = |statement: block_whir::BlockStatement<'_>,
+                   roots: &[block_whir::PreparedRoots]| {
+        if let Some(tx) = sender.lock().expect("lock").as_ref() {
+            let _ = tx.send((statement.to_owned(), roots.to_vec()));
+        }
+    };
+    let (elf_ref, opts_ref, format_ref) = (&elf, &opts, &format);
+    let (proved, pre) = std::thread::scope(|scope| {
+        let pre = scope.spawn(
+            move || -> Result<(WhirBlockPlan, Vec<LfmProgram>, f64, f64), String> {
+                let (statement, roots) = rx
+                    .recv()
+                    .map_err(|_| "the prover never stated".to_string())?;
+                let at = t0.elapsed().as_secs_f64();
+                let plan = WhirBlockPlan::derive_with(
+                    elf_ref,
+                    opts_ref,
+                    format_ref,
+                    statement.view(),
+                    leaves,
+                    fan_in,
+                    Some(&roots),
+                )?;
+                // One plain thread a leaf, off the rayon pool phase B is using.
+                let programs: Vec<LfmProgram> = std::thread::scope(|inner| {
+                    let handles: Vec<_> = (0..plan.partition().num_leaves())
+                        .map(|k| {
+                            let plan = &plan;
+                            inner.spawn(move || plan.leaf_program(k))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .map_err(|_| "a leaf emitter panicked".to_string())?
+                        })
+                        .collect::<Result<_, String>>()
+                })?;
+                Ok((plan, programs, at, t0.elapsed().as_secs_f64()))
+            },
+        );
+        let proved =
+            block_whir::prove_block_whir_observed(&elf, &input, &opts, &format, &options, &observe);
+        // A prover that failed before stating must not leave the planner waiting.
+        *sender.lock().expect("lock") = None;
+        (proved, pre.join())
+    });
+    let (proof, stamps) = proved.expect("the block proves");
+    let base = t0.elapsed().as_secs_f64();
+    let (plan, programs, stated_at, ready_at) = pre
+        .expect("the planner did not panic")
+        .expect("the plan and the leaves derive");
     print!("{}", stamps.report());
-    println!("W3 BASE: {base:.2}s");
-    let t = std::time::Instant::now();
-    let ok = verify_block_whir(&proof, &elf, &opts, &format).expect("the verifier runs");
     println!(
-        "W3 BASE VERIFY: {} in {:.2}s",
-        if ok { "ACCEPTED" } else { "REJECTED" },
-        t.elapsed().as_secs_f64()
+        "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",
+        programs.len(),
+        if ready_at <= base {
+            "inside the base"
+        } else {
+            "after the base"
+        }
     );
-    assert!(ok, "the block proof must verify");
-
-    let t = std::time::Instant::now();
-    let plan = WhirBlockPlan::derive(&elf, &opts, &format, proof.statement(), leaves)
-        .expect("the plan derives");
     println!(
-        "W3 PLAN: {:.2}s · {} groups · costs {:?} (Σ {}) · {} leaves {:?} · {} prepared",
-        t.elapsed().as_secs_f64(),
+        "W3 PLAN: {} groups · costs {:?} (Σ {}) · {} leaves {:?} · {} prepared",
         plan.num_groups(),
         plan.costs(),
         plan.costs().iter().sum::<usize>(),
@@ -708,19 +942,55 @@ fn the_whir_block_tree_on_a_real_block() {
     );
 
     let t = std::time::Instant::now();
-    let (top, walls) = compose(&plan, &proof, "W3").expect("the tree proves");
-    let recursion = t.elapsed().as_secs_f64();
-    let levels: Vec<String> = walls
-        .iter()
-        .map(|(wall, busy)| format!("{wall:.2} ({busy:.2})"))
-        .collect();
+    let (timings, proofs) =
+        prove_tree_pipelined(&plan, &proof, programs, siblings).expect("the tree proves");
+    let top = &proofs.last().expect("a top").1;
+    let tree = t.elapsed().as_secs_f64();
+    let whole = t0.elapsed().as_secs_f64();
+    for (lv, level) in timings.iter().enumerate() {
+        let programs: Vec<String> = level
+            .programs
+            .iter()
+            .map(|(built, prove)| format!("{built:.2}+{prove:.2}"))
+            .collect();
+        println!(
+            "W3 LEVEL {lv}: {:.2}s wall · per program build+prove {}",
+            level.wall,
+            programs.join(" · ")
+        );
+    }
     println!(
-        "W3 RECURSION: {recursion:.2}s · levels wall (artifacts + prove) {} · whole block {:.2}s",
-        levels.join(" · "),
-        base + recursion
+        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s",
+        whole - base
     );
+
+    // Off the clock: the harness's checks.
     let t = std::time::Instant::now();
-    let verdict = verify_block_tree(&elf, &opts, &format, proof.statement(), leaves, &wrap, &top);
+    for (i, (artifacts, lfm)) in proofs.iter().enumerate() {
+        assert!(
+            super::proof::verify_against_artifacts(artifacts, &lfm.proof, &lfm.public_words, &wrap),
+            "tree proof {i} verifies against its own program"
+        );
+    }
+    let ok = verify_block_whir(&proof, &elf, &opts, &format).expect("the verifier runs");
+    println!(
+        "W3 HARNESS VERIFY: {} tree proofs and the base {} in {:.2}s",
+        proofs.len(),
+        if ok { "ACCEPTED" } else { "REJECTED" },
+        t.elapsed().as_secs_f64()
+    );
+    assert!(ok, "the block proof must verify");
+    let t = std::time::Instant::now();
+    let verdict = verify_block_tree(
+        &elf,
+        &opts,
+        &format,
+        proof.statement(),
+        leaves,
+        fan_in,
+        &wrap,
+        top,
+    );
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {
