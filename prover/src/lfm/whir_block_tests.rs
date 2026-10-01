@@ -53,6 +53,15 @@ fn other_format() -> BlockFormat {
 }
 
 fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+    small_block_at(name, format, block_whir::BLOCK_ECDAS_ROWS_LOG2)
+}
+
+/// [`small_block`] with ECDAS cut at 2^`ecdas_rows_log2` rows.
+fn small_block_at(
+    name: &str,
+    format: &BlockFormat,
+    ecdas_rows_log2: usize,
+) -> (Vec<u8>, BlockWhirProof) {
     let elf = asm_elf_bytes(name);
     let opts = ProofOptions::default_test_options();
     let proof = prove_block_whir(
@@ -63,6 +72,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
         &BlockOptions {
             max_rows: MaxRowsConfig::small(),
             keccak_rnd_rows_log2: 3,
+            ecdas_rows_log2,
             drop_levels: 3,
             window_log2: None,
             stream_keccak_rnd: false,
@@ -346,6 +356,7 @@ fn dense_block_with(
         &BlockOptions {
             max_rows: MaxRowsConfig::default(),
             keccak_rnd_rows_log2: 16,
+            ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
             drop_levels: 3,
             window_log2: None,
             stream_keccak_rnd: false,
@@ -700,6 +711,52 @@ fn compose(
     }
     let [top] = <[Proved; 1]>::try_from(level).map_err(|l| format!("{} tops", l.len()))?;
     Ok((top.proof, walls))
+}
+
+/// ★ ECDAS cut through the block's recursion: test_ecsm_multi with ECDAS in
+/// 16-row tables (four; the 0xABCDEF call through three) proves as a block
+/// whose tree the verifier accepts. The same statement with one ECDAS table
+/// stated over [`block_whir::BLOCK_ECDAS_MAX_VARS`] is refused before any
+/// program is derived.
+#[test]
+#[ignore = "proves block leaves and nodes over a small block; box tier"]
+fn the_whir_block_tree_verifies_a_split_ecdas() {
+    super::device_permit::arm(1);
+    let format = small_format();
+    let (elf, proof) = small_block_at("test_ecsm_multi", &format, 4);
+    assert_eq!(proof.table_counts.ecdas, 4, "four ECDAS tables");
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, None);
+    let (top, _) = compose(&plan, &proof, "ECDAS TREE").expect("the honest tree proves");
+    let verify = |statement: block_whir::BlockStatement<'_>| {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            statement,
+            None,
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+    };
+    verify(proof.statement()).expect("the block's verifier accepts the split ECDAS");
+
+    let mut tall = proof.statement().to_owned();
+    let (_, range, cap) = block_whir::chunked_table_ranges(&tall.table_counts)[1].clone();
+    tall.table_num_vars[range.start] = (cap + 1) as u8;
+    let refused = verify(tall.view());
+    assert!(
+        refused.is_err(),
+        "an ECDAS table stated over its cap must be refused"
+    );
+    println!(
+        "WHIR BLOCK TREE ECDAS SPLIT: {} groups, 4 ECDAS tables, accepted; an ECDAS over its cap \
+         refused ({})",
+        plan.num_groups(),
+        refused.err().unwrap_or_default()
+    );
 }
 
 /// ★ The tree over a small block proves to a top, and the block's verifier —
