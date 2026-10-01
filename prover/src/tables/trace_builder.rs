@@ -3614,6 +3614,18 @@ pub struct StreamSkip {
     pub store: usize,
 }
 
+/// BITWISE lookups a windowed build counted while the run was still being
+/// walked: the histogram of the first `bitwise_ops` in-walk lookups and of the
+/// first `memw_register_rows` MEMW_R rows (the table phase's two dominant
+/// sources). The table phase counts the rest of those two lists and every other
+/// source as always; the histogram is a commutative monoid, so the
+/// multiplicities are the same.
+pub(crate) struct PreCounted {
+    pub(crate) histogram: bitwise::BitwiseHistogram,
+    pub(crate) bitwise_ops: usize,
+    pub(crate) memw_register_rows: usize,
+}
+
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
 pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     TraceTable::from_columns_main(Vec::new(), 1)
@@ -4111,6 +4123,7 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
     skip: &StreamSkip,
+    pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -4242,7 +4255,12 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
-    let mut base = bitwise::BitwiseHistogram::new();
+    let (mut base, counted_iw, counted_reg) = match pre {
+        Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
+        None => (bitwise::BitwiseHistogram::new(), 0, 0),
+    };
+    let uncounted_iw = &bitwise_ops[counted_iw..];
+    let uncounted_reg = &memw_register_rows[counted_reg..];
 
     #[cfg(feature = "parallel")]
     {
@@ -4257,12 +4275,12 @@ fn build_traces<I: ImageSource + Sync>(
         // byte-identical multiplicities (same as the serial fallback below).
         let cap = rayon::current_num_threads().clamp(1, 8);
         let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
-        let iw_chunk = bitwise_ops.len().div_ceil(cap).max(1);
-        for slice in bitwise_ops.chunks(iw_chunk) {
+        let iw_chunk = uncounted_iw.len().div_ceil(cap).max(1);
+        for slice in uncounted_iw.chunks(iw_chunk) {
             units.push(Box::new(move |h| h.add_ops(slice)));
         }
-        let reg_chunk = memw_register_rows.len().div_ceil(cap).max(1);
-        for slice in memw_register_rows.chunks(reg_chunk) {
+        let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
+        for slice in uncounted_reg.chunks(reg_chunk) {
             units.push(Box::new(move |h| {
                 memw_register::collect_bitwise_from_memw_register(slice, h)
             }));
@@ -4292,8 +4310,8 @@ fn build_traces<I: ImageSource + Sync>(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        base.add_ops(&bitwise_ops);
-        memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
+        base.add_ops(uncounted_iw);
+        memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
         for f in &collectors {
             f(&mut base);
         }
@@ -5867,6 +5885,7 @@ impl Traces {
             is_final,
             l2g_memory_bookend,
             &StreamSkip::default(),
+            None,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5946,6 +5965,7 @@ impl Traces {
             true,
             false,
             &StreamSkip::default(),
+            None,
         )
     }
 }

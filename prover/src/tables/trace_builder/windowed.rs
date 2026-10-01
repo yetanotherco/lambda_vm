@@ -49,9 +49,9 @@ use stark::trace::TraceTable;
 
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
-    CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, RegisterState, RoutedSegments,
-    StreamSkip, Traces, WalkOutputs, build_initial_image, build_traces, collect_halt_ops,
-    collect_ops_from_cpu_into, route_ops,
+    CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted, RegisterState,
+    RoutedSegments, StreamSkip, Traces, WalkOutputs, bitwise, build_initial_image, build_traces,
+    collect_halt_ops, collect_ops_from_cpu_into, route_ops,
 };
 use crate::Error;
 use crate::tables::{cpu, load, lt, memw, memw_aligned, memw_register, register, shift, store};
@@ -110,6 +110,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// The routing's segments (smaller lists), appended per window.
     segments: RoutedSegments,
     emitted: StreamSkip,
+    /// The BITWISE lookups of the walked windows' in-walk lookups and MEMW_R
+    /// rows, counted as the windows arrive.
+    counted: PreCounted,
     stamps: WindowStamps,
 }
 
@@ -148,6 +151,11 @@ impl<'a> WindowedTraceBuilder<'a> {
             windows: Vec::new(),
             segments: RoutedSegments::default(),
             emitted: StreamSkip::default(),
+            counted: PreCounted {
+                histogram: bitwise::BitwiseHistogram::new(),
+                bitwise_ops: 0,
+                memw_register_rows: 0,
+            },
             stamps: WindowStamps::default(),
         })
     }
@@ -212,6 +220,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             windows,
             segments,
             emitted,
+            counted,
             ..
         } = self;
         let (cpu_ops, walk) = concatenate(windows);
@@ -231,6 +240,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             true,
             false,
             &emitted,
+            Some(counted),
         )
     }
 
@@ -255,6 +265,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 windows: &mut self.windows,
                 segments: &mut self.segments,
                 emitted: &mut self.emitted,
+                counted: &mut self.counted,
                 route_secs: &mut self.stamps.route,
                 handout_secs: &mut self.stamps.generate,
             },
@@ -303,6 +314,7 @@ pub struct Accumulator<'b> {
     windows: &'b mut Vec<WalkedWindow>,
     segments: &'b mut RoutedSegments,
     emitted: &'b mut StreamSkip,
+    counted: &'b mut PreCounted,
     route_secs: &'b mut f64,
     handout_secs: &'b mut f64,
 }
@@ -314,6 +326,14 @@ impl Accumulator<'_> {
         let t = std::time::Instant::now();
         self.segments
             .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
+        // The table phase's two dominant BITWISE sources, counted now.
+        self.counted.histogram.add_ops(&window.walk.bitwise_ops);
+        super::memw_register::collect_bitwise_from_memw_register(
+            &window.walk.memw.register_rows,
+            &mut self.counted.histogram,
+        );
+        self.counted.bitwise_ops += window.walk.bitwise_ops.len();
+        self.counted.memw_register_rows += window.walk.memw.register_rows.len();
         self.windows.push(window);
         *self.route_secs += t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
