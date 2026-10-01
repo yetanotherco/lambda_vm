@@ -65,6 +65,7 @@ fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             keccak_rnd_rows_log2: 3,
             drop_levels: 3,
             window_log2: None,
+            stream_keccak_rnd: false,
         },
     )
     .expect("the block proves")
@@ -344,6 +345,7 @@ fn dense_block_with(
             keccak_rnd_rows_log2: 16,
             drop_levels: 3,
             window_log2: None,
+            stream_keccak_rnd: false,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1073,11 +1075,18 @@ fn the_whir_block_tree_on_a_real_block() {
     let siblings = knob("W3_SIBLINGS").unwrap_or(3);
     let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
     let format = BlockFormat::production();
-    let options = BlockOptions::production();
+    let mut options = BlockOptions::production();
+    // `BLOCK_WHIR_STREAM_KECCAK_RND=0`: KECCAK_RND built at the run's end (the
+    // control arm of its streaming).
+    options.stream_keccak_rnd =
+        std::env::var("BLOCK_WHIR_STREAM_KECCAK_RND").map_or(true, |v| v.trim() != "0");
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
-    println!("W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in}");
+    println!(
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {}",
+        options.stream_keccak_rnd
+    );
 
     let t0 = std::time::Instant::now();
     let sender = std::sync::Mutex::new(None::<std::sync::mpsc::Sender<_>>);

@@ -42,6 +42,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         keccak_rnd_rows_log2,
         drop_levels: 3,
         window_log2: None,
+        stream_keccak_rnd: false,
     }
 }
 
@@ -259,6 +260,25 @@ fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
     let format = many_groups();
     let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 3, 4));
     assert!(proof.table_counts.keccak_rnd >= 2);
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// The same with KECCAK_RND's chunks streamed as their ops arrive (chunks of
+/// 2^5 rows, the builder's smallest): the same table count as built at the
+/// end, and the proof verifies.
+#[test]
+fn a_streamed_block_with_keccak_rnd_streamed_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let at_end = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 5, 3));
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.stream_keccak_rnd = true;
+    let proof = prove(&elf, &format, &o);
+    assert!(proof.table_counts.keccak_rnd >= 2);
+    assert_eq!(
+        proof.table_counts.keccak_rnd,
+        at_end.table_counts.keccak_rnd
+    );
     assert!(verify(&proof, &elf, &format));
 }
 

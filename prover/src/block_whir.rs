@@ -115,6 +115,9 @@ pub struct BlockOptions {
     /// table as its chunk completes ([`WindowedTraceBuilder`]); `None`: build
     /// the whole run, then commit.
     pub window_log2: Option<usize>,
+    /// With windows: stream KECCAK_RND's 2^`keccak_rnd_rows_log2`-row chunks as
+    /// their ops arrive, instead of building them at the run's end.
+    pub stream_keccak_rnd: bool,
 }
 
 impl BlockOptions {
@@ -126,6 +129,7 @@ impl BlockOptions {
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             drop_levels: BLOCK_TREE_DROP_LEVELS,
             window_log2: Some(BLOCK_WINDOW_LOG2),
+            stream_keccak_rnd: true,
         }
     }
 }
@@ -1028,6 +1032,7 @@ struct StreamAirs {
     lt: crate::VmAir,
     shift: crate::VmAir,
     store: crate::VmAir,
+    keccak_rnd: crate::VmAir,
 }
 
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
@@ -1044,6 +1049,7 @@ impl StreamAirs {
             lt: Box::new(create_lt_air(opts)),
             shift: Box::new(create_shift_air(opts)),
             store: Box::new(create_store_air(opts)),
+            keccak_rnd: Box::new(create_keccak_rnd_air(opts)),
         }
     }
 
@@ -1057,6 +1063,7 @@ impl StreamAirs {
             StreamTable::Lt => self.lt.as_ref(),
             StreamTable::Shift => self.shift.as_ref(),
             StreamTable::Store => self.store.as_ref(),
+            StreamTable::KeccakRnd => self.keccak_rnd.as_ref(),
         }
     }
 }
@@ -1072,6 +1079,7 @@ fn stream_name(table: StreamTable, index: usize) -> String {
         StreamTable::Lt => "LT",
         StreamTable::Shift => "SHIFT",
         StreamTable::Store => "STORE",
+        StreamTable::KeccakRnd => "KECCAK_RND",
     };
     format!("{base}[{index}]")
 }
@@ -1214,6 +1222,9 @@ fn prove_streamed(
             let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
+                if options.stream_keccak_rnd {
+                    builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
                 // thread appends each walked window, routes it and hands its
@@ -1258,6 +1269,13 @@ fn prove_streamed(
                 let mut rest = builder.finish(&last)?;
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
+                if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
+                    return Err(Error::Prover(
+                        "omit_first_keccak_rnd is a non-streamed deviation: a streamed chunk \
+                         lands by its index"
+                            .into(),
+                    ));
+                }
                 if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
                     rest.keccak_rnds.remove(0);
                 }
