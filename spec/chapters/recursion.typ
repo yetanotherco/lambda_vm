@@ -257,12 +257,12 @@ $
 Note here that one can reconstruct $verify'$ from $verify^*$ as
 $
 	sum_(b in BB) verify^*([comm(x), comm(y)], [proof, b])
-	&=^((triangle)) or.big_(b in BB) verify^*([comm(x), comm(y)], [proof, b])\
+	&=^((hexa)) or.big_(b in BB) verify^*([comm(x), comm(y)], [proof, b])\
 	&= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 0), proof) or verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 1), proof)\
 	&= verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof)\
 	&= verify'(comm(x), comm(y), proof),\
 $
-where $(triangle)$ holds under the assumption that a single proof $proof$ cannot 
+where $(hexa)$ holds under the assumption that a single proof $proof$ cannot 
 attest to two distinct instances.
 This makes the `OR` operation ($or$) effectively equivalent to the `XOR` operation,
 which is equivalent to addition in $BB$.
@@ -323,7 +323,7 @@ involving _field_ arithmetic --- e.g., verifying `FRI` folding ---
 while $verify_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
 by means of the Fiat-Shamir transformation.
 
-The communication record primarily exists of the various Fiat-Shamir-derived
+The communication record primarily consists of the various Fiat-Shamir-derived
 challenges required by $verify_f$ to complete verification.
 During execution, $verify_b$ is in charge of validating these record values,
 while $verify_f$ assumes them to be correct.
