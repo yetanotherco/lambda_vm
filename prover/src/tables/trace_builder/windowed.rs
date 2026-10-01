@@ -44,6 +44,7 @@ use std::collections::HashMap;
 
 use executor::elf::Elf;
 use executor::vm::logs::Log;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use stark::trace::TraceTable;
 
@@ -305,7 +306,11 @@ impl<'a> WindowedTraceBuilder<'a> {
             e.store,
             store::generate_store_trace
         );
-        jobs.into_par_iter().map(|job| job()).collect()
+        #[cfg(feature = "parallel")]
+        let jobs = jobs.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let jobs = jobs.into_iter();
+        jobs.map(|job| job()).collect()
     }
 }
 
