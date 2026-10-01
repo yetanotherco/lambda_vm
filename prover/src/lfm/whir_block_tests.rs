@@ -1076,10 +1076,10 @@ fn the_whir_block_tree_on_a_real_block() {
     let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
     let format = BlockFormat::production();
     let mut options = BlockOptions::production();
-    // `BLOCK_WHIR_STREAM_KECCAK_RND=0`: KECCAK_RND built at the run's end (the
-    // control arm of its streaming).
+    // `BLOCK_WHIR_STREAM_KECCAK_RND=1`: KECCAK_RND's chunks streamed (off by
+    // default: NO EFFECT on this block, FAST 418).
     options.stream_keccak_rnd =
-        std::env::var("BLOCK_WHIR_STREAM_KECCAK_RND").map_or(true, |v| v.trim() != "0");
+        std::env::var("BLOCK_WHIR_STREAM_KECCAK_RND").is_ok_and(|v| v.trim() == "1");
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);

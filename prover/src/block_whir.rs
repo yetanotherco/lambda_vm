@@ -116,7 +116,9 @@ pub struct BlockOptions {
     /// the whole run, then commit.
     pub window_log2: Option<usize>,
     /// With windows: stream KECCAK_RND's 2^`keccak_rnd_rows_log2`-row chunks as
-    /// their ops arrive, instead of building them at the run's end.
+    /// their ops arrive, instead of building them at the run's end. Off by
+    /// default: on block 25368371 the keccak work sits at the run's end, and
+    /// streaming it read NO EFFECT (FAST 418).
     pub stream_keccak_rnd: bool,
 }
 
@@ -129,7 +131,7 @@ impl BlockOptions {
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             drop_levels: BLOCK_TREE_DROP_LEVELS,
             window_log2: Some(BLOCK_WINDOW_LOG2),
-            stream_keccak_rnd: true,
+            stream_keccak_rnd: false,
         }
     }
 }
