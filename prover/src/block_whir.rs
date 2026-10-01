@@ -1491,19 +1491,24 @@ fn stream_pipelined<'a, R>(
 
 /// The run's tables the windows did not stream, laid out in parallel, and what
 /// the statement reads off the run; `marks` are seconds since the prove
-/// started.
+/// started. `prepared` is `None` when it is left for after the packing.
 struct RestLaid<'a> {
     table_counts: TableCounts,
     runtime_page_ranges: Vec<RuntimePageRange>,
     num_private_input_pages: usize,
     public_output: Vec<u8>,
+    airs: &'a VmAirs,
+    page_configs: Vec<crate::tables::page::PageConfig>,
     refs: Vec<&'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
-    prepared: Vec<PreparedColumns>,
+    prepared: Option<Vec<PreparedColumns>>,
     tables: Vec<Placed<'a>>,
     marks: Vec<(&'static str, f64)>,
     busy: f64,
 }
 
+/// `prepared_now`: derive the prepared columns here, before the tables are
+/// laid out; otherwise the caller derives them once the groups are sent (phase
+/// A reads none of them).
 fn lay_out_rest<'a>(
     mut traces: Box<Traces>,
     program: &Elf,
@@ -1511,6 +1516,7 @@ fn lay_out_rest<'a>(
     format: &BlockFormat,
     run_airs: &'a std::sync::OnceLock<VmAirs>,
     start: Instant,
+    prepared_now: bool,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
     let at = || start.elapsed().as_secs_f64();
@@ -1539,8 +1545,14 @@ fn lay_out_rest<'a>(
         )
     });
     marks.push(("airs", at()));
-    let prepared = prepared_tables(airs, &traces.page_configs, format)?;
-    marks.push(("prepared", at()));
+    let prepared = if prepared_now {
+        let prepared = prepared_tables(airs, &traces.page_configs, format)?;
+        marks.push(("prepared", at()));
+        Some(prepared)
+    } else {
+        None
+    };
+    let page_configs = traces.page_configs.clone();
     let refs = airs.air_refs();
     let pairs = airs.air_trace_pairs(&mut traces);
     let tables: Vec<Placed<'a>> = pairs
@@ -1564,6 +1576,8 @@ fn lay_out_rest<'a>(
         runtime_page_ranges,
         num_private_input_pages,
         public_output,
+        airs,
+        page_configs,
         refs,
         prepared,
         tables,
@@ -1724,8 +1738,12 @@ fn prove_streamed(
                     closed_at: Vec::new(),
                     blocked: 0.0,
                 };
-                let rest_of = |traces| lay_out_rest(traces, program, opts, format, run_airs, start);
-                let (streamed, rest) = if options.layout_workers == 0 {
+                // Off the inline path, the prepared columns wait until the
+                // groups are sent.
+                let inline = options.layout_workers == 0;
+                let rest_of =
+                    |traces| lay_out_rest(traces, program, opts, format, run_airs, start, inline);
+                let (streamed, rest) = if inline {
                     let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
                     (streamed, rest_of(traces)?)
                 } else {
@@ -1743,6 +1761,8 @@ fn prove_streamed(
                     runtime_page_ranges,
                     num_private_input_pages,
                     public_output,
+                    airs,
+                    page_configs,
                     refs,
                     prepared,
                     tables: rest_tables,
@@ -1773,6 +1793,14 @@ fn prove_streamed(
                 let mut marks = vec![("streamed placed", placed_at)];
                 marks.extend(rest_marks);
                 marks.push(("groups closed", start.elapsed().as_secs_f64()));
+                let prepared = match prepared {
+                    Some(prepared) => prepared,
+                    None => {
+                        let prepared = prepared_tables(airs, &page_configs, format)?;
+                        marks.push(("prepared", start.elapsed().as_secs_f64()));
+                        prepared
+                    }
+                };
                 let shapes: Vec<(usize, usize)> = shapes
                     .into_iter()
                     .enumerate()
