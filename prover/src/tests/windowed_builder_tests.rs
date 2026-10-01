@@ -336,25 +336,31 @@ fn table_digests(t: &Traces) -> Vec<(String, String)> {
     tables
         .into_par_iter()
         .map(|(name, table, hashed)| {
-            let mut rows: Vec<Vec<u64>> = (0..table.main_table.height)
-                .map(|r| {
-                    table
-                        .main_table
-                        .get_row(r)
-                        .iter()
-                        .map(|v| v.canonical())
-                        .collect()
-                })
-                .collect();
-            if hashed {
-                rows.sort_unstable();
-            }
+            // Streamed, never materialized: a block's traces are tens of GiB.
+            // A HashMap-ordered table is digested as the sorted list of its
+            // rows' digests (32 bytes a row), which is order-free.
+            let row_bytes = |r: usize| -> Vec<u8> {
+                table
+                    .main_table
+                    .get_row(r)
+                    .iter()
+                    .flat_map(|v| v.canonical().to_le_bytes())
+                    .collect()
+            };
             let mut h = blake3::Hasher::new();
             h.update(&(table.main_table.width as u64).to_le_bytes());
             h.update(&(table.main_table.height as u64).to_le_bytes());
-            for row in rows {
-                for v in row {
-                    h.update(&v.to_le_bytes());
+            if hashed {
+                let mut rows: Vec<[u8; 32]> = (0..table.main_table.height)
+                    .map(|r| *blake3::hash(&row_bytes(r)).as_bytes())
+                    .collect();
+                rows.sort_unstable();
+                for row in rows {
+                    h.update(&row);
+                }
+            } else {
+                for r in 0..table.main_table.height {
+                    h.update(&row_bytes(r));
                 }
             }
             (name, h.finalize().to_hex()[..16].to_string())
