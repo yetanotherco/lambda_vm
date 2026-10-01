@@ -15,15 +15,15 @@
 #       CPU, from a /proc sampler beside the same runs.
 #
 # MODES  (one prover at a time; each step bounded by `timeout`; a deadline skips what would overrun)
-#   --quick (the default)  ~15 min after the build, peak host ~48 GiB. Run A (Nsight Systems with GPU metrics
+#   --quick (the default)  ~15 min after the build (~20 with a first build), peak host ~48 GiB. Run A (Nsight Systems with GPU metrics
 #       and the CPU sampler) on both workloads, then five Nsight Compute passes on the top kernels: the WHIR
 #       phase-A coset leaves, the phase-B GKR and lean rounds, and the LFM multi_prove leaves and Merkle levels. Answers Q1's busy/idle, families
 #       and GPU-metric means per phase, Q2's per-hold busy and families, Q3, and a first roof reading.
-#   --full  ~45-60 min after the build, same peak. Adds a reference run of each workload without a
+#   --full  ~35-55 min with the build, same peak. Adds a reference run of each workload without a
 #       profiler (its walls), and every Nsight Compute pass of the plan (one launch of each shape for
 #       the kernels that carry each phase and each hold). Answers Q1 and Q2's roofs kernel by kernel.
-#   The build is a few minutes in a fresh work directory (two checkouts, two target directories) and is
-#   reused by a re-run.
+#   The build is ~4-5 minutes in a fresh work directory (two checkouts, two target directories; FAST: 76 s +
+#   177 s) and is reused by a re-run. FAST's dry runs of everything but ncu took 7 minutes.
 #
 # WHAT IT RUNS  (the structure of lane I-PROF's noepoch_counters.sh, 09-30, and mauro-ncu.sh, 09-28)
 #   1. Checks; each failure refuses with exit 9 and says what to fix: Linux; an NVIDIA GPU with nothing
@@ -73,7 +73,7 @@
 # RUN  (inside tmux or screen, the GPU otherwise idle, big programs closed)
 #   bash noepoch_counters.sh --preflight-only   # the checks alone, about two minutes
 #   bash noepoch_counters.sh --quick            # ~15 min after the build
-#   bash noepoch_counters.sh --full             # ~45-60 min after the build
+#   bash noepoch_counters.sh --full             # ~35-55 min with the build, at most ~60
 #   The work directory is ./lambda-vm-prof2 (NP_WORKDIR=/path to change). The script writes only there:
 #   the clone, the cargo cache (CARGO_HOME), temporary files (TMPDIR), the tools' config (HOME) and the
 #   runs. (Nsight itself keeps lock and IPC files in /tmp.)
@@ -103,7 +103,7 @@
 #   NP_CLOCK           ncu --clock-control: base (default, as on 09-25 and 09-28), boost or none
 #   NP_GPU_METRICS_HZ  run A's GPU-metrics sampling rate (default 2000)
 #   NP_NCU_VRAM_MB     run B's VRAM budget in MiB (default: WHIR its record's, STARK 16000 as on 09-28)
-#   NP_DEADLINE_MIN    minutes from the start after which nothing new starts (quick 35, full 80)
+#   NP_DEADLINE_MIN    minutes from the start after which nothing new starts (quick 30, full 58)
 #   NP_PASS_TIMEOUT    seconds per run-B pass (900) · NP_RUN_TIMEOUT per reference / run-A run (900)
 #   NP_BUILD_TIMEOUT   seconds for each build (2400)
 #   NP_IDLE_MIB        the GPU counts as idle below this many MiB in use with no compute process (500)
@@ -220,7 +220,9 @@ FAST 419 (no-epoch WHIR, whole 22.30 s, base 18.13-18.55, phase A 10.37-10.73, r
 FAST 456 (no-epoch STARK, whole 31.78 s: base 21.28, level 0 5.18, interior 4.88), FAST 454 (R4: idle
 inside the recursion's holds 1.2-1.8 s of 9.5 s held), FAST 457 (the STARK recursion card-bound at
 every level), G5-NCU (09-28: the epoch pipelines' base kernels at their roofs, RPX fmaheavy-bound) and this
-script's FAST dry runs (490+). Mauro's machine is not FAST (another CPU, 60 GiB), so walls get wide bands;
+script's FAST dry runs 492/493 (no counters: WHIR base 18.38, phase A 10.61, phase B 7.73, whole 22.65 s,
+nsys peak RSS 47.7 GiB; phase A kernel-busy 52 %, phase B 63 %; STARK whole 31.72 s, 15 multi_prove holds
+6.90 s held at 85-88 % kernel-busy). Mauro's machine is not FAST (another CPU, 60 GiB), so walls get wide bands;
 the structural checks are exact.
 
 Gates (a miss makes the VERDICT PARTIAL or FAILED):
@@ -231,12 +233,12 @@ Gates (a miss makes the VERDICT PARTIAL or FAILED):
   - every run-B pass that runs profiles at least one launch.
 Expected (reported, not gated):
   - walls: WHIR base 16-22 s, whole 20-27 s; STARK base 19-25 s, recursion 9-13 s, whole 29-37 s;
-    nsys run A within +15 % of the reference; host peak WHIR 40-48 GiB, STARK 36-46 GiB;
+    nsys run A within +15 % of the reference; host peak WHIR 42-50 GiB, STARK 38-46 GiB;
   - WHIR phase A 9-12 s, phase B 6-9 s; phase B card busy below phase A's (the argue's host glue, memory
     argue-idle-is-host-glue); the top phase-A kernels (RPX leaves, Merkle levels) at a compute roof
     (fmaheavy >= 80 %), as on 09-28;
-  - STARK recursion: about 15 multi_prove holds of 0.3-0.7 s; inside them kernel busy 60-90 % (R4: idle
-    13-19 % of held time); the LFM kernels' launches smaller than the base's, so more of them under one
+  - STARK recursion: 15 multi_prove holds of 0.3-0.7 s; inside them kernel busy 70-95 % (R4: idle
+    13-19 % of held time; FAST 492: 85-88 %); the LFM kernels' launches smaller than the base's, so more of them under one
     wave; RPX kernels still fmaheavy-bound where they fill the card.
 PREREG
 }
@@ -395,7 +397,7 @@ knob_defaults() {
   NP_CLOCK="${NP_CLOCK:-base}"
   NP_GPU_METRICS_HZ="${NP_GPU_METRICS_HZ:-2000}"
   NP_NCU_VRAM_MB="${NP_NCU_VRAM_MB:-}"
-  if [ "$NP_MODE" = full ]; then NP_DEADLINE_MIN="${NP_DEADLINE_MIN:-80}"; else NP_DEADLINE_MIN="${NP_DEADLINE_MIN:-35}"; fi
+  if [ "$NP_MODE" = full ]; then NP_DEADLINE_MIN="${NP_DEADLINE_MIN:-58}"; else NP_DEADLINE_MIN="${NP_DEADLINE_MIN:-30}"; fi
   NP_PASS_TIMEOUT="${NP_PASS_TIMEOUT:-900}"
   NP_RUN_TIMEOUT="${NP_RUN_TIMEOUT:-900}"
   NP_BUILD_TIMEOUT="${NP_BUILD_TIMEOUT:-2400}"

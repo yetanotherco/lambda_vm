@@ -24,21 +24,21 @@ whose performance counters are open. The script answers three questions and send
 cd ~/mauro
 curl -fsSLO https://raw.githubusercontent.com/yetanotherco/lambda_vm/<sha>/scripts/profile/noepoch_counters.sh
 bash noepoch_counters.sh --preflight-only   # the checks alone, about 2 minutes
-bash noepoch_counters.sh --quick            # about 15 minutes after the build
-bash noepoch_counters.sh --full             # about 45-60 minutes after the build
+bash noepoch_counters.sh --quick            # about 15 minutes after the build (about 20 the first time)
+bash noepoch_counters.sh --full             # about 35-55 minutes including the build
 ```
 
 The script works only inside `./lambda-vm-prof2` (set `NP_WORKDIR=/path` to use another directory).
 It clones the public repository at two pinned commits, downloads the block input and the guest ELF
 (both checked by sha256), builds both provers, and runs everything with an explicit environment
-(`env -i`). The build takes a few minutes the first time and is reused by a re-run.
+(`env -i`). The build takes 4-5 minutes the first time and is reused by a re-run.
 
-| mode | runtime after the build | peak host RAM | answers |
+| mode | runtime | peak host RAM | answers |
 |---|---|---|---|
-| `--quick` | about 15 min | about 46 GiB | Q1 per-phase busy/idle, kernel families and GPU-metric means; Q2 per-hold busy and families; Q3; a first roof reading on the top 2 kernels of each workload |
-| `--full` | about 45-60 min | about 46 GiB | all of quick, plus the unprofiled walls and the roof of every kernel that carries a phase or a hold |
+| `--quick` | about 15 min (+5 for a first build) | about 48 GiB | Q1 per-phase busy/idle, kernel families and GPU-metric means; Q2 per-hold busy and families; Q3; the roofs of the top kernels (WHIR phase-A coset leaves, phase-B GKR and lean rounds; LFM leaves and Merkle levels) |
+| `--full` | about 35-55 min including the build | about 48 GiB | all of quick, plus the unprofiled walls and the roof of every kernel that carries a phase or a hold |
 
-Nothing new starts after a deadline (35 minutes for quick, 80 for full), so a slow machine skips the
+Nothing new starts after a deadline (30 minutes for quick, 58 for full), so a slow machine skips the
 last passes instead of running long.
 
 ## What to send back
