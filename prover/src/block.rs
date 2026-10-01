@@ -184,6 +184,27 @@ pub fn prove_block(
     )
 }
 
+/// [`prove_block`], handing `on_shape` the proof's [`BlockShape`] once the
+/// traces are built, before the prove: what a consumer of the proof will
+/// receive, so the recursion's programs can be derived while the base proves.
+///
+/// [`BlockShape`]: crate::lfm::block_plan::BlockShape
+pub fn prove_block_observed(
+    elf_bytes: &[u8],
+    private_input: &[u8],
+    opts: &ProofOptions,
+    on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
+) -> Result<(VmProof, BlockTimes), Error> {
+    prove_block_with_observed(
+        elf_bytes,
+        private_input,
+        opts,
+        &block_max_rows(),
+        ResidencyMode::RecomputeLdeDevice,
+        on_shape,
+    )
+}
+
 /// Execute the whole program, build every trace at `max_rows`, and prove it as
 /// one monolithic proof under `residency`. DECODE's commitment, a function of
 /// the ELF and `opts` alone, is derived on a helper thread beside the
@@ -194,6 +215,24 @@ pub fn prove_block_with(
     opts: &ProofOptions,
     max_rows: &MaxRowsConfig,
     residency: ResidencyMode,
+) -> Result<(VmProof, BlockTimes), Error> {
+    prove_block_with_observed(
+        elf_bytes,
+        private_input,
+        opts,
+        max_rows,
+        residency,
+        &mut |_| {},
+    )
+}
+
+fn prove_block_with_observed(
+    elf_bytes: &[u8],
+    private_input: &[u8],
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    residency: ResidencyMode,
+    on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
     #[cfg(feature = "cuda")]
@@ -222,6 +261,7 @@ pub fn prove_block_with(
         residency,
         precommits,
         &mut times,
+        on_shape,
     )?;
     eprintln!(
         "BLOCK PHASE total {:.2}s (execute {:.2} · build {:.2} · setup {:.2} · prove {:.2})",
@@ -543,7 +583,8 @@ fn build_streamed(
 /// The prove step over built traces: the AIRs [`crate::prove_with_options_and_inputs`]
 /// builds (with DECODE's commitment supplied when given), the monolithic
 /// statement in the transcript, and one `multi_prove` under `residency`.
-/// Prints the instance census before proving.
+/// Prints the instance census and hands `on_shape` the proof's shape before
+/// proving.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_block_traces(
     elf_bytes: &[u8],
@@ -554,6 +595,7 @@ pub fn prove_block_traces(
     residency: ResidencyMode,
     precommits: Vec<(String, Precommit)>,
     times: &mut BlockTimes,
+    on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<VmProof, Error> {
     let t = Instant::now();
     let table_counts = traces.table_counts();
@@ -593,6 +635,13 @@ pub fn prove_block_traces(
             .iter()
             .map(|(air, trace, _)| (air.name(), trace.num_rows(), trace.num_main_columns)),
     );
+    on_shape(&crate::lfm::block_plan::BlockShape {
+        table_counts: table_counts.clone(),
+        runtime_page_ranges: runtime_page_ranges.clone(),
+        num_private_input_pages,
+        public_output_len: public_output.len(),
+        trace_lengths: pairs.iter().map(|(_, trace, _)| trace.num_rows()).collect(),
+    });
     times.setup = t.elapsed().as_secs_f64();
     eprintln!(
         "BLOCK PHASE setup {:.2}s · residency {residency:?}",

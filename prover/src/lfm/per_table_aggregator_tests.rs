@@ -1074,9 +1074,6 @@ pub(super) fn real_child_timed(
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> (RealChild, f64) {
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
-    use stark::proof::view::MultiProofView;
-
     let t_verify = std::time::Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
@@ -1088,6 +1085,19 @@ pub(super) fn real_child_timed(
         "the harness only reads children production accepts"
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
+    (real_child_unverified(artifacts, opts, proved), verify_secs)
+}
+
+/// [`real_child_timed`] without its verify, for a caller that verifies the same
+/// proof elsewhere and fails the run on a refusal before it reports anything
+/// (the block tree's children, verified beside the timed path).
+pub(super) fn real_child_unverified(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> RealChild {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use stark::proof::view::MultiProofView;
 
     // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
     // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
@@ -1151,17 +1161,14 @@ pub(super) fn real_child_timed(
         .map(|(idx, air)| super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup))
         .collect();
 
-    (
-        RealChild {
-            artifacts,
-            opts,
-            public_words: proved.public_words.clone(),
-            tables,
-            legs,
-            z_alpha: (lookup[0], lookup[1]),
-        },
-        verify_secs,
-    )
+    RealChild {
+        artifacts,
+        opts,
+        public_words: proved.public_words.clone(),
+        tables,
+        legs,
+        z_alpha: (lookup[0], lookup[1]),
+    }
 }
 
 /// The child's shape, as the node's emitter reads it.

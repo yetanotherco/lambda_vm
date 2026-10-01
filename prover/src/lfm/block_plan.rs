@@ -480,12 +480,46 @@ impl BlockTreePlan {
         &self,
         wrap_opts: &crate::ProofOptions,
     ) -> Result<(LfmArtifacts, Vec<PhaseTimes>), String> {
+        let (mut tree, phases) = self.derive_levels(
+            wrap_opts,
+            &|program| artifacts_of(program, wrap_opts),
+            false,
+        )?;
+        match tree.pop().map(<[_; 1]>::try_from) {
+            Some(Ok([(_, artifacts)])) => Ok((artifacts, phases)),
+            _ => Err("the tree does not close to one node".to_string()),
+        }
+    }
+
+    /// Every program of the tree with its artifacts, level by level (the leaves
+    /// in leaf order first, the top last), built by `build` — what a prover
+    /// proves from when it derives the tree ahead of the base's proof. The
+    /// programs are [`Self::derive_top`]'s.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn derive_tree(
+        &self,
+        wrap_opts: &crate::ProofOptions,
+        build: &(dyn Fn(&LfmProgram) -> LfmArtifacts + Sync),
+    ) -> Result<(TreePrograms, Vec<PhaseTimes>), String> {
+        self.derive_levels(wrap_opts, build, true)
+    }
+
+    /// The tree level by level; below the top, each level's programs and
+    /// artifacts are kept only when `keep`.
+    fn derive_levels(
+        &self,
+        wrap_opts: &crate::ProofOptions,
+        build: &(dyn Fn(&LfmProgram) -> LfmArtifacts + Sync),
+        keep: bool,
+    ) -> Result<(TreePrograms, Vec<PhaseTimes>), String> {
         let words = self.child_layout().total();
         let mut phases = Vec::new();
+        let mut kept = Vec::new();
         let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
         let mut level = derive_level(
             &leaves,
             |&k| self.leaf_program(k),
+            build,
             wrap_opts,
             words,
             &mut phases,
@@ -494,9 +528,16 @@ impl BlockTreePlan {
         for (lv, arities) in levels.iter().enumerate() {
             let top = lv + 1 == levels.len();
             let mut groups = Vec::with_capacity(arities.arities.len());
+            let mut done = Vec::new();
             let mut rest = level.into_iter();
             for &a in &arities.arities {
-                let kids: Vec<DerivedChild> = rest.by_ref().take(a).map(|(_, d)| d).collect();
+                let mut kids: Vec<DerivedChild> = Vec::with_capacity(a);
+                for (program, artifacts, child) in rest.by_ref().take(a) {
+                    kids.push(child);
+                    if keep {
+                        done.push((program, artifacts));
+                    }
+                }
                 if kids.len() != a {
                     return Err(format!("level {}: arities overrun the children", lv + 1));
                 }
@@ -505,18 +546,23 @@ impl BlockTreePlan {
             if rest.next().is_some() {
                 return Err(format!("level {}: arities leave children over", lv + 1));
             }
+            if keep {
+                kept.push(done);
+            }
             level = derive_level(
                 &groups,
                 |kids| self.node_program(kids, top),
+                build,
                 wrap_opts,
                 words,
                 &mut phases,
             )?;
         }
-        match <[_; 1]>::try_from(level) {
-            Ok([(artifacts, _)]) => Ok((artifacts, phases)),
-            Err(level) => Err(format!("the tree closes to {} nodes", level.len())),
+        if level.len() != 1 {
+            return Err(format!("the tree closes to {} nodes", level.len()));
         }
+        kept.push(level.into_iter().map(|(p, a, _)| (p, a)).collect());
+        Ok((kept, phases))
     }
 
     /// One instance's shapes, mutable — a mutation, test-only: a leaf emitted
@@ -631,25 +677,37 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
     )
 }
 
+/// A tree's programs with their artifacts, level by level: the leaves first, in
+/// leaf order, then each node level, the top last.
+pub(crate) type TreePrograms = Vec<Vec<(LfmProgram, LfmArtifacts)>>;
+
 /// One level of a tree's derivation: each item's program emitted, its artifacts
-/// built and its shape as a child derived, in parallel and in order. Pushes the
-/// level's stopwatch onto `phases`.
+/// built by `build` and its shape as a child derived, in parallel and in order.
+/// Pushes the level's stopwatch onto `phases`.
 fn derive_level<T: Sync>(
     items: &[T],
     emit: impl Fn(&T) -> Result<LfmProgram, String> + Sync,
+    build: &(dyn Fn(&LfmProgram) -> LfmArtifacts + Sync),
     wrap_opts: &crate::ProofOptions,
     words: usize,
     phases: &mut Vec<PhaseTimes>,
-) -> Result<Vec<(LfmArtifacts, DerivedChild)>, String> {
+) -> Result<Vec<(LfmProgram, LfmArtifacts, DerivedChild)>, String> {
     let t = Instant::now();
-    let one = |item: &T| -> Result<(LfmArtifacts, DerivedChild, f64, f64), String> {
+    type Derived = (LfmProgram, LfmArtifacts, DerivedChild, f64, f64);
+    let one = |item: &T| -> Result<Derived, String> {
         let t = Instant::now();
         let program = emit(item)?;
         let emitted = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let artifacts = artifacts_of(&program, wrap_opts);
+        let artifacts = build(&program);
         let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
-        Ok((artifacts, derived, emitted, t.elapsed().as_secs_f64()))
+        Ok((
+            program,
+            artifacts,
+            derived,
+            emitted,
+            t.elapsed().as_secs_f64(),
+        ))
     };
     #[cfg(feature = "parallel")]
     let done: Vec<_> = {
@@ -664,10 +722,10 @@ fn derive_level<T: Sync>(
     };
     let level = done
         .into_iter()
-        .map(|(artifacts, derived, emitted, built)| {
+        .map(|(program, artifacts, derived, emitted, built)| {
             phase.emit += emitted;
             phase.build += built;
-            (artifacts, derived)
+            (program, artifacts, derived)
         })
         .collect();
     phase.wall = t.elapsed().as_secs_f64();

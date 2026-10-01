@@ -16,6 +16,7 @@ use stark::proof::view::MultiProofView;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
+use super::LfmArtifacts;
 use super::block_leaf::{BlockPartition, emit_block_leaf_over, partition_by_rule};
 use super::block_node::{
     BlockBindings, BlockLayout, BlockNodeInputs, bind_and_publish_with, emit_block_node_with,
@@ -1051,12 +1052,24 @@ pub(super) fn prove_program(
     arenas: &[Vec<LfmWord>],
     opts: &crate::ProofOptions,
 ) -> (RealChild, super::proof::LfmProof) {
+    prove_program_with(label, program, None, arenas, opts, true)
+}
+
+/// [`prove_program`] over the artifacts built ahead, when given. Without
+/// `verify_inline` the proof is read back unverified: the caller verifies it
+/// elsewhere ([`BesideVerifies`]) before anything is reported.
+pub(super) fn prove_program_with(
+    label: &str,
+    program: &LfmProgram,
+    built: Option<LfmArtifacts>,
+    arenas: &[Vec<LfmWord>],
+    opts: &crate::ProofOptions,
+    verify_inline: bool,
+) -> (RealChild, super::proof::LfmProof) {
     let t = std::time::Instant::now();
-    let artifacts = super::program_census::build_artifacts_counted(
-        program,
-        opts,
-        crate::hash_pin::BLOCK_HASHER,
-    );
+    let artifacts = built.unwrap_or_else(|| {
+        super::program_census::build_artifacts_counted(program, opts, crate::hash_pin::BLOCK_HASHER)
+    });
     let t_artifacts = t.elapsed().as_secs_f64();
     let t = std::time::Instant::now();
     let proved = super::proof::lfm_prove(program, &artifacts, arenas, opts)
@@ -1064,15 +1077,78 @@ pub(super) fn prove_program(
     let t_prove = t.elapsed().as_secs_f64();
     super::per_table_aggregator_tests::print_prove_split(label);
     let t = std::time::Instant::now();
-    let (child, t_verify) =
-        super::per_table_aggregator_tests::real_child_timed(artifacts, opts.clone(), &proved);
+    let (child, verified) = if verify_inline {
+        let (child, t_verify) =
+            super::per_table_aggregator_tests::real_child_timed(artifacts, opts.clone(), &proved);
+        (child, format!("verify {t_verify:.2}"))
+    } else {
+        let child = super::per_table_aggregator_tests::real_child_unverified(
+            artifacts,
+            opts.clone(),
+            &proved,
+        );
+        (child, "verified beside".to_string())
+    };
     println!(
         "   {label} TIMING: {} instructions · build_artifacts {t_artifacts:.2}s · prove \
-         {t_prove:.2}s · harvest {:.2}s (verify {t_verify:.2})",
+         {t_prove:.2}s · harvest {:.2}s ({verified})",
         program.instrs.len(),
         t.elapsed().as_secs_f64()
     );
     (child, proved)
+}
+
+/// Child proofs verified on helper threads beside the timed path
+/// (`NOEPOCH_CHILD_VERIFY=beside`): production's verify of each, every one
+/// joined, a refusal failing the run, before anything is reported.
+#[derive(Default)]
+pub(super) struct BesideVerifies(std::sync::Mutex<Vec<(String, std::thread::JoinHandle<bool>)>>);
+
+impl BesideVerifies {
+    fn spawn(
+        &self,
+        label: &str,
+        artifacts: LfmArtifacts,
+        proof: super::proof::LfmProof,
+        opts: crate::ProofOptions,
+    ) {
+        let handle = std::thread::spawn(move || {
+            super::proof::verify_against_artifacts(
+                &artifacts,
+                &proof.proof,
+                &proof.public_words,
+                &opts,
+            )
+        });
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((label.to_string(), handle));
+    }
+
+    /// Joins every verify, panicking on a refusal; returns how many and the
+    /// seconds the join waited.
+    fn join_all(&self) -> (usize, f64) {
+        let t = std::time::Instant::now();
+        let jobs = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let n = jobs.len();
+        for (label, handle) in jobs {
+            let accepted = handle
+                .join()
+                .unwrap_or_else(|_| panic!("{label}: the verify beside panicked"));
+            assert!(
+                accepted,
+                "{label}: production refuses the child (verified beside)"
+            );
+        }
+        (n, t.elapsed().as_secs_f64())
+    }
+}
+
+/// `NOEPOCH_CHILD_VERIFY=beside`: the tree's child proofs verified beside the
+/// timed path.
+fn child_verify_beside_knob() -> bool {
+    std::env::var("NOEPOCH_CHILD_VERIFY").is_ok_and(|v| v == "beside")
 }
 
 /// ★ The block tree's FINAL check over the plan the harness holds: the top
@@ -1100,6 +1176,37 @@ pub(super) fn compose_block_tree(
     leaves: Vec<RealChild>,
     opts: &crate::ProofOptions,
     siblings: usize,
+) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
+    compose_block_tree_with(plan, leaves, opts, siblings, None, None)
+}
+
+/// One program derived ahead, with its artifacts, in the slot its prover takes
+/// it from.
+type AheadSlot = std::sync::Mutex<Option<(LfmProgram, LfmArtifacts)>>;
+
+/// Take a program derived ahead from its slot (each is proved once).
+fn take_ahead(slot: &AheadSlot, label: &str) -> (LfmProgram, LfmArtifacts) {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_else(|| panic!("{label}: no program ahead"))
+}
+
+/// `NOEPOCH_TREE_AHEAD=1`: the tree's programs derived beside the base.
+fn tree_ahead_knob() -> bool {
+    std::env::var("NOEPOCH_TREE_AHEAD").is_ok_and(|v| v == "1")
+}
+
+/// [`compose_block_tree`], each node proved from the program and artifacts
+/// derived ahead when `ahead` holds the node levels, and each node below the top
+/// verified on `beside` when given (the top is verified inline).
+pub(super) fn compose_block_tree_with(
+    plan: &BlockTreePlan,
+    leaves: Vec<RealChild>,
+    opts: &crate::ProofOptions,
+    siblings: usize,
+    ahead: Option<&[Vec<AheadSlot>]>,
+    beside: Option<&BesideVerifies>,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
     use super::per_table_aggregator::{FAN_IN, Level, tree_shape};
     let mut shape = tree_shape(leaves.len(), FAN_IN);
@@ -1129,10 +1236,36 @@ pub(super) fn compose_block_tree(
                 if top { " TOP" } else { "" }
             );
             let te = std::time::Instant::now();
-            let program = block_node_program(plan, &kids, top);
-            println!("   {label}: emitted in {:.2}s", te.elapsed().as_secs_f64());
+            let (program, built) = match ahead {
+                Some(levels) => {
+                    let (program, artifacts) = take_ahead(&levels[lv][j], &label);
+                    (program, Some(artifacts))
+                }
+                None => (block_node_program(plan, &kids, top), None),
+            };
+            println!(
+                "   {label}: {} in {:.2}s",
+                if built.is_some() {
+                    "program ahead"
+                } else {
+                    "emitted"
+                },
+                te.elapsed().as_secs_f64()
+            );
             super::per_table_aggregator_tests::census_and_panel(&program, &label, FAN_IN);
-            let (child, proof) = prove_program(&label, &program, &block_node_arenas(&kids), opts);
+            let inline = top || beside.is_none();
+            let (child, proof) = prove_program_with(
+                &label,
+                &program,
+                built,
+                &block_node_arenas(&kids),
+                opts,
+                inline,
+            );
+            if let (false, Some(b)) = (inline, beside) {
+                b.spawn(&label, child.artifacts.clone(), proof, opts.clone());
+                return (child, None);
+            }
             (child, top.then_some(proof))
         });
         let (next, mut proofs): (Vec<RealChild>, Vec<Option<super::proof::LfmProof>>) =
@@ -1203,6 +1336,7 @@ fn small_block(name: &str, input: &[u8], opts: &crate::ProofOptions) -> (Vec<u8>
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("build the traces");
+    let mut observed = None;
     let proof = crate::block::prove_block_traces(
         &elf_bytes,
         &program,
@@ -1212,8 +1346,14 @@ fn small_block(name: &str, input: &[u8], opts: &crate::ProofOptions) -> (Vec<u8>
         stark::residency_mode::ResidencyMode::Retain,
         Vec::new(),
         &mut crate::block::BlockTimes::default(),
+        &mut |shape| observed = Some(shape.clone()),
     )
     .expect("the small block proves");
+    assert_eq!(
+        format!("{:?}", observed.expect("the prover hands out the shape")),
+        format!("{:?}", BlockShape::of_proof(&proof)),
+        "the shape handed out before the prove is the proof's"
+    );
     (elf_bytes, proof)
 }
 
@@ -1664,8 +1804,46 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
             )
         })
         .collect();
+    let leaf_artifacts: Vec<LfmArtifacts> = leaves.iter().map(|c| c.artifacts.clone()).collect();
     let (top, top_proof, _) = compose_block_tree(&rb.plan, leaves, &wrap_opts, 1);
     assert_top_claims_the_block(&top, &rb);
+
+    // The tree derived ahead (`NOEPOCH_TREE_AHEAD`'s path: every program and its
+    // artifacts, built on host-only threads) is the tree the harness proved: each
+    // leaf's artifacts equal the device-built ones field by field, and the top is
+    // the proved top.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .start_handler(|_| super::commit::mark_thread_host_only())
+        .build()
+        .expect("a host-only pool");
+    let (tree, _) = pool
+        .install(|| {
+            rb.plan.derive_tree(&wrap_opts, &|program| {
+                super::registry::build_artifacts_with_hasher(
+                    program,
+                    &wrap_opts,
+                    crate::hash_pin::BLOCK_HASHER,
+                )
+            })
+        })
+        .expect("the tree derives ahead");
+    let ahead_leaves: Vec<&LfmArtifacts> = tree[0].iter().map(|(_, a)| a).collect();
+    assert_eq!(
+        ahead_leaves,
+        leaf_artifacts.iter().collect::<Vec<_>>(),
+        "the host-built leaf artifacts ahead are the proved leaves'"
+    );
+    let ahead_top = &tree.last().expect("a top level")[0].1;
+    assert_eq!(
+        ahead_top.program_id, top.artifacts.program_id,
+        "the tree ahead closes to the proved top"
+    );
+    println!(
+        "BLOCK VERIFIER FIXTURE: the tree derived ahead on the host is the proved tree ({} \
+         programs; leaf artifacts equal field by field; top id equal)",
+        tree.iter().map(Vec::len).sum::<usize>()
+    );
 
     let verify = |elf: &[u8], shape: &BlockShape, output: &[u8]| {
         super::block_plan::verify_block_tree_under(
@@ -1854,25 +2032,60 @@ fn the_block_tree_composes_to_a_top_node() {
     // host) computed on a pool of its own while the base proves, joined by the
     // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline.
     let elf_beside = elf_beside_knob();
+    // `NOEPOCH_TREE_AHEAD=1`: the same pool then derives every tree program and
+    // its artifacts from the shape the base hands out before its prove, on the
+    // host (the base owns the card), and the levels prove from them.
+    let tree_ahead = elf_beside.is_some() && tree_ahead_knob();
+    let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
+    let t_base0 = Instant::now();
     let consts_beside = elf_beside.map(|threads| {
-        let (elf, opts) = (elf_bytes.clone(), inner.clone());
+        let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
         std::thread::spawn(move || {
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .thread_name(|i| format!("elf-beside-{i}"))
+                .start_handler(|_| super::commit::mark_thread_host_only())
                 .build()
                 .expect("the ELF constants pool builds");
             let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
-            (consts, t.elapsed().as_secs_f64())
+            let secs = t.elapsed().as_secs_f64();
+            let ahead = match (&consts, tree_ahead) {
+                (Ok(c), true) => shape_rx.recv().ok().map(|shape| {
+                    let t = Instant::now();
+                    let derived = pool.install(|| {
+                        let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
+                        plan.derive_tree(&wrap, &|program| {
+                            super::registry::build_artifacts_with_hasher(
+                                program,
+                                &wrap,
+                                crate::hash_pin::BLOCK_HASHER,
+                            )
+                        })
+                    });
+                    (
+                        shape,
+                        derived,
+                        t.elapsed().as_secs_f64(),
+                        t_base0.elapsed().as_secs_f64(),
+                    )
+                }),
+                _ => None,
+            };
+            (consts, secs, ahead)
         })
     });
 
     // ---- the base.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
-    let (proof, times) =
-        crate::block::prove_block(&elf_bytes, &input, &inner).expect("the block must prove");
+    let mut shape_at = None;
+    let (proof, times) = crate::block::prove_block_observed(&elf_bytes, &input, &inner, &mut |s| {
+        shape_at = Some(t.elapsed().as_secs_f64());
+        let _ = shape_tx.send(s.clone());
+    })
+    .expect("the block must prove");
+    drop(shape_tx);
     let base = t.elapsed().as_secs_f64();
     let (base_peak, _) = base_sampler.stop();
     println!(
@@ -1894,17 +2107,54 @@ fn the_block_tree_composes_to_a_top_node() {
     // verifies first, as before.
     let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
     let t = Instant::now();
+    let mut ahead_tree = None;
     let consts = consts_beside.map(|handle| {
         let tj = Instant::now();
-        let (consts, secs) = handle.join().expect("the ELF constants thread panicked");
+        let (consts, secs, ahead) = handle.join().expect("the ELF constants thread panicked");
         println!(
             "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
              waited {:.2}s (counted in the harvest)",
             elf_beside.unwrap_or(0),
             tj.elapsed().as_secs_f64()
         );
+        if let Some((shape, derived, secs, done_at)) = ahead {
+            let (tree, phases) = derived.expect("the tree derives ahead");
+            assert_eq!(
+                format!("{shape:?}"),
+                format!("{:?}", BlockShape::of_proof(&proof)),
+                "the shape handed out before the prove is the proof's"
+            );
+            let split: Vec<String> = phases
+                .iter()
+                .map(|p| format!("{} in {:.2} (emit Σ {:.2}, build Σ {:.2})", p.programs, p.wall, p.emit, p.build))
+                .collect();
+            println!(
+                "   TREE AHEAD: {} programs derived beside the base in {secs:.2}s on the host (shape at \
+                 {:.2}s, done at {done_at:.2}s of a {base:.2}s base) · {}",
+                tree.iter().map(Vec::len).sum::<usize>(),
+                shape_at.unwrap_or(f64::NAN),
+                split.join(" · ")
+            );
+            ahead_tree = Some(tree);
+        }
         std::sync::Arc::new(consts.expect("the ELF constants compute"))
     });
+    assert!(
+        !tree_ahead || ahead_tree.is_some(),
+        "NOEPOCH_TREE_AHEAD=1 derived no tree"
+    );
+    // Each program ahead in a slot its prover takes it from.
+    let mut ahead_levels: Vec<Vec<AheadSlot>> = ahead_tree
+        .unwrap_or_default()
+        .into_iter()
+        .map(|level| {
+            level
+                .into_iter()
+                .map(|p| std::sync::Mutex::new(Some(p)))
+                .collect()
+        })
+        .collect();
+    let ahead_leaves = (!ahead_levels.is_empty()).then(|| ahead_levels.remove(0));
     let shape = BlockShape::of_proof(&proof);
     let (mut rb, verify, replay, beside) = if inline_verify {
         let (rb, verify, replay) =
@@ -1994,6 +2244,7 @@ fn the_block_tree_composes_to_a_top_node() {
     );
 
     // ---- level 0: the leaves.
+    let beside_verifies = child_verify_beside_knob().then(BesideVerifies::default);
     let l0 = tree_siblings_l0().min(k);
     println!("   ★ LEVEL-0 CONCURRENCY: {l0} leaf proof(s) at once (LFM_TREE_SIBLINGS_L0)");
     super::device_permit::arm(l0);
@@ -2002,10 +2253,21 @@ fn the_block_tree_composes_to_a_top_node() {
     let leaves = in_index_order(k, l0, |j| {
         let label = format!("BLOCK L0 leaf {j}");
         let te = Instant::now();
-        let program = block_leaf_program(&rb, j);
+        let (program, built) = match &ahead_leaves {
+            Some(slots) => {
+                let (program, artifacts) = take_ahead(&slots[j], &label);
+                (program, Some(artifacts))
+            }
+            None => (block_leaf_program(&rb, j), None),
+        };
         let arenas = block_leaf_arenas(&rb, &partition, j);
         println!(
-            "   {label}: emitted + arenas in {:.2}s",
+            "   {label}: {} + arenas in {:.2}s",
+            if built.is_some() {
+                "program ahead"
+            } else {
+                "emitted"
+            },
             te.elapsed().as_secs_f64()
         );
         super::per_table_aggregator_tests::census_and_panel(
@@ -2013,7 +2275,17 @@ fn the_block_tree_composes_to_a_top_node() {
             &label,
             super::per_table_aggregator::FAN_IN,
         );
-        let child = prove_as_child(&label, &program, &arenas, &wrap_opts);
+        let (child, proof) = prove_program_with(
+            &label,
+            &program,
+            built,
+            &arenas,
+            &wrap_opts,
+            beside_verifies.is_none(),
+        );
+        if let Some(b) = &beside_verifies {
+            b.spawn(&label, child.artifacts.clone(), proof, wrap_opts.clone());
+        }
         let words: Vec<LfmWord> = child.public_words.iter().map(|(_, w)| *w).collect();
         assert_eq!(
             words,
@@ -2034,8 +2306,24 @@ fn the_block_tree_composes_to_a_top_node() {
     println!("   ★ SIBLING CONCURRENCY: {siblings} node proof(s) at once (LFM_TREE_SIBLINGS)");
     super::device_permit::arm(siblings);
     let t = Instant::now();
-    let (top, top_proof, walls) = compose_block_tree(&rb.plan, leaves, &wrap_opts, siblings);
+    let (top, top_proof, walls) = compose_block_tree_with(
+        &rb.plan,
+        leaves,
+        &wrap_opts,
+        siblings,
+        (!ahead_levels.is_empty()).then_some(&ahead_levels[..]),
+        beside_verifies.as_ref(),
+    );
     super::device_permit::arm(1);
+    // Every child verified beside is joined here, inside the interior's time: a
+    // refusal fails the run before anything is reported.
+    if let Some(b) = &beside_verifies {
+        let (n, waited) = b.join_all();
+        println!(
+            "   CHILD VERIFIES beside the timed path: {n} accepted (production's verify), the join \
+             waited {waited:.2}s (counted in the interior)"
+        );
+    }
     let interior = t.elapsed().as_secs_f64();
     // The verify beside level 0 must have accepted the block, over the same
     // reconstruction the leaves read (one state word), before anything counts.

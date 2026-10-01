@@ -84,6 +84,7 @@ impl OneBuild {
             residency,
             Vec::new(),
             &mut BlockTimes::default(),
+            &mut |_| {},
         )
     }
 

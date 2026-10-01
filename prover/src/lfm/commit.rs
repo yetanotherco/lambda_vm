@@ -139,6 +139,18 @@ pub fn group_columns(group: &ColumnGroup) -> Vec<Vec<FE>> {
     (0..group.width).map(column).collect()
 }
 
+std::thread_local! {
+    static HOST_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commit every group built on this thread on the host from now on, whatever
+/// [`device_artifacts`] says. For a pool's start handler: artifacts built while
+/// another proof owns the card (the block tree derived beside the base) must not
+/// dispatch to it, since these commits run outside every `VramGate`.
+pub fn mark_thread_host_only() {
+    HOST_ONLY.with(|h| h.set(true));
+}
+
 /// Whether an instruction column group is committed on the DEVICE when one is
 /// present. `LFM_DEVICE_ARTIFACTS=0` forces the host pass and is the A/B control
 /// for O1.
@@ -228,7 +240,11 @@ pub fn commit_group_device_or_host_with(
     layout: LeafLayout,
 ) -> Commitment {
     #[cfg(feature = "cuda")]
-    if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
+    if device_artifacts()
+        && !HOST_ONLY.with(|h| h.get())
+        && group.padded_rows > 0
+        && group.width > 0
+    {
         let set = stark::device_set::commit_device_set_rpl(
             group.padded_rows,
             group.width,
