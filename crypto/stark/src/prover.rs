@@ -2390,10 +2390,9 @@ pub trait IsStarkProver<
         let ncols = handle.m;
         let rpl = layout.rows_per_leaf();
         let byte_len = <FieldElement<Field> as ByteConversion>::BYTE_LEN;
-        let mut buf = vec![0u8; rpl * ncols * byte_len];
-        // Every level of each rebuilt subtree, leaves first.
-        let mut subtrees: Vec<Vec<Vec<Commitment>>> = Vec::with_capacity(bases.len());
-        for (bi, &b) in bases.iter().enumerate() {
+        // Every level of one rebuilt subtree, leaves first, and its root.
+        let rebuild = |bi: usize| -> (Vec<Vec<Commitment>>, Commitment) {
+            let mut buf = vec![0u8; rpl * ncols * byte_len];
             let mut level: Vec<Commitment> = (0..per)
                 .map(|j| {
                     let first = (bi * per + j) * rpl * ncols;
@@ -2413,7 +2412,17 @@ pub trait IsStarkProver<
                     .collect();
                 levels.push(std::mem::replace(&mut level, up));
             }
-            if top.node(top.top_level, b) != Some(&level[0]) {
+            (levels, level[0])
+        };
+        #[cfg(feature = "parallel")]
+        let rebuilt: Vec<(Vec<Vec<Commitment>>, Commitment)> =
+            (0..bases.len()).into_par_iter().map(rebuild).collect();
+        #[cfg(not(feature = "parallel"))]
+        let rebuilt: Vec<(Vec<Vec<Commitment>>, Commitment)> =
+            (0..bases.len()).map(rebuild).collect();
+        let mut subtrees: Vec<Vec<Vec<Commitment>>> = Vec::with_capacity(bases.len());
+        for (&b, (levels, root)) in bases.iter().zip(rebuilt) {
+            if top.node(top.top_level, b) != Some(&root) {
                 return Err(ProvingError::RecomputedCommitmentMismatch(format!(
                     "the rebuilt subtree {b} (2^{} leaves) does not match the kept tree",
                     per.trailing_zeros()
@@ -5544,6 +5553,7 @@ pub trait IsStarkProver<
                 Some(MainLdeSlot::DroppedDevice)
             ) {
                 let __ps_rc = crate::prove_split::mark();
+                let tl_rc = table_timeline().then(crate::prove_split::epoch_secs);
                 // Kept top levels: the LDE alone, no second hash. The commit
                 // (root-only tree + top levels) stays; the openings rebuild the
                 // queried subtrees and check them against the kept nodes.
@@ -5585,6 +5595,13 @@ pub trait IsStarkProver<
                     *gpu_main_cells[idx].lock().unwrap() = Some(handle);
                     TOP_TREE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+                    if let Some(st) = tl_rc {
+                        eprintln!(
+                            "TABLE TL recommit idx={idx} {} est=0.00GiB claim={st:.3} start={st:.3} end={:.3}",
+                            air.name(),
+                            crate::prove_split::epoch_secs()
+                        );
+                    }
                 } else {
                     let (commit, cached_main, gpu_main) = {
                         let absorbed = main_commit_cells[idx].lock().unwrap();
@@ -5611,6 +5628,13 @@ pub trait IsStarkProver<
                     *main_lde_cells[idx].lock().unwrap() = Some(MainLdeSlot::Retained(cached_main));
                     *gpu_main_cells[idx].lock().unwrap() = gpu_main;
                     crate::prove_split::add(&crate::prove_split::MAIN_RECOMMIT, __ps_rc);
+                    if let Some(st) = tl_rc {
+                        eprintln!(
+                            "TABLE TL recommit idx={idx} {} est=0.00GiB claim={st:.3} start={st:.3} end={:.3}",
+                            air.name(),
+                            crate::prove_split::epoch_secs()
+                        );
+                    }
                 }
             }
 
