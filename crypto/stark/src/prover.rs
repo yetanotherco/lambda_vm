@@ -4981,6 +4981,10 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
+        // The streamed block commits here, on its builder threads, before the
+        // prove opens `r1_main_commit`; the span names those commits.
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_precommit_table");
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let layout = crate::leaf_layout::table_leaf_layout(air, trace.num_rows());
         Self::r1_commit_table(
