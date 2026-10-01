@@ -163,6 +163,142 @@ impl TableVerifyShape {
             "the trace trees' cap is the format's, at their depth and query count"
         );
     }
+
+    /// The verification legs' shape for `air`'s sub-proof over `trace_length`
+    /// rows, and the AIR's constraint analysis — from the AIR, the trace length
+    /// and the AIR's options, never from a proof. The part count is the AIR's
+    /// degree bound over `trace_length` (the host verifier pins the proof's copy
+    /// to it, `verifier.rs:1730`).
+    ///
+    /// Refuses a trace length that is not a power of two and a format the host
+    /// would lay out with other tree heights than these shapes (`StarkCaps`, the
+    /// prover's and verifier's own derivation).
+    pub fn derive(
+        air: &super::epoch::DynVmAir<'_>,
+        trace_length: usize,
+    ) -> Result<(Self, Analysis), String> {
+        use stark::verifier::IsStarkVerifier;
+        if !trace_length.is_power_of_two() {
+            return Err(format!("trace length {trace_length} is not a power of two"));
+        }
+        let opts = air.options();
+        let layout = stark::verifier::Verifier::<
+            crate::tables::types::GoldilocksField,
+            crate::tables::types::GoldilocksExtension,
+            (),
+        >::ood_layout(air);
+        let artifact = stark::constraint_ir::ConstraintArtifact::capture(air);
+
+        let (main_width, aux_width) = air.trace_layout();
+        let num_total_cols = main_width + aux_width;
+        let num_precomputed = if air.is_preprocessed() {
+            air.num_precomputed_columns()
+        } else {
+            0
+        };
+        let log2_trace_length = trace_length.trailing_zeros();
+        let log2_lde_length = log2_trace_length + (opts.blowup_factor as usize).trailing_zeros();
+        let num_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+
+        // The trace matrices in DEEP column order — precomputed, main, aux.
+        let mut trace_groups = Vec::new();
+        if num_precomputed > 0 {
+            trace_groups.push(super::sub_proof::GroupShape {
+                num_columns: num_precomputed,
+                is_ext: false,
+            });
+        }
+        trace_groups.push(super::sub_proof::GroupShape {
+            num_columns: main_width - num_precomputed,
+            is_ext: false,
+        });
+        if aux_width > 0 {
+            trace_groups.push(super::sub_proof::GroupShape {
+                num_columns: aux_width,
+                is_ext: true,
+            });
+        }
+        let deep = super::deep::DeepShape {
+            step_size: layout.step_size(),
+            num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
+            num_total_cols,
+            next_row_cols: layout.next_row_cols().to_vec(),
+            num_composition_parts: num_parts,
+            log2_trace_length,
+        };
+
+        // The table's leaf layout (S2): the host prover's and verifier's own
+        // per-table resolution.
+        let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+        let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
+        let sub = SubProofShape {
+            deep,
+            trace_groups,
+            merkle_depth,
+            log2_lde_length,
+            coset_offset: FE::from(opts.coset_offset),
+            trace_cap: opts
+                .format
+                .merkle_cap
+                .height(opts.fri_number_of_queries, merkle_depth),
+            layout: leaf_layout,
+        };
+        let has_aux_trace = air.has_aux_trace();
+        let shape = Self {
+            quotient: QuotientShape {
+                log2_trace_length,
+                num_composition_parts: num_parts,
+                boundary: boundary_terms(has_aux_trace, num_total_cols),
+            },
+            fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout),
+            main_width,
+            num_alpha_powers: if has_aux_trace {
+                artifact.shape.max_bus_elements as usize
+            } else {
+                0
+            },
+            num_queries: opts.fri_number_of_queries,
+            sub,
+        };
+
+        // The cap heights: these shapes' against the host's own `StarkCaps`, so
+        // the two sides derive every tree's height and depth from one function.
+        let host = stark::merkle_caps::StarkCaps::for_options(
+            opts,
+            log2_lde_length as usize,
+            leaf_layout.is_one_row(),
+        )
+        .map_err(|e| format!("a format the host does not lay out: {e:?}"))?;
+        let fri_agrees = host.fri.len() == shape.fri.num_committed()
+            && host
+                .fri_depths
+                .iter()
+                .zip(&host.fri)
+                .enumerate()
+                .all(|(i, (&d, &c))| d == shape.fri.layer_depth(i) && c == shape.fri.layer_cap(i));
+        if host.trace_depth != shape.sub.merkle_depth
+            || host.trace != shape.sub.trace_cap
+            || !fri_agrees
+        {
+            return Err("the legs' tree heights differ from the host's StarkCaps".to_string());
+        }
+        Ok((shape, super::constraints::analyze(&artifact)))
+    }
+}
+
+/// The preprocessed root the host verifier takes for `air` over `trace_length`
+/// rows: `precomputed_commitment_for` the table's resolved leaf layout (S2 — a
+/// layout with no root is `None`, never the other layout's root). A verifier
+/// constant: never the proof's copy.
+pub fn layout_precomputed_commitment<PI>(
+    air: &dyn stark::traits::AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = crate::tables::types::GoldilocksExtension,
+        PublicInputs = PI,
+    >,
+    trace_length: usize,
+) -> Option<stark::config::Commitment> {
+    air.precomputed_commitment_for(stark::leaf_layout::table_leaf_layout(air, trace_length))
 }
 
 /// The two arenas one sub-proof's query verification reads, in declaration

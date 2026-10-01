@@ -37,24 +37,19 @@
 //! and not about what is done with it.
 
 use stark::config::Commitment;
-use stark::constraint_ir::ConstraintArtifact;
 use stark::proof::view::StarkProofView;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-use super::constraints::{Analysis, BoundaryTerm, QuotientShape, analyze};
-use super::deep::DeepShape;
+use super::constraints::{Analysis, BoundaryTerm};
 use super::epoch_verify::{TableVerifyShape, boundary_terms};
 use super::executor::execute;
 use super::fri::FriShape;
-use super::sub_proof::{GroupShape, SubProofShape};
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
 type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
-type V = Verifier<Gl, Ext3, ()>;
 
 /// Everything the verification legs read about one real sub-proof.
 ///
@@ -102,61 +97,33 @@ pub(super) fn build_table_legs(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
 ) -> TableLegs {
-    let opts = air.options();
-    let layout = V::ood_layout(air);
-    let artifact = ConstraintArtifact::capture(air);
-
+    // The shapes, from the AIR and the trace length alone; the proof's blocks
+    // are then checked against them, never read into them.
+    let trace_length = view.trace_length();
+    let (verify, analysis) = TableVerifyShape::derive(air, trace_length)
+        .unwrap_or_else(|e| panic!("the legs' shape derives: {e}"));
     let (main_width, aux_width) = air.trace_layout();
-    let num_total_cols = main_width + aux_width;
     let num_precomputed = if air.is_preprocessed() {
         air.num_precomputed_columns()
     } else {
         0
     };
-
-    let trace_length = view.trace_length();
     let log2_trace_length = trace_length.trailing_zeros();
-    let log2_blowup = (opts.blowup_factor as usize).trailing_zeros();
-    let log2_lde_length = log2_trace_length + log2_blowup;
-    let claimed_parts = view.composition_poly_parts_ood_evaluation();
-
-    // The trace matrices in DEEP column order — precomputed, main, aux — as the
-    // proof carries them and `build_host_sub_proof` reads them.
-    let mut trace_groups = Vec::new();
-    if num_precomputed > 0 {
-        trace_groups.push(GroupShape {
-            num_columns: num_precomputed,
-            is_ext: false,
-        });
-    }
-    trace_groups.push(GroupShape {
-        num_columns: main_width - num_precomputed,
-        is_ext: false,
-    });
-    if aux_width > 0 {
-        trace_groups.push(GroupShape {
-            num_columns: aux_width,
-            is_ext: true,
-        });
-    }
-
-    let deep = DeepShape {
-        step_size: layout.step_size(),
-        num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
-        num_total_cols,
-        next_row_cols: layout.next_row_cols().to_vec(),
-        num_composition_parts: claimed_parts.len(),
-        log2_trace_length,
-    };
+    assert_eq!(
+        view.composition_poly_parts_ood_evaluation().len(),
+        verify.quotient.num_composition_parts,
+        "the proof's part count is the AIR's degree bound"
+    );
     // The grid the machine rebuilds and the blocks the proof carries must
     // describe one table. Asserted rather than assumed because the machine's
     // reconstruction is indexed by the SHAPE and filled from the BLOCKS: a width
     // disagreement would silently scatter the next-row values into wrong columns.
+    let deep = &verify.sub.deep;
     let ood_c = view.trace_ood_evaluations();
     let ood_n = view.trace_ood_next_evaluations();
     assert_eq!(
         ood_c.width(),
-        num_total_cols,
+        deep.num_total_cols,
         "the current-row OOD block is the full trace width"
     );
     assert_eq!(
@@ -174,60 +141,6 @@ pub(super) fn build_table_legs(
         deep.num_eval_points - deep.step_size,
         "the next-row block covers every evaluation point past the first step"
     );
-
-    // The table's leaf layout (S2): the host prover's and verifier's own
-    // per-table resolution, so `auto` mixes layouts across a proof's tables.
-    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
-    let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
-    let sub = SubProofShape {
-        deep,
-        trace_groups,
-        merkle_depth,
-        log2_lde_length,
-        coset_offset: FE::from(opts.coset_offset),
-        trace_cap: opts
-            .format
-            .merkle_cap
-            .height(opts.fri_number_of_queries, merkle_depth),
-        layout: leaf_layout,
-    };
-    let has_aux_trace = air.has_aux_trace();
-    let verify = TableVerifyShape {
-        quotient: QuotientShape {
-            log2_trace_length,
-            num_composition_parts: claimed_parts.len(),
-            boundary: boundary_terms(has_aux_trace, num_total_cols),
-        },
-        fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout),
-        main_width,
-        num_alpha_powers: if has_aux_trace {
-            artifact.shape.max_bus_elements as usize
-        } else {
-            0
-        },
-        num_queries: opts.fri_number_of_queries,
-        sub,
-    };
-
-    // ---- the cap heights: the in-guest shapes' against the host's own
-    // `StarkCaps` (the prover's and the verifier's), so the two sides derive
-    // every tree's height and depth from one function.
-    let host_caps = stark::merkle_caps::StarkCaps::for_options(
-        opts,
-        log2_lde_length as usize,
-        leaf_layout.is_one_row(),
-    )
-    .expect("a format the host lays out");
-    assert_eq!(host_caps.trace_depth, verify.sub.merkle_depth);
-    assert_eq!(
-        host_caps.trace, verify.sub.trace_cap,
-        "the trace trees' cap"
-    );
-    assert_eq!(host_caps.fri.len(), verify.fri.num_committed());
-    for (i, (&d, &c)) in host_caps.fri_depths.iter().zip(&host_caps.fri).enumerate() {
-        assert_eq!(d, verify.fri.layer_depth(i), "FRI layer {i}'s tree depth");
-        assert_eq!(c, verify.fri.layer_cap(i), "FRI layer {i}'s cap");
-    }
 
     // ---- the owner split: query 0 of a capped tree carries the cap at the end
     // of its path; the arenas take the `D − c` siblings, the caps arena the cap.
@@ -332,12 +245,12 @@ pub(super) fn build_table_legs(
 
     TableLegs {
         verify,
-        analysis: analyze(&artifact),
+        analysis,
         openings,
         fri_openings,
         caps,
         production_boundary,
-        has_aux_trace,
+        has_aux_trace: air.has_aux_trace(),
         num_precomputed_cols: num_precomputed,
         precomputed_commitment: air
             .is_preprocessed()
@@ -345,18 +258,15 @@ pub(super) fn build_table_legs(
     }
 }
 
-/// The precomputed-columns commitment the host verifier takes for `air` over
-/// a trace of `trace_length` rows: `precomputed_commitment_for` the table's
-/// resolved leaf layout (S2 — a layout with no root is a hard
-/// error, never the other layout's root). At row pairs it IS
+/// [`super::epoch_verify::layout_precomputed_commitment`], where a layout
+/// with no root is a hard error. At row pairs it IS
 /// `air.precomputed_commitment()`.
 pub(super) fn layout_precomputed_commitment<PI>(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
     trace_length: usize,
 ) -> Commitment {
-    let layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
-    air.precomputed_commitment_for(layout)
-        .unwrap_or_else(|| panic!("no precomputed commitment at {layout:?}"))
+    super::epoch_verify::layout_precomputed_commitment(air, trace_length)
+        .unwrap_or_else(|| panic!("no precomputed commitment at {trace_length} rows"))
 }
 
 /// Every query's FRI layer openings, per layer `(opened values, path)`, and
