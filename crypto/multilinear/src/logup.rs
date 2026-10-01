@@ -183,6 +183,91 @@ pub fn input_layer<E: IsField + 'static>(
     FractionLayer::new(Mle::new(p)?, Mle::new(q)?)
 }
 
+/// A table's input layer as a plan over its base columns (D-BATCH M1-2): for
+/// each interaction's two sides, its terms — where the column a factor reads
+/// starts in the table's run of columns (`column · rows`) and its shift, mod
+/// `rows` — with their ext3 coefficients, and the side's constant, all as raw
+/// limbs for the card.
+///
+/// Side `2i` is interaction `i`'s numerator, `2i + 1` its denominator;
+/// `side_start[s] .. side_start[s + 1]` are side `s`'s terms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputPlan {
+    pub side_start: Vec<u32>,
+    pub terms: Vec<u64>,
+    pub coeffs: Vec<u64>,
+    pub constants: Vec<u64>,
+}
+
+impl InputPlan {
+    pub fn interactions(&self) -> usize {
+        self.side_start.len() / 2
+    }
+}
+
+/// The plan for `interactions` over factors whose sources are `sources` (one
+/// per slot: the committed column and shift a factor reads, `None` for a
+/// public factor). `None` when a side reads a public factor, when a slot is
+/// unknown, or when `E` is not the cubic extension the card works in.
+pub fn input_plan<E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    sources: &[Option<crate::claim_reduce::FactorSource>],
+    rows: usize,
+) -> Option<InputPlan> {
+    let mut plan = InputPlan {
+        side_start: vec![0],
+        terms: Vec::new(),
+        coeffs: Vec::new(),
+        constants: Vec::new(),
+    };
+    for interaction in interactions {
+        for side in [&interaction.numerator, &interaction.denominator] {
+            for (slot, coefficient) in side.terms() {
+                let source = (*sources.get(*slot)?)?;
+                plan.terms.push((source.column * rows) as u64);
+                plan.terms.push((source.offset % rows.max(1)) as u64);
+                plan.coeffs
+                    .extend_from_slice(&crate::gpu::ext3_raw(coefficient)?);
+            }
+            plan.constants
+                .extend_from_slice(&crate::gpu::ext3_raw(side.constant_term())?);
+            plan.side_start
+                .push(u32::try_from(plan.terms.len() / 2).ok()?);
+        }
+    }
+    Some(plan)
+}
+
+/// The input layer and the tree above it, written straight from the table's
+/// resident base columns ([`crate::gpu::input_layer_tree_from_columns`]),
+/// under `LAMBDA_VM_ARGUE_GKR_INPUT`. `None` when the columns are not on the
+/// card, a side reads a public factor, or the card declines — the caller then
+/// takes today's path.
+pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    trace: &crate::constraint_argument::TraceData<F, E>,
+) -> Option<crate::gkr::FractionTree<E>> {
+    if interactions.is_empty() {
+        return None;
+    }
+    let (store, first) = trace.resident_shared()?;
+    let rows = trace.columns().first()?.len();
+    let sources: Vec<_> = trace
+        .kinds()
+        .iter()
+        .map(crate::constraint_argument::FactorKind::source)
+        .collect();
+    let plan = input_plan(interactions, &sources, rows)?;
+    let tree = crate::gpu::input_layer_tree_from_columns(
+        store,
+        first,
+        trace.columns().len(),
+        rows,
+        &plan,
+    )?;
+    crate::gkr::FractionTree::from_device(tree).ok()
+}
+
 /// The input layer and the tree above it, built where the factors already are.
 ///
 /// The layer is `interactions × rows` fractions — the biggest thing a table's
@@ -334,6 +419,144 @@ pub fn claim_statements<'a, E: IsField + 'static>(
         denominator,
         row_point: row_point.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod input_plan_tests {
+    use super::*;
+    use crate::claim_reduce::FactorSource;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type EE = FieldElement<Ext3>;
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn ext(seed: &mut u64) -> EE {
+        EE::new([next(seed).into(), next(seed).into(), next(seed).into()])
+    }
+
+    /// What `gkr_input_from_columns` computes, on the host: the kernel's
+    /// arithmetic, cell by cell, from the plan's raw limbs.
+    fn run_plan(
+        plan: &InputPlan,
+        columns: &[u64],
+        rows: usize,
+        padding: bool,
+    ) -> (Vec<EE>, Vec<EE>) {
+        let interactions = plan.interactions();
+        let slots = if padding {
+            interactions.next_power_of_two()
+        } else {
+            interactions
+        };
+        let raw = |limbs: &[u64]| crate::gpu::ext3_from_raw::<Ext3>(limbs);
+        let (mut p, mut q) = (Vec::new(), Vec::new());
+        for s in 0..slots {
+            for r in 0..rows {
+                if s >= interactions {
+                    p.push(EE::zero());
+                    q.push(EE::one());
+                    continue;
+                }
+                let side = |which: usize| {
+                    let mut acc = raw(&plan.constants[which * 3..which * 3 + 3]);
+                    for t in plan.side_start[which] as usize..plan.side_start[which + 1] as usize {
+                        let mut k = r + plan.terms[2 * t + 1] as usize;
+                        if k >= rows {
+                            k -= rows;
+                        }
+                        let value =
+                            FieldElement::<Gl>::from(columns[plan.terms[2 * t] as usize + k]);
+                        acc += raw(&plan.coeffs[t * 3..t * 3 + 3]) * value.to_extension::<Ext3>();
+                    }
+                    acc
+                };
+                p.push(side(2 * s));
+                q.push(side(2 * s + 1));
+            }
+        }
+        (p, q)
+    }
+
+    /// ★ The plan's cells are the lifted path's: for interactions over direct
+    /// and shifted columns, padded or not, the kernel's arithmetic on the plan
+    /// equals `input_layer` over the lifted factors, cell for cell.
+    #[test]
+    fn the_plan_writes_the_lifted_input_layer() {
+        let mut seed = 0x5EED_u64;
+        for (rows, width, count) in [(1usize, 2usize, 1usize), (8, 3, 3), (32, 5, 5), (64, 7, 9)] {
+            let columns: Vec<Vec<u64>> = (0..width)
+                .map(|_| {
+                    (0..rows)
+                        .map(|_| next(&mut seed) % 0xFFFF_FFFF_0000_0001)
+                        .collect()
+                })
+                .collect();
+            // Every column direct, then two shifted views, then a public slot.
+            let mut sources: Vec<Option<FactorSource>> =
+                (0..width).map(|c| Some(FactorSource::direct(c))).collect();
+            sources.push(Some(FactorSource::shifted(0, 1)));
+            sources.push(Some(FactorSource::shifted(width - 1, 3)));
+            sources.push(None);
+            let factors: Vec<Mle<Ext3>> = sources
+                .iter()
+                .map(|source| {
+                    let evals = (0..rows)
+                        .map(|r| match source {
+                            Some(src) => FieldElement::<Gl>::from(
+                                columns[src.column][(r + src.offset) % rows],
+                            )
+                            .to_extension::<Ext3>(),
+                            None => EE::from(7u64),
+                        })
+                        .collect();
+                    Mle::new(evals).unwrap()
+                })
+                .collect();
+            let committed = sources.len() - 1;
+            let affine = |seed: &mut u64| {
+                let terms = (0..(next(seed) % 4) as usize)
+                    .map(|_| ((next(seed) as usize) % committed, ext(seed)))
+                    .collect();
+                Affine::new(terms, ext(seed))
+            };
+            let interactions: Vec<Interaction<Ext3>> = (0..count)
+                .map(|_| Interaction::new(affine(&mut seed), affine(&mut seed)))
+                .collect();
+            let plan = input_plan(&interactions, &sources, rows).expect("a plan over columns");
+            let flat: Vec<u64> = columns.concat();
+            let want = input_layer(&interactions, &factors).unwrap();
+            let (p, q) = run_plan(&plan, &flat, rows, true);
+            assert_eq!(p, want.p.evals(), "rows {rows}: the numerators differ");
+            assert_eq!(q, want.q.evals(), "rows {rows}: the denominators differ");
+            let (p, _) = run_plan(&plan, &flat, rows, false);
+            assert_eq!(p.len(), count * rows, "unpadded: the real cells only");
+            assert_eq!(p[..], want.p.evals()[..count * rows]);
+        }
+    }
+
+    /// A side that reads a public factor has no plan: the caller keeps
+    /// today's path.
+    #[test]
+    fn a_public_factor_has_no_plan() {
+        let sources = vec![Some(FactorSource::direct(0)), None];
+        let interactions = vec![Interaction::new(
+            Affine::factor(1),
+            Affine::constant(EE::one()),
+        )];
+        assert_eq!(input_plan::<Ext3>(&interactions, &sources, 4), None);
+        let interactions = vec![Interaction::new(
+            Affine::factor(0),
+            Affine::constant(EE::one()),
+        )];
+        assert!(input_plan::<Ext3>(&interactions, &sources, 4).is_some());
+    }
 }
 
 #[cfg(test)]

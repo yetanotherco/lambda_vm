@@ -120,6 +120,14 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// factors and tree. See [`note_gkr_tree_refusal`]; each one is also a
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Fraction trees whose input layer was written from the base columns
+/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+static INPUT_COLUMNS_TREES: AtomicU64 = AtomicU64::new(0);
+
+/// Fraction trees whose input layer was written from the base columns.
+pub fn input_columns_trees() -> u64 {
+    INPUT_COLUMNS_TREES.load(Ordering::Relaxed)
+}
 
 /// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the stream's
 /// kernels so the tree's split charges each part its own card time.
@@ -800,6 +808,17 @@ static HAND_BACK_FOR_TESTS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[doc(hidden)]
 pub fn set_hand_back_threshold_for_tests(bytes: Option<u64>) {
     HAND_BACK_FOR_TESTS.store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Tests only: every tree built from here on hands its input layer back and
+/// writes it again for its last sumcheck, as the widest precompiles do when the
+/// card cannot carry it — so a test can reach the rewrite on any table.
+/// Process-wide: a test that sets it runs alone.
+static HAND_BACK_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn force_hand_back_for_tests(on: bool) {
+    HAND_BACK_FORCED.store(on, Ordering::Relaxed);
 }
 
 /// Cells — factors times rows — below which the host wins.
@@ -2068,6 +2087,50 @@ pub fn argue_lean_tail() -> bool {
 }
 
 static ARGUE_LEAN_TAIL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a table's GKR input layer is written straight from its resident
+/// base columns (`LAMBDA_VM_ARGUE_GKR_INPUT`, any non-empty value other than
+/// `0`; D-BATCH M1-2): one launch for every interaction, base × ext3, where
+/// today's path runs two programs an interaction over the lifted factors. The
+/// same cells, so the same tree and proof. Off by default until its A/B; off is
+/// today's path. Read once, with a banner.
+pub fn argue_gkr_input() -> bool {
+    match ARGUE_GKR_INPUT_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                let on = env_on("LAMBDA_VM_ARGUE_GKR_INPUT");
+                eprintln!(
+                    "★ ARGUE GKR INPUT: {}",
+                    if on {
+                        "from the base columns (LAMBDA_VM_ARGUE_GKR_INPUT=1)"
+                    } else {
+                        "from the lifted factors (today's)"
+                    }
+                );
+                on
+            })
+        }
+    }
+}
+
+static ARGUE_GKR_INPUT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_ARGUE_GKR_INPUT` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's.
+#[doc(hidden)]
+pub fn force_argue_gkr_input(on: Option<bool>) {
+    ARGUE_GKR_INPUT_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
 
 /// Overrides `LAMBDA_VM_ARGUE_LEAN_TAIL` for the whole process — for a test that
 /// proves both ways in one binary. `None` restores the environment's setting.
@@ -3424,7 +3487,81 @@ pub fn input_layer_tree<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
-    input_layer_tree_impl(factors, numerators, denominators, false)
+    let rows = factors.0.len();
+    let interactions = numerators.len();
+    let stream = factors.0.stream().clone();
+    input_layer_tree_impl(
+        stream,
+        rows,
+        interactions,
+        lifted_writer(factors, numerators, denominators),
+        false,
+    )
+}
+
+/// Writes a tree's input layer, padded to a power of two or not — the call a
+/// tree makes at its build and, when it gave the layer back, for its last
+/// sumcheck.
+#[cfg(feature = "cuda")]
+type InputWriter = std::sync::Arc<dyn Fn(bool) -> Option<math_cuda::gkr::Halves> + Send + Sync>;
+
+/// The writer that runs each interaction's two programs over the lifted
+/// factors (`write_input_layer`).
+#[cfg(feature = "cuda")]
+fn lifted_writer<E>(
+    factors: std::sync::Arc<DeviceFactors>,
+    numerators: Vec<crate::program::Program<E>>,
+    denominators: Vec<crate::program::Program<E>>,
+) -> InputWriter
+where
+    E: math::field::traits::IsField + 'static,
+{
+    std::sync::Arc::new(move |padding| {
+        write_input_layer(&factors, &numerators, &denominators, padding)
+    })
+}
+
+/// The tree over a table's input layer written straight from its base
+/// columns (D-BATCH M1-2, `LAMBDA_VM_ARGUE_GKR_INPUT`): one launch writes
+/// every interaction's two sides from the epoch's resident columns, where
+/// [`input_layer_tree`] runs two programs an interaction over the lifted
+/// factors. The same cells, so the same tree, output and GKR proof.
+///
+/// `plan` is [`crate::logup::input_plan`]'s, over the table's run of `width`
+/// columns from `first`. `None` when that run is not resident or the card
+/// declines, before anything is written.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree_from_columns(
+    resident: std::sync::Arc<ResidentColumns>,
+    first: usize,
+    width: usize,
+    rows: usize,
+    plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
+    if !resident.0.is_run(first, width) || plan.interactions() == 0 {
+        return None;
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    let uploaded = std::sync::Arc::new(
+        math_cuda::gkr::InputPlan::upload(
+            &stream,
+            &plan.side_start,
+            &plan.terms,
+            &plan.coeffs,
+            &plan.constants,
+        )
+        .ok()?,
+    );
+    let interactions = plan.interactions();
+    let writer_stream = stream.clone();
+    let write: InputWriter = std::sync::Arc::new(move |padding| {
+        let view = resident.0.view(first, width);
+        math_cuda::gkr::input_from_columns(&writer_stream, &view, rows, &uploaded, padding).ok()
+    });
+    let tree = input_layer_tree_impl(stream, rows, interactions, write, false)?;
+    INPUT_COLUMNS_TREES.fetch_add(1, Ordering::Relaxed);
+    Some(tree)
 }
 
 /// The prefetch sibling of [`input_layer_tree`]: builds the tree WITHOUT
@@ -3456,7 +3593,15 @@ where
     if be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < need {
         return None;
     }
-    input_layer_tree_impl(factors, numerators, denominators, true)
+    let interactions = numerators.len();
+    let stream = factors.0.stream().clone();
+    input_layer_tree_impl(
+        stream,
+        rows,
+        interactions,
+        lifted_writer(factors, numerators, denominators),
+        true,
+    )
 }
 
 /// Count a GKR tree whose whole-tree promise the budget refused on the consume
@@ -3478,20 +3623,16 @@ fn note_gkr_tree_refusal(bytes: u64, cells: usize) {
 /// site; everything else is identical, so the eager caller is byte-for-byte the
 /// path it always was.
 #[cfg(feature = "cuda")]
-fn input_layer_tree_impl<E>(
-    factors: std::sync::Arc<DeviceFactors>,
-    numerators: Vec<crate::program::Program<E>>,
-    denominators: Vec<crate::program::Program<E>>,
+fn input_layer_tree_impl(
+    stream: std::sync::Arc<math_cuda::CudaStream>,
+    rows: usize,
+    interactions: usize,
+    write: InputWriter,
     defer: bool,
-) -> Option<DeviceTree>
-where
-    E: math::field::traits::IsField + 'static,
-{
-    let rows = factors.0.len();
-    let slots = numerators.len().next_power_of_two();
+) -> Option<DeviceTree> {
+    let slots = interactions.next_power_of_two();
     let full = slots * rows;
-    let real = numerators.len() * rows;
-    let stream = factors.0.stream().clone();
+    let real = interactions * rows;
 
     // Carrying the layer cannot fail late; handing it back can, and by then
     // the transcript has moved and there is no host path left. So it is
@@ -3501,11 +3642,13 @@ where
     // gigabytes, and nothing else.
     let eager = (4 * full) as u64 * 24;
     let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
-    let carried = math_cuda::device::reserve(eager);
-    if carried.is_some() || eager - lazy < worth_handing_back() {
+    let carried =
+        math_cuda::device::reserve(eager).filter(|_| !HAND_BACK_FORCED.load(Ordering::Relaxed));
+    let hand_back = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    if !hand_back && (carried.is_some() || eager - lazy < worth_handing_back()) {
         drop(carried);
         let t = crate::whir_split::tick();
-        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
+        let (p, q) = write(true)?;
         tree_sync!(stream);
         crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
         let t = crate::whir_split::tick();
@@ -3548,7 +3691,7 @@ where
     };
 
     let t = crate::whir_split::tick();
-    let (p, q) = write_input_layer(&factors, &numerators, &denominators, false)?;
+    let (p, q) = write(false)?;
     tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let num_vars = full.trailing_zeros() as usize;
@@ -3567,7 +3710,7 @@ where
     let num_layers = tree.num_layers();
 
     let rebuild = move || {
-        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
+        let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
             p,
@@ -3596,6 +3739,17 @@ pub fn input_layer_tree<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn input_layer_tree_from_columns(
+    _resident: std::sync::Arc<ResidentColumns>,
+    _first: usize,
+    _width: usize,
+    _rows: usize,
+    _plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
     None
 }
 

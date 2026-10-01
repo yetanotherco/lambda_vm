@@ -186,6 +186,14 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
+    /// The same, shared: for a device tree that writes its input layer again
+    /// from the columns after this borrow is gone.
+    pub fn resident_shared(&self) -> Option<(std::sync::Arc<crate::gpu::ResidentColumns>, usize)> {
+        self.resident
+            .as_ref()
+            .map(|(store, first)| (store.clone(), *first))
+    }
+
     /// The epoch's columns on the card, and where this table's start.
     pub fn resident(&self) -> Option<(&crate::gpu::ResidentColumns, usize)> {
         self.resident

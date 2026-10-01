@@ -370,6 +370,8 @@ pub struct Backend {
     pub gkr_eq_levels_ext3: CudaFunction,
     pub gkr_round_gruen: CudaFunction,
     pub gkr_gruen_finish: CudaFunction,
+    // D-BATCH M1-2's input layer from the base columns (`crate::gkr::input_from_columns`).
+    pub gkr_input_from_columns: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
     pub mle_fold_base_ext3: CudaFunction,
     pub eq_expand_level_ext3: CudaFunction,
@@ -1199,6 +1201,7 @@ impl Backend {
             gkr_eq_levels_ext3: sumcheck.load_function("gkr_eq_levels_ext3")?,
             gkr_round_gruen: sumcheck.load_function("gkr_round_gruen")?,
             gkr_gruen_finish: sumcheck.load_function("gkr_gruen_finish")?,
+            gkr_input_from_columns: sumcheck.load_function("gkr_input_from_columns")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,

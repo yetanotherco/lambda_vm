@@ -708,3 +708,98 @@ impl InputLayer {
         GruenLayer::new(&self.stream, &self.p, &self.q, self.num_vars, point, low)
     }
 }
+
+/// An input layer's plan on the card (D-BATCH M1-2): each side's range of
+/// terms, the terms — where a term's column starts in the table's run of base
+/// columns and its shift — their ext3 coefficients, and each side's constant.
+/// Uploaded once a table and kept for the layer's rewrite.
+pub struct InputPlan {
+    side_start: CudaSlice<u32>,
+    terms: CudaSlice<u64>,
+    coeffs: CudaSlice<u64>,
+    constants: CudaSlice<u64>,
+    interactions: usize,
+}
+
+impl InputPlan {
+    /// `side_start` has `2·interactions + 1` entries (side `2i` the
+    /// numerator of interaction `i`, `2i + 1` its denominator); `terms` two
+    /// u64 a term, `coeffs` three, `constants` three a side.
+    pub fn upload(
+        stream: &Arc<CudaStream>,
+        side_start: &[u32],
+        terms: &[u64],
+        coeffs: &[u64],
+        constants: &[u64],
+    ) -> Result<Self> {
+        assert!(
+            side_start.len() % 2 == 1,
+            "two sides an interaction, and the end"
+        );
+        let interactions = side_start.len() / 2;
+        let count = *side_start.last().expect("the end") as usize;
+        assert_eq!(terms.len(), 2 * count, "two u64 a term");
+        assert_eq!(coeffs.len(), 3 * count, "an ext3 coefficient a term");
+        assert_eq!(constants.len(), 6 * interactions, "an ext3 constant a side");
+        // An allocation to point at when a table's sides have no terms.
+        let or_one = |v: &[u64]| if v.is_empty() { vec![0u64] } else { v.to_vec() };
+        Ok(Self {
+            side_start: crate::device::htod_or_trim(stream, side_start)?,
+            terms: crate::device::htod_or_trim(stream, &or_one(terms))?,
+            coeffs: crate::device::htod_or_trim(stream, &or_one(coeffs))?,
+            constants: crate::device::htod_or_trim(stream, &or_one(constants))?,
+            interactions,
+        })
+    }
+
+    pub fn interactions(&self) -> usize {
+        self.interactions
+    }
+}
+
+/// The input layer written from the table's base columns in one launch
+/// (`gkr_input_from_columns`): `columns` is the table's run, `rows` a column,
+/// and the slots are the interactions, padded to a power of two with `0/1`
+/// when `padding` — the layout the lifted path writes.
+pub fn input_from_columns(
+    stream: &Arc<CudaStream>,
+    columns: &cudarc::driver::CudaView<'_, u64>,
+    rows: usize,
+    plan: &InputPlan,
+    padding: bool,
+) -> Result<Halves> {
+    let be = backend()?;
+    let interactions = plan.interactions;
+    let slots = if padding {
+        interactions.next_power_of_two()
+    } else {
+        interactions
+    };
+    let cells = slots * rows;
+    // SAFETY: the kernel writes every cell of both.
+    let mut p = unsafe { crate::device::alloc_or_trim::<u64>(stream, cells * 3) }?;
+    let mut q = unsafe { crate::device::alloc_or_trim::<u64>(stream, cells * 3) }?;
+    let rows_arg = rows as u64;
+    let interactions_arg = interactions as u64;
+    let slots_arg = slots as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.gkr_input_from_columns)
+            .arg(columns)
+            .arg(&rows_arg)
+            .arg(&plan.side_start)
+            .arg(&plan.terms)
+            .arg(&plan.coeffs)
+            .arg(&plan.constants)
+            .arg(&interactions_arg)
+            .arg(&slots_arg)
+            .arg(&mut p)
+            .arg(&mut q)
+            .launch(LaunchConfig {
+                grid_dim: ((cells as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok((p, q))
+}

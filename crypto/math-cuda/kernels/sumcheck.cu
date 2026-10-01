@@ -1143,3 +1143,53 @@ extern "C" __global__ void gkr_gruen_finish(uint64_t *__restrict__ p, uint64_t *
         at[2] = v.c;
     }
 }
+
+// The fraction tree's input layer straight from the table's base columns (D-BATCH M1-2,
+// `crate::gkr::input_from_columns`): cell `(s, r)` of `p` and `q` for every interaction slot
+// `s < slots` and row `r`, both sides in one launch, where the old path lifts every column into
+// the extension and runs one program launch per side. Side `2s` (numerator) and `2s + 1`
+// (denominator) are `constant + Σ coeff·column[(r + shift) mod rows]` over their terms — base ×
+// ext3 products, the same field values the lifted program computes. Slots from `interactions` on
+// are the padding's `0/1`.
+//
+// `d_side_start` (2·interactions + 1 entries) indexes the terms; term `t` is two u64 in `d_terms`
+// — where its column starts in `d_columns` and its shift, already reduced mod `rows` — and its
+// coefficient at `d_coeffs[3t]`. A side's constant is at `d_constants[3·side]`.
+extern "C" __global__ void gkr_input_from_columns(
+    const uint64_t *__restrict__ d_columns, uint64_t rows,
+    const uint32_t *__restrict__ d_side_start, const uint64_t *__restrict__ d_terms,
+    const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
+    uint64_t interactions, uint64_t slots, uint64_t *__restrict__ p, uint64_t *__restrict__ q) {
+    uint64_t total = slots * rows;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t s = task / rows;
+        uint64_t r = task - s * rows;
+        Fe3 side[2];
+        if (s < interactions) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                uint64_t which = 2 * s + h;
+                Fe3 acc = load_ext(d_constants + which * 3);
+                for (uint32_t t = d_side_start[which]; t < d_side_start[which + 1]; t++) {
+                    uint64_t k = r + d_terms[2 * t + 1];
+                    if (k >= rows) k -= rows;
+                    uint64_t value = d_columns[d_terms[2 * t] + k];
+                    acc = ext3::add(acc, ext3::mul_base(load_ext(d_coeffs + (uint64_t)t * 3), value));
+                }
+                side[h] = acc;
+            }
+        } else {
+            side[0] = ext3::zero();
+            side[1] = ext3::one();
+        }
+        uint64_t *at = p + task * 3;
+        at[0] = side[0].a;
+        at[1] = side[0].b;
+        at[2] = side[0].c;
+        at = q + task * 3;
+        at[0] = side[1].a;
+        at[1] = side[1].b;
+        at[2] = side[1].c;
+    }
+}

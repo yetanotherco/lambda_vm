@@ -1075,6 +1075,9 @@ where
     // is built — same factors, same (z, alpha, beta) — only when, so a prebuilt
     // tree yields byte-for-byte the same proof as building it here now.
     // The tree where the factors reside, the lift timed on its own.
+    // Under `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) the input layer is
+    // written from the resident base columns; the factors are still lifted, for
+    // the zerocheck.
     let resident_tree = || {
         let lift = tick();
         let resident = table.trace.reside_from_columns();
@@ -1082,7 +1085,11 @@ where
             factors.tree_sync();
         }
         lap(&split::TREE_LIFT, lift);
-        resident.and_then(|resident| logup::resident_tree(&interactions, resident))
+        let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
+            .then(|| logup::resident_tree_from_columns(&interactions, &table.trace))
+            .flatten();
+        from_columns
+            .or_else(|| resident.and_then(|resident| logup::resident_tree(&interactions, resident)))
     };
     let t = tick();
     let tree = match prebuilt {
@@ -2480,6 +2487,8 @@ mod tests {
         fused: u64,
         /// Device GKR layers that ran Gruen's rounds (D-ARGUE S1-3).
         gruen: u64,
+        /// Fraction trees whose input layer was written from the base columns.
+        input: u64,
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
@@ -2502,6 +2511,7 @@ mod tests {
         program: bool,
         fused: bool,
         gruen: bool,
+        input: bool,
     }
 
     const TODAY: Knobs = Knobs {
@@ -2512,6 +2522,7 @@ mod tests {
         program: false,
         fused: false,
         gruen: false,
+        input: false,
     };
 
     /// Commits the tall tables afresh and proves them under `knobs`.
@@ -2548,8 +2559,10 @@ mod tests {
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(Some(knobs.fused));
         multilinear::gkr_gruen::force_argue_gkr_gruen(Some(knobs.gruen));
+        multilinear::gpu::force_argue_gkr_input(Some(knobs.input));
         let fused = multilinear::gpu_fused::fused_sessions();
         let gruen = multilinear::gkr_gruen::gruen_layers();
+        let input = multilinear::gpu::input_columns_trees();
         let (card, host, built, gathered, single, lean) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
@@ -2578,8 +2591,10 @@ mod tests {
             lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
             fused: multilinear::gpu_fused::fused_sessions() - fused,
             gruen: multilinear::gkr_gruen::gruen_layers() - gruen,
+            input: multilinear::gpu::input_columns_trees() - input,
         });
         multilinear::gkr_gruen::force_argue_gkr_gruen(None);
+        multilinear::gpu::force_argue_gkr_input(None);
         multilinear::gpu_fused::force_argue_fused(None);
         #[cfg(feature = "cuda")]
         math_cuda::sumcheck::force_int_nodes(None);
@@ -3753,6 +3768,86 @@ mod tests {
         }
     }
 
+    /// ★ `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) moves no byte of the proof,
+    /// alone and with the production defaults beside it (the fused zerocheck and
+    /// the Gruen layers): the same canonical bytes, table by table and whole, the
+    /// same transcript and next challenge, and every proof verifies. On a device
+    /// the arms show their trees written from the columns. ⚠ Run it alone.
+    #[test]
+    fn the_argument_proves_the_same_bytes_with_the_input_from_columns() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+        let airs = airs();
+        let columns = tall_columns();
+        let device = a_device();
+        let production = Knobs {
+            columns: true,
+            tables: true,
+            reads: true,
+            fused: true,
+            gruen: true,
+            ..TODAY
+        };
+        for (base, arm) in [
+            (
+                TODAY,
+                Knobs {
+                    input: true,
+                    ..TODAY
+                },
+            ),
+            (
+                production,
+                Knobs {
+                    input: true,
+                    ..production
+                },
+            ),
+        ] {
+            let mut today = prove_tall(&airs, &columns, base);
+            verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
+            assert_eq!(today.input, 0, "{base:?}: no tree from the columns");
+            let today_state = today.transcript.state();
+            let today_next = today.transcript.sample_field_element();
+            let mut got = prove_tall(&airs, &columns, arm);
+            if device {
+                assert!(
+                    got.input > 0,
+                    "{arm:?}: the trees were written from the columns"
+                );
+                eprintln!(
+                    "argue gkr input: {arm:?}: {} trees from the columns",
+                    got.input
+                );
+            } else {
+                assert_eq!(got.input, 0, "{arm:?}: no device, no tree from the columns");
+                eprintln!("argue gkr input: no device; today's trees");
+            }
+            assert_eq!(
+                first_table_that_differs(&today.proof, &got.proof),
+                None,
+                "{arm:?}: a table's argument changed"
+            );
+            assert_eq!(
+                bincode::serialize(&today.proof).unwrap(),
+                bincode::serialize(&got.proof).unwrap(),
+                "{arm:?}: the proofs' canonical bytes differ"
+            );
+            assert_eq!(
+                today_state,
+                got.transcript.state(),
+                "{arm:?}: the transcripts parted"
+            );
+            assert_eq!(
+                today_next,
+                got.transcript.sample_field_element(),
+                "{arm:?}: the next challenge moved"
+            );
+            verify_tall(&got.committed, &got.proof).unwrap_or_else(|e| panic!("{arm:?}: {e:?}"));
+        }
+    }
+
     /// ⛔ The identity above can fail. With the fault armed, every Gruen layer
     /// adds one to its first round's `s(1)`. The proof must then differ from
     /// today's at CPU, the first table argued, and be refused by GKR's layer
@@ -3883,6 +3978,7 @@ mod tests {
             program: true,
             fused: false,
             gruen: false,
+            input: false,
         };
         for knobs in [
             Knobs {
