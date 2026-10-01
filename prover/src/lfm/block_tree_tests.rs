@@ -400,6 +400,37 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
+/// m5: a nonzero pad byte in the public output's last half is refused.
+/// `test_commit_3` commits three bytes, so the last half carries one pad byte,
+/// which the statement's `bit_dec(half, 8·live)` keeps zero; the honest arenas
+/// execute.
+#[test]
+#[ignore = "proves a VM block (BITWISE is 2^20 rows); box tier"]
+fn a_nonzero_pad_byte_in_the_output_is_refused() {
+    let opts = fixture_block_options();
+    let (elf_bytes, proof) = small_block("test_commit_3", &[], &opts);
+    let (rb, ..) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
+    assert_eq!(
+        rb.public_output.len() % 4,
+        3,
+        "a ragged output: three live bytes in the last half"
+    );
+    let partition = rb.plan.partition().clone();
+    let program = block_leaf_program(&rb, 0);
+    let arenas = block_leaf_arenas(&rb, &partition, 0);
+    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .unwrap_or_else(|e| panic!("the honest leaf executes: {e:?}"));
+    let last = arenas[0].len() - 1;
+    let v: u64 = arenas[0][last][0].canonical();
+    let mut padded = arenas.clone();
+    padded[0][last] = base_word(FE::from(v | (1u64 << 24)));
+    assert!(
+        execute(&program, &padded, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        "a nonzero pad byte in the last output half must not execute"
+    );
+    println!("BLOCK FIXTURE: a nonzero pad byte in the last output half is refused");
+}
+
 // =============================== (c) the bindings =========================
 
 /// Two children's published words under [`BlockLayout::child`], honest: the same
