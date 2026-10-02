@@ -614,6 +614,10 @@ struct MemLedger {
     committed: std::sync::atomic::AtomicUsize,
     committed_packed: std::sync::atomic::AtomicUsize,
     committed_wide: std::sync::atomic::AtomicUsize,
+    /// The executor's windows of logs on their way to the walker, and the
+    /// walked windows on their way to the accumulator.
+    logs_bytes: std::sync::atomic::AtomicUsize,
+    walked_bytes: std::sync::atomic::AtomicUsize,
     /// The builder's run so far after the last absorbed window, the walk's
     /// carried memory state, and the executor's memory, as last published.
     builder_bytes: std::sync::atomic::AtomicUsize,
@@ -634,6 +638,8 @@ impl MemLedger {
             committed: AtomicUsize::new(0),
             committed_packed: AtomicUsize::new(0),
             committed_wide: AtomicUsize::new(0),
+            logs_bytes: AtomicUsize::new(0),
+            walked_bytes: AtomicUsize::new(0),
             builder_bytes: AtomicUsize::new(0),
             walk_bytes: AtomicUsize::new(0),
             executor_bytes: AtomicUsize::new(0),
@@ -710,8 +716,8 @@ impl MemLedger {
         });
         eprintln!(
             "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
-             ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · builder {:.2} · walk {:.2} · \
-             executor {:.2} (GiB)",
+             ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · logs {:.2} · walked {:.2} · \
+             builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
             self.queued.load(Relaxed),
             g(&self.queued_bytes),
@@ -721,6 +727,8 @@ impl MemLedger {
             self.committed.load(Relaxed),
             g(&self.committed_packed),
             g(&self.committed_wide),
+            g(&self.logs_bytes),
+            g(&self.walked_bytes),
             g(&self.builder_bytes),
             g(&self.walk_bytes),
             g(&self.executor_bytes),
@@ -900,10 +908,13 @@ fn build_streamed(
                 .resume_with_limit(window)
                 .map_err(|e| Error::Execution(format!("{e}")))?
             {
-                if log_tx.send(logs.to_vec()).is_err() {
+                let logs = logs.to_vec();
+                let logs_bytes = logs.capacity() * std::mem::size_of::<executor::vm::logs::Log>();
+                if log_tx.send(logs).is_err() {
                     break;
                 }
                 if let Some(ledger) = ledger {
+                    ledger.logs_bytes.fetch_add(logs_bytes, Relaxed);
                     ledger
                         .executor_bytes
                         .store(executor.memory().heap_bytes(), Relaxed);
@@ -1109,6 +1120,12 @@ fn build_streamed(
                                 let walked = walker.walk(&prev)?;
                                 if let Some(ledger) = ledger {
                                     ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
+                                    ledger.logs_bytes.fetch_sub(
+                                        prev.capacity()
+                                            * std::mem::size_of::<executor::vm::logs::Log>(),
+                                        Relaxed,
+                                    );
+                                    ledger.walked_bytes.fetch_add(walked.heap_bytes(), Relaxed);
                                 }
                                 if walked_tx.send(walked).is_err() {
                                     break;
@@ -1119,6 +1136,9 @@ fn build_streamed(
                     });
                     for walked in walked_rx {
                         let t = Instant::now();
+                        if let Some(ledger) = ledger {
+                            ledger.walked_bytes.fetch_sub(walked.heap_bytes(), Relaxed);
+                        }
                         for job in accumulator.absorb(walked) {
                             let job = Streamed::Job(job);
                             let bytes = streamed_bytes(&job);

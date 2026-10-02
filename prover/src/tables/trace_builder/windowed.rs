@@ -433,6 +433,13 @@ pub struct WalkedWindow {
     walk: WalkOutputs,
 }
 
+impl WalkedWindow {
+    /// The bytes its lists take on the heap (capacities).
+    pub fn heap_bytes(&self) -> usize {
+        super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
+    }
+}
+
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Walker<'b> {
     artifacts: &'b DecodeArtifacts,
