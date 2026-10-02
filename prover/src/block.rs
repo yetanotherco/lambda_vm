@@ -448,6 +448,15 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
+/// `LAMBDA_VM_BLOCK_PACKED_BUILD=0`: with [`narrow_finished`], the finish
+/// builds KECCAK_RND and LT at 8 bytes a cell and packs them afterwards, as
+/// the other tables ([`WindowedTraceBuilder::build_wide_then_pack`]); unset or
+/// anything else builds them packed a block at a time. The A arm of the packed
+/// builds: the words are the same either way.
+fn packed_builds() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").map_or(true, |v| v.trim() != "0")
+}
+
 /// `LAMBDA_VM_BLOCK_FINISH_WIDE=n` (n >= 1): with [`narrow_finished`], phase
 /// A's finish generates at most `n` chunks at 8 bytes a cell at once
 /// ([`WindowedTraceBuilder::bound_finished_generation`]); unset or `0` is no
@@ -1193,6 +1202,9 @@ fn build_streamed(
                 builder = builder
                     .pack_finished_tables()
                     .bound_finished_generation(finish_wide_chunks());
+                if !packed_builds() {
+                    builder = builder.build_wide_then_pack();
+                }
             }
             if let Some(ledger) = ledger {
                 eprintln!(

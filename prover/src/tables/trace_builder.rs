@@ -3895,6 +3895,10 @@ pub struct StreamSkip {
     /// cell at once ([`WidePermits`]), so the 64-bit copies in flight before
     /// each is packed stay bounded whatever the block's size. `0`: no bound.
     pub wide_chunks: usize,
+    /// With [`Self::pack`]: build KECCAK_RND and LT at 8 bytes a cell and pack
+    /// each afterwards, as every other table, instead of packed a block at a
+    /// time (the A arm of the packed builds). The words are the same.
+    pub wide_builds: bool,
 }
 
 /// How a build packs what it generates ([`StreamSkip::pack`]), and the permits
@@ -4947,9 +4951,9 @@ fn build_traces<I: ImageSource + Sync>(
     };
     // A packing build generates LT packed a block at a time, as KECCAK_RND.
     #[cfg(feature = "disk-spill")]
-    let built_packed = pack.on && storage_mode != StorageMode::Disk;
+    let built_packed = pack.on && !skip.wide_builds && storage_mode != StorageMode::Disk;
     #[cfg(not(feature = "disk-spill"))]
-    let built_packed = pack.on;
+    let built_packed = pack.on && !skip.wide_builds;
     let gen_lts = || {
         let (generate, pack): (fn(&[LtOperation]) -> _, _) = if built_packed {
             (

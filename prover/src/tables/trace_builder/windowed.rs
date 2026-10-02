@@ -275,6 +275,15 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// With [`Self::pack_finished_tables`], `finish` builds KECCAK_RND and LT
+    /// at 8 bytes a cell and packs them afterwards, as the other tables
+    /// ([`StreamSkip::wide_builds`]), instead of packed a block at a time. The
+    /// tables are the same.
+    pub fn build_wide_then_pack(mut self) -> Self {
+        self.emitted.wide_builds = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus
