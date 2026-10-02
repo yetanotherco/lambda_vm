@@ -1233,7 +1233,23 @@ fn the_whir_block_tree_on_a_real_block() {
     let leaves = knob("W3_LEAVES");
     let siblings = knob("W3_SIBLINGS").unwrap_or(3);
     let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
-    let format = BlockFormat::production();
+    // `BLOCK_WHIR_ARGUE=batched`: each group's tables argued together, at the
+    // format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k` for 2^k).
+    let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
+        Ok("batched") => match knob("BLOCK_WHIR_ARGUE_CAP") {
+            Some(cap) => ArgueFormat::Batched {
+                bin_log_cells: u8::try_from(cap).expect("a cap below 2^256"),
+            },
+            None => ArgueFormat::BATCHED,
+        },
+        Ok("per-table") | Err(_) => ArgueFormat::PerTable,
+        Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
+    };
+    let format = BlockFormat {
+        argue,
+        ..BlockFormat::production()
+    };
+    println!("W3 ARGUE: {argue:?}");
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_STREAM_KECCAK_RND=1`: KECCAK_RND's chunks streamed (off by
     // default: NO EFFECT on this block, FAST 418).
@@ -1407,7 +1423,7 @@ fn the_whir_block_tree_on_a_real_block() {
     let t = std::time::Instant::now();
     // The production verifier when the run is at its presets; the fixture form
     // only when a knob moved the tree off them.
-    let verdict = if leaves.is_none() && fan_in == BLOCK_FAN_IN {
+    let verdict = if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == ArgueFormat::PerTable {
         verify_block_tree(&elf, proof.statement(), top)
     } else {
         verify_block_tree_under(
@@ -1431,4 +1447,153 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     verdict.expect("the block's verifier accepts the top");
+}
+
+// ========================= the batched argue (N-4) ========================
+
+/// [`small_format`] with each group's tables argued together at the format's
+/// cap.
+fn small_batched() -> BlockFormat {
+    BlockFormat {
+        argue: ArgueFormat::BATCHED,
+        ..small_format()
+    }
+}
+
+/// ★ Under the batched format every leaf executes over an honest block proof,
+/// publishing the plan's id, state and output, and their shares cancel: the
+/// batched groups close the block's bus across the leaves. Each group costs the
+/// leaf less than its tables argued one by one.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn batched_block_leaves_execute_and_close_the_bus() {
+    let format = small_batched();
+    for (name, leaves) in [
+        ("all_instructions_64", Some(3)),
+        ("test_commit_4", Some(2)),
+        ("test_keccak", None),
+        ("test_commit_4", Some(1)),
+    ] {
+        let (elf, proof) = small_block(name, &format);
+        assert_eq!(proof.argues.len(), proof.groups.len());
+        let plan = plan_of(&elf, &proof, &format, leaves);
+        let per_table = plan_of(&elf, &proof, &small_format(), leaves);
+        println!(
+            "WHIR BLOCK BATCHED LEAVES {name}: {} groups, costs {:?} (per table {:?}), partition {:?}",
+            plan.num_groups(),
+            plan.costs(),
+            per_table.costs(),
+            plan.partition().leaves(),
+        );
+        for (g, (batched, each)) in plan.costs().iter().zip(per_table.costs()).enumerate() {
+            assert!(batched <= each, "{name} group {g}: {batched} > {each}");
+        }
+        let layout = plan.child_layout();
+        let words = leaves_words(&plan, &proof);
+        let id = id_words(plan.id());
+        let mut sum = FEE::zero();
+        for w in &words {
+            assert_eq!(w[layout.id(0)], id[0]);
+            assert_eq!(w[layout.id(1)], id[1]);
+            assert_eq!(w[layout.state(0)], words[0][layout.state(0)]);
+            sum += ext_of(&w[layout.sum()]);
+        }
+        assert_eq!(sum, FEE::zero(), "{name}: the leaves' shares cancel");
+        // The format is the plan's: a per-table plan has no reading of a
+        // batched proof, and a batched plan none of a per-table one.
+        assert!(block_leaf_arena(&per_table, &proof, 0).is_err());
+    }
+}
+
+/// ★ A batched leaf refuses each forgery of its group's argue — a bus output,
+/// a ladder step's half, a ladder round, a constraint round, a factor value —
+/// and a tampered prepared opening, which executes with the prepared openings
+/// left out (the mutation): the preprocessed and prepared checks stay in place
+/// under the batched argue.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn a_batched_block_leaf_refuses_a_tampered_witness() {
+    let format = small_batched();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(1));
+    run_leaf(&plan, &proof, 0, LeafChecks::ALL).expect("the honest leaf executes");
+    let one = FEE::one();
+    // The tallest bin of group 0, whose ladder has a step with rounds.
+    let (bin, steps) = proof.argues[0]
+        .gkr
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i, l.layers.len()))
+        .max_by_key(|&(_, steps)| steps)
+        .expect("a ladder");
+    assert!(steps >= 2, "a ladder with a step that has rounds");
+    type Forge = fn(&mut BlockWhirProof, usize, usize);
+    let forgeries: [(&str, Forge); 5] = [
+        ("bus output", |p, _, _| {
+            p.argues[0].bus_outputs[0].0 += FEE::one()
+        }),
+        ("ladder half", |p, bin, steps| {
+            p.argues[0].gkr[bin].layers[steps - 1].halves[0].p_lo += FEE::one()
+        }),
+        ("ladder round", |p, bin, steps| {
+            p.argues[0].gkr[bin].layers[steps - 1].sumcheck.rounds[0].evaluations[0] += FEE::one()
+        }),
+        ("constraint round", |p, _, _| {
+            p.argues[0].constraint.rounds[0].evaluations[0] += FEE::one()
+        }),
+        ("factor value", |p, _, _| {
+            p.argues[0].factor_values[0][0] += FEE::one()
+        }),
+    ];
+    for (name, forge) in forgeries {
+        let mut forged = proof.clone();
+        forge(&mut forged, bin, steps);
+        assert!(
+            run_leaf(&plan, &forged, 0, LeafChecks::ALL).is_err(),
+            "a forged {name}"
+        );
+    }
+    let mut prepared = proof.clone();
+    prepared.prepared[0].polys[0].final_value += one;
+    assert!(run_leaf(&plan, &prepared, 0, LeafChecks::ALL).is_err());
+    let without = LeafChecks {
+        prepared: false,
+        ..LeafChecks::ALL
+    };
+    assert!(
+        run_leaf(&plan, &prepared, 0, without).is_ok(),
+        "with the prepared openings left out the tamper executes"
+    );
+}
+
+/// ★ The batched block's tree proves to the top its plan derives, and the
+/// format is the verifier's: the batched top is accepted under the batched
+/// format and refused under the per-table one.
+#[test]
+#[ignore = "proves a block tree; box tier"]
+fn the_batched_whir_block_tree_proves_to_the_derived_top() {
+    super::device_permit::arm(1);
+    let format = small_batched();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let (top, _) = compose(&plan, &proof, "BATCHED TREE").expect("the honest tree proves");
+    let under = |format: &BlockFormat| {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            format,
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+    };
+    under(&format).expect("the batched verifier accepts the honest top");
+    assert!(
+        under(&small_format()).is_err(),
+        "the per-table verifier refuses the batched top"
+    );
 }
