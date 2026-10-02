@@ -197,6 +197,90 @@ pub fn generate_decode_trace(
     (trace, pc_to_row)
 }
 
+/// Every instruction of a program decoded once, in the DECODE table's row
+/// order: the entry of row `r` is [`generate_decode_trace`]'s row `r` (both
+/// sort the pcs), and the CPU padding entry's row follows the last
+/// instruction's. A CPU op keeps its DECODE row instead of a copy of the entry
+/// ([`super::cpu::CpuOperation`]), so its decode is one indexed read here and
+/// its DECODE lookup is counted by row, with no pc search.
+#[derive(Debug)]
+pub struct DecodeTable {
+    /// The entries, in pc order.
+    entries: Vec<DecodeEntry>,
+    /// `(first pc, its row, number of pcs)` of each run of pcs 4 apart,
+    /// ascending: a pc's row is found by run, not by hashing.
+    runs: Vec<(u64, u32, u32)>,
+}
+
+impl DecodeTable {
+    /// The table of `instructions`, each decoded as the DECODE trace decodes
+    /// it (length 4).
+    ///
+    /// # Panics
+    /// If the program has 2^32 − 1 instructions or more (rows are `u32`).
+    pub fn from_instructions(instructions: &U64HashMap<Instruction>) -> Self {
+        let mut pcs: Vec<u64> = instructions.keys().copied().collect();
+        // The order of `generate_decode_trace`'s rows.
+        pcs.sort_unstable();
+        assert!(
+            pcs.len() < u32::MAX as usize,
+            "{} instructions do not fit u32 DECODE rows",
+            pcs.len()
+        );
+        let mut entries = Vec::with_capacity(pcs.len());
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        for pc in pcs {
+            let row = entries.len() as u32;
+            entries.push(DecodeEntry::from_instruction(pc, instructions[&pc], 4));
+            match runs.last_mut() {
+                Some((first, _, len)) if first.checked_add(4 * *len as u64) == Some(pc) => {
+                    *len += 1
+                }
+                _ => runs.push((pc, row, 1)),
+            }
+        }
+        Self { entries, runs }
+    }
+
+    /// The DECODE row of the instruction at `pc`, if the program has one.
+    #[inline]
+    pub fn row(&self, pc: u64) -> Option<u32> {
+        self.runs.iter().find_map(|&(first, row, len)| {
+            let offset = pc.wrapping_sub(first);
+            (offset % 4 == 0 && offset / 4 < len as u64).then(|| row + (offset / 4) as u32)
+        })
+    }
+
+    /// The entry of DECODE row `row` (a row [`Self::row`] returned).
+    #[inline]
+    pub fn entry(&self, row: u32) -> &DecodeEntry {
+        &self.entries[row as usize]
+    }
+
+    /// The DECODE row of the CPU padding entry (`pc = CPU_PADDING_PC`).
+    pub fn padding_row(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `op` with its decode.
+    #[inline]
+    pub fn op<'a>(&'a self, op: &'a super::cpu::CpuOperation) -> super::cpu::CpuOp<'a> {
+        super::cpu::CpuOp::new(self.entry(op.decode_row), op)
+    }
+}
+
+/// Counts one DECODE lookup per row of `rows` into the MU column (rows a
+/// [`DecodeTable`] gives).
+pub fn count_rows(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    rows: impl IntoIterator<Item = usize>,
+) {
+    for row in rows {
+        let current = trace.main_table.get(row, cols::MU);
+        trace.main_table.set_fe(row, cols::MU, current + FE::one());
+    }
+}
+
 /// Updates multiplicities in the DECODE trace table.
 ///
 /// For each PC in `lookups`, increments the MU column in the corresponding row.
