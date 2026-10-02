@@ -85,3 +85,24 @@ fn a_chunk_in_one_part_is_not_copied() {
         (12u32..20).collect::<Vec<_>>()
     );
 }
+
+/// The bytes the tail and its chunks hold count each part once: a shared part
+/// by each holder's range, a part held alone at its capacity.
+#[test]
+fn the_held_bytes_count_each_part_once() {
+    let mut tail = Tail::new();
+    tail.push(vec![0u32; 10]);
+    tail.push(vec![1u32; 10]);
+    let all = 2 * 10 * std::mem::size_of::<u32>();
+    assert_eq!(tail.heap_bytes(), all);
+
+    let a = tail.take(6);
+    let b = tail.take(6);
+    assert_eq!(a.heap_bytes() + b.heap_bytes() + tail.heap_bytes(), all);
+    // With a dropped, b holds the first part alone, and all of it stays.
+    drop(a);
+    assert_eq!(b.heap_bytes() + tail.heap_bytes(), all);
+    // Once b goes, only the tail's part is left.
+    drop(b);
+    assert_eq!(tail.heap_bytes(), all / 2);
+}
