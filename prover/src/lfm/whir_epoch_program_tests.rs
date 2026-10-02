@@ -164,7 +164,10 @@ fn the_production_epoch_recount() {
             production.format,
             crate::zf_format::ZfFormat::DEFAULT.chain_format()
         );
-        assert_eq!(production.num_queries, 112, "the flip keeps Q");
+        assert_eq!(
+            production.num_queries, 114,
+            "first6 keeps Q; the default's 18-bit grind buys two queries"
+        );
         assert_eq!(ChainShape::new(&production, 25).rounds(), 6, "first6 at 25");
     }
     let (layouts, _domains) = stacks(&shapes, &sizes, &config).expect("the epoch's stacks build");
