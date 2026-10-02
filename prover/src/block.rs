@@ -664,6 +664,8 @@ impl MemLedger {
         const GIB: f64 = (1u64 << 30) as f64;
         let g = |a: &std::sync::atomic::AtomicUsize| a.load(Relaxed) as f64 / GIB;
         let rss = proc_rss_bytes().map_or("n/a".to_string(), |b| format!("{:.2}", b as f64 / GIB));
+        let faults =
+            proc_minor_faults().map_or("n/a".to_string(), |f| format!("{:.2}", f as f64 / 1e6));
         let heap = heap_stats().map_or("heap n/a".to_string(), |[live, active, resident, mapped, retained]| {
             let g = |b: usize| b as f64 / GIB;
             format!(
@@ -677,7 +679,7 @@ impl MemLedger {
             )
         });
         eprintln!(
-            "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
+            "BLOCK MEM {label} t={:.1} · rss {rss} · minflt {faults} M · {heap} · queue {} chunks {:.2} · committing {:.2} · \
              ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · logs {:.2} · walked {:.2} · \
              builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
@@ -732,6 +734,15 @@ impl Drop for MemSampler {
             let _ = handle.join();
         }
     }
+}
+
+/// This process's minor page faults so far (`/proc/self/stat`, field 10), on
+/// Linux: each a first touch of a page the allocator had not kept.
+fn proc_minor_faults() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command name may hold spaces; the fields after it do not.
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(7)?.parse().ok()
 }
 
 /// This process's resident set (`VmRSS`), on Linux.
