@@ -57,6 +57,9 @@ pub(crate) struct ProducerConfig {
     pub sink: Sink,
     /// Print `PRODUCER LIVE` lines as the run goes.
     pub live: bool,
+    /// Run the finish (`false`: stop after the windows, the last window
+    /// unwalked — for blocks whose finish does not fit the box).
+    pub finish: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -458,6 +461,9 @@ pub(crate) fn run_producer(
                     opt(rss_gib()),
                     opt(report.peak_windows)
                 ));
+                if !cfg.finish {
+                    return Ok(report);
+                }
                 build_stamps::start();
                 let t_finish = Instant::now();
                 let traces = builder.finish(&last)?;
@@ -669,7 +675,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 ///
 /// Window 2^20 is the WHIR prover's (`BLOCK_WINDOW_LOG2`), 2^21 the STARK
 /// prover's (`max_rows.cpu`). `LAMBDA_VM_PRODUCER_SINK=skip` drops each chunk
-/// job ungenerated.
+/// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows.
 #[test]
 #[ignore = "box only: executes and walks a real block"]
 fn the_block_producer_alone() {
@@ -689,6 +695,7 @@ fn the_block_producer_alone() {
         drop_ops: env_usize("LAMBDA_VM_PRODUCER_DROP_OPS", 1) != 0,
         sink,
         live: true,
+        finish: env_usize("LAMBDA_VM_PRODUCER_FINISH", 1) != 0,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -774,6 +781,7 @@ fn the_producer_harness_drives_the_builder() {
                     drop_ops,
                     sink,
                     live: false,
+                    finish: true,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
                 let what = format!("{name}, window {window}, {sink:?}");
