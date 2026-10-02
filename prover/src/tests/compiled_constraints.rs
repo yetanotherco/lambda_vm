@@ -55,7 +55,7 @@ const BYTES_PROGRAM: &str = "add";
 type Program = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
 
 /// Every production program, labelled, under the options it is built with.
-fn production_programs(opts: &ProofOptions) -> Vec<(String, Program)> {
+pub(crate) fn production_programs(opts: &ProofOptions) -> Vec<(String, Program)> {
     let mut out = Vec::new();
     let mut push = |label: String, air: DynAir<'_>| {
         out.push((label, air.constraint_program().clone()));
