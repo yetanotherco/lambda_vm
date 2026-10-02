@@ -170,6 +170,53 @@ impl NarrowMain {
             .collect()
     }
 
+    /// A 128-bit digest of the packed trace (its shape, widths and bytes): a
+    /// fast, non-cryptographic check that a trace built again is this one. A
+    /// prover bug is the threat, not an adversary.
+    pub fn digest(&self) -> [u64; 2] {
+        const K: [u64; 4] = [
+            0x9e37_79b9_7f4a_7c15,
+            0xc2b2_ae3d_27d4_eb4f,
+            0x1656_67b1_9e37_79f9,
+            0x85eb_ca77_c2b2_ae63,
+        ];
+        let mix = |acc: u64, w: u64, k: u64| (acc ^ w).wrapping_mul(k).rotate_left(31);
+        let mut lanes = [
+            self.rows as u64,
+            self.widths.len() as u64,
+            self.data.len() as u64,
+            0x243f_6a88_85a3_08d3,
+        ];
+        for (i, &w) in self.widths.iter().enumerate() {
+            lanes[i % 4] = mix(lanes[i % 4], u64::from(w), K[i % 4]);
+        }
+        let mut blocks = self.data.chunks_exact(32);
+        for block in &mut blocks {
+            for (l, word) in block.chunks_exact(8).enumerate() {
+                let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+                lanes[l] = mix(lanes[l], w, K[l]);
+            }
+        }
+        let mut tail = [0u8; 32];
+        tail[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+        for (l, word) in tail.chunks_exact(8).enumerate() {
+            let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+            lanes[l] = mix(lanes[l], w, K[l]);
+        }
+        // MurmurHash3's finalizer, so every input bit reaches every output bit.
+        let fmix = |mut h: u64| {
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            h ^ (h >> 33)
+        };
+        [
+            fmix(lanes[0] ^ lanes[2].rotate_left(23)),
+            fmix(lanes[1] ^ lanes[3].rotate_left(41)),
+        ]
+    }
+
     /// Flip the low bit of the first packed byte: a wrong word, for the tests
     /// that check a bad widen is refused.
     #[cfg(any(test, feature = "test-utils"))]
@@ -382,6 +429,28 @@ mod tests {
             assert_eq!(builder.finish(), whole, "blocks of {block} rows");
         }
         assert_eq!(whole.widths(), &[8, 1, 1, 8, 4, 4]);
+    }
+
+    /// The digest sees every packed byte and the shape: equal traces digest
+    /// alike, and one flipped bit anywhere (head, middle, the tail past the
+    /// last 32-byte block) or another row count changes it.
+    #[test]
+    fn the_digest_sees_every_byte() {
+        let cols = 3;
+        let words: Vec<u64> = (0..(1000 * cols) as u64).map(|i| i * 7 % 300).collect();
+        let narrow = NarrowMain::pack(&words, cols);
+        assert_eq!(narrow.digest(), NarrowMain::pack(&words, cols).digest());
+        assert!(
+            !narrow.data().len().is_multiple_of(32),
+            "a tail past the last block"
+        );
+        for at in [0, narrow.data().len() / 2, narrow.data().len() - 1] {
+            let mut bent = narrow.clone();
+            bent.data[at] ^= 1;
+            assert_ne!(bent.digest(), narrow.digest(), "byte {at}");
+        }
+        let fewer = NarrowMain::pack(&words[..999 * cols], cols);
+        assert_ne!(fewer.digest(), narrow.digest());
     }
 
     /// An empty trace packs to nothing and widens to nothing.
