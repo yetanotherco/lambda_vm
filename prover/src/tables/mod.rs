@@ -51,6 +51,7 @@ pub mod register;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;
+pub mod trace_hash;
 
 pub use types::BusId;
 
