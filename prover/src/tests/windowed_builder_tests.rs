@@ -124,66 +124,140 @@ fn rows(t: &Table) -> Vec<Vec<FieldElement<GoldilocksField>>> {
         .collect()
 }
 
-/// Equal tables — row for row, or as row multisets for the tables that lay
-/// their rows out in `HashMap` order.
-fn same(what: &str, a: &Table, b: &Table, hashed: bool) {
+/// Equal tables, row for row — also the six that lay their rows out in
+/// `HashMap` order, since every such map in the process hashes with one state
+/// (`tables::trace_hash`).
+fn same(what: &str, a: &Table, b: &Table) {
     assert_eq!(
         (a.main_table.width, a.main_table.height),
         (b.main_table.width, b.main_table.height),
         "{what}: shape"
     );
-    let (mut ra, mut rb) = (rows(a), rows(b));
-    if hashed {
-        let key = |r: &Vec<FieldElement<GoldilocksField>>| {
-            r.iter().map(|v| v.canonical()).collect::<Vec<u64>>()
-        };
-        ra.sort_by_key(key);
-        rb.sort_by_key(key);
-    }
-    assert!(ra == rb, "{what}: rows differ");
+    assert!(rows(a) == rows(b), "{what}: rows differ");
 }
 
-fn same_list(what: &str, a: &[Table], b: &[Table], hashed: bool) {
+fn same_list(what: &str, a: &[Table], b: &[Table]) {
     assert_eq!(a.len(), b.len(), "{what}: table count");
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        same(&format!("{what}[{i}]"), x, y, hashed);
+        same(&format!("{what}[{i}]"), x, y);
     }
 }
 
 fn same_traces(a: &Traces, b: &Traces) {
-    same_list("CPU", &a.cpus, &b.cpus, false);
-    same_list("MEMW_R", &a.memw_registers, &b.memw_registers, false);
-    same_list("MEMW_A", &a.memw_aligneds, &b.memw_aligneds, false);
-    same_list("MEMW", &a.memws, &b.memws, false);
-    same_list("LOAD", &a.loads, &b.loads, false);
-    same_list("STORE", &a.stores, &b.stores, false);
-    same_list("SHIFT", &a.shifts, &b.shifts, false);
-    same_list("CPU32", &a.cpu32s, &b.cpu32s, false);
-    same_list("COMMIT", &a.commits, &b.commits, false);
-    same_list("KECCAK", &a.keccaks, &b.keccaks, false);
-    same_list("KECCAK_RND", &a.keccak_rnds, &b.keccak_rnds, false);
-    same_list("ECSM", &a.ecsms, &b.ecsms, false);
-    same_list("ECDAS", &a.ecdases, &b.ecdases, false);
-    same_list("HINT", &a.hints, &b.hints, false);
-    same_list("PAGE", &a.pages, &b.pages, false);
-    same_list("LT", &a.lts, &b.lts, true);
-    same_list("MUL", &a.muls, &b.muls, true);
-    same_list("DVRM", &a.dvrms, &b.dvrms, true);
-    same_list("BRANCH", &a.branches, &b.branches, true);
-    same_list("EQ", &a.eqs, &b.eqs, true);
-    same_list("BYTEWISE", &a.bytewises, &b.bytewises, true);
-    same("BITWISE", &a.bitwise, &b.bitwise, false);
-    same("DECODE", &a.decode, &b.decode, false);
-    same("REGISTER", &a.register, &b.register, false);
-    same("HALT", &a.halt, &b.halt, false);
-    same("KECCAK_RC", &a.keccak_rc, &b.keccak_rc, false);
-    same("BLAKE3", &a.blake3, &b.blake3, false);
+    same_list("CPU", &a.cpus, &b.cpus);
+    same_list("MEMW_R", &a.memw_registers, &b.memw_registers);
+    same_list("MEMW_A", &a.memw_aligneds, &b.memw_aligneds);
+    same_list("MEMW", &a.memws, &b.memws);
+    same_list("LOAD", &a.loads, &b.loads);
+    same_list("STORE", &a.stores, &b.stores);
+    same_list("SHIFT", &a.shifts, &b.shifts);
+    same_list("CPU32", &a.cpu32s, &b.cpu32s);
+    same_list("COMMIT", &a.commits, &b.commits);
+    same_list("KECCAK", &a.keccaks, &b.keccaks);
+    same_list("KECCAK_RND", &a.keccak_rnds, &b.keccak_rnds);
+    same_list("ECSM", &a.ecsms, &b.ecsms);
+    same_list("ECDAS", &a.ecdases, &b.ecdases);
+    same_list("HINT", &a.hints, &b.hints);
+    same_list("PAGE", &a.pages, &b.pages);
+    same_list("LT", &a.lts, &b.lts);
+    same_list("MUL", &a.muls, &b.muls);
+    same_list("DVRM", &a.dvrms, &b.dvrms);
+    same_list("BRANCH", &a.branches, &b.branches);
+    same_list("EQ", &a.eqs, &b.eqs);
+    same_list("BYTEWISE", &a.bytewises, &b.bytewises);
+    same("BITWISE", &a.bitwise, &b.bitwise);
+    same("DECODE", &a.decode, &b.decode);
+    same("REGISTER", &a.register, &b.register);
+    same("HALT", &a.halt, &b.halt);
+    same("KECCAK_RC", &a.keccak_rc, &b.keccak_rc);
+    same("BLAKE3", &a.blake3, &b.blake3);
     assert_eq!(a.public_output_bytes, b.public_output_bytes);
     assert_eq!(a.num_blake3_ops, b.num_blake3_ops);
     assert_eq!(a.page_configs.len(), b.page_configs.len());
     assert_eq!(
         format!("{:?}", a.table_counts()),
         format!("{:?}", b.table_counts())
+    );
+}
+
+/// ★ Two builds of one run in one process lay out every table alike, row for
+/// row: also LT, EQ, BYTEWISE, BRANCH, MUL and DVRM, which deduplicate through a
+/// `HashMap` and lay rows out in its order (each map took fresh random keys
+/// before `tables::trace_hash`). Regenerating a streamed chunk needs this.
+#[test]
+fn every_build_in_a_process_lays_out_the_hash_ordered_tables_alike() {
+    use crate::tables::dvrm::{DvrmOperation, generate_dvrm_trace};
+    use crate::tables::mul::{MulOperation, generate_mul_trace};
+    let mut rows = [0usize; 4];
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("bench_32k", MaxRowsConfig::uniform(1 << 14)),
+    ] {
+        let (program, logs) = run(name);
+        let (a, b) = (
+            whole(&program, &logs, &max_rows),
+            whole(&program, &logs, &max_rows),
+        );
+        same_traces(&a, &b);
+        for (most, list) in rows
+            .iter_mut()
+            .zip([&a.lts, &a.eqs, &a.bytewises, &a.branches])
+        {
+            *most = (*most).max(list.iter().map(|t| t.main_table.height).sum());
+        }
+    }
+    // Enough distinct operations that two hash keys would order them apart.
+    assert!(rows.iter().all(|&n| n >= 8), "rows per table: {rows:?}");
+    // The programs divide and multiply by few distinct operands: 199 of each.
+    let muls: Vec<(MulOperation, bool)> = (1..200u64)
+        .map(|i| {
+            let op = MulOperation {
+                lhs: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                lhs_signed: i % 2 == 0,
+                rhs: i * 7919,
+                rhs_signed: i % 3 == 0,
+            };
+            (op, i % 5 == 0)
+        })
+        .collect();
+    same(
+        "MUL",
+        &generate_mul_trace(&muls),
+        &generate_mul_trace(&muls),
+    );
+    let dvrms: Vec<(DvrmOperation, bool)> = (1..200u64)
+        .map(|i| {
+            let op = DvrmOperation {
+                n: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                d: i % 13 + 1,
+                signed: i % 2 == 0,
+            };
+            (op, i % 3 == 0)
+        })
+        .collect();
+    same(
+        "DVRM",
+        &generate_dvrm_trace(&dvrms),
+        &generate_dvrm_trace(&dvrms),
+    );
+}
+
+/// The hash state itself: the process's state hashes alike in every clone, and
+/// the fixed state (`LAMBDA_VM_FIXED_TRACE_HASH=1`) is SipHash-1-3 with zero
+/// keys, the same in every process.
+#[test]
+fn the_trace_hash_state_is_one_per_process() {
+    use crate::tables::trace_hash::{TraceHashState, trace_hash_state};
+    use std::hash::BuildHasher;
+    let key = (0x1234_5678_9abc_def0u64, true);
+    assert_eq!(
+        trace_hash_state().hash_one(key),
+        trace_hash_state().hash_one(key)
+    );
+    assert_eq!(
+        TraceHashState::fixed().hash_one(key),
+        std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .hash_one(key)
     );
 }
 
@@ -734,38 +808,38 @@ fn a_chunk_is_only_put_back_into_its_placeholder() {
     assert!(traces.insert_streamed(again).is_err());
 }
 
-/// One digest per table: its width and its rows (sorted for the six tables
-/// that lay their rows out in `HashMap` order, whose row order no two builds
-/// share).
+/// One digest per table: its width, its height and its rows in order (also
+/// for the six that lay their rows out in `HashMap` order: one hash state per
+/// process, `tables::trace_hash`).
 fn table_digests(t: &Traces) -> Vec<(String, String)> {
     use rayon::prelude::*;
-    let mut tables: Vec<(String, &Table, bool)> = Vec::new();
-    let lists: [(&str, &Vec<Table>, bool); 21] = [
-        ("CPU", &t.cpus, false),
-        ("MEMW_R", &t.memw_registers, false),
-        ("MEMW_A", &t.memw_aligneds, false),
-        ("MEMW", &t.memws, false),
-        ("LOAD", &t.loads, false),
-        ("STORE", &t.stores, false),
-        ("SHIFT", &t.shifts, false),
-        ("CPU32", &t.cpu32s, false),
-        ("COMMIT", &t.commits, false),
-        ("KECCAK", &t.keccaks, false),
-        ("KECCAK_RND", &t.keccak_rnds, false),
-        ("ECSM", &t.ecsms, false),
-        ("ECDAS", &t.ecdases, false),
-        ("HINT", &t.hints, false),
-        ("PAGE", &t.pages, false),
-        ("LT", &t.lts, true),
-        ("MUL", &t.muls, true),
-        ("DVRM", &t.dvrms, true),
-        ("BRANCH", &t.branches, true),
-        ("EQ", &t.eqs, true),
-        ("BYTEWISE", &t.bytewises, true),
+    let mut tables: Vec<(String, &Table)> = Vec::new();
+    let lists: [(&str, &Vec<Table>); 21] = [
+        ("CPU", &t.cpus),
+        ("MEMW_R", &t.memw_registers),
+        ("MEMW_A", &t.memw_aligneds),
+        ("MEMW", &t.memws),
+        ("LOAD", &t.loads),
+        ("STORE", &t.stores),
+        ("SHIFT", &t.shifts),
+        ("CPU32", &t.cpu32s),
+        ("COMMIT", &t.commits),
+        ("KECCAK", &t.keccaks),
+        ("KECCAK_RND", &t.keccak_rnds),
+        ("ECSM", &t.ecsms),
+        ("ECDAS", &t.ecdases),
+        ("HINT", &t.hints),
+        ("PAGE", &t.pages),
+        ("LT", &t.lts),
+        ("MUL", &t.muls),
+        ("DVRM", &t.dvrms),
+        ("BRANCH", &t.branches),
+        ("EQ", &t.eqs),
+        ("BYTEWISE", &t.bytewises),
     ];
-    for (name, list, hashed) in lists {
+    for (name, list) in lists {
         for (i, table) in list.iter().enumerate() {
-            tables.push((format!("{name}[{i}]"), table, hashed));
+            tables.push((format!("{name}[{i}]"), table));
         }
     }
     for (name, table) in [
@@ -776,14 +850,12 @@ fn table_digests(t: &Traces) -> Vec<(String, String)> {
         ("KECCAK_RC", &t.keccak_rc),
         ("BLAKE3", &t.blake3),
     ] {
-        tables.push((name.to_string(), table, false));
+        tables.push((name.to_string(), table));
     }
     tables
         .into_par_iter()
-        .map(|(name, table, hashed)| {
+        .map(|(name, table)| {
             // Streamed, never materialized: a block's traces are tens of GiB.
-            // A HashMap-ordered table is digested as the sorted list of its
-            // rows' digests (32 bytes a row), which is order-free.
             let row_bytes = |r: usize| -> Vec<u8> {
                 table
                     .main_table
@@ -795,18 +867,8 @@ fn table_digests(t: &Traces) -> Vec<(String, String)> {
             let mut h = blake3::Hasher::new();
             h.update(&(table.main_table.width as u64).to_le_bytes());
             h.update(&(table.main_table.height as u64).to_le_bytes());
-            if hashed {
-                let mut rows: Vec<[u8; 32]> = (0..table.main_table.height)
-                    .map(|r| *blake3::hash(&row_bytes(r)).as_bytes())
-                    .collect();
-                rows.sort_unstable();
-                for row in rows {
-                    h.update(&row);
-                }
-            } else {
-                for r in 0..table.main_table.height {
-                    h.update(&row_bytes(r));
-                }
+            for r in 0..table.main_table.height {
+                h.update(&row_bytes(r));
             }
             (name, h.finalize().to_hex()[..16].to_string())
         })

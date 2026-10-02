@@ -97,9 +97,9 @@ impl BytewiseOperation {
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
+    use super::trace_hash::{OpMap, trace_hash_state};
 
-    let mut op_map: HashMap<BytewiseOperation, u64> = HashMap::new();
+    let mut op_map: OpMap<BytewiseOperation, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
