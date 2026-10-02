@@ -1155,9 +1155,10 @@ pub fn lfm_verify_whir(
 
 /// A TEST-ONLY switch that proves W-LFM chains without grinding.
 ///
-/// A W-LFM chain grinds 20 bits before each redrawable challenge, and on a
-/// laptop's CPU that search is most of a small proof's time (≈ 24 grinds, ≈ 29 s
-/// for `TrivialV0`). The refusals the tests check do not depend on it, so they
+/// A W-LFM chain grinds before its redrawable challenges (by default 18 bits
+/// before each round's queries), and on a laptop's CPU that search is most of a
+/// small proof's time (≈ 24 grinds, ≈ 29 s for `TrivialV0` when it ground 20
+/// bits before every challenge). The refusals the tests check do not depend on it, so they
 /// run with it off; the round trip that anchors the production config keeps it
 /// on. Thread-local, and applied inside [`whir_lfm_config`], so the prover, the
 /// verifier and the emitter of one test all see the same config and a

@@ -562,8 +562,15 @@ fn the_leg_program_round_trips_as_a_w_lfm_proof() {
 ///
 /// The child publishes a NODE schema (`SchemaLayout::node(0)`), the instrument's
 /// assumption, so the two are compared like for like.
+///
+/// The pins follow the process's grind bits, which set Q (a W-LFM plan refuses
+/// artifacts built under another config, so one process costs one setting):
+/// at the default's 18 (Q 114) the 18-bit pins; under
+/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` (Q 112, the default before the bits moved)
+/// the 20-bit pins and the design's instrument numbers, which were taken there.
 #[test]
 fn the_w_leg_costs_at_the_sizing_shapes() {
+    use crate::zf_format::{LEGACY_WHIR_GRIND_BITS, PRODUCTION_WHIR_GRIND_BITS, ZfFormat};
     let opts = options();
     let publics = super::per_table_aggregator::SchemaLayout::node(0).total();
     let mut rows = Vec::new();
@@ -615,7 +622,54 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
         );
         rows_b.push((*label, cost.perms, cost.operations(), cost.hints));
     }
-    // ★ The policy-B pins, same format.
+    let check =
+        |rows: &[(&str, usize, usize, usize)], pins: &[(&str, usize, usize, usize)], what: &str| {
+            for &(label, perms, ops, hints) in pins {
+                let row = rows
+                    .iter()
+                    .find(|(l, ..)| *l == label)
+                    .expect("the profile is in the table");
+                assert_eq!(
+                    (row.1, row.2, row.3),
+                    (perms, ops, hints),
+                    "{label} ({what}): (perms, ops, hints) moved off the pin"
+                );
+            }
+        };
+    let bits = ZfFormat::global().whir_grind_bits;
+    if bits == PRODUCTION_WHIR_GRIND_BITS {
+        // ★ THE PINS at the default's 18 bits (Q 114), both policies: two more
+        // queries a chain, so every leg costs more to verify than at 20 bits
+        // (wrap 0: +619 perms under policy A, +596 under B).
+        check(
+            &rows,
+            &[
+                ("wrap 0", 40_342, 403_062, 76_608),
+                ("global wrap", 63_558, 601_451, 119_698),
+                ("L1N0", 63_603, 602_296, 119_755),
+                ("L2N0", 83_370, 777_006, 157_349),
+                ("node -1", 41_835, 413_171, 78_887),
+            ],
+            "A, 18 bits",
+        );
+        check(
+            &rows_b,
+            &[
+                ("wrap 0", 38_970, 389_075, 75_113),
+                ("global wrap", 63_483, 598_273, 119_698),
+                ("L1N0", 63_528, 599_001, 119_755),
+                ("L2N0", 63_580, 599_687, 119_830),
+                ("node -1", 41_760, 409_686, 78_887),
+            ],
+            "B, 18 bits",
+        );
+        return;
+    }
+    assert_eq!(
+        bits, LEGACY_WHIR_GRIND_BITS,
+        "the sizing pins exist at 18 and 20 grind bits only"
+    );
+    // ★ The policy-B pins at 20 bits, same format.
     //
     // Re-blessed under P2 (the chains grind before their queries only, with
     // one spent nonce a round): each chain round drops its folding and OOD
@@ -657,9 +711,9 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
         );
     }
 
-    // ★ THE PINS, at the default format (stack 27, first6, cap auto, grind 20
-    // before the queries only — P2): `(label, permutations, operations,
-    // hints)`, the exact form's values. Re-blessed under P2 as the B pins
+    // ★ THE PINS at 20 bits (stack 27, first6, cap auto, grind 20 before the
+    // queries only — P2): `(label, permutations, operations, hints)`, the exact
+    // form's values. Re-blessed under P2 as the B pins
     // above; before it: wrap 0 39,795 / 398,742 / 75,432 · global 62,651 /
     // 594,462 / 117,796 · L1N0 62,696 / 595,307 / 117,853 · L2N0 82,155 /
     // 767,664 / 154,805 · node −1 41,266 / 408,727 / 77,677.
