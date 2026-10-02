@@ -8,7 +8,7 @@ use math::field::element::FieldElement;
 use stark::trace::TraceTable;
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::{StreamTable, Traces, WalkLean, WindowedTraceBuilder};
+use crate::tables::trace_builder::{Counter, StreamTable, Traces, WalkLean, WindowedTraceBuilder};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::asm_elf_bytes;
 
@@ -1032,4 +1032,220 @@ fn the_lean_walk_builds_the_whole_run_tables() {
             }
         }
     }
+}
+
+/// How a build that counts its windows apart feeds its counter.
+#[derive(Clone, Copy, Debug)]
+enum Counting {
+    /// `push`: on the builder's own thread.
+    Push,
+    /// The split, each window's jobs counted into one counter as they come.
+    Split,
+    /// The split, every job counted at the end, last first, into two counters.
+    SplitReversed,
+}
+
+/// The windowed build with the table phase's commutative BITWISE sources
+/// counted window by window ([`WindowedTraceBuilder::count_windows_apart`]),
+/// ops dropped or kept; `mutate` sees every count job and the counters before
+/// they are added (the split only).
+fn windowed_counting(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    drop: bool,
+    counting: Counting,
+    mutate: &dyn Fn(&mut Vec<crate::tables::trace_builder::CountJob>, &mut [Counter]),
+) -> Result<Traces, crate::Error> {
+    let builder = WindowedTraceBuilder::new(program, &[], max_rows).expect("the builder");
+    let builder = if drop {
+        builder.drop_streamed_ops().expect("before any window")
+    } else {
+        builder
+    };
+    let mut builder = builder.count_windows_apart().expect("before any window");
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    let mut counters = vec![Counter::new(), Counter::new()];
+    let mut later = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        match counting {
+            Counting::Push => chunks.extend(builder.push(w)?),
+            Counting::Split | Counting::SplitReversed => {
+                let (mut walker, mut accumulator) = builder.split();
+                let walked = walker.walk(w)?;
+                chunks.extend(
+                    accumulator
+                        .absorb(walked)
+                        .into_iter()
+                        .map(|job| job.generate()),
+                );
+                let mut jobs = accumulator.take_count_jobs();
+                mutate(&mut jobs, &mut counters);
+                if matches!(counting, Counting::Split) {
+                    jobs.into_iter().for_each(|job| counters[0].count(job));
+                } else {
+                    later.extend(jobs);
+                }
+            }
+        }
+    }
+    let n = later.len();
+    for (i, job) in later.into_iter().rev().enumerate() {
+        counters[usize::from(2 * i >= n)].count(job);
+    }
+    if !matches!(counting, Counting::Push) {
+        mutate(&mut Vec::new(), &mut counters);
+        for counter in counters {
+            builder.add_counter(counter)?;
+        }
+    }
+    let mut traces = builder.finish(&logs[cut..])?;
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    Ok(traces)
+}
+
+fn no_mutation(_: &mut Vec<crate::tables::trace_builder::CountJob>, _: &mut [Counter]) {}
+
+/// The programs whose windows carry every source a counter counts: BRANCH,
+/// EQ, BYTEWISE, MUL, DVRM and CPU32 (all_instructions_64), KECCAK, BLAKE3 in
+/// both modes, ECSM and ECDAS, COMMIT, HINT.
+fn counted_programs() -> Vec<(&'static str, Elf, Vec<Log>)> {
+    let mut programs: Vec<_> = [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_blake3",
+        "test_blake3_absorb",
+        "test_ecsm_multi",
+        "test_commit_split",
+    ]
+    .into_iter()
+    .map(|name| {
+        let (program, logs) = run(name);
+        (name, program, logs)
+    })
+    .collect();
+    let hint = std::fs::read(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../executor/program_artifacts/rust/hint_min.elf"),
+    )
+    .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let program = Elf::load(&hint).expect("the hint guest loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the hint guest runs")
+        .logs;
+    programs.push(("hint_min", program, logs));
+    programs
+}
+
+/// ★ Counting the table phase's commutative BITWISE sources window by window
+/// builds the whole-run tables, BITWISE included, at every window length, ops
+/// dropped or kept, counted on the builder's thread, by one counter as the
+/// windows come, or by two counters in reverse order.
+#[test]
+fn counting_the_windows_apart_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for (name, program, logs) in counted_programs() {
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33, 1000, logs.len()] {
+            for drop in [false, true] {
+                for counting in [Counting::Push, Counting::Split, Counting::SplitReversed] {
+                    let built = windowed_counting(
+                        &program,
+                        &logs,
+                        &max_rows,
+                        window,
+                        drop,
+                        counting,
+                        &no_mutation,
+                    )
+                    .unwrap_or_else(|e| panic!("{name}/{window}/{drop}/{counting:?}: {e}"));
+                    same_traces(&reference, &built);
+                }
+            }
+        }
+    }
+}
+
+/// The BITWISE table of a build counted apart with `mutate`, against the
+/// whole-run one: whether they differ.
+fn bitwise_differs(
+    name: &str,
+    window: usize,
+    mutate: &dyn Fn(&mut Vec<crate::tables::trace_builder::CountJob>, &mut [Counter]),
+) -> bool {
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run(name);
+    let reference = whole(&program, &logs, &max_rows);
+    let built = windowed_counting(
+        &program,
+        &logs,
+        &max_rows,
+        window,
+        true,
+        Counting::Split,
+        mutate,
+    )
+    .expect("the build");
+    rows(&reference.bitwise) != rows(&built.bitwise)
+}
+
+/// Each part of the counting carries weight: a window's KECCAK lookups left
+/// uncounted, or the table phase counting again what the windows counted at
+/// the end of SHIFT's list, the in-walk lookups or the LT ops, changes BITWISE.
+#[test]
+fn the_window_counts_are_load_bearing() {
+    assert!(!bitwise_differs("test_keccak_multi", 7, &no_mutation));
+    // One window's KECCAK ops, the first window's that has any.
+    let forgot = std::cell::Cell::new(false);
+    assert!(bitwise_differs("test_keccak_multi", 7, &|jobs, _| {
+        if !forgot.get() && jobs.iter_mut().any(|job| job.forget_keccak()) {
+            forgot.set(true);
+        }
+    }));
+    assert!(forgot.get(), "a window with KECCAK ops");
+    for forget in 0..3 {
+        assert!(
+            bitwise_differs("all_instructions_64", 7, &|_, counters| {
+                for counter in counters.iter_mut() {
+                    let counted = counter.counted_mut();
+                    match forget {
+                        0 => counted.shift_cpu32 = 0,
+                        1 => counted.bitwise_cpu32 = 0,
+                        _ => counted.lt_dvrm = 0,
+                    }
+                }
+            }),
+            "forgetting part {forget}"
+        );
+    }
+}
+
+/// A run whose windows' counts are not all added is refused at `finish`, and
+/// counting apart is refused once a window was walked.
+#[test]
+fn a_run_with_a_window_uncounted_is_refused() {
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("all_instructions_64");
+    let lost = windowed_counting(
+        &program,
+        &logs,
+        &max_rows,
+        7,
+        true,
+        Counting::Split,
+        &|jobs, _| {
+            jobs.pop();
+        },
+    );
+    assert!(lost.is_err(), "a lost count job is refused");
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    builder.push(&logs[..7]).expect("a window");
+    assert!(builder.count_windows_apart().is_err());
 }

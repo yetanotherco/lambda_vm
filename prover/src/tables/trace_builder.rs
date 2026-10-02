@@ -75,8 +75,8 @@ use crate::paged_mem::{ImageSource, PagedMem};
 mod lean_walk_tests;
 mod windowed;
 pub use windowed::{
-    Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    Accumulator, ChunkJob, CountJob, Counter, StreamTable, StreamedChunk, WalkedWindow, Walker,
+    WindowStamps, WindowedTraceBuilder,
 };
 
 // =============================================================================
@@ -3950,6 +3950,85 @@ pub(crate) struct PreCounted {
     /// list it derives from the ops left.
     pub(crate) memw_lt: Vec<LtOperation>,
     pub(crate) memw_aligned_lt: Vec<LtOperation>,
+    /// With [`WindowedTraceBuilder::count_windows_apart`]: every window's routed
+    /// segments and precompile lists are in `histogram` (MUL's and DVRM's
+    /// per-instance lookups excepted, [`count_window_sources`]); the table phase
+    /// leaves them out.
+    ///
+    /// [`WindowedTraceBuilder::count_windows_apart`]: windowed::WindowedTraceBuilder::count_windows_apart
+    pub(crate) windows: Option<WindowsCounted>,
+}
+
+/// What [`count_window_sources`] counted that the table phase finds at the end
+/// of a list of its own: SHIFT's CPU32 ops end the SHIFT list, CPU32's lookups
+/// the in-walk lookups, and the DVRM-derived LT ops the LT ops it is handed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowsCounted {
+    pub(crate) shift_cpu32: usize,
+    pub(crate) bitwise_cpu32: usize,
+    pub(crate) lt_dvrm: usize,
+}
+
+impl std::ops::AddAssign for WindowsCounted {
+    fn add_assign(&mut self, other: Self) {
+        self.shift_cpu32 += other.shift_cpu32;
+        self.bitwise_cpu32 += other.bitwise_cpu32;
+        self.lt_dvrm += other.lt_dvrm;
+    }
+}
+
+/// Counts the table phase's BITWISE lookups of a window's routed segments and
+/// of its precompile lists (`walk`'s COMMIT, KECCAK, BLAKE3, ECSM, ECDAS and
+/// HINT ops) into `histogram`: all of them but MUL's and DVRM's per-instance
+/// lookups, which depend on where an op lands in the run's list. Commutative,
+/// so the windows may be counted in any order and on any thread.
+fn count_window_sources(
+    segments: &RoutedSegments,
+    walk: &WalkOutputs,
+    histogram: &mut bitwise::BitwiseHistogram,
+) -> WindowsCounted {
+    histogram.add_ops(&collect_bitwise_from_branch(&segments.branch_ops));
+    for op in &segments.eq_ops {
+        histogram.add_ops(&op.collect_bitwise_ops());
+    }
+    for op in &segments.bytewise_ops {
+        histogram.add_ops(&op.collect_bitwise_ops());
+    }
+    for list in [
+        &segments.mul_filter,
+        &segments.mul_cpu32,
+        &segments.mul_dvrm_filter,
+        &segments.mul_dvrm_cpu32,
+    ] {
+        for (op, _) in list {
+            for_each_bitwise_from_mul_row(op, |lookup| histogram.bump(lookup));
+        }
+    }
+    for list in [&segments.dvrm_filter, &segments.dvrm_cpu32] {
+        for (op, _) in list {
+            for_each_bitwise_from_dvrm_row(op, |lookup| histogram.bump(lookup));
+        }
+    }
+    histogram.add_ops(&shift::collect_bitwise_from_shift(&segments.shift_cpu32));
+    histogram.add_ops(&segments.bitwise_cpu32);
+    histogram.add_ops(&collect_bitwise_from_lt(&segments.lt_dvrm_filter));
+    histogram.add_ops(&collect_bitwise_from_lt(&segments.lt_dvrm_cpu32));
+    histogram.add_ops(&collect_bitwise_from_commit(&walk.commit_ops));
+    histogram.add_ops(&collect_bitwise_from_keccak(&walk.keccak_ops));
+    if !strip_blake3_side_effects() {
+        histogram.add_ops(&collect_bitwise_from_blake3(
+            &walk.blake3_ops,
+            &walk.blake3_absorb_ops,
+        ));
+    }
+    histogram.add_ops(&collect_bitwise_from_ecsm(&walk.ecsm_ops));
+    histogram.add_ops(&collect_bitwise_from_ecdas(&walk.ecdas_ops));
+    histogram.add_ops(&collect_bitwise_from_hint(&walk.hint_ops));
+    WindowsCounted {
+        shift_cpu32: segments.shift_cpu32.len(),
+        bitwise_cpu32: segments.bitwise_cpu32.len(),
+        lt_dvrm: segments.lt_dvrm_filter.len() + segments.lt_dvrm_cpu32.len(),
+    }
 }
 
 impl PreCounted {
@@ -4183,6 +4262,26 @@ impl RoutedSegments {
             + vec_heap_bytes(&self.lt_dvrm_cpu32)
             + vec_heap_bytes(&self.mul_dvrm_filter)
             + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// Appends a later window's segments, copied out of `other`, which stays
+    /// with whoever else reads it ([`count_window_sources`] on another thread).
+    fn append_copied(&mut self, other: &Self) {
+        self.branch_ops.extend_from_slice(&other.branch_ops);
+        self.mul_filter.extend_from_slice(&other.mul_filter);
+        self.dvrm_filter.extend_from_slice(&other.dvrm_filter);
+        self.eq_ops.extend_from_slice(&other.eq_ops);
+        self.bytewise_ops.extend_from_slice(&other.bytewise_ops);
+        self.store_ops.extend_from_slice(&other.store_ops);
+        self.shift_cpu32.extend_from_slice(&other.shift_cpu32);
+        self.mul_cpu32.extend_from_slice(&other.mul_cpu32);
+        self.dvrm_cpu32.extend_from_slice(&other.dvrm_cpu32);
+        self.bitwise_cpu32.extend_from_slice(&other.bitwise_cpu32);
+        self.lt_dvrm_filter.extend_from_slice(&other.lt_dvrm_filter);
+        self.lt_dvrm_cpu32.extend_from_slice(&other.lt_dvrm_cpu32);
+        self.mul_dvrm_filter
+            .extend_from_slice(&other.mul_dvrm_filter);
+        self.mul_dvrm_cpu32.extend_from_slice(&other.mul_dvrm_cpu32);
     }
 
     /// Appends a later window's segments, segment by segment.
@@ -4564,6 +4663,9 @@ fn build_traces<I: ImageSource + Sync>(
         hint_ops,
     } = ops;
 
+    // The LT ops handed in (the walk's, then the DVRM-derived): phase 3 appends.
+    let lt_handed_in = lt_ops.len();
+
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
@@ -4639,43 +4741,74 @@ fn build_traces<I: ImageSource + Sync>(
     let dvrm_chunk = max_rows.dvrm;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
+    // With the windows counted apart, their sources are in the histogram but
+    // for MUL's and DVRM's per-instance lookups; the lists they end are counted
+    // up to them.
+    let windows = pre.as_ref().and_then(|pre| pre.windows);
+    let counted = windows.unwrap_or_default();
+    let before = |len: usize, counted: usize, what: &str| {
+        len.checked_sub(counted).ok_or_else(|| {
+            Error::Prover(format!(
+                "{counted} {what} were counted by the windows but the list holds {len}"
+            ))
+        })
+    };
+    let shift_end = before(shift_ops.len(), counted.shift_cpu32, "CPU32 SHIFT ops")?;
+    let iw_end = before(bitwise_ops.len(), counted.bitwise_cpu32, "CPU32 lookups")?;
+    let lt_dvrm_start = before(lt_handed_in, counted.lt_dvrm, "DVRM-derived LT ops")?;
     let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
         Box::new(|h| {
-            for op in &bytewise_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
+            h.add_ops(&collect_bitwise_from_lt(&lt_ops[..lt_dvrm_start]));
+            h.add_ops(&collect_bitwise_from_lt(&lt_ops[lt_handed_in..]));
         }),
-        Box::new(|h| {
-            for op in &eq_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
+        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops[..shift_end]))),
         Box::new(|h| {
             for op in &store_ops {
                 h.add_ops(&op.collect_bitwise_ops());
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
-        Box::new(|h| {
-            if !strip_blake3_side_effects() {
-                h.add_ops(&collect_bitwise_from_blake3(
-                    &blake3_ops,
-                    &blake3_absorb_ops,
-                ));
-            }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
+    if windows.is_some() {
+        collectors.push(Box::new(|h| {
+            h.add_ops(&collect_bitwise_from_mul_instances(&mul_ops, mul_chunk))
+        }));
+        collectors.push(Box::new(|h| {
+            h.add_ops(&collect_bitwise_from_dvrm_instances(&dvrm_ops, dvrm_chunk))
+        }));
+    } else {
+        collectors.extend([
+            Box::new(|h: &mut bitwise::BitwiseHistogram| {
+                h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))
+            }) as Collector,
+            Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
+            Box::new(|h| {
+                for op in &bytewise_ops {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| {
+                for op in &eq_ops {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+            Box::new(|h| {
+                if !strip_blake3_side_effects() {
+                    h.add_ops(&collect_bitwise_from_blake3(
+                        &blake3_ops,
+                        &blake3_absorb_ops,
+                    ));
+                }
+            }),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
+        ]);
+    }
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
@@ -4689,7 +4822,11 @@ fn build_traces<I: ImageSource + Sync>(
         Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
         None => (bitwise::BitwiseHistogram::new(), 0, 0),
     };
-    let uncounted_iw = &bitwise_ops[counted_iw..];
+    let uncounted_iw = bitwise_ops.get(counted_iw..iw_end).ok_or_else(|| {
+        Error::Prover(format!(
+            "{counted_iw} in-walk lookups were counted ahead of {iw_end}"
+        ))
+    })?;
     let uncounted_reg = &memw_register_rows[counted_reg..];
 
     #[cfg(feature = "parallel")]
