@@ -986,9 +986,10 @@ fn the_lean_walk_builds_the_whole_run_tables() {
     }
 }
 
-/// The builder split three ways (the CPU ops decoded ahead of the walk) builds
-/// the whole-run tables, lean or not, kept or dropped; and the walk refuses a
-/// decoded window that is not the next one, or that halts.
+/// The builder split three ways (the CPU ops decoded ahead of the walk) and four
+/// (the routing on its own too, with the ops dropped) builds the whole-run
+/// tables, lean or not; and the walk refuses a decoded window that is not the
+/// next one, or that halts.
 #[test]
 fn the_decoded_split_builds_the_whole_run_tables() {
     let max_rows = MaxRowsConfig::small();
@@ -1011,7 +1012,22 @@ fn the_decoded_split_builds_the_whole_run_tables() {
                     let body = logs.len() - 1;
                     let cut = body - body % window;
                     let mut chunks = Vec::new();
-                    {
+                    if drop {
+                        // Four parts: the routing on its own as well.
+                        let (mut decoder, mut walker, mut router, mut accumulator) =
+                            builder.split_staged();
+                        for w in logs[..cut].chunks(window) {
+                            let decoded = decoder.decode(w).expect("a window decodes");
+                            let walked = walker.walk_decoded(decoded).expect("a window");
+                            let routed = router.route(walked);
+                            chunks.extend(
+                                accumulator
+                                    .absorb_routed(routed)
+                                    .into_iter()
+                                    .map(|j| j.generate()),
+                            );
+                        }
+                    } else {
                         let (mut decoder, mut walker, mut accumulator) = builder.split_decoded();
                         for w in logs[..cut].chunks(window) {
                             let decoded = decoder.decode(w).expect("a window decodes");

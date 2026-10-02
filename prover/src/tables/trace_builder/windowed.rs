@@ -169,6 +169,9 @@ pub struct WindowStamps {
     pub walk: f64,
     pub route: f64,
     pub generate: f64,
+    /// With the routing on a [`Router`] of its own, the accumulator's time
+    /// keeping each routed window (`route` is then the router's).
+    pub append: f64,
 }
 
 impl<'a> WindowedTraceBuilder<'a> {
@@ -506,6 +509,63 @@ impl<'a> WindowedTraceBuilder<'a> {
             },
         )
     }
+
+    /// The builder in four parts: [`Self::split_decoded`]'s, with the routing
+    /// taken out of the accumulator into a [`Router`] — the routing and the
+    /// in-walk lookups the walk left out on one thread, keeping each window and
+    /// handing its chunks out ([`Accumulator::absorb_routed`]) on another. Fed
+    /// the windows in order, `router.route` then `accumulator.absorb_routed`
+    /// builds what `accumulator.absorb` builds. The router counts into a
+    /// histogram of its own, which `finish` adds to the run's.
+    pub fn split_staged(&mut self) -> (Decoder<'_>, Walker<'_>, Router<'_>, Accumulator<'_>) {
+        let in_walk = self.lean.in_walk();
+        if in_walk != InWalk::List && self.walk_counted.is_none() {
+            self.walk_counted = Some(Box::new(bitwise::BitwiseHistogram::new()));
+        }
+        let (walker_counted, router_counted) = match in_walk {
+            InWalk::Count => (self.walk_counted.as_deref_mut(), None),
+            InWalk::Leave => (None, self.walk_counted.as_deref_mut()),
+            InWalk::List => (None, None),
+        };
+        (
+            Decoder {
+                artifacts: &self.artifacts,
+                decode: self.decode.as_ref(),
+                cycles: self.cycles,
+            },
+            Walker {
+                artifacts: &self.artifacts,
+                decode: self.decode.as_ref(),
+                in_walk,
+                counted: walker_counted,
+                memory_state: &mut self.memory_state,
+                register_state: &mut self.register_state,
+                cycles: &mut self.cycles,
+                windows: &mut self.stamps.windows,
+                walk_secs: &mut self.stamps.walk,
+            },
+            Router {
+                lean: self.lean,
+                stream_memw_lt: self.stream_memw_lt,
+                counted: router_counted,
+                route_secs: &mut self.stamps.route,
+            },
+            Accumulator {
+                lean: self.lean,
+                decode_rows: self.decode.as_ref(),
+                stream_memw_lt: self.stream_memw_lt,
+                max_rows: &self.max_rows,
+                pc_to_row: &self.artifacts.decode_pc_to_row,
+                kept: self.kept.as_mut(),
+                windows: &mut self.windows,
+                segments: &mut self.segments,
+                emitted: &mut self.emitted,
+                counted: &mut self.counted,
+                route_secs: &mut self.stamps.append,
+                handout_secs: &mut self.stamps.generate,
+            },
+        )
+    }
 }
 
 /// One window, walked: its CPU ops and what the walk emitted for them.
@@ -640,42 +700,124 @@ pub struct Accumulator<'b> {
     handout_secs: &'b mut f64,
 }
 
+/// A walked window with its routing done ([`Router::route`]), for
+/// [`Accumulator::absorb_routed`].
+pub struct RoutedWindow {
+    window: WalkedWindow,
+    segments: RoutedSegments,
+    /// With [`WindowedTraceBuilder::stream_memw_lt`], the MEMW and MEMW_A ops
+    /// whose LT ops the routing added to the window's LT list.
+    memw_lt_done: usize,
+    memw_aligned_lt_done: usize,
+}
+
+/// The routing part of a builder split four ways
+/// ([`WindowedTraceBuilder::split_staged`]).
+pub struct Router<'b> {
+    lean: WalkLean,
+    stream_memw_lt: bool,
+    /// With [`InWalk::Leave`], where the router counts the in-walk lookups.
+    counted: Option<&'b mut bitwise::BitwiseHistogram>,
+    route_secs: &'b mut f64,
+}
+
+impl Router<'_> {
+    /// Routes a walked window and counts the in-walk lookups the walk left
+    /// out. Windows must come in run order.
+    pub fn route(&mut self, window: WalkedWindow) -> RoutedWindow {
+        let t = std::time::Instant::now();
+        let routed = route_window(
+            self.lean,
+            self.stream_memw_lt,
+            window,
+            self.counted.as_deref_mut(),
+        );
+        *self.route_secs += t.elapsed().as_secs_f64();
+        routed
+    }
+}
+
+/// A window's routing: its segments, the MEMW-derived LT ops when they stream,
+/// and — when the walk left them out — its in-walk lookups counted into
+/// `histogram` from the CPU and LOAD ops.
+fn route_window(
+    lean: WalkLean,
+    stream_memw_lt: bool,
+    mut window: WalkedWindow,
+    histogram: Option<&mut bitwise::BitwiseHistogram>,
+) -> RoutedWindow {
+    let (mut memw_lt_done, mut memw_aligned_lt_done) = (0, 0);
+    if stream_memw_lt {
+        let walk = &mut window.walk;
+        walk.lt_ops
+            .extend(super::collect_lt_from_memw(&walk.memw.general));
+        walk.lt_ops
+            .extend(super::collect_lt_from_memw_aligned(&walk.memw.aligned));
+        memw_lt_done = walk.memw.general.len();
+        memw_aligned_lt_done = walk.memw.aligned.len();
+    }
+    let route = if lean.route {
+        route_ops_one_pass
+    } else {
+        route_ops
+    };
+    let segments = route(&window.cpu_ops, &window.walk.cpu32_ops);
+    // The table phase's dominant BITWISE source, counted now: from the CPU
+    // and LOAD ops when the walk left the lookups out (the list is then
+    // empty); the accumulator counts the list otherwise.
+    if lean.in_walk() == InWalk::Leave
+        && let Some(histogram) = histogram
+    {
+        window
+            .cpu_ops
+            .iter()
+            .for_each(|op| op.count_bitwise_into(histogram));
+        window
+            .walk
+            .load_ops
+            .iter()
+            .for_each(|op| op.count_bitwise_into(histogram));
+    }
+    RoutedWindow {
+        window,
+        segments,
+        memw_lt_done,
+        memw_aligned_lt_done,
+    }
+}
+
 impl Accumulator<'_> {
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
-    pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
+    pub fn absorb(&mut self, window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
-        if self.stream_memw_lt {
-            let walk = &mut window.walk;
-            walk.lt_ops
-                .extend(super::collect_lt_from_memw(&walk.memw.general));
-            walk.lt_ops
-                .extend(super::collect_lt_from_memw_aligned(&walk.memw.aligned));
-            self.emitted.memw_lt_done += walk.memw.general.len();
-            self.emitted.memw_aligned_lt_done += walk.memw.aligned.len();
-        }
-        let route = if self.lean.route {
-            route_ops_one_pass
-        } else {
-            route_ops
-        };
-        self.segments
-            .append(route(&window.cpu_ops, &window.walk.cpu32_ops));
-        // The table phase's dominant BITWISE source, counted now: from the CPU
-        // and LOAD ops when the walk left the lookups out (the list is then
-        // empty), from the list otherwise.
-        if self.lean.in_walk() == InWalk::Leave {
-            let histogram = &mut self.counted.histogram;
-            window
-                .cpu_ops
-                .iter()
-                .for_each(|op| op.count_bitwise_into(histogram));
-            window
-                .walk
-                .load_ops
-                .iter()
-                .for_each(|op| op.count_bitwise_into(histogram));
-        }
+        let routed = route_window(
+            self.lean,
+            self.stream_memw_lt,
+            window,
+            Some(&mut self.counted.histogram),
+        );
+        self.keep_and_hand_out(routed, t)
+    }
+
+    /// [`Self::absorb`] for a window a [`Router`] routed.
+    pub fn absorb_routed(&mut self, routed: RoutedWindow) -> Vec<ChunkJob> {
+        self.keep_and_hand_out(routed, std::time::Instant::now())
+    }
+
+    /// Keeps a routed window and hands out the chunks the run's lists now
+    /// complete; `route_secs` gets the time since `t`, `handout_secs` the
+    /// hand-out's.
+    fn keep_and_hand_out(&mut self, routed: RoutedWindow, t: std::time::Instant) -> Vec<ChunkJob> {
+        let RoutedWindow {
+            mut window,
+            segments,
+            memw_lt_done,
+            memw_aligned_lt_done,
+        } = routed;
+        self.emitted.memw_lt_done += memw_lt_done;
+        self.emitted.memw_aligned_lt_done += memw_aligned_lt_done;
+        self.segments.append(segments);
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
         if let Some(kept) = self.kept.as_deref_mut() {

@@ -29,7 +29,9 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 
-use super::{ChunkJob, DecodedWindow, StreamTable, WalkedWindow, WindowedTraceBuilder};
+use super::{
+    ChunkJob, DecodedWindow, RoutedWindow, StreamTable, WalkedWindow, WindowedTraceBuilder,
+};
 use crate::Error;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::build_stamps;
@@ -66,6 +68,9 @@ pub(crate) struct ProducerConfig {
     /// Build each window's CPU ops on a decoder thread of their own, ahead of
     /// the walk ([`WindowedTraceBuilder::split_decoded`]).
     pub decoder: bool,
+    /// Route each walked window on a router thread of its own, before the
+    /// accumulator ([`WindowedTraceBuilder::split_staged`]).
+    pub router: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -378,7 +383,8 @@ pub(crate) fn run_producer(
                 report.builder_setup = t_setup.elapsed().as_secs_f64();
                 let cpu0 = thread_cpu();
                 let last = {
-                    let (mut decoder, mut walker, mut accumulator) = builder.split_decoded();
+                    let (mut decoder, mut walker, mut router, mut accumulator) =
+                        builder.split_staged();
                     std::thread::scope(|inner| -> Result<Vec<Log>, Error> {
                         // With `decoder`, each window's CPU ops are built on a
                         // thread of their own ahead of the walk.
@@ -450,22 +456,54 @@ pub(crate) fn run_producer(
                             })?;
                             Ok::<_, Error>((last, times, walked_at))
                         })?;
+                        // With `router`, each walked window is routed on a
+                        // thread of its own before the accumulator keeps it.
+                        enum Next {
+                            Walked(Box<WalkedWindow>, f64),
+                            Routed(Box<RoutedWindow>, f64),
+                        }
+                        let mut next: Box<dyn Iterator<Item = Next> + Send> = if cfg.router {
+                            let (rtx, rrx) = mpsc::sync_channel::<(RoutedWindow, f64)>(2);
+                            spawn_named(inner, "prod-route", move || {
+                                let cpu0 = thread_cpu();
+                                for (walked, walk) in walked_rx {
+                                    if rtx.send((router.route(walked), walk)).is_err() {
+                                        break;
+                                    }
+                                }
+                                live(format!("router done · cpu {} s", opt(cpu_since(cpu0))));
+                            })?;
+                            Box::new(rrx.into_iter().map(|(r, w)| Next::Routed(Box::new(r), w)))
+                        } else {
+                            Box::new(
+                                walked_rx
+                                    .into_iter()
+                                    .map(|(w, s)| Next::Walked(Box::new(w), s)),
+                            )
+                        };
                         loop {
                             let t_recv = Instant::now();
-                            let Ok((walked, walk)) = walked_rx.recv() else {
+                            let Some(item) = next.next() else {
                                 break;
                             };
                             report.accumulator.recv_blocked += t_recv.elapsed().as_secs_f64();
                             let t_census = Instant::now();
+                            let (walk, window) = match &item {
+                                Next::Walked(w, walk) => (*walk, w.as_ref()),
+                                Next::Routed(r, walk) => (*walk, &r.window),
+                            };
                             let row = WindowRow {
-                                cycles: walked.cpu_ops.len(),
+                                cycles: window.cpu_ops.len(),
                                 walk,
-                                first_touch_bytes: first_touch_bytes(&walked),
+                                first_touch_bytes: first_touch_bytes(window),
                                 ..WindowRow::default()
                             };
                             report.census += t_census.elapsed().as_secs_f64();
                             let t_absorb = Instant::now();
-                            let jobs = accumulator.absorb(walked);
+                            let jobs = match item {
+                                Next::Walked(walked, _) => accumulator.absorb(*walked),
+                                Next::Routed(routed, _) => accumulator.absorb_routed(*routed),
+                            };
                             let absorb = t_absorb.elapsed().as_secs_f64();
                             let row = WindowRow {
                                 absorb,
@@ -734,7 +772,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// prover's (`max_rows.cpu`). `LAMBDA_VM_PRODUCER_SINK=skip` drops each chunk
 /// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows;
 /// `LAMBDA_VM_PRODUCER_LOG_DIGEST=1` prints a digest of every log (untimed);
-/// `LAMBDA_VM_PRODUCER_DECODER=1` builds the CPU ops on a decoder thread.
+/// `LAMBDA_VM_PRODUCER_DECODER=1` builds the CPU ops on a decoder thread;
+/// `LAMBDA_VM_PRODUCER_ROUTER=1` routes each window on a router thread.
 /// It refuses to run unless jemalloc never purges (the record chains'
 /// posture, `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`) or
 /// `LAMBDA_VM_PRODUCER_POSTURE=any` says another posture is meant.
@@ -783,6 +822,7 @@ fn the_block_producer_alone() {
         finish: env_usize("LAMBDA_VM_PRODUCER_FINISH", 1) != 0,
         log_digest: env_usize("LAMBDA_VM_PRODUCER_LOG_DIGEST", 0) != 0,
         decoder: env_usize("LAMBDA_VM_PRODUCER_DECODER", 0) != 0,
+        router: env_usize("LAMBDA_VM_PRODUCER_ROUTER", 0) != 0,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -860,10 +900,11 @@ fn the_producer_harness_drives_the_builder() {
         let elf = asm_elf_bytes(name);
         for window in [7, 33] {
             let (cycles, jobs) = reference_jobs(&elf, &max_rows, window);
-            for (sink, drop_ops, decoder) in [
-                (Sink::Generate, true, false),
-                (Sink::Skip, false, false),
-                (Sink::Generate, true, true),
+            for (sink, drop_ops, decoder, router) in [
+                (Sink::Generate, true, false, false),
+                (Sink::Skip, false, false, false),
+                (Sink::Generate, true, true, true),
+                (Sink::Generate, false, true, true),
             ] {
                 let cfg = ProducerConfig {
                     window,
@@ -875,9 +916,12 @@ fn the_producer_harness_drives_the_builder() {
                     finish: true,
                     log_digest: false,
                     decoder,
+                    router,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
-                let what = format!("{name}, window {window}, {sink:?}, decoder {decoder}");
+                let what = format!(
+                    "{name}, window {window}, {sink:?}, decoder {decoder}, router {router}"
+                );
                 assert_eq!(report.cycles, cycles, "{what}: cycles");
                 assert_eq!(
                     report.windows.len(),
