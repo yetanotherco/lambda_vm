@@ -586,9 +586,11 @@ impl BlockTreePlan {
     }
 }
 
-/// The block tree's fan-in: children per interior node. The epoch tree's
+/// The block tree's fan-in: children per interior node. Four: the record
+/// block's 8 leaves prove 3 nodes instead of 7 (FAST 399: recursion −1.02 s
+/// against two; FAST 450: three is +1.15 s against four). The epoch tree's
 /// [`super::per_table_aggregator::FAN_IN`] is a separate constant.
-pub const BLOCK_FAN_IN: usize = 2;
+pub const BLOCK_FAN_IN: usize = 4;
 
 /// The fan-in the plan derives under: [`BLOCK_FAN_IN`], or
 /// `NOEPOCH_BLOCK_FAN_IN` (2 to 8) for a measurement. It is a tree-format

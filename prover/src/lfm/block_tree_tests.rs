@@ -662,11 +662,6 @@ fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
         "constants computed under other options are refused"
     );
     let plan = BlockTreePlan::derive_with(&a, &opts, &shape, &consts).expect("the plan derives");
-    assert_eq!(
-        super::block_plan::BLOCK_FAN_IN,
-        super::per_table_aggregator::FAN_IN,
-        "the block tree's default fan-in is today's tree"
-    );
     let inline = BlockTreePlan::derive(&a, &opts, &shape).expect("the plan derives");
     assert_eq!(
         plan.attested(),
@@ -711,6 +706,35 @@ fn the_partition_cost_model_is_pinned_to_its_version() {
         (2, &[vec![0, 2], vec![4, 5], vec![3, 6], vec![1, 7]][..]),
         "the rule's output moved: bump PARTITION_COST_MODEL with it"
     );
+}
+
+/// The block tree's fan-in is a tree-format constant (every node program and
+/// so the top depend on it): four by default, apart from the epoch tree's two.
+/// The record block's 8 leaves lay out as two nodes of four under a two-child
+/// top; a block of up to four leaves is the top alone.
+#[test]
+fn the_block_tree_fans_in_four_by_default() {
+    use super::block_plan::{BLOCK_FAN_IN, block_fan_in};
+    use super::per_table_aggregator::{FAN_IN, tree_shape};
+    assert_eq!(BLOCK_FAN_IN, 4, "the block tree's default fan-in");
+    assert_eq!(FAN_IN, 2, "the epoch tree keeps its own fan-in");
+    if std::env::var_os("NOEPOCH_BLOCK_FAN_IN").is_none() {
+        assert_eq!(block_fan_in(), BLOCK_FAN_IN, "no knob: the plan's fan-in");
+    }
+    let arities = |leaves: usize| -> Vec<Vec<usize>> {
+        tree_shape(leaves, BLOCK_FAN_IN)
+            .into_iter()
+            .map(|l| l.arities)
+            .collect()
+    };
+    assert_eq!(
+        arities(8),
+        vec![vec![4, 4], vec![2]],
+        "the record block's 8 leaves"
+    );
+    assert_eq!(arities(4), vec![vec![4]], "four leaves: the top alone");
+    assert_eq!(arities(3), vec![vec![3]], "three leaves: the top alone");
+    assert_eq!(arities(9), vec![vec![4, 4, 1], vec![3]], "a leftover leaf");
 }
 
 /// m5: a nonzero pad byte in the public output's last half is refused, over a
@@ -1395,9 +1419,10 @@ fn tree_ahead_mode() -> Option<AheadMode> {
 }
 
 /// Threads of the pipeline builder's own pool for the node emission, by
-/// default: one per level-1 node of the block's 8 leaves at fan-in 2 (FAST 455:
-/// level 0 −0.40 s, recursion −0.29 s; on the global pool a leaf proof's join
-/// could steal an emission and hold the card idle).
+/// default: one per level-1 node of the block's 8 leaves at fan-in 2, where it
+/// was measured (FAST 455: level 0 −0.40 s, recursion −0.29 s; on the global
+/// pool a leaf proof's join could steal an emission and hold the card idle). At
+/// fan-in 4 level 1 has two nodes to emit.
 const EMIT_POOL_THREADS: usize = 4;
 
 /// `NOEPOCH_EMIT_POOL=<threads>`: the pipeline's builder emits the node
