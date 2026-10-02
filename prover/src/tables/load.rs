@@ -196,7 +196,16 @@ impl LoadOperation {
 pub fn generate_load_trace(
     operations: &[LoadOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_load_trace_segments(&[operations])
+}
+
+/// [`generate_load_trace`] over `segments`, the operations one after another: a chunk handed
+/// out as the window parts it lies in.
+pub(crate) fn generate_load_trace_segments(
+    segments: &[&[LoadOperation]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -204,7 +213,7 @@ pub fn generate_load_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, op) in operations.iter().enumerate() {
+    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         // Input columns
         table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
