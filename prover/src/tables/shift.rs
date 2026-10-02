@@ -726,14 +726,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// Total number of SHIFT transition constraints.
-pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
+pub const NUM_SHIFT_CONSTRAINTS: usize = 21;
 
 // =========================================================================
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..19.
+// folder, the verifier folder and IR capture. Constraint indices 0..21.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
@@ -893,6 +893,23 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
             let one = b.one();
             b.emit_base(16 + off, flag.clone() * (one - flag));
         }
+
+        // idx 19: ZbsIsBit — zbs * (1 - zbs). The only other anchor on zbs is
+        // `ZERO[bit_shift] → zbs | μ`, which vanishes on a μ = 0 padding row; there
+        // a free zbs = 2 turns the five HWSL senders' `1 - zbs` into −1, so the row
+        // *provides* arbitrary HWSL tuples and cancels a real row's forged ones
+        // (`SLL 1, 1 = 0` verified).
+        let zbs = b.main(0, cols::ZBS);
+        let one = b.one();
+        b.emit_base(19, zbs.clone() * (one - zbs));
+
+        // idx 20: MuIsBit — μ * (1 - μ). SHIFT never deduplicates (one row per op),
+        // and idx 0 only pins μ = 1 when direction = 1. For a left shift a free μ
+        // scales the output (`left = μ - direction`), and μ = −1 turns every
+        // μ-gated lookup into a provider.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(20, mu.clone() * (one - mu));
     }
 }
 

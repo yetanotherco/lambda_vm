@@ -270,8 +270,9 @@ fn test_bus_interactions_count() {
     // - 8x IS_HALF senders for outputs (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
     // - 2x ALU receivers (lo, hi)
-    // Total: 2 + 8 + 8 + 4 + 2 = 24
-    assert_eq!(interactions.len(), 24, "Expected 24 bus interactions");
+    // - 2x IS_HALF senders bounding the multiplicities (μ_lo, μ_hi)
+    // Total: 2 + 8 + 8 + 4 + 2 + 2 = 26
+    assert_eq!(interactions.len(), 26, "Expected 26 bus interactions");
 }
 
 #[test]
@@ -415,4 +416,142 @@ fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
         "BITWISE MSB16 multiplicity ({tallied}) must equal total MUL-instance MSB16 \
          sends ({sends}); a mismatch leaves the Msb16 bus unbalanced"
     );
+}
+
+// Soundness regression: μ_lo/μ_hi are bounded, non-negative multiplicities.
+// Every MUL range check fires with μ_lo + μ_hi, so a free μ_hi = −1 next to
+// μ_lo = 1 switched them all off (`multiplicity_forgery_poc`). Each μ is now
+// IS_HALF-range-checked weighted by itself, and trace generation splits a
+// row whose count would exceed `MU_MAX`.
+
+/// Presence: each multiplicity is IS_HALF-checked weighted by itself, so an
+/// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
+#[test]
+fn test_mul_bounds_its_multiplicities() {
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusValue, Multiplicity, Packing};
+    for col in [cols::MU_LO, cols::MU_HI] {
+        assert!(
+            bus_interactions().iter().any(|i| i.is_sender
+                && i.bus_id == BusId::IsHalfword as u64
+                && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
+                && matches!(i.values.as_slice(),
+                    [BusValue::Packed { start_column, packing: Packing::Direct }] if *start_column == col)),
+            "MUL must IS_HALF-check multiplicity column {col} weighted by itself"
+        );
+    }
+}
+
+/// Splitting: a count above `MU_MAX` spreads over rows that each stay within the
+/// bound and together preserve both totals; exactly `MU_MAX` still fits one row.
+#[test]
+fn test_dedup_mul_rows_splits_counts_above_mu_max() {
+    use crate::tables::mul::{MU_MAX, dedup_mul_rows};
+    let op = MulOperation::new(3, false, 5, false);
+    let ops: Vec<_> = std::iter::repeat_n((op.clone(), false), MU_MAX as usize + 5)
+        .chain(std::iter::repeat_n((op.clone(), true), 3))
+        .collect();
+    let mut rows: Vec<(u64, u64)> = dedup_mul_rows(&ops)
+        .iter()
+        .map(|(_, m)| (m.mu_lo, m.mu_hi))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![(5, 0), (MU_MAX, 3)]);
+
+    let ops: Vec<_> = std::iter::repeat_n((op, true), MU_MAX as usize).collect();
+    assert_eq!(dedup_mul_rows(&ops).len(), 1);
+    assert!(dedup_mul_rows(&[]).is_empty());
+
+    // The generated trace never holds a μ above the bound.
+    let ops: Vec<_> = std::iter::repeat_n(
+        (MulOperation::new(7, true, 9, true), false),
+        2 * MU_MAX as usize + 1,
+    )
+    .collect();
+    let trace = generate_mul_trace(&ops);
+    let mut total = 0u64;
+    for r in 0..trace.num_rows() {
+        let mu = trace.get_main(r, cols::MU_LO).to_raw();
+        assert!(mu <= MU_MAX);
+        total += mu;
+    }
+    assert_eq!(total, ops.len() as u64);
+}
+
+/// Consistency: the BITWISE collector tallies exactly the per-row lookups the
+/// generated MUL instances send — IS_HALF[μ_lo], IS_HALF[μ_hi] weighted by μ
+/// (padding sends nothing) and MSB16 per row whose sign flag is set — both across
+/// several small instances and for a row split by `MU_MAX`.
+#[test]
+fn test_mul_per_row_lookups_match_collector() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::mul::MU_MAX;
+    use crate::tables::trace_builder::collect_bitwise_from_mul;
+    use std::collections::HashMap;
+
+    let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);
+    let distinct = [
+        MulOperation::new(3, false, 5, false),
+        MulOperation::new(0x1234_5678_9abc_def0, true, 0x8000_0000_0000_0001, true),
+        MulOperation::new(u64::MAX, true, 2, false),
+    ];
+    let small: Vec<_> = distinct
+        .iter()
+        .cycle()
+        .take(11)
+        .enumerate()
+        .map(|(i, op)| (op.clone(), i % 2 == 0))
+        .collect();
+    let split: Vec<_> = std::iter::repeat_n((distinct[1].clone(), false), MU_MAX as usize + 2)
+        .chain(distinct.iter().map(|op| (op.clone(), true)))
+        .collect();
+
+    for (ops, chunk) in [(small, 4usize), (split, 1 << 20)] {
+        let collected = collect_bitwise_from_mul(&ops, chunk);
+
+        // IS_HALF minus the per-raw-op range checks leaves the μ bounds.
+        let mut is_half: HashMap<(u8, u8), i64> = HashMap::new();
+        for b in collected
+            .iter()
+            .filter(|b| b.lookup_type == BitwiseOperationType::IsHalf)
+        {
+            *is_half.entry((b.x, b.y)).or_default() += 1;
+        }
+        for (op, _) in &ops {
+            let (lo, hi) = op.compute_product();
+            for word in [op.lhs, op.rhs, lo, hi] {
+                for shift in [0, 16, 32, 48] {
+                    *is_half.entry(half(word >> shift & 0xFFFF)).or_default() -= 1;
+                }
+            }
+        }
+
+        let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
+        let mut msb16 = 0usize;
+        for c in ops.chunks(chunk) {
+            let t = generate_mul_trace(c);
+            for r in 0..t.num_rows() {
+                for col in [cols::MU_LO, cols::MU_HI] {
+                    let mu = t.get_main(r, col).to_raw();
+                    *expected.entry(half(mu)).or_default() += mu as i64;
+                }
+                msb16 += t.get_main(r, cols::LHS_SIGNED).to_raw() as usize;
+                msb16 += t.get_main(r, cols::RHS_SIGNED).to_raw() as usize;
+            }
+        }
+        is_half.retain(|_, n| *n != 0);
+        expected.retain(|_, n| *n != 0);
+        assert_eq!(
+            is_half, expected,
+            "IS_HALF[μ] tally must match the trace rows"
+        );
+        assert_eq!(
+            collected
+                .iter()
+                .filter(|b| b.lookup_type == BitwiseOperationType::Msb16)
+                .count(),
+            msb16,
+            "MSB16 tally must match the trace rows"
+        );
+    }
 }

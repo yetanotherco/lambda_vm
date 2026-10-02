@@ -69,6 +69,8 @@ pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod multiplicity_forgery_poc;
+#[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]
 pub mod page_layout_tests;

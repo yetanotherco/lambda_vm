@@ -1734,9 +1734,11 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
 /// and IS_B20 lookups for carry range checks.
 ///
-/// IS_HALF and IS_B20 are emitted once per raw op. MSB16 is deduplicated
-/// per `max_rows_mul` chunk, mirroring `chunk_and_generate_optional` — a unique
-/// signed op that spans two instances is sent twice and must be tallied twice.
+/// IS_HALF and IS_B20 are emitted once per raw op. The per-row lookups (MSB16
+/// and the IS_HALF[μ_lo]/IS_HALF[μ_hi] multiplicity bounds) are counted over the
+/// rows of each `max_rows_mul` chunk, mirroring `chunk_and_generate_optional` —
+/// a unique signed op that spans two instances is sent twice and must be tallied
+/// twice.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_mul(
@@ -1793,28 +1795,38 @@ pub(crate) fn collect_bitwise_from_mul(
         }
     }
 
-    // MSB16: dedup per chunk — the MUL AIR sends Msb16 once per unique signed row
-    // per instance, so the collector must mirror the same chunk boundary.
+    // Per-row lookups, over exactly the rows `generate_mul_trace` builds for each
+    // `max_rows_mul` chunk (`chunk_and_generate_optional`): IS_HALF[μ_lo] and
+    // IS_HALF[μ_hi] are sent μ_lo / μ_hi times (so padding rows send nothing), and
+    // MSB16 fires once per row whose sign flag is set — a unique signed op spanning two
+    // instances, or split over two rows by `mul::MU_MAX`, is sent once per row.
+    let halfword = |v: u64| {
+        BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (v & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+        )
+    };
     for chunk in mul_ops.chunks(max_rows_mul) {
-        let mut msb16_seen = std::collections::HashSet::new();
-        for (op, _wants_hi) in chunk {
-            if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
-                if op.lhs_signed {
-                    let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
-                    bitwise_ops.push(BitwiseOperation::halfword(
-                        BitwiseOperationType::Msb16,
-                        (lhs_3 & 0xFF) as u8,
-                        (lhs_3 >> 8) as u8,
-                    ));
-                }
-                if op.rhs_signed {
-                    let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
-                    bitwise_ops.push(BitwiseOperation::halfword(
-                        BitwiseOperationType::Msb16,
-                        (rhs_3 & 0xFF) as u8,
-                        (rhs_3 >> 8) as u8,
-                    ));
-                }
+        for (op, mu) in &mul::dedup_mul_rows(chunk) {
+            for m in [mu.mu_lo, mu.mu_hi] {
+                bitwise_ops.extend(std::iter::repeat_n(halfword(m), m as usize));
+            }
+            if op.lhs_signed {
+                let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (lhs_3 & 0xFF) as u8,
+                    (lhs_3 >> 8) as u8,
+                ));
+            }
+            if op.rhs_signed {
+                let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (rhs_3 & 0xFF) as u8,
+                    (rhs_3 >> 8) as u8,
+                ));
             }
         }
     }
@@ -1831,9 +1843,10 @@ pub(crate) fn collect_bitwise_from_mul(
 /// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
 /// are collected here alongside the constraint-level ones.
 ///
-/// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16 and the
-/// NEG-template ZERO lookups (C3/C5) are deduplicated per `max_rows_dvrm`
-/// chunk, mirroring `chunk_and_generate_optional`.
+/// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16, the
+/// NEG-template ZERO lookups (C3/C5) and the IS_HALF[μ_q]/IS_HALF[μ_r]
+/// multiplicity bounds are counted over the rows of each `max_rows_dvrm` chunk,
+/// mirroring `chunk_and_generate_optional`.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_dvrm(
@@ -1920,11 +1933,26 @@ pub(crate) fn collect_bitwise_from_dvrm(
         bitwise_ops.push(BitwiseOperation::zero(d_sum));
     }
 
-    // MSB16: same per-chunk dedup as MUL (Column(SIGNED) is a bit, not a count).
+    // Per-row lookups, over exactly the rows `generate_dvrm_trace` builds for each
+    // `max_rows_dvrm` chunk (`chunk_and_generate_optional`): IS_HALF[μ_q] and
+    // IS_HALF[μ_r] sent μ_q / μ_r times (padding rows send nothing); MSB16 (Column(SIGNED))
+    // and the NEG-template ZERO lookups (Column(SIGN_R)/Column(SIGN_D)) once per
+    // row whose bit is set. An op split over two rows by `dvrm::MU_MAX` sends
+    // them once per row.
+    let halfword = |v: u64| {
+        BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (v & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+        )
+    };
     for chunk in dvrm_ops.chunks(max_rows_dvrm) {
-        let mut msb16_seen = std::collections::HashSet::new();
-        for (op, _wants_remainder) in chunk {
-            if op.signed && msb16_seen.insert(op.clone()) {
+        for (op, mu) in &dvrm::dedup_dvrm_rows(chunk) {
+            for m in [mu.mu_q, mu.mu_r] {
+                bitwise_ops.extend(std::iter::repeat_n(halfword(m), m as usize));
+            }
+
+            if op.signed {
                 let r = op.compute_remainder();
 
                 // MSB16[n[3]]
@@ -1951,46 +1979,38 @@ pub(crate) fn collect_bitwise_from_dvrm(
                     (d_3 >> 8) as u8,
                 ));
             }
-        }
-    }
 
-    // ZERO (NEG template): same — SIGN_R/SIGN_D are bits, dedup per chunk.
-    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
-        let mut zero_seen = std::collections::HashSet::new();
-        for (op, _wants_remainder) in chunk {
-            if zero_seen.insert(op.clone()) {
-                // C3: NEG for r (when sign_r = 1)
-                if op.sign_r() {
-                    let r = op.compute_remainder();
-                    let r_halves: [u32; 4] = [
-                        (r & 0xFFFF) as u32,
-                        ((r >> 16) & 0xFFFF) as u32,
-                        ((r >> 32) & 0xFFFF) as u32,
-                        ((r >> 48) & 0xFFFF) as u32,
-                    ];
-                    // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
-                    bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
-                    // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
-                    bitwise_ops.push(BitwiseOperation::zero(
-                        r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
-                    ));
-                }
+            // C3: NEG for r (when sign_r = 1)
+            if op.sign_r() {
+                let r = op.compute_remainder();
+                let r_halves: [u32; 4] = [
+                    (r & 0xFFFF) as u32,
+                    ((r >> 16) & 0xFFFF) as u32,
+                    ((r >> 32) & 0xFFFF) as u32,
+                    ((r >> 48) & 0xFFFF) as u32,
+                ];
+                // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
+                bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
+                // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
+                bitwise_ops.push(BitwiseOperation::zero(
+                    r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
+                ));
+            }
 
-                // C5: NEG for d (when sign_d = 1)
-                if op.sign_d() {
-                    let d_halves: [u32; 4] = [
-                        (op.d & 0xFFFF) as u32,
-                        ((op.d >> 16) & 0xFFFF) as u32,
-                        ((op.d >> 32) & 0xFFFF) as u32,
-                        ((op.d >> 48) & 0xFFFF) as u32,
-                    ];
-                    // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
-                    bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
-                    // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
-                    bitwise_ops.push(BitwiseOperation::zero(
-                        d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
-                    ));
-                }
+            // C5: NEG for d (when sign_d = 1)
+            if op.sign_d() {
+                let d_halves: [u32; 4] = [
+                    (op.d & 0xFFFF) as u32,
+                    ((op.d >> 16) & 0xFFFF) as u32,
+                    ((op.d >> 32) & 0xFFFF) as u32,
+                    ((op.d >> 48) & 0xFFFF) as u32,
+                ];
+                // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
+                bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
+                // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
+                bitwise_ops.push(BitwiseOperation::zero(
+                    d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
+                ));
             }
         }
     }
