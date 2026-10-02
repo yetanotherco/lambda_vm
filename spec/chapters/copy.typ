@@ -80,19 +80,10 @@ void* memcpy(  void* dest, const void* src, std::size_t count );
 void* memmove( void* dest, const void* src, std::size_t count );		
 void* memset(  void* dest,          int ch, std::size_t count );
 ```
-Rather that supporting `memset` directly, this accelerator instead enables _repeating_ a selection of eight bytes over a desired length `count`. 
-A `memset(dest, ch, count)`-function call with  $#`count` > 8$ can then be compiled as 
-```c
-SD dst, ch; // store `ch` at `dst`
-memcpy(dest + 8, dest, count - 8)
-```
-#et[technically, you'd have to duplicate the `ch`.... Also, hte ref to memcpy is confusing...]
-where we expect the `memcpy` function to perform the copy one byte at a time, incrementing the address as it goes along.
-This leads to eight copies of `ch` being repeated across the entire address interval $[#`dest`, #`dest` + #`count`)$, which is equivalent to setting the values held by all these addresses to `ch`.
-We will later show how this chip achieves this by inverting the overlap handling when $#`is_set` = 1$.
-Lastly, note that `memset` calls with $#`count` <= 8$ should be mapped to a `STORE` operation directly, which is more efficient anyway.
+To deal with only a single interface, it was decided to have this accelerator only provide support for repeating a selection of eight bytes over a desired length `count`, rather than supporting `memset` proper. 
+The implementation of `memset(dest, ch, count)` can then be reduced to a small stub that asserts that $#`count` > 8$, writes `ch` to the first eight addresses of `dest`, and lastly invokes this accelerator with an syscall to repeat the character for the remaining $#`count` - 8$ bytes; the stub should execute a `STORE` operation for `memset` calls with $#`count` <= 8$, which is more efficient anyway.
 
-With the `mem*` operations now aligned, we turn our attention the `write` syscall, which has the following interface#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]]):
+Having settled on the interface for the `mem*` operations, we turn our attention the `write` syscall, which has the following interface#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]]):
 ```c
 ssize_t write(size_t count; int fd, const void buf[count], size_t count);
 ```
@@ -210,7 +201,7 @@ As requested by the standard, this chip accepts arbitrary operand alignment.
 
 Note that this chip is only an accelerator; in practice, a library with functions
 has to be made to resolve the differences in calling ABI between the
-`memset`/`memcpy`/`memmove`/`write` functions and the syscalls this chip accelerates.
+`memset`/`memcpy`/`memmove` functions and the syscalls this chip accelerates; only `write` does not need an extra stub.
 
 Moreover, the standard's fourth operation, `memcmp`, is not covered by this chip, as it does not involve copying.
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
