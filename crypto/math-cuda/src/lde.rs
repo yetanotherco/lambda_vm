@@ -938,6 +938,8 @@ mod inplace_transpose_tests {
 enum InnerInput<'a> {
     Host(&'a [u64]),
     Dev(&'a CudaSlice<u64>),
+    /// A packed trace, widened on the device into the expansion's input rows.
+    Narrow(crate::narrow::NarrowInput<'a>),
 }
 
 /// The expansion stage shared by the row-major commit pipelines: upload (or
@@ -981,6 +983,14 @@ fn expand_row_major_on_stream(
         }
         InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
         InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Narrow(t) => crate::narrow::widen_into(
+            stream,
+            be,
+            t,
+            n,
+            total_cols,
+            &mut buf.slice_mut(0..n * total_cols),
+        )?,
     }
 
     // Snapshot the trace-domain input (column-major) before the iNTT overwrites
@@ -1065,6 +1075,16 @@ fn expand_col_major_on_stream(
     let mut buf = unsafe { stream.alloc::<u64>(total) }?;
     let buf_ptr = buf.device_ptr(stream).0;
     const PINNED_H2D_MIN_U64: usize = 1 << 20;
+    if let InnerInput::Narrow(t) = input {
+        crate::narrow::widen_into(
+            stream,
+            be,
+            t,
+            n,
+            total_cols,
+            &mut buf.slice_mut(tail..total),
+        )?;
+    }
     if let InnerInput::Host(h) = input {
         let mut staged = buf.slice_mut(tail..total);
         if h.len() >= PINNED_H2D_MIN_U64 && crate::device::staging_pairs_enabled() {
@@ -1079,7 +1099,7 @@ fn expand_col_major_on_stream(
     let (snapshot, src, order) = {
         let (mut head, staged) = buf.split_at_mut(tail);
         let row_major = match input {
-            InnerInput::Host(_) => staged.slice(0..trace),
+            InnerInput::Host(_) | InnerInput::Narrow(_) => staged.slice(0..trace),
             InnerInput::Dev(d) => d.slice(0..trace),
         };
         if retain_trace_col_major {
@@ -1482,6 +1502,7 @@ fn coset_lde_row_major_inner(
     let input_len = match &input {
         InnerInput::Host(h) => h.len(),
         InnerInput::Dev(d) => d.len(),
+        InnerInput::Narrow(t) => t.rows() * total_cols,
     };
     assert_eq!(input_len, n * total_cols);
     assert!(n.is_power_of_two());
@@ -1671,25 +1692,78 @@ pub fn coset_lde_row_major_keep_no_tree(
         _ => InnerInput::Host(row_major),
     };
     assert_eq!(row_major.len(), n * m);
+    let be = backend()?;
+    let stream = be.next_stream();
+    keep_no_tree_on_stream(
+        &stream,
+        be,
+        input,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+    )
+}
+
+/// [`coset_lde_row_major_keep_no_tree`] from a packed trace (the stark crate's
+/// `NarrowMain` layout: column `c` is `n` little-endian words of `widths[c]`
+/// bytes from `offsets[c]` in `data`): uploaded packed and widened on the LDE's
+/// stream straight into the rows the host upload would have filled, so the
+/// device holds no copy of the trace beyond today's.
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_narrow_keep_no_tree(
+    data: &[u8],
+    offsets: &[u64],
+    widths: &[u8],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    keep_no_tree_on_stream(
+        &stream,
+        be,
+        InnerInput::Narrow(crate::narrow::NarrowInput::new(data, offsets, widths, n, m)),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keep_no_tree_on_stream(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    input: InnerInput,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, "coset_lde_row_major_keep_no_tree lde_size");
-    let be = backend()?;
-    let stream = be.next_stream();
     let (col_major_dev, ready, lde_out, trace_col_major) =
         if row_major_commit_takes_engine(n, blowup_factor, retain_host_lde) {
             let (buf, trace_col_major) =
-                expand_col_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+                expand_col_major_on_stream(stream, be, input, n, m, blowup_factor, weights, true)?;
             let ready = be.take_event()?;
-            ready.event().record(&stream)?;
+            ready.event().record(stream)?;
             (buf, ready, Vec::new(), trace_col_major)
         } else {
             let (buf, trace_col_major) =
-                expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+                expand_row_major_on_stream(stream, be, input, n, m, blowup_factor, weights, true)?;
             let (col_major_dev, ready, lde_out) =
-                drain_and_transpose(&stream, be, buf, lde_size, m, retain_host_lde)?;
+                drain_and_transpose(stream, be, buf, lde_size, m, retain_host_lde)?;
             (col_major_dev, ready, lde_out, trace_col_major)
         };
     let handle = GpuLdeBase {

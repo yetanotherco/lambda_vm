@@ -178,6 +178,7 @@ pub struct Backend {
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
+    pub widen_narrow_row_major: CudaFunction,
     pub gl_add: CudaFunction,
     pub gl_sub: CudaFunction,
     pub gl_mul: CudaFunction,
@@ -984,6 +985,7 @@ impl Backend {
 
         Ok(Self {
             vector_add_u64: arith.load_function("vector_add_u64")?,
+            widen_narrow_row_major: arith.load_function("widen_narrow_row_major")?,
             gl_add: arith.load_function("gl_add_kernel")?,
             gl_sub: arith.load_function("gl_sub_kernel")?,
             gl_mul: arith.load_function("gl_mul_kernel")?,

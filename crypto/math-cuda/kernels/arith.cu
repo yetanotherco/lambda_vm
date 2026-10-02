@@ -95,3 +95,24 @@ extern "C" __global__ void ext3_sub_kernel(const uint64_t *a_int,
     c_int[tid*3 + 1] = r.b;
     c_int[tid*3 + 2] = r.c;
 }
+
+// Widen a packed main trace (crypto/stark/src/narrow.rs): column c holds `rows`
+// little-endian words of widths[c] bytes from byte offsets[c] of `data`; `out`
+// is the row-major rows x cols trace of the same words, zero-extended. One
+// thread per output word, so the writes coalesce.
+extern "C" __global__ void widen_narrow_row_major(const uint8_t *data,
+                                                  const uint64_t *offsets,
+                                                  const uint8_t *widths,
+                                                  uint64_t *out,
+                                                  uint64_t rows,
+                                                  uint64_t cols) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= rows * cols) return;
+    uint64_t r = tid / cols;
+    uint64_t c = tid - r * cols;
+    uint32_t w = widths[c];
+    const uint8_t *p = data + offsets[c] + r * w;
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < w; i++) v |= (uint64_t)p[i] << (8 * i);
+    out[tid] = v;
+}
