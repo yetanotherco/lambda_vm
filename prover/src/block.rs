@@ -439,6 +439,17 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
+/// `LAMBDA_VM_BLOCK_FINISH_WIDE=n` (n >= 1): with [`narrow_finished`], phase
+/// A's finish generates at most `n` chunks at 8 bytes a cell at once
+/// ([`WindowedTraceBuilder::bound_finished_generation`]); unset or `0` is no
+/// bound. A measurement knob until its gate.
+fn finish_wide_chunks() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_FINISH_WIDE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
 /// knob; unset is [`STREAM_COMMITTERS`].
 fn stream_committers() -> usize {
@@ -912,7 +923,9 @@ fn build_streamed(
                 builder = builder.drop_streamed_ops()?;
             }
             if narrow_finished() {
-                builder = builder.pack_finished_tables();
+                builder = builder
+                    .pack_finished_tables()
+                    .bound_finished_generation(finish_wide_chunks());
             }
             if let Some(ledger) = ledger {
                 eprintln!(
@@ -1310,5 +1323,38 @@ mod queue_tests {
             waiting.join().unwrap();
         });
         assert_eq!(*queue.held.lock().unwrap(), (20, 2));
+    }
+}
+
+#[cfg(test)]
+mod wide_permit_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::tables::trace_builder::WidePermits;
+
+    /// However many workers want one, at most `n` hold a permit at once, and
+    /// every worker gets one in the end.
+    #[test]
+    fn at_most_n_chunks_hold_a_permit() {
+        let permits = WidePermits::new(2);
+        let (holding, most, done) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let _permit = permits.acquire();
+                    let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    holding.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+        assert_eq!(most.load(Ordering::SeqCst), 2);
     }
 }

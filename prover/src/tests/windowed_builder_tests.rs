@@ -687,15 +687,18 @@ fn packing_the_finished_tables_keeps_the_words() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [7, 33] {
+        // A bound of one chunk at 8 bytes a cell at once (and none, 0) builds
+        // the same tables.
+        for (window, bound) in [(7, 0), (33, 0), (33, 1)] {
             let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
                 b.drop_streamed_ops()
                     .expect("before any window")
                     .pack_finished_tables()
+                    .bound_finished_generation(bound)
             });
             assert!(
                 widen_all(&mut packed) > 0,
-                "{name}/{window}: no table was packed"
+                "{name}/{window}/{bound}: no table was packed"
             );
             same_traces(&reference, &packed);
         }
