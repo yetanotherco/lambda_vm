@@ -10,6 +10,9 @@ pub mod bitwise_bus_tests;
 pub mod bitwise_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
+pub mod block_batched_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod block_whir_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
