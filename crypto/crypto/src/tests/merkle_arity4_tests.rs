@@ -162,3 +162,34 @@ fn a_tampered_arity_4_path_is_rejected() {
     }
     assert!(tree.get_batch_proof(&[0, 1]).is_err());
 }
+
+#[test]
+fn an_arity_4_tree_verifies_uncapped_through_the_cap_api_and_refuses_caps() {
+    use crate::merkle_tree::cap::{CappedRoot, embed_cap_arity};
+    for k in [1usize, 4, 5] {
+        let n = 1usize << k;
+        let data = rows(n);
+        let tree = MerkleTree::<P1Backend>::build(&data).expect("non-empty");
+        let mut path = tree.get_proof_by_pos(n - 1).expect("in range").merkle_path;
+        let leaf = P1Backend::hash_data(&data[n - 1]);
+        // `depth` is the binary depth the STARK's shapes speak.
+        let (capped, siblings) =
+            CappedRoot::from_owner::<P1Backend>(&tree.root, &path, k, 0).expect("uncapped");
+        assert!(capped.verify::<P1Backend>(siblings, n - 1, leaf));
+        assert!(
+            !capped.verify::<P1Backend>(siblings, n, leaf),
+            "index past the tree"
+        );
+        assert!(
+            !capped.verify::<P1Backend>(&siblings[3..], n - 1, leaf),
+            "a level short"
+        );
+        assert!(
+            CappedRoot::from_owner::<P1Backend>(&tree.root, &path, k, 1).is_none(),
+            "caps refused"
+        );
+        embed_cap_arity(&mut [&mut path], k, &[tree.root], 4).expect("full path, no cap");
+        assert!(embed_cap_arity(&mut [&mut path], k + 2, &[tree.root], 4).is_err());
+        assert!(embed_cap_arity(&mut [&mut path], k, &[tree.root, tree.root], 4).is_err());
+    }
+}
