@@ -532,3 +532,231 @@ pub fn is_shifted(kinds: &[FactorKind]) -> bool {
         .filter_map(FactorKind::source)
         .any(|source| source.offset != 0)
 }
+
+// ============================ inside a block leaf ===========================
+
+/// A batched argue's wires, hinted from an arena with every count taken from
+/// the tables' SHAPES and the plan — never from a proof — and OWNED, for
+/// [`BatchedStore::reduces`] and [`BatchedArgueWires`] to borrow.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) struct BatchedStore {
+    pub(crate) bus_outputs: Vec<(Ext, Ext)>,
+    pub(crate) gkr: Vec<Vec<LadderStepWires>>,
+    pub(crate) constraint: Vec<Vec<Ext>>,
+    pub(crate) factor_values: Vec<Vec<Ext>>,
+    /// Per table, a shifted table's reduction rounds and column values.
+    reduce_parts: Vec<Option<ReduceParts>>,
+}
+
+/// A reduction's rounds and column values, as wires.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+type ReduceParts = (Vec<Vec<Ext>>, Vec<Ext>);
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl BatchedStore {
+    /// The reductions as wires, one slot per table.
+    pub(crate) fn reduces(&self) -> Vec<Option<ReduceWires<'_>>> {
+        self.reduce_parts
+            .iter()
+            .map(|part| {
+                part.as_ref().map(|(rounds, columns)| ReduceWires {
+                    sumcheck: rounds,
+                    column_values: columns,
+                })
+            })
+            .collect()
+    }
+}
+
+/// How many words a batched argue over `shapes` binned by `plan` takes, in
+/// [`hint_batched_shaped`]'s order: what [`push_batched_words`] must write.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn batched_words(shapes: &[TableShape<'_>], plan: &ArguePlan) -> usize {
+    let mut words = 2 * shapes.len();
+    for bin in &plan.bins {
+        let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+        let steps = heights.iter().copied().max().unwrap_or(0);
+        for i in 0..steps {
+            let active = heights.iter().filter(|&&h| h > i).count();
+            words += i * GKR_SUMCHECK_DEGREE + 4 * active;
+        }
+    }
+    words += plan.num_vars * plan.degree;
+    words += shapes.iter().map(|s| s.sources().len()).sum::<usize>();
+    for (t, shape) in shapes.iter().enumerate() {
+        if plan.shapes[t].shifted {
+            words += shape.num_vars * REDUCE_DEGREE + shape.num_columns;
+        }
+    }
+    words
+}
+
+/// Hints a batched argue's wires from `arena` at `at`, in [`push_batched_words`]'
+/// order: the bus outputs, each bin's ladder (each step's rounds, then its active
+/// trees' halves), the constraint rounds, the factor values, then each shifted
+/// table's reduction. Every count is `emit_batched_argue`'s own, from the shapes
+/// and the plan, so a proof of another shape cannot be read into it.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn hint_batched_shaped(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+) -> BatchedStore {
+    let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
+        (0..count)
+            .map(|_| {
+                let wire = b.hint_word(arena, *at).as_ext();
+                *at += 1;
+                wire
+            })
+            .collect()
+    };
+    let bus_outputs = (0..shapes.len())
+        .map(|_| {
+            let pq = take(b, 2);
+            (pq[0], pq[1])
+        })
+        .collect();
+    let gkr = plan
+        .bins
+        .iter()
+        .map(|bin| {
+            let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+            let steps = heights.iter().copied().max().unwrap_or(0);
+            (0..steps)
+                .map(|i| {
+                    let active = heights.iter().filter(|&&h| h > i).count();
+                    LadderStepWires {
+                        sumcheck: (0..i).map(|_| take(b, GKR_SUMCHECK_DEGREE)).collect(),
+                        halves: (0..active)
+                            .map(|_| {
+                                let h = take(b, 4);
+                                [h[0], h[1], h[2], h[3]]
+                            })
+                            .collect(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let constraint = (0..plan.num_vars).map(|_| take(b, plan.degree)).collect();
+    let factor_values = shapes.iter().map(|s| take(b, s.sources().len())).collect();
+    let reduce_parts = shapes
+        .iter()
+        .enumerate()
+        .map(|(t, shape)| {
+            plan.shapes[t].shifted.then(|| {
+                let rounds = (0..shape.num_vars)
+                    .map(|_| take(b, REDUCE_DEGREE))
+                    .collect();
+                (rounds, take(b, shape.num_columns))
+            })
+        })
+        .collect();
+    BatchedStore {
+        bus_outputs,
+        gkr,
+        constraint,
+        factor_values,
+        reduce_parts,
+    }
+}
+
+/// A batched argue's words, in [`hint_batched_shaped`]'s order.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn push_batched_words(
+    words: &mut Vec<super::word::LfmWord>,
+    argue: &stark::multilinear_table::BatchedArgue<crate::tables::types::GoldilocksExtension>,
+) {
+    use super::word::ext_word;
+    for (p, q) in &argue.bus_outputs {
+        words.extend([ext_word(p), ext_word(q)]);
+    }
+    for ladder in &argue.gkr {
+        for step in &ladder.layers {
+            for round in &step.sumcheck.rounds {
+                words.extend(round.evaluations.iter().map(ext_word));
+            }
+            for h in &step.halves {
+                words.extend([h.p_lo, h.p_hi, h.q_lo, h.q_hi].iter().map(ext_word));
+            }
+        }
+    }
+    for round in &argue.constraint.rounds {
+        words.extend(round.evaluations.iter().map(ext_word));
+    }
+    for values in &argue.factor_values {
+        words.extend(values.iter().map(ext_word));
+    }
+    for reduce in argue.reduces.iter().flatten() {
+        for round in &reduce.sumcheck.rounds {
+            words.extend(round.evaluations.iter().map(ext_word));
+        }
+        words.extend(reduce.column_values.iter().map(ext_word));
+    }
+}
+
+/// ★ A block group's tables, batched: [`emit_batched_argue`] on the group's
+/// fork, then each table's preprocessed leg at the point its columns are
+/// claimed at — the host's `check_preprocessed` after `verify_argue`, which
+/// `block_verify_with` runs per table — leaving what the per-table walk leaves.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_batched_walk(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    store: &BatchedStore,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    plans: &[super::whir_epoch::PreprocessedPlan<'_>],
+    slots: &[&[usize]],
+    z: Ext,
+    alpha_powers: &[Ext],
+    beta: Ext,
+) -> super::whir_epoch::TableWalk {
+    assert_eq!(shapes.len(), plans.len(), "one preprocessed plan per table");
+    assert_eq!(shapes.len(), slots.len(), "one slot map per table");
+    let reduces = store.reduces();
+    let verdict = emit_batched_argue(
+        b,
+        transcript,
+        &BatchedArgueWires {
+            bus_outputs: &store.bus_outputs,
+            gkr: &store.gkr,
+            constraint: &store.constraint,
+            factor_values: &store.factor_values,
+            reduces: &reduces,
+        },
+        shapes,
+        plan,
+        z,
+        alpha_powers,
+        beta,
+    );
+    let mut walk = super::whir_epoch::TableWalk {
+        outputs: Vec::with_capacity(shapes.len()),
+        points: Vec::with_capacity(shapes.len()),
+        widths: Vec::with_capacity(shapes.len()),
+        values: Vec::new(),
+    };
+    for (t, ((point, columns), output)) in verdict
+        .tables
+        .into_iter()
+        .zip(verdict.bus_outputs)
+        .enumerate()
+    {
+        let table = super::whir_table::TableVerdictWires {
+            bus_output: output,
+            point,
+            column_values: columns,
+        };
+        super::whir_epoch::emit_preprocessed_leg(b, &plans[t], slots[t], &shapes[t], &table);
+        walk.outputs.push(table.bus_output);
+        walk.widths.push(table.column_values.len());
+        walk.values.extend(table.column_values.iter().copied());
+        walk.points.push(table.point);
+    }
+    walk
+}

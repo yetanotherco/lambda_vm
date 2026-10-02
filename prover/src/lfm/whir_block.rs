@@ -362,13 +362,6 @@ impl WhirBlockPlan {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
-        // The leaves walk each table's own argument.
-        if format.argue != multilinear::whir_chain::ArgueFormat::PerTable {
-            return Err(format!(
-                "the block's recursion verifies the per-table argue, not {:?}",
-                format.argue
-            ));
-        }
         // The machine replays the algebraic transcript: it verifies a block
         // proved over RPX, and nothing else.
         if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
@@ -454,10 +447,16 @@ impl WhirBlockPlan {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
             let entry = fresh_schedule().entry();
-            let tables: usize = shapes
-                .iter()
-                .map(|shape| table_verify_cost(shape, entry).perms())
-                .sum();
+            let tables: usize = match batched_cap(config) {
+                None => shapes
+                    .iter()
+                    .map(|shape| table_verify_cost(shape, entry).perms())
+                    .sum(),
+                Some(cap) => {
+                    super::whir_batch::batched_argue_cost(&shapes, &owned.argue_plan(cap), entry)
+                        .perms()
+                }
+            };
             let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
             let (_, group_of) = group_columns(&group_shapes);
             let layout = &frame.stack_layouts[g];
@@ -866,6 +865,26 @@ impl<'a> Shapes<'a> {
             })
             .collect()
     }
+
+    /// The batched argue's plan over these tables, the host's own
+    /// [`stark::multilinear_table::argue_plan`] at the format's cap: the bins
+    /// are part of the transcript, so the leaf never restates them.
+    fn argue_plan(&self, bin_log_cells: u8) -> stark::multilinear_table::ArguePlan {
+        let shapes: Vec<stark::multilinear_table::ArgueShape> = self
+            .layouts
+            .iter()
+            .map(|layout| stark::multilinear_table::ArgueShape::of(&layout.statement()))
+            .collect();
+        stark::multilinear_table::argue_plan(&shapes, bin_log_cells)
+    }
+}
+
+/// The batched argue's bin cap when the block's format batches its groups.
+fn batched_cap(config: &multilinear::whir_chain::ChainConfig) -> Option<u8> {
+    match config.format.argue {
+        multilinear::whir_chain::ArgueFormat::Batched { bin_log_cells } => Some(bin_log_cells),
+        multilinear::whir_chain::ArgueFormat::PerTable => None,
+    }
 }
 
 /// How a table's preprocessed columns are discharged in a leaf: the epoch's
@@ -1107,14 +1126,37 @@ fn emit_leaf(
 
         let mut fork = transcript.clone();
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
-        let store: Vec<TableWires> = shapes
-            .iter()
-            .map(|shape| hint_table_wires_shaped(b, arena, &mut at, shape))
-            .collect();
-        let wires: Vec<TableProofWires<'_>> = store.iter().map(TableWires::borrow).collect();
-        let walk = emit_table_walk(
-            b, &mut fork, &wires, &shapes, &plans, &slots, z, &ladder, beta,
-        );
+        let walk = match batched_cap(config) {
+            None => {
+                let store: Vec<TableWires> = shapes
+                    .iter()
+                    .map(|shape| hint_table_wires_shaped(b, arena, &mut at, shape))
+                    .collect();
+                let wires: Vec<TableProofWires<'_>> =
+                    store.iter().map(TableWires::borrow).collect();
+                emit_table_walk(
+                    b, &mut fork, &wires, &shapes, &plans, &slots, z, &ladder, beta,
+                )
+            }
+            // The group's tables in one batched argue, its bins the host's.
+            Some(cap) => {
+                let argue_plan = owned.argue_plan(cap);
+                let store =
+                    super::whir_batch::hint_batched_shaped(b, arena, &mut at, &shapes, &argue_plan);
+                super::whir_batch::emit_batched_walk(
+                    b,
+                    &mut fork,
+                    &store,
+                    &shapes,
+                    &argue_plan,
+                    &plans,
+                    &slots,
+                    z,
+                    &ladder,
+                    beta,
+                )
+            }
+        };
 
         // The group's opening, against its own carried roots.
         let layout = &frame.stack_layouts[g];
@@ -1254,21 +1296,41 @@ pub fn block_leaf_arena(
         let tables = &plan.groups[g];
         let owned = Shapes::build(&refs, &frame.shapes, tables)?;
         let start = plan.group_start(g);
-        for (slot, shape) in owned.table_shapes().iter().enumerate() {
-            let table = proof
-                .proof
-                .tables
-                .get(start + slot)
-                .ok_or("the proof is short of tables")?;
-            let before = words.len();
-            push_table_words(&mut words, table);
-            if words.len() - before != table_words(shape) {
-                return Err(format!(
-                    "table {} carries {} words, its shape {}",
-                    tables[slot],
-                    words.len() - before,
-                    table_words(shape)
-                ));
+        match batched_cap(&frame.config) {
+            None => {
+                for (slot, shape) in owned.table_shapes().iter().enumerate() {
+                    let table = proof
+                        .proof
+                        .tables
+                        .get(start + slot)
+                        .ok_or("the proof is short of tables")?;
+                    let before = words.len();
+                    push_table_words(&mut words, table);
+                    if words.len() - before != table_words(shape) {
+                        return Err(format!(
+                            "table {} carries {} words, its shape {}",
+                            tables[slot],
+                            words.len() - before,
+                            table_words(shape)
+                        ));
+                    }
+                }
+            }
+            Some(cap) => {
+                let argue = proof
+                    .argues
+                    .get(g)
+                    .ok_or("the proof is short of batched argues")?;
+                let shapes = owned.table_shapes();
+                let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(cap));
+                let before = words.len();
+                super::whir_batch::push_batched_words(&mut words, argue);
+                if words.len() - before != expected {
+                    return Err(format!(
+                        "group {g}'s batched argue carries {} words, its shapes {expected}",
+                        words.len() - before
+                    ));
+                }
             }
         }
         let layout = &frame.stack_layouts[g];

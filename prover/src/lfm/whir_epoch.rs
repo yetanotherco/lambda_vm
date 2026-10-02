@@ -1035,7 +1035,7 @@ pub fn emit_table_walk(
 
 /// One table's preprocessed columns, checked against the values its own
 /// argument settled on.
-fn emit_preprocessed_leg(
+pub(crate) fn emit_preprocessed_leg(
     b: &mut LfmBuilder,
     plan: &PreprocessedPlan<'_>,
     slot_of: &[usize],
