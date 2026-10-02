@@ -79,9 +79,9 @@ use crate::tables::{
 };
 
 #[cfg(test)]
-mod tail_tests;
-#[cfg(test)]
 mod producer_harness;
+#[cfg(test)]
+mod tail_tests;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
@@ -643,22 +643,30 @@ impl Accumulator<'_> {
         } else {
             route_ops
         };
-        self.segments
-            .append(route(&window.cpu_ops, self.decode, &window.walk.cpu32_ops));
+        let tp = std::time::Instant::now();
+        let routed = route(&window.cpu_ops, self.decode, &window.walk.cpu32_ops);
+        split_probe::add("route_ops", tp);
+        let tp = std::time::Instant::now();
+        self.segments.append(routed);
+        split_probe::add("route_append", tp);
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise.
         if self.lean.lookups {
             let histogram = &mut self.counted.histogram;
+            let tp = std::time::Instant::now();
             window
                 .cpu_ops
                 .iter()
                 .for_each(|op| self.decode.op(op).count_bitwise_into(histogram));
+            split_probe::add("count_cpu", tp);
+            let tp = std::time::Instant::now();
             window
                 .walk
                 .load_ops
                 .iter()
                 .for_each(|op| op.count_bitwise_into(histogram));
+            split_probe::add("count_load", tp);
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
@@ -666,7 +674,9 @@ impl Accumulator<'_> {
             // Nothing else reads the in-walk lookups; MEMW_R's rows are
             // counted as their chunks leave.
             drop(std::mem::take(&mut window.walk.bitwise_ops));
+            let tp = std::time::Instant::now();
             kept.append(window);
+            split_probe::add("kept_append", tp);
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             let jobs = tail_jobs(
@@ -830,6 +840,26 @@ fn chunk_jobs(
         e.store += 1;
     }
     jobs
+}
+
+/// Probe (not for merge): seconds per accumulator stage, summed over the run.
+pub(crate) mod split_probe {
+    use std::sync::Mutex;
+    static SECS: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
+    pub(crate) fn add(label: &'static str, since: std::time::Instant) {
+        let secs = since.elapsed().as_secs_f64();
+        if let Ok(mut v) = SECS.lock() {
+            match v.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, s)) => *s += secs,
+                None => v.push((label, secs)),
+            }
+        }
+    }
+    pub(crate) fn take() -> Vec<(&'static str, f64)> {
+        SECS.lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
 }
 
 /// The cycles the walker collects and walks at a time (`LAMBDA_VM_WALK_BATCH`,
@@ -1155,8 +1185,12 @@ fn tail_jobs(
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
             let max = $max;
             while $tail.len >= max {
+                let tp = std::time::Instant::now();
                 let $ops = $tail.take(max);
+                split_probe::add(concat!("take_", stringify!($variant)), tp);
+                let tp = std::time::Instant::now();
                 $count
+                split_probe::add(concat!("count_", stringify!($variant)), tp);
                 jobs.push(ChunkJob {
                     table: $table,
                     index: $done,
@@ -1167,7 +1201,10 @@ fn tail_jobs(
         }};
     }
     while kept.cpu.len >= m.cpu {
+        let tp = std::time::Instant::now();
         let ops = kept.cpu.take(m.cpu);
+        split_probe::add("take_Cpu", tp);
+        let tp = std::time::Instant::now();
         decode::count_rows(
             &mut kept.decode,
             ops.iter().map(|op| op.decode_row as usize),
@@ -1179,6 +1216,7 @@ fn tail_jobs(
         {
             counted.last_ecall = Some((op.timestamp, op.next_pc));
         }
+        split_probe::add("count_Cpu", tp);
         jobs.push(ChunkJob {
             table: StreamTable::Cpu,
             index: e.cpu,
@@ -1257,10 +1295,14 @@ fn tail_jobs(
     // STORE's ops are a routing segment: its own tail.
     let store = &mut segments.store_ops;
     while store.len() >= m.store {
+        let tp = std::time::Instant::now();
         let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
+        split_probe::add("take_Store", tp);
+        let tp = std::time::Instant::now();
         for op in &ops {
             counted.histogram.add_ops(&op.collect_bitwise_ops());
         }
+        split_probe::add("count_Store", tp);
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index: e.store,
