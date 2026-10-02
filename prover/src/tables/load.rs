@@ -151,11 +151,26 @@ impl LoadOperation {
     /// - read4: MSB8[res[3]] -> sign_bit
     /// - read8: no MSB8 lookup needed (all 8 bytes are used)
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        self.bitwise_op().into_iter().collect()
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s lookup counted into `histogram`, with no
+    /// list built.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        if let Some(op) = self.bitwise_op() {
+            histogram.bump(op);
+        }
+    }
+
+    /// The one lookup of [`Self::collect_bitwise_ops`], if any.
+    #[inline]
+    fn bitwise_op(&self) -> Option<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
         // For width 8, no sign extension is needed
         if self.width == 8 {
-            return Vec::new();
+            return None;
         }
 
         // Get the byte index for the MSB8 lookup based on width
@@ -163,14 +178,14 @@ impl LoadOperation {
             1 => 0, // res[0] for read1
             2 => 1, // res[1] for read2
             4 => 3, // res[3] for read4
-            _ => return Vec::new(),
+            _ => return None,
         };
 
         let input_byte = self.res[byte_idx] as u8;
-        vec![BitwiseOperation::single_byte(
+        Some(BitwiseOperation::single_byte(
             BitwiseOperationType::Msb8,
             input_byte,
-        )]
+        ))
     }
 }
 

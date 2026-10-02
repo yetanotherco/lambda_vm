@@ -67,7 +67,7 @@ use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::types::{GoldilocksExtension, GoldilocksField};
+use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
@@ -95,12 +95,26 @@ struct MemoryState {
     /// page-map lookup + dense indexing, no per-cell hashing or rehash-on-grow)
     /// is both lighter and faster than a per-cell `HashMap`.
     cells: PagedMem<MemoryCell>,
+    /// Lean accesses ([`WalkLean::memory`]): a multi-byte access inside one
+    /// page finds the page once, and the last page found is remembered (`hot`).
+    /// The cells read and written are the same.
+    lean: bool,
+    /// `(page base, page index)` of the last page a lean access found, or
+    /// [`NO_PAGE`]. While `lean`, every page allocation goes through
+    /// [`Self::page_or_insert`], which leaves the page it allocated here, so an
+    /// index here is never one an allocation moved.
+    hot: (u64, usize),
 }
+
+/// No page: page bases are multiples of the page size, so never odd.
+const NO_PAGE: (u64, usize) = (1, 0);
 
 impl MemoryState {
     fn new() -> Self {
         Self {
             cells: PagedMem::new((0, 0)),
+            lean: false,
+            hot: NO_PAGE,
         }
     }
 
@@ -114,7 +128,11 @@ impl MemoryState {
         for (addr, value) in image.image_iter() {
             cells.set(addr, (value, 0));
         }
-        Self { cells }
+        Self {
+            cells,
+            lean: false,
+            hot: NO_PAGE,
+        }
     }
 
     /// Number of distinct pages that contain at least one cell.
@@ -136,13 +154,62 @@ impl MemoryState {
 
     /// Write a byte to memory with the given timestamp.
     fn write_byte(&mut self, address: u64, value: u8, timestamp: u64) {
-        self.cells.set(address, (value, timestamp));
+        if self.lean {
+            let (base, off) = PagedMem::<MemoryCell>::page_of(address);
+            let index = self.page_or_insert(base);
+            self.cells.page_set(index, off, (value, timestamp));
+        } else {
+            self.cells.set(address, (value, timestamp));
+        }
+    }
+
+    /// The index of the allocated page at `base`, through `hot` (lean only).
+    #[inline]
+    fn page(&mut self, base: u64) -> Option<usize> {
+        if self.hot.0 == base {
+            return Some(self.hot.1);
+        }
+        let index = self.cells.page_index(base)?;
+        self.hot = (base, index);
+        Some(index)
+    }
+
+    /// The index of the page at `base`, allocated on first touch, through `hot`
+    /// (lean only).
+    #[inline]
+    fn page_or_insert(&mut self, base: u64) -> usize {
+        if self.hot.0 == base {
+            return self.hot.1;
+        }
+        let index = self.cells.page_index_or_insert(base);
+        self.hot = (base, index);
+        index
+    }
+
+    /// `count` (≤ 8) bytes from `base_address` within one page: the access a
+    /// lean walk makes in one page lookup. `None` when it is not lean or the
+    /// bytes cross a page (or wrap past `u64::MAX`).
+    #[inline]
+    fn one_page(&self, base_address: u64, count: usize) -> Option<(u64, usize)> {
+        let (base, off) = PagedMem::<MemoryCell>::page_of(base_address);
+        (self.lean && count > 0 && off + count <= page::DEFAULT_PAGE_SIZE).then_some((base, off))
     }
 
     /// Read multiple bytes. Returns arrays of values and timestamps.
-    fn read_bytes(&self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
+    fn read_bytes(&mut self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
         let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
+        if let Some((base, off)) = self.one_page(base_address, count) {
+            // A page never allocated reads (0, 0) throughout, as `read_byte`.
+            if let Some(index) = self.page(base) {
+                for i in 0..count {
+                    let (val, ts) = self.cells.page_get(index, off + i);
+                    values[i] = val as u32;
+                    timestamps[i] = ts;
+                }
+            }
+            return (values, timestamps);
+        }
         for i in 0..count {
             let (val, ts) = self.read_byte(base_address.wrapping_add(i as u64));
             values[i] = val as u32;
@@ -153,6 +220,14 @@ impl MemoryState {
 
     /// Write multiple bytes from a value.
     fn write_bytes(&mut self, base_address: u64, value: u64, count: usize, timestamp: u64) {
+        if let Some((base, off)) = self.one_page(base_address, count) {
+            let index = self.page_or_insert(base);
+            for i in 0..count {
+                let byte = ((value >> (i * 8)) & 0xFF) as u8;
+                self.cells.page_set(index, off + i, (byte, timestamp));
+            }
+            return;
+        }
         for i in 0..count {
             let byte = ((value >> (i * 8)) & 0xFF) as u8;
             self.write_byte(base_address.wrapping_add(i as u64), byte, timestamp);
@@ -385,6 +460,134 @@ fn collect_cpu_ops_into(
     Ok(())
 }
 
+/// The parts of the lean walk a windowed build uses (D-EXEC E1). The tables are
+/// the same with any of them; the whole-run build uses none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalkLean {
+    /// Each cycle's decode read from a [`DecodeTable`].
+    pub(crate) decode: bool,
+    /// Memory accesses through [`MemoryState`]'s page-found paths.
+    pub(crate) memory: bool,
+    /// The in-walk BITWISE lookups counted by the accumulator from the CPU and
+    /// LOAD ops instead of listed by the walk.
+    pub(crate) lookups: bool,
+    /// The routing in one pass over a window's CPU ops ([`route_ops_one_pass`]).
+    pub(crate) route: bool,
+}
+
+impl WalkLean {
+    pub(crate) const ALL: Self = Self {
+        decode: true,
+        memory: true,
+        lookups: true,
+        route: true,
+    };
+    pub(crate) const NONE: Self = Self {
+        decode: false,
+        memory: false,
+        lookups: false,
+        route: false,
+    };
+
+    /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
+    /// of `decode`, `memory`, `lookups`, `route`. Read once; any other value is
+    /// refused.
+    pub(crate) fn from_env() -> Result<Self, Error> {
+        static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
+        LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
+            Err(_) => Ok(Self::ALL),
+            Ok(v) => Self::parse(&v).ok_or_else(|| {
+                format!(
+                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, route"
+                )
+            }),
+        })
+        .clone()
+        .map_err(Error::Prover)
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        match v.trim() {
+            "1" => return Some(Self::ALL),
+            "0" => return Some(Self::NONE),
+            _ => {}
+        }
+        let mut lean = Self::NONE;
+        for part in v.split(',').map(str::trim) {
+            match part {
+                "decode" => lean.decode = true,
+                "memory" => lean.memory = true,
+                "lookups" => lean.lookups = true,
+                "route" => lean.route = true,
+                _ => return None,
+            }
+        }
+        Some(lean)
+    }
+}
+
+/// Every pc of the instruction map decoded once, in dense runs of consecutive
+/// pcs (4 bytes apart): a cycle's [`DecodeEntry`] is one indexed read instead of
+/// a hash lookup and a decode of its instruction. Built from the map, so it holds
+/// exactly the pcs the map holds, each decoded as
+/// [`CpuOperation::from_log_and_instruction`] decodes it.
+pub(crate) struct DecodeTable {
+    /// `(first pc, the entries of pc, pc + 4, …)`, ascending.
+    runs: Vec<(u64, Vec<DecodeEntry>)>,
+}
+
+impl DecodeTable {
+    pub(crate) fn from_instructions(instructions: &U64HashMap<Instruction>) -> Self {
+        let mut pcs: Vec<u64> = instructions.keys().copied().collect();
+        pcs.sort_unstable();
+        let mut runs: Vec<(u64, Vec<DecodeEntry>)> = Vec::new();
+        for pc in pcs {
+            let entry = DecodeEntry::from_instruction(pc, instructions[&pc], 4);
+            match runs.last_mut() {
+                Some((first, entries))
+                    if first.checked_add(4 * entries.len() as u64) == Some(pc) =>
+                {
+                    entries.push(entry)
+                }
+                _ => runs.push((pc, vec![entry])),
+            }
+        }
+        Self { runs }
+    }
+
+    /// The decode of the instruction at `pc`, if the map holds one.
+    #[inline]
+    fn get(&self, pc: u64) -> Option<&DecodeEntry> {
+        self.runs.iter().find_map(|(first, entries)| {
+            let offset = pc.wrapping_sub(*first);
+            if offset % 4 != 0 {
+                return None;
+            }
+            entries.get(usize::try_from(offset / 4).ok()?)
+        })
+    }
+}
+
+/// [`collect_cpu_ops_from`] with each cycle's decode read from `table`: the same
+/// ops.
+fn collect_cpu_ops_from_table(
+    logs: &[Log],
+    table: &DecodeTable,
+    first: usize,
+) -> Result<Vec<CpuOperation>, Error> {
+    let mut cpu_ops = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        // As `collect_cpu_ops_into`.
+        let timestamp = ((first + i) as u64) * 4 + 4;
+        let decode = table
+            .get(log.current_pc)
+            .ok_or(Error::MissingInstruction(log.current_pc))?
+            .clone();
+        cpu_ops.push(CpuOperation::from_log(log, timestamp, decode));
+    }
+    Ok(cpu_ops)
+}
+
 // =============================================================================
 // Phase 2: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
@@ -583,7 +786,7 @@ fn collect_ops_from_cpu(
     Vec<hint::HintOperation>,
 ) {
     let mut out = WalkOutputs::with_capacity(cpu_ops.len());
-    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out);
+    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out, true);
     let WalkOutputs {
         memw,
         load_ops,
@@ -639,12 +842,18 @@ pub(crate) struct WalkOutputs {
 impl WalkOutputs {
     /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it.
     fn with_capacity(cpu_ops: usize) -> Self {
+        Self::for_walk(cpu_ops, true)
+    }
+
+    /// [`Self::with_capacity`], with no room for the in-walk lookups when the
+    /// walk leaves them out (`lookups` false, see [`collect_ops_from_cpu_into`]).
+    fn for_walk(cpu_ops: usize, lookups: bool) -> Self {
         Self {
             memw: MemwBuckets::with_register_capacity(cpu_ops * 3),
             load_ops: Vec::with_capacity(cpu_ops / 8 + 1),
             lt_ops: Vec::with_capacity(cpu_ops / 10 + 1),
             shift_ops: Vec::with_capacity(cpu_ops / 10 + 1),
-            bitwise_ops: Vec::with_capacity(cpu_ops * 4),
+            bitwise_ops: Vec::with_capacity(if lookups { cpu_ops * 4 } else { 0 }),
             commit_ops: Vec::new(),
             keccak_ops: Vec::new(),
             blake3_ops: Vec::new(),
@@ -657,12 +866,17 @@ impl WalkOutputs {
     }
 }
 
-/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]).
+/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). Without
+/// `lookups` the walk leaves out the in-walk BITWISE lookups (each CPU op's and
+/// each LOAD op's), which are a function of the CPU and LOAD ops it emits: the
+/// caller counts them from those ([`CpuOperation::count_bitwise_into`],
+/// [`LoadOperation::count_bitwise_into`]).
 fn collect_ops_from_cpu_into(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
+    lookups: bool,
 ) {
     let WalkOutputs {
         memw,
@@ -701,10 +915,13 @@ fn collect_ops_from_cpu_into(
 
         // Collect memory operations for Load/Store instructions
         if op.decode.fields.is_load() {
-            let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
+            let (memw_op, load_op) = collect_load_op_from_cpu(op, memory_state);
             memw.push(memw_op);
+            if lookups {
+                // MSB8 lookups for the sign bit extraction.
+                bitwise_ops.extend(load_op.collect_bitwise_ops());
+            }
             load_ops.push(load_op);
-            bitwise_ops.extend(lookups);
         } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw.push(memw_op);
@@ -887,7 +1104,9 @@ fn collect_ops_from_cpu_into(
         // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
         // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
         // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
-        bitwise_ops.extend(op.collect_bitwise_ops());
+        if lookups {
+            bitwise_ops.extend(op.collect_bitwise_ops());
+        }
     }
 
     // Each ecall generates count+1 operations (count real rows + 1 end row).
@@ -901,11 +1120,12 @@ fn collect_ops_from_cpu_into(
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
 ///
-/// Returns: (memw_op, load_op, bitwise_ops)
+/// Returns: (memw_op, load_op); the LOAD op's BITWISE lookups are
+/// [`LoadOperation::collect_bitwise_ops`].
 fn collect_load_op_from_cpu(
     op: &CpuOperation,
     memory_state: &mut MemoryState,
-) -> (MemwOperation, LoadOperation, Vec<BitwiseOperation>) {
+) -> (MemwOperation, LoadOperation) {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
@@ -952,13 +1172,10 @@ fn collect_load_op_from_cpu(
         res_bytes.map(u64::from),
     );
 
-    // Collect MSB8 lookups for sign bit extraction
-    let bitwise_ops = load_op.collect_bitwise_ops();
-
     // Update memory state
     memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
 
-    (memw_op, load_op, bitwise_ops)
+    (memw_op, load_op)
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
@@ -3915,14 +4132,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     let branch_ops: Vec<BranchOperation> = cpu_ops
         .iter()
         .filter(|op| op.branch_cond)
-        .map(|op| {
-            BranchOperation::new(
-                op.decode.pc,
-                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
-            )
-        })
+        .map(route_branch)
         .collect();
 
     // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
@@ -3930,26 +4140,14 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     let mul_filter: Vec<(MulOperation, bool)> = cpu_ops
         .iter()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
-                f.alu_muldiv(),
-            )
-        })
+        .map(route_mul)
         .collect();
 
     // Collect DVRM operations from non-word DIV/REM instructions.
     let dvrm_filter: Vec<(DvrmOperation, bool)> = cpu_ops
         .iter()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
-                f.alu_muldiv(),
-            )
-        })
+        .map(route_dvrm)
         .collect();
 
     // Collect the ALU/MEMORY chip ops (non-word rows).
@@ -3957,7 +4155,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     let eq_ops: Vec<eq::EqOperation> = cpu_ops
         .iter()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+        .map(route_eq)
         .collect();
     let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
         .iter()
@@ -3965,7 +4163,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
             let f = &op.decode.fields;
             !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
         })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+        .map(route_bytewise)
         .collect();
     // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
     // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
@@ -3973,18 +4171,118 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     let store_ops: Vec<store::StoreOperation> = cpu_ops
         .iter()
         .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            // The MEMORY bus and the STORE chip's MEMW write share the base
-            // timestamp (spec store.toml uses one `timestamp` for both).
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
-            )
-        })
+        .map(route_store)
         .collect();
 
+    route_from_cpu_segments(
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
+    )
+}
+
+/// [`route_ops`] in one pass over the CPU ops instead of one per segment: each
+/// op goes to every segment whose filter it passes, in CPU order, which is each
+/// filter's order — the same segments.
+fn route_ops_one_pass(
+    cpu_ops: &[CpuOperation],
+    cpu32_ops: &[cpu32::Cpu32Operation],
+) -> RoutedSegments {
+    let mut branch_ops = Vec::new();
+    let mut mul_filter = Vec::new();
+    let mut dvrm_filter = Vec::new();
+    let mut eq_ops = Vec::new();
+    let mut bytewise_ops = Vec::new();
+    let mut store_ops = Vec::new();
+    for op in cpu_ops {
+        let f = &op.decode.fields;
+        if op.branch_cond {
+            branch_ops.push(route_branch(op));
+        }
+        if !f.word_instr {
+            if f.is_mul() {
+                mul_filter.push(route_mul(op));
+            }
+            if f.is_divrem() {
+                dvrm_filter.push(route_dvrm(op));
+            }
+            if f.is_eq() {
+                eq_ops.push(route_eq(op));
+            }
+            if f.is_and() || f.is_or() || f.is_xor() {
+                bytewise_ops.push(route_bytewise(op));
+            }
+        }
+        if f.is_store() {
+            store_ops.push(route_store(op));
+        }
+    }
+    route_from_cpu_segments(
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
+    )
+}
+
+// [`route_ops`]'s op for each segment it filters out of the CPU ops.
+fn route_branch(op: &CpuOperation) -> BranchOperation {
+    BranchOperation::new(
+        op.decode.pc,
+        op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+        op.rv1,        // register value must match the CPU's BRANCH bus signature
+        op.decode.fields.jalr(),
+    )
+}
+fn route_mul(op: &CpuOperation) -> (MulOperation, bool) {
+    let f = op.decode.fields;
+    (
+        MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+        f.alu_muldiv(),
+    )
+}
+fn route_dvrm(op: &CpuOperation) -> (DvrmOperation, bool) {
+    let f = op.decode.fields;
+    (
+        DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+        f.alu_muldiv(),
+    )
+}
+fn route_eq(op: &CpuOperation) -> eq::EqOperation {
+    eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert())
+}
+fn route_bytewise(op: &CpuOperation) -> bytewise::BytewiseOperation {
+    bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op())
+}
+fn route_store(op: &CpuOperation) -> store::StoreOperation {
+    // The MEMORY bus and the STORE chip's MEMW write share the base
+    // timestamp (spec store.toml uses one `timestamp` for both).
+    store::StoreOperation::new(
+        op.res,
+        op.timestamp,
+        op.rv2,
+        op.decode.fields.mem_bytes() as u8,
+    )
+}
+
+/// The rest of [`route_ops`] once the CPU ops' segments are filtered: CPU32's
+/// dispatch and what the DVRM ops imply.
+fn route_from_cpu_segments(
+    branch_ops: Vec<BranchOperation>,
+    mul_filter: Vec<(MulOperation, bool)>,
+    dvrm_filter: Vec<(DvrmOperation, bool)>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    cpu32_ops: &[cpu32::Cpu32Operation],
+) -> RoutedSegments {
     // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
     // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
     // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
@@ -5029,8 +5327,7 @@ pub fn count_table_lengths(
 
         // Memory ops from load/store
         if cpu_op.decode.fields.is_load() {
-            let (memw_op, _load_op, _bitwise) =
-                collect_load_op_from_cpu(&cpu_op, &mut memory_state);
+            let (memw_op, _load_op) = collect_load_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
                 &mut memw_by_width,

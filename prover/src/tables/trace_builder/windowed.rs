@@ -67,9 +67,10 @@ use stark::trace::TraceTable;
 
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
-    CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted, RegisterState,
-    RoutedSegments, StreamSkip, Traces, WalkOutputs, bitwise, build_initial_image, build_traces,
-    collect_halt_ops, collect_ops_from_cpu_into, route_ops,
+    CollectedOps, DecodeArtifacts, DecodeTable, MemoryState, MemwBuckets, PreCounted,
+    RegisterState, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, bitwise,
+    build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into, route_ops,
+    route_ops_one_pass,
 };
 use crate::Error;
 use crate::tables::{
@@ -146,6 +147,11 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::drop_streamed_ops`]: the run so far, without the handed-out ops
     /// (`windows` stays empty).
     kept: Option<Kept>,
+    /// The parts of the lean walk this build uses.
+    lean: WalkLean,
+    /// With [`WalkLean::decode`], the walk reads each cycle's decode from here,
+    /// from the instruction map otherwise.
+    decode: Option<DecodeTable>,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -169,10 +175,16 @@ impl<'a> WindowedTraceBuilder<'a> {
     ) -> Result<Self, Error> {
         let image = build_initial_image(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
-        let memory_state = MemoryState::from_image(&image);
+        let mut memory_state = MemoryState::from_image(&image);
         let register_state = RegisterState::from_init(&register_init);
+        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        let lean = WalkLean::from_env()?;
+        let decode = lean
+            .decode
+            .then(|| DecodeTable::from_instructions(&artifacts.instructions));
+        memory_state.lean = lean.memory;
         Ok(Self {
-            artifacts: DecodeArtifacts::from_elf(elf)?,
+            artifacts,
             image,
             register_init,
             max_rows: max_rows.clone(),
@@ -194,7 +206,22 @@ impl<'a> WindowedTraceBuilder<'a> {
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
             kept: None,
+            lean,
+            decode,
         })
+    }
+
+    /// Walk with these lean parts, whatever `LAMBDA_VM_WALK_LEAN` says (the
+    /// tables are the same). Before the first window only.
+    #[cfg(test)]
+    pub(crate) fn walk_lean(mut self, lean: WalkLean) -> Self {
+        assert_eq!(self.cycles, 0, "walk_lean after a window was walked");
+        self.decode = lean
+            .decode
+            .then(|| DecodeTable::from_instructions(&self.artifacts.instructions));
+        self.memory_state.lean = lean.memory;
+        self.lean = lean;
+        self
     }
 
     /// Collects the next window of the run's logs (not the last one: that is
@@ -302,16 +329,27 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// [`Traces::insert_streamed`] puts the chunks back.
     pub fn finish(mut self, logs: &[Log]) -> Result<Traces, Error> {
         // The last window may halt: it is walked here, not by the `Walker`.
-        let cpu_ops = super::collect_cpu_ops_from(logs, &self.artifacts.instructions, self.cycles)?;
+        let cpu_ops = match &self.decode {
+            Some(table) => super::collect_cpu_ops_from_table(logs, table, self.cycles)?,
+            None => super::collect_cpu_ops_from(logs, &self.artifacts.instructions, self.cycles)?,
+        };
         self.cycles += logs.len();
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
+        // The last window's in-walk lookups are listed and counted by the
+        // table phase, lean or not.
         collect_ops_from_cpu_into(
             &cpu_ops,
             &mut self.memory_state,
             &mut self.register_state,
             &mut walk,
+            true,
         );
-        self.segments.append(route_ops(&cpu_ops, &walk.cpu32_ops));
+        let route = if self.lean.route {
+            route_ops_one_pass
+        } else {
+            route_ops
+        };
+        self.segments.append(route(&cpu_ops, &walk.cpu32_ops));
         let last = WalkedWindow { cpu_ops, walk };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -408,6 +446,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         (
             Walker {
                 artifacts: &self.artifacts,
+                decode: self.decode.as_ref(),
+                lookups: !self.lean.lookups,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
                 cycles: &mut self.cycles,
@@ -415,6 +455,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 walk_secs: &mut self.stamps.walk,
             },
             Accumulator {
+                lean: self.lean,
                 stream_memw_lt: self.stream_memw_lt,
                 max_rows: &self.max_rows,
                 pc_to_row: &self.artifacts.decode_pc_to_row,
@@ -439,6 +480,9 @@ pub struct WalkedWindow {
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Walker<'b> {
     artifacts: &'b DecodeArtifacts,
+    decode: Option<&'b DecodeTable>,
+    /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
+    lookups: bool,
     memory_state: &'b mut MemoryState,
     register_state: &'b mut RegisterState,
     cycles: &'b mut usize,
@@ -454,11 +498,20 @@ impl Walker<'_> {
             return Err(Error::HaltInNonFinalEpoch);
         }
         let t = std::time::Instant::now();
-        let cpu_ops =
-            super::collect_cpu_ops_from(logs, &self.artifacts.instructions, *self.cycles)?;
+        let cpu_ops = match self.decode {
+            Some(table) => super::collect_cpu_ops_from_table(logs, table, *self.cycles)?,
+            None => super::collect_cpu_ops_from(logs, &self.artifacts.instructions, *self.cycles)?,
+        };
         *self.cycles += logs.len();
-        let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
-        collect_ops_from_cpu_into(&cpu_ops, self.memory_state, self.register_state, &mut walk);
+        // Without `lookups`, the accumulator counts them (`absorb`).
+        let mut walk = WalkOutputs::for_walk(cpu_ops.len(), self.lookups);
+        collect_ops_from_cpu_into(
+            &cpu_ops,
+            self.memory_state,
+            self.register_state,
+            &mut walk,
+            self.lookups,
+        );
         *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
         Ok(WalkedWindow { cpu_ops, walk })
@@ -467,6 +520,9 @@ impl Walker<'_> {
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Accumulator<'b> {
+    /// The lean parts the builder uses: with `lookups` the walker left each
+    /// window's in-walk lookups out, with `route` the routing is one pass.
+    lean: WalkLean,
     stream_memw_lt: bool,
     max_rows: &'b crate::tables::MaxRowsConfig,
     pc_to_row: &'b decode::PcToRow,
@@ -493,9 +549,28 @@ impl Accumulator<'_> {
             self.emitted.memw_lt_done += walk.memw.general.len();
             self.emitted.memw_aligned_lt_done += walk.memw.aligned.len();
         }
+        let route = if self.lean.route {
+            route_ops_one_pass
+        } else {
+            route_ops
+        };
         self.segments
-            .append(route_ops(&window.cpu_ops, &window.walk.cpu32_ops));
-        // The table phase's dominant BITWISE source, counted now.
+            .append(route(&window.cpu_ops, &window.walk.cpu32_ops));
+        // The table phase's dominant BITWISE source, counted now: from the CPU
+        // and LOAD ops when the walk left the lookups out (the list is then
+        // empty), from the list otherwise.
+        if self.lean.lookups {
+            let histogram = &mut self.counted.histogram;
+            window
+                .cpu_ops
+                .iter()
+                .for_each(|op| op.count_bitwise_into(histogram));
+            window
+                .walk
+                .load_ops
+                .iter()
+                .for_each(|op| op.count_bitwise_into(histogram));
+        }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
         if let Some(kept) = self.kept.as_deref_mut() {

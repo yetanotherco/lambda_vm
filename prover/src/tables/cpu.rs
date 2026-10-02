@@ -415,9 +415,23 @@ impl CpuOperation {
     /// 3 `ARE_BYTES` (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags) and
     /// 4 `IS_HALF` (the four halves of `res`).
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        let mut ops = Vec::with_capacity(7);
+        self.for_each_bitwise_op(|op| ops.push(op));
+        ops
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s lookups counted into `histogram`, with no
+    /// list built.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        self.for_each_bitwise_op(|op| histogram.bump(op));
+    }
+
+    /// Each of [`Self::collect_bitwise_ops`]'s lookups, in its order.
+    #[inline]
+    fn for_each_bitwise_op(&self, mut emit: impl FnMut(super::bitwise::BitwiseOperation)) {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let f = self.decode.fields;
-        let mut ops = Vec::with_capacity(7);
 
         // Must mirror the trace columns exactly. On word delegate rows the CPU
         // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
@@ -426,17 +440,17 @@ impl CpuOperation {
         let z = |v: u8| if word { 0 } else { v };
         let res = if word { 0 } else { self.res };
 
-        ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.rs1),
             z(f.rs2),
         ));
-        ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.rd),
             f.half_instruction_length,
         ));
-        ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.alu_flags),
             z(f.mem_flags),
@@ -444,14 +458,12 @@ impl CpuOperation {
 
         for i in 0..4 {
             let half = ((res >> (i * 16)) & 0xFFFF) as u16;
-            ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
             ));
         }
-
-        ops
     }
 }
 
