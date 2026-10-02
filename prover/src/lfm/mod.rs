@@ -53,6 +53,7 @@ pub mod layout;
 pub mod lde;
 pub mod logup;
 pub mod merkle_cap;
+pub mod p1_commit;
 pub mod p1w16_chip;
 pub mod per_table_aggregator;
 pub mod poseidon;
