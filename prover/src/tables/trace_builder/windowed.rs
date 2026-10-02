@@ -231,6 +231,15 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// Pack each table `finish` builds at the bytes its columns need as soon as
+    /// it is generated (`TraceTable::pack_main_narrow`, [`StreamSkip::pack`]),
+    /// so the finish never holds many 64-bit tables at once. The streamed
+    /// chunks are the caller's to pack. The words are the same.
+    pub fn pack_finished_tables(mut self) -> Self {
+        self.emitted.pack = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus

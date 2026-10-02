@@ -3631,6 +3631,13 @@ pub struct StreamSkip {
     ///
     /// [`WindowedTraceBuilder::drop_streamed_ops`]: windowed::WindowedTraceBuilder::drop_streamed_ops
     pub tails: bool,
+    /// Pack each table the build generates at the bytes its columns need as
+    /// soon as it is generated (`TraceTable::pack_main_narrow`), so the build
+    /// never holds many 64-bit tables at once ([`WindowedTraceBuilder::pack_finished_tables`]).
+    /// `false` everywhere else.
+    ///
+    /// [`WindowedTraceBuilder::pack_finished_tables`]: windowed::WindowedTraceBuilder::pack_finished_tables
+    pub pack: bool,
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -3664,6 +3671,7 @@ pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksEx
 /// the first `skip` chunks already handed out: those slots get placeholders
 /// and are not generated again. `skip == 0` is the plain call. With `tails`,
 /// `ops` holds only the ops past those chunks ([`StreamSkip::tails`]).
+#[allow(clippy::too_many_arguments)]
 fn chunk_and_generate_skipping<T: Sync>(
     ops: &[T],
     max_rows: usize,
@@ -3671,6 +3679,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if skip == 0 {
@@ -3679,6 +3688,7 @@ fn chunk_and_generate_skipping<T: Sync>(
                 ops,
                 max_rows,
                 generate,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -3687,6 +3697,7 @@ fn chunk_and_generate_skipping<T: Sync>(
                 ops,
                 max_rows,
                 generate,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -3708,6 +3719,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tables.extend(generate_chunks(
         rest,
         generate,
+        pack,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?);
@@ -3722,6 +3734,7 @@ fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -3732,6 +3745,7 @@ fn chunk_and_generate<T: Sync>(
     generate_chunks(
         op_chunks,
         generate,
+        pack,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -3753,6 +3767,7 @@ fn chunk_and_generate_optional<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -3763,6 +3778,7 @@ fn chunk_and_generate_optional<T: Sync>(
     generate_chunks(
         op_chunks,
         generate,
+        pack,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -3777,12 +3793,14 @@ fn chunk_and_generate_optional<T: Sync>(
 fn generate_optional<T: Sync>(
     ops: &[T],
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
     generate_chunks(
         op_chunks,
         generate,
+        pack,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )
@@ -3794,6 +3812,7 @@ fn generate_optional<T: Sync>(
 fn generate_chunks<T: Sync>(
     op_chunks: Vec<&[T]>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
@@ -3810,6 +3829,13 @@ fn generate_chunks<T: Sync>(
         }
         return Ok(tables);
     }
+    let generate = |chunk: &[T]| {
+        let mut table = generate(chunk);
+        if pack {
+            table.pack_main_narrow();
+        }
+        table
+    };
     #[cfg(feature = "parallel")]
     let tables = op_chunks.into_par_iter().map(generate).collect();
     #[cfg(not(feature = "parallel"))]
@@ -4114,6 +4140,7 @@ fn build_traces<I: ImageSource + Sync>(
     skip: &StreamSkip,
     mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
+    let pack = skip.pack;
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -4372,6 +4399,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             false,
             cpu::generate_cpu_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4384,6 +4412,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             memw::generate_memw_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4396,6 +4425,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             memw_aligned::generate_memw_aligned_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4410,6 +4440,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             false,
             memw_register::generate_memw_register_trace_from_rows,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4422,6 +4453,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             load::generate_load_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4434,6 +4466,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             lt::generate_lt_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4446,6 +4479,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             shift::generate_shift_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4455,6 +4489,7 @@ fn build_traces<I: ImageSource + Sync>(
             &mul_ops,
             max_rows.mul,
             mul::generate_mul_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4464,6 +4499,7 @@ fn build_traces<I: ImageSource + Sync>(
             &dvrm_ops,
             max_rows.dvrm,
             dvrm::generate_dvrm_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4473,6 +4509,7 @@ fn build_traces<I: ImageSource + Sync>(
             &branch_ops,
             max_rows.branch,
             branch::generate_branch_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4484,6 +4521,7 @@ fn build_traces<I: ImageSource + Sync>(
             &eq_ops,
             max_rows.eq,
             eq::generate_eq_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4493,6 +4531,7 @@ fn build_traces<I: ImageSource + Sync>(
             &bytewise_ops,
             max_rows.bytewise,
             bytewise::generate_bytewise_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4505,6 +4544,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             store::generate_store_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4514,6 +4554,7 @@ fn build_traces<I: ImageSource + Sync>(
             &cpu32_ops,
             max_rows.cpu32,
             cpu32::generate_cpu32_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4538,6 +4579,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &commit_ops,
             commit::generate_commit_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4546,6 +4588,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &keccak_ops,
             keccak::generate_keccak_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4563,6 +4606,7 @@ fn build_traces<I: ImageSource + Sync>(
             generate_optional(
                 &keccak_rnd_ops,
                 keccak_rnd::generate_keccak_rnd_trace,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -4572,6 +4616,7 @@ fn build_traces<I: ImageSource + Sync>(
                 &keccak_rnd_ops,
                 (max_rows.keccak_rnd / 24).max(1),
                 keccak_rnd::generate_keccak_rnd_trace,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -4601,6 +4646,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &ecsm_ops,
             ecsm::generate_ecsm_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4610,6 +4656,7 @@ fn build_traces<I: ImageSource + Sync>(
             generate_optional(
                 &ecdas_ops,
                 ecdas::generate_ecdas_trace,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -4620,6 +4667,7 @@ fn build_traces<I: ImageSource + Sync>(
                 &ecdas_ops,
                 max_rows.ecdas.max(1),
                 ecdas::generate_ecdas_trace,
+                pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -4630,6 +4678,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &hint_ops,
             hint::generate_hint_trace,
+            pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
