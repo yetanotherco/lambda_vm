@@ -980,3 +980,38 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
     println!("DETERMINISM RESULT: {runs_equal}/2 windowed runs equal the whole-run build");
     assert_eq!(runs_equal, 2);
 }
+
+/// ★ Phase A's stream builds the same traces and precommits the same instances
+/// however its chunks reach the device: the committers generating them (as
+/// today), or generator threads ahead of them with every queue held to one
+/// chunk at a time (the bounded queues' back-pressure on every hand-off).
+#[test]
+fn the_stream_builds_the_same_traces_with_generators_and_bounded_queues() {
+    let opts = crate::lfm::proof::block_base_options();
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+        let (mut today, mut names) =
+            crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0, None)
+                .expect("committers generate");
+        assert!(!names.is_empty(), "{name}: nothing was streamed");
+        for (committers, generators, budget) in [(2, 3, Some(1)), (1, 1, None)] {
+            let (mut pooled, mut pooled_names) = crate::block::stream_for_test(
+                &program, &opts, &max_rows, committers, generators, budget,
+            )
+            .expect("generators ahead of the committers");
+            names.sort();
+            pooled_names.sort();
+            assert_eq!(names, pooled_names, "{name}: the instances precommitted");
+            widen_all(&mut pooled);
+            widen_all(&mut today);
+            same_traces(&today, &pooled);
+        }
+    }
+}

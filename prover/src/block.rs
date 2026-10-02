@@ -264,6 +264,7 @@ fn prove_block_with_observed(
             max_rows,
             residency,
             &mut times,
+            &StreamConfig::from_env(),
             ledger.as_deref(),
         )?
     } else {
@@ -460,6 +461,30 @@ fn stream_committers() -> usize {
         .unwrap_or(STREAM_COMMITTERS)
 }
 
+/// `LAMBDA_VM_BLOCK_GENERATORS=n` (1..=16): `n` threads generate each streamed
+/// chunk, and pack it on the host under narrow storage, before a committer
+/// takes it, so the committers only commit (and a chunk waits packed rather
+/// than as its ops). Unset or `0`: the committers generate. A measurement
+/// knob until its gate.
+fn stream_generators() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_GENERATORS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= 16)
+        .unwrap_or(0)
+}
+
+/// `LAMBDA_VM_BLOCK_READY_MIB=n` (n >= 1): with [`stream_generators`], the
+/// generated chunks waiting for a committer hold at most `n` MiB; unset or `0`:
+/// unbounded.
+fn ready_queue_budget() -> Option<usize> {
+    std::env::var("LAMBDA_VM_BLOCK_READY_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n << 20)
+}
+
 /// `LAMBDA_VM_BLOCK_QUEUE_MIB=n` (n >= 1): the streamed chunks waiting for a
 /// committer hold at most `n` MiB of ops ([`QueueRoom`]); the producer waits
 /// for room, and so do the walk and the executor behind it. Unset or `0`:
@@ -470,6 +495,29 @@ fn commit_queue_budget() -> Option<usize> {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .map(|n| n << 20)
+}
+
+/// How phase A's stream hands its chunks to the device: committer and
+/// generator threads, and the byte budgets of what waits for them.
+#[derive(Clone, Copy, Debug)]
+struct StreamConfig {
+    committers: usize,
+    generators: usize,
+    ops_budget: Option<usize>,
+    ready_budget: Option<usize>,
+}
+
+impl StreamConfig {
+    /// The block's: [`stream_committers`], [`stream_generators`],
+    /// [`commit_queue_budget`], [`ready_queue_budget`].
+    fn from_env() -> Self {
+        Self {
+            committers: stream_committers(),
+            generators: stream_generators(),
+            ops_budget: commit_queue_budget(),
+            ready_budget: ready_queue_budget(),
+        }
+    }
 }
 
 /// The streamed chunks on their way to a committer, by the bytes their ops
@@ -554,9 +602,13 @@ struct MemLedger {
     /// bytes (a job's ops, or the `push` arm's generated chunk).
     queued: std::sync::atomic::AtomicUsize,
     queued_bytes: std::sync::atomic::AtomicUsize,
-    /// What the committers hold: a taken job's ops, then its 64-bit trace
-    /// until it is packed or kept.
+    /// What the committers (or the generators) hold: a taken job's ops, then
+    /// its 64-bit trace until it is packed or kept.
     committing_bytes: std::sync::atomic::AtomicUsize,
+    /// Chunks generated (and packed) waiting for a committer, and their bytes
+    /// ([`stream_generators`]).
+    ready: std::sync::atomic::AtomicUsize,
+    ready_bytes: std::sync::atomic::AtomicUsize,
     /// Committed streamed chunks waiting for the finish, and their main
     /// traces' bytes, packed and 64-bit.
     committed: std::sync::atomic::AtomicUsize,
@@ -577,6 +629,8 @@ impl MemLedger {
             queued: AtomicUsize::new(0),
             queued_bytes: AtomicUsize::new(0),
             committing_bytes: AtomicUsize::new(0),
+            ready: AtomicUsize::new(0),
+            ready_bytes: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
             committed_packed: AtomicUsize::new(0),
             committed_wide: AtomicUsize::new(0),
@@ -608,15 +662,32 @@ impl MemLedger {
         self.committing_bytes.fetch_sub(ops, Relaxed);
     }
 
-    /// A committer kept a committed chunk of `wide` 64-bit bytes as `packed`
-    /// bytes (`None`: kept 64-bit).
-    fn keep(&self, wide: usize, packed: Option<usize>) {
+    /// A generator handed a chunk it held at `wide` bytes to the committers
+    /// as `held` bytes (packed, or still 64-bit).
+    fn ready(&self, wide: usize, held: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         self.committing_bytes.fetch_sub(wide, Relaxed);
+        self.ready.fetch_add(1, Relaxed);
+        self.ready_bytes.fetch_add(held, Relaxed);
+    }
+
+    /// A committer took a generated chunk of `held` bytes.
+    fn take_ready(&self, held: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ready.fetch_sub(1, Relaxed);
+        self.ready_bytes.fetch_sub(held, Relaxed);
+        self.committing_bytes.fetch_add(held, Relaxed);
+    }
+
+    /// A committer kept a committed chunk it held at `held` bytes as `packed`
+    /// bytes (`None`: kept 64-bit).
+    fn keep(&self, held: usize, packed: Option<usize>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.committing_bytes.fetch_sub(held, Relaxed);
         self.committed.fetch_add(1, Relaxed);
         match packed {
             Some(packed) => self.committed_packed.fetch_add(packed, Relaxed),
-            None => self.committed_wide.fetch_add(wide, Relaxed),
+            None => self.committed_wide.fetch_add(held, Relaxed),
         };
     }
 
@@ -639,11 +710,14 @@ impl MemLedger {
         });
         eprintln!(
             "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
-             committed {} ({:.2} packed + {:.2} 64-bit) · builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
+             ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · builder {:.2} · walk {:.2} · \
+             executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
             self.queued.load(Relaxed),
             g(&self.queued_bytes),
             g(&self.committing_bytes),
+            self.ready.load(Relaxed),
+            g(&self.ready_bytes),
             self.committed.load(Relaxed),
             g(&self.committed_packed),
             g(&self.committed_wide),
@@ -783,6 +857,7 @@ fn stream_air(table: StreamTable, index: usize, opts: &ProofOptions) -> VmAir {
 /// this thread keeps, routes and hands out each walked window. A window is
 /// walked once the next one arrives (the last goes to `finish`). The traces are
 /// a whole-run build's (the builder's own tests).
+#[allow(clippy::too_many_arguments)]
 fn build_streamed(
     program: &Elf,
     private_input: &[u8],
@@ -790,6 +865,7 @@ fn build_streamed(
     max_rows: &MaxRowsConfig,
     residency: ResidencyMode,
     times: &mut BlockTimes,
+    stream: &StreamConfig,
     ledger: Option<&MemLedger>,
 ) -> Result<Produced, Error> {
     use std::sync::Mutex;
@@ -800,8 +876,12 @@ fn build_streamed(
     let t = Instant::now();
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
-    let committer_count = stream_committers();
-    let queue = QueueRoom::new(commit_queue_budget());
+    let committer_count = stream.committers;
+    let queue = QueueRoom::new(stream.ops_budget);
+    let generators = stream.generators;
+    let ready = QueueRoom::new(stream.ready_budget);
+    let (ready_tx, ready_rx) = mpsc::channel::<(StreamedChunk, usize)>();
+    let ready_rx = Mutex::new(ready_rx);
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
@@ -839,33 +919,96 @@ fn build_streamed(
             s.spawn(|| warm_data_page_commitments(program, opts));
         }
 
-        // Committers: each streamed chunk generated and Round-1 committed, as
-        // the chunks complete.
+        // Generators ([`stream_generators`]): each streamed chunk generated,
+        // and packed under narrow storage, ahead of the committers.
+        for _ in 0..generators {
+            let (job_rx, queue, ready, narrowed, generate_secs) =
+                (&job_rx, &queue, &ready, &narrowed, &generate_secs);
+            let ready_tx = ready_tx.clone();
+            s.spawn(move || {
+                loop {
+                    let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    let job_bytes = streamed_bytes(&job);
+                    if let Some(ledger) = ledger {
+                        ledger.take(job_bytes);
+                    }
+                    let t = Instant::now();
+                    let mut chunk = match job {
+                        Streamed::Job(job) => job.generate(),
+                        Streamed::Chunk(chunk) => chunk,
+                    };
+                    queue.release(job_bytes);
+                    let wide = wide_bytes(&chunk.trace);
+                    if let Some(ledger) = ledger {
+                        ledger.generated(job_bytes, wide);
+                    }
+                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                        t.elapsed().as_secs_f64();
+                    let tp = Instant::now();
+                    if narrow && chunk.trace.pack_main_narrow() {
+                        narrowed.lock().unwrap_or_else(|e| e.into_inner()).2 +=
+                            tp.elapsed().as_secs_f64();
+                    }
+                    let held = chunk.trace.narrow_main().map_or(wide, |t| t.data().len());
+                    if let Some(ledger) = ledger {
+                        ledger.ready(wide, held);
+                    }
+                    ready.admit(held);
+                    if ready_tx.send((chunk, held)).is_err() {
+                        ready.release(held);
+                    }
+                }
+            });
+        }
+        drop(ready_tx);
+
+        // Committers: each streamed chunk generated (unless a generator did)
+        // and Round-1 committed, as the chunks complete.
         let mut committers = Vec::new();
         for _ in 0..committer_count {
             committers.push(s.spawn(|| -> Result<(), Error> {
                 let commit_all = || -> Result<(), Error> {
                     loop {
-                        let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(job) = job else {
-                            return Ok(());
+                        // `t`: from the chunk's arrival (its generation
+                        // included when this committer generates it).
+                        let (mut chunk, wide, held, t) = if generators > 0 {
+                            let next = ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok((chunk, held)) = next else {
+                                return Ok(());
+                            };
+                            let t = Instant::now();
+                            ready.release(held);
+                            if let Some(ledger) = ledger {
+                                ledger.take_ready(held);
+                            }
+                            let wide = wide_bytes(&chunk.trace);
+                            (chunk, wide, held, t)
+                        } else {
+                            let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(job) = job else {
+                                return Ok(());
+                            };
+                            let t = Instant::now();
+                            let job_bytes = streamed_bytes(&job);
+                            if let Some(ledger) = ledger {
+                                ledger.take(job_bytes);
+                            }
+                            let chunk = match job {
+                                Streamed::Job(job) => job.generate(),
+                                Streamed::Chunk(chunk) => chunk,
+                            };
+                            queue.release(job_bytes);
+                            let wide = wide_bytes(&chunk.trace);
+                            if let Some(ledger) = ledger {
+                                ledger.generated(job_bytes, wide);
+                            }
+                            *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                                t.elapsed().as_secs_f64();
+                            (chunk, wide, wide, t)
                         };
-                        let job_bytes = streamed_bytes(&job);
-                        if let Some(ledger) = ledger {
-                            ledger.take(job_bytes);
-                        }
-                        let t = Instant::now();
-                        let mut chunk = match job {
-                            Streamed::Job(job) => job.generate(),
-                            Streamed::Chunk(chunk) => chunk,
-                        };
-                        queue.release(job_bytes);
-                        let wide = wide_bytes(&chunk.trace);
-                        if let Some(ledger) = ledger {
-                            ledger.generated(job_bytes, wide);
-                        }
-                        *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                            t.elapsed().as_secs_f64();
                         let air = stream_air(chunk.table, chunk.index, opts);
                         let name = air.name().to_string();
                         #[allow(unused_mut)]
@@ -901,7 +1044,7 @@ fn build_streamed(
                         }
                         if let Some(ledger) = ledger {
                             let packed = chunk.trace.narrow_main().map(|t| t.data().len());
-                            ledger.keep(wide, packed);
+                            ledger.keep(held, packed);
                         }
                         committed
                             .lock()
@@ -912,6 +1055,7 @@ fn build_streamed(
                 let result = commit_all();
                 if result.is_err() {
                     queue.close();
+                    ready.close();
                 }
                 result
             }));
@@ -1045,10 +1189,15 @@ fn build_streamed(
         times.build = total - times.execute;
         eprintln!(
             "BLOCK PHASE stream {total:.2}s (execute {:.2} on its thread · collect+build {collect_secs:.2} · \
-             build+commit of {n} streamed instances {:.2} on {committer_count} threads, generate {:.2} of it)",
+             build+commit of {n} streamed instances {:.2} on {committer_count} threads, generate {:.2} {})",
             times.execute,
             *commit_secs.lock().unwrap_or_else(|e| e.into_inner()),
             *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
+            if generators > 0 {
+                format!("on {generators} generator threads")
+            } else {
+                "of it".to_string()
+            },
         );
         if narrow {
             let (wide, packed, secs, by_device) =
@@ -1066,14 +1215,20 @@ fn build_streamed(
             );
         }
         let (most_bytes, most_chunks) = *queue.most.lock().unwrap_or_else(|e| e.into_inner());
+        let (ready_bytes, ready_chunks) = *ready.most.lock().unwrap_or_else(|e| e.into_inner());
+        let budget =
+            |b: Option<usize>| b.map_or("none".to_string(), |b| format!("{} MiB", b >> 20));
         eprintln!(
-            "BLOCK QUEUE: {committer_count} committers · budget {} · at most {:.2} GiB in {most_chunks} \
-             chunks waiting for a committer · the producer waited {:.2} s for room",
-            queue
-                .budget
-                .map_or("none".to_string(), |b| format!("{} MiB", b >> 20)),
+            "BLOCK QUEUE: {committer_count} committers · {generators} generators · ops budget {} · at most \
+             {:.2} GiB in {most_chunks} chunks waiting as ops · the producer waited {:.2} s for room · \
+             ready budget {} · at most {:.2} GiB in {ready_chunks} chunks waiting generated · the \
+             generators waited {:.2} s for room",
+            budget(queue.budget),
             most_bytes as f64 / (1u64 << 30) as f64,
             *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
+            budget(ready.budget),
+            ready_bytes as f64 / (1u64 << 30) as f64,
+            *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
         );
         Ok((traces, decode_commitment, precommits))
     })
@@ -1232,6 +1387,40 @@ fn print_census<'a>(instances: impl Iterator<Item = (&'a str, usize, usize)>) {
         "BLOCK CENSUS total: {instances_total} sub-proofs, {} table types, {cells_total} main cells",
         types.len()
     );
+}
+
+/// [`build_streamed`] of `program` (no input) under a stream of `committers`
+/// committers, `generators` generators and `budget` bytes for each queue, for
+/// the tests: the traces, and the AIR of each streamed instance precommitted.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    committers: usize,
+    generators: usize,
+    budget: Option<usize>,
+) -> Result<(Traces, Vec<String>), Error> {
+    let stream = StreamConfig {
+        committers,
+        generators,
+        ops_budget: budget,
+        ready_budget: budget,
+    };
+    let (traces, _, precommits) = build_streamed(
+        program,
+        &[],
+        opts,
+        max_rows,
+        ResidencyMode::RecomputeLdeDevice,
+        &mut BlockTimes::default(),
+        &stream,
+        None,
+    )?;
+    Ok((
+        traces,
+        precommits.into_iter().map(|(name, _)| name).collect(),
+    ))
 }
 
 #[cfg(test)]
