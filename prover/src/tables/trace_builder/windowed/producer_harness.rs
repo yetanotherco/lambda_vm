@@ -689,6 +689,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// The block producer over a real block (D-EXEC X0). Box only.
 ///
 /// ```text
+/// _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1 \
 /// PRODUCER_ELF=/root/fixtures/ethrex_8f826601.elf \
 /// PRODUCER_INPUT=/root/fixtures/ethrex_mainnet_25368371_573004e6.bin \
 /// LAMBDA_VM_PRODUCER_WINDOW_LOG2=20 LAMBDA_VM_PRODUCER_ROWS_LOG2=21 \
@@ -700,9 +701,35 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// prover's (`max_rows.cpu`). `LAMBDA_VM_PRODUCER_SINK=skip` drops each chunk
 /// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows;
 /// `LAMBDA_VM_PRODUCER_LOG_DIGEST=1` prints a digest of every log (untimed).
+/// It refuses to run unless jemalloc never purges (the record chains'
+/// posture, `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`) or
+/// `LAMBDA_VM_PRODUCER_POSTURE=any` says another posture is meant.
 #[test]
 #[ignore = "box only: executes and walks a real block"]
 fn the_block_producer_alone() {
+    // The record chains run this binary under jemalloc's never-purge posture
+    // (`_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`); under the
+    // default decay the walk and the accumulator spent ~59 % of their time
+    // re-faulting freed pages (FAST 597), so a run under another posture is not
+    // a producer measurement unless it says so (`LAMBDA_VM_PRODUCER_POSTURE=any`).
+    // The options are read back from jemalloc itself, not from the environment.
+    let read = |name: &[u8]| -> isize {
+        // SAFETY: both options are jemalloc `ssize_t`s; `raw::read` checks the width.
+        unsafe { tikv_jemalloc_ctl::raw::read(name) }.expect("a jemalloc option")
+    };
+    let (dirty, muzzy) = (read(b"opt.dirty_decay_ms\0"), read(b"opt.muzzy_decay_ms\0"));
+    println!(
+        "PRODUCER POSTURE jemalloc opt.dirty_decay_ms {dirty} · opt.muzzy_decay_ms {muzzy} · \
+         _RJEM_MALLOC_CONF {:?}",
+        std::env::var("_RJEM_MALLOC_CONF").ok()
+    );
+    assert!(
+        (dirty, muzzy) == (-1, -1)
+            || std::env::var("LAMBDA_VM_PRODUCER_POSTURE").is_ok_and(|v| v == "any"),
+        "jemalloc decays freed pages (dirty {dirty}, muzzy {muzzy} ms): the record chains run never \
+         purge. Set _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1, or \
+         LAMBDA_VM_PRODUCER_POSTURE=any for a deliberate other posture"
+    );
     let elf = std::env::var("PRODUCER_ELF").expect("PRODUCER_ELF: the guest ELF's path");
     let input = std::env::var("PRODUCER_INPUT").expect("PRODUCER_INPUT: the block input's path");
     let elf_bytes = std::fs::read(&elf).unwrap_or_else(|e| panic!("read {elf}: {e}"));
