@@ -1007,7 +1007,7 @@ pub fn validate(prog: &Program, bp: &BudgetedProgram) -> Result<(), String> {
             Dim::Ext => {
                 if d < bp.base_words as usize
                     || d + 3 > words
-                    || (d - bp.base_words as usize) % 3 != 0
+                    || !(d - bp.base_words as usize).is_multiple_of(3)
                 {
                     return Err(err("ext result outside an ext slot".into()));
                 }
