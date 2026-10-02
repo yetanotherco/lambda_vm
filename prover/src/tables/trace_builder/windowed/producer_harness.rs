@@ -187,17 +187,25 @@ fn first_touch_bytes(window: &WalkedWindow) -> usize {
         return 0;
     };
     let memw = &window.walk.memw;
-    memw.aligned
+    // An aligned row's bytes share one old timestamp.
+    let aligned: usize = memw
+        .aligned
         .iter()
-        .chain(&memw.general)
-        .filter(|op| !op.is_register)
-        .map(|op| {
-            op.old_timestamp[..usize::from(op.width).min(8)]
-                .iter()
-                .filter(|&&ts| ts < t0)
-                .count()
-        })
-        .sum()
+        .filter(|row| !row.is_register() && row.old_timestamp() < t0)
+        .map(|row| usize::from(row.width()).min(8))
+        .sum();
+    aligned
+        + memw
+            .general
+            .iter()
+            .filter(|op| !op.is_register)
+            .map(|op| {
+                op.old_timestamp[..usize::from(op.width).min(8)]
+                    .iter()
+                    .filter(|&&ts| ts < t0)
+                    .count()
+            })
+            .sum::<usize>()
 }
 
 fn spawn_named<'scope, 'env, T: Send + 'scope>(
@@ -828,9 +836,15 @@ fn first_touch_bytes_are_the_distinct_bytes_a_window_touches() {
             let distinct: std::collections::BTreeSet<u64> = memw
                 .aligned
                 .iter()
-                .chain(&memw.general)
-                .filter(|op| !op.is_register)
-                .flat_map(|op| (0..u64::from(op.width)).map(|k| op.base_address.wrapping_add(k)))
+                .filter(|row| !row.is_register())
+                .map(|row| (row.base_address(), row.width()))
+                .chain(
+                    memw.general
+                        .iter()
+                        .filter(|op| !op.is_register)
+                        .map(|op| (op.base_address, op.width)),
+                )
+                .flat_map(|(base, width)| (0..u64::from(width)).map(move |k| base.wrapping_add(k)))
                 .collect();
             assert_eq!(
                 first_touch_bytes(&walked),

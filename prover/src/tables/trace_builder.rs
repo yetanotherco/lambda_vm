@@ -697,7 +697,7 @@ fn classify_memw(op: &MemwOperation) -> MemwRoute {
 struct MemwBuckets {
     /// Compact register rows (filled directly into the MEMW_R columns).
     register_rows: Vec<RegRow>,
-    aligned: Vec<MemwOperation>,
+    aligned: Vec<memw_aligned::AlignedRow>,
     general: Vec<MemwOperation>,
 }
 
@@ -714,7 +714,7 @@ impl MemwBuckets {
     fn push(&mut self, op: MemwOperation) {
         match classify_memw(&op) {
             MemwRoute::Register => self.register_rows.push(RegRow::from_memw(&op)),
-            MemwRoute::Aligned => self.aligned.push(op),
+            MemwRoute::Aligned => self.aligned.push(memw_aligned::AlignedRow::from_memw(&op)),
             MemwRoute::General => self.general.push(op),
         }
     }
@@ -2268,13 +2268,13 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
 /// Collects LT operations from MEMW_A for timestamp ordering.
 ///
 /// Each aligned operation has a single old_timestamp < timestamp check.
-fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
+fn collect_lt_from_memw_aligned(memw_aligned_ops: &[memw_aligned::AlignedRow]) -> Vec<LtOperation> {
     // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
     // Alignment guarantees addr + (width-1) never wraps: the largest width-N
     // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
     memw_aligned_ops
         .iter()
-        .map(|op| LtOperation::new(op.old_timestamp[0], op.timestamp, false))
+        .map(|op| LtOperation::new(op.old_timestamp(), op.timestamp(), false))
         .collect()
 }
 
@@ -2309,7 +2309,7 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 ///
 /// IS_HALF[base_address[i]] for i ∈ [0, 1] and IS_WORD[base_address[2]] are
 /// assumptions — the caller's (CPU's) responsibility.
-fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_memw_aligned(ops: &[memw_aligned::AlignedRow]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
     for_each_bitwise_from_memw_aligned(ops, |op| bitwise_ops.push(op));
     bitwise_ops
@@ -2318,7 +2318,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// [`collect_bitwise_from_memw_aligned`]'s lookups counted into `histogram`,
 /// with no list built.
 fn count_bitwise_from_memw_aligned(
-    ops: &[MemwOperation],
+    ops: &[memw_aligned::AlignedRow],
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
     for_each_bitwise_from_memw_aligned(ops, |op| histogram.bump(op));
@@ -2326,12 +2326,12 @@ fn count_bitwise_from_memw_aligned(
 
 /// Each of [`collect_bitwise_from_memw_aligned`]'s lookups, in its order.
 fn for_each_bitwise_from_memw_aligned(
-    ops: &[MemwOperation],
+    ops: &[memw_aligned::AlignedRow],
     mut emit: impl FnMut(BitwiseOperation),
 ) {
     for op in ops {
-        let low_half = (op.base_address & 0xFFFF) as u32;
-        let mask: u32 = match op.width {
+        let low_half = (op.base_address() & 0xFFFF) as u32;
+        let mask: u32 = match op.width() {
             2 => 1,
             4 => 3,
             8 => 7,
@@ -3893,7 +3893,7 @@ pub struct Traces {
 struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
-    memw_aligned_ops: Vec<MemwOperation>,
+    memw_aligned_ops: Vec<memw_aligned::AlignedRow>,
     /// Direct-fill MEMW_R rows (register fast path).
     memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
