@@ -115,12 +115,12 @@ impl BlockPartition {
 /// D-NOEPOCH §12.2's rule over the block's AIR-order instance list:
 ///
 /// 1. the KECCAK_RND instances seed leaves `0, 1, 2, …` (mod `num_leaves`);
-/// 2. ECDAS goes to leaf 1, `ECSM[0]` to leaf 2 and `KECCAK[0]` to leaf 3
+/// 2. `ECDAS[0]` goes to leaf 1, `ECSM[0]` to leaf 2 and `KECCAK[0]` to leaf 3
 ///    (mod `num_leaves`);
 /// 3. the fixed and tiny tables (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT,
 ///    COMMIT, HINT) go to leaf 0;
-/// 4. every other instance — ECSM and KECCAK chunks past the first included,
-///    so no count of them can overfill one leaf — in AIR order but PAGE last,
+/// 4. every other instance — ECDAS, ECSM and KECCAK chunks past the first
+///    included, so no count of them can overfill one leaf — in AIR order but PAGE last,
 ///    goes to the leaf whose cost so far is smallest (ties: the lowest leaf).
 ///
 /// `names` are the AIRs' names (`CPU[3]`, `PAGE:0x1000` …; the instance suffix
@@ -141,14 +141,19 @@ pub fn partition_by_rule(
         leaves[k % num_leaves].push(i);
         placed[i] = true;
     };
-    let (mut keccak_rnd, mut ecsm, mut keccak) = (0usize, 0usize, 0usize);
+    let (mut keccak_rnd, mut ecdas, mut ecsm, mut keccak) = (0usize, 0usize, 0usize, 0usize);
     for (i, name) in names.iter().enumerate() {
         match kind(name).as_str() {
             "KECCAK_RND" => {
                 place(&mut leaves, keccak_rnd, i);
                 keccak_rnd += 1;
             }
-            "ECDAS" => place(&mut leaves, 1, i),
+            "ECDAS" => {
+                if ecdas == 0 {
+                    place(&mut leaves, 1, i);
+                }
+                ecdas += 1;
+            }
             "ECSM" => {
                 if ecsm == 0 {
                     place(&mut leaves, 2, i);

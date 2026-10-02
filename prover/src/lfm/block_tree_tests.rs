@@ -318,8 +318,8 @@ fn the_partition_refuses_a_gap_an_overlap_and_an_empty_leaf() {
     assert!(empty.contains("verifies no instance"), "{empty}");
 }
 
-/// The rule's seeds and its min-load fill, on a toy instance list; KECCAK and
-/// ECSM chunks past the first fill by load with the rest.
+/// The rule's seeds and its min-load fill, on a toy instance list; KECCAK, ECSM
+/// and ECDAS chunks past the first fill by load with the rest.
 #[test]
 fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
     let names = [
@@ -361,11 +361,11 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
     // More leaves than the rule can fill: refused, never an empty leaf.
     assert!(partition_by_rule(&names, &costs, names.len() + 1).is_err());
 
-    // KECCAK[1] and ECSM[1] (instances 7 and 11 now) are not seeded: they fill
-    // by load in AIR order, before the CPU chunks. Loads after seeding: 67,
-    // 100, 40, 50 as above. KECCAK[1] → 2 (40 → 90), ECSM[1] → 3 (50 → 90),
-    // CPU[0] → 0 (67 → 97), CPU[1] → 2 (90 → 120), MEMW_R[0] → 3 (90 → 120),
-    // PAGE → 0 (97 → 107).
+    // KECCAK[1], ECSM[1] and ECDAS[1] (instances 7, 11 and 13 now) are not
+    // seeded: they fill by load in AIR order, before the CPU chunks. Loads after
+    // seeding: 67, 100, 40, 50 as above. KECCAK[1] → 2 (40 → 90), ECSM[1] → 3
+    // (50 → 90), ECDAS[1] → 0 (67 → 107), CPU[0] → 2 (90 → 120), CPU[1] → 3
+    // (90 → 120), MEMW_R[0] → 1 (100 → 130), PAGE → 0 (107 → 117).
     let chunked = [
         "BITWISE",
         "DECODE",
@@ -380,6 +380,7 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
         "ECSM[0]",
         "ECSM[1]",
         "ECDAS[0]",
+        "ECDAS[1]",
         "HINT[0]",
         "CPU[0]",
         "CPU[1]",
@@ -387,16 +388,16 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
         "MEMW_R[0]",
     ];
     let costs = [
-        1, 1, 1, 1, 1, 1, 50, 50, 60, 60, 40, 40, 40, 1, 30, 30, 10, 30,
+        1, 1, 1, 1, 1, 1, 50, 50, 60, 60, 40, 40, 40, 40, 1, 30, 30, 10, 30,
     ];
     let p = partition_by_rule(&chunked, &costs, 4).expect("four leaves fill");
     assert_eq!(
         p.leaves(),
         &[
-            vec![0, 1, 2, 3, 4, 5, 8, 13, 14, 16],
-            vec![9, 12],
+            vec![0, 1, 2, 3, 4, 5, 8, 13, 14, 17],
+            vec![9, 12, 18],
             vec![7, 10, 15],
-            vec![6, 11, 17],
+            vec![6, 11, 16],
         ]
     );
 }
@@ -566,15 +567,16 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
-/// ★ KECCAK and ECSM chunks past the first are spread by load, so no count of
-/// them overfills a leaf: 13 KECCAK instances at their 2^18 cap (≈ 284 k
-/// permutations of in-guest verification, over [`super::block_plan::LEAF_PERMS_CAP`]
-/// on one leaf) and 13 ECSM at 2^17 (≈ 423 k) beside 41 CPU chunks derive a
-/// plan whose every leaf is under the cap, with each table's chunks on more
-/// than one leaf. Pinned to one leaf each, as ECDAS still is, no leaf count
-/// can bring that leaf under the cap and the plan is refused.
+/// ★ KECCAK, ECSM and ECDAS chunks past the first are spread by load, so no
+/// count of them overfills a leaf: 13 KECCAK instances at their 2^18 cap (≈ 284
+/// k permutations of in-guest verification, over
+/// [`super::block_plan::LEAF_PERMS_CAP`] on one leaf), 13 ECSM at 2^17 (≈ 423 k)
+/// and 13 ECDAS at 2^17 (≈ 346 k) beside 41 CPU chunks derive a plan whose
+/// every leaf is under the cap, with each table's chunks on more than one leaf.
+/// Pinned to one leaf each, no leaf count can bring that leaf under the cap and
+/// the plan is refused.
 #[test]
-fn the_plan_spreads_keccak_and_ecsm_chunks_by_load() {
+fn the_plan_spreads_chunked_accelerators_by_load() {
     let opts = super::proof::block_base_options();
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
@@ -583,19 +585,21 @@ fn the_plan_spreads_keccak_and_ecsm_chunks_by_load() {
     const CPUS: usize = 40;
     shape.table_counts.keccak = CHUNKS;
     shape.table_counts.ecsm = CHUNKS;
+    shape.table_counts.ecdas = CHUNKS;
     shape.table_counts.cpu += CPUS;
-    // In AIR order after the five fixed tables: KECCAK 5–17, ECSM 18–30, then
-    // CPU[0] (32 rows) and the 40 CPU chunks added at 2^21.
-    let first_cpu = crate::FIXED_TABLE_COUNT + 2 * CHUNKS;
+    // In AIR order after the five fixed tables: KECCAK 5–17, ECSM 18–30, ECDAS
+    // 31–43, then CPU[0] (32 rows) and the 40 CPU chunks added at 2^21.
+    let first_cpu = crate::FIXED_TABLE_COUNT + 3 * CHUNKS;
     let mut lengths: Vec<usize> = shape.trace_lengths[..crate::FIXED_TABLE_COUNT].to_vec();
     lengths.extend([crate::BLOCK_KECCAK_MAX_ROWS; CHUNKS]);
     lengths.extend([crate::BLOCK_ECSM_MAX_ROWS; CHUNKS]);
+    lengths.extend([crate::BLOCK_ECDAS_MAX_ROWS; CHUNKS]);
     lengths.push(shape.trace_lengths[crate::FIXED_TABLE_COUNT]);
     lengths.extend([1 << 21; CPUS]);
     lengths.extend_from_slice(&shape.trace_lengths[crate::FIXED_TABLE_COUNT + 1..]);
     shape.trace_lengths = lengths;
     let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
-    assert!(plan.instance(first_cpu - 1).name.starts_with("ECSM["));
+    assert!(plan.instance(first_cpu - 1).name.starts_with("ECDAS["));
     assert!(plan.instance(first_cpu).name.starts_with("CPU["));
     let costs = plan.costs();
     let partition = plan.partition();
@@ -617,7 +621,8 @@ fn the_plan_spreads_keccak_and_ecsm_chunks_by_load() {
             .count()
     };
     let (keccak_leaves, ecsm_leaves) = (leaves_of("KECCAK"), leaves_of("ECSM"));
-    assert!(keccak_leaves > 1 && ecsm_leaves > 1);
+    let ecdas_leaves = leaves_of("ECDAS");
+    assert!(keccak_leaves > 1 && ecsm_leaves > 1 && ecdas_leaves > 1);
     let one_kind = |kind: &str| {
         let prefix = format!("{kind}[");
         (0..shape.trace_lengths.len())
@@ -627,9 +632,10 @@ fn the_plan_spreads_keccak_and_ecsm_chunks_by_load() {
     };
     println!(
         "PLAN SPREAD: {CHUNKS} KECCAK ({} perms) on {keccak_leaves} leaves, {CHUNKS} ECSM ({} perms) \
-         on {ecsm_leaves}; {} leaves, heaviest {heaviest}",
+         on {ecsm_leaves}, {CHUNKS} ECDAS ({} perms) on {ecdas_leaves}; {} leaves, heaviest {heaviest}",
         one_kind("KECCAK"),
         one_kind("ECSM"),
+        one_kind("ECDAS"),
         partition.num_leaves()
     );
 }
