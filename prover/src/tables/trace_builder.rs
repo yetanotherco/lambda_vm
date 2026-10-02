@@ -3895,6 +3895,9 @@ pub struct StreamSkip {
     /// each afterwards, as every other table, instead of packed a block at a
     /// time (the A arm of the packed builds). The words are the same.
     pub wide_builds: bool,
+    /// Concatenate LT's segments into one list in phase 3, as the build did
+    /// before [`Segmented`] (the A arm of the segments). The tables are the same.
+    pub concat_lt: bool,
 }
 
 /// How a build packs what it generates ([`StreamSkip::pack`]).
@@ -4704,15 +4707,29 @@ fn build_traces<I: ImageSource + Sync>(
             ]
         })
         .collect();
-    let lt_ops = Segmented {
-        parts: vec![
-            &lt_ops[..],
-            &memw_lt,
-            &lt_from_memw,
-            &memw_aligned_lt,
-            &lt_from_memw_aligned,
-            &lt_from_hints,
-        ],
+    let lt_concat: Vec<LtOperation>;
+    let lt_ops = if skip.concat_lt {
+        let mut all = lt_ops;
+        all.extend(memw_lt);
+        all.extend(lt_from_memw);
+        all.extend(memw_aligned_lt);
+        all.extend(lt_from_memw_aligned);
+        all.extend(lt_from_hints);
+        lt_concat = all;
+        Segmented {
+            parts: vec![&lt_concat[..]],
+        }
+    } else {
+        Segmented {
+            parts: vec![
+                &lt_ops[..],
+                &memw_lt,
+                &lt_from_memw,
+                &memw_aligned_lt,
+                &lt_from_memw_aligned,
+                &lt_from_hints,
+            ],
+        }
     };
     finish_mark("p3 lt");
 

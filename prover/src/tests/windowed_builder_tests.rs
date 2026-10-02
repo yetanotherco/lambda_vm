@@ -687,16 +687,22 @@ fn packing_the_finished_tables_keeps_the_words() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        // A bound of one chunk at 8 bytes a cell at once (and none, 0) builds
-        // the same tables.
-        // And so do KECCAK_RND and LT built wide, then packed.
-        for (window, wide) in [(7, false), (33, false), (33, true)] {
+        // KECCAK_RND and LT built packed or wide then packed, and LT's ops
+        // chunked as segments or concatenated into one list (the segments' A
+        // arm), all give the same tables.
+        for (window, wide, concat) in [
+            (7, false, false),
+            (33, false, false),
+            (33, true, false),
+            (33, false, true),
+        ] {
             let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
                 let b = b
                     .drop_streamed_ops()
                     .expect("before any window")
                     .pack_finished_tables();
-                if wide { b.build_wide_then_pack() } else { b }
+                let b = if wide { b.build_wide_then_pack() } else { b };
+                if concat { b.concat_lt() } else { b }
             });
             assert!(
                 widen_all(&mut packed) > 0,

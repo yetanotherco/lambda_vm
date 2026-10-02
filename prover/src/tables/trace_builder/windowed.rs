@@ -276,6 +276,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// `finish` concatenates LT's ops into one list before chunking them
+    /// ([`StreamSkip::concat_lt`]), as it did before keeping them as segments.
+    /// The tables are the same.
+    pub fn concat_lt(mut self) -> Self {
+        self.emitted.concat_lt = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus

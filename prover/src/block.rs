@@ -448,6 +448,13 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
+/// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
+/// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
+/// of keeping them as segments; the tables are the same.
+fn lt_concat() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
+}
+
 /// `LAMBDA_VM_BLOCK_PACKED_BUILD=1`: with [`narrow_finished`], the finish
 /// builds KECCAK_RND and LT packed a block at a time; unset or anything else
 /// builds them at 8 bytes a cell and packs them afterwards, as the other
@@ -1032,6 +1039,9 @@ fn build_streamed(
                 if !packed_builds() {
                     builder = builder.build_wide_then_pack();
                 }
+            }
+            if lt_concat() {
+                builder = builder.concat_lt();
             }
             if let Some(ledger) = ledger {
                 eprintln!(
