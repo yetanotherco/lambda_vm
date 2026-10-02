@@ -359,3 +359,87 @@ fn the_one_pass_routing_is_the_routing() {
         );
     }
 }
+
+/// Routing a run window by window into the run's segments in place, counting
+/// the CPU ops' lookups in the same pass, gives the segments the one-pass
+/// routing's appended windows give, and the counts of the separate count.
+#[test]
+fn the_in_place_routing_is_the_appended_routing() {
+    for name in [
+        "all_instructions_64",
+        "lw_sw_offset_odd",
+        "test_keccak_multi",
+        "mulh_max",
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+        let logs = Executor::new(&program, Vec::new())
+            .expect("the executor starts")
+            .run()
+            .expect("the program runs")
+            .logs;
+        let artifacts = DecodeArtifacts::from_elf(&program).expect("the decode artifacts");
+        let decode = &artifacts.decode;
+        let cpu_ops = collect_cpu_ops(&logs, decode).expect("the CPU ops");
+        let image = build_initial_image(&program, &[]);
+        let register_init = register::register_init_from_entry_point(program.entry_point);
+        for window in [1, 37, cpu_ops.len()] {
+            let mut memory_state = MemoryState::from_image(&image);
+            let mut register_state = RegisterState::from_init(&register_init);
+            let (mut appended, mut in_place) =
+                (RoutedSegments::default(), RoutedSegments::default());
+            let (mut counted, mut fused) = (
+                bitwise::BitwiseHistogram::new(),
+                bitwise::BitwiseHistogram::new(),
+            );
+            for ops in cpu_ops.chunks(window) {
+                let mut walk = WalkOutputs::with_capacity(ops.len());
+                collect_ops_from_cpu_into(
+                    ops,
+                    decode,
+                    &mut memory_state,
+                    &mut register_state,
+                    &mut walk,
+                    true,
+                );
+                appended.append(route_ops_one_pass(ops, decode, &walk.cpu32_ops));
+                ops.iter()
+                    .for_each(|op| decode.op(op).count_bitwise_into(&mut counted));
+                route_ops_into(ops, decode, &walk.cpu32_ops, &mut in_place, &mut fused);
+            }
+            assert_eq!(
+                format!("{:?}", segments_of(appended)),
+                format!("{:?}", segments_of(in_place)),
+                "{name}, windows of {window}"
+            );
+            assert!(
+                multiplicities(&counted) == multiplicities(&fused),
+                "{name}, windows of {window}: counts"
+            );
+        }
+    }
+}
+
+/// Every segment, in a printable form.
+fn segments_of(s: RoutedSegments) -> String {
+    let RoutedSegments {
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        shift_cpu32,
+        mul_cpu32,
+        dvrm_cpu32,
+        bitwise_cpu32,
+        lt_dvrm_filter,
+        lt_dvrm_cpu32,
+        mul_dvrm_filter,
+        mul_dvrm_cpu32,
+    } = s;
+    format!(
+        "{branch_ops:?}|{mul_filter:?}|{dvrm_filter:?}|{eq_ops:?}|{bytewise_ops:?}|{store_ops:?}|\
+         {shift_cpu32:?}|{mul_cpu32:?}|{dvrm_cpu32:?}|{bitwise_cpu32:?}|{lt_dvrm_filter:?}|\
+         {lt_dvrm_cpu32:?}|{mul_dvrm_filter:?}|{mul_dvrm_cpu32:?}"
+    )
+}
