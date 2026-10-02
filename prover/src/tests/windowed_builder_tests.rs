@@ -8,7 +8,7 @@ use math::field::element::FieldElement;
 use stark::trace::TraceTable;
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::{StreamTable, Traces, WindowedTraceBuilder};
+use crate::tables::trace_builder::{StreamTable, Traces, WalkLean, WindowedTraceBuilder};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::asm_elf_bytes;
 
@@ -916,4 +916,60 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
     }
     println!("DETERMINISM RESULT: {runs_equal}/2 windowed runs equal the whole-run build");
     assert_eq!(runs_equal, 2);
+}
+
+/// ★ The lean walk (D-EXEC E1: each cycle's decode from a dense table, memory
+/// accesses found by page, the in-walk BITWISE lookups counted from the CPU and
+/// LOAD ops instead of listed, the routing in one pass) builds the whole-run
+/// tables, and so does the walk it replaces: at every window length, with and
+/// without dropping the streamed ops (the dropping builds through the split),
+/// on programs with keccak calls, narrow and odd-offset loads and stores; and
+/// so does each part alone.
+#[test]
+fn the_lean_walk_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    let only = |f: fn(&mut WalkLean)| {
+        let mut lean = WalkLean::NONE;
+        f(&mut lean);
+        lean
+    };
+    let parts = [
+        only(|l| l.decode = true),
+        only(|l| l.memory = true),
+        only(|l| l.lookups = true),
+        only(|l| l.route = true),
+    ];
+    for name in [
+        "sub",
+        "all_instructions_64",
+        "test_keccak",
+        "test_keccak_multi",
+        "lw_sw_offset_odd",
+        "test_memw_split_ts",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 32, 33, 1000, logs.len()] {
+            let mut settings = vec![WalkLean::NONE, WalkLean::ALL];
+            if window == 33 && name.starts_with("test_") {
+                settings.extend(parts);
+            }
+            for lean in settings {
+                for drop in [false, true] {
+                    let (traces, _) =
+                        windowed_with(&program, &logs, &max_rows, window, drop, |builder| {
+                            let builder = builder.walk_lean(lean);
+                            if drop {
+                                builder
+                                    .drop_streamed_ops()
+                                    .expect("before the first window")
+                            } else {
+                                builder
+                            }
+                        });
+                    same_traces(&reference, &traces);
+                }
+            }
+        }
+    }
 }
