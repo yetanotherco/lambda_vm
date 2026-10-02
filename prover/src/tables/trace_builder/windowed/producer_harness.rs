@@ -136,6 +136,31 @@ fn thread_cpu() -> Option<f64> {
     Some(ns as f64 * 1e-9)
 }
 
+/// PROBE: this thread's user and system seconds and minor faults so far, from
+/// `/proc/thread-self/stat` (clock ticks of 10 ms), printed as a
+/// `PRODUCER THREAD` line.
+fn thread_probe(name: &str) {
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else {
+        return;
+    };
+    let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return;
+    };
+    // After the comm: state (field 3), ppid (4), … minflt (10), utime (14), stime (15).
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |i: usize| {
+        f.get(i - 3)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    println!(
+        "PRODUCER THREAD {name}: user {:.2} s · sys {:.2} s · minor faults {}",
+        num(14) as f64 / 100.0,
+        num(15) as f64 / 100.0,
+        num(10)
+    );
+}
+
 /// The process's `VmHWM` in GiB (Linux).
 fn peak_gib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -293,6 +318,7 @@ pub(crate) fn run_producer(
             }
             times.done_at = since();
             times.cpu = cpu_since(cpu0);
+            thread_probe("prod-exec");
             live(format!(
                 "executor done · {cycles} cycles · resume {resume:.3} · copy {copy:.3} · cpu {} s",
                 opt(times.cpu)
@@ -355,6 +381,7 @@ pub(crate) fn run_producer(
                 }
                 times.done_at = since();
                 times.cpu = cpu_since(cpu0);
+                thread_probe(&format!("prod-gen{i}"));
                 times
             })?);
         }
@@ -407,6 +434,7 @@ pub(crate) fn run_producer(
                             }
                             times.done_at = since();
                             times.cpu = cpu_since(cpu0);
+                            thread_probe("prod-walk");
                             live(format!(
                                 "walker done · {} windows · walk {walk_total:.3} · cpu {} s",
                                 walked_at.len(),
@@ -474,6 +502,7 @@ pub(crate) fn run_producer(
                 report.stamp_route = stamps.route;
                 report.stamp_handout = stamps.generate;
                 report.peak_windows = peak_gib();
+                thread_probe("prod-acc (windows done)");
                 live(format!(
                     "windows done · walk {:.3} · route {:.3} · hand-out {:.3} · accumulator cpu {} s · \
                      rss {} GiB · hwm {} GiB",
