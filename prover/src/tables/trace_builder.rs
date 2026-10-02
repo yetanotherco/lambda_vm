@@ -482,6 +482,11 @@ pub(crate) struct WalkLean {
     /// walker, and the median block's windows gained 0.9 s against a
     /// registered 1.5–5 s (FAST 601).
     pub(crate) walk_counts: bool,
+    /// The accumulator's hand-out without copies or lists: a chunk leaves as
+    /// shared ranges of the window parts (the generator makes it one list),
+    /// its lookups are counted without a list, and each CPU op's DECODE row
+    /// comes from the decode table (with `decode`) instead of a hash map.
+    pub(crate) handout: bool,
 }
 
 impl WalkLean {
@@ -491,6 +496,7 @@ impl WalkLean {
         lookups: true,
         route: true,
         walk_counts: false,
+        handout: true,
     };
     pub(crate) const NONE: Self = Self {
         decode: false,
@@ -498,6 +504,7 @@ impl WalkLean {
         lookups: false,
         route: false,
         walk_counts: false,
+        handout: false,
     };
 
     /// How the walk treats its in-walk BITWISE lookups under these parts.
@@ -512,8 +519,8 @@ impl WalkLean {
     }
 
     /// `LAMBDA_VM_WALK_LEAN`: unset or `1` the parts of [`Self::ALL`], `0` none,
-    /// or a comma list of `decode`, `memory`, `lookups`, `route`, `walkcount`.
-    /// Read once; any other value is refused.
+    /// or a comma list of `decode`, `memory`, `lookups`, `route`, `walkcount`,
+    /// `handout`. Read once; any other value is refused.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
         LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
@@ -521,7 +528,7 @@ impl WalkLean {
             Ok(v) => Self::parse(&v).ok_or_else(|| {
                 format!(
                     "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, \
-                     route, walkcount"
+                     route, walkcount, handout"
                 )
             }),
         })
@@ -543,6 +550,7 @@ impl WalkLean {
                 "lookups" => lean.lookups = true,
                 "route" => lean.route = true,
                 "walkcount" => lean.walk_counts = true,
+                "handout" => lean.handout = true,
                 _ => return None,
             }
         }

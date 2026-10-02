@@ -944,6 +944,12 @@ fn the_lean_walk_builds_the_whole_run_tables() {
             walk_counts: true,
             ..WalkLean::ALL
         },
+        // Every part but the hand-out's (copies and lists, as before).
+        WalkLean {
+            handout: false,
+            ..WalkLean::ALL
+        },
+        only(|l| l.handout = true),
     ];
     for name in [
         "sub",
