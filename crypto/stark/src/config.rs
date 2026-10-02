@@ -495,8 +495,12 @@ const _: () = assert!(matches!(
 /// drift-test time, with a mismatch that names no cause. Here it is a compile
 /// error that names one.
 ///
+/// The one exemption is `crypto/blake3-7round`, which asks for seven rounds by
+/// name: a build that carries it is a hash-comparison build that recomputes the
+/// roots it needs, not one that lost the feature by accident.
 const _: () = assert!(
-    crypto::hash::blake3::BLAKE3_ROUNDS == crypto::hash::blake3::BLAKE3_SIX_ROUNDS,
+    crypto::hash::blake3::BLAKE3_ROUNDS == crypto::hash::blake3::BLAKE3_SIX_ROUNDS
+        || crypto::hash::blake3::BLAKE3_STANDARD_FORCED,
     "the default commitment configuration is BLAKE3, so this build must enable \
      `crypto/blake3-6round` (via `lambda-vm-prover/blake3-6round`, or the \
      default feature set): every blessed root was generated at six rounds"
