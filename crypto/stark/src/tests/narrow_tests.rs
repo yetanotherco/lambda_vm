@@ -161,9 +161,14 @@ fn a_bad_device_widen_is_refused() {
             0,
             "table {table}: the perturbation never fired"
         );
+        // The kept-top check is the one that fires: its message names the
+        // rebuilt subtree and the kept tree (no table).
         match out {
             Err(ProvingError::RecomputedCommitmentMismatch(msg)) => {
-                assert!(msg.contains(&format!("table {table}")), "{msg}")
+                assert!(
+                    msg.contains("does not match the kept tree"),
+                    "table {table}: {msg}"
+                )
             }
             Err(e) => panic!("table {table}: wrong refusal {e:?}"),
             Ok(_) => panic!("table {table}: a bad widen was proved"),
