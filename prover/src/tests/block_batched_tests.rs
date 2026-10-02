@@ -527,45 +527,58 @@ fn default_digest(proof: &BlockWhirProof) -> String {
 
 /// ★ The per-table default keeps today's bytes: the default format's proof of
 /// fixed traces over canonical rows ([`canonical_rows`]) — its multilinear
-/// proof, its prepared openings and its partition — digests to what
-/// noepoch/whir @ 11e2de53d (before the batched format) proves over the same
-/// rows, with a deterministic grind. The batched argue's only mark on a
-/// default proof is [`BlockWhirProof::argues`], empty.
+/// proof, its prepared openings and its partition — digests to what the block
+/// prover before the batched format proves over the same rows, with a
+/// deterministic grind. The batched argue's only mark on a default proof is
+/// [`BlockWhirProof::argues`], empty.
+///
+/// The digests depend on the ELF bytes (the statement absorbs the program's
+/// digest), and the guests' bytes differ between toolchains, so the expected
+/// digests are not constants here: `BLOCK_DEFAULT_DIGESTS` carries them
+/// (`name=hex;name=hex;…`), proved on the same machine and ELFs by the same
+/// body at the base sha (the box gate does both). A record: at noepoch/whir @
+/// 11e2de53d, on the laptop's ELFs (all_instructions_64 md5 9ded1481…,
+/// test_dense_pages b753fbd8…, sub ceefc702…), the host proves 6e0bd41e…,
+/// 3b7726b1…, ca028342…, the same in two runs, and this branch proves the same.
 ///
 /// Run alone, with the grind deterministic (it is read once per process):
 ///
 /// ```text
-/// LAMBDA_VM_DETERMINISTIC_GRIND=1 cargo test --release -p lambda-vm-prover --lib -- \
-///     tests::block_batched_tests::the_default_format_keeps_todays_bytes --exact --ignored
+/// LAMBDA_VM_DETERMINISTIC_GRIND=1 BLOCK_DEFAULT_DIGESTS='all_instructions_64=…;test_dense_pages=…;sub=…' \
+///     cargo test --release -p lambda-vm-prover --lib -- \
+///     tests::block_batched_tests::the_default_format_keeps_todays_bytes --exact --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "needs LAMBDA_VM_DETERMINISTIC_GRIND=1, run alone"]
+#[ignore = "needs LAMBDA_VM_DETERMINISTIC_GRIND=1 and BLOCK_DEFAULT_DIGESTS, run alone"]
 fn the_default_format_keeps_todays_bytes() {
     assert!(
         crypto::grinding::deterministic(),
         "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
     );
+    let given = std::env::var("BLOCK_DEFAULT_DIGESTS")
+        .expect("BLOCK_DEFAULT_DIGESTS: the base sha's digests, name=hex;…");
+    let expected = |name: &str| -> String {
+        given
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(n, _)| *n == name)
+            .map(|(_, hex)| hex.to_string())
+            .unwrap_or_else(|| panic!("BLOCK_DEFAULT_DIGESTS has no digest for {name}"))
+    };
     let cases = [
         (
             "all_instructions_64",
             many_groups(PER_TABLE),
             MaxRowsConfig::small(),
-            TODAY_ALL_INSTRUCTIONS_64,
         ),
         (
             "test_dense_pages",
             one_group(PER_TABLE),
             MaxRowsConfig::default(),
-            TODAY_DENSE_PAGES,
         ),
-        (
-            "sub",
-            many_groups(PER_TABLE),
-            MaxRowsConfig::small(),
-            TODAY_SUB,
-        ),
+        ("sub", many_groups(PER_TABLE), MaxRowsConfig::small()),
     ];
-    for (name, format, max_rows, today) in cases {
+    for (name, format, max_rows) in cases {
         let (program, elf, mut traces) = fixed_traces(name, &max_rows, 16);
         canonical_rows(&program, &mut traces);
         let o = options(max_rows, 16);
@@ -581,16 +594,13 @@ fn the_default_format_keeps_todays_bytes() {
         assert!(proof.argues.is_empty(), "{name}");
         let digest = default_digest(&proof);
         println!("BLOCK DEFAULT DIGEST {name}: {digest}");
-        assert_eq!(digest, today, "{name}: the default format's bytes moved");
+        assert_eq!(
+            digest,
+            expected(name),
+            "{name}: the default format's bytes moved"
+        );
     }
 }
-
-/// [`the_default_format_keeps_todays_bytes`]' digests, proved at noepoch/whir
-/// @ 11e2de53d (before the batched format) on the host, the same in two runs.
-const TODAY_ALL_INSTRUCTIONS_64: &str =
-    "6e0bd41e2a32e5090a420539401c044f03b7001d534e8c1547d8edc5bb80fb4b";
-const TODAY_DENSE_PAGES: &str = "3b7726b1e4ef99a61503d71b7e3d51c3fd5e7bcb307fd93d954fe48948d8db53";
-const TODAY_SUB: &str = "ca028342931fd34e9ef2c82fa0ed44281a4b92dc2a2c394d6c39e7067f5a4f42";
 
 /// ★ N-2's card gate (box only): every group's batched argue on the card
 /// proves the host reference's bytes, over one commitment — the same fixed
