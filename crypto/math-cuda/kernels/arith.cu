@@ -116,3 +116,46 @@ extern "C" __global__ void widen_narrow_row_major(const uint8_t *data,
     for (uint32_t i = 0; i < w; i++) v |= (uint64_t)p[i] << (8 * i);
     out[tid] = v;
 }
+
+// Column maxima of a column-major rows x cols trace (`src[c*rows + r]`), the
+// widths of its packed form (crypto/stark/src/narrow.rs): blockIdx.y is the
+// column, the x blocks stride its rows, and each block folds its maximum into
+// max_out[c]. blockDim.x must be 256.
+extern "C" __global__ void column_max_col_major(const uint64_t *src,
+                                                uint64_t rows,
+                                                unsigned long long *max_out) {
+    __shared__ unsigned long long s[256];
+    const uint64_t *col = src + (uint64_t)blockIdx.y * rows;
+    unsigned long long m = 0;
+    for (uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; r < rows;
+         r += (uint64_t)gridDim.x * blockDim.x) {
+        unsigned long long v = col[r];
+        m = v > m ? v : m;
+    }
+    s[threadIdx.x] = m;
+    __syncthreads();
+    for (unsigned int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (threadIdx.x < k && s[threadIdx.x + k] > s[threadIdx.x]) s[threadIdx.x] = s[threadIdx.x + k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(&max_out[blockIdx.y], s[0]);
+}
+
+// Pack a column-major rows x cols trace at per-column widths: column c's word
+// r goes to out[offsets[c] + r*widths[c]], little-endian (the layout
+// widen_narrow_row_major reads). One thread per word.
+extern "C" __global__ void pack_col_major(const uint64_t *src,
+                                          uint64_t rows,
+                                          uint64_t cols,
+                                          const uint64_t *offsets,
+                                          const uint8_t *widths,
+                                          uint8_t *out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= rows * cols) return;
+    uint64_t c = tid / rows;
+    uint64_t r = tid - c * rows;
+    uint32_t w = widths[c];
+    uint64_t v = src[tid];
+    uint8_t *p = out + offsets[c] + r * w;
+    for (uint32_t i = 0; i < w; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
