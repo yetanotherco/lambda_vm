@@ -51,6 +51,10 @@ where
     /// instead of paying the H2D inside its chain.
     #[cfg(feature = "cuda")]
     pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+    /// The main trace packed at the bytes its columns need
+    /// ([`Self::pack_main_narrow`]): `main_table` then holds no data, only its
+    /// width and height, until [`Self::widen_main_on_host`].
+    pub(crate) narrow_main: Option<std::sync::Arc<crate::narrow::NarrowMain>>,
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -192,6 +196,7 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
@@ -222,6 +227,7 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
@@ -245,6 +251,7 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
@@ -353,7 +360,83 @@ where
     }
 
     pub fn columns_main(&self) -> Vec<Vec<FieldElement<F>>> {
+        if let Some(narrow) = &self.narrow_main {
+            return (0..narrow.cols())
+                .map(|c| {
+                    narrow
+                        .column(c)
+                        .into_iter()
+                        .map(|w| word_as_element::<F>(w))
+                        .collect()
+                })
+                .collect();
+        }
         self.main_table.columns()
+    }
+
+    /// Pack the main trace at the bytes its columns need and free the 64-bit
+    /// copy ([`crate::narrow::NarrowMain`]): the raw words come back bit for
+    /// bit from [`Self::widen_main_on_host`], or on the device from the
+    /// prover. Only a Goldilocks trace held in memory packs, and none under
+    /// `debug-checks`; `false` leaves the trace as it was.
+    pub fn pack_main_narrow(&mut self) -> bool
+    where
+        F: 'static,
+    {
+        if self.narrow_main.is_some() {
+            return true;
+        }
+        // The debug checks read the host trace after the aux build, where the
+        // packed copy is already freed.
+        if cfg!(feature = "debug-checks") {
+            return false;
+        }
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || self.main_table.data.len() != self.main_table.width * self.main_table.height
+        {
+            return false;
+        }
+        #[cfg(feature = "disk-spill")]
+        if self.main_table.mmap_backing.is_some() {
+            return false;
+        }
+        let words = elements_as_words(&self.main_table.data);
+        let narrow = crate::narrow::NarrowMain::pack(words, self.main_table.width);
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        true
+    }
+
+    /// Whether the main trace is packed ([`Self::pack_main_narrow`]).
+    pub fn is_main_narrow(&self) -> bool {
+        self.narrow_main.is_some()
+    }
+
+    /// The packed main trace, if [`Self::pack_main_narrow`] packed it.
+    pub fn narrow_main(&self) -> Option<&crate::narrow::NarrowMain> {
+        self.narrow_main.as_deref()
+    }
+
+    /// Bring a packed main trace back to 64-bit words on the host, the words
+    /// it was packed from. A no-op on a trace that is not packed.
+    pub fn widen_main_on_host(&mut self)
+    where
+        F: 'static,
+    {
+        let Some(narrow) = self.narrow_main.take() else {
+            return;
+        };
+        let mut words = vec![0u64; narrow.rows() * narrow.cols()];
+        narrow.widen_into(&mut words);
+        self.main_table.data = words_as_elements::<F>(words);
+    }
+
+    /// Drop a packed main trace without widening it: its last reader (the
+    /// device recompute, then the aux build) is done. The table keeps its
+    /// width and height.
+    pub fn drop_narrow_main(&mut self) {
+        self.narrow_main = None;
     }
 
     pub fn columns_aux(&self) -> Vec<Vec<FieldElement<E>>> {
@@ -1156,4 +1239,46 @@ where
         }
     }
     evaluation_points
+}
+
+/// A Goldilocks word as a field element: the packing is only done for
+/// Goldilocks traces ([`TraceTable::pack_main_narrow`]), whose elements are the
+/// raw `u64` words.
+fn word_as_element<F: IsField>(w: u64) -> FieldElement<F> {
+    debug_assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    // SAFETY: only reached for a packed trace, which `pack_main_narrow` packs
+    // only when `F` is `GoldilocksField`, whose `FieldElement` is a
+    // `#[repr(transparent)]` `u64`.
+    unsafe { std::mem::transmute_copy::<u64, FieldElement<F>>(&w) }
+}
+
+/// A Goldilocks trace's elements as their raw words (see [`word_as_element`]).
+fn elements_as_words<F: IsField>(data: &[FieldElement<F>]) -> &[u64] {
+    assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    // SAFETY: as `word_as_element`; same size and alignment as `u64`.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len()) }
+}
+
+/// Raw words back as a Goldilocks trace's elements, without a copy.
+fn words_as_elements<F: IsField>(words: Vec<u64>) -> Vec<FieldElement<F>> {
+    assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    let mut words = std::mem::ManuallyDrop::new(words);
+    // SAFETY: as `word_as_element`; the allocation's layout (size and
+    // alignment of `u64`) is the element's.
+    unsafe {
+        Vec::from_raw_parts(
+            words.as_mut_ptr() as *mut FieldElement<F>,
+            words.len(),
+            words.capacity(),
+        )
+    }
 }

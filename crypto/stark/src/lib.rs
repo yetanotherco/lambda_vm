@@ -29,6 +29,7 @@ pub mod merkle_caps;
 pub mod multilinear_air;
 pub mod multilinear_logup;
 pub mod multilinear_table;
+pub mod narrow;
 pub mod ood;
 pub(crate) mod par;
 pub mod profile_markers;
