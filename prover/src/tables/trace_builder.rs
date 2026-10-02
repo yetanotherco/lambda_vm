@@ -528,6 +528,38 @@ impl WalkLean {
     }
 }
 
+/// PROBE ONLY (exec/e2-probe, not for merge): parts of the walk to leave out,
+/// for attributing its time (`LAMBDA_VM_WALK_PROBE_SKIP`, a comma list of
+/// `cpu32`, `mem`, `regs`, `alu`). The traces are wrong with any of them.
+pub(crate) mod walk_probe {
+    #[derive(Default)]
+    pub(crate) struct Skip {
+        pub(crate) cpu32: bool,
+        pub(crate) mem: bool,
+        pub(crate) regs: bool,
+        pub(crate) alu: bool,
+    }
+
+    pub(crate) fn skip() -> &'static Skip {
+        static SKIP: std::sync::OnceLock<Skip> = std::sync::OnceLock::new();
+        SKIP.get_or_init(|| {
+            let mut skip = Skip::default();
+            if let Ok(v) = std::env::var("LAMBDA_VM_WALK_PROBE_SKIP") {
+                for part in v.split(',').map(str::trim) {
+                    match part {
+                        "cpu32" => skip.cpu32 = true,
+                        "mem" => skip.mem = true,
+                        "regs" => skip.regs = true,
+                        "alu" => skip.alu = true,
+                        _ => {}
+                    }
+                }
+            }
+            skip
+        })
+    }
+}
+
 /// Every pc of the instruction map decoded once, in dense runs of consecutive
 /// pcs (4 bytes apart): a cycle's [`DecodeEntry`] is one indexed read instead of
 /// a hash lookup and a decode of its instruction. Built from the map, so it holds
@@ -904,19 +936,21 @@ fn collect_ops_from_cpu_into(
     let start_commit_index = register_state.read_index().0;
     let mut current_commit_index = start_commit_index;
     let mut commit_ecall_count = 0u32;
+    let skip = walk_probe::skip();
 
     for op in cpu_ops {
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
         // collector below so the MEMW table balances).
-        if op.decode.fields.word_instr {
+        if op.decode.fields.word_instr && !skip.cpu32 {
             cpu32_ops.push(build_cpu32_op(op));
         }
 
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
-        if op.decode.fields.is_load() {
+        if skip.mem {
+        } else if op.decode.fields.is_load() {
             let (memw_op, load_op) = collect_load_op_from_cpu(op, memory_state);
             memw.push(memw_op);
             if lookups {
@@ -930,7 +964,9 @@ fn collect_ops_from_cpu_into(
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, memw);
+        if !skip.regs {
+            collect_register_ops_from_cpu(op, register_state, memw);
+        }
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -1078,7 +1114,7 @@ fn collect_ops_from_cpu_into(
         // the ALU chips); the main CPU does not send the ALU bus for them, so we
         // must not emit chip ops here. CPU32 op-generation is B5b.
         let f = op.decode.fields;
-        if !f.word_instr {
+        if !f.word_instr && !skip.alu {
             // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
             // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
             if f.is_lt() {

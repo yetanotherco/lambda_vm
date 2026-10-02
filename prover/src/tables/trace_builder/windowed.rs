@@ -502,6 +502,7 @@ impl Walker<'_> {
             Some(table) => super::collect_cpu_ops_from_table(logs, table, *self.cycles)?,
             None => super::collect_cpu_ops_from(logs, &self.artifacts.instructions, *self.cycles)?,
         };
+        handout_probe::note_decode(t.elapsed());
         *self.cycles += logs.len();
         // Without `lookups`, the accumulator counts them (`absorb`).
         let mut walk = WalkOutputs::for_walk(cpu_ops.len(), self.lookups);
@@ -1069,6 +1070,26 @@ pub(crate) mod handout_probe {
                 None => log.push((table, 1, take.as_secs_f64(), count.as_secs_f64())),
             }
         }
+    }
+
+    static DECODE: Mutex<f64> = Mutex::new(0.0);
+
+    /// The walker's seconds building CPU ops.
+    pub(crate) fn note_decode(secs: Duration) {
+        if ON.load(Ordering::Relaxed)
+            && let Ok(mut total) = DECODE.lock()
+        {
+            *total += secs.as_secs_f64();
+        }
+    }
+
+    /// The walker's seconds building CPU ops so far, reset.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_decode() -> f64 {
+        DECODE
+            .lock()
+            .map(|mut t| std::mem::take(&mut *t))
+            .unwrap_or(0.0)
     }
 
     /// `(table, chunks, take s, count s)`.
