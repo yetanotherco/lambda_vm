@@ -251,6 +251,8 @@ fn prove_block_with_observed(
     let mut times = BlockTimes::default();
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
+    #[cfg(feature = "cuda")]
+    stark::prover::set_default_pack_after_commit(narrow_streamed());
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let (mut traces, decode_commitment, precommits) = if stream_phase_a() {
         build_streamed(
@@ -389,12 +391,15 @@ fn drop_streamed_ops() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").map_or(true, |v| v.trim() != "0")
 }
 
-/// `LAMBDA_VM_BLOCK_NARROW=1`: each streamed instance's main trace is packed
-/// at the bytes its columns need once its Round-1 commit exists
-/// (`TraceTable::pack_main_narrow`), about 2 bytes a cell instead of 8; phase B
-/// uploads it packed and widens it on the device, or on the host where the
-/// device path does not run. The words are the same, so no proof byte moves.
-/// Off by default until its box gate (D-MEMORY M3).
+/// `LAMBDA_VM_BLOCK_NARROW=1`: every plain table's main trace is packed at the
+/// bytes its columns need once its Round-1 commit exists, about 2 bytes a cell
+/// instead of 8. The device packs it from the commit's snapshot
+/// (`stark::prover::set_default_pack_after_commit`): the streamed instances on
+/// their committers, the rest in phase B's Round 1. A table committed on the
+/// host is packed on the host (`TraceTable::pack_main_narrow`). Phase B uploads
+/// it packed and widens it on the device, or on the host where the device path
+/// does not run. The words are the same, so no proof byte moves. Off by default
+/// until its box gate (D-MEMORY M3).
 fn narrow_streamed() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| v.trim() == "1")
 }
@@ -460,8 +465,9 @@ fn build_streamed(
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
-    // Packed instances: (wide bytes, packed bytes, seconds packing).
-    let narrowed = Mutex::new((0usize, 0usize, 0.0f64));
+    // Packed instances: (wide bytes, packed bytes, seconds packing on the
+    // host, instances the device packed).
+    let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
     let narrow = narrow_streamed();
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
@@ -507,7 +513,8 @@ fn build_streamed(
                         t.elapsed().as_secs_f64();
                     let air = stream_air(chunk.table, chunk.index, opts);
                     let name = air.name().to_string();
-                    let pre = crate::hash_pin::BlockProver::precommit_main(
+                    #[allow(unused_mut)]
+                    let mut pre = crate::hash_pin::BlockProver::precommit_main(
                         air.as_ref(),
                         &chunk.trace,
                         #[cfg(feature = "disk-spill")]
@@ -520,12 +527,21 @@ fn build_streamed(
                     if narrow {
                         let tp = Instant::now();
                         let wide = chunk.trace.num_rows() * chunk.trace.num_main_columns * 8;
-                        if chunk.trace.pack_main_narrow() {
+                        // The device packed it from the commit's snapshot, or
+                        // the host packs it here.
+                        let by_device = pre
+                            .take_narrow()
+                            .is_some_and(|t| chunk.trace.install_main_narrow(t));
+                        if by_device || chunk.trace.pack_main_narrow() {
                             let packed = chunk.trace.narrow_main().map_or(0, |t| t.data().len());
                             let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
                             n.0 += wide;
                             n.1 += packed;
-                            n.2 += tp.elapsed().as_secs_f64();
+                            if by_device {
+                                n.3 += 1;
+                            } else {
+                                n.2 += tp.elapsed().as_secs_f64();
+                            }
                         }
                     }
                     committed
@@ -631,10 +647,11 @@ fn build_streamed(
             *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
         );
         if narrow {
-            let (wide, packed, secs) = *narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            let (wide, packed, secs, by_device) =
+                *narrowed.lock().unwrap_or_else(|e| e.into_inner());
             eprintln!(
-                "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) \
-                 in {secs:.2} s on the committers",
+                "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) · \
+                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the committers",
                 wide as f64 / (1u64 << 30) as f64,
                 packed as f64 / (1u64 << 30) as f64,
                 if wide > 0 {
