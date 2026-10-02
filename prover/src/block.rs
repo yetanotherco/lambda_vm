@@ -469,17 +469,21 @@ fn stream_committers() -> usize {
         .unwrap_or(STREAM_COMMITTERS)
 }
 
-/// `LAMBDA_VM_BLOCK_GENERATORS=n` (1..=16): `n` threads generate each streamed
+/// Generator threads for the streamed instances ([`stream_generators`]).
+const STREAM_GENERATORS: usize = 6;
+
+/// `LAMBDA_VM_BLOCK_GENERATORS=n` (0..=16): `n` threads generate each streamed
 /// chunk, and pack it on the host under narrow storage, before a committer
-/// takes it, so the committers only commit (and a chunk waits packed rather
-/// than as its ops). Unset or `0`: the committers generate. A measurement
-/// knob until its gate.
+/// takes it, so the committers only commit and a chunk waits packed rather
+/// than as its ops. `0`: the committers generate (the A arm). Unset is
+/// [`STREAM_GENERATORS`]: at the median block on BIG the queue of ops fell
+/// from 32.8 to 1.4 GiB, the peak 13.75 GiB and the base 12.2 s (BIG 103).
 fn stream_generators() -> usize {
     std::env::var("LAMBDA_VM_BLOCK_GENERATORS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n <= 16)
-        .unwrap_or(0)
+        .unwrap_or(STREAM_GENERATORS)
 }
 
 /// `LAMBDA_VM_BLOCK_READY_MIB=n` (n >= 1): with [`stream_generators`], the
