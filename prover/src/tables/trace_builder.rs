@@ -3929,6 +3929,10 @@ pub struct StreamSkip {
     /// packed stay bounded whatever the block's size. `0`: no cap. The tables
     /// are the same.
     pub kr_wide_cap: usize,
+    /// Phase 5 starts KECCAK_RND's and LT's builds before every other table's,
+    /// so their tables (most of the finish's commit work) reach phase A's
+    /// committers sooner. The tables are the same.
+    pub kr_first: bool,
 }
 
 /// What a build does with each table it generates: packs it
@@ -4344,13 +4348,28 @@ pub(crate) struct CompactLt {
     index: Vec<(usize, u64)>,
     len: usize,
     last_rhs: u64,
+    /// The ops as they are, 24 bytes each, instead of the stream (the A arm,
+    /// `LAMBDA_VM_BLOCK_COMPACT_LT=0`).
+    raw: Option<Vec<LtOperation>>,
 }
 
 const COMPACT_LT_BLOCK: usize = 4096;
 
 impl CompactLt {
+    /// A list that keeps its ops as they are (the A arm of the compact form).
+    pub(crate) fn raw() -> Self {
+        Self {
+            raw: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
     /// Append `ops` (each with `signed` and `invert` false).
     pub(crate) fn extend(&mut self, ops: &[LtOperation]) {
+        if let Some(raw) = &mut self.raw {
+            raw.extend_from_slice(ops);
+            return;
+        }
         fn put(out: &mut Vec<u8>, mut v: u64) {
             while v >= 0x80 {
                 out.push(v as u8 | 0x80);
@@ -4376,16 +4395,22 @@ impl CompactLt {
 
     /// The bytes it takes on the heap (capacities).
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.bytes.capacity() + self.index.capacity() * std::mem::size_of::<(usize, u64)>()
+        self.raw.as_ref().map_or(0, vec_heap_bytes)
+            + self.bytes.capacity()
+            + self.index.capacity() * std::mem::size_of::<(usize, u64)>()
     }
 }
 
 impl Expand<LtOperation> for CompactLt {
     fn len(&self) -> usize {
-        self.len
+        self.raw.as_ref().map_or(self.len, Vec::len)
     }
 
     fn expand_into(&self, start: usize, end: usize, out: &mut Vec<LtOperation>) {
+        if let Some(raw) = &self.raw {
+            out.extend_from_slice(&raw[start.min(raw.len())..end.min(raw.len())]);
+            return;
+        }
         let end = end.min(self.len);
         if start >= end {
             return;
@@ -5608,34 +5633,65 @@ fn build_traces<I: ImageSource + Sync>(
                     });
                 }};
             }
-            // Heaviest builds first so the scheduler overlaps them with the rest.
-            spawn_into!(memw_registers_slot, gen_memw_registers);
-            spawn_into!(cpus_slot, gen_cpus);
-            spawn_into!(memws_slot, gen_memws);
-            spawn_into!(lts_slot, gen_lts);
-            spawn_into!(decode_slot, gen_decode);
-            spawn_into!(branches_slot, gen_branches);
-            spawn_into!(bitwise_slot, gen_bitwise);
-            spawn_into!(muls_slot, gen_muls);
-            spawn_into!(memw_aligneds_slot, gen_memw_aligneds);
-            spawn_into!(loads_slot, gen_loads);
-            spawn_into!(shifts_slot, gen_shifts);
-            spawn_into!(dvrms_slot, gen_dvrms);
-            spawn_into!(pages_slot, gen_pages);
-            spawn_into!(keccaks_slot, gen_keccaks);
-            spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
-            spawn_into!(keccak_rc_slot, gen_keccak_rc);
-            spawn_into!(blake3_slot, gen_blake3);
-            spawn_into!(commits_slot, gen_commits);
-            spawn_into!(register_slot, gen_register);
-            spawn_into!(halt_slot, gen_halt);
-            spawn_into!(eqs_slot, gen_eqs);
-            spawn_into!(bytewises_slot, gen_bytewises);
-            spawn_into!(stores_slot, gen_stores);
-            spawn_into!(cpu32s_slot, gen_cpu32s);
-            spawn_into!(ecsms_slot, gen_ecsms);
-            spawn_into!(ecdases_slot, gen_ecdases);
-            spawn_into!(hints_slot, gen_hints);
+            // Heaviest builds first so the scheduler overlaps them with the rest
+            // (`kr_first`: KECCAK_RND and LT ahead of them all).
+            if skip.kr_first {
+                spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
+                spawn_into!(lts_slot, gen_lts);
+                spawn_into!(memw_registers_slot, gen_memw_registers);
+                spawn_into!(cpus_slot, gen_cpus);
+                spawn_into!(memws_slot, gen_memws);
+                spawn_into!(decode_slot, gen_decode);
+                spawn_into!(branches_slot, gen_branches);
+                spawn_into!(bitwise_slot, gen_bitwise);
+                spawn_into!(muls_slot, gen_muls);
+                spawn_into!(memw_aligneds_slot, gen_memw_aligneds);
+                spawn_into!(loads_slot, gen_loads);
+                spawn_into!(shifts_slot, gen_shifts);
+                spawn_into!(dvrms_slot, gen_dvrms);
+                spawn_into!(pages_slot, gen_pages);
+                spawn_into!(keccaks_slot, gen_keccaks);
+                spawn_into!(keccak_rc_slot, gen_keccak_rc);
+                spawn_into!(blake3_slot, gen_blake3);
+                spawn_into!(commits_slot, gen_commits);
+                spawn_into!(register_slot, gen_register);
+                spawn_into!(halt_slot, gen_halt);
+                spawn_into!(eqs_slot, gen_eqs);
+                spawn_into!(bytewises_slot, gen_bytewises);
+                spawn_into!(stores_slot, gen_stores);
+                spawn_into!(cpu32s_slot, gen_cpu32s);
+                spawn_into!(ecsms_slot, gen_ecsms);
+                spawn_into!(ecdases_slot, gen_ecdases);
+                spawn_into!(hints_slot, gen_hints);
+            } else {
+                spawn_into!(memw_registers_slot, gen_memw_registers);
+                spawn_into!(cpus_slot, gen_cpus);
+                spawn_into!(memws_slot, gen_memws);
+                spawn_into!(lts_slot, gen_lts);
+                spawn_into!(decode_slot, gen_decode);
+                spawn_into!(branches_slot, gen_branches);
+                spawn_into!(bitwise_slot, gen_bitwise);
+                spawn_into!(muls_slot, gen_muls);
+                spawn_into!(memw_aligneds_slot, gen_memw_aligneds);
+                spawn_into!(loads_slot, gen_loads);
+                spawn_into!(shifts_slot, gen_shifts);
+                spawn_into!(dvrms_slot, gen_dvrms);
+                spawn_into!(pages_slot, gen_pages);
+                spawn_into!(keccaks_slot, gen_keccaks);
+                spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
+                spawn_into!(keccak_rc_slot, gen_keccak_rc);
+                spawn_into!(blake3_slot, gen_blake3);
+                spawn_into!(commits_slot, gen_commits);
+                spawn_into!(register_slot, gen_register);
+                spawn_into!(halt_slot, gen_halt);
+                spawn_into!(eqs_slot, gen_eqs);
+                spawn_into!(bytewises_slot, gen_bytewises);
+                spawn_into!(stores_slot, gen_stores);
+                spawn_into!(cpu32s_slot, gen_cpu32s);
+                spawn_into!(ecsms_slot, gen_ecsms);
+                spawn_into!(ecdases_slot, gen_ecdases);
+                spawn_into!(hints_slot, gen_hints);
+            }
         });
     } else {
         cpus_slot = Some(gen_cpus());

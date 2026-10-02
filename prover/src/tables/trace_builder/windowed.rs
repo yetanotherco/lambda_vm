@@ -276,6 +276,22 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// `finish` starts KECCAK_RND's and LT's builds before every other table's
+    /// ([`StreamSkip::kr_first`]). The tables are the same.
+    pub fn generate_kr_first(mut self) -> Self {
+        self.emitted.kr_first = true;
+        self
+    }
+
+    /// Keep the LT ops derived from the MEMW and MEMW_A ops this builder drops
+    /// at 24 bytes each instead of compact ([`super::CompactLt`]), the A arm of
+    /// the compact form. Before the first window only. The tables are the same.
+    pub fn raw_memw_lt(mut self) -> Self {
+        self.counted.memw_lt = super::CompactLt::raw();
+        self.counted.memw_aligned_lt = super::CompactLt::raw();
+        self
+    }
+
     /// With [`Self::build_wide_then_pack`], `finish` builds at most `cap`
     /// KECCAK_RND chunks at 8 bytes a cell at once ([`StreamSkip::kr_wide_cap`];
     /// 0 is no cap). The tables are the same.
