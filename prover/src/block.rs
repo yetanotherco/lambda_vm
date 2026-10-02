@@ -1551,9 +1551,16 @@ fn build_streamed(
         if narrow {
             let (wide, packed, secs, by_device) =
                 *narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            // With generators on, they pack every table they hand over (the
+            // finish's included); the committers only pack without them.
+            let packers = if generators > 0 {
+                "generators"
+            } else {
+                "committers"
+            };
             eprintln!(
                 "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) · \
-                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the committers",
+                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the {packers}",
                 wide as f64 / (1u64 << 30) as f64,
                 packed as f64 / (1u64 << 30) as f64,
                 if wide > 0 {
