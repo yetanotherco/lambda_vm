@@ -247,6 +247,7 @@ pub(crate) fn run_producer(
 
     super::handout_probe::start();
     super::handout_probe::take_decode();
+    super::handout_probe::take_named();
     let jobs_rx: Mutex<Option<mpsc::Receiver<ChunkJob>>> = Mutex::new(None);
     let generated: Mutex<Vec<(StreamTable, usize, f64)>> = Mutex::new(Vec::new());
     let chunk_done_at: Mutex<Vec<f64>> = Mutex::new(Vec::new());
@@ -565,6 +566,9 @@ pub(crate) fn run_producer(
         super::handout_probe::take_decode(),
         std::env::var("LAMBDA_VM_WALK_PROBE_SKIP").unwrap_or_default()
     );
+    for (name, secs) in super::handout_probe::take_named() {
+        println!("PRODUCER ABSORB {name}: {secs:.3} s");
+    }
     for (table, chunks, take, count) in super::handout_probe::take() {
         println!(
             "PRODUCER HANDOUT {table:?}: {chunks} chunks · take {take:.3} s · count {count:.3} s"

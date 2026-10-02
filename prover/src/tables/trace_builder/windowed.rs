@@ -555,8 +555,11 @@ impl Accumulator<'_> {
         } else {
             route_ops
         };
+        let t_route = std::time::Instant::now();
         self.segments
             .append(route(&window.cpu_ops, &window.walk.cpu32_ops));
+        handout_probe::note_named("route", t_route.elapsed());
+        let t_lookups = std::time::Instant::now();
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise.
@@ -574,11 +577,14 @@ impl Accumulator<'_> {
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
+        handout_probe::note_named("lookups", t_lookups.elapsed());
         if let Some(kept) = self.kept.as_deref_mut() {
             // Nothing else reads the in-walk lookups; MEMW_R's rows are
             // counted as their chunks leave.
+            let t_append = std::time::Instant::now();
             drop(std::mem::take(&mut window.walk.bitwise_ops));
             kept.append(window);
+            handout_probe::note_named("append", t_append.elapsed());
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             let jobs = tail_jobs(
@@ -1073,6 +1079,28 @@ pub(crate) mod handout_probe {
     }
 
     static DECODE: Mutex<f64> = Mutex::new(0.0);
+    static NAMED: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
+
+    /// Seconds of one named part of `absorb`.
+    pub(crate) fn note_named(name: &'static str, secs: Duration) {
+        if ON.load(Ordering::Relaxed)
+            && let Ok(mut named) = NAMED.lock()
+        {
+            match named.iter_mut().find(|(n, _)| *n == name) {
+                Some(row) => row.1 += secs.as_secs_f64(),
+                None => named.push((name, secs.as_secs_f64())),
+            }
+        }
+    }
+
+    /// The named parts so far, reset.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_named() -> Vec<(&'static str, f64)> {
+        NAMED
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
+    }
 
     /// The walker's seconds building CPU ops.
     pub(crate) fn note_decode(secs: Duration) {
