@@ -739,11 +739,12 @@ fn table_digests(t: &Traces) -> Vec<(String, String)> {
         .collect()
 }
 
-/// ★ Box only (`--ignored`): on a real block, the windowed build — split across
-/// a walker and an accumulator thread, its chunks generated on a third, beside a
-/// thread that keeps the host's memory busy — gives the whole-run build's
-/// tables, twice. Reads `BLOCK_WHIR_ELF` and `BLOCK_WHIR_INPUT`; prints
-/// `DETERMINISM` lines.
+/// ★ Box only (`--ignored`): on a real block at the block's caps, the windowed
+/// build — split across a walker and an accumulator thread, its chunks
+/// generated on a third, beside a thread that keeps the host's memory busy —
+/// gives the whole-run build's tables, twice: keeping its windows, then
+/// dropping each streamed chunk's ops as it leaves (the block's default). Reads
+/// `BLOCK_WHIR_ELF` and `BLOCK_WHIR_INPUT`; prints `DETERMINISM` lines.
 #[test]
 #[ignore = "a real block: box only"]
 fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
@@ -753,7 +754,7 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
     let input =
         std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).unwrap();
     let program = Elf::load(&elf).expect("the ELF loads");
-    let max_rows = MaxRowsConfig::uniform(1 << 21);
+    let max_rows = crate::block::block_max_rows();
     let logs = Executor::new(&program, input.clone())
         .expect("the executor starts")
         .run()
@@ -790,6 +791,9 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
             });
             let mut builder =
                 WindowedTraceBuilder::new(&program, &input, &max_rows).expect("the builder");
+            if run_index == 1 {
+                builder = builder.drop_streamed_ops().expect("before any window");
+            }
             let chunks = {
                 let (mut walker, mut accumulator) = builder.split();
                 std::thread::scope(|inner| {
@@ -821,7 +825,10 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
             traces.insert_streamed(chunks).expect("placeholders");
             stop.store(true, Ordering::Relaxed);
             busy.join().expect("the busy thread");
-            println!("DETERMINISM windowed run {run_index}: {streamed} chunks streamed");
+            println!(
+                "DETERMINISM windowed run {run_index}: {streamed} chunks streamed, ops {}",
+                if run_index == 1 { "dropped" } else { "kept" }
+            );
             table_digests(&traces)
         });
         let differing: Vec<&String> = reference
