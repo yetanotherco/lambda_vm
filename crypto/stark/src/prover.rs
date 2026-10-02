@@ -1220,17 +1220,61 @@ fn recommit_top_levels() -> Option<usize> {
 /// its kept top the most levels, from 1 up to the policy's own depth, whose
 /// rebuilt subtree holds at most `n` field elements
 /// ([`depth_within_rebuild_budget`]): wide tables keep more of their tree,
-/// none keeps less. Unset or `0`: the policy's single depth, as before
-/// (`LAMBDA_VM_RECOMMIT_TOP_LEVELS` or the caller's default).
+/// none keeps less. `0`: the policy's single depth for every table. Unset:
+/// [`set_default_kept_subtree_elems`]'s value (0 unless a caller set one).
 #[cfg(feature = "cuda")]
 fn kept_subtree_cap() -> Option<usize> {
-    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("LAMBDA_VM_KEPT_SUBTREE_ELEMS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    })
+    static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let env = ENV.get_or_init(|| std::env::var(KEPT_SUBTREE_ELEMS_ENV).ok());
+    let cap = kept_subtree_cap_setting(
+        env.as_deref(),
+        KEPT_SUBTREE_ELEMS_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "[prover] kept top levels: {} ({})",
+            match cap {
+                Some(n) => format!("each table's rebuilt subtree at most {n} field elements"),
+                None => "one depth for every table".to_string(),
+            },
+            if env.is_some() {
+                KEPT_SUBTREE_ELEMS_ENV
+            } else {
+                "the caller's default"
+            }
+        );
+    });
+    cap
+}
+
+/// The environment variable [`kept_subtree_cap`] reads.
+#[cfg(feature = "cuda")]
+const KEPT_SUBTREE_ELEMS_ENV: &str = "LAMBDA_VM_KEPT_SUBTREE_ELEMS";
+
+/// [`kept_subtree_cap`] for a raw environment value and a caller's default:
+/// the environment, when set, decides (`0` or unparsable = one depth for
+/// every table); else the default (`0` = one depth).
+#[cfg(any(feature = "cuda", test))]
+fn kept_subtree_cap_setting(env: Option<&str>, default: usize) -> Option<usize> {
+    match env {
+        Some(v) => v.trim().parse::<usize>().ok(),
+        None => Some(default),
+    }
+    .filter(|&n| n > 0)
+}
+
+/// The kept-depth cap when `LAMBDA_VM_KEPT_SUBTREE_ELEMS` is unset: 0 (the
+/// default) is one depth for every table.
+static KEPT_SUBTREE_ELEMS_DEFAULT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the cap on a kept top's rebuilt subtree, in field elements, that
+/// applies when `LAMBDA_VM_KEPT_SUBTREE_ELEMS` is unset (see
+/// [`kept_subtree_cap`]); 0 keeps one depth for every table. Proofs are the
+/// same bytes either way.
+pub fn set_default_kept_subtree_elems(n: usize) {
+    KEPT_SUBTREE_ELEMS_DEFAULT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The bottom levels a plain table of `cols` columns at `rows_per_leaf` rows
@@ -1240,13 +1284,16 @@ fn kept_subtree_cap() -> Option<usize> {
 /// Every query rebuilds its subtree on the host from rows gathered off the
 /// device (`top_tree_proofs`), so a subtree's cost grows with the row's width,
 /// while the kept top it saves grows with the row count. At the median block
-/// KECCAK_RND (1,480 columns, 2^16 rows) spent 0.45–0.58 s a table on its
-/// queries at k = 6, holding 7.8 GiB of the VRAM gate meanwhile (BIG 464).
-/// Under a cap of 8,192 and k = 6: KECCAK_RND k = 1, ECDAS 2, KECCAK 3, every
-/// table of ≤ 64 columns 6. Never deeper than `k`: a uniform k = 8 cost the
-/// median's phase B 37.5 s for 1.71 GiB of peak (BIG 109), and the kept tops
-/// hold 2.96 GiB in all at k = 6. The tree, and so every opening, is the same
-/// at any depth.
+/// KECCAK_RND (1,480 columns, one row a leaf, 2^16 rows) spent 0.67 s a table
+/// on its queries at k = 6, holding 7.8 GiB of the VRAM gate meanwhile, and
+/// its rebuilds filled the global rayon pool, so every other table in phase
+/// B's head waited 44–137 ms on its out-of-domain columns (BIG 466). Under a
+/// cap of 8,192 and k = 6: KECCAK_RND k = 2, ECDAS 3, KECCAK 4, every other
+/// table 6; KECCAK_RND's queries took 93 ms, the head's idle fell from 9–10 s
+/// to under 1 s and phase B by 8.4 s, for 0.15 GiB more of kept tops. Never
+/// deeper than `k`: a uniform k = 8 cost the median's phase B 37.5 s for 1.71
+/// GiB of peak (BIG 109). The tree, and so every opening, is the same at any
+/// depth.
 #[cfg(feature = "cuda")]
 fn kept_depth_for_width(k: usize, rows_per_leaf: usize, cols: usize) -> usize {
     match kept_subtree_cap() {
@@ -1295,6 +1342,27 @@ mod kept_depth_tests {
             depth_within_rebuild_budget(cap, 2, 10, 0),
             1,
             "k = 0 reads as 1"
+        );
+    }
+
+    /// The environment, when set, decides; else the caller's default; 0 is
+    /// one depth for every table either way.
+    #[test]
+    fn the_cap_reads_the_environment_then_the_default() {
+        use super::kept_subtree_cap_setting as setting;
+        assert_eq!(setting(None, 0), None, "no default: one depth");
+        assert_eq!(setting(None, 8192), Some(8192), "the caller's default");
+        assert_eq!(setting(Some("0"), 8192), None, "0 opts out of the default");
+        assert_eq!(
+            setting(Some(" 4096 "), 8192),
+            Some(4096),
+            "the environment wins"
+        );
+        assert_eq!(setting(Some("x"), 8192), None, "unparsable: one depth");
+        assert_eq!(
+            setting(Some("16384"), 0),
+            Some(16384),
+            "the environment alone"
         );
     }
 }
