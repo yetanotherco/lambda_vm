@@ -825,6 +825,27 @@ impl WalkOutputs {
         }
     }
 
+    /// [`Self::for_walk`] with the streamed lists sized from an earlier walk's
+    /// lengths per cycle (`sizes`, an eighth over), so a window's lists are
+    /// allocated once instead of grown from empty or from a fixed guess.
+    pub(crate) fn for_walk_sized(cpu_ops: usize, lookups: bool, sizes: &WalkSizes) -> Self {
+        let mut out = Self::for_walk(cpu_ops, lookups);
+        if sizes.cycles == 0 {
+            return out;
+        }
+        let size = |len: usize| {
+            let scaled = (len as u128 * cpu_ops as u128 / sizes.cycles as u128) as usize;
+            scaled + scaled / 8 + 16
+        };
+        out.memw.register_rows = Vec::with_capacity(size(sizes.register_rows));
+        out.memw.aligned = Vec::with_capacity(size(sizes.aligned));
+        out.memw.general = Vec::with_capacity(size(sizes.general));
+        out.load_ops = Vec::with_capacity(size(sizes.load));
+        out.lt_ops = Vec::with_capacity(size(sizes.lt));
+        out.shift_ops = Vec::with_capacity(size(sizes.shift));
+        out
+    }
+
     /// The bytes its lists take on the heap (capacities, not lengths).
     pub(crate) fn heap_bytes(&self) -> usize {
         self.memw.heap_bytes()
@@ -864,6 +885,34 @@ impl WalkOutputs {
         .into_iter()
         .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
         .collect()
+    }
+}
+
+/// The lengths of a walk's streamed lists and the cycles it walked: what
+/// [`WalkOutputs::for_walk_sized`] sizes the next window's lists from.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WalkSizes {
+    cycles: usize,
+    register_rows: usize,
+    aligned: usize,
+    general: usize,
+    load: usize,
+    lt: usize,
+    shift: usize,
+}
+
+impl WalkSizes {
+    /// `walk`'s lengths over `cycles` cycles.
+    pub(crate) fn of(walk: &WalkOutputs, cycles: usize) -> Self {
+        Self {
+            cycles,
+            register_rows: walk.memw.register_rows.len(),
+            aligned: walk.memw.aligned.len(),
+            general: walk.memw.general.len(),
+            load: walk.load_ops.len(),
+            lt: walk.lt_ops.len(),
+            shift: walk.shift_ops.len(),
+        }
     }
 }
 
