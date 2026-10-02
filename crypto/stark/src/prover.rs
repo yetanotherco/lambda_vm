@@ -1216,16 +1216,12 @@ fn recommit_top_levels() -> Option<usize> {
     (k > 0).then_some(k)
 }
 
-/// The deepest subtree a plain table may leave out of its kept top under
-/// [`kept_subtree_cap`].
-#[cfg(any(feature = "cuda", test))]
-const KEPT_DEPTH_MAX: usize = 8;
-
 /// `LAMBDA_VM_KEPT_SUBTREE_ELEMS=n` (n ≥ 1): each plain table leaves out of
-/// its kept top the most levels whose rebuilt subtree holds at most `n` field
-/// elements ([`depth_within_rebuild_budget`]), from 1 to [`KEPT_DEPTH_MAX`],
-/// in place of one depth for every table. Unset or `0`: the policy's single
-/// depth, as before (`LAMBDA_VM_RECOMMIT_TOP_LEVELS` or the caller's default).
+/// its kept top the most levels, from 1 up to the policy's own depth, whose
+/// rebuilt subtree holds at most `n` field elements
+/// ([`depth_within_rebuild_budget`]): wide tables keep more of their tree,
+/// none keeps less. Unset or `0`: the policy's single depth, as before
+/// (`LAMBDA_VM_RECOMMIT_TOP_LEVELS` or the caller's default).
 #[cfg(feature = "cuda")]
 fn kept_subtree_cap() -> Option<usize> {
     static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -1239,30 +1235,32 @@ fn kept_subtree_cap() -> Option<usize> {
 
 /// The bottom levels a plain table of `cols` columns at `rows_per_leaf` rows
 /// per leaf leaves out of its kept top: the policy's `k`, or under
-/// [`kept_subtree_cap`] the depth its row width allows.
+/// [`kept_subtree_cap`] at most `k`, as many as its row width allows.
 ///
 /// Every query rebuilds its subtree on the host from rows gathered off the
 /// device (`top_tree_proofs`), so a subtree's cost grows with the row's width,
 /// while the kept top it saves grows with the row count. At the median block
 /// KECCAK_RND (1,480 columns, 2^16 rows) spent 0.45–0.58 s a table on its
 /// queries at k = 6, holding 7.8 GiB of the VRAM gate meanwhile (BIG 464).
-/// Under a cap of 8,192: KECCAK_RND k = 1, ECDAS 2, KECCAK 3, CPU 6, LT 7,
-/// MEMW_R 8. The tree, and so every opening, is the same at any depth.
+/// Under a cap of 8,192 and k = 6: KECCAK_RND k = 1, ECDAS 2, KECCAK 3, every
+/// table of ≤ 64 columns 6. Never deeper than `k`: a uniform k = 8 cost the
+/// median's phase B 37.5 s for 1.71 GiB of peak (BIG 109), and the kept tops
+/// hold 2.96 GiB in all at k = 6. The tree, and so every opening, is the same
+/// at any depth.
 #[cfg(feature = "cuda")]
 fn kept_depth_for_width(k: usize, rows_per_leaf: usize, cols: usize) -> usize {
     match kept_subtree_cap() {
         None => k,
-        Some(cap) => depth_within_rebuild_budget(cap, rows_per_leaf, cols),
+        Some(cap) => depth_within_rebuild_budget(cap, rows_per_leaf, cols, k),
     }
 }
 
-/// The most levels, from 1 to [`KEPT_DEPTH_MAX`], whose subtree of 2^levels
-/// leaves of `rows_per_leaf` rows of `cols` columns holds at most `cap` field
-/// elements.
+/// The most levels, from 1 to `max`, whose subtree of 2^levels leaves of
+/// `rows_per_leaf` rows of `cols` columns holds at most `cap` field elements.
 #[cfg(any(feature = "cuda", test))]
-fn depth_within_rebuild_budget(cap: usize, rows_per_leaf: usize, cols: usize) -> usize {
+fn depth_within_rebuild_budget(cap: usize, rows_per_leaf: usize, cols: usize, max: usize) -> usize {
     let per_leaf = rows_per_leaf.max(1).saturating_mul(cols.max(1));
-    let mut depth = KEPT_DEPTH_MAX;
+    let mut depth = max.max(1);
     while depth > 1 && per_leaf.saturating_mul(1 << depth) > cap {
         depth -= 1;
     }
@@ -1273,30 +1271,30 @@ fn depth_within_rebuild_budget(cap: usize, rows_per_leaf: usize, cols: usize) ->
 mod kept_depth_tests {
     use super::depth_within_rebuild_budget;
 
-    /// Under one cap, wide tables rebuild shallow subtrees and narrow ones
-    /// deep ones, from 1 to 8 levels.
+    /// Under one cap, wide tables rebuild shallow subtrees; no table goes
+    /// deeper than the policy's depth, and none below one level.
     #[test]
     fn the_kept_depth_follows_the_row_width() {
-        let cap = 8192;
-        assert_eq!(depth_within_rebuild_budget(cap, 2, 1480), 1, "KECCAK_RND");
+        let (cap, k) = (8192, 6);
+        let depth = |rpl, cols| depth_within_rebuild_budget(cap, rpl, cols, k);
+        assert_eq!(depth(2, 1480), 1, "KECCAK_RND");
+        assert_eq!(depth(2, 521), 2, "ECDAS: 8 × 1,042 > 8,192");
+        assert_eq!(depth(2, 511), 3, "KECCAK: 8 × 1,022 = 8,176");
+        assert_eq!(depth(2, 64), 6, "64 columns: 64 × 128 = 8,192");
+        assert_eq!(depth(2, 65), 5, "65 columns: 64 × 130 > 8,192");
+        assert_eq!(depth(2, 38), 6, "CPU");
+        assert_eq!(depth(2, 17), 6, "LT: never past k");
+        assert_eq!(depth(2, 10), 6, "MEMW_R: never past k");
+        assert_eq!(depth(1, 100_000), 1, "never below 1");
         assert_eq!(
-            depth_within_rebuild_budget(cap, 2, 521),
-            2,
-            "ECDAS: 8 × 1,042 > 8,192"
+            depth_within_rebuild_budget(cap, 2, 10, 8),
+            8,
+            "a deeper policy bounds it instead"
         );
         assert_eq!(
-            depth_within_rebuild_budget(cap, 2, 511),
-            3,
-            "KECCAK: 8 × 1,022 = 8,176"
-        );
-        assert_eq!(depth_within_rebuild_budget(cap, 2, 38), 6, "CPU");
-        assert_eq!(depth_within_rebuild_budget(cap, 2, 17), 7, "LT");
-        assert_eq!(depth_within_rebuild_budget(cap, 2, 10), 8, "MEMW_R");
-        assert_eq!(depth_within_rebuild_budget(cap, 1, 1), 8, "never past 8");
-        assert_eq!(
-            depth_within_rebuild_budget(cap, 1, 100_000),
+            depth_within_rebuild_budget(cap, 2, 10, 0),
             1,
-            "never below 1"
+            "k = 0 reads as 1"
         );
     }
 }
