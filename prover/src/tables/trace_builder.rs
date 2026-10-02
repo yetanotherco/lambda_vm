@@ -75,8 +75,8 @@ use crate::paged_mem::{ImageSource, PagedMem};
 mod lean_walk_tests;
 mod windowed;
 pub use windowed::{
-    Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    Accumulator, ChunkJob, DecodedWindow, Decoder, StreamTable, StreamedChunk, WalkedWindow,
+    Walker, WindowStamps, WindowedTraceBuilder,
 };
 
 // =============================================================================

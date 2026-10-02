@@ -462,7 +462,23 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// what [`push_jobs`](Self::push_jobs) builds; afterwards
     /// [`finish`](Self::finish) takes the last window as usual.
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
+        let (_, walker, accumulator) = self.split_decoded();
+        (walker, accumulator)
+    }
+
+    /// The builder in three parts: a [`Decoder`] that builds each window's
+    /// CPU ops from its logs ahead of the walk (it reads no carried state, so
+    /// it can run on another thread, e.g. beside the executor), and the
+    /// [`Walker`] and [`Accumulator`] of [`Self::split`]. Fed the windows in
+    /// order, `decoder.decode` then `walker.walk_decoded` builds what
+    /// `walker.walk` builds.
+    pub fn split_decoded(&mut self) -> (Decoder<'_>, Walker<'_>, Accumulator<'_>) {
         (
+            Decoder {
+                artifacts: &self.artifacts,
+                decode: self.decode.as_ref(),
+                cycles: self.cycles,
+            },
             Walker {
                 artifacts: &self.artifacts,
                 decode: self.decode.as_ref(),
@@ -498,6 +514,44 @@ pub struct WalkedWindow {
     walk: WalkOutputs,
 }
 
+/// A window's CPU ops built by a [`Decoder`], to be walked by
+/// [`Walker::walk_decoded`].
+pub struct DecodedWindow {
+    /// The run's cycle the window starts at.
+    first: usize,
+    cpu_ops: Vec<super::CpuOperation>,
+    /// Whether a cycle of the window halts (only the run's last may).
+    halts: bool,
+}
+
+/// The decode part of a builder split three ways
+/// ([`WindowedTraceBuilder::split_decoded`]).
+pub struct Decoder<'b> {
+    artifacts: &'b DecodeArtifacts,
+    decode: Option<&'b DecodeTable>,
+    /// Cycles decoded so far: the next window's first cycle.
+    cycles: usize,
+}
+
+impl Decoder<'_> {
+    /// The CPU ops of the run's next window, as [`Walker::walk`] builds them.
+    /// The run's last window may be decoded too, but it is `finish`'s: the
+    /// walker refuses a window that halts.
+    pub fn decode(&mut self, logs: &[Log]) -> Result<DecodedWindow, Error> {
+        let first = self.cycles;
+        let cpu_ops = match self.decode {
+            Some(table) => super::collect_cpu_ops_from_table(logs, table, first)?,
+            None => super::collect_cpu_ops_from(logs, &self.artifacts.instructions, first)?,
+        };
+        self.cycles += logs.len();
+        Ok(DecodedWindow {
+            first,
+            cpu_ops,
+            halts: logs.iter().any(|log| log.next_pc == 0),
+        })
+    }
+}
+
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Walker<'b> {
     artifacts: &'b DecodeArtifacts,
@@ -525,7 +579,32 @@ impl Walker<'_> {
             Some(table) => super::collect_cpu_ops_from_table(logs, table, *self.cycles)?,
             None => super::collect_cpu_ops_from(logs, &self.artifacts.instructions, *self.cycles)?,
         };
-        *self.cycles += logs.len();
+        let walked = self.walk_cpu_ops(cpu_ops);
+        *self.walk_secs += t.elapsed().as_secs_f64();
+        Ok(walked)
+    }
+
+    /// Walks the next window from the CPU ops a [`Decoder`] built for it
+    /// (not the run's last). Refuses a window that is not the next one.
+    pub fn walk_decoded(&mut self, window: DecodedWindow) -> Result<WalkedWindow, Error> {
+        if window.halts {
+            return Err(Error::HaltInNonFinalEpoch);
+        }
+        if window.first != *self.cycles {
+            return Err(Error::Prover(format!(
+                "a decoded window starting at cycle {} given to the walk at cycle {}",
+                window.first, *self.cycles
+            )));
+        }
+        let t = std::time::Instant::now();
+        let walked = self.walk_cpu_ops(window.cpu_ops);
+        *self.walk_secs += t.elapsed().as_secs_f64();
+        Ok(walked)
+    }
+
+    /// The walk of one window's CPU ops (its decode done).
+    fn walk_cpu_ops(&mut self, cpu_ops: Vec<super::CpuOperation>) -> WalkedWindow {
+        *self.cycles += cpu_ops.len();
         // Left out, the accumulator counts them (`absorb`).
         let mut walk = WalkOutputs::for_walk(cpu_ops.len(), self.in_walk == InWalk::List);
         collect_ops_from_cpu_into(
@@ -536,9 +615,8 @@ impl Walker<'_> {
             self.in_walk,
             self.counted.as_deref_mut(),
         );
-        *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
-        Ok(WalkedWindow { cpu_ops, walk })
+        WalkedWindow { cpu_ops, walk }
     }
 }
 

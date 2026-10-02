@@ -29,7 +29,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 
-use super::{ChunkJob, StreamTable, WalkedWindow, WindowedTraceBuilder};
+use super::{ChunkJob, DecodedWindow, StreamTable, WalkedWindow, WindowedTraceBuilder};
 use crate::Error;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::build_stamps;
@@ -63,6 +63,9 @@ pub(crate) struct ProducerConfig {
     /// Hash every log the executor emits (on the executor thread, so not
     /// for a timed run): two executors agree on a run iff their digests do.
     pub log_digest: bool,
+    /// Build each window's CPU ops on a decoder thread of their own, ahead of
+    /// the walk ([`WindowedTraceBuilder::split_decoded`]).
+    pub decoder: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -375,8 +378,35 @@ pub(crate) fn run_producer(
                 report.builder_setup = t_setup.elapsed().as_secs_f64();
                 let cpu0 = thread_cpu();
                 let last = {
-                    let (mut walker, mut accumulator) = builder.split();
+                    let (mut decoder, mut walker, mut accumulator) = builder.split_decoded();
                     std::thread::scope(|inner| -> Result<Vec<Log>, Error> {
+                        // With `decoder`, each window's CPU ops are built on a
+                        // thread of their own ahead of the walk.
+                        type Input = (Vec<Log>, Option<DecodedWindow>);
+                        let input: Box<dyn Iterator<Item = Input> + Send> = if cfg.decoder {
+                            let (dtx, drx) = mpsc::sync_channel::<Input>(2);
+                            spawn_named(inner, "prod-decode", move || {
+                                let cpu0 = thread_cpu();
+                                let mut decode = 0.0;
+                                for logs in log_rx {
+                                    let t = Instant::now();
+                                    let decoded = decoder.decode(&logs)?;
+                                    decode += t.elapsed().as_secs_f64();
+                                    if dtx.send((logs, Some(decoded))).is_err() {
+                                        break;
+                                    }
+                                }
+                                live(format!(
+                                    "decoder done · decode {decode:.3} · cpu {} s",
+                                    opt(cpu_since(cpu0))
+                                ));
+                                Ok::<_, Error>(())
+                            })?;
+                            Box::new(drx.into_iter())
+                        } else {
+                            Box::new(log_rx.into_iter().map(|logs| (logs, None)))
+                        };
+                        let mut input = input;
                         let (walked_tx, walked_rx) = mpsc::sync_channel::<(WalkedWindow, f64)>(2);
                         let walking = spawn_named(inner, "prod-walk", move || {
                             let cpu0 = thread_cpu();
@@ -384,16 +414,19 @@ pub(crate) fn run_producer(
                             let mut walked_at = Vec::new();
                             let mut walk_total = 0.0;
                             // One window held back: the run's last is `finish`'s.
-                            let mut held: Option<Vec<Log>> = None;
+                            let mut held: Option<Input> = None;
                             loop {
                                 let t_recv = Instant::now();
-                                let Ok(logs) = log_rx.recv() else {
+                                let Some(next) = input.next() else {
                                     break;
                                 };
                                 times.recv_blocked += t_recv.elapsed().as_secs_f64();
-                                if let Some(prev) = held.replace(logs) {
+                                if let Some((prev, decoded)) = held.replace(next) {
                                     let t_walk = Instant::now();
-                                    let walked = walker.walk(&prev)?;
+                                    let walked = match decoded {
+                                        Some(decoded) => walker.walk_decoded(decoded)?,
+                                        None => walker.walk(&prev)?,
+                                    };
                                     let secs = t_walk.elapsed().as_secs_f64();
                                     walk_total += secs;
                                     walked_at.push(since());
@@ -412,7 +445,7 @@ pub(crate) fn run_producer(
                                 walked_at.len(),
                                 opt(times.cpu)
                             ));
-                            let last = held.ok_or_else(|| {
+                            let (last, _) = held.ok_or_else(|| {
                                 Error::Execution("the run executed no cycle".to_string())
                             })?;
                             Ok::<_, Error>((last, times, walked_at))
@@ -700,7 +733,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// Window 2^20 is the WHIR prover's (`BLOCK_WINDOW_LOG2`), 2^21 the STARK
 /// prover's (`max_rows.cpu`). `LAMBDA_VM_PRODUCER_SINK=skip` drops each chunk
 /// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows;
-/// `LAMBDA_VM_PRODUCER_LOG_DIGEST=1` prints a digest of every log (untimed).
+/// `LAMBDA_VM_PRODUCER_LOG_DIGEST=1` prints a digest of every log (untimed);
+/// `LAMBDA_VM_PRODUCER_DECODER=1` builds the CPU ops on a decoder thread.
 /// It refuses to run unless jemalloc never purges (the record chains'
 /// posture, `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`) or
 /// `LAMBDA_VM_PRODUCER_POSTURE=any` says another posture is meant.
@@ -748,6 +782,7 @@ fn the_block_producer_alone() {
         live: true,
         finish: env_usize("LAMBDA_VM_PRODUCER_FINISH", 1) != 0,
         log_digest: env_usize("LAMBDA_VM_PRODUCER_LOG_DIGEST", 0) != 0,
+        decoder: env_usize("LAMBDA_VM_PRODUCER_DECODER", 0) != 0,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -825,7 +860,11 @@ fn the_producer_harness_drives_the_builder() {
         let elf = asm_elf_bytes(name);
         for window in [7, 33] {
             let (cycles, jobs) = reference_jobs(&elf, &max_rows, window);
-            for (sink, drop_ops) in [(Sink::Generate, true), (Sink::Skip, false)] {
+            for (sink, drop_ops, decoder) in [
+                (Sink::Generate, true, false),
+                (Sink::Skip, false, false),
+                (Sink::Generate, true, true),
+            ] {
                 let cfg = ProducerConfig {
                     window,
                     max_rows: max_rows.clone(),
@@ -835,9 +874,10 @@ fn the_producer_harness_drives_the_builder() {
                     live: false,
                     finish: true,
                     log_digest: false,
+                    decoder,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
-                let what = format!("{name}, window {window}, {sink:?}");
+                let what = format!("{name}, window {window}, {sink:?}, decoder {decoder}");
                 assert_eq!(report.cycles, cycles, "{what}: cycles");
                 assert_eq!(
                     report.windows.len(),

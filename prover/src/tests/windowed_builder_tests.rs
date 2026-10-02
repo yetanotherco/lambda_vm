@@ -985,3 +985,60 @@ fn the_lean_walk_builds_the_whole_run_tables() {
         }
     }
 }
+
+/// The builder split three ways (the CPU ops decoded ahead of the walk) builds
+/// the whole-run tables, lean or not, kept or dropped; and the walk refuses a
+/// decoded window that is not the next one, or that halts.
+#[test]
+fn the_decoded_split_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "lw_sw_offset_odd",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33] {
+            for lean in [WalkLean::NONE, WalkLean::ALL] {
+                for drop in [false, true] {
+                    let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                        .expect("the builder")
+                        .walk_lean(lean);
+                    if drop {
+                        builder = builder.drop_streamed_ops().expect("before any window");
+                    }
+                    let body = logs.len() - 1;
+                    let cut = body - body % window;
+                    let mut chunks = Vec::new();
+                    {
+                        let (mut decoder, mut walker, mut accumulator) = builder.split_decoded();
+                        for w in logs[..cut].chunks(window) {
+                            let decoded = decoder.decode(w).expect("a window decodes");
+                            let walked = walker.walk_decoded(decoded).expect("a window");
+                            chunks.extend(
+                                accumulator.absorb(walked).into_iter().map(|j| j.generate()),
+                            );
+                        }
+                    }
+                    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+                    traces.insert_streamed(chunks).expect("placeholders");
+                    same_traces(&reference, &traces);
+                }
+            }
+        }
+    }
+
+    let (program, logs) = run("test_keccak_multi");
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    let (mut decoder, mut walker, _) = builder.split_decoded();
+    let first = decoder.decode(&logs[..10]).expect("decodes");
+    let second = decoder.decode(&logs[10..20]).expect("decodes");
+    assert!(walker.walk_decoded(second).is_err(), "out of order");
+    walker.walk_decoded(first).expect("in order");
+    let last = decoder.decode(&logs[20..]).expect("decodes");
+    assert!(matches!(
+        walker.walk_decoded(last),
+        Err(crate::Error::HaltInNonFinalEpoch)
+    ));
+}
