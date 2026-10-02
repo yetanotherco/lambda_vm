@@ -199,8 +199,11 @@ struct LoweredProgram {
     compiled: Option<&'static str>,
     /// The program's budgeted lowerings, by budget and specialization
     /// (`None`: none fits).
-    si: std::sync::Mutex<Vec<((u32, bool), Option<std::sync::Arc<SiLowered>>)>>,
+    si: std::sync::Mutex<Vec<(SiKey, Option<std::sync::Arc<SiLowered>>)>>,
 }
+
+/// A budgeted lowering's key: the word budget and whether it is specialized.
+type SiKey = (u32, bool);
 
 /// A budgeted lowering ([`super::budgeted`]) with its packed steps.
 pub struct SiLowered {
