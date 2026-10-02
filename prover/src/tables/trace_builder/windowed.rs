@@ -276,6 +276,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// With [`Self::build_wide_then_pack`], `finish` builds at most `cap`
+    /// KECCAK_RND chunks at 8 bytes a cell at once ([`StreamSkip::kr_wide_cap`];
+    /// 0 is no cap). The tables are the same.
+    pub fn cap_kr_wide(mut self, cap: usize) -> Self {
+        self.emitted.kr_wide_cap = cap;
+        self
+    }
+
     /// `finish` concatenates LT's ops into one list before chunking them
     /// ([`StreamSkip::concat_lt`]), as it did before keeping them as segments.
     /// The tables are the same.

@@ -3923,6 +3923,12 @@ pub struct StreamSkip {
     /// Concatenate LT's segments into one list in phase 3, as the build did
     /// before [`Segmented`] (the A arm of the segments). The tables are the same.
     pub concat_lt: bool,
+    /// With [`Self::pack`] and [`Self::wide_builds`]: at most this many
+    /// KECCAK_RND chunks are built at 8 bytes a cell at once (the build goes
+    /// in waves of this many), so the 64-bit copies in flight before each is
+    /// packed stay bounded whatever the block's size. `0`: no cap. The tables
+    /// are the same.
+    pub kr_wide_cap: usize,
 }
 
 /// What a build does with each table it generates: packs it
@@ -3931,6 +3937,10 @@ pub struct StreamSkip {
 #[derive(Clone, Copy)]
 struct Packing<'a> {
     on: bool,
+    /// Build at most this many chunks at once, in waves (0: all at once, as
+    /// rayon schedules them). Waves leave the other workers free for the
+    /// other tables, where a permit would park them.
+    wave: usize,
     /// The sink, the kind of the tables this build makes, and the instance
     /// the first of them is.
     hand: Option<(&'a dyn FinishSink, FinishedKind, usize)>,
@@ -4230,7 +4240,19 @@ fn generate_chunks_with<C: Send, T>(
         }
     };
     #[cfg(feature = "parallel")]
-    let tables = chunks.into_par_iter().enumerate().map(generate).collect();
+    let tables = if pack.wave > 0 {
+        let mut tables = Vec::with_capacity(chunks.len());
+        let mut chunks = chunks.into_iter().enumerate();
+        loop {
+            let wave: Vec<(usize, C)> = chunks.by_ref().take(pack.wave).collect();
+            if wave.is_empty() {
+                break tables;
+            }
+            tables.par_extend(wave.into_par_iter().map(generate));
+        }
+    } else {
+        chunks.into_par_iter().enumerate().map(generate).collect()
+    };
     #[cfg(not(feature = "parallel"))]
     let tables = chunks.into_iter().enumerate().map(generate).collect();
     Ok(tables)
@@ -4747,6 +4769,7 @@ fn build_traces<I: ImageSource + Sync>(
 ) -> Result<Traces, Error> {
     let pack = Packing {
         on: skip.pack,
+        wave: 0,
         hand: None,
     };
     // Each plain table goes to `sink` as it is generated (its slot keeps a
@@ -5319,6 +5342,16 @@ fn build_traces<I: ImageSource + Sync>(
                         .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
                 },
                 Packing { on: true, ..pack },
+            )
+        } else if pack.on && skip.kr_wide_cap > 0 {
+            // Built wide, then packed: at most `kr_wide_cap` 64-bit chunks at
+            // once.
+            (
+                keccak_rnd::generate_keccak_rnd_trace,
+                Packing {
+                    wave: skip.kr_wide_cap,
+                    ..pack
+                },
             )
         } else {
             (keccak_rnd::generate_keccak_rnd_trace, pack)
@@ -6807,6 +6840,48 @@ mod segmented_tests {
             .collect()
     }
 
+    /// A build in waves (`Packing::wave`) never has more than a wave's
+    /// chunks in its generator at once, and gives the tables, in order, that
+    /// the unbounded build gives.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_build_in_waves_holds_at_most_a_wave() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let all: Vec<u64> = (1..=37).collect();
+        for wave in [0, 1, 2, 3, 37, 100] {
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let generate = |ops: &[u64]| {
+                most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let table = table_of(ops);
+                now.fetch_sub(1, SeqCst);
+                table
+            };
+            let pack = Packing {
+                on: false,
+                wave,
+                hand: None,
+            };
+            let tables = generate_chunks(
+                all.chunks(3).collect(),
+                generate,
+                pack,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .expect("generated");
+            let want: Vec<Table> = all.chunks(3).map(table_of).collect();
+            assert_eq!(words(&tables), words(&want), "wave {wave}");
+            if wave > 0 {
+                assert!(
+                    most.load(SeqCst) <= wave,
+                    "wave {wave}: {} at once",
+                    most.load(SeqCst)
+                );
+            }
+        }
+    }
+
     /// Chunked from its segments, a list gives the tables its concatenation
     /// gives: every split of the segments (empty ones too), chunk sizes that
     /// cut inside and across them, with and without chunks streamed ahead
@@ -6817,6 +6892,7 @@ mod segmented_tests {
         let layouts: [&[usize]; 4] = [&[37], &[0, 10, 0, 27], &[5, 5, 5, 22], &[1, 36, 0]];
         let off = Packing {
             on: false,
+            wave: 0,
             hand: None,
         };
         for layout in layouts {

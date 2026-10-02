@@ -810,21 +810,27 @@ fn packing_the_finished_tables_keeps_the_words() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        // KECCAK_RND and LT built packed or wide then packed, and LT's ops
-        // chunked as segments or concatenated into one list (the segments' A
-        // arm), all give the same tables.
-        for (window, wide, concat) in [
-            (7, false, false),
-            (33, false, false),
-            (33, true, false),
-            (33, false, true),
+        // KECCAK_RND and LT built packed or wide then packed (KECCAK_RND's
+        // wide chunks capped or not), and LT's ops chunked as segments or
+        // concatenated into one list (the segments' A arm), all give the same
+        // tables.
+        for (window, wide, concat, cap) in [
+            (7, false, false, 0),
+            (33, false, false, 0),
+            (33, true, false, 0),
+            (33, true, false, 2),
+            (33, false, true, 0),
         ] {
             let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
                 let b = b
                     .drop_streamed_ops()
                     .expect("before any window")
                     .pack_finished_tables();
-                let b = if wide { b.build_wide_then_pack() } else { b };
+                let b = if wide {
+                    b.build_wide_then_pack().cap_kr_wide(cap)
+                } else {
+                    b
+                };
                 if concat { b.concat_lt() } else { b }
             });
             assert!(

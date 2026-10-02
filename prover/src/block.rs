@@ -466,6 +466,18 @@ fn packed_builds() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `LAMBDA_VM_BLOCK_KR_WIDE_CAP=n` (1..=64): with KECCAK_RND built wide, then
+/// packed (the default), the finish builds at most `n` of its chunks at
+/// 8 bytes a cell at once ([`WindowedTraceBuilder::cap_kr_wide`]); unset,
+/// 0 or anything else, no cap. The tables are the same.
+fn kr_wide_cap() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_KR_WIDE_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(0)
+}
+
 /// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
 /// knob; unset is [`STREAM_COMMITTERS`].
 fn stream_committers() -> usize {
@@ -1065,7 +1077,7 @@ fn build_streamed(
             if narrow_finished() {
                 builder = builder.pack_finished_tables();
                 if !packed_builds() {
-                    builder = builder.build_wide_then_pack();
+                    builder = builder.build_wide_then_pack().cap_kr_wide(kr_wide_cap());
                 }
             }
             if lt_concat() {
