@@ -587,7 +587,7 @@ pub(crate) fn launch_col_major_leaves(
             &be.rpx_leaves_base_batched,
             crate::rpx::rpx_launch_cfg(threads),
         ),
-        (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
+        (DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1, _) => {
             unimplemented!("{hash:?} device commit not yet ported (column-major leaves)")
         }
     };

@@ -1293,7 +1293,7 @@ fn build_inner_tree_levels_for(
         DeviceHash::Rpx256 => {
             crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
         }
-        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+        DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1 => {
             unimplemented!("{hash:?} device commit not yet ported (inner tree levels)")
         }
     }
@@ -1400,7 +1400,7 @@ pub(crate) fn launch_row_major_leaves(
                 log_num_rows,
                 leaves_out,
             ),
-            (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
+            (DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1, _) => {
                 unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
             }
         };
@@ -1419,7 +1419,7 @@ pub(crate) fn launch_row_major_leaves(
             &be.rpx_leaves_base_row_major_row_range,
             crate::rpx::rpx_launch_cfg(num_rows),
         ),
-        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+        DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1 => {
             unimplemented!("{hash:?} device commit not yet ported (row-major one-row leaves)")
         }
     };
@@ -2941,7 +2941,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
                 lde_u64,
                 &mut leaves_view,
             )?,
-            (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
+            (DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1, _) => {
                 unimplemented!("{hash:?} device commit not yet ported (column-major base leaves)")
             }
         }
@@ -3180,7 +3180,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                     log_num_rows,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+                DeviceHash::Rpo256 | DeviceHash::Poseidon | DeviceHash::Poseidon1 => {
                     unimplemented!("{hash:?} device commit not yet ported (comp-poly ext3 leaves)")
                 }
             }

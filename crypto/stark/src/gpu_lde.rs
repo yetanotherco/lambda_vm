@@ -65,6 +65,7 @@ const fn device_hash_for(hash: CommitmentHash) -> math_cuda::DeviceHash {
         CommitmentHash::Rpo256 => math_cuda::DeviceHash::Rpo256,
         CommitmentHash::Rpx256 => math_cuda::DeviceHash::Rpx256,
         CommitmentHash::Poseidon => math_cuda::DeviceHash::Poseidon,
+        CommitmentHash::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
     }
 }
 
@@ -77,6 +78,7 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
         math_cuda::DeviceHash::Rpo256 => CommitmentHash::Rpo256,
         math_cuda::DeviceHash::Rpx256 => CommitmentHash::Rpx256,
         math_cuda::DeviceHash::Poseidon => CommitmentHash::Poseidon,
+        math_cuda::DeviceHash::Poseidon1 => CommitmentHash::Poseidon1,
     }
 }
 
@@ -91,12 +93,13 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
 /// and is added to this list with its arm. Discriminants are compared because
 /// `PartialEq` is not `const`.
 const _: () = {
-    const ALL: [CommitmentHash; 5] = [
+    const ALL: [CommitmentHash; 6] = [
         CommitmentHash::Keccak256,
         CommitmentHash::Blake3,
         CommitmentHash::Rpo256,
         CommitmentHash::Rpx256,
         CommitmentHash::Poseidon,
+        CommitmentHash::Poseidon1,
     ];
     let mut i = 0;
     while i < ALL.len() {
@@ -2230,7 +2233,9 @@ where
         math_cuda::DeviceHash::Rpx256 => {
             math_cuda::rpx::build_comp_poly_tree_from_evals_ext3_keep_rpl(&raw_parts, rows_per_leaf)
         }
-        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
+        math_cuda::DeviceHash::Rpo256
+        | math_cuda::DeviceHash::Poseidon
+        | math_cuda::DeviceHash::Poseidon1 => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
             B::COMMITMENT_HASH
         ),
@@ -2300,7 +2305,9 @@ where
             handle.lde_size,
             rows_per_leaf,
         ),
-        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
+        math_cuda::DeviceHash::Rpo256
+        | math_cuda::DeviceHash::Poseidon
+        | math_cuda::DeviceHash::Poseidon1 => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
             B::COMMITMENT_HASH
         ),

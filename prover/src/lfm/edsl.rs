@@ -596,6 +596,8 @@ impl WrapHash {
             stark::config::CommitmentHash::Rpo256
             | stark::config::CommitmentHash::Rpx256
             | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
+            // No recursion verifies a Poseidon1 proof yet (`p1/*` stage P3).
+            stark::config::CommitmentHash::Poseidon1 => WrapHash::Algebraic,
         }
     }
 

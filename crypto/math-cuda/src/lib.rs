@@ -84,6 +84,10 @@ pub enum DeviceHash {
     /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
     /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
     Poseidon,
+    /// ZisK's Poseidon1 instance (width 16, rate 12, arity-4 trees) — the
+    /// `p1/*` exploration branch. Kernels in [`p1w16`]; a dispatch site not yet
+    /// wired aborts loudly on this key.
+    Poseidon1,
 }
 
 impl DeviceHash {
@@ -95,6 +99,7 @@ impl DeviceHash {
             Self::Rpo256 => "rpo256",
             Self::Rpx256 => "rpx256",
             Self::Poseidon => "poseidon-goldilocks",
+            Self::Poseidon1 => "poseidon1-w16",
         }
     }
 }
