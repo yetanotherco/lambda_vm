@@ -58,6 +58,7 @@
 //! [`finish`]: WindowedTraceBuilder::finish
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use executor::elf::Elf;
 use executor::vm::logs::Log;
@@ -68,9 +69,9 @@ use stark::trace::TraceTable;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     CollectedOps, DecodeArtifacts, DecodeTable, MemoryState, MemwBuckets, PreCounted,
-    RegisterState, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, bitwise,
-    build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into, route_ops,
-    route_ops_one_pass,
+    RegisterState, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, WindowsCounted,
+    bitwise, build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
+    count_window_sources, route_ops, route_ops_one_pass,
 };
 use crate::Error;
 use crate::tables::{
@@ -149,6 +150,102 @@ pub struct WindowedTraceBuilder<'a> {
     /// With [`WalkLean::decode`], the walk reads each cycle's decode from here,
     /// from the instruction map otherwise.
     decode: Option<DecodeTable>,
+    /// [`Self::count_windows_apart`].
+    apart: Option<Box<Apart>>,
+}
+
+/// The bookkeeping of [`WindowedTraceBuilder::count_windows_apart`].
+#[derive(Default)]
+struct Apart {
+    /// The absorbed windows' count jobs, until [`Accumulator::take_count_jobs`].
+    jobs: Vec<CountJob>,
+    /// Windows absorbed, and windows whose counts are in the histogram.
+    absorbed: usize,
+    added: usize,
+    /// What the counts in the histogram leave the table phase to skip.
+    counted: WindowsCounted,
+}
+
+/// One window's share of the table phase's BITWISE counting
+/// ([`WindowedTraceBuilder::count_windows_apart`]): its routed segments, shared
+/// with nothing that writes them, and a copy of its precompile lists.
+pub struct CountJob {
+    segments: Arc<RoutedSegments>,
+    walk: WalkOutputs,
+}
+
+impl CountJob {
+    /// Leaves the window's KECCAK ops out of its count (tests' mutation);
+    /// whether it had any.
+    #[cfg(test)]
+    pub(crate) fn forget_keccak(&mut self) -> bool {
+        !std::mem::take(&mut self.walk.keccak_ops).is_empty()
+    }
+}
+
+/// Counts [`CountJob`]s, on any thread, in any order, into a histogram of its
+/// own; [`WindowedTraceBuilder::add_counter`] adds it to the run's.
+pub struct Counter {
+    histogram: Box<bitwise::BitwiseHistogram>,
+    counted: WindowsCounted,
+    windows: usize,
+    secs: f64,
+}
+
+impl Default for Counter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Counter {
+    pub fn new() -> Self {
+        Self {
+            histogram: Box::new(bitwise::BitwiseHistogram::new()),
+            counted: WindowsCounted::default(),
+            windows: 0,
+            secs: 0.0,
+        }
+    }
+
+    pub fn count(&mut self, job: CountJob) {
+        let t = std::time::Instant::now();
+        self.counted += count_window_sources(&job.segments, &job.walk, &mut self.histogram);
+        self.windows += 1;
+        drop(job);
+        self.secs += t.elapsed().as_secs_f64();
+    }
+
+    /// What it counted that the table phase skips at a list's end (tests'
+    /// mutations).
+    #[cfg(test)]
+    pub(crate) fn counted_mut(&mut self) -> &mut WindowsCounted {
+        &mut self.counted
+    }
+
+    /// The windows counted so far.
+    pub fn windows(&self) -> usize {
+        self.windows
+    }
+
+    /// The seconds spent counting (and freeing the jobs).
+    pub fn secs(&self) -> f64 {
+        self.secs
+    }
+}
+
+/// A window's precompile lists, copied for its count job (the run keeps its
+/// own): small next to the window's other lists.
+fn precompile_lists(walk: &WalkOutputs) -> WalkOutputs {
+    let mut lists = WalkOutputs::with_capacity(0);
+    lists.commit_ops.clone_from(&walk.commit_ops);
+    lists.keccak_ops.clone_from(&walk.keccak_ops);
+    lists.blake3_ops.clone_from(&walk.blake3_ops);
+    lists.blake3_absorb_ops.clone_from(&walk.blake3_absorb_ops);
+    lists.ecsm_ops.clone_from(&walk.ecsm_ops);
+    lists.ecdas_ops.clone_from(&walk.ecdas_ops);
+    lists.hint_ops.clone_from(&walk.hint_ops);
+    lists
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -199,12 +296,14 @@ impl<'a> WindowedTraceBuilder<'a> {
                 last_ecall: None,
                 memw_lt: Vec::new(),
                 memw_aligned_lt: Vec::new(),
+                windows: None,
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
             kept: None,
             lean,
             decode,
+            apart: None,
         })
     }
 
@@ -242,7 +341,16 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn push_jobs(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
         let (mut walker, mut accumulator) = self.split();
         let walked = walker.walk(logs)?;
-        Ok(accumulator.absorb(walked))
+        let jobs = accumulator.absorb(walked);
+        // Counting apart, but on this thread.
+        if let Some(apart) = self.apart.as_deref_mut() {
+            for job in std::mem::take(&mut apart.jobs) {
+                apart.counted +=
+                    count_window_sources(&job.segments, &job.walk, &mut self.counted.histogram);
+                apart.added += 1;
+            }
+        }
+        Ok(jobs)
     }
 
     /// Cut KECCAK_RND into tables of `rows` rows — the split a block proof makes
@@ -290,6 +398,63 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         self.kept = Some(Kept::new(self.artifacts.decode_trace.clone()));
         Ok(self)
+    }
+
+    /// Count the table phase's commutative BITWISE sources window by window, off
+    /// the finish: each window's routed segments (BRANCH, EQ, BYTEWISE, MUL and
+    /// DVRM but their per-instance lookups, CPU32's SHIFT ops and lookups, the
+    /// DVRM-derived LT ops) and precompile lists (COMMIT, KECCAK, BLAKE3, ECSM,
+    /// ECDAS, HINT). After each window the caller takes its [`CountJob`]s
+    /// ([`Accumulator::take_count_jobs`]) and counts them into a [`Counter`] on
+    /// a thread of its own, then adds the counter ([`Self::add_counter`])
+    /// before [`Self::finish`], which counts the last window and refuses a run
+    /// with a window's counts missing. [`Self::push`] counts on its own thread.
+    /// The tables are the same. Before the first window only.
+    pub fn count_windows_apart(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "count_windows_apart after a window was walked".to_string(),
+            ));
+        }
+        self.apart = Some(Box::default());
+        Ok(self)
+    }
+
+    /// Adds a [`Counter`]'s counts to the run's ([`Self::count_windows_apart`]).
+    pub fn add_counter(&mut self, counter: Counter) -> Result<(), Error> {
+        let Some(apart) = self.apart.as_deref_mut() else {
+            return Err(Error::Prover(
+                "a counter was added to a build that does not count apart".to_string(),
+            ));
+        };
+        self.counted.histogram.merge(&counter.histogram);
+        apart.counted += counter.counted;
+        apart.added += counter.windows;
+        Ok(())
+    }
+
+    /// Under [`Self::count_windows_apart`], counts the last window as the
+    /// others were counted, once every other window's counts are in.
+    fn count_last_window(
+        &mut self,
+        routed: &RoutedSegments,
+        walk: &WalkOutputs,
+    ) -> Result<(), Error> {
+        let Some(apart) = self.apart.as_deref_mut() else {
+            return Ok(());
+        };
+        if apart.added != apart.absorbed || !apart.jobs.is_empty() {
+            return Err(Error::Prover(format!(
+                "the counts of {} of {} windows were added ({} count jobs not taken)",
+                apart.added,
+                apart.absorbed,
+                apart.jobs.len()
+            )));
+        }
+        let mut counted = apart.counted;
+        counted += count_window_sources(routed, walk, &mut self.counted.histogram);
+        self.counted.windows = Some(counted);
+        Ok(())
     }
 
     /// Per streamed table (CPU, MEMW_R, MEMW_A, MEMW, LOAD, LT, SHIFT, STORE),
@@ -346,7 +511,9 @@ impl<'a> WindowedTraceBuilder<'a> {
         } else {
             route_ops
         };
-        self.segments.append(route(&cpu_ops, &walk.cpu32_ops));
+        let routed = route(&cpu_ops, &walk.cpu32_ops);
+        self.count_last_window(&routed, &walk)?;
+        self.segments.append(routed);
         let last = WalkedWindow { cpu_ops, walk };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -461,6 +628,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 segments: &mut self.segments,
                 emitted: &mut self.emitted,
                 counted: &mut self.counted,
+                apart: self.apart.as_deref_mut(),
                 route_secs: &mut self.stamps.route,
                 handout_secs: &mut self.stamps.generate,
             },
@@ -528,11 +696,21 @@ pub struct Accumulator<'b> {
     segments: &'b mut RoutedSegments,
     emitted: &'b mut StreamSkip,
     counted: &'b mut PreCounted,
+    apart: Option<&'b mut Apart>,
     route_secs: &'b mut f64,
     handout_secs: &'b mut f64,
 }
 
 impl Accumulator<'_> {
+    /// The absorbed windows' count jobs not taken yet
+    /// ([`WindowedTraceBuilder::count_windows_apart`]; none otherwise).
+    pub fn take_count_jobs(&mut self) -> Vec<CountJob> {
+        self.apart
+            .as_deref_mut()
+            .map(|apart| std::mem::take(&mut apart.jobs))
+            .unwrap_or_default()
+    }
+
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
@@ -551,8 +729,21 @@ impl Accumulator<'_> {
         } else {
             route_ops
         };
-        self.segments
-            .append(route(&window.cpu_ops, &window.walk.cpu32_ops));
+        let routed = route(&window.cpu_ops, &window.walk.cpu32_ops);
+        match self.apart.as_deref_mut() {
+            // The counter reads the window's segments where they are; the
+            // run's lists take a copy.
+            Some(apart) => {
+                let routed = Arc::new(routed);
+                self.segments.append_copied(&routed);
+                apart.absorbed += 1;
+                apart.jobs.push(CountJob {
+                    segments: routed,
+                    walk: precompile_lists(&window.walk),
+                });
+            }
+            None => self.segments.append(routed),
+        }
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise.
