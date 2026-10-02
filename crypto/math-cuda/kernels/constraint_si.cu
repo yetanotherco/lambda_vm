@@ -1,0 +1,399 @@
+// Bounded-slot composition interpreter.
+//
+// Evaluates a constraint program lowered by
+// `crypto/stark/src/constraint_ir/budgeted.rs` (roots in index order, each
+// root's cone on demand, leaves read as operands, a fixed budget of words a
+// row) and fuses the composition accumulation, exactly like
+// `constraint_composition_kernel` (constraint_interp.cu):
+//
+//   H(row) = z_inv[row % z_len] * Σ_c beta[c] * C_c(row)
+//          + Σ_b z_b_inv[b*num_rows + row] * beta_b * (trace_b - value_b)
+//
+// What differs is where values live. `constraint_composition_kernel` keeps a
+// per-thread slot file of thousands of words in global memory (every root is
+// pinned until the end of the walk); here a row's values fit in `num_words`
+// words, kept in shared memory (`si_smem_*`) or in a per-thread local array
+// (`si_local_*`, cached in L1). With no slot file in DRAM the grid covers
+// every row (no thread cap).
+//
+// ⛔ BIT-IDENTICAL BY CONSTRUCTION. Every step is the call `eval_program_row`
+// makes for its node's op, operand dims and result dim, with the operands in
+// IR order — including the mixed base/ext shortcuts and the literal
+// `sub(0, ·)`. A recomputed value is the same function of the same leaves. The
+// accumulation adds root `c` after roots `0..c` with `mul_base` for a base
+// root and `mul(beta, ·)` for an ext root. The tail is the interpreter's own.
+// The lowering's validator (`budgeted::validate`) replays every program
+// symbolically; `tools/si_host_check.cpp` runs this source as host C++
+// against `constraint_composition_kernel` limb for limb.
+//
+// A step is one `uint4` {op, a, b, dst}. Operands are `kind << 29 | payload`:
+//   BSLOT word · ESLOT first word · MAIN/AUX col | offset << 20 · BCONST index
+//   · EUNI index into the ext uniform table (the program's ext constants, the
+//   RAP challenges it reads, the alpha powers it reads, the table offset).
+// Op tags and operand kinds MUST stay in sync with budgeted.rs.
+
+#include "goldilocks.cuh"
+#include "ext3.cuh"
+
+using ext3::Fe3;
+
+#define SI_BADD 0u
+#define SI_BSUB 1u
+#define SI_BMUL 2u
+#define SI_BNEG 3u
+#define SI_EADD 4u
+#define SI_ESUB 5u
+#define SI_EMUL 6u
+#define SI_EADD_BX 7u
+#define SI_ESUB_BX 8u
+#define SI_EMUL_BX 9u
+#define SI_EADD_XB 10u
+#define SI_ESUB_XB 11u
+#define SI_EMUL_XB 12u
+#define SI_ENEG 13u
+#define SI_EMBED 14u
+#define SI_ACC_B 15u
+#define SI_ACC_E 16u
+
+#define SIK_SHIFT 29u
+#define SIK_PAYLOAD_MASK 0x1FFFFFFFu
+#define SIK_BSLOT 0u
+#define SIK_ESLOT 1u
+#define SIK_MAIN 2u
+#define SIK_AUX 3u
+#define SIK_BCONST 4u
+#define SIK_EUNI 5u
+#define SI_COL_OFFSET_SHIFT 20u
+#define SI_COL_MASK 0xFFFFFu
+
+// Slots in dynamic shared memory: word `w` of the thread's row `j` at
+// `smem[(w * R + j) * blockDim.x + threadIdx.x]` (consecutive threads,
+// consecutive words: no bank conflict).
+template <int R> struct SmemSlots {
+    uint64_t *base;
+    uint32_t stride;
+    __device__ __forceinline__ uint64_t &at(uint32_t w, int j) {
+        return base[(uint64_t)(w * R + j) * stride];
+    }
+};
+
+// Slots in a per-thread local array (local memory, cached in L1).
+template <int R, int MAXW> struct LocalSlots {
+    uint64_t v[MAXW * R];
+    __device__ __forceinline__ uint64_t &at(uint32_t w, int j) { return v[w * R + j]; }
+};
+
+// The per-launch read-only inputs a step's operands resolve against.
+struct SiInputs {
+    const uint64_t *base_consts;
+    const Fe3 *uni;
+    const uint64_t *main;
+    uint64_t main_stride;
+    const uint64_t *aux;
+    uint64_t aux_stride;
+};
+
+template <int R, class S>
+__device__ __forceinline__ uint64_t si_base(S &s, const SiInputs &in, uint32_t e, int j,
+                                            const uint64_t *r0, const uint64_t *r1) {
+    uint32_t p = e & SIK_PAYLOAD_MASK;
+    switch (e >> SIK_SHIFT) {
+    case SIK_BSLOT:
+        return s.at(p, j);
+    case SIK_MAIN: {
+        uint64_t r = (p >> SI_COL_OFFSET_SHIFT) ? r1[j] : r0[j];
+        return in.main[(uint64_t)(p & SI_COL_MASK) * in.main_stride + r];
+    }
+    default: // SIK_BCONST
+        return in.base_consts[p];
+    }
+}
+
+// Any operand as ext3; base values embed as {x, 0, 0}.
+template <int R, class S>
+__device__ __forceinline__ Fe3 si_ext(S &s, const SiInputs &in, uint32_t e, int j,
+                                      const uint64_t *r0, const uint64_t *r1) {
+    uint32_t p = e & SIK_PAYLOAD_MASK;
+    switch (e >> SIK_SHIFT) {
+    case SIK_ESLOT:
+        return ext3::make(s.at(p, j), s.at(p + 1, j), s.at(p + 2, j));
+    case SIK_AUX: {
+        uint64_t r = (p >> SI_COL_OFFSET_SHIFT) ? r1[j] : r0[j];
+        uint64_t c = (uint64_t)(p & SI_COL_MASK) * 3;
+        return ext3::make(in.aux[c * in.aux_stride + r], in.aux[(c + 1) * in.aux_stride + r],
+                          in.aux[(c + 2) * in.aux_stride + r]);
+    }
+    case SIK_EUNI:
+        return in.uni[p];
+    default:
+        return ext3::make(si_base<R>(s, in, e, j, r0, r1), 0, 0);
+    }
+}
+
+template <class S>
+__device__ __forceinline__ void si_put(S &s, uint32_t w, int j, const Fe3 &v) {
+    s.at(w, j) = v.a;
+    s.at(w + 1, j) = v.b;
+    s.at(w + 2, j) = v.c;
+}
+
+// One thread's walk over the program for its R rows (`row[j]`, with their
+// frame-offset-1 rows `r1[j]`), then the interpreter's tail. Rows past the end
+// are walked on a clamped row and not written.
+template <int R, class S>
+__device__ __forceinline__ void si_rows(
+    S &s, const SiInputs &in, const uint4 *__restrict__ prog, uint32_t num_steps,
+    const Fe3 *__restrict__ beta, const uint64_t *row, const bool *valid, uint64_t next_step,
+    uint64_t num_rows, Fe3 *__restrict__ d_h, const uint64_t *__restrict__ d_z_inv, uint64_t z_len,
+    uint64_t num_boundary, const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux, const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta, const uint64_t *__restrict__ d_b_z_inv) {
+    uint64_t r0[R], r1[R];
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        r0[j] = row[j];
+        uint64_t r = row[j] + next_step;
+        r1[j] = r >= num_rows ? r - num_rows : r;
+    }
+    Fe3 sum[R];
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        sum[j] = ext3::zero();
+    }
+    // The program is padded with one step, so the prefetch never reads past it.
+    uint4 next = __ldg(prog);
+    for (uint32_t pc = 0; pc < num_steps; pc++) {
+        uint4 st = next;
+        next = __ldg(prog + pc + 1);
+        const uint32_t a = st.y, b = st.z, d = st.w;
+        switch (st.x) {
+        case SI_BADD:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+                s.at(d, j) = goldilocks::add(x, y);
+            }
+            break;
+        case SI_BSUB:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+                s.at(d, j) = goldilocks::sub(x, y);
+            }
+            break;
+        case SI_BMUL:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+                s.at(d, j) = goldilocks::mul(x, y);
+            }
+            break;
+        case SI_BNEG:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                s.at(d, j) = goldilocks::neg(si_base<R>(s, in, a, j, r0, r1));
+            }
+            break;
+        case SI_EADD:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::add(x, y));
+            }
+            break;
+        case SI_ESUB:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::sub(x, y));
+            }
+            break;
+        case SI_EMUL:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::mul(x, y));
+            }
+            break;
+        case SI_EADD_BX:
+            // {x,0,0} + y = {add(x,y.a), y.b, y.c} (add(0,v) == v).
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::make(goldilocks::add(x, y.a), y.b, y.c));
+            }
+            break;
+        case SI_ESUB_BX:
+            // {x,0,0} - y: sub(0, ·) kept literal (not bitwise neg).
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j,
+                       ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b),
+                                  goldilocks::sub(0, y.c)));
+            }
+            break;
+        case SI_EMUL_BX:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::mul_base(y, x));
+            }
+            break;
+        case SI_EADD_XB:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::make(goldilocks::add(x.a, y), x.b, x.c));
+            }
+            break;
+        case SI_ESUB_XB:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::make(goldilocks::sub(x.a, y), x.b, x.c));
+            }
+            break;
+        case SI_EMUL_XB:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+                si_put(s, d, j, ext3::mul_base(x, y));
+            }
+            break;
+        case SI_ENEG:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                si_put(s, d, j, ext3::neg(si_ext<R>(s, in, a, j, r0, r1)));
+            }
+            break;
+        case SI_EMBED:
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                si_put(s, d, j, si_ext<R>(s, in, a, j, r0, r1));
+            }
+            break;
+        case SI_ACC_B: {
+            const Fe3 c = beta[b];
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                sum[j] = ext3::add(sum[j], ext3::mul_base(c, si_base<R>(s, in, a, j, r0, r1)));
+            }
+            break;
+        }
+        case SI_ACC_E: {
+            const Fe3 c = beta[b];
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                sum[j] = ext3::add(sum[j], ext3::mul(c, si_ext<R>(s, in, a, j, r0, r1)));
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    // The interpreter's tail, verbatim.
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        if (!valid[j]) {
+            continue;
+        }
+        const uint64_t rw = row[j];
+        Fe3 h = ext3::mul_base(sum[j], d_z_inv[rw % z_len]);
+        for (uint64_t bi = 0; bi < num_boundary; bi++) {
+            uint64_t col = d_b_col[bi];
+            Fe3 tcell;
+            if (d_b_is_aux[bi] != 0) {
+                uint64_t base = col * 3;
+                tcell = ext3::make(in.aux[(base + 0) * in.aux_stride + rw],
+                                   in.aux[(base + 1) * in.aux_stride + rw],
+                                   in.aux[(base + 2) * in.aux_stride + rw]);
+            } else {
+                tcell = ext3::make(in.main[col * in.main_stride + rw], 0, 0);
+            }
+            Fe3 bp = ext3::sub(tcell, d_b_value[bi]);
+            Fe3 zb = ext3::mul_base(d_b_beta[bi], d_b_z_inv[bi * num_rows + rw]);
+            h = ext3::add(h, ext3::mul(zb, bp));
+        }
+        d_h[rw] = h;
+    }
+}
+
+// The kernels' shared parameter list (the launch site passes the same
+// arguments to every variant).
+#define SI_PARAMS                                                                                  \
+    Fe3 *__restrict__ d_h, const uint4 *__restrict__ prog, uint32_t num_steps,                    \
+        const uint64_t *__restrict__ d_base_consts, const Fe3 *__restrict__ d_uni,                 \
+        const Fe3 *__restrict__ d_beta, const uint64_t *__restrict__ d_main, uint64_t main_stride, \
+        const uint64_t *__restrict__ d_aux, uint64_t aux_stride, uint64_t next_step,               \
+        uint64_t num_rows, const uint64_t *__restrict__ d_z_inv, uint64_t z_len,                   \
+        uint64_t num_boundary, const uint64_t *__restrict__ d_b_col,                               \
+        const uint64_t *__restrict__ d_b_is_aux, const Fe3 *__restrict__ d_b_value,                \
+        const Fe3 *__restrict__ d_b_beta, const uint64_t *__restrict__ d_b_z_inv
+
+// A thread takes rows g, g + n, …, g + (R−1)·n of each tile of R·n rows
+// (n = the grid's threads), grid-striding over the tiles.
+template <int R, class S>
+__device__ __forceinline__ void si_grid(S &s, SI_PARAMS) {
+    SiInputs in;
+    in.base_consts = d_base_consts;
+    in.uni = d_uni;
+    in.main = d_main;
+    in.main_stride = main_stride;
+    in.aux = d_aux;
+    in.aux_stride = aux_stride;
+    const uint64_t n = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t g = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint64_t tile = 0; tile < num_rows; tile += (uint64_t)R * n) {
+        uint64_t row[R];
+        bool valid[R];
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t r = tile + (uint64_t)j * n + g;
+            valid[j] = r < num_rows;
+            row[j] = valid[j] ? r : 0;
+        }
+        si_rows<R>(s, in, prog, num_steps, d_beta, row, valid, next_step, num_rows, d_h, d_z_inv,
+                   z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value, d_b_beta, d_b_z_inv);
+    }
+}
+
+template <int R> __device__ __forceinline__ void si_smem(SI_PARAMS) {
+    extern __shared__ uint64_t si_smem_words[];
+    SmemSlots<R> s;
+    s.base = si_smem_words + threadIdx.x;
+    s.stride = blockDim.x;
+    si_grid<R>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
+               aux_stride, next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux,
+               d_b_value, d_b_beta, d_b_z_inv);
+}
+
+template <int R, int MAXW> __device__ __forceinline__ void si_local(SI_PARAMS) {
+    LocalSlots<R, MAXW> s;
+    si_grid<R>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
+               aux_stride, next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux,
+               d_b_value, d_b_beta, d_b_z_inv);
+}
+
+#define SI_ARGS                                                                                    \
+    d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux, aux_stride,    \
+        next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,         \
+        d_b_beta, d_b_z_inv
+
+// Shared-memory slots: `num_words · R · blockDim.x` u64 of dynamic shared memory.
+extern "C" __global__ void si_smem_r1(SI_PARAMS) { si_smem<1>(SI_ARGS); }
+extern "C" __global__ void si_smem_r2(SI_PARAMS) { si_smem<2>(SI_ARGS); }
+
+// Local-array slots, one row a thread; the program's `num_words` must not
+// exceed the variant's width.
+extern "C" __global__ void si_local_w32(SI_PARAMS) { si_local<1, 32>(SI_ARGS); }
+extern "C" __global__ void si_local_w48(SI_PARAMS) { si_local<1, 48>(SI_ARGS); }
+extern "C" __global__ void si_local_w64(SI_PARAMS) { si_local<1, 64>(SI_ARGS); }
+extern "C" __global__ void si_local_w128(SI_PARAMS) { si_local<1, 128>(SI_ARGS); }
