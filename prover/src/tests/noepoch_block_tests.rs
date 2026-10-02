@@ -255,7 +255,7 @@ fn vm_hwm_gib() -> Option<f64> {
 /// ★ THE BLOCK: `prove_block` over `NOEPOCH_ELF` with `NOEPOCH_INPUT` at the
 /// block's production format (`lfm::proof::block_base_options`, the process's
 /// `ZfFormat`), then the monolithic verifier. Prints the census, the phase
-/// walls, the peak RSS and one `NOEPOCH RESULT` line.
+/// walls, the peak RSS, one `NOEPOCH DIGEST` and one `NOEPOCH RESULT` line.
 #[test]
 #[ignore = "proves a whole block; GPU box only (NOEPOCH_ELF, NOEPOCH_INPUT)"]
 fn noepoch_block_prove_and_verify() {
@@ -279,7 +279,15 @@ fn noepoch_block_prove_and_verify() {
     let (proof, times) = prove_block(&elf_bytes, &input, &opts).expect("the block must prove");
     let prove_peak = vm_hwm_gib();
     let sub_proofs = proof.proof.proofs.len();
-    let size = proof_bytes(&proof).len();
+    let bytes = proof_bytes(&proof);
+    let size = bytes.len();
+    // Two processes prove the same bytes under LAMBDA_VM_FIXED_TRACE_HASH=1 and
+    // LAMBDA_VM_DETERMINISTIC_GRIND: compare these lines.
+    println!(
+        "NOEPOCH DIGEST: {} (blake3 of the {size} proof bytes)",
+        &blake3::hash(&bytes).to_hex()[..32]
+    );
+    drop(bytes);
 
     let t = std::time::Instant::now();
     let verified = matches!(
