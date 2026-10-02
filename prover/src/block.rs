@@ -401,7 +401,15 @@ fn drop_streamed_ops() -> bool {
 /// does not run. The words are the same, so no proof byte moves. Off by default
 /// until its box gate (D-MEMORY M3).
 fn narrow_streamed() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| v.trim() == "1")
+    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| matches!(v.trim(), "1" | "2"))
+}
+
+/// `LAMBDA_VM_BLOCK_NARROW=2`: [`narrow_streamed`], and the tables phase A's
+/// finish builds are packed as each is generated
+/// ([`WindowedTraceBuilder::pack_finished_tables`]), so the finish never holds
+/// them at 8 bytes a cell; their Round-1 commits read the packed columns.
+fn narrow_finished() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| v.trim() == "2")
 }
 
 /// Committer threads for the streamed instances.
@@ -556,6 +564,9 @@ fn build_streamed(
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
+            }
+            if narrow_finished() {
+                builder = builder.pack_finished_tables();
             }
             let mut collect_secs = 0.0;
             let last = if stream_by_push() {
