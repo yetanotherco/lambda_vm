@@ -480,6 +480,11 @@ pub(crate) struct WalkLean {
     pub(crate) lookups: bool,
     /// The routing in one pass over a window's CPU ops ([`route_ops_one_pass`]).
     pub(crate) route: bool,
+    /// The accumulator's hand-out without copies or lists: a chunk leaves as
+    /// shared ranges of the window parts (the generator makes it one list),
+    /// its lookups are counted without a list, and each CPU op's DECODE row
+    /// comes from the decode table (with `decode`) instead of a hash map.
+    pub(crate) handout: bool,
 }
 
 impl WalkLean {
@@ -488,24 +493,27 @@ impl WalkLean {
         memory: true,
         lookups: true,
         route: true,
+        handout: true,
     };
     pub(crate) const NONE: Self = Self {
         decode: false,
         memory: false,
         lookups: false,
         route: false,
+        handout: false,
     };
 
     /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
-    /// of `decode`, `memory`, `lookups`, `route`. Read once; any other value is
-    /// refused.
+    /// of `decode`, `memory`, `lookups`, `route`, `handout`. Read once; any
+    /// other value is refused.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
         LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
             Err(_) => Ok(Self::ALL),
             Ok(v) => Self::parse(&v).ok_or_else(|| {
                 format!(
-                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, route"
+                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, \
+                     route, handout"
                 )
             }),
         })
@@ -526,6 +534,7 @@ impl WalkLean {
                 "memory" => lean.memory = true,
                 "lookups" => lean.lookups = true,
                 "route" => lean.route = true,
+                "handout" => lean.handout = true,
                 _ => return None,
             }
         }
