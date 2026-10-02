@@ -477,8 +477,10 @@ pub(crate) struct WalkLean {
     pub(crate) route: bool,
     /// The in-walk BITWISE lookups counted by the walker as it walks, into a
     /// histogram of its own the finish adds to the run's; with it `lookups`
-    /// has no effect. It moves that counting off the accumulator, which binds
-    /// the median block's windows (FAST 600).
+    /// has no effect. Not in [`Self::ALL`]: it moves that counting off the
+    /// accumulator, but the accumulator's hand-out slows beside the busier
+    /// walker, and the median block's windows gained 0.9 s against a
+    /// registered 1.5–5 s (FAST 601).
     pub(crate) walk_counts: bool,
 }
 
@@ -488,7 +490,7 @@ impl WalkLean {
         memory: true,
         lookups: true,
         route: true,
-        walk_counts: true,
+        walk_counts: false,
     };
     pub(crate) const NONE: Self = Self {
         decode: false,
@@ -509,9 +511,9 @@ impl WalkLean {
         }
     }
 
-    /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
-    /// of `decode`, `memory`, `lookups`, `route`, `walkcount`. Read once; any
-    /// other value is refused.
+    /// `LAMBDA_VM_WALK_LEAN`: unset or `1` the parts of [`Self::ALL`], `0` none,
+    /// or a comma list of `decode`, `memory`, `lookups`, `route`, `walkcount`.
+    /// Read once; any other value is refused.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
         LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {

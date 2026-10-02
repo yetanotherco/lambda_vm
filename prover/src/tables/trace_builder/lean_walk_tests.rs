@@ -186,8 +186,15 @@ fn the_walk_lean_knob_names_its_parts() {
     assert_eq!(WalkLean::parse("1"), Some(WalkLean::ALL));
     assert_eq!(WalkLean::parse(" 0 "), Some(WalkLean::NONE));
     assert_eq!(
-        WalkLean::parse("decode,memory,lookups,route,walkcount"),
+        WalkLean::parse("decode,memory,lookups,route"),
         Some(WalkLean::ALL)
+    );
+    assert_eq!(
+        WalkLean::parse("decode,memory,lookups,route,walkcount"),
+        Some(WalkLean {
+            walk_counts: true,
+            ..WalkLean::ALL
+        })
     );
     assert_eq!(
         WalkLean::parse("walkcount").map(|lean| lean.in_walk()),
