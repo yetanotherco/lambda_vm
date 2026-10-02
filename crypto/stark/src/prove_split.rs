@@ -114,6 +114,12 @@ fn record(slot: &Slot, nanos: u64) {
             stages[stage] += nanos;
             t.set(stages);
         });
+        SPANS.with(|spans| {
+            if let Some(spans) = spans.borrow_mut().as_mut() {
+                let end = epoch_secs();
+                spans.push((stage, end - nanos as f64 / 1e9, end));
+            }
+        });
     }
 }
 
@@ -143,13 +149,39 @@ static TABLE_STAGES: [(&str, &Slot); 12] = [
 
 thread_local! {
     static TABLE: std::cell::Cell<[u64; 12]> = const { std::cell::Cell::new([0; 12]) };
+    /// While a table is open on this thread ([`table_begin`]): each stage's
+    /// (index, start, end) in unix seconds, the `PROVE SPLIT t=[..]` clock.
+    static SPANS: std::cell::RefCell<Option<Vec<(usize, f64, f64)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Opens a table on this thread: its stage seconds start from zero, and each
+/// stage's start and end are kept until [`table_take`].
+pub fn table_begin() {
+    TABLE.with(|t| t.set([0; 12]));
+    SPANS.with(|spans| *spans.borrow_mut() = Some(Vec::new()));
+}
+
+/// This thread's name and kernel thread id (`/proc/thread-self`, Linux),
+/// for joining a table's line to a per-thread sampler.
+fn thread_label() -> String {
+    let tid = std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "n/a".to_string());
+    let current = std::thread::current();
+    format!("{}/{tid}", current.name().unwrap_or("unnamed"))
 }
 
 /// This thread's stage seconds since the last call, cleared, as
 /// ` stages=[name s · …]` (the stages that ran), or `None` when none did —
 /// always so when `LFM_PROVE_SPLIT` is off, because then nothing is recorded.
+/// After [`table_begin`] the line also names the thread
+/// (` thread=name/tid`) and gives each stage's span
+/// (` at=[name start-end · …]`, unix seconds).
 pub fn table_take() -> Option<String> {
     let stages = TABLE.with(|t| t.replace([0; 12]));
+    let spans = SPANS.with(|spans| spans.borrow_mut().take());
     if stages.iter().all(|&n| n == 0) {
         return None;
     }
@@ -159,7 +191,15 @@ pub fn table_take() -> Option<String> {
         .filter(|&(_, n)| n > 0)
         .map(|((name, _), n)| format!("{name} {:.3}", n as f64 / 1e9))
         .collect();
-    Some(format!(" stages=[{}]", ran.join(" · ")))
+    let mut line = format!(" stages=[{}]", ran.join(" · "));
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        let at: Vec<String> = spans
+            .iter()
+            .map(|&(stage, start, end)| format!("{} {start:.3}-{end:.3}", TABLE_STAGES[stage].0))
+            .collect();
+        line = format!(" thread={}{line} at=[{}]", thread_label(), at.join(" · "));
+    }
+    Some(line)
 }
 
 // ── phase walls, one per prove, measured on the calling thread ──────────────
@@ -451,6 +491,51 @@ mod tests {
         // The process-wide Σ saw all of it; give it back for the next prove.
         for slot in [&AUX_BUILD, &R4_QUERIES, &MAIN_COMMIT, &R3_ABSORB] {
             assert!(slot.take() > 0.0);
+        }
+    }
+
+    /// An open table also keeps each stage's span, ends after starts and in
+    /// the order the stages closed, and names its thread; the next table
+    /// starts empty.
+    #[test]
+    fn an_open_table_keeps_each_stage_span_and_its_thread() {
+        let line = std::thread::Builder::new()
+            .name("fused-test".to_string())
+            .spawn(|| {
+                record(&R2_CONSTRAINTS, 7_000_000_000);
+                table_begin();
+                record(&AUX_BUILD, 2_000_000);
+                record(&R4_QUERIES, 3_000_000);
+                let first = table_take().expect("stages ran");
+                let after = table_take();
+                (first, after)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let (first, after) = line;
+        assert!(first.starts_with(" thread=fused-test/"), "{first}");
+        assert!(
+            first.contains(" stages=[aux_build 0.002 · r4_queries 0.003] at=[aux_build "),
+            "{first}"
+        );
+        let at = first.split(" at=[").nth(1).unwrap().trim_end_matches(']');
+        let spans: Vec<(f64, f64)> = at
+            .split(" · ")
+            .map(|s| {
+                let (a, b) = s.rsplit_once(' ').unwrap().1.split_once('-').unwrap();
+                (a.parse().unwrap(), b.parse().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            spans.len(),
+            2,
+            "the stage recorded before the table opened is not in it"
+        );
+        assert!(spans.iter().all(|(a, b)| a <= b) && spans[0].1 <= spans[1].1);
+        assert_eq!(after, None, "taken: the next table starts empty");
+        for slot in [&R2_CONSTRAINTS, &AUX_BUILD, &R4_QUERIES] {
+            slot.take();
         }
     }
 }

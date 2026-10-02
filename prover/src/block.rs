@@ -40,6 +40,20 @@ fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
+/// `scope.spawn`, the thread named `name` so a per-thread sampler can tell the
+/// stream's threads apart. A thread that cannot start is fatal, as with
+/// `scope.spawn`.
+fn spawn_named<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: String,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn_scoped(scope, f)
+        .expect("spawn a block stream thread")
+}
+
 /// Rows per full-height instance: every splittable table is cut into
 /// instances of `2^BLOCK_ROWS_LOG2` rows (the tail padded to its power of two).
 pub const BLOCK_ROWS_LOG2: u32 = 21;
@@ -245,6 +259,24 @@ fn prove_block_with_observed(
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
+    // With the table timeline on, the global rayon pool's workers are named
+    // `rayon-<n>` for a per-thread sampler; only a pool nothing built yet can
+    // be named, so a process that used rayon before says so.
+    #[cfg(feature = "parallel")]
+    if std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1") {
+        let named = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("rayon-{i}"))
+            .build_global()
+            .is_ok();
+        eprintln!(
+            "[block] the global rayon pool's workers {}",
+            if named {
+                "are named rayon-<n>"
+            } else {
+                "keep their names (the pool was built before the block)"
+            }
+        );
+    }
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
     #[cfg(feature = "cuda")]
@@ -1074,28 +1106,33 @@ fn build_streamed(
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
-        let exec = s.spawn(move || -> Result<f64, Error> {
-            let t = Instant::now();
-            let mut executor = Executor::new(program, private_input.to_vec())
-                .map_err(|e| Error::Execution(format!("{e}")))?;
-            while let Some(logs) = executor
-                .resume_with_limit(window)
-                .map_err(|e| Error::Execution(format!("{e}")))?
-            {
-                let logs = logs.to_vec();
-                let logs_bytes = logs.capacity() * std::mem::size_of::<executor::vm::logs::Log>();
-                if log_tx.send(logs).is_err() {
-                    break;
+        let exec = spawn_named(
+            s,
+            "block-exec".to_string(),
+            move || -> Result<f64, Error> {
+                let t = Instant::now();
+                let mut executor = Executor::new(program, private_input.to_vec())
+                    .map_err(|e| Error::Execution(format!("{e}")))?;
+                while let Some(logs) = executor
+                    .resume_with_limit(window)
+                    .map_err(|e| Error::Execution(format!("{e}")))?
+                {
+                    let logs = logs.to_vec();
+                    let logs_bytes =
+                        logs.capacity() * std::mem::size_of::<executor::vm::logs::Log>();
+                    if log_tx.send(logs).is_err() {
+                        break;
+                    }
+                    if let Some(ledger) = ledger {
+                        ledger.logs_bytes.fetch_add(logs_bytes, Relaxed);
+                        ledger
+                            .executor_bytes
+                            .store(executor.memory().heap_bytes(), Relaxed);
+                    }
                 }
-                if let Some(ledger) = ledger {
-                    ledger.logs_bytes.fetch_add(logs_bytes, Relaxed);
-                    ledger
-                        .executor_bytes
-                        .store(executor.memory().heap_bytes(), Relaxed);
-                }
-            }
-            Ok(t.elapsed().as_secs_f64())
-        });
+                Ok(t.elapsed().as_secs_f64())
+            },
+        );
         let decode = s.spawn(|| {
             crate::tables::decode::commitment_from_elf_device_or_host(program, opts)
                 .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
@@ -1106,11 +1143,11 @@ fn build_streamed(
 
         // Generators ([`stream_generators`]): each streamed chunk generated,
         // and packed under narrow storage, ahead of the committers.
-        for _ in 0..generators {
+        for g in 0..generators {
             let (job_rx, queue, ready, narrowed, generate_secs) =
                 (&job_rx, &queue, &ready, &narrowed, &generate_secs);
             let ready_tx = ready_tx.clone();
-            s.spawn(move || {
+            spawn_named(s, format!("gen-{g}"), move || {
                 loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(job) = job else {
@@ -1167,132 +1204,139 @@ fn build_streamed(
         // Committers: each streamed chunk generated (unless a generator did)
         // and Round-1 committed, as the chunks complete.
         let mut committers = Vec::new();
-        for _ in 0..committer_count {
-            committers.push(s.spawn(|| -> Result<(), Error> {
-                let commit_all = || -> Result<(), Error> {
-                    loop {
-                        // `t`: from the chunk's arrival (its generation
-                        // included when this committer generates it).
-                        let (mut chunk, wide, held, finished, t) = if generators > 0 {
-                            let next = ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                            let Ok(ToCommit {
-                                table,
-                                held,
-                                finished,
-                            }) = next
-                            else {
-                                return Ok(());
-                            };
-                            let t = Instant::now();
-                            ready.release(held);
-                            if let Some(ledger) = ledger {
-                                ledger.take_ready(held);
-                            }
-                            let wide = wide_bytes(&table.trace);
-                            (table, wide, held, finished, t)
-                        } else {
-                            let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                            let Ok(job) = job else {
-                                return Ok(());
-                            };
-                            let t = Instant::now();
-                            let job_bytes = streamed_bytes(&job);
-                            if let Some(ledger) = ledger {
-                                ledger.take(job_bytes);
-                            }
-                            let (table, finished) = match job {
-                                Streamed::Job(job) => (FinishedTable::from(job.generate()), false),
-                                Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
-                                Streamed::Finished(table) => (table, true),
-                            };
-                            let wide = wide_bytes(&table.trace);
-                            let held = if finished {
-                                job_bytes
-                            } else {
-                                queue.release(job_bytes);
+        for c in 0..committer_count {
+            committers.push(spawn_named(
+                s,
+                format!("commit-{c}"),
+                || -> Result<(), Error> {
+                    let commit_all = || -> Result<(), Error> {
+                        loop {
+                            // `t`: from the chunk's arrival (its generation
+                            // included when this committer generates it).
+                            let (mut chunk, wide, held, finished, t) = if generators > 0 {
+                                let next =
+                                    ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                                let Ok(ToCommit {
+                                    table,
+                                    held,
+                                    finished,
+                                }) = next
+                                else {
+                                    return Ok(());
+                                };
+                                let t = Instant::now();
+                                ready.release(held);
                                 if let Some(ledger) = ledger {
-                                    ledger.generated(job_bytes, wide);
+                                    ledger.take_ready(held);
                                 }
-                                *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                                    t.elapsed().as_secs_f64();
-                                wide
-                            };
-                            (table, wide, held, finished, t)
-                        };
-                        let air = finish_sink::air_for(chunk.kind, chunk.index, opts);
-                        let name = air.name().to_string();
-                        let on_card = commit_card_bytes(&air, &chunk.trace);
-                        card.admit(on_card);
-                        let commit = || {
-                            crate::hash_pin::BlockProver::precommit_main(
-                                air.as_ref(),
-                                &chunk.trace,
-                                #[cfg(feature = "disk-spill")]
-                                stark::storage_mode::StorageMode::Ram,
-                                residency,
-                            )
-                        };
-                        #[cfg(feature = "parallel")]
-                        let pre = match &commit_pool {
-                            Some(pool) => pool.install(commit),
-                            None => commit(),
-                        };
-                        #[cfg(not(feature = "parallel"))]
-                        let pre = commit();
-                        let pre = pre.map_err(|e| Error::Prover(format!("{e:?}")));
-                        card.release(on_card);
-                        #[allow(unused_mut)]
-                        let mut pre = pre?;
-                        *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                            t.elapsed().as_secs_f64();
-                        if finished {
-                            let mut f =
-                                finished_committed.lock().unwrap_or_else(|e| e.into_inner());
-                            f.0 += 1;
-                            f.1 += t.elapsed().as_secs_f64();
-                        }
-                        if finished {
-                            // What phase B's Round 1 does after the same commit:
-                            // the device's packed copy replaces the 64-bit one.
-                            if let Some(packed) = pre.take_narrow() {
-                                chunk.trace.install_main_narrow(packed);
-                            }
-                        } else if narrow {
-                            let tp = Instant::now();
-                            // The device packed it from the commit's snapshot, or
-                            // the host packs it here.
-                            let by_device = pre
-                                .take_narrow()
-                                .is_some_and(|t| chunk.trace.install_main_narrow(t));
-                            if by_device || chunk.trace.pack_main_narrow() {
-                                let packed =
-                                    chunk.trace.narrow_main().map_or(0, |t| t.data().len());
-                                let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
-                                n.0 += wide;
-                                n.1 += packed;
-                                if by_device {
-                                    n.3 += 1;
+                                let wide = wide_bytes(&table.trace);
+                                (table, wide, held, finished, t)
+                            } else {
+                                let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                                let Ok(job) = job else {
+                                    return Ok(());
+                                };
+                                let t = Instant::now();
+                                let job_bytes = streamed_bytes(&job);
+                                if let Some(ledger) = ledger {
+                                    ledger.take(job_bytes);
+                                }
+                                let (table, finished) = match job {
+                                    Streamed::Job(job) => {
+                                        (FinishedTable::from(job.generate()), false)
+                                    }
+                                    Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
+                                    Streamed::Finished(table) => (table, true),
+                                };
+                                let wide = wide_bytes(&table.trace);
+                                let held = if finished {
+                                    job_bytes
                                 } else {
-                                    n.2 += tp.elapsed().as_secs_f64();
+                                    queue.release(job_bytes);
+                                    if let Some(ledger) = ledger {
+                                        ledger.generated(job_bytes, wide);
+                                    }
+                                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                                        t.elapsed().as_secs_f64();
+                                    wide
+                                };
+                                (table, wide, held, finished, t)
+                            };
+                            let air = finish_sink::air_for(chunk.kind, chunk.index, opts);
+                            let name = air.name().to_string();
+                            let on_card = commit_card_bytes(&air, &chunk.trace);
+                            card.admit(on_card);
+                            let commit = || {
+                                crate::hash_pin::BlockProver::precommit_main(
+                                    air.as_ref(),
+                                    &chunk.trace,
+                                    #[cfg(feature = "disk-spill")]
+                                    stark::storage_mode::StorageMode::Ram,
+                                    residency,
+                                )
+                            };
+                            #[cfg(feature = "parallel")]
+                            let pre = match &commit_pool {
+                                Some(pool) => pool.install(commit),
+                                None => commit(),
+                            };
+                            #[cfg(not(feature = "parallel"))]
+                            let pre = commit();
+                            let pre = pre.map_err(|e| Error::Prover(format!("{e:?}")));
+                            card.release(on_card);
+                            #[allow(unused_mut)]
+                            let mut pre = pre?;
+                            *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                                t.elapsed().as_secs_f64();
+                            if finished {
+                                let mut f =
+                                    finished_committed.lock().unwrap_or_else(|e| e.into_inner());
+                                f.0 += 1;
+                                f.1 += t.elapsed().as_secs_f64();
+                            }
+                            if finished {
+                                // What phase B's Round 1 does after the same commit:
+                                // the device's packed copy replaces the 64-bit one.
+                                if let Some(packed) = pre.take_narrow() {
+                                    chunk.trace.install_main_narrow(packed);
+                                }
+                            } else if narrow {
+                                let tp = Instant::now();
+                                // The device packed it from the commit's snapshot, or
+                                // the host packs it here.
+                                let by_device = pre
+                                    .take_narrow()
+                                    .is_some_and(|t| chunk.trace.install_main_narrow(t));
+                                if by_device || chunk.trace.pack_main_narrow() {
+                                    let packed =
+                                        chunk.trace.narrow_main().map_or(0, |t| t.data().len());
+                                    let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
+                                    n.0 += wide;
+                                    n.1 += packed;
+                                    if by_device {
+                                        n.3 += 1;
+                                    } else {
+                                        n.2 += tp.elapsed().as_secs_f64();
+                                    }
                                 }
                             }
+                            if let Some(ledger) = ledger {
+                                let packed = chunk.trace.narrow_main().map(|t| t.data().len());
+                                ledger.keep(held, packed);
+                            }
+                            committed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((chunk, name, pre));
                         }
-                        if let Some(ledger) = ledger {
-                            let packed = chunk.trace.narrow_main().map(|t| t.data().len());
-                            ledger.keep(held, packed);
-                        }
-                        committed
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((chunk, name, pre));
+                    };
+                    let result = commit_all();
+                    if result.is_err() {
+                        card.close();
                     }
-                };
-                let result = commit_all();
-                if result.is_err() {
-                    card.close();
-                }
-                result
-            }));
+                    result
+                },
+            ));
         }
 
         let produce = || -> Result<(Traces, f64), Error> {
@@ -1339,28 +1383,32 @@ fn build_streamed(
                 let (mut walker, mut accumulator) = builder.split();
                 std::thread::scope(|inner| -> Result<_, Error> {
                     let (walked_tx, walked_rx) = mpsc::sync_channel(2);
-                    let walking = inner.spawn(move || -> Result<_, Error> {
-                        // One window held back: the run's last is `finish`'s.
-                        let mut held: Option<Vec<executor::vm::logs::Log>> = None;
-                        for logs in log_rx.iter() {
-                            if let Some(prev) = held.replace(logs) {
-                                let walked = walker.walk(&prev)?;
-                                if let Some(ledger) = ledger {
-                                    ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
-                                    ledger.logs_bytes.fetch_sub(
-                                        prev.capacity()
-                                            * std::mem::size_of::<executor::vm::logs::Log>(),
-                                        Relaxed,
-                                    );
-                                    ledger.walked_bytes.fetch_add(walked.heap_bytes(), Relaxed);
-                                }
-                                if walked_tx.send(walked).is_err() {
-                                    break;
+                    let walking = spawn_named(
+                        inner,
+                        "block-walk".to_string(),
+                        move || -> Result<_, Error> {
+                            // One window held back: the run's last is `finish`'s.
+                            let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                            for logs in log_rx.iter() {
+                                if let Some(prev) = held.replace(logs) {
+                                    let walked = walker.walk(&prev)?;
+                                    if let Some(ledger) = ledger {
+                                        ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
+                                        ledger.logs_bytes.fetch_sub(
+                                            prev.capacity()
+                                                * std::mem::size_of::<executor::vm::logs::Log>(),
+                                            Relaxed,
+                                        );
+                                        ledger.walked_bytes.fetch_add(walked.heap_bytes(), Relaxed);
+                                    }
+                                    if walked_tx.send(walked).is_err() {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        Ok(held.unwrap_or_default())
-                    });
+                            Ok(held.unwrap_or_default())
+                        },
+                    );
                     for walked in walked_rx {
                         let t = Instant::now();
                         if let Some(ledger) = ledger {

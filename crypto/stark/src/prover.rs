@@ -1344,8 +1344,11 @@ fn run_admitted<T: Send>(
         m.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     };
     std::thread::scope(|scope| {
-        for _ in 0..workers.max(1).min(order.len().max(1)) {
-            scope.spawn(|| {
+        for n in 0..workers.max(1).min(order.len().max(1)) {
+            // Named (`fused-3`), so a per-thread sampler can tell the drivers
+            // from the rayon workers they hand their parallel work to.
+            let driver = std::thread::Builder::new().name(format!("{phase}-{n}"));
+            let spawned = driver.spawn_scoped(scope, || {
                 loop {
                     let t_claim = timeline.then(crate::prove_split::epoch_secs);
                     let (idx, permit) = if packing {
@@ -1378,7 +1381,7 @@ fn run_admitted<T: Send>(
                     let t_start = timeline.then(crate::prove_split::epoch_secs);
                     if timeline {
                         // This driver's stages from here on are this table's.
-                        let _ = crate::prove_split::table_take();
+                        crate::prove_split::table_begin();
                     }
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
                     if let (Some(t_claim), Some(t_start)) = (t_claim, t_start) {
@@ -1410,6 +1413,8 @@ fn run_admitted<T: Send>(
                     }
                 }
             });
+            // As `scope.spawn` would: a driver that cannot start is fatal.
+            spawned.expect("spawn a table driver thread");
         }
     });
     if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
