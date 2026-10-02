@@ -1,6 +1,6 @@
 //! End-to-end regression tests for unconstrained multiplicities: MUL's
 //! `μ_lo`/`μ_hi` and DVRM's `μ_q`/`μ_r` must be bounded and non-negative, and
-//! SHIFT's `zbs` must be a bit.
+//! SHIFT's `zbs` and LOAD's `μ` must be bits.
 //!
 //! **MUL / DVRM.** Both chips send every range check (and DVRM its MUL/LT/ZERO checks) with
 //! multiplicity `μ_a + μ_b`, the row's total lookup count. Before the fix neither
@@ -15,6 +15,13 @@
 //! row nothing pinned `zbs`: `zbs = 2` made that −1, so the padding row provided
 //! exactly the HWSL tuples a forged real row needed (`1 << 1 = 0` verified
 //! against `main`). The fix bit-constrains `zbs` (and μ).
+//!
+//! **LOAD.** LOAD never deduplicates, but μ was pinned to 1 only when a
+//! read2/4/8 flag was set, so a byte-load row's μ was free. A `μ = −1 / μ = 1`
+//! pair of LBU rows with the same `res[0]` cancels on MEMORY/MEMW (neither
+//! carries `sign_bit`) while netting `MSB8[res[0]] → 0` minus `→ 1`, which
+//! cancels a real LB row's forged sign bit (`lb 0x05 = 0xFF..05` verified
+//! against `main`). The fix bit-constrains μ.
 //!
 //! Each guest computes a value with one real instruction and commits it; the
 //! malicious prover claims a different value and reshapes the chip's rows. It
@@ -40,20 +47,34 @@ use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use executor::vm::logs::Log;
 
 fn opts() -> ProofOptions {
     crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
 }
 
-/// One forgery scenario: a guest whose single `lhs ∘ rhs` instruction yields
-/// `honest`, and the chip rewrite that makes it yield `forged` instead.
+/// One forgery scenario: a guest whose target instruction (picked out of the
+/// logs by `is_target`) yields `honest`, and the chip rewrite that makes it
+/// yield `forged` instead.
 struct Scenario {
     guest: &'static str,
     lhs: u64,
     rhs: u64,
     honest: u64,
     forged: u64,
+    is_target: fn(&Log, &Scenario) -> bool,
     forge_rows: fn(&mut Traces, &Scenario),
+}
+
+/// An `lhs ∘ rhs = honest` arithmetic instruction.
+fn arith_log(l: &Log, s: &Scenario) -> bool {
+    l.src1_val == s.lhs && l.src2_val == s.rhs && l.dst_val == s.honest
+}
+
+/// The `lb t1, 8(sp)` log: the only instruction with a non-zero base register
+/// that writes the honest byte (`li t0, 5` reads `zero`, `sb`/`sd` write none).
+fn lb_log(l: &Log, s: &Scenario) -> bool {
+    l.src1_val != 0 && l.dst_val == s.honest
 }
 
 const MUL: Scenario = Scenario {
@@ -62,6 +83,7 @@ const MUL: Scenario = Scenario {
     rhs: 5,
     honest: 15,
     forged: 99,
+    is_target: arith_log,
     forge_rows: forge_mul_rows,
 };
 
@@ -71,6 +93,7 @@ const DIVU: Scenario = Scenario {
     rhs: 2,
     honest: 3,
     forged: 100,
+    is_target: arith_log,
     forge_rows: forge_dvrm_rows,
 };
 
@@ -80,13 +103,24 @@ const SLL: Scenario = Scenario {
     rhs: 1,
     honest: 2,
     forged: 0,
+    is_target: arith_log,
     forge_rows: forge_shift_rows,
+};
+
+const LB: Scenario = Scenario {
+    guest: "poc_lb_commit",
+    lhs: 0,
+    rhs: 0,
+    honest: 5,
+    forged: 0xFFFF_FFFF_FFFF_FF05,
+    is_target: lb_log,
+    forge_rows: forge_load_rows,
 };
 
 /// Which deviations the malicious prover applies.
 #[derive(Clone, Copy)]
 struct Forge {
-    /// Rewrite the execution so the CPU claims `lhs ∘ rhs = forged`.
+    /// Rewrite the execution so the CPU claims the target yields `forged`.
     claim: bool,
     /// Rewrite the chip's rows so they answer the forged claim.
     rows: bool,
@@ -105,8 +139,8 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
     if forge.claim {
         let idx = logs
             .iter()
-            .position(|l| l.src1_val == s.lhs && l.src2_val == s.rhs && l.dst_val == s.honest)
-            .expect("arithmetic log not found");
+            .position(|l| (s.is_target)(l, s))
+            .expect("target instruction log not found");
         logs[idx].dst_val = s.forged;
         // The following `sd t1, 0(sp)` stores the result: keep it consistent.
         logs[idx + 1..]
@@ -350,6 +384,80 @@ fn forge_shift_rows(traces: &mut Traces, s: &Scenario) {
     }
 }
 
+/// LOAD: `lb` of the byte 0x05 forged to sign-extend as if negative
+/// (`0xFFFF_FFFF_FFFF_FF05`).
+///
+/// * Row A (the real LB, `μ = 1, signed = 1`) gets `res[1..8] = 0xFF` and
+///   `sign_bit = 1`, which the extension constraints accept. Its MSB8 send
+///   `(0x05, 1)` is a tuple BITWISE has no row for.
+/// * Padding rows B and C become an LBU-shaped pair (`signed = 0`, so the
+///   extension constraints pin `res[1..8] = 0` whatever `sign_bit` is) with the
+///   same `res[0] = 0x05`: B has `μ = −1, sign_bit = 1`, C has `μ = 1,
+///   sign_bit = 0`. Their MEMORY and MEMW tuples carry no `sign_bit` and cancel
+///   each other; their MSB8 sends net `(0x05, 0) − (0x05, 1)`, which cancels
+///   A's bogus send and re-supplies the honest one. BITWISE is untouched.
+/// * The MEMW read answering A carries `res` as both `old` and `value`. For a
+///   1-byte read only byte 0 is bound to a memory token, so its bytes 1..8 are
+///   free and are rewritten to match A.
+fn forge_load_rows(traces: &mut Traces, s: &Scenario) {
+    use crate::tables::load::cols;
+    use crate::tables::memw_aligned::cols as ma;
+    const FF: u64 = 0xFF;
+    let byte = s.honest;
+
+    let t = &mut traces.loads[0];
+    let rows = t.num_rows();
+    let a = (0..rows)
+        .find(|&r| {
+            *t.get_main(r, cols::MU) == FE::one()
+                && *t.get_main(r, cols::SIGNED) == FE::one()
+                && [cols::READ2, cols::READ4, cols::READ8]
+                    .iter()
+                    .all(|&c| *t.get_main(r, c) == FE::zero())
+                && *t.get_main(r, cols::RES[0]) == FE::from(byte)
+        })
+        .expect("honest LB row not found");
+    assert_eq!(*t.get_main(a, cols::SIGN_BIT), FE::zero());
+    let ts = [cols::TIMESTAMP_0, cols::TIMESTAMP_1].map(|c| *t.get_main(a, c));
+    let padding: Vec<usize> = (0..rows)
+        .filter(|&r| (0..cols::NUM_COLUMNS).all(|c| *t.get_main(r, c) == FE::zero()))
+        .take(2)
+        .collect();
+    let [b, c] = padding[..] else {
+        panic!("two all-zero padding rows are needed for the cancelling pair");
+    };
+
+    for &col in &cols::RES[1..] {
+        t.set_main(a, col, FE::from(FF));
+    }
+    t.set_main(a, cols::SIGN_BIT, FE::one());
+    for (row, mu, sign_bit) in [
+        (b, FE::zero() - FE::one(), FE::one()),
+        (c, FE::one(), FE::zero()),
+    ] {
+        t.set_main(row, cols::RES[0], FE::from(byte));
+        t.set_main(row, cols::MU, mu);
+        t.set_main(row, cols::SIGN_BIT, sign_bit);
+    }
+
+    let m = traces.memw_aligneds.iter_mut().find_map(|m| {
+        (0..m.num_rows())
+            .find(|&r| {
+                *m.get_main(r, ma::IS_REGISTER) == FE::zero()
+                    && *m.get_main(r, ma::MU_READ) == FE::one()
+                    && *m.get_main(r, ma::TIMESTAMP_0) == ts[0]
+                    && *m.get_main(r, ma::TIMESTAMP_1) == ts[1]
+            })
+            .map(|r| (m, r))
+    });
+    let (m, r) = m.expect("the MEMW_A read answering the LB not found");
+    assert_eq!(*m.get_main(r, ma::VALUE[0]), FE::from(byte));
+    for i in 1..8 {
+        m.set_main(r, ma::OLD[i], FE::from(FF));
+        m.set_main(r, ma::VALUE[i], FE::from(FF));
+    }
+}
+
 fn verifier_accepts(s: &Scenario, proof: &VmProof) -> bool {
     crate::verify_with_options(proof, &asm_elf_bytes(s.guest), &opts(), None, None)
         .expect("verify must not error")
@@ -481,5 +589,39 @@ fn shift_zbs_two_padding_row_forgery_is_rejected() {
             }
         ),
         "FORGERY: 1 << 1 = 0 was accepted — zbs is not bit-constrained"
+    );
+}
+
+#[test]
+fn load_honest_control_verifies() {
+    assert_honest_verifies(&LB);
+}
+
+/// Negative control: the CPU claims `lb 0x05 = 0xFF..05` but the LOAD rows are
+/// left honest.
+#[test]
+fn load_unanswered_forged_claim_is_rejected() {
+    assert!(!crafted_accepted(
+        &LB,
+        Forge {
+            claim: true,
+            rows: false
+        }
+    ));
+}
+
+/// Regression: `lb` of 0x05 sign-extended to `0xFFFF_FFFF_FFFF_FF05` via a
+/// `μ = −1 / μ = 1` byte-load pair that swaps A's MSB8 tuple.
+#[test]
+fn load_negative_mu_sign_extension_forgery_is_rejected() {
+    assert!(
+        !crafted_accepted(
+            &LB,
+            Forge {
+                claim: true,
+                rows: true
+            }
+        ),
+        "FORGERY: lb 0x05 = 0xFFFFFFFFFFFFFF05 was accepted — LOAD's μ is not bit-constrained"
     );
 }
