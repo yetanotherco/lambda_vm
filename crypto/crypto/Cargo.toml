@@ -95,6 +95,13 @@ blake3-6round = []
 # own switch means flipping `blake3-6round` to a default cannot turn the absorb
 # path on by accident.
 blake3-absorb = ["blake3-6round"]
+# Force standard 7-round BLAKE3 even when `blake3-6round` is on through the
+# default feature set. Exists for the hash-comparison builds, which cannot drop
+# this crate's defaults: every dependent names `crypto` with them on. It moves
+# every BLAKE3 user at once (Merkle, FRI, transcript, grinding, the LFM chips),
+# so every root blessed at six rounds is wrong under it; `stark::config` admits
+# it only through `BLAKE3_STANDARD_FORCED`.
+blake3-7round = []
 # The device nonce search behind `generate_nonce_maybe_gpu`.
 cuda = ["dep:math-cuda", "std"]
 # Host-only diagnostic: count keccak finalizes during verify (see `hash_metrics`).

@@ -105,10 +105,14 @@ pub const BLAKE3_SIX_ROUNDS: usize = 6;
 /// message schedule, the counter split and the feed-forward are fixed — which is
 /// what lets the 7-round anchor certify the whole code path rather than a
 /// separate 7-round copy of it.
-#[cfg(not(feature = "blake3-6round"))]
+#[cfg(any(not(feature = "blake3-6round"), feature = "blake3-7round"))]
 pub const BLAKE3_ROUNDS: usize = BLAKE3_STANDARD_ROUNDS;
-#[cfg(feature = "blake3-6round")]
+#[cfg(all(feature = "blake3-6round", not(feature = "blake3-7round")))]
 pub const BLAKE3_ROUNDS: usize = BLAKE3_SIX_ROUNDS;
+
+/// `blake3-7round` overrode `blake3-6round`: the build is at seven rounds
+/// although the default feature set asked for six.
+pub const BLAKE3_STANDARD_FORCED: bool = cfg!(feature = "blake3-7round");
 
 /// The BLAKE3 quarter-round G (spec §2.1).
 #[inline]

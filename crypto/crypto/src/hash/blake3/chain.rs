@@ -324,7 +324,11 @@ pub fn unpack_syscall_out(state: &[u64; SYSCALL_STATE_DWORDS]) -> [u32; 16] {
 /// `t` is not a parameter: the construction is a single chunk that never ends,
 /// so the counter is 0 at every block (§1.7). The syscall ABI still carries a
 /// full 64-bit counter, and this is where it is pinned to zero.
-#[cfg(all(target_arch = "riscv64", feature = "blake3-6round"))]
+#[cfg(all(
+    target_arch = "riscv64",
+    feature = "blake3-6round",
+    not(feature = "blake3-7round")
+))]
 fn compress_block(
     cv: &[u32; 8],
     block: &[u32; 16],
@@ -350,7 +354,11 @@ fn compress_block(
 /// See the riscv64 arm above for what this is one of two of. Every host build
 /// takes this path, and so does a guest built without `blake3-6round`: the
 /// accelerator is 6-round only, so at 7 rounds there is nothing to dispatch to.
-#[cfg(not(all(target_arch = "riscv64", feature = "blake3-6round")))]
+#[cfg(not(all(
+    target_arch = "riscv64",
+    feature = "blake3-6round",
+    not(feature = "blake3-7round")
+)))]
 fn compress_block(
     cv: &[u32; 8],
     block: &[u32; 16],
@@ -373,7 +381,10 @@ fn compress_block(
 /// dispatches to the accelerator: a `target_arch` gate would put it out of reach
 /// of every host build, including `make lint`'s `blake3-6round` pass, which is
 /// the one place CI compiles this feature at all.
-#[cfg(feature = "blake3-6round")]
+#[cfg(all(feature = "blake3-absorb", feature = "blake3-7round"))]
+compile_error!("the BLAKE3 absorb accelerator is 6-round only; `blake3-7round` cannot reach it");
+
+#[cfg(all(feature = "blake3-6round", not(feature = "blake3-7round")))]
 const _: () = assert!(
     BLAKE3_ROUNDS == super::BLAKE3_SIX_ROUNDS,
     "the BLAKE3 accelerator implements 6 rounds only, but `blake3-6round` did \
@@ -923,6 +934,28 @@ mod tests {
                 "length {len}"
             );
         }
+    }
+
+    /// Under `blake3-7round` the crate-global entry points — what the Merkle
+    /// backends, the transcript and grinding call — are the `blake3` crate, for
+    /// every length up to one chunk and for the 64-byte parent form.
+    #[cfg(feature = "blake3-7round")]
+    #[test]
+    fn forced_seven_rounds_is_the_blake3_crate() {
+        assert_eq!(BLAKE3_ROUNDS, BLAKE3_STANDARD_ROUNDS);
+        for len in 0..=1024usize {
+            let msg = message(len);
+            assert_eq!(blake3_chain(&msg), *blake3::hash(&msg).as_bytes(), "length {len}");
+            let mut h = Blake3Chain::new();
+            h.update(&msg);
+            assert_eq!(h.finalize_digest(), *blake3::hash(&msg).as_bytes(), "length {len}");
+        }
+        let (l, r): ([u8; 32], [u8; 32]) =
+            (core::array::from_fn(|i| i as u8), core::array::from_fn(|i| 0xa0 ^ i as u8));
+        let mut lr = [0u8; 64];
+        lr[..32].copy_from_slice(&l);
+        lr[32..].copy_from_slice(&r);
+        assert_eq!(blake3_parent(&l, &r), *blake3::hash(&lr).as_bytes());
     }
 
     /// ★ **P3, stated as a test.** Past one chunk the construction deliberately
