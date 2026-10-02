@@ -895,6 +895,30 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
     }
+
+    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
+    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
+        [
+            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
+            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
+            ("memw", vec_heap_bytes(&self.memw.general)),
+            ("load", vec_heap_bytes(&self.load_ops)),
+            ("lt", vec_heap_bytes(&self.lt_ops)),
+            ("shift", vec_heap_bytes(&self.shift_ops)),
+            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
+            ("commit", vec_heap_bytes(&self.commit_ops)),
+            ("keccak", vec_heap_bytes(&self.keccak_ops)),
+            ("blake3", vec_heap_bytes(&self.blake3_ops)),
+            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
+            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
+            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
+            ("hint", vec_heap_bytes(&self.hint_ops)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
+        .collect()
+    }
 }
 
 /// The bytes `list`'s buffer takes on the heap: its capacity, not its length.
@@ -3933,8 +3957,9 @@ impl<'a> Packing<'a> {
 }
 
 /// Where a build's table phase is, for a caller that wants to know
-/// ([`set_finish_marks`]): called with "p3 lt", "p4 bitwise", each phase-5
-/// generator's name as it finishes, and "p5 done". Unset, nothing is called.
+/// ([`set_finish_marks`]): called with "p3 lt" (and the bytes of LT's ops),
+/// "p4 bitwise", each phase-5 generator's name as it finishes, and "p5 done".
+/// Unset, nothing is called.
 pub type FinishMarks = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 static FINISH_MARKS: std::sync::RwLock<Option<FinishMarks>> = std::sync::RwLock::new(None);
@@ -3984,6 +4009,18 @@ impl PreCounted {
         self.histogram.heap_bytes()
             + vec_heap_bytes(&self.memw_lt)
             + vec_heap_bytes(&self.memw_aligned_lt)
+    }
+
+    /// [`Self::heap_bytes`] part by part.
+    pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            (
+                "counted memw_a_lt".to_string(),
+                vec_heap_bytes(&self.memw_aligned_lt),
+            ),
+        ]
     }
 }
 
@@ -4329,6 +4366,29 @@ impl RoutedSegments {
             + vec_heap_bytes(&self.lt_dvrm_cpu32)
             + vec_heap_bytes(&self.mul_dvrm_filter)
             + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        [
+            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
+            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
+            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("store", vec_heap_bytes(&self.store_ops)),
+            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
+            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
+            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
+            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
+            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
+            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
+            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
+            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("segments {name}"), bytes))
+        .collect()
     }
 
     /// Appends a later window's segments, segment by segment.
@@ -4771,7 +4831,11 @@ fn build_traces<I: ImageSource + Sync>(
             ],
         }
     };
-    finish_mark("p3 lt");
+    finish_mark(&format!(
+        "p3 lt ({:.2} GiB of LT ops in {} segments)",
+        (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / (1u64 << 30) as f64,
+        lt_ops.parts.len()
+    ));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups

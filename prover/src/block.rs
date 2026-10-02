@@ -659,6 +659,23 @@ impl MemLedger {
         };
     }
 
+    /// One line of `what`'s parts, largest first, those of at least 0.01 GiB.
+    fn parts(&self, what: &str, mut parts: Vec<(String, usize)>) {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let total: usize = parts.iter().map(|(_, b)| b).sum();
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        let listed: Vec<String> = parts
+            .iter()
+            .filter(|(_, b)| *b as f64 >= 0.01 * GIB)
+            .map(|(name, b)| format!("{name} {:.2}", *b as f64 / GIB))
+            .collect();
+        eprintln!(
+            "BLOCK MEM {what} parts: {:.2} GiB · {}",
+            total as f64 / GIB,
+            listed.join(" · ")
+        );
+    }
+
     fn line(&self, label: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         const GIB: f64 = (1u64 << 30) as f64;
@@ -1133,6 +1150,7 @@ fn build_streamed(
             drop(job_tx);
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
+                ledger.parts("builder", builder.heap_parts());
             }
             let windows = builder.stamps();
             let t = Instant::now();

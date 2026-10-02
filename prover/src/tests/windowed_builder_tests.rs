@@ -671,6 +671,36 @@ fn widen_all(t: &mut Traces) -> usize {
     packed
 }
 
+/// The builder's parts (`heap_parts`, BLOCK MEM's breakdown) add up to what
+/// the accumulator reports it holds, plus the walk's memory state, at every
+/// window, with the streamed ops dropped or kept.
+#[test]
+fn the_builder_parts_add_up_to_what_it_holds() {
+    let (program, logs) = run("all_instructions_64");
+    let max_rows = MaxRowsConfig::uniform(4);
+    for drop in [false, true] {
+        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+        if drop {
+            builder = builder.drop_streamed_ops().expect("before any window");
+        }
+        let body = logs.len() - 1;
+        let cut = body - body % 7;
+        for w in logs[..cut].chunks(7) {
+            builder.push(w).expect("a window");
+            let parts = builder.heap_parts();
+            let state: usize = parts
+                .iter()
+                .filter(|(name, _)| name == "memory state")
+                .map(|(_, b)| b)
+                .sum();
+            let rest: usize = parts.iter().map(|(_, b)| b).sum::<usize>() - state;
+            let (walker, accumulator) = builder.split();
+            assert_eq!(rest, accumulator.held_bytes(), "drop {drop}");
+            assert_eq!(state, walker.state_bytes(), "drop {drop}");
+        }
+    }
+}
+
 /// The plain tables' slots in a build (every kind a finish hands off), and
 /// whether each is a placeholder.
 fn plain_slots(t: &Traces) -> Vec<(&'static str, Vec<bool>)> {
