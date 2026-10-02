@@ -347,14 +347,14 @@ kind = "interaction"
 tag = "MEMW"
 input = [0, "src", "value", ["+", "timestamp", "is_set"], 0, 0, ["not", "single"]]
 output = "value"
-multiplicity = ["-", "μ", "zc"]
+multiplicity = ["-", "μ", ["idx", "count_borrows", 1]]
 ref = "copy:c:read_value"
 
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
 input = [["*", 2, "is_write"], "dst", "value", ["+", "timestamp", ["-", 1, "is_set"]], 0, 0, ["not", "single"]]
-multiplicity = ["-", "μ", "zc"]
+multiplicity = ["-", "μ", ["idx", "count_borrows", 1]]
 ref = "copy:c:write_value"
 
 [[constraints.copy]]
