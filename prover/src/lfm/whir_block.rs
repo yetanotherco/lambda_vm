@@ -27,10 +27,10 @@
 //! state and the output equal across children, add the sums, and the top
 //! asserts the total is zero — the host's single bus check, where every table's
 //! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does,
-//! so the node needs no fraction arithmetic ([`emit_share`]: under
-//! `LFM_WHIR_SHARE_INVERSE=1` a zero denominator has no satisfying assignment
-//! whatever `p` is, the host's `None`; the default `ediv(p, q)` leaves the share
-//! free when `p = q = 0`).
+//! so the node needs no fraction arithmetic ([`emit_share`]: the share is
+//! `p · (1/q)`, so a zero denominator has no satisfying assignment whatever `p`
+//! is, the host's `None`; `LFM_WHIR_SHARE_INVERSE=0` restores the former
+//! `ediv(p, q)`, which leaves the share free when `p = q = 0`).
 //!
 //! # Never from a proof
 //!
@@ -78,16 +78,16 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
 
-/// `LFM_WHIR_SHARE_INVERSE`: `1` emits a leaf's bus share as `p · (1/q)`
-/// ([`emit_share`]); unset or `0` keeps `ediv(p, q)`, today's leaf programs.
-/// Read once per process. Both sides derive the leaf programs, so the
-/// verifier's setting is part of the tree identity it derives.
+/// `LFM_WHIR_SHARE_INVERSE`: unset or `1` emits a leaf's bus share as
+/// `p · (1/q)` ([`emit_share`]); `0` keeps the former `ediv(p, q)` leaf programs
+/// (and their tree ids). Read once per process. Both sides derive the leaf
+/// programs, so the verifier's setting is part of the tree identity it derives.
 pub fn share_inverse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(
         || match std::env::var("LFM_WHIR_SHARE_INVERSE").as_deref() {
-            Err(_) | Ok("0") => false,
-            Ok("1") => true,
+            Err(_) | Ok("1") => true,
+            Ok("0") => false,
             Ok(v) => panic!("LFM_WHIR_SHARE_INVERSE must be 0 or 1, got `{v}`"),
         },
     )
