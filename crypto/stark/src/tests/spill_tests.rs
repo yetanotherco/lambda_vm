@@ -506,13 +506,15 @@ fn a_corrupted_slot_refuses_the_proof() {
 
 /// ★ Negative, the digest off: a slot changed on disk after its trace's
 /// Round-1 commit is never a proof the verifier accepts unless it is the
-/// resident proof itself (a word no stage of phase B reads). Refused or
-/// rejected at least once, so the check is not vacuous.
+/// resident proof itself (a word no stage of phase B reads). Where phase B
+/// recomputes the main LDE from the spilled words (`RecomputeLde`, and
+/// `RecomputeLdeDevice` on a host build), every perturbation is caught: the
+/// openings no longer match the absorbed tree.
 #[test]
 fn a_perturbed_slot_without_the_digest_is_never_accepted() {
-    let mut caught = 0;
     for residency in RESIDENCIES {
         let want = resident(residency);
+        let (mut refused, mut rejected) = (0, 0);
         for table in 0..3 {
             let store = store(DirectIo::Auto);
             store.set_verify(false);
@@ -527,16 +529,19 @@ fn a_perturbed_slot_without_the_digest_is_never_accepted() {
                 },
             );
             match out {
-                Err(_) => caught += 1,
-                Ok(proof) if !verifies(&proof) => caught += 1,
+                Err(_) => refused += 1,
+                Ok(proof) if !verifies(&proof) => rejected += 1,
                 Ok(proof) => assert!(
                     bytes(&proof) == want,
                     "{residency:?} table {table}: a perturbed trace proved and verified"
                 ),
             }
         }
+        eprintln!("{residency:?}: refused {refused}, rejected {rejected} of 3");
+        if residency == ResidencyMode::RecomputeLde {
+            assert_eq!(refused + rejected, 3, "{residency:?}");
+        }
     }
-    assert!(caught > 0, "no perturbation was caught");
 }
 
 /// ★ On the card with kept top levels: every trace spilled (after its
