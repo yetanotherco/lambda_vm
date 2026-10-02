@@ -500,7 +500,7 @@ fn windowed_streaming(
 /// ★ Dropping each streamed chunk's ops as it leaves builds the whole-run
 /// tables, table for table, at every window length, through `push` and through
 /// the split (with the derived LT ops kept compact, the default, or at 24
-/// bytes each, and KECCAK_RND and LT generated first or not); with the MEMW-derived LT ops streamed as well it builds what that
+/// bytes each); with the MEMW-derived LT ops streamed as well it builds what that
 /// builder builds, LT carrying the whole-run multiplicities. Also with CPU
 /// chunks of 24 rows, whose dropped chunks each pad 8 rows, and with chunks of 4
 /// rows (one op for the rarer tables), so that every streamed table drops
@@ -560,12 +560,11 @@ fn dropping_the_streamed_ops_builds_the_same_tables() {
                 same_traces(&reference, &dropping);
                 if !split {
                     // The derived LT ops held at 24 bytes each (the compact
-                    // form's A arm), KECCAK_RND and LT generated first: the same.
+                    // form's A arm): the same.
                     let (raw, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
                         b.drop_streamed_ops()
                             .expect("before any window")
                             .raw_memw_lt()
-                            .generate_kr_first()
                     });
                     same_traces(&reference, &raw);
                 }

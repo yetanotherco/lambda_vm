@@ -491,14 +491,6 @@ fn compact_lt() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_COMPACT_LT").is_ok_and(|v| v.trim() == "0")
 }
 
-/// `LAMBDA_VM_BLOCK_P5_KR_FIRST=1`: the finish starts KECCAK_RND's and LT's
-/// builds before every other table's ([`WindowedTraceBuilder::generate_kr_first`]),
-/// so most of its commit work reaches phase A's committers sooner; off by
-/// default. The tables are the same.
-fn p5_kr_first() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_P5_KR_FIRST").is_ok_and(|v| v.trim() == "1")
-}
-
 /// With [`narrow_finished`], the finish builds KECCAK_RND and LT packed a
 /// block at a time; `LAMBDA_VM_BLOCK_PACKED_BUILD=0` builds them at 8 bytes a
 /// cell and packs them afterwards, as the other tables
@@ -1402,9 +1394,6 @@ fn build_streamed(
             }
             if !compact_lt() {
                 builder = builder.raw_memw_lt();
-            }
-            if p5_kr_first() {
-                builder = builder.generate_kr_first();
             }
             if let Some(ledger) = ledger {
                 eprintln!(
