@@ -1280,6 +1280,25 @@ fn emit_pool_knob() -> usize {
     }
 }
 
+/// `NOEPOCH_TREE_EMIT_WINDOW=<W>`: in the pipeline mode, only the first W leaf
+/// programs are emitted beside the base; the builder emits the rest in leaf
+/// order, at most `2 × W` ahead of its artifact builds, on its own pool. Unset
+/// (the default) emits every leaf program beside the base, which holds them all
+/// through the base's prove (≈ 338 MiB a leaf at the median block, BIG 480).
+fn emit_window_knob() -> Option<usize> {
+    std::env::var("NOEPOCH_TREE_EMIT_WINDOW")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|w: &usize| *w >= 1)
+                .unwrap_or_else(|| {
+                    panic!("NOEPOCH_TREE_EMIT_WINDOW must be a positive integer, got `{v}`")
+                })
+        })
+}
+
 /// [`compose_block_tree`], each node proved from the program and artifacts
 /// derived ahead when `ahead` holds the node levels, and each node below the top
 /// verified on `beside` when given (the top is verified inline).
@@ -2191,6 +2210,7 @@ fn the_block_tree_composes_to_a_top_node() {
     // from them.
     let tree_ahead = elf_beside.and(tree_ahead_mode());
     let emit_threads = emit_pool_knob();
+    let emit_window = emit_window_knob();
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2229,12 +2249,13 @@ fn the_block_tree_composes_to_a_top_node() {
                             AheadMode::Pipe => {
                                 use rayon::prelude::*;
                                 let te = Instant::now();
-                                let leaves = (0..plan.partition().num_leaves())
+                                let n = plan.partition().num_leaves();
+                                let beside = emit_window.map_or(n, |w| w.min(n));
+                                let leaves = (0..beside)
                                     .into_par_iter()
                                     .map(|k| plan.leaf_program(k))
                                     .collect::<Result<Vec<_>, String>>()?;
-                                let pipe =
-                                    std::sync::Arc::new(Pipe::new(leaves.len(), &plan.levels()));
+                                let pipe = std::sync::Arc::new(Pipe::new(n, &plan.levels()));
                                 let emitted = super::block_plan::PhaseTimes {
                                     programs: leaves.len(),
                                     wall: te.elapsed().as_secs_f64(),
@@ -2258,7 +2279,7 @@ fn the_block_tree_composes_to_a_top_node() {
             let _ = ready_tx.send((consts, secs, ahead));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
-            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads))
+            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads, emit_window.unwrap_or(0)))
         })
     });
 
@@ -2497,7 +2518,8 @@ fn the_block_tree_composes_to_a_top_node() {
             let times = times.expect("the tree's builder");
             println!(
                 "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
-                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit)",
+                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit) · leaf \
+                 programs {}",
                 times.leaves,
                 times.levels,
                 times.emit,
@@ -2506,7 +2528,12 @@ fn the_block_tree_composes_to_a_top_node() {
                 } else {
                     "global pool".to_string()
                 },
-                times.build
+                times.build,
+                match emit_window {
+                    Some(w) =>
+                        format!("emitted in a window of {w} (the first {w} beside the base)"),
+                    None => "all emitted beside the base".to_string(),
+                }
             );
         }
     }

@@ -5,7 +5,9 @@
 //! - `1`: every program and its artifacts derived beside the base, on the host
 //!   ([`super::block_plan::BlockTreePlan::derive_tree`]); [`Pipe::filled`].
 //! - `pipe`, the default (`0` derives each program inline, before it proves):
-//!   the leaf programs emitted beside the base (host, no artifacts);
+//!   the leaf programs emitted beside the base (host, no artifacts) — all of
+//!   them, or with an emission window W only the first W, the rest emitted by
+//!   the builder at most W ahead of its builds (`NOEPOCH_TREE_EMIT_WINDOW`);
 //!   once the base is done, [`Pipe::run_builder`] builds each leaf's artifacts on
 //!   the card, then emits each node program as soon as its children's ARTIFACTS
 //!   exist (a node reads its children's shapes, not their proofs) and builds its
@@ -35,6 +37,53 @@ pub(super) struct Pipe {
     leaves: Vec<Slot>,
     levels: Vec<Vec<Slot>>,
     failed: AtomicBool,
+}
+
+/// The pool the builder emits programs on: its own host-only threads, or none
+/// (the global pool).
+#[cfg(feature = "parallel")]
+type EmitPool = rayon::ThreadPool;
+#[cfg(not(feature = "parallel"))]
+type EmitPool = ();
+
+/// Emits `items` in order, `window` at a time on `pool`, and sends each result
+/// down `tx` as soon as its chunk is done. The receiver holds at most `window`
+/// sent and not taken, and one chunk is in emission, so at most `2 × window`
+/// programs exist ahead of the consumer. Stops after sending an error, or when
+/// the receiver is gone.
+fn emit_in_order<T: Send>(
+    items: std::ops::Range<usize>,
+    window: usize,
+    pool: Option<&EmitPool>,
+    emit: &(dyn Fn(usize) -> Result<T, String> + Sync),
+    tx: &std::sync::mpsc::SyncSender<Result<T, String>>,
+) {
+    let window = window.max(1);
+    let mut next = items.start;
+    while next < items.end {
+        let chunk = next..(next + window).min(items.end);
+        next = chunk.end;
+        #[cfg(feature = "parallel")]
+        let emitted: Vec<Result<T, String>> = {
+            use rayon::prelude::*;
+            let run = || chunk.clone().into_par_iter().map(emit).collect::<Vec<_>>();
+            match pool {
+                Some(pool) => pool.install(run),
+                None => run(),
+            }
+        };
+        #[cfg(not(feature = "parallel"))]
+        let emitted: Vec<Result<T, String>> = {
+            let _ = pool;
+            chunk.map(emit).collect()
+        };
+        for result in emitted {
+            let failed = result.is_err();
+            if tx.send(result).is_err() || failed {
+                return;
+            }
+        }
+    }
 }
 
 /// When the builder finished each stage, in seconds since it started.
@@ -126,15 +175,22 @@ impl Pipe {
     /// waits forever. With `emit_threads` > 0 the node programs are emitted on a
     /// pool of that many host-only threads of the builder's own, not on the
     /// global pool the provers' host phases use.
+    ///
+    /// `leaf_programs` are the first leaves' programs. With an `emit_window` W
+    /// > 0 they may be fewer than the leaves, and the builder emits the rest
+    /// itself, in leaf order, on the same pool, at most `2 × W` ahead of its
+    /// builds (`NOEPOCH_TREE_EMIT_WINDOW`): the same programs, emitted later, so
+    /// they do not all sit in memory beside the base.
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
+        emit_window: usize,
     ) -> Result<BuilderTimes, String> {
         let run = std::panic::AssertUnwindSafe(|| {
-            self.build(plan, leaf_programs, wrap_opts, emit_threads)
+            self.build(plan, leaf_programs, wrap_opts, emit_threads, emit_window)
         });
         let outcome = std::panic::catch_unwind(run);
         if !matches!(outcome, Ok(Ok(_))) {
@@ -152,6 +208,7 @@ impl Pipe {
         leaf_programs: Vec<LfmProgram>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
+        emit_window: usize,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
         // ⚠ On the global pool, a prover that joins inside its `multi_prove`
@@ -172,7 +229,10 @@ impl Pipe {
             None
         };
         #[cfg(not(feature = "parallel"))]
-        let _ = emit_threads;
+        let emit_pool: Option<EmitPool> = {
+            let _ = emit_threads;
+            None
+        };
         let words = plan.child_layout().total();
         let mut build_secs = 0.0;
         let mut built = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
@@ -186,12 +246,39 @@ impl Pipe {
             build_secs += t.elapsed().as_secs_f64();
             Ok((artifacts, derived))
         };
-        let mut children = Vec::with_capacity(leaf_programs.len());
-        for (k, program) in leaf_programs.into_iter().enumerate() {
-            let (artifacts, derived) = built(&program)?;
-            children.push(derived);
-            self.put(&self.leaves[k], program, artifacts);
+        let n = self.leaves.len();
+        let given = leaf_programs.len();
+        if given > n || (given < n && emit_window == 0) {
+            return Err(format!(
+                "{given} leaf programs for {n} leaves with an emission window of {emit_window}"
+            ));
         }
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Result<LfmProgram, String>>(emit_window.max(1));
+        let emit_leaf = |k: usize| plan.leaf_program(k);
+        let mut children = std::thread::scope(|scope| -> Result<Vec<DerivedChild>, String> {
+            if given < n {
+                let pool = emit_pool.as_ref();
+                let emit_leaf = &emit_leaf;
+                scope.spawn(move || emit_in_order(given..n, emit_window, pool, emit_leaf, &tx));
+            } else {
+                drop(tx);
+            }
+            let mut given = leaf_programs.into_iter();
+            let mut children = Vec::with_capacity(n);
+            for k in 0..n {
+                let program = match given.next() {
+                    Some(program) => program,
+                    None => rx
+                        .recv()
+                        .map_err(|_| format!("leaf {k}: the leaf emitter stopped early"))??,
+                };
+                let (artifacts, derived) = built(&program)?;
+                children.push(derived);
+                self.put(&self.leaves[k], program, artifacts);
+            }
+            Ok(children)
+        })?;
         let leaves_at = start.elapsed().as_secs_f64();
         let mut level_at = Vec::new();
         let mut emit = 0.0;
@@ -250,5 +337,63 @@ impl Pipe {
             emit,
             build: build_secs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The deferred leaf emitter hands its items over in order and never runs
+    /// more than two windows ahead of a slow consumer.
+    #[test]
+    fn the_leaf_emitter_keeps_its_order_and_its_window() {
+        let window = 3;
+        let emitted = AtomicUsize::new(0);
+        let emit = |k: usize| -> Result<usize, String> {
+            emitted.fetch_add(1, Ordering::SeqCst);
+            Ok(k * 10)
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<usize, String>>(window);
+        let mut worst = 0;
+        std::thread::scope(|scope| {
+            scope.spawn(|| emit_in_order(5..25, window, None, &emit, &tx));
+            for (received, k) in (5..25).enumerate() {
+                std::thread::sleep(Duration::from_millis(5));
+                worst = worst.max(emitted.load(Ordering::SeqCst) - received);
+                assert_eq!(rx.recv().expect("the emitter sends every item"), Ok(k * 10));
+            }
+        });
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            20,
+            "every item emitted once"
+        );
+        assert!(
+            worst <= 2 * window,
+            "{worst} items ahead of the consumer, window {window}"
+        );
+    }
+
+    /// An emission error is the last thing the emitter sends, after the items
+    /// before it in order; the consumer then sees the channel close.
+    #[test]
+    fn the_leaf_emitter_stops_at_an_error() {
+        let emit = |k: usize| -> Result<usize, String> {
+            if k == 7 {
+                Err(format!("leaf {k} does not emit"))
+            } else {
+                Ok(k)
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<usize, String>>(2);
+        std::thread::scope(|scope| {
+            scope.spawn(move || emit_in_order(5..20, 2, None, &emit, &tx));
+            assert_eq!(rx.recv().unwrap(), Ok(5));
+            assert_eq!(rx.recv().unwrap(), Ok(6));
+            assert_eq!(rx.recv().unwrap(), Err("leaf 7 does not emit".to_string()));
+            assert!(rx.recv().is_err(), "nothing after the error");
+        });
     }
 }
