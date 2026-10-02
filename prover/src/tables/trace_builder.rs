@@ -2407,55 +2407,73 @@ pub(crate) fn collect_bitwise_from_mul(
     max_rows_mul: usize,
 ) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 20);
-
-    // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
     for (op, _wants_hi) in mul_ops {
-        let (lo, hi) = op.compute_product();
+        for_each_bitwise_from_mul_row(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops.extend(collect_bitwise_from_mul_instances(mul_ops, max_rows_mul));
+    bitwise_ops
+}
 
-        // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
-        // in mul::bus_interactions).
-        for word in [op.lhs, op.rhs] {
-            for shift in [0, 16, 32, 48] {
-                let half = ((word >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
+/// One MUL op's own lookups (IS_HALF and IS_B20), which do not depend on the
+/// chip instance it lands in: counted per op wherever the op is.
+pub(crate) fn for_each_bitwise_from_mul_row(
+    op: &MulOperation,
+    mut emit: impl FnMut(BitwiseOperation),
+) {
+    // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
+    let (lo, hi) = op.compute_product();
 
-        // IS_HALF for lo halfwords
+    // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
+    // in mul::bus_interactions).
+    for word in [op.lhs, op.rhs] {
         for shift in [0, 16, 32, 48] {
-            let half = ((lo >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
+            let half = ((word >> shift) & 0xFFFF) as u16;
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
             ));
-        }
-
-        // IS_HALF for hi halfwords
-        for shift in [0, 16, 32, 48] {
-            let half = ((hi >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        // IS_B20 for carry[0..4] range checks
-        let raw_products = op.compute_raw_products();
-        let carries = mul::compute_carries(lo, hi, &raw_products);
-        for carry in carries {
-            let x = (carry & 0xFF) as u8;
-            let y = ((carry >> 8) & 0xFF) as u8;
-            let z = ((carry >> 16) & 0xF) as u8;
-            bitwise_ops.push(BitwiseOperation::b20(x, y, z));
         }
     }
 
+    // IS_HALF for lo halfwords
+    for shift in [0, 16, 32, 48] {
+        let half = ((lo >> shift) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+
+    // IS_HALF for hi halfwords
+    for shift in [0, 16, 32, 48] {
+        let half = ((hi >> shift) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+
+    // IS_B20 for carry[0..4] range checks
+    let raw_products = op.compute_raw_products();
+    let carries = mul::compute_carries(lo, hi, &raw_products);
+    for carry in carries {
+        let x = (carry & 0xFF) as u8;
+        let y = ((carry >> 8) & 0xFF) as u8;
+        let z = ((carry >> 16) & 0xF) as u8;
+        emit(BitwiseOperation::b20(x, y, z));
+    }
+}
+
+/// The MUL lookups deduplicated per chip instance (`max_rows_mul` chunk): they
+/// depend on where the op lands in the run's list, so they are counted over it.
+pub(crate) fn collect_bitwise_from_mul_instances(
+    mul_ops: &[(MulOperation, bool)],
+    max_rows_mul: usize,
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::new();
     // MSB16: dedup per chunk — the MUL AIR sends Msb16 once per unique signed row
     // per instance, so the collector must mirror the same chunk boundary.
     for chunk in mul_ops.chunks(max_rows_mul) {
@@ -2504,85 +2522,104 @@ pub(crate) fn collect_bitwise_from_dvrm(
     max_rows_dvrm: usize,
 ) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
-
     for (op, _wants_remainder) in dvrm_ops {
-        // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
-        // half-limbs so a prover cannot supply non-canonical halves (matches the
-        // n/d IS_HALF senders in dvrm::bus_interactions).
-        for word in [op.n, op.d] {
-            for shift in [0, 16, 32, 48] {
-                let half = ((word >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
+        for_each_bitwise_from_dvrm_row(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops.extend(collect_bitwise_from_dvrm_instances(dvrm_ops, max_rows_dvrm));
+    bitwise_ops
+}
 
-        // IS_HALF for r[0..4] (DVRM-C13)
-        let r = op.compute_remainder();
+/// One DVRM op's own lookups (IS_HALF ×20 and ZERO ×2), which do not depend on
+/// the chip instance it lands in: counted per op wherever the op is.
+pub(crate) fn for_each_bitwise_from_dvrm_row(
+    op: &DvrmOperation,
+    mut emit: impl FnMut(BitwiseOperation),
+) {
+    // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
+    // half-limbs so a prover cannot supply non-canonical halves (matches the
+    // n/d IS_HALF senders in dvrm::bus_interactions).
+    for word in [op.n, op.d] {
         for shift in [0, 16, 32, 48] {
-            let half = ((r >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
+            let half = ((word >> shift) & 0xFFFF) as u16;
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
             ));
         }
-
-        // IS_HALF for n_sub_r[0..4] (DVRM-C14)
-        let n_sub_r = op.n.wrapping_sub(r);
-        for shift in [0, 16, 32, 48] {
-            let half = ((n_sub_r >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        // IS_HALF for q[0..4] (DVRM-C11)
-        let q = op.compute_quotient();
-        for shift in [0, 16, 32, 48] {
-            let half = ((q >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        // ZERO lookups per raw op (multiplicity = μ_sum = μ_q + μ_r)
-
-        // C8: ZERO[overflow; overflow_sum]
-        // overflow_sum = n[0]+n[1]+n[2]+n[3] - 32769*sign_n + 262141 - d[0]-d[1]-d[2]-d[3]
-        let n_halves: [u32; 4] = [
-            (op.n & 0xFFFF) as u32,
-            ((op.n >> 16) & 0xFFFF) as u32,
-            ((op.n >> 32) & 0xFFFF) as u32,
-            ((op.n >> 48) & 0xFFFF) as u32,
-        ];
-        let d_halves: [u32; 4] = [
-            (op.d & 0xFFFF) as u32,
-            ((op.d >> 16) & 0xFFFF) as u32,
-            ((op.d >> 32) & 0xFFFF) as u32,
-            ((op.d >> 48) & 0xFFFF) as u32,
-        ];
-        let sign_n: u32 = if op.sign_n() { 1 } else { 0 };
-        let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3] + 262141
-            - 32769 * sign_n
-            - d_halves[0]
-            - d_halves[1]
-            - d_halves[2]
-            - d_halves[3];
-        bitwise_ops.push(BitwiseOperation::zero(overflow_sum));
-
-        // C20: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
-        let d_sum = d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3];
-        bitwise_ops.push(BitwiseOperation::zero(d_sum));
     }
 
+    // IS_HALF for r[0..4] (DVRM-C13)
+    let r = op.compute_remainder();
+    for shift in [0, 16, 32, 48] {
+        let half = ((r >> shift) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+
+    // IS_HALF for n_sub_r[0..4] (DVRM-C14)
+    let n_sub_r = op.n.wrapping_sub(r);
+    for shift in [0, 16, 32, 48] {
+        let half = ((n_sub_r >> shift) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+
+    // IS_HALF for q[0..4] (DVRM-C11)
+    let q = op.compute_quotient();
+    for shift in [0, 16, 32, 48] {
+        let half = ((q >> shift) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+
+    // ZERO lookups per raw op (multiplicity = μ_sum = μ_q + μ_r)
+
+    // C8: ZERO[overflow; overflow_sum]
+    // overflow_sum = n[0]+n[1]+n[2]+n[3] - 32769*sign_n + 262141 - d[0]-d[1]-d[2]-d[3]
+    let n_halves: [u32; 4] = [
+        (op.n & 0xFFFF) as u32,
+        ((op.n >> 16) & 0xFFFF) as u32,
+        ((op.n >> 32) & 0xFFFF) as u32,
+        ((op.n >> 48) & 0xFFFF) as u32,
+    ];
+    let d_halves: [u32; 4] = [
+        (op.d & 0xFFFF) as u32,
+        ((op.d >> 16) & 0xFFFF) as u32,
+        ((op.d >> 32) & 0xFFFF) as u32,
+        ((op.d >> 48) & 0xFFFF) as u32,
+    ];
+    let sign_n: u32 = if op.sign_n() { 1 } else { 0 };
+    let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3] + 262141
+        - 32769 * sign_n
+        - d_halves[0]
+        - d_halves[1]
+        - d_halves[2]
+        - d_halves[3];
+    emit(BitwiseOperation::zero(overflow_sum));
+
+    // C20: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
+    let d_sum = d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3];
+    emit(BitwiseOperation::zero(d_sum));
+}
+
+/// The DVRM lookups deduplicated per chip instance (`max_rows_dvrm` chunk:
+/// MSB16 and the NEG-template ZERO): they depend on where the op lands in the
+/// run's list, so they are counted over it.
+pub(crate) fn collect_bitwise_from_dvrm_instances(
+    dvrm_ops: &[(DvrmOperation, bool)],
+    max_rows_dvrm: usize,
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::new();
     // MSB16: same per-chunk dedup as MUL (Column(SIGNED) is a bit, not a count).
     for chunk in dvrm_ops.chunks(max_rows_dvrm) {
         let mut msb16_seen = std::collections::HashSet::new();
