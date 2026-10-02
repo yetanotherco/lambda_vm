@@ -256,6 +256,13 @@ fn prove_block_with_observed(
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let ledger = memlog().then(|| std::sync::Arc::new(MemLedger::new()));
     let _sampler = ledger.clone().map(MemSampler::start);
+    // The finish's phases, on the ledger's clock, while phase A runs.
+    if let Some(ledger) = &ledger {
+        let ledger = ledger.clone();
+        crate::tables::trace_builder::set_finish_marks(Some(std::sync::Arc::new(move |label| {
+            ledger.line(&format!("finish {label}"))
+        })));
+    }
     let (mut traces, decode_commitment, precommits) = if stream_phase_a() {
         build_streamed(
             &program,
@@ -272,6 +279,7 @@ fn prove_block_with_observed(
         (traces, decode, Vec::new())
     };
     if let Some(ledger) = &ledger {
+        crate::tables::trace_builder::set_finish_marks(None);
         ledger.line("phase A end");
     }
 

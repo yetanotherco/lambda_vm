@@ -3943,6 +3943,30 @@ impl Drop for WidePermit<'_> {
     }
 }
 
+/// Where a build's table phase is, for a caller that wants to know
+/// ([`set_finish_marks`]): called with "p3 lt", "p4 bitwise", each phase-5
+/// generator's name as it finishes, and "p5 done". Unset, nothing is called.
+pub type FinishMarks = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+static FINISH_MARKS: std::sync::RwLock<Option<FinishMarks>> = std::sync::RwLock::new(None);
+
+/// Install (or with `None`, remove) the process's finish marks: a measurement
+/// hook (`LAMBDA_VM_BLOCK_MEMLOG`); it changes no table.
+pub fn set_finish_marks(marks: Option<FinishMarks>) {
+    *FINISH_MARKS.write().unwrap_or_else(|e| e.into_inner()) = marks;
+}
+
+/// Call the finish marks, if any are installed.
+fn finish_mark(label: &str) {
+    let marks = FINISH_MARKS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(marks) = marks {
+        marks(label);
+    }
+}
+
 /// BITWISE lookups a windowed build counted while the run was still being
 /// walked: the histogram of the first `bitwise_ops` in-walk lookups and of the
 /// first `memw_register_rows` MEMW_R rows (the table phase's two dominant
@@ -4607,6 +4631,7 @@ fn build_traces<I: ImageSource + Sync>(
             LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
+    finish_mark("p3 lt");
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -4812,6 +4837,7 @@ fn build_traces<I: ImageSource + Sync>(
     let bitwise_histogram = base;
     // The in-walk lookup Vec has been counted into the histogram; free it now.
     drop(bitwise_ops);
+    finish_mark("p4 bitwise");
     #[cfg(feature = "instruments")]
     drop(__sp);
 
@@ -5204,7 +5230,10 @@ fn build_traces<I: ImageSource + Sync>(
             macro_rules! spawn_into {
                 ($slot:ident, $gen:ident) => {{
                     let slot = &mut $slot;
-                    s.spawn(move |_| *slot = Some($gen()));
+                    s.spawn(move |_| {
+                        *slot = Some($gen());
+                        finish_mark(concat!("p5 ", stringify!($gen)));
+                    });
                 }};
             }
             // Heaviest builds first so the scheduler overlaps them with the rest.
@@ -5266,6 +5295,7 @@ fn build_traces<I: ImageSource + Sync>(
         hints_slot = Some(gen_hints());
     }
 
+    finish_mark("p5 done");
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
     let cpus = cpus_slot.expect(PHASE5_RAN)?;
     let memws = memws_slot.expect(PHASE5_RAN)?;
