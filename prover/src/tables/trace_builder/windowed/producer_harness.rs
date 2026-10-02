@@ -521,6 +521,12 @@ pub(crate) fn run_producer(
                     opt(rss_gib()),
                     opt(report.peak_windows)
                 ));
+                {
+                    let split = super::split_probe::take();
+                    let line: Vec<String> =
+                        split.iter().map(|(l, s)| format!("{l}={s:.3}")).collect();
+                    eprintln!("PRODUCER SPLIT {}", line.join(" "));
+                }
                 if !cfg.finish {
                     return Ok(report);
                 }
