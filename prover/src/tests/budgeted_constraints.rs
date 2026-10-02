@@ -289,3 +289,450 @@ fn dump_budgeted_programs() {
     std::fs::write(std::path::Path::new(&dir).join("si_programs.txt"), out)
         .expect("write the dump");
 }
+
+/// On the device: the bounded-slot interpreter against the slot-file
+/// interpreter, a proof proved both ways, and the kernel-time benchmark.
+#[cfg(feature = "cuda")]
+mod device {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use math_cuda::constraint_interp::{
+        SiConfig, SiStore, set_composition_timing, si_blocks_per_sm, si_device_report,
+        take_composition_device_ms,
+    };
+    use math_cuda::device::backend;
+    use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
+    use stark::constraint_ir::gpu_interp::{
+        CompositionInputs, GPU_COMPOSITION_COMPILED_CALLS, GPU_COMPOSITION_SI_CALLS,
+        GpuComposition, SI_MUTATE_FIRST_ACC, SiMode, SiTuning, override_compiled_constraints,
+        override_interp_si, try_eval_composition_gpu,
+    };
+
+    use crate::tests::compiled_constraints::{
+        BYTES_PROGRAM, FixedTraces, bytes_options, proof_bytes,
+    };
+
+    /// Tests that flip the process-wide overrides take this first.
+    static OVERRIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn shared(rows: u32, block: u32, budget: u32) -> SiTuning {
+        SiTuning {
+            cfg: SiConfig {
+                store: SiStore::Shared,
+                rows_per_thread: rows,
+                block,
+            },
+            budget,
+        }
+    }
+
+    fn local(block: u32, budget: u32) -> SiTuning {
+        SiTuning {
+            cfg: SiConfig {
+                store: SiStore::Local,
+                rows_per_thread: 1,
+                block,
+            },
+            budget,
+        }
+    }
+
+    fn name(t: &SiTuning) -> String {
+        let s = match t.cfg.store {
+            SiStore::Shared => "smem",
+            SiStore::Local => "local",
+        };
+        format!(
+            "{s}/r{}/t{}/b{}",
+            t.cfg.rows_per_thread, t.cfg.block, t.budget
+        )
+    }
+
+    /// Random device-resident inputs for one program over `rows` LDE rows.
+    struct Inputs {
+        main: GpuLdeBase,
+        aux: GpuLdeExt3,
+        rap: Vec<Fp3>,
+        alpha: Vec<Fp3>,
+        offset: Fp3,
+        beta: Vec<Fp3>,
+        z_inv: Vec<Fp>,
+        b_col: Vec<usize>,
+        b_is_aux: Vec<bool>,
+        b_value: Vec<Fp3>,
+        b_beta: Vec<Fp3>,
+        b_z_inv: Vec<Arc<Vec<Fp>>>,
+    }
+
+    fn inputs(p: &Program, rows: usize, seed: u64) -> Inputs {
+        let (main_cols, aux_cols, rap_len, alpha_len) = footprint(p);
+        let mut rng = SplitMix64(seed);
+        let fp3 = |rng: &mut SplitMix64| {
+            Fp3::from_raw([
+                Fp::from_raw(rng.next_u64()),
+                Fp::from_raw(rng.next_u64()),
+                Fp::from_raw(rng.next_u64()),
+            ])
+        };
+        let base: Vec<u64> = (0..main_cols * rows).map(|_| rng.next_u64()).collect();
+        let ext: Vec<u64> = (0..aux_cols * 3 * rows).map(|_| rng.next_u64()).collect();
+        let be = backend().expect("cuda backend");
+        let stream = be.next_stream();
+        let main_buf = stream.clone_htod(&base).expect("upload main");
+        let aux_buf = stream.clone_htod(&ext).expect("upload aux");
+        stream.synchronize().expect("sync");
+        Inputs {
+            main: GpuLdeBase {
+                ready: None,
+                buf: Arc::new(main_buf),
+                m: main_cols,
+                lde_size: rows,
+                tree: None,
+                trace_dev: None,
+                trace_rows: 0,
+            },
+            aux: GpuLdeExt3 {
+                ready: None,
+                buf: Arc::new(aux_buf),
+                m: aux_cols,
+                lde_size: rows,
+                tree: None,
+            },
+            rap: (0..rap_len).map(|_| fp3(&mut rng)).collect(),
+            alpha: (0..alpha_len).map(|_| fp3(&mut rng)).collect(),
+            offset: fp3(&mut rng),
+            beta: (0..p.roots.len()).map(|_| fp3(&mut rng)).collect(),
+            z_inv: (0..4).map(|_| Fp::from_raw(rng.next_u64())).collect(),
+            b_col: vec![0, aux_cols - 1],
+            b_is_aux: vec![false, true],
+            b_value: (0..2).map(|_| fp3(&mut rng)).collect(),
+            b_beta: (0..2).map(|_| fp3(&mut rng)).collect(),
+            b_z_inv: (0..2)
+                .map(|_| Arc::new((0..rows).map(|_| Fp::from_raw(rng.next_u64())).collect()))
+                .collect(),
+        }
+    }
+
+    /// One composition under the current overrides: `H` host-drained, or
+    /// (`keep`) kept on the device and waited for.
+    fn composition(p: &Program, x: &Inputs, rows: usize, keep: bool) -> Option<Vec<u64>> {
+        let accum = CompositionInputs {
+            beta_trans: &x.beta,
+            z_inv: &x.z_inv,
+            b_col: &x.b_col,
+            b_is_aux: &x.b_is_aux,
+            b_value: &x.b_value,
+            b_beta: &x.b_beta,
+            b_z_inv: &x.b_z_inv,
+        };
+        match try_eval_composition_gpu(
+            p, &x.main, &x.aux, &x.rap, &x.alpha, &x.offset, 4, rows, &accum, keep,
+        ) {
+            Some(GpuComposition::Host(h)) => Some(h),
+            Some(GpuComposition::Dev(h)) => {
+                h.synchronize().expect("synchronize");
+                None
+            }
+            None => panic!("the GPU composition path must engage"),
+        }
+    }
+
+    /// The shapes every program is checked under: both stores, both row
+    /// counts, a small and a large budget.
+    fn parity_shapes() -> Vec<SiTuning> {
+        vec![
+            shared(1, 128, 48),
+            shared(2, 64, 32),
+            shared(1, 64, 128),
+            local(128, 48),
+            local(64, 24),
+        ]
+    }
+
+    /// ★ The bounded-slot interpreter computes the slot-file interpreter's
+    /// `H`, limb for limb, for every production program, under every parity
+    /// shape, on two seeds of random full-range LDE columns and uniforms.
+    #[test]
+    fn every_si_shape_computes_the_interpreters_h() {
+        let _guard = OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+        const ROWS: usize = 4096;
+        let mut compared = 0;
+        for (key, (labels, p)) in distinct_programs() {
+            let label = short(&labels);
+            for seed in [1u64, 0xDEAD_BEEF] {
+                let x = inputs(&p, ROWS, seed ^ key);
+                override_compiled_constraints(Some(false));
+                override_interp_si(Some((SiMode::Off, SiTuning::default())));
+                let reference = composition(&p, &x, ROWS, false).expect("host H");
+                for t in parity_shapes() {
+                    if lower_budgeted(&p, t.budget).is_err() {
+                        continue;
+                    }
+                    override_interp_si(Some((SiMode::All, t)));
+                    let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);
+                    let got = composition(&p, &x, ROWS, false).expect("host H");
+                    let ran = GPU_COMPOSITION_SI_CALLS.load(SeqCst) - before;
+                    assert_eq!(ran, 1, "{label} {}: the bounded-slot kernel ran", name(&t));
+                    assert!(
+                        got == reference,
+                        "{label} (key {key:016x}, seed {seed:#x}, {}): H differs from the interpreter's",
+                        name(&t)
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        override_interp_si(None);
+        override_compiled_constraints(None);
+        println!("SI PARITY: {compared} program-shape-seed runs equal");
+        assert!(compared >= 300, "only {compared} runs compared");
+    }
+
+    /// ★ A proof made with the bounded-slot interpreter on every program is
+    /// byte for byte the default proof, from one set of traces at grinding 0,
+    /// after the control (two default proofs equal). Then the mutation
+    /// control: with every budgeted program's first accumulation taking the
+    /// next root's coefficient, the proof must change and fail to verify, or
+    /// the prover must refuse it.
+    #[test]
+    #[ignore = "requires a GPU: proves a program four times"]
+    fn the_si_interpreter_proves_the_same_bytes() {
+        let _guard = OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+        let fixed = FixedTraces::build(BYTES_PROGRAM);
+        let opts = bytes_options();
+        let prove = |mode: SiMode| {
+            override_interp_si(Some((mode, SiTuning::default())));
+            let proof = fixed.prove(&opts);
+            override_interp_si(None);
+            proof
+        };
+        let control = proof_bytes(&prove(SiMode::Off).expect("prove"));
+        let default = proof_bytes(&prove(SiMode::Off).expect("prove"));
+        assert!(control == default, "the control: two default proofs differ");
+        println!(
+            "SI BYTES: the control, two default proofs of one set of traces: {} bytes each, equal",
+            default.len()
+        );
+        let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);
+        let compiled_before = GPU_COMPOSITION_COMPILED_CALLS.load(SeqCst);
+        let si = prove(SiMode::All).expect("prove");
+        let ran = GPU_COMPOSITION_SI_CALLS.load(SeqCst) - before;
+        assert!(
+            ran > 0,
+            "no composition ran on the bounded-slot interpreter"
+        );
+        assert_eq!(
+            GPU_COMPOSITION_COMPILED_CALLS.load(SeqCst),
+            compiled_before,
+            "a compiled kernel ran under `all`"
+        );
+        assert!(
+            proof_bytes(&si) == default,
+            "the bounded-slot interpreter changed the proof"
+        );
+        assert!(fixed.verifies(&si, &opts), "the proof does not verify");
+        println!("SI BYTES: the bounded-slot proof ({ran} compositions) equals it and verifies");
+
+        SI_MUTATE_FIRST_ACC.store(true, SeqCst);
+        let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);
+        let mutated = prove(SiMode::All);
+        SI_MUTATE_FIRST_ACC.store(false, SeqCst);
+        let ran = GPU_COMPOSITION_SI_CALLS.load(SeqCst) - before;
+        assert!(ran > 0, "the mutant never ran");
+        match mutated {
+            Err(e) => {
+                println!("SI BYTES: the mutant ({ran} compositions): the prover refused: {e:?}")
+            }
+            Ok(proof) => {
+                assert!(
+                    proof_bytes(&proof) != default,
+                    "the mutant left the proof unchanged"
+                );
+                assert!(
+                    !fixed.verifies(&proof, &opts),
+                    "a proof made with the mutant verifies"
+                );
+                println!(
+                    "SI BYTES: the mutant ({ran} compositions): the proof changed and does not verify"
+                );
+            }
+        }
+    }
+
+    /// Kernel milliseconds (CUDA events, median of 5 after one warm-up) of one
+    /// program under the current overrides.
+    fn kernel_ms(p: &Program, x: &Inputs, rows: usize) -> Option<f64> {
+        let mut ms = Vec::new();
+        for i in 0..6 {
+            let _ = take_composition_device_ms();
+            composition(p, x, rows, true);
+            let t = take_composition_device_ms()?;
+            if i > 0 {
+                ms.push(t);
+            }
+        }
+        ms.sort_by(|a, b| a.total_cmp(b));
+        Some(ms[ms.len() / 2])
+    }
+
+    /// The full sweep of shapes (S1).
+    fn sweep_shapes() -> Vec<SiTuning> {
+        let mut v = Vec::new();
+        for block in [64, 128, 256] {
+            for budget in [24, 32, 48, 64, 96, 128] {
+                v.push(shared(1, block, budget));
+            }
+        }
+        for block in [64, 128] {
+            for budget in [24, 32, 48, 64] {
+                v.push(shared(2, block, budget));
+            }
+        }
+        for block in [64, 128, 256] {
+            for budget in [32, 48, 64, 128] {
+                v.push(local(block, budget));
+            }
+        }
+        v
+    }
+
+    /// The reduced sweep every program gets (S2b's sizing).
+    fn short_shapes() -> Vec<SiTuning> {
+        vec![
+            shared(1, 128, 32),
+            shared(1, 128, 48),
+            shared(1, 128, 64),
+            shared(1, 64, 48),
+            shared(1, 64, 96),
+            shared(2, 64, 32),
+            shared(2, 64, 48),
+            local(128, 32),
+            local(128, 48),
+            local(128, 64),
+            local(256, 48),
+        ]
+    }
+
+    /// The LDE rows a program is timed at: the interpreted programs at the
+    /// sizes D-INTERP's gate names, every other program at 2^20.
+    fn bench_rows(labels: &[String]) -> usize {
+        let has = |n: &str| labels.iter().any(|l| l == n);
+        if has("KECCAK_RND") || has("KECCAK") || has("ECSM") {
+            1 << 18
+        } else if has("ECDAS") {
+            1 << 19
+        } else {
+            1 << 20
+        }
+    }
+
+    /// S1: kernel time per program, the slot-file interpreter and the compiled
+    /// kernel (when the program has one) against the bounded-slot interpreter
+    /// under every shape (the full sweep for the programs that carry the
+    /// composition time, a reduced one for the rest). One `SI BENCH` line per
+    /// program and shape, one `SI BEST` line per program.
+    #[test]
+    #[ignore = "a benchmark: run on the box"]
+    fn bench_si_against_the_interpreter() {
+        let _guard = OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+        println!("SI DEVICE: {}", si_device_report().expect("device report"));
+        set_composition_timing(true);
+        let full: &[&str] = &[
+            "KECCAK_RND",
+            "ECDAS",
+            "KECCAK",
+            "ECSM",
+            "CPU",
+            "MEMW_R",
+            "MEMW_A",
+            "LT",
+            "LFM LFM_HASH",
+        ];
+        for (key, (labels, p)) in distinct_programs() {
+            let label = short(&labels);
+            if labels.iter().any(|l| l.starts_with("L2G[")) && !labels.iter().any(|l| l == "L2G[1]")
+            {
+                continue; // one L2G program is enough
+            }
+            let rows = bench_rows(&labels);
+            let x = inputs(&p, rows, key);
+            override_interp_si(Some((SiMode::Off, SiTuning::default())));
+            override_compiled_constraints(Some(false));
+            let interp = kernel_ms(&p, &x, rows).expect("interpreter timed");
+            override_compiled_constraints(Some(true));
+            let compiled = if math_cuda::constraint_interp::compiled_composition_kernel(
+                codegen::structural_key(&DeviceProgram::lower(&p)),
+            )
+            .is_some()
+            {
+                kernel_ms(&p, &x, rows)
+            } else {
+                None
+            };
+            override_compiled_constraints(Some(false));
+            let shapes = if labels.iter().any(|l| full.contains(&l.as_str())) {
+                sweep_shapes()
+            } else {
+                short_shapes()
+            };
+            let nodes = DeviceProgram::lower(&p).nodes.len();
+            let mut best: Option<(f64, String)> = None;
+            for t in shapes {
+                let Ok(bp) = lower_budgeted(&p, t.budget) else {
+                    continue;
+                };
+                if t.cfg.kernel(bp.num_words).is_none() {
+                    continue;
+                }
+                let occ = si_blocks_per_sm(t.cfg, bp.num_words).unwrap_or(0);
+                if occ == 0 {
+                    println!(
+                        "SI BENCH {label:<34} {:<20} words {:3} does not fit",
+                        name(&t),
+                        bp.num_words
+                    );
+                    continue;
+                }
+                override_interp_si(Some((SiMode::All, t)));
+                let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);
+                let Some(ms) = kernel_ms(&p, &x, rows) else {
+                    println!("SI BENCH {label:<34} {:<20} failed", name(&t));
+                    continue;
+                };
+                assert!(
+                    GPU_COMPOSITION_SI_CALLS.load(SeqCst) > before,
+                    "{label}: SI ran"
+                );
+                println!(
+                    "SI BENCH {label:<34} {:<20} rows {rows:8} nodes {nodes:6} steps {:6} words {:3} \
+                     blocks/SM {occ:2} ms {ms:9.3} vs interp {interp:9.3} compiled {} ps/node-row {:.2}",
+                    name(&t),
+                    bp.steps.len(),
+                    bp.num_words,
+                    compiled
+                        .map(|c| format!("{c:9.3}"))
+                        .unwrap_or_else(|| "        -".into()),
+                    ms * 1e9 / (nodes as f64 * rows as f64),
+                );
+                if best.as_ref().is_none_or(|(b, _)| ms < *b) {
+                    best = Some((ms, name(&t)));
+                }
+            }
+            if let Some((ms, shape)) = best {
+                println!(
+                    "SI BEST {label:<34} rows {rows:8} nodes {nodes:6} best {shape:<20} {ms:9.3} ms · \
+                     interp {interp:9.3} ({:.2}x) · compiled {}",
+                    interp / ms,
+                    compiled
+                        .map(|c| format!("{c:9.3} (si/compiled {:.2})", ms / c))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+        }
+        override_interp_si(None);
+        override_compiled_constraints(None);
+        set_composition_timing(false);
+    }
+}
