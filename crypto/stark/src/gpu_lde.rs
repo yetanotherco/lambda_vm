@@ -1454,13 +1454,88 @@ where
     E: IsField + 'static,
     B: DeviceTreeBackend,
 {
+    leaf_and_tree_keep::<F, E, B>(
+        table,
+        what,
+        row_major,
+        predev,
+        None,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        rows_per_leaf,
+    )
+}
+
+/// [`try_expand_leaf_and_tree_row_major_keep`] from a packed trace (its host
+/// words freed): the packed columns are uploaded and widened on the device
+/// into the commit's input.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_expand_leaf_and_tree_narrow_keep<F, E, B>(
+    table: &str,
+    what: &'static str,
+    narrow: &crate::narrow::NarrowMain,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: DeviceTreeBackend,
+{
+    leaf_and_tree_keep::<F, E, B>(
+        table,
+        what,
+        &[],
+        None,
+        Some(narrow),
+        narrow.rows(),
+        narrow.cols(),
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        rows_per_leaf,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn leaf_and_tree_keep<F, E, B>(
+    table: &str,
+    what: &'static str,
+    row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
+    narrow: Option<&crate::narrow::NarrowMain>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: DeviceTreeBackend,
+{
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
     if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
-    if row_major.len() != n * m || m == 0 || n == 0 {
+    if (row_major.len() != n * m && narrow.is_none()) || m == 0 || n == 0 {
         return None;
     }
     let lde_size = n.saturating_mul(blowup_factor);
@@ -1478,7 +1553,6 @@ where
     let set = commit_device_set_rpl(n, m, blowup_factor, true, rows_per_leaf);
     admit_commit(lde_size, &shape, &set)?;
 
-    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
     GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
@@ -1489,17 +1563,35 @@ where
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     // Admitted means the device path is the only path: a failure here aborts.
-    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_rpl(
-        raw,
-        predev,
-        device_hash_of::<B>(),
-        n,
-        m,
-        blowup_factor,
-        &weights_u64,
-        retain_host_lde,
-        rows_per_leaf,
-    ) {
+    let committed = match narrow {
+        Some(t) => {
+            let offsets: Vec<u64> = t.offsets().iter().map(|&o| o as u64).collect();
+            math_cuda::lde::coset_lde_narrow_with_merkle_tree_keep_rpl(
+                t.data(),
+                &offsets,
+                t.widths(),
+                device_hash_of::<B>(),
+                n,
+                m,
+                blowup_factor,
+                &weights_u64,
+                retain_host_lde,
+                rows_per_leaf,
+            )
+        }
+        None => math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_rpl(
+            unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) },
+            predev,
+            device_hash_of::<B>(),
+            n,
+            m,
+            blowup_factor,
+            &weights_u64,
+            retain_host_lde,
+            rows_per_leaf,
+        ),
+    };
+    let (handle, lde_u64) = match committed {
         Ok(v) => v,
         Err(e) => {
             abort_or_test_fallback(
@@ -1533,11 +1625,15 @@ where
 /// when `retain_host_lde`, its row-major host copy. `None` when the device
 /// declines (the caller then commits in full). For a table whose tree is
 /// already committed and whose openings come from its kept top levels.
+///
+/// A packed trace (`narrow`, its host words freed) is uploaded packed and
+/// widened on the device into the LDE's input; `row_major` is then empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_row_major_keep_no_tree<F, E>(
     table: &str,
     row_major: &[FieldElement<E>],
     predev: Option<&math_cuda::CudaSlice<u64>>,
+    narrow: Option<&crate::narrow::NarrowMain>,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -1548,9 +1644,10 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
+    let narrow = narrow.filter(|t| t.rows() == n && t.cols() == m);
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<E>() != TypeId::of::<GoldilocksField>()
-        || row_major.len() != n * m
+        || (row_major.len() != n * m && narrow.is_none())
         || m == 0
         || n == 0
     {
@@ -1567,18 +1664,37 @@ where
     // The commit's device set bounds this one (the same LDE, no tree).
     let set = commit_device_set_rpl(n, m, blowup_factor, true, 2);
     admit_commit(lde_size, &shape, &set)?;
-    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
     GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
-    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_keep_no_tree(
-        raw,
-        predev,
-        n,
-        m,
-        blowup_factor,
-        &weights_u64,
-        retain_host_lde,
-    ) {
+    let lde = match narrow {
+        // Uploaded packed and widened on the LDE's stream.
+        Some(t) => {
+            let offsets: Vec<u64> = t.offsets().iter().map(|&o| o as u64).collect();
+            math_cuda::lde::coset_lde_narrow_keep_no_tree(
+                t.data(),
+                &offsets,
+                t.widths(),
+                n,
+                m,
+                blowup_factor,
+                &weights_u64,
+                retain_host_lde,
+            )
+        }
+        None => {
+            let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+            math_cuda::lde::coset_lde_row_major_keep_no_tree(
+                raw,
+                predev,
+                n,
+                m,
+                blowup_factor,
+                &weights_u64,
+                retain_host_lde,
+            )
+        }
+    };
+    let (handle, lde_u64) = match lde {
         Ok(v) => v,
         Err(e) => {
             abort_or_test_fallback(

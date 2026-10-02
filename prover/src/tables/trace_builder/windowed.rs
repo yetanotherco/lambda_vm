@@ -258,6 +258,15 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// Pack each table `finish` builds at the bytes its columns need as soon as
+    /// it is generated (`TraceTable::pack_main_narrow`, [`StreamSkip::pack`]),
+    /// so the finish never holds many 64-bit tables at once. The streamed
+    /// chunks are the caller's to pack. The words are the same.
+    pub fn pack_finished_tables(mut self) -> Self {
+        self.emitted.pack = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus
@@ -291,6 +300,12 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept.shift.held(),
             (store, store),
         ])
+    }
+
+    /// The bytes the initial memory image (a map of bytes) takes on the heap,
+    /// at about one entry and one control byte per slot.
+    pub fn image_bytes(&self) -> usize {
+        self.image.capacity() * (std::mem::size_of::<(u64, u8)>() + 1)
     }
 
     /// The time the windows took so far.
@@ -490,6 +505,11 @@ impl Walker<'_> {
         *self.windows += 1;
         Ok(WalkedWindow { cpu_ops, walk })
     }
+
+    /// The bytes the walk's carried memory state takes on the heap.
+    pub fn state_bytes(&self) -> usize {
+        self.memory_state.heap_bytes()
+    }
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -510,6 +530,21 @@ pub struct Accumulator<'b> {
 }
 
 impl Accumulator<'_> {
+    /// The bytes the builder's run so far takes on the heap: the kept windows
+    /// or tails, the routed segments and what was counted ahead (lists at
+    /// their capacities).
+    pub fn held_bytes(&self) -> usize {
+        let windows: usize = self
+            .windows
+            .iter()
+            .map(|w| super::vec_heap_bytes(&w.cpu_ops) + w.walk.heap_bytes())
+            .sum();
+        self.kept.as_deref().map_or(0, Kept::heap_bytes)
+            + windows
+            + self.segments.heap_bytes()
+            + self.counted.heap_bytes()
+    }
+
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
@@ -744,6 +779,11 @@ impl<T: Clone> Tail<T> {
         (self.len, self.len + self.start)
     }
 
+    /// The bytes its parts take on the heap.
+    fn heap_bytes(&self) -> usize {
+        self.parts.iter().map(super::vec_heap_bytes).sum()
+    }
+
     /// The ops not handed out, as one list.
     fn into_vec(mut self) -> Vec<T> {
         if self.start == 0 && self.parts.len() == 1 {
@@ -786,6 +826,20 @@ impl Kept {
             rest: WalkOutputs::with_capacity(0),
             decode,
         }
+    }
+
+    /// The bytes the run so far takes on the heap: the tails, the other lists
+    /// and DECODE.
+    fn heap_bytes(&self) -> usize {
+        self.cpu.heap_bytes()
+            + self.register_rows.heap_bytes()
+            + self.aligned.heap_bytes()
+            + self.general.heap_bytes()
+            + self.load.heap_bytes()
+            + self.lt.heap_bytes()
+            + self.shift.heap_bytes()
+            + self.rest.heap_bytes()
+            + self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>()
     }
 
     /// A walked window's lists, appended in run order.
@@ -1108,6 +1162,20 @@ enum ChunkOps {
 }
 
 impl ChunkJob {
+    /// The bytes its ops take on the heap.
+    pub fn op_bytes(&self) -> usize {
+        use super::vec_heap_bytes as b;
+        match &self.ops {
+            ChunkOps::Cpu(ops) => b(ops),
+            ChunkOps::MemwRegister(ops) => b(ops),
+            ChunkOps::MemwAligned(ops) | ChunkOps::Memw(ops) => b(ops),
+            ChunkOps::Load(ops) => b(ops),
+            ChunkOps::Lt(ops) => b(ops),
+            ChunkOps::Shift(ops) => b(ops),
+            ChunkOps::Store(ops) => b(ops),
+        }
+    }
+
     pub fn generate(self) -> StreamedChunk {
         let trace = match &self.ops {
             ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(ops),

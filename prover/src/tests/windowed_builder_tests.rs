@@ -637,6 +637,71 @@ fn dropping_the_streamed_ops_keeps_ecdas_chunked_the_same() {
     }
 }
 
+/// Every packed table of `t` widened back on the host; how many were packed.
+fn widen_all(t: &mut Traces) -> usize {
+    let mut packed = 0;
+    for list in [
+        &mut t.cpus,
+        &mut t.memw_registers,
+        &mut t.memw_aligneds,
+        &mut t.memws,
+        &mut t.loads,
+        &mut t.stores,
+        &mut t.shifts,
+        &mut t.cpu32s,
+        &mut t.commits,
+        &mut t.keccaks,
+        &mut t.keccak_rnds,
+        &mut t.ecsms,
+        &mut t.ecdases,
+        &mut t.hints,
+        &mut t.pages,
+        &mut t.lts,
+        &mut t.muls,
+        &mut t.dvrms,
+        &mut t.branches,
+        &mut t.eqs,
+        &mut t.bytewises,
+    ] {
+        for table in list.iter_mut().filter(|t| t.is_main_narrow()) {
+            table.widen_main_on_host();
+            packed += 1;
+        }
+    }
+    packed
+}
+
+/// Packing the tables `finish` builds keeps their words: a windowed build
+/// whose finish packs each table as it is generated (`pack_finished_tables`,
+/// with the streamed ops dropped, as the block runs it) widens back to the
+/// whole-run build, table for table, and it did pack.
+#[test]
+fn packing_the_finished_tables_keeps_the_words() {
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [7, 33] {
+            let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
+                b.drop_streamed_ops()
+                    .expect("before any window")
+                    .pack_finished_tables()
+            });
+            assert!(
+                widen_all(&mut packed) > 0,
+                "{name}/{window}: no table was packed"
+            );
+            same_traces(&reference, &packed);
+        }
+    }
+}
+
 /// ★ Dropping bounds what the builder holds: after every window each streamed
 /// table holds less than a chunk of ops not handed out, and its lists take room
 /// for at most a window's part more — however long the run. Keeping every

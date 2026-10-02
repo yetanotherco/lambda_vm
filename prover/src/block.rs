@@ -251,7 +251,11 @@ fn prove_block_with_observed(
     let mut times = BlockTimes::default();
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
+    #[cfg(feature = "cuda")]
+    stark::prover::set_default_pack_after_commit(narrow_streamed());
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let ledger = memlog().then(|| std::sync::Arc::new(MemLedger::new()));
+    let _sampler = ledger.clone().map(MemSampler::start);
     let (mut traces, decode_commitment, precommits) = if stream_phase_a() {
         build_streamed(
             &program,
@@ -260,11 +264,15 @@ fn prove_block_with_observed(
             max_rows,
             residency,
             &mut times,
+            ledger.as_deref(),
         )?
     } else {
         let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
         (traces, decode, Vec::new())
     };
+    if let Some(ledger) = &ledger {
+        ledger.line("phase A end");
+    }
 
     let proof = prove_block_traces(
         elf_bytes,
@@ -277,6 +285,9 @@ fn prove_block_with_observed(
         &mut times,
         on_shape,
     )?;
+    if let Some(ledger) = &ledger {
+        ledger.line("prove end");
+    }
     eprintln!(
         "BLOCK PHASE total {:.2}s (execute {:.2} · build {:.2} · setup {:.2} · prove {:.2})",
         times.total(),
@@ -389,8 +400,250 @@ fn drop_streamed_ops() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").map_or(true, |v| v.trim() != "0")
 }
 
+/// Narrow storage, `LAMBDA_VM_BLOCK_NARROW`: `0` keeps every main trace at 8
+/// bytes a cell (the A arm), `1` packs each plain table after its Round-1
+/// commit ([`narrow_streamed`] alone), and unset or anything else is `2`: both
+/// [`narrow_streamed`] and [`narrow_finished`] (D-MEMORY M3).
+fn narrow_level() -> u8 {
+    match std::env::var("LAMBDA_VM_BLOCK_NARROW")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => 2,
+    }
+}
+
+/// Every plain table's main trace is packed at the bytes its columns need once
+/// its Round-1 commit exists, about 2 bytes a cell instead of 8. The device
+/// packs it from the commit's snapshot
+/// (`stark::prover::set_default_pack_after_commit`): the streamed instances on
+/// their committers, the rest in phase B's Round 1. A table committed on the
+/// host is packed on the host (`TraceTable::pack_main_narrow`). Phase B uploads
+/// it packed and widens it on the device, or on the host where the device path
+/// does not run. The words are the same, so no proof byte moves. On unless
+/// `LAMBDA_VM_BLOCK_NARROW=0`.
+fn narrow_streamed() -> bool {
+    narrow_level() >= 1
+}
+
+/// [`narrow_streamed`], and the tables phase A's finish builds are packed as
+/// each is generated ([`WindowedTraceBuilder::pack_finished_tables`]), so the
+/// finish never holds them at 8 bytes a cell; their Round-1 commits read the
+/// packed columns. On unless `LAMBDA_VM_BLOCK_NARROW` is `0` or `1`.
+fn narrow_finished() -> bool {
+    narrow_level() == 2
+}
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
+
+/// `LAMBDA_VM_BLOCK_MEMLOG=1`: [`MemLedger`]'s `BLOCK MEM` lines, every half
+/// second from the block's start to its proof and at the phase marks. A
+/// measurement knob, off by default.
+fn memlog() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_MEMLOG").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Where the block's host memory is: what phase A holds in the places it knows
+/// of, printed ([`MemLedger::line`]) beside the process's resident set and, in
+/// the lib's tests (which run jemalloc), the allocator's live, active and
+/// resident bytes. Lists count at their capacities. It changes no trace.
+struct MemLedger {
+    start: Instant,
+    /// Streamed chunks sent to the committers and not taken yet, and their
+    /// bytes (a job's ops, or the `push` arm's generated chunk).
+    queued: std::sync::atomic::AtomicUsize,
+    queued_bytes: std::sync::atomic::AtomicUsize,
+    /// What the committers hold: a taken job's ops, then its 64-bit trace
+    /// until it is packed or kept.
+    committing_bytes: std::sync::atomic::AtomicUsize,
+    /// Committed streamed chunks waiting for the finish, and their main
+    /// traces' bytes, packed and 64-bit.
+    committed: std::sync::atomic::AtomicUsize,
+    committed_packed: std::sync::atomic::AtomicUsize,
+    committed_wide: std::sync::atomic::AtomicUsize,
+    /// The builder's run so far after the last absorbed window, the walk's
+    /// carried memory state, and the executor's memory, as last published.
+    builder_bytes: std::sync::atomic::AtomicUsize,
+    walk_bytes: std::sync::atomic::AtomicUsize,
+    executor_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl MemLedger {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicUsize;
+        Self {
+            start: Instant::now(),
+            queued: AtomicUsize::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            committing_bytes: AtomicUsize::new(0),
+            committed: AtomicUsize::new(0),
+            committed_packed: AtomicUsize::new(0),
+            committed_wide: AtomicUsize::new(0),
+            builder_bytes: AtomicUsize::new(0),
+            walk_bytes: AtomicUsize::new(0),
+            executor_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// A chunk of `bytes` sent to the committers.
+    fn queue(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued.fetch_add(1, Relaxed);
+        self.queued_bytes.fetch_add(bytes, Relaxed);
+    }
+
+    /// A committer took a chunk of `bytes`.
+    fn take(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued.fetch_sub(1, Relaxed);
+        self.queued_bytes.fetch_sub(bytes, Relaxed);
+        self.committing_bytes.fetch_add(bytes, Relaxed);
+    }
+
+    /// A committer turned `ops` bytes of a job into a `wide` 64-bit trace.
+    fn generated(&self, ops: usize, wide: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.committing_bytes.fetch_add(wide, Relaxed);
+        self.committing_bytes.fetch_sub(ops, Relaxed);
+    }
+
+    /// A committer kept a committed chunk of `wide` 64-bit bytes as `packed`
+    /// bytes (`None`: kept 64-bit).
+    fn keep(&self, wide: usize, packed: Option<usize>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.committing_bytes.fetch_sub(wide, Relaxed);
+        self.committed.fetch_add(1, Relaxed);
+        match packed {
+            Some(packed) => self.committed_packed.fetch_add(packed, Relaxed),
+            None => self.committed_wide.fetch_add(wide, Relaxed),
+        };
+    }
+
+    fn line(&self, label: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        const GIB: f64 = (1u64 << 30) as f64;
+        let g = |a: &std::sync::atomic::AtomicUsize| a.load(Relaxed) as f64 / GIB;
+        let rss = proc_rss_bytes().map_or("n/a".to_string(), |b| format!("{:.2}", b as f64 / GIB));
+        let heap = heap_stats().map_or("heap n/a".to_string(), |[live, active, resident, mapped, retained]| {
+            let g = |b: usize| b as f64 / GIB;
+            format!(
+                "heap live {:.2} · active {:.2} · resident {:.2} (resident − live {:.2}) · mapped {:.2} · retained {:.2}",
+                g(live),
+                g(active),
+                g(resident),
+                g(resident.saturating_sub(live)),
+                g(mapped),
+                g(retained),
+            )
+        });
+        eprintln!(
+            "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
+             committed {} ({:.2} packed + {:.2} 64-bit) · builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
+            self.start.elapsed().as_secs_f64(),
+            self.queued.load(Relaxed),
+            g(&self.queued_bytes),
+            g(&self.committing_bytes),
+            self.committed.load(Relaxed),
+            g(&self.committed_packed),
+            g(&self.committed_wide),
+            g(&self.builder_bytes),
+            g(&self.walk_bytes),
+            g(&self.executor_bytes),
+        );
+    }
+}
+
+/// The ledger's line every half second on a thread of its own, until dropped.
+struct MemSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MemSampler {
+    fn start(ledger: std::sync::Arc<MemLedger>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("block-memlog".to_string())
+            .spawn(move || {
+                while !flag.load(Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(500));
+                    if !flag.load(Relaxed) {
+                        ledger.line("tick");
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for MemSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+/// This process's resident set (`VmRSS`), on Linux.
+fn proc_rss_bytes() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib: usize = status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
+/// jemalloc's allocated, active, resident, mapped and retained bytes: in the
+/// lib's tests, which install jemalloc as the allocator (`lib.rs`).
+#[cfg(test)]
+fn heap_stats() -> Option<[usize; 5]> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // The statistics are cached until the epoch turns.
+    epoch::advance().ok()?;
+    Some([
+        stats::allocated::read().ok()?,
+        stats::active::read().ok()?,
+        stats::resident::read().ok()?,
+        stats::mapped::read().ok()?,
+        stats::retained::read().ok()?,
+    ])
+}
+
+/// Outside the lib's tests the allocator's statistics are not read.
+#[cfg(not(test))]
+fn heap_stats() -> Option<[usize; 5]> {
+    None
+}
+
+/// The bytes a streamed chunk on its way to a committer holds.
+fn streamed_bytes(streamed: &Streamed) -> usize {
+    match streamed {
+        Streamed::Job(job) => job.op_bytes(),
+        Streamed::Chunk(chunk) => wide_bytes(&chunk.trace),
+    }
+}
+
+/// A main trace's bytes at 8 bytes a cell.
+fn wide_bytes(
+    trace: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >,
+) -> usize {
+    trace.num_rows() * trace.num_main_columns * std::mem::size_of::<u64>()
+}
 
 /// A streamed chunk on its way to a committer: a job the committer generates,
 /// or (the `push` arm) a chunk the producer generated.
@@ -439,8 +692,10 @@ fn build_streamed(
     max_rows: &MaxRowsConfig,
     residency: ResidencyMode,
     times: &mut BlockTimes,
+    ledger: Option<&MemLedger>,
 ) -> Result<Produced, Error> {
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::mpsc;
 
     let window = max_rows.cpu;
@@ -450,6 +705,10 @@ fn build_streamed(
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
+    // Packed instances: (wide bytes, packed bytes, seconds packing on the
+    // host, instances the device packed).
+    let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
+    let narrow = narrow_streamed();
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -463,6 +722,11 @@ fn build_streamed(
             {
                 if log_tx.send(logs.to_vec()).is_err() {
                     break;
+                }
+                if let Some(ledger) = ledger {
+                    ledger
+                        .executor_bytes
+                        .store(executor.memory().heap_bytes(), Relaxed);
                 }
             }
             Ok(t.elapsed().as_secs_f64())
@@ -485,16 +749,26 @@ fn build_streamed(
                     let Ok(job) = job else {
                         return Ok(());
                     };
+                    let job_bytes = ledger.map_or(0, |ledger| {
+                        let bytes = streamed_bytes(&job);
+                        ledger.take(bytes);
+                        bytes
+                    });
                     let t = Instant::now();
-                    let chunk = match job {
+                    let mut chunk = match job {
                         Streamed::Job(job) => job.generate(),
                         Streamed::Chunk(chunk) => chunk,
                     };
+                    let wide = wide_bytes(&chunk.trace);
+                    if let Some(ledger) = ledger {
+                        ledger.generated(job_bytes, wide);
+                    }
                     *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
                         t.elapsed().as_secs_f64();
                     let air = stream_air(chunk.table, chunk.index, opts);
                     let name = air.name().to_string();
-                    let pre = crate::hash_pin::BlockProver::precommit_main(
+                    #[allow(unused_mut)]
+                    let mut pre = crate::hash_pin::BlockProver::precommit_main(
                         air.as_ref(),
                         &chunk.trace,
                         #[cfg(feature = "disk-spill")]
@@ -504,6 +778,29 @@ fn build_streamed(
                     .map_err(|e| Error::Prover(format!("{e:?}")))?;
                     *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
                         t.elapsed().as_secs_f64();
+                    if narrow {
+                        let tp = Instant::now();
+                        // The device packed it from the commit's snapshot, or
+                        // the host packs it here.
+                        let by_device = pre
+                            .take_narrow()
+                            .is_some_and(|t| chunk.trace.install_main_narrow(t));
+                        if by_device || chunk.trace.pack_main_narrow() {
+                            let packed = chunk.trace.narrow_main().map_or(0, |t| t.data().len());
+                            let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
+                            n.0 += wide;
+                            n.1 += packed;
+                            if by_device {
+                                n.3 += 1;
+                            } else {
+                                n.2 += tp.elapsed().as_secs_f64();
+                            }
+                        }
+                    }
+                    if let Some(ledger) = ledger {
+                        let packed = chunk.trace.narrow_main().map(|t| t.data().len());
+                        ledger.keep(wide, packed);
+                    }
                     committed
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -517,6 +814,16 @@ fn build_streamed(
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
             }
+            if narrow_finished() {
+                builder = builder.pack_finished_tables();
+            }
+            if let Some(ledger) = ledger {
+                eprintln!(
+                    "BLOCK MEM builder created: initial image {:.2} GiB",
+                    builder.image_bytes() as f64 / (1u64 << 30) as f64
+                );
+                ledger.line("start");
+            }
             let mut collect_secs = 0.0;
             let last = if stream_by_push() {
                 let mut held: Option<Vec<executor::vm::logs::Log>> = None;
@@ -524,7 +831,11 @@ fn build_streamed(
                     if let Some(prev) = held.replace(logs) {
                         let t = Instant::now();
                         for chunk in builder.push(&prev)? {
-                            let _ = job_tx.send(Streamed::Chunk(chunk));
+                            let chunk = Streamed::Chunk(chunk);
+                            if let Some(ledger) = ledger {
+                                ledger.queue(streamed_bytes(&chunk));
+                            }
+                            let _ = job_tx.send(chunk);
                         }
                         collect_secs += t.elapsed().as_secs_f64();
                     }
@@ -538,10 +849,14 @@ fn build_streamed(
                         // One window held back: the run's last is `finish`'s.
                         let mut held: Option<Vec<executor::vm::logs::Log>> = None;
                         for logs in log_rx.iter() {
-                            if let Some(prev) = held.replace(logs)
-                                && walked_tx.send(walker.walk(&prev)?).is_err()
-                            {
-                                break;
+                            if let Some(prev) = held.replace(logs) {
+                                let walked = walker.walk(&prev)?;
+                                if let Some(ledger) = ledger {
+                                    ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
+                                }
+                                if walked_tx.send(walked).is_err() {
+                                    break;
+                                }
                             }
                         }
                         Ok(held.unwrap_or_default())
@@ -549,7 +864,16 @@ fn build_streamed(
                     for walked in walked_rx {
                         let t = Instant::now();
                         for job in accumulator.absorb(walked) {
-                            let _ = job_tx.send(Streamed::Job(job));
+                            let job = Streamed::Job(job);
+                            if let Some(ledger) = ledger {
+                                ledger.queue(streamed_bytes(&job));
+                            }
+                            let _ = job_tx.send(job);
+                        }
+                        if let Some(ledger) = ledger {
+                            ledger
+                                .builder_bytes
+                                .store(accumulator.held_bytes(), Relaxed);
                         }
                         collect_secs += t.elapsed().as_secs_f64();
                     }
@@ -557,10 +881,16 @@ fn build_streamed(
                 })?
             };
             drop(job_tx);
+            if let Some(ledger) = ledger {
+                ledger.line("windows walked");
+            }
             let windows = builder.stamps();
             let t = Instant::now();
             let traces = builder.finish(&last)?;
             let finish_secs = t.elapsed().as_secs_f64();
+            if let Some(ledger) = ledger {
+                ledger.line("finish done");
+            }
             eprintln!(
                 "BLOCK STREAM builder: {} windows · walk {:.2} · route {:.2} · hand-out {:.2} · \
                  finish {finish_secs:.2} (s) · streamed ops dropped {}",
@@ -606,6 +936,21 @@ fn build_streamed(
             *commit_secs.lock().unwrap_or_else(|e| e.into_inner()),
             *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
         );
+        if narrow {
+            let (wide, packed, secs, by_device) =
+                *narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!(
+                "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) · \
+                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the committers",
+                wide as f64 / (1u64 << 30) as f64,
+                packed as f64 / (1u64 << 30) as f64,
+                if wide > 0 {
+                    packed as f64 * 8.0 / wide as f64
+                } else {
+                    0.0
+                },
+            );
+        }
         Ok((traces, decode_commitment, precommits))
     })
 }
@@ -665,6 +1010,26 @@ pub fn prove_block_traces(
             .iter()
             .map(|(air, trace, _)| (air.name(), trace.num_rows(), trace.num_main_columns)),
     );
+    if memlog() {
+        // The main traces the prove starts from: packed, and at 8 bytes a cell.
+        let (mut packed, mut wide, mut n_packed) = (0usize, 0usize, 0usize);
+        for (_, trace, _) in &pairs {
+            match trace.narrow_main() {
+                Some(narrow) => {
+                    packed += narrow.data().len();
+                    n_packed += 1;
+                }
+                None => wide += wide_bytes(trace),
+            }
+        }
+        eprintln!(
+            "BLOCK MEM traces: {} instances · {n_packed} packed {:.2} GiB · {} at 8 B/cell {:.2} GiB",
+            pairs.len(),
+            packed as f64 / (1u64 << 30) as f64,
+            pairs.len() - n_packed,
+            wide as f64 / (1u64 << 30) as f64,
+        );
+    }
     on_shape(&crate::lfm::block_plan::BlockShape {
         table_counts: table_counts.clone(),
         runtime_page_ranges: runtime_page_ranges.clone(),
@@ -743,4 +1108,41 @@ fn print_census<'a>(instances: impl Iterator<Item = (&'a str, usize, usize)>) {
         "BLOCK CENSUS total: {instances_total} sub-proofs, {} table types, {cells_total} main cells",
         types.len()
     );
+}
+
+#[cfg(test)]
+mod memlog_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use super::MemLedger;
+
+    /// A chunk queued, taken, generated and kept leaves nothing queued or in a
+    /// committer's hands, and counts once as committed (packed or 64-bit).
+    #[test]
+    fn the_ledger_moves_each_chunk_from_the_queue_to_the_committed() {
+        let ledger = MemLedger::new();
+        ledger.queue(300);
+        ledger.queue(200);
+        assert_eq!(ledger.queued.load(Relaxed), 2);
+        assert_eq!(ledger.queued_bytes.load(Relaxed), 500);
+
+        ledger.take(300);
+        ledger.generated(300, 800);
+        assert_eq!(ledger.committing_bytes.load(Relaxed), 800);
+        ledger.keep(800, Some(220));
+
+        ledger.take(200);
+        ledger.generated(200, 640);
+        ledger.keep(640, None);
+
+        assert_eq!(ledger.queued.load(Relaxed), 0);
+        assert_eq!(ledger.queued_bytes.load(Relaxed), 0);
+        assert_eq!(ledger.committing_bytes.load(Relaxed), 0);
+        assert_eq!(ledger.committed.load(Relaxed), 2);
+        assert_eq!(ledger.committed_packed.load(Relaxed), 220);
+        assert_eq!(ledger.committed_wide.load(Relaxed), 640);
+        // In the lib's tests jemalloc is the allocator: the line reads it.
+        assert!(super::heap_stats().is_some_and(|[live, ..]| live > 0));
+        ledger.line("test");
+    }
 }

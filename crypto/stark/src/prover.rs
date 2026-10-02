@@ -593,6 +593,20 @@ where
     #[cfg(feature = "cuda")]
     gpu_main: Option<math_cuda::lde::GpuLdeBase>,
     recommit_on_device: bool,
+    /// The trace packed by the device from the commit's snapshot
+    /// ([`set_default_pack_after_commit`]), for the caller to install.
+    narrow: Option<crate::narrow::NarrowMain>,
+}
+
+impl<Field: IsField + 'static, H: StarkHash> PrecommittedMain<Field, H>
+where
+    FieldElement<Field>: AsBytes + Sync + Send,
+{
+    /// The trace the device packed after this commit, if it packed one
+    /// (`TraceTable::install_main_narrow` takes it).
+    pub fn take_narrow(&mut self) -> Option<crate::narrow::NarrowMain> {
+        self.narrow.take()
+    }
 }
 
 impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
@@ -1214,8 +1228,24 @@ pub fn set_default_recommit_top_levels(k: usize) {
     TOP_LEVELS_DEFAULT.store(k, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a plain table's commit under `RecomputeLdeDevice` with kept top
+/// levels also packs its trace on the device from the commit's snapshot
+/// (`math_cuda::narrow::pack_trace_snapshot`), so the host can drop the 64-bit
+/// copy (`TraceTable::install_main_narrow`). Off unless a caller sets it.
+static PACK_AFTER_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether commits pack their traces on the device (see
+/// [`PACK_AFTER_COMMIT`]). Proofs are the same bytes either way.
+pub fn set_default_pack_after_commit(on: bool) {
+    PACK_AFTER_COMMIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Tables whose fused task recomputed the LDE alone against kept top levels.
 pub static TOP_TREE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Of those, the tables whose packed main trace was widened on the device.
+pub static NARROW_DEVICE_WIDENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `LAMBDA_VM_GATE_PACKING=1`: [`run_admitted`] admits the first table in walk
 /// order that fits the gate instead of blocking on the next one. Off by
@@ -2047,6 +2077,46 @@ pub trait IsStarkProver<
         let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
         let retain_host_lde = !device_only && !residency.recommits_on_device();
+        // A packed trace (`TraceTable::pack_main_narrow`) commits from its
+        // packed columns on the device; every other path below reads a
+        // widened copy, and the trace itself stays packed.
+        #[cfg(feature = "cuda")]
+        if let Some(narrow) = trace.narrow_main()
+            && precomputed.is_none()
+            && !residency.recomputes_on_host()
+            && let Some((tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_narrow_keep::<
+                    Field,
+                    Field,
+                    H::Batched<Field>,
+                >(
+                    table,
+                    "R1 main commit",
+                    narrow,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    retain_host_lde,
+                    rows_per_leaf,
+                )
+        {
+            let root = tree.root;
+            if device_only && !residency.recommits_on_device() {
+                crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok((
+                TableCommit::plain(tree, root),
+                (main_data, narrow.cols()),
+                Some(handle),
+            ));
+        }
+        let widened;
+        let trace = if trace.is_main_narrow() {
+            widened = trace.widened_copy();
+            &widened
+        } else {
+            trace
+        };
         #[cfg(feature = "cuda")]
         if precomputed.is_none() && !residency.recomputes_on_host() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -5072,6 +5142,8 @@ pub trait IsStarkProver<
             storage_mode,
             residency,
         )?;
+        #[allow(unused_mut)]
+        let mut narrow = None;
         // `RecomputeLdeDevice`: the root is all this phase keeps. The device
         // LDE, tree and trace snapshot are freed here, inside the admitted
         // region, so the next table's commit is admitted against an empty
@@ -5095,6 +5167,23 @@ pub trait IsStarkProver<
                             ))
                         })?;
                         committed.0.top_tree = Some(Arc::new(top));
+                        // The trace, packed from the snapshot before it is
+                        // freed: the fused task widens it on the device.
+                        if PACK_AFTER_COMMIT.load(std::sync::atomic::Ordering::Relaxed)
+                            && !trace.is_main_narrow()
+                        {
+                            let rows = handle.trace_rows;
+                            narrow = math_cuda::narrow::pack_trace_snapshot(&handle)
+                                .map_err(|e| {
+                                    ProvingError::DevicePath(format!(
+                                        "table {}: packing the trace: {e:?}",
+                                        air.name()
+                                    ))
+                                })?
+                                .and_then(|(widths, data)| {
+                                    crate::narrow::NarrowMain::from_parts(rows, widths, data)
+                                });
+                        }
                     }
                     true
                 }
@@ -5111,6 +5200,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "cuda")]
             gpu_main,
             recommit_on_device,
+            narrow,
         })
     }
 
@@ -5370,7 +5460,7 @@ pub trait IsStarkProver<
         );
         crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
         let __ps_abs = crate::prove_split::mark();
-        for result in main_results {
+        for (idx, result) in main_results.into_iter().enumerate() {
             let result = result.expect("run_admitted fills every slot");
             let PrecommittedMain {
                 commit,
@@ -5378,7 +5468,13 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 gpu_main,
                 recommit_on_device,
+                narrow,
             } = result?;
+            // A trace the device packed after its Round-1 commit drops its
+            // 64-bit copy here; its fused task widens it on the device.
+            if let Some(narrow) = narrow {
+                air_trace_pairs[idx].1.install_main_narrow(narrow);
+            }
             if let Some(ref pre_root) = commit.precomputed_root {
                 transcript.append_bytes(pre_root);
             }
@@ -5569,6 +5665,24 @@ pub trait IsStarkProver<
             let domain = &domains[idx];
             let twiddles = &twiddle_caches[idx];
 
+            // A packed main trace (`TraceTable::pack_main_narrow`) is widened
+            // on the device by the kept-top recompute below; every other path
+            // reads the host words, so it gets them back first.
+            #[cfg(feature = "cuda")]
+            let widens_on_device = matches!(
+                main_lde_cells[idx].lock().unwrap().as_ref(),
+                Some(MainLdeSlot::DroppedDevice)
+            ) && main_commit_cells[idx]
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.top_tree.is_some());
+            #[cfg(not(feature = "cuda"))]
+            let widens_on_device = false;
+            if trace.is_main_narrow() && !widens_on_device {
+                trace.widen_main_on_host();
+            }
+
             // `RecomputeLdeDevice`: Round 1 kept only this table's root, so
             // commit the trace on the device again before anything reads the
             // slot. From here the task is the `Retain` one: the commit (its
@@ -5591,7 +5705,15 @@ pub trait IsStarkProver<
                     .as_ref()
                     .is_some_and(|c| c.top_tree.is_some());
                 #[cfg(any(test, feature = "test-utils"))]
+                if top_levels_kept
+                    && crate::residency_mode::test_hooks::take_narrow_perturbation(idx)
+                    && let Some(narrow) = trace.narrow_main.as_mut()
+                {
+                    std::sync::Arc::make_mut(narrow).flip_first_bit();
+                }
+                #[cfg(any(test, feature = "test-utils"))]
                 if top_levels_kept && crate::residency_mode::test_hooks::take_perturbation(idx) {
+                    trace.widen_main_on_host();
                     let col = trace.main_table.width - 1;
                     let v = *trace.main_table.get(0, col);
                     trace
@@ -5600,11 +5722,12 @@ pub trait IsStarkProver<
                 }
                 let relde = if top_levels_kept {
                     let (trace_slice, num_cols) = trace.main_data_row_major();
-                    let n = trace_slice.len().checked_div(num_cols).unwrap_or(0);
+                    let n = trace.num_rows();
                     crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
                         air.name(),
                         trace_slice,
                         trace.main_rowmajor_dev(),
+                        trace.narrow_main(),
                         n,
                         num_cols,
                         domain.blowup_factor,
@@ -5616,6 +5739,9 @@ pub trait IsStarkProver<
                     None
                 };
                 if let Some((handle, cached_main)) = relde {
+                    if trace.is_main_narrow() {
+                        NARROW_DEVICE_WIDENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(td) = &handle.trace_dev {
                         trace.set_main_trace_dev(
                             std::sync::Arc::clone(td),
@@ -5635,6 +5761,8 @@ pub trait IsStarkProver<
                         );
                     }
                 } else {
+                    // The full recommit reads the host words.
+                    trace.widen_main_on_host();
                     let (commit, cached_main, gpu_main) = {
                         let absorbed = main_commit_cells[idx].lock().unwrap();
                         Self::recommit_main_trace_device(
@@ -5685,6 +5813,9 @@ pub trait IsStarkProver<
             // The trace-domain snapshot retained by the R1 main LDE has exactly
             // one consumer — the aux build above. Reclaim it before this
             // table's aux-commit + DEEP/FRI VRAM peak.
+            // A packed main trace had the same two readers (the recompute and
+            // the aux build's host fallback): free it too.
+            trace.drop_narrow_main();
             #[cfg(feature = "cuda")]
             {
                 trace.clear_main_trace_dev();

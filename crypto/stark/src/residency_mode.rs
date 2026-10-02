@@ -94,4 +94,22 @@ pub mod test_hooks {
             .compare_exchange(idx + 1, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
+
+    /// `0` is off. `i + 1` flips one bit of table `i`'s packed main trace
+    /// right before the device widens it (a wrong packed word, as a wrong
+    /// width map would make), so the recomputed LDE no longer matches the
+    /// kept top levels. Cleared by the recompute that fires it.
+    pub static PERTURB_NARROW_BEFORE_RECOMMIT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Arm [`PERTURB_NARROW_BEFORE_RECOMMIT`] for table `idx`.
+    pub fn perturb_narrow_before_recommit(idx: usize) {
+        PERTURB_NARROW_BEFORE_RECOMMIT.store(idx + 1, Ordering::SeqCst);
+    }
+
+    /// Whether table `idx` is the armed one; disarms the hook when it is.
+    pub fn take_narrow_perturbation(idx: usize) -> bool {
+        PERTURB_NARROW_BEFORE_RECOMMIT
+            .compare_exchange(idx + 1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
