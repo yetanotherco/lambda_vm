@@ -895,6 +895,30 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
     }
+
+    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
+    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
+        [
+            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
+            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
+            ("memw", vec_heap_bytes(&self.memw.general)),
+            ("load", vec_heap_bytes(&self.load_ops)),
+            ("lt", vec_heap_bytes(&self.lt_ops)),
+            ("shift", vec_heap_bytes(&self.shift_ops)),
+            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
+            ("commit", vec_heap_bytes(&self.commit_ops)),
+            ("keccak", vec_heap_bytes(&self.keccak_ops)),
+            ("blake3", vec_heap_bytes(&self.blake3_ops)),
+            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
+            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
+            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
+            ("hint", vec_heap_bytes(&self.hint_ops)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
+        .collect()
+    }
 }
 
 /// The bytes `list`'s buffer takes on the heap: its capacity, not its length.
@@ -3899,6 +3923,12 @@ pub struct StreamSkip {
     /// Concatenate LT's segments into one list in phase 3, as the build did
     /// before [`Segmented`] (the A arm of the segments). The tables are the same.
     pub concat_lt: bool,
+    /// With [`Self::pack`] and [`Self::wide_builds`]: at most this many
+    /// KECCAK_RND chunks are built at 8 bytes a cell at once (the build goes
+    /// in waves of this many), so the 64-bit copies in flight before each is
+    /// packed stay bounded whatever the block's size. `0`: no cap. The tables
+    /// are the same.
+    pub kr_wide_cap: usize,
 }
 
 /// What a build does with each table it generates: packs it
@@ -3907,6 +3937,10 @@ pub struct StreamSkip {
 #[derive(Clone, Copy)]
 struct Packing<'a> {
     on: bool,
+    /// Build at most this many chunks at once, in waves (0: all at once, as
+    /// rayon schedules them). Waves leave the other workers free for the
+    /// other tables, where a permit would park them.
+    wave: usize,
     /// The sink, the kind of the tables this build makes, and the instance
     /// the first of them is.
     hand: Option<(&'a dyn FinishSink, FinishedKind, usize)>,
@@ -3933,8 +3967,9 @@ impl<'a> Packing<'a> {
 }
 
 /// Where a build's table phase is, for a caller that wants to know
-/// ([`set_finish_marks`]): called with "p3 lt", "p4 bitwise", each phase-5
-/// generator's name as it finishes, and "p5 done". Unset, nothing is called.
+/// ([`set_finish_marks`]): called with "p3 lt" (and the bytes of LT's ops),
+/// "p4 bitwise", each phase-5 generator's name as it finishes, and "p5 done".
+/// Unset, nothing is called.
 pub type FinishMarks = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 static FINISH_MARKS: std::sync::RwLock<Option<FinishMarks>> = std::sync::RwLock::new(None);
@@ -3984,6 +4019,18 @@ impl PreCounted {
         self.histogram.heap_bytes()
             + vec_heap_bytes(&self.memw_lt)
             + vec_heap_bytes(&self.memw_aligned_lt)
+    }
+
+    /// [`Self::heap_bytes`] part by part.
+    pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            (
+                "counted memw_a_lt".to_string(),
+                vec_heap_bytes(&self.memw_aligned_lt),
+            ),
+        ]
     }
 }
 
@@ -4193,7 +4240,19 @@ fn generate_chunks_with<C: Send, T>(
         }
     };
     #[cfg(feature = "parallel")]
-    let tables = chunks.into_par_iter().enumerate().map(generate).collect();
+    let tables = if pack.wave > 0 {
+        let mut tables = Vec::with_capacity(chunks.len());
+        let mut chunks = chunks.into_iter().enumerate();
+        loop {
+            let wave: Vec<(usize, C)> = chunks.by_ref().take(pack.wave).collect();
+            if wave.is_empty() {
+                break tables;
+            }
+            tables.par_extend(wave.into_par_iter().map(generate));
+        }
+    } else {
+        chunks.into_par_iter().enumerate().map(generate).collect()
+    };
     #[cfg(not(feature = "parallel"))]
     let tables = chunks.into_iter().enumerate().map(generate).collect();
     Ok(tables)
@@ -4329,6 +4388,29 @@ impl RoutedSegments {
             + vec_heap_bytes(&self.lt_dvrm_cpu32)
             + vec_heap_bytes(&self.mul_dvrm_filter)
             + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        [
+            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
+            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
+            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("store", vec_heap_bytes(&self.store_ops)),
+            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
+            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
+            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
+            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
+            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
+            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
+            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
+            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("segments {name}"), bytes))
+        .collect()
     }
 
     /// Appends a later window's segments, segment by segment.
@@ -4687,6 +4769,7 @@ fn build_traces<I: ImageSource + Sync>(
 ) -> Result<Traces, Error> {
     let pack = Packing {
         on: skip.pack,
+        wave: 0,
         hand: None,
     };
     // Each plain table goes to `sink` as it is generated (its slot keeps a
@@ -4771,7 +4854,11 @@ fn build_traces<I: ImageSource + Sync>(
             ],
         }
     };
-    finish_mark("p3 lt");
+    finish_mark(&format!(
+        "p3 lt ({:.2} GiB of LT ops in {} segments)",
+        (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / (1u64 << 30) as f64,
+        lt_ops.parts.len()
+    ));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -5255,6 +5342,16 @@ fn build_traces<I: ImageSource + Sync>(
                         .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
                 },
                 Packing { on: true, ..pack },
+            )
+        } else if pack.on && skip.kr_wide_cap > 0 {
+            // Built wide, then packed: at most `kr_wide_cap` 64-bit chunks at
+            // once.
+            (
+                keccak_rnd::generate_keccak_rnd_trace,
+                Packing {
+                    wave: skip.kr_wide_cap,
+                    ..pack
+                },
             )
         } else {
             (keccak_rnd::generate_keccak_rnd_trace, pack)
@@ -6743,6 +6840,48 @@ mod segmented_tests {
             .collect()
     }
 
+    /// A build in waves (`Packing::wave`) never has more than a wave's
+    /// chunks in its generator at once, and gives the tables, in order, that
+    /// the unbounded build gives.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_build_in_waves_holds_at_most_a_wave() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let all: Vec<u64> = (1..=37).collect();
+        for wave in [0, 1, 2, 3, 37, 100] {
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let generate = |ops: &[u64]| {
+                most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let table = table_of(ops);
+                now.fetch_sub(1, SeqCst);
+                table
+            };
+            let pack = Packing {
+                on: false,
+                wave,
+                hand: None,
+            };
+            let tables = generate_chunks(
+                all.chunks(3).collect(),
+                generate,
+                pack,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .expect("generated");
+            let want: Vec<Table> = all.chunks(3).map(table_of).collect();
+            assert_eq!(words(&tables), words(&want), "wave {wave}");
+            if wave > 0 {
+                assert!(
+                    most.load(SeqCst) <= wave,
+                    "wave {wave}: {} at once",
+                    most.load(SeqCst)
+                );
+            }
+        }
+    }
+
     /// Chunked from its segments, a list gives the tables its concatenation
     /// gives: every split of the segments (empty ones too), chunk sizes that
     /// cut inside and across them, with and without chunks streamed ahead
@@ -6753,6 +6892,7 @@ mod segmented_tests {
         let layouts: [&[usize]; 4] = [&[37], &[0, 10, 0, 27], &[5, 5, 5, 22], &[1, 36, 0]];
         let off = Packing {
             on: false,
+            wave: 0,
             hand: None,
         };
         for layout in layouts {

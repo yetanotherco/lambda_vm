@@ -276,6 +276,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// With [`Self::build_wide_then_pack`], `finish` builds at most `cap`
+    /// KECCAK_RND chunks at 8 bytes a cell at once ([`StreamSkip::kr_wide_cap`];
+    /// 0 is no cap). The tables are the same.
+    pub fn cap_kr_wide(mut self, cap: usize) -> Self {
+        self.emitted.kr_wide_cap = cap;
+        self
+    }
+
     /// `finish` concatenates LT's ops into one list before chunking them
     /// ([`StreamSkip::concat_lt`]), as it did before keeping them as segments.
     /// The tables are the same.
@@ -333,6 +341,22 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// How many chunks of each streamed table have been handed out.
     pub fn streamed(&self) -> StreamSkip {
         self.emitted
+    }
+
+    /// What the builder holds on the heap, list by list (capacities): the
+    /// kept tails and lists, the kept windows, the routed segments, what was
+    /// counted ahead and the walk's memory state. A measurement
+    /// (`LAMBDA_VM_BLOCK_MEMLOG`); it changes nothing.
+    pub fn heap_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = self.kept.as_ref().map_or_else(Vec::new, Kept::heap_parts);
+        parts.push((
+            "windows".to_string(),
+            self.windows.iter().map(WalkedWindow::heap_bytes).sum(),
+        ));
+        parts.extend(self.segments.heap_parts());
+        parts.extend(self.counted.heap_parts());
+        parts.push(("memory state".to_string(), self.memory_state.heap_bytes()));
+        parts
     }
 
     /// Collects the run's last window and builds every table the windows did
@@ -877,6 +901,25 @@ impl Kept {
             + self.shift.heap_bytes()
             + self.rest.heap_bytes()
             + self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>()
+    }
+
+    /// [`Self::heap_bytes`] list by list, each named `kept {list}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = vec![
+            ("kept cpu".to_string(), self.cpu.heap_bytes()),
+            ("kept memw_r".to_string(), self.register_rows.heap_bytes()),
+            ("kept memw_a".to_string(), self.aligned.heap_bytes()),
+            ("kept memw".to_string(), self.general.heap_bytes()),
+            ("kept load".to_string(), self.load.heap_bytes()),
+            ("kept lt".to_string(), self.lt.heap_bytes()),
+            ("kept shift".to_string(), self.shift.heap_bytes()),
+            (
+                "kept decode".to_string(),
+                self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
+            ),
+        ];
+        parts.extend(self.rest.heap_parts("kept rest "));
+        parts
     }
 
     /// A walked window's lists, appended in run order.
