@@ -21,7 +21,7 @@
       ("is_byte", [`IS_BYTE` template], <isbyte>),
       ("is_whh", [`IS_WHH` template], <iswhh>),
       ("sign", [`SIGN` template], <sign>),
-      ("add", [`ADD`/`SUB`/`ADDNW` templates], <add>),
+      ("add", [`ADD`/`SUB` templates], <add>),
       ("neg", [`NEG` template], <neg>),
       ("reg", [`REG`/`REGW` template], <reg>),
     )),

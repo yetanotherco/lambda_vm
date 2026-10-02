@@ -28,14 +28,6 @@ input = ["DWordWL", "DWordWL"]
 output = "DWordWL"
 cond = "BaseField"
 
-# cond => ADDNW<sum; lhs, rhs>
-[[signatures]]
-tag = "ADDNW"
-kind = "template"
-input = ["DWordWL", "DWordWL"]
-output = "DWordWL"
-cond = "BaseField"
-
 # cond => NEG<neg; X>
 [[signatures]]
 tag = "NEG"
