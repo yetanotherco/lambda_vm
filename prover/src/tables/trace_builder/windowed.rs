@@ -338,7 +338,19 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// Collects the run's last window and builds every table the windows did
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
-    pub fn finish(mut self, logs: &[Log]) -> Result<Traces, Error> {
+    pub fn finish(self, logs: &[Log]) -> Result<Traces, Error> {
+        self.finish_handing(logs, None)
+    }
+
+    /// [`finish`](Self::finish), handing each plain table to `sink` as soon as
+    /// it is generated ([`crate::finish_sink`]): a table the sink takes leaves
+    /// a placeholder in its slot, for [`crate::finish_sink::insert_finished`]
+    /// to fill; one it declines stays. `None` is [`finish`](Self::finish).
+    pub fn finish_handing(
+        mut self,
+        logs: &[Log],
+        sink: Option<&dyn crate::finish_sink::FinishSink>,
+    ) -> Result<Traces, Error> {
         // The last window may halt: it is walked here, not by the `Walker`.
         let cpu_ops = match &self.decode {
             Some(table) => super::collect_cpu_ops_from_table(logs, table, self.cycles)?,
@@ -439,6 +451,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             false,
             &skip,
             Some(pre),
+            sink,
         )
     }
 
