@@ -131,6 +131,13 @@ impl NarrowMain {
         })
     }
 
+    /// The rows, the column widths and the packed bytes, for a store that
+    /// keeps the bytes elsewhere ([`crate::spill`]); [`Self::from_parts`] puts
+    /// them back together.
+    pub(crate) fn into_parts(self) -> (usize, Vec<u8>, Vec<u8>) {
+        (self.rows, self.widths, self.data)
+    }
+
     /// Rows of the trace.
     pub fn rows(&self) -> usize {
         self.rows
