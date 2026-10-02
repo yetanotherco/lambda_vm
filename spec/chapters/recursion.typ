@@ -311,22 +311,25 @@ $r_i := d_(verify^*)([comm(instance), comm(product(verify^*_0, verify^*_1))], [p
 where $delta_(i,j)$ denotes the Kronecker delta function.
 
 = The theory applied
+#let vbin = $verify_sans("bin")$
+#let vfld = $verify_sans("fld")$
+
 We now discuss how the split-recursion system is integrated in practice.
 
 == The split
 Let $v$ denote the verification algorithm performing all steps outlined in @verification.
-We split $v$ into halves $verify_f$ and $verify_b$ such that an efficient
+We split $v$ into halves $vfld$ and $vbin$ such that an efficient
 arithmetization is achieved when the former is executed in the _field-VM_ (@field-VM)
 and the latter on the _RiscV-VM_ (@cpu).
-Practically speaking, $verify_f$ is put in charge of all verification steps
+Practically speaking, $vfld$ is put in charge of all verification steps
 involving _field_ arithmetic --- e.g., verifying `FRI` folding --- 
-while $verify_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
+while $vbin$ performs all _binary_ arithmetic --- e.g., challenge derivation
 by means of the Fiat-Shamir transformation.
 
 The communication record primarily consists of the various Fiat-Shamir-derived
-challenges required by $verify_f$ to complete verification.
-During execution, $verify_b$ is in charge of validating these record values,
-while $verify_f$ assumes them to be correct.
+challenges required by $vfld$ to complete verification.
+During execution, $vbin$ is in charge of validating these record values,
+while $vfld$ assumes them to be correct.
 
 #et([update the communication record overview once @verification is complete.])
 
@@ -364,13 +367,13 @@ verifying the proof.
 Note that it is not a problem that comitting in this way is at the discretion of the VM's
 guest program: in recursive verification, the guest program is publically known.
 
-Hence, by having $verify_b ([comm(x), comm(y)], [[proof, b], record])$ write
+Hence, by having $vbin ([comm(x), comm(y)], [[proof, b], record])$ write
 the commitments $comm(x)$ and $comm(y)$ it is provided to `stdout`, and using 
 the same commitments to check the proof's `PAGE` tables for the commitment 
 domain (see @memory) when $b=1$, the ultimate verifier of the
 final proof can be confident that the same verification algorithm was used
 at every recursion step when verifying 
-$(comm(x), comm(y)) = (comm(instance), comm(product(verify_b, verify_f)))$.
+$(comm(x), comm(y)) = (comm(instance), comm(product(vbin, vfld)))$.
 
 == Summary
 
@@ -379,7 +382,7 @@ The communication record contains all challenges derived from the proof by
 means of the Fiat-Shamir transformation.
 
 *`RiscV-VM` subalgorithm*
-$verify_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
+$vbin ([comm(instance), comm(instance2)], [[proof, b], record])$:
 - `write` $comm(instance)$ and $comm(instance2)$ to `stdout`.
 - derives challenges from $proof$ by means of Fiat-Shamir, and assert that they 
   match those located in $record$ at the expected location.
@@ -391,7 +394,7 @@ $verify_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
     $comm(instance2)$ at the expected location.
 
 *`Field-VM` subalgorithm*
-$verify_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
+$vfld ([comm(instance), comm(instance2)], [[proof, b], record])$:
 - assert that $b in {0, 1}$
 - Performs the field arithmetic steps required to verify that $proof$ attests
   to $instance$ (when $b=0$) or $instance2$ (when $b = 1$),
