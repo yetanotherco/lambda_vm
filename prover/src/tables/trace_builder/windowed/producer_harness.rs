@@ -220,6 +220,7 @@ pub(crate) fn run_producer(
     };
     let stop_rss = std::sync::atomic::AtomicBool::new(false);
 
+    super::handout_probe::start();
     let jobs_rx: Mutex<Option<mpsc::Receiver<ChunkJob>>> = Mutex::new(None);
     let generated: Mutex<Vec<(StreamTable, usize, f64)>> = Mutex::new(Vec::new());
     let chunk_done_at: Mutex<Vec<f64>> = Mutex::new(Vec::new());
@@ -529,6 +530,11 @@ pub(crate) fn run_producer(
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
     report.peak_end = peak_gib();
+    for (table, chunks, take, count) in super::handout_probe::take() {
+        println!(
+            "PRODUCER HANDOUT {table:?}: {chunks} chunks · take {take:.3} s · count {count:.3} s"
+        );
+    }
     Ok(report)
 }
 

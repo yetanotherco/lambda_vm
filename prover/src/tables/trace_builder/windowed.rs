@@ -919,8 +919,11 @@ fn tail_jobs(
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
             let max = $max;
             while $tail.len >= max {
+                let t0 = std::time::Instant::now();
                 let $ops = $tail.take(max);
+                let t1 = std::time::Instant::now();
                 $count
+                handout_probe::note($table, t1 - t0, t1.elapsed());
                 jobs.push(ChunkJob {
                     table: $table,
                     index: $done,
@@ -1014,10 +1017,13 @@ fn tail_jobs(
     // STORE's ops are a routing segment: its own tail.
     let store = &mut segments.store_ops;
     while store.len() >= m.store {
+        let t0 = std::time::Instant::now();
         let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
+        let t1 = std::time::Instant::now();
         for op in &ops {
             counted.histogram.add_ops(&op.collect_bitwise_ops());
         }
+        handout_probe::note(StreamTable::Store, t1 - t0, t1.elapsed());
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index: e.store,
@@ -1026,6 +1032,53 @@ fn tail_jobs(
         e.store += 1;
     }
     jobs
+}
+
+/// PROBE ONLY (exec/e2-probe, not for merge): the hand-out's seconds per
+/// streamed table, split into taking the chunk's ops out of the tail and
+/// counting what the table phase reads from them.
+pub(crate) mod handout_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::StreamTable;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static LOG: Mutex<Vec<(StreamTable, usize, f64, f64)>> = Mutex::new(Vec::new());
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn start() {
+        if let Ok(mut log) = LOG.lock() {
+            log.clear();
+        }
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note(table: StreamTable, take: Duration, count: Duration) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut log) = LOG.lock() {
+            match log.iter_mut().find(|row| row.0 == table) {
+                Some(row) => {
+                    row.1 += 1;
+                    row.2 += take.as_secs_f64();
+                    row.3 += count.as_secs_f64();
+                }
+                None => log.push((table, 1, take.as_secs_f64(), count.as_secs_f64())),
+            }
+        }
+    }
+
+    /// `(table, chunks, take s, count s)`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take() -> Vec<(StreamTable, usize, f64, f64)> {
+        ON.store(false, Ordering::Relaxed);
+        LOG.lock()
+            .map(|mut log| std::mem::take(&mut *log))
+            .unwrap_or_default()
+    }
 }
 
 /// `rayon::join` under the `parallel` feature, the two calls in order without
