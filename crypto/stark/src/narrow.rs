@@ -10,9 +10,13 @@
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Rows per block of the pack and widen passes: each block reads and writes
-/// every column once, so the row-major side is read sequentially.
+/// Rows per block of the widen pass: each block reads and writes every column
+/// once, so the row-major side is written sequentially.
 const BLOCK_ROWS: usize = 1 << 12;
+
+/// Rows per block of the pack pass: a block's words (a few hundred KiB) stay in
+/// cache while each column takes its strided share.
+const PACK_BLOCK_ROWS: usize = 1 << 10;
 
 /// A main trace at 1, 2, 4 or 8 bytes per cell (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,38 +44,21 @@ fn width_of(max: u64) -> u8 {
 impl NarrowMain {
     /// Pack the `cols`-wide row-major words `row_major`. `cols` must divide its
     /// length (a trace of `rows * cols` cells).
+    ///
+    /// Runs on the caller's thread: the block packs each streamed instance on
+    /// its committer, and a pack spread over the shared pool there competed
+    /// with the executor and the walk (FAST 505).
     pub fn pack(row_major: &[u64], cols: usize) -> Self {
         let rows = row_major.len().checked_div(cols).unwrap_or(0);
         debug_assert_eq!(rows * cols, row_major.len());
         let row_major = &row_major[..rows * cols];
 
-        let block_max = |block: &[u64]| -> Vec<u64> {
-            let mut max = vec![0u64; cols];
-            for row in block.chunks_exact(cols) {
-                for (m, &v) in max.iter_mut().zip(row) {
-                    *m = (*m).max(v);
-                }
+        let mut max = vec![0u64; cols];
+        for row in row_major.chunks_exact(cols.max(1)) {
+            for (m, &v) in max.iter_mut().zip(row) {
+                *m = (*m).max(v);
             }
-            max
-        };
-        let merge = |mut a: Vec<u64>, b: Vec<u64>| {
-            for (x, y) in a.iter_mut().zip(b) {
-                *x = (*x).max(y);
-            }
-            a
-        };
-        let block_len = (BLOCK_ROWS * cols).max(1);
-        #[cfg(feature = "parallel")]
-        let max = row_major
-            .par_chunks(block_len)
-            .map(block_max)
-            .reduce(|| vec![0u64; cols], merge);
-        #[cfg(not(feature = "parallel"))]
-        let max = row_major
-            .chunks(block_len)
-            .map(block_max)
-            .fold(vec![0u64; cols], merge);
-
+        }
         let widths: Vec<u8> = max.into_iter().map(width_of).collect();
         let mut offsets = Vec::with_capacity(cols);
         let mut total = 0usize;
@@ -81,36 +68,39 @@ impl NarrowMain {
         }
         let mut data = vec![0u8; total];
 
-        // One block's part of every column, as disjoint slices.
-        let mut parts: Vec<Vec<&mut [u8]>> = (0..rows.div_ceil(BLOCK_ROWS))
-            .map(|_| Vec::with_capacity(cols))
-            .collect();
+        // Each column's slice, written a block of rows at a time so the
+        // block's rows stay in cache across the columns.
+        let mut columns: Vec<&mut [u8]> = Vec::with_capacity(cols);
         let mut rest = data.as_mut_slice();
         for &w in &widths {
             let (column, tail) = rest.split_at_mut(rows * w as usize);
+            columns.push(column);
             rest = tail;
-            for (b, part) in column.chunks_mut(BLOCK_ROWS * w as usize).enumerate() {
-                parts[b].push(part);
-            }
         }
-        let widths_ref = &widths;
-        let fill = |(b, mut outs): (usize, Vec<&mut [u8]>)| {
-            let first = b * BLOCK_ROWS;
-            let last = (first + BLOCK_ROWS).min(rows);
-            for (r, row) in row_major[first * cols..last * cols]
-                .chunks_exact(cols)
-                .enumerate()
-            {
-                for ((out, &w), &v) in outs.iter_mut().zip(widths_ref).zip(row) {
-                    let w = w as usize;
-                    out[r * w..(r + 1) * w].copy_from_slice(&v.to_le_bytes()[..w]);
+        for first in (0..rows).step_by(PACK_BLOCK_ROWS) {
+            let last = (first + PACK_BLOCK_ROWS).min(rows);
+            let block = &row_major[first * cols..last * cols];
+            for (c, (column, &w)) in columns.iter_mut().zip(&widths).enumerate() {
+                let words = block.iter().skip(c).step_by(cols);
+                let w = w as usize;
+                let out = &mut column[first * w..last * w];
+                match w {
+                    1 => out.iter_mut().zip(words).for_each(|(o, &v)| *o = v as u8),
+                    2 => out
+                        .chunks_exact_mut(2)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&(v as u16).to_le_bytes())),
+                    4 => out
+                        .chunks_exact_mut(4)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&(v as u32).to_le_bytes())),
+                    _ => out
+                        .chunks_exact_mut(8)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&v.to_le_bytes())),
                 }
             }
-        };
-        #[cfg(feature = "parallel")]
-        parts.into_par_iter().enumerate().for_each(fill);
-        #[cfg(not(feature = "parallel"))]
-        parts.into_iter().enumerate().for_each(fill);
+        }
 
         Self {
             rows,
