@@ -48,6 +48,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
+        drop_streamed_ops: false,
         layout_workers: 0,
         pack_rest_as_laid_out: false,
     }
@@ -315,6 +316,30 @@ fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
     let proof = prove(&elf, &format, &o);
     assert_eq!(proof.table_counts.lt, plain.table_counts.lt);
     assert!(verify(&proof, &elf, &format));
+}
+
+/// ★ With the builder dropping each streamed chunk's ops as it leaves (D-MEMORY
+/// M1), alone and with the MEMW-derived LT ops streamed: the same groups and
+/// table counts as keeping them, and the proof verifies.
+#[test]
+fn a_streamed_block_with_dropped_ops_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    for stream_memw_lt in [false, true] {
+        let mut keep = streamed(MaxRowsConfig::small(), 5, 3);
+        keep.stream_memw_lt = stream_memw_lt;
+        let kept = prove(&elf, &format, &keep);
+        let mut o = keep.clone();
+        o.drop_streamed_ops = true;
+        let proof = prove(&elf, &format, &o);
+        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+        assert_eq!(proof.groups, kept.groups, "LT streamed {stream_memw_lt}");
+        assert_eq!(
+            format!("{:?}", proof.table_counts),
+            format!("{:?}", kept.table_counts)
+        );
+        assert!(verify(&proof, &elf, &format));
+    }
 }
 
 /// The streamed chunks laid out on three threads, and the rest of the run
@@ -878,6 +903,48 @@ fn the_block_caps_the_chunked_tables_heights() {
     }
 }
 
+/// ★ G2: no table may be stated taller than [`block_whir::BLOCK_MAX_TABLE_VARS`]
+/// (2^27), so no chain is taller than the 2^27 stack; at the cap it passes.
+#[test]
+fn no_table_may_be_stated_over_the_table_cap() {
+    let cap = block_whir::BLOCK_MAX_TABLE_VARS as u8;
+    let mut stated = vec![10u8; 17];
+    assert!(block_whir::check_table_heights(&stated).is_ok());
+    stated[3] = cap;
+    assert!(
+        block_whir::check_table_heights(&stated).is_ok(),
+        "at the cap"
+    );
+    stated[3] = cap + 1;
+    let refused = block_whir::check_table_heights(&stated);
+    assert!(
+        format!("{refused:?}").contains("table 3"),
+        "a table over the cap must be refused, got {refused:?}"
+    );
+}
+
+/// ★ G2 end to end: a statement giving table 0 (BITWISE) 2^28 rows is refused
+/// at the frame with the cap's own error, before any AIR is built.
+///
+/// Mutation (box script): `check_table_heights` returning `Ok(())` and the error
+/// is no longer the cap's.
+#[test]
+fn a_table_stated_over_the_table_cap_is_refused() {
+    let elf = asm_elf_bytes("sub");
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    assert!(verify(&proof, &elf, &format));
+    proof.table_num_vars[0] = (block_whir::BLOCK_MAX_TABLE_VARS + 1) as u8;
+    let refused =
+        block_whir::verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &format);
+    let msg = format!("{refused:?}");
+    assert!(
+        msg.contains("table 0 states 2^28 rows") && msg.contains("at most 2^27"),
+        "the frame must refuse a table over the table cap with the cap's error, got {msg}"
+    );
+    println!("BLOCK WHIR TABLE OVER CAP: refused at the frame: {msg}");
+}
+
 /// The ranges the caps read are the chunked AIRs' positions in
 /// [`crate::VmAirs::air_refs`] — the statement's table order — and nothing
 /// next to them.
@@ -1128,7 +1195,8 @@ fn block_whir_on_a_real_block() {
     };
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
-    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them.
+    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
+    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -1137,8 +1205,9 @@ fn block_whir_on_a_real_block() {
     }
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · argue {:?} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
@@ -1146,6 +1215,11 @@ fn block_whir_on_a_real_block() {
         if prepared { "on" } else { "off" },
         options.layout_workers,
         options.pack_rest_as_laid_out,
+        if options.drop_streamed_ops {
+            "on"
+        } else {
+            "off"
+        },
         format.argue,
         format.zf.banner(),
     );

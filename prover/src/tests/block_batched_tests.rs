@@ -55,6 +55,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
+        drop_streamed_ops: false,
         layout_workers: 0,
         pack_rest_as_laid_out: false,
     }

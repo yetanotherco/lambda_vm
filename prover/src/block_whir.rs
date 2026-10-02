@@ -91,6 +91,13 @@ pub const BLOCK_KECCAK_RND_MAX_VARS: usize = 16;
 /// tree is ≈ 3 GiB and its columns fit one polynomial of a 2^27 stack.
 pub const BLOCK_ECDAS_MAX_VARS: usize = 17;
 
+/// The tallest table a block statement may state, in variables: a verifier
+/// constant ([`check_table_heights`]). A group stacks at `want.min(cap).max(tallest)`
+/// variables, so one taller table would make its chain taller than the 2^27
+/// stack and take its fold phase below the chains' 130.393 bits (127.39 at a
+/// 2^30 table). Honest tables are at most 2^21 rows.
+pub const BLOCK_MAX_TABLE_VARS: usize = 27;
+
 const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
 const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
 
@@ -175,6 +182,11 @@ pub struct BlockOptions {
     /// whole-run build's, the same LT multiplicities). Off by default: the
     /// extra chunks bind the layout thread, a REGRESSION (FAST 420).
     pub stream_memw_lt: bool,
+    /// With windows: the builder drops each streamed chunk's ops as the chunk
+    /// leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so the build does
+    /// not hold the run's op lists to its end; the traces are the same. Off by
+    /// default until its box gate (D-MEMORY M1).
+    pub drop_streamed_ops: bool,
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
     /// order all the same, while the layout thread lays out the rest of the
@@ -200,6 +212,7 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
+            drop_streamed_ops: false,
             layout_workers: 0,
             pack_rest_as_laid_out: false,
         }
@@ -448,6 +461,22 @@ pub(crate) fn chunked_table_ranges(
         ),
         ("ECDAS", ecdas..ecdas + counts.ecdas, BLOCK_ECDAS_MAX_VARS),
     ]
+}
+
+/// Every table at most [`BLOCK_MAX_TABLE_VARS`] variables, so no group's chain
+/// is taller than the larger of the format's stack and 2^27.
+pub(crate) fn check_table_heights(table_num_vars: &[u8]) -> Result<(), Error> {
+    if let Some((idx, &num_vars)) = table_num_vars
+        .iter()
+        .enumerate()
+        .find(|&(_, &n)| usize::from(n) > BLOCK_MAX_TABLE_VARS)
+    {
+        return Err(Error::InvalidTableCounts(format!(
+            "table {idx} states 2^{num_vars} rows — a block table takes at most \
+             2^{BLOCK_MAX_TABLE_VARS}"
+        )));
+    }
+    Ok(())
 }
 
 /// Every KECCAK_RND table at most [`BLOCK_KECCAK_RND_MAX_VARS`] variables and
@@ -1891,6 +1920,9 @@ fn prove_streamed(
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
                 }
+                if options.drop_streamed_ops {
+                    builder = builder.drop_streamed_ops()?;
+                }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
                 // thread appends each walked window, routes it and hands its
@@ -2348,7 +2380,7 @@ pub(crate) struct BlockFrame {
 
 /// The statement's checks, and what they leave: the counts within bounds, the
 /// page layout the ELF and the ranges imply, one height per table the counts
-/// imply, the AIR set, the groups an exact partition within the group maximum
+/// imply, each height under its cap, the AIR set, the groups an exact partition within the group maximum
 /// and each within the stack budget.
 pub(crate) fn block_frame(
     statement: BlockStatement<'_>,
@@ -2388,6 +2420,7 @@ pub(crate) fn block_frame(
             "the statement implies {expected} tables and states {num_tables} heights",
         )));
     }
+    check_table_heights(statement.table_num_vars)?;
     check_chunked_heights(statement.table_counts, statement.table_num_vars)?;
 
     let airs = VmAirs::new(
