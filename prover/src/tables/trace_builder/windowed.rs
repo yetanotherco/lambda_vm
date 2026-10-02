@@ -267,14 +267,6 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
-    /// With [`Self::pack_finished_tables`], `finish` generates at most `n`
-    /// chunks at 8 bytes a cell at once ([`StreamSkip::wide_chunks`]); `0` is
-    /// no bound. The tables are the same.
-    pub fn bound_finished_generation(mut self, n: usize) -> Self {
-        self.emitted.wide_chunks = n;
-        self
-    }
-
     /// With [`Self::pack_finished_tables`], `finish` builds KECCAK_RND and LT
     /// at 8 bytes a cell and packs them afterwards, as the other tables
     /// ([`StreamSkip::wide_builds`]), instead of packed a block at a time. The

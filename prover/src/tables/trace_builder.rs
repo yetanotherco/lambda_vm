@@ -3891,60 +3891,16 @@ pub struct StreamSkip {
     ///
     /// [`WindowedTraceBuilder::pack_finished_tables`]: windowed::WindowedTraceBuilder::pack_finished_tables
     pub pack: bool,
-    /// With [`Self::pack`]: at most this many chunks are generated at 8 bytes a
-    /// cell at once ([`WidePermits`]), so the 64-bit copies in flight before
-    /// each is packed stay bounded whatever the block's size. `0`: no bound.
-    pub wide_chunks: usize,
     /// With [`Self::pack`]: build KECCAK_RND and LT at 8 bytes a cell and pack
     /// each afterwards, as every other table, instead of packed a block at a
     /// time (the A arm of the packed builds). The words are the same.
     pub wide_builds: bool,
 }
 
-/// How a build packs what it generates ([`StreamSkip::pack`]), and the permits
-/// that bound the 64-bit chunks in flight ([`StreamSkip::wide_chunks`]).
+/// How a build packs what it generates ([`StreamSkip::pack`]).
 #[derive(Clone, Copy)]
-struct Packing<'a> {
+struct Packing {
     on: bool,
-    permits: Option<&'a WidePermits>,
-}
-
-/// Permits for generating a chunk at 8 bytes a cell: a generator holds one
-/// from before it allocates its table until the table is packed. A holder does
-/// serial work only (the generators and `NarrowMain::pack` run on their
-/// caller's thread), so a waiting rayon worker never blocks a holder.
-pub(crate) struct WidePermits {
-    free: std::sync::Mutex<usize>,
-    freed: std::sync::Condvar,
-}
-
-impl WidePermits {
-    pub(crate) fn new(n: usize) -> Self {
-        Self {
-            free: std::sync::Mutex::new(n.max(1)),
-            freed: std::sync::Condvar::new(),
-        }
-    }
-
-    /// Wait for a permit; it is given back when the guard drops.
-    pub(crate) fn acquire(&self) -> WidePermit<'_> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
-        while *free == 0 {
-            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
-        }
-        *free -= 1;
-        WidePermit(self)
-    }
-}
-
-/// A held [`WidePermits`] permit.
-pub(crate) struct WidePermit<'a>(&'a WidePermits);
-
-impl Drop for WidePermit<'_> {
-    fn drop(&mut self) {
-        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.0.freed.notify_one();
-    }
 }
 
 /// Where a build's table phase is, for a caller that wants to know
@@ -4019,7 +3975,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing<'_>,
+    pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if skip == 0 {
@@ -4074,7 +4030,7 @@ fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing<'_>,
+    pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4107,7 +4063,7 @@ fn chunk_and_generate_optional<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing<'_>,
+    pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4133,7 +4089,7 @@ fn chunk_and_generate_optional<T: Sync>(
 fn generate_optional<T: Sync>(
     ops: &[T],
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing<'_>,
+    pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
@@ -4152,7 +4108,7 @@ fn generate_optional<T: Sync>(
 fn generate_chunks<T: Sync>(
     op_chunks: Vec<&[T]>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing<'_>,
+    pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
@@ -4170,7 +4126,6 @@ fn generate_chunks<T: Sync>(
         return Ok(tables);
     }
     let generate = |chunk: &[T]| {
-        let _permit = pack.permits.map(WidePermits::acquire);
         let mut table = generate(chunk);
         if pack.on {
             table.pack_main_narrow();
@@ -4580,11 +4535,7 @@ fn build_traces<I: ImageSource + Sync>(
     skip: &StreamSkip,
     mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
-    let permits = (skip.pack && skip.wide_chunks > 0).then(|| WidePermits::new(skip.wide_chunks));
-    let pack = Packing {
-        on: skip.pack,
-        permits: permits.as_ref(),
-    };
+    let pack = Packing { on: skip.pack };
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -4960,10 +4911,7 @@ fn build_traces<I: ImageSource + Sync>(
                 |ops| {
                     lt::generate_lt_trace_packed(ops).unwrap_or_else(|| lt::generate_lt_trace(ops))
                 },
-                Packing {
-                    on: true,
-                    permits: None,
-                },
+                Packing { on: true },
             )
         } else {
             (lt::generate_lt_trace, pack)
@@ -5119,10 +5067,7 @@ fn build_traces<I: ImageSource + Sync>(
                     keccak_rnd::generate_keccak_rnd_trace_packed(ops)
                         .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
                 },
-                Packing {
-                    on: true,
-                    permits: None,
-                },
+                Packing { on: true },
             )
         } else {
             (keccak_rnd::generate_keccak_rnd_trace, pack)
