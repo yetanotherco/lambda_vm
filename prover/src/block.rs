@@ -444,15 +444,22 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
-/// `LAMBDA_VM_BLOCK_FINISH_WIDE=n` (n >= 1): with [`narrow_finished`], phase
-/// A's finish generates at most `n` chunks at 8 bytes a cell at once
-/// ([`WindowedTraceBuilder::bound_finished_generation`]); unset or `0` is no
-/// bound. A measurement knob until its gate.
-fn finish_wide_chunks() -> usize {
-    std::env::var("LAMBDA_VM_BLOCK_FINISH_WIDE")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+/// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
+/// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
+/// of keeping them as segments; the tables are the same.
+fn lt_concat() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
+}
+
+/// `LAMBDA_VM_BLOCK_PACKED_BUILD=1`: with [`narrow_finished`], the finish
+/// builds KECCAK_RND and LT packed a block at a time; unset or anything else
+/// builds them at 8 bytes a cell and packs them afterwards, as the other
+/// tables ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the
+/// same either way. Off by default: at the median block on BIG the packed
+/// builds held the peak 14.75 GiB lower but made phase B 6.3 s slower (BIG 104),
+/// over the lead's 3 s line for a default.
+fn packed_builds() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "1")
 }
 
 /// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
@@ -482,44 +489,34 @@ fn stream_generators() -> usize {
         .unwrap_or(STREAM_GENERATORS)
 }
 
-/// `LAMBDA_VM_BLOCK_READY_MIB=n` (n >= 1): with [`stream_generators`], the
-/// generated chunks waiting for a committer hold at most `n` MiB; unset or `0`:
-/// unbounded.
-fn ready_queue_budget() -> Option<usize> {
-    std::env::var("LAMBDA_VM_BLOCK_READY_MIB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .map(|n| n << 20)
+/// When the tables the finish builds get their Round-1 commits
+/// (`LAMBDA_VM_BLOCK_FINISH_COMMIT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishCommit {
+    /// Unset or `0`: in phase B's Round 1, as before.
+    PhaseB,
+    /// `1`: on phase A's committers, each as soon as the finish has built it
+    /// ([`WindowedTraceBuilder::finish_handing`]), while the finish goes on.
+    Handed,
+    /// `after`: on phase A's committers, every one once the finish has
+    /// returned ([`finish_sink::hand_built`]): the commits move without
+    /// overlapping the finish. A measurement arm.
+    After,
 }
 
-/// `LAMBDA_VM_BLOCK_QUEUE_MIB=n` (n >= 1): the streamed chunks waiting for a
-/// committer hold at most `n` MiB of ops ([`QueueRoom`]); the producer waits
-/// for room, and so do the walk and the executor behind it. Unset or `0`:
-/// unbounded. A measurement knob until its gate.
-fn commit_queue_budget() -> Option<usize> {
-    std::env::var("LAMBDA_VM_BLOCK_QUEUE_MIB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .map(|n| n << 20)
-}
-
-/// `LAMBDA_VM_BLOCK_FINISH_COMMIT=after`: once the finish returns, every plain
-/// table it built goes to phase A's committers ([`finish_sink::hand_built`])
-/// instead of phase B's main commit. The finish does not hand its tables off
-/// as it builds them yet (the bounded finish will, through the same sink), so
-/// this arm moves those commits without overlapping them with the finish: a
-/// measurement arm and the committer side's gate. Unset or `0`: phase B
-/// commits them, as before; anything else stops the run.
-fn finish_commit_after() -> bool {
+/// [`FinishCommit`] from `LAMBDA_VM_BLOCK_FINISH_COMMIT`; anything else stops
+/// the run.
+fn finish_commit() -> FinishCommit {
     match std::env::var("LAMBDA_VM_BLOCK_FINISH_COMMIT")
         .as_deref()
         .map(str::trim)
     {
-        Err(_) | Ok("0") => false,
-        Ok("after") => true,
-        Ok(other) => panic!("LAMBDA_VM_BLOCK_FINISH_COMMIT must be `0` or `after`, got `{other}`"),
+        Err(_) | Ok("0") => FinishCommit::PhaseB,
+        Ok("1") => FinishCommit::Handed,
+        Ok("after") => FinishCommit::After,
+        Ok(other) => {
+            panic!("LAMBDA_VM_BLOCK_FINISH_COMMIT must be `0`, `1` or `after`, got `{other}`")
+        }
     }
 }
 
@@ -556,55 +553,22 @@ fn commit_card_bytes(air: &crate::test_utils::VmAir, trace: &finish_sink::Trace)
     .total() as usize
 }
 
-/// How phase A's stream hands its chunks to the device: committer and
-/// generator threads, the byte budgets of what waits for them, whether the
-/// finish's tables are committed in phase A, and the card's byte budget for
-/// the commits.
-#[derive(Clone, Copy, Debug)]
-struct StreamConfig {
-    committers: usize,
-    generators: usize,
-    ops_budget: Option<usize>,
-    ready_budget: Option<usize>,
-    finish_after: bool,
-    card_budget: Option<usize>,
-}
-
-impl StreamConfig {
-    /// The block's: [`stream_committers`], [`stream_generators`],
-    /// [`commit_queue_budget`], [`ready_queue_budget`], [`finish_commit_after`],
-    /// [`card_gate_budget`].
-    fn from_env() -> Self {
-        Self {
-            committers: stream_committers(),
-            generators: stream_generators(),
-            ops_budget: commit_queue_budget(),
-            ready_budget: ready_queue_budget(),
-            finish_after: finish_commit_after(),
-            card_budget: card_gate_budget(),
-        }
-    }
-}
-
-/// The streamed chunks on their way to a committer, by the bytes their ops
-/// hold: counted always (the most at once is reported), and bounded by a
-/// budget when there is one. A chunk is admitted when the queue is empty or it
-/// fits, so a chunk bigger than the budget still goes, alone. It leaves the
-/// queue once its committer has generated it (its ops are freed then).
-struct QueueRoom {
+/// Phase A's card gate ([`card_gate_budget`]): a commit is admitted when the
+/// card holds nothing or its bytes fit beside what it holds, so a commit
+/// bigger than the budget still runs, alone. Without a budget it only counts.
+/// The most it held, and how long the committers waited, are reported.
+struct CardGate {
     budget: Option<usize>,
-    /// (bytes, chunks) admitted and not yet generated.
+    /// (bytes, commits) admitted now.
     held: std::sync::Mutex<(usize, usize)>,
     room: std::sync::Condvar,
-    /// The most bytes, and the most chunks, held at once.
     most: std::sync::Mutex<(usize, usize)>,
-    /// Seconds the producer waited for room.
     waited: std::sync::Mutex<f64>,
-    /// A committer stopped: nothing waits for room any more.
+    /// A committer stopped: nothing waits any more.
     closed: std::sync::atomic::AtomicBool,
 }
 
-impl QueueRoom {
+impl CardGate {
     fn new(budget: Option<usize>) -> Self {
         Self {
             budget,
@@ -616,7 +580,7 @@ impl QueueRoom {
         }
     }
 
-    /// Wait until a chunk of `bytes` fits, then count it in.
+    /// Wait until a commit of `bytes` fits, then count it in.
     fn admit(&self, bytes: usize) {
         let t = Instant::now();
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -634,7 +598,7 @@ impl QueueRoom {
         *self.waited.lock().unwrap_or_else(|e| e.into_inner()) += t.elapsed().as_secs_f64();
     }
 
-    /// A chunk of `bytes` left the queue.
+    /// A commit of `bytes` is done.
     fn release(&self, bytes: usize) {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         held.0 = held.0.saturating_sub(bytes);
@@ -642,7 +606,7 @@ impl QueueRoom {
         self.room.notify_all();
     }
 
-    /// A committer stopped on an error: the producer must not wait on it.
+    /// A committer stopped on an error: the others must not wait on it.
     fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -651,93 +615,64 @@ impl QueueRoom {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_PURGE=1`: once the run is walked, before the finish
-/// builds its tables, the allocator returns the pages freed so far to the OS
-/// ([`purge_freed_pages`]), so the finish does not stack its working set on
-/// pages its threads cannot reuse. A measurement knob, off by default.
-fn purge_before_finish() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_PURGE").is_ok_and(|v| v.trim() == "1")
+/// How phase A's stream hands its chunks to the device: committer and
+/// generator threads, when the finish's tables are committed, and the card's
+/// byte budget for the commits.
+#[derive(Clone, Copy, Debug)]
+struct StreamConfig {
+    committers: usize,
+    generators: usize,
+    finish: FinishCommit,
+    card_budget: Option<usize>,
 }
 
-/// Every jemalloc arena's freed (dirty and muzzy) pages returned to the OS now,
-/// the decay settings left as they were (never, under the posture): each
-/// arena's decay is set to 0, which purges at once, then back. In the lib's
-/// tests, which install jemalloc (`lib.rs`); `false` elsewhere.
-#[cfg(test)]
-fn purge_freed_pages() -> bool {
-    use tikv_jemalloc_ctl::{arenas, raw};
-    let Ok(n) = arenas::narenas::read() else {
-        return false;
-    };
-    for i in 0..n {
-        for kind in ["dirty", "muzzy"] {
-            let name = format!("arena.{i}.{kind}_decay_ms\0");
-            // SAFETY: a NUL-terminated mallctl name whose value is an ssize_t.
-            unsafe {
-                let Ok(was) = raw::read::<isize>(name.as_bytes()) else {
-                    continue;
-                };
-                let _ = raw::write(name.as_bytes(), 0isize);
-                let _ = raw::write(name.as_bytes(), was);
-            }
+impl StreamConfig {
+    /// The block's: [`stream_committers`], [`stream_generators`],
+    /// [`finish_commit`], [`card_gate_budget`].
+    fn from_env() -> Self {
+        Self {
+            committers: stream_committers(),
+            generators: stream_generators(),
+            finish: finish_commit(),
+            card_budget: card_gate_budget(),
         }
     }
-    true
 }
 
-/// Outside the lib's tests the allocator is not driven.
-#[cfg(not(test))]
-fn purge_freed_pages() -> bool {
-    false
+/// The streamed chunks waiting for a committer (or, generated, for a
+/// committer to take them), by their bytes: the most held at once is reported.
+/// A chunk leaves once it is generated (its ops are freed then), or once a
+/// committer takes it.
+struct QueueRoom {
+    /// (bytes, chunks) held now.
+    held: std::sync::Mutex<(usize, usize)>,
+    /// The most bytes, and the most chunks, held at once.
+    most: std::sync::Mutex<(usize, usize)>,
 }
 
-/// `LAMBDA_VM_BLOCK_DRAIN_PURGE=1`: from the walk's end to phase A's end, the
-/// allocator arenas of the walker and the accumulator (where the streamed
-/// chunks' ops were allocated) return each freed page at once, so the ops the
-/// committers free while the finish runs do not stay resident beside the
-/// finish's working set; every other arena keeps its pages. A measurement
-/// knob, off by default.
-fn drain_purge() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_DRAIN_PURGE").is_ok_and(|v| v.trim() == "1")
-}
-
-/// The calling thread's jemalloc arena, in the lib's tests (`lib.rs` installs
-/// jemalloc); `None` elsewhere.
-#[cfg(test)]
-fn current_arena() -> Option<u32> {
-    // SAFETY: a NUL-terminated mallctl name whose value is an unsigned.
-    unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"thread.arena\0").ok() }
-}
-
-#[cfg(not(test))]
-fn current_arena() -> Option<u32> {
-    None
-}
-
-/// Set `arena`'s dirty and muzzy decay (milliseconds; 0 purges at once and on
-/// every later free, -1 never), returning what it had. Lib tests only.
-#[cfg(test)]
-fn swap_arena_decay(arena: u32, (dirty, muzzy): (isize, isize)) -> Option<(isize, isize)> {
-    use tikv_jemalloc_ctl::raw;
-    let (d, m) = (
-        format!("arena.{arena}.dirty_decay_ms\0"),
-        format!("arena.{arena}.muzzy_decay_ms\0"),
-    );
-    // SAFETY: NUL-terminated mallctl names whose values are ssize_t.
-    unsafe {
-        let was = (
-            raw::read::<isize>(d.as_bytes()).ok()?,
-            raw::read::<isize>(m.as_bytes()).ok()?,
-        );
-        raw::write(d.as_bytes(), dirty).ok()?;
-        raw::write(m.as_bytes(), muzzy).ok()?;
-        Some(was)
+impl QueueRoom {
+    fn new() -> Self {
+        Self {
+            held: std::sync::Mutex::new((0, 0)),
+            most: std::sync::Mutex::new((0, 0)),
+        }
     }
-}
 
-#[cfg(not(test))]
-fn swap_arena_decay(_arena: u32, _decay: (isize, isize)) -> Option<(isize, isize)> {
-    None
+    /// A chunk of `bytes` joined the queue.
+    fn admit(&self, bytes: usize) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.0 += bytes;
+        held.1 += 1;
+        let mut most = self.most.lock().unwrap_or_else(|e| e.into_inner());
+        *most = (most.0.max(held.0), most.1.max(held.1));
+    }
+
+    /// A chunk of `bytes` left the queue.
+    fn release(&self, bytes: usize) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.0 = held.0.saturating_sub(bytes);
+        held.1 = held.1.saturating_sub(1);
+    }
 }
 
 /// `LAMBDA_VM_BLOCK_MEMLOG=1`: [`MemLedger`]'s `BLOCK MEM` lines, every half
@@ -864,6 +799,8 @@ impl MemLedger {
         const GIB: f64 = (1u64 << 30) as f64;
         let g = |a: &std::sync::atomic::AtomicUsize| a.load(Relaxed) as f64 / GIB;
         let rss = proc_rss_bytes().map_or("n/a".to_string(), |b| format!("{:.2}", b as f64 / GIB));
+        let faults =
+            proc_minor_faults().map_or("n/a".to_string(), |f| format!("{:.2}", f as f64 / 1e6));
         let heap = heap_stats().map_or("heap n/a".to_string(), |[live, active, resident, mapped, retained]| {
             let g = |b: usize| b as f64 / GIB;
             format!(
@@ -877,7 +814,7 @@ impl MemLedger {
             )
         });
         eprintln!(
-            "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
+            "BLOCK MEM {label} t={:.1} · rss {rss} · minflt {faults} M · {heap} · queue {} chunks {:.2} · committing {:.2} · \
              ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · logs {:.2} · walked {:.2} · \
              builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
@@ -932,6 +869,15 @@ impl Drop for MemSampler {
             let _ = handle.join();
         }
     }
+}
+
+/// This process's minor page faults so far (`/proc/self/stat`, field 10), on
+/// Linux: each a first touch of a page the allocator had not kept.
+fn proc_minor_faults() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command name may hold spaces; the fields after it do not.
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(7)?.parse().ok()
 }
 
 /// This process's resident set (`VmRSS`), on Linux.
@@ -1074,14 +1020,14 @@ fn build_streamed(
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
     let committer_count = stream.committers;
-    let queue = QueueRoom::new(stream.ops_budget);
+    let queue = QueueRoom::new();
     let generators = stream.generators;
-    let ready = QueueRoom::new(stream.ready_budget);
+    let ready = QueueRoom::new();
     let (ready_tx, ready_rx) = mpsc::channel::<ToCommit>();
     let ready_rx = Mutex::new(ready_rx);
     // Phase A's card gate ([`card_gate_budget`]): every commit admitted by its
     // device set; the most it held and the committers' wait are reported.
-    let card = QueueRoom::new(stream.card_budget);
+    let card = CardGate::new(stream.card_budget);
     // Tables the finish handed off and the committers committed, and their
     // seconds from arrival to commit.
     let finished_committed = Mutex::new((0usize, 0.0f64));
@@ -1092,11 +1038,6 @@ fn build_streamed(
     // host, instances the device packed).
     let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
     let narrow = narrow_streamed();
-    let drain = drain_purge();
-    // The walker's and the accumulator's arenas ([`drain_purge`]), and the
-    // decay each had while they purge at once.
-    let producer_arenas: &Mutex<Vec<u32>> = &Mutex::new(Vec::new());
-    let drained: Mutex<Vec<(u32, (isize, isize))>> = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -1307,8 +1248,6 @@ fn build_streamed(
                 };
                 let result = commit_all();
                 if result.is_err() {
-                    queue.close();
-                    ready.close();
                     card.close();
                 }
                 result
@@ -1316,20 +1255,18 @@ fn build_streamed(
         }
 
         let produce = || -> Result<(Traces, f64), Error> {
-            if drain {
-                producer_arenas
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend(current_arena());
-            }
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
             }
             if narrow_finished() {
-                builder = builder
-                    .pack_finished_tables()
-                    .bound_finished_generation(finish_wide_chunks());
+                builder = builder.pack_finished_tables();
+                if !packed_builds() {
+                    builder = builder.build_wide_then_pack();
+                }
+            }
+            if lt_concat() {
+                builder = builder.concat_lt();
             }
             if let Some(ledger) = ledger {
                 eprintln!(
@@ -1362,12 +1299,6 @@ fn build_streamed(
                 std::thread::scope(|inner| -> Result<_, Error> {
                     let (walked_tx, walked_rx) = mpsc::sync_channel(2);
                     let walking = inner.spawn(move || -> Result<_, Error> {
-                        if drain {
-                            producer_arenas
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .extend(current_arena());
-                        }
                         // One window held back: the run's last is `finish`'s.
                         let mut held: Option<Vec<executor::vm::logs::Log>> = None;
                         for logs in log_rx.iter() {
@@ -1415,7 +1346,7 @@ fn build_streamed(
             };
             // The finish's sink keeps the committers' queue open until the
             // finish's tables are handed off.
-            let sink = stream.finish_after.then(|| BlockFinishSink {
+            let sink = (stream.finish != FinishCommit::PhaseB).then(|| BlockFinishSink {
                 tx: job_tx.clone(),
                 ledger,
             });
@@ -1423,43 +1354,16 @@ fn build_streamed(
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
             }
-            if drain {
-                let (t, before) = (Instant::now(), proc_rss_bytes());
-                let mut arenas = producer_arenas.lock().unwrap_or_else(|e| e.into_inner());
-                arenas.sort_unstable();
-                arenas.dedup();
-                let swapped: Vec<(u32, (isize, isize))> = arenas
-                    .iter()
-                    .filter_map(|&a| swap_arena_decay(a, (0, 0)).map(|was| (a, was)))
-                    .collect();
-                eprintln!(
-                    "BLOCK DRAIN PURGE: arenas {:?} return freed pages at once until phase A ends ({:.2} s) · \
-                     VmRSS {:.2} → {:.2} GiB",
-                    swapped.iter().map(|(a, _)| a).collect::<Vec<_>>(),
-                    t.elapsed().as_secs_f64(),
-                    before.map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64),
-                    proc_rss_bytes().map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64),
-                );
-                *drained.lock().unwrap_or_else(|e| e.into_inner()) = swapped;
-            }
-            if purge_before_finish() {
-                let (t, before) = (Instant::now(), proc_rss_bytes());
-                let purged = purge_freed_pages();
-                let gib = |b: Option<usize>| b.map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64);
-                eprintln!(
-                    "BLOCK PURGE before the finish: {} in {:.2} s · VmRSS {:.2} → {:.2} GiB",
-                    if purged { "purged" } else { "not available" },
-                    t.elapsed().as_secs_f64(),
-                    gib(before),
-                    gib(proc_rss_bytes()),
-                );
-            }
             let windows = builder.stamps();
             let t = Instant::now();
+            let handing = sink
+                .as_ref()
+                .filter(|_| stream.finish == FinishCommit::Handed)
+                .map(|sink| sink as &dyn FinishSink);
             #[allow(unused_mut)]
-            let mut traces = builder.finish(&last)?;
+            let mut traces = builder.finish_handing(&last, handing)?;
             let finish_secs = t.elapsed().as_secs_f64();
-            if let Some(sink) = sink {
+            if let Some(sink) = sink.filter(|_| stream.finish == FinishCommit::After) {
                 let handed = finish_sink::hand_built(&mut traces, &sink);
                 eprintln!(
                     "BLOCK FINISH COMMIT: {handed} tables the finish built handed to phase A's \
@@ -1487,12 +1391,6 @@ fn build_streamed(
             if let Err(e) = join(c) {
                 errors.push(e);
             }
-        }
-        // Phase A's committers are done: the producer's arenas keep their
-        // pages again.
-        for (arena, was) in std::mem::take(&mut *drained.lock().unwrap_or_else(|e| e.into_inner()))
-        {
-            let _ = swap_arena_decay(arena, was);
         }
         let (mut traces, collect_secs) = produced?;
         if let Some(e) = errors.into_iter().next() {
@@ -1556,19 +1454,12 @@ fn build_streamed(
         );
         let (most_bytes, most_chunks) = *queue.most.lock().unwrap_or_else(|e| e.into_inner());
         let (ready_bytes, ready_chunks) = *ready.most.lock().unwrap_or_else(|e| e.into_inner());
-        let budget =
-            |b: Option<usize>| b.map_or("none".to_string(), |b| format!("{} MiB", b >> 20));
         eprintln!(
-            "BLOCK QUEUE: {committer_count} committers · {generators} generators · ops budget {} · at most \
-             {:.2} GiB in {most_chunks} chunks waiting as ops · the producer waited {:.2} s for room · \
-             ready budget {} · at most {:.2} GiB in {ready_chunks} chunks waiting generated · the \
-             generators waited {:.2} s for room",
-            budget(queue.budget),
+            "BLOCK QUEUE: {committer_count} committers · {generators} generators · at most {:.2} GiB in \
+             {most_chunks} chunks waiting as ops · at most {:.2} GiB in {ready_chunks} chunks waiting \
+             generated",
             most_bytes as f64 / (1u64 << 30) as f64,
-            *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
-            budget(ready.budget),
             ready_bytes as f64 / (1u64 << 30) as f64,
-            *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
         );
         Ok((traces, decode_commitment, precommits))
     })
@@ -1730,8 +1621,8 @@ fn print_census<'a>(instances: impl Iterator<Item = (&'a str, usize, usize)>) {
 }
 
 /// [`build_streamed`] of `program` (no input) under a stream of `committers`
-/// committers, `generators` generators and `budget` bytes for each queue, for
-/// the tests: the traces, and the AIR of each streamed instance precommitted.
+/// committers and `generators` generators, for the tests: the traces, and the
+/// AIR of each streamed instance precommitted.
 #[cfg(test)]
 pub(crate) fn stream_for_test(
     program: &Elf,
@@ -1739,7 +1630,6 @@ pub(crate) fn stream_for_test(
     max_rows: &MaxRowsConfig,
     committers: usize,
     generators: usize,
-    budget: Option<usize>,
 ) -> Result<(Traces, Vec<String>), Error> {
     stream_config_for_test(
         program,
@@ -1748,24 +1638,24 @@ pub(crate) fn stream_for_test(
         StreamConfig {
             committers,
             generators,
-            ops_budget: budget,
-            ready_budget: budget,
-            finish_after: false,
+            finish: FinishCommit::PhaseB,
             card_budget: None,
         },
     )
 }
 
-/// [`stream_for_test`] with every table the finish builds committed in phase
-/// A once it returns ([`finish_commit_after`]), the commits admitted through a
-/// card gate of `card_budget` bytes, and the ledger on.
+/// [`stream_for_test`] with the finish's tables committed in phase A
+/// (`finish`: [`FinishCommit::Handed`] or [`FinishCommit::After`]), the
+/// commits admitted through a card gate of `card_budget` bytes, and the ledger
+/// on.
 #[cfg(test)]
-pub(crate) fn stream_finish_after_for_test(
+pub(crate) fn stream_finish_commit_for_test(
     program: &Elf,
     opts: &ProofOptions,
     max_rows: &MaxRowsConfig,
     committers: usize,
     generators: usize,
+    handed: bool,
     card_budget: Option<usize>,
 ) -> Result<(Traces, Vec<String>), Error> {
     stream_config_for_test(
@@ -1775,9 +1665,11 @@ pub(crate) fn stream_finish_after_for_test(
         StreamConfig {
             committers,
             generators,
-            ops_budget: None,
-            ready_budget: None,
-            finish_after: true,
+            finish: if handed {
+                FinishCommit::Handed
+            } else {
+                FinishCommit::After
+            },
             card_budget,
         },
     )
@@ -1790,7 +1682,7 @@ fn stream_config_for_test(
     max_rows: &MaxRowsConfig,
     stream: StreamConfig,
 ) -> Result<(Traces, Vec<String>), Error> {
-    let ledger = stream.finish_after.then(MemLedger::new);
+    let ledger = (stream.finish != FinishCommit::PhaseB).then(MemLedger::new);
     let (traces, _, precommits) = build_streamed(
         program,
         &[],
@@ -1857,115 +1749,17 @@ mod memlog_tests {
 
 #[cfg(test)]
 mod queue_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
     use super::QueueRoom;
 
-    /// Within a budget the producer waits for room: a chunk that would pass the
-    /// budget is admitted only once an earlier one left. A chunk bigger than
-    /// the budget still goes when the queue is empty.
+    /// The queue reports the most bytes and chunks it held at once.
     #[test]
-    fn a_bounded_queue_admits_a_chunk_once_it_fits() {
-        let queue = QueueRoom::new(Some(100));
+    fn the_queue_reports_the_most_it_held() {
+        let queue = QueueRoom::new();
         queue.admit(60);
         queue.admit(40);
-        let admitted = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                queue.admit(30);
-                admitted.store(true, Ordering::SeqCst);
-            });
-            std::thread::sleep(Duration::from_millis(100));
-            assert!(!admitted.load(Ordering::SeqCst), "admitted past the budget");
-            queue.release(60);
-        });
-        assert!(admitted.load(Ordering::SeqCst));
-        assert_eq!(*queue.held.lock().unwrap(), (70, 2));
-        assert_eq!(*queue.most.lock().unwrap(), (100, 2));
-        queue.release(40);
-        queue.release(30);
-        queue.admit(500);
-        assert_eq!(*queue.held.lock().unwrap(), (500, 1));
-    }
-
-    /// Unbounded, nothing waits; a stopped committer frees a waiting producer.
-    #[test]
-    fn an_unbounded_or_closed_queue_never_waits() {
-        let unbounded = QueueRoom::new(None);
-        for _ in 0..10 {
-            unbounded.admit(1 << 30);
-        }
-        assert_eq!(unbounded.most.lock().unwrap().1, 10);
-
-        let queue = QueueRoom::new(Some(10));
+        queue.release(60);
         queue.admit(10);
-        std::thread::scope(|s| {
-            let waiting = s.spawn(|| queue.admit(10));
-            std::thread::sleep(Duration::from_millis(50));
-            queue.close();
-            waiting.join().unwrap();
-        });
-        assert_eq!(*queue.held.lock().unwrap(), (20, 2));
-    }
-}
-
-#[cfg(test)]
-mod wide_permit_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use crate::tables::trace_builder::WidePermits;
-
-    /// However many workers want one, at most `n` hold a permit at once, and
-    /// every worker gets one in the end.
-    #[test]
-    fn at_most_n_chunks_hold_a_permit() {
-        let permits = WidePermits::new(2);
-        let (holding, most, done) = (
-            AtomicUsize::new(0),
-            AtomicUsize::new(0),
-            AtomicUsize::new(0),
-        );
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                s.spawn(|| {
-                    let _permit = permits.acquire();
-                    let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
-                    most.fetch_max(now, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    holding.fetch_sub(1, Ordering::SeqCst);
-                    done.fetch_add(1, Ordering::SeqCst);
-                });
-            }
-        });
-        assert_eq!(done.load(Ordering::SeqCst), 8);
-        assert_eq!(most.load(Ordering::SeqCst), 2);
-    }
-}
-
-#[cfg(test)]
-mod purge_tests {
-    /// The purge reaches jemalloc in the lib's tests and leaves every arena's
-    /// decay settings as they were.
-    #[test]
-    fn a_purge_leaves_the_decay_settings_as_they_were() {
-        use tikv_jemalloc_ctl::raw;
-        let name = b"arena.0.dirty_decay_ms\0";
-        // SAFETY: a NUL-terminated mallctl name whose value is an ssize_t.
-        let before = unsafe { raw::read::<isize>(name) }.expect("arena 0 decay");
-        // Something to purge: a freed allocation.
-        drop(vec![1u8; 64 << 20]);
-        assert!(super::purge_freed_pages());
-        let after = unsafe { raw::read::<isize>(name) }.expect("arena 0 decay");
-        assert_eq!(before, after);
-    }
-
-    /// A thread finds its own arena, and a swapped decay comes back as it was.
-    #[test]
-    fn an_arena_decay_swaps_and_swaps_back() {
-        let arena = super::current_arena().expect("this thread's arena");
-        let was = super::swap_arena_decay(arena, (0, 0)).expect("swap to 0");
-        assert_eq!(super::swap_arena_decay(arena, was), Some((0, 0)));
-        assert_eq!(super::swap_arena_decay(arena, was), Some(was));
+        assert_eq!(*queue.held.lock().unwrap(), (50, 2));
+        assert_eq!(*queue.most.lock().unwrap(), (100, 2));
     }
 }

@@ -595,12 +595,13 @@ mod tests {
         );
     }
 
-    /// ★ Phase A's committers also commit the tables the finish built
-    /// (`LAMBDA_VM_BLOCK_FINISH_COMMIT=after`): the stream builds the same
-    /// traces, precommits every streamed instance it did before and every
-    /// plain table the finish built, leaves the ledger empty, and a card gate
-    /// that admits one commit at a time changes none of it — with the
-    /// committers generating, or generators ahead of them.
+    /// ★ Phase A's committers also commit the tables the finish built, each as
+    /// the finish builds it (`LAMBDA_VM_BLOCK_FINISH_COMMIT=1`) or all once it
+    /// returns (`after`): the stream builds the same traces, precommits every
+    /// streamed instance it did before and every plain table the finish built,
+    /// leaves the ledger empty, and a card gate that admits one commit at a
+    /// time changes none of it — with the committers generating, or generators
+    /// ahead of them.
     #[test]
     fn the_stream_commits_the_finish_tables_in_phase_a() {
         let opts = crate::lfm::proof::block_base_options();
@@ -611,7 +612,7 @@ mod tests {
         for name in ["all_instructions_64", "test_keccak_multi"] {
             let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
             let (mut today, mut names) =
-                crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0, None)
+                crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0)
                     .expect("the stream as it is");
             let mut every: Vec<String> = instances(&mut today)
                 .into_iter()
@@ -620,13 +621,16 @@ mod tests {
             every.sort();
             names.sort();
             assert!(names.len() < every.len(), "{name}: the finish built tables");
-            for (committers, generators) in [(3, 0), (2, 3)] {
-                let (mut after, mut after_names) = crate::block::stream_finish_after_for_test(
+            for (committers, generators, handed) in
+                [(3, 0, true), (2, 3, true), (3, 0, false), (2, 3, false)]
+            {
+                let (mut after, mut after_names) = crate::block::stream_finish_commit_for_test(
                     &program,
                     &opts,
                     &max_rows,
                     committers,
                     generators,
+                    handed,
                     Some(1),
                 )
                 .expect("the finish's tables committed in phase A");

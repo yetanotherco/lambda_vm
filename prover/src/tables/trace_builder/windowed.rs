@@ -267,11 +267,20 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
-    /// With [`Self::pack_finished_tables`], `finish` generates at most `n`
-    /// chunks at 8 bytes a cell at once ([`StreamSkip::wide_chunks`]); `0` is
-    /// no bound. The tables are the same.
-    pub fn bound_finished_generation(mut self, n: usize) -> Self {
-        self.emitted.wide_chunks = n;
+    /// With [`Self::pack_finished_tables`], `finish` builds KECCAK_RND and LT
+    /// at 8 bytes a cell and packs them afterwards, as the other tables
+    /// ([`StreamSkip::wide_builds`]), instead of packed a block at a time. The
+    /// tables are the same.
+    pub fn build_wide_then_pack(mut self) -> Self {
+        self.emitted.wide_builds = true;
+        self
+    }
+
+    /// `finish` concatenates LT's ops into one list before chunking them
+    /// ([`StreamSkip::concat_lt`]), as it did before keeping them as segments.
+    /// The tables are the same.
+    pub fn concat_lt(mut self) -> Self {
+        self.emitted.concat_lt = true;
         self
     }
 
@@ -329,7 +338,19 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// Collects the run's last window and builds every table the windows did
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
-    pub fn finish(mut self, logs: &[Log]) -> Result<Traces, Error> {
+    pub fn finish(self, logs: &[Log]) -> Result<Traces, Error> {
+        self.finish_handing(logs, None)
+    }
+
+    /// [`finish`](Self::finish), handing each plain table to `sink` as soon as
+    /// it is generated ([`crate::finish_sink`]): a table the sink takes leaves
+    /// a placeholder in its slot, for [`crate::finish_sink::insert_finished`]
+    /// to fill; one it declines stays. `None` is [`finish`](Self::finish).
+    pub fn finish_handing(
+        mut self,
+        logs: &[Log],
+        sink: Option<&dyn crate::finish_sink::FinishSink>,
+    ) -> Result<Traces, Error> {
         // The last window may halt: it is walked here, not by the `Walker`.
         let cpu_ops = match &self.decode {
             Some(table) => super::collect_cpu_ops_from_table(logs, table, self.cycles)?,
@@ -430,6 +451,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             false,
             &skip,
             Some(pre),
+            sink,
         )
     }
 

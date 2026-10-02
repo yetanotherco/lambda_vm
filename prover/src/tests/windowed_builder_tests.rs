@@ -671,6 +671,99 @@ fn widen_all(t: &mut Traces) -> usize {
     packed
 }
 
+/// The plain tables' slots in a build (every kind a finish hands off), and
+/// whether each is a placeholder.
+fn plain_slots(t: &Traces) -> Vec<(&'static str, Vec<bool>)> {
+    let lists: [(&'static str, &Vec<Table>); 20] = [
+        ("CPU", &t.cpus),
+        ("MEMW_R", &t.memw_registers),
+        ("MEMW_A", &t.memw_aligneds),
+        ("MEMW", &t.memws),
+        ("LOAD", &t.loads),
+        ("LT", &t.lts),
+        ("SHIFT", &t.shifts),
+        ("STORE", &t.stores),
+        ("MUL", &t.muls),
+        ("DVRM", &t.dvrms),
+        ("BRANCH", &t.branches),
+        ("EQ", &t.eqs),
+        ("BYTEWISE", &t.bytewises),
+        ("CPU32", &t.cpu32s),
+        ("COMMIT", &t.commits),
+        ("KECCAK", &t.keccaks),
+        ("KECCAK_RND", &t.keccak_rnds),
+        ("ECSM", &t.ecsms),
+        ("ECDAS", &t.ecdases),
+        ("HINT", &t.hints),
+    ];
+    lists
+        .into_iter()
+        .map(|(name, list)| (name, list.iter().map(|t| t.main_table.width == 0).collect()))
+        .collect()
+}
+
+/// ★ A finish handing its tables to a sink (`finish_handing`) hands every plain
+/// table it generates, once, as the instance its slot is: it keeps none (every
+/// plain slot is left a placeholder), and the handed tables put back
+/// (`finish_sink::insert_finished`) with the streamed chunks give the whole-run
+/// build, table for table, packed or not, with chunks streamed ahead of the
+/// finish (chunks of 4 rows: every streamed table has some). A sink that
+/// declines every table leaves the build as `finish` makes it.
+#[test]
+fn the_finish_hands_every_plain_table_to_its_sink() {
+    use crate::finish_sink::{CollectingSink, insert_finished};
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("all_instructions_64", MaxRowsConfig::uniform(4)),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for (window, pack, decline) in [(7, false, false), (33, true, false), (33, true, true)] {
+            let what = format!("{name}/{window}/pack {pack}/decline {decline}");
+            let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                .expect("the builder")
+                .drop_streamed_ops()
+                .expect("before any window");
+            if pack {
+                builder = builder.pack_finished_tables();
+            }
+            let body = logs.len() - 1;
+            let cut = body - body % window;
+            let mut chunks = Vec::new();
+            for w in logs[..cut].chunks(window) {
+                chunks.extend(builder.push(w).expect("a window"));
+            }
+            let sink = CollectingSink::new(decline);
+            let mut traces = builder
+                .finish_handing(&logs[cut..], Some(&sink))
+                .expect("the last window");
+            let handed = sink.tables.into_inner().expect("the sink's lock");
+            if decline {
+                assert!(handed.is_empty(), "{what}: a declining sink kept a table");
+            } else {
+                assert!(!handed.is_empty(), "{what}: nothing was handed off");
+                for (table, slots) in plain_slots(&traces) {
+                    assert!(
+                        slots.iter().all(|&placeholder| placeholder),
+                        "{what}: the finish kept a {table} table"
+                    );
+                }
+                insert_finished(&mut traces, handed).expect("each table lands on its slot");
+            }
+            traces
+                .insert_streamed(chunks)
+                .expect("every chunk has a placeholder");
+            widen_all(&mut traces);
+            same_traces(&reference, &traces);
+        }
+    }
+}
+
 /// Packing the tables `finish` builds keeps their words: a windowed build
 /// whose finish packs each table as it is generated (`pack_finished_tables`,
 /// with the streamed ops dropped, as the block runs it) widens back to the
@@ -687,18 +780,26 @@ fn packing_the_finished_tables_keeps_the_words() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        // A bound of one chunk at 8 bytes a cell at once (and none, 0) builds
-        // the same tables.
-        for (window, bound) in [(7, 0), (33, 0), (33, 1)] {
+        // KECCAK_RND and LT built packed or wide then packed, and LT's ops
+        // chunked as segments or concatenated into one list (the segments' A
+        // arm), all give the same tables.
+        for (window, wide, concat) in [
+            (7, false, false),
+            (33, false, false),
+            (33, true, false),
+            (33, false, true),
+        ] {
             let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
-                b.drop_streamed_ops()
+                let b = b
+                    .drop_streamed_ops()
                     .expect("before any window")
-                    .pack_finished_tables()
-                    .bound_finished_generation(bound)
+                    .pack_finished_tables();
+                let b = if wide { b.build_wide_then_pack() } else { b };
+                if concat { b.concat_lt() } else { b }
             });
             assert!(
                 widen_all(&mut packed) > 0,
-                "{name}/{window}/{bound}: no table was packed"
+                "{name}/{window}/{wide}: no table was packed"
             );
             same_traces(&reference, &packed);
         }
@@ -1038,11 +1139,10 @@ fn the_lean_walk_builds_the_whole_run_tables() {
 }
 
 /// ★ Phase A's stream builds the same traces and precommits the same instances
-/// however its chunks reach the device: the committers generating them (as
-/// today), or generator threads ahead of them with every queue held to one
-/// chunk at a time (the bounded queues' back-pressure on every hand-off).
+/// however its chunks reach the device: the committers generating them, or
+/// generator threads ahead of them, more of them than committers or as few.
 #[test]
-fn the_stream_builds_the_same_traces_with_generators_and_bounded_queues() {
+fn the_stream_builds_the_same_traces_with_generators() {
     let opts = crate::lfm::proof::block_base_options();
     let chunked_keccak = MaxRowsConfig {
         keccak_rnd: 48,
@@ -1054,14 +1154,13 @@ fn the_stream_builds_the_same_traces_with_generators_and_bounded_queues() {
     ] {
         let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
         let (mut today, mut names) =
-            crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0, None)
+            crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0)
                 .expect("committers generate");
         assert!(!names.is_empty(), "{name}: nothing was streamed");
-        for (committers, generators, budget) in [(2, 3, Some(1)), (1, 1, None)] {
-            let (mut pooled, mut pooled_names) = crate::block::stream_for_test(
-                &program, &opts, &max_rows, committers, generators, budget,
-            )
-            .expect("generators ahead of the committers");
+        for (committers, generators) in [(2, 3), (1, 1), (3, 6)] {
+            let (mut pooled, mut pooled_names) =
+                crate::block::stream_for_test(&program, &opts, &max_rows, committers, generators)
+                    .expect("generators ahead of the committers");
             names.sort();
             pooled_names.sort();
             assert_eq!(names, pooled_names, "{name}: the instances precommitted");
