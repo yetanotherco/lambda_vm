@@ -60,6 +60,9 @@ pub(crate) struct ProducerConfig {
     /// Run the finish (`false`: stop after the windows, the last window
     /// unwalked — for blocks whose finish does not fit the box).
     pub finish: bool,
+    /// Hash every log the executor emits (on the executor thread, so not
+    /// for a timed run): two executors agree on a run iff their digests do.
+    pub log_digest: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -249,6 +252,7 @@ pub(crate) fn run_producer(
             let (mut resume, mut copy) = (0.0, 0.0);
             let mut executed_at = Vec::new();
             let mut cycles = 0usize;
+            let mut digest = cfg.log_digest.then(blake3::Hasher::new);
             let t_setup = Instant::now();
             let mut executor = Executor::new(program, input.to_vec())
                 .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -266,6 +270,19 @@ pub(crate) fn run_producer(
                 let logs = logs.to_vec();
                 copy += t_copy.elapsed().as_secs_f64();
                 cycles += logs.len();
+                if let Some(digest) = digest.as_mut() {
+                    for log in &logs {
+                        for v in [
+                            log.current_pc,
+                            log.next_pc,
+                            log.src1_val,
+                            log.src2_val,
+                            log.dst_val,
+                        ] {
+                            digest.update(&v.to_le_bytes());
+                        }
+                    }
+                }
                 let t_send = Instant::now();
                 let sent = log_tx.send(logs);
                 times.send_blocked += t_send.elapsed().as_secs_f64();
@@ -280,6 +297,12 @@ pub(crate) fn run_producer(
                 "executor done · {cycles} cycles · resume {resume:.3} · copy {copy:.3} · cpu {} s",
                 opt(times.cpu)
             ));
+            if let Some(digest) = digest {
+                println!(
+                    "PRODUCER LOGS digest {} · {cycles} cycles",
+                    &digest.finalize().to_hex()[..32]
+                );
+            }
             Ok::<_, Error>(ExecPart {
                 setup,
                 resume,
@@ -675,7 +698,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 ///
 /// Window 2^20 is the WHIR prover's (`BLOCK_WINDOW_LOG2`), 2^21 the STARK
 /// prover's (`max_rows.cpu`). `LAMBDA_VM_PRODUCER_SINK=skip` drops each chunk
-/// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows.
+/// job ungenerated; `LAMBDA_VM_PRODUCER_FINISH=0` stops after the windows;
+/// `LAMBDA_VM_PRODUCER_LOG_DIGEST=1` prints a digest of every log (untimed).
 #[test]
 #[ignore = "box only: executes and walks a real block"]
 fn the_block_producer_alone() {
@@ -696,6 +720,7 @@ fn the_block_producer_alone() {
         sink,
         live: true,
         finish: env_usize("LAMBDA_VM_PRODUCER_FINISH", 1) != 0,
+        log_digest: env_usize("LAMBDA_VM_PRODUCER_LOG_DIGEST", 0) != 0,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -782,6 +807,7 @@ fn the_producer_harness_drives_the_builder() {
                     sink,
                     live: false,
                     finish: true,
+                    log_digest: false,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
                 let what = format!("{name}, window {window}, {sink:?}");
