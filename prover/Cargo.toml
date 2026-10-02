@@ -16,6 +16,9 @@ fvm-n1 = []
 blake3-pin = []
 # The block path at keccak-256 (main's hash); static roots are recomputed.
 keccak-pin = []
+# blake3-pin at standard 7-round BLAKE3: every BLAKE3 user in the build moves
+# with it (Merkle, FRI, transcript, grinding, the LFM chips).
+blake3-std-pin = ["blake3-pin", "crypto/blake3-7round"]
 parallel = [
     "stark/parallel",
     "math/parallel",

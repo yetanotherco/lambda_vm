@@ -221,6 +221,31 @@ mod tests {
         );
     }
 
+    /// Under `blake3-std-pin` the block path's Merkle parents and its
+    /// transcript digest are the `blake3` crate, and A6R would not be.
+    #[cfg(feature = "blake3-std-pin")]
+    #[test]
+    fn the_std_pin_commits_and_sponges_standard_blake3() {
+        use crypto::fiat_shamir::transcript_hash::TranscriptHash;
+        use crypto::hash::blake3::chain::blake3_chain_rounds;
+        use crypto::hash::blake3::{BLAKE3_ROUNDS, BLAKE3_STANDARD_ROUNDS};
+        use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+        use digest::Digest;
+
+        assert_eq!(BLAKE3_ROUNDS, BLAKE3_STANDARD_ROUNDS);
+        let l: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let r: [u8; 32] = core::array::from_fn(|i| 0x5a ^ (3 * i) as u8);
+        let lr = [l, r].concat();
+        type Batched = <BlockStarkHash as StarkHash>::Batched<crate::tables::types::GoldilocksField>;
+        assert_eq!(Batched::hash_new_parent(&l, &r), *blake3::hash(&lr).as_bytes());
+        assert_ne!(Batched::hash_new_parent(&l, &r), blake3_chain_rounds(&lr, 6));
+
+        let msg: Vec<u8> = (0..300u32).map(|i| (i * 7 + 1) as u8).collect();
+        let mut d = <<BlockStarkHash as StarkHash>::Transcript as TranscriptHash>::Digest::new();
+        d.update(&msg);
+        assert_eq!(d.finalize().as_slice(), blake3::hash(&msg).as_bytes());
+    }
+
     /// ✓ A fresh transcript is deterministic in its seed — the property every
     /// prove/verify pair depends on, and the one a mis-wired constructor breaks.
     #[test]
