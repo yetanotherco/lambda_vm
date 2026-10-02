@@ -61,9 +61,9 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     // calloc with madvise(MADV_DONTNEED) unless opt.thp is always, so every
     // page of a reused buffer faults again.
     static MEMSET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let zeros: Vec<u64> = if *MEMSET.get_or_init(|| {
-        std::env::var("LAMBDA_VM_PROBE_ZERO_MEMSET").is_ok_and(|v| v == "1")
-    }) {
+    let zeros: Vec<u64> = if *MEMSET
+        .get_or_init(|| std::env::var("LAMBDA_VM_PROBE_ZERO_MEMSET").is_ok_and(|v| v == "1"))
+    {
         let mut zeros = Vec::with_capacity(len);
         zeros.resize(len, 0u64);
         zeros
