@@ -47,11 +47,11 @@ fn test_from_log_add_reg_reg() {
     );
     assert_eq!(op.rv1, 10);
     assert_eq!(op.rv2, 20);
-    assert_eq!(op.arg2, 20, "reg-reg: arg2 = rv2 (imm = 0)");
+    assert_eq!(op.arg2(), 20, "reg-reg: arg2 = rv2 (imm = 0)");
     assert_eq!(op.res, 30, "res = rv1 + arg2");
     assert_eq!(op.rvd, 30, "rvd = res (not memory)");
     assert_eq!(op.next_pc, PC + 4);
-    assert!(!op.branch_cond);
+    assert!(!op.branch_cond());
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn test_from_log_addi() {
         15,
         PC + 4,
     );
-    assert_eq!(op.arg2, 5, "reg-imm: arg2 = imm (rv2 = 0)");
+    assert_eq!(op.arg2(), 5, "reg-imm: arg2 = imm (rv2 = 0)");
     assert_eq!(op.res, 15);
     assert_eq!(op.rvd, 15);
 }
@@ -105,8 +105,8 @@ fn test_from_log_beq_taken() {
         0,
         PC + 8,
     );
-    assert!(op.branch_cond, "BEQ with equal operands is taken");
-    assert_eq!(op.arg2, 5, "conditional branch: arg2 = rv2");
+    assert!(op.branch_cond(), "BEQ with equal operands is taken");
+    assert_eq!(op.arg2(), 5, "conditional branch: arg2 = rv2");
     assert_eq!(op.res, 1, "EQ result on the ALU bus is 1 when taken");
     assert_eq!(op.next_pc, PC + 8, "taken branch uses the executor next_pc");
 }
@@ -125,7 +125,7 @@ fn test_from_log_beq_not_taken() {
         0,
         PC + 4,
     );
-    assert!(!op.branch_cond);
+    assert!(!op.branch_cond());
     assert_eq!(op.res, 0);
     assert_eq!(
         op.next_pc,
@@ -149,7 +149,7 @@ fn test_from_log_bne_taken() {
         PC + 8,
     );
     assert!(
-        op.branch_cond,
+        op.branch_cond(),
         "BNE with differing operands is taken (invert)"
     );
     assert_eq!(op.res, 1);
