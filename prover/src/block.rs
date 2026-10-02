@@ -439,6 +439,93 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
+/// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
+/// knob; unset is [`STREAM_COMMITTERS`].
+fn stream_committers() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_COMMITTERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=8).contains(n))
+        .unwrap_or(STREAM_COMMITTERS)
+}
+
+/// `LAMBDA_VM_BLOCK_QUEUE_MIB=n` (n >= 1): the streamed chunks waiting for a
+/// committer hold at most `n` MiB of ops ([`QueueRoom`]); the producer waits
+/// for room, and so do the walk and the executor behind it. Unset or `0`:
+/// unbounded. A measurement knob until its gate.
+fn commit_queue_budget() -> Option<usize> {
+    std::env::var("LAMBDA_VM_BLOCK_QUEUE_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n << 20)
+}
+
+/// The streamed chunks on their way to a committer, by the bytes their ops
+/// hold: counted always (the most at once is reported), and bounded by a
+/// budget when there is one. A chunk is admitted when the queue is empty or it
+/// fits, so a chunk bigger than the budget still goes, alone. It leaves the
+/// queue once its committer has generated it (its ops are freed then).
+struct QueueRoom {
+    budget: Option<usize>,
+    /// (bytes, chunks) admitted and not yet generated.
+    held: std::sync::Mutex<(usize, usize)>,
+    room: std::sync::Condvar,
+    /// The most bytes, and the most chunks, held at once.
+    most: std::sync::Mutex<(usize, usize)>,
+    /// Seconds the producer waited for room.
+    waited: std::sync::Mutex<f64>,
+    /// A committer stopped: nothing waits for room any more.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl QueueRoom {
+    fn new(budget: Option<usize>) -> Self {
+        Self {
+            budget,
+            held: std::sync::Mutex::new((0, 0)),
+            room: std::sync::Condvar::new(),
+            most: std::sync::Mutex::new((0, 0)),
+            waited: std::sync::Mutex::new(0.0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Wait until a chunk of `bytes` fits, then count it in.
+    fn admit(&self, bytes: usize) {
+        let t = Instant::now();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while self
+            .budget
+            .is_some_and(|budget| held.0 > 0 && held.0 + bytes > budget)
+            && !self.closed.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            held = self.room.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.0 += bytes;
+        held.1 += 1;
+        let mut most = self.most.lock().unwrap_or_else(|e| e.into_inner());
+        *most = (most.0.max(held.0), most.1.max(held.1));
+        *self.waited.lock().unwrap_or_else(|e| e.into_inner()) += t.elapsed().as_secs_f64();
+    }
+
+    /// A chunk of `bytes` left the queue.
+    fn release(&self, bytes: usize) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.0 = held.0.saturating_sub(bytes);
+        held.1 = held.1.saturating_sub(1);
+        self.room.notify_all();
+    }
+
+    /// A committer stopped on an error: the producer must not wait on it.
+    fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        self.room.notify_all();
+    }
+}
+
 /// `LAMBDA_VM_BLOCK_MEMLOG=1`: [`MemLedger`]'s `BLOCK MEM` lines, every half
 /// second from the block's start to its proof and at the phase marks. A
 /// measurement knob, off by default.
@@ -702,6 +789,8 @@ fn build_streamed(
     let t = Instant::now();
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
+    let committer_count = stream_committers();
+    let queue = QueueRoom::new(commit_queue_budget());
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
@@ -742,70 +831,78 @@ fn build_streamed(
         // Committers: each streamed chunk generated and Round-1 committed, as
         // the chunks complete.
         let mut committers = Vec::new();
-        for _ in 0..STREAM_COMMITTERS {
+        for _ in 0..committer_count {
             committers.push(s.spawn(|| -> Result<(), Error> {
-                loop {
-                    let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                    let Ok(job) = job else {
-                        return Ok(());
-                    };
-                    let job_bytes = ledger.map_or(0, |ledger| {
-                        let bytes = streamed_bytes(&job);
-                        ledger.take(bytes);
-                        bytes
-                    });
-                    let t = Instant::now();
-                    let mut chunk = match job {
-                        Streamed::Job(job) => job.generate(),
-                        Streamed::Chunk(chunk) => chunk,
-                    };
-                    let wide = wide_bytes(&chunk.trace);
-                    if let Some(ledger) = ledger {
-                        ledger.generated(job_bytes, wide);
-                    }
-                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                        t.elapsed().as_secs_f64();
-                    let air = stream_air(chunk.table, chunk.index, opts);
-                    let name = air.name().to_string();
-                    #[allow(unused_mut)]
-                    let mut pre = crate::hash_pin::BlockProver::precommit_main(
-                        air.as_ref(),
-                        &chunk.trace,
-                        #[cfg(feature = "disk-spill")]
-                        stark::storage_mode::StorageMode::Ram,
-                        residency,
-                    )
-                    .map_err(|e| Error::Prover(format!("{e:?}")))?;
-                    *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                        t.elapsed().as_secs_f64();
-                    if narrow {
-                        let tp = Instant::now();
-                        // The device packed it from the commit's snapshot, or
-                        // the host packs it here.
-                        let by_device = pre
-                            .take_narrow()
-                            .is_some_and(|t| chunk.trace.install_main_narrow(t));
-                        if by_device || chunk.trace.pack_main_narrow() {
-                            let packed = chunk.trace.narrow_main().map_or(0, |t| t.data().len());
-                            let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
-                            n.0 += wide;
-                            n.1 += packed;
-                            if by_device {
-                                n.3 += 1;
-                            } else {
-                                n.2 += tp.elapsed().as_secs_f64();
+                let commit_all = || -> Result<(), Error> {
+                    loop {
+                        let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(job) = job else {
+                            return Ok(());
+                        };
+                        let job_bytes = streamed_bytes(&job);
+                        if let Some(ledger) = ledger {
+                            ledger.take(job_bytes);
+                        }
+                        let t = Instant::now();
+                        let mut chunk = match job {
+                            Streamed::Job(job) => job.generate(),
+                            Streamed::Chunk(chunk) => chunk,
+                        };
+                        queue.release(job_bytes);
+                        let wide = wide_bytes(&chunk.trace);
+                        if let Some(ledger) = ledger {
+                            ledger.generated(job_bytes, wide);
+                        }
+                        *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                            t.elapsed().as_secs_f64();
+                        let air = stream_air(chunk.table, chunk.index, opts);
+                        let name = air.name().to_string();
+                        #[allow(unused_mut)]
+                        let mut pre = crate::hash_pin::BlockProver::precommit_main(
+                            air.as_ref(),
+                            &chunk.trace,
+                            #[cfg(feature = "disk-spill")]
+                            stark::storage_mode::StorageMode::Ram,
+                            residency,
+                        )
+                        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+                        *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                            t.elapsed().as_secs_f64();
+                        if narrow {
+                            let tp = Instant::now();
+                            // The device packed it from the commit's snapshot, or
+                            // the host packs it here.
+                            let by_device = pre
+                                .take_narrow()
+                                .is_some_and(|t| chunk.trace.install_main_narrow(t));
+                            if by_device || chunk.trace.pack_main_narrow() {
+                                let packed =
+                                    chunk.trace.narrow_main().map_or(0, |t| t.data().len());
+                                let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
+                                n.0 += wide;
+                                n.1 += packed;
+                                if by_device {
+                                    n.3 += 1;
+                                } else {
+                                    n.2 += tp.elapsed().as_secs_f64();
+                                }
                             }
                         }
+                        if let Some(ledger) = ledger {
+                            let packed = chunk.trace.narrow_main().map(|t| t.data().len());
+                            ledger.keep(wide, packed);
+                        }
+                        committed
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((chunk, name, pre));
                     }
-                    if let Some(ledger) = ledger {
-                        let packed = chunk.trace.narrow_main().map(|t| t.data().len());
-                        ledger.keep(wide, packed);
-                    }
-                    committed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((chunk, name, pre));
+                };
+                let result = commit_all();
+                if result.is_err() {
+                    queue.close();
                 }
+                result
             }));
         }
 
@@ -832,8 +929,10 @@ fn build_streamed(
                         let t = Instant::now();
                         for chunk in builder.push(&prev)? {
                             let chunk = Streamed::Chunk(chunk);
+                            let bytes = streamed_bytes(&chunk);
+                            queue.admit(bytes);
                             if let Some(ledger) = ledger {
-                                ledger.queue(streamed_bytes(&chunk));
+                                ledger.queue(bytes);
                             }
                             let _ = job_tx.send(chunk);
                         }
@@ -865,8 +964,10 @@ fn build_streamed(
                         let t = Instant::now();
                         for job in accumulator.absorb(walked) {
                             let job = Streamed::Job(job);
+                            let bytes = streamed_bytes(&job);
+                            queue.admit(bytes);
                             if let Some(ledger) = ledger {
-                                ledger.queue(streamed_bytes(&job));
+                                ledger.queue(bytes);
                             }
                             let _ = job_tx.send(job);
                         }
@@ -931,7 +1032,7 @@ fn build_streamed(
         times.build = total - times.execute;
         eprintln!(
             "BLOCK PHASE stream {total:.2}s (execute {:.2} on its thread · collect+build {collect_secs:.2} · \
-             build+commit of {n} streamed instances {:.2} on {STREAM_COMMITTERS} threads, generate {:.2} of it)",
+             build+commit of {n} streamed instances {:.2} on {committer_count} threads, generate {:.2} of it)",
             times.execute,
             *commit_secs.lock().unwrap_or_else(|e| e.into_inner()),
             *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
@@ -951,6 +1052,16 @@ fn build_streamed(
                 },
             );
         }
+        let (most_bytes, most_chunks) = *queue.most.lock().unwrap_or_else(|e| e.into_inner());
+        eprintln!(
+            "BLOCK QUEUE: {committer_count} committers · budget {} · at most {:.2} GiB in {most_chunks} \
+             chunks waiting for a committer · the producer waited {:.2} s for room",
+            queue
+                .budget
+                .map_or("none".to_string(), |b| format!("{} MiB", b >> 20)),
+            most_bytes as f64 / (1u64 << 30) as f64,
+            *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         Ok((traces, decode_commitment, precommits))
     })
 }
@@ -1144,5 +1255,60 @@ mod memlog_tests {
         // In the lib's tests jemalloc is the allocator: the line reads it.
         assert!(super::heap_stats().is_some_and(|[live, ..]| live > 0));
         ledger.line("test");
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::QueueRoom;
+
+    /// Within a budget the producer waits for room: a chunk that would pass the
+    /// budget is admitted only once an earlier one left. A chunk bigger than
+    /// the budget still goes when the queue is empty.
+    #[test]
+    fn a_bounded_queue_admits_a_chunk_once_it_fits() {
+        let queue = QueueRoom::new(Some(100));
+        queue.admit(60);
+        queue.admit(40);
+        let admitted = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                queue.admit(30);
+                admitted.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!admitted.load(Ordering::SeqCst), "admitted past the budget");
+            queue.release(60);
+        });
+        assert!(admitted.load(Ordering::SeqCst));
+        assert_eq!(*queue.held.lock().unwrap(), (70, 2));
+        assert_eq!(*queue.most.lock().unwrap(), (100, 2));
+        queue.release(40);
+        queue.release(30);
+        queue.admit(500);
+        assert_eq!(*queue.held.lock().unwrap(), (500, 1));
+    }
+
+    /// Unbounded, nothing waits; a stopped committer frees a waiting producer.
+    #[test]
+    fn an_unbounded_or_closed_queue_never_waits() {
+        let unbounded = QueueRoom::new(None);
+        for _ in 0..10 {
+            unbounded.admit(1 << 30);
+        }
+        assert_eq!(unbounded.most.lock().unwrap().1, 10);
+
+        let queue = QueueRoom::new(Some(10));
+        queue.admit(10);
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| queue.admit(10));
+            std::thread::sleep(Duration::from_millis(50));
+            queue.close();
+            waiting.join().unwrap();
+        });
+        assert_eq!(*queue.held.lock().unwrap(), (20, 2));
     }
 }
