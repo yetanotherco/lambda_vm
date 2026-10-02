@@ -391,25 +391,40 @@ fn drop_streamed_ops() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").map_or(true, |v| v.trim() != "0")
 }
 
-/// `LAMBDA_VM_BLOCK_NARROW=1`: every plain table's main trace is packed at the
-/// bytes its columns need once its Round-1 commit exists, about 2 bytes a cell
-/// instead of 8. The device packs it from the commit's snapshot
+/// Narrow storage, `LAMBDA_VM_BLOCK_NARROW`: `0` keeps every main trace at 8
+/// bytes a cell (the A arm), `1` packs each plain table after its Round-1
+/// commit ([`narrow_streamed`] alone), and unset or anything else is `2`: both
+/// [`narrow_streamed`] and [`narrow_finished`] (D-MEMORY M3).
+fn narrow_level() -> u8 {
+    match std::env::var("LAMBDA_VM_BLOCK_NARROW")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => 2,
+    }
+}
+
+/// Every plain table's main trace is packed at the bytes its columns need once
+/// its Round-1 commit exists, about 2 bytes a cell instead of 8. The device
+/// packs it from the commit's snapshot
 /// (`stark::prover::set_default_pack_after_commit`): the streamed instances on
 /// their committers, the rest in phase B's Round 1. A table committed on the
 /// host is packed on the host (`TraceTable::pack_main_narrow`). Phase B uploads
 /// it packed and widens it on the device, or on the host where the device path
-/// does not run. The words are the same, so no proof byte moves. Off by default
-/// until its box gate (D-MEMORY M3).
+/// does not run. The words are the same, so no proof byte moves. On unless
+/// `LAMBDA_VM_BLOCK_NARROW=0`.
 fn narrow_streamed() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| matches!(v.trim(), "1" | "2"))
+    narrow_level() >= 1
 }
 
-/// `LAMBDA_VM_BLOCK_NARROW=2`: [`narrow_streamed`], and the tables phase A's
-/// finish builds are packed as each is generated
-/// ([`WindowedTraceBuilder::pack_finished_tables`]), so the finish never holds
-/// them at 8 bytes a cell; their Round-1 commits read the packed columns.
+/// [`narrow_streamed`], and the tables phase A's finish builds are packed as
+/// each is generated ([`WindowedTraceBuilder::pack_finished_tables`]), so the
+/// finish never holds them at 8 bytes a cell; their Round-1 commits read the
+/// packed columns. On unless `LAMBDA_VM_BLOCK_NARROW` is `0` or `1`.
 fn narrow_finished() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| v.trim() == "2")
+    narrow_level() == 2
 }
 
 /// Committer threads for the streamed instances.
