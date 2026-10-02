@@ -164,45 +164,25 @@ pub struct CpuOperation {
     pub next_pc: u64,
     /// Value to write back to rd.
     pub rvd: u64,
-    /// Value of register rs1.
+    /// Value of register rs1 (for an ECALL, a7: the syscall number).
     pub rv1: u64,
     /// Value of register rs2.
     pub rv2: u64,
-    /// Multiplexed second ALU argument.
-    pub arg2: u64,
     /// ALU result (or memory address for LOAD/STORE).
     pub res: u64,
-    /// Whether the branch/jump is taken.
-    pub branch_cond: bool,
-
-    /// Whether this ECALL is a Commit syscall.
-    pub ecall_commit: bool,
-    /// For Commit ECALLs: buffer address from x11.
-    pub commit_buf_addr: u64,
-    /// For Commit ECALLs: byte count from x12.
-    pub commit_count: u64,
-    /// Whether this ECALL is a KeccakPermute syscall.
-    pub ecall_keccak: bool,
-    /// For KeccakPermute ECALLs: state address from x10.
-    pub keccak_state_addr: u64,
-    /// Whether this ECALL is a Blake3Compress syscall.
-    pub ecall_blake3: bool,
-    /// For Blake3Compress ECALLs: state address from x10.
-    pub blake3_state_addr: u64,
-    /// Whether this ECALL is a Blake3Absorb (chained-absorb) syscall. Its four
-    /// operands (x10..x13) are recovered from the register state in the trace
-    /// builder, exactly like ECSM and HINT — one ecall expands to a whole group
-    /// of BLAKE3 rows, so there is nothing useful to carry on this row.
-    pub ecall_blake3_absorb: bool,
-
-    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
-    pub ecall_ecsm: bool,
-
-    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
-    /// addresses (x10/x11/x12) are recovered from the register state in the trace
-    /// builder, exactly like ECSM.
-    pub ecall_hint: bool,
+    /// An ECALL's operands from its log: `[x11, x12]` for COMMIT (buffer
+    /// address, byte count), `[x10, 0]` for KECCAK and BLAKE3 (state address),
+    /// zero otherwise. ECSM, HINT and BLAKE3 absorb read theirs from the
+    /// register state in the trace builder.
+    ///
+    /// The rest of what a row needs (`arg2`, the branch decision, the ECALL's
+    /// syscall) is a function of these fields: methods, so the op stays 96
+    /// bytes (the walk materializes one per cycle).
+    pub ecall_args: [u64; 2],
 }
+
+// The walk materializes one per cycle: keep it at 96 bytes.
+const _: () = assert!(std::mem::size_of::<CpuOperation>() == 96);
 
 impl CpuOperation {
     /// Creates a new CPU operation with defaults.
@@ -229,33 +209,137 @@ impl CpuOperation {
         self.decode.fields.mem_flags & 1 == 1
     }
 
+    /// Multiplexed second ALU argument (CPU-A1, `cpu.toml`): `imm` under
+    /// MEMORY, `rv2` under BRANCH (JAL/JALR read no rs2), `rv2 + imm` otherwise
+    /// (≤ 1 nonzero by decode A2); 0 on a word delegate row.
+    #[inline]
+    pub fn arg2(&self) -> u64 {
+        let f = &self.decode.fields;
+        if f.word_instr {
+            0
+        } else if f.memory {
+            self.decode.imm
+        } else if f.branch {
+            self.rv2
+        } else {
+            self.rv2.wrapping_add(self.decode.imm)
+        }
+    }
+
+    /// Whether the branch/jump is taken: JAL/JALR always, a conditional branch
+    /// by the EQ/LT comparison (with invert) in `alu_flags`; never off BRANCH
+    /// or on a word delegate row.
+    #[inline]
+    pub fn branch_cond(&self) -> bool {
+        let f = &self.decode.fields;
+        !f.word_instr && f.branch && (self.jalr() || Self::branch_taken(f, self.rv1, self.rv2))
+    }
+
+    /// Whether this is an ECALL of syscall `number` (`rv1` is a7 on an ECALL).
+    #[inline]
+    fn ecall_of(&self, number: u64) -> bool {
+        self.decode.fields.ecall && self.rv1 == number
+    }
+
+    /// Whether this ECALL is a Commit syscall.
+    #[inline]
+    pub fn ecall_commit(&self) -> bool {
+        self.ecall_of(SyscallNumbers::Commit as u64)
+    }
+
+    /// For Commit ECALLs: buffer address from x11.
+    #[inline]
+    pub fn commit_buf_addr(&self) -> u64 {
+        if self.ecall_commit() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// For Commit ECALLs: byte count from x12.
+    #[inline]
+    pub fn commit_count(&self) -> u64 {
+        if self.ecall_commit() {
+            self.ecall_args[1]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a KeccakPermute syscall.
+    #[inline]
+    pub fn ecall_keccak(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER)
+    }
+
+    /// For KeccakPermute ECALLs: state address from x10.
+    #[inline]
+    pub fn keccak_state_addr(&self) -> u64 {
+        if self.ecall_keccak() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a Blake3Compress syscall.
+    #[inline]
+    pub fn ecall_blake3(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER)
+    }
+
+    /// For Blake3Compress ECALLs: state address from x10.
+    #[inline]
+    pub fn blake3_state_addr(&self) -> u64 {
+        if self.ecall_blake3() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a Blake3Absorb (chained-absorb) syscall. Its four
+    /// operands (x10..x13) are recovered from the register state in the trace
+    /// builder, exactly like ECSM and HINT.
+    #[inline]
+    pub fn ecall_blake3_absorb(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::BLAKE3_ABSORB_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall.
+    #[inline]
+    pub fn ecall_ecsm(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the
+    /// trace builder, exactly like ECSM.
+    #[inline]
+    pub fn ecall_hint(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::HINT_SYSCALL_NUMBER)
+    }
+
     /// Creates a CpuOperation from an executor Log and a DecodeEntry.
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let f = decode.fields;
         // Real byte length: the column stores half.
         let instruction_length = 2 * f.half_instruction_length as u64;
 
-        // ECALL syscall classification (rv1 = a7 = syscall number).
-        let ecall_commit = f.ecall && log.src1_val == SyscallNumbers::Commit as u64;
-        let (commit_buf_addr, commit_count) = if ecall_commit {
-            (log.src2_val, log.dst_val)
+        // An ECALL's operands from the log (rv1 = a7 = syscall number): COMMIT's
+        // buffer and count, KECCAK's and BLAKE3's state address.
+        let ecall_args = if !f.ecall {
+            [0, 0]
+        } else if log.src1_val == SyscallNumbers::Commit as u64 {
+            [log.src2_val, log.dst_val]
+        } else if log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER
+            || log.src1_val == executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER
+        {
+            [log.src2_val, 0]
         } else {
-            (0, 0)
+            [0, 0]
         };
-        let ecall_keccak =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
-        let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
-        let ecall_blake3 =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER;
-        let blake3_state_addr = if ecall_blake3 { log.src2_val } else { 0 };
-        let ecall_blake3_absorb = f.ecall
-            && log.src1_val == executor::vm::instruction::execution::BLAKE3_ABSORB_SYSCALL_NUMBER;
-        // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
-        // in the trace builder.
-        let ecall_ecsm =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
-        let ecall_hint =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -268,14 +352,7 @@ impl CpuOperation {
                 rv1: log.src1_val,
                 rv2: if f.read_register2 { log.src2_val } else { 0 },
                 rvd: log.dst_val,
-                ecall_commit,
-                commit_buf_addr,
-                commit_count,
-                ecall_keccak,
-                keccak_state_addr,
-                ecall_blake3,
-                blake3_state_addr,
-                ecall_blake3_absorb,
+                ecall_args,
                 decode,
                 timestamp,
                 ..Default::default()
@@ -368,19 +445,8 @@ impl CpuOperation {
             rvd,
             rv1,
             rv2,
-            arg2,
             res,
-            branch_cond,
-            ecall_commit,
-            commit_buf_addr,
-            commit_count,
-            ecall_keccak,
-            keccak_state_addr,
-            ecall_blake3,
-            blake3_state_addr,
-            ecall_blake3_absorb,
-            ecall_ecsm,
-            ecall_hint,
+            ecall_args,
         }
     }
 
@@ -532,7 +598,7 @@ pub fn generate_cpu_trace(
         let (imm, rvd, rv1, rv2, arg2, res) = if word {
             (0, 0, 0, 0, 0, 0)
         } else {
-            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
+            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2(), op.res)
         };
 
         table.set_dword_wl(row_idx, cols::IMM_0, imm);
@@ -565,7 +631,7 @@ pub fn generate_cpu_trace(
         // res as DWordHL (4 × 16-bit halves).
         table.set_dword_hl(row_idx, cols::RES_0, res);
 
-        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond);
+        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond());
 
         // Inline-PC coordination columns.
         let pc_double_read = !word && f.read_register1 && f.rs1 == 255;

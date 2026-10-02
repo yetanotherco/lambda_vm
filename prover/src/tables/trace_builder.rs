@@ -1010,7 +1010,7 @@ fn collect_ops_from_cpu_into(
         collect_register_ops_from_cpu(op, register_state, memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
-        if op.ecall_commit {
+        if op.ecall_commit() {
             commit_ops.extend(expand_commit_operations_for_ecall(
                 op,
                 memory_state,
@@ -1018,7 +1018,7 @@ fn collect_ops_from_cpu_into(
             ));
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw.extend_ops(reg_commit_ops);
-            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            let count = u32::try_from(op.commit_count()).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .expect("commit index exceeds u32 range");
@@ -1031,8 +1031,8 @@ fn collect_ops_from_cpu_into(
         }
 
         // Collect KeccakPermute ECALL operations
-        if op.ecall_keccak {
-            let state_addr = op.keccak_state_addr;
+        if op.ecall_keccak() {
+            let state_addr = op.keccak_state_addr();
             let mut input = [0u64; 25];
             for (i, lane) in input.iter_mut().enumerate() {
                 let addr = state_addr
@@ -1063,8 +1063,8 @@ fn collect_ops_from_cpu_into(
         }
 
         // Collect Blake3Compress ECALL operations
-        if op.ecall_blake3 {
-            let state_addr = op.blake3_state_addr;
+        if op.ecall_blake3() {
+            let state_addr = op.blake3_state_addr();
             // 14 input dwords: h | m | t | (block_len, flags), LE words.
             let mut words = [0u32; 28];
             for k in 0..14usize {
@@ -1121,7 +1121,7 @@ fn collect_ops_from_cpu_into(
         // Collect Blake3Absorb ECALL operations. One ecall becomes a whole GROUP
         // of `num_blocks + 1` BLAKE3 rows, so unlike every other accelerator the
         // chip op collected here is a group rather than a row.
-        if op.ecall_blake3_absorb {
+        if op.ecall_blake3_absorb() {
             let (absorb_memw, absorb_op) =
                 collect_blake3_absorb_ops(op, memory_state, register_state);
             // Same strip gate as the single-compression MEMW above: the switch
@@ -1135,7 +1135,7 @@ fn collect_ops_from_cpu_into(
         }
 
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
-        if op.ecall_ecsm {
+        if op.ecall_ecsm() {
             let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
             memw.extend_ops(ecsm_memw);
@@ -1144,7 +1144,7 @@ fn collect_ops_from_cpu_into(
         }
 
         // Collect Hint ecall operations (the 32-byte output write).
-        if op.ecall_hint {
+        if op.ecall_hint() {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
             memw.extend_ops(hint_memw);
             hint_ops.push(hint_op);
@@ -1161,7 +1161,7 @@ fn collect_ops_from_cpu_into(
             if f.is_lt() {
                 lt_ops.push(LtOperation::new_with_invert(
                     op.rv1,
-                    op.arg2,
+                    op.arg2(),
                     f.alu_signed(),
                     f.alu_signed2_or_invert(),
                 ));
@@ -1172,7 +1172,7 @@ fn collect_ops_from_cpu_into(
             if f.is_shift() {
                 shift_ops.push(ShiftOperation::new(
                     op.rv1,
-                    op.arg2,
+                    op.arg2(),
                     f.alu_signed2_or_invert(),
                     f.alu_signed(),
                     f.word_instr,
@@ -1762,8 +1762,8 @@ fn collect_commit_memw_ops(
     memory_state: &mut MemoryState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
-    let buf_addr = op.commit_buf_addr;
-    let count = op.commit_count;
+    let buf_addr = op.commit_buf_addr();
+    let count = op.commit_count();
 
     let mut memw_ops = Vec::with_capacity(5 + count as usize);
 
@@ -1922,7 +1922,7 @@ fn collect_keccak_memw_ops(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
-    let state_addr = op.keccak_state_addr;
+    let state_addr = op.keccak_state_addr();
     let mut memw_ops = Vec::with_capacity(26); // 1 register read + 25 lane ops
 
     // Per spec (keccak:c:read_addr): read register x10 to get state_addr
@@ -2152,7 +2152,7 @@ fn collect_blake3_memw_ops(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
-    let state_addr = op.blake3_state_addr;
+    let state_addr = op.blake3_state_addr();
     let mut memw_ops = Vec::with_capacity(23); // 1 register read + 22 dword ops
 
     // Read register x10 to bind state_addr (same as keccak:c:read_addr).
@@ -2987,8 +2987,8 @@ fn expand_commit_operations_for_ecall(
     let mut ops = Vec::new();
 
     let timestamp = ecall.timestamp;
-    let buf_addr = ecall.commit_buf_addr;
-    let count = ecall.commit_count;
+    let buf_addr = ecall.commit_buf_addr();
+    let count = ecall.commit_count();
 
     for i in 0..=count {
         let remaining = count - i;
@@ -4236,7 +4236,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     // Collect BRANCH operations from CPU ops where branch_cond = true
     let branch_ops: Vec<BranchOperation> = cpu_ops
         .iter()
-        .filter(|op| op.branch_cond)
+        .filter(|op| op.branch_cond())
         .map(route_branch)
         .collect();
 
@@ -4305,7 +4305,7 @@ fn route_ops_one_pass(
     let mut store_ops = Vec::new();
     for op in cpu_ops {
         let f = &op.decode.fields;
-        if op.branch_cond {
+        if op.branch_cond() {
             branch_ops.push(route_branch(op));
         }
         if !f.word_instr {
@@ -4349,22 +4349,22 @@ fn route_branch(op: &CpuOperation) -> BranchOperation {
 fn route_mul(op: &CpuOperation) -> (MulOperation, bool) {
     let f = op.decode.fields;
     (
-        MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+        MulOperation::new(op.rv1, f.alu_signed(), op.arg2(), f.alu_signed2_or_invert()),
         f.alu_muldiv(),
     )
 }
 fn route_dvrm(op: &CpuOperation) -> (DvrmOperation, bool) {
     let f = op.decode.fields;
     (
-        DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+        DvrmOperation::new(op.rv1, op.arg2(), f.alu_signed()),
         f.alu_muldiv(),
     )
 }
 fn route_eq(op: &CpuOperation) -> eq::EqOperation {
-    eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert())
+    eq::EqOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_signed2_or_invert())
 }
 fn route_bytewise(op: &CpuOperation) -> bytewise::BytewiseOperation {
-    bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op())
+    bytewise::BytewiseOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_op())
 }
 fn route_store(op: &CpuOperation) -> store::StoreOperation {
     // The MEMORY bus and the STORE chip's MEMW write share the base
@@ -5463,10 +5463,10 @@ pub fn count_table_lengths(
         }
 
         // ECALL Commit
-        if cpu_op.ecall_commit {
+        if cpu_op.ecall_commit() {
             // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
             // without building the op vector.
-            commit_count += (cpu_op.commit_count as usize)
+            commit_count += (cpu_op.commit_count() as usize)
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
@@ -5479,14 +5479,14 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
-            let count = u32::try_from(cpu_op.commit_count)
+            let count = u32::try_from(cpu_op.commit_count())
                 .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        if cpu_op.ecall_hint {
+        if cpu_op.ecall_hint() {
             // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
             // 8-byte output writes go through the memory argument, plus the three LT
             // range-checks (selector < 3, in_addr and out_addr low limbs). Replaying it
@@ -5519,7 +5519,7 @@ pub fn count_table_lengths(
         if !f.word_instr && f.is_divrem() {
             dvrm_count += 1;
         }
-        if cpu_op.branch_cond {
+        if cpu_op.branch_cond() {
             branch_count += 1;
         }
     }
