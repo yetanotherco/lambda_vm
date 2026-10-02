@@ -317,6 +317,40 @@ fn a_split_builder_builds_the_whole_run_tables() {
     }
 }
 
+/// The walker collects and walks a window a batch of cycles at a time; any
+/// batch (one cycle, a few, more than the window, or the whole window first)
+/// builds the whole-run tables, ops kept or dropped.
+#[test]
+fn a_batched_walk_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "lw_sw_offset_odd",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [33, 1000] {
+            for batch in [1, 7, 64, 0] {
+                for drop in [false, true] {
+                    let (traces, _) =
+                        windowed_with(&program, &logs, &max_rows, window, true, |builder| {
+                            let builder = builder.walk_batch(batch);
+                            if drop {
+                                builder
+                                    .drop_streamed_ops()
+                                    .expect("before the first window")
+                            } else {
+                                builder
+                            }
+                        });
+                    same_traces(&reference, &traces);
+                }
+            }
+        }
+    }
+}
+
 /// And at the production chunk sizes, where a small program streams nothing
 /// and the builder is the whole-run build over windows.
 #[test]
