@@ -79,6 +79,7 @@ fn small_block_at(
             stream_memw_lt: false,
             drop_streamed_ops: false,
             layout_workers: 0,
+            layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
         },
     )
@@ -417,6 +418,7 @@ fn dense_block_with(
             stream_memw_lt: false,
             drop_streamed_ops: false,
             layout_workers: 0,
+            layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
         },
         deviations,
@@ -1246,6 +1248,20 @@ fn the_whir_block_tree_on_a_real_block() {
         options.layout_workers = n;
     }
     // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
+    // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
+    // `none` lifts the bound (the reverted version, BIG 390).
+    match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("none") => options.layout_ahead = None,
+        Ok(k) => {
+            if let Ok(k) = k.parse() {
+                options.layout_ahead = Some(k);
+            }
+        }
+        Err(_) => {}
+    }
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
@@ -1262,10 +1278,11 @@ fn the_whir_block_tree_on_a_real_block() {
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
     println!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {}",
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {}",
         options.stream_keccak_rnd,
         options.stream_memw_lt,
         options.layout_workers,
+        options.layout_ahead,
         options.pack_rest_as_laid_out,
         options.drop_streamed_ops
     );
