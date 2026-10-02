@@ -291,6 +291,10 @@ fn prove_block_with_observed(
             ledger.line(&format!("finish {label}"))
         })));
     }
+    // The spill outlives the prove: phase B reads the spilled traces back.
+    let spill = stream_phase_a()
+        .then(|| Spill::open(spill_policy()))
+        .flatten();
     let (mut traces, decode_commitment, precommits) = if stream_phase_a() {
         build_streamed(
             &program,
@@ -301,6 +305,7 @@ fn prove_block_with_observed(
             &mut times,
             &StreamConfig::from_env(),
             ledger.as_deref(),
+            spill.as_ref(),
         )?
     } else {
         let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
@@ -309,6 +314,9 @@ fn prove_block_with_observed(
     if let Some(ledger) = &ledger {
         crate::tables::trace_builder::set_finish_marks(None);
         ledger.line("phase A end");
+    }
+    if let Some(spill) = &spill {
+        eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
 
     let proof = prove_block_traces(
@@ -324,6 +332,9 @@ fn prove_block_with_observed(
     )?;
     if let Some(ledger) = &ledger {
         ledger.line("prove end");
+    }
+    if let Some(spill) = &spill {
+        eprintln!("BLOCK SPILL end: {}", spill.report());
     }
     eprintln!(
         "BLOCK PHASE total {:.2}s (execute {:.2} · build {:.2} · setup {:.2} · prove {:.2})",
@@ -688,7 +699,7 @@ fn commit_pool_threads() -> usize {
 /// generator threads, when the finish's tables are committed, the card's byte
 /// budget for the commits, and the committers' own pool.
 #[derive(Clone, Copy, Debug)]
-struct StreamConfig {
+pub(crate) struct StreamConfig {
     committers: usize,
     generators: usize,
     finish: FinishCommit,
@@ -710,6 +721,219 @@ impl StreamConfig {
     }
 }
 
+/// What phase A does with each committed instance's packed main trace
+/// (D-ANYBLOCK S2, `LAMBDA_VM_BLOCK_SPILL`): keep it on the host, or write it to
+/// a spill file ([`stark::spill`]) for phase B to read back ahead of its walks.
+/// The words that come back are the words that went out (digest-checked), so
+/// no proof byte depends on the policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SpillPolicy {
+    /// Keep every trace (the default).
+    Off,
+    /// Spill every committed instance that is packed (a measurement arm).
+    Always,
+    /// Keep at most this many bytes of committed packed traces on the host;
+    /// spill the rest.
+    Budget(u64),
+    /// Spill once the host would pass the target ([`spill_target_bytes`]):
+    /// see [`spill_decision`].
+    Auto,
+}
+
+/// `LAMBDA_VM_BLOCK_SPILL`: `off` (and unset) | `always` | `auto` | `<GiB>` (a
+/// resident budget for committed packed traces). Anything else is `off`.
+fn spill_policy() -> SpillPolicy {
+    parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
+}
+
+fn parse_spill_policy(value: Option<&str>) -> SpillPolicy {
+    match value.map(str::trim) {
+        Some("always") => SpillPolicy::Always,
+        Some("auto") => SpillPolicy::Auto,
+        Some(gib) => gib
+            .parse::<f64>()
+            .ok()
+            .filter(|g| g.is_finite() && *g >= 0.0)
+            .map_or(SpillPolicy::Off, |g| {
+                SpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
+            }),
+        None => SpillPolicy::Off,
+    }
+}
+
+/// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
+/// cgroup's `memory.max` less 10 GiB, else `MemTotal` less 10 GiB.
+fn spill_target_bytes() -> u64 {
+    const MARGIN: u64 = 10 << 30;
+    if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+    {
+        return (gib * (1u64 << 30) as f64) as u64;
+    }
+    let cgroup_max = cgroup_file("memory.max").and_then(|v| v.trim().parse::<u64>().ok());
+    let mem_total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kib| kib << 10)
+    });
+    cgroup_max
+        .or(mem_total)
+        .map_or(u64::MAX, |b| b.saturating_sub(MARGIN))
+}
+
+/// A file of this process's cgroup (v2), read whole.
+fn cgroup_file(name: &str) -> Option<String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    std::fs::read_to_string(format!("/sys/fs/cgroup{}/{name}", path.trim())).ok()
+}
+
+/// What `auto` reads as the host's bytes: the larger of the process's peak
+/// resident set (`VmHWM`; the resident set itself is not monotone under the
+/// allocator's posture, which drops and re-faults recycled extents) and its
+/// cgroup's charge (`memory.current`, which also counts the page cache).
+fn host_bytes_now() -> u64 {
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .map(|kib| kib << 10)
+        });
+    let charged = cgroup_file("memory.current").and_then(|v| v.trim().parse::<u64>().ok());
+    hwm.unwrap_or(0).max(charged.unwrap_or(0))
+}
+
+/// `auto`'s reserve beside the host's bytes: what the rest of the block will
+/// still need once the instances committed so far (`cells` main cells) are
+/// on the host. With the finish's tables committed in phase A (and spilled
+/// by the same policy), that is the finish's transients, ≈ 0.18 GiB per G
+/// cells committed (0.135 per total G cells ÷ the streamed share 0.763,
+/// I-MEM §8), plus 6 GiB for phase B's bump and the read-back window.
+fn spill_reserve_bytes(cells: u64) -> u64 {
+    const PER_G: f64 = 0.18 * (1u64 << 30) as f64;
+    (cells as f64 / 1e9 * PER_G) as u64 + (6 << 30)
+}
+
+/// The policy's choice for one committed instance of `bytes` packed bytes:
+/// `resident` are the committed packed bytes kept so far, `cells` the main
+/// cells committed so far (this instance's included), `host` the host's bytes
+/// ([`host_bytes_now`]), read only by `auto`.
+fn spill_decision(
+    policy: SpillPolicy,
+    target: u64,
+    resident: u64,
+    cells: u64,
+    bytes: u64,
+    host: impl FnOnce() -> u64,
+) -> bool {
+    match policy {
+        SpillPolicy::Off => false,
+        SpillPolicy::Always => true,
+        SpillPolicy::Budget(budget) => resident + bytes > budget,
+        SpillPolicy::Auto => {
+            host()
+                .saturating_add(spill_reserve_bytes(cells))
+                .saturating_add(bytes)
+                > target
+        }
+    }
+}
+
+/// The upstream queues' byte budgets while spilling: the ops waiting for a
+/// generator, and the generated chunks waiting for a committer. A disk slower
+/// than the stream fills the spill's writer queue, the committers wait on it,
+/// and these make the walk wait in turn instead of piling work up.
+const SPILL_QUEUE_BYTES: usize = 4 << 30;
+const SPILL_READY_BYTES: usize = 2 << 30;
+
+/// Phase A's spill: the policy, its store, and what it decided.
+struct Spill {
+    policy: SpillPolicy,
+    target: u64,
+    store: stark::spill::SpillStore,
+    /// Committed packed bytes kept on the host, and committed main cells.
+    resident: std::sync::atomic::AtomicU64,
+    cells: std::sync::atomic::AtomicU64,
+    /// (instances, bytes) spilled, and instances kept.
+    spilled: std::sync::Mutex<(u64, u64, u64)>,
+}
+
+impl Spill {
+    /// The policy's store, opened; `None` when the policy is `off`, or when
+    /// the store will not open (the block then runs resident, as without a
+    /// policy, and says why).
+    fn open(policy: SpillPolicy) -> Option<Self> {
+        if policy == SpillPolicy::Off {
+            return None;
+        }
+        match stark::spill::SpillStore::open(stark::spill::SpillOptions::default()) {
+            Ok(store) => Some(Self {
+                policy,
+                target: spill_target_bytes(),
+                store,
+                resident: std::sync::atomic::AtomicU64::new(0),
+                cells: std::sync::atomic::AtomicU64::new(0),
+                spilled: std::sync::Mutex::new((0, 0, 0)),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "BLOCK SPILL: {policy:?} wanted, but the store did not open ({e}): resident"
+                );
+                None
+            }
+        }
+    }
+
+    /// A committed instance's packed trace: spilled when the policy says so
+    /// and the store takes it. Returns the bytes spilled (0: kept).
+    fn consider(&self, trace: &mut finish_sink::Trace) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(bytes) = trace.narrow_main().map(|t| t.data().len()) else {
+            return 0;
+        };
+        let cells = (trace.num_rows() * trace.num_main_columns) as u64;
+        let cells = self.cells.fetch_add(cells, Relaxed) + cells;
+        let resident = self.resident.load(Relaxed);
+        let wanted = spill_decision(
+            self.policy,
+            self.target,
+            resident,
+            cells,
+            bytes as u64,
+            host_bytes_now,
+        );
+        let mut s = self.spilled.lock().unwrap_or_else(|e| e.into_inner());
+        if wanted && trace.spill_main(&self.store) {
+            s.0 += 1;
+            s.1 += bytes as u64;
+            bytes
+        } else {
+            s.2 += 1;
+            self.resident.fetch_add(bytes as u64, Relaxed);
+            0
+        }
+    }
+
+    /// The `BLOCK SPILL` line: the policy, its decisions and the store.
+    fn report(&self) -> String {
+        let (n, bytes, kept) = *self.spilled.lock().unwrap_or_else(|e| e.into_inner());
+        let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+        format!(
+            "{:?} · target {:.1} GiB · spilled {n} instances {:.2} GiB · kept {kept} ({:.2} GiB packed) · {}",
+            self.policy,
+            g(self.target),
+            g(bytes),
+            g(self.resident.load(std::sync::atomic::Ordering::Relaxed)),
+            self.store.stats(),
+        )
+    }
+}
+
 /// The streamed chunks waiting for a committer (or, generated, for a
 /// committer to take them), by their bytes: the most held at once is reported.
 /// A chunk leaves once it is generated (its ops are freed then), or once a
@@ -719,23 +943,44 @@ struct QueueRoom {
     held: std::sync::Mutex<(usize, usize)>,
     /// The most bytes, and the most chunks, held at once.
     most: std::sync::Mutex<(usize, usize)>,
+    /// With a budget, [`Self::admit`] waits until the chunk fits beside what is
+    /// held (a chunk alone always fits): the spill's back-pressure upstream,
+    /// so a disk slower than the stream throttles the walk instead of piling
+    /// ops and generated chunks up ([`SPILL_QUEUE_BYTES`]).
+    budget: Option<usize>,
+    room: std::sync::Condvar,
+    /// Seconds spent waiting for room.
+    waited: std::sync::Mutex<f64>,
 }
 
 impl QueueRoom {
-    fn new() -> Self {
+    fn with_budget(budget: Option<usize>) -> Self {
         Self {
             held: std::sync::Mutex::new((0, 0)),
             most: std::sync::Mutex::new((0, 0)),
+            budget,
+            room: std::sync::Condvar::new(),
+            waited: std::sync::Mutex::new(0.0),
         }
     }
 
-    /// A chunk of `bytes` joined the queue.
+    /// A chunk of `bytes` joined the queue (once it fits, with a budget).
     fn admit(&self, bytes: usize) {
+        let t = Instant::now();
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while self
+            .budget
+            .is_some_and(|budget| held.0 > 0 && held.0 + bytes > budget)
+        {
+            held = self.room.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
         held.0 += bytes;
         held.1 += 1;
         let mut most = self.most.lock().unwrap_or_else(|e| e.into_inner());
         *most = (most.0.max(held.0), most.1.max(held.1));
+        if self.budget.is_some() {
+            *self.waited.lock().unwrap_or_else(|e| e.into_inner()) += t.elapsed().as_secs_f64();
+        }
     }
 
     /// A chunk of `bytes` left the queue.
@@ -743,6 +988,7 @@ impl QueueRoom {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         held.0 = held.0.saturating_sub(bytes);
         held.1 = held.1.saturating_sub(1);
+        self.room.notify_all();
     }
 }
 
@@ -775,6 +1021,8 @@ struct MemLedger {
     committed: std::sync::atomic::AtomicUsize,
     committed_packed: std::sync::atomic::AtomicUsize,
     committed_wide: std::sync::atomic::AtomicUsize,
+    /// Committed instances' packed traces sent to the spill file.
+    committed_spilled: std::sync::atomic::AtomicUsize,
     /// The executor's windows of logs on their way to the walker, and the
     /// walked windows on their way to the accumulator.
     logs_bytes: std::sync::atomic::AtomicUsize,
@@ -799,6 +1047,7 @@ impl MemLedger {
             committed: AtomicUsize::new(0),
             committed_packed: AtomicUsize::new(0),
             committed_wide: AtomicUsize::new(0),
+            committed_spilled: AtomicUsize::new(0),
             logs_bytes: AtomicUsize::new(0),
             walked_bytes: AtomicUsize::new(0),
             builder_bytes: AtomicUsize::new(0),
@@ -865,6 +1114,14 @@ impl MemLedger {
         };
     }
 
+    /// A committed instance's packed trace went to the spill file instead of
+    /// staying here: `bytes` move from the committed packed to the spilled.
+    fn spilled(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.committed_packed.fetch_sub(bytes, Relaxed);
+        self.committed_spilled.fetch_add(bytes, Relaxed);
+    }
+
     /// One line of `what`'s parts, largest first, those of at least 0.01 GiB.
     fn parts(&self, what: &str, mut parts: Vec<(String, usize)>) {
         const GIB: f64 = (1u64 << 30) as f64;
@@ -903,7 +1160,7 @@ impl MemLedger {
         });
         eprintln!(
             "BLOCK MEM {label} t={:.1} · rss {rss} · minflt {faults} M · {heap} · queue {} chunks {:.2} · committing {:.2} · \
-             ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · logs {:.2} · walked {:.2} · \
+             ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · spilled {:.2} · logs {:.2} · walked {:.2} · \
              builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
             self.queued.load(Relaxed),
@@ -914,6 +1171,7 @@ impl MemLedger {
             self.committed.load(Relaxed),
             g(&self.committed_packed),
             g(&self.committed_wide),
+            g(&self.committed_spilled),
             g(&self.logs_bytes),
             g(&self.walked_bytes),
             g(&self.builder_bytes),
@@ -1098,6 +1356,7 @@ fn build_streamed(
     times: &mut BlockTimes,
     stream: &StreamConfig,
     ledger: Option<&MemLedger>,
+    spill: Option<&Spill>,
 ) -> Result<Produced, Error> {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering::Relaxed;
@@ -1108,9 +1367,11 @@ fn build_streamed(
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
     let committer_count = stream.committers;
-    let queue = QueueRoom::new();
+    // While spilling, both queues have a byte budget: a slow disk throttles
+    // the walk ([`SPILL_QUEUE_BYTES`]).
+    let queue = QueueRoom::with_budget(spill.map(|_| SPILL_QUEUE_BYTES));
     let generators = stream.generators;
-    let ready = QueueRoom::new();
+    let ready = QueueRoom::with_budget(spill.map(|_| SPILL_READY_BYTES));
     let (ready_tx, ready_rx) = mpsc::channel::<ToCommit>();
     let ready_rx = Mutex::new(ready_rx);
     // Phase A's card gate ([`card_gate_budget`]): every commit admitted by its
@@ -1359,9 +1620,13 @@ fn build_streamed(
                                     }
                                 }
                             }
+                            let packed = chunk.trace.narrow_main().map(|t| t.data().len());
+                            let spilled = spill.map_or(0, |spill| spill.consider(&mut chunk.trace));
                             if let Some(ledger) = ledger {
-                                let packed = chunk.trace.narrow_main().map(|t| t.data().len());
                                 ledger.keep(held, packed);
+                                if spilled > 0 {
+                                    ledger.spilled(spilled);
+                                }
                             }
                             committed
                                 .lock()
@@ -1579,9 +1844,11 @@ fn build_streamed(
         eprintln!(
             "BLOCK QUEUE: {committer_count} committers · {generators} generators · at most {:.2} GiB in \
              {most_chunks} chunks waiting as ops · at most {:.2} GiB in {ready_chunks} chunks waiting \
-             generated",
+             generated · waited for room {:.2} s (ops) {:.2} s (generated)",
             most_bytes as f64 / (1u64 << 30) as f64,
             ready_bytes as f64 / (1u64 << 30) as f64,
+            *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
+            *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
         );
         Ok((traces, decode_commitment, precommits))
     })
@@ -1833,7 +2100,22 @@ fn stream_config_for_test(
     max_rows: &MaxRowsConfig,
     stream: StreamConfig,
 ) -> Result<(Traces, Vec<String>), Error> {
-    let ledger = (stream.finish != FinishCommit::PhaseB).then(MemLedger::new);
+    stream_spill_for_test(program, opts, max_rows, stream, None).map(|(t, n, _)| (t, n))
+}
+
+/// Phase A's stream with the spill policy `policy` (`None`: no spill):
+/// the traces (spilled ones still spilled), the instances precommitted, and
+/// the `BLOCK SPILL` report.
+#[cfg(test)]
+pub(crate) fn stream_spill_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    stream: StreamConfig,
+    policy: Option<SpillPolicy>,
+) -> Result<(Traces, Vec<String>, String), Error> {
+    let spill = policy.map(|p| Spill::open(p).expect("the spill store opens"));
+    let ledger = (stream.finish != FinishCommit::PhaseB || spill.is_some()).then(MemLedger::new);
     let (traces, _, precommits) = build_streamed(
         program,
         &[],
@@ -1843,7 +2125,9 @@ fn stream_config_for_test(
         &mut BlockTimes::default(),
         &stream,
         ledger.as_ref(),
+        spill.as_ref(),
     )?;
+    let report = spill.as_ref().map(Spill::report).unwrap_or_default();
     if let Some(ledger) = &ledger {
         use std::sync::atomic::Ordering::Relaxed;
         // Every table the ledger saw queued was taken and kept.
@@ -1868,7 +2152,104 @@ fn stream_config_for_test(
     Ok((
         traces,
         precommits.into_iter().map(|(name, _)| name).collect(),
+        report,
     ))
+}
+
+/// The stream's configuration for a test: `committers` / `generators`, the
+/// finish's tables committed in phase A or B, no card gate, the global pool.
+#[cfg(test)]
+pub(crate) fn stream_config(
+    committers: usize,
+    generators: usize,
+    finish_in_a: bool,
+) -> StreamConfig {
+    StreamConfig {
+        committers,
+        generators,
+        finish: if finish_in_a {
+            FinishCommit::Handed
+        } else {
+            FinishCommit::PhaseB
+        },
+        card_budget: None,
+        commit_pool: 0,
+    }
+}
+
+#[cfg(test)]
+mod spill_policy_tests {
+    use super::{SpillPolicy, parse_spill_policy, spill_decision, spill_reserve_bytes};
+
+    const GIB: u64 = 1 << 30;
+
+    /// `LAMBDA_VM_BLOCK_SPILL`'s values: off, always, auto, a budget in GiB;
+    /// anything else (and unset) is off.
+    #[test]
+    fn the_spill_policy_reads_its_knob() {
+        assert_eq!(parse_spill_policy(None), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(Some("off")), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(Some("always")), SpillPolicy::Always);
+        assert_eq!(parse_spill_policy(Some(" auto ")), SpillPolicy::Auto);
+        assert_eq!(
+            parse_spill_policy(Some("40")),
+            SpillPolicy::Budget(40 * GIB)
+        );
+        assert_eq!(
+            parse_spill_policy(Some("0.5")),
+            SpillPolicy::Budget(GIB / 2)
+        );
+        assert_eq!(parse_spill_policy(Some("-1")), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(Some("lots")), SpillPolicy::Off);
+    }
+
+    /// Off keeps, always spills, a budget spills what would pass it, and auto
+    /// spills once the host, the reserve for what the block has committed and
+    /// the instance would pass the target — and, the host flat, keeps spilling
+    /// as the block commits more (its reserve only grows).
+    #[test]
+    fn the_spill_decision_follows_its_policy() {
+        let never = || panic!("only auto reads the host");
+        assert!(!spill_decision(SpillPolicy::Off, 0, 0, 0, GIB, never));
+        assert!(spill_decision(
+            SpillPolicy::Always,
+            u64::MAX,
+            0,
+            0,
+            1,
+            never
+        ));
+        let budget = SpillPolicy::Budget(10 * GIB);
+        assert!(!spill_decision(budget, 0, 9 * GIB, 0, GIB, never));
+        assert!(spill_decision(budget, 0, 9 * GIB, 0, GIB + 1, never));
+        let target = 110 * GIB;
+        // The median at the walk's end: 72 GiB on the host, 23 G cells.
+        assert!(!spill_decision(
+            SpillPolicy::Auto,
+            target,
+            0,
+            23_000_000_000,
+            GIB / 10,
+            || 72 * GIB
+        ));
+        // A block twice the median: the same host, more committed.
+        assert!(spill_decision(
+            SpillPolicy::Auto,
+            target,
+            0,
+            60_000_000_000,
+            GIB / 10,
+            || 100 * GIB
+        ));
+        let mut spilling = false;
+        for g in (1..400).map(|g| g * 1_000_000_000u64) {
+            let now = spill_decision(SpillPolicy::Auto, target, 0, g, GIB / 10, || 95 * GIB);
+            assert!(now || !spilling, "auto stopped spilling at {g} cells");
+            spilling = now;
+        }
+        assert!(spilling);
+        assert!(spill_reserve_bytes(0) == 6 * GIB && spill_reserve_bytes(10_000_000_000) > 7 * GIB);
+    }
 }
 
 #[cfg(test)]
@@ -1915,12 +2296,38 @@ mod queue_tests {
     /// The queue reports the most bytes and chunks it held at once.
     #[test]
     fn the_queue_reports_the_most_it_held() {
-        let queue = QueueRoom::new();
+        let queue = QueueRoom::with_budget(None);
         queue.admit(60);
         queue.admit(40);
         queue.release(60);
         queue.admit(10);
         assert_eq!(*queue.held.lock().unwrap(), (50, 2));
         assert_eq!(*queue.most.lock().unwrap(), (100, 2));
+    }
+
+    /// With a budget, a chunk that does not fit beside what is held waits
+    /// until enough is released, and a chunk alone always fits.
+    #[test]
+    fn a_budgeted_queue_waits_for_room() {
+        let queue = std::sync::Arc::new(QueueRoom::with_budget(Some(100)));
+        queue.admit(500);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                queue.admit(60);
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "admitted beside a full queue"
+        );
+        queue.release(500);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("admitted once there is room");
+        waiter.join().unwrap();
+        assert_eq!(*queue.held.lock().unwrap(), (60, 1));
     }
 }

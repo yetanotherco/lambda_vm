@@ -674,7 +674,11 @@ fn widen_all(t: &mut Traces) -> usize {
         &mut t.eqs,
         &mut t.bytewises,
     ] {
-        for table in list.iter_mut().filter(|t| t.is_main_narrow()) {
+        for table in list
+            .iter_mut()
+            .filter(|t| t.is_main_narrow() || t.is_main_spilled())
+        {
+            // A spilled trace is read back first.
             table.widen_main_on_host();
             packed += 1;
         }
@@ -1181,6 +1185,56 @@ fn the_lean_walk_builds_the_whole_run_tables() {
                     same_traces(&reference, &traces);
                 }
             }
+        }
+    }
+}
+
+/// ★ Phase A's stream with its committed instances spilled (D-ANYBLOCK S2)
+/// builds the same traces once they are read back: every instance spilled
+/// (`always`, and a budget of 0), the finish's tables committed in phase A
+/// or B, the committers generating or generators ahead; and a budget the
+/// block never reaches spills nothing.
+#[test]
+fn the_stream_spills_and_reads_back_the_same_traces() {
+    use crate::block::{SpillPolicy, stream_config, stream_spill_for_test};
+    let opts = crate::lfm::proof::block_base_options();
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+        for (committers, generators, finish_in_a) in [(3, 0, false), (2, 3, true)] {
+            let config = stream_config(committers, generators, finish_in_a);
+            let (mut resident, mut names, _) =
+                stream_spill_for_test(&program, &opts, &max_rows, config, None).expect("resident");
+            names.sort();
+            widen_all(&mut resident);
+            for policy in [SpillPolicy::Always, SpillPolicy::Budget(0)] {
+                let (mut spilled, mut spilled_names, report) =
+                    stream_spill_for_test(&program, &opts, &max_rows, config, Some(policy))
+                        .expect("spilled");
+                assert!(
+                    report.contains(" · spilled ") && !report.contains("spilled 0 instances"),
+                    "{name}/{policy:?}: nothing spilled: {report}"
+                );
+                spilled_names.sort();
+                assert_eq!(names, spilled_names, "{name}: the instances precommitted");
+                widen_all(&mut spilled);
+                same_traces(&resident, &spilled);
+            }
+            let (_, _, report) = stream_spill_for_test(
+                &program,
+                &opts,
+                &max_rows,
+                config,
+                Some(SpillPolicy::Budget(u64::MAX / 2)),
+            )
+            .expect("a budget never reached");
+            assert!(report.contains("spilled 0 instances"), "{name}: {report}");
         }
     }
 }
