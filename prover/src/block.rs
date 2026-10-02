@@ -455,19 +455,21 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
-/// `LAMBDA_VM_BLOCK_PACKED_BUILD=1`: with [`narrow_finished`], the finish
-/// builds KECCAK_RND and LT packed a block at a time; unset or anything else
-/// builds them at 8 bytes a cell and packs them afterwards, as the other
-/// tables ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the
-/// same either way. Off by default: at the median block on BIG the packed
-/// builds held the peak 14.75 GiB lower but made phase B 6.3 s slower (BIG 104),
-/// over the lead's 3 s line for a default.
+/// With [`narrow_finished`], the finish builds KECCAK_RND and LT packed a
+/// block at a time; `LAMBDA_VM_BLOCK_PACKED_BUILD=0` builds them at 8 bytes a
+/// cell and packs them afterwards, as the other tables
+/// ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the same
+/// either way. On by default: at the median block on BIG the wide builds'
+/// 64-bit KECCAK_RND chunks in flight held the peak ≈ 14 GiB higher (BIG 107:
+/// 96.7 against 82.7 GiB), which a block at the top of the July median range
+/// (≈ 12×) does not have room for, and the packed builds cost no base time
+/// there (−1.85 s; phase B +0.7 s, the finish −2.6 s).
 fn packed_builds() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "1")
+    !std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "0")
 }
 
 /// `LAMBDA_VM_BLOCK_KR_WIDE_CAP=n` (1..=64): with KECCAK_RND built wide, then
-/// packed (the default), the finish builds at most `n` of its chunks at
+/// packed (`LAMBDA_VM_BLOCK_PACKED_BUILD=0`), the finish builds at most `n` of its chunks at
 /// 8 bytes a cell at once ([`WindowedTraceBuilder::cap_kr_wide`]); unset,
 /// 0 or anything else, no cap. The tables are the same.
 fn kr_wide_cap() -> usize {
