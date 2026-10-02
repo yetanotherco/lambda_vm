@@ -193,8 +193,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                 bitwise_ops: 0,
                 memw_register_rows: 0,
                 last_ecall: None,
-                memw_lt: Vec::new(),
-                memw_aligned_lt: Vec::new(),
+                memw_lt: super::CompactLt::default(),
+                memw_aligned_lt: super::CompactLt::default(),
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -1043,7 +1043,7 @@ fn tail_jobs(
             counted.histogram.add_ops(&lookups);
             if !stream_memw_lt {
                 let lt = super::collect_lt_from_memw_aligned(&ops);
-                counted.memw_aligned_lt.extend(lt);
+                counted.memw_aligned_lt.extend(&lt);
             }
         }
     );
@@ -1055,7 +1055,7 @@ fn tail_jobs(
         e.memw,
         |ops| {
             if !stream_memw_lt {
-                counted.memw_lt.extend(super::collect_lt_from_memw(&ops));
+                counted.memw_lt.extend(&super::collect_lt_from_memw(&ops));
             }
         }
     );
