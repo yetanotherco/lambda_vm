@@ -209,9 +209,11 @@ when both algorithm-halves accept the same record for this input.
 More formally, we define
 $(verify_0, verify_1, d_v)$ 
 as a valid _split_ of 
-verifier $verify in verifierSpace$ if
+verifier $verify in verifierSpace$ if for all $(comm(instance), proof) in commitmentSpace times proofSpace$
+it holds that:
 $
-  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff verify_0(comm(instance), [proof, d_v (comm(instance), proof)]) = 1 and verify_1(comm(instance), [proof, d_v (comm(instance), proof)]) = 1,
+  &verify(comm(instance), proof) = 1 implies verify_0(comm(instance), [proof, d_v (comm(instance), proof)]) = 1 and verify_1(comm(instance), [proof, d_v (comm(instance), proof)]) = 1,\
+  forall r in recordSpace:&verify_0(comm(instance), [proof, r]) = 1 and verify_1(comm(instance), [proof, r]) = 1 implies verify(comm(instance), proof) = 1,\
 $
 with
 $verify_0, verify_1: commitmentSpace times proofSpace times recordSpace to BB$
