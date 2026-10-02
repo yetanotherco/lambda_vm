@@ -1914,6 +1914,48 @@ pub fn coset_lde_row_major_with_merkle_tree_keep_rpl(
     Ok((handle, lde_out))
 }
 
+/// [`coset_lde_row_major_with_merkle_tree_keep_rpl`] from a packed trace (the
+/// stark crate's `NarrowMain` layout, as [`coset_lde_narrow_keep_no_tree`]):
+/// the packed columns are uploaded and widened on the commit's stream into the
+/// rows the host upload would have filled.
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_narrow_with_merkle_tree_keep_rpl(
+    data: &[u8],
+    offsets: &[u64],
+    widths: &[u8],
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let input = InnerInput::Narrow(crate::narrow::NarrowInput::new(data, offsets, widths, n, m));
+    let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
+        input,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        "coset_lde_row_major lde_size",
+        true,
+        retain_host_lde,
+        rows_per_leaf,
+    )?;
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+        ready: Some(ready),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((handle, lde_out))
+}
+
 /// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
 /// precomputed columns `[0, split_col)` and the multiplicity columns
 /// `[split_col, m)` commit to separate trees over the same row-major LDE,
