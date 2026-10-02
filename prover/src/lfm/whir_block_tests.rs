@@ -340,12 +340,13 @@ fn a_block_leaf_refuses_a_tampered_witness() {
     );
 }
 
-/// ★ W1: the leaf's bus share ([`emit_share`]). Under the inverse form
-/// (`LFM_WHIR_SHARE_INVERSE=1`) a zero `q` has no satisfying assignment whatever
-/// `p` is — `q · inv = 1` — which is the host's `contribution() = None`
-/// refusal. The default `ediv(p, q)` refuses `q = 0` only when `p ≠ 0`: at
-/// `p = q = 0` its constraint `q · out = p` holds for every `out` (the executor
-/// writes 1), so the share is free — the gap the inverse form closes.
+/// ★ W1: the leaf's bus share ([`emit_share`]). Under the inverse form (the
+/// default) a zero `q` has no satisfying assignment whatever `p` is —
+/// `q · inv = 1` — which is the host's `contribution() = None` refusal. The
+/// former `ediv(p, q)` (`LFM_WHIR_SHARE_INVERSE=0`) refuses `q = 0` only when
+/// `p ≠ 0`: at `p = q = 0` its constraint `q · out = p` holds for every `out`
+/// (the executor writes 1), so the share is free — the gap the inverse form
+/// closes. The process default is checked to be the inverse form.
 #[test]
 fn a_zero_denominator_has_no_satisfying_assignment() {
     let run = |p: u64, q: u64, inverse: bool| {
@@ -370,6 +371,12 @@ fn a_zero_denominator_has_no_satisfying_assignment() {
         run(0, 0, true).is_err(),
         "the inverse form must refuse p = q = 0"
     );
+    if std::env::var_os("LFM_WHIR_SHARE_INVERSE").is_none() {
+        assert!(
+            super::whir_block::share_inverse(),
+            "the default share is the inverse form"
+        );
+    }
     assert!(
         run(0, 0, false).is_ok(),
         "the default ediv(p, q) executes p = q = 0 (its share is free): the gap"
