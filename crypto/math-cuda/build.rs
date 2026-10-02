@@ -285,6 +285,7 @@ fn main() {
     // pinned on the host by `tests/host_kat/p1w16_host_kat.cpp`. Loaded only by
     // that module, never by the backend.
     println!("cargo:rerun-if-changed=kernels/p1w16_constants.cuh");
+    println!("cargo:rerun-if-changed=kernels/p1w8_constants.cuh");
     compile_kernel("p1w16.cu", "p1w16.cubin", have_nvcc, &[]);
     compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
     compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);

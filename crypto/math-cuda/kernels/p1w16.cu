@@ -43,6 +43,13 @@
 //   V = 3  the Grain Cauchy MDS alternative (`permute_cauchy`: dense full
 //          rounds, the paper's sparse partial rounds, V = 1's multiply).
 // Every variant computes the same field values and `permute` canonicalises.
+//
+// ZISK'S INSTANCE (stage P1 of the Poseidon1 base STARK, at the end of the
+// file): the same permutation with ZisK's leaf hash (`zisk_leaf`: zero
+// capacity, the previous digest carried into it) over cosets and the STARK's
+// LDE rows, and ZisK's width-8 grinding permutation (`p1w8`, its own Fourier
+// form). Oracle: `crypto::hash::poseidon1_stark` / `poseidon1_w8`, whose
+// vectors come from ZisK's own code (`tests/host_kat/p1_zisk_kat_vectors.h`).
 
 #include <cstdint>
 #include "goldilocks.cuh"
@@ -410,7 +417,169 @@ __device__ __forceinline__ void compress4(const uint64_t *children, uint64_t out
     for (int i = 0; i < DIGEST; ++i) out[i] = s[i];
 }
 
+// ZisK's leaf hash (`linear_hash_seq` at width 16; host oracle
+// `crypto::hash::poseidon1_stark::linear_hash`): each block of up to 12 felts
+// overwrites lanes 0..12, zero-filled past its end; the capacity lanes 12..16
+// are zero for the first block and the previous output's lanes 0..4 for every
+// later one. No length, flag or domain. An empty leaf never permutes.
+template <int V, typename Load>
+__device__ __forceinline__ void zisk_leaf(uint64_t num_felts, Load load, uint64_t digest[DIGEST]) {
+    uint64_t s[WIDTH];
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = 0;
+    uint64_t t = 0;
+#pragma unroll 1
+    for (; t + RATE <= num_felts; t += RATE) {
+        if (t > 0) {
+#pragma unroll
+            for (int i = 0; i < DIGEST; ++i) s[RATE + i] = s[i];
+        }
+#pragma unroll
+        for (int k = 0; k < RATE; ++k) s[k] = load(t + k);
+        permute<V>(s);
+    }
+    if (t < num_felts) {
+        if (t > 0) {
+#pragma unroll
+            for (int i = 0; i < DIGEST; ++i) s[RATE + i] = s[i];
+        }
+#pragma unroll
+        for (int k = 0; k < RATE; ++k) s[k] = (t + k < num_felts) ? load(t + k) : 0;
+        permute<V>(s);
+    }
+#pragma unroll
+    for (int i = 0; i < DIGEST; ++i) digest[i] = s[i];
+}
+
 }  // namespace p1w16
+
+// ---------------------------------------------------------------------------
+// Width 8: ZisK's grinding permutation (`crypto::hash::poseidon1_w8`). The same
+// recipe at t = 8: x^7, R_F 8, R_P 22, Grain constants, the circulant
+// `[7, 1, 3, 8, 8, 3, 4, 9]`; the 8-point DFT (omega = 2^24) diagonalises it.
+//   V = 1  textbook rounds (rolled loop, dense circulant every round);
+//   V = 2  the partial rounds in the Fourier domain (`p1_fourier.py` at T = 8).
+// ---------------------------------------------------------------------------
+#include "p1w8_constants.cuh"
+
+namespace p1w8 {
+
+enum : int { WIDTH = 8 };
+using p1w16::HALF_FULL;
+using p1w16::PARTIAL;
+using p1w16::ROUNDS;
+
+// The circulant over 32-bit halves, as `p1w16::mds`: each half-sum is below
+// 43·2^32 < 2^38, `hi < 2^7`.
+__device__ __forceinline__ void mds(uint64_t s[WIDTH]) {
+    uint32_t lo32[WIDTH], hi32[WIDTH];
+#pragma unroll
+    for (int j = 0; j < WIDTH; ++j) {
+        lo32[j] = (uint32_t)s[j];
+        hi32[j] = (uint32_t)(s[j] >> 32);
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) {
+        uint64_t acc_lo = 0, acc_hi = 0;
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j) {
+            const uint64_t c = MDS_ROW[(j + WIDTH - i) % WIDTH];
+            acc_lo += c * (uint64_t)lo32[j];
+            acc_hi += c * (uint64_t)hi32[j];
+        }
+        const uint64_t lo = (acc_hi << 32) + acc_lo;
+        const uint64_t carry = (lo < acc_lo) ? 1ull : 0ull;
+        const uint64_t hi = (acc_hi >> 32) + carry;
+        s[i] = goldilocks::add(lo, hi * goldilocks::EPSILON);
+    }
+}
+
+template <int V>
+__device__ __forceinline__ void full_round(uint64_t s[WIDTH], int r) {
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = p1w16::sbox<V>(goldilocks::add(s[i], RC[r][i]));
+    mds(s);
+}
+
+// The 8-point DFT, `p1w16::dft16`'s radix-2 form at width 8.
+template <int V, bool INV>
+__device__ __forceinline__ void dft8(uint64_t x[WIDTH]) {
+    constexpr int BITREV[WIDTH] = {0, 4, 2, 6, 1, 5, 3, 7};
+    uint64_t y[WIDTH];
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) y[i] = x[BITREV[i]];
+#pragma unroll
+    for (int h = 1; h < WIDTH; h <<= 1) {
+#pragma unroll
+        for (int start = 0; start < WIDTH; start += 2 * h) {
+#pragma unroll
+            for (int j = 0; j < h; ++j) {
+                const int e = j * (4 / h);  // omega_{2h}^j = omega^(j·8/(2h))
+                const int ei = INV ? ((WIDTH - e) & (WIDTH - 1)) : e;
+                const uint64_t a = y[start + j];
+                const uint64_t t =
+                    (e == 0) ? y[start + j + h] : p1w16::fmul<V>(y[start + j + h], OMEGA_POW[ei]);
+                y[start + j] = goldilocks::add(a, t);
+                y[start + j + h] = goldilocks::sub(a, t);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) x[i] = y[i];
+}
+
+// ★ The permutation; the output is canonical.
+template <int V>
+__device__ __forceinline__ void permute(uint64_t s[WIDTH]) {
+    if constexpr (V == 2) {
+#pragma unroll 1
+        for (int r = 0; r < HALF_FULL - 1; ++r) full_round<V>(s, r);
+#pragma unroll
+        for (int i = 0; i < WIDTH; ++i)
+            s[i] = p1w16::sbox<V>(goldilocks::add(s[i], RC[HALF_FULL - 1][i]));
+        dft8<V, false>(s);
+#pragma unroll
+        for (int i = 0; i < WIDTH; ++i) s[i] = p1w16::fmul<V>(s[i], FD[i]);
+#pragma unroll 1
+        for (int k = 0; k < PARTIAL; ++k) {
+            uint64_t sum = s[0];
+#pragma unroll
+            for (int i = 1; i < WIDTH; ++i) sum = goldilocks::add(sum, s[i]);
+            const uint64_t a0 = goldilocks::add(p1w16::fmul<V>(sum, INV8), RC[HALF_FULL + k][0]);
+            const uint64_t delta = goldilocks::sub(p1w16::sbox<V>(a0), a0);
+            if (k + 1 < PARTIAL) {
+#pragma unroll
+                for (int i = 0; i < WIDTH; ++i)
+                    s[i] = p1w16::fmul<V>(goldilocks::add(goldilocks::add(s[i], FC[k][i]), delta), FD[i]);
+            } else {
+#pragma unroll
+                for (int i = 0; i < WIDTH; ++i)
+                    s[i] = p1w16::fmul<V>(goldilocks::add(goldilocks::add(s[i], FC[k][i]), delta),
+                                          FD_LAST[i]);
+            }
+        }
+        dft8<V, true>(s);
+#pragma unroll 1
+        for (int r = HALF_FULL + PARTIAL; r < ROUNDS; ++r) full_round<V>(s, r);
+    } else {
+#pragma unroll 1
+        for (int r = 0; r < ROUNDS; ++r) {
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::add(s[i], RC[r][i]);
+            if (r < HALF_FULL || r >= HALF_FULL + PARTIAL) {
+#pragma unroll
+                for (int i = 0; i < WIDTH; ++i) s[i] = p1w16::sbox<V>(s[i]);
+            } else {
+                s[0] = p1w16::sbox<V>(s[0]);
+            }
+            mds(s);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
+}
+
+}  // namespace p1w8
 
 // ---------------------------------------------------------------------------
 // The `extern "C"` surface, one entry per variant.
@@ -545,6 +714,131 @@ P1W16_ENTRIES(v0, 0, )
 P1W16_ENTRIES(v1, 1, )
 P1W16_ENTRIES(v2, 2, )
 P1W16_ENTRIES(c1, 3, )
+
+// ---------------------------------------------------------------------------
+// ZisK's instance (stage P1 of the Poseidon1 base STARK): its leaf hash over
+// the coset geometry above and over the STARK's column-major LDE rows, and its
+// width-8 grind. The Fourier-domain permutation (V = 2) only; the 4-ary node
+// is `p1w16_merkle_level4_v2` unchanged. Digests are four canonical u64s.
+// ---------------------------------------------------------------------------
+
+// Coset leaves under ZisK's leaf hash: leaf `tid` hashes
+// `codeword[tid + t·num_leaves]` (base) or that element's three components
+// (ext3), `t` in `[0, block)`.
+extern "C" __global__ void p1w16_zleaves_base_coset_v2(const uint64_t *__restrict__ codeword,
+                                                       uint64_t num_leaves, uint64_t block,
+                                                       uint64_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
+}
+
+extern "C" __global__ void p1w16_zleaves_ext3_coset_v2(const uint64_t *__restrict__ codeword,
+                                                       uint64_t num_leaves, uint64_t block,
+                                                       uint64_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        3 * block,
+        [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
+}
+
+// One leaf per bit-reversed LDE row: column `c` of row `br` at
+// `columns[c * col_stride + br]`, absorbed column by column —
+// `rpx_leaves_base_batched`'s geometry. An ext3 matrix stored as three base
+// slabs per column (`rpx_leaves_ext3_batched`) is this kernel over
+// `num_cols = 3 · ext3 columns`: felt `3c + k` is slab `3c + k`.
+extern "C" __global__ void p1w16_zleaves_rows_v2(const uint64_t *__restrict__ columns,
+                                                 uint64_t col_stride, uint64_t num_cols,
+                                                 uint64_t num_rows, uint64_t log_num_rows,
+                                                 uint64_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        num_cols, [&](uint64_t c) { return columns[c * col_stride + br]; }, d);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
+}
+
+// Row-pair leaves: leaf `tid` hashes bit-reversed rows `2·tid` then `2·tid + 1`,
+// each column by column — `rpx_leaves_base_row_pair_batched`'s geometry.
+extern "C" __global__ void p1w16_zleaves_row_pair_v2(const uint64_t *__restrict__ columns,
+                                                     uint64_t col_stride, uint64_t num_cols,
+                                                     uint64_t num_rows, uint64_t log_num_rows,
+                                                     uint64_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows / 2) return;
+    const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        2 * num_cols,
+        [&](uint64_t i) {
+            return i < num_cols ? columns[i * col_stride + br0]
+                                : columns[(i - num_cols) * col_stride + br1];
+        },
+        d);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
+}
+
+// Width-8 parity probe: `n` independent permutations.
+template <int V>
+__device__ __forceinline__ void p1w8_probe(const uint64_t *states, uint64_t n, uint64_t *out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint64_t s[p1w8::WIDTH];
+#pragma unroll
+    for (int i = 0; i < p1w8::WIDTH; ++i) s[i] = states[tid * p1w8::WIDTH + i];
+    p1w8::permute<V>(s);
+#pragma unroll
+    for (int i = 0; i < p1w8::WIDTH; ++i) out[tid * p1w8::WIDTH + i] = s[i];
+}
+
+// ZisK's grind: the smallest nonce in `[base, base + count)` whose width-8
+// permutation of `[c0, c1, c2, nonce, 0, 0, 0, 0]` has lane 0 below `limit`
+// (`crypto::hash::poseidon1_stark::grinding_lane0`). The grid-stride loop,
+// first-hit `atomicMin` and poll of `grind_search` above.
+template <int V>
+__device__ __forceinline__ void p1w8_grind(const uint64_t *challenge, uint64_t limit, uint64_t base,
+                                           uint64_t count, volatile unsigned long long *result) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t c0 = challenge[0], c1 = challenge[1], c2 = challenge[2];
+    for (uint64_t i = tid; i < count; i += stride) {
+        uint64_t nonce = base + i;
+        if (nonce < base) break;
+        if (nonce >= (uint64_t)*result) break;
+        uint64_t s[p1w8::WIDTH] = {c0, c1, c2, goldilocks::canonical(nonce), 0, 0, 0, 0};
+        p1w8::permute<V>(s);
+        if (s[0] < limit) {
+            atomicMin((unsigned long long *)result, (unsigned long long)nonce);
+        }
+    }
+}
+
+#define P1W8_ENTRIES(NAME, V)                                                                      \
+    extern "C" __global__ void p1w8_permute_probe_##NAME(const uint64_t *states, uint64_t n,       \
+                                                         uint64_t *out) {                          \
+        p1w8_probe<V>(states, n, out);                                                             \
+    }                                                                                              \
+    extern "C" __global__ void p1w8_grind_search_##NAME(const uint64_t *challenge, uint64_t limit, \
+                                                        uint64_t base, uint64_t count,             \
+                                                        volatile unsigned long long *result) {     \
+        p1w8_grind<V>(challenge, limit, base, count, result);                                      \
+    }
+
+P1W8_ENTRIES(v1, 1)
+P1W8_ENTRIES(v2, 2)
 
 // Bench fill: `out[i]` = a SplitMix64 of `i`, canonicalised — a codeword the
 // microbench hashes without a host upload.

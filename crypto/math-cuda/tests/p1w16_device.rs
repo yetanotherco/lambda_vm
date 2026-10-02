@@ -181,3 +181,132 @@ fn p1w16_microbench() {
     let lines = p1w16::microbench(log_len, reps, 1 << 28).expect("device");
     assert!(lines.len() >= 10, "every arm printed");
 }
+
+// ---------------------------------------------------------------------------
+// ZisK's instance (stage P1): the kernels against `crypto::hash::poseidon1_stark`
+// and `crypto::hash::poseidon1_w8`, whose vectors come from ZisK's own code.
+// ---------------------------------------------------------------------------
+
+use crypto::hash::{poseidon1_stark as zisk, poseidon1_w8 as w8};
+
+#[test]
+fn the_device_zisk_coset_leaves_match_the_host() {
+    let mut rng = ChaCha8Rng::seed_from_u64(4);
+    for (block, ext3) in [
+        (64u64, false),
+        (13, false),
+        (12, false),
+        (16, true),
+        (5, true),
+    ] {
+        let per = if ext3 { 3 } else { 1 };
+        let num_leaves = 1027u64;
+        let cw = random_felts(&mut rng, (num_leaves * block * per) as usize);
+        let got = p1w16::zisk_leaves_coset(&cw, block, ext3).expect("device");
+        for j in 0..num_leaves {
+            let mut felts = Vec::new();
+            for t in 0..block {
+                let at = (j + t * num_leaves) as usize;
+                if ext3 {
+                    felts.extend_from_slice(&cw[3 * at..3 * at + 3]);
+                } else {
+                    felts.push(cw[at]);
+                }
+            }
+            assert_eq!(
+                got[4 * j as usize..4 * j as usize + 4],
+                canon(&zisk::linear_hash(&fp(&felts)))[..],
+                "block {block} ext3 {ext3} leaf {j}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_device_zisk_row_leaves_match_the_host() {
+    let mut rng = ChaCha8Rng::seed_from_u64(5);
+    let num_rows = 1u64 << 10;
+    for (num_cols, pair) in [(7u64, false), (24, false), (16, true), (25, true)] {
+        let col_stride = num_rows + 3;
+        let m = random_felts(&mut rng, (num_cols * col_stride) as usize);
+        let got =
+            p1w16::zisk_leaves_rows(&m, col_stride, num_cols, num_rows, pair).expect("device");
+        let log = num_rows.trailing_zeros();
+        let row = |r: u64| -> Vec<u64> {
+            let br = r.reverse_bits() >> (64 - log);
+            (0..num_cols)
+                .map(|c| m[(c * col_stride + br) as usize])
+                .collect()
+        };
+        let num_leaves = if pair { num_rows / 2 } else { num_rows };
+        for j in 0..num_leaves {
+            let felts = if pair {
+                [row(2 * j), row(2 * j + 1)].concat()
+            } else {
+                row(j)
+            };
+            assert_eq!(
+                got[4 * j as usize..4 * j as usize + 4],
+                canon(&zisk::linear_hash(&fp(&felts)))[..],
+                "cols {num_cols} pair {pair} leaf {j}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_device_width_8_permutation_matches_the_host() {
+    let mut rng = ChaCha8Rng::seed_from_u64(6);
+    let n = 4099;
+    let states = random_felts(&mut rng, n * 8);
+    for v in 0..p1w16::W8_VARIANTS.len() {
+        let got = p1w16::w8_permute_many(v, &states).expect("device");
+        for (i, chunk) in states.chunks(8).enumerate() {
+            let s: [Fp; 8] = core::array::from_fn(|k| Fp::from(chunk[k]));
+            assert_eq!(
+                got[i * 8..(i + 1) * 8],
+                canon(&w8::permute(s))[..],
+                "W8 variant {v} state {i}"
+            );
+        }
+    }
+}
+
+/// ZisK's grind returns the smallest nonce the host scan finds; a limit of zero
+/// finds nothing.
+#[test]
+fn the_device_zisk_grind_returns_the_smallest_valid_nonce() {
+    let challenge = [11u64, 22, 33];
+    let bits = 12;
+    let ch: [Fp; 3] = core::array::from_fn(|i| Fp::from(challenge[i]));
+    let want = (0..1u64 << 20)
+        .find(|&n| zisk::grinding_ok(&ch, &Fp::from(n), bits))
+        .expect("a hit below 2^20");
+    for v in 0..p1w16::W8_VARIANTS.len() {
+        for grid in [1u32, 1024] {
+            let got =
+                p1w16::w8_grind(v, &challenge, 1u64 << (64 - bits), 1 << 20, grid).expect("device");
+            assert_eq!(got, Some(want), "W8 variant {v} grid {grid}");
+        }
+        assert_eq!(
+            p1w16::w8_grind(v, &challenge, 0, 1 << 16, 64).expect("device"),
+            None
+        );
+    }
+}
+
+/// ★ Stage P1's microbenchmark (the box job reads its `BENCH` lines).
+#[test]
+#[ignore = "microbenchmark: a 2^29 buffer by default; run on the box with --ignored"]
+fn p1_zisk_microbench() {
+    let log_len: u32 = std::env::var("P1W16_LOG_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(29);
+    let reps: u32 = std::env::var("P1W16_REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    let lines = p1w16::microbench_zisk(log_len, reps, 1 << 28).expect("device");
+    assert!(lines.len() >= 25, "every arm printed: {}", lines.len());
+}
