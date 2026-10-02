@@ -4355,32 +4355,78 @@ fn build_traces<I: ImageSource + Sync>(
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
-    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
-    // split into row-ranges in the parallel path below) stays a single whole-source collector.
-    let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
-        Box::new(|h| {
-            for op in &bytewise_ops {
+    // The sources that are a sum over their ops are cut into slices of whole ops, so phase 4's
+    // buckets share them (a whole source was one bucket's long pole) and no slice's list of
+    // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
+    // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
+    // below; the rest stay one collector each.
+    let mut collectors: Vec<Collector> = Vec::new();
+    for slice in lt_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_lt(slice))
+        }));
+    }
+    for slice in mul_ops.chunks(mul_chunk.max(1)) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_mul(slice, mul_chunk))
+        }));
+    }
+    for slice in dvrm_ops.chunks(dvrm_chunk.max(1)) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_dvrm(slice, dvrm_chunk))
+        }));
+    }
+    for slice in branch_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_branch(slice))
+        }));
+    }
+    for slice in shift_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&shift::collect_bitwise_from_shift(slice))
+        }));
+    }
+    for slice in bytewise_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &eq_ops {
+        }));
+    }
+    for slice in eq_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &store_ops {
+        }));
+    }
+    for slice in store_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        }));
+    }
+    for slice in memw_aligned_ops.chunks(1 << 22) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_memw_aligned(slice))
+        }));
+    }
+    // About 5,000 lookups per permutation.
+    for slice in keccak_ops.chunks(1 << 11) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_keccak(slice))
+        }));
+    }
+    for slice in ecdas_ops.chunks(1 << 16) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_ecdas(slice))
+        }));
+    }
+    collectors.extend([
+        Box::new(|h: &mut bitwise::BitwiseHistogram| {
+            h.add_ops(&collect_bitwise_from_commit(&commit_ops))
+        }) as Collector,
         Box::new(|h| {
             if !strip_blake3_side_effects() {
                 h.add_ops(&collect_bitwise_from_blake3(
@@ -4390,10 +4436,9 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
-    ];
+    ]);
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
