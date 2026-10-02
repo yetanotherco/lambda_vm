@@ -197,8 +197,9 @@ struct LoweredProgram {
     /// The compiled composition kernel generated for this program's structure
     /// ([`super::codegen::structural_key`]), if the generator emitted one.
     compiled: Option<&'static str>,
-    /// The program's budgeted lowerings, by budget (`None`: none fits).
-    si: std::sync::Mutex<Vec<(u32, Option<std::sync::Arc<SiLowered>>)>>,
+    /// The program's budgeted lowerings, by budget and specialization
+    /// (`None`: none fits).
+    si: std::sync::Mutex<Vec<((u32, bool), Option<std::sync::Arc<SiLowered>>)>>,
 }
 
 /// A budgeted lowering ([`super::budgeted`]) with its packed steps.
@@ -209,14 +210,21 @@ pub struct SiLowered {
 }
 
 impl LoweredProgram {
-    /// The budgeted lowering within `budget` words a row, lowered once.
-    fn si(&self, prog: &GoldilocksProgram, budget: u32) -> Option<std::sync::Arc<SiLowered>> {
+    /// The budgeted lowering within `budget` words a row (with the
+    /// specialized opcodes when `fast`), lowered once.
+    fn si(
+        &self,
+        prog: &GoldilocksProgram,
+        budget: u32,
+        fast: bool,
+    ) -> Option<std::sync::Arc<SiLowered>> {
         let mut cache = self.si.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, l)) = cache.iter().find(|(b, _)| *b == budget) {
+        if let Some((_, l)) = cache.iter().find(|(k, _)| *k == (budget, fast)) {
             return l.clone();
         }
         let lowered = super::budgeted::lower_budgeted(prog, budget)
             .ok()
+            .map(|bp| if fast { super::budgeted::specialize(&bp) } else { bp })
             .map(|bp| {
                 let mut steps = bp.packed_steps();
                 steps.extend_from_slice(&[0; 4]);
@@ -231,7 +239,7 @@ impl LoweredProgram {
                 );
                 std::sync::Arc::new(SiLowered { bp, steps })
             });
-        cache.push((budget, lowered.clone()));
+        cache.push(((budget, fast), lowered.clone()));
         lowered
     }
 }
@@ -265,9 +273,9 @@ pub fn interp_si_setting(raw: Option<&str>) -> SiMode {
     }
 }
 
-/// `LAMBDA_VM_GPU_SI_SHAPE=<shared|local>:<rows a thread>:<block>:<budget words>`:
-/// the bounded-slot interpreter's launch shape and word budget. Default
-/// `shared:1:128:48`.
+/// `LAMBDA_VM_GPU_SI_SHAPE=<shared|local>:<rows a thread>:<block>:<budget words>[:fast|:generic]`:
+/// the bounded-slot interpreter's launch shape, word budget and whether the
+/// lowering uses the specialized opcodes. Default `shared:1:128:48:fast`.
 pub const SI_SHAPE_ENV: &str = "LAMBDA_VM_GPU_SI_SHAPE";
 
 /// The bounded-slot interpreter's launch shape and word budget.
@@ -275,6 +283,8 @@ pub const SI_SHAPE_ENV: &str = "LAMBDA_VM_GPU_SI_SHAPE";
 pub struct SiTuning {
     pub cfg: math_cuda::constraint_interp::SiConfig,
     pub budget: u32,
+    /// The specialized opcodes ([`super::budgeted::specialize`]).
+    pub fast: bool,
 }
 
 impl Default for SiTuning {
@@ -286,6 +296,7 @@ impl Default for SiTuning {
                 block: 128,
             },
             budget: 48,
+            fast: true,
         }
     }
 }
@@ -297,12 +308,19 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
         return SiTuning::default();
     };
     let bad = || -> ! {
-        panic!("{SI_SHAPE_ENV} must be <shared|local>:<rows>:<block>:<budget>, got {raw:?}")
+        panic!(
+            "{SI_SHAPE_ENV} must be <shared|local>:<rows>:<block>:<budget>[:fast|:generic], got {raw:?}"
+        )
     };
     let parts: Vec<&str> = raw.split(':').collect();
-    if parts.len() != 4 {
+    if !(4..=5).contains(&parts.len()) {
         bad();
     }
+    let fast = match parts.get(4) {
+        None | Some(&"fast") => true,
+        Some(&"generic") => false,
+        _ => bad(),
+    };
     let store = match parts[0] {
         "shared" => SiStore::Shared,
         "local" => SiStore::Local,
@@ -328,6 +346,7 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
             block,
         },
         budget,
+        fast,
     }
 }
 
@@ -677,7 +696,7 @@ where
         SiMode::Uncompiled => compiled.is_none(),
         SiMode::All => true,
     };
-    if si_takes && let Some(si) = lowered.si(gprog, tuning.budget) {
+    if si_takes && let Some(si) = lowered.si(gprog, tuning.budget, tuning.fast) {
         let triples = |v: &[u64]| -> Vec<[u64; 3]> {
             v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
         };
@@ -896,9 +915,11 @@ mod tests {
                     rows_per_thread: 1,
                     block: 256
                 },
-                budget: 64
+                budget: 64,
+                fast: true,
             }
         );
+        assert!(!si_shape_setting(Some("shared:1:128:48:generic")).fast);
         assert_eq!(
             si_shape_setting(Some("shared:2:64:32")).cfg.rows_per_thread,
             2

@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 
 use math::field::element::FieldElement;
 use stark::constraint_ir::budgeted::{
-    BudgetedProgram, Policy, eval_budgeted_row, lower_budgeted, lower_with_split, validate,
+    BudgetedProgram, Policy, eval_budgeted_row, lower_budgeted, lower_with_split, specialize,
+    validate,
 };
 use stark::constraint_ir::{
     ConstraintProgram, DeviceProgram, Dim, Op, codegen, eval_device_program,
@@ -251,14 +252,23 @@ fn dump_budgeted_programs() {
     for (labels, p) in distinct_programs().into_values() {
         let dev = DeviceProgram::lower(&p);
         let (mc, ac, _, _) = footprint(&p);
-        for budget in [24u32, 48, 128] {
+        for (budget, fast) in [
+            (24u32, false),
+            (48, false),
+            (128, false),
+            (24, true),
+            (48, true),
+            (128, true),
+        ] {
             let Ok(bp) = lower_budgeted(&p, budget) else {
                 continue;
             };
+            let bp = if fast { specialize(&bp) } else { bp };
             let _ = writeln!(
                 out,
-                "P {}@{budget} {} {} {} {} {} {} {} {} {mc} {ac} {budget}",
+                "P {}@{budget}{} {} {} {} {} {} {} {} {} {mc} {ac} {budget}",
                 short(&labels).replace(' ', "_"),
+                if fast { "/fast" } else { "" },
                 dev.nodes.len(),
                 dev.roots.len(),
                 dev.num_base_slots,
@@ -325,6 +335,7 @@ mod device {
                 block,
             },
             budget,
+            fast: true,
         }
     }
 
@@ -336,7 +347,12 @@ mod device {
                 block,
             },
             budget,
+            fast: true,
         }
+    }
+
+    fn generic(t: SiTuning) -> SiTuning {
+        SiTuning { fast: false, ..t }
     }
 
     fn name(t: &SiTuning) -> String {
@@ -344,8 +360,9 @@ mod device {
             SiStore::Shared => "smem",
             SiStore::Local => "local",
         };
+        let f = if t.fast { "" } else { "/gen" };
         format!(
-            "{s}/r{}/t{}/b{}",
+            "{s}/r{}/t{}/b{}{f}",
             t.cfg.rows_per_thread, t.cfg.block, t.budget
         )
     }
@@ -444,7 +461,9 @@ mod device {
     fn parity_shapes() -> Vec<SiTuning> {
         vec![
             shared(1, 128, 48),
+            generic(shared(1, 128, 48)),
             shared(2, 64, 32),
+            generic(shared(2, 64, 32)),
             shared(1, 64, 128),
             local(128, 48),
             local(64, 24),
@@ -595,6 +614,12 @@ mod device {
                 v.push(local(block, budget));
             }
         }
+        v.push(shared(1, 32, 128));
+        v.push(shared(1, 32, 96));
+        // The generic opcodes at three shapes: what the specialized ones gain.
+        v.push(generic(shared(1, 128, 48)));
+        v.push(generic(shared(1, 64, 128)));
+        v.push(generic(local(128, 48)));
         v
     }
 
@@ -612,6 +637,7 @@ mod device {
             local(128, 48),
             local(128, 64),
             local(256, 48),
+            generic(shared(1, 128, 48)),
         ]
     }
 
@@ -734,5 +760,42 @@ mod device {
         override_interp_si(None);
         override_compiled_constraints(None);
         set_composition_timing(false);
+    }
+}
+
+/// The opcode × operand-kind mix of the lowered programs (which handler
+/// shapes the kernel runs most).
+#[test]
+#[ignore = "a census, not a test"]
+fn budgeted_opcode_mix() {
+    use stark::constraint_ir::budgeted::{
+        SI_ACC_B, SI_ACC_E, SI_BNEG, SI_EMBED, SI_ENEG, SIK_SHIFT,
+    };
+    let opts = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4");
+    let kinds = ["bslot", "eslot", "main", "aux", "bconst", "euni", "?", "?"];
+    for (label, p) in production_programs(&opts) {
+        if !["CPU", "KECCAK_RND", "ECDAS", "MEMW_R", "LT", "MEMW_A"].contains(&label.as_str()) {
+            continue;
+        }
+        let bp = lower_budgeted(&p, 48).expect("lowers");
+        let mut mix: BTreeMap<String, usize> = BTreeMap::new();
+        for s in &bp.steps {
+            let ka = kinds[(s.a >> SIK_SHIFT) as usize];
+            let kb = if matches!(s.op, SI_BNEG | SI_ENEG | SI_EMBED | SI_ACC_B | SI_ACC_E) {
+                "-"
+            } else {
+                kinds[(s.b >> SIK_SHIFT) as usize]
+            };
+            *mix.entry(format!("op{:02} {ka}/{kb}", s.op)).or_default() += 1;
+        }
+        let mut v: Vec<(String, usize)> = mix.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let total = bp.steps.len();
+        let line: Vec<String> = v
+            .iter()
+            .take(14)
+            .map(|(k, n)| format!("{k} {:.1}%", 100.0 * *n as f64 / total as f64))
+            .collect();
+        println!("MIX {label} ({total} steps): {}", line.join(" · "));
     }
 }

@@ -79,8 +79,71 @@ pub const SI_EMBED: u32 = 14;
 pub const SI_ACC_B: u32 = 15;
 /// Transition sum, ext root: `sum = ext3::add(sum, ext3::mul(beta[b], a))`.
 pub const SI_ACC_E: u32 = 16;
-/// The number of opcodes (the kernel's switch covers `0..SI_NUM_OPS`).
+/// The number of generic opcodes.
 pub const SI_NUM_OPS: u32 = 17;
+
+/// The first specialized opcode. A specialized step is a generic step whose
+/// operand kinds are fixed by its opcode, so the kernel's handler loads them
+/// with no kind switch ([`specialize`], [`SI_FAST`]).
+pub const SI_FAST_BASE: u32 = 32;
+
+/// The specialized opcodes, `SI_FAST_BASE + i`: (generic opcode, kind of `a`,
+/// kind of `b`; `NONE` for a unary op or an accumulation). The hot shapes of
+/// the production programs (`budgeted_opcode_mix`).
+pub const SI_FAST: [(u32, u32, u32); 20] = [
+    (SI_BADD, SIK_BSLOT, SIK_BSLOT),
+    (SI_BSUB, SIK_BSLOT, SIK_BSLOT),
+    (SI_BMUL, SIK_BSLOT, SIK_BSLOT),
+    (SI_BMUL, SIK_MAIN, SIK_BCONST),
+    (SI_BMUL, SIK_BCONST, SIK_MAIN),
+    (SI_BMUL, SIK_BSLOT, SIK_MAIN),
+    (SI_BMUL, SIK_MAIN, SIK_BSLOT),
+    (SI_BADD, SIK_MAIN, SIK_BSLOT),
+    (SI_BADD, SIK_BCONST, SIK_BSLOT),
+    (SI_EADD, SIK_ESLOT, SIK_ESLOT),
+    (SI_ESUB, SIK_ESLOT, SIK_ESLOT),
+    (SI_EMUL, SIK_ESLOT, SIK_ESLOT),
+    (SI_EMUL_BX, SIK_MAIN, SIK_EUNI),
+    (SI_EMUL_BX, SIK_BSLOT, SIK_EUNI),
+    (SI_EMUL_BX, SIK_MAIN, SIK_ESLOT),
+    (SI_EMUL_BX, SIK_BSLOT, SIK_ESLOT),
+    (SI_ACC_B, SIK_BSLOT, NONE),
+    (SI_ACC_E, SIK_ESLOT, NONE),
+    (SI_ESUB, SIK_ESLOT, SIK_AUX),
+    (SI_EMUL, SIK_AUX, SIK_ESLOT),
+];
+
+/// The generic opcode a step runs: its own, or the one its specialized opcode
+/// stands for — `None` when a specialized opcode's operands are not the kinds
+/// it fixes (a malformed step).
+pub fn generic_op(st: &SiStep) -> Option<u32> {
+    if st.op < SI_NUM_OPS {
+        return Some(st.op);
+    }
+    let (op, ka, kb) = *SI_FAST.get(st.op.checked_sub(SI_FAST_BASE)? as usize)?;
+    let kinds_ok = st.a >> SIK_SHIFT == ka && (kb == NONE || st.b >> SIK_SHIFT == kb);
+    kinds_ok.then_some(op)
+}
+
+/// The program with every step whose operand kinds match a specialized
+/// opcode's rewritten to it. The same computation step for step.
+pub fn specialize(bp: &BudgetedProgram) -> BudgetedProgram {
+    let mut out = bp.clone();
+    for st in &mut out.steps {
+        let unary = matches!(st.op, SI_BNEG | SI_ENEG | SI_EMBED | SI_ACC_B | SI_ACC_E);
+        let (ka, kb) = (
+            st.a >> SIK_SHIFT,
+            if unary { NONE } else { st.b >> SIK_SHIFT },
+        );
+        if let Some(i) = SI_FAST
+            .iter()
+            .position(|&(op, a, b)| op == st.op && a == ka && b == kb)
+        {
+            st.op = SI_FAST_BASE + i as u32;
+        }
+    }
+    out
+}
 
 /// Bit position of the 3-bit operand kind.
 pub const SIK_SHIFT: u32 = 29;
@@ -959,6 +1022,12 @@ pub fn validate(prog: &Program, bp: &BudgetedProgram) -> Result<(), String> {
     };
     for (k, (st, &node)) in bp.steps.iter().zip(&bp.step_nodes).enumerate() {
         let err = |m: String| format!("step {k} ({st:?}, node {node}): {m}");
+        let Some(gop) = generic_op(st) else {
+            return Err(err(
+                "a specialized opcode over operands of other kinds".into()
+            ));
+        };
+        let st = &SiStep { op: gop, ..*st };
         if matches!(st.op, SI_ACC_B | SI_ACC_E) {
             if node != NONE || st.b != next_acc {
                 return Err(err(format!(
@@ -1073,7 +1142,8 @@ pub fn eval_budgeted_row(
     };
     let mut sum = Ext3E::zero();
     for st in &bp.steps {
-        match st.op {
+        let op = generic_op(st).expect("a well-formed specialized step");
+        match op {
             SI_BADD => {
                 let v = base(&w, st.a) + base(&w, st.b);
                 put_b(&mut w, st.dst, v)
@@ -1281,6 +1351,32 @@ mod tests {
                 check_parity(&prog, &bp, budget as u64, 20);
             }
         }
+    }
+
+    #[test]
+    fn the_specialized_program_is_the_same_walk() {
+        let prog = program();
+        for policy in [Policy::Furthest, Policy::FurthestPerCost] {
+            for (nb, ne) in [(3, 2), (4, 3), (32, 32)] {
+                let bp = lower_with_split(&prog, nb, ne, policy).unwrap();
+                let sp = specialize(&bp);
+                assert!(
+                    sp.steps.iter().any(|s| s.op >= SI_FAST_BASE),
+                    "some step specialized"
+                );
+                check_parity(&prog, &sp, 0xF00D ^ nb as u64, 50);
+            }
+        }
+        // A specialized opcode over an operand of another kind is refused.
+        let sp = specialize(&lower_with_split(&prog, 4, 3, Policy::Furthest).unwrap());
+        let k = sp
+            .steps
+            .iter()
+            .position(|s| s.op >= SI_FAST_BASE && s.a >> SIK_SHIFT == SIK_BSLOT)
+            .expect("a specialized step reading a base slot");
+        let mut m = sp.clone();
+        m.steps[k].a = enc(SIK_BCONST, 0);
+        assert!(validate(&prog, &m).is_err());
     }
 
     #[test]

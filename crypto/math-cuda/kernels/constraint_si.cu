@@ -66,6 +66,29 @@ using ext3::Fe3;
 #define SI_COL_OFFSET_SHIFT 20u
 #define SI_COL_MASK 0xFFFFFu
 
+// Specialized opcodes (budgeted.rs `SI_FAST`): a generic op whose operand kinds
+// the opcode fixes, so the handler loads them directly.
+#define SI_F_BADD_SS 32u
+#define SI_F_BSUB_SS 33u
+#define SI_F_BMUL_SS 34u
+#define SI_F_BMUL_MC 35u
+#define SI_F_BMUL_CM 36u
+#define SI_F_BMUL_SM 37u
+#define SI_F_BMUL_MS 38u
+#define SI_F_BADD_MS 39u
+#define SI_F_BADD_CS 40u
+#define SI_F_EADD_SS 41u
+#define SI_F_ESUB_SS 42u
+#define SI_F_EMUL_SS 43u
+#define SI_F_EMULBX_MU 44u
+#define SI_F_EMULBX_SU 45u
+#define SI_F_EMULBX_MS 46u
+#define SI_F_EMULBX_SS 47u
+#define SI_F_ACCB_S 48u
+#define SI_F_ACCE_S 49u
+#define SI_F_ESUB_SA 50u
+#define SI_F_EMUL_AS 51u
+
 // Slots in dynamic shared memory: word `w` of the thread's row `j` at
 // `smem[(w * R + j) * blockDim.x + threadIdx.x]` (consecutive threads,
 // consecutive words: no bank conflict).
@@ -128,6 +151,35 @@ __device__ __forceinline__ Fe3 si_ext(S &s, const SiInputs &in, uint32_t e, int 
     default:
         return ext3::make(si_base<R>(s, in, e, j, r0, r1), 0, 0);
     }
+}
+
+// Fixed-kind operand loads for the specialized handlers.
+template <class S> __device__ __forceinline__ uint64_t ld_bs(S &s, uint32_t e, int j) {
+    return s.at(e & SIK_PAYLOAD_MASK, j);
+}
+template <class S> __device__ __forceinline__ Fe3 ld_es(S &s, uint32_t e, int j) {
+    uint32_t p = e & SIK_PAYLOAD_MASK;
+    return ext3::make(s.at(p, j), s.at(p + 1, j), s.at(p + 2, j));
+}
+__device__ __forceinline__ uint64_t ld_main(const SiInputs &in, uint32_t e, int j, const uint64_t *r0,
+                                            const uint64_t *r1) {
+    uint32_t p = e & SIK_PAYLOAD_MASK;
+    uint64_t r = (p >> SI_COL_OFFSET_SHIFT) ? r1[j] : r0[j];
+    return in.main[(uint64_t)(p & SI_COL_MASK) * in.main_stride + r];
+}
+__device__ __forceinline__ Fe3 ld_aux(const SiInputs &in, uint32_t e, int j, const uint64_t *r0,
+                                      const uint64_t *r1) {
+    uint32_t p = e & SIK_PAYLOAD_MASK;
+    uint64_t r = (p >> SI_COL_OFFSET_SHIFT) ? r1[j] : r0[j];
+    uint64_t c = (uint64_t)(p & SI_COL_MASK) * 3;
+    return ext3::make(in.aux[c * in.aux_stride + r], in.aux[(c + 1) * in.aux_stride + r],
+                      in.aux[(c + 2) * in.aux_stride + r]);
+}
+__device__ __forceinline__ uint64_t ld_bc(const SiInputs &in, uint32_t e) {
+    return in.base_consts[e & SIK_PAYLOAD_MASK];
+}
+__device__ __forceinline__ Fe3 ld_eu(const SiInputs &in, uint32_t e) {
+    return in.uni[e & SIK_PAYLOAD_MASK];
 }
 
 template <class S>
@@ -295,6 +347,73 @@ __device__ __forceinline__ void si_rows(
             }
             break;
         }
+        // Specialized: the generic op above, with the operand kinds fixed.
+#define SI_FOR_ROWS _Pragma("unroll") for (int j = 0; j < R; j++)
+        case SI_F_BADD_SS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bs(s, a, j), ld_bs(s, b, j));
+            break;
+        case SI_F_BSUB_SS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::sub(ld_bs(s, a, j), ld_bs(s, b, j));
+            break;
+        case SI_F_BMUL_SS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_bs(s, b, j));
+            break;
+        case SI_F_BMUL_MC:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bc(in, b));
+            break;
+        case SI_F_BMUL_CM:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bc(in, a), ld_main(in, b, j, r0, r1));
+            break;
+        case SI_F_BMUL_SM:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_main(in, b, j, r0, r1));
+            break;
+        case SI_F_BMUL_MS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
+            break;
+        case SI_F_BADD_MS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
+            break;
+        case SI_F_BADD_CS:
+            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bc(in, a), ld_bs(s, b, j));
+            break;
+        case SI_F_EADD_SS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::add(ld_es(s, a, j), ld_es(s, b, j)));
+            break;
+        case SI_F_ESUB_SS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_es(s, b, j)));
+            break;
+        case SI_F_EMUL_SS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_es(s, a, j), ld_es(s, b, j)));
+            break;
+        case SI_F_EMULBX_MU:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_main(in, a, j, r0, r1)));
+            break;
+        case SI_F_EMULBX_SU:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_bs(s, a, j)));
+            break;
+        case SI_F_EMULBX_MS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_main(in, a, j, r0, r1)));
+            break;
+        case SI_F_EMULBX_SS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_bs(s, a, j)));
+            break;
+        case SI_F_ACCB_S: {
+            const Fe3 c = beta[b];
+            SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul_base(c, ld_bs(s, a, j)));
+            break;
+        }
+        case SI_F_ACCE_S: {
+            const Fe3 c = beta[b];
+            SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul(c, ld_es(s, a, j)));
+            break;
+        }
+        case SI_F_ESUB_SA:
+            SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_aux(in, b, j, r0, r1)));
+            break;
+        case SI_F_EMUL_AS:
+            SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_aux(in, a, j, r0, r1), ld_es(s, b, j)));
+            break;
+#undef SI_FOR_ROWS
         default:
             break;
         }
