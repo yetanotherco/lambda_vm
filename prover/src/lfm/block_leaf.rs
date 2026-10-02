@@ -115,11 +115,13 @@ impl BlockPartition {
 /// D-NOEPOCH §12.2's rule over the block's AIR-order instance list:
 ///
 /// 1. the KECCAK_RND instances seed leaves `0, 1, 2, …` (mod `num_leaves`);
-/// 2. ECDAS, ECSM and KECCAK go to leaves 1, 2, 3 (mod `num_leaves`);
+/// 2. ECDAS goes to leaf 1, `ECSM[0]` to leaf 2 and `KECCAK[0]` to leaf 3
+///    (mod `num_leaves`);
 /// 3. the fixed and tiny tables (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT,
 ///    COMMIT, HINT) go to leaf 0;
-/// 4. every other instance, in AIR order but PAGE last, goes to the leaf whose
-///    cost so far is smallest (ties: the lowest leaf).
+/// 4. every other instance — ECSM and KECCAK chunks past the first included,
+///    so no count of them can overfill one leaf — in AIR order but PAGE last,
+///    goes to the leaf whose cost so far is smallest (ties: the lowest leaf).
 ///
 /// `names` are the AIRs' names (`CPU[3]`, `PAGE:0x1000` …; the instance suffix
 /// after `[` or `:` is ignored) and `costs` any additive per-instance cost.
@@ -139,7 +141,7 @@ pub fn partition_by_rule(
         leaves[k % num_leaves].push(i);
         placed[i] = true;
     };
-    let mut keccak_rnd = 0usize;
+    let (mut keccak_rnd, mut ecsm, mut keccak) = (0usize, 0usize, 0usize);
     for (i, name) in names.iter().enumerate() {
         match kind(name).as_str() {
             "KECCAK_RND" => {
@@ -147,8 +149,18 @@ pub fn partition_by_rule(
                 keccak_rnd += 1;
             }
             "ECDAS" => place(&mut leaves, 1, i),
-            "ECSM" => place(&mut leaves, 2, i),
-            "KECCAK" => place(&mut leaves, 3, i),
+            "ECSM" => {
+                if ecsm == 0 {
+                    place(&mut leaves, 2, i);
+                }
+                ecsm += 1;
+            }
+            "KECCAK" => {
+                if keccak == 0 {
+                    place(&mut leaves, 3, i);
+                }
+                keccak += 1;
+            }
             "BITWISE" | "DECODE" | "KECCAK_RC" | "REGISTER" | "HALT" | "COMMIT" | "HINT" => {
                 place(&mut leaves, 0, i)
             }
