@@ -3751,7 +3751,7 @@ pub trait IsStarkProver<
         // layer's from the fold layout (a group tree under a fold schedule),
         // so a capped `fri = dp` or one-row proof caps the trees it committed.
         let caps = crate::merkle_caps::StarkCaps::from_layout(
-            air.options().format.merkle_cap,
+            crate::config::effective_cap_policy::<H>(air.options().format.merkle_cap),
             number_of_queries,
             domain_size.trailing_zeros() as usize,
             &fri_layout,

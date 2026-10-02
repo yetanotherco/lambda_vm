@@ -114,6 +114,8 @@ pub mod windowed_builder_tests;
 pub mod shift_tests;
 
 #[cfg(test)]
+pub mod p1_stark_tests;
+#[cfg(test)]
 pub mod skip_empty_tables_tests;
 #[cfg(test)]
 pub mod statement_alignment_tests;
@@ -142,7 +144,6 @@ pub mod zf_air_cache_tests;
 pub mod zf_lfm_bytes_tests;
 #[cfg(all(test, feature = "cuda"))]
 pub mod zf_rpx_device_tests;
-#[cfg(test)]
 pub mod zf_rpx_golden_tests;
 #[cfg(test)]
 pub mod zf_rpx_vectors;

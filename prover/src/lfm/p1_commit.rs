@@ -287,7 +287,17 @@ impl StarkHash for P1StarkHash {
     type Transcript = P1TranscriptHash;
 
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
+
+    const ARITY: usize = 4;
 }
+
+// The configuration's arity is its backends'.
+const _: () = {
+    assert!(<P1BatchBackend<GoldilocksField> as IsMerkleTreeBackend>::ARITY == P1StarkHash::ARITY);
+    assert!(
+        <P1PairBackend<GoldilocksExtension> as IsMerkleTreeBackend>::ARITY == P1StarkHash::ARITY
+    );
+};
 
 // =========================================================================
 // The transcript
