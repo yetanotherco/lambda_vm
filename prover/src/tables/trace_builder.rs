@@ -4111,13 +4111,37 @@ fn generate_chunks<T: Sync>(
     pack: Packing,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    generate_chunks_with(
+        op_chunks,
+        |chunk: &&[T], generate: &dyn Fn(&[T]) -> TraceTable<_, _>| generate(chunk),
+        generate,
+        pack,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// [`generate_chunks`] over chunks that `view` hands to the generator as op
+/// slices, each made only when its generation starts (a chunk that straddles
+/// two segments is copied then, and freed with its table).
+fn generate_chunks_with<C: Send, T>(
+    chunks: Vec<C>,
+    view: impl Fn(
+        &C,
+        &dyn Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension>
+    + Sync,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: Packing,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
     // allocates, keeping trace memory bounded.
     #[cfg(feature = "disk-spill")]
     if storage_mode == StorageMode::Disk {
-        let mut tables = Vec::with_capacity(op_chunks.len());
-        for chunk in op_chunks {
-            let mut t = generate(chunk);
+        let mut tables = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let mut t = view(chunk, &generate);
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
@@ -4125,17 +4149,106 @@ fn generate_chunks<T: Sync>(
         }
         return Ok(tables);
     }
-    let generate = |chunk: &[T]| {
-        let mut table = generate(chunk);
+    let generate = |chunk: C| {
+        let mut table = view(&chunk, &generate);
         if pack.on {
             table.pack_main_narrow();
         }
         table
     };
     #[cfg(feature = "parallel")]
-    let tables = op_chunks.into_par_iter().map(generate).collect();
+    let tables = chunks.into_par_iter().map(generate).collect();
     #[cfg(not(feature = "parallel"))]
-    let tables = op_chunks.into_iter().map(generate).collect();
+    let tables = chunks.into_iter().map(generate).collect();
+    Ok(tables)
+}
+
+/// A list kept as the segments it is the concatenation of, never concatenated
+/// (phase 3's LT ops: the kept tail, the MEMW and MEMW_A prefixes and what the
+/// finish derives, each a list of its own).
+struct Segmented<'a, T> {
+    parts: Vec<&'a [T]>,
+}
+
+impl<'a, T: Clone> Segmented<'a, T> {
+    fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.len()).sum()
+    }
+
+    /// Ops `start..end` of the concatenation: borrowed when one segment holds
+    /// them, copied when they straddle segments.
+    fn range(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
+        let mut at = 0usize;
+        let mut pieces: Vec<&'a [T]> = Vec::new();
+        for part in &self.parts {
+            let (lo, hi) = (at, at + part.len());
+            if hi > start && lo < end {
+                pieces.push(&part[start.max(lo) - lo..end.min(hi) - lo]);
+            }
+            at = hi;
+            if at >= end {
+                break;
+            }
+        }
+        match pieces.as_slice() {
+            [] => std::borrow::Cow::Borrowed(&[]),
+            [one] => std::borrow::Cow::Borrowed(one),
+            _ => std::borrow::Cow::Owned(pieces.concat()),
+        }
+    }
+}
+
+/// [`chunk_and_generate_skipping`] over a [`Segmented`] list: the same chunks
+/// (whole multiples of `max_rows` of the concatenation, the same placeholders
+/// and padding rules), each made from the segments only as it is generated.
+#[allow(clippy::too_many_arguments)]
+fn chunk_and_generate_segmented<T: Clone + Sync>(
+    ops: &Segmented<'_, T>,
+    max_rows: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: Packing,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let len = ops.len();
+    let max_rows = max_rows.max(1);
+    let chunks: Vec<(usize, usize)> = (0..len.div_ceil(max_rows))
+        .map(|k| (k * max_rows, ((k + 1) * max_rows).min(len)))
+        .collect();
+    let (placeholders, chunks) = if skip == 0 {
+        // As `chunk_and_generate` / `chunk_and_generate_optional`: an empty
+        // list is one empty chunk, or no table at all when the table is
+        // optional.
+        let chunks = if len == 0 && !optional {
+            vec![(0, 0)]
+        } else {
+            chunks
+        };
+        (0, chunks)
+    } else if tails {
+        (skip, chunks)
+    } else {
+        if skip > chunks.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                chunks.len()
+            )));
+        }
+        (skip, chunks[skip..].to_vec())
+    };
+    let mut tables: Vec<_> = (0..placeholders).map(|_| streamed_placeholder()).collect();
+    tables.extend(generate_chunks_with(
+        chunks,
+        |&(start, end): &(usize, usize), generate: &dyn Fn(&[T]) -> TraceTable<_, _>| {
+            generate(&ops.range(start, end))
+        },
+        generate,
+        pack,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?);
     Ok(tables)
 }
 
@@ -4542,7 +4655,7 @@ fn build_traces<I: ImageSource + Sync>(
         memw_aligned_ops,
         memw_register_rows,
         load_ops,
-        mut lt_ops,
+        lt_ops,
         shift_ops,
         bitwise_ops,
         branch_ops,
@@ -4564,28 +4677,43 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw(
-        &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
-    ));
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_aligned_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw_aligned(
+    // LT's list is these segments in this order, kept apart: concatenating them
+    // into one list reallocated multi-GiB copies at the median block.
+    let memw_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_lt))
+        .unwrap_or_default();
+    let lt_from_memw = collect_lt_from_memw(&memw_ops[skip.memw_lt_done.min(memw_ops.len())..]);
+    let memw_aligned_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_aligned_lt))
+        .unwrap_or_default();
+    let lt_from_memw_aligned = collect_lt_from_memw_aligned(
         &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
-    ));
+    );
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
-    lt_ops.extend(hint_ops.iter().flat_map(|op| {
-        [
-            LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
-            LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-            LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-        ]
-    }));
+    let lt_from_hints: Vec<LtOperation> = hint_ops
+        .iter()
+        .flat_map(|op| {
+            [
+                LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+                LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+                LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+            ]
+        })
+        .collect();
+    let lt_ops = Segmented {
+        parts: vec![
+            &lt_ops[..],
+            &memw_lt,
+            &lt_from_memw,
+            &memw_aligned_lt,
+            &lt_from_memw_aligned,
+            &lt_from_hints,
+        ],
+    };
     finish_mark("p3 lt");
 
     // =====================================================================
@@ -4641,7 +4769,7 @@ fn build_traces<I: ImageSource + Sync>(
     // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
     // below; the rest stay one collector each.
     let mut collectors: Vec<Collector> = Vec::new();
-    for slice in lt_ops.chunks(1 << 20) {
+    for slice in lt_ops.parts.iter().flat_map(|part| part.chunks(1 << 20)) {
         collectors.push(Box::new(move |h| {
             h.add_ops(&collect_bitwise_from_lt(slice))
         }));
@@ -4916,7 +5044,7 @@ fn build_traces<I: ImageSource + Sync>(
         } else {
             (lt::generate_lt_trace, pack)
         };
-        chunk_and_generate_skipping(
+        chunk_and_generate_segmented(
             &lt_ops,
             max_rows.lt,
             skip.lt,
@@ -6519,5 +6647,131 @@ impl Traces {
             &StreamSkip::default(),
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// One column holding the ops, padded to a power of two.
+    fn table_of(ops: &[u64]) -> Table {
+        let rows = ops.len().next_power_of_two().max(4);
+        let mut data = crate::tables::types::zeroed_fe_vec(rows);
+        for (cell, &op) in data.iter_mut().zip(ops) {
+            *cell = crate::tables::types::FE::from(op);
+        }
+        TraceTable::new_main(data, 1, 1)
+    }
+
+    fn words(tables: &[Table]) -> Vec<(usize, Vec<u64>)> {
+        tables
+            .iter()
+            .map(|t| {
+                (
+                    t.main_table.width,
+                    t.main_table
+                        .row_major_data()
+                        .iter()
+                        .map(|v| v.canonical())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Chunked from its segments, a list gives the tables its concatenation
+    /// gives: every split of the segments (empty ones too), chunk sizes that
+    /// cut inside and across them, with and without chunks streamed ahead
+    /// (tails or whole lists), optional or not, and an empty list.
+    #[test]
+    fn a_segmented_list_chunks_as_its_concatenation() {
+        let all: Vec<u64> = (1..=37).collect();
+        let layouts: [&[usize]; 4] = [&[37], &[0, 10, 0, 27], &[5, 5, 5, 22], &[1, 36, 0]];
+        let off = Packing { on: false };
+        for layout in layouts {
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for &n in layout {
+                parts.push(&all[at..at + n]);
+                at += n;
+            }
+            let segmented = Segmented { parts };
+            for max in [1, 4, 5, 10, 37, 100] {
+                for (skip, tails) in [(0, false), (2, true), (2, false)] {
+                    for optional in [true, false] {
+                        // With `tails`, the list is what is left past the
+                        // streamed chunks: the same list either way here.
+                        let whole = chunk_and_generate_skipping(
+                            &all,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            off,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        let split = chunk_and_generate_segmented(
+                            &segmented,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            off,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        match (whole, split) {
+                            (Ok(a), Ok(b)) => assert_eq!(
+                                words(&a),
+                                words(&b),
+                                "{layout:?} max {max} skip {skip} tails {tails} optional {optional}"
+                            ),
+                            (Err(_), Err(_)) => {}
+                            (a, b) => panic!(
+                                "{layout:?} max {max} skip {skip}: {:?} vs {:?}",
+                                a.is_ok(),
+                                b.is_ok()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let empty: Segmented<'_, u64> = Segmented {
+            parts: vec![&[], &[]],
+        };
+        for optional in [true, false] {
+            let a = chunk_and_generate_skipping(
+                &[] as &[u64],
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                off,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .unwrap();
+            let b = chunk_and_generate_segmented(
+                &empty,
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                off,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .unwrap();
+            assert_eq!(words(&a), words(&b), "empty, optional {optional}");
+        }
     }
 }
