@@ -1106,7 +1106,12 @@ fn windowed_counting(
     let body = logs.len() - 1;
     let cut = body - body % window;
     let mut chunks = Vec::new();
-    let mut counters = vec![Counter::new(), Counter::new()];
+    // A counter is an 80 MiB histogram: only as many as the mode uses.
+    let mut counters: Vec<Counter> = match counting {
+        Counting::Push => Vec::new(),
+        Counting::Split => vec![Counter::new()],
+        Counting::SplitReversed => vec![Counter::new(), Counter::new()],
+    };
     let mut later = Vec::new();
     for w in logs[..cut].chunks(window) {
         match counting {
