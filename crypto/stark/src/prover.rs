@@ -6894,10 +6894,15 @@ pub trait IsStarkProver<
         // (masked columns only), and absorb only the surviving values — the
         // verifier absorbs the identical two blocks in the same order.
         let __ps_oa = crate::prove_split::mark();
+        let __ps_ol = crate::prove_split::mark();
         let (ood_block0, ood_block1) =
             Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+        crate::prove_split::add(&crate::prove_split::R3A_LAYOUT, __ps_ol);
         for block in [&ood_block0, &ood_block1] {
-            for col in ood_columns(block).iter() {
+            let __ps_oc = crate::prove_split::mark();
+            let columns = ood_columns(block);
+            crate::prove_split::add(&crate::prove_split::R3A_COLUMNS, __ps_oc);
+            for col in columns.iter() {
                 for elem in col.iter() {
                     transcript.append_field_element(elem);
                 }
