@@ -677,8 +677,8 @@ fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
 
 /// The partition's cost model is part of the verifier's identity (it decides
 /// every leaf's instance list), so its output is pinned to its version: a change
-/// to the closed form, the fork constant or the cap fails here until
-/// `PARTITION_COST_MODEL` is bumped with it.
+/// to the closed form, the fork constant, the cap or the rule's seeds fails
+/// here until `PARTITION_COST_MODEL` is bumped with it.
 #[test]
 fn the_partition_cost_model_is_pinned_to_its_version() {
     // The block base's preset without the environment's format knobs, so the
@@ -689,8 +689,27 @@ fn the_partition_cost_model_is_pinned_to_its_version() {
     let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
     assert_eq!(
         (plan.cost_model(), plan.costs()),
-        (1, vec![4654, 3884, 3994, 3884, 4544, 4874, 3994, 3554]),
+        (2, vec![4654, 3884, 3994, 3884, 4544, 4874, 3994, 3554]),
         "the cost model's output moved: bump PARTITION_COST_MODEL with it"
+    );
+    // v2's rule: the first ECDAS, ECSM and KECCAK seed leaves 1, 2 and 3; their
+    // second chunks fill by load with the rest (v1 put them on the same leaves:
+    // [[0, 7], [5, 6], [3, 4], [1, 2]]).
+    let names = [
+        "BITWISE",
+        "KECCAK[0]",
+        "KECCAK[1]",
+        "ECSM[0]",
+        "ECSM[1]",
+        "ECDAS[0]",
+        "ECDAS[1]",
+        "CPU[0]",
+    ];
+    let rule = partition_by_rule(&names, &[1, 50, 50, 40, 40, 40, 40, 30], 4).expect("fills");
+    assert_eq!(
+        (plan.cost_model(), rule.leaves()),
+        (2, &[vec![0, 2], vec![4, 5], vec![3, 6], vec![1, 7]][..]),
+        "the rule's output moved: bump PARTITION_COST_MODEL with it"
     );
 }
 
