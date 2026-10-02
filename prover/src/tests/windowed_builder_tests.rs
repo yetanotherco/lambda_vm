@@ -414,7 +414,6 @@ fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
                     &format!("{name} KECCAK_RND/{per} window {window}"),
                     &split,
                     &traces.keccak_rnds,
-                    false,
                 );
                 // One-cycle windows push every cycle but the last, so every
                 // chunk the ops fill before the run ends streams.
