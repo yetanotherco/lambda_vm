@@ -585,6 +585,46 @@ impl QueueRoom {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_PURGE=1`: once the run is walked, before the finish
+/// builds its tables, the allocator returns the pages freed so far to the OS
+/// ([`purge_freed_pages`]), so the finish does not stack its working set on
+/// pages its threads cannot reuse. A measurement knob, off by default.
+fn purge_before_finish() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_PURGE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Every jemalloc arena's freed (dirty and muzzy) pages returned to the OS now,
+/// the decay settings left as they were (never, under the posture): each
+/// arena's decay is set to 0, which purges at once, then back. In the lib's
+/// tests, which install jemalloc (`lib.rs`); `false` elsewhere.
+#[cfg(test)]
+fn purge_freed_pages() -> bool {
+    use tikv_jemalloc_ctl::{arenas, raw};
+    let Ok(n) = arenas::narenas::read() else {
+        return false;
+    };
+    for i in 0..n {
+        for kind in ["dirty", "muzzy"] {
+            let name = format!("arena.{i}.{kind}_decay_ms\0");
+            // SAFETY: a NUL-terminated mallctl name whose value is an ssize_t.
+            unsafe {
+                let Ok(was) = raw::read::<isize>(name.as_bytes()) else {
+                    continue;
+                };
+                let _ = raw::write(name.as_bytes(), 0isize);
+                let _ = raw::write(name.as_bytes(), was);
+            }
+        }
+    }
+    true
+}
+
+/// Outside the lib's tests the allocator is not driven.
+#[cfg(not(test))]
+fn purge_freed_pages() -> bool {
+    false
+}
+
 /// `LAMBDA_VM_BLOCK_MEMLOG=1`: [`MemLedger`]'s `BLOCK MEM` lines, every half
 /// second from the block's start to its proof and at the phase marks. A
 /// measurement knob, off by default.
@@ -1162,6 +1202,18 @@ fn build_streamed(
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
             }
+            if purge_before_finish() {
+                let (t, before) = (Instant::now(), proc_rss_bytes());
+                let purged = purge_freed_pages();
+                let gib = |b: Option<usize>| b.map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64);
+                eprintln!(
+                    "BLOCK PURGE before the finish: {} in {:.2} s · VmRSS {:.2} → {:.2} GiB",
+                    if purged { "purged" } else { "not available" },
+                    t.elapsed().as_secs_f64(),
+                    gib(before),
+                    gib(proc_rss_bytes()),
+                );
+            }
             let windows = builder.stamps();
             let t = Instant::now();
             let traces = builder.finish(&last)?;
@@ -1565,5 +1617,23 @@ mod wide_permit_tests {
         });
         assert_eq!(done.load(Ordering::SeqCst), 8);
         assert_eq!(most.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    /// The purge reaches jemalloc in the lib's tests and leaves every arena's
+    /// decay settings as they were.
+    #[test]
+    fn a_purge_leaves_the_decay_settings_as_they_were() {
+        use tikv_jemalloc_ctl::raw;
+        let name = b"arena.0.dirty_decay_ms\0";
+        // SAFETY: a NUL-terminated mallctl name whose value is an ssize_t.
+        let before = unsafe { raw::read::<isize>(name) }.expect("arena 0 decay");
+        // Something to purge: a freed allocation.
+        drop(vec![1u8; 64 << 20]);
+        assert!(super::purge_freed_pages());
+        let after = unsafe { raw::read::<isize>(name) }.expect("arena 0 decay");
+        assert_eq!(before, after);
     }
 }
