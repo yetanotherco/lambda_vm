@@ -80,9 +80,9 @@ use crate::tables::{
 };
 
 #[cfg(test)]
-mod tail_tests;
-#[cfg(test)]
 mod producer_harness;
+#[cfg(test)]
+mod tail_tests;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 

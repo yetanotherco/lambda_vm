@@ -63,6 +63,9 @@ pub(crate) struct ProducerConfig {
     /// Hash every log the executor emits (on the executor thread, so not
     /// for a timed run): two executors agree on a run iff their digests do.
     pub log_digest: bool,
+    /// Count each segment's L2G rows and the run's pages ([`SegmentCensus`];
+    /// on the accumulator thread, so not for a timed run).
+    pub segment_census: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -93,6 +96,8 @@ pub(crate) struct ThreadTimes {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProducerReport {
+    /// [`ProducerConfig::segment_census`]'s counts.
+    pub segments: Option<SegmentCensus>,
     pub cycles: usize,
     pub exec_setup: f64,
     pub exec_resume: f64,
@@ -206,6 +211,112 @@ fn first_touch_bytes(window: &WalkedWindow) -> usize {
                     .count()
             })
             .sum::<usize>()
+}
+
+/// The segment sizes (cycles) of the segment census (D-SEGMENTS G0).
+const CENSUS_SEGMENTS_LOG2: [u32; 3] = [26, 27, 28];
+
+/// D-SEGMENTS G0 (`LAMBDA_VM_PRODUCER_SEGMENT_CENSUS=1`): for each segment size
+/// S, the distinct memory bytes each S-cycle segment touches (its L2G rows: a
+/// byte counts in a segment at its first access there, the access whose old
+/// timestamp precedes the segment's first cycle), and the pages the run touches
+/// (GLOBAL_MEMORY instances). Registers are not memory cells.
+#[derive(Clone, Debug)]
+pub(crate) struct SegmentCensus {
+    /// The segment sizes, log2 cycles (windows must not straddle them).
+    logs: [u32; 3],
+    /// `rows[i][k]`: segment `k`'s rows at `logs[i]`.
+    rows: [Vec<usize>; 3],
+    pages: std::collections::HashSet<u64>,
+}
+
+impl Default for SegmentCensus {
+    fn default() -> Self {
+        Self::with_logs(CENSUS_SEGMENTS_LOG2)
+    }
+}
+
+impl SegmentCensus {
+    fn with_logs(logs: [u32; 3]) -> Self {
+        Self {
+            logs,
+            rows: Default::default(),
+            pages: Default::default(),
+        }
+    }
+
+    /// Counts one walked window (its CPU ops start a 2^`log2` window's worth
+    /// of cycles into the run, in the run's timestamps).
+    fn add(&mut self, window: &WalkedWindow) {
+        let Some(t0) = window.cpu_ops.first().map(|op| op.timestamp) else {
+            return;
+        };
+        let first_cycle = (t0 - 4) / 4;
+        let memw = &window.walk.memw;
+        for (i, log2) in self.logs.iter().enumerate() {
+            let segment = (first_cycle >> log2) as usize;
+            let seg_t0 = (((segment as u64) << log2) * 4) + 4;
+            // A window never straddles a segment (2^21-cycle windows, 2^26+
+            // segments).
+            let aligned: usize = memw
+                .aligned
+                .iter()
+                .filter(|row| !row.is_register() && row.old_timestamp() < seg_t0)
+                .map(|row| usize::from(row.width()).min(8))
+                .sum();
+            let general: usize = memw
+                .general
+                .iter()
+                .filter(|op| !op.is_register)
+                .map(|op| {
+                    op.old_timestamp[..usize::from(op.width).min(8)]
+                        .iter()
+                        .filter(|&&ts| ts < seg_t0)
+                        .count()
+                })
+                .sum();
+            let rows = &mut self.rows[i];
+            if rows.len() <= segment {
+                rows.resize(segment + 1, 0);
+            }
+            rows[segment] += aligned + general;
+        }
+        let page = |addr: u64| addr >> 18;
+        for row in memw.aligned.iter().filter(|row| !row.is_register()) {
+            let base = row.base_address();
+            self.pages.insert(page(base));
+            self.pages
+                .insert(page(base.wrapping_add(u64::from(row.width()).max(1) - 1)));
+        }
+        for op in memw.general.iter().filter(|op| !op.is_register) {
+            self.pages.insert(page(op.base_address));
+            self.pages.insert(page(
+                op.base_address.wrapping_add(u64::from(op.width).max(1) - 1),
+            ));
+        }
+    }
+
+    /// One `PRODUCER SEGMENTS` line per segment size.
+    fn lines(&self, label: &str) -> Vec<String> {
+        const CHUNK: usize = 1 << 21;
+        self.logs
+            .iter()
+            .zip(&self.rows)
+            .map(|(log2, rows)| {
+                let sum: usize = rows.iter().sum();
+                let max = rows.iter().copied().max().unwrap_or(0);
+                let chunks: usize = rows.iter().map(|r| r.div_ceil(CHUNK)).sum();
+                format!(
+                    "PRODUCER SEGMENTS label={label} S=2^{log2} segments={} rows={:?} max={max} sum={sum} \
+                     l2g_chunks={chunks} pages={} global_instances={}",
+                    rows.len(),
+                    rows,
+                    self.pages.len(),
+                    chunks + self.pages.len()
+                )
+            })
+            .collect()
+    }
 }
 
 fn spawn_named<'scope, 'env, T: Send + 'scope>(
@@ -402,6 +513,7 @@ pub(crate) fn run_producer(
             "prod-acc",
             move || -> Result<ProducerReport, Error> {
                 let mut report = ProducerReport::default();
+                let mut census = cfg.segment_census.then(SegmentCensus::default);
                 let t_setup = Instant::now();
                 let mut builder = WindowedTraceBuilder::new(program, input, &cfg.max_rows)?;
                 if cfg.drop_ops {
@@ -466,6 +578,9 @@ pub(crate) fn run_producer(
                                 first_touch_bytes: first_touch_bytes(&walked),
                                 ..WindowRow::default()
                             };
+                            if let Some(census) = census.as_mut() {
+                                census.add(&walked);
+                            }
                             report.census += t_census.elapsed().as_secs_f64();
                             let t_absorb = Instant::now();
                             let jobs = accumulator.absorb(walked);
@@ -505,6 +620,7 @@ pub(crate) fn run_producer(
                 report.windows_done_at = since();
                 report.accumulator.done_at = report.windows_done_at;
                 report.accumulator.cpu = cpu_since(cpu0);
+                report.segments = census.take();
                 let stamps = builder.stamps();
                 report.stamp_walk = stamps.walk;
                 report.stamp_route = stamps.route;
@@ -595,6 +711,9 @@ impl ProducerReport {
     /// `key=value` pairs for a script to read.
     pub(crate) fn lines(&self, cfg: &ProducerConfig, label: &str) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(census) = &self.segments {
+            out.extend(census.lines(label));
+        }
         let cycles = self.cycles.max(1) as f64;
         let ns = |secs: f64| secs * 1e9 / cycles;
         let sum = |f: fn(&ThreadTimes) -> Option<f64>| -> Option<f64> {
@@ -798,6 +917,7 @@ fn the_block_producer_alone() {
         live: true,
         finish: env_usize("LAMBDA_VM_PRODUCER_FINISH", 1) != 0,
         log_digest: env_usize("LAMBDA_VM_PRODUCER_LOG_DIGEST", 0) != 0,
+        segment_census: env_usize("LAMBDA_VM_PRODUCER_SEGMENT_CENSUS", 0) != 0,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -870,6 +990,61 @@ fn first_touch_bytes_are_the_distinct_bytes_a_window_touches() {
     }
 }
 
+/// The segment census counts, per segment, the distinct bytes its windows'
+/// memory accesses cover, and the run's pages: on keccak programs walked in
+/// 16-cycle windows against 32-, 64- and 128-cycle segments.
+#[test]
+fn the_segment_census_counts_each_segments_distinct_bytes() {
+    for name in ["test_keccak", "test_keccak_multi"] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+        let logs = Executor::new(&program, Vec::new())
+            .expect("the executor starts")
+            .run()
+            .expect("the program runs")
+            .logs;
+        let mut builder =
+            WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small()).expect("the builder");
+        let (mut walker, _) = builder.split();
+        let logs2 = [5u32, 6, 7];
+        let mut census = SegmentCensus::with_logs(logs2);
+        let mut expected: [Vec<std::collections::BTreeSet<u64>>; 3] = Default::default();
+        let mut pages = std::collections::BTreeSet::new();
+        let body = logs.len() - 1;
+        for (w, part) in logs[..body - body % 16].chunks(16).enumerate() {
+            let walked = walker.walk(part).expect("a window");
+            census.add(&walked);
+            let memw = &walked.walk.memw;
+            let bytes: Vec<u64> = memw
+                .aligned
+                .iter()
+                .filter(|row| !row.is_register())
+                .map(|row| (row.base_address(), row.width()))
+                .chain(
+                    memw.general
+                        .iter()
+                        .filter(|op| !op.is_register)
+                        .map(|op| (op.base_address, op.width)),
+                )
+                .flat_map(|(base, width)| (0..u64::from(width)).map(move |k| base.wrapping_add(k)))
+                .collect();
+            pages.extend(bytes.iter().map(|b| b >> 18));
+            for (i, log2) in logs2.iter().enumerate() {
+                let segment = (w * 16) >> log2;
+                if expected[i].len() <= segment {
+                    expected[i].resize(segment + 1, Default::default());
+                }
+                expected[i][segment].extend(bytes.iter().copied());
+            }
+        }
+        for i in 0..3 {
+            let want: Vec<usize> = expected[i].iter().map(|s| s.len()).collect();
+            assert_eq!(census.rows[i], want, "{name}, segments of 2^{}", logs2[i]);
+        }
+        assert!(census.rows[0].len() > 1, "{name}: one segment only");
+        assert_eq!(census.pages.len(), pages.len(), "{name}: pages");
+    }
+}
+
 /// The harness runs the producer end to end on small programs: every cycle
 /// executed, the same chunks a plain windowed build hands out, every job
 /// reaching a generator under both sinks, and the windows' memory census
@@ -891,6 +1066,7 @@ fn the_producer_harness_drives_the_builder() {
                     live: false,
                     finish: true,
                     log_digest: false,
+                    segment_census: true,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
                 let what = format!("{name}, window {window}, {sink:?}");
