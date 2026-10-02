@@ -11,7 +11,7 @@ use crate::tables::types::{FE, FEE};
 use crate::test_utils::E as FEE_FIELD;
 use crate::test_utils::asm_elf_bytes;
 use crate::zf_format::ZfFormat;
-use multilinear::whir_chain::StackVars;
+use multilinear::whir_chain::{ArgueFormat, StackVars};
 use stark::proof::options::ProofOptions;
 
 use super::block_node::{
@@ -40,6 +40,7 @@ fn small_format() -> BlockFormat {
         group_polys: 2,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
+        argue: ArgueFormat::PerTable,
     }
 }
 
@@ -340,6 +341,7 @@ fn dense_format() -> BlockFormat {
         group_polys: block_whir::BLOCK_GROUP_POLYS,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
+        argue: ArgueFormat::PerTable,
     }
 }
 

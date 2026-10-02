@@ -1505,7 +1505,7 @@ where
 /// opening, never by a flag a caller sets on its own — otherwise it is a switch
 /// that turns off a check with nothing put in its place. The caller derives both
 /// from one `at` slice; see `multi_verify`.
-fn check_preprocessed<F, E>(
+pub(crate) fn check_preprocessed<F, E>(
     statement: TableStatement<'_, F, E>,
     reduced: &claim_reduce::ReducedClaim<E>,
     settled_out_of_band: usize,

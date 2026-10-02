@@ -15,9 +15,11 @@
 //!    uses). The transcript's state after the draw is the block's `S_post`.
 //! 3. **Phase B (prove), per group `g`, on the fork `S_post ‖ g`.** The group's
 //!    columns go up again; each of its tables is argued (today's
-//!    [`prove`]); the group's codewords are recomputed — no hash, the tree's
-//!    top is kept — and its stack is opened at the tables' points
-//!    ([`stacked_eval::prove`]).
+//!    [`prove`]) — or, under [`ArgueFormat::Batched`], the group's tables are
+//!    argued together ([`batched::prove_argue`]: a lockstep GKR per bin and one
+//!    constraint sumcheck for the group); the group's codewords are recomputed
+//!    — no hash, the tree's top is kept — and its stack is opened at the
+//!    tables' points ([`stacked_eval::prove`]).
 //!
 //! The tables whose leading preprocessed columns are settled out of band are
 //! stacked per group ([`BlockPrepared`]): each such stack's derived roots are
@@ -60,14 +62,15 @@ use multilinear::{
     stacked_eval::{self, Claimed, ColumnsAt, RetiredStack, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
-    whir_chain::{ChainConfig, StackVars},
+    whir_chain::{ArgueFormat, ChainConfig, StackVars},
     whir_commit::Commitment,
     whir_hash::WhirHash,
 };
 
 use crate::multilinear_table::{
-    CommittedTable, MultiProof, TableStatement, absorb_roots_and_challenge, contribution,
-    global_layout, prove, verify,
+    CommittedTable, MultiProof, TableStatement, absorb_roots_and_challenge,
+    batched::{self, BatchedArgue, ProverFaults, VerifierChecks, Where},
+    check_preprocessed, contribution, global_layout, prove, verify,
 };
 
 /// How the block's tables split into groups: contiguous runs in table order,
@@ -117,6 +120,10 @@ pub struct GroupStamps {
     pub open: f64,
     /// Host bytes kept of the group's trees between the phases.
     pub tree_bytes: usize,
+    /// The device ledger's peak promise through the group's argue — the
+    /// argue's own and the next group's columns uploaded beside it. Bytes; 0
+    /// without a device.
+    pub argue_reserved: u64,
     /// When the group's commit ended, seconds since phase A started.
     pub committed_at: f64,
 }
@@ -257,6 +264,40 @@ pub struct PreparedDeviation {
     /// of it to the tables (and to its derived roots) refuses it.
     pub consistent: bool,
 }
+
+/// How a test makes the prover argue a group wrongly under the batched argue,
+/// or argue every group on the host, for the card-vs-host byte gate. The
+/// production prover takes [`ArgueDeviation::default`]: no fault, the card.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ArgueDeviation {
+    /// The group whose batched argue takes `faults`.
+    pub group: Option<usize>,
+    pub faults: ProverFaults,
+    /// Where every group's batched argue runs.
+    pub at: Where,
+}
+
+impl Default for ArgueDeviation {
+    fn default() -> Self {
+        Self {
+            group: None,
+            faults: ProverFaults::default(),
+            at: Where::Device,
+        }
+    }
+}
+
+/// What phase B proves: the [`MultiProof`] (its `tables` empty under the
+/// batched argue), the groups' batched argues (one per group under the batched
+/// argue, none under the per-table one), the prepared openings in the
+/// `prepared` list's order, and every group's stamps.
+pub type BlockProved<F, E> = (
+    MultiProof<F, E>,
+    Vec<BatchedArgue<E>>,
+    Vec<StackedProof<F, E>>,
+    Vec<GroupStamps>,
+);
 
 /// The block after phase A: every table, the groups' roots and the tops of
 /// their trees. The codewords are gone.
@@ -472,19 +513,32 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone,
 {
-    let (proof, _, stamps) =
-        block_prove_on_forks::<F, E, T, H>(committed, config, transcript, &[], &[], &|g| g)?;
+    // The batched argue's messages are not a `MultiProof`'s: its callers take
+    // them from `block_prove_on_forks`.
+    if config.format.argue != ArgueFormat::PerTable {
+        return Err(MlError::ArgueFormatMismatch);
+    }
+    let (proof, _, _, stamps) = block_prove_on_forks::<F, E, T, H>(
+        committed,
+        config,
+        transcript,
+        &[],
+        &[],
+        &|g| g,
+        &ArgueDeviation::default(),
+    )?;
     Ok((proof, stamps))
 }
 
 /// [`block_prove`] with the tables' prepared openings, and group `g` proved on
-/// the fork of index `fork_of(g)`. Returns the proof, the prepared openings in
-/// `prepared`'s order, and the stamps.
+/// the fork of index `fork_of(g)`, under the config's argue format
+/// ([`BlockProved`]).
 ///
-/// Only a test proves on a fork map other than the identity: it is how a proof
-/// whose groups sit on the wrong forks is built, for the verifier to refuse.
+/// Only a test proves on a fork map other than the identity, or with an
+/// [`ArgueDeviation`] other than the default: it is how a proof whose groups
+/// sit on the wrong forks, or argue wrongly, is built, for the verifier to
+/// refuse.
 #[doc(hidden)]
-#[allow(clippy::type_complexity)]
 pub fn block_prove_on_forks<F, E, T, H>(
     committed: BlockCommitted<'_, F, E>,
     config: &ChainConfig,
@@ -492,7 +546,8 @@ pub fn block_prove_on_forks<F, E, T, H>(
     prepared: &[BlockPrepared<'_, F, H>],
     deviations: &[PreparedDeviation],
     fork_of: &dyn Fn(usize) -> usize,
-) -> Result<(MultiProof<F, E>, Vec<StackedProof<F, E>>, Vec<GroupStamps>), MlError>
+    argue: &ArgueDeviation,
+) -> Result<BlockProved<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
@@ -529,6 +584,7 @@ where
     let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
 
     let mut table_proofs = Vec::with_capacity(tables.len());
+    let mut argues = Vec::new();
     let mut openings = Vec::with_capacity(sizes.len());
     let mut prepared_openings = Vec::with_capacity(prepared.len());
     let mut at = 0usize;
@@ -557,21 +613,50 @@ where
         stamps[g].upload_b += t.elapsed().as_secs_f64();
 
         // The group's tables, one after another, each leaving its columns
-        // claimed at its own point — with the next group's upload beside them.
+        // claimed at its own point — or, batched, all of them in one argue —
+        // with the next group's upload beside them.
         let t = Instant::now();
+        multilinear::gpu::reset_reserved_window();
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
         let group_ref: &[CommittedTable<'_, F, E>] = group;
         let (argued, next_store, joined) = std::thread::scope(|scope| {
             let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
             let argued = (|| -> Result<(), MlError> {
-                for table in group_ref.iter() {
-                    let (proof, point) = prove(table, &z, &alpha, &beta, &mut fork, None)?;
-                    for _ in 0..table.num_committed_columns() {
-                        points.push(point.clone());
+                match config.format.argue {
+                    ArgueFormat::PerTable => {
+                        for table in group_ref.iter() {
+                            let (proof, point) = prove(table, &z, &alpha, &beta, &mut fork, None)?;
+                            for _ in 0..table.num_committed_columns() {
+                                points.push(point.clone());
+                            }
+                            values.extend(proof.constraint.reduce.column_values.iter().cloned());
+                            table_proofs.push(proof);
+                        }
                     }
-                    values.extend(proof.constraint.reduce.column_values.iter().cloned());
-                    table_proofs.push(proof);
+                    ArgueFormat::Batched { bin_log_cells } => {
+                        let faults = match argue.group {
+                            Some(faulty) if faulty == g => argue.faults,
+                            _ => ProverFaults::default(),
+                        };
+                        let (proof, reduced) = batched::prove_argue(
+                            group_ref,
+                            &z,
+                            &alpha,
+                            &beta,
+                            bin_log_cells,
+                            &mut fork,
+                            faults,
+                            argue.at,
+                        )?;
+                        for (table, claim) in group_ref.iter().zip(reduced) {
+                            for _ in 0..table.num_committed_columns() {
+                                points.push(claim.point.clone());
+                            }
+                            values.extend(claim.column_values);
+                        }
+                        argues.push(proof);
+                    }
                 }
                 Ok(())
             })();
@@ -581,6 +666,7 @@ where
         });
         argued?;
         stamps[g].argue = t.elapsed().as_secs_f64() - joined;
+        stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
         if let Some(next_store) = next_store {
             // The wait for the upload after the argument ended is the next
             // group's upload cost; the rest of it hid behind this argument.
@@ -674,6 +760,7 @@ where
             columns: openings,
             preprocessed: None,
         },
+        argues,
         prepared_openings,
         stamps,
     ))
@@ -711,6 +798,7 @@ where
 {
     block_verify_with::<F, E, T, H>(
         proof,
+        &[],
         prepared_openings,
         prepared,
         statements,
@@ -721,17 +809,25 @@ where
         config,
         transcript,
         false,
+        VerifierChecks::ALL,
     )
 }
 
-/// [`block_verify`] with the prepared openings left unchecked when
-/// `skip_prepared` — their prefixes still skipped by `check_preprocessed` — a
-/// mutation: a test shows the openings are what refuses a prover that opens a
-/// prepared table wrongly.
+/// [`block_verify`] under either argue format, the config's: per table, the
+/// proof's `tables`; batched, `argues`, one per group, each read on its
+/// group's fork ([`batched::verify_argue`]). The other format's messages must
+/// be absent.
+///
+/// The prepared openings are left unchecked when `skip_prepared` — their
+/// prefixes still skipped by `check_preprocessed` — and the batched argue's
+/// checks and the bus balance are switched by `checks`. Both are mutations: a
+/// test shows each check is what refuses its forgery. Production passes
+/// `false` and [`VerifierChecks::ALL`].
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn block_verify_with<F, E, T, H>(
     proof: &MultiProof<F, E>,
+    argues: &[BatchedArgue<E>],
     prepared_openings: &[StackedProof<F, E>],
     prepared: &[BlockPreparedCheck<'_, F>],
     statements: &[TableStatement<'_, F, E>],
@@ -742,6 +838,7 @@ pub fn block_verify_with<F, E, T, H>(
     config: &ChainConfig,
     transcript: &mut T,
     skip_prepared: bool,
+    checks: VerifierChecks,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -753,11 +850,14 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone,
 {
-    if proof.tables.len() != statements.len() {
-        return Err(MlError::QueryCountMismatch {
-            expected: statements.len(),
-            got: proof.tables.len(),
-        });
+    // The format is the verifier's config's, never the proof's: that format's
+    // messages present in full, the other's absent.
+    let (table_proofs, group_argues) = match config.format.argue {
+        ArgueFormat::PerTable => (statements.len(), 0),
+        ArgueFormat::Batched { .. } => (0, sizes.len()),
+    };
+    if proof.tables.len() != table_proofs || argues.len() != group_argues {
+        return Err(MlError::ArgueFormatMismatch);
     }
     if layouts.len() != sizes.len()
         || domains.len() != sizes.len()
@@ -841,18 +941,54 @@ where
         let mut fork = group_fork::<E, T>(transcript, g);
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
-        for ((table, statement), &settled) in proof.tables[statement_at..statement_at + size]
-            .iter()
-            .zip(&statements[statement_at..statement_at + size])
-            .zip(&settled[statement_at..statement_at + size])
-        {
-            let (output, reduced) =
-                verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
-            balance += contribution(&output).ok_or(MlError::BusImbalance)?;
-            for _ in 0..statement.slot_of.len() {
-                points.push(reduced.point.clone());
+        let group_statements = &statements[statement_at..statement_at + size];
+        let group_settled = &settled[statement_at..statement_at + size];
+        match config.format.argue {
+            ArgueFormat::PerTable => {
+                for ((table, statement), &settled) in proof.tables
+                    [statement_at..statement_at + size]
+                    .iter()
+                    .zip(group_statements)
+                    .zip(group_settled)
+                {
+                    let (output, reduced) =
+                        verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
+                    balance += contribution(&output).ok_or(MlError::BusImbalance)?;
+                    for _ in 0..statement.slot_of.len() {
+                        points.push(reduced.point.clone());
+                    }
+                    values.extend(reduced.column_values);
+                }
             }
-            values.extend(reduced.column_values);
+            ArgueFormat::Batched { bin_log_cells } => {
+                // The group's bins come from its statements and the
+                // verifier's cap, never from the proof.
+                let argue = &argues[g];
+                let reduced = batched::verify_argue(
+                    argue,
+                    group_statements,
+                    bin_log_cells,
+                    &z,
+                    &alpha,
+                    &beta,
+                    &mut fork,
+                    checks,
+                )?;
+                for output in &argue.bus_outputs {
+                    balance += contribution(output).ok_or(MlError::BusImbalance)?;
+                }
+                for ((statement, reduced), &settled) in
+                    group_statements.iter().zip(reduced).zip(group_settled)
+                {
+                    if checks.preprocessed {
+                        check_preprocessed(*statement, &reduced, settled)?;
+                    }
+                    for _ in 0..statement.slot_of.len() {
+                        points.push(reduced.point.clone());
+                    }
+                    values.extend(reduced.column_values);
+                }
+            }
         }
         let roots = &proof.roots[root_at..root_at + layout.num_polys()];
         stacked_eval::verify::<F, E, T, H>(
@@ -897,7 +1033,7 @@ where
         statement_at += size;
         root_at += layout.num_polys();
     }
-    if balance != *expected {
+    if checks.balance && balance != *expected {
         return Err(MlError::BusImbalance);
     }
     Ok(())

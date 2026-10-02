@@ -29,9 +29,12 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
+use multilinear::whir_chain::{ArgueFormat, ChainConfig};
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
-use stark::multilinear_table::{CommittedTable, MultiProof, TableLayout, TableStatement};
+use stark::multilinear_table::{
+    BatchedArgue, CommittedTable, MultiProof, TableLayout, TableStatement, batched::VerifierChecks,
+};
 use stark::table::Table;
 use stark::trace::TraceTable;
 use std::time::Instant;
@@ -113,6 +116,12 @@ pub struct BlockFormat {
     /// the recursion needs — or evaluated by the host verifier. Off exists to
     /// measure what the openings cost the base.
     pub prepared: bool,
+    /// How each group's tables argue: one argument per table
+    /// ([`ArgueFormat::PerTable`], production), or one per group — a lockstep
+    /// GKR per bin of its trees and one constraint sumcheck over its tables
+    /// ([`ArgueFormat::Batched`], D-BATCH's format on the block). The proof
+    /// carries the other format's messages in [`BlockWhirProof::argues`].
+    pub argue: ArgueFormat,
 }
 
 /// The most groups a block statement may declare. The block has 9; the bound
@@ -129,7 +138,16 @@ impl BlockFormat {
             group_polys: BLOCK_GROUP_POLYS,
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
+            argue: ArgueFormat::PerTable,
         }
+    }
+
+    /// The chain's config over `shapes`: the WHIR format's, with this format's
+    /// argue. Every side of a block builds its config here.
+    pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
+        let mut config = chain_config_under(&self.zf, shapes);
+        config.format.argue = self.argue;
+        config
     }
 }
 
@@ -216,6 +234,10 @@ pub struct BlockWhirProof {
     /// The prepared openings ([`group_stacks`]), one per group that holds a
     /// prepared table, in group order.
     pub prepared: Vec<multilinear::stacked_eval::StackedProof<F, E>>,
+    /// Under [`ArgueFormat::Batched`], each group's batched argue, in group
+    /// order, and `proof.tables` is empty; under [`ArgueFormat::PerTable`],
+    /// empty. Which one a verifier reads is its format's, never the proof's.
+    pub argues: Vec<BatchedArgue<E>>,
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -343,6 +365,20 @@ impl BlockStamps {
         out.push_str(&format!(
             "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed on the host · phase B on one thread + one upload helper\n",
             self.top_paths.0, self.top_paths.1,
+        ));
+        let reserved: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| format!("{}", g.argue_reserved >> 20))
+            .collect();
+        out.push_str(&format!(
+            "BLOCK ARGUE HW: max {} MiB · per group [{}] (the ledger's peak through each argue, the next group's upload included)\n",
+            self.groups
+                .iter()
+                .map(|g| g.argue_reserved >> 20)
+                .max()
+                .unwrap_or(0),
+            reserved.join(", "),
         ));
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
@@ -920,6 +956,9 @@ pub(crate) struct Deviations {
     /// `(table, other)`, AIR indices: open `table`'s prepared block at `other`'s
     /// point (a table of its group and its height), consistently.
     pub prepared_points: Vec<(usize, usize)>,
+    /// Under the batched argue: a group argued with faults, or every group
+    /// argued on the host ([`multilinear_block::ArgueDeviation`]).
+    pub argue: multilinear_block::ArgueDeviation,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -1138,7 +1177,7 @@ pub(crate) fn prove_traces(
     let pairs = airs.air_trace_pairs(traces);
     let shapes = shapes_of(&pairs)?;
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
-    let config = chain_config_under(&format.zf, &shapes);
+    let config = format.chain_config(&shapes);
     let sizes = block_groups(&shapes, config.format.stack, format.group_polys)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -1251,7 +1290,7 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
                 &config,
@@ -1259,6 +1298,7 @@ pub(crate) fn prove_traces(
                 &openings,
                 &tampered,
                 fork_of,
+                &deviations.argue,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
@@ -1268,7 +1308,7 @@ pub(crate) fn prove_traces(
             paths_after.1 - paths_before.1,
         );
         stamps.groups = groups;
-        (proof, prepared_openings)
+        (proof, argues, prepared_openings)
     });
 
     Ok(BlockWhirProof {
@@ -1279,7 +1319,8 @@ pub(crate) fn prove_traces(
         public_output,
         num_private_input_pages,
         groups,
-        prepared: proof.1,
+        prepared: proof.2,
+        argues: proof.1,
     })
 }
 
@@ -1819,7 +1860,7 @@ fn prove_streamed(
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
     // shape) is built when the shapes are known, and must agree on those.
-    let commit_config = chain_config_under(&format.zf, &[]);
+    let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
 
@@ -2088,7 +2129,7 @@ fn prove_streamed(
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
-        let config = chain_config_under(&format.zf, &laid.shapes);
+        let config = format.chain_config(&laid.shapes);
         if config.log_blowup != commit_config.log_blowup
             || config.log_folding != commit_config.log_folding
             || config.format != commit_config.format
@@ -2146,7 +2187,7 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
                 &config,
@@ -2154,6 +2195,7 @@ fn prove_streamed(
                 &openings,
                 &tampered,
                 fork_of,
+                &deviations.argue,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
@@ -2172,6 +2214,7 @@ fn prove_streamed(
             num_private_input_pages: laid.num_private_input_pages,
             groups: laid.groups,
             prepared: prepared_openings,
+            argues,
         })
     })
 }
@@ -2372,7 +2415,7 @@ pub(crate) fn block_frame(
         .zip(statement.table_num_vars)
         .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
         .collect();
-    let config = chain_config_under(&format.zf, &shapes);
+    let config = format.chain_config(&shapes);
     drop(air_refs);
 
     // The groups are the statement's; their stacks are built here, from the
@@ -2422,24 +2465,41 @@ pub fn verify_block_whir(
     proof_options: &ProofOptions,
     format: &BlockFormat,
 ) -> Result<bool, Error> {
-    verify_block_whir_with(proof, elf_bytes, proof_options, format, false)
+    verify_block_whir_with(
+        proof,
+        elf_bytes,
+        proof_options,
+        format,
+        false,
+        VerifierChecks::ALL,
+    )
 }
 
 /// [`verify_block_whir`] with the prepared openings left unchecked when
-/// `skip_prepared` — a mutation, for the tests that show the openings are what
-/// refuses a wrongly opened prepared table.
+/// `skip_prepared`, and the batched argue's checks and the bus balance switched
+/// by `argue_checks` — mutations, for the tests that show each check is what refuses
+/// its forgery.
 pub(crate) fn verify_block_whir_with(
     proof: &BlockWhirProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     format: &BlockFormat,
     skip_prepared: bool,
+    argue_checks: VerifierChecks,
 ) -> Result<bool, Error> {
-    if proof.proof.tables.len() != proof.table_num_vars.len() {
+    // One argument per table, or one per group, by the verifier's format; the
+    // other format's messages absent.
+    let (tables, argues) = match format.argue {
+        ArgueFormat::PerTable => (proof.table_num_vars.len(), 0),
+        ArgueFormat::Batched { .. } => (0, proof.groups.len()),
+    };
+    if proof.proof.tables.len() != tables || proof.argues.len() != argues {
         return Err(Error::InvalidTableCounts(format!(
-            "the proof carries {} table arguments and {} heights",
+            "the proof carries {} table arguments and {} batched argues; its format \
+             ({:?}) takes {tables} and {argues}",
             proof.proof.tables.len(),
-            proof.table_num_vars.len(),
+            proof.argues.len(),
+            format.argue,
         )));
     }
     let frame = block_frame(proof.statement(), elf_bytes, proof_options, format)?;
@@ -2525,6 +2585,7 @@ pub(crate) fn verify_block_whir_with(
         };
         multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
+            &proof.argues,
             &proof.prepared,
             &checks,
             &statements,
@@ -2535,6 +2596,7 @@ pub(crate) fn verify_block_whir_with(
             config,
             &mut transcript,
             skip_prepared,
+            argue_checks,
         )
         .is_ok()
     }))

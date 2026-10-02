@@ -197,10 +197,10 @@ mod preprocessed_tests;
 mod program_shape_tests;
 #[cfg(test)]
 mod whir_air_tests;
-#[cfg(all(test, feature = "parallel"))]
-mod whir_block_tests;
 #[cfg(test)]
 mod whir_batch_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod whir_block_tests;
 #[cfg(test)]
 mod whir_bus_tests;
 #[cfg(test)]

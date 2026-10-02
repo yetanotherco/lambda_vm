@@ -264,6 +264,13 @@ impl WhirBlockPlan {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
+        // The leaves walk each table's own argument.
+        if format.argue != multilinear::whir_chain::ArgueFormat::PerTable {
+            return Err(format!(
+                "the block's recursion verifies the per-table argue, not {:?}",
+                format.argue
+            ));
+        }
         // The machine replays the algebraic transcript: it verifies a block
         // proved over RPX, and nothing else.
         if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {

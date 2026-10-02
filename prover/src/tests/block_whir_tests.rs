@@ -10,7 +10,8 @@ use crate::tables::MaxRowsConfig;
 use crate::test_utils::{E, asm_elf_bytes};
 use crate::zf_format::ZfFormat;
 use math::field::element::FieldElement;
-use multilinear::whir_chain::StackVars;
+use multilinear::whir_chain::{ArgueFormat, StackVars};
+use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::ProofOptions;
 
 /// The production format; one group holds a small program whole.
@@ -20,6 +21,7 @@ fn one_group() -> BlockFormat {
         group_polys: block_whir::BLOCK_GROUP_POLYS,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
+        argue: ArgueFormat::PerTable,
     }
 }
 
@@ -33,6 +35,7 @@ fn many_groups() -> BlockFormat {
         group_polys: 2,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
+        argue: ArgueFormat::PerTable,
     }
 }
 
@@ -634,6 +637,7 @@ fn verify_skipping_prepared(proof: &BlockWhirProof, elf: &[u8], format: &BlockFo
         &ProofOptions::default_test_options(),
         format,
         true,
+        VerifierChecks::ALL,
     )
     .unwrap_or(false)
 }
@@ -1102,8 +1106,24 @@ fn block_whir_on_a_real_block() {
     let input = std::fs::read(&input_path).expect("read the input");
     // `BLOCK_WHIR_PREPARED=0`: the openings off, for the arm that prices them.
     let prepared = std::env::var("BLOCK_WHIR_PREPARED").map_or(true, |v| v.trim() != "0");
+    // `BLOCK_WHIR_ARGUE=batched`: each group's tables argued together, at the
+    // format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k` for 2^k).
+    let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
+        Ok("batched") => ArgueFormat::Batched {
+            bin_log_cells: std::env::var("BLOCK_WHIR_ARGUE_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(match ArgueFormat::BATCHED {
+                    ArgueFormat::Batched { bin_log_cells } => bin_log_cells,
+                    ArgueFormat::PerTable => unreachable!("the batched format"),
+                }),
+        },
+        Ok("per-table") | Err(_) => ArgueFormat::PerTable,
+        Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
+    };
     let format = BlockFormat {
         prepared,
+        argue,
         ..BlockFormat::production()
     };
     let mut options = BlockOptions::production();
@@ -1118,7 +1138,7 @@ fn block_whir_on_a_real_block() {
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · argue {:?} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
@@ -1126,6 +1146,7 @@ fn block_whir_on_a_real_block() {
         if prepared { "on" } else { "off" },
         options.layout_workers,
         options.pack_rest_as_laid_out,
+        format.argue,
         format.zf.banner(),
     );
     // The options #1010's base proves its epochs under.
@@ -1150,16 +1171,23 @@ fn block_whir_on_a_real_block() {
         multilinear::gpu::open_host_fallbacks(),
     );
     println!(
+        "BLOCK ARGUE DEVICE: GKR tree refusals {} · fused sessions {} · fused declines {}",
+        multilinear::gpu::gkr_tree_refusals(),
+        multilinear::gpu_fused::fused_sessions(),
+        multilinear::gpu_fused::fused_declines(),
+    );
+    println!(
         "BLOCK PROVE WALL: {prove_wall:.2}s · host peak {:.2} GiB",
         host_peak_gib()
     );
     let t = std::time::Instant::now();
     let ok = verify_block_whir(&proof, &elf, &opts, &format).expect("the verifier runs");
     println!(
-        "BLOCK VERIFY: {} in {:.2}s · proof {} tables, {} groups, {} roots",
+        "BLOCK VERIFY: {} in {:.2}s · proof {} tables, {} batched argues, {} groups, {} roots",
         if ok { "ACCEPTED" } else { "REJECTED" },
         t.elapsed().as_secs_f64(),
         proof.proof.tables.len(),
+        proof.argues.len(),
         proof.proof.columns.len(),
         proof.proof.roots.len(),
     );
