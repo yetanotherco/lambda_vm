@@ -938,6 +938,12 @@ fn the_lean_walk_builds_the_whole_run_tables() {
         only(|l| l.memory = true),
         only(|l| l.lookups = true),
         only(|l| l.route = true),
+        only(|l| l.walk_counts = true),
+        // Counting by the accumulator (the walk leaves the lookups out).
+        WalkLean {
+            walk_counts: false,
+            ..WalkLean::ALL
+        },
     ];
     for name in [
         "sub",

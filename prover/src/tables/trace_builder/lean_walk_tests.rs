@@ -186,8 +186,16 @@ fn the_walk_lean_knob_names_its_parts() {
     assert_eq!(WalkLean::parse("1"), Some(WalkLean::ALL));
     assert_eq!(WalkLean::parse(" 0 "), Some(WalkLean::NONE));
     assert_eq!(
-        WalkLean::parse("decode,memory,lookups,route"),
+        WalkLean::parse("decode,memory,lookups,route,walkcount"),
         Some(WalkLean::ALL)
+    );
+    assert_eq!(
+        WalkLean::parse("walkcount").map(|lean| lean.in_walk()),
+        Some(InWalk::Count)
+    );
+    assert_eq!(
+        WalkLean::parse("lookups").map(|lean| lean.in_walk()),
+        Some(InWalk::Leave)
     );
     assert_eq!(
         WalkLean::parse("memory, route"),
@@ -235,24 +243,27 @@ fn the_counted_lookups_are_the_listed_ones() {
         let cpu_ops = collect_cpu_ops(&logs, &artifacts.instructions).expect("the CPU ops");
         let image = build_initial_image(&program, &[]);
         let register_init = register::register_init_from_entry_point(program.entry_point);
-        let walk = |lookups: bool| {
+        let walk = |in_walk: InWalk| {
             let mut memory_state = MemoryState::from_image(&image);
-            memory_state.lean = !lookups;
+            memory_state.lean = in_walk != InWalk::List;
             let mut register_state = RegisterState::from_init(&register_init);
-            let mut out = WalkOutputs::for_walk(cpu_ops.len(), lookups);
+            let mut out = WalkOutputs::for_walk(cpu_ops.len(), in_walk == InWalk::List);
+            let mut histogram = (in_walk == InWalk::Count).then(bitwise::BitwiseHistogram::new);
             collect_ops_from_cpu_into(
                 &cpu_ops,
                 &mut memory_state,
                 &mut register_state,
                 &mut out,
-                lookups,
+                in_walk,
+                histogram.as_mut(),
             );
-            out
+            (out, histogram)
         };
-        let (listed, lean) = (walk(true), walk(false));
+        let ((listed, _), (lean, _)) = (walk(InWalk::List), walk(InWalk::Leave));
+        let (walker_counted, walker_histogram) = walk(InWalk::Count);
         assert!(
-            lean.bitwise_ops.is_empty(),
-            "{name}: the lean walk lists no lookup"
+            lean.bitwise_ops.is_empty() && walker_counted.bitwise_ops.is_empty(),
+            "{name}: a lean walk lists no lookup"
         );
         assert!(
             !listed.bitwise_ops.is_empty(),
@@ -273,6 +284,11 @@ fn the_counted_lookups_are_the_listed_ones() {
         assert!(
             multiplicities(&counted) == expected,
             "{name}: counted ≠ listed"
+        );
+        let walker_histogram = walker_histogram.expect("the walker's histogram");
+        assert!(
+            multiplicities(&walker_histogram) == expected,
+            "{name}: counted by the walker ≠ listed"
         );
         if lean.load_ops.iter().any(|op| op.width < 8) {
             narrow += 1;
@@ -312,7 +328,8 @@ fn the_one_pass_routing_is_the_routing() {
             &mut memory_state,
             &mut register_state,
             &mut walk,
-            true,
+            InWalk::List,
+            None,
         );
         let show = |s: RoutedSegments| {
             let RoutedSegments {

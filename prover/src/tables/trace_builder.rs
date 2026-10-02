@@ -475,6 +475,11 @@ pub(crate) struct WalkLean {
     pub(crate) lookups: bool,
     /// The routing in one pass over a window's CPU ops ([`route_ops_one_pass`]).
     pub(crate) route: bool,
+    /// The in-walk BITWISE lookups counted by the walker as it walks, into a
+    /// histogram of its own the finish adds to the run's; with it `lookups`
+    /// has no effect. It moves that counting off the accumulator, which binds
+    /// the median block's windows (FAST 600).
+    pub(crate) walk_counts: bool,
 }
 
 impl WalkLean {
@@ -483,24 +488,38 @@ impl WalkLean {
         memory: true,
         lookups: true,
         route: true,
+        walk_counts: true,
     };
     pub(crate) const NONE: Self = Self {
         decode: false,
         memory: false,
         lookups: false,
         route: false,
+        walk_counts: false,
     };
 
+    /// How the walk treats its in-walk BITWISE lookups under these parts.
+    pub(crate) fn in_walk(&self) -> InWalk {
+        if self.walk_counts {
+            InWalk::Count
+        } else if self.lookups {
+            InWalk::Leave
+        } else {
+            InWalk::List
+        }
+    }
+
     /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
-    /// of `decode`, `memory`, `lookups`, `route`. Read once; any other value is
-    /// refused.
+    /// of `decode`, `memory`, `lookups`, `route`, `walkcount`. Read once; any
+    /// other value is refused.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
         LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
             Err(_) => Ok(Self::ALL),
             Ok(v) => Self::parse(&v).ok_or_else(|| {
                 format!(
-                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, route"
+                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, \
+                     route, walkcount"
                 )
             }),
         })
@@ -521,11 +540,23 @@ impl WalkLean {
                 "memory" => lean.memory = true,
                 "lookups" => lean.lookups = true,
                 "route" => lean.route = true,
+                "walkcount" => lean.walk_counts = true,
                 _ => return None,
             }
         }
         Some(lean)
     }
+}
+
+/// What the walk does with each CPU op's and LOAD op's BITWISE lookups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InWalk {
+    /// Lists them in [`WalkOutputs`]'s `bitwise_ops`.
+    List,
+    /// Leaves them to the caller, which counts them from the ops.
+    Leave,
+    /// Counts them into the histogram the caller passes.
+    Count,
 }
 
 /// Every pc of the instruction map decoded once, in dense runs of consecutive
@@ -788,7 +819,14 @@ fn collect_ops_from_cpu(
     Vec<hint::HintOperation>,
 ) {
     let mut out = WalkOutputs::with_capacity(cpu_ops.len());
-    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out, true);
+    collect_ops_from_cpu_into(
+        cpu_ops,
+        memory_state,
+        register_state,
+        &mut out,
+        InWalk::List,
+        None,
+    );
     let WalkOutputs {
         memw,
         load_ops,
@@ -847,8 +885,8 @@ impl WalkOutputs {
         Self::for_walk(cpu_ops, true)
     }
 
-    /// [`Self::with_capacity`], with no room for the in-walk lookups when the
-    /// walk leaves them out (`lookups` false, see [`collect_ops_from_cpu_into`]).
+    /// [`Self::with_capacity`], with no room for the in-walk lookups unless the
+    /// walk lists them (`lookups`, see [`collect_ops_from_cpu_into`]).
     fn for_walk(cpu_ops: usize, lookups: bool) -> Self {
         Self {
             memw: MemwBuckets::with_register_capacity(cpu_ops * 3),
@@ -868,18 +906,26 @@ impl WalkOutputs {
     }
 }
 
-/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). Without
-/// `lookups` the walk leaves out the in-walk BITWISE lookups (each CPU op's and
-/// each LOAD op's), which are a function of the CPU and LOAD ops it emits: the
-/// caller counts them from those ([`CpuOperation::count_bitwise_into`],
-/// [`LoadOperation::count_bitwise_into`]).
+/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). The
+/// in-walk BITWISE lookups (each CPU op's and each LOAD op's) are listed in
+/// `out`'s `bitwise_ops` ([`InWalk::List`]), counted into `histogram`
+/// ([`InWalk::Count`], with the same per-op generators:
+/// [`CpuOperation::count_bitwise_into`], [`LoadOperation::count_bitwise_into`]),
+/// or left out ([`InWalk::Leave`]: the caller counts them from the CPU and LOAD
+/// ops, of which they are a function).
 fn collect_ops_from_cpu_into(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
-    lookups: bool,
+    lookups: InWalk,
+    mut histogram: Option<&mut bitwise::BitwiseHistogram>,
 ) {
+    assert_eq!(
+        lookups == InWalk::Count,
+        histogram.is_some(),
+        "the walk counts its lookups into a histogram iff it is given one"
+    );
     let WalkOutputs {
         memw,
         load_ops,
@@ -919,9 +965,11 @@ fn collect_ops_from_cpu_into(
         if op.decode.fields.is_load() {
             let (memw_op, load_op) = collect_load_op_from_cpu(op, memory_state);
             memw.push(memw_op);
-            if lookups {
-                // MSB8 lookups for the sign bit extraction.
-                bitwise_ops.extend(load_op.collect_bitwise_ops());
+            // MSB8 lookups for the sign bit extraction.
+            match (lookups, histogram.as_deref_mut()) {
+                (InWalk::List, _) => bitwise_ops.extend(load_op.collect_bitwise_ops()),
+                (InWalk::Count, Some(histogram)) => load_op.count_bitwise_into(histogram),
+                _ => {}
             }
             load_ops.push(load_op);
         } else if op.decode.fields.is_store() {
@@ -1106,8 +1154,10 @@ fn collect_ops_from_cpu_into(
         // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
         // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
         // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
-        if lookups {
-            bitwise_ops.extend(op.collect_bitwise_ops());
+        match (lookups, histogram.as_deref_mut()) {
+            (InWalk::List, _) => bitwise_ops.extend(op.collect_bitwise_ops()),
+            (InWalk::Count, Some(histogram)) => op.count_bitwise_into(histogram),
+            _ => {}
         }
     }
 
