@@ -8,7 +8,7 @@
 #let (proofSpace, proof) = ($bb(Pi)$, $pi$)
 
 #let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
-#let commit(x) = $overline(#x)$
+#let commit(x) = $dash(#x)$
 #let comm(x) = $commit(#x)$
 
 #let hash = $H$
@@ -17,7 +17,7 @@
 #let language = $cal(L)$
 
 #let verifierSpace = $cal(V)$
-#let (prove, verify) = ($italic("p")$, $italic("v")$)
+#let (prove, verify) = ($italic(p)$, $italic(v)$)
 
 // Mathematical symbols
 #let (zero, one) = ($0$, $1$)
