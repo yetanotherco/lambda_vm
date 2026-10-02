@@ -28,7 +28,7 @@ use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    ChunkJob, DecodeArtifacts, StreamTable, StreamedChunk, Traces, WindowedTraceBuilder,
+    ChunkJob, Counter, DecodeArtifacts, StreamTable, StreamedChunk, Traces, WindowedTraceBuilder,
     build_initial_image,
 };
 use crate::test_utils::{
@@ -436,6 +436,20 @@ fn narrow_finished() -> bool {
     narrow_level() == 2
 }
 
+/// `LAMBDA_VM_FINISH_EARLY=0` leaves the table phase's commutative BITWISE
+/// sources to the finish (the A arm); unset or anything else counts them window
+/// by window on a counter thread of their own
+/// ([`WindowedTraceBuilder::count_windows_apart`], D-EXEC E2), so the finish
+/// counts only the last window and what depends on the whole run. The traces
+/// are the same either way.
+fn count_windows_apart() -> bool {
+    std::env::var("LAMBDA_VM_FINISH_EARLY").map_or(true, |v| v.trim() != "0")
+}
+
+/// Count jobs waiting for the counter: each holds one window's routed
+/// segments, so this bounds what the counter keeps alive.
+const COUNT_JOBS_AHEAD: usize = 2;
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
@@ -817,6 +831,9 @@ fn build_streamed(
             if narrow_finished() {
                 builder = builder.pack_finished_tables();
             }
+            if count_windows_apart() {
+                builder = builder.count_windows_apart()?;
+            }
             if let Some(ledger) = ledger {
                 eprintln!(
                     "BLOCK MEM builder created: initial image {:.2} GiB",
@@ -843,7 +860,16 @@ fn build_streamed(
                 held.unwrap_or_default()
             } else {
                 let (mut walker, mut accumulator) = builder.split();
-                std::thread::scope(|inner| -> Result<_, Error> {
+                let (last, counter) = std::thread::scope(|inner| -> Result<_, Error> {
+                    // The windows' BITWISE counting, off the accumulator.
+                    let (count_tx, count_rx) = mpsc::sync_channel(COUNT_JOBS_AHEAD);
+                    let counting = inner.spawn(move || {
+                        let mut counter = Counter::new();
+                        for job in count_rx {
+                            counter.count(job);
+                        }
+                        counter
+                    });
                     let (walked_tx, walked_rx) = mpsc::sync_channel(2);
                     let walking = inner.spawn(move || -> Result<_, Error> {
                         // One window held back: the run's last is `finish`'s.
@@ -876,9 +902,26 @@ fn build_streamed(
                                 .store(accumulator.held_bytes(), Relaxed);
                         }
                         collect_secs += t.elapsed().as_secs_f64();
+                        for job in accumulator.take_count_jobs() {
+                            let _ = count_tx.send(job);
+                        }
                     }
-                    join(walking)
-                })?
+                    drop(count_tx);
+                    let last = join(walking)?;
+                    let counter = counting
+                        .join()
+                        .map_err(|_| Error::Prover("the counter panicked".to_string()))?;
+                    Ok((last, counter))
+                })?;
+                if counter.windows() > 0 {
+                    eprintln!(
+                        "BLOCK STREAM counter: {} windows · count {:.2} (s)",
+                        counter.windows(),
+                        counter.secs()
+                    );
+                    builder.add_counter(counter)?;
+                }
+                last
             };
             drop(job_tx);
             if let Some(ledger) = ledger {
