@@ -579,6 +579,12 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
             GoldilocksField::sample_field_element_from(&mut next_u64)
         }))
     }
+
+    /// The coordinates are Goldilocks and the rejection loop runs per
+    /// coordinate, so the predicate is the base field's.
+    fn candidate_in_range(candidate: u64) -> bool {
+        GoldilocksField::candidate_in_range(candidate)
+    }
 }
 
 // =====================================================

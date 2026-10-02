@@ -20,7 +20,10 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
+use cudarc::nvrtc::Ptx;
 
 use crate::Result;
 use crate::device::backend;
@@ -32,6 +35,55 @@ const BLOCK_DIM: u32 = 256;
 /// bounds those buffers regardless of LDE size; threads grid-stride over the
 /// remaining rows. 65536 mirrors OpenVM's quotient `TASK_SIZE`.
 const MAX_THREADS: u32 = 1 << 16;
+
+/// The compiled composition kernels (`kernels/constraint_compiled.cu`), loaded
+/// on first use rather than with the backend: a missing or unloadable module
+/// only sends programs back to the interpreter.
+const CONSTRAINT_COMPILED_CUBIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/constraint_compiled.cubin"));
+
+/// Threads per block of the compiled kernels (`CCOMP_BLOCK` in the generated
+/// source; `stark::constraint_ir::codegen::COMPILED_BLOCK_DIM`).
+const COMPILED_BLOCK_DIM: u32 = 128;
+
+/// The largest grid a compiled kernel launches; it grid-strides beyond.
+const COMPILED_MAX_GRID: u32 = 65_535;
+
+/// The compiled composition kernel generated for the program with this
+/// structural key (`stark::constraint_ir::codegen::structural_key`), if any.
+pub fn compiled_composition_kernel(key: u64) -> Option<&'static str> {
+    let table = crate::constraint_compiled_keys::COMPILED_COMPOSITION_KERNELS;
+    table
+        .binary_search_by_key(&key, |&(k, _)| k)
+        .ok()
+        .map(|i| table[i].1)
+}
+
+/// A compiled kernel by name, from the module loaded on first use.
+fn compiled_function(name: &'static str) -> Result<CudaFunction> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MODULE: OnceLock<std::result::Result<Arc<CudaModule>, cudarc::driver::DriverError>> =
+        OnceLock::new();
+    static FUNCTIONS: OnceLock<Mutex<HashMap<&'static str, CudaFunction>>> = OnceLock::new();
+    let module = MODULE
+        .get_or_init(|| {
+            let be = backend()?;
+            be.ctx
+                .load_module(Ptx::from_binary(CONSTRAINT_COMPILED_CUBIN.to_vec()))
+        })
+        .clone()?;
+    let mut functions = FUNCTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = functions.get(name) {
+        return Ok(f.clone());
+    }
+    let f = module.load_function(name)?;
+    functions.insert(name, f.clone());
+    Ok(f)
+}
 
 /// Evaluate every constraint of a lowered program over the device-resident LDE.
 ///
@@ -208,6 +260,7 @@ pub fn upload_base_vec(v: &[u64]) -> Result<GpuBaseVec> {
 /// [`eval_composition_on_device_keep`]).
 #[allow(clippy::too_many_arguments)]
 fn eval_composition_launch(
+    compiled: Option<&'static str>,
     nodes: &[u64],
     num_nodes: usize,
     num_base_slots: usize,
@@ -283,9 +336,21 @@ fn eval_composition_launch(
         stream.memcpy_dtod(&src.buf, &mut dst)?;
     }
 
-    let max_grid = MAX_THREADS / BLOCK_DIM;
-    let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
-    let num_threads = (grid as usize) * (BLOCK_DIM as usize);
+    // The interpreter's grid is capped by its per-thread slot file; a compiled
+    // kernel keeps its values in registers, so it has no scratch and a grid
+    // that fills the card. Either way every row is written by the grid-stride
+    // loop, from row-local inputs only.
+    let compiled_fn = compiled.map(compiled_function).transpose()?;
+    let (grid, block, num_threads) = if compiled_fn.is_some() {
+        let grid = (num_rows as u32)
+            .div_ceil(COMPILED_BLOCK_DIM)
+            .clamp(1, COMPILED_MAX_GRID);
+        (grid, COMPILED_BLOCK_DIM, 0)
+    } else {
+        let max_grid = MAX_THREADS / BLOCK_DIM;
+        let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
+        (grid, BLOCK_DIM, (grid as usize) * (BLOCK_DIM as usize))
+    };
 
     // Per-thread slot scratch, uninitialized (the walk writes before reading).
     let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
@@ -304,12 +369,15 @@ fn eval_composition_launch(
 
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
+        block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
+    let kernel = compiled_fn
+        .as_ref()
+        .unwrap_or(&be.constraint_composition_kernel);
     unsafe {
         stream
-            .launch_builder(&be.constraint_composition_kernel)
+            .launch_builder(kernel)
             .arg(&mut d_h)
             .arg(&d_nodes)
             .arg(&num_nodes_u64)
@@ -349,8 +417,14 @@ fn eval_composition_launch(
 ///
 /// Uniform-zerofier case only (the VM has no end-exemptions); the caller gates
 /// on `is_uniform` and falls back to CPU otherwise.
+///
+/// `compiled` names the program's compiled kernel
+/// ([`compiled_composition_kernel`]) to run in place of the interpreter: the
+/// same `H`, bit for bit, from straight-line code with no slot file. `None`
+/// runs the interpreter.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_composition_on_device(
+    compiled: Option<&'static str>,
     nodes: &[u64],
     num_nodes: usize,
     num_base_slots: usize,
@@ -371,6 +445,7 @@ pub fn eval_composition_on_device(
         return Ok(Vec::new());
     }
     let (d_h, stream) = eval_composition_launch(
+        compiled,
         nodes,
         num_nodes,
         num_base_slots,
@@ -404,9 +479,18 @@ pub struct GpuCompH {
     stream: Arc<CudaStream>,
 }
 
+impl GpuCompH {
+    /// Wait until `H` is computed (a benchmark's clock stop; the prover never
+    /// waits here, it enqueues its consumers on the same stream).
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()
+    }
+}
+
 /// [`eval_composition_on_device`] keeping `H` on device — no D2H.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_composition_on_device_keep(
+    compiled: Option<&'static str>,
     nodes: &[u64],
     num_nodes: usize,
     num_base_slots: usize,
@@ -424,6 +508,7 @@ pub fn eval_composition_on_device_keep(
     accum: &CompositionAccum,
 ) -> Result<GpuCompH> {
     let (buf, stream) = eval_composition_launch(
+        compiled,
         nodes,
         num_nodes,
         num_base_slots,

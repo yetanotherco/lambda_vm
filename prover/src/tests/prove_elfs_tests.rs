@@ -13,14 +13,28 @@
 //!
 //! TODO: LT bus (needs LT table integration)
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+// ★ The Fiat-Shamir transcript MUST be the one `DefaultStarkHash` names, not
+// `DefaultTranscript`'s own type-parameter default.
+//
+// `crypto::…::DefaultTranscript<F, T = KeccakTranscriptHash>` defaults to keccak;
+// since BLAKE3 became `DefaultStarkHash`, that default is no longer the
+// production hash. Proving under the bare type while
+// `compute_expected_commit_bus_balance_view` replays under
+// `DefaultStarkTranscript` derives the two sides' LogUp challenges from
+// DIFFERENT hashes, so the expected COMMIT contribution is computed at the wrong
+// challenge point and every program with non-empty public output fails to verify
+// with "LogUp bus does not balance" — 19 tests in this file. `config.rs` warns
+// about exactly this half-flip ("the type system cannot force this; naming the
+// alias is what makes the production path follow DefaultStarkHash"); the warning
+// applies to the test harness too.
+
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::proof::view::{MultiProofView, StarkProofView};
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
@@ -123,13 +137,13 @@ pub(crate) fn weigh_the_bus(
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-    {
-        Ok(proof) => proof,
-        // Panic rather than return false: `false` is reserved for "the verifier
-        // rejected", so a negative test cannot pass because proving fell over.
-        Err(e) => panic!("prover failed, which is not a verifier rejection: {e:?}"),
-    };
+    let multi_proof =
+        match multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])) {
+            Ok(proof) => proof,
+            // Panic rather than return false: `false` is reserved for "the verifier
+            // rejected", so a negative test cannot pass because proving fell over.
+            Err(e) => panic!("prover failed, which is not a verifier rejection: {e:?}"),
+        };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
     let views: Vec<StarkProofView<F, E, ()>> = multi_proof
@@ -137,7 +151,7 @@ pub(crate) fn weigh_the_bus(
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -149,10 +163,10 @@ pub(crate) fn weigh_the_bus(
 
     // Verify using centralized air_refs() which includes all tables
     let air_refs = airs.air_refs();
-    let accepted = Verifier::multi_verify_views(
+    let accepted = crate::hash_pin::BlockVerifier::multi_verify_views(
         &air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
 
@@ -170,10 +184,14 @@ pub(crate) fn weigh_the_bus(
     }
 
     let accepted_with_target_moved = recheck_with_moved_target
-        && Verifier::multi_verify_views(
+        && crate::hash_pin::BlockVerifier::multi_verify_views(
             &air_refs,
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            // The SAME pinned transcript as the accepting arm above. A plain
+            // `DefaultTranscript` here would make the two arms differ by HASH as
+            // well as by target, so a rejection would no longer be evidence that
+            // moving the target is what the verifier caught.
+            &mut crate::hash_pin::block_transcript(&[]),
             &contribution_sum,
         );
 
@@ -214,7 +232,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("prove");
     let num_private_input_pages = traces
@@ -263,7 +281,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &air_refs,
         &views,
@@ -272,10 +290,10 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
-    Verifier::multi_verify_views(
+    crate::hash_pin::BlockVerifier::multi_verify_views(
         &air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     )
 }
@@ -326,15 +344,15 @@ fn test_cpu_only_no_bus() {
         _,
     )> = vec![(&cpu_air, &mut cpu_trace, &())];
 
-    let multi_proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("Prover failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
-        Verifier::multi_verify(
+        crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         ),
         "CPU-only verification failed"
@@ -1196,6 +1214,209 @@ fn test_prove_elfs_keccak_multi_call() {
 }
 
 #[test]
+fn test_prove_elfs_blake3() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest seeds the 14 input dwords with k+1, compresses, copies out over
+    // m and compresses again. Cross-check the committed output against a direct
+    // replay of the executor's compression function.
+    use executor::vm::instruction::execution::blake3_compress_6round;
+    let words: [u32; 28] = core::array::from_fn(|i| {
+        let dw = (i / 2 + 1) as u64;
+        if i % 2 == 0 {
+            dw as u32
+        } else {
+            (dw >> 32) as u32
+        }
+    });
+    let h: [u32; 8] = words[0..8].try_into().unwrap();
+    let m: [u32; 16] = words[8..24].try_into().unwrap();
+    let t = (words[24] as u64) | ((words[25] as u64) << 32);
+    let (block_len, flags) = (words[26], words[27]);
+    let out1 = blake3_compress_6round(&h, &m, t, block_len, flags);
+    let out2 = blake3_compress_6round(&h, &out1, t, block_len, flags);
+    let expected_bytes: Vec<u8> = out2.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed output must match two chained 6-round compressions"
+    );
+
+    // Must use from_elf_and_logs (stack RAM needs PAGE tables, like keccak).
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "blake3 prove/verify failed"
+    );
+}
+
+/// ★ The chained-absorb mode, end to end through the REAL prover.
+///
+/// The unit suite in `tables::blake3::absorb_tests` checks the mode's
+/// constraints and its internal bus in isolation; this is the honest path that
+/// exercises everything they cannot: the CPU's `Ecall` send meeting the group's
+/// FIRST row, the MEMW ordering of a dozen accesses that all carry the ecall's
+/// single timestamp, the BITWISE multiplicities the group's rows consume, and a
+/// second group whose `cv_out` write lands on memory the first group wrote.
+///
+/// The guest absorbs three blocks in one ecall and one more in a second, so the
+/// trace holds a 4-row group and a 2-row group at different timestamps — the
+/// shape that would break if the chain were keyed on anything but the timestamp.
+#[test]
+fn test_prove_elfs_blake3_absorb() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Replay the guest's two absorbs against the ecall's pure form. The guest
+    // seeds cv_in with dwords 1..4 and the message with dwords 100..123, then
+    // absorbs blocks 0..3 under CHUNK_START and block 1 again under interior
+    // flags.
+    use executor::vm::instruction::execution::blake3_absorb_chain_6round;
+    let dword_words = |dwords: &[u64]| -> Vec<u32> {
+        dwords
+            .iter()
+            .flat_map(|d| [*d as u32, (*d >> 32) as u32])
+            .collect()
+    };
+    let cv_in: [u32; 8] = dword_words(&[1, 2, 3, 4]).try_into().unwrap();
+    let msg: Vec<u32> = dword_words(&(100u64..124).collect::<Vec<_>>());
+    let block = |i: usize| -> [u32; 16] { msg[i * 16..(i + 1) * 16].try_into().unwrap() };
+
+    let after_first = blake3_absorb_chain_6round(&cv_in, &[block(0), block(1), block(2)], 1);
+    let after_second = blake3_absorb_chain_6round(&after_first, &[block(1)], 0);
+    let expected_bytes: Vec<u8> = after_second.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed chaining value must match two chained absorb ecalls"
+    );
+
+    // Stack RAM needs PAGE tables, like keccak and the single-compression mode.
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "blake3 absorb prove/verify failed"
+    );
+}
+
+/// ★ F1 acceptance: a machine-level attempt at an UNALIGNED absorb must not
+/// verify — and this records WHICH layer rejects it, because that turned out to
+/// be load-bearing and undocumented.
+///
+/// The executor refuses an unaligned x11 outright, so no program can reach this
+/// state; the trace has to be forged. Rewriting `M_BASE`'s low halfword, and the
+/// eight `MSG_PTR` low halfwords with it so the pointer arithmetic still holds,
+/// is exactly the shape a prover would submit.
+///
+/// TWO independent layers reject it now, and the order matters to anyone
+/// changing either:
+///
+///  1. **The chip's alignment constraint** `FIRST·(M_BASE[0] − 8·Q) = 0`, added
+///     for F1. This is what makes the rejection a statement about the ABI.
+///  2. **The MEMW argument**, which would have rejected this particular forgery
+///     even before (1) existed — for an unrelated reason worth naming: the
+///     chip's message reads would address `msg+1 …`, and the MEMW table holds no
+///     access there, so the `Memw` bus has sends with no receiver. That is a
+///     property of THIS forgery, not a general defence: a forger who also
+///     rewrote the MEMW rows clears (2) and is caught only by (1).
+///
+/// The test asserts the rejection and pins (2)'s premise — that MEMW really has
+/// no row at the unaligned address — so the claim cannot rot silently.
+#[test]
+fn test_prove_elfs_blake3_absorb_unaligned_message_rejected() {
+    use crate::tables::blake3::MSG_DWORDS;
+    use crate::tables::blake3::cols as b3;
+    use crate::tables::memw::cols as memw_cols;
+    use crate::tables::memw_aligned::cols as memw_a_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    let one = FieldElement::<GoldilocksField>::one();
+    let zero = FieldElement::<GoldilocksField>::zero();
+
+    // The first row of an absorb group, and its honest message base.
+    let first_row = (0..traces.blake3.num_rows())
+        .find(|&r| *traces.blake3.main_table.get(r, b3::FIRST) == one)
+        .expect("the guest performs at least one absorb");
+    let honest_base_lo = *traces.blake3.main_table.get(first_row, b3::M_BASE);
+
+    // Premise of rejection path (2): the memory tables access the aligned base
+    // and nothing one byte past it. An 8-aligned dword read takes the MEMW_A
+    // fast path, so both tables have to be scanned, and both are chunked.
+    let memw_has_base = |addr: FieldElement<GoldilocksField>| {
+        let in_memw = traces.memws.iter().any(|t| {
+            (0..t.num_rows()).any(|r| {
+                *t.main_table.get(r, memw_cols::IS_REGISTER) == zero
+                    && *t.main_table.get(r, memw_cols::BASE_ADDRESS_0) == addr
+            })
+        });
+        let in_memw_a = traces.memw_aligneds.iter().any(|t| {
+            (0..t.num_rows()).any(|r| {
+                *t.main_table.get(r, memw_a_cols::IS_REGISTER) == zero
+                    && *t.main_table.get(r, memw_a_cols::BASE_ADDRESS[0]) == addr
+            })
+        });
+        in_memw || in_memw_a
+    };
+    assert!(
+        memw_has_base(honest_base_lo),
+        "the honest message base must be a real MEMW access"
+    );
+    assert!(
+        !memw_has_base(honest_base_lo + one),
+        "nothing accesses the unaligned address — this is why MEMW also rejects"
+    );
+
+    // Forge: shift the message base and its dword pointers by one byte, keeping
+    // `msg_ptr[j] = M_BASE + 8j` internally consistent.
+    traces
+        .blake3
+        .main_table
+        .set(first_row, b3::M_BASE, honest_base_lo + one);
+    for j in 0..MSG_DWORDS {
+        let c = b3::msg_ptr(j, 0);
+        let v = *traces.blake3.main_table.get(first_row, c);
+        traces.blake3.main_table.set(first_row, c, v + one);
+    }
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "an unaligned absorb message must not verify"
+    );
+}
+
+#[test]
 fn test_prove_elfs_ecsm() {
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -1792,7 +2013,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
 
@@ -1814,7 +2035,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -1824,10 +2045,10 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2549,7 +2770,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
@@ -2571,7 +2792,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2581,10 +2802,10 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2626,7 +2847,7 @@ fn test_deep_stack_missing_pages_rejected() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
@@ -2647,7 +2868,7 @@ fn test_deep_stack_missing_pages_rejected() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2657,10 +2878,10 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2737,7 +2958,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
@@ -2759,7 +2980,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2769,10 +2990,10 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2845,6 +3066,7 @@ fn test_verify_rejects_zero_table_counts() {
             ecdas: 0,
             hint: 0,
             commit: 0,
+            blake3: 0,
         },
         ..vm_proof
     };
@@ -2930,12 +3152,15 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        // 0 is legal for all seven of these (each table is conditional), so this
+        // fixture stays a test of the REQUIRED tables' zero-rejection.
         keccak: 0,
         keccak_rnd: 0,
         ecsm: 0,
         ecdas: 0,
         hint: 0,
         commit: 0,
+        blake3: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -2968,15 +3193,15 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         (airs.decode.as_ref(), &mut decode_trace, &()),
     ];
 
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("Proof generation should succeed");
 
     assert_eq!(proof.proofs.len(), 2);
 
-    let verified = Verifier::multi_verify(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify(
         &verifier_air_refs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     );
 
@@ -3435,7 +3660,7 @@ fn test_prove_first_epoch_without_halt() {
 
     let multi_proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("first epoch failed to prove");
 
@@ -3444,7 +3669,7 @@ fn test_prove_first_epoch_without_halt() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -3455,10 +3680,10 @@ fn test_prove_first_epoch_without_halt() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &airs.air_refs(),
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "first epoch (HALT excluded) failed to verify"
@@ -3524,7 +3749,7 @@ fn test_prove_second_epoch_from_snapshot() {
 
     let multi_proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("second epoch failed to prove");
 
@@ -3533,7 +3758,7 @@ fn test_prove_second_epoch_from_snapshot() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -3544,10 +3769,10 @@ fn test_prove_second_epoch_from_snapshot() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &airs.air_refs(),
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "second epoch (register init from snapshot) failed to verify"
@@ -3638,7 +3863,7 @@ fn test_epoch_proof_commits_l2g() {
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
 
-    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("epoch proof with inert L2G failed to prove");
 
     let mut refs = airs.air_refs();
@@ -3649,7 +3874,7 @@ fn test_epoch_proof_commits_l2g() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &refs,
         &views,
@@ -3660,10 +3885,10 @@ fn test_epoch_proof_commits_l2g() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "epoch proof with inert L2G failed to verify"
@@ -3800,7 +4025,7 @@ fn test_continuation_pipeline_end_to_end() {
 
         let mut pairs = airs.air_trace_pairs(&mut traces);
         pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
-        let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
             .expect("epoch proof failed to prove");
 
         let mut refs = airs.air_refs();
@@ -3810,7 +4035,7 @@ fn test_continuation_pipeline_end_to_end() {
             .iter()
             .map(StarkProofView::Owned)
             .collect();
-        let mut replay = DefaultTranscript::<E>::new(&[]);
+        let mut replay = crate::hash_pin::block_transcript(&[]);
         let expected_bus_balance = compute_expected_commit_bus_balance_view(
             &refs,
             &views,
@@ -3820,10 +4045,10 @@ fn test_continuation_pipeline_end_to_end() {
         )
         .expect("fingerprint collision in test");
         assert!(
-            Verifier::multi_verify_views(
+            crate::hash_pin::BlockVerifier::multi_verify_views(
                 &refs,
                 &views,
-                &mut DefaultTranscript::<E>::new(&[]),
+                &mut crate::hash_pin::block_transcript(&[]),
                 &expected_bus_balance,
             ),
             "epoch {i} failed to verify"
@@ -3943,7 +4168,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("epoch with L2G memory bookend failed to prove");
 
     let mut refs = airs.air_refs();
@@ -3953,7 +4178,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = crate::hash_pin::block_transcript(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &refs,
         &views,
@@ -3964,12 +4189,451 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
+}
+
+// =============================================================================
+// ★ R1 — the conditional BLAKE3 table
+// =============================================================================
+//
+// BLAKE3 left `FIXED_TABLE_COUNT` and became `TableCounts::blake3`, a 0-or-1
+// count. That is a soundness claim, not a size optimisation: it asserts that
+// omitting the table is safe BECAUSE a workload that used BLAKE3 leaves an
+// Ecall-bus send with no receiver, so the omission cannot verify. These four
+// tests are that claim — the two honest directions, the forgery, and the
+// binding that stops prover and verifier disagreeing quietly.
+//
+// Why it matters at all: always-on, the table cost a real block's recursion
+// wrap +31.2% of its trace cells and +44% of its peak memory while carrying
+// 0.035% of the epoch's own cells (WRAP-GROWTH-BISECT.md).
+
+/// Build traces for an asm ELF, the same minimal path the suite's other
+/// prove tests use.
+fn traces_for_asm(name: &str) -> (Vec<u8>, Elf, Traces) {
+    let elf_bytes = crate::test_utils::asm_elf_bytes(name);
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, vec![]).expect("executor");
+    let result = executor.run().expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf_bytes, elf, traces)
+}
+
+/// (a) A workload that never touches BLAKE3 proves and verifies WITHOUT the
+/// table — the recovery R1 exists for.
+///
+/// The count is what the sub-proof arithmetic is checked against, so asserting
+/// it here is asserting the table is genuinely absent rather than merely small.
+#[test]
+fn a_workload_without_blake3_proves_without_the_table() {
+    let (_, elf, mut traces) = traces_for_asm("sub");
+
+    assert_eq!(
+        traces.num_blake3_ops, 0,
+        "the `sub` program must not use BLAKE3, or this tests nothing"
+    );
+    let counts = traces.table_counts();
+    assert_eq!(counts.blake3, 0, "an unused BLAKE3 table is not carried");
+
+    let airs = VmAirs::new(
+        &elf,
+        &ProofOptions::default_test_options(),
+        true,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(!airs.include_blake3);
+    assert!(
+        !airs.air_refs().iter().any(|a| a.name() == "BLAKE3"),
+        "the AIR set must not contain a table the proof does not carry"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a keccak-free, blake3-free program must prove and verify with no BLAKE3 table"
+    );
+}
+
+/// (b) A workload that DOES use BLAKE3 proves and verifies WITH the table.
+///
+/// The control for (a): the conditional must not have made the table
+/// unreachable, which an "always omit" bug would pass (a) and fail here.
+#[test]
+fn a_workload_using_blake3_proves_with_the_table() {
+    let (_, elf, mut traces) = traces_for_asm("test_blake3");
+
+    assert!(
+        traces.num_blake3_ops > 0,
+        "the `test_blake3` program must use BLAKE3, or this tests nothing"
+    );
+    let counts = traces.table_counts();
+    assert_eq!(counts.blake3, 1, "a used BLAKE3 table is carried");
+
+    let airs = VmAirs::new(
+        &elf,
+        &ProofOptions::default_test_options(),
+        true,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(airs.include_blake3);
+    assert!(
+        airs.air_refs().iter().any(|a| a.name() == "BLAKE3"),
+        "the AIR set must contain the table the proof carries"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a blake3-using program must prove and verify with the BLAKE3 table"
+    );
+}
+
+/// ★ (c) THE FORGERY — stripped, and honest about how far the stripping got.
+///
+/// The naive version of this test is INERT. A BLAKE3 syscall touches several
+/// buses, and omitting the table unbalances all of them at once: Memory/MEMW
+/// (its state reads and writes), AreBytes, IsHalfword and ByteAlu (its byte
+/// checks and XORs), and only then Ecall. Those are numerically overwhelming,
+/// so the naive proof is rejected long before the Ecall argument matters — it
+/// would be rejected identically if the Ecall receiver had never been written.
+///
+/// `STRIP_BLAKE3_SIDE_EFFECTS` builds the trace with BLAKE3's MEMW ops and its
+/// BITWISE multiplicities left out, to narrow the rejection toward Ecall alone.
+///
+/// ## ⚠ MEASURED: it is narrowed, NOT yet sole
+///
+/// Under `--features debug-checks` this forgery leaves THREE buses imbalanced
+/// beyond the by-design `Commit` residual:
+///
+/// - **19 `Ecall`** — the one this argument is about.
+/// - **16 `Memory`** — removing BLAKE3's MEMW ops breaks the memory chain for
+///   the state region; `test_blake3` does not satisfy the "never re-reads the
+///   digest region" precondition that would make the removal chain-consistent.
+/// - **24 `ByteAlu`** — subtracting `collect_bitwise_from_blake3` did not zero
+///   BLAKE3's whole ByteAlu contribution.
+///
+/// `AreBytes` and `IsHalfword` DO balance, so the strip is doing real work: it
+/// takes the imbalance from five buses to three. But this test does not yet
+/// establish Ecall as the sole cause, and must not be cited as if it did.
+/// Finishing it needs a workload whose digest region is never re-read, plus a
+/// subtract path for the remaining ByteAlu multiplicities (there is none on
+/// `bitwise::update_multiplicities` today). See RESUME-WRAPSLIM.md, F1.
+///
+/// What it DOES establish, and what the inert version did not: the omission is
+/// rejected with the two largest confounders removed, prover and verifier
+/// agreeing on the false shape throughout — both build the AIR set from
+/// `blake3: 0`, so the counts are self-consistent and the sub-proof cross-check
+/// cannot separate them.
+#[test]
+fn a_blake3_workload_claiming_no_blake3_table_is_rejected() {
+    use crate::tables::trace_builder::STRIP_BLAKE3_SIDE_EFFECTS;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, vec![]).expect("executor");
+    let result = executor.run().expect("execution");
+
+    // ---- the control: the SAME workload, unstripped, is honest and verifies.
+    // Without this, a stripped trace that fails for some unrelated reason would
+    // read as the argument working.
+    {
+        let mut honest =
+            Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[])
+                .unwrap();
+        assert_eq!(honest.table_counts().blake3, 1);
+        assert!(
+            prove_and_verify_vm_minimal(&elf, &mut honest),
+            "the control must verify, or the stripped arm below proves nothing"
+        );
+    }
+
+    // ---- the forgery: BLAKE3's side contributions stripped, table claimed absent.
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.set(true));
+    let stripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[])
+    }));
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.set(false));
+    let mut traces = stripped
+        .expect("stripping must not panic the trace builder")
+        .expect("stripped traces build");
+
+    assert!(
+        traces.num_blake3_ops > 0,
+        "the workload really used BLAKE3 — only its SIDE effects were stripped, \
+         so the CPU ecall and its Ecall send are still present"
+    );
+
+    let mut forged = traces.table_counts();
+    assert_eq!(forged.blake3, 1, "honest count before the tamper");
+    forged.blake3 = 0;
+    assert!(
+        forged.validate().is_ok(),
+        "a zero BLAKE3 count is well-formed; only the bus may reject it"
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &forged,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(!airs.include_blake3, "the forged shape must omit the table");
+
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let proved = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]));
+
+    let verified = match &proved {
+        Err(_) => false,
+        Ok(multi_proof) => {
+            let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+                .proofs
+                .iter()
+                .map(StarkProofView::Owned)
+                .collect();
+            let mut replay = crate::hash_pin::block_transcript(&[]);
+            match crate::compute_expected_commit_bus_balance_view(
+                &airs.air_refs(),
+                &views,
+                &traces.public_output_bytes,
+                0,
+                &mut replay,
+            ) {
+                None => false,
+                Some(expected) => crate::hash_pin::BlockVerifier::multi_verify_views(
+                    &airs.air_refs(),
+                    &views,
+                    &mut crate::hash_pin::block_transcript(&[]),
+                    &expected,
+                ),
+            }
+        }
+    };
+
+    assert!(
+        !verified,
+        "a proof that omits the BLAKE3 table for a workload that used BLAKE3 must \
+         NOT verify. Ecall is among the buses left unmatched (see the doc above \
+         for the two that are not yet stripped). If this fires, the soundness \
+         argument on `TableCounts::blake3` is in question and the table must go \
+         back to always-on until it is re-established."
+    );
+    println!(
+        "stripped forgery rejected at: {}",
+        if proved.is_err() {
+            "prove (no consistent auxiliary trace)"
+        } else {
+            "verify (bus balance)"
+        }
+    );
+}
+
+/// (d) The count is bound into the transcript, so prover and verifier cannot
+/// disagree about it silently.
+///
+/// `include_blake3` is prover-asserted — unlike `include_halt`, the verifier
+/// cannot derive it a priori. Binding is what turns a disagreement into a
+/// rejection instead of two parties verifying different statements.
+#[test]
+fn the_blake3_count_is_bound_into_the_statement() {
+    use crate::statement::{StatementKind, absorb_statement};
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let mut counts = crate::TableCounts {
+        cpu: 3,
+        lt: 1,
+        memw: 2,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 2,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
+        blake3: 1,
+    };
+
+    let challenge_for = |counts: &crate::TableCounts| {
+        let mut t = crate::hash_pin::block_transcript(&[]);
+        absorb_statement(
+            &mut t,
+            StatementKind::Monolithic,
+            &elf_bytes,
+            &[1, 2, 3],
+            counts,
+            0,
+            &[],
+            7,
+        );
+        t.sample_field_element()
+    };
+
+    counts.blake3 = 1;
+    let with = challenge_for(&counts);
+    counts.blake3 = 0;
+    let without = challenge_for(&counts);
+
+    assert_ne!(
+        with, without,
+        "the BLAKE3 count must change the transcript — unbound, a prover could \
+         claim one shape and a verifier build another from the same bytes"
+    );
+}
+
+/// (e) A BLAKE3 count above one is rejected before any AIR is built.
+///
+/// `TableCounts::blake3` is a 0-or-1 presence count, but `total()` adds it while
+/// `VmAirs` derives `include_blake3` as `== 1`. Those two disagree for any value
+/// outside {0, 1}: a count of 2 inflates the expected sub-proof total by two
+/// while the AIR set gains none. `validate()`'s upper bound is what keeps that
+/// disagreement unreachable, so the bound itself is pinned here rather than left
+/// as an invariant nobody tests.
+///
+/// It fails safe twice over — the arithmetic below shows the count check would
+/// also reject — but a proof should never get that far on a malformed count.
+#[test]
+fn a_blake3_count_above_one_is_rejected() {
+    let mut counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
+        blake3: 1,
+    };
+    assert!(counts.validate().is_ok(), "1 is the honest maximum");
+    counts.blake3 = 0;
+    assert!(
+        counts.validate().is_ok(),
+        "0 is legal — the table is conditional (see TableCounts::blake3)"
+    );
+
+    for bogus in [2usize, 3, usize::MAX] {
+        counts.blake3 = bogus;
+        let err = counts
+            .validate()
+            .expect_err("a BLAKE3 count above one must be rejected");
+        assert!(
+            format!("{err}").contains("blake3"),
+            "the rejection must name the field, got {err}"
+        );
+    }
+
+    // The second line of defence, stated so the ordering is deliberate: even
+    // unvalidated, `total()` counts 2 where `air_refs` would build 0, so the
+    // sub-proof cross-check cannot pass either.
+    counts.blake3 = 2;
+    let with_two = counts.total().expect("the fixture's counts sum");
+    counts.blake3 = 0;
+    assert_eq!(
+        with_two,
+        counts.total().expect("the fixture's counts sum") + 2,
+        "total() counts every claimed BLAKE3 table, so a count the AIR set does \
+         not honour can never match the proof length"
+    );
+}
+
+/// (f) The six Ecall receivers carry pairwise-distinct syscall numbers.
+///
+/// This is the premise the whole omission argument rests on: CPU sends the
+/// syscall number as trace data, each receiver matches its own constant, and
+/// BLAKE3's is matched by no other table — so removing BLAKE3 leaves its sends
+/// unreceivable rather than absorbed by a neighbour. That is currently true by
+/// inspection of six literals in five files, which is exactly the kind of fact
+/// that stops being true silently.
+///
+/// A collision here would not be a failed test so much as a soundness break: two
+/// tables sharing a number could receive each other's sends, and a workload
+/// using one could be proved with only the other present.
+#[test]
+fn the_ecall_receiver_syscall_numbers_are_pairwise_distinct() {
+    use executor::vm::instruction::execution::{
+        BLAKE3_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, HINT_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER,
+    };
+
+    // HALT and COMMIT spell their numbers inline in their receivers
+    // (`tables/halt.rs`, `tables/commit.rs`) rather than via a shared constant.
+    const HALT_SYSCALL_NUMBER: u64 = 93;
+    const COMMIT_SYSCALL_NUMBER: u64 = 64;
+
+    let receivers = [
+        ("HALT", HALT_SYSCALL_NUMBER),
+        ("COMMIT", COMMIT_SYSCALL_NUMBER),
+        ("KECCAK", KECCAK_SYSCALL_NUMBER),
+        ("BLAKE3", BLAKE3_SYSCALL_NUMBER),
+        ("ECSM", ECSM_SYSCALL_NUMBER),
+        ("HINT", HINT_SYSCALL_NUMBER),
+    ];
+
+    for (i, (name_a, a)) in receivers.iter().enumerate() {
+        for (name_b, b) in &receivers[i + 1..] {
+            assert_ne!(
+                a, b,
+                "{name_a} and {name_b} share an Ecall syscall number — either could \
+                 receive the other's sends, and omitting one table would stop being \
+                 detectable"
+            );
+        }
+    }
+
+    // The split the receivers actually compare on is (lo32, hi32), so equal
+    // halves would collide even with distinct u64s.
+    let halves: Vec<(u32, u32)> = receivers
+        .iter()
+        .map(|(_, n)| ((n & 0xFFFF_FFFF) as u32, (n >> 32) as u32))
+        .collect();
+    for (i, a) in halves.iter().enumerate() {
+        for b in &halves[i + 1..] {
+            assert_ne!(a, b, "two receivers agree on both 32-bit halves");
+        }
+    }
 }

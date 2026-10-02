@@ -393,6 +393,29 @@ impl<F: IsField> Table<F> {
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
+        // One column per worker: the table is row-major, so this is a strided
+        // read of the whole trace and the widest thing between the executor and
+        // the commitment.
+        let column = |col_idx: usize| -> Vec<FieldElement<F>> {
+            (0..self.height)
+                .map(|row_idx| self.get(row_idx, col_idx).clone())
+                .collect()
+        };
+        #[cfg(feature = "parallel")]
+        return (0..self.width).into_par_iter().map(column).collect();
+        #[cfg(not(feature = "parallel"))]
+        return (0..self.width).map(column).collect();
+    }
+
+    /// [`Self::columns`] on the calling thread: the same columns, in the same
+    /// order, built by the same per-column read.
+    ///
+    /// For tables a few rows high, such as a proof's out-of-domain evaluations,
+    /// where the rayon pool costs more than the transpose. From a thread that
+    /// is not a rayon worker, a parallel iterator is injected into the global
+    /// pool and the caller blocks until a worker takes it, however busy the
+    /// pool is with other work.
+    pub fn columns_serial(&self) -> Vec<Vec<FieldElement<F>>> {
         (0..self.width)
             .map(|col_idx| {
                 (0..self.height)
