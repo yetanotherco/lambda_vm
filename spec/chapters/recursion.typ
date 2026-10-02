@@ -26,8 +26,6 @@
 #let prob = $PP$
 #let to = math.arrow.r
 
-#show math.equation.where(block: false): box
-
 #set list(marker: [---])
 
 = Proof recursion <proof-recursion>

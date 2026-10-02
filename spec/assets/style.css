@@ -648,3 +648,17 @@ dt::after {
 dd {
   grid-column-start: 2;
 }
+
+/* Notelist */
+.notelist > ul {
+  list-style: none;
+  padding-left: 1em;
+}
+
+.notelist > ul > li figure {
+  display: none;
+}
+
+sup {
+  font-size: 0.8em;
+}

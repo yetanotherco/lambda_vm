@@ -46,6 +46,7 @@
 //          | ["-", expr]                  ; -expr
 //          | ["-", expr1, expr2, ...]     ; expr1 - expr2 - ...
 //          | ["cast", expr, type]         ; expr as type
+//          | ["next", var]                ; var'
 // 
 // 
 // To limit the number of parentheses that are placed in an expression,
@@ -54,19 +55,20 @@
 
 #let PREC = (
   "MIN": -1, // <the most secret heart of any expression>
-  "idx": 0,  // []
-  "pow": 1,  // ^
-  "neg": 2,  // Unary -
-  "cast": 3, // cast
-  "mul": 4,  // *
-  "div": 5,  // /
-  "mod": 6,  // mod
-  "sum": 7,  // Σ
-  "not": 8,  // not
-  "sub": 9,  // -
-  "add": 10,  // +  
-  "eq": 11,   // = and :=
-  "MAX": 12, // <the void outside every expression>
+  "next": 0, // var'
+  "idx": 1,  // []
+  "pow": 2,  // ^
+  "neg": 3,  // Unary -
+  "cast": 4, // cast
+  "mul": 5,  // *
+  "div": 6,  // /
+  "mod": 7,  // mod
+  "sum": 8,  // Σ
+  "not": 9,  // not
+  "sub": 10,  // -
+  "add": 11,  // +  
+  "eq": 12,   // = and :=
+  "MAX": 13, // <the void outside every expression>
 )
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
@@ -114,7 +116,7 @@
       `⧼` + raw(e.at(1)) + `⧽`
     },
     "arr": (pp, rec, e) => `[` + e.slice(1).map(rec.with(PREC.MAX)).join(`, `) + `]`,
-    "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
+    "idx": (pp, rec, e) => cwrap(rec(PREC.idx, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`, pp < PREC.idx),
     "not": (pp, rec, e) => cwrap(rec(PREC.not, 1) + ` - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
@@ -136,9 +138,8 @@
     },
     "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
-      assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
-      // technically wrong associativity, but it's a constant
-      rec(PREC.pow, e.at(1)) + `^` + rec(PREC.pow, e.at(2))
+      // `<=` in the wrap to deal with right associativity
+      cwrap(rec(PREC.pow, e.at(1)) + `^` + rec(PREC.pow, e.at(2)), pp <= PREC.pow)
     },
     "=": (pp, rec, e) => rec(PREC.eq, e.at(1)) + ` = ` + rec(PREC.eq, e.at(2)),
     ":=": (pp, rec, e) => rec(PREC.eq, e.at(1)) + ` := ` + rec(PREC.eq, e.at(2)),
@@ -154,6 +155,10 @@
     "cast": (pp, rec, e) => {
       assert(e.len() == 3, message: "Invalid type cast: " + repr(e))
       cwrap(rec(PREC.cast, e.at(1)) + ` as ` + type_to_code(e.at(2)), pp < PREC.cast)
+    },
+    "next": (pp, rec, e) =>  {
+      assert(e.len() == 2 and type(e.at(1)) == str, message: "Invalid transition variable: " + repr(e))
+      cwrap(rec(PREC.next, e.at(1)) + `'`, pp < PREC.next)
     },
   ),
   num: (n) => raw(str(n)),
@@ -217,8 +222,7 @@
     },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
-      assert(type(e.at(1)) == int, message: "Can only exponentiate constants")
-      $#e.at(1)^#rec(PREC.MAX, e.at(2))$
+      mwrap($#rec(PREC.pow, e.at(1))^#rec(PREC.MAX, e.at(2))$, pp <= PREC.pow)
     },
     "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
     ":=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) := #rec(PREC.eq, e.at(2))$,
@@ -236,7 +240,11 @@
     },
     "cast": (pp, rec, e) => {
       assert(e.len() == 3, message: "Invalid type cast: " + repr(e))
-      cwrap($#rec(PREC.cast, e.at(1)) colon.double #type_to_math(e.at(2))$, pp < PREC.cast)
+      mwrap($#rec(PREC.cast, e.at(1)) colon.double #type_to_math(e.at(2))$, pp < PREC.cast)
+    },
+    "next": (pp, rec, e) =>  {
+      assert(e.len() == 2 and type(e.at(1)) == str, message: "Invalid transition variable: " + repr(e))
+      mwrap($#rec(PREC.next, e.at(1))'$, pp < PREC.next)
     },
   ),
   var: v => if v.len() == 1 { $#v$ } else { $#raw(v)$ },

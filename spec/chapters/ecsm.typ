@@ -12,8 +12,6 @@
 
 #let config = load_config()
 
-#show math.equation.where(block: false): box
-
 #let ecsm_chip = load_chip("src/ecsm.toml", config)
 #let ecsm = raw(ecsm_chip.name)
 

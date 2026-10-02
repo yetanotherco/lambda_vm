@@ -57,8 +57,8 @@
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),
-      ("field", [`Field` VM], <field-VM>),
-      ("field_decode", [`Field` `DECODE` table], <field-decode>),
+      ("field_vm", [Field VM], <field-VM>),
+      ("field_vm_decode", [Field `DECODE` table], <field-decode>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
@@ -104,10 +104,37 @@
   assert(false, message: "Unsupported target: " + target())
 }
 
+#let notelist(prefix, body) = {
+  show list: it => context if target() == "html" {
+    html.div(class: "notelist", it)
+  } else {
+    it
+  }
+  show figure.where(kind: "note"): it => super(it.counter.display(it.numbering)) + it
+  show terms: it => list(marker: none, indent: 0pt, ..it.children.map(c => {
+    let labelname = if c.term.has("text") {
+      c.term.text
+    } else {
+      c.term.children.map(x => x.text).join()
+    }
+    list.item[
+      #box[#figure(numbering: "[1]", kind: "note", supplement: [], none)#label(prefix + ":note:" + labelname)]
+      #c.description
+    ]
+  }))
+  body
+}
+
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
+  show math.equation.where(block: false): box // Don't line-break inline equations by default
   show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
+  show ref: it => if it.element != none and it.element.func() == figure and it.element.kind == "note" {
+    super[[#it]]
+  } else {
+    it
+  }
   show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
     set figure.caption(position: top)
     show figure.caption: cap => block(

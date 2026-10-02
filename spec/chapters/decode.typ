@@ -8,7 +8,7 @@
   render_chip_padding_table,
 )
 #import "/expr.typ": expr_to_math
-#import "/meta.typ": stripe_tables
+#import "/meta.typ": stripe_tables, notelist
 
 #let config = load_config()
 #let chip = load_chip("src/decode.toml", config)
@@ -82,11 +82,6 @@ For the purpose of brevity and readability, the table uses the following rules-o
 
 Further clarification is provided in the notes following the table.
 
-/// Add a reference to one or more notes following this table.
-#let ref_note(..refs) = {
-  super("[" + refs.pos().map(r => ref(r)).join(",") + "]")
-}
-
 #let decoding_table(lines) = {
   show figure: set block(breakable: true)
   show: stripe_tables
@@ -107,55 +102,55 @@ Further clarification is provided in the notes following the table.
 
 #let decoding = (
     // OP-IMM
-  ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SLTI[U]   rd, rs1, imm`], [`LT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
+  ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], [@decode:note:word_instr]),
+  ([`SLTI[U]   rd, rs1, imm`], [`LT`], [], [#sym.not`[U]`], [], [@decode:note:signed]),
   ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []),
   ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []),
   ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []),
-  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
-  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [], [@decode:note:word_instr]),
+  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [@decode:note:word_instr]),
+  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [@decode:note:word_instr]),
   // OP
-  ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SLT[U]    rd, rs1, rs2`], [`LT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
+  ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], [@decode:note:word_instr]),
+  ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], [@decode:note:word_instr]),
+  ([`SLT[U]    rd, rs1, rs2`], [`LT`], [], [#sym.not`[U]`], [], [@decode:note:signed]),
   ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []),
   ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []),
   ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []),
-  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
-  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [#ref_note(<note_word_instr>)]),
-  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [#ref_note(<note_word_instr>)]),
+  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [], [@decode:note:word_instr]),
+  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [], [`invert`], [@decode:note:word_instr]),
+  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT[W]`], [`[W]`], [1], [`invert`], [@decode:note:word_instr]),
   // OP - M
-  ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`signed2`], [#ref_note(<note_word_instr>)]),
+  ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`signed2`], [@decode:note:word_instr]),
   ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`signed2`, `muldiv_selector`], []),
   ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []),
   ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []),
-  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [#ref_note(<note_word_instr>, <note_signed>)]),
-  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [#ref_note(<note_word_instr>, <note_signed>)]),
+  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [@decode:note:word_instr@decode:note:signed]),
+  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [@decode:note:word_instr@decode:note:signed]),
   // LUI/AUIPC
-  ([`LUI       rd, imm`], [`ADD`], [], [], [], [#ref_note(<note-lui>)]),
-  ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [#ref_note(<note-auipc>)]),
-  ([`JAL       rd, imm`], [], [], [], [`BRANCH`, `JALR`, `rs1 := x255`], [#ref_note(<note-jal>)]),
+  ([`LUI       rd, imm`], [`ADD`], [], [], [], [@decode:note:lui]),
+  ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [@decode:note:auipc]),
+  ([`JAL       rd, imm`], [], [], [], [`BRANCH`, `JALR`, `rs1 := x255`], [@decode:note:jal]),
   // Branching
   ([`JALR      rd, rs1, imm`], [], [], [], [`BRANCH`, `JALR`], []),
   ([`BEQ      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`], []),
   ([`BNE      rs1, rs2, imm`], [`EQ`], [], [], [`BRANCH`, `invert`], []),
-  ([`BLT[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`], [#ref_note(<note_signed>)]),
-  ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`, `invert`], [#ref_note(<note_signed>)]),
+  ([`BLT[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`], [@decode:note:signed]),
+  ([`BGE[U]   rs1, rs2, imm`], [`LT`], [], [#sym.not`[U]`], [`BRANCH`, `invert`], [@decode:note:signed]),
   // LOAD
   ([`LD        rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_8B`], []),
-  ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_4B`], [#ref_note(<note_signed>)]),
-  ([`LH[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_2B`], [#ref_note(<note_signed>)]),
-  ([`LB[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`], [#ref_note(<note_signed>)]),
+  ([`LW[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_4B`], [@decode:note:signed]),
+  ([`LH[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`, `mem_2B`], [@decode:note:signed]),
+  ([`LB[U]     rd, rs1, imm`], [`ADD`], [], [], [`MEMORY`, `mem_signed := `#sym.not`[U]`], [@decode:note:signed]),
   // STORE
   ([`SD       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_8B`], []),
   ([`SW       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_4B`], []),
   ([`SH       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`, `mem_2B`], []),
   ([`SB       rs1, rs2, imm`], [`ADD`], [], [], [`MEMORY`, `memory_op`], []),
   // ECALL/EBREAK
-  ([`ECALL`], [], [], [], [`ECALL`, $#`rs1` := #`x17`$], [#ref_note(<note-ecall>)]),
+  ([`ECALL`], [], [], [], [`ECALL`, $#`rs1` := #`x17`$], [@decode:note:ecall]),
   // FENCE
-  ([`FENCE`], [`ADD`], [], [], [], [#ref_note(<note-fence>)]),
+  ([`FENCE`], [`ADD`], [], [], [], [@decode:note:fence]),
 )
 
 #decoding_table(decoding)
@@ -172,63 +167,21 @@ It is represented as half the number of bytes in the instruction to make misalig
 Additionally, having the variable opens the door for future optimizations involving "fused" instructions, where common sequences
 of instructions are merged into a single decoded version and need only a single CPU row to prove.
 
-// Construct a note that can be referenced through `lbl`
-#let referenceable_note(lbl, note) = {
-  show figure: (it) => align(left, [#it])
-  [#figure(kind: "note", supplement: [], [#note]) #label(lbl)]
-}
-
 == Notes
 We note the following about the above decoding table:
-#enum(numbering: "[1]",
-  enum.item(
-    referenceable_note(
-      "note_word_instr",
-      [`word_instr`: `[W]` indicates that $#`word_instr` = 1$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant. Similarly, `SHIFT[W]` indicates the `SHIFTW` operation for the `W`-variant, and `SHIFT` otherwise.]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note_signed",
-      [`signed`: #sym.not`[U]` indicates that $#`signed` = 1$ for the *non-`U`*-variant of the operation, and $0$ for the `U`-variant.]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note-lui",
-      [`LUI`: this operation loads the 20-bit `imm` in the upper bits of `rd`.
+#notelist("decode")[
+  / word_instr: `word_instr`: `[W]` indicates that $#`word_instr` = 1$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant. Similarly, `SHIFT[W]` indicates the `SHIFTW` operation for the `W`-variant, and `SHIFT` otherwise.
+  / signed: `signed`: #sym.not`[U]` indicates that $#`signed` = 1$ for the *non-`U`*-variant of the operation, and $0$ for the `U`-variant.
+  / lui: `LUI`: this operation loads the 20-bit `imm` in the upper bits of `rd`.
       Observe that this can be represented using `ADDI rd, x0, imm`.
-      As such, *we expect the decoding to take care of writing the immediate in bit range $[12:32]$ of `imm` and extending it to 64 bits.*]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note-auipc",
-      [`AUIPC`: this operation adds the 20-bit immediate to the upper bits of `pc` and stores the result in `rd`. 
+      As such, *we expect the decoding to take care of writing the immediate in bit range $[12:32]$ of `imm` and extending it to 64 bits.*
+  / auipc: `AUIPC`: this operation adds the 20-bit immediate to the upper bits of `pc` and stores the result in `rd`. 
       Given that the `pc` is stored in `x255`, this operation can be represented using `ADDI rd, x255, imm`.
-      As such, *we expect the decoding to take care of writing the immediate in bit range $[12:32]$ of `imm` and extending it to 64 bits.*]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note-jal",
-      [`JAL`: this operation stores $#`pc` + #`2 * half_instruction_length`$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
+      As such, *we expect the decoding to take care of writing the immediate in bit range $[12:32]$ of `imm` and extending it to 64 bits.*
+  / jal: `JAL`: this operation stores $#`pc` + #`2 * half_instruction_length`$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
       Note that this can be represented using `JALR rd, x255, imm`.
-      As such, *we expect the decoding to take care of writing the immediate in bit range $[1:21]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note-ecall",
-      [`ECALL`:
+      As such, *we expect the decoding to take care of writing the immediate in bit range $[1:21]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*
+  / ecall: `ECALL`:
       "On RISC-V a system call has its own instruction: `ECALL`. [...] A7 [= register `x17`] contains the system call number." #link("https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[[source]]
-      ]
-    )
-  ),
-  enum.item(
-    referenceable_note(
-      "note-fence",
-      [`FENCE`: currently, the VM interprets this operation as `ADDI x0 x0 0`; a no-op.]
-    )
-  )
-)
+  / fence: `FENCE`: currently, the VM interprets this operation as `ADDI x0 x0 0`; a no-op.
+]
