@@ -71,6 +71,8 @@ use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
+#[cfg(test)]
+mod lean_walk_tests;
 mod windowed;
 pub use windowed::{
     Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
