@@ -281,6 +281,11 @@ fn main() {
     compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
     // The WHIR path's own kernels. They carry no compile-time knob, so they
     // take the empty define list rather than gaining a second signature.
+    // D-HASH stage 1's Poseidon1 width-16 MEASUREMENT kernels (`src/p1w16.rs`),
+    // pinned on the host by `tests/host_kat/p1w16_host_kat.cpp`. Loaded only by
+    // that module, never by the backend.
+    println!("cargo:rerun-if-changed=kernels/p1w16_constants.cuh");
+    compile_kernel("p1w16.cu", "p1w16.cubin", have_nvcc, &[]);
     compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
     compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
 }

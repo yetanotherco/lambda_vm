@@ -53,6 +53,7 @@ pub mod layout;
 pub mod lde;
 pub mod logup;
 pub mod merkle_cap;
+pub mod p1w16_chip;
 pub mod per_table_aggregator;
 pub mod poseidon;
 pub mod preprocessed;
@@ -179,6 +180,10 @@ mod machine_tests;
 mod one_row_guest_tests;
 #[cfg(test)]
 mod one_row_tests;
+#[cfg(test)]
+mod p1w16_census_tests;
+#[cfg(test)]
+mod p1w16_chip_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]

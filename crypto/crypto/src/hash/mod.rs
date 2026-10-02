@@ -2,5 +2,6 @@ pub mod blake3;
 pub mod platform_blake3;
 pub mod platform_keccak;
 pub mod poseidon;
+pub mod poseidon1_w16;
 pub mod rpx;
 pub mod sha3;
