@@ -1261,10 +1261,27 @@ fn gate_packing() -> bool {
     })
 }
 
+/// `LAMBDA_VM_FUSED_WALK`: the fused region's walk. Unset or `heaviest` is the
+/// heaviest-first walk every measurement so far used; `mix` interleaves the
+/// table types in proportion ([`mixed_walk`]); anything else stops the run.
+/// The walk only orders the drivers' claims: each table proves on its own
+/// transcript fork and the proofs are drained in index order, so no proof byte
+/// depends on it.
+fn fused_walk_mix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAMBDA_VM_FUSED_WALK").as_deref() {
+        Err(_) | Ok("heaviest") => false,
+        Ok("mix") => true,
+        Ok(other) => panic!("LAMBDA_VM_FUSED_WALK must be `heaviest` or `mix`, got `{other}`"),
+    })
+}
+
 /// `LAMBDA_VM_TABLE_TIMELINE=1`: one `TABLE TL` line per table per admitted
 /// phase — when a driver claimed it, when the gate admitted it and when it
 /// finished (unix seconds, the clock the `PROVE SPLIT` line's `t=[..]` uses),
-/// and the bytes it was admitted for. Off by default.
+/// and the bytes it was admitted for. With `LFM_PROVE_SPLIT=1` the line also
+/// carries the table's own stage seconds ([`crate::prove_split::table_take`]).
+/// Off by default.
 fn table_timeline() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1"))
@@ -1359,14 +1376,19 @@ fn run_admitted<T: Send>(
                         return;
                     }
                     let t_start = timeline.then(crate::prove_split::epoch_secs);
+                    if timeline {
+                        // This driver's stages from here on are this table's.
+                        let _ = crate::prove_split::table_take();
+                    }
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
                     if let (Some(t_claim), Some(t_start)) = (t_claim, t_start) {
                         eprintln!(
                             "TABLE TL {phase} idx={idx} {} est={:.2}GiB claim={t_claim:.3} \
-                             start={t_start:.3} end={:.3}",
+                             start={t_start:.3} end={:.3}{}",
                             label(idx),
                             estimates[idx] as f64 / (1u64 << 30) as f64,
                             crate::prove_split::epoch_secs(),
+                            crate::prove_split::table_take().unwrap_or_default(),
                         );
                     }
                     // Released explicitly: the catch means unwinding no longer
@@ -1504,6 +1526,51 @@ fn heaviest_first(weights: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..weights.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(weights[i]));
     order
+}
+
+/// A table's type for [`mixed_walk`]: its AIR name before the instance suffix
+/// (`CPU[3]` → `CPU`) or the page base (`PAGE:0x40000` → `PAGE`).
+fn table_type(name: &str) -> &str {
+    name.split(['[', ':']).next().unwrap_or(name)
+}
+
+/// `order` (a walk) with the table types interleaved in proportion. The j-th of
+/// a type's n tables, in `order`'s order, is keyed (j + ½)/n; the walk is the
+/// keys ascending, ties in `order`'s order. Every prefix of the walk then holds
+/// each type in its share of the whole.
+///
+/// Why: at the median block (BR-MED, BIG 440b) the heaviest-first walk puts
+/// all 36 KECCAK_RND instances, then LT and the PAGE tables, ahead of CPU and
+/// MEMW_R, and with packing every slot freed in the first ≈ 28 s goes to the
+/// next of them; the card ran at ≈ 68 % there and at 100 % for the rest.
+/// Mixed, each window of the fused region carries the same blend of
+/// card-heavy and host-heavy tables.
+fn mixed_walk(order: &[usize], names: &[String]) -> Vec<usize> {
+    use std::collections::BTreeMap;
+    let mut count: BTreeMap<&str, u64> = BTreeMap::new();
+    for &i in order {
+        *count.entry(table_type(&names[i])).or_default() += 1;
+    }
+    // (rank within its type, the type's count, position in `order`).
+    let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut keyed: Vec<(u64, u64, usize)> = order
+        .iter()
+        .enumerate()
+        .map(|(pos, &i)| {
+            let ty = table_type(&names[i]);
+            let j = seen.entry(ty).or_default();
+            let key = (*j, count[ty], pos);
+            *j += 1;
+            key
+        })
+        .collect();
+    // (2a + 1)/2n < (2b + 1)/2m ⇔ (2a + 1)·m < (2b + 1)·n, exact in u128.
+    keyed.sort_by(|&(a, n, pa), &(b, m, pb)| {
+        let lhs = u128::from(2 * a + 1) * u128::from(m);
+        let rhs = u128::from(2 * b + 1) * u128::from(n);
+        lhs.cmp(&rhs).then(pa.cmp(&pb))
+    });
+    keyed.into_iter().map(|(_, _, pos)| order[pos]).collect()
 }
 
 /// One line naming the walk a phase took, heaviest first. Printed once per
@@ -6163,8 +6230,16 @@ pub trait IsStarkProver<
 
         let __ps_fused = crate::prove_split::mark();
         let peak_order = heaviest_first(&peak_walk_weights);
+        let (peak_order, walk) = if fused_walk_mix() {
+            (
+                mixed_walk(&peak_order, &table_names),
+                "types mixed in proportion, LAMBDA_VM_FUSED_WALK=mix",
+            )
+        } else {
+            (peak_order, "walk weight, largest first")
+        };
         eprintln!(
-            "[prover] table walk rounds 2-4 (walk weight, largest first): {}",
+            "[prover] table walk rounds 2-4 ({walk}): {}",
             describe_walk(&peak_order, &peak_walk_weights, &table_names)
         );
 
@@ -6983,7 +7058,7 @@ fn print_bus_balance_report<FieldExtension>(
 
 #[cfg(test)]
 mod walk_tests {
-    use super::{heaviest_first, table_walk_weight};
+    use super::{heaviest_first, mixed_walk, table_type, table_walk_weight};
 
     /// The weight is `2·lde·(8·main + 24·aux) + 256·lde`. These constants are a
     /// schedule, not a size, so this test exists to make a change to them a
@@ -7028,6 +7103,72 @@ mod walk_tests {
     #[test]
     fn ties_keep_registry_order() {
         assert_eq!(heaviest_first(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
+    }
+
+    /// The mixed walk is a permutation of the walk it is given, keeps each
+    /// type's own order, counts every PAGE as one type, and spreads the types
+    /// in proportion: with four A's, two B's and one C, every prefix holds each
+    /// type within one table of its share.
+    #[test]
+    fn the_mixed_walk_interleaves_types_in_proportion() {
+        let names: Vec<String> = [
+            "A[0]",
+            "A[1]",
+            "A[2]",
+            "A[3]",
+            "B[0]",
+            "B[1]",
+            "PAGE:0x0",
+            "PAGE:0x40000",
+            "C",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Heaviest first: all of A, then B, then the pages, then C.
+        let order: Vec<usize> = (0..names.len()).collect();
+        let mixed = mixed_walk(&order, &names);
+        let named: Vec<&str> = mixed.iter().map(|&i| names[i].as_str()).collect();
+        // Keys: A 1/8, 3/8, 5/8, 7/8; B 1/4, 3/4; PAGE 1/4, 3/4; C 1/2. Ties
+        // keep the given order (B before PAGE).
+        assert_eq!(
+            named,
+            [
+                "A[0]",
+                "B[0]",
+                "PAGE:0x0",
+                "A[1]",
+                "C",
+                "A[2]",
+                "B[1]",
+                "PAGE:0x40000",
+                "A[3]"
+            ]
+        );
+        let mut sorted = mixed.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, order, "a permutation of the walk");
+        for prefix in 1..=mixed.len() {
+            let share = |ty: &str, n: usize| {
+                let got = mixed[..prefix]
+                    .iter()
+                    .filter(|&&i| table_type(&names[i]) == ty)
+                    .count() as f64;
+                (got - n as f64 * prefix as f64 / mixed.len() as f64).abs()
+            };
+            for (ty, n) in [("A", 4), ("B", 2), ("PAGE", 2), ("C", 1)] {
+                assert!(share(ty, n) <= 1.0, "{ty} off its share at {prefix}");
+            }
+        }
+    }
+
+    /// One type alone is left as it was: the mixed walk of a walk with a single
+    /// type is that walk.
+    #[test]
+    fn the_mixed_walk_of_one_type_is_the_walk() {
+        let names: Vec<String> = (0..5).map(|i| format!("CPU[{i}]")).collect();
+        let order = vec![3, 1, 4, 0, 2];
+        assert_eq!(mixed_walk(&order, &names), order);
     }
 }
 

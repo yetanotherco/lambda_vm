@@ -38,8 +38,9 @@
 //!
 //! # ⚠ One prove at a time
 //!
-//! The accumulators are process-global (the fused region's drivers are rayon
-//! workers, so a thread-local cannot see them). Two `multi_prove` calls in
+//! The accumulators are process-global, so the Σ covers every driver thread
+//! (only the per-table copy that `TABLE TL` prints is per thread, see
+//! [`table_take`]). Two `multi_prove` calls in
 //! flight would therefore mix their numbers. On the LFM tree that cannot happen
 //! — `lfm::device_permit` holds the card across `multi_prove` — and in the base
 //! there is a single prover thread. Rather than assume it, [`begin`] counts
@@ -96,9 +97,69 @@ pub fn mark() -> Option<Instant> {
 #[inline]
 pub fn add(slot: &Slot, start: Option<Instant>) {
     if let Some(t) = start {
-        slot.0
-            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        record(slot, t.elapsed().as_nanos() as u64);
     }
+}
+
+/// `nanos` into `slot`, and into this thread's per-table copy when `slot` is
+/// one of [`TABLE_STAGES`].
+fn record(slot: &Slot, nanos: u64) {
+    slot.0.fetch_add(nanos, Ordering::Relaxed);
+    if let Some(stage) = TABLE_STAGES
+        .iter()
+        .position(|(_, s)| std::ptr::eq(*s, slot))
+    {
+        TABLE.with(|t| {
+            let mut stages = t.get();
+            stages[stage] += nanos;
+            t.set(stages);
+        });
+    }
+}
+
+// ── one table's stages, per driver thread ───────────────────────────────────
+//
+// A fused task runs on one driver thread from claim to end (`run_admitted`
+// spawns OS threads, and every stage below is closed on the thread that runs
+// the task), so a thread-local copy of the per-table slots holds exactly the
+// table that thread is proving. `run_admitted` takes it before the task (to
+// clear what an earlier table left) and after (to print it).
+
+/// The per-table slots a `TABLE TL` line reports, in the order they run.
+static TABLE_STAGES: [(&str, &Slot); 12] = [
+    ("recommit", &MAIN_RECOMMIT),
+    ("aux_build", &AUX_BUILD),
+    ("aux_commit", &AUX_COMMIT),
+    ("r1_assemble", &R1_ASSEMBLE),
+    ("r2_constraints", &R2_CONSTRAINTS),
+    ("r2_decompose", &R2_DECOMPOSE),
+    ("r2_commit", &R2_COMMIT),
+    ("r3_ood", &R3_OOD),
+    ("r3_absorb", &R3_ABSORB),
+    ("r4_deep_fri", &R4_DEEP_FRI),
+    ("r4_grind", &R4_GRIND),
+    ("r4_queries", &R4_QUERIES),
+];
+
+thread_local! {
+    static TABLE: std::cell::Cell<[u64; 12]> = const { std::cell::Cell::new([0; 12]) };
+}
+
+/// This thread's stage seconds since the last call, cleared, as
+/// ` stages=[name s · …]` (the stages that ran), or `None` when none did —
+/// always so when `LFM_PROVE_SPLIT` is off, because then nothing is recorded.
+pub fn table_take() -> Option<String> {
+    let stages = TABLE.with(|t| t.replace([0; 12]));
+    if stages.iter().all(|&n| n == 0) {
+        return None;
+    }
+    let ran: Vec<String> = TABLE_STAGES
+        .iter()
+        .zip(stages)
+        .filter(|&(_, n)| n > 0)
+        .map(|((name, _), n)| format!("{name} {:.3}", n as f64 / 1e9))
+        .collect();
+    Some(format!(" stages=[{}]", ran.join(" · ")))
 }
 
 // ── phase walls, one per prove, measured on the calling thread ──────────────
@@ -360,5 +421,36 @@ mod tests {
         });
         assert!((S.take() - 1.0).abs() < 1e-9, "four workers, 0.25s each");
         assert_eq!(S.take(), 0.0, "and the second read finds it cleared");
+    }
+
+    /// A table's stages are its driver's own: two threads recording into the
+    /// same slots each read back only theirs, a phase wall never shows, and the
+    /// read clears the thread's copy (the next table starts from zero).
+    #[test]
+    fn table_stages_are_per_thread_and_clear_on_take() {
+        let lines: Vec<(Option<String>, Option<String>)> = std::thread::scope(|sc| {
+            let a = sc.spawn(|| {
+                record(&AUX_BUILD, 250_000_000);
+                record(&R4_QUERIES, 1_500_000_000);
+                record(&MAIN_COMMIT, 7_000_000_000);
+                (table_take(), table_take())
+            });
+            let b = sc.spawn(|| {
+                record(&R3_ABSORB, 20_000_000);
+                (table_take(), table_take())
+            });
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(
+            lines[0].0.as_deref(),
+            Some(" stages=[aux_build 0.250 · r4_queries 1.500]")
+        );
+        assert_eq!(lines[1].0.as_deref(), Some(" stages=[r3_absorb 0.020]"));
+        assert_eq!(lines[0].1, None, "the take cleared it");
+        assert_eq!(lines[1].1, None);
+        // The process-wide Σ saw all of it; give it back for the next prove.
+        for slot in [&AUX_BUILD, &R4_QUERIES, &MAIN_COMMIT, &R3_ABSORB] {
+            assert!(slot.take() > 0.0);
+        }
     }
 }
