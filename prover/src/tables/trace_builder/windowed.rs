@@ -636,22 +636,36 @@ impl Accumulator<'_> {
             self.emitted.memw_lt_done += walk.memw.general.len();
             self.emitted.memw_aligned_lt_done += walk.memw.aligned.len();
         }
-        let route = if self.lean.route {
-            route_ops_one_pass
-        } else {
-            route_ops
-        };
-        self.segments
-            .append(route(&window.cpu_ops, self.decode, &window.walk.cpu32_ops));
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
-        // empty), from the list otherwise.
+        // empty), from the list otherwise. The one-pass routing appends to the
+        // run's segments and counts the CPU ops' lookups as it goes.
+        if self.lean.route && self.lean.lookups && route_fused() {
+            super::route_ops_into(
+                &window.cpu_ops,
+                self.decode,
+                &window.walk.cpu32_ops,
+                self.segments,
+                &mut self.counted.histogram,
+            );
+        } else {
+            let route = if self.lean.route {
+                route_ops_one_pass
+            } else {
+                route_ops
+            };
+            self.segments
+                .append(route(&window.cpu_ops, self.decode, &window.walk.cpu32_ops));
+            if self.lean.lookups {
+                let histogram = &mut self.counted.histogram;
+                window
+                    .cpu_ops
+                    .iter()
+                    .for_each(|op| self.decode.op(op).count_bitwise_into(histogram));
+            }
+        }
         if self.lean.lookups {
             let histogram = &mut self.counted.histogram;
-            window
-                .cpu_ops
-                .iter()
-                .for_each(|op| self.decode.op(op).count_bitwise_into(histogram));
             window
                 .walk
                 .load_ops
@@ -828,6 +842,15 @@ fn chunk_jobs(
         e.store += 1;
     }
     jobs
+}
+
+/// Whether the accumulator routes a window into the run's segments in place
+/// and counts its CPU ops' lookups in the same pass (unset or `1`), or routes
+/// it into segments of its own, appends them, then counts
+/// (`LAMBDA_VM_ROUTE_FUSED=0`). Read once. The segments and counts are the same.
+fn route_fused() -> bool {
+    static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// The cycles the walker collects and walks at a time (`LAMBDA_VM_WALK_BATCH`,
