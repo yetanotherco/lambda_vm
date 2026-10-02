@@ -181,47 +181,7 @@ impl NarrowMain {
     /// fast, non-cryptographic check that a trace built again is this one. A
     /// prover bug is the threat, not an adversary.
     pub fn digest(&self) -> [u64; 2] {
-        const K: [u64; 4] = [
-            0x9e37_79b9_7f4a_7c15,
-            0xc2b2_ae3d_27d4_eb4f,
-            0x1656_67b1_9e37_79f9,
-            0x85eb_ca77_c2b2_ae63,
-        ];
-        let mix = |acc: u64, w: u64, k: u64| (acc ^ w).wrapping_mul(k).rotate_left(31);
-        let mut lanes = [
-            self.rows as u64,
-            self.widths.len() as u64,
-            self.data.len() as u64,
-            0x243f_6a88_85a3_08d3,
-        ];
-        for (i, &w) in self.widths.iter().enumerate() {
-            lanes[i % 4] = mix(lanes[i % 4], u64::from(w), K[i % 4]);
-        }
-        let mut blocks = self.data.chunks_exact(32);
-        for block in &mut blocks {
-            for (l, word) in block.chunks_exact(8).enumerate() {
-                let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
-                lanes[l] = mix(lanes[l], w, K[l]);
-            }
-        }
-        let mut tail = [0u8; 32];
-        tail[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
-        for (l, word) in tail.chunks_exact(8).enumerate() {
-            let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
-            lanes[l] = mix(lanes[l], w, K[l]);
-        }
-        // MurmurHash3's finalizer, so every input bit reaches every output bit.
-        let fmix = |mut h: u64| {
-            h ^= h >> 33;
-            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-            h ^= h >> 33;
-            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-            h ^ (h >> 33)
-        };
-        [
-            fmix(lanes[0] ^ lanes[2].rotate_left(23)),
-            fmix(lanes[1] ^ lanes[3].rotate_left(41)),
-        ]
+        digest_parts(self.rows, &self.widths, &self.data)
     }
 
     /// Flip the low bit of the first packed byte: a wrong word, for the tests
@@ -261,6 +221,52 @@ impl NarrowMain {
             .enumerate()
             .for_each(widen_block);
     }
+}
+
+/// [`NarrowMain::digest`] of a packed trace held as its parts (the spill
+/// store digests the bytes on its writer thread).
+pub(crate) fn digest_parts(rows: usize, widths: &[u8], data: &[u8]) -> [u64; 2] {
+    const K: [u64; 4] = [
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+        0x1656_67b1_9e37_79f9,
+        0x85eb_ca77_c2b2_ae63,
+    ];
+    let mix = |acc: u64, w: u64, k: u64| (acc ^ w).wrapping_mul(k).rotate_left(31);
+    let mut lanes = [
+        rows as u64,
+        widths.len() as u64,
+        data.len() as u64,
+        0x243f_6a88_85a3_08d3,
+    ];
+    for (i, &w) in widths.iter().enumerate() {
+        lanes[i % 4] = mix(lanes[i % 4], u64::from(w), K[i % 4]);
+    }
+    let mut blocks = data.chunks_exact(32);
+    for block in &mut blocks {
+        for (l, word) in block.chunks_exact(8).enumerate() {
+            let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+            lanes[l] = mix(lanes[l], w, K[l]);
+        }
+    }
+    let mut tail = [0u8; 32];
+    tail[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+    for (l, word) in tail.chunks_exact(8).enumerate() {
+        let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        lanes[l] = mix(lanes[l], w, K[l]);
+    }
+    // MurmurHash3's finalizer, so every input bit reaches every output bit.
+    let fmix = |mut h: u64| {
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
+    };
+    [
+        fmix(lanes[0] ^ lanes[2].rotate_left(23)),
+        fmix(lanes[1] ^ lanes[3].rotate_left(41)),
+    ]
 }
 
 /// A [`NarrowMain`] built a block of rows at a time, so a generator never holds

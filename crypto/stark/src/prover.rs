@@ -1094,6 +1094,21 @@ struct VramPermit<'a> {
     bytes: u64,
 }
 
+// Permits held by this thread: a driver must hold none while it waits for a
+// spilled trace (`AdmitReady`), which the tests check where it waits.
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static PERMITS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl<'a> VramPermit<'a> {
+    fn new(gate: &'a VramGate, bytes: u64) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        PERMITS_HELD.with(|p| p.set(p.get() + 1));
+        Self { gate, bytes }
+    }
+}
+
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
@@ -1108,7 +1123,7 @@ impl VramGate {
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget {
                 *used = used.saturating_add(bytes);
-                return VramPermit { gate: self, bytes };
+                return VramPermit::new(self, bytes);
             }
             used = self.freed.wait(used).unwrap();
         }
@@ -1144,15 +1159,17 @@ impl VramGate {
                         continue;
                     }
                     any_left = true;
-                    if !ready(idx) {
-                        unready = true;
-                        continue;
-                    }
                     let bytes = estimates[idx];
                     if *used == 0 || used.saturating_add(bytes) <= self.budget {
+                        // Readiness only for what fits: it takes the
+                        // read-back's lock under the gate's.
+                        if !ready(idx) {
+                            unready = true;
+                            continue;
+                        }
                         claimed[pos] = true;
                         *used = used.saturating_add(bytes);
-                        return Some((idx, VramPermit { gate: self, bytes }));
+                        return Some((idx, VramPermit::new(self, bytes)));
                     }
                 }
                 if !any_left {
@@ -1273,6 +1290,7 @@ mod admit_ready_tests {
         fn is_ready(&self, idx: usize) -> bool {
             idx != self.slow || self.released.load(Ordering::SeqCst)
         }
+        fn close(&self) {}
     }
 
     /// ★ A driver waits for its table's inputs (a spilled trace read back)
@@ -1308,6 +1326,64 @@ mod admit_ready_tests {
         );
         assert_eq!(out, vec![Some(0), Some(1)]);
         assert_eq!(*gate.used.lock().unwrap(), 0);
+    }
+
+    /// ★ A task that panics before taking its parked read: with a one-byte
+    /// window the read-back can park nothing else, and a driver waiting for
+    /// the next read would wait forever. `run_admitted` closes the read-back
+    /// when it keeps the panic, so every driver returns and that panic is the
+    /// one reported.
+    #[test]
+    fn a_panicking_task_releases_the_drivers_waiting_on_reads() {
+        use crate::spill::{Prefetch, ReadPhase, SpillOptions, SpillStore};
+        use crate::trace::TraceTable;
+        use math::field::element::FieldElement;
+        use math::field::{
+            extensions_goldilocks::Degree3GoldilocksExtensionField as E,
+            goldilocks::GoldilocksField as F,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let store = SpillStore::open(SpillOptions::default()).unwrap();
+            let mut traces = Vec::new();
+            let mut reads = Vec::new();
+            for i in 0..3 {
+                let words = (0..64u64).map(FieldElement::<F>::from).collect();
+                let mut trace = TraceTable::<F, E>::new_main(words, 1, 1);
+                assert!(trace.pack_main_narrow() && trace.spill_main(&store));
+                reads.push((ReadPhase::Fused, i, trace.spilled_main().unwrap().clone()));
+                traces.push(trace);
+            }
+            store.flush();
+            let prefetch = Prefetch::start(reads, 1);
+            let ready = super::SpillReady {
+                prefetch: &prefetch,
+                phase: ReadPhase::Fused,
+            };
+            let gate = VramGate::new(u64::MAX);
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_admitted(
+                    "panic",
+                    &[0, 1, 2],
+                    &[1, 1, 1],
+                    &gate,
+                    2,
+                    Some(&ready),
+                    |idx| format!("t{idx}"),
+                    |idx| {
+                        assert!(idx != 0, "table 0 fails before its read is taken");
+                        prefetch.take(ReadPhase::Fused, idx).is_some()
+                    },
+                )
+            }));
+            let message = out.err().and_then(|p| p.downcast_ref::<String>().cloned());
+            let _ = tx.send(message);
+        });
+        let message = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("run_admitted hung after a task panicked");
+        let message = message.expect("the task's panic is re-raised");
+        assert!(message.contains("table 0 fails"), "{message}");
     }
 }
 
@@ -1411,7 +1487,9 @@ fn spill_prefetch_window() -> u64 {
 /// finished (unix seconds, the clock the `PROVE SPLIT` line's `t=[..]` uses),
 /// and the bytes it was admitted for. With `LFM_PROVE_SPLIT=1` the line also
 /// carries the table's own stage seconds ([`crate::prove_split::table_take`]).
-/// Off by default.
+/// In the walk-order arm `claim` is taken before the wait for the table's
+/// spilled trace ([`AdmitReady`]), so `start − claim` is that wait plus the
+/// gate's. Off by default.
 fn table_timeline() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1"))
@@ -1419,6 +1497,8 @@ fn table_timeline() -> bool {
 
 impl Drop for VramPermit<'_> {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-utils"))]
+        PERMITS_HELD.with(|p| p.set(p.get().saturating_sub(1)));
         let mut used = self.gate.used.lock().unwrap();
         *used = used.saturating_sub(self.bytes);
         drop(used);
@@ -1434,6 +1514,10 @@ trait AdmitReady: Sync {
     fn wait(&self, idx: usize);
     /// Whether they are, without blocking (the packing arm).
     fn is_ready(&self, idx: usize) -> bool;
+    /// Stop waiting: every index reads ready from now on. Called once a task
+    /// has panicked, when the tasks that would have taken the inputs read so
+    /// far no longer run and a reader bounded by them would never finish.
+    fn close(&self);
 }
 
 /// One phase's reads of a prove's spill prefetch.
@@ -1444,10 +1528,19 @@ struct SpillReady<'a> {
 
 impl AdmitReady for SpillReady<'_> {
     fn wait(&self, idx: usize) {
+        #[cfg(any(test, feature = "test-utils"))]
+        assert_eq!(
+            PERMITS_HELD.with(|p| p.get()),
+            0,
+            "a driver waits for table {idx}'s spilled trace holding a VRAM permit"
+        );
         self.prefetch.wait(self.phase, idx)
     }
     fn is_ready(&self, idx: usize) -> bool {
         self.prefetch.is_ready(self.phase, idx)
+    }
+    fn close(&self) {
+        self.prefetch.close()
     }
 }
 
@@ -1535,6 +1628,9 @@ fn run_admitted<T: Send>(
                         // never held across the disk.
                         if let Some(ready) = ready {
                             ready.wait(idx);
+                            if taken(&first_panic) {
+                                return;
+                            }
                         }
                         (idx, gate.acquire(estimates[idx]))
                     };
@@ -1571,6 +1667,13 @@ fn run_admitted<T: Send>(
                             let mut slot = first_panic.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.is_none() {
                                 *slot = Some(payload);
+                            }
+                            drop(slot);
+                            // The siblings stop running tasks, so inputs read
+                            // ahead for them are never taken: release every
+                            // driver waiting on one.
+                            if let Some(ready) = ready {
+                                ready.close();
                             }
                             return;
                         }
@@ -5469,7 +5572,16 @@ pub trait IsStarkProver<
             .map(|(air, trace, _)| crate::leaf_layout::table_leaf_layout(*air, trace.num_rows()))
             .collect();
 
+        // Test overrides of this thread's proves (`spill::test_hooks`).
+        #[cfg(any(test, feature = "test-utils"))]
+        let test_overrides = crate::spill::test_hooks::current();
+
         let k = table_parallelism(num_airs);
+        #[cfg(any(test, feature = "test-utils"))]
+        let k = test_overrides
+            .as_ref()
+            .and_then(|(o, _)| o.drivers)
+            .unwrap_or(k);
 
         // VRAM budgeted admission. The budget caps the summed device working set
         // of the tables proved concurrently so large blocks don't exhaust VRAM.
@@ -5491,6 +5603,11 @@ pub trait IsStarkProver<
         // don't re-add pre-sizing without a shared-slab design that bounds the
         // number of allocations.
 
+        #[cfg(any(test, feature = "test-utils"))]
+        let vram_budget = test_overrides
+            .as_ref()
+            .and_then(|(o, _)| o.vram_budget)
+            .unwrap_or(vram_budget);
         let vram_gate = VramGate::new(vram_budget);
 
         // The shapes the AIR and the domain fix, read once: the device-set
@@ -5605,9 +5722,20 @@ pub trait IsStarkProver<
                 .iter()
                 .filter_map(|&idx| spilled(idx).map(|s| (crate::spill::ReadPhase::Fused, idx, s)));
             let reads: Vec<_> = round_one.chain(fused).collect();
-            (!reads.is_empty())
-                .then(|| crate::spill::Prefetch::start(reads, spill_prefetch_window()))
+            let window = spill_prefetch_window();
+            #[cfg(any(test, feature = "test-utils"))]
+            let window = test_overrides
+                .as_ref()
+                .and_then(|(o, _)| o.window)
+                .unwrap_or(window);
+            (!reads.is_empty()).then(|| crate::spill::Prefetch::start(reads, window))
         };
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((_, log)) = &test_overrides {
+            let mut log = log.lock().unwrap();
+            log.r1_walk = main_walk_order.clone();
+            log.fused_walk = peak_order.clone();
+        }
         let spill_ready = |phase| {
             spill_prefetch
                 .as_ref()
@@ -5673,6 +5801,15 @@ pub trait IsStarkProver<
             r1_ready.as_ref().map(|r| r as &dyn AdmitReady),
             |idx| table_names[idx].clone(),
             |idx| {
+                #[cfg(any(test, feature = "test-utils"))]
+                if let Some((_, log)) = &test_overrides {
+                    log.lock().unwrap().r1_started.push(idx);
+                }
+                // First, so no return below can leave bytes read ahead for
+                // this table parked in the read-back's window.
+                let read = spill_prefetch
+                    .as_ref()
+                    .and_then(|p| p.take(crate::spill::ReadPhase::Round1, idx));
                 if let Some(pre) = precommitted_cells
                     .get(idx)
                     .and_then(|c| c.lock().unwrap().take())
@@ -5684,9 +5821,6 @@ pub trait IsStarkProver<
                 // words; the trace stays spilled for its fused task.
                 let loaded;
                 let trace = if trace.is_main_spilled() {
-                    let read = spill_prefetch
-                        .as_ref()
-                        .and_then(|p| p.take(crate::spill::ReadPhase::Round1, idx));
                     loaded = trace
                         .with_spilled_main_loaded(read)
                         .map_err(|e| ProvingError::spilled(air.name(), e))?;
@@ -5719,8 +5853,12 @@ pub trait IsStarkProver<
                 narrow,
             } = result?;
             // A trace the device packed after its Round-1 commit drops its
-            // 64-bit copy here; its fused task widens it on the device.
-            if let Some(narrow) = narrow {
+            // 64-bit copy here; its fused task widens it on the device. A
+            // spilled trace keeps its slot: the device's copy is the same
+            // bytes, dropped rather than spilled twice.
+            if let Some(narrow) = narrow
+                && !air_trace_pairs[idx].1.is_main_spilled()
+            {
                 air_trace_pairs[idx].1.install_main_narrow(narrow);
             }
             if let Some(ref pre_root) = commit.precomputed_root {
@@ -5899,6 +6037,15 @@ pub trait IsStarkProver<
             ),
             ProvingError,
         > {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some((_, log)) = &test_overrides {
+                log.lock().unwrap().fused_started.push(idx);
+            }
+            // First, so no return below can leave bytes read ahead for this
+            // table parked in the read-back's window.
+            let read = spill_prefetch
+                .as_ref()
+                .and_then(|p| p.take(crate::spill::ReadPhase::Fused, idx));
             let mut pair = pair_cells[idx].lock().unwrap();
             let (air, trace, _) = &mut *pair;
             let domain = &domains[idx];
@@ -5908,9 +6055,6 @@ pub trait IsStarkProver<
             // the bytes read ahead, else from the disk now — or the table is
             // refused before any of its device work.
             if trace.is_main_spilled() {
-                let read = spill_prefetch
-                    .as_ref()
-                    .and_then(|p| p.take(crate::spill::ReadPhase::Fused, idx));
                 trace
                     .unspill_main_with(read)
                     .map_err(|e| ProvingError::spilled(air.name(), e))?;

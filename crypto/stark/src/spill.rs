@@ -10,8 +10,8 @@
 //! permit, never while holding one.
 //!
 //! The words that come back are the words that went out, checked against the
-//! digest taken before the write ([`NarrowMain::digest`]), so no proof byte can
-//! depend on the spill. The digest is not cryptographic: the threat is a bug
+//! digest the writer takes before it writes them ([`NarrowMain::digest`]), so
+//! no proof byte can depend on the spill. The digest is not cryptographic: the threat is a bug
 //! or the disk, not an adversary, and the kept-top check and the verifier
 //! stay behind it.
 //!
@@ -265,10 +265,11 @@ pub(crate) struct Slot {
     store: Arc<Inner>,
     offset: u64,
     len: usize,
-    /// The packed trace's shape and its digest before the write.
+    /// The packed trace's shape, and its digest, taken by the writer before
+    /// it writes the bytes (never by the spiller: phase A's committers).
     rows: usize,
     widths: Vec<u8>,
-    digest: [u64; 2],
+    digest: std::sync::OnceLock<[u64; 2]>,
     state: Mutex<SlotState>,
     changed: Condvar,
 }
@@ -347,11 +348,16 @@ impl Inner {
 
 impl Slot {
     /// The packed trace from `bytes` read back, checked against the digest.
+    /// Every slot in the file has one (the writer takes it first); bytes that
+    /// never left memory before a writer reached them have none to check.
     fn check(&self, bytes: Vec<u8>) -> Result<NarrowMain, SpillError> {
         let narrow = NarrowMain::from_parts(self.rows, self.widths.clone(), bytes)
             .ok_or(SpillError::Mismatch)?;
         let store = &*self.store;
-        if store.verify.load(Ordering::Relaxed) && narrow.digest() != self.digest {
+        if let Some(&digest) = self.digest.get()
+            && store.verify.load(Ordering::Relaxed)
+            && narrow.digest() != digest
+        {
             Counters::add(&store.counters.mismatches, 1);
             return Err(SpillError::Mismatch);
         }
@@ -416,6 +422,9 @@ impl Slot {
             }
         };
         let t = Instant::now();
+        let _ = self
+            .digest
+            .set(crate::narrow::digest_parts(self.rows, &self.widths, &bytes));
         let result = store.write_at(self.offset, &bytes, bounce);
         let mut state = lock(&self.state);
         match result {
@@ -470,12 +479,17 @@ impl std::fmt::Debug for SpilledMain {
     }
 }
 
-/// Two spilled traces are equal when their packed traces are: the same
-/// shape, length and digest.
+/// Two spilled traces are equal when they are one slot, or two whose packed
+/// traces have the same shape, length and digest (taken by their writers).
 impl PartialEq for SpilledMain {
     fn eq(&self, other: &Self) -> bool {
         let (a, b) = (&*self.slot, &*other.slot);
-        a.rows == b.rows && a.widths == b.widths && a.len == b.len && a.digest == b.digest
+        Arc::ptr_eq(&self.slot, &other.slot)
+            || (a.rows == b.rows
+                && a.widths == b.widths
+                && a.len == b.len
+                && a.digest.get().is_some()
+                && a.digest.get() == b.digest.get())
     }
 }
 
@@ -502,9 +516,10 @@ impl SpilledMain {
         self.slot.len == 0
     }
 
-    /// The digest taken before the write ([`NarrowMain::digest`]).
-    pub fn digest(&self) -> [u64; 2] {
-        self.slot.digest
+    /// The digest the writer took before writing the bytes
+    /// ([`NarrowMain::digest`]); `None` until a writer has reached them.
+    pub fn digest(&self) -> Option<[u64; 2]> {
+        self.slot.digest.get().copied()
     }
 
     /// A copy of the packed trace, checked against its digest; the slot
@@ -643,7 +658,6 @@ impl SpillStore {
         if inner.failed.load(Ordering::Acquire) {
             return Err(narrow);
         }
-        let digest = narrow.digest();
         let len = narrow.data().len() as u64;
         let mut queue = lock(&inner.queue);
         while queue.bytes > 0
@@ -664,7 +678,7 @@ impl SpillStore {
             len: data.len(),
             rows,
             widths,
-            digest,
+            digest: std::sync::OnceLock::new(),
             state: Mutex::new(SlotState::Memory(data)),
             changed: Condvar::new(),
         });
@@ -960,6 +974,14 @@ impl Prefetch {
         }
     }
 
+    /// Stop: every read not handed over yet is its driver's to make, and
+    /// every wait returns. For a prove whose tasks stopped running (a panic):
+    /// the reads parked for them would never be taken.
+    pub(crate) fn close(&self) {
+        lock(&self.shared.state).stop = true;
+        self.shared.changed.notify_all();
+    }
+
     /// One line for the prove's log.
     pub(crate) fn report(&self) -> String {
         let state = lock(&self.shared.state);
@@ -1240,4 +1262,65 @@ fn named_then_unlinked(dir: &Path) -> io::Result<File> {
         .open(&path)?;
     std::fs::remove_file(&path)?;
     Ok(file)
+}
+
+/// Test-only overrides of the next proves on the calling thread, and the
+/// order their admitted tasks start in.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_hooks {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    /// What [`with_prove_overrides`] changes.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ProveOverrides {
+        /// The VRAM gate's budget, in bytes.
+        pub vram_budget: Option<u64>,
+        /// The spill read-back's window, in bytes.
+        pub window: Option<u64>,
+        /// Driver threads per admitted phase.
+        pub drivers: Option<usize>,
+    }
+
+    /// Per admitted phase: its walk order, and the order its tasks started in.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Admissions {
+        pub r1_walk: Vec<usize>,
+        pub r1_started: Vec<usize>,
+        pub fused_walk: Vec<usize>,
+        pub fused_started: Vec<usize>,
+    }
+
+    type Current = Option<(ProveOverrides, Arc<Mutex<Admissions>>)>;
+
+    thread_local! {
+        static CURRENT: RefCell<Current> = const { RefCell::new(None) };
+    }
+
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CURRENT.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    /// Run `f` (proves on this thread) under `overrides`; what it returns,
+    /// and the admissions its proves logged.
+    pub fn with_prove_overrides<R>(
+        overrides: ProveOverrides,
+        f: impl FnOnce() -> R,
+    ) -> (R, Admissions) {
+        let log = Arc::new(Mutex::new(Admissions::default()));
+        CURRENT.with(|c| *c.borrow_mut() = Some((overrides, Arc::clone(&log))));
+        let reset = Reset;
+        let out = f();
+        drop(reset);
+        let admissions = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (out, admissions)
+    }
+
+    pub(crate) fn current() -> Current {
+        CURRENT.with(|c| c.borrow().clone())
+    }
 }

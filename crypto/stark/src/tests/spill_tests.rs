@@ -117,6 +117,11 @@ fn a_spilled_trace_round_trips_bit_for_bit() {
         let stats = store.stats();
         assert_eq!(stats.written, shapes.len() as u64, "{direct:?}: {stats}");
         for (mut trace, narrow, words) in spilled {
+            // The writer took the digest of the bytes it wrote.
+            assert_eq!(
+                trace.spilled_main().unwrap().digest(),
+                Some(narrow.digest())
+            );
             // A copy first (the slot stays), then the last read.
             assert_eq!(trace.spilled_main().unwrap().load().unwrap(), narrow);
             trace.unspill_main().unwrap();
@@ -334,6 +339,11 @@ fn prove_spilled(
         (&add_air, &mut add_trace),
         (&mul_air, &mut mul_trace),
     ] {
+        // Packed first, as the block's generators pack each streamed chunk
+        // before its committer precommits and then spills it.
+        if pack || spill != Spill::No {
+            assert!(trace.pack_main_narrow());
+        }
         if spill != Spill::BeforeRoundOne {
             precommitted.push(Some(Prover::precommit_main(
                 air,
@@ -342,9 +352,6 @@ fn prove_spilled(
                 crate::storage_mode::StorageMode::Ram,
                 residency,
             )?));
-        }
-        if pack || spill != Spill::No {
-            assert!(trace.pack_main_narrow());
         }
         if spill != Spill::No {
             // A failed store declines, and the trace stays packed.
@@ -544,6 +551,98 @@ fn a_perturbed_slot_without_the_digest_is_never_accepted() {
     }
 }
 
+/// ★ A trace is its packed copy's only owner right after its precommit, so
+/// the block's committer can spill it there: packed before the precommit
+/// (the generators' order) or after it, under every residency.
+#[test]
+fn a_just_precommitted_trace_spills() {
+    let o = test_options();
+    let air = new_cpu_air_with_lookup(&o);
+    for residency in RESIDENCIES {
+        for pack_first in [true, false] {
+            let store = store(DirectIo::Auto);
+            let (mut trace, _, _) = traces();
+            if pack_first {
+                assert!(trace.pack_main_narrow());
+            }
+            let pre = Prover::precommit_main(
+                &air,
+                &trace,
+                #[cfg(feature = "disk-spill")]
+                crate::storage_mode::StorageMode::Ram,
+                residency,
+            )
+            .unwrap();
+            if !pack_first {
+                assert!(trace.pack_main_narrow());
+            }
+            assert!(
+                trace.spill_main(&store),
+                "{residency:?} pack first {pack_first}: the precommit kept a hold on the packed trace"
+            );
+            drop(pre);
+        }
+    }
+}
+
+/// The prove of [`prove_spilled`] on a thread of its own under `overrides`,
+/// within `secs` seconds (a hang is a failure, not a stuck test run).
+fn prove_spilled_within(
+    secs: u64,
+    overrides: crate::spill::test_hooks::ProveOverrides,
+    residency: ResidencyMode,
+    spill: Spill,
+    read_delay_ms: u64,
+) -> (
+    Result<MultiProof<F, E, ()>, ProvingError>,
+    crate::spill::test_hooks::Admissions,
+    crate::spill::SpillStats,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = store(DirectIo::Auto);
+        store.set_read_delay_ms(read_delay_ms);
+        let (out, admissions) = crate::spill::test_hooks::with_prove_overrides(overrides, || {
+            prove_spilled(residency, spill, true, Some(&store), |_| {})
+        });
+        let _ = tx.send((out, admissions, store.stats()));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("the prove hung")
+}
+
+/// ★ A slow disk with the tightest admission: a VRAM budget that admits one
+/// table at a time, a read-back window of one read, three drivers and 100 ms
+/// per read. Every driver waits for its trace before its permit (checked
+/// where it waits: it holds none), the read-back hands the reads over in walk
+/// order, and so both phases start their tables in walk order. Were a wait
+/// inside a permit, the driver holding it would wait on a read stuck behind
+/// one only a permit can take: a hang.
+#[test]
+fn a_slow_read_back_admits_in_walk_order_holding_no_permit() {
+    let overrides = crate::spill::test_hooks::ProveOverrides {
+        vram_budget: Some(1),
+        window: Some(1),
+        drivers: Some(3),
+    };
+    for residency in RESIDENCIES {
+        let want = resident(residency);
+        let (out, admissions, stats) =
+            prove_spilled_within(120, overrides, residency, Spill::BeforeRoundOne, 100);
+        let got = bytes(&out.unwrap());
+        assert!(want == got, "{residency:?}: proof bytes moved ({stats})");
+        assert_eq!(stats.reads, 6, "{residency:?}: {stats}");
+        assert_eq!(
+            admissions.r1_started, admissions.r1_walk,
+            "{residency:?}: Round 1 out of walk order"
+        );
+        assert_eq!(
+            admissions.fused_started, admissions.fused_walk,
+            "{residency:?}: the fused phase out of walk order"
+        );
+    }
+}
+
 /// ★ On the card with kept top levels: every trace spilled (after its
 /// precommit, or before Round 1) is read back, widened on the device in its
 /// fused task, and proves `Retain`'s bytes.
@@ -641,4 +740,65 @@ fn a_perturbed_slot_without_the_digest_is_refused_on_the_card() {
             Err(e) => panic!("table {table}: unexpected refusal {e:?}"),
         }
     }
+}
+
+/// ★ On the card: a slow disk with the tightest admission (one table at a
+/// time, one read ahead, three drivers, 100 ms per read): both phases start
+/// in walk order, no driver waits holding a permit, every table widens on the
+/// device, and the proof is `Retain`'s.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn a_slow_read_back_admits_in_walk_order_on_the_card() {
+    use std::sync::atomic::Ordering;
+    let want = resident(ResidencyMode::Retain);
+    let overrides = crate::spill::test_hooks::ProveOverrides {
+        vram_budget: Some(1),
+        window: Some(1),
+        drivers: Some(3),
+    };
+    for spill in [Spill::AfterPrecommit, Spill::BeforeRoundOne] {
+        let before = crate::prover::NARROW_DEVICE_WIDENS.load(Ordering::SeqCst);
+        let (out, admissions, stats) = prove_spilled_within(
+            300,
+            overrides,
+            ResidencyMode::RecomputeLdeDevice,
+            spill,
+            100,
+        );
+        let widens = crate::prover::NARROW_DEVICE_WIDENS.load(Ordering::SeqCst) - before;
+        eprintln!("{spill:?} slow: {stats} · {admissions:?}");
+        assert!(want == bytes(&out.unwrap()), "{spill:?}: proof bytes moved");
+        assert_eq!(widens, 3, "{spill:?}: every table widens on the device");
+        assert_eq!(admissions.fused_started, admissions.fused_walk, "{spill:?}");
+        if spill == Spill::BeforeRoundOne {
+            assert_eq!(admissions.r1_started, admissions.r1_walk);
+        }
+    }
+}
+
+/// ★ On the card: a chunk packed by the device after its precommit
+/// (`take_narrow`, as the committers install it) is its packed copy's only
+/// owner, so it spills.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn a_trace_packed_by_the_device_after_its_precommit_spills() {
+    crate::prover::set_default_pack_after_commit(true);
+    let o = test_options();
+    let air = new_cpu_air_with_lookup(&o);
+    let store = store(DirectIo::Auto);
+    let (mut trace, _, _) = traces();
+    let mut pre = Prover::precommit_main(
+        &air,
+        &trace,
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+        ResidencyMode::RecomputeLdeDevice,
+    )
+    .unwrap();
+    crate::prover::set_default_pack_after_commit(false);
+    let narrow = pre.take_narrow().expect("the device packed the trace");
+    assert!(trace.install_main_narrow(narrow));
+    assert!(trace.spill_main(&store), "the precommit kept a hold");
 }
