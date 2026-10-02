@@ -192,6 +192,16 @@ impl BlockTimes {
 /// recommit).
 pub const BLOCK_RECOMMIT_TOP_LEVELS: usize = 6;
 
+/// The block's cap on a kept top's rebuilt subtree, in field elements: each
+/// plain table leaves out of its kept top at most [`BLOCK_RECOMMIT_TOP_LEVELS`]
+/// levels, fewer when its row is wide (KECCAK_RND 2, ECDAS 3, KECCAK 4, every
+/// table of ≤ 64 columns 6). At the median block phase B −8.44 s (KECCAK_RND's
+/// queries 0.67 → 0.09 s a table, the fused region's head idle 9–10 → under
+/// 1 s), the 1× base −0.70 s, kept tops +0.15 GiB (BIG 466). Proofs are the
+/// same bytes. `LAMBDA_VM_KEPT_SUBTREE_ELEMS` overrides it (0 = one depth for
+/// every table, as before).
+pub const BLOCK_KEPT_SUBTREE_ELEMS: usize = 8192;
+
 /// [`prove_block_with`] at the block's shape: [`block_max_rows`] and
 /// [`ResidencyMode::RecomputeLdeDevice`].
 pub fn prove_block(
@@ -279,6 +289,8 @@ fn prove_block_with_observed(
     }
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
+    #[cfg(feature = "cuda")]
+    stark::prover::set_default_kept_subtree_elems(BLOCK_KEPT_SUBTREE_ELEMS);
     #[cfg(feature = "cuda")]
     stark::prover::set_default_pack_after_commit(narrow_streamed());
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
@@ -1815,9 +1827,16 @@ fn build_streamed(
         if narrow {
             let (wide, packed, secs, by_device) =
                 *narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            // With generators on, they pack every table they hand over (the
+            // finish's included); the committers only pack without them.
+            let packers = if generators > 0 {
+                "generators"
+            } else {
+                "committers"
+            };
             eprintln!(
                 "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) · \
-                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the committers",
+                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the {packers}",
                 wide as f64 / (1u64 << 30) as f64,
                 packed as f64 / (1u64 << 30) as f64,
                 if wide > 0 {

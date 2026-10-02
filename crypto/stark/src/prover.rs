@@ -1460,6 +1460,157 @@ fn recommit_top_levels() -> Option<usize> {
     (k > 0).then_some(k)
 }
 
+/// `LAMBDA_VM_KEPT_SUBTREE_ELEMS=n` (n ≥ 1): each plain table leaves out of
+/// its kept top the most levels, from 1 up to the policy's own depth, whose
+/// rebuilt subtree holds at most `n` field elements
+/// ([`depth_within_rebuild_budget`]): wide tables keep more of their tree,
+/// none keeps less. `0`: the policy's single depth for every table. Unset:
+/// [`set_default_kept_subtree_elems`]'s value (0 unless a caller set one).
+#[cfg(feature = "cuda")]
+fn kept_subtree_cap() -> Option<usize> {
+    static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let env = ENV.get_or_init(|| std::env::var(KEPT_SUBTREE_ELEMS_ENV).ok());
+    let cap = kept_subtree_cap_setting(
+        env.as_deref(),
+        KEPT_SUBTREE_ELEMS_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "[prover] kept top levels: {} ({})",
+            match cap {
+                Some(n) => format!("each table's rebuilt subtree at most {n} field elements"),
+                None => "one depth for every table".to_string(),
+            },
+            if env.is_some() {
+                KEPT_SUBTREE_ELEMS_ENV
+            } else {
+                "the caller's default"
+            }
+        );
+    });
+    cap
+}
+
+/// The environment variable [`kept_subtree_cap`] reads.
+#[cfg(feature = "cuda")]
+const KEPT_SUBTREE_ELEMS_ENV: &str = "LAMBDA_VM_KEPT_SUBTREE_ELEMS";
+
+/// [`kept_subtree_cap`] for a raw environment value and a caller's default:
+/// the environment, when set, decides (`0` or unparsable = one depth for
+/// every table); else the default (`0` = one depth).
+#[cfg(any(feature = "cuda", test))]
+fn kept_subtree_cap_setting(env: Option<&str>, default: usize) -> Option<usize> {
+    match env {
+        Some(v) => v.trim().parse::<usize>().ok(),
+        None => Some(default),
+    }
+    .filter(|&n| n > 0)
+}
+
+/// The kept-depth cap when `LAMBDA_VM_KEPT_SUBTREE_ELEMS` is unset: 0 (the
+/// default) is one depth for every table.
+static KEPT_SUBTREE_ELEMS_DEFAULT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the cap on a kept top's rebuilt subtree, in field elements, that
+/// applies when `LAMBDA_VM_KEPT_SUBTREE_ELEMS` is unset (see
+/// [`kept_subtree_cap`]); 0 keeps one depth for every table. Proofs are the
+/// same bytes either way.
+pub fn set_default_kept_subtree_elems(n: usize) {
+    KEPT_SUBTREE_ELEMS_DEFAULT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The bottom levels a plain table of `cols` columns at `rows_per_leaf` rows
+/// per leaf leaves out of its kept top: the policy's `k`, or under
+/// [`kept_subtree_cap`] at most `k`, as many as its row width allows.
+///
+/// Every query rebuilds its subtree on the host from rows gathered off the
+/// device (`top_tree_proofs`), so a subtree's cost grows with the row's width,
+/// while the kept top it saves grows with the row count. At the median block
+/// KECCAK_RND (1,480 columns, one row a leaf, 2^16 rows) spent 0.67 s a table
+/// on its queries at k = 6, holding 7.8 GiB of the VRAM gate meanwhile, and
+/// its rebuilds filled the global rayon pool, so every other table in phase
+/// B's head waited 44–137 ms on its out-of-domain columns (BIG 466). Under a
+/// cap of 8,192 and k = 6: KECCAK_RND k = 2, ECDAS 3, KECCAK 4, every other
+/// table 6; KECCAK_RND's queries took 93 ms, the head's idle fell from 9–10 s
+/// to under 1 s and phase B by 8.4 s, for 0.15 GiB more of kept tops. Never
+/// deeper than `k`: a uniform k = 8 cost the median's phase B 37.5 s for 1.71
+/// GiB of peak (BIG 109). The tree, and so every opening, is the same at any
+/// depth.
+#[cfg(feature = "cuda")]
+fn kept_depth_for_width(k: usize, rows_per_leaf: usize, cols: usize) -> usize {
+    match kept_subtree_cap() {
+        None => k,
+        Some(cap) => depth_within_rebuild_budget(cap, rows_per_leaf, cols, k),
+    }
+}
+
+/// The most levels, from 1 to `max`, whose subtree of 2^levels leaves of
+/// `rows_per_leaf` rows of `cols` columns holds at most `cap` field elements.
+#[cfg(any(feature = "cuda", test))]
+fn depth_within_rebuild_budget(cap: usize, rows_per_leaf: usize, cols: usize, max: usize) -> usize {
+    let per_leaf = rows_per_leaf.max(1).saturating_mul(cols.max(1));
+    let mut depth = max.max(1);
+    while depth > 1 && per_leaf.saturating_mul(1 << depth) > cap {
+        depth -= 1;
+    }
+    depth
+}
+
+#[cfg(test)]
+mod kept_depth_tests {
+    use super::depth_within_rebuild_budget;
+
+    /// Under one cap, wide tables rebuild shallow subtrees; no table goes
+    /// deeper than the policy's depth, and none below one level.
+    #[test]
+    fn the_kept_depth_follows_the_row_width() {
+        let (cap, k) = (8192, 6);
+        let depth = |rpl, cols| depth_within_rebuild_budget(cap, rpl, cols, k);
+        assert_eq!(depth(2, 1480), 1, "KECCAK_RND");
+        assert_eq!(depth(2, 521), 2, "ECDAS: 8 × 1,042 > 8,192");
+        assert_eq!(depth(2, 511), 3, "KECCAK: 8 × 1,022 = 8,176");
+        assert_eq!(depth(2, 64), 6, "64 columns: 64 × 128 = 8,192");
+        assert_eq!(depth(2, 65), 5, "65 columns: 64 × 130 > 8,192");
+        assert_eq!(depth(2, 38), 6, "CPU");
+        assert_eq!(depth(2, 17), 6, "LT: never past k");
+        assert_eq!(depth(2, 10), 6, "MEMW_R: never past k");
+        assert_eq!(depth(1, 100_000), 1, "never below 1");
+        assert_eq!(
+            depth_within_rebuild_budget(cap, 2, 10, 8),
+            8,
+            "a deeper policy bounds it instead"
+        );
+        assert_eq!(
+            depth_within_rebuild_budget(cap, 2, 10, 0),
+            1,
+            "k = 0 reads as 1"
+        );
+    }
+
+    /// The environment, when set, decides; else the caller's default; 0 is
+    /// one depth for every table either way.
+    #[test]
+    fn the_cap_reads_the_environment_then_the_default() {
+        use super::kept_subtree_cap_setting as setting;
+        assert_eq!(setting(None, 0), None, "no default: one depth");
+        assert_eq!(setting(None, 8192), Some(8192), "the caller's default");
+        assert_eq!(setting(Some("0"), 8192), None, "0 opts out of the default");
+        assert_eq!(
+            setting(Some(" 4096 "), 8192),
+            Some(4096),
+            "the environment wins"
+        );
+        assert_eq!(setting(Some("x"), 8192), None, "unparsable: one depth");
+        assert_eq!(
+            setting(Some("16384"), 0),
+            Some(16384),
+            "the environment alone"
+        );
+    }
+}
+
 /// The kept-top-levels policy when `LAMBDA_VM_RECOMMIT_TOP_LEVELS` is unset:
 /// 0 (the default) is the full device recommit.
 static TOP_LEVELS_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -5487,7 +5638,9 @@ pub trait IsStarkProver<
                     // A plain table's top levels, off the device before its
                     // buffers are freed (preprocessed tables recommit in full).
                     if let (Some(k), None, Some(tree)) = (
-                        recommit_top_levels(),
+                        recommit_top_levels().map(|k| {
+                            kept_depth_for_width(k, layout.rows_per_leaf(), trace.num_main_columns)
+                        }),
                         committed.0.precomputed_root,
                         handle.tree.as_ref(),
                     ) {
@@ -5497,6 +5650,18 @@ pub trait IsStarkProver<
                                 air.name()
                             ))
                         })?;
+                        // The kept top's shape, for sizing the cap offline.
+                        if table_timeline() {
+                            eprintln!(
+                                "TABLE KEPT {} cols={} rpl={} leaves={} k={k} top_level={} bytes={}",
+                                air.name(),
+                                trace.num_main_columns,
+                                layout.rows_per_leaf(),
+                                top.leaves,
+                                top.top_level,
+                                std::mem::size_of_val(top.nodes.as_slice()),
+                            );
+                        }
                         committed.0.top_tree = Some(Arc::new(top));
                         // The trace, packed from the snapshot before it is
                         // freed: the fused task widens it on the device.
@@ -7220,10 +7385,15 @@ pub trait IsStarkProver<
         // (masked columns only), and absorb only the surviving values — the
         // verifier absorbs the identical two blocks in the same order.
         let __ps_oa = crate::prove_split::mark();
+        let __ps_ol = crate::prove_split::mark();
         let (ood_block0, ood_block1) =
             Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+        crate::prove_split::add(&crate::prove_split::R3A_LAYOUT, __ps_ol);
         for block in [&ood_block0, &ood_block1] {
-            for col in ood_columns(block).iter() {
+            let __ps_oc = crate::prove_split::mark();
+            let columns = ood_columns(block);
+            crate::prove_split::add(&crate::prove_split::R3A_COLUMNS, __ps_oc);
+            for col in columns.iter() {
                 for elem in col.iter() {
                     transcript.append_field_element(elem);
                 }
