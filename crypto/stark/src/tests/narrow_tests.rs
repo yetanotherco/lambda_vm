@@ -331,3 +331,70 @@ fn traces_packed_by_the_device_prove_retains_bytes() {
     assert!(retained == precommitted, "precommitted: proof bytes moved");
     assert!(retained == round_one, "Round 1: proof bytes moved");
 }
+
+/// The instance proved by `multi_prove` with every trace packed BEFORE its
+/// Round-1 commit (the block's finish-built tables): the commit reads the
+/// packed columns (on the device) or a widened copy (on the host).
+fn prove_packed_before_round_one(residency: ResidencyMode) -> MultiProof<F, E, ()> {
+    let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
+    for trace in [&mut cpu_trace, &mut add_trace, &mut mul_trace] {
+        assert!(trace.pack_main_narrow());
+    }
+    let proof_options = test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+    let pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+    Prover::multi_prove(
+        pairs,
+        &mut DefaultTranscript::<E>::new(&[]),
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+        residency,
+    )
+    .unwrap()
+}
+
+/// ★ Traces packed before their Round-1 commit prove the unpacked bytes under
+/// every residency (host build: the commit reads a widened copy).
+#[test]
+fn traces_packed_before_round_one_prove_the_same_bytes() {
+    for residency in [
+        ResidencyMode::Retain,
+        ResidencyMode::RecomputeLde,
+        ResidencyMode::RecomputeLdeDevice,
+    ] {
+        let wide = bytes(&prove_precommitted(residency, Pack::No).unwrap());
+        let packed = bytes(&prove_packed_before_round_one(residency));
+        assert!(wide == packed, "{residency:?}: proof bytes moved");
+    }
+}
+
+/// ★ On the card with kept top levels: traces packed before Round 1 are
+/// committed from their packed columns and widened on the device in their
+/// fused tasks, and the proof is `Retain`'s byte for byte.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn traces_packed_before_round_one_commit_on_the_card() {
+    use std::sync::atomic::Ordering;
+    let retained = bytes(&prove_precommitted(ResidencyMode::Retain, Pack::No).unwrap());
+    let before = crate::prover::NARROW_DEVICE_WIDENS.load(Ordering::SeqCst);
+    let packed = bytes(&prove_packed_before_round_one(
+        ResidencyMode::RecomputeLdeDevice,
+    ));
+    let widens = crate::prover::NARROW_DEVICE_WIDENS.load(Ordering::SeqCst) - before;
+    assert_eq!(
+        widens, 3,
+        "every table must stay packed and widen on the device"
+    );
+    assert!(retained == packed, "proof bytes moved");
+}

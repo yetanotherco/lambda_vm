@@ -457,6 +457,18 @@ where
         self.main_table.data = words_as_elements::<F>(words);
     }
 
+    /// A copy of this trace with its main words on the host (widened from the
+    /// packed form when it is packed), for a path that reads them while the
+    /// trace itself stays packed.
+    pub fn widened_copy(&self) -> Self
+    where
+        F: 'static,
+    {
+        let mut copy = self.clone();
+        copy.widen_main_on_host();
+        copy
+    }
+
     /// Drop a packed main trace without widening it: its last reader (the
     /// device recompute, then the aux build) is done. The table keeps its
     /// width and height.

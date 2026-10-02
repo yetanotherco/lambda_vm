@@ -2077,6 +2077,46 @@ pub trait IsStarkProver<
         let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
         let retain_host_lde = !device_only && !residency.recommits_on_device();
+        // A packed trace (`TraceTable::pack_main_narrow`) commits from its
+        // packed columns on the device; every other path below reads a
+        // widened copy, and the trace itself stays packed.
+        #[cfg(feature = "cuda")]
+        if let Some(narrow) = trace.narrow_main()
+            && precomputed.is_none()
+            && !residency.recomputes_on_host()
+            && let Some((tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_narrow_keep::<
+                    Field,
+                    Field,
+                    H::Batched<Field>,
+                >(
+                    table,
+                    "R1 main commit",
+                    narrow,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    retain_host_lde,
+                    rows_per_leaf,
+                )
+        {
+            let root = tree.root;
+            if device_only && !residency.recommits_on_device() {
+                crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok((
+                TableCommit::plain(tree, root),
+                (main_data, narrow.cols()),
+                Some(handle),
+            ));
+        }
+        let widened;
+        let trace = if trace.is_main_narrow() {
+            widened = trace.widened_copy();
+            &widened
+        } else {
+            trace
+        };
         #[cfg(feature = "cuda")]
         if precomputed.is_none() && !residency.recomputes_on_host() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -5129,7 +5169,9 @@ pub trait IsStarkProver<
                         committed.0.top_tree = Some(Arc::new(top));
                         // The trace, packed from the snapshot before it is
                         // freed: the fused task widens it on the device.
-                        if PACK_AFTER_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
+                        if PACK_AFTER_COMMIT.load(std::sync::atomic::Ordering::Relaxed)
+                            && !trace.is_main_narrow()
+                        {
                             let rows = handle.trace_rows;
                             narrow = math_cuda::narrow::pack_trace_snapshot(&handle)
                                 .map_err(|e| {
