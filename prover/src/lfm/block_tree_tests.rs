@@ -2634,6 +2634,26 @@ fn the_block_tree_composes_to_a_top_node() {
         super::block_plan::LEAF_PERMS_CAP,
         rb.plan.cost_model()
     );
+    // Which leaves verify the chunked accelerators' instances (the rule seeds
+    // each table's first instance and fills its later chunks by load).
+    let leaves_of = |kind: &str| -> Vec<usize> {
+        let prefix = format!("{kind}[");
+        (0..k)
+            .filter(|&j| {
+                partition
+                    .leaf(j)
+                    .iter()
+                    .any(|&i| names[i].starts_with(&prefix))
+            })
+            .collect()
+    };
+    println!(
+        "   BLOCK PARTITION CHUNKED: KECCAK on leaves {:?} · ECSM {:?} · ECDAS {:?} · KECCAK_RND {:?}",
+        leaves_of("KECCAK"),
+        leaves_of("ECSM"),
+        leaves_of("ECDAS"),
+        leaves_of("KECCAK_RND")
+    );
 
     // ---- level 0: the leaves.
     let beside_verifies = child_verify_beside_knob().then(BesideVerifies::default);
