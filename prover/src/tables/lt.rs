@@ -159,21 +159,58 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = deduplicate(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
-    let table = &mut trace.main_table;
+    fill_lt_rows(&mut trace.main_table, &unique_ops);
+    trace
+}
 
+/// [`generate_lt_trace`], packed (`stark::narrow`) as it is built, a block of
+/// [`PACKED_BLOCK_ROWS`] rows at a time: the same words in the same order,
+/// and never the whole 64-bit table. `None` where a trace cannot be held
+/// packed (`TraceTable::from_narrow_main`).
+pub fn generate_lt_trace_packed(
+    operations: &[LtOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let unique_ops = deduplicate(operations);
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let mut builder = stark::narrow::NarrowBuilder::new(num_rows, cols::NUM_COLUMNS);
+    for part in unique_ops.chunks(PACKED_BLOCK_ROWS) {
+        let mut block = stark::table::Table::new(
+            crate::tables::types::zeroed_fe_vec(part.len() * cols::NUM_COLUMNS),
+            cols::NUM_COLUMNS,
+        );
+        fill_lt_rows(&mut block, part);
+        builder.push_rows(crate::tables::types::fe_words(block.row_major_data()));
+    }
+    TraceTable::from_narrow_main(builder.finish(), 1)
+}
+
+/// Rows per block of [`generate_lt_trace_packed`].
+const PACKED_BLOCK_ROWS: usize = 1 << 12;
+
+/// The distinct operations with their multiplicities, in the map's order (one
+/// hash state per process, `tables::trace_hash`, so the order is a function of
+/// `operations`).
+fn deduplicate(operations: &[LtOperation]) -> Vec<(LtOperation, u64)> {
+    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
+    let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
+    for op in operations {
+        *op_map.entry(op.clone()).or_insert(0) += 1;
+    }
+    op_map.into_iter().collect()
+}
+
+/// Rows `0..unique_ops.len()` of a zeroed LT table.
+fn fill_lt_rows(
+    table: &mut stark::table::Table<GoldilocksField>,
+    unique_ops: &[(LtOperation, u64)],
+) {
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         // Store input columns
         table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
@@ -204,8 +241,6 @@ pub fn generate_lt_trace(
         // All LT lookups go through the unified ALU bus → single multiplicity.
         table.set_u64(row_idx, cols::MU, *multiplicity);
     }
-
-    trace
 }
 
 // =========================================================================

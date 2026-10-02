@@ -408,6 +408,26 @@ where
         true
     }
 
+    /// A trace held packed from the start: `narrow`'s rows and columns, with no
+    /// 64-bit copy ever made (`narrow::NarrowBuilder`). `None` where a trace
+    /// cannot be held packed, as [`Self::pack_main_narrow`] refuses it: not
+    /// Goldilocks, or under `debug-checks`.
+    pub fn from_narrow_main(narrow: crate::narrow::NarrowMain, step_size: usize) -> Option<Self>
+    where
+        F: 'static,
+    {
+        if cfg!(feature = "debug-checks")
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return None;
+        }
+        let mut trace = Self::new_main(Vec::new(), narrow.cols(), step_size);
+        trace.main_table.height = narrow.rows();
+        trace.narrow_main = Some(std::sync::Arc::new(narrow));
+        Some(trace)
+    }
+
     /// Take `narrow` as this trace's packed main trace (packed elsewhere, e.g.
     /// by the device from the commit's snapshot) and free the 64-bit copy, as
     /// [`Self::pack_main_narrow`] would. `false`, and the trace untouched, when

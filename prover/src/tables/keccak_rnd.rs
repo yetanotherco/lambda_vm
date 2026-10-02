@@ -252,8 +252,42 @@ pub fn generate_keccak_rnd_trace(
         cols::NUM_COLUMNS,
         1,
     );
-    let table = &mut trace.main_table;
+    fill_keccak_rnd_rows(&mut trace.main_table, ops);
+    // Padding rows have mu=0 and all zeros (default)
+    trace
+}
 
+/// [`generate_keccak_rnd_trace`], packed (`stark::narrow`) as it is built, a
+/// block of [`PACKED_BLOCK_OPS`] permutations at a time: the same words, and
+/// never the whole 64-bit table (a 2^16-row chunk is 776 MB at 8 bytes a
+/// cell, its block 36 MB). `None` where a trace cannot be held packed
+/// (`TraceTable::from_narrow_main`).
+pub fn generate_keccak_rnd_trace_packed(
+    ops: &[KeccakRoundOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let n_rows = (ops.len() * 24).next_power_of_two().max(4);
+    let mut builder = stark::narrow::NarrowBuilder::new(n_rows, cols::NUM_COLUMNS);
+    for part in ops.chunks(PACKED_BLOCK_OPS) {
+        let mut block = stark::table::Table::new(
+            crate::tables::types::zeroed_fe_vec(part.len() * 24 * cols::NUM_COLUMNS),
+            cols::NUM_COLUMNS,
+        );
+        fill_keccak_rnd_rows(&mut block, part);
+        builder.push_rows(crate::tables::types::fe_words(block.row_major_data()));
+    }
+    TraceTable::from_narrow_main(builder.finish(), 1)
+}
+
+/// Permutations per block of [`generate_keccak_rnd_trace_packed`].
+const PACKED_BLOCK_OPS: usize = 128;
+
+/// Rows `0..24 * ops.len()` of a zeroed KECCAK_RND table: each permutation's
+/// 24 rounds.
+#[allow(clippy::needless_range_loop)]
+fn fill_keccak_rnd_rows(
+    table: &mut stark::table::Table<GoldilocksField>,
+    ops: &[KeccakRoundOperation],
+) {
     for (op_idx, op) in ops.iter().enumerate() {
         // Execute round-by-round, tracking the state
         let mut state = op.input;
@@ -427,9 +461,6 @@ pub fn generate_keccak_rnd_trace(
             table.set_fe(row_idx, cols::MU, FE::one());
         }
     }
-
-    // Padding rows have mu=0 and all zeros (default)
-    trace
 }
 
 // =========================================================================
