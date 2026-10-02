@@ -1409,7 +1409,9 @@ fn spill_prefetch_window() -> u64 {
 /// `LAMBDA_VM_TABLE_TIMELINE=1`: one `TABLE TL` line per table per admitted
 /// phase — when a driver claimed it, when the gate admitted it and when it
 /// finished (unix seconds, the clock the `PROVE SPLIT` line's `t=[..]` uses),
-/// and the bytes it was admitted for. Off by default.
+/// and the bytes it was admitted for. With `LFM_PROVE_SPLIT=1` the line also
+/// carries the table's own stage seconds ([`crate::prove_split::table_take`]).
+/// Off by default.
 fn table_timeline() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1"))
@@ -1500,8 +1502,11 @@ fn run_admitted<T: Send>(
         m.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     };
     std::thread::scope(|scope| {
-        for _ in 0..workers.max(1).min(order.len().max(1)) {
-            scope.spawn(|| {
+        for n in 0..workers.max(1).min(order.len().max(1)) {
+            // Named (`fused-3`), so a per-thread sampler can tell the drivers
+            // from the rayon workers they hand their parallel work to.
+            let driver = std::thread::Builder::new().name(format!("{phase}-{n}"));
+            let spawned = driver.spawn_scoped(scope, || {
                 loop {
                     let t_claim = timeline.then(crate::prove_split::epoch_secs);
                     let (idx, permit) = if packing {
@@ -1538,14 +1543,19 @@ fn run_admitted<T: Send>(
                         return;
                     }
                     let t_start = timeline.then(crate::prove_split::epoch_secs);
+                    if timeline {
+                        // This driver's stages from here on are this table's.
+                        crate::prove_split::table_begin();
+                    }
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
                     if let (Some(t_claim), Some(t_start)) = (t_claim, t_start) {
                         eprintln!(
                             "TABLE TL {phase} idx={idx} {} est={:.2}GiB claim={t_claim:.3} \
-                             start={t_start:.3} end={:.3}",
+                             start={t_start:.3} end={:.3}{}",
                             label(idx),
                             estimates[idx] as f64 / (1u64 << 30) as f64,
                             crate::prove_split::epoch_secs(),
+                            crate::prove_split::table_take().unwrap_or_default(),
                         );
                     }
                     // Released explicitly: the catch means unwinding no longer
@@ -1567,6 +1577,8 @@ fn run_admitted<T: Send>(
                     }
                 }
             });
+            // As `scope.spawn` would: a driver that cannot start is fatal.
+            spawned.expect("spawn a table driver thread");
         }
     });
     if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
