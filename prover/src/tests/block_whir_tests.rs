@@ -45,6 +45,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
+        drop_streamed_ops: false,
         layout_workers: 0,
         pack_rest_as_laid_out: false,
     }
@@ -312,6 +313,30 @@ fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
     let proof = prove(&elf, &format, &o);
     assert_eq!(proof.table_counts.lt, plain.table_counts.lt);
     assert!(verify(&proof, &elf, &format));
+}
+
+/// ★ With the builder dropping each streamed chunk's ops as it leaves (D-MEMORY
+/// M1), alone and with the MEMW-derived LT ops streamed: the same groups and
+/// table counts as keeping them, and the proof verifies.
+#[test]
+fn a_streamed_block_with_dropped_ops_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    for stream_memw_lt in [false, true] {
+        let mut keep = streamed(MaxRowsConfig::small(), 5, 3);
+        keep.stream_memw_lt = stream_memw_lt;
+        let kept = prove(&elf, &format, &keep);
+        let mut o = keep.clone();
+        o.drop_streamed_ops = true;
+        let proof = prove(&elf, &format, &o);
+        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+        assert_eq!(proof.groups, kept.groups, "LT streamed {stream_memw_lt}");
+        assert_eq!(
+            format!("{:?}", proof.table_counts),
+            format!("{:?}", kept.table_counts)
+        );
+        assert!(verify(&proof, &elf, &format));
+    }
 }
 
 /// The streamed chunks laid out on three threads, and the rest of the run
@@ -1108,7 +1133,8 @@ fn block_whir_on_a_real_block() {
     };
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
-    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them.
+    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
+    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -1117,8 +1143,9 @@ fn block_whir_on_a_real_block() {
     }
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
@@ -1126,6 +1153,11 @@ fn block_whir_on_a_real_block() {
         if prepared { "on" } else { "off" },
         options.layout_workers,
         options.pack_rest_as_laid_out,
+        if options.drop_streamed_ops {
+            "on"
+        } else {
+            "off"
+        },
         format.zf.banner(),
     );
     // The options #1010's base proves its epochs under.
