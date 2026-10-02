@@ -56,7 +56,20 @@ pub fn dword_wl(x: u64) -> [FE; 2] {
 pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
     const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
-    let zeros: Vec<u64> = vec![0u64; len];
+    // PROBE: `LAMBDA_VM_PROBE_ZERO_MEMSET=1` takes an uninitialised buffer and
+    // zeroes it in place instead: jemalloc zeroes a recycled dirty extent for
+    // calloc with madvise(MADV_DONTNEED) unless opt.thp is always, so every
+    // page of a reused buffer faults again.
+    static MEMSET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let zeros: Vec<u64> = if *MEMSET.get_or_init(|| {
+        std::env::var("LAMBDA_VM_PROBE_ZERO_MEMSET").is_ok_and(|v| v == "1")
+    }) {
+        let mut zeros = Vec::with_capacity(len);
+        zeros.resize(len, 0u64);
+        zeros
+    } else {
+        vec![0u64; len]
+    };
     // Reinterpret the buffer as `Vec<FE>` via its raw parts rather than
     // `mem::transmute::<Vec<u64>, Vec<FE>>`. `Vec`'s field layout is unspecified
     // and may depend on its element type, so transmuting one `Vec` to another
