@@ -572,7 +572,16 @@ pub fn generate_cpu_trace(
     operations: &[CpuOperation],
     decode: &DecodeTable,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = operations.len();
+    generate_cpu_trace_segments(&[operations], decode)
+}
+
+/// [`generate_cpu_trace`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_cpu_trace_segments(
+    segments: &[&[CpuOperation]],
+    decode: &DecodeTable,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = n.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -581,7 +590,7 @@ pub fn generate_cpu_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, op) in operations.iter().enumerate() {
+    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         let op = decode.op(op);
         let f = &op.decode.fields;
         let word = f.word_instr;
@@ -679,7 +688,12 @@ pub fn generate_cpu_trace(
     // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
     // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
     // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
-    let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
+    let last_ts = segments
+        .iter()
+        .rev()
+        .find_map(|s| s.last())
+        .map(|op| op.timestamp)
+        .unwrap_or(0);
     for row_idx in n..num_rows {
         let j = (row_idx - n + 1) as u64;
         table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
