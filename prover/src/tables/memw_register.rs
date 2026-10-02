@@ -210,7 +210,16 @@ pub(crate) fn generate_memw_register_trace(
 pub(crate) fn generate_memw_register_trace_from_rows(
     rows: &[RegRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = rows.len().next_power_of_two().max(4);
+    generate_memw_register_trace_from_rows_segments(&[rows])
+}
+
+/// [`generate_memw_register_trace_from_rows`] over `segments`, the rows one after another: a chunk handed
+/// out as the window parts it lies in.
+pub(crate) fn generate_memw_register_trace_from_rows_segments(
+    segments: &[&[RegRow]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -218,7 +227,7 @@ pub(crate) fn generate_memw_register_trace_from_rows(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, r) in rows.iter().enumerate() {
+    for (row_idx, r) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         // ADDRESS = base_address / 2 (already divided in RegRow).
         table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
         // Timestamp split into lo/hi 32-bit words.
