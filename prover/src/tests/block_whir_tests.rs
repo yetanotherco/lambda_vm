@@ -1336,6 +1336,14 @@ fn block_whir_on_a_real_block() {
         h.finish()
     };
     println!("BLOCK SHAPE DIGEST: {shape:016x}");
+    // The proof's bytes: two processes prove the same ones under
+    // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
+    println!(
+        "BLOCK PROOF DIGEST: {} (blake3 of the {} proof bytes)",
+        &blake3::hash(&bytes).to_hex()[..32],
+        bytes.len()
+    );
     assert!(ok, "the block proof must verify");
 }
 
