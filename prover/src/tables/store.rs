@@ -80,13 +80,22 @@ impl StoreOperation {
     /// The 8 `ARE_BYTES[value[i], 0]` range checks this op sends, for the BITWISE
     /// table's multiplicity bookkeeping.
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        (0..8).map(|i| self.bitwise_op(i)).collect()
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s lookups counted into `histogram`, with
+    /// no list built.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        (0..8).for_each(|i| histogram.bump(self.bitwise_op(i)));
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s `i`-th lookup: byte `i` of the value.
+    #[inline]
+    fn bitwise_op(&self, i: usize) -> super::bitwise::BitwiseOperation {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
-        (0..8)
-            .map(|i| {
-                let byte = ((self.value >> (i * 8)) & 0xFF) as u8;
-                BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, byte)
-            })
-            .collect()
+        let byte = ((self.value >> (i * 8)) & 0xFF) as u8;
+        BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, byte)
     }
 }
 
