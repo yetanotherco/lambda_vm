@@ -159,7 +159,15 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = deduplicate(operations);
+    generate_lt_trace_segments(&[operations])
+}
+
+/// [`generate_lt_trace`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_lt_trace_segments(
+    segments: &[&[LtOperation]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = deduplicate(segments.iter().flat_map(|s| s.iter()));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -197,7 +205,9 @@ const PACKED_BLOCK_ROWS: usize = 1 << 12;
 /// The distinct operations with their multiplicities, in the map's order (one
 /// hash state per process, `tables::trace_hash`, so the order is a function of
 /// `operations`).
-fn deduplicate(operations: &[LtOperation]) -> Vec<(LtOperation, u64)> {
+fn deduplicate<'a>(
+    operations: impl IntoIterator<Item = &'a LtOperation>,
+) -> Vec<(LtOperation, u64)> {
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
     let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
