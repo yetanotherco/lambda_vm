@@ -1230,7 +1230,8 @@ fn cells_of(
 }
 
 /// The streamed phase A's traces are the serial build's under the block's own
-/// caps (KECCAK_RND chunked, which the shared builder's tests do not cover):
+/// caps (KECCAK, KECCAK_RND and ECSM chunked, which the shared builder's tests
+/// do not cover):
 /// windows of one CPU instance fed to [`WindowedTraceBuilder`], the last to
 /// `finish`, the chunks put back with `insert_streamed`, equal
 /// `Traces::from_elf_and_logs` table by table, chunk by chunk and row by row
@@ -1242,12 +1243,18 @@ fn cells_of(
 fn windowed_collection_builds_the_serial_traces() {
     use crate::tables::trace_builder::WindowedTraceBuilder;
     let chunked_keccak = MaxRowsConfig {
+        keccak: 1,
         keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    let chunked_ecsm = MaxRowsConfig {
+        ecsm: 1,
         ..MaxRowsConfig::small()
     };
     for (name, max_rows) in [
         ("all_instructions_64", MaxRowsConfig::small()),
         ("test_keccak_multi", chunked_keccak),
+        ("test_ecsm_multi", chunked_ecsm),
         ("fib_iterative_160k", MaxRowsConfig::uniform(1 << 14)),
     ] {
         let elf_bytes = asm_elf_bytes(name);
@@ -1333,9 +1340,12 @@ fn windowed_collection_builds_the_serial_traces() {
             assert_eq!(serial.table_counts().cpu, streamed.table_counts().cpu);
             assert!(n_streamed > 0, "{name}: no chunk was streamed");
             println!(
-                "{name}: windowed = serial ({} windows, {n_streamed} streamed chunks, {} KECCAK_RND)",
+                "{name}: windowed = serial ({} windows, {n_streamed} streamed chunks, {} KECCAK, {} \
+                 KECCAK_RND, {} ECSM)",
                 windows.len(),
-                streamed.keccak_rnds.len()
+                streamed.keccaks.len(),
+                streamed.keccak_rnds.len(),
+                streamed.ecsms.len()
             );
         }
     }
