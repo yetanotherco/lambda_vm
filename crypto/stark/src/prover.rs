@@ -429,6 +429,16 @@ pub fn precomputed_tree_cache_entries() -> usize {
 static PRECOMPUTED_TREE_HITS: AtomicU64 = AtomicU64::new(0);
 static PRECOMPUTED_TREE_MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The bytes of the Merkle nodes put in the precomputed-tree cache since the
+/// process started (an eviction does not subtract them; with no cap, the
+/// default, it is what the cache holds).
+static PRECOMPUTED_TREE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`PRECOMPUTED_TREE_BYTES`]: a measurement for the caller's ledger.
+pub fn precomputed_tree_cache_bytes_inserted() -> u64 {
+    PRECOMPUTED_TREE_BYTES.load(Ordering::Relaxed)
+}
+
 /// `(hits, misses)` on the precomputed-tree cache since the process started.
 pub fn precomputed_tree_cache_hit_miss() -> (u64, u64) {
     (
@@ -471,6 +481,10 @@ pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     rows_per_leaf: usize,
     tree: Arc<MerkleTree<B>>,
 ) {
+    PRECOMPUTED_TREE_BYTES.fetch_add(
+        std::mem::size_of_val(tree.nodes()) as u64,
+        Ordering::Relaxed,
+    );
     precomputed_tree_insert_capped(
         &mut precomputed_tree_cache().lock().unwrap(),
         (root, rows_per_leaf),
@@ -606,6 +620,29 @@ where
     /// (`TraceTable::install_main_narrow` takes it).
     pub fn take_narrow(&mut self) -> Option<crate::narrow::NarrowMain> {
         self.narrow.take()
+    }
+
+    /// The host bytes this precommit holds, as (Merkle tree nodes, kept top
+    /// levels, cached main trace, packed copy not yet taken). A measurement for
+    /// the caller's memory ledger; it changes nothing.
+    pub fn host_bytes(&self) -> [usize; 4] {
+        let trees = std::mem::size_of_val(self.commit.tree.nodes())
+            + self
+                .commit
+                .precomputed_tree
+                .as_ref()
+                .map_or(0, |t| std::mem::size_of_val(t.nodes()));
+        #[cfg(feature = "cuda")]
+        let tops = self
+            .commit
+            .top_tree
+            .as_ref()
+            .map_or(0, |t| t.nodes.len() * std::mem::size_of::<Commitment>());
+        #[cfg(not(feature = "cuda"))]
+        let tops = 0;
+        let cached = self.cached_main.0.len() * std::mem::size_of::<FieldElement<Field>>();
+        let narrow = self.narrow.as_ref().map_or(0, |n| n.data().len());
+        [trees, tops, cached, narrow]
     }
 }
 

@@ -193,8 +193,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                 bitwise_ops: 0,
                 memw_register_rows: 0,
                 last_ecall: None,
-                memw_lt: Vec::new(),
-                memw_aligned_lt: Vec::new(),
+                memw_lt: super::CompactLt::default(),
+                memw_aligned_lt: super::CompactLt::default(),
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -273,6 +273,22 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// tables are the same.
     pub fn build_wide_then_pack(mut self) -> Self {
         self.emitted.wide_builds = true;
+        self
+    }
+
+    /// `finish` starts KECCAK_RND's and LT's builds before every other table's
+    /// ([`StreamSkip::kr_first`]). The tables are the same.
+    pub fn generate_kr_first(mut self) -> Self {
+        self.emitted.kr_first = true;
+        self
+    }
+
+    /// Keep the LT ops derived from the MEMW and MEMW_A ops this builder drops
+    /// at 24 bytes each instead of compact ([`super::CompactLt`]), the A arm of
+    /// the compact form. Before the first window only. The tables are the same.
+    pub fn raw_memw_lt(mut self) -> Self {
+        self.counted.memw_lt = super::CompactLt::raw();
+        self.counted.memw_aligned_lt = super::CompactLt::raw();
         self
     }
 
@@ -1043,7 +1059,7 @@ fn tail_jobs(
             counted.histogram.add_ops(&lookups);
             if !stream_memw_lt {
                 let lt = super::collect_lt_from_memw_aligned(&ops);
-                counted.memw_aligned_lt.extend(lt);
+                counted.memw_aligned_lt.extend(&lt);
             }
         }
     );
@@ -1055,7 +1071,7 @@ fn tail_jobs(
         e.memw,
         |ops| {
             if !stream_memw_lt {
-                counted.memw_lt.extend(super::collect_lt_from_memw(&ops));
+                counted.memw_lt.extend(&super::collect_lt_from_memw(&ops));
             }
         }
     );
