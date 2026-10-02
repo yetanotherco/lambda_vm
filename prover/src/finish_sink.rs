@@ -26,7 +26,7 @@ use stark::trace::TraceTable;
 
 use crate::Error;
 use crate::ProofOptions;
-use crate::tables::trace_builder::{StreamTable, Traces};
+use crate::tables::trace_builder::{StreamTable, StreamedChunk, Traces};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::{
     VmAir, create_branch_air, create_bytewise_air, create_commit_air, create_cpu_air,
@@ -200,6 +200,17 @@ pub struct FinishedTable {
     pub trace: Trace,
 }
 
+/// A streamed chunk is a table of its kind: the committers take both alike.
+impl From<StreamedChunk> for FinishedTable {
+    fn from(chunk: StreamedChunk) -> Self {
+        Self {
+            kind: chunk.table.into(),
+            index: chunk.index,
+            trace: chunk.trace,
+        }
+    }
+}
+
 /// Where a finish hands its tables. `hand` must not block: the finish calls it
 /// from its generators (rayon workers), as each table exists.
 pub trait FinishSink: Sync {
@@ -224,6 +235,26 @@ pub fn hand_or_keep(
         None => crate::tables::trace_builder::streamed_placeholder(),
         Some(declined) => declined.trace,
     }
+}
+
+/// Every plain table `traces` holds (not a placeholder) handed to `sink` at
+/// once, in [`FinishedKind::ALL`] order: what a finish that hands nothing off
+/// leaves for phase B. The tables handed.
+pub fn hand_built(traces: &mut Traces, sink: &dyn FinishSink) -> usize {
+    let mut handed = 0;
+    for kind in FinishedKind::ALL {
+        let slots = kind.slots(traces);
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.main_table.width == 0 {
+                continue;
+            }
+            let trace =
+                std::mem::replace(slot, crate::tables::trace_builder::streamed_placeholder());
+            *slot = hand_or_keep(Some(sink), kind, index, trace);
+            handed += usize::from(slot.main_table.width == 0);
+        }
+    }
+    handed
 }
 
 /// A sink that sends each table into a committer queue of `T`s (a channel the
@@ -531,6 +562,92 @@ mod tests {
                 "{} is the build's again",
                 kind.name(i)
             );
+        }
+
+        // `hand_built` hands every table still in a slot, once.
+        let sink = CollectingSink::new(false);
+        assert_eq!(hand_built(&mut traces, &sink), present.len());
+        assert_eq!(
+            hand_built(&mut traces, &sink),
+            0,
+            "only placeholders are left"
+        );
+        let handed = std::mem::take(&mut *sink.tables.lock().unwrap());
+        insert_finished(&mut traces, handed).expect("back into the placeholders");
+        for &(kind, i) in &present {
+            assert!(same(
+                &kind.slots(&mut traces)[i],
+                &kind.slots(&mut before.clone())[i]
+            ));
+        }
+    }
+
+    /// The same table, column for column, packed or not.
+    fn same_columns(what: &str, a: &Trace, b: &Trace) {
+        assert_eq!(
+            (a.main_table.width, a.main_table.height),
+            (b.main_table.width, b.main_table.height),
+            "{what}: shape"
+        );
+        assert!(
+            a.columns_main() == b.columns_main(),
+            "{what}: columns differ"
+        );
+    }
+
+    /// ★ Phase A's committers also commit the tables the finish built
+    /// (`LAMBDA_VM_BLOCK_FINISH_COMMIT=after`): the stream builds the same
+    /// traces, precommits every streamed instance it did before and every
+    /// plain table the finish built, leaves the ledger empty, and a card gate
+    /// that admits one commit at a time changes none of it — with the
+    /// committers generating, or generators ahead of them.
+    #[test]
+    fn the_stream_commits_the_finish_tables_in_phase_a() {
+        let opts = crate::lfm::proof::block_base_options();
+        let max_rows = MaxRowsConfig {
+            keccak_rnd: 48,
+            ..MaxRowsConfig::small()
+        };
+        for name in ["all_instructions_64", "test_keccak_multi"] {
+            let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+            let (mut today, mut names) =
+                crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0, None)
+                    .expect("the stream as it is");
+            let mut every: Vec<String> = instances(&mut today)
+                .into_iter()
+                .map(|(kind, i)| kind.name(i))
+                .collect();
+            every.sort();
+            names.sort();
+            assert!(names.len() < every.len(), "{name}: the finish built tables");
+            for (committers, generators) in [(3, 0), (2, 3)] {
+                let (mut after, mut after_names) = crate::block::stream_finish_after_for_test(
+                    &program,
+                    &opts,
+                    &max_rows,
+                    committers,
+                    generators,
+                    Some(1),
+                )
+                .expect("the finish's tables committed in phase A");
+                after_names.sort();
+                assert_eq!(after_names, every, "{name}: every plain table precommitted");
+                for (kind, i) in instances(&mut today) {
+                    same_columns(
+                        &format!("{name} {}", kind.name(i)),
+                        &kind.slots(&mut today)[i],
+                        &kind.slots(&mut after)[i],
+                    );
+                }
+                same_columns("BITWISE", &today.bitwise, &after.bitwise);
+                same_columns("DECODE", &today.decode, &after.decode);
+                same_columns("REGISTER", &today.register, &after.register);
+                same_columns("HALT", &today.halt, &after.halt);
+                assert_eq!(today.pages.len(), after.pages.len());
+                for (i, (a, b)) in today.pages.iter().zip(&after.pages).enumerate() {
+                    same_columns(&format!("PAGE {i}"), a, b);
+                }
+            }
         }
     }
 
