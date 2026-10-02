@@ -4574,14 +4574,32 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
+    // A packing build generates LT packed a block at a time, as KECCAK_RND.
+    #[cfg(feature = "disk-spill")]
+    let built_packed = pack.on && storage_mode != StorageMode::Disk;
+    #[cfg(not(feature = "disk-spill"))]
+    let built_packed = pack.on;
     let gen_lts = || {
+        let (generate, pack): (fn(&[LtOperation]) -> _, _) = if built_packed {
+            (
+                |ops| {
+                    lt::generate_lt_trace_packed(ops).unwrap_or_else(|| lt::generate_lt_trace(ops))
+                },
+                Packing {
+                    on: true,
+                    permits: None,
+                },
+            )
+        } else {
+            (lt::generate_lt_trace, pack)
+        };
         chunk_and_generate_skipping(
             &lt_ops,
             max_rows.lt,
             skip.lt,
             skip.tails,
             true,
-            lt::generate_lt_trace,
+            generate,
             pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -4720,11 +4738,7 @@ fn build_traces<I: ImageSource + Sync>(
             .collect();
         // A packing build generates each chunk packed a block at a time, so it
         // holds no 64-bit copy and takes no permit.
-        #[cfg(feature = "disk-spill")]
-        let packed = pack.on && storage_mode != StorageMode::Disk;
-        #[cfg(not(feature = "disk-spill"))]
-        let packed = pack.on;
-        let (generate, pack): (fn(&[KeccakRoundOperation]) -> _, _) = if packed {
+        let (generate, pack): (fn(&[KeccakRoundOperation]) -> _, _) = if built_packed {
             (
                 |ops| {
                     keccak_rnd::generate_keccak_rnd_trace_packed(ops)
