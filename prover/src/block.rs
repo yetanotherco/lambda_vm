@@ -615,26 +615,43 @@ impl CardGate {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_COMMIT_POOL=n` (1..=32): the committers make their commits
+/// inside a rayon pool of `n` threads of their own, so the host-side parallel
+/// work of a commit (a small table's host LDE and tree, a packed trace's
+/// widening) does not queue behind the finish's generation, which holds every
+/// worker of the global pool while it runs (BIG 462: during p5 the finish handed
+/// 140 tables and none was committed until p5 ended). Unset or `0`: the global
+/// pool, as before.
+fn commit_pool_threads() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_COMMIT_POOL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= 32)
+        .unwrap_or(0)
+}
+
 /// How phase A's stream hands its chunks to the device: committer and
-/// generator threads, when the finish's tables are committed, and the card's
-/// byte budget for the commits.
+/// generator threads, when the finish's tables are committed, the card's byte
+/// budget for the commits, and the committers' own pool.
 #[derive(Clone, Copy, Debug)]
 struct StreamConfig {
     committers: usize,
     generators: usize,
     finish: FinishCommit,
     card_budget: Option<usize>,
+    commit_pool: usize,
 }
 
 impl StreamConfig {
     /// The block's: [`stream_committers`], [`stream_generators`],
-    /// [`finish_commit`], [`card_gate_budget`].
+    /// [`finish_commit`], [`card_gate_budget`], [`commit_pool_threads`].
     fn from_env() -> Self {
         Self {
             committers: stream_committers(),
             generators: stream_generators(),
             finish: finish_commit(),
             card_budget: card_gate_budget(),
+            commit_pool: commit_pool_threads(),
         }
     }
 }
@@ -1028,6 +1045,22 @@ fn build_streamed(
     // Phase A's card gate ([`card_gate_budget`]): every commit admitted by its
     // device set; the most it held and the committers' wait are reported.
     let card = CardGate::new(stream.card_budget);
+    // The committers' own pool ([`commit_pool_threads`]). Each committer is an
+    // OS thread of this scope, never a worker of either pool, so `install`
+    // only parks the committer until its commit is done.
+    #[cfg(feature = "parallel")]
+    let commit_pool = match stream.commit_pool {
+        0 => None,
+        n => Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("block-commit-{i}"))
+                .build()
+                .map_err(|e| Error::Prover(format!("the committers' pool: {e}")))?,
+        ),
+    };
+    #[cfg(not(feature = "parallel"))]
+    let _ = stream.commit_pool;
     // Tables the finish handed off and the committers committed, and their
     // seconds from arrival to commit.
     let finished_committed = Mutex::new((0usize, 0.0f64));
@@ -1190,15 +1223,23 @@ fn build_streamed(
                         let name = air.name().to_string();
                         let on_card = commit_card_bytes(&air, &chunk.trace);
                         card.admit(on_card);
-                        #[allow(unused_mut)]
-                        let pre = crate::hash_pin::BlockProver::precommit_main(
-                            air.as_ref(),
-                            &chunk.trace,
-                            #[cfg(feature = "disk-spill")]
-                            stark::storage_mode::StorageMode::Ram,
-                            residency,
-                        )
-                        .map_err(|e| Error::Prover(format!("{e:?}")));
+                        let commit = || {
+                            crate::hash_pin::BlockProver::precommit_main(
+                                air.as_ref(),
+                                &chunk.trace,
+                                #[cfg(feature = "disk-spill")]
+                                stark::storage_mode::StorageMode::Ram,
+                                residency,
+                            )
+                        };
+                        #[cfg(feature = "parallel")]
+                        let pre = match &commit_pool {
+                            Some(pool) => pool.install(commit),
+                            None => commit(),
+                        };
+                        #[cfg(not(feature = "parallel"))]
+                        let pre = commit();
+                        let pre = pre.map_err(|e| Error::Prover(format!("{e:?}")));
                         card.release(on_card);
                         #[allow(unused_mut)]
                         let mut pre = pre?;
@@ -1640,15 +1681,18 @@ pub(crate) fn stream_for_test(
             generators,
             finish: FinishCommit::PhaseB,
             card_budget: None,
+            commit_pool: 0,
         },
     )
 }
 
 /// [`stream_for_test`] with the finish's tables committed in phase A
 /// (`finish`: [`FinishCommit::Handed`] or [`FinishCommit::After`]), the
-/// commits admitted through a card gate of `card_budget` bytes, and the ledger
-/// on.
+/// commits admitted through a card gate of `card_budget` bytes and made in a
+/// pool of `commit_pool` threads of their own (0: the global pool), and the
+/// ledger on.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_finish_commit_for_test(
     program: &Elf,
     opts: &ProofOptions,
@@ -1657,6 +1701,7 @@ pub(crate) fn stream_finish_commit_for_test(
     generators: usize,
     handed: bool,
     card_budget: Option<usize>,
+    commit_pool: usize,
 ) -> Result<(Traces, Vec<String>), Error> {
     stream_config_for_test(
         program,
@@ -1671,6 +1716,7 @@ pub(crate) fn stream_finish_commit_for_test(
                 FinishCommit::After
             },
             card_budget,
+            commit_pool,
         },
     )
 }

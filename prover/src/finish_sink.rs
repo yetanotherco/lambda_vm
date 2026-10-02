@@ -601,7 +601,7 @@ mod tests {
     /// streamed instance it did before and every plain table the finish built,
     /// leaves the ledger empty, and a card gate that admits one commit at a
     /// time changes none of it — with the committers generating, or generators
-    /// ahead of them.
+    /// ahead of them, committing in the global pool or in one of their own.
     #[test]
     fn the_stream_commits_the_finish_tables_in_phase_a() {
         let opts = crate::lfm::proof::block_base_options();
@@ -621,9 +621,12 @@ mod tests {
             every.sort();
             names.sort();
             assert!(names.len() < every.len(), "{name}: the finish built tables");
-            for (committers, generators, handed) in
-                [(3, 0, true), (2, 3, true), (3, 0, false), (2, 3, false)]
-            {
+            for (committers, generators, handed, pool) in [
+                (3, 0, true, 0),
+                (2, 3, true, 2),
+                (3, 0, false, 2),
+                (2, 3, false, 0),
+            ] {
                 let (mut after, mut after_names) = crate::block::stream_finish_commit_for_test(
                     &program,
                     &opts,
@@ -632,6 +635,7 @@ mod tests {
                     generators,
                     handed,
                     Some(1),
+                    pool,
                 )
                 .expect("the finish's tables committed in phase A");
                 after_names.sort();
@@ -682,6 +686,82 @@ mod tests {
         )
         .expect_err("no such slot");
         assert!(format!("{err:?}").contains("has no slot"), "{err:?}");
+    }
+
+    /// Seconds a commit of `table` takes on an OS thread while every worker of
+    /// the global rayon pool is held (as the finish's generation holds them),
+    /// made in the global pool or in a pool of its own. The workers are let go
+    /// as soon as the commit is done, or after `hold` seconds.
+    fn commit_beside_a_busy_global_pool(table: &FinishedTable, own_pool: bool, hold: f64) -> f64 {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let opts = bytes_options();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let busy = std::sync::Arc::new(AtomicUsize::new(0));
+        let workers = rayon::current_num_threads();
+        let deadline = Instant::now() + Duration::from_secs_f64(hold);
+        for _ in 0..workers {
+            let (done, busy) = (done.clone(), busy.clone());
+            rayon::spawn(move || {
+                busy.fetch_add(1, Ordering::SeqCst);
+                while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                busy.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while busy.load(Ordering::SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let commit = || precommit_finished(table, &opts, ResidencyMode::RecomputeLdeDevice);
+                let pre = if own_pool {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(2)
+                        .build()
+                        .expect("a pool")
+                        .install(commit)
+                } else {
+                    commit()
+                };
+                pre.expect("the commit");
+            });
+        });
+        let secs = t.elapsed().as_secs_f64();
+        done.store(true, Ordering::SeqCst);
+        while busy.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        secs
+    }
+
+    /// ★ The trap BIG 462 hit, and its way out: a commit's host-side parallel
+    /// work waits for the global pool while the finish's generation holds every
+    /// worker, and does not when it runs in a pool of its own.
+    #[test]
+    fn a_commit_in_its_own_pool_does_not_wait_for_a_busy_global_pool() {
+        let (_, _, traces) = build("add", &MaxRowsConfig::default());
+        let table = FinishedTable {
+            kind: FinishedKind::Cpu,
+            index: 0,
+            trace: traces.cpus[0].clone(),
+        };
+        let hold = 3.0;
+        let starved = commit_beside_a_busy_global_pool(&table, false, hold);
+        let own = commit_beside_a_busy_global_pool(&table, true, hold);
+        eprintln!(
+            "commit beside a held global pool: {starved:.2} s in it, {own:.2} s in its own pool"
+        );
+        assert!(
+            starved >= hold * 0.8,
+            "the global-pool commit should wait for the held workers ({starved:.2} s of {hold} s)"
+        );
+        assert!(
+            own < hold * 0.5,
+            "the commit in its own pool waited {own:.2} s beside the held workers"
+        );
     }
 
     /// A channel sink sends while its committers listen and gives the table
