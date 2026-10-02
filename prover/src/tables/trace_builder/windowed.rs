@@ -566,7 +566,8 @@ impl Accumulator<'_> {
                 self.max_rows,
                 self.stream_memw_lt,
                 self.pc_to_row,
-                self.decode_rows,
+                self.lean.handout,
+                self.decode_rows.filter(|_| self.lean.handout),
                 kept,
                 self.segments,
                 self.emitted,
@@ -792,6 +793,19 @@ impl<T: Clone> Tail<T> {
         Segments { parts }
     }
 
+    /// [`Self::take`] as the hand-out was before chunks were shared: the
+    /// chunk's ops copied out of the parts into one list (a part that is
+    /// exactly the chunk still moves out whole). The control for
+    /// [`WalkLean::handout`].
+    fn take_copied(&mut self, n: usize) -> Segments<T> {
+        let n = n.min(self.len);
+        if self.start == 0 && self.parts.front().is_some_and(|part| part.len() == n) {
+            return self.take(n);
+        }
+        let ops: Vec<T> = self.take(n).iter().cloned().collect();
+        Segments::whole(ops)
+    }
+
     /// (ops not handed out, ops the parts hold).
     fn held(&self) -> (usize, usize) {
         (self.len, self.len + self.start)
@@ -913,6 +927,7 @@ fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
     stream_memw_lt: bool,
     pc_to_row: &decode::PcToRow,
+    handout: bool,
     decode_rows: Option<&DecodeTable>,
     kept: &mut Kept,
     segments: &mut RoutedSegments,
@@ -927,7 +942,11 @@ fn tail_jobs(
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
             let max = $max;
             while $tail.len >= max {
-                let $ops = $tail.take(max);
+                let $ops = if handout {
+                    $tail.take(max)
+                } else {
+                    $tail.take_copied(max)
+                };
                 $count
                 jobs.push(ChunkJob {
                     table: $table,
@@ -981,7 +1000,12 @@ fn tail_jobs(
         e.memw_aligned,
         |ops| {
             for slice in ops.slices() {
-                super::count_bitwise_from_memw_aligned(slice, &mut counted.histogram);
+                if handout {
+                    super::count_bitwise_from_memw_aligned(slice, &mut counted.histogram);
+                } else {
+                    let lookups = super::collect_bitwise_from_memw_aligned(slice);
+                    counted.histogram.add_ops(&lookups);
+                }
                 if !stream_memw_lt {
                     let lt = super::collect_lt_from_memw_aligned(slice);
                     counted.memw_aligned_lt.extend(lt);
@@ -1006,7 +1030,13 @@ fn tail_jobs(
     take_chunks!(StreamTable::Load, Load, kept.load, m.load, e.load);
     take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
         for slice in ops.slices() {
-            super::count_bitwise_from_lt(slice, &mut counted.histogram)
+            if handout {
+                super::count_bitwise_from_lt(slice, &mut counted.histogram)
+            } else {
+                counted
+                    .histogram
+                    .add_ops(&super::collect_bitwise_from_lt(slice))
+            }
         }
     });
     take_chunks!(
@@ -1017,7 +1047,13 @@ fn tail_jobs(
         e.shift,
         |ops| {
             for slice in ops.slices() {
-                shift::count_bitwise_from_shift(slice, &mut counted.histogram)
+                if handout {
+                    shift::count_bitwise_from_shift(slice, &mut counted.histogram)
+                } else {
+                    counted
+                        .histogram
+                        .add_ops(&shift::collect_bitwise_from_shift(slice))
+                }
             }
         }
     );
@@ -1026,7 +1062,11 @@ fn tail_jobs(
     while store.len() >= m.store {
         let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
         for op in &ops {
-            op.count_bitwise_into(&mut counted.histogram);
+            if handout {
+                op.count_bitwise_into(&mut counted.histogram);
+            } else {
+                counted.histogram.add_ops(&op.collect_bitwise_ops());
+            }
         }
         jobs.push(ChunkJob {
             table: StreamTable::Store,
