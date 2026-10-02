@@ -709,8 +709,62 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
 /// leaf order, then each node level, the top last.
 pub(crate) type TreePrograms = Vec<Vec<(LfmProgram, LfmArtifacts)>>;
 
+/// `LAMBDA_VM_BLOCK_DERIVE_BUILDS=<n>`: at most `n` of a level's artifact builds
+/// run at once while a tree is derived ([`BlockTreePlan::derive_top`], so the
+/// block verifier, and [`BlockTreePlan::derive_tree`]); unset, as many as the
+/// pool runs. A build's device commits are admitted per dispatch against the
+/// whole card, with no running total, so an unbounded level puts as many builds
+/// on the card as there are threads: the median block's verifier peaked at
+/// 31.85 GiB of a 32 GiB card (BIG 480). Scheduling only: every artifact is a
+/// pure function of its program and the options, so the derived tree and the
+/// top program do not depend on it.
+fn derive_builds_bound() -> Option<usize> {
+    static BOUND: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| match std::env::var("LAMBDA_VM_BLOCK_DERIVE_BUILDS") {
+        Ok(v) if !v.is_empty() => Some(v.parse::<usize>().ok().filter(|&n| n >= 1).unwrap_or_else(
+            || panic!("LAMBDA_VM_BLOCK_DERIVE_BUILDS must be a positive integer, got `{v}`"),
+        )),
+        _ => None,
+    })
+}
+
+/// At most `n` holders at once; [`BuildGate::enter`] waits for a place.
+struct BuildGate {
+    free: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A place in a [`BuildGate`], given back on drop.
+struct BuildPlace<'a>(&'a BuildGate);
+
+impl BuildGate {
+    fn new(n: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(n),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn enter(&self) -> BuildPlace<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        BuildPlace(self)
+    }
+}
+
+impl Drop for BuildPlace<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
 /// One level of a tree's derivation: each item's program emitted, its artifacts
-/// built by `build` and its shape as a child derived, in parallel and in order.
+/// built by `build` and its shape as a child derived, in parallel and in order,
+/// at most [`derive_builds_bound`] builds at once.
 /// Pushes the level's stopwatch onto `phases`.
 fn derive_level<T: Sync>(
     items: &[T],
@@ -722,12 +776,15 @@ fn derive_level<T: Sync>(
 ) -> Result<Vec<(LfmProgram, LfmArtifacts, DerivedChild)>, String> {
     let t = Instant::now();
     type Derived = (LfmProgram, LfmArtifacts, DerivedChild, f64, f64);
+    let gate = derive_builds_bound().map(BuildGate::new);
     let one = |item: &T| -> Result<Derived, String> {
         let t = Instant::now();
         let program = emit(item)?;
         let emitted = t.elapsed().as_secs_f64();
         let t = Instant::now();
+        let place = gate.as_ref().map(BuildGate::enter);
         let artifacts = build(&program);
+        drop(place);
         let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
         Ok((
             program,
@@ -955,4 +1012,38 @@ fn verify_under(
     }
     times.check = t.elapsed().as_secs_f64();
     Ok((artifacts.program_id, times))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The derive's build gate lets at most its bound through at once, and every
+    /// waiter through in the end.
+    #[test]
+    fn the_build_gate_holds_its_bound() {
+        let gate = BuildGate::new(2);
+        let inside = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _place = gate.enter();
+                    let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 8, "every holder got through");
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            2,
+            "never more than the bound at once"
+        );
+    }
 }
