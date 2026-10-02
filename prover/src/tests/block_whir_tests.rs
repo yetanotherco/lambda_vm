@@ -899,6 +899,48 @@ fn the_block_caps_the_chunked_tables_heights() {
     }
 }
 
+/// ★ G2: no table may be stated taller than [`block_whir::BLOCK_MAX_TABLE_VARS`]
+/// (2^27), so no chain is taller than the 2^27 stack; at the cap it passes.
+#[test]
+fn no_table_may_be_stated_over_the_table_cap() {
+    let cap = block_whir::BLOCK_MAX_TABLE_VARS as u8;
+    let mut stated = vec![10u8; 17];
+    assert!(block_whir::check_table_heights(&stated).is_ok());
+    stated[3] = cap;
+    assert!(
+        block_whir::check_table_heights(&stated).is_ok(),
+        "at the cap"
+    );
+    stated[3] = cap + 1;
+    let refused = block_whir::check_table_heights(&stated);
+    assert!(
+        format!("{refused:?}").contains("table 3"),
+        "a table over the cap must be refused, got {refused:?}"
+    );
+}
+
+/// ★ G2 end to end: a statement giving table 0 (BITWISE) 2^28 rows is refused
+/// at the frame with the cap's own error, before any AIR is built.
+///
+/// Mutation (box script): `check_table_heights` returning `Ok(())` and the error
+/// is no longer the cap's.
+#[test]
+fn a_table_stated_over_the_table_cap_is_refused() {
+    let elf = asm_elf_bytes("sub");
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    assert!(verify(&proof, &elf, &format));
+    proof.table_num_vars[0] = (block_whir::BLOCK_MAX_TABLE_VARS + 1) as u8;
+    let refused =
+        block_whir::verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &format);
+    let msg = format!("{refused:?}");
+    assert!(
+        msg.contains("table 0 states 2^28 rows") && msg.contains("at most 2^27"),
+        "the frame must refuse a table over the table cap with the cap's error, got {msg}"
+    );
+    println!("BLOCK WHIR TABLE OVER CAP: refused at the frame: {msg}");
+}
+
 /// The ranges the caps read are the chunked AIRs' positions in
 /// [`crate::VmAirs::air_refs`] — the statement's table order — and nothing
 /// next to them.

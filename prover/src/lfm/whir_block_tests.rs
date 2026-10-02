@@ -24,9 +24,9 @@ use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, pub
 use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child_timed};
 use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
 use super::whir_block::{
-    BLOCK_FAN_IN, BlockPartition, LeafChecks, WhirBlockPlan, artifacts_of, block_leaf_arena,
-    id_words, leaf_program_with, out_halves, partition_groups, verify_block_tree,
-    verify_block_tree_under,
+    BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
+    block_leaf_arena, emit_share, id_words, leaf_partition, leaf_program_with, out_halves,
+    partition_groups, verify_block_tree, verify_block_tree_under,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -148,6 +148,38 @@ fn the_group_partition_is_heaviest_first_onto_the_least_loaded_leaf() {
     // Never more leaves than groups, and one leaf takes everything.
     assert_eq!(partition_groups(&[5, 9], 7).num_leaves(), 2);
     assert_eq!(partition_groups(&[5, 9, 1], 1).leaves(), &[vec![0, 1, 2]]);
+}
+
+/// ★ G3: no leaf over the cap. A group over it is refused (a group is atomic
+/// for a leaf); without a fixed count, leaves are added from `⌈Σ/cap⌉` while
+/// the heaviest is over it; and the block's own costs (FAST 421's W3 plan) keep
+/// today's three leaves, so the default tree is unchanged.
+#[test]
+fn the_leaf_partition_keeps_every_leaf_under_the_cap() {
+    let refused = leaf_partition(&[200, 10], None, 150);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("group 0 costs 200")),
+        "a group over the cap must be refused, got {refused:?}"
+    );
+    assert!(leaf_partition(&[200, 10], Some(2), 150).is_err());
+    // ⌈300/150⌉ = 2 leaves would carry 200: one more leaf, 100 each.
+    let p = leaf_partition(&[100, 100, 100], None, 150).expect("partitions");
+    assert_eq!(p.num_leaves(), 3, "{:?}", p.leaves());
+    // A fixed count (the tests', never a statement's) is the caller's.
+    assert_eq!(
+        leaf_partition(&[100, 100, 100], Some(1), 150)
+            .expect("partitions")
+            .num_leaves(),
+        1
+    );
+    let block = [
+        65825, 64356, 64405, 64474, 66559, 65146, 81574, 68482, 105991,
+    ];
+    let p = leaf_partition(&block, None, LEAF_PERMS_CAP).expect("partitions");
+    assert_eq!(p.leaves(), partition_groups(&block, 3).leaves());
+    assert_eq!(p.leaves(), &[vec![1, 5, 8], vec![0, 2, 6], vec![3, 4, 7]]);
 }
 
 #[test]
@@ -311,26 +343,40 @@ fn a_block_leaf_refuses_a_tampered_witness() {
     );
 }
 
-/// The leaf's bus share divides `p` by `q`: a zero `q` has no satisfying
-/// assignment, which is the host's `contribution() = None` refusal.
+/// ★ W1: the leaf's bus share ([`emit_share`]). Under the inverse form
+/// (`LFM_WHIR_SHARE_INVERSE=1`) a zero `q` has no satisfying assignment whatever
+/// `p` is — `q · inv = 1` — which is the host's `contribution() = None`
+/// refusal. The default `ediv(p, q)` refuses `q = 0` only when `p ≠ 0`: at
+/// `p = q = 0` its constraint `q · out = p` holds for every `out` (the executor
+/// writes 1), so the share is free — the gap the inverse form closes.
 #[test]
 fn a_zero_denominator_has_no_satisfying_assignment() {
-    let run = |q: u64| {
+    let run = |p: u64, q: u64, inverse: bool| {
         let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
         let a = b.declare_arena(2);
-        let p = b.hint_word(a, 0).as_ext();
+        let p_wire = b.hint_word(a, 0).as_ext();
         let q_wire = b.hint_word(a, 1).as_ext();
-        let share = b.ediv(p, q_wire);
+        let share = emit_share(&mut b, p_wire, q_wire, inverse);
         b.public(share.as_cell());
         let program = compile(b.finish());
         let words = vec![
-            super::word::ext_word(&FEE::from(7u64)),
+            super::word::ext_word(&FEE::from(p)),
             super::word::ext_word(&FEE::from(q)),
         ];
         execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER).map(|_| ())
     };
-    assert!(run(3).is_ok());
-    assert!(run(0).is_err());
+    for inverse in [false, true] {
+        assert!(run(7, 3, inverse).is_ok(), "inverse {inverse}: 7/3");
+        assert!(run(7, 0, inverse).is_err(), "inverse {inverse}: 7/0");
+    }
+    assert!(
+        run(0, 0, true).is_err(),
+        "the inverse form must refuse p = q = 0"
+    );
+    assert!(
+        run(0, 0, false).is_ok(),
+        "the default ediv(p, q) executes p = q = 0 (its share is free): the gap"
+    );
 }
 
 /// The production format with three polynomials a group: the dense fixture's
@@ -713,6 +759,50 @@ fn compose(
     }
     let [top] = <[Proved; 1]>::try_from(level).map_err(|l| format!("{} tops", l.len()))?;
     Ok((top.proof, walls))
+}
+
+/// ★ G3 through the plan: test_commit_4's heaviest group costs ≈ 220 k
+/// permutations; under a 200 k leaf cap the plan refuses the statement (no
+/// leaf can hold that group), under the production cap it derives today's
+/// partition.
+#[test]
+#[ignore = "proves a small block; box tier"]
+fn a_group_over_the_leaf_cap_is_refused() {
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let derive = |cap: usize| {
+        WhirBlockPlan::derive_capped(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            None,
+            cap,
+        )
+    };
+    let plan = derive(LEAF_PERMS_CAP).expect("the production cap derives the plan");
+    let heaviest = *plan.costs().iter().max().expect("a group");
+    assert!(
+        heaviest > 200_000 && heaviest <= LEAF_PERMS_CAP,
+        "{heaviest}"
+    );
+    assert_eq!(
+        plan.partition().leaves(),
+        plan_of(&elf, &proof, &format, None).partition().leaves()
+    );
+    let refused = derive(heaviest - 1);
+    let msg = refused.as_ref().err().cloned().unwrap_or_default();
+    assert!(
+        msg.contains("costs") && msg.contains(&format!("at most {}", heaviest - 1)),
+        "a group over the leaf cap must be refused, got {msg:?}"
+    );
+    println!(
+        "WHIR BLOCK LEAF CAP: heaviest group {heaviest}; under a cap of {}: {msg}",
+        heaviest - 1
+    );
 }
 
 /// ★ ECDAS cut through the block's recursion: test_ecsm_multi with ECDAS in

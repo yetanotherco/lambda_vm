@@ -26,9 +26,11 @@
 //! The nodes are [`super::block_node`]'s, unchanged: they check the id, the
 //! state and the output equal across children, add the sums, and the top
 //! asserts the total is zero — the host's single bus check, where every table's
-//! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does
-//! (a zero denominator has no satisfying assignment, the host's `None`), so the
-//! node needs no fraction arithmetic.
+//! share is in scope. A leaf divides `p/q` itself, as #1010's epoch closure does,
+//! so the node needs no fraction arithmetic ([`emit_share`]: under
+//! `LFM_WHIR_SHARE_INVERSE=1` a zero denominator has no satisfying assignment
+//! whatever `p` is, the host's `None`; the default `ediv(p, q)` leaves the share
+//! free when `p = q = 0`).
 //!
 //! # Never from a proof
 //!
@@ -75,6 +77,36 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
+
+/// `LFM_WHIR_SHARE_INVERSE`: `1` emits a leaf's bus share as `p · (1/q)`
+/// ([`emit_share`]); unset or `0` keeps `ediv(p, q)`, today's leaf programs.
+/// Read once per process. Both sides derive the leaf programs, so the
+/// verifier's setting is part of the tree identity it derives.
+pub fn share_inverse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("LFM_WHIR_SHARE_INVERSE").as_deref() {
+            Err(_) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(v) => panic!("LFM_WHIR_SHARE_INVERSE must be 0 or 1, got `{v}`"),
+        },
+    )
+}
+
+/// One table's share `p/q` of the block's bus sum. XALU division constrains
+/// `q · out = p`, so `ediv(p, q)` has no satisfying assignment when `q = 0`
+/// and `p ≠ 0`, but leaves `out` free when `p = q = 0`. With `inverse`, the
+/// share is `p · ediv(1, q)`: `q · inv = 1` has no assignment for any `q = 0`,
+/// whatever `p` is — the host's `contribution() = None` refusal.
+pub fn emit_share(b: &mut LfmBuilder, p: Ext, q: Ext, inverse: bool) -> Ext {
+    if inverse {
+        let one = b.ext_const(&FEE::one());
+        let inv = b.ediv(one, q);
+        b.emul(p, inv)
+    } else {
+        b.ediv(p, q)
+    }
+}
 
 /// Children a node verifies: three, so the block's three leaves close in ONE
 /// node, the top, instead of two levels.
@@ -168,6 +200,44 @@ pub fn partition_groups(costs: &[usize], num_leaves: usize) -> BlockPartition {
         .expect("the rule places every group exactly once by construction")
 }
 
+/// The leaf partition of groups costing `costs` permutations, under a leaf cap
+/// of `cap`: over `num_leaves` leaves when the caller fixes the count (the
+/// tests', never a statement's), else over the fewest leaves from
+/// `⌈Σ cost / cap⌉` at which no leaf is over the cap — one more leaf while the
+/// heaviest is over it, the STARK block's rule (`block_plan::partition_for`).
+/// Refuses a group over the cap, which no leaf can hold: a group is atomic for
+/// a leaf (its stacked opening covers all its tables), and without the bound a
+/// statement could grow one leaf, and its LFM chips, without limit.
+pub fn leaf_partition(
+    costs: &[usize],
+    num_leaves: Option<usize>,
+    cap: usize,
+) -> Result<BlockPartition, String> {
+    if let Some((g, &cost)) = costs.iter().enumerate().find(|&(_, &c)| c > cap) {
+        return Err(format!(
+            "group {g} costs {cost} permutations — a leaf takes at most {cap}"
+        ));
+    }
+    if let Some(k) = num_leaves {
+        return Ok(partition_groups(costs, k.max(1)));
+    }
+    let mut k = costs.iter().sum::<usize>().div_ceil(cap).max(1);
+    loop {
+        let partition = partition_groups(costs, k);
+        let heaviest = partition
+            .leaves()
+            .iter()
+            .map(|leaf| leaf.iter().map(|&g| costs[g]).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        // Every group is under the cap, so one group a leaf always fits.
+        if heaviest <= cap || k >= costs.len() {
+            return Ok(partition);
+        }
+        k += 1;
+    }
+}
+
 // ================================= the plan ===============================
 
 /// One group's prepared stack, as the plan derived it.
@@ -227,8 +297,10 @@ pub struct TreeProgram {
 }
 
 impl WhirBlockPlan {
-    /// Derive the plan over `num_leaves` leaves (`⌈Σ cost / cap⌉` when `None`),
-    /// or refuse a statement the host verifier refuses.
+    /// Derive the plan over `num_leaves` leaves (when `None`, the fewest from
+    /// `⌈Σ cost / cap⌉` with no leaf over the cap: [`leaf_partition`]), or
+    /// refuse a statement the host verifier refuses or whose group is over the
+    /// leaf cap.
     pub fn derive(
         elf_bytes: &[u8],
         proof_options: &crate::ProofOptions,
@@ -260,6 +332,32 @@ impl WhirBlockPlan {
         num_leaves: Option<usize>,
         fan_in: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+    ) -> Result<Self, String> {
+        Self::derive_capped(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            num_leaves,
+            fan_in,
+            prepared_roots,
+            LEAF_PERMS_CAP,
+        )
+    }
+
+    /// [`Self::derive_with`] under a leaf cap of `leaf_cap` permutations
+    /// ([`leaf_partition`]); everything but the tests' refusals runs at
+    /// [`LEAF_PERMS_CAP`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_capped(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: Option<usize>,
+        fan_in: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+        leaf_cap: usize,
     ) -> Result<Self, String> {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
@@ -375,10 +473,7 @@ impl WhirBlockPlan {
             costs.push(tables + opening + prepared_perms);
         }
         drop(refs);
-        let k = num_leaves
-            .unwrap_or_else(|| costs.iter().sum::<usize>().div_ceil(LEAF_PERMS_CAP))
-            .max(1);
-        let partition = partition_groups(&costs, k);
+        let partition = leaf_partition(&costs, num_leaves, leaf_cap)?;
         let id = crate::statement::elf_digest(&statement_bytes);
         Ok(Self {
             frame,
@@ -1101,8 +1196,9 @@ fn emit_leaf(
     // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on
     // the carrier (commits are indexed from 0 in a block).
     let mut sum: Option<Ext> = None;
+    let inverse = share_inverse();
     for (p, q) in &outputs {
-        let share = b.ediv(*p, *q);
+        let share = emit_share(b, *p, *q, inverse);
         sum = Some(match sum {
             None => share,
             Some(running) => b.eadd(running, share),
