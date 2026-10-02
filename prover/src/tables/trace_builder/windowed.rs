@@ -58,6 +58,7 @@
 //! [`finish`]: WindowedTraceBuilder::finish
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use executor::elf::Elf;
 use executor::vm::logs::Log;
@@ -79,6 +80,8 @@ use crate::tables::{
 
 #[cfg(test)]
 mod producer_harness;
+#[cfg(test)]
+mod tail_tests;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
@@ -703,7 +706,11 @@ fn chunk_jobs(
                 jobs.push(ChunkJob {
                     table: $table,
                     index,
-                    ops: ChunkOps::$variant(gather(windows, list, index * max..(index + 1) * max)),
+                    ops: ChunkOps::$variant(Segments::whole(gather(
+                        windows,
+                        list,
+                        index * max..(index + 1) * max,
+                    ))),
                 });
                 $done += 1;
             }
@@ -755,18 +762,57 @@ fn chunk_jobs(
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index,
-            ops: ChunkOps::Store(store[index * m.store..(index + 1) * m.store].to_vec()),
+            ops: ChunkOps::Store(Segments::whole(
+                store[index * m.store..(index + 1) * m.store].to_vec(),
+            )),
         });
         e.store += 1;
     }
     jobs
 }
 
+/// A chunk's ops as ranges of the window parts it spans. A part is shared
+/// (`Arc`) by the chunks that straddle it and by the tail that holds its rest,
+/// so handing a chunk out copies nothing; the generator makes the ops one
+/// slice ([`Self::contiguous`]) — a borrow when the chunk is one part's range.
+pub(crate) struct Segments<T> {
+    parts: Vec<(Arc<Vec<T>>, std::ops::Range<usize>)>,
+}
+
+impl<T: Clone> Segments<T> {
+    /// A list as one segment.
+    fn whole(ops: Vec<T>) -> Self {
+        let len = ops.len();
+        Self {
+            parts: vec![(Arc::new(ops), 0..len)],
+        }
+    }
+
+    /// The segments' slices, in order.
+    fn slices(&self) -> impl DoubleEndedIterator<Item = &[T]> {
+        self.parts.iter().map(|(part, range)| &part[range.clone()])
+    }
+
+    /// The ops, in order.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
+        self.slices().flatten()
+    }
+
+    /// The ops as one slice: borrowed from the part when there is one
+    /// segment, copied into a new list otherwise.
+    fn contiguous(&self) -> std::borrow::Cow<'_, [T]> {
+        match self.parts.as_slice() {
+            [(part, range)] => std::borrow::Cow::Borrowed(&part[range.clone()]),
+            _ => std::borrow::Cow::Owned(self.slices().flatten().cloned().collect()),
+        }
+    }
+}
+
 /// A streamed table's ops not yet in a handed-out chunk
 /// ([`WindowedTraceBuilder::drop_streamed_ops`]): the windows' lists, moved in
 /// whole, of which the first `start` ops of the first have left.
 struct Tail<T> {
-    parts: VecDeque<Vec<T>>,
+    parts: VecDeque<Arc<Vec<T>>>,
     start: usize,
     len: usize,
 }
@@ -783,34 +829,35 @@ impl<T: Clone> Tail<T> {
     fn push(&mut self, part: Vec<T>) {
         if !part.is_empty() {
             self.len += part.len();
-            self.parts.push_back(part);
+            self.parts.push_back(Arc::new(part));
         }
     }
 
-    /// The first `n` ops (at most `len`). A part that is exactly the chunk
-    /// moves out whole; a part the chunk uses up is freed.
-    fn take(&mut self, n: usize) -> Vec<T> {
+    /// The first `n` ops (at most `len`), as ranges of the parts they span: no
+    /// op is copied. A part the chunk uses up leaves the tail (the chunk then
+    /// holds it alone); a part it ends inside stays, shared, for the next.
+    fn take(&mut self, n: usize) -> Segments<T> {
         let n = n.min(self.len);
         self.len -= n;
-        if self.start == 0 && self.parts.front().is_some_and(|part| part.len() == n) {
-            return self.parts.pop_front().unwrap_or_default();
-        }
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
+        let mut parts = Vec::new();
+        let mut want = n;
+        while want > 0 {
             let Some(front) = self.parts.front() else {
                 break;
             };
-            let want = n - out.len();
-            if front.len() - self.start <= want {
-                out.extend_from_slice(&front[self.start..]);
-                self.parts.pop_front();
+            let available = front.len() - self.start;
+            if available <= want {
+                let part = self.parts.pop_front().expect("the front part");
+                parts.push((part, self.start..self.start + available));
+                want -= available;
                 self.start = 0;
             } else {
-                out.extend_from_slice(&front[self.start..self.start + want]);
+                parts.push((Arc::clone(front), self.start..self.start + want));
                 self.start += want;
+                want = 0;
             }
         }
-        out
+        Segments { parts }
     }
 
     /// (ops not handed out, ops the parts hold).
@@ -818,10 +865,12 @@ impl<T: Clone> Tail<T> {
         (self.len, self.len + self.start)
     }
 
-    /// The ops not handed out, as one list.
+    /// The ops not handed out, as one list: a part no chunk shares any more
+    /// moves out whole when it is all that is left.
     fn into_vec(mut self) -> Vec<T> {
         if self.start == 0 && self.parts.len() == 1 {
-            return self.parts.pop_front().unwrap_or_default();
+            let part = self.parts.pop_front().expect("one part");
+            return Arc::try_unwrap(part).unwrap_or_else(|shared| shared.as_ref().clone());
         }
         let mut out = Vec::with_capacity(self.len);
         for (i, part) in self.parts.into_iter().enumerate() {
@@ -984,7 +1033,12 @@ fn tail_jobs(
         m.memw_register,
         e.memw_register,
         |ops| {
-            super::memw_register::collect_bitwise_from_memw_register(&ops, &mut counted.histogram)
+            for rows in ops.slices() {
+                super::memw_register::collect_bitwise_from_memw_register(
+                    rows,
+                    &mut counted.histogram,
+                )
+            }
         }
     );
     take_chunks!(
@@ -994,10 +1048,12 @@ fn tail_jobs(
         m.memw_aligned,
         e.memw_aligned,
         |ops| {
-            super::count_bitwise_from_memw_aligned(&ops, &mut counted.histogram);
-            if !stream_memw_lt {
-                let lt = super::collect_lt_from_memw_aligned(&ops);
-                counted.memw_aligned_lt.extend(lt);
+            for slice in ops.slices() {
+                super::count_bitwise_from_memw_aligned(slice, &mut counted.histogram);
+                if !stream_memw_lt {
+                    let lt = super::collect_lt_from_memw_aligned(slice);
+                    counted.memw_aligned_lt.extend(lt);
+                }
             }
         }
     );
@@ -1009,13 +1065,17 @@ fn tail_jobs(
         e.memw,
         |ops| {
             if !stream_memw_lt {
-                counted.memw_lt.extend(super::collect_lt_from_memw(&ops));
+                for slice in ops.slices() {
+                    counted.memw_lt.extend(super::collect_lt_from_memw(slice));
+                }
             }
         }
     );
     take_chunks!(StreamTable::Load, Load, kept.load, m.load, e.load);
     take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
-        super::count_bitwise_from_lt(&ops, &mut counted.histogram)
+        for slice in ops.slices() {
+            super::count_bitwise_from_lt(slice, &mut counted.histogram)
+        }
     });
     take_chunks!(
         StreamTable::Shift,
@@ -1023,7 +1083,11 @@ fn tail_jobs(
         kept.shift,
         m.shift,
         e.shift,
-        |ops| { shift::count_bitwise_from_shift(&ops, &mut counted.histogram) }
+        |ops| {
+            for slice in ops.slices() {
+                shift::count_bitwise_from_shift(slice, &mut counted.histogram)
+            }
+        }
     );
     // KECCAK_RND's ops stay: KECCAK needs them all.
     if e.keccak_rnd_rows > 0 {
@@ -1054,7 +1118,7 @@ fn tail_jobs(
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index: e.store,
-            ops: ChunkOps::Store(ops),
+            ops: ChunkOps::Store(Segments::whole(ops)),
         });
         e.store += 1;
     }
@@ -1200,14 +1264,14 @@ pub struct ChunkJob {
 }
 
 enum ChunkOps {
-    Cpu(Vec<super::CpuOperation>),
-    MemwRegister(Vec<super::RegRow>),
-    MemwAligned(Vec<super::MemwOperation>),
-    Memw(Vec<super::MemwOperation>),
-    Load(Vec<super::LoadOperation>),
-    Lt(Vec<super::LtOperation>),
-    Shift(Vec<super::ShiftOperation>),
-    Store(Vec<store::StoreOperation>),
+    Cpu(Segments<super::CpuOperation>),
+    MemwRegister(Segments<super::RegRow>),
+    MemwAligned(Segments<super::MemwOperation>),
+    Memw(Segments<super::MemwOperation>),
+    Load(Segments<super::LoadOperation>),
+    Lt(Segments<super::LtOperation>),
+    Shift(Segments<super::ShiftOperation>),
+    Store(Segments<store::StoreOperation>),
     KeccakRnd {
         ops: Vec<super::keccak::KeccakOperation>,
         skip: usize,
@@ -1218,16 +1282,20 @@ enum ChunkOps {
 impl ChunkJob {
     pub fn generate(self) -> StreamedChunk {
         let trace = match &self.ops {
-            ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(ops),
+            // A chunk spanning several window parts is made one list here,
+            // on the generator's thread, not the accumulator's.
+            ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(&ops.contiguous()),
             ChunkOps::MemwRegister(ops) => {
-                memw_register::generate_memw_register_trace_from_rows(ops)
+                memw_register::generate_memw_register_trace_from_rows(&ops.contiguous())
             }
-            ChunkOps::MemwAligned(ops) => memw_aligned::generate_memw_aligned_trace(ops),
-            ChunkOps::Memw(ops) => memw::generate_memw_trace(ops),
-            ChunkOps::Load(ops) => load::generate_load_trace(ops),
-            ChunkOps::Lt(ops) => lt::generate_lt_trace(ops),
-            ChunkOps::Shift(ops) => shift::generate_shift_trace(ops),
-            ChunkOps::Store(ops) => store::generate_store_trace(ops),
+            ChunkOps::MemwAligned(ops) => {
+                memw_aligned::generate_memw_aligned_trace(&ops.contiguous())
+            }
+            ChunkOps::Memw(ops) => memw::generate_memw_trace(&ops.contiguous()),
+            ChunkOps::Load(ops) => load::generate_load_trace(&ops.contiguous()),
+            ChunkOps::Lt(ops) => lt::generate_lt_trace(&ops.contiguous()),
+            ChunkOps::Shift(ops) => shift::generate_shift_trace(&ops.contiguous()),
+            ChunkOps::Store(ops) => store::generate_store_trace(&ops.contiguous()),
             ChunkOps::KeccakRnd { ops, skip, rows } => {
                 let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
                     .iter()
