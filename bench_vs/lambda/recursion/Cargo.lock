@@ -359,7 +359,6 @@ dependencies = [
  "digest",
  "ecsm",
  "executor",
- "libc",
  "log",
  "math",
  "multilinear",
