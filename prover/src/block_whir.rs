@@ -138,14 +138,16 @@ pub const BLOCK_MAX_GROUPS: usize = 64;
 
 impl BlockFormat {
     /// The process's WHIR format (as [`crate::multilinear_prove::chain_config`]
-    /// reads it), [`BLOCK_GROUP_POLYS`] and [`BLOCK_MAX_GROUPS`].
+    /// reads it), [`BLOCK_GROUP_POLYS`], [`BLOCK_MAX_GROUPS`], and each group's
+    /// tables argued together ([`ArgueFormat::BATCHED`]; Mauro 10-02: "batch the
+    /// constraints"). `ArgueFormat::PerTable` stays a format to measure against.
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
             group_polys: BLOCK_GROUP_POLYS,
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
-            argue: ArgueFormat::PerTable,
+            argue: ArgueFormat::BATCHED,
         }
     }
 

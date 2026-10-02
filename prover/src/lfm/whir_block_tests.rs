@@ -1235,8 +1235,9 @@ fn the_whir_block_tree_on_a_real_block() {
     let leaves = knob("W3_LEAVES");
     let siblings = knob("W3_SIBLINGS").unwrap_or(3);
     let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
-    // `BLOCK_WHIR_ARGUE=batched`: each group's tables argued together, at the
-    // format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k` for 2^k).
+    // `BLOCK_WHIR_ARGUE=batched|per-table` (production: batched): each group's
+    // tables argued together, at the format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k`
+    // for 2^k), or each on its own.
     let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
         Ok("batched") => match knob("BLOCK_WHIR_ARGUE_CAP") {
             Some(cap) => ArgueFormat::Batched {
@@ -1244,7 +1245,8 @@ fn the_whir_block_tree_on_a_real_block() {
             },
             None => ArgueFormat::BATCHED,
         },
-        Ok("per-table") | Err(_) => ArgueFormat::PerTable,
+        Ok("per-table") => ArgueFormat::PerTable,
+        Err(_) => BlockFormat::production().argue,
         Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
     };
     let format = BlockFormat {
@@ -1448,20 +1450,21 @@ fn the_whir_block_tree_on_a_real_block() {
     let t = std::time::Instant::now();
     // The production verifier when the run is at its presets; the fixture form
     // only when a knob moved the tree off them.
-    let verdict = if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == ArgueFormat::PerTable {
-        verify_block_tree(&elf, proof.statement(), top)
-    } else {
-        verify_block_tree_under(
-            &elf,
-            &opts,
-            &format,
-            proof.statement(),
-            leaves,
-            fan_in,
-            &wrap,
-            top,
-        )
-    };
+    let verdict =
+        if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
+            verify_block_tree(&elf, proof.statement(), top)
+        } else {
+            verify_block_tree_under(
+                &elf,
+                &opts,
+                &format,
+                proof.statement(),
+                leaves,
+                fan_in,
+                &wrap,
+                top,
+            )
+        };
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {

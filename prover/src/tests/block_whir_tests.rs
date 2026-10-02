@@ -1205,8 +1205,9 @@ fn block_whir_on_a_real_block() {
     let input = std::fs::read(&input_path).expect("read the input");
     // `BLOCK_WHIR_PREPARED=0`: the openings off, for the arm that prices them.
     let prepared = std::env::var("BLOCK_WHIR_PREPARED").map_or(true, |v| v.trim() != "0");
-    // `BLOCK_WHIR_ARGUE=batched`: each group's tables argued together, at the
-    // format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k` for 2^k).
+    // `BLOCK_WHIR_ARGUE=batched|per-table` (production: batched): each group's
+    // tables argued together, at the format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k`
+    // for 2^k), or each on its own.
     let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
         Ok("batched") => ArgueFormat::Batched {
             bin_log_cells: std::env::var("BLOCK_WHIR_ARGUE_CAP")
@@ -1217,7 +1218,8 @@ fn block_whir_on_a_real_block() {
                     ArgueFormat::PerTable => unreachable!("the batched format"),
                 }),
         },
-        Ok("per-table") | Err(_) => ArgueFormat::PerTable,
+        Ok("per-table") => ArgueFormat::PerTable,
+        Err(_) => BlockFormat::production().argue,
         Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
     };
     let format = BlockFormat {
