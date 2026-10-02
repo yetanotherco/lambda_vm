@@ -32,7 +32,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
+use super::trace_hash::{OpMap, trace_hash_state};
 
 use super::types::{
     BusId, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
@@ -284,7 +284,8 @@ pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
-    let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
+    let mut op_map: OpMap<DvrmOperation, DvrmMultiplicities> =
+        OpMap::with_hasher(trace_hash_state());
 
     for (op, wants_remainder) in operations {
         let entry = op_map.entry(op.clone()).or_default();
