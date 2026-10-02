@@ -1650,6 +1650,36 @@ pub fn prove_block_traces(
             pairs.len() - n_packed,
             wide as f64 / (1u64 << 30) as f64,
         );
+        // What else the heap holds as the prove starts: the precommits (the
+        // streamed and phase-A-committed instances'), the precomputed-tree
+        // cache, and what no gauge names (the AIRs just built included).
+        let mut held = [0usize; 4];
+        for (_, pre) in &precommits {
+            for (h, b) in held.iter_mut().zip(pre.host_bytes()) {
+                *h += b;
+            }
+        }
+        let cache = stark::prover::precomputed_tree_cache_bytes_inserted() as usize;
+        let g = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "BLOCK MEM precommits: {} · trees {:.2} · kept tops {:.2} · cached main {:.2} · packed copies {:.2} (GiB)",
+            precommits.len(),
+            g(held[0]),
+            g(held[1]),
+            g(held[2]),
+            g(held[3]),
+        );
+        if let Some([live, ..]) = heap_stats() {
+            let named = packed + wide + held.iter().sum::<usize>() + cache;
+            eprintln!(
+                "BLOCK MEM setup: heap live {:.2} = traces {:.2} + precommits {:.2} + precomputed trees {:.2} + unnamed {:.2} (GiB)",
+                g(live),
+                g(packed + wide),
+                g(held.iter().sum()),
+                g(cache),
+                g(live.saturating_sub(named)),
+            );
+        }
     }
     on_shape(&crate::lfm::block_plan::BlockShape {
         table_counts: table_counts.clone(),
@@ -1813,6 +1843,16 @@ fn stream_config_for_test(
             0,
             "bytes left committing"
         );
+    }
+    // Every precommit reports the host bytes it holds (BLOCK MEM precommits):
+    // at least its commitment's Merkle nodes or kept top levels.
+    for (name, pre) in &precommits {
+        let [trees, tops, _, _] = pre.host_bytes();
+        if trees + tops == 0 {
+            return Err(Error::Prover(format!(
+                "{name}: a precommit reports no host bytes"
+            )));
+        }
     }
     Ok((
         traces,
