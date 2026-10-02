@@ -687,15 +687,18 @@ fn packing_the_finished_tables_keeps_the_words() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [7, 33] {
+        // A bound of one chunk at 8 bytes a cell at once (and none, 0) builds
+        // the same tables.
+        for (window, bound) in [(7, 0), (33, 0), (33, 1)] {
             let (mut packed, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
                 b.drop_streamed_ops()
                     .expect("before any window")
                     .pack_finished_tables()
+                    .bound_finished_generation(bound)
             });
             assert!(
                 widen_all(&mut packed) > 0,
-                "{name}/{window}: no table was packed"
+                "{name}/{window}/{bound}: no table was packed"
             );
             same_traces(&reference, &packed);
         }
@@ -1030,6 +1033,41 @@ fn the_lean_walk_builds_the_whole_run_tables() {
                     same_traces(&reference, &traces);
                 }
             }
+        }
+    }
+}
+
+/// ★ Phase A's stream builds the same traces and precommits the same instances
+/// however its chunks reach the device: the committers generating them (as
+/// today), or generator threads ahead of them with every queue held to one
+/// chunk at a time (the bounded queues' back-pressure on every hand-off).
+#[test]
+fn the_stream_builds_the_same_traces_with_generators_and_bounded_queues() {
+    let opts = crate::lfm::proof::block_base_options();
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+        let (mut today, mut names) =
+            crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0, None)
+                .expect("committers generate");
+        assert!(!names.is_empty(), "{name}: nothing was streamed");
+        for (committers, generators, budget) in [(2, 3, Some(1)), (1, 1, None)] {
+            let (mut pooled, mut pooled_names) = crate::block::stream_for_test(
+                &program, &opts, &max_rows, committers, generators, budget,
+            )
+            .expect("generators ahead of the committers");
+            names.sort();
+            pooled_names.sort();
+            assert_eq!(names, pooled_names, "{name}: the instances precommitted");
+            widen_all(&mut pooled);
+            widen_all(&mut today);
+            same_traces(&today, &pooled);
         }
     }
 }

@@ -3891,6 +3891,56 @@ pub struct StreamSkip {
     ///
     /// [`WindowedTraceBuilder::pack_finished_tables`]: windowed::WindowedTraceBuilder::pack_finished_tables
     pub pack: bool,
+    /// With [`Self::pack`]: at most this many chunks are generated at 8 bytes a
+    /// cell at once ([`WidePermits`]), so the 64-bit copies in flight before
+    /// each is packed stay bounded whatever the block's size. `0`: no bound.
+    pub wide_chunks: usize,
+}
+
+/// How a build packs what it generates ([`StreamSkip::pack`]), and the permits
+/// that bound the 64-bit chunks in flight ([`StreamSkip::wide_chunks`]).
+#[derive(Clone, Copy)]
+struct Packing<'a> {
+    on: bool,
+    permits: Option<&'a WidePermits>,
+}
+
+/// Permits for generating a chunk at 8 bytes a cell: a generator holds one
+/// from before it allocates its table until the table is packed. A holder does
+/// serial work only (the generators and `NarrowMain::pack` run on their
+/// caller's thread), so a waiting rayon worker never blocks a holder.
+pub(crate) struct WidePermits {
+    free: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl WidePermits {
+    pub(crate) fn new(n: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(n.max(1)),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait for a permit; it is given back when the guard drops.
+    pub(crate) fn acquire(&self) -> WidePermit<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        WidePermit(self)
+    }
+}
+
+/// A held [`WidePermits`] permit.
+pub(crate) struct WidePermit<'a>(&'a WidePermits);
+
+impl Drop for WidePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -3941,7 +3991,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: bool,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if skip == 0 {
@@ -3996,7 +4046,7 @@ fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: bool,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4029,7 +4079,7 @@ fn chunk_and_generate_optional<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: bool,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4055,7 +4105,7 @@ fn chunk_and_generate_optional<T: Sync>(
 fn generate_optional<T: Sync>(
     ops: &[T],
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: bool,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
@@ -4074,7 +4124,7 @@ fn generate_optional<T: Sync>(
 fn generate_chunks<T: Sync>(
     op_chunks: Vec<&[T]>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: bool,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
@@ -4092,8 +4142,9 @@ fn generate_chunks<T: Sync>(
         return Ok(tables);
     }
     let generate = |chunk: &[T]| {
+        let _permit = pack.permits.map(WidePermits::acquire);
         let mut table = generate(chunk);
-        if pack {
+        if pack.on {
             table.pack_main_narrow();
         }
         table
@@ -4501,7 +4552,11 @@ fn build_traces<I: ImageSource + Sync>(
     skip: &StreamSkip,
     mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
-    let pack = skip.pack;
+    let permits = (skip.pack && skip.wide_chunks > 0).then(|| WidePermits::new(skip.wide_chunks));
+    let pack = Packing {
+        on: skip.pack,
+        permits: permits.as_ref(),
+    };
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -4600,32 +4655,78 @@ fn build_traces<I: ImageSource + Sync>(
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
-    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
-    // split into row-ranges in the parallel path below) stays a single whole-source collector.
-    let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
-        Box::new(|h| {
-            for op in &bytewise_ops {
+    // The sources that are a sum over their ops are cut into slices of whole ops, so phase 4's
+    // buckets share them (a whole source was one bucket's long pole) and no slice's list of
+    // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
+    // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
+    // below; the rest stay one collector each.
+    let mut collectors: Vec<Collector> = Vec::new();
+    for slice in lt_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_lt(slice))
+        }));
+    }
+    for slice in mul_ops.chunks(mul_chunk.max(1)) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_mul(slice, mul_chunk))
+        }));
+    }
+    for slice in dvrm_ops.chunks(dvrm_chunk.max(1)) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_dvrm(slice, dvrm_chunk))
+        }));
+    }
+    for slice in branch_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_branch(slice))
+        }));
+    }
+    for slice in shift_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&shift::collect_bitwise_from_shift(slice))
+        }));
+    }
+    for slice in bytewise_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &eq_ops {
+        }));
+    }
+    for slice in eq_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &store_ops {
+        }));
+    }
+    for slice in store_ops.chunks(1 << 20) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        }));
+    }
+    for slice in memw_aligned_ops.chunks(1 << 22) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_memw_aligned(slice))
+        }));
+    }
+    // About 5,000 lookups per permutation.
+    for slice in keccak_ops.chunks(1 << 11) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_keccak(slice))
+        }));
+    }
+    for slice in ecdas_ops.chunks(1 << 16) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_ecdas(slice))
+        }));
+    }
+    collectors.extend([
+        Box::new(|h: &mut bitwise::BitwiseHistogram| {
+            h.add_ops(&collect_bitwise_from_commit(&commit_ops))
+        }) as Collector,
         Box::new(|h| {
             if !strip_blake3_side_effects() {
                 h.add_ops(&collect_bitwise_from_blake3(
@@ -4635,10 +4736,9 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
-    ];
+    ]);
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
@@ -4819,14 +4919,32 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
+    // A packing build generates LT packed a block at a time, as KECCAK_RND.
+    #[cfg(feature = "disk-spill")]
+    let built_packed = pack.on && storage_mode != StorageMode::Disk;
+    #[cfg(not(feature = "disk-spill"))]
+    let built_packed = pack.on;
     let gen_lts = || {
+        let (generate, pack): (fn(&[LtOperation]) -> _, _) = if built_packed {
+            (
+                |ops| {
+                    lt::generate_lt_trace_packed(ops).unwrap_or_else(|| lt::generate_lt_trace(ops))
+                },
+                Packing {
+                    on: true,
+                    permits: None,
+                },
+            )
+        } else {
+            (lt::generate_lt_trace, pack)
+        };
         chunk_and_generate_skipping(
             &lt_ops,
             max_rows.lt,
             skip.lt,
             skip.tails,
             true,
-            lt::generate_lt_trace,
+            generate,
             pack,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -4963,10 +5081,26 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
+        // A packing build generates each chunk packed a block at a time, so it
+        // holds no 64-bit copy and takes no permit.
+        let (generate, pack): (fn(&[KeccakRoundOperation]) -> _, _) = if built_packed {
+            (
+                |ops| {
+                    keccak_rnd::generate_keccak_rnd_trace_packed(ops)
+                        .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
+                },
+                Packing {
+                    on: true,
+                    permits: None,
+                },
+            )
+        } else {
+            (keccak_rnd::generate_keccak_rnd_trace, pack)
+        };
         if max_rows.keccak_rnd == super::KECCAK_RND_UNCHUNKED {
             generate_optional(
                 &keccak_rnd_ops,
-                keccak_rnd::generate_keccak_rnd_trace,
+                generate,
                 pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
@@ -4976,7 +5110,7 @@ fn build_traces<I: ImageSource + Sync>(
             chunk_and_generate_optional(
                 &keccak_rnd_ops,
                 (max_rows.keccak_rnd / 24).max(1),
-                keccak_rnd::generate_keccak_rnd_trace,
+                generate,
                 pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,

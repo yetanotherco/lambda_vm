@@ -75,6 +75,18 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
 }
 
+/// The raw words of `data`, without a copy: what a trace's packed form
+/// (`stark::narrow`) stores.
+#[inline]
+pub fn fe_words(data: &[FE]) -> &[u64] {
+    const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
+    const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
+    // SAFETY: `FE` is `#[repr(transparent)]` over `u64` with identical size and
+    // alignment (asserted above), so `data`'s elements are `data.len()` valid,
+    // aligned `u64`s for as long as `data` is borrowed.
+    unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u64, data.len()) }
+}
+
 #[cfg(test)]
 mod zeroed_fe_vec_tests {
     use super::*;

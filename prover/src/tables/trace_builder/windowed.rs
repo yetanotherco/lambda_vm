@@ -267,6 +267,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// With [`Self::pack_finished_tables`], `finish` generates at most `n`
+    /// chunks at 8 bytes a cell at once ([`StreamSkip::wide_chunks`]); `0` is
+    /// no bound. The tables are the same.
+    pub fn bound_finished_generation(mut self, n: usize) -> Self {
+        self.emitted.wide_chunks = n;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus
@@ -464,6 +472,13 @@ impl<'a> WindowedTraceBuilder<'a> {
 pub struct WalkedWindow {
     cpu_ops: Vec<super::CpuOperation>,
     walk: WalkOutputs,
+}
+
+impl WalkedWindow {
+    /// The bytes its lists take on the heap (capacities).
+    pub fn heap_bytes(&self) -> usize {
+        super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
+    }
 }
 
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
