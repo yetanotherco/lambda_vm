@@ -625,6 +625,55 @@ fn purge_freed_pages() -> bool {
     false
 }
 
+/// `LAMBDA_VM_BLOCK_DRAIN_PURGE=1`: from the walk's end to phase A's end, the
+/// allocator arenas of the walker and the accumulator (where the streamed
+/// chunks' ops were allocated) return each freed page at once, so the ops the
+/// committers free while the finish runs do not stay resident beside the
+/// finish's working set; every other arena keeps its pages. A measurement
+/// knob, off by default.
+fn drain_purge() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_DRAIN_PURGE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// The calling thread's jemalloc arena, in the lib's tests (`lib.rs` installs
+/// jemalloc); `None` elsewhere.
+#[cfg(test)]
+fn current_arena() -> Option<u32> {
+    // SAFETY: a NUL-terminated mallctl name whose value is an unsigned.
+    unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"thread.arena\0").ok() }
+}
+
+#[cfg(not(test))]
+fn current_arena() -> Option<u32> {
+    None
+}
+
+/// Set `arena`'s dirty and muzzy decay (milliseconds; 0 purges at once and on
+/// every later free, -1 never), returning what it had. Lib tests only.
+#[cfg(test)]
+fn swap_arena_decay(arena: u32, (dirty, muzzy): (isize, isize)) -> Option<(isize, isize)> {
+    use tikv_jemalloc_ctl::raw;
+    let (d, m) = (
+        format!("arena.{arena}.dirty_decay_ms\0"),
+        format!("arena.{arena}.muzzy_decay_ms\0"),
+    );
+    // SAFETY: NUL-terminated mallctl names whose values are ssize_t.
+    unsafe {
+        let was = (
+            raw::read::<isize>(d.as_bytes()).ok()?,
+            raw::read::<isize>(m.as_bytes()).ok()?,
+        );
+        raw::write(d.as_bytes(), dirty).ok()?;
+        raw::write(m.as_bytes(), muzzy).ok()?;
+        Some(was)
+    }
+}
+
+#[cfg(not(test))]
+fn swap_arena_decay(_arena: u32, _decay: (isize, isize)) -> Option<(isize, isize)> {
+    None
+}
+
 /// `LAMBDA_VM_BLOCK_MEMLOG=1`: [`MemLedger`]'s `BLOCK MEM` lines, every half
 /// second from the block's start to its proof and at the phase marks. A
 /// measurement knob, off by default.
@@ -937,6 +986,11 @@ fn build_streamed(
     // host, instances the device packed).
     let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
     let narrow = narrow_streamed();
+    let drain = drain_purge();
+    // The walker's and the accumulator's arenas ([`drain_purge`]), and the
+    // decay each had while they purge at once.
+    let producer_arenas: &Mutex<Vec<u32>> = &Mutex::new(Vec::new());
+    let drained: Mutex<Vec<(u32, (isize, isize))>> = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -1113,6 +1167,12 @@ fn build_streamed(
         }
 
         let produce = || -> Result<(Traces, f64), Error> {
+            if drain {
+                producer_arenas
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(current_arena());
+            }
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
@@ -1153,6 +1213,12 @@ fn build_streamed(
                 std::thread::scope(|inner| -> Result<_, Error> {
                     let (walked_tx, walked_rx) = mpsc::sync_channel(2);
                     let walking = inner.spawn(move || -> Result<_, Error> {
+                        if drain {
+                            producer_arenas
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .extend(current_arena());
+                        }
                         // One window held back: the run's last is `finish`'s.
                         let mut held: Option<Vec<executor::vm::logs::Log>> = None;
                         for logs in log_rx.iter() {
@@ -1202,6 +1268,25 @@ fn build_streamed(
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
             }
+            if drain {
+                let (t, before) = (Instant::now(), proc_rss_bytes());
+                let mut arenas = producer_arenas.lock().unwrap_or_else(|e| e.into_inner());
+                arenas.sort_unstable();
+                arenas.dedup();
+                let swapped: Vec<(u32, (isize, isize))> = arenas
+                    .iter()
+                    .filter_map(|&a| swap_arena_decay(a, (0, 0)).map(|was| (a, was)))
+                    .collect();
+                eprintln!(
+                    "BLOCK DRAIN PURGE: arenas {:?} return freed pages at once until phase A ends ({:.2} s) · \
+                     VmRSS {:.2} → {:.2} GiB",
+                    swapped.iter().map(|(a, _)| a).collect::<Vec<_>>(),
+                    t.elapsed().as_secs_f64(),
+                    before.map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64),
+                    proc_rss_bytes().map_or(-1.0, |b| b as f64 / (1u64 << 30) as f64),
+                );
+                *drained.lock().unwrap_or_else(|e| e.into_inner()) = swapped;
+            }
             if purge_before_finish() {
                 let (t, before) = (Instant::now(), proc_rss_bytes());
                 let purged = purge_freed_pages();
@@ -1239,6 +1324,12 @@ fn build_streamed(
             if let Err(e) = join(c) {
                 errors.push(e);
             }
+        }
+        // Phase A's committers are done: the producer's arenas keep their
+        // pages again.
+        for (arena, was) in std::mem::take(&mut *drained.lock().unwrap_or_else(|e| e.into_inner()))
+        {
+            let _ = swap_arena_decay(arena, was);
         }
         let (mut traces, collect_secs) = produced?;
         if let Some(e) = errors.into_iter().next() {
@@ -1635,5 +1726,14 @@ mod purge_tests {
         assert!(super::purge_freed_pages());
         let after = unsafe { raw::read::<isize>(name) }.expect("arena 0 decay");
         assert_eq!(before, after);
+    }
+
+    /// A thread finds its own arena, and a swapped decay comes back as it was.
+    #[test]
+    fn an_arena_decay_swaps_and_swaps_back() {
+        let arena = super::current_arena().expect("this thread's arena");
+        let was = super::swap_arena_decay(arena, (0, 0)).expect("swap to 0");
+        assert_eq!(super::swap_arena_decay(arena, was), Some((0, 0)));
+        assert_eq!(super::swap_arena_decay(arena, was), Some(was));
     }
 }
