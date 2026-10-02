@@ -1248,8 +1248,16 @@ fn the_whir_block_tree_on_a_real_block() {
     // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
-    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
-    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
+    // (production drops them).
+    match std::env::var("BLOCK_WHIR_DROP_OPS")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.drop_streamed_ops = false,
+        Ok("1") => options.drop_streamed_ops = true,
+        _ => {}
+    }
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);

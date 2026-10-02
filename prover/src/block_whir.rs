@@ -166,8 +166,9 @@ pub struct BlockOptions {
     pub stream_memw_lt: bool,
     /// With windows: the builder drops each streamed chunk's ops as the chunk
     /// leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so the build does
-    /// not hold the run's op lists to its end; the traces are the same. Off by
-    /// default until its box gate (D-MEMORY M1).
+    /// not hold the run's op lists to its end; the traces are the same. On in
+    /// production (D-MEMORY M1, FAST 501: 1× base −0.74 s, peak 47.4 → 36.6
+    /// GiB, the 1.20× block proves).
     pub drop_streamed_ops: bool,
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
@@ -194,7 +195,7 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
-            drop_streamed_ops: false,
+            drop_streamed_ops: true,
             layout_workers: 0,
             pack_rest_as_laid_out: false,
         }

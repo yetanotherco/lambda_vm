@@ -1176,7 +1176,8 @@ fn block_whir_on_a_real_block() {
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
     // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
-    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
+    // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
+    // (production drops them).
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -1185,7 +1186,14 @@ fn block_whir_on_a_real_block() {
     }
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
-    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
+    match std::env::var("BLOCK_WHIR_DROP_OPS")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.drop_streamed_ops = false,
+        Ok("1") => options.drop_streamed_ops = true,
+        _ => {}
+    }
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {} · {}",
         format.group_polys,
@@ -1237,6 +1245,22 @@ fn block_whir_on_a_real_block() {
         proof.proof.columns.len(),
         proof.proof.roots.len(),
     );
+    // The statement's shape, beside the roots: two proves of one block give
+    // the same digest when they built the same tables and partition (row
+    // order inside the HashMap-ordered tables aside), whatever their proof
+    // bytes.
+    let shape = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        proof.table_num_vars.hash(&mut h);
+        proof.groups.hash(&mut h);
+        format!("{:?}", proof.table_counts).hash(&mut h);
+        format!("{:?}", proof.runtime_page_ranges).hash(&mut h);
+        proof.public_output.hash(&mut h);
+        proof.num_private_input_pages.hash(&mut h);
+        h.finish()
+    };
+    println!("BLOCK SHAPE DIGEST: {shape:016x}");
     assert!(ok, "the block proof must verify");
 }
 
