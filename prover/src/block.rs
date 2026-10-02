@@ -525,15 +525,14 @@ fn stream_generators() -> usize {
 /// (`LAMBDA_VM_BLOCK_FINISH_COMMIT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FinishCommit {
-    /// Unset or `0`: in phase B's Round 1, as before.
+    /// `0`: in phase B's Round 1 (the A arm).
     PhaseB,
-    /// `1`: on phase A's committers, each as soon as the finish has built it
-    /// ([`WindowedTraceBuilder::finish_handing`]), while the finish goes on.
+    /// Unset or `1`: on phase A's committers, each as soon as the finish has
+    /// built it ([`WindowedTraceBuilder::finish_handing`]), while the finish
+    /// goes on. At the median block on BIG, with the committers' own pool:
+    /// phase A +5.45 s, phase B −13.32 s, base −7.85 s (BIG 463, three runs an
+    /// arm).
     Handed,
-    /// `after`: on phase A's committers, every one once the finish has
-    /// returned ([`finish_sink::hand_built`]): the commits move without
-    /// overlapping the finish. A measurement arm.
-    After,
 }
 
 /// [`FinishCommit`] from `LAMBDA_VM_BLOCK_FINISH_COMMIT`; anything else stops
@@ -543,12 +542,9 @@ fn finish_commit() -> FinishCommit {
         .as_deref()
         .map(str::trim)
     {
-        Err(_) | Ok("0") => FinishCommit::PhaseB,
-        Ok("1") => FinishCommit::Handed,
-        Ok("after") => FinishCommit::After,
-        Ok(other) => {
-            panic!("LAMBDA_VM_BLOCK_FINISH_COMMIT must be `0`, `1` or `after`, got `{other}`")
-        }
+        Err(_) | Ok("1") => FinishCommit::Handed,
+        Ok("0") => FinishCommit::PhaseB,
+        Ok(other) => panic!("LAMBDA_VM_BLOCK_FINISH_COMMIT must be `0` or `1`, got `{other}`"),
     }
 }
 
@@ -647,19 +643,23 @@ impl CardGate {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_COMMIT_POOL=n` (1..=32): the committers make their commits
+/// Threads in the committers' own rayon pool ([`commit_pool_threads`]).
+const COMMIT_POOL_THREADS: usize = 8;
+
+/// `LAMBDA_VM_BLOCK_COMMIT_POOL=n` (0..=32): the committers make their commits
 /// inside a rayon pool of `n` threads of their own, so the host-side parallel
 /// work of a commit (a small table's host LDE and tree, a packed trace's
 /// widening) does not queue behind the finish's generation, which holds every
 /// worker of the global pool while it runs (BIG 462: during p5 the finish handed
-/// 140 tables and none was committed until p5 ended). Unset or `0`: the global
-/// pool, as before.
+/// 140 tables and none was committed until p5 ended; BIG 463 with the pool:
+/// 127–141 committed in p5). `0`: the global pool (the A arm). Unset is
+/// [`COMMIT_POOL_THREADS`].
 fn commit_pool_threads() -> usize {
     std::env::var("LAMBDA_VM_BLOCK_COMMIT_POOL")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n <= 32)
-        .unwrap_or(0)
+        .unwrap_or(COMMIT_POOL_THREADS)
 }
 
 /// How phase A's stream hands its chunks to the device: committer and
@@ -1445,20 +1445,10 @@ fn build_streamed(
             }
             let windows = builder.stamps();
             let t = Instant::now();
-            let handing = sink
-                .as_ref()
-                .filter(|_| stream.finish == FinishCommit::Handed)
-                .map(|sink| sink as &dyn FinishSink);
-            #[allow(unused_mut)]
-            let mut traces = builder.finish_handing(&last, handing)?;
+            let traces =
+                builder.finish_handing(&last, sink.as_ref().map(|sink| sink as &dyn FinishSink))?;
+            drop(sink);
             let finish_secs = t.elapsed().as_secs_f64();
-            if let Some(sink) = sink.filter(|_| stream.finish == FinishCommit::After) {
-                let handed = finish_sink::hand_built(&mut traces, &sink);
-                eprintln!(
-                    "BLOCK FINISH COMMIT: {handed} tables the finish built handed to phase A's \
-                     committers once it returned (LAMBDA_VM_BLOCK_FINISH_COMMIT=after)"
-                );
-            }
             if let Some(ledger) = ledger {
                 ledger.line("finish done");
             }
@@ -1734,20 +1724,18 @@ pub(crate) fn stream_for_test(
     )
 }
 
-/// [`stream_for_test`] with the finish's tables committed in phase A
-/// (`finish`: [`FinishCommit::Handed`] or [`FinishCommit::After`]), the
+/// [`stream_for_test`] with the finish's tables handed to phase A's
+/// committers as the finish builds them ([`FinishCommit::Handed`]), the
 /// commits admitted through a card gate of `card_budget` bytes and made in a
 /// pool of `commit_pool` threads of their own (0: the global pool), and the
 /// ledger on.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_finish_commit_for_test(
     program: &Elf,
     opts: &ProofOptions,
     max_rows: &MaxRowsConfig,
     committers: usize,
     generators: usize,
-    handed: bool,
     card_budget: Option<usize>,
     commit_pool: usize,
 ) -> Result<(Traces, Vec<String>), Error> {
@@ -1758,11 +1746,7 @@ pub(crate) fn stream_finish_commit_for_test(
         StreamConfig {
             committers,
             generators,
-            finish: if handed {
-                FinishCommit::Handed
-            } else {
-                FinishCommit::After
-            },
+            finish: FinishCommit::Handed,
             card_budget,
             commit_pool,
         },

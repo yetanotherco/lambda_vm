@@ -239,8 +239,9 @@ pub fn hand_or_keep(
 
 /// Every plain table `traces` holds (not a placeholder) handed to `sink` at
 /// once, in [`FinishedKind::ALL`] order: what a finish that hands nothing off
-/// leaves for phase B. The tables handed.
-pub fn hand_built(traces: &mut Traces, sink: &dyn FinishSink) -> usize {
+/// leaves for phase B. The tables handed. A finish double for the tests.
+#[cfg(test)]
+pub(crate) fn hand_built(traces: &mut Traces, sink: &dyn FinishSink) -> usize {
     let mut handed = 0;
     for kind in FinishedKind::ALL {
         let slots = kind.slots(traces);
@@ -596,8 +597,8 @@ mod tests {
     }
 
     /// ★ Phase A's committers also commit the tables the finish built, each as
-    /// the finish builds it (`LAMBDA_VM_BLOCK_FINISH_COMMIT=1`) or all once it
-    /// returns (`after`): the stream builds the same traces, precommits every
+    /// the finish builds it (`LAMBDA_VM_BLOCK_FINISH_COMMIT`, the default): the
+    /// stream builds the same traces, precommits every
     /// streamed instance it did before and every plain table the finish built,
     /// leaves the ledger empty, and a card gate that admits one commit at a
     /// time changes none of it — with the committers generating, or generators
@@ -621,19 +622,13 @@ mod tests {
             every.sort();
             names.sort();
             assert!(names.len() < every.len(), "{name}: the finish built tables");
-            for (committers, generators, handed, pool) in [
-                (3, 0, true, 0),
-                (2, 3, true, 2),
-                (3, 0, false, 2),
-                (2, 3, false, 0),
-            ] {
+            for (committers, generators, pool) in [(3, 0, 0), (2, 3, 2), (3, 0, 2), (2, 3, 0)] {
                 let (mut after, mut after_names) = crate::block::stream_finish_commit_for_test(
                     &program,
                     &opts,
                     &max_rows,
                     committers,
                     generators,
-                    handed,
                     Some(1),
                     pool,
                 )
