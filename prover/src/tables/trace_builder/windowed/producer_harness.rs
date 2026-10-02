@@ -15,7 +15,11 @@
 //!
 //! Thread seconds come from `/proc/thread-self/schedstat` (Linux; `None`
 //! elsewhere), peak memory from `VmHWM`. The threads are named (`prod-exec`,
-//! `prod-walk`, `prod-acc`, `prod-gen<i>`) so a profiler can tell them apart.
+//! `prod-walk`, `prod-acc`, `prod-gen<i>`, `prod-rss`) so a profiler can tell
+//! them apart. With `live`, each stage prints a `PRODUCER LIVE` line as it
+//! happens (every window, each thread's end, the finish) and `prod-rss` prints
+//! the resident set every second, so a run killed for memory still says how far
+//! it got.
 
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -51,6 +55,8 @@ pub(crate) struct ProducerConfig {
     /// [`WindowedTraceBuilder::drop_streamed_ops`].
     pub drop_ops: bool,
     pub sink: Sink,
+    /// Print `PRODUCER LIVE` lines as the run goes.
+    pub live: bool,
 }
 
 /// One walked window, as the accumulator saw it.
@@ -132,6 +138,14 @@ fn peak_gib() -> Option<f64> {
     Some(kib / (1024.0 * 1024.0))
 }
 
+/// The process's `VmRSS` in GiB (Linux).
+fn rss_gib() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kib: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib / (1024.0 * 1024.0))
+}
+
 fn cpu_since(start: Option<f64>) -> Option<f64> {
     Some(thread_cpu()? - start?)
 }
@@ -193,12 +207,37 @@ pub(crate) fn run_producer(
     let window = cfg.window.max(1);
     let start = Instant::now();
     let since = || start.elapsed().as_secs_f64();
+    let live = |line: String| {
+        if cfg.live {
+            println!("PRODUCER LIVE {:.3} {line}", since());
+        }
+    };
+    let stop_rss = std::sync::atomic::AtomicBool::new(false);
 
     let jobs_rx: Mutex<Option<mpsc::Receiver<ChunkJob>>> = Mutex::new(None);
     let generated: Mutex<Vec<(StreamTable, usize, f64)>> = Mutex::new(Vec::new());
     let chunk_done_at: Mutex<Vec<f64>> = Mutex::new(Vec::new());
 
     let (mut report, exec, generators) = std::thread::scope(|scope| {
+        if cfg.live {
+            let stop_rss = &stop_rss;
+            spawn_named(scope, "prod-rss", move || {
+                let stopped = || stop_rss.load(std::sync::atomic::Ordering::Relaxed);
+                while !stopped() {
+                    live(format!(
+                        "rss {} GiB · hwm {} GiB",
+                        opt(rss_gib()),
+                        opt(peak_gib())
+                    ));
+                    for _ in 0..10 {
+                        if stopped() {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })?;
+        }
         // The executor, a window at a time, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<Log>>(2);
         let exec = spawn_named(scope, "prod-exec", move || {
@@ -234,6 +273,10 @@ pub(crate) fn run_producer(
             }
             times.done_at = since();
             times.cpu = cpu_since(cpu0);
+            live(format!(
+                "executor done · {cycles} cycles · resume {resume:.3} · copy {copy:.3} · cpu {} s",
+                opt(times.cpu)
+            ));
             Ok::<_, Error>(ExecPart {
                 setup,
                 resume,
@@ -313,6 +356,7 @@ pub(crate) fn run_producer(
                             let cpu0 = thread_cpu();
                             let mut times = ThreadTimes::default();
                             let mut walked_at = Vec::new();
+                            let mut walk_total = 0.0;
                             // One window held back: the run's last is `finish`'s.
                             let mut held: Option<Vec<Log>> = None;
                             loop {
@@ -325,6 +369,7 @@ pub(crate) fn run_producer(
                                     let t_walk = Instant::now();
                                     let walked = walker.walk(&prev)?;
                                     let secs = t_walk.elapsed().as_secs_f64();
+                                    walk_total += secs;
                                     walked_at.push(since());
                                     let t_send = Instant::now();
                                     let sent = walked_tx.send((walked, secs));
@@ -336,6 +381,11 @@ pub(crate) fn run_producer(
                             }
                             times.done_at = since();
                             times.cpu = cpu_since(cpu0);
+                            live(format!(
+                                "walker done · {} windows · walk {walk_total:.3} · cpu {} s",
+                                walked_at.len(),
+                                opt(times.cpu)
+                            ));
                             let last = held.ok_or_else(|| {
                                 Error::Execution("the run executed no cycle".to_string())
                             })?;
@@ -358,11 +408,23 @@ pub(crate) fn run_producer(
                             let t_absorb = Instant::now();
                             let jobs = accumulator.absorb(walked);
                             let absorb = t_absorb.elapsed().as_secs_f64();
-                            report.windows.push(WindowRow {
+                            let row = WindowRow {
                                 absorb,
                                 jobs: jobs.len(),
                                 ..row
-                            });
+                            };
+                            live(format!(
+                                "window {} · cycles {} · walk {:.4} · absorb {:.4} · jobs {} · first-touch \
+                                 bytes {} · rss {} GiB",
+                                report.windows.len(),
+                                row.cycles,
+                                row.walk,
+                                row.absorb,
+                                row.jobs,
+                                row.first_touch_bytes,
+                                opt(rss_gib())
+                            ));
+                            report.windows.push(row);
                             let t_send = Instant::now();
                             for job in jobs {
                                 if job_tx.send(job).is_err() {
@@ -386,12 +448,27 @@ pub(crate) fn run_producer(
                 report.stamp_route = stamps.route;
                 report.stamp_handout = stamps.generate;
                 report.peak_windows = peak_gib();
+                live(format!(
+                    "windows done · walk {:.3} · route {:.3} · hand-out {:.3} · accumulator cpu {} s · \
+                     rss {} GiB · hwm {} GiB",
+                    report.stamp_walk,
+                    report.stamp_route,
+                    report.stamp_handout,
+                    opt(report.accumulator.cpu),
+                    opt(rss_gib()),
+                    opt(report.peak_windows)
+                ));
                 build_stamps::start();
                 let t_finish = Instant::now();
                 let traces = builder.finish(&last)?;
                 report.finish = t_finish.elapsed().as_secs_f64();
                 report.finish_marks = build_stamps::take();
                 report.peak_finish = peak_gib();
+                live(format!(
+                    "finish done · {:.3} s · hwm {} GiB",
+                    report.finish,
+                    opt(report.peak_finish)
+                ));
                 let t_drop = Instant::now();
                 drop(traces);
                 report.drop_tables = t_drop.elapsed().as_secs_f64();
@@ -399,7 +476,9 @@ pub(crate) fn run_producer(
             },
         )?;
 
-        let report = join(builder, "builder")?;
+        let report = join(builder, "builder");
+        stop_rss.store(true, std::sync::atomic::Ordering::Relaxed);
+        let report = report?;
         let generators: Vec<ThreadTimes> = generators
             .into_iter()
             .map(|g| join(g, "generator"))
@@ -546,12 +625,7 @@ impl ProducerReport {
             opt(self.peak_finish),
             opt(self.peak_end),
         ));
-        for (i, row) in self.windows.iter().enumerate() {
-            out.push(format!(
-                "PRODUCER WINDOW {i}: cycles {} · walk {:.4} · absorb {:.4} · jobs {} · first-touch bytes {}",
-                row.cycles, row.walk, row.absorb, row.jobs, row.first_touch_bytes
-            ));
-        }
+
         out.push(format!(
             "PRODUCER SUMMARY label={label} cycles={} windows={} exec_cpu={} exec_resume={:.3} exec_span={:.3} \
              walker_walk={:.3} walker_cpu={} acc_route={:.3} acc_handout={:.3} acc_cpu={} gen_secs={gen_secs:.3} \
@@ -614,6 +688,7 @@ fn the_block_producer_alone() {
         generators: env_usize("LAMBDA_VM_PRODUCER_GENERATORS", 3),
         drop_ops: env_usize("LAMBDA_VM_PRODUCER_DROP_OPS", 1) != 0,
         sink,
+        live: true,
     };
     let label = std::path::Path::new(&input)
         .file_stem()
@@ -698,6 +773,7 @@ fn the_producer_harness_drives_the_builder() {
                     generators: 2,
                     drop_ops,
                     sink,
+                    live: false,
                 };
                 let report = run_producer(&elf, &[], &cfg).expect("the producer runs");
                 let what = format!("{name}, window {window}, {sink:?}");
