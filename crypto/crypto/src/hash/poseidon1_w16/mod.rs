@@ -5,6 +5,10 @@
 //! so the base-hash candidate can be measured (chip census, device kernels)
 //! against RPX; choosing to ship it is a separate decision.
 //!
+//! ZisK runs this same instance (pil2-proofman's `Poseidon1_16`): its own
+//! implementation reproduces the known answers here, and [`super::poseidon1_stark`]
+//! builds ZisK's leaf, tree, transcript and grinding on it.
+//!
 //! # The instance, and where each number comes from
 //!
 //! Plonky3 publishes Goldilocks Poseidon1 constants and known answers only at

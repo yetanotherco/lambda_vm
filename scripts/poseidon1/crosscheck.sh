@@ -8,6 +8,9 @@
 #    permutation reproduces our W16 KATs;
 # 5. exhaustive MDS check of the W16 circulant, with a negative control;
 # 6. Plonky3's Rust Poseidon1 (sparse partial rounds) reproduces our W16 KATs.
+# 7. ZisK's own Rust (pil2-proofman `proofman-fields`, MIT/Apache) regenerates the base
+#    STARK's known answers (W16/W8 permutations, leaf, 4-ary tree and path, transcript,
+#    grinding) byte for byte.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 PLONKY3=${PLONKY3:-/Users/maurofab/workspace/Plonky3}
@@ -48,3 +51,9 @@ echo "negative control (last entry 3 -> 1):"
 (cd "$HERE/p3_crosscheck" && CARGO_TARGET_DIR="$OUT/p3_target" "$RUN" cargo run --release -q) \
   > "$OUT/p3_rust_kat16.txt"
 diff "$OUT/p3_rust_kat16.txt" "$OUT/mine_kat16.txt" && echo "W16 KATs: Plonky3 Rust Poseidon1 MATCH"
+
+(cd "$HERE/zisk_crosscheck" && CARGO_TARGET_DIR="$OUT/zisk_target" "$RUN" cargo run --release -q) \
+  > "$OUT/zisk_kat.rs"
+rustfmt --edition 2024 "$OUT/zisk_kat.rs"
+diff "$OUT/zisk_kat.rs" "$HERE/../../crypto/crypto/src/hash/poseidon1_stark/zisk_kat.rs" \
+  && echo "base-STARK KATs: ZisK proofman-fields MATCH"
