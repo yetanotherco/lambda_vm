@@ -368,3 +368,30 @@ fn the_one_pass_routing_is_the_routing() {
         );
     }
 }
+
+/// The decode table's row of each pc is the DECODE trace's
+/// ([`decode::generate_decode_trace`]'s `pc_to_row`), so counting DECODE's
+/// multiplicities through it counts the same rows; a pc outside the map has
+/// none.
+#[test]
+fn the_decode_tables_rows_are_the_decode_traces() {
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "lw_sw_offset_odd",
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+        let instructions = decode::instructions_from_elf(&program).expect("the instructions");
+        let (_, pc_to_row) = decode::generate_decode_trace(&instructions);
+        let table = DecodeTable::from_instructions(&instructions);
+        for &pc in instructions.keys() {
+            assert_eq!(
+                table.row(pc),
+                pc_to_row.get(&pc).copied(),
+                "{name}: pc {pc:#x}"
+            );
+        }
+        assert_eq!(table.row(super::cpu::CPU_PADDING_PC), None);
+        assert_eq!(table.row(u64::MAX), None);
+    }
+}

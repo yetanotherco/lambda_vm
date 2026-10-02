@@ -590,6 +590,25 @@ impl DecodeTable {
         Self { runs }
     }
 
+    /// The DECODE row of the instruction at `pc`, if the map holds one: the
+    /// rows go in pc order ([`decode::generate_decode_trace`]), and so do the
+    /// runs' entries, so a pc's row is its place among them.
+    #[inline]
+    pub(crate) fn row(&self, pc: u64) -> Option<usize> {
+        let mut before = 0;
+        for (first, entries) in &self.runs {
+            let offset = pc.wrapping_sub(*first);
+            if offset % 4 == 0
+                && let Ok(slot) = usize::try_from(offset / 4)
+                && slot < entries.len()
+            {
+                return Some(before + slot);
+            }
+            before += entries.len();
+        }
+        None
+    }
+
     /// The decode of the instruction at `pc`, if the map holds one.
     #[inline]
     fn get(&self, pc: u64) -> Option<&DecodeEntry> {
@@ -2284,7 +2303,24 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 /// assumptions — the caller's (CPU's) responsibility.
 fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
+    for_each_bitwise_from_memw_aligned(ops, |op| bitwise_ops.push(op));
+    bitwise_ops
+}
 
+/// [`collect_bitwise_from_memw_aligned`]'s lookups counted into `histogram`,
+/// with no list built.
+fn count_bitwise_from_memw_aligned(
+    ops: &[MemwOperation],
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    for_each_bitwise_from_memw_aligned(ops, |op| histogram.bump(op));
+}
+
+/// Each of [`collect_bitwise_from_memw_aligned`]'s lookups, in its order.
+fn for_each_bitwise_from_memw_aligned(
+    ops: &[MemwOperation],
+    mut emit: impl FnMut(BitwiseOperation),
+) {
     for op in ops {
         let low_half = (op.base_address & 0xFFFF) as u32;
         let mask: u32 = match op.width {
@@ -2302,14 +2338,12 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
         );
         let x = (value & 0xFF) as u8;
         let y = ((value >> 8) & 0xFF) as u8;
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             x,
             y,
         ));
     }
-
-    bitwise_ops
 }
 
 // =============================================================================
@@ -2363,18 +2397,29 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
+    for_each_bitwise_from_lt(lt_ops, |op| bitwise_ops.push(op));
+    bitwise_ops
+}
 
+/// [`collect_bitwise_from_lt`]'s lookups counted into `histogram`, with no
+/// list built.
+fn count_bitwise_from_lt(lt_ops: &[LtOperation], histogram: &mut bitwise::BitwiseHistogram) {
+    for_each_bitwise_from_lt(lt_ops, |op| histogram.bump(op));
+}
+
+/// Each of [`collect_bitwise_from_lt`]'s lookups, in its order.
+fn for_each_bitwise_from_lt(lt_ops: &[LtOperation], mut emit: impl FnMut(BitwiseOperation)) {
     for op in lt_ops {
         // MSB16 lookups for lhs[2] and rhs[2]
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
 
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (lhs_2 & 0xFF) as u8,
             (lhs_2 >> 8) as u8,
         ));
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (rhs_2 & 0xFF) as u8,
             (rhs_2 >> 8) as u8,
@@ -2384,7 +2429,7 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
@@ -2394,19 +2439,17 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
         // IS_HALFWORD lookups for lhs[1] and rhs[1]
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             (lhs_1 >> 8) as u8,
         ));
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             (rhs_1 >> 8) as u8,
         ));
     }
-
-    bitwise_ops
 }
 
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
