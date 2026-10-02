@@ -77,6 +77,9 @@ use crate::tables::{
     cpu, decode, load, lt, memw, memw_aligned, memw_register, register, shift, store,
 };
 
+#[cfg(test)]
+mod producer_harness;
+
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 /// The tables a windowed build streams: those whose op lists grow in
