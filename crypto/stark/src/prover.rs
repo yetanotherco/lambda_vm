@@ -593,6 +593,20 @@ where
     #[cfg(feature = "cuda")]
     gpu_main: Option<math_cuda::lde::GpuLdeBase>,
     recommit_on_device: bool,
+    /// The trace packed by the device from the commit's snapshot
+    /// ([`set_default_pack_after_commit`]), for the caller to install.
+    narrow: Option<crate::narrow::NarrowMain>,
+}
+
+impl<Field: IsField + 'static, H: StarkHash> PrecommittedMain<Field, H>
+where
+    FieldElement<Field>: AsBytes + Sync + Send,
+{
+    /// The trace the device packed after this commit, if it packed one
+    /// (`TraceTable::install_main_narrow` takes it).
+    pub fn take_narrow(&mut self) -> Option<crate::narrow::NarrowMain> {
+        self.narrow.take()
+    }
 }
 
 impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
@@ -1212,6 +1226,18 @@ static TOP_LEVELS_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// full recommit. Proofs are the same bytes either way.
 pub fn set_default_recommit_top_levels(k: usize) {
     TOP_LEVELS_DEFAULT.store(k, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a plain table's commit under `RecomputeLdeDevice` with kept top
+/// levels also packs its trace on the device from the commit's snapshot
+/// (`math_cuda::narrow::pack_trace_snapshot`), so the host can drop the 64-bit
+/// copy (`TraceTable::install_main_narrow`). Off unless a caller sets it.
+static PACK_AFTER_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether commits pack their traces on the device (see
+/// [`PACK_AFTER_COMMIT`]). Proofs are the same bytes either way.
+pub fn set_default_pack_after_commit(on: bool) {
+    PACK_AFTER_COMMIT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Tables whose fused task recomputed the LDE alone against kept top levels.
@@ -5076,6 +5102,8 @@ pub trait IsStarkProver<
             storage_mode,
             residency,
         )?;
+        #[allow(unused_mut)]
+        let mut narrow = None;
         // `RecomputeLdeDevice`: the root is all this phase keeps. The device
         // LDE, tree and trace snapshot are freed here, inside the admitted
         // region, so the next table's commit is admitted against an empty
@@ -5099,6 +5127,21 @@ pub trait IsStarkProver<
                             ))
                         })?;
                         committed.0.top_tree = Some(Arc::new(top));
+                        // The trace, packed from the snapshot before it is
+                        // freed: the fused task widens it on the device.
+                        if PACK_AFTER_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
+                            let rows = handle.trace_rows;
+                            narrow = math_cuda::narrow::pack_trace_snapshot(&handle)
+                                .map_err(|e| {
+                                    ProvingError::DevicePath(format!(
+                                        "table {}: packing the trace: {e:?}",
+                                        air.name()
+                                    ))
+                                })?
+                                .and_then(|(widths, data)| {
+                                    crate::narrow::NarrowMain::from_parts(rows, widths, data)
+                                });
+                        }
                     }
                     true
                 }
@@ -5115,6 +5158,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "cuda")]
             gpu_main,
             recommit_on_device,
+            narrow,
         })
     }
 
@@ -5374,7 +5418,7 @@ pub trait IsStarkProver<
         );
         crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
         let __ps_abs = crate::prove_split::mark();
-        for result in main_results {
+        for (idx, result) in main_results.into_iter().enumerate() {
             let result = result.expect("run_admitted fills every slot");
             let PrecommittedMain {
                 commit,
@@ -5382,7 +5426,13 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 gpu_main,
                 recommit_on_device,
+                narrow,
             } = result?;
+            // A trace the device packed after its Round-1 commit drops its
+            // 64-bit copy here; its fused task widens it on the device.
+            if let Some(narrow) = narrow {
+                air_trace_pairs[idx].1.install_main_narrow(narrow);
+            }
             if let Some(ref pre_root) = commit.precomputed_root {
                 transcript.append_bytes(pre_root);
             }

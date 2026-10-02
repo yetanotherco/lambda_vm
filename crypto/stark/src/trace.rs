@@ -408,6 +408,31 @@ where
         true
     }
 
+    /// Take `narrow` as this trace's packed main trace (packed elsewhere, e.g.
+    /// by the device from the commit's snapshot) and free the 64-bit copy, as
+    /// [`Self::pack_main_narrow`] would. `false`, and the trace untouched, when
+    /// its shape is not this trace's or the trace could not be packed here.
+    pub fn install_main_narrow(&mut self, narrow: crate::narrow::NarrowMain) -> bool
+    where
+        F: 'static,
+    {
+        if narrow.rows() != self.main_table.height
+            || narrow.cols() != self.main_table.width
+            || cfg!(feature = "debug-checks")
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return false;
+        }
+        #[cfg(feature = "disk-spill")]
+        if self.main_table.mmap_backing.is_some() {
+            return false;
+        }
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        true
+    }
+
     /// Whether the main trace is packed ([`Self::pack_main_narrow`]).
     pub fn is_main_narrow(&self) -> bool {
         self.narrow_main.is_some()

@@ -110,6 +110,27 @@ impl NarrowMain {
         }
     }
 
+    /// A packed trace from its parts (the device pack's output): `rows` rows,
+    /// the column widths, and the columns back to back. `None` when a width is
+    /// not 1, 2, 4 or 8 or the bytes are not `rows × Σ widths`.
+    pub fn from_parts(rows: usize, widths: Vec<u8>, data: Vec<u8>) -> Option<Self> {
+        if widths.iter().any(|w| ![1, 2, 4, 8].contains(w)) {
+            return None;
+        }
+        let mut offsets = Vec::with_capacity(widths.len());
+        let mut total = 0usize;
+        for &w in &widths {
+            offsets.push(total);
+            total = total.checked_add(rows.checked_mul(w as usize)?)?;
+        }
+        (total == data.len()).then_some(Self {
+            rows,
+            widths,
+            offsets,
+            data,
+        })
+    }
+
     /// Rows of the trace.
     pub fn rows(&self) -> usize {
         self.rows
