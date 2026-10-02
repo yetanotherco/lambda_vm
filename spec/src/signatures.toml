@@ -118,12 +118,6 @@ tag = "ECALL"
 kind = "interaction"
 input = ["Word", "DWordWL"]
 
-# COMMIT_DEFER[timestamp, src, dst, count]
-[[signatures]]
-tag = "COMMIT_DEFER"
-kind = "interaction"
-input = ["Word", "DWordWL", "DWordWL", "DWordWL"]
-
 # COPY_NEXT[timestamp, src, dst, count, is_set, is_commit]
 [[signatures]]
 tag = "COPY_NEXT"
