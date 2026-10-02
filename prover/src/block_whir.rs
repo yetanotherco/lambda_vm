@@ -41,7 +41,7 @@ use crate::multilinear_prove::{
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::trace_builder::{
-    ChunkJob, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
+    ChunkJob, Counter, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -97,6 +97,20 @@ pub const BLOCK_MAX_TABLE_VARS: usize = 27;
 
 const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
 const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
+
+/// `LAMBDA_VM_FINISH_EARLY=0` leaves the table phase's commutative BITWISE
+/// sources to the finish (the A arm); unset or anything else counts them window
+/// by window on a counter thread of their own
+/// ([`WindowedTraceBuilder::count_windows_apart`], D-EXEC E2), so the finish
+/// counts only the last window and what depends on the whole run. The traces
+/// are the same either way.
+fn count_windows_apart() -> bool {
+    std::env::var("LAMBDA_VM_FINISH_EARLY").map_or(true, |v| v.trim() != "0")
+}
+
+/// Count jobs waiting for the counter: each holds one window's routed
+/// segments, so this bounds what the counter keeps alive.
+const COUNT_JOBS_AHEAD: usize = 2;
 
 /// Tree levels a group keeps OFF the host between its commit and its opening:
 /// a query re-hashes `2^4` of its codeword's cosets to rebuild them. A
@@ -2004,13 +2018,25 @@ fn prove_streamed(
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
                 }
+                if count_windows_apart() {
+                    builder = builder.count_windows_apart()?;
+                }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
                 // thread appends each walked window, routes it and hands its
                 // chunks out as jobs (the layout thread generates them).
-                let last = {
+                let (last, counter) = {
                     let (mut walker, mut accumulator) = builder.split();
-                    std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
+                    std::thread::scope(|inner| -> Result<_, Error> {
+                        // The windows' BITWISE counting, off the accumulator.
+                        let (ctx, crx) = std::sync::mpsc::sync_channel(COUNT_JOBS_AHEAD);
+                        let counting = inner.spawn(move || {
+                            let mut counter = Counter::new();
+                            for job in crx {
+                                counter.count(job);
+                            }
+                            counter
+                        });
                         let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
                         let walking = inner.spawn(move || -> Result<_, Error> {
                             // One window held back: only the run's last window
@@ -2035,12 +2061,28 @@ fn prove_streamed(
                                     return Err(Error::Prover("the layout thread stopped".into()));
                                 }
                             }
+                            for job in accumulator.take_count_jobs() {
+                                let _ = ctx.send(job);
+                            }
                         }
-                        walking
+                        drop(ctx);
+                        let last = walking
                             .join()
-                            .map_err(|_| Error::Prover("the block's walker panicked".into()))?
+                            .map_err(|_| Error::Prover("the block's walker panicked".into()))??;
+                        let counter = counting
+                            .join()
+                            .map_err(|_| Error::Prover("the block's counter panicked".into()))?;
+                        Ok((last, counter))
                     })?
                 };
+                if counter.windows() > 0 {
+                    eprintln!(
+                        "BLOCK STREAM counter: {} windows · count {:.2} (s)",
+                        counter.windows(),
+                        counter.secs()
+                    );
+                    builder.add_counter(counter)?;
+                }
                 let windows_done = start.elapsed().as_secs_f64();
                 let window_stamps = builder.stamps();
                 // The table phase's marks, for `finish` alone.
