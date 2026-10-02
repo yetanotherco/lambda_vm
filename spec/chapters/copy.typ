@@ -89,7 +89,7 @@ memcpy(dest + 8, dest, count - 8)
 #et[technically, you'd have to duplicate the `ch`.... Also, hte ref to memcpy is confusing...]
 where we expect the `memcpy` function to perform the copy one byte at a time, incrementing the address as it goes along.
 This leads to eight copies of `ch` being repeated across the entire address interval $[#`dest`, #`dest` + #`count`)$, which is equivalent to setting the values held by all these addresses to `ch`.
-We will later show how this chip achieves this when $#`is_set` = 1$.
+We will later show how this chip achieves this by inverting the overlap handling when $#`is_set` = 1$.
 Lastly, note that `memset` calls with $#`count` <= 8$ should be mapped to a `STORE` operation directly, which is more efficient anyway.
 
 With the `mem*` operations now aligned, we turn our attention the `write` syscall, which has the following interface#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]]):
@@ -149,8 +149,7 @@ instead of reading this information from the registers as is done on `first`-row
 
 #render_constraint_table(chip, config, groups: "forward")
 
-Note: constraints @copy:c:range_src_incr, @copy:c:range_dst_incr and @copy:c:range_count_decr
-are included to satisfy assumptions made by the `ADD` and `SUB` templates.
+Note: constraints @copy:c:range_src_incr and @copy:c:range_dst_incr are included to satisfy assumptions made by the `ADD` template;  @copy:c:range_count_decr satisfies the assumption made by the `SUB` template in (which is inlined through @copy:c:count_borrows).
 
 == Terminating the recursion
 
@@ -158,15 +157,19 @@ Observe from @copy:c:send_next_chunk that raising the prover-hinted flag `end`
 stops the recursive behaviour.
 Without constraining this flag, the prover has two possibilities to cheat: set the 
 flag early, or set the flag late.
-Premature raising is prevented by asserting that the flag is only set when either 
-$#`count` = #`step`$, or $(#`count`, #`first`) = (0,1)$.
+To see how this can be prevented, we first observe that there are two valid states 
+that should end a sequence: $#`count` = #`step`$ and $(#`count`, #`first`) = (0,1)$.
 #footnote[This second case is required to allow a zero-length copy.]
-With the second case indicated by prover-hinted flag `zc` (short for "zero-copy"), 
-this constraint can now be captured by @copy:c:end_implies_count_is_step_or_zc_upper and @copy:c:end_implies_count_is_step_or_zc_lower.
-While raising the flag too late is possible, doing so results in `count` wrapping
-around to $2^64-1$, requiring a virtually impossible $2^61$ more rows before the next exit attempt.
-Moreover, the copy would now overwrite the values on the `PAGE` with index 0, 
-which is caught during verification. #et[link source]
+Note that by asserting @copy:c:borrow_implies_first and @copy:c:borrow_implies_count_is_zero, we can use `count_borrows[1]` as proxy to indicate the second state.
+The statement $#`end` arrow.double.l.r #`count`=#`step` or (#`count` = 0 and #`first`)$ is then decomposed into
+- $#`end` arrow.double.r #`count`=#`step` or (#`count` = 0 and #`first`)$
+- $#`end` arrow.double.l #`count` = #`step`$
+- $#`end` arrow.double.l #`count` = 0 and #`first`$
+where the first implication is captured by constraints
+@copy:c:end_implies_count_is_step_or_zc_lower and
+@copy:c:end_implies_count_is_step_or_zc_upper, and
+the second by @copy:c:borrow_implies_end.
+Note that the third implication is already captured indirectly by @copy:c:borrow_implies_first: not setting the flag in this case will lead to a new row with $#`first` = 0$ being introduced (by @copy:c:send_next_chunk) which is guaranteed to have $#`count_borrows[1]` = 1$, thus violating this constraint.
 
 #render_constraint_table(chip, config, groups: "restrict_end")
 
@@ -190,7 +193,8 @@ which is enforced by @copy:c:set_gap.
 == Bits
 Lastly, both `first` and `end` must be bits, and both must imply $#`μ` = 1$ to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
 Note that $#`μ` - #`zc`$ is always binary, since $#`zc` => #`μ` = 1$ indirectly holds
-via @copy:c:zc_implies_first.
+via @copy:c:borrow_implies_first.
+// TODO
 #render_constraint_table(chip, config, groups: "bits")
 
 = Padding

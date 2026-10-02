@@ -90,12 +90,6 @@ desc = "$#`first` dot #`is_write`$; whether this row is the first of a `commit` 
 pad = 0
 
 [[variables.auxiliary]]
-name = "zc"
-type = "Bit"
-desc = "whether this sequence is a zero-copy"
-pad = 0
-
-[[variables.auxiliary]]
 name = "dst_res"
 type = "DWordWHH"
 desc = "$#`dst` + #`count` dot #`is_write`$"
@@ -108,6 +102,15 @@ name = "step"
 type = "Byte"
 desc = "The stride this row advances by: $1$ if `single` is set, or $8$ otherwise."
 def = ["-", 8, ["*", 7, "single"]]
+
+[[variables.virtual]]
+name = "count_borrows"
+desc = "Borrow values used to constrain $#`count_decr` = #`count` - #`step`$."
+type = ["Bit", 2]
+def = {idx="i", polys=[
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "count_decr", 0], "step"], ["idx", "count", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "count_decr", 1], ["idx", "count_borrows", 0]], ["idx", "count", 1]]]},
+]}
 
 # Multiplicity
 
@@ -262,10 +265,10 @@ ref = "copy:c:dst_incr"
 
 [[constraints.forward]]
 kind = "template"
-tag = "SUB"
-input = [["cast", "count", "DWordWL"], ["arr", "step", 0]]
-output = ["cast", "count_decr", "DWordWL"]
-ref = "copy:c:count_decr"
+tag = "IS_BIT"
+input = [["idx", "count_borrows", "i"]]
+iter = ["i", 0, 1]
+ref = "copy:c:count_borrows"
 
 [[constraints.forward]]
 kind = "template"
@@ -306,40 +309,35 @@ ref = "copy:c:receive_next_chunk"
 name = "restrict_end"
 
 [[constraints.restrict_end]]
-kind = "template"
-tag = "IS_BIT"
-input = ["zc"]
+kind = "arith"
+constraint = "$#`count_borrows[1]` => #`first`$"
+poly = ["*", ["idx", "count_borrows", 1], ["not", "first"]]
+ref = "copy:c:borrow_implies_first"
 
 [[constraints.restrict_end]]
 kind = "arith"
-constraint = "$#`zc` => #`first`$"
-poly = ["*", "zc", ["not", "first"]]
-ref = "copy:c:zc_implies_first"
-
-[[constraints.restrict_end]]
-kind = "arith"
-constraint = "$#`zc` => #`end`$"
-poly = ["*", "zc", ["not", "end"]]
-ref = "copy:c:zc_implies_end"
-
-[[constraints.restrict_end]]
-kind = "arith"
-constraint = "$#`zc` => #`count` = 0$"
-poly = ["*", "zc", ["idx", "count", "i"]]
+constraint = "$#`count_borrows[1]` => #`count` = 0$"
+poly = ["*", ["idx", "count_borrows", 1], ["idx", "count", "i"]]
 iter = ["i", 0, 1]
-ref = "copy:c:zc_implies_count_is_zero"
+ref = "copy:c:borrow_implies_count_is_zero"
 
 [[constraints.restrict_end]]
 kind = "arith"
-constraint = "$#`end` => #`zc` = 1 or floor.l #`count` / 2^32 floor.r = 0$"
-poly = ["*", "end", ["not", "zc"], ["idx", "count", 1]]
+constraint = "$#`end` => #`count_borrow[1]` or floor.l #`count` / 2^32 floor.r = 0$"
+poly = ["*", "end", ["not", ["idx", "count_borrows", 1]], ["idx", "count", 1]]
 ref = "copy:c:end_implies_count_is_step_or_zc_upper"
 
 [[constraints.restrict_end]]
 kind = "arith"
-constraint = "$#`end` => #`zc` = 1 or #`count[0]` = #`step`$"
-poly = ["*", "end", ["not", "zc"], ["-", ["idx", "count", 0], "step"]]
+constraint = "$#`end` => #`count_borrow[1]` or #`count[0]` = #`step`$"
+poly = ["*", "end", ["not", ["idx", "count_borrows", 1]], ["-", ["idx", "count", 0], "step"]]
 ref = "copy:c:end_implies_count_is_step_or_zc_lower"
+
+[[constraints.restrict_end]]
+kind = "arith"
+constraint = "$#`count_borrows[1]` => #`end`$"
+poly = ["*", ["idx", "count_borrows", 1], ["not", "end"]]
+ref = "copy:c:borrow_implies_end"
 
 [[constraint_groups]]
 name = "copy"
