@@ -906,7 +906,24 @@ use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
     // No deduplication: each operation has μ=1, matching generate_shift_trace.
     let mut bitwise_ops = Vec::new();
+    for_each_bitwise_from_shift(operations, |op| bitwise_ops.push(op));
+    bitwise_ops
+}
 
+/// [`collect_bitwise_from_shift`]'s lookups counted into `histogram`, with no
+/// list built.
+pub(crate) fn count_bitwise_from_shift(
+    operations: &[ShiftOperation],
+    histogram: &mut super::bitwise::BitwiseHistogram,
+) {
+    for_each_bitwise_from_shift(operations, |op| histogram.bump(op));
+}
+
+/// Each of [`collect_bitwise_from_shift`]'s lookups, in its order.
+fn for_each_bitwise_from_shift(
+    operations: &[ShiftOperation],
+    mut emit: impl FnMut(BitwiseOperation),
+) {
     for op in operations {
         let aux = op.compute_aux();
         let left = !op.direction;
@@ -916,7 +933,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         if op.signed {
             let x = (op.in_halves[3] & 0xFF) as u8;
             let y = (op.in_halves[3] >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::Msb16,
                 x,
                 y,
@@ -925,7 +942,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
 
         // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
         if left {
-            bitwise_ops.push(BitwiseOperation::byte_op(
+            emit(BitwiseOperation::byte_op(
                 BitwiseOperationType::ByteAluAnd,
                 op.shift,
                 15,
@@ -936,7 +953,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         if right {
             let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
             let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
-            bitwise_ops.push(BitwiseOperation::byte_op(
+            emit(BitwiseOperation::byte_op(
                 BitwiseOperationType::ByteAluAnd,
                 complement,
                 15,
@@ -944,7 +961,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         }
 
         // C3: ZERO[bit_shift] | μ (= 1)
-        bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
+        emit(BitwiseOperation::zero(aux.bit_shift as u32));
 
         // C4.i + C7: HWSL paired lookups | 1-zbs
         // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
@@ -953,7 +970,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             for i in 0..4 {
                 let x = (op.in_halves[i] & 0xFF) as u8;
                 let y = (op.in_halves[i] >> 8) as u8;
-                bitwise_ops.push(BitwiseOperation::shift_op(
+                emit(BitwiseOperation::shift_op(
                     BitwiseOperationType::Hwsl,
                     x,
                     y,
@@ -964,7 +981,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
             let ext_x = (extension & 0xFF) as u8;
             let ext_y = (extension >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::shift_op(
+            emit(BitwiseOperation::shift_op(
                 BitwiseOperationType::Hwsl,
                 ext_x,
                 ext_y,
@@ -974,7 +991,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
 
         // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
         let mask = if op.word_instr { 16 } else { 48 };
-        bitwise_ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::ByteAluAnd,
             op.shift,
             mask,
@@ -984,18 +1001,18 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63, SHIFT_HIGH) is
         // the spec's `shift[3]` Word; IS_WORD is assumed via its bus equality
         // with the CPU's well-formed arg2 high word, so it needs no check.
-        bitwise_ops.push(BitwiseOperation::single_byte(
+        emit(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             ((op.shift_amount >> 8) & 0xFF) as u8,
         ));
         // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
         // redundant with the BYTE_ALU[AND, shift, mask] lookups above).
-        bitwise_ops.push(BitwiseOperation::single_byte(
+        emit(BitwiseOperation::single_byte(
             BitwiseOperationType::AreBytes,
             op.shift,
         ));
         let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (half & 0xFF) as u8,
             (half >> 8) as u8,
@@ -1003,13 +1020,11 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
         // active row — matches the four IS_HALF senders added in `bus_interactions`.
         for i in 0..4 {
-            bitwise_ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (op.in_halves[i] & 0xFF) as u8,
                 (op.in_halves[i] >> 8) as u8,
             ));
         }
     }
-
-    bitwise_ops
 }

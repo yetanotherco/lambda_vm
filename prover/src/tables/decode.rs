@@ -197,6 +197,20 @@ pub fn generate_decode_trace(
     (trace, pc_to_row)
 }
 
+/// Adds one to the multiplicity of each DECODE row in `rows`, as
+/// [`update_multiplicities`] does for each pc it maps to a row.
+pub(crate) fn add_to_rows(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    rows: impl IntoIterator<Item = usize>,
+) {
+    for row_idx in rows {
+        let current = trace.main_table.get(row_idx, cols::MU);
+        trace
+            .main_table
+            .set_fe(row_idx, cols::MU, current + FE::one());
+    }
+}
+
 /// Updates multiplicities in the DECODE trace table.
 ///
 /// For each PC in `lookups`, increments the MU column in the corresponding row.
