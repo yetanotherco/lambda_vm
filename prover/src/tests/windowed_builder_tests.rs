@@ -999,7 +999,6 @@ fn the_lean_walk_builds_the_whole_run_tables() {
         lean
     };
     let parts = [
-        only(|l| l.decode = true),
         only(|l| l.memory = true),
         only(|l| l.lookups = true),
         only(|l| l.route = true),

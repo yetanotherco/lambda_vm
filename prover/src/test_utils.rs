@@ -57,7 +57,9 @@ use crate::tables::cpu::{
 use crate::tables::cpu32::{
     Cpu32Constraints, bus_interactions as cpu32_bus_interactions, cols as cpu32_cols,
 };
-use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::decode::{
+    DecodeTable, bus_interactions as decode_bus_interactions, cols as decode_cols,
+};
 use crate::tables::dvrm::{
     DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
@@ -268,12 +270,13 @@ pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<BitwiseOperation> {
+    let decode = DecodeTable::from_instructions(instructions);
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4, instruction);
-            op.collect_bitwise_ops()
+            let row = decode.row(log.current_pc).unwrap();
+            let op = CpuOperation::from_log(log, (i as u64) * 4, decode.entry(row), row);
+            decode.op(&op).collect_bitwise_ops()
         })
         .collect()
 }
