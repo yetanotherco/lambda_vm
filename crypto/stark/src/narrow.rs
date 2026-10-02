@@ -209,6 +209,91 @@ impl NarrowMain {
     }
 }
 
+/// A [`NarrowMain`] built a block of rows at a time, so a generator never holds
+/// a whole 64-bit trace: each pushed block is packed into its columns at once,
+/// and a column whose block needs more bytes than it had so far is re-encoded
+/// at the wider width. Rows never pushed are zero. The result is the
+/// [`NarrowMain::pack`] of the whole trace, byte for byte.
+pub struct NarrowBuilder {
+    rows: usize,
+    cols: usize,
+    pushed: usize,
+    widths: Vec<u8>,
+    /// Column-major, one buffer per column at its width so far.
+    columns: Vec<Vec<u8>>,
+}
+
+impl NarrowBuilder {
+    /// A builder for a `rows` × `cols` trace.
+    pub fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            pushed: 0,
+            widths: vec![1; cols],
+            columns: (0..cols).map(|_| Vec::with_capacity(rows)).collect(),
+        }
+    }
+
+    /// Append whole rows, row-major (`cols` words each). Panics past `rows`.
+    pub fn push_rows(&mut self, row_major: &[u64]) {
+        let cols = self.cols.max(1);
+        assert_eq!(row_major.len() % cols, 0, "push_rows: whole rows only");
+        let n = row_major.len() / cols;
+        assert!(
+            self.pushed + n <= self.rows,
+            "push_rows: past the trace's rows"
+        );
+        for c in 0..self.cols {
+            let words = row_major.iter().skip(c).step_by(cols);
+            let need = width_of(words.clone().copied().max().unwrap_or(0));
+            if need > self.widths[c] {
+                self.columns[c] = rewiden(&self.columns[c], self.widths[c], need, self.rows);
+                self.widths[c] = need;
+            }
+            let column = &mut self.columns[c];
+            match self.widths[c] {
+                1 => column.extend(words.map(|&v| v as u8)),
+                2 => words.for_each(|&v| column.extend_from_slice(&(v as u16).to_le_bytes())),
+                4 => words.for_each(|&v| column.extend_from_slice(&(v as u32).to_le_bytes())),
+                _ => words.for_each(|&v| column.extend_from_slice(&v.to_le_bytes())),
+            }
+        }
+        self.pushed += n;
+    }
+
+    /// The packed trace: the rows pushed, then zero rows up to `rows`.
+    pub fn finish(self) -> NarrowMain {
+        let rows = self.rows;
+        let mut offsets = Vec::with_capacity(self.cols);
+        let total: usize = self.widths.iter().map(|&w| rows * w as usize).sum();
+        let mut data = Vec::with_capacity(total);
+        for (column, &w) in self.columns.into_iter().zip(&self.widths) {
+            offsets.push(data.len());
+            data.extend_from_slice(&column);
+            data.resize(data.len() + (rows - self.pushed) * w as usize, 0);
+        }
+        NarrowMain {
+            rows,
+            widths: self.widths,
+            offsets,
+            data,
+        }
+    }
+}
+
+/// `bytes`, cells of `from` bytes each, re-encoded at `to` bytes each (little
+/// endian, so each cell is zero-extended), with room for `rows` cells.
+fn rewiden(bytes: &[u8], from: u8, to: u8, rows: usize) -> Vec<u8> {
+    let (from, to) = (from as usize, to as usize);
+    let mut out = Vec::with_capacity(rows * to);
+    for cell in bytes.chunks_exact(from) {
+        out.extend_from_slice(cell);
+        out.resize(out.len() + (to - from), 0);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +343,45 @@ mod tests {
             narrow.data().len(),
             rows * narrow.widths().iter().map(|&w| w as usize).sum::<usize>()
         );
+    }
+
+    /// Built a block at a time — with columns that need more bytes only in a
+    /// later block, and zero rows never pushed — the trace packs to the bytes
+    /// [`NarrowMain::pack`] gives the whole trace.
+    #[test]
+    fn a_trace_built_a_block_at_a_time_packs_as_a_whole() {
+        let cols = 6;
+        let rows = 3 * 1000 + 37;
+        let pushed = rows - 37;
+        let data: Vec<u64> = (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                if r >= pushed {
+                    return 0;
+                }
+                let x = (r as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (8 * c as u32);
+                match c {
+                    // Grows from 1 byte to 2 in the second block, to 8 in the last.
+                    0 if r < 1000 => x & 0xff,
+                    0 if r < 2000 => x & 0xffff,
+                    0 => x,
+                    1 => x & 0xff,
+                    2 => 0,
+                    3 if r == pushed - 1 => u64::MAX,
+                    3 => x & 0xff,
+                    _ => x & 0xffff_ffff,
+                }
+            })
+            .collect();
+        let whole = NarrowMain::pack(&data, cols);
+        for block in [1, 7, 1000, 4096] {
+            let mut builder = NarrowBuilder::new(rows, cols);
+            for part in data[..pushed * cols].chunks(block * cols) {
+                builder.push_rows(part);
+            }
+            assert_eq!(builder.finish(), whole, "blocks of {block} rows");
+        }
+        assert_eq!(whole.widths(), &[8, 1, 1, 8, 4, 4]);
     }
 
     /// An empty trace packs to nothing and widens to nothing.

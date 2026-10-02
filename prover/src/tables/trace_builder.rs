@@ -4718,10 +4718,30 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
+        // A packing build generates each chunk packed a block at a time, so it
+        // holds no 64-bit copy and takes no permit.
+        #[cfg(feature = "disk-spill")]
+        let packed = pack.on && storage_mode != StorageMode::Disk;
+        #[cfg(not(feature = "disk-spill"))]
+        let packed = pack.on;
+        let (generate, pack): (fn(&[KeccakRoundOperation]) -> _, _) = if packed {
+            (
+                |ops| {
+                    keccak_rnd::generate_keccak_rnd_trace_packed(ops)
+                        .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
+                },
+                Packing {
+                    on: true,
+                    permits: None,
+                },
+            )
+        } else {
+            (keccak_rnd::generate_keccak_rnd_trace, pack)
+        };
         if max_rows.keccak_rnd == super::KECCAK_RND_UNCHUNKED {
             generate_optional(
                 &keccak_rnd_ops,
-                keccak_rnd::generate_keccak_rnd_trace,
+                generate,
                 pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
@@ -4731,7 +4751,7 @@ fn build_traces<I: ImageSource + Sync>(
             chunk_and_generate_optional(
                 &keccak_rnd_ops,
                 (max_rows.keccak_rnd / 24).max(1),
-                keccak_rnd::generate_keccak_rnd_trace,
+                generate,
                 pack,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
