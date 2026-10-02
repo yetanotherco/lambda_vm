@@ -2291,13 +2291,82 @@ fn prep_global(
     }
 }
 
-/// [`prove_global`]'s prove half, over a finished [`GlobalPrep`].
+/// `LAMBDA_VM_GLOBAL_RESIDENCY`: the residency the cross-epoch global proof
+/// runs under. Unset, empty or `device` is [`ResidencyMode::RecomputeLdeDevice`]
+/// (the default); `retain` is [`ResidencyMode::Retain`], the mode it ran under
+/// before (the A arm of an A/B, and the way back). The proof is the same bytes
+/// either way.
+///
+/// [`ResidencyMode::RecomputeLdeDevice`]: stark::residency_mode::ResidencyMode::RecomputeLdeDevice
+/// [`ResidencyMode::Retain`]: stark::residency_mode::ResidencyMode::Retain
+pub const GLOBAL_RESIDENCY_ENV: &str = "LAMBDA_VM_GLOBAL_RESIDENCY";
+
+/// The global proof's residency for a raw value of [`GLOBAL_RESIDENCY_ENV`]:
+/// unset, empty or `device` is `RecomputeLdeDevice`, `retain` is `Retain`, and
+/// anything else stops the run — a typo read as the default would measure one
+/// mode under the other's name.
+pub fn global_residency_setting(raw: Option<&str>) -> stark::residency_mode::ResidencyMode {
+    use stark::residency_mode::ResidencyMode;
+    match raw.map(str::trim) {
+        None | Some("") | Some("device") => ResidencyMode::RecomputeLdeDevice,
+        Some("retain") => ResidencyMode::Retain,
+        Some(other) => panic!("{GLOBAL_RESIDENCY_ENV} must be device or retain, got {other:?}"),
+    }
+}
+
+/// The residency the global proof runs under in this process: read once from
+/// [`GLOBAL_RESIDENCY_ENV`], and named on stderr in one write, so a log states
+/// the mode its global proof ran.
+///
+/// ⛔ WHY NOT `Retain`. The global proof has one table per epoch and one per
+/// touched page, so its table count grows with the block. Under `Retain`
+/// every table's Round-1 LDE, tree and trace snapshot stay on the card until
+/// its fused task, and no VRAM gate counts them: from 108 epochs Round 1 runs
+/// the card out, and this proof has no host path (the BIG block ladder: a CUDA
+/// OOM in this proof's Round-1 main commit at 108, 135, 142 and 143 epochs,
+/// the host at 29–48 GiB). Under `RecomputeLdeDevice` Round 1 keeps only each table's
+/// root; each fused task commits its table on the device again under the gate,
+/// and the prover refuses the proof unless the new root equals the absorbed
+/// one. The cost is that second commit.
+fn global_residency() -> stark::residency_mode::ResidencyMode {
+    static MODE: std::sync::OnceLock<stark::residency_mode::ResidencyMode> =
+        std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = global_residency_setting(std::env::var(GLOBAL_RESIDENCY_ENV).ok().as_deref());
+        let line = format!("GLOBAL RESIDENCY: {mode:?}\n");
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        mode
+    })
+}
+
+/// [`prove_global`]'s prove half, over a finished [`GlobalPrep`], under
+/// [`global_residency`].
 fn prove_prepped_global(
     prep: GlobalPrep,
     elf_bytes: &[u8],
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
+) -> Result<MultiProof<F, E, ()>, Error> {
+    prove_prepped_global_under(
+        prep,
+        elf_bytes,
+        page_bases,
+        num_private_input_pages,
+        opts,
+        global_residency(),
+    )
+}
+
+/// [`prove_prepped_global`] under a residency the caller names.
+fn prove_prepped_global_under(
+    prep: GlobalPrep,
+    elf_bytes: &[u8],
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+    residency: stark::residency_mode::ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, Error> {
     let GlobalPrep {
         num_epochs,
@@ -2329,7 +2398,7 @@ fn prove_prepped_global(
         ),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
-        stark::residency_mode::ResidencyMode::Retain,
+        residency,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))
 }
@@ -3450,7 +3519,9 @@ pub(crate) fn prove_continuation_scheduled(
     // which no gate counts at all. Measured on an RTX 5090 (31.40 GiB): the
     // overlap window opened about `builders + 2` epochs before the end, and
     // inside it the card ran out with tables from BOTH proves aborting in the
-    // same instant (`gpu_lde::refuse_host_recovery`).
+    // same instant (`gpu_lde::refuse_host_recovery`). This proof now keeps no
+    // round-1 working set (`global_residency`), but the epoch proves still
+    // do, and the two gates still do not sum.
     //
     // The cost of serialising is this proof's own wall time, which the overlap
     // used to hide behind the tail epochs. It changes no proof bytes: the global
@@ -6155,5 +6226,289 @@ mod tests {
         );
         assert_eq!(tau(113), 6);
         assert_eq!(densest(113), 9_731);
+    }
+}
+
+/// The global proof's residency ([`global_residency`]): the setting on the
+/// host; on the card, `Retain` against `RecomputeLdeDevice` byte for byte from
+/// one execution's boundaries, the recommit's root check, and a block's base
+/// timed for the A/B.
+#[cfg(test)]
+mod global_residency_tests {
+    use super::*;
+    use stark::residency_mode::ResidencyMode;
+
+    #[test]
+    fn the_global_residency_defaults_to_the_device_recommit() {
+        for raw in [None, Some(""), Some("device"), Some(" device ")] {
+            assert_eq!(
+                global_residency_setting(raw),
+                ResidencyMode::RecomputeLdeDevice,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            global_residency_setting(Some("retain")),
+            ResidencyMode::Retain
+        );
+        for typo in ["Retain", "recompute", "1"] {
+            assert!(
+                std::panic::catch_unwind(|| global_residency_setting(Some(typo))).is_err(),
+                "{typo:?} must stop the run"
+            );
+        }
+    }
+
+    /// A block's ELF, input and epoch size, from `GLOBAL_RESIDENCY_ELF`,
+    /// `GLOBAL_RESIDENCY_INPUT` and `GLOBAL_RESIDENCY_EPOCH_LOG2` (2^21, the
+    /// ladder's, when unset).
+    fn block_inputs() -> (Vec<u8>, Vec<u8>, u32) {
+        let read = |var: &str| {
+            let path = std::env::var(var).unwrap_or_else(|_| panic!("{var} is unset"));
+            std::fs::read(&path).unwrap_or_else(|e| panic!("read {var}={path}: {e}"))
+        };
+        let epoch_log2 = std::env::var("GLOBAL_RESIDENCY_EPOCH_LOG2")
+            .map(|v| v.parse().expect("GLOBAL_RESIDENCY_EPOCH_LOG2 is a number"))
+            .unwrap_or(21);
+        (
+            read("GLOBAL_RESIDENCY_ELF"),
+            read("GLOBAL_RESIDENCY_INPUT"),
+            epoch_log2,
+        )
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn global_bytes(proof: &MultiProof<F, E, ()>) -> Vec<u8> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+            .expect("serialize")
+            .to_vec()
+    }
+
+    /// The process's peak resident set (`VmHWM`), where `/proc` has it.
+    fn host_peak_gib() -> Option<f64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kib: f64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kib / (1u64 << 20) as f64)
+    }
+
+    /// One execution's boundaries, from which the global proof is prepared and
+    /// proved as often as a test needs. The L2G and GLOBAL_MEMORY traces are a
+    /// function of the boundaries (address order), so every prove starts from
+    /// the same traces.
+    #[cfg(feature = "cuda")]
+    struct OneExecution {
+        elf_bytes: Vec<u8>,
+        elf: Elf,
+        boundaries: EpochBoundaries,
+        init_page_data: HashMap<u64, Vec<u8>>,
+        page_bases: Vec<u64>,
+        num_private_input_pages: usize,
+        opts: ProofOptions,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl OneExecution {
+        fn new() -> Self {
+            let (elf_bytes, input, epoch_log2) = block_inputs();
+            let elf = Elf::load(&elf_bytes).expect("load the ELF");
+            let artifacts = DecodeArtifacts::from_elf(&elf).expect("DECODE artifacts");
+            let boundaries = for_each_epoch(&elf, &input, epoch_log2, &artifacts, |_, _| Ok(()))
+                .expect("execute the block");
+            let init_page_data = build_init_page_data(&build_initial_image_paged(&elf, &input));
+            let page_bases = touched_page_bases(&boundaries);
+            Self {
+                num_private_input_pages: page::private_input_page_count(&input),
+                elf_bytes,
+                elf,
+                boundaries,
+                init_page_data,
+                page_bases,
+                opts: crate::lfm::proof::block_base_options(),
+            }
+        }
+
+        fn prep(&self) -> GlobalPrep {
+            prep_global(
+                &self.boundaries,
+                &self.init_page_data,
+                &self.page_bases,
+                self.num_private_input_pages,
+                &self.opts,
+            )
+        }
+
+        fn prove(&self, residency: ResidencyMode) -> Result<MultiProof<F, E, ()>, Error> {
+            prove_prepped_global_under(
+                self.prep(),
+                &self.elf_bytes,
+                &self.page_bases,
+                self.num_private_input_pages,
+                &self.opts,
+                residency,
+            )
+        }
+
+        fn verifies(&self, proof: &MultiProof<F, E, ()>) -> bool {
+            verify_global(
+                self.boundaries.len(),
+                &self.page_bases,
+                MultiProofView::Owned(proof),
+                &self.elf,
+                &self.elf_bytes,
+                self.num_private_input_pages,
+                &self.opts,
+                None,
+            )
+        }
+    }
+
+    /// ★ The global proof is the same bytes under `RecomputeLdeDevice` as under
+    /// `Retain`, from one execution's boundaries at the block's options. Two
+    /// `Retain` proofs first: the control that makes the comparison mean
+    /// something (run it under `LAMBDA_VM_DETERMINISTIC_GRIND=1`, so the nonce
+    /// is a function of the transcript). Then the device recommit, counted, so
+    /// a run whose tables all fell to the host arm cannot pass as one that
+    /// recommitted; it must equal both and verify. Then the mutation control:
+    /// the largest table's trace moves before its recommit, and the prover
+    /// must refuse with `RecomputedCommitmentMismatch`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "proves a block's global proof four times; GPU box only (GLOBAL_RESIDENCY_ELF, GLOBAL_RESIDENCY_INPUT)"]
+    fn the_global_proof_is_the_same_bytes_under_the_device_recommit() {
+        use stark::residency_mode::{DEVICE_RECOMMITS, test_hooks};
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let run = OneExecution::new();
+        let tables = run.boundaries.len() + run.page_bases.len();
+        println!(
+            "GLOBAL BYTES: {} epochs · {} touched pages · {tables} tables",
+            run.boundaries.len(),
+            run.page_bases.len()
+        );
+        let control = global_bytes(
+            &run.prove(ResidencyMode::Retain)
+                .expect("prove under Retain"),
+        );
+        let retained = run
+            .prove(ResidencyMode::Retain)
+            .expect("prove under Retain");
+        assert!(
+            global_bytes(&retained) == control,
+            "the control: two Retain proofs of one execution differ"
+        );
+        assert!(run.verifies(&retained), "the Retain proof does not verify");
+        println!(
+            "GLOBAL BYTES: the control, two Retain proofs: {} bytes each, equal, sha256 {}",
+            control.len(),
+            sha256_hex(&control)
+        );
+
+        let before = DEVICE_RECOMMITS.load(SeqCst);
+        let recommitted = run
+            .prove(ResidencyMode::RecomputeLdeDevice)
+            .expect("prove under RecomputeLdeDevice");
+        let recommits = DEVICE_RECOMMITS.load(SeqCst) - before;
+        assert!(recommits > 0, "no table was recommitted on the device");
+        let bytes = global_bytes(&recommitted);
+        assert!(
+            bytes == control,
+            "RecomputeLdeDevice changed the global proof (sha256 {} against {})",
+            sha256_hex(&bytes),
+            sha256_hex(&control)
+        );
+        assert!(
+            run.verifies(&recommitted),
+            "the RecomputeLdeDevice proof does not verify"
+        );
+        println!(
+            "GLOBAL BYTES: RecomputeLdeDevice ({recommits} of {tables} tables recommitted on the \
+             device): equal, sha256 {}, verifies",
+            sha256_hex(&bytes)
+        );
+
+        // The largest table: the one surest to take the device arm.
+        let prep = run.prep();
+        let largest = prep
+            .l2g_traces
+            .iter()
+            .chain(&prep.gm_traces)
+            .enumerate()
+            .max_by_key(|(_, t)| t.num_rows())
+            .map(|(i, _)| i)
+            .expect("a global table");
+        drop(prep);
+        test_hooks::perturb_before_recommit(largest);
+        let mutated = run.prove(ResidencyMode::RecomputeLdeDevice);
+        let fired = test_hooks::PERTURB_BEFORE_RECOMMIT.load(SeqCst) == 0;
+        test_hooks::PERTURB_BEFORE_RECOMMIT.store(0, SeqCst);
+        assert!(fired, "table {largest}: the perturbation never fired");
+        match mutated {
+            Err(Error::Prover(msg))
+                if msg.contains("RecomputedCommitmentMismatch")
+                    && msg.contains(&format!("table {largest} ")) =>
+            {
+                println!("GLOBAL BYTES: table {largest} moved before its recommit: refused ({msg})")
+            }
+            Err(e) => panic!("table {largest}: wrong refusal {e:?}"),
+            Ok(_) => panic!("table {largest}: a trace that moved was proved"),
+        }
+    }
+
+    /// #1009's base on a block, timed as the ladder times it (execution to the
+    /// global proof), under this process's [`global_residency`]: one arm of the
+    /// A/B. It names the global proof's sha256, so the arms of one block
+    /// compare bytes across processes (the global traces are a function of the
+    /// execution, and the device grind returns the smallest nonce), and then
+    /// verifies the bundle, untimed.
+    #[test]
+    #[ignore = "proves a whole block; GPU box only (GLOBAL_RESIDENCY_ELF, GLOBAL_RESIDENCY_INPUT)"]
+    fn the_epoch_base_on_a_block() {
+        let (elf_bytes, input, epoch_log2) = block_inputs();
+        let opts = crate::lfm::proof::block_base_options();
+        let t = std::time::Instant::now();
+        let bundle = prove_continuation(&elf_bytes, &input, epoch_log2, &opts)
+            .expect("the epoch base must prove");
+        let base = t.elapsed().as_secs_f64();
+        let peak = host_peak_gib();
+        let global = global_bytes(&bundle.global);
+        println!(
+            "GLOBAL RESIDENCY BASE: {base:.2} s · {} epochs · {} touched pages · residency {:?} · \
+             global proof {} B sha256 {} · host peak {}",
+            bundle.num_epochs(),
+            bundle.touched_page_bases.len(),
+            global_residency(),
+            global.len(),
+            sha256_hex(&global),
+            peak.map_or("unknown".to_string(), |g| format!("{g:.2} GiB")),
+        );
+        let t = std::time::Instant::now();
+        let verified = verify_continuation(&elf_bytes, &bundle, &opts);
+        println!(
+            "GLOBAL RESIDENCY VERIFY: {} in {:.2} s",
+            if matches!(verified, Ok(Some(_))) {
+                "ok"
+            } else {
+                "FAILED"
+            },
+            t.elapsed().as_secs_f64()
+        );
+        assert!(
+            matches!(verified, Ok(Some(_))),
+            "the base does not verify: {verified:?}"
+        );
     }
 }
