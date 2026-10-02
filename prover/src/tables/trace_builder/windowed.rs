@@ -673,7 +673,7 @@ fn list_cpu(w: &WalkedWindow) -> &[super::CpuOperation] {
 fn list_register_rows(w: &WalkedWindow) -> &[super::RegRow] {
     &w.walk.memw.register_rows
 }
-fn list_aligned(w: &WalkedWindow) -> &[super::MemwOperation] {
+fn list_aligned(w: &WalkedWindow) -> &[memw_aligned::AlignedRow] {
     &w.walk.memw.aligned
 }
 fn list_general(w: &WalkedWindow) -> &[super::MemwOperation] {
@@ -825,7 +825,7 @@ impl<T: Clone> Tail<T> {
 struct Kept {
     cpu: Tail<super::CpuOperation>,
     register_rows: Tail<super::RegRow>,
-    aligned: Tail<super::MemwOperation>,
+    aligned: Tail<memw_aligned::AlignedRow>,
     general: Tail<super::MemwOperation>,
     load: Tail<super::LoadOperation>,
     lt: Tail<super::LtOperation>,
@@ -1177,7 +1177,7 @@ pub struct ChunkJob {
 enum ChunkOps {
     Cpu(Vec<super::CpuOperation>),
     MemwRegister(Vec<super::RegRow>),
-    MemwAligned(Vec<super::MemwOperation>),
+    MemwAligned(Vec<memw_aligned::AlignedRow>),
     Memw(Vec<super::MemwOperation>),
     Load(Vec<super::LoadOperation>),
     Lt(Vec<super::LtOperation>),
@@ -1192,7 +1192,8 @@ impl ChunkJob {
         match &self.ops {
             ChunkOps::Cpu(ops) => b(ops),
             ChunkOps::MemwRegister(ops) => b(ops),
-            ChunkOps::MemwAligned(ops) | ChunkOps::Memw(ops) => b(ops),
+            ChunkOps::MemwAligned(ops) => b(ops),
+            ChunkOps::Memw(ops) => b(ops),
             ChunkOps::Load(ops) => b(ops),
             ChunkOps::Lt(ops) => b(ops),
             ChunkOps::Shift(ops) => b(ops),
