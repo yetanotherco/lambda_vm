@@ -445,6 +445,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             },
             Accumulator {
                 lean: self.lean,
+                decode_rows: self.decode.as_ref(),
                 stream_memw_lt: self.stream_memw_lt,
                 max_rows: &self.max_rows,
                 pc_to_row: &self.artifacts.decode_pc_to_row,
@@ -517,6 +518,9 @@ pub struct Accumulator<'b> {
     /// The lean parts the builder uses: with `lookups` the walker left each
     /// window's in-walk lookups out, with `route` the routing is one pass.
     lean: WalkLean,
+    /// With the lean decode, each CPU op's DECODE row is read from here
+    /// instead of `pc_to_row`'s hash map.
+    decode_rows: Option<&'b DecodeTable>,
     stream_memw_lt: bool,
     max_rows: &'b crate::tables::MaxRowsConfig,
     pc_to_row: &'b decode::PcToRow,
@@ -593,6 +597,7 @@ impl Accumulator<'_> {
                 self.max_rows,
                 self.stream_memw_lt,
                 self.pc_to_row,
+                self.decode_rows,
                 kept,
                 self.segments,
                 self.emitted,
@@ -907,10 +912,12 @@ impl Kept {
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
 /// chunk taken out of the tails, and what the table phase reads from its ops
 /// counted as it leaves (`counted`, and DECODE in `kept`).
+#[allow(clippy::too_many_arguments)]
 fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
     stream_memw_lt: bool,
     pc_to_row: &decode::PcToRow,
+    decode_rows: Option<&DecodeTable>,
     kept: &mut Kept,
     segments: &mut RoutedSegments,
     e: &mut StreamSkip,
@@ -936,8 +943,21 @@ fn tail_jobs(
         }};
     }
     take_chunks!(StreamTable::Cpu, Cpu, kept.cpu, m.cpu, e.cpu, |ops| {
-        let pcs: Vec<u64> = ops.iter().map(|op| op.decode.pc).collect();
-        decode::update_multiplicities(&mut kept.decode, pc_to_row, &pcs);
+        // Each op's DECODE row: from the dense table when there is one (no
+        // hashing, no list of pcs), from the map otherwise.
+        match decode_rows {
+            Some(rows) => decode::add_to_rows(
+                &mut kept.decode,
+                ops.iter().filter_map(|op| {
+                    let pc = op.decode.pc;
+                    rows.row(pc).or_else(|| pc_to_row.get(&pc).copied())
+                }),
+            ),
+            None => {
+                let pcs: Vec<u64> = ops.iter().map(|op| op.decode.pc).collect();
+                decode::update_multiplicities(&mut kept.decode, pc_to_row, &pcs);
+            }
+        }
         if let Some(op) = ops.iter().rev().find(|op| op.decode.fields.ecall) {
             counted.last_ecall = Some((op.timestamp, op.next_pc));
         }
@@ -959,8 +979,7 @@ fn tail_jobs(
         m.memw_aligned,
         e.memw_aligned,
         |ops| {
-            let lookups = super::collect_bitwise_from_memw_aligned(&ops);
-            counted.histogram.add_ops(&lookups);
+            super::count_bitwise_from_memw_aligned(&ops, &mut counted.histogram);
             if !stream_memw_lt {
                 let lt = super::collect_lt_from_memw_aligned(&ops);
                 counted.memw_aligned_lt.extend(lt);
@@ -981,9 +1000,7 @@ fn tail_jobs(
     );
     take_chunks!(StreamTable::Load, Load, kept.load, m.load, e.load);
     take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
-        counted
-            .histogram
-            .add_ops(&super::collect_bitwise_from_lt(&ops))
+        super::count_bitwise_from_lt(&ops, &mut counted.histogram)
     });
     take_chunks!(
         StreamTable::Shift,
@@ -991,18 +1008,14 @@ fn tail_jobs(
         kept.shift,
         m.shift,
         e.shift,
-        |ops| {
-            counted
-                .histogram
-                .add_ops(&shift::collect_bitwise_from_shift(&ops))
-        }
+        |ops| { shift::count_bitwise_from_shift(&ops, &mut counted.histogram) }
     );
     // STORE's ops are a routing segment: its own tail.
     let store = &mut segments.store_ops;
     while store.len() >= m.store {
         let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
         for op in &ops {
-            counted.histogram.add_ops(&op.collect_bitwise_ops());
+            op.count_bitwise_into(&mut counted.histogram);
         }
         jobs.push(ChunkJob {
             table: StreamTable::Store,
