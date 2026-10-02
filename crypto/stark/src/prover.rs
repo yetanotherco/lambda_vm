@@ -1217,6 +1217,10 @@ pub fn set_default_recommit_top_levels(k: usize) {
 /// Tables whose fused task recomputed the LDE alone against kept top levels.
 pub static TOP_TREE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Of those, the tables whose packed main trace was widened on the device.
+pub static NARROW_DEVICE_WIDENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// `LAMBDA_VM_GATE_PACKING=1`: [`run_admitted`] admits the first table in walk
 /// order that fits the gate instead of blocking on the next one. Off by
 /// default (the walk-order admission every measurement so far used).
@@ -5569,6 +5573,24 @@ pub trait IsStarkProver<
             let domain = &domains[idx];
             let twiddles = &twiddle_caches[idx];
 
+            // A packed main trace (`TraceTable::pack_main_narrow`) is widened
+            // on the device by the kept-top recompute below; every other path
+            // reads the host words, so it gets them back first.
+            #[cfg(feature = "cuda")]
+            let widens_on_device = matches!(
+                main_lde_cells[idx].lock().unwrap().as_ref(),
+                Some(MainLdeSlot::DroppedDevice)
+            ) && main_commit_cells[idx]
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.top_tree.is_some());
+            #[cfg(not(feature = "cuda"))]
+            let widens_on_device = false;
+            if trace.is_main_narrow() && !widens_on_device {
+                trace.widen_main_on_host();
+            }
+
             // `RecomputeLdeDevice`: Round 1 kept only this table's root, so
             // commit the trace on the device again before anything reads the
             // slot. From here the task is the `Retain` one: the commit (its
@@ -5591,7 +5613,15 @@ pub trait IsStarkProver<
                     .as_ref()
                     .is_some_and(|c| c.top_tree.is_some());
                 #[cfg(any(test, feature = "test-utils"))]
+                if top_levels_kept
+                    && crate::residency_mode::test_hooks::take_narrow_perturbation(idx)
+                    && let Some(narrow) = trace.narrow_main.as_mut()
+                {
+                    std::sync::Arc::make_mut(narrow).flip_first_bit();
+                }
+                #[cfg(any(test, feature = "test-utils"))]
                 if top_levels_kept && crate::residency_mode::test_hooks::take_perturbation(idx) {
+                    trace.widen_main_on_host();
                     let col = trace.main_table.width - 1;
                     let v = *trace.main_table.get(0, col);
                     trace
@@ -5600,11 +5630,12 @@ pub trait IsStarkProver<
                 }
                 let relde = if top_levels_kept {
                     let (trace_slice, num_cols) = trace.main_data_row_major();
-                    let n = trace_slice.len().checked_div(num_cols).unwrap_or(0);
+                    let n = trace.num_rows();
                     crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
                         air.name(),
                         trace_slice,
                         trace.main_rowmajor_dev(),
+                        trace.narrow_main(),
                         n,
                         num_cols,
                         domain.blowup_factor,
@@ -5616,6 +5647,9 @@ pub trait IsStarkProver<
                     None
                 };
                 if let Some((handle, cached_main)) = relde {
+                    if trace.is_main_narrow() {
+                        NARROW_DEVICE_WIDENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(td) = &handle.trace_dev {
                         trace.set_main_trace_dev(
                             std::sync::Arc::clone(td),
@@ -5635,6 +5669,8 @@ pub trait IsStarkProver<
                         );
                     }
                 } else {
+                    // The full recommit reads the host words.
+                    trace.widen_main_on_host();
                     let (commit, cached_main, gpu_main) = {
                         let absorbed = main_commit_cells[idx].lock().unwrap();
                         Self::recommit_main_trace_device(
@@ -5685,6 +5721,9 @@ pub trait IsStarkProver<
             // The trace-domain snapshot retained by the R1 main LDE has exactly
             // one consumer — the aux build above. Reclaim it before this
             // table's aux-commit + DEEP/FRI VRAM peak.
+            // A packed main trace had the same two readers (the recompute and
+            // the aux build's host fallback): free it too.
+            trace.drop_narrow_main();
             #[cfg(feature = "cuda")]
             {
                 trace.clear_main_trace_dev();

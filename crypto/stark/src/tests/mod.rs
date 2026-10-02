@@ -15,6 +15,7 @@ pub mod grinding_tests;
 pub mod host_schedule_tests;
 pub mod log_read_only_program_tests;
 pub mod merkle_cap_tests;
+pub mod narrow_tests;
 pub mod one_row_tests;
 pub mod opening_width_tests;
 pub mod path_length_tests;
