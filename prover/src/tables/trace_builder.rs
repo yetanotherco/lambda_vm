@@ -117,6 +117,11 @@ impl MemoryState {
         Self { cells }
     }
 
+    /// The bytes its pages take on the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.cells.heap_bytes()
+    }
+
     /// Number of distinct pages that contain at least one cell.
     #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
@@ -445,6 +450,12 @@ impl MemwBuckets {
         }
     }
 
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.register_rows)
+            + vec_heap_bytes(&self.aligned)
+            + vec_heap_bytes(&self.general)
+    }
+
     #[inline]
     fn push(&mut self, op: MemwOperation) {
         match classify_memw(&op) {
@@ -655,6 +666,29 @@ impl WalkOutputs {
             hint_ops: Vec::new(),
         }
     }
+
+    /// The bytes its lists take on the heap (capacities, not lengths).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.memw.heap_bytes()
+            + vec_heap_bytes(&self.load_ops)
+            + vec_heap_bytes(&self.lt_ops)
+            + vec_heap_bytes(&self.shift_ops)
+            + vec_heap_bytes(&self.bitwise_ops)
+            + vec_heap_bytes(&self.commit_ops)
+            + vec_heap_bytes(&self.keccak_ops)
+            + vec_heap_bytes(&self.blake3_ops)
+            + vec_heap_bytes(&self.blake3_absorb_ops)
+            + vec_heap_bytes(&self.cpu32_ops)
+            + vec_heap_bytes(&self.ecsm_ops)
+            + vec_heap_bytes(&self.ecdas_ops)
+            + vec_heap_bytes(&self.hint_ops)
+    }
+}
+
+/// The bytes `list`'s buffer takes on the heap: its capacity, not its length.
+/// Elements that own heap memory of their own are counted at their inline size.
+pub(crate) fn vec_heap_bytes<T>(list: &Vec<T>) -> usize {
+    list.capacity() * std::mem::size_of::<T>()
 }
 
 /// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]).
@@ -3662,6 +3696,15 @@ pub(crate) struct PreCounted {
     pub(crate) memw_aligned_lt: Vec<LtOperation>,
 }
 
+impl PreCounted {
+    /// The bytes it takes on the heap: the histogram and the derived LT ops.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.histogram.heap_bytes()
+            + vec_heap_bytes(&self.memw_lt)
+            + vec_heap_bytes(&self.memw_aligned_lt)
+    }
+}
+
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
 pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     TraceTable::from_columns_main(Vec::new(), 1)
@@ -3868,6 +3911,24 @@ struct RoutedSegments {
 }
 
 impl RoutedSegments {
+    /// The bytes its segments take on the heap.
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.branch_ops)
+            + vec_heap_bytes(&self.mul_filter)
+            + vec_heap_bytes(&self.dvrm_filter)
+            + vec_heap_bytes(&self.eq_ops)
+            + vec_heap_bytes(&self.bytewise_ops)
+            + vec_heap_bytes(&self.store_ops)
+            + vec_heap_bytes(&self.shift_cpu32)
+            + vec_heap_bytes(&self.mul_cpu32)
+            + vec_heap_bytes(&self.dvrm_cpu32)
+            + vec_heap_bytes(&self.bitwise_cpu32)
+            + vec_heap_bytes(&self.lt_dvrm_filter)
+            + vec_heap_bytes(&self.lt_dvrm_cpu32)
+            + vec_heap_bytes(&self.mul_dvrm_filter)
+            + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
     /// Appends a later window's segments, segment by segment.
     fn append(&mut self, other: Self) {
         self.branch_ops.extend(other.branch_ops);

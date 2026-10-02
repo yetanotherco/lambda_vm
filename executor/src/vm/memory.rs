@@ -67,6 +67,13 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// The bytes the memory takes on the heap: the word map's slots (an entry
+    /// and a control byte each) and the public output.
+    pub fn heap_bytes(&self) -> usize {
+        self.cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1)
+            + self.public_output.capacity()
+    }
+
     pub fn load_byte(&self, address: u64) -> u8 {
         let aligned_address = address - address % 4;
         let value = self
