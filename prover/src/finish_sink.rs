@@ -26,7 +26,7 @@ use stark::trace::TraceTable;
 
 use crate::Error;
 use crate::ProofOptions;
-use crate::tables::trace_builder::{StreamTable, Traces};
+use crate::tables::trace_builder::{StreamTable, StreamedChunk, Traces};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::{
     VmAir, create_branch_air, create_bytewise_air, create_commit_air, create_cpu_air,
@@ -200,6 +200,17 @@ pub struct FinishedTable {
     pub trace: Trace,
 }
 
+/// A streamed chunk is a table of its kind: the committers take both alike.
+impl From<StreamedChunk> for FinishedTable {
+    fn from(chunk: StreamedChunk) -> Self {
+        Self {
+            kind: chunk.table.into(),
+            index: chunk.index,
+            trace: chunk.trace,
+        }
+    }
+}
+
 /// Where a finish hands its tables. `hand` must not block: the finish calls it
 /// from its generators (rayon workers), as each table exists.
 pub trait FinishSink: Sync {
@@ -224,6 +235,27 @@ pub fn hand_or_keep(
         None => crate::tables::trace_builder::streamed_placeholder(),
         Some(declined) => declined.trace,
     }
+}
+
+/// Every plain table `traces` holds (not a placeholder) handed to `sink` at
+/// once, in [`FinishedKind::ALL`] order: what a finish that hands nothing off
+/// leaves for phase B. The tables handed. A finish double for the tests.
+#[cfg(test)]
+pub(crate) fn hand_built(traces: &mut Traces, sink: &dyn FinishSink) -> usize {
+    let mut handed = 0;
+    for kind in FinishedKind::ALL {
+        let slots = kind.slots(traces);
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.main_table.width == 0 {
+                continue;
+            }
+            let trace =
+                std::mem::replace(slot, crate::tables::trace_builder::streamed_placeholder());
+            *slot = hand_or_keep(Some(sink), kind, index, trace);
+            handed += usize::from(slot.main_table.width == 0);
+        }
+    }
+    handed
 }
 
 /// A sink that sends each table into a committer queue of `T`s (a channel the
@@ -532,6 +564,94 @@ mod tests {
                 kind.name(i)
             );
         }
+
+        // `hand_built` hands every table still in a slot, once.
+        let sink = CollectingSink::new(false);
+        assert_eq!(hand_built(&mut traces, &sink), present.len());
+        assert_eq!(
+            hand_built(&mut traces, &sink),
+            0,
+            "only placeholders are left"
+        );
+        let handed = std::mem::take(&mut *sink.tables.lock().unwrap());
+        insert_finished(&mut traces, handed).expect("back into the placeholders");
+        for &(kind, i) in &present {
+            assert!(same(
+                &kind.slots(&mut traces)[i],
+                &kind.slots(&mut before.clone())[i]
+            ));
+        }
+    }
+
+    /// The same table, column for column, packed or not.
+    fn same_columns(what: &str, a: &Trace, b: &Trace) {
+        assert_eq!(
+            (a.main_table.width, a.main_table.height),
+            (b.main_table.width, b.main_table.height),
+            "{what}: shape"
+        );
+        assert!(
+            a.columns_main() == b.columns_main(),
+            "{what}: columns differ"
+        );
+    }
+
+    /// ★ Phase A's committers also commit the tables the finish built, each as
+    /// the finish builds it (`LAMBDA_VM_BLOCK_FINISH_COMMIT`, the default): the
+    /// stream builds the same traces, precommits every
+    /// streamed instance it did before and every plain table the finish built,
+    /// leaves the ledger empty, and a card gate that admits one commit at a
+    /// time changes none of it — with the committers generating, or generators
+    /// ahead of them, committing in the global pool or in one of their own.
+    #[test]
+    fn the_stream_commits_the_finish_tables_in_phase_a() {
+        let opts = crate::lfm::proof::block_base_options();
+        let max_rows = MaxRowsConfig {
+            keccak_rnd: 48,
+            ..MaxRowsConfig::small()
+        };
+        for name in ["all_instructions_64", "test_keccak_multi"] {
+            let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+            let (mut today, mut names) =
+                crate::block::stream_for_test(&program, &opts, &max_rows, 3, 0)
+                    .expect("the stream as it is");
+            let mut every: Vec<String> = instances(&mut today)
+                .into_iter()
+                .map(|(kind, i)| kind.name(i))
+                .collect();
+            every.sort();
+            names.sort();
+            assert!(names.len() < every.len(), "{name}: the finish built tables");
+            for (committers, generators, pool) in [(3, 0, 0), (2, 3, 2), (3, 0, 2), (2, 3, 0)] {
+                let (mut after, mut after_names) = crate::block::stream_finish_commit_for_test(
+                    &program,
+                    &opts,
+                    &max_rows,
+                    committers,
+                    generators,
+                    Some(1),
+                    pool,
+                )
+                .expect("the finish's tables committed in phase A");
+                after_names.sort();
+                assert_eq!(after_names, every, "{name}: every plain table precommitted");
+                for (kind, i) in instances(&mut today) {
+                    same_columns(
+                        &format!("{name} {}", kind.name(i)),
+                        &kind.slots(&mut today)[i],
+                        &kind.slots(&mut after)[i],
+                    );
+                }
+                same_columns("BITWISE", &today.bitwise, &after.bitwise);
+                same_columns("DECODE", &today.decode, &after.decode);
+                same_columns("REGISTER", &today.register, &after.register);
+                same_columns("HALT", &today.halt, &after.halt);
+                assert_eq!(today.pages.len(), after.pages.len());
+                for (i, (a, b)) in today.pages.iter().zip(&after.pages).enumerate() {
+                    same_columns(&format!("PAGE {i}"), a, b);
+                }
+            }
+        }
     }
 
     /// A table for a slot that holds a table, or for a slot that does not exist,
@@ -561,6 +681,82 @@ mod tests {
         )
         .expect_err("no such slot");
         assert!(format!("{err:?}").contains("has no slot"), "{err:?}");
+    }
+
+    /// Seconds a commit of `table` takes on an OS thread while every worker of
+    /// the global rayon pool is held (as the finish's generation holds them),
+    /// made in the global pool or in a pool of its own. The workers are let go
+    /// as soon as the commit is done, or after `hold` seconds.
+    fn commit_beside_a_busy_global_pool(table: &FinishedTable, own_pool: bool, hold: f64) -> f64 {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let opts = bytes_options();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let busy = std::sync::Arc::new(AtomicUsize::new(0));
+        let workers = rayon::current_num_threads();
+        let deadline = Instant::now() + Duration::from_secs_f64(hold);
+        for _ in 0..workers {
+            let (done, busy) = (done.clone(), busy.clone());
+            rayon::spawn(move || {
+                busy.fetch_add(1, Ordering::SeqCst);
+                while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                busy.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while busy.load(Ordering::SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let commit = || precommit_finished(table, &opts, ResidencyMode::RecomputeLdeDevice);
+                let pre = if own_pool {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(2)
+                        .build()
+                        .expect("a pool")
+                        .install(commit)
+                } else {
+                    commit()
+                };
+                pre.expect("the commit");
+            });
+        });
+        let secs = t.elapsed().as_secs_f64();
+        done.store(true, Ordering::SeqCst);
+        while busy.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        secs
+    }
+
+    /// ★ The trap BIG 462 hit, and its way out: a commit's host-side parallel
+    /// work waits for the global pool while the finish's generation holds every
+    /// worker, and does not when it runs in a pool of its own.
+    #[test]
+    fn a_commit_in_its_own_pool_does_not_wait_for_a_busy_global_pool() {
+        let (_, _, traces) = build("add", &MaxRowsConfig::default());
+        let table = FinishedTable {
+            kind: FinishedKind::Cpu,
+            index: 0,
+            trace: traces.cpus[0].clone(),
+        };
+        let hold = 3.0;
+        let starved = commit_beside_a_busy_global_pool(&table, false, hold);
+        let own = commit_beside_a_busy_global_pool(&table, true, hold);
+        eprintln!(
+            "commit beside a held global pool: {starved:.2} s in it, {own:.2} s in its own pool"
+        );
+        assert!(
+            starved >= hold * 0.8,
+            "the global-pool commit should wait for the held workers ({starved:.2} s of {hold} s)"
+        );
+        assert!(
+            own < hold * 0.5,
+            "the commit in its own pool waited {own:.2} s beside the held workers"
+        );
     }
 
     /// A channel sink sends while its committers listen and gives the table

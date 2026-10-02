@@ -24,16 +24,12 @@ use executor::vm::execution::Executor;
 use stark::prover::IsStarkProver;
 use stark::residency_mode::ResidencyMode;
 
+use crate::finish_sink::{self, FinishSink, FinishedTable};
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    ChunkJob, DecodeArtifacts, StreamTable, StreamedChunk, Traces, WindowedTraceBuilder,
-    build_initial_image,
-};
-use crate::test_utils::{
-    VmAir, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_shift_air, create_store_air,
+    ChunkJob, DecodeArtifacts, StreamedChunk, Traces, WindowedTraceBuilder, build_initial_image,
 };
 use crate::{AcceleratorShape, Commitment, Error, ProofOptions, VmAirs, VmProof};
 
@@ -42,6 +38,20 @@ fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
     handle
         .join()
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
+
+/// `scope.spawn`, the thread named `name` so a per-thread sampler can tell the
+/// stream's threads apart. A thread that cannot start is fatal, as with
+/// `scope.spawn`.
+fn spawn_named<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: String,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn_scoped(scope, f)
+        .expect("spawn a block stream thread")
 }
 
 /// Rows per full-height instance: every splittable table is cut into
@@ -258,6 +268,24 @@ fn prove_block_with_observed(
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
+    // With the table timeline on, the global rayon pool's workers are named
+    // `rayon-<n>` for a per-thread sampler; only a pool nothing built yet can
+    // be named, so a process that used rayon before says so.
+    #[cfg(feature = "parallel")]
+    if std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1") {
+        let named = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("rayon-{i}"))
+            .build_global()
+            .is_ok();
+        eprintln!(
+            "[block] the global rayon pool's workers {}",
+            if named {
+                "are named rayon-<n>"
+            } else {
+                "keep their names (the pool was built before the block)"
+            }
+        );
+    }
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
     #[cfg(feature = "cuda")]
@@ -387,9 +415,9 @@ type Precommit = stark::prover::PrecommittedMain<
     crate::hash_pin::BlockStarkHash,
 >;
 
-/// A streamed instance back from its committer: the chunk (for
-/// `Traces::insert_streamed`), its AIR name and its Round-1 commit.
-type Committed = (StreamedChunk, String, Precommit);
+/// An instance back from its committer: the table (for
+/// [`finish_sink::insert_finished`]), its AIR name and its Round-1 commit.
+type Committed = (FinishedTable, String, Precommit);
 
 /// Phase A's output: the traces, DECODE's root and the streamed instances'
 /// precommits by AIR name.
@@ -516,20 +544,169 @@ fn stream_generators() -> usize {
         .unwrap_or(STREAM_GENERATORS)
 }
 
+/// When the tables the finish builds get their Round-1 commits
+/// (`LAMBDA_VM_BLOCK_FINISH_COMMIT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishCommit {
+    /// `0`: in phase B's Round 1 (the A arm).
+    PhaseB,
+    /// Unset or `1`: on phase A's committers, each as soon as the finish has
+    /// built it ([`WindowedTraceBuilder::finish_handing`]), while the finish
+    /// goes on. At the median block on BIG, with the committers' own pool:
+    /// phase A +5.45 s, phase B −13.32 s, base −7.85 s (BIG 463, three runs an
+    /// arm).
+    Handed,
+}
+
+/// [`FinishCommit`] from `LAMBDA_VM_BLOCK_FINISH_COMMIT`; anything else stops
+/// the run.
+fn finish_commit() -> FinishCommit {
+    match std::env::var("LAMBDA_VM_BLOCK_FINISH_COMMIT")
+        .as_deref()
+        .map(str::trim)
+    {
+        Err(_) | Ok("1") => FinishCommit::Handed,
+        Ok("0") => FinishCommit::PhaseB,
+        Ok(other) => panic!("LAMBDA_VM_BLOCK_FINISH_COMMIT must be `0` or `1`, got `{other}`"),
+    }
+}
+
+/// Phase A's card gate, in bytes: each commit a committer makes is admitted
+/// by its device set (the estimate phase B's Round 1 admits the same commit
+/// against) under the card's admission budget, so more committers, or larger
+/// tables beside them, cannot over-fill the card. Without it each commit is
+/// admitted alone against the whole budget and nothing sums concurrent ones.
+/// `LAMBDA_VM_BLOCK_CARD_GATE=0` drops it (the A arm); off the device there is
+/// no budget.
+fn card_gate_budget() -> Option<usize> {
+    if std::env::var("LAMBDA_VM_BLOCK_CARD_GATE").is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    #[cfg(feature = "cuda")]
+    return stark::gpu_lde::device_vram_budget_bytes().map(|b| b as usize);
+    #[cfg(not(feature = "cuda"))]
+    return None;
+}
+
+/// The card bytes `air`'s Round-1 commit of `trace` is admitted for: its
+/// device set (LDE, trace snapshot, tree, scratch) at the trace's leaf layout,
+/// as phase B's Round 1 estimates it.
+fn commit_card_bytes(air: &crate::test_utils::VmAir, trace: &finish_sink::Trace) -> usize {
+    let n = trace.num_rows();
+    let layout = stark::leaf_layout::table_leaf_layout(air.as_ref(), n);
+    stark::device_set::commit_device_set_rpl(
+        n,
+        trace.num_main_columns,
+        air.options().blowup_factor as usize,
+        true,
+        layout.rows_per_leaf(),
+    )
+    .total() as usize
+}
+
+/// Phase A's card gate ([`card_gate_budget`]): a commit is admitted when the
+/// card holds nothing or its bytes fit beside what it holds, so a commit
+/// bigger than the budget still runs, alone. Without a budget it only counts.
+/// The most it held, and how long the committers waited, are reported.
+struct CardGate {
+    budget: Option<usize>,
+    /// (bytes, commits) admitted now.
+    held: std::sync::Mutex<(usize, usize)>,
+    room: std::sync::Condvar,
+    most: std::sync::Mutex<(usize, usize)>,
+    waited: std::sync::Mutex<f64>,
+    /// A committer stopped: nothing waits any more.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl CardGate {
+    fn new(budget: Option<usize>) -> Self {
+        Self {
+            budget,
+            held: std::sync::Mutex::new((0, 0)),
+            room: std::sync::Condvar::new(),
+            most: std::sync::Mutex::new((0, 0)),
+            waited: std::sync::Mutex::new(0.0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Wait until a commit of `bytes` fits, then count it in.
+    fn admit(&self, bytes: usize) {
+        let t = Instant::now();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while self
+            .budget
+            .is_some_and(|budget| held.0 > 0 && held.0 + bytes > budget)
+            && !self.closed.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            held = self.room.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.0 += bytes;
+        held.1 += 1;
+        let mut most = self.most.lock().unwrap_or_else(|e| e.into_inner());
+        *most = (most.0.max(held.0), most.1.max(held.1));
+        *self.waited.lock().unwrap_or_else(|e| e.into_inner()) += t.elapsed().as_secs_f64();
+    }
+
+    /// A commit of `bytes` is done.
+    fn release(&self, bytes: usize) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.0 = held.0.saturating_sub(bytes);
+        held.1 = held.1.saturating_sub(1);
+        self.room.notify_all();
+    }
+
+    /// A committer stopped on an error: the others must not wait on it.
+    fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        self.room.notify_all();
+    }
+}
+
+/// Threads in the committers' own rayon pool ([`commit_pool_threads`]).
+const COMMIT_POOL_THREADS: usize = 8;
+
+/// `LAMBDA_VM_BLOCK_COMMIT_POOL=n` (0..=32): the committers make their commits
+/// inside a rayon pool of `n` threads of their own, so the host-side parallel
+/// work of a commit (a small table's host LDE and tree, a packed trace's
+/// widening) does not queue behind the finish's generation, which holds every
+/// worker of the global pool while it runs (BIG 462: during p5 the finish handed
+/// 140 tables and none was committed until p5 ended; BIG 463 with the pool:
+/// 127–141 committed in p5). `0`: the global pool (the A arm). Unset is
+/// [`COMMIT_POOL_THREADS`].
+fn commit_pool_threads() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_COMMIT_POOL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= 32)
+        .unwrap_or(COMMIT_POOL_THREADS)
+}
+
 /// How phase A's stream hands its chunks to the device: committer and
-/// generator threads.
+/// generator threads, when the finish's tables are committed, the card's byte
+/// budget for the commits, and the committers' own pool.
 #[derive(Clone, Copy, Debug)]
 struct StreamConfig {
     committers: usize,
     generators: usize,
+    finish: FinishCommit,
+    card_budget: Option<usize>,
+    commit_pool: usize,
 }
 
 impl StreamConfig {
-    /// The block's: [`stream_committers`], [`stream_generators`].
+    /// The block's: [`stream_committers`], [`stream_generators`],
+    /// [`finish_commit`], [`card_gate_budget`], [`commit_pool_threads`].
     fn from_env() -> Self {
         Self {
             committers: stream_committers(),
             generators: stream_generators(),
+            finish: finish_commit(),
+            card_budget: card_gate_budget(),
+            commit_pool: commit_pool_threads(),
         }
     }
 }
@@ -636,6 +813,13 @@ impl MemLedger {
         use std::sync::atomic::Ordering::Relaxed;
         self.queued.fetch_add(1, Relaxed);
         self.queued_bytes.fetch_add(bytes, Relaxed);
+    }
+
+    /// A chunk of `bytes` counted by [`Self::queue`] was never sent.
+    fn unqueue(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued.fetch_sub(1, Relaxed);
+        self.queued_bytes.fetch_sub(bytes, Relaxed);
     }
 
     /// A committer took a chunk of `bytes`.
@@ -825,7 +1009,15 @@ fn streamed_bytes(streamed: &Streamed) -> usize {
     match streamed {
         Streamed::Job(job) => job.op_bytes(),
         Streamed::Chunk(chunk) => wide_bytes(&chunk.trace),
+        Streamed::Finished(table) => held_bytes(&table.trace),
     }
+}
+
+/// A main trace's bytes as held: packed, or 64-bit.
+fn held_bytes(trace: &finish_sink::Trace) -> usize {
+    trace
+        .narrow_main()
+        .map_or_else(|| wide_bytes(trace), |t| t.data().len())
 }
 
 /// A main trace's bytes at 8 bytes a cell.
@@ -839,30 +1031,49 @@ fn wide_bytes(
 }
 
 /// A streamed chunk on its way to a committer: a job the committer generates,
-/// or (the `push` arm) a chunk the producer generated.
+/// (the `push` arm) a chunk the producer generated, or a table the finish
+/// handed off ([`BlockFinishSink`]), generated already.
 enum Streamed {
     Job(ChunkJob),
     Chunk(StreamedChunk),
+    Finished(FinishedTable),
 }
 
-/// The AIR a streamed chunk is proved under, named as [`VmAirs::new`] names it.
-fn stream_air(table: StreamTable, index: usize, opts: &ProofOptions) -> VmAir {
-    match table {
-        StreamTable::Cpu => Box::new(create_cpu_air(opts).with_name(&format!("CPU[{index}]"))),
-        StreamTable::MemwRegister => {
-            Box::new(create_memw_register_air(opts).with_name(&format!("MEMW_R[{index}]")))
+/// A generated table on its way from a generator to a committer: the table,
+/// the bytes it holds, and whether the finish handed it off.
+struct ToCommit {
+    table: FinishedTable,
+    held: usize,
+    finished: bool,
+}
+
+/// The finish's sink in phase A: each table it is handed goes into the
+/// committers' queue, behind the streamed chunks, and is counted in the
+/// ledger as queued. It never waits (the finish calls it from its rayon
+/// workers): the ops budget does not apply to a table that is already built.
+/// Once the queue is closed (a committer stopped) it gives the table back.
+struct BlockFinishSink<'a> {
+    tx: std::sync::mpsc::Sender<Streamed>,
+    ledger: Option<&'a MemLedger>,
+}
+
+impl FinishSink for BlockFinishSink<'_> {
+    fn hand(&self, table: FinishedTable) -> Option<FinishedTable> {
+        let bytes = held_bytes(&table.trace);
+        if let Some(ledger) = self.ledger {
+            ledger.queue(bytes);
         }
-        StreamTable::MemwAligned => {
-            Box::new(create_memw_aligned_air(opts).with_name(&format!("MEMW_A[{index}]")))
-        }
-        StreamTable::Memw => Box::new(create_memw_air(opts).with_name(&format!("MEMW[{index}]"))),
-        StreamTable::Load => Box::new(create_load_air(opts).with_name(&format!("LOAD[{index}]"))),
-        StreamTable::Lt => Box::new(create_lt_air(opts).with_name(&format!("LT[{index}]"))),
-        StreamTable::Shift => {
-            Box::new(create_shift_air(opts).with_name(&format!("SHIFT[{index}]")))
-        }
-        StreamTable::Store => {
-            Box::new(create_store_air(opts).with_name(&format!("STORE[{index}]")))
+        match self.tx.send(Streamed::Finished(table)) {
+            Ok(()) => None,
+            Err(refused) => {
+                if let Some(ledger) = self.ledger {
+                    ledger.unqueue(bytes);
+                }
+                match refused.0 {
+                    Streamed::Finished(table) => Some(table),
+                    Streamed::Job(_) | Streamed::Chunk(_) => None,
+                }
+            }
         }
     }
 }
@@ -901,8 +1112,30 @@ fn build_streamed(
     let queue = QueueRoom::new();
     let generators = stream.generators;
     let ready = QueueRoom::new();
-    let (ready_tx, ready_rx) = mpsc::channel::<(StreamedChunk, usize)>();
+    let (ready_tx, ready_rx) = mpsc::channel::<ToCommit>();
     let ready_rx = Mutex::new(ready_rx);
+    // Phase A's card gate ([`card_gate_budget`]): every commit admitted by its
+    // device set; the most it held and the committers' wait are reported.
+    let card = CardGate::new(stream.card_budget);
+    // The committers' own pool ([`commit_pool_threads`]). Each committer is an
+    // OS thread of this scope, never a worker of either pool, so `install`
+    // only parks the committer until its commit is done.
+    #[cfg(feature = "parallel")]
+    let commit_pool = match stream.commit_pool {
+        0 => None,
+        n => Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("block-commit-{i}"))
+                .build()
+                .map_err(|e| Error::Prover(format!("the committers' pool: {e}")))?,
+        ),
+    };
+    #[cfg(not(feature = "parallel"))]
+    let _ = stream.commit_pool;
+    // Tables the finish handed off and the committers committed, and their
+    // seconds from arrival to commit.
+    let finished_committed = Mutex::new((0usize, 0.0f64));
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
@@ -913,28 +1146,33 @@ fn build_streamed(
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
-        let exec = s.spawn(move || -> Result<f64, Error> {
-            let t = Instant::now();
-            let mut executor = Executor::new(program, private_input.to_vec())
-                .map_err(|e| Error::Execution(format!("{e}")))?;
-            while let Some(logs) = executor
-                .resume_with_limit(window)
-                .map_err(|e| Error::Execution(format!("{e}")))?
-            {
-                let logs = logs.to_vec();
-                let logs_bytes = logs.capacity() * std::mem::size_of::<executor::vm::logs::Log>();
-                if log_tx.send(logs).is_err() {
-                    break;
+        let exec = spawn_named(
+            s,
+            "block-exec".to_string(),
+            move || -> Result<f64, Error> {
+                let t = Instant::now();
+                let mut executor = Executor::new(program, private_input.to_vec())
+                    .map_err(|e| Error::Execution(format!("{e}")))?;
+                while let Some(logs) = executor
+                    .resume_with_limit(window)
+                    .map_err(|e| Error::Execution(format!("{e}")))?
+                {
+                    let logs = logs.to_vec();
+                    let logs_bytes =
+                        logs.capacity() * std::mem::size_of::<executor::vm::logs::Log>();
+                    if log_tx.send(logs).is_err() {
+                        break;
+                    }
+                    if let Some(ledger) = ledger {
+                        ledger.logs_bytes.fetch_add(logs_bytes, Relaxed);
+                        ledger
+                            .executor_bytes
+                            .store(executor.memory().heap_bytes(), Relaxed);
+                    }
                 }
-                if let Some(ledger) = ledger {
-                    ledger.logs_bytes.fetch_add(logs_bytes, Relaxed);
-                    ledger
-                        .executor_bytes
-                        .store(executor.memory().heap_bytes(), Relaxed);
-                }
-            }
-            Ok(t.elapsed().as_secs_f64())
-        });
+                Ok(t.elapsed().as_secs_f64())
+            },
+        );
         let decode = s.spawn(|| {
             crate::tables::decode::commitment_from_elf_device_or_host(program, opts)
                 .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))
@@ -945,11 +1183,11 @@ fn build_streamed(
 
         // Generators ([`stream_generators`]): each streamed chunk generated,
         // and packed under narrow storage, ahead of the committers.
-        for _ in 0..generators {
+        for g in 0..generators {
             let (job_rx, queue, ready, narrowed, generate_secs) =
                 (&job_rx, &queue, &ready, &narrowed, &generate_secs);
             let ready_tx = ready_tx.clone();
-            s.spawn(move || {
+            spawn_named(s, format!("gen-{g}"), move || {
                 loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(job) = job else {
@@ -960,29 +1198,43 @@ fn build_streamed(
                         ledger.take(job_bytes);
                     }
                     let t = Instant::now();
-                    let mut chunk = match job {
-                        Streamed::Job(job) => job.generate(),
-                        Streamed::Chunk(chunk) => chunk,
+                    // A table the finish handed off is built already, and it
+                    // never took room in the ops queue.
+                    let (mut table, finished) = match job {
+                        Streamed::Job(job) => (FinishedTable::from(job.generate()), false),
+                        Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
+                        Streamed::Finished(table) => (table, true),
                     };
-                    queue.release(job_bytes);
-                    let wide = wide_bytes(&chunk.trace);
+                    if !finished {
+                        queue.release(job_bytes);
+                    }
+                    let wide = wide_bytes(&table.trace);
                     if let Some(ledger) = ledger {
                         ledger.generated(job_bytes, wide);
                     }
-                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                        t.elapsed().as_secs_f64();
+                    if !finished {
+                        *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                            t.elapsed().as_secs_f64();
+                    }
                     let tp = Instant::now();
-                    if narrow && chunk.trace.pack_main_narrow() {
+                    if narrow
+                        && table.trace.narrow_main().is_none()
+                        && table.trace.pack_main_narrow()
+                    {
                         narrowed.lock().unwrap_or_else(|e| e.into_inner()).2 +=
                             tp.elapsed().as_secs_f64();
                     }
-                    let held = chunk.trace.narrow_main().map_or(wide, |t| t.data().len());
+                    let held = held_bytes(&table.trace);
                     if let Some(ledger) = ledger {
                         ledger.ready(wide, held);
                     }
                     ready.admit(held);
-                    if ready_tx.send((chunk, held)).is_err() {
-                        ready.release(held);
+                    if let Err(refused) = ready_tx.send(ToCommit {
+                        table,
+                        held,
+                        finished,
+                    }) {
+                        ready.release(refused.0.held);
                     }
                 }
             });
@@ -992,92 +1244,139 @@ fn build_streamed(
         // Committers: each streamed chunk generated (unless a generator did)
         // and Round-1 committed, as the chunks complete.
         let mut committers = Vec::new();
-        for _ in 0..committer_count {
-            committers.push(s.spawn(|| -> Result<(), Error> {
-                let commit_all = || -> Result<(), Error> {
-                    loop {
-                        // `t`: from the chunk's arrival (its generation
-                        // included when this committer generates it).
-                        let (mut chunk, wide, held, t) = if generators > 0 {
-                            let next = ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                            let Ok((chunk, held)) = next else {
-                                return Ok(());
-                            };
-                            let t = Instant::now();
-                            ready.release(held);
-                            if let Some(ledger) = ledger {
-                                ledger.take_ready(held);
-                            }
-                            let wide = wide_bytes(&chunk.trace);
-                            (chunk, wide, held, t)
-                        } else {
-                            let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                            let Ok(job) = job else {
-                                return Ok(());
-                            };
-                            let t = Instant::now();
-                            let job_bytes = streamed_bytes(&job);
-                            if let Some(ledger) = ledger {
-                                ledger.take(job_bytes);
-                            }
-                            let chunk = match job {
-                                Streamed::Job(job) => job.generate(),
-                                Streamed::Chunk(chunk) => chunk,
-                            };
-                            queue.release(job_bytes);
-                            let wide = wide_bytes(&chunk.trace);
-                            if let Some(ledger) = ledger {
-                                ledger.generated(job_bytes, wide);
-                            }
-                            *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                                t.elapsed().as_secs_f64();
-                            (chunk, wide, wide, t)
-                        };
-                        let air = stream_air(chunk.table, chunk.index, opts);
-                        let name = air.name().to_string();
-                        #[allow(unused_mut)]
-                        let mut pre = crate::hash_pin::BlockProver::precommit_main(
-                            air.as_ref(),
-                            &chunk.trace,
-                            #[cfg(feature = "disk-spill")]
-                            stark::storage_mode::StorageMode::Ram,
-                            residency,
-                        )
-                        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-                        *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                            t.elapsed().as_secs_f64();
-                        if narrow {
-                            let tp = Instant::now();
-                            // The device packed it from the commit's snapshot, or
-                            // the host packs it here.
-                            let by_device = pre
-                                .take_narrow()
-                                .is_some_and(|t| chunk.trace.install_main_narrow(t));
-                            if by_device || chunk.trace.pack_main_narrow() {
-                                let packed =
-                                    chunk.trace.narrow_main().map_or(0, |t| t.data().len());
-                                let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
-                                n.0 += wide;
-                                n.1 += packed;
-                                if by_device {
-                                    n.3 += 1;
+        for c in 0..committer_count {
+            committers.push(spawn_named(
+                s,
+                format!("commit-{c}"),
+                || -> Result<(), Error> {
+                    let commit_all = || -> Result<(), Error> {
+                        loop {
+                            // `t`: from the chunk's arrival (its generation
+                            // included when this committer generates it).
+                            let (mut chunk, wide, held, finished, t) = if generators > 0 {
+                                let next =
+                                    ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                                let Ok(ToCommit {
+                                    table,
+                                    held,
+                                    finished,
+                                }) = next
+                                else {
+                                    return Ok(());
+                                };
+                                let t = Instant::now();
+                                ready.release(held);
+                                if let Some(ledger) = ledger {
+                                    ledger.take_ready(held);
+                                }
+                                let wide = wide_bytes(&table.trace);
+                                (table, wide, held, finished, t)
+                            } else {
+                                let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                                let Ok(job) = job else {
+                                    return Ok(());
+                                };
+                                let t = Instant::now();
+                                let job_bytes = streamed_bytes(&job);
+                                if let Some(ledger) = ledger {
+                                    ledger.take(job_bytes);
+                                }
+                                let (table, finished) = match job {
+                                    Streamed::Job(job) => {
+                                        (FinishedTable::from(job.generate()), false)
+                                    }
+                                    Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
+                                    Streamed::Finished(table) => (table, true),
+                                };
+                                let wide = wide_bytes(&table.trace);
+                                let held = if finished {
+                                    job_bytes
                                 } else {
-                                    n.2 += tp.elapsed().as_secs_f64();
+                                    queue.release(job_bytes);
+                                    if let Some(ledger) = ledger {
+                                        ledger.generated(job_bytes, wide);
+                                    }
+                                    *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                                        t.elapsed().as_secs_f64();
+                                    wide
+                                };
+                                (table, wide, held, finished, t)
+                            };
+                            let air = finish_sink::air_for(chunk.kind, chunk.index, opts);
+                            let name = air.name().to_string();
+                            let on_card = commit_card_bytes(&air, &chunk.trace);
+                            card.admit(on_card);
+                            let commit = || {
+                                crate::hash_pin::BlockProver::precommit_main(
+                                    air.as_ref(),
+                                    &chunk.trace,
+                                    #[cfg(feature = "disk-spill")]
+                                    stark::storage_mode::StorageMode::Ram,
+                                    residency,
+                                )
+                            };
+                            #[cfg(feature = "parallel")]
+                            let pre = match &commit_pool {
+                                Some(pool) => pool.install(commit),
+                                None => commit(),
+                            };
+                            #[cfg(not(feature = "parallel"))]
+                            let pre = commit();
+                            let pre = pre.map_err(|e| Error::Prover(format!("{e:?}")));
+                            card.release(on_card);
+                            #[allow(unused_mut)]
+                            let mut pre = pre?;
+                            *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
+                                t.elapsed().as_secs_f64();
+                            if finished {
+                                let mut f =
+                                    finished_committed.lock().unwrap_or_else(|e| e.into_inner());
+                                f.0 += 1;
+                                f.1 += t.elapsed().as_secs_f64();
+                            }
+                            if finished {
+                                // What phase B's Round 1 does after the same commit:
+                                // the device's packed copy replaces the 64-bit one.
+                                if let Some(packed) = pre.take_narrow() {
+                                    chunk.trace.install_main_narrow(packed);
+                                }
+                            } else if narrow {
+                                let tp = Instant::now();
+                                // The device packed it from the commit's snapshot, or
+                                // the host packs it here.
+                                let by_device = pre
+                                    .take_narrow()
+                                    .is_some_and(|t| chunk.trace.install_main_narrow(t));
+                                if by_device || chunk.trace.pack_main_narrow() {
+                                    let packed =
+                                        chunk.trace.narrow_main().map_or(0, |t| t.data().len());
+                                    let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
+                                    n.0 += wide;
+                                    n.1 += packed;
+                                    if by_device {
+                                        n.3 += 1;
+                                    } else {
+                                        n.2 += tp.elapsed().as_secs_f64();
+                                    }
                                 }
                             }
+                            if let Some(ledger) = ledger {
+                                let packed = chunk.trace.narrow_main().map(|t| t.data().len());
+                                ledger.keep(held, packed);
+                            }
+                            committed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((chunk, name, pre));
                         }
-                        if let Some(ledger) = ledger {
-                            let packed = chunk.trace.narrow_main().map(|t| t.data().len());
-                            ledger.keep(held, packed);
-                        }
-                        committed
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((chunk, name, pre));
+                    };
+                    let result = commit_all();
+                    if result.is_err() {
+                        card.close();
                     }
-                };
-                commit_all()
-            }));
+                    result
+                },
+            ));
         }
 
         let produce = || -> Result<(Traces, f64), Error> {
@@ -1124,28 +1423,32 @@ fn build_streamed(
                 let (mut walker, mut accumulator) = builder.split();
                 std::thread::scope(|inner| -> Result<_, Error> {
                     let (walked_tx, walked_rx) = mpsc::sync_channel(2);
-                    let walking = inner.spawn(move || -> Result<_, Error> {
-                        // One window held back: the run's last is `finish`'s.
-                        let mut held: Option<Vec<executor::vm::logs::Log>> = None;
-                        for logs in log_rx.iter() {
-                            if let Some(prev) = held.replace(logs) {
-                                let walked = walker.walk(&prev)?;
-                                if let Some(ledger) = ledger {
-                                    ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
-                                    ledger.logs_bytes.fetch_sub(
-                                        prev.capacity()
-                                            * std::mem::size_of::<executor::vm::logs::Log>(),
-                                        Relaxed,
-                                    );
-                                    ledger.walked_bytes.fetch_add(walked.heap_bytes(), Relaxed);
-                                }
-                                if walked_tx.send(walked).is_err() {
-                                    break;
+                    let walking = spawn_named(
+                        inner,
+                        "block-walk".to_string(),
+                        move || -> Result<_, Error> {
+                            // One window held back: the run's last is `finish`'s.
+                            let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                            for logs in log_rx.iter() {
+                                if let Some(prev) = held.replace(logs) {
+                                    let walked = walker.walk(&prev)?;
+                                    if let Some(ledger) = ledger {
+                                        ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
+                                        ledger.logs_bytes.fetch_sub(
+                                            prev.capacity()
+                                                * std::mem::size_of::<executor::vm::logs::Log>(),
+                                            Relaxed,
+                                        );
+                                        ledger.walked_bytes.fetch_add(walked.heap_bytes(), Relaxed);
+                                    }
+                                    if walked_tx.send(walked).is_err() {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        Ok(held.unwrap_or_default())
-                    });
+                            Ok(held.unwrap_or_default())
+                        },
+                    );
                     for walked in walked_rx {
                         let t = Instant::now();
                         if let Some(ledger) = ledger {
@@ -1170,6 +1473,12 @@ fn build_streamed(
                     join(walking)
                 })?
             };
+            // The finish's sink keeps the committers' queue open until the
+            // finish's tables are handed off.
+            let sink = (stream.finish != FinishCommit::PhaseB).then(|| BlockFinishSink {
+                tx: job_tx.clone(),
+                ledger,
+            });
             drop(job_tx);
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
@@ -1177,7 +1486,9 @@ fn build_streamed(
             }
             let windows = builder.stamps();
             let t = Instant::now();
-            let traces = builder.finish(&last)?;
+            let traces =
+                builder.finish_handing(&last, sink.as_ref().map(|sink| sink as &dyn FinishSink))?;
+            drop(sink);
             let finish_secs = t.elapsed().as_secs_f64();
             if let Some(ledger) = ledger {
                 ledger.line("finish done");
@@ -1210,14 +1521,16 @@ fn build_streamed(
 
         let committed: Vec<Committed> =
             std::mem::take(&mut *committed.lock().unwrap_or_else(|e| e.into_inner()));
-        let n = committed.len();
-        let mut chunks = Vec::with_capacity(n);
-        let mut precommits = Vec::with_capacity(n);
-        for (chunk, name, pre) in committed {
-            chunks.push(chunk);
+        let (n_finished, finished_secs) =
+            *finished_committed.lock().unwrap_or_else(|e| e.into_inner());
+        let n = committed.len() - n_finished;
+        let mut tables = Vec::with_capacity(committed.len());
+        let mut precommits = Vec::with_capacity(committed.len());
+        for (table, name, pre) in committed {
+            tables.push(table);
             precommits.push((name, pre));
         }
-        traces.insert_streamed(chunks)?;
+        finish_sink::insert_finished(&mut traces, tables)?;
         let total = t.elapsed().as_secs_f64();
         times.build = total - times.execute;
         eprintln!(
@@ -1247,6 +1560,18 @@ fn build_streamed(
                 },
             );
         }
+        let (card_most, card_commits) = *card.most.lock().unwrap_or_else(|e| e.into_inner());
+        eprintln!(
+            "BLOCK CARD GATE: budget {} · at most {:.2} GiB in {card_commits} commits at once · the \
+             committers waited {:.2} s for the card · {n_finished} tables of the finish committed in \
+             phase A ({finished_secs:.2} s on the committers)",
+            card.budget.map_or("none".to_string(), |b| format!(
+                "{:.2} GiB",
+                b as f64 / (1u64 << 30) as f64
+            )),
+            card_most as f64 / (1u64 << 30) as f64,
+            *card.waited.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         let (most_bytes, most_chunks) = *queue.most.lock().unwrap_or_else(|e| e.into_inner());
         let (ready_bytes, ready_chunks) = *ready.most.lock().unwrap_or_else(|e| e.into_inner());
         eprintln!(
@@ -1426,10 +1751,57 @@ pub(crate) fn stream_for_test(
     committers: usize,
     generators: usize,
 ) -> Result<(Traces, Vec<String>), Error> {
-    let stream = StreamConfig {
-        committers,
-        generators,
-    };
+    stream_config_for_test(
+        program,
+        opts,
+        max_rows,
+        StreamConfig {
+            committers,
+            generators,
+            finish: FinishCommit::PhaseB,
+            card_budget: None,
+            commit_pool: 0,
+        },
+    )
+}
+
+/// [`stream_for_test`] with the finish's tables handed to phase A's
+/// committers as the finish builds them ([`FinishCommit::Handed`]), the
+/// commits admitted through a card gate of `card_budget` bytes and made in a
+/// pool of `commit_pool` threads of their own (0: the global pool), and the
+/// ledger on.
+#[cfg(test)]
+pub(crate) fn stream_finish_commit_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    committers: usize,
+    generators: usize,
+    card_budget: Option<usize>,
+    commit_pool: usize,
+) -> Result<(Traces, Vec<String>), Error> {
+    stream_config_for_test(
+        program,
+        opts,
+        max_rows,
+        StreamConfig {
+            committers,
+            generators,
+            finish: FinishCommit::Handed,
+            card_budget,
+            commit_pool,
+        },
+    )
+}
+
+#[cfg(test)]
+fn stream_config_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    stream: StreamConfig,
+) -> Result<(Traces, Vec<String>), Error> {
+    let ledger = (stream.finish != FinishCommit::PhaseB).then(MemLedger::new);
     let (traces, _, precommits) = build_streamed(
         program,
         &[],
@@ -1438,8 +1810,19 @@ pub(crate) fn stream_for_test(
         ResidencyMode::RecomputeLdeDevice,
         &mut BlockTimes::default(),
         &stream,
-        None,
+        ledger.as_ref(),
     )?;
+    if let Some(ledger) = &ledger {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Every table the ledger saw queued was taken and kept.
+        assert_eq!(ledger.queued.load(Relaxed), 0, "queued chunks left");
+        assert_eq!(ledger.ready.load(Relaxed), 0, "ready chunks left");
+        assert_eq!(
+            ledger.committing_bytes.load(Relaxed),
+            0,
+            "bytes left committing"
+        );
+    }
     Ok((
         traces,
         precommits.into_iter().map(|(name, _)| name).collect(),
