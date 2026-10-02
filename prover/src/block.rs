@@ -389,6 +389,16 @@ fn drop_streamed_ops() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_DROP_OPS").map_or(true, |v| v.trim() != "0")
 }
 
+/// `LAMBDA_VM_BLOCK_NARROW=1`: each streamed instance's main trace is packed
+/// at the bytes its columns need once its Round-1 commit exists
+/// (`TraceTable::pack_main_narrow`), about 2 bytes a cell instead of 8; phase B
+/// uploads it packed and widens it on the device, or on the host where the
+/// device path does not run. The words are the same, so no proof byte moves.
+/// Off by default until its box gate (D-MEMORY M3).
+fn narrow_streamed() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_NARROW").is_ok_and(|v| v.trim() == "1")
+}
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
@@ -450,6 +460,9 @@ fn build_streamed(
     let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
+    // Packed instances: (wide bytes, packed bytes, seconds packing).
+    let narrowed = Mutex::new((0usize, 0usize, 0.0f64));
+    let narrow = narrow_streamed();
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -486,7 +499,7 @@ fn build_streamed(
                         return Ok(());
                     };
                     let t = Instant::now();
-                    let chunk = match job {
+                    let mut chunk = match job {
                         Streamed::Job(job) => job.generate(),
                         Streamed::Chunk(chunk) => chunk,
                     };
@@ -504,6 +517,17 @@ fn build_streamed(
                     .map_err(|e| Error::Prover(format!("{e:?}")))?;
                     *commit_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
                         t.elapsed().as_secs_f64();
+                    if narrow {
+                        let tp = Instant::now();
+                        let wide = chunk.trace.num_rows() * chunk.trace.num_main_columns * 8;
+                        if chunk.trace.pack_main_narrow() {
+                            let packed = chunk.trace.narrow_main().map_or(0, |t| t.data().len());
+                            let mut n = narrowed.lock().unwrap_or_else(|e| e.into_inner());
+                            n.0 += wide;
+                            n.1 += packed;
+                            n.2 += tp.elapsed().as_secs_f64();
+                        }
+                    }
                     committed
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -606,6 +630,20 @@ fn build_streamed(
             *commit_secs.lock().unwrap_or_else(|e| e.into_inner()),
             *generate_secs.lock().unwrap_or_else(|e| e.into_inner()),
         );
+        if narrow {
+            let (wide, packed, secs) = *narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!(
+                "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) \
+                 in {secs:.2} s on the committers",
+                wide as f64 / (1u64 << 30) as f64,
+                packed as f64 / (1u64 << 30) as f64,
+                if wide > 0 {
+                    packed as f64 * 8.0 / wide as f64
+                } else {
+                    0.0
+                },
+            );
+        }
         Ok((traces, decode_commitment, precommits))
     })
 }
