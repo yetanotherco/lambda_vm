@@ -50,6 +50,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         stream_memw_lt: false,
         drop_streamed_ops: false,
         layout_workers: 0,
+        layout_ahead: Some(2),
         pack_rest_as_laid_out: false,
     }
 }
@@ -362,6 +363,37 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
             format!("{:?}", proof.table_counts),
             format!("{:?}", inline.table_counts)
         );
+        assert!(verify(&proof, &elf, &format));
+    }
+}
+
+/// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
+/// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
+/// and not yet packed at once, and the groups are the inline layout's.
+#[test]
+fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    for k in [0, 2] {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.layout_workers = 3;
+        o.layout_ahead = Some(k);
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        let most = stamps.layout.ahead_most;
+        assert!(
+            (1..=k + 1).contains(&most),
+            "k {k}: {most} chunks unpacked at once"
+        );
+        assert_eq!(proof.groups, inline.groups, "k {k}");
         assert!(verify(&proof, &elf, &format));
     }
 }
@@ -1196,24 +1228,47 @@ fn block_whir_on_a_real_block() {
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
     // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
-    // `BLOCK_WHIR_DROP_OPS=1`: the builder drops the streamed chunks' ops.
+    // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
+    // (production drops them).
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
     {
         options.layout_workers = n;
     }
+    // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
+    // `none` lifts the bound (the reverted version, BIG 390).
+    match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("none") => options.layout_ahead = None,
+        Ok(k) => {
+            if let Ok(k) = k.parse() {
+                options.layout_ahead = Some(k);
+            }
+        }
+        Err(_) => {}
+    }
     options.pack_rest_as_laid_out =
         std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
-    options.drop_streamed_ops = std::env::var("BLOCK_WHIR_DROP_OPS").is_ok_and(|v| v.trim() == "1");
+    match std::env::var("BLOCK_WHIR_DROP_OPS")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.drop_streamed_ops = false,
+        Ok("1") => options.drop_streamed_ops = true,
+        _ => {}
+    }
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
         options.drop_levels,
         if prepared { "on" } else { "off" },
         options.layout_workers,
+        options.layout_ahead,
         options.pack_rest_as_laid_out,
         if options.drop_streamed_ops {
             "on"
@@ -1265,6 +1320,22 @@ fn block_whir_on_a_real_block() {
         proof.proof.columns.len(),
         proof.proof.roots.len(),
     );
+    // The statement's shape, beside the roots: two proves of one block give
+    // the same digest when they built the same tables and partition (row
+    // order inside the HashMap-ordered tables aside), whatever their proof
+    // bytes.
+    let shape = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        proof.table_num_vars.hash(&mut h);
+        proof.groups.hash(&mut h);
+        format!("{:?}", proof.table_counts).hash(&mut h);
+        format!("{:?}", proof.runtime_page_ranges).hash(&mut h);
+        proof.public_output.hash(&mut h);
+        proof.num_private_input_pages.hash(&mut h);
+        h.finish()
+    };
+    println!("BLOCK SHAPE DIGEST: {shape:016x}");
     assert!(ok, "the block proof must verify");
 }
 

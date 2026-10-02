@@ -184,8 +184,9 @@ pub struct BlockOptions {
     pub stream_memw_lt: bool,
     /// With windows: the builder drops each streamed chunk's ops as the chunk
     /// leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so the build does
-    /// not hold the run's op lists to its end; the traces are the same. Off by
-    /// default until its box gate (D-MEMORY M1).
+    /// not hold the run's op lists to its end; the traces are the same. On in
+    /// production (D-MEMORY M1, FAST 501: 1× base −0.74 s, peak 47.4 → 36.6
+    /// GiB, the 1.20× block proves).
     pub drop_streamed_ops: bool,
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
@@ -194,6 +195,11 @@ pub struct BlockOptions {
     /// base (FAST 421 / 422), but their extra host memory grows with the block
     /// (BIG 390: +2.2 / +4.2 / +8.7 GiB at 1.0 / 1.3 / 1.8×).
     pub layout_workers: usize,
+    /// With `layout_workers > 0`: `Some(k)` lets at most `k + 1` streamed
+    /// chunks be laid out (or in the making) and not yet packed, where the
+    /// inline layout holds one; `None` leaves only the channels to bound them,
+    /// which BIG 390 saw grow with the block. Production `Some(2)` (D-EXEC E3).
+    pub layout_ahead: Option<usize>,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
     /// of after all of them; the packing order is the same.
@@ -212,8 +218,9 @@ impl BlockOptions {
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
-            drop_streamed_ops: false,
+            drop_streamed_ops: true,
             layout_workers: 0,
+            layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
         }
     }
@@ -296,6 +303,9 @@ pub struct LayoutStamps {
     pub chunks: f64,
     /// The rest's five slowest tables to lay out and its first in AIR order.
     pub slowest: Vec<(String, f64)>,
+    /// The most streamed chunks laid out (or in the making) and not yet
+    /// packed at once, under [`BlockOptions::layout_ahead`].
+    pub ahead_most: usize,
 }
 
 impl BlockStamps {
@@ -358,8 +368,13 @@ impl BlockStamps {
                 .collect();
             let closed: Vec<String> = l.closed_at.iter().map(|at| format!("{at:.2}")).collect();
             out.push_str(&format!(
-                "BLOCK LAYOUT: {} worker(s) · {} · groups closed at [{}] · packer waited on phase A {:.2}s · chunks laid out {:.2}s (summed)\n",
+                "BLOCK LAYOUT: {} worker(s), at most {} chunk(s) unpacked · {} · groups closed at [{}] · packer waited on phase A {:.2}s · chunks laid out {:.2}s (summed)\n",
                 l.workers,
+                if l.ahead_most == 0 && l.workers > 0 {
+                    "unbounded".to_string()
+                } else {
+                    l.ahead_most.to_string()
+                },
                 marks.join(" · "),
                 closed.join(", "),
                 l.blocked,
@@ -1532,6 +1547,9 @@ struct StreamLaid<'a> {
     chunks: f64,
     placed_at: f64,
     rest: Vec<(usize, (usize, usize))>,
+    /// The most chunks laid out (or in the making) and not yet packed at once;
+    /// 0 when nothing bounded them.
+    ahead_most: usize,
 }
 
 /// A table of the rest laid out, sent to the packer: its position in AIR order
@@ -1558,12 +1576,14 @@ fn stream_inline<'a>(
             }
             Built::Rest(traces) => {
                 let placed_at = packer.start.elapsed().as_secs_f64();
+                let ahead_most = usize::from(!shapes.is_empty());
                 let streamed = StreamLaid {
                     packer,
                     shapes,
                     chunks,
                     placed_at,
                     rest: Vec::new(),
+                    ahead_most,
                 };
                 return Ok((streamed, traces));
             }
@@ -1574,6 +1594,88 @@ fn stream_inline<'a>(
     ))
 }
 
+/// Streamed chunks laid out (or in the making) and not yet packed, at most so
+/// many ([`BlockOptions::layout_ahead`]): a worker takes a permit before it
+/// takes a job, so every job taken holds one and the next chunk to pack is
+/// never starved; the packer gives it back once the chunk is packed.
+struct Permits {
+    state: std::sync::Mutex<PermitState>,
+    freed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PermitState {
+    free: usize,
+    out: usize,
+    most: usize,
+    closed: bool,
+}
+
+impl Permits {
+    fn new(n: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(PermitState {
+                free: n,
+                ..PermitState::default()
+            }),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits for a permit; `false` once the packer has stopped.
+    fn take(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        loop {
+            if state.closed {
+                return false;
+            }
+            if state.free > 0 {
+                state.free -= 1;
+                state.out += 1;
+                state.most = state.most.max(state.out);
+                return true;
+            }
+            state = match self.freed.wait(state) {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+        }
+    }
+
+    fn give(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.free += 1;
+            state.out = state.out.saturating_sub(1);
+        }
+        self.freed.notify_one();
+    }
+
+    /// Wakes every waiting worker for good.
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+        self.freed.notify_all();
+    }
+
+    fn most(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.most)
+    }
+}
+
+/// Closes the permits when the packer stops, however it stops.
+struct ClosePermits<'p>(Option<&'p Permits>);
+
+impl Drop for ClosePermits<'_> {
+    fn drop(&mut self) {
+        if let Some(permits) = self.0 {
+            permits.close();
+        }
+    }
+}
+
 /// The chunks laid out on `workers` threads and packed on one more, in
 /// arrival order all the same, so a waiting phase A holds back only the
 /// packing; this thread hands them out and, once the run is built, lays out
@@ -1582,15 +1684,19 @@ fn stream_inline<'a>(
 /// out, and it packs them after the chunks, in AIR order. Their channel is
 /// unbounded: the rest is already in memory, and a full channel would park
 /// the rayon threads phase A's commits need.
+#[allow(clippy::too_many_arguments)]
 fn stream_pipelined<'a, R>(
     brx: std::sync::mpsc::Receiver<Built>,
     airs: &'a StreamAirs,
     mut packer: Packer<'a>,
     workers: usize,
+    ahead: Option<usize>,
     pack_rest: bool,
     rest: impl FnOnce(Box<Traces>, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
+    let permits = ahead.map(|k| Permits::new(k + 1));
+    let permits = permits.as_ref();
     std::thread::scope(|scope| {
         let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Box<ChunkJob>)>(workers);
         let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
@@ -1600,13 +1706,23 @@ fn stream_pipelined<'a, R>(
             let dtx = dtx.clone();
             scope.spawn(move || {
                 loop {
+                    if let Some(permits) = permits
+                        && !permits.take()
+                    {
+                        return;
+                    }
                     // The lock is held for the receive alone. A poisoned lock
                     // means a sibling panicked, which the scope reports.
                     let next = match jrx.lock() {
                         Ok(jobs) => jobs.recv(),
-                        Err(_) => return,
+                        Err(_) => Err(std::sync::mpsc::RecvError),
                     };
-                    let Ok((seq, job)) = next else { return };
+                    let Ok((seq, job)) = next else {
+                        if let Some(permits) = permits {
+                            permits.give();
+                        }
+                        return;
+                    };
                     let t = Instant::now();
                     let laid = lay_out_chunk(airs, *job);
                     if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
@@ -1622,6 +1738,7 @@ fn stream_pipelined<'a, R>(
         let (rtx, rrx) = std::sync::mpsc::channel::<RestDone<'a>>();
         let rtx = pack_rest.then_some(rtx);
         let placer = scope.spawn(move || -> Result<StreamLaid<'a>, Error> {
+            let _close = ClosePermits(permits);
             let mut pending = std::collections::BTreeMap::new();
             let mut next = 0usize;
             let mut shapes = Vec::new();
@@ -1633,6 +1750,9 @@ fn stream_pipelined<'a, R>(
                     let (table, index, shape, laid) = laid?;
                     shapes.push((table, index, shape));
                     packer.place(Key::Streamed(table, index), shape, laid)?;
+                    if let Some(permits) = permits {
+                        permits.give();
+                    }
                     next += 1;
                 }
             }
@@ -1666,6 +1786,7 @@ fn stream_pipelined<'a, R>(
                 chunks,
                 placed_at,
                 rest: placed,
+                ahead_most: 0,
             })
         });
         let mut handed = 0usize;
@@ -1692,9 +1813,10 @@ fn stream_pipelined<'a, R>(
                 None
             }
         };
-        let streamed = placer
+        let mut streamed = placer
             .join()
             .map_err(|_| Error::Prover("the block's packer panicked".into()))??;
+        streamed.ahead_most = permits.map_or(0, Permits::most);
         if streamed.shapes.len() != handed {
             return Err(Error::Prover(format!(
                 "{} of {handed} streamed chunks packed",
@@ -2020,6 +2142,7 @@ fn prove_streamed(
                         stream_airs,
                         packer,
                         options.layout_workers,
+                        options.layout_ahead,
                         options.pack_rest_as_laid_out,
                         rest_of,
                     )?
@@ -2031,6 +2154,7 @@ fn prove_streamed(
                     chunks,
                     placed_at,
                     rest: rest_packed,
+                    ahead_most,
                 } = streamed;
                 let RestLaid {
                     table_counts,
@@ -2134,6 +2258,7 @@ fn prove_streamed(
                         blocked,
                         chunks,
                         slowest,
+                        ahead_most,
                     },
                 })
             });
