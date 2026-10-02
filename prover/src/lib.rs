@@ -123,8 +123,9 @@ pub struct RuntimePageRange {
 pub const FIXED_TABLE_COUNT: usize = 5;
 
 /// How many sub-proofs each counted table contributes. Chunked chips report
-/// their chunk count; the six accelerators are not chunked and report 0 or 1
-/// (see `validate`). The verifier needs this to reconstruct matching AIRs.
+/// their chunk count; the six accelerators report 0 or 1 (see `validate`),
+/// except KECCAK, KECCAK_RND, ECSM and ECDAS in a no-epoch block, which chunks
+/// them (`validate_for`). The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
@@ -276,9 +277,9 @@ impl TableCounts {
     }
 
     /// [`Self::validate`] under the verifier's own accelerator shape: the one
-    /// place `shape` may lift the one-table bound, and only for KECCAK_RND and
-    /// ECDAS. The shape is the VERIFIER's constant (the entry point it was
-    /// called through), never a value read from the proof.
+    /// place `shape` may lift the one-table bound, and only for KECCAK,
+    /// KECCAK_RND, ECSM and ECDAS. The shape is the VERIFIER's constant (the
+    /// entry point it was called through), never a value read from the proof.
     pub fn validate_for(&self, shape: AcceleratorShape) -> Result<(), Error> {
         let required = [("cpu", self.cpu), ("memw_register", self.memw_register)];
         for (name, count) in required {
@@ -302,24 +303,25 @@ impl TableCounts {
         // than one BLAKE3 table, and an unbounded count would have the verifier
         // allocate AIRs off a number the proof has not been checked against.
         //
-        // `AcceleratorShape::BlockChunked` (the block verifier) takes
-        // KECCAK_RND and ECDAS chunked like any splittable table: their
-        // constraints read one row (no transition reaches another) and their
-        // steps chain through a bus (KECCAK_RND's rounds on the Keccak bus,
-        // ECDAS's double/add steps on the Ecdas bus, keyed by the call's
-        // timestamp and the step's `(round, op)`), so a cut between two rows
+        // `AcceleratorShape::BlockChunked` (the block verifier) takes KECCAK,
+        // KECCAK_RND, ECSM and ECDAS chunked like any splittable table: their
+        // constraints read one row (no transition reaches another) and a row
+        // reaches anything beyond itself only through a bus, keyed by its
+        // call's timestamp (KECCAK and ECSM are one row per call; KECCAK_RND's
+        // rounds chain on the Keccak bus, ECDAS's double/add steps on the
+        // Ecdas bus with the step's `(round, op)`). So a cut between two rows
         // changes nothing a bus or a constraint sees — the argument that makes
         // every chunked table sound. Their heights are the shape's too
         // ([`Self::check_heights_for`]).
-        let (keccak_rnd_bound, ecdas_bound) = match shape {
-            AcceleratorShape::Single => (self.keccak_rnd, self.ecdas),
-            AcceleratorShape::BlockChunked => (self.keccak_rnd.min(1), self.ecdas.min(1)),
+        let chunked = |count: usize| match shape {
+            AcceleratorShape::Single => count,
+            AcceleratorShape::BlockChunked => count.min(1),
         };
         let at_most_one = [
-            ("keccak", self.keccak),
-            ("keccak_rnd", keccak_rnd_bound),
-            ("ecsm", self.ecsm),
-            ("ecdas", ecdas_bound),
+            ("keccak", chunked(self.keccak)),
+            ("keccak_rnd", chunked(self.keccak_rnd)),
+            ("ecsm", chunked(self.ecsm)),
+            ("ecdas", chunked(self.ecdas)),
             ("hint", self.hint),
             ("commit", self.commit),
             ("blake3", self.blake3),
@@ -336,8 +338,9 @@ impl TableCounts {
 
     /// The instance heights `shape` bounds, against `trace_length(i)`, the rows
     /// of the proof's `i`-th instance. `Single` bounds none; `BlockChunked`
-    /// bounds every KECCAK_RND instance by [`BLOCK_KECCAK_RND_MAX_ROWS`] and
-    /// every ECDAS instance by [`BLOCK_ECDAS_MAX_ROWS`], which is what keeps a
+    /// bounds every KECCAK, KECCAK_RND, ECSM and ECDAS instance by its cap
+    /// ([`BLOCK_KECCAK_MAX_ROWS`], [`BLOCK_KECCAK_RND_MAX_ROWS`],
+    /// [`BLOCK_ECSM_MAX_ROWS`], [`BLOCK_ECDAS_MAX_ROWS`]), which is what keeps a
     /// chunked table's DEEP batching phase at its bits whatever the prover
     /// declares (one chunk at 2^30 rows would be a valid table of padding).
     ///
@@ -371,25 +374,39 @@ impl TableCounts {
     /// KECCAK, KECCAK_RND, ECSM, ECDAS, … (pinned against the AIR names by
     /// `block_chunked_ranges_name_the_chunked_airs`). Counts that passed the
     /// sub-proof cross-check cannot overflow these sums.
-    fn block_chunked_ranges(&self) -> [(&'static str, std::ops::Range<usize>, usize); 2] {
-        let keccak_rnd = FIXED_TABLE_COUNT + self.commit + self.keccak;
-        let ecdas = keccak_rnd + self.keccak_rnd + self.ecsm;
+    fn block_chunked_ranges(&self) -> [(&'static str, std::ops::Range<usize>, usize); 4] {
+        let keccak = FIXED_TABLE_COUNT + self.commit;
+        let keccak_rnd = keccak + self.keccak;
+        let ecsm = keccak_rnd + self.keccak_rnd;
+        let ecdas = ecsm + self.ecsm;
         [
-            (
-                "KECCAK_RND",
-                keccak_rnd..keccak_rnd + self.keccak_rnd,
-                BLOCK_KECCAK_RND_MAX_ROWS,
-            ),
+            ("KECCAK", keccak..keccak_rnd, BLOCK_KECCAK_MAX_ROWS),
+            ("KECCAK_RND", keccak_rnd..ecsm, BLOCK_KECCAK_RND_MAX_ROWS),
+            ("ECSM", ecsm..ecdas, BLOCK_ECSM_MAX_ROWS),
             ("ECDAS", ecdas..ecdas + self.ecdas, BLOCK_ECDAS_MAX_ROWS),
         ]
     }
 }
+
+/// The most rows a KECCAK instance of a no-epoch block may have, a verifier
+/// constant of [`AcceleratorShape::BlockChunked`]: at 2^18 the DEEP batching
+/// phase keeps 129.21 bits (L = 581) and the instance's device set is ≈ 7.5
+/// GiB. A keccak-heavy block at the gas limit makes ≈ 2^21 permutation calls,
+/// which one table would hold at 126.21 bits on a ≈ 58.5 GiB device set.
+pub const BLOCK_KECCAK_MAX_ROWS: usize = 1 << 18;
 
 /// The most rows a KECCAK_RND instance of a no-epoch block may have, a
 /// verifier constant of [`AcceleratorShape::BlockChunked`]: at 2^16 the DEEP
 /// batching phase keeps 129.43 bits (158.393 − log2 LDE − log2(L − 1), L =
 /// 1,999), above the block's minimum of record 128.946.
 pub const BLOCK_KECCAK_RND_MAX_ROWS: usize = 1 << 16;
+
+/// The most rows an ECSM instance of a no-epoch block may have, a verifier
+/// constant of [`AcceleratorShape::BlockChunked`]: at 2^17 the DEEP batching
+/// phase keeps 129.49 bits (L = 960) and the instance's device set is ≈ 7.9
+/// GiB; one table at 2^18 would read 128.49, under the block's minimum of
+/// record.
+pub const BLOCK_ECSM_MAX_ROWS: usize = 1 << 17;
 
 /// The most rows an ECDAS instance of a no-epoch block may have, a verifier
 /// constant of [`AcceleratorShape::BlockChunked`]: at 2^17 the DEEP batching
@@ -404,14 +421,15 @@ pub const BLOCK_ECDAS_MAX_ROWS: usize = 1 << 17;
 /// A verifier-side constant, chosen by the entry point: [`verify_with_options`]
 /// and every epoch and recursion verifier use `Single`; only the no-epoch block
 /// verifiers ([`block::verify_block`] and the block tree's shape check) use
-/// `BlockChunked`, because only the block prover chunks KECCAK_RND and ECDAS
-/// (`MaxRowsConfig::keccak_rnd`, `MaxRowsConfig::ecdas`).
+/// `BlockChunked`, because only the block prover chunks KECCAK, KECCAK_RND,
+/// ECSM and ECDAS (`MaxRowsConfig::keccak`, `keccak_rnd`, `ecsm`, `ecdas`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceleratorShape {
     /// Every accelerator is one table or none, at any height.
     Single,
-    /// KECCAK_RND and ECDAS may be chunked, every instance at most
-    /// [`BLOCK_KECCAK_RND_MAX_ROWS`] / [`BLOCK_ECDAS_MAX_ROWS`] rows; the other
+    /// KECCAK, KECCAK_RND, ECSM and ECDAS may be chunked, every instance at
+    /// most [`BLOCK_KECCAK_MAX_ROWS`] / [`BLOCK_KECCAK_RND_MAX_ROWS`] /
+    /// [`BLOCK_ECSM_MAX_ROWS`] / [`BLOCK_ECDAS_MAX_ROWS`] rows; the other
     /// accelerators are one table or none.
     BlockChunked,
 }

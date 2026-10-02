@@ -340,7 +340,7 @@ fn noepoch_epoch_base_reference() {
 
 /// The block shape's accelerator rule, host only: a chunked KECCAK_RND count is
 /// accepted by the block shape and refused by the single shape every other
-/// verifier uses; the other accelerators stay at one table under both.
+/// verifier uses; HINT, COMMIT and BLAKE3 stay at one table under both.
 #[test]
 fn a_chunked_keccak_rnd_is_accepted_only_by_the_block_shape() {
     use crate::AcceleratorShape;
@@ -359,14 +359,18 @@ fn a_chunked_keccak_rnd_is_accepted_only_by_the_block_shape() {
         chunked.validate().is_err(),
         "the single shape refuses 4 KECCAK_RND tables"
     );
-    let mut two_keccak = honest.clone();
-    two_keccak.keccak = 2;
-    assert!(
-        two_keccak
-            .validate_for(AcceleratorShape::BlockChunked)
-            .is_err(),
-        "KECCAK (the permutation table) stays one table under the block shape"
-    );
+    for (name, set) in [
+        ("hint", (|c| c.hint = 2) as fn(&mut crate::TableCounts)),
+        ("commit", |c| c.commit = 2),
+        ("blake3", |c| c.blake3 = 2),
+    ] {
+        let mut two = honest.clone();
+        set(&mut two);
+        assert!(
+            two.validate_for(AcceleratorShape::BlockChunked).is_err(),
+            "{name} stays one table under the block shape"
+        );
+    }
 }
 
 /// ★ KECCAK_RND chunked (S2): test_keccak_multi's three permutations at 24 rows
@@ -408,9 +412,10 @@ fn noepoch_keccak_rnd_chunked_proves_and_verifies() {
     );
 }
 
-/// Every accelerator present, KECCAK_RND in two chunks and ECDAS in three: in
-/// proof order (`VmAirs::air_refs`) the five fixed tables, COMMIT 5, KECCAK 6,
-/// KECCAK_RND 7–8, ECSM 9, ECDAS 10–12, HINT 13, CPU 14–15, MEMW_R 16.
+/// Every accelerator present, KECCAK, KECCAK_RND and ECSM in two chunks and
+/// ECDAS in three: in proof order (`VmAirs::air_refs`) the five fixed tables,
+/// COMMIT 5, KECCAK 6–7, KECCAK_RND 8–9, ECSM 10–11, ECDAS 12–14, HINT 15,
+/// CPU 16–17, MEMW_R 18.
 fn chunked_counts() -> crate::TableCounts {
     crate::TableCounts {
         cpu: 2,
@@ -427,9 +432,9 @@ fn chunked_counts() -> crate::TableCounts {
         bytewise: 0,
         store: 0,
         cpu32: 0,
-        keccak: 1,
+        keccak: 2,
         keccak_rnd: 2,
-        ecsm: 1,
+        ecsm: 2,
         ecdas: 3,
         hint: 1,
         commit: 1,
@@ -437,70 +442,99 @@ fn chunked_counts() -> crate::TableCounts {
     }
 }
 
-/// The block shape's accelerator rule for ECDAS, host only: three ECDAS tables
-/// pass the block shape and are refused by the single shape every other
-/// verifier uses; ECSM (the call table) stays at one table under both.
+/// The block shape's accelerator rule for each chunked table, host only: two
+/// or three tables of KECCAK, KECCAK_RND, ECSM or ECDAS pass the block shape,
+/// and each one alone over one table is refused by the single shape every
+/// other verifier uses; HINT stays at one table under both.
 #[test]
-fn a_chunked_ecdas_is_accepted_only_by_the_block_shape() {
+fn each_chunked_accelerator_is_accepted_only_by_the_block_shape() {
     use crate::AcceleratorShape;
     let counts = chunked_counts();
     assert!(counts.validate_for(AcceleratorShape::BlockChunked).is_ok());
-    let mut ecdas_only = counts.clone();
-    ecdas_only.keccak_rnd = 1;
+    let mut one_of_each = counts.clone();
+    (one_of_each.keccak, one_of_each.keccak_rnd) = (1, 1);
+    (one_of_each.ecsm, one_of_each.ecdas) = (1, 1);
+    assert!(one_of_each.validate().is_ok(), "the control: one of each");
+    for (name, set) in [
+        ("KECCAK", (|c| c.keccak = 2) as fn(&mut crate::TableCounts)),
+        ("KECCAK_RND", |c| c.keccak_rnd = 2),
+        ("ECSM", |c| c.ecsm = 2),
+        ("ECDAS", |c| c.ecdas = 3),
+    ] {
+        let mut chunked = one_of_each.clone();
+        set(&mut chunked);
+        assert!(
+            chunked.validate_for(AcceleratorShape::BlockChunked).is_ok(),
+            "the block shape takes {name} chunked"
+        );
+        assert!(
+            chunked.validate().is_err(),
+            "the single shape refuses {name} chunked"
+        );
+    }
+    let mut two_hint = counts.clone();
+    two_hint.hint = 2;
     assert!(
-        ecdas_only.validate().is_err(),
-        "the single shape refuses 3 ECDAS tables"
-    );
-    let mut one_ecdas = ecdas_only.clone();
-    one_ecdas.ecdas = 1;
-    assert!(one_ecdas.validate().is_ok(), "the control: one of each");
-    let mut two_ecsm = counts.clone();
-    two_ecsm.ecsm = 2;
-    assert!(
-        two_ecsm
+        two_hint
             .validate_for(AcceleratorShape::BlockChunked)
             .is_err(),
-        "ECSM stays one table under the block shape"
+        "HINT stays one table under the block shape"
     );
 }
 
-/// ★ The block shape caps the chunked tables' heights, and only theirs: an
-/// ECDAS instance over [`crate::BLOCK_ECDAS_MAX_ROWS`] and a KECCAK_RND
-/// instance over [`crate::BLOCK_KECCAK_RND_MAX_ROWS`] are refused by the block
-/// shape and accepted by the single shape (which bounds no height); every
-/// other table at a height far over both caps is accepted. The controls next
-/// to each range (ECSM before ECDAS, HINT after it, KECCAK before KECCAK_RND)
-/// are what an off-by-one in the instance ranges would cap instead.
+/// ★ The block shape caps the chunked tables' heights, and only theirs: a
+/// KECCAK, KECCAK_RND, ECSM or ECDAS instance over its cap
+/// ([`crate::BLOCK_KECCAK_MAX_ROWS`], [`crate::BLOCK_KECCAK_RND_MAX_ROWS`],
+/// [`crate::BLOCK_ECSM_MAX_ROWS`], [`crate::BLOCK_ECDAS_MAX_ROWS`]) is refused
+/// by the block shape and accepted by the single shape (which bounds no
+/// height); every other table at a height far over every cap is accepted. The
+/// controls next to the ranges (COMMIT before KECCAK, HINT after ECDAS) are
+/// what an off-by-one in the instance ranges would cap instead
+/// (`block_chunked_ranges_name_the_chunked_airs` pins the ranges themselves).
 #[test]
 fn the_block_shape_caps_the_chunked_tables_heights() {
     use crate::AcceleratorShape::{BlockChunked, Single};
     let counts = chunked_counts();
     let n = counts.total().expect("fits") + crate::FIXED_TABLE_COUNT;
-    assert_eq!(n, 17);
+    assert_eq!(n, 19);
     let check = |shape, lengths: &[usize]| counts.check_heights_for(shape, |i| lengths[i]);
     let honest = vec![1usize << 10; n];
     assert!(check(BlockChunked, &honest).is_ok());
 
     let mut at_caps = honest.clone();
-    at_caps[7..9].fill(crate::BLOCK_KECCAK_RND_MAX_ROWS);
-    at_caps[10..13].fill(crate::BLOCK_ECDAS_MAX_ROWS);
+    at_caps[6..8].fill(crate::BLOCK_KECCAK_MAX_ROWS);
+    at_caps[8..10].fill(crate::BLOCK_KECCAK_RND_MAX_ROWS);
+    at_caps[10..12].fill(crate::BLOCK_ECSM_MAX_ROWS);
+    at_caps[12..15].fill(crate::BLOCK_ECDAS_MAX_ROWS);
     assert!(
         check(BlockChunked, &at_caps).is_ok(),
         "an instance at its cap passes"
     );
 
     for (what, idx, rows) in [
-        ("ECDAS[2] over its cap", 12, crate::BLOCK_ECDAS_MAX_ROWS * 2),
-        ("ECDAS[0] over its cap", 10, crate::BLOCK_ECDAS_MAX_ROWS * 2),
+        ("ECDAS[2] over its cap", 14, crate::BLOCK_ECDAS_MAX_ROWS * 2),
+        ("ECDAS[0] over its cap", 12, crate::BLOCK_ECDAS_MAX_ROWS * 2),
+        ("ECSM[1] over its cap", 11, crate::BLOCK_ECSM_MAX_ROWS * 2),
+        ("ECSM[0] over its cap", 10, crate::BLOCK_ECSM_MAX_ROWS * 2),
         (
             "KECCAK_RND[1] over its cap",
-            8,
+            9,
             crate::BLOCK_KECCAK_RND_MAX_ROWS * 2,
         ),
         (
             "KECCAK_RND[0] over its cap",
-            7,
+            8,
             crate::BLOCK_KECCAK_RND_MAX_ROWS * 2,
+        ),
+        (
+            "KECCAK[1] over its cap",
+            7,
+            crate::BLOCK_KECCAK_MAX_ROWS * 2,
+        ),
+        (
+            "KECCAK[0] over its cap",
+            6,
+            crate::BLOCK_KECCAK_MAX_ROWS * 2,
         ),
     ] {
         let mut lengths = honest.clone();
@@ -516,11 +550,9 @@ fn the_block_shape_caps_the_chunked_tables_heights() {
 
     for (what, idx) in [
         ("COMMIT", 5),
-        ("KECCAK", 6),
-        ("ECSM", 9),
-        ("HINT", 13),
-        ("CPU[0]", 14),
-        ("MEMW_R[0]", 16),
+        ("HINT", 15),
+        ("CPU[0]", 16),
+        ("MEMW_R[0]", 18),
     ] {
         let mut lengths = honest.clone();
         lengths[idx] = 1 << 22;
@@ -569,6 +601,107 @@ fn block_chunked_ranges_name_the_chunked_airs() {
         let prefix = format!("{table}[");
         assert!(!names[range.start - 1].starts_with(&prefix));
         assert!(!names[range.end].starts_with(&prefix));
+    }
+}
+
+/// The DEEP batching phase's proven bits for a table of `rows` rows whose DEEP
+/// batch has `l` terms, at rate `1 / blowup`: BCHKS25 Thm 4.2 in the Johnson
+/// regime, the gap at its floor (`α = 0`), batching by powers of one challenge
+/// — ZisK's security calculator (pil2-proofman `regimes.rs`,
+/// `JohnsonBoundRegime::error_powers`), the accounting of record.
+fn deep_batching_bits(rows: usize, l: usize, blowup: usize) -> f64 {
+    let p = ((1u128 << 64) - (1u128 << 32) + 1) as f64;
+    let field = p * p * p;
+    let rate = 1.0 / blowup as f64;
+    let sqrt_rate = rate.sqrt();
+    let gap = 1.0 / 300.0;
+    let ms = (sqrt_rate / (2.0 * gap)).ceil().max(3.0) + 0.5;
+    let n = rows as f64 / rate;
+    let first = (2.0 * ms.powi(5) + 3.0 * ms * gap * rate) * n / (3.0 * rate * sqrt_rate);
+    let second = ms / sqrt_rate;
+    -((first + second) / field * (l as f64 - 1.0)).log2()
+}
+
+/// ★ Every chunked table keeps its DEEP batching phase above the block's
+/// minimum of record at its cap, whatever height a prover declares under it:
+/// the batch size `L` (composition parts + main and aux columns + next-row
+/// openings) is read from the AIR the verifier builds, and the bits at the cap
+/// are pinned to the campaign calculator's (`danyblock/bits.out`: KECCAK
+/// 129.213 at 2^18, KECCAK_RND 129.429 at 2^16, ECSM 129.488 at 2^17, ECDAS
+/// 129.907 at 2^17). The minimum of record is the query phase (110 queries,
+/// 20 bits of grinding: 128.946), which no table height moves; one doubling
+/// past each cap falls under it, so each cap is the largest that keeps it.
+#[test]
+fn every_chunked_table_keeps_its_batching_bits_at_its_cap() {
+    let opts = crate::lfm::proof::block_base_options();
+    let blowup = opts.blowup_factor as usize;
+    assert_eq!(
+        (blowup, opts.fri_number_of_queries, opts.grinding_factor),
+        (4, 110, 20),
+        "the block's posture of record"
+    );
+    let gap = 1.0 / 300.0;
+    let query_bits = opts.grinding_factor as f64
+        + opts.fri_number_of_queries as f64 * -((1.0 / blowup as f64).sqrt() + gap).log2();
+    assert!(
+        (query_bits - 128.946).abs() < 1e-3,
+        "query phase {query_bits}"
+    );
+    let airs: [(&str, crate::test_utils::VmAir, usize, usize, f64); 4] = [
+        (
+            "KECCAK",
+            Box::new(crate::test_utils::create_keccak_air(&opts)),
+            crate::BLOCK_KECCAK_MAX_ROWS,
+            581,
+            129.213,
+        ),
+        (
+            "KECCAK_RND",
+            Box::new(crate::test_utils::create_keccak_rnd_air(&opts)),
+            crate::BLOCK_KECCAK_RND_MAX_ROWS,
+            1999,
+            129.429,
+        ),
+        (
+            "ECSM",
+            Box::new(crate::test_utils::create_ecsm_air(&opts)),
+            crate::BLOCK_ECSM_MAX_ROWS,
+            960,
+            129.488,
+        ),
+        (
+            "ECDAS",
+            Box::new(crate::test_utils::create_ecdas_air(&opts)),
+            crate::BLOCK_ECDAS_MAX_ROWS,
+            718,
+            129.907,
+        ),
+    ];
+    for (name, air, cap, pinned_l, pinned_bits) in airs {
+        let (main, aux) = air.trace_layout();
+        let parts = air.composition_poly_degree_bound(cap) / cap;
+        let l = parts + main + aux + air.trace_ood_next_row_columns().len();
+        assert_eq!(l, pinned_l, "{name}: the DEEP batch size moved");
+        let at_cap = deep_batching_bits(cap, l, blowup);
+        let past_cap = deep_batching_bits(2 * cap, l, blowup);
+        assert!(
+            (at_cap - pinned_bits).abs() < 1e-3,
+            "{name}: {at_cap:.3} bits at its cap, the calculator reads {pinned_bits}"
+        );
+        assert!(
+            at_cap >= query_bits && at_cap >= 128.0,
+            "{name}: {at_cap:.3} bits at its cap, under the minimum of record"
+        );
+        assert!(
+            past_cap < query_bits,
+            "{name}: {past_cap:.3} bits at twice its cap; a larger cap would do"
+        );
+        println!(
+            "BLOCK CAP BITS {name}: L {l}, 2^{} rows {at_cap:.3} bits, 2^{} {past_cap:.3} \
+             (minimum of record {query_bits:.3})",
+            cap.trailing_zeros(),
+            cap.trailing_zeros() + 1
+        );
     }
 }
 
@@ -757,6 +890,253 @@ fn noepoch_ecdas_over_its_cap_is_refused() {
         "the block verifier must refuse an ECDAS instance over its cap"
     );
     println!("NOEPOCH ECDAS OVER CAP: 2^18 rows, single shape accepts, block verifier refuses");
+}
+
+/// A chunked one-call-per-row accelerator of the box tests: KECCAK (one row
+/// per permutation call) or ECSM (one row per scalar multiplication call).
+#[derive(Clone, Copy)]
+enum CallTable {
+    Keccak,
+    Ecsm,
+}
+
+impl CallTable {
+    fn name(self) -> &'static str {
+        match self {
+            CallTable::Keccak => "KECCAK",
+            CallTable::Ecsm => "ECSM",
+        }
+    }
+
+    /// The guest that calls it three times: test_keccak_multi's three
+    /// permutations, test_ecsm_multi's three scalar multiplications (k = 1, 5,
+    /// 0xABCDEF).
+    fn guest(self) -> &'static str {
+        match self {
+            CallTable::Keccak => "test_keccak_multi",
+            CallTable::Ecsm => "test_ecsm_multi",
+        }
+    }
+
+    /// The block's caps with this table cut every `calls` calls.
+    fn chunked(self, calls: usize) -> MaxRowsConfig {
+        match self {
+            CallTable::Keccak => MaxRowsConfig {
+                keccak: calls,
+                ..MaxRowsConfig::default()
+            },
+            CallTable::Ecsm => MaxRowsConfig {
+                ecsm: calls,
+                ..MaxRowsConfig::default()
+            },
+        }
+    }
+
+    fn tables(self, traces: &mut Traces) -> &mut Vec<stark::trace::TraceTable<FieldF, FieldE>> {
+        match self {
+            CallTable::Keccak => &mut traces.keccaks,
+            CallTable::Ecsm => &mut traces.ecsms,
+        }
+    }
+
+    fn count(self, counts: &crate::TableCounts) -> usize {
+        match self {
+            CallTable::Keccak => counts.keccak,
+            CallTable::Ecsm => counts.ecsm,
+        }
+    }
+
+    /// The table's width and its MU and timestamp columns.
+    fn columns(self) -> (usize, usize, [usize; 2]) {
+        use crate::tables::{ecsm, keccak};
+        match self {
+            CallTable::Keccak => (
+                keccak::cols::NUM_COLUMNS,
+                keccak::cols::MU,
+                [keccak::cols::TIMESTAMP_0, keccak::cols::TIMESTAMP_1],
+            ),
+            CallTable::Ecsm => (
+                ecsm::cols::NUM_COLUMNS,
+                ecsm::cols::MU,
+                [ecsm::cols::TIMESTAMP_0, ecsm::cols::TIMESTAMP_1],
+            ),
+        }
+    }
+
+    /// The block format's cap on one instance.
+    fn cap(self) -> usize {
+        match self {
+            CallTable::Keccak => crate::BLOCK_KECCAK_MAX_ROWS,
+            CallTable::Ecsm => crate::BLOCK_ECSM_MAX_ROWS,
+        }
+    }
+}
+
+type FieldF = crate::tables::types::GoldilocksField;
+type FieldE = crate::tables::types::GoldilocksExtension;
+
+/// ★ KECCAK and ECSM chunked: three calls at one call a chunk give three
+/// instances (and KECCAK at two calls a chunk two). The block verifier accepts
+/// each proof; the single-shape verifier — every other verifier's — refuses
+/// the same bytes, at a count of 2 as at 3 (the shape is the verifier's
+/// constant, never read from the proof). Retain and RecomputeLdeDevice agree
+/// byte for byte.
+#[test]
+#[ignore = "proves three VM programs twice each at blowup 4; GPU box gate (cuda)"]
+fn noepoch_keccak_and_ecsm_chunked_prove_and_verify() {
+    let opts = bytes_options();
+    for (table, calls, instances) in [
+        (CallTable::Keccak, 1, 3),
+        (CallTable::Keccak, 2, 2),
+        (CallTable::Ecsm, 1, 3),
+    ] {
+        let name = table.name();
+        let build = OneBuild::new(table.guest(), &table.chunked(calls));
+        assert_eq!(
+            table.count(&build.traces.table_counts()),
+            instances,
+            "{name}: {calls} call(s) a chunk"
+        );
+        let retained = build
+            .prove(&opts, ResidencyMode::Retain, false)
+            .expect("prove under Retain");
+        let recommitted = build
+            .prove(&opts, ResidencyMode::RecomputeLdeDevice, true)
+            .expect("prove under RecomputeLdeDevice");
+        assert!(
+            build.verifies(&recommitted, &opts),
+            "{name}: the block verifier accepts {instances} instances"
+        );
+        assert!(
+            !build.verifies_single_shape(&recommitted, &opts),
+            "{name}: the single-shape verifier must refuse {instances} tables"
+        );
+        assert!(proof_bytes(&retained) == proof_bytes(&recommitted));
+        println!(
+            "NOEPOCH {name} CHUNKED: {instances} instances, block verifier accepts, single shape \
+             refuses, bytes equal"
+        );
+    }
+}
+
+/// ★ A KECCAK or ECSM row is one whole call, so a chunk boundary falls between
+/// calls, and a call reaches its rounds or steps, its scalar bits and its
+/// memory only through buses keyed by its timestamp.
+///
+/// - Control: the first call of chunk 0 and the first call of chunk 1 swapped
+///   as whole rows is the same multiset of rows, and verifies: the boundary
+///   carries nothing a bus does not.
+/// - Negative: the same two rows swap only their timestamps, so each claims
+///   the other's call. No constraint of either table reads the timestamp, so
+///   both rows still satisfy their constraints; only the bus tuples moved
+///   (the Ecall receive still balances: both timestamps are still received
+///   once), and the block is refused.
+#[test]
+#[ignore = "proves two VM programs three times each at blowup 4; GPU box gate (cuda)"]
+fn noepoch_keccak_and_ecsm_rows_are_keyed_on_the_bus() {
+    let opts = bytes_options();
+    for table in [CallTable::Keccak, CallTable::Ecsm] {
+        let name = table.name();
+        let build = OneBuild::new(table.guest(), &table.chunked(1));
+        let (width, mu, ts_cols) = table.columns();
+        let one = crate::tables::types::FE::one();
+        let mut traces = build.traces.clone();
+        let chunks = table.tables(&mut traces);
+        assert_eq!(chunks.len(), 3, "{name}: one call a chunk");
+        let ts =
+            |t: &stark::trace::TraceTable<FieldF, FieldE>| ts_cols.map(|c| *t.main_table.get(0, c));
+        assert_eq!(*chunks[0].main_table.get(0, mu), one);
+        assert_eq!(*chunks[1].main_table.get(0, mu), one);
+        assert_ne!(
+            ts(&chunks[0]),
+            ts(&chunks[1]),
+            "{name}: two different calls"
+        );
+
+        assert!(
+            block_accepts(&build, &build.traces, &opts),
+            "{name}: the honest chunked build verifies"
+        );
+
+        let swap = |traces: &mut Traces, cols: &[usize]| {
+            let chunks = table.tables(traces);
+            for &col in cols {
+                let x = *chunks[0].main_table.get(0, col);
+                let y = *chunks[1].main_table.get(0, col);
+                chunks[0].main_table.set(0, col, y);
+                chunks[1].main_table.set(0, col, x);
+            }
+        };
+        let mut swapped = build.traces.clone();
+        swap(&mut swapped, &(0..width).collect::<Vec<_>>());
+        assert!(
+            block_accepts(&build, &swapped, &opts),
+            "{name}: whole calls swapped across chunks are the same calls: accepted"
+        );
+        println!("NOEPOCH {name} SPLIT CONTROL: whole rows swapped across chunks, accepted");
+
+        let mut rekeyed = build.traces.clone();
+        swap(&mut rekeyed, &ts_cols);
+        assert!(
+            !block_accepts(&build, &rekeyed, &opts),
+            "{name}: a call reattached to another call's timestamp must be refused"
+        );
+        println!("NOEPOCH {name} SPLIT NEGATIVE: chunk 0 and chunk 1 swapped timestamps, refused");
+    }
+}
+
+/// ★ The KECCAK and ECSM height caps end to end: the guest's one table padded
+/// to twice its cap (a valid table: the extra rows are padding) proves; the
+/// block verifier refuses it (an instance over [`crate::BLOCK_KECCAK_MAX_ROWS`]
+/// / [`crate::BLOCK_ECSM_MAX_ROWS`]) and the single-shape verifier, which
+/// bounds no height, accepts the same bytes.
+///
+/// Mutation (box script): `check_heights_for` returning `Ok(())` and the block
+/// verifier accepts.
+#[test]
+#[ignore = "proves a 2^19-row KECCAK and a 2^18-row ECSM at blowup 4; GPU box gate (cuda)"]
+fn noepoch_keccak_and_ecsm_over_their_caps_are_refused() {
+    let opts = bytes_options();
+    for table in [CallTable::Keccak, CallTable::Ecsm] {
+        let name = table.name();
+        let build = OneBuild::new(table.guest(), &MaxRowsConfig::default());
+        let (_, mu, _) = table.columns();
+        let mut traces = build.traces.clone();
+        let tables = table.tables(&mut traces);
+        assert_eq!(tables.len(), 1, "{name}: one table at the default caps");
+        let (rows, width) = (tables[0].num_rows(), tables[0].main_table.width);
+        assert!(rows < table.cap());
+        let padding = tables[0].main_table.get_row(rows - 1).to_vec();
+        assert_eq!(
+            padding[mu],
+            crate::tables::types::FE::zero(),
+            "{name}: the last row is padding"
+        );
+        let tall = 2 * table.cap();
+        let mut data = Vec::with_capacity(tall * width);
+        for r in 0..rows {
+            data.extend_from_slice(tables[0].main_table.get_row(r));
+        }
+        for _ in rows..tall {
+            data.extend_from_slice(&padding);
+        }
+        tables[0] = stark::trace::TraceTable::new_main(data, width, 1);
+        let proof = build
+            .prove_these(&traces, &opts, ResidencyMode::Retain, false)
+            .unwrap_or_else(|e| panic!("{name}: a padded table is a valid table: {e:?}"));
+        assert!(
+            build.verifies_single_shape(&proof, &opts),
+            "{name}: the single shape bounds no height: the proof itself is sound"
+        );
+        assert!(
+            !build.verifies(&proof, &opts),
+            "{name}: the block verifier must refuse an instance over its cap"
+        );
+        println!(
+            "NOEPOCH {name} OVER CAP: 2^{} rows, single shape accepts, block verifier refuses",
+            tall.trailing_zeros()
+        );
+    }
 }
 
 /// The data-page record returns the root recorded for the same INIT column

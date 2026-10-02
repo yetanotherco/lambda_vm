@@ -359,6 +359,7 @@ fn the_partition_rule_seeds_the_wide_tables_and_fills_by_load() {
     assert_eq!(one.leaves(), &[(0..names.len()).collect::<Vec<_>>()]);
     // More leaves than the rule can fill: refused, never an empty leaf.
     assert!(partition_by_rule(&names, &costs, names.len() + 1).is_err());
+
 }
 
 // ============================ (M1) the plan's shape ========================
@@ -405,8 +406,8 @@ fn honest_fixture_shape(elf: &executor::elf::Elf) -> BlockShape {
 /// pre-checks): a non-chunked accelerator counted twice, a KECCAK_RND count the
 /// trace lengths do not cover, more private-input pages than the bound, a
 /// runtime page range over an ELF page, a trace length that is not a power of
-/// two, and an ECDAS or KECCAK_RND instance over its cap. Each tamper is the
-/// only change to a shape the checks accept.
+/// two, and a KECCAK, KECCAK_RND, ECSM or ECDAS instance over its cap. Each
+/// tamper is the only change to a shape the checks accept.
 #[test]
 fn the_plan_refuses_a_shape_the_host_refuses() {
     use super::block_plan::check_shape;
@@ -427,7 +428,7 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
         (
             "a non-chunked accelerator counted twice",
             Box::new(|s| {
-                s.table_counts.keccak = 2;
+                s.table_counts.hint = 2;
                 s.trace_lengths.extend([32, 32]);
             }),
         ),
@@ -472,6 +473,23 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
                 s.trace_lengths[5] = 2 * crate::BLOCK_KECCAK_RND_MAX_ROWS;
             }),
         ),
+        (
+            "a KECCAK instance over its cap",
+            Box::new(|s| {
+                // KECCAK[1] is instance 6: the five fixed tables, then KECCAK[0].
+                s.table_counts.keccak = 2;
+                s.trace_lengths.extend([32, 32]);
+                s.trace_lengths[6] = 2 * crate::BLOCK_KECCAK_MAX_ROWS;
+            }),
+        ),
+        (
+            "an ECSM instance over its cap",
+            Box::new(|s| {
+                s.table_counts.ecsm = 2;
+                s.trace_lengths.extend([32, 32]);
+                s.trace_lengths[5] = 2 * crate::BLOCK_ECSM_MAX_ROWS;
+            }),
+        ),
     ];
     for (what, tamper) in tampers {
         let mut shape = honest.clone();
@@ -491,13 +509,21 @@ fn the_plan_refuses_a_shape_the_host_refuses() {
     chunked.table_counts.keccak_rnd = 3;
     chunked.trace_lengths.extend([32, 32, 32]);
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
-    // So is ECDAS, each instance at its cap at most.
+    // So are ECDAS, KECCAK and ECSM, each instance at its cap at most.
     chunked.table_counts.ecdas = 2;
-    chunked.trace_lengths.extend([32, 32]);
+    chunked.table_counts.keccak = 2;
+    chunked.table_counts.ecsm = 2;
+    chunked.trace_lengths.extend([32; 6]);
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
-    // The instance after the last ECDAS (CPU[0], index 5 + 3 + 2) is not
-    // capped: an off-by-one in the ranges would refuse it.
-    chunked.trace_lengths[10] = 1 << 22;
+    // KECCAK 5–6, KECCAK_RND 7–9, ECSM 10–11, ECDAS 12–13, each at its cap.
+    chunked.trace_lengths[5..7].fill(crate::BLOCK_KECCAK_MAX_ROWS);
+    chunked.trace_lengths[7..10].fill(crate::BLOCK_KECCAK_RND_MAX_ROWS);
+    chunked.trace_lengths[10..12].fill(crate::BLOCK_ECSM_MAX_ROWS);
+    chunked.trace_lengths[12..14].fill(crate::BLOCK_ECDAS_MAX_ROWS);
+    assert!(check_shape(&elf, &opts, &chunked).is_ok());
+    // The instance after the last ECDAS (CPU[0], index 14) is not capped: an
+    // off-by-one in the ranges would refuse it.
+    chunked.trace_lengths[14] = 1 << 22;
     assert!(check_shape(&elf, &opts, &chunked).is_ok());
 }
 
@@ -2037,6 +2063,91 @@ fn the_block_tree_verifies_a_chunked_ecdas() {
         partition.num_leaves(),
         refused.err().unwrap_or_default()
     );
+}
+
+/// ★ KECCAK and ECSM chunked through the block's recursion: test_keccak_multi's
+/// three permutations and test_ecsm_multi's three scalar multiplications, one
+/// call a chunk (three instances each), prove as blocks whose trees the block
+/// verifier derives and accepts. Each proof's shape with its first chunk
+/// declared over its cap ([`crate::BLOCK_KECCAK_MAX_ROWS`],
+/// [`crate::BLOCK_ECSM_MAX_ROWS`]) is refused before any program is derived.
+#[test]
+#[ignore = "proves two VM blocks and their trees; box tier"]
+fn the_block_tree_verifies_chunked_keccak_and_ecsm() {
+    let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let small = crate::tables::MaxRowsConfig::small;
+    for (guest, kind, max_rows, cap) in [
+        (
+            "test_keccak_multi",
+            "KECCAK",
+            crate::tables::MaxRowsConfig {
+                keccak: 1,
+                ..small()
+            },
+            crate::BLOCK_KECCAK_MAX_ROWS,
+        ),
+        (
+            "test_ecsm_multi",
+            "ECSM",
+            crate::tables::MaxRowsConfig { ecsm: 1, ..small() },
+            crate::BLOCK_ECSM_MAX_ROWS,
+        ),
+    ] {
+        let (elf_bytes, proof) = small_block_at(guest, &[], &opts, &max_rows);
+        let shape = BlockShape::of_proof(&proof);
+        let c = &shape.table_counts;
+        let (count, first) = match kind {
+            "KECCAK" => (c.keccak, crate::FIXED_TABLE_COUNT + c.commit),
+            _ => (
+                c.ecsm,
+                crate::FIXED_TABLE_COUNT + c.commit + c.keccak + c.keccak_rnd,
+            ),
+        };
+        assert_eq!(count, 3, "{kind}: one call a chunk");
+        let (rb, ..) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
+        let partition = rb.plan.partition().clone();
+        let leaves: Vec<RealChild> = (0..partition.num_leaves())
+            .map(|k| {
+                prove_as_child(
+                    &format!("plan leaf {k}"),
+                    &block_leaf_program(&rb, k),
+                    &block_leaf_arenas(&rb, &partition, k),
+                    &wrap_opts,
+                )
+            })
+            .collect();
+        let (top, top_proof, _) = compose_block_tree(&rb.plan, leaves, &wrap_opts, 1);
+        assert_top_claims_the_block(&top, &rb);
+        let verify = |shape: &BlockShape| {
+            super::block_plan::verify_block_tree_under(
+                &elf_bytes,
+                &opts,
+                &wrap_opts,
+                None,
+                shape,
+                &proof.public_output,
+                &top_proof,
+            )
+        };
+        let derived = verify(&shape).expect("the verifier accepts the chunked block");
+        assert_eq!(derived, top.artifacts.program_id);
+
+        assert_eq!(rb.plan.instance(first).name, format!("{kind}[0]"));
+        let mut tall = shape.clone();
+        tall.trace_lengths[first] = 2 * cap;
+        let refused = verify(&tall);
+        assert!(
+            refused.is_err(),
+            "a {kind} instance declared over its cap must be refused"
+        );
+        println!(
+            "BLOCK TREE {kind} CHUNKED: {} leaf(s), 3 {kind} instances, accepted; a {kind} over \
+             its cap refused ({})",
+            partition.num_leaves(),
+            refused.err().unwrap_or_default()
+        );
+    }
 }
 
 // ============================ production scale ============================

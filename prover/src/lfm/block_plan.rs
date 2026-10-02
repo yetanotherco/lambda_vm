@@ -605,9 +605,9 @@ pub fn block_fan_in() -> usize {
 /// built: the accelerator shape (`BlockChunked`, the block verifier's), the
 /// private-input-page bound, the page configs (ELF pages plus the runtime
 /// ranges: aligned, non-empty, disjoint from the ELF's), the instance count
-/// against the trace lengths, the chunked tables' heights (KECCAK_RND and
-/// ECDAS under their caps) and each trace length (a power of two inside the
-/// field's two-adicity). Returns the page configs.
+/// against the trace lengths, the chunked tables' heights (KECCAK, KECCAK_RND,
+/// ECSM and ECDAS under their caps) and each trace length (a power of two
+/// inside the field's two-adicity). Returns the page configs.
 pub fn check_shape(
     elf: &executor::elf::Elf,
     opts: &crate::ProofOptions,
