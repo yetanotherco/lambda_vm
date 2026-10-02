@@ -265,6 +265,10 @@ pub(crate) struct Slot {
     store: Arc<Inner>,
     offset: u64,
     len: usize,
+    /// The packed trace's shape and its digest before the write.
+    rows: usize,
+    widths: Vec<u8>,
+    digest: [u64; 2],
     state: Mutex<SlotState>,
     changed: Condvar,
 }
@@ -339,25 +343,21 @@ impl Inner {
         Counters::add(&self.counters.read_ns, t.elapsed().as_nanos() as u64);
         Ok(out)
     }
+}
 
-    /// A packed trace from its parts, checked against its digest.
-    fn check(
-        &self,
-        rows: usize,
-        widths: Vec<u8>,
-        bytes: Vec<u8>,
-        digest: [u64; 2],
-    ) -> Result<NarrowMain, SpillError> {
-        let narrow = NarrowMain::from_parts(rows, widths, bytes).ok_or(SpillError::Mismatch)?;
-        if self.verify.load(Ordering::Relaxed) && narrow.digest() != digest {
-            Counters::add(&self.counters.mismatches, 1);
+impl Slot {
+    /// The packed trace from `bytes` read back, checked against the digest.
+    fn check(&self, bytes: Vec<u8>) -> Result<NarrowMain, SpillError> {
+        let narrow = NarrowMain::from_parts(self.rows, self.widths.clone(), bytes)
+            .ok_or(SpillError::Mismatch)?;
+        let store = &*self.store;
+        if store.verify.load(Ordering::Relaxed) && narrow.digest() != self.digest {
+            Counters::add(&store.counters.mismatches, 1);
             return Err(SpillError::Mismatch);
         }
         Ok(narrow)
     }
-}
 
-impl Slot {
     /// A copy of the bytes, from memory or the file; waits out a write in
     /// flight.
     fn read(&self) -> io::Result<Vec<u8>> {
@@ -452,20 +452,18 @@ fn taken() -> io::Error {
 }
 
 /// A spilled trace's shape and where its bytes are
-/// ([`crate::trace::TraceTable::spill_main`]). Clones share the slot.
+/// ([`crate::trace::TraceTable::spill_main`]). One pointer, so a trace pays
+/// eight bytes for it; clones share the slot.
 #[derive(Clone)]
 pub struct SpilledMain {
     slot: Arc<Slot>,
-    rows: usize,
-    widths: Vec<u8>,
-    digest: [u64; 2],
 }
 
 impl std::fmt::Debug for SpilledMain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpilledMain")
-            .field("rows", &self.rows)
-            .field("cols", &self.widths.len())
+            .field("rows", &self.slot.rows)
+            .field("cols", &self.slot.widths.len())
             .field("bytes", &self.slot.len)
             .field("offset", &self.slot.offset)
             .finish_non_exhaustive()
@@ -476,10 +474,8 @@ impl std::fmt::Debug for SpilledMain {
 /// shape, length and digest.
 impl PartialEq for SpilledMain {
     fn eq(&self, other: &Self) -> bool {
-        self.rows == other.rows
-            && self.widths == other.widths
-            && self.slot.len == other.slot.len
-            && self.digest == other.digest
+        let (a, b) = (&*self.slot, &*other.slot);
+        a.rows == b.rows && a.widths == b.widths && a.len == b.len && a.digest == b.digest
     }
 }
 
@@ -488,12 +484,12 @@ impl Eq for SpilledMain {}
 impl SpilledMain {
     /// Rows of the trace.
     pub fn rows(&self) -> usize {
-        self.rows
+        self.slot.rows
     }
 
     /// Bytes per cell of each column.
     pub fn widths(&self) -> &[u8] {
-        &self.widths
+        &self.slot.widths
     }
 
     /// Packed bytes.
@@ -508,26 +504,21 @@ impl SpilledMain {
 
     /// The digest taken before the write ([`NarrowMain::digest`]).
     pub fn digest(&self) -> [u64; 2] {
-        self.digest
+        self.slot.digest
     }
 
     /// A copy of the packed trace, checked against its digest; the slot
     /// stays readable.
     pub fn load(&self) -> Result<NarrowMain, SpillError> {
-        let bytes = self.slot.read().map_err(SpillError::Io)?;
-        self.slot
-            .store
-            .check(self.rows, self.widths.clone(), bytes, self.digest)
+        self.slot.check(self.slot.read().map_err(SpillError::Io)?)
     }
 
     /// The packed trace for its last reader, checked against its digest:
     /// bytes still in memory move out unless a clone of this handle could
     /// read them again.
     pub(crate) fn into_narrow(self) -> Result<NarrowMain, SpillError> {
-        let bytes = self.slot.read_last(0).map_err(SpillError::Io)?;
         self.slot
-            .store
-            .check(self.rows, self.widths, bytes, self.digest)
+            .check(self.slot.read_last(0).map_err(SpillError::Io)?)
     }
 }
 
@@ -671,6 +662,9 @@ impl SpillStore {
             store: Arc::clone(inner),
             offset,
             len: data.len(),
+            rows,
+            widths,
+            digest,
             state: Mutex::new(SlotState::Memory(data)),
             changed: Condvar::new(),
         });
@@ -681,12 +675,7 @@ impl SpillStore {
         inner.work.notify_one();
         Counters::add(&inner.counters.slots, 1);
         Counters::add(&inner.counters.bytes, len);
-        Ok(SpilledMain {
-            slot,
-            rows,
-            widths,
-            digest,
-        })
+        Ok(SpilledMain { slot })
     }
 
     /// Test only: whether reads check their digest.
@@ -1037,15 +1026,10 @@ fn read_ahead(shared: &PrefetchShared, reads: Vec<(ReadPhase, usize, SpilledMain
             ReadPhase::Round1 => spilled.load(),
             ReadPhase::Fused => {
                 let others = 1 + later(&spilled.slot, &pending);
-                let SpilledMain {
-                    slot,
-                    rows,
-                    widths,
-                    digest,
-                } = spilled;
+                let slot = spilled.slot;
                 slot.read_last(others)
                     .map_err(SpillError::Io)
-                    .and_then(|bytes| slot.store.check(rows, widths, bytes, digest))
+                    .and_then(|bytes| slot.check(bytes))
             }
         };
         let mut state = lock(&shared.state);
