@@ -5265,6 +5265,18 @@ pub trait IsStarkProver<
                                 air.name()
                             ))
                         })?;
+                        // The kept top's shape, for sizing the cap offline.
+                        if table_timeline() {
+                            eprintln!(
+                                "TABLE KEPT {} cols={} rpl={} leaves={} k={k} top_level={} bytes={}",
+                                air.name(),
+                                trace.num_main_columns,
+                                layout.rows_per_leaf(),
+                                top.leaves,
+                                top.top_level,
+                                std::mem::size_of_val(top.nodes.as_slice()),
+                            );
+                        }
                         committed.0.top_tree = Some(Arc::new(top));
                         // The trace, packed from the snapshot before it is
                         // freed: the fused task widens it on the device.
