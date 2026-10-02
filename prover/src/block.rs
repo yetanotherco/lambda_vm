@@ -448,15 +448,36 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
-/// `LAMBDA_VM_BLOCK_PACKED_BUILD=1`: with [`narrow_finished`], the finish
-/// builds KECCAK_RND and LT packed a block at a time; unset or anything else
-/// builds them at 8 bytes a cell and packs them afterwards, as the other
-/// tables ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the
-/// same either way. Off by default: at the median block on BIG the packed
-/// builds held the peak 14.75 GiB lower but made phase B 6.3 s slower (BIG 104),
-/// over the lead's 3 s line for a default.
+/// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
+/// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
+/// of keeping them as segments; the tables are the same.
+fn lt_concat() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
+}
+
+/// With [`narrow_finished`], the finish builds KECCAK_RND and LT packed a
+/// block at a time; `LAMBDA_VM_BLOCK_PACKED_BUILD=0` builds them at 8 bytes a
+/// cell and packs them afterwards, as the other tables
+/// ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the same
+/// either way. On by default: at the median block on BIG the wide builds'
+/// 64-bit KECCAK_RND chunks in flight held the peak ≈ 14 GiB higher (BIG 107:
+/// 96.7 against 82.7 GiB), which a block at the top of the July median range
+/// (≈ 12×) does not have room for, and the packed builds cost no base time
+/// there (−1.85 s; phase B +0.7 s, the finish −2.6 s).
 fn packed_builds() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "1")
+    !std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "0")
+}
+
+/// `LAMBDA_VM_BLOCK_KR_WIDE_CAP=n` (1..=64): with KECCAK_RND built wide, then
+/// packed (`LAMBDA_VM_BLOCK_PACKED_BUILD=0`), the finish builds at most `n` of its chunks at
+/// 8 bytes a cell at once ([`WindowedTraceBuilder::cap_kr_wide`]); unset,
+/// 0 or anything else, no cap. The tables are the same.
+fn kr_wide_cap() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_KR_WIDE_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(0)
 }
 
 /// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
@@ -652,11 +673,30 @@ impl MemLedger {
         };
     }
 
+    /// One line of `what`'s parts, largest first, those of at least 0.01 GiB.
+    fn parts(&self, what: &str, mut parts: Vec<(String, usize)>) {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let total: usize = parts.iter().map(|(_, b)| b).sum();
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        let listed: Vec<String> = parts
+            .iter()
+            .filter(|(_, b)| *b as f64 >= 0.01 * GIB)
+            .map(|(name, b)| format!("{name} {:.2}", *b as f64 / GIB))
+            .collect();
+        eprintln!(
+            "BLOCK MEM {what} parts: {:.2} GiB · {}",
+            total as f64 / GIB,
+            listed.join(" · ")
+        );
+    }
+
     fn line(&self, label: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         const GIB: f64 = (1u64 << 30) as f64;
         let g = |a: &std::sync::atomic::AtomicUsize| a.load(Relaxed) as f64 / GIB;
         let rss = proc_rss_bytes().map_or("n/a".to_string(), |b| format!("{:.2}", b as f64 / GIB));
+        let faults =
+            proc_minor_faults().map_or("n/a".to_string(), |f| format!("{:.2}", f as f64 / 1e6));
         let heap = heap_stats().map_or("heap n/a".to_string(), |[live, active, resident, mapped, retained]| {
             let g = |b: usize| b as f64 / GIB;
             format!(
@@ -670,7 +710,7 @@ impl MemLedger {
             )
         });
         eprintln!(
-            "BLOCK MEM {label} t={:.1} · rss {rss} · {heap} · queue {} chunks {:.2} · committing {:.2} · \
+            "BLOCK MEM {label} t={:.1} · rss {rss} · minflt {faults} M · {heap} · queue {} chunks {:.2} · committing {:.2} · \
              ready {} packed {:.2} · committed {} ({:.2} packed + {:.2} 64-bit) · logs {:.2} · walked {:.2} · \
              builder {:.2} · walk {:.2} · executor {:.2} (GiB)",
             self.start.elapsed().as_secs_f64(),
@@ -725,6 +765,15 @@ impl Drop for MemSampler {
             let _ = handle.join();
         }
     }
+}
+
+/// This process's minor page faults so far (`/proc/self/stat`, field 10), on
+/// Linux: each a first touch of a page the allocator had not kept.
+fn proc_minor_faults() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command name may hold spaces; the fields after it do not.
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(7)?.parse().ok()
 }
 
 /// This process's resident set (`VmRSS`), on Linux.
@@ -1030,8 +1079,11 @@ fn build_streamed(
             if narrow_finished() {
                 builder = builder.pack_finished_tables();
                 if !packed_builds() {
-                    builder = builder.build_wide_then_pack();
+                    builder = builder.build_wide_then_pack().cap_kr_wide(kr_wide_cap());
                 }
+            }
+            if lt_concat() {
+                builder = builder.concat_lt();
             }
             if let Some(ledger) = ledger {
                 eprintln!(
@@ -1112,6 +1164,7 @@ fn build_streamed(
             drop(job_tx);
             if let Some(ledger) = ledger {
                 ledger.line("windows walked");
+                ledger.parts("builder", builder.heap_parts());
             }
             let windows = builder.stamps();
             let t = Instant::now();

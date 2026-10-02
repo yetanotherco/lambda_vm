@@ -69,6 +69,7 @@ use super::shift::{self, ShiftOperation};
 use super::store;
 use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
 use crate::Error;
+use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
 
 #[cfg(test)]
@@ -893,6 +894,30 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.ecsm_ops)
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
+    }
+
+    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
+    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
+        [
+            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
+            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
+            ("memw", vec_heap_bytes(&self.memw.general)),
+            ("load", vec_heap_bytes(&self.load_ops)),
+            ("lt", vec_heap_bytes(&self.lt_ops)),
+            ("shift", vec_heap_bytes(&self.shift_ops)),
+            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
+            ("commit", vec_heap_bytes(&self.commit_ops)),
+            ("keccak", vec_heap_bytes(&self.keccak_ops)),
+            ("blake3", vec_heap_bytes(&self.blake3_ops)),
+            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
+            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
+            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
+            ("hint", vec_heap_bytes(&self.hint_ops)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
+        .collect()
     }
 }
 
@@ -3895,17 +3920,56 @@ pub struct StreamSkip {
     /// each afterwards, as every other table, instead of packed a block at a
     /// time (the A arm of the packed builds). The words are the same.
     pub wide_builds: bool,
+    /// Concatenate LT's segments into one list in phase 3, as the build did
+    /// before [`Segmented`] (the A arm of the segments). The tables are the same.
+    pub concat_lt: bool,
+    /// With [`Self::pack`] and [`Self::wide_builds`]: at most this many
+    /// KECCAK_RND chunks are built at 8 bytes a cell at once (the build goes
+    /// in waves of this many), so the 64-bit copies in flight before each is
+    /// packed stay bounded whatever the block's size. `0`: no cap. The tables
+    /// are the same.
+    pub kr_wide_cap: usize,
 }
 
-/// How a build packs what it generates ([`StreamSkip::pack`]).
+/// What a build does with each table it generates: packs it
+/// ([`StreamSkip::pack`]), then hands it to the finish's sink
+/// ([`finish_sink::hand_or_keep`]) or keeps it.
 #[derive(Clone, Copy)]
-struct Packing {
+struct Packing<'a> {
     on: bool,
+    /// Build at most this many chunks at once, in waves (0: all at once, as
+    /// rayon schedules them). Waves leave the other workers free for the
+    /// other tables, where a permit would park them.
+    wave: usize,
+    /// The sink, the kind of the tables this build makes, and the instance
+    /// the first of them is.
+    hand: Option<(&'a dyn FinishSink, FinishedKind, usize)>,
+}
+
+impl<'a> Packing<'a> {
+    /// This packing, its tables handed to `sink` (when there is one) as
+    /// `kind`'s from instance 0.
+    fn handing(self, sink: Option<&'a dyn FinishSink>, kind: FinishedKind) -> Self {
+        Self {
+            hand: sink.map(|sink| (sink, kind, 0)),
+            ..self
+        }
+    }
+
+    /// This packing, its first table instance `first` of its kind (past the
+    /// streamed chunks' placeholders).
+    fn starting_at(self, first: usize) -> Self {
+        Self {
+            hand: self.hand.map(|(sink, kind, _)| (sink, kind, first)),
+            ..self
+        }
+    }
 }
 
 /// Where a build's table phase is, for a caller that wants to know
-/// ([`set_finish_marks`]): called with "p3 lt", "p4 bitwise", each phase-5
-/// generator's name as it finishes, and "p5 done". Unset, nothing is called.
+/// ([`set_finish_marks`]): called with "p3 lt" (and the bytes of LT's ops),
+/// "p4 bitwise", each phase-5 generator's name as it finishes, and "p5 done".
+/// Unset, nothing is called.
 pub type FinishMarks = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 static FINISH_MARKS: std::sync::RwLock<Option<FinishMarks>> = std::sync::RwLock::new(None);
@@ -3956,6 +4020,18 @@ impl PreCounted {
             + vec_heap_bytes(&self.memw_lt)
             + vec_heap_bytes(&self.memw_aligned_lt)
     }
+
+    /// [`Self::heap_bytes`] part by part.
+    pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            (
+                "counted memw_a_lt".to_string(),
+                vec_heap_bytes(&self.memw_aligned_lt),
+            ),
+        ]
+    }
 }
 
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
@@ -3975,7 +4051,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if skip == 0 {
@@ -4015,7 +4091,7 @@ fn chunk_and_generate_skipping<T: Sync>(
     tables.extend(generate_chunks(
         rest,
         generate,
-        pack,
+        pack.starting_at(skip),
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?);
@@ -4030,7 +4106,7 @@ fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4063,7 +4139,7 @@ fn chunk_and_generate_optional<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -4089,7 +4165,7 @@ fn chunk_and_generate_optional<T: Sync>(
 fn generate_optional<T: Sync>(
     ops: &[T],
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
@@ -4108,16 +4184,41 @@ fn generate_optional<T: Sync>(
 fn generate_chunks<T: Sync>(
     op_chunks: Vec<&[T]>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    pack: Packing,
+    pack: Packing<'_>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    generate_chunks_with(
+        op_chunks,
+        |chunk: &&[T], generate: &dyn Fn(&[T]) -> TraceTable<_, _>| generate(chunk),
+        generate,
+        pack,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// [`generate_chunks`] over chunks that `view` hands to the generator as op
+/// slices, each made only when its generation starts (a chunk that straddles
+/// two segments is copied then, and freed with its table). Disk mode keeps
+/// every table: it is spilled, not handed off.
+fn generate_chunks_with<C: Send, T>(
+    chunks: Vec<C>,
+    view: impl Fn(
+        &C,
+        &dyn Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension>
+    + Sync,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: Packing<'_>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
     // allocates, keeping trace memory bounded.
     #[cfg(feature = "disk-spill")]
     if storage_mode == StorageMode::Disk {
-        let mut tables = Vec::with_capacity(op_chunks.len());
-        for chunk in op_chunks {
-            let mut t = generate(chunk);
+        let mut tables = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let mut t = view(chunk, &generate);
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
@@ -4125,17 +4226,124 @@ fn generate_chunks<T: Sync>(
         }
         return Ok(tables);
     }
-    let generate = |chunk: &[T]| {
-        let mut table = generate(chunk);
+    let generate = |(i, chunk): (usize, C)| {
+        let mut table = view(&chunk, &generate);
+        drop(chunk);
         if pack.on {
             table.pack_main_narrow();
         }
-        table
+        match pack.hand {
+            Some((sink, kind, first)) => {
+                finish_sink::hand_or_keep(Some(sink), kind, first + i, table)
+            }
+            None => table,
+        }
     };
     #[cfg(feature = "parallel")]
-    let tables = op_chunks.into_par_iter().map(generate).collect();
+    let tables = if pack.wave > 0 {
+        let mut tables = Vec::with_capacity(chunks.len());
+        let mut chunks = chunks.into_iter().enumerate();
+        loop {
+            let wave: Vec<(usize, C)> = chunks.by_ref().take(pack.wave).collect();
+            if wave.is_empty() {
+                break tables;
+            }
+            tables.par_extend(wave.into_par_iter().map(generate));
+        }
+    } else {
+        chunks.into_par_iter().enumerate().map(generate).collect()
+    };
     #[cfg(not(feature = "parallel"))]
-    let tables = op_chunks.into_iter().map(generate).collect();
+    let tables = chunks.into_iter().enumerate().map(generate).collect();
+    Ok(tables)
+}
+
+/// A list kept as the segments it is the concatenation of, never concatenated
+/// (phase 3's LT ops: the kept tail, the MEMW and MEMW_A prefixes and what the
+/// finish derives, each a list of its own).
+struct Segmented<'a, T> {
+    parts: Vec<&'a [T]>,
+}
+
+impl<'a, T: Clone> Segmented<'a, T> {
+    fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.len()).sum()
+    }
+
+    /// Ops `start..end` of the concatenation: borrowed when one segment holds
+    /// them, copied when they straddle segments.
+    fn range(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
+        let mut at = 0usize;
+        let mut pieces: Vec<&'a [T]> = Vec::new();
+        for part in &self.parts {
+            let (lo, hi) = (at, at + part.len());
+            if hi > start && lo < end {
+                pieces.push(&part[start.max(lo) - lo..end.min(hi) - lo]);
+            }
+            at = hi;
+            if at >= end {
+                break;
+            }
+        }
+        match pieces.as_slice() {
+            [] => std::borrow::Cow::Borrowed(&[]),
+            [one] => std::borrow::Cow::Borrowed(one),
+            _ => std::borrow::Cow::Owned(pieces.concat()),
+        }
+    }
+}
+
+/// [`chunk_and_generate_skipping`] over a [`Segmented`] list: the same chunks
+/// (whole multiples of `max_rows` of the concatenation, the same placeholders
+/// and padding rules), each made from the segments only as it is generated.
+#[allow(clippy::too_many_arguments)]
+fn chunk_and_generate_segmented<T: Clone + Sync>(
+    ops: &Segmented<'_, T>,
+    max_rows: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    pack: Packing<'_>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let len = ops.len();
+    let max_rows = max_rows.max(1);
+    let chunks: Vec<(usize, usize)> = (0..len.div_ceil(max_rows))
+        .map(|k| (k * max_rows, ((k + 1) * max_rows).min(len)))
+        .collect();
+    let (placeholders, chunks) = if skip == 0 {
+        // As `chunk_and_generate` / `chunk_and_generate_optional`: an empty
+        // list is one empty chunk, or no table at all when the table is
+        // optional.
+        let chunks = if len == 0 && !optional {
+            vec![(0, 0)]
+        } else {
+            chunks
+        };
+        (0, chunks)
+    } else if tails {
+        (skip, chunks)
+    } else {
+        if skip > chunks.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                chunks.len()
+            )));
+        }
+        (skip, chunks[skip..].to_vec())
+    };
+    let mut tables: Vec<_> = (0..placeholders).map(|_| streamed_placeholder()).collect();
+    tables.extend(generate_chunks_with(
+        chunks,
+        |&(start, end): &(usize, usize), generate: &dyn Fn(&[T]) -> TraceTable<_, _>| {
+            generate(&ops.range(start, end))
+        },
+        generate,
+        pack.starting_at(placeholders),
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?);
     Ok(tables)
 }
 
@@ -4180,6 +4388,29 @@ impl RoutedSegments {
             + vec_heap_bytes(&self.lt_dvrm_cpu32)
             + vec_heap_bytes(&self.mul_dvrm_filter)
             + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        [
+            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
+            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
+            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("store", vec_heap_bytes(&self.store_ops)),
+            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
+            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
+            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
+            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
+            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
+            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
+            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
+            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("segments {name}"), bytes))
+        .collect()
     }
 
     /// Appends a later window's segments, segment by segment.
@@ -4534,15 +4765,23 @@ fn build_traces<I: ImageSource + Sync>(
     l2g_memory_bookend: bool,
     skip: &StreamSkip,
     mut pre: Option<PreCounted>,
+    sink: Option<&dyn FinishSink>,
 ) -> Result<Traces, Error> {
-    let pack = Packing { on: skip.pack };
+    let pack = Packing {
+        on: skip.pack,
+        wave: 0,
+        hand: None,
+    };
+    // Each plain table goes to `sink` as it is generated (its slot keeps a
+    // placeholder) unless the sink declines it.
+    let to = |kind| pack.handing(sink, kind);
     let CollectedOps {
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
         memw_register_rows,
         load_ops,
-        mut lt_ops,
+        lt_ops,
         shift_ops,
         bitwise_ops,
         branch_ops,
@@ -4564,29 +4803,62 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw(
-        &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
-    ));
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_aligned_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw_aligned(
+    // LT's list is these segments in this order, kept apart: concatenating them
+    // into one list reallocated multi-GiB copies at the median block.
+    let memw_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_lt))
+        .unwrap_or_default();
+    let lt_from_memw = collect_lt_from_memw(&memw_ops[skip.memw_lt_done.min(memw_ops.len())..]);
+    let memw_aligned_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_aligned_lt))
+        .unwrap_or_default();
+    let lt_from_memw_aligned = collect_lt_from_memw_aligned(
         &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
-    ));
+    );
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
-    lt_ops.extend(hint_ops.iter().flat_map(|op| {
-        [
-            LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
-            LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-            LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-        ]
-    }));
-    finish_mark("p3 lt");
+    let lt_from_hints: Vec<LtOperation> = hint_ops
+        .iter()
+        .flat_map(|op| {
+            [
+                LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+                LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+                LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+            ]
+        })
+        .collect();
+    let lt_concat: Vec<LtOperation>;
+    let lt_ops = if skip.concat_lt {
+        let mut all = lt_ops;
+        all.extend(memw_lt);
+        all.extend(lt_from_memw);
+        all.extend(memw_aligned_lt);
+        all.extend(lt_from_memw_aligned);
+        all.extend(lt_from_hints);
+        lt_concat = all;
+        Segmented {
+            parts: vec![&lt_concat[..]],
+        }
+    } else {
+        Segmented {
+            parts: vec![
+                &lt_ops[..],
+                &memw_lt,
+                &lt_from_memw,
+                &memw_aligned_lt,
+                &lt_from_memw_aligned,
+                &lt_from_hints,
+            ],
+        }
+    };
+    finish_mark(&format!(
+        "p3 lt ({:.2} GiB of LT ops in {} segments)",
+        (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / (1u64 << 30) as f64,
+        lt_ops.parts.len()
+    ));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -4641,7 +4913,7 @@ fn build_traces<I: ImageSource + Sync>(
     // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
     // below; the rest stay one collector each.
     let mut collectors: Vec<Collector> = Vec::new();
-    for slice in lt_ops.chunks(1 << 20) {
+    for slice in lt_ops.parts.iter().flat_map(|part| part.chunks(1 << 20)) {
         collectors.push(Box::new(move |h| {
             h.add_ops(&collect_bitwise_from_lt(slice))
         }));
@@ -4841,7 +5113,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             false,
             cpu::generate_cpu_trace,
-            pack,
+            to(FinishedKind::Cpu),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4854,7 +5126,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             memw::generate_memw_trace,
-            pack,
+            to(FinishedKind::Memw),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4867,7 +5139,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             memw_aligned::generate_memw_aligned_trace,
-            pack,
+            to(FinishedKind::MemwAligned),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4882,7 +5154,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             false,
             memw_register::generate_memw_register_trace_from_rows,
-            pack,
+            to(FinishedKind::MemwRegister),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4895,7 +5167,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             load::generate_load_trace,
-            pack,
+            to(FinishedKind::Load),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4906,17 +5178,18 @@ fn build_traces<I: ImageSource + Sync>(
     #[cfg(not(feature = "disk-spill"))]
     let built_packed = pack.on && !skip.wide_builds;
     let gen_lts = || {
+        let pack = to(FinishedKind::Lt);
         let (generate, pack): (fn(&[LtOperation]) -> _, _) = if built_packed {
             (
                 |ops| {
                     lt::generate_lt_trace_packed(ops).unwrap_or_else(|| lt::generate_lt_trace(ops))
                 },
-                Packing { on: true },
+                Packing { on: true, ..pack },
             )
         } else {
             (lt::generate_lt_trace, pack)
         };
-        chunk_and_generate_skipping(
+        chunk_and_generate_segmented(
             &lt_ops,
             max_rows.lt,
             skip.lt,
@@ -4936,7 +5209,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             shift::generate_shift_trace,
-            pack,
+            to(FinishedKind::Shift),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4946,7 +5219,7 @@ fn build_traces<I: ImageSource + Sync>(
             &mul_ops,
             max_rows.mul,
             mul::generate_mul_trace,
-            pack,
+            to(FinishedKind::Mul),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4956,7 +5229,7 @@ fn build_traces<I: ImageSource + Sync>(
             &dvrm_ops,
             max_rows.dvrm,
             dvrm::generate_dvrm_trace,
-            pack,
+            to(FinishedKind::Dvrm),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4966,7 +5239,7 @@ fn build_traces<I: ImageSource + Sync>(
             &branch_ops,
             max_rows.branch,
             branch::generate_branch_trace,
-            pack,
+            to(FinishedKind::Branch),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4978,7 +5251,7 @@ fn build_traces<I: ImageSource + Sync>(
             &eq_ops,
             max_rows.eq,
             eq::generate_eq_trace,
-            pack,
+            to(FinishedKind::Eq),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4988,7 +5261,7 @@ fn build_traces<I: ImageSource + Sync>(
             &bytewise_ops,
             max_rows.bytewise,
             bytewise::generate_bytewise_trace,
-            pack,
+            to(FinishedKind::Bytewise),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5001,7 +5274,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.tails,
             true,
             store::generate_store_trace,
-            pack,
+            to(FinishedKind::Store),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5011,7 +5284,7 @@ fn build_traces<I: ImageSource + Sync>(
             &cpu32_ops,
             max_rows.cpu32,
             cpu32::generate_cpu32_trace,
-            pack,
+            to(FinishedKind::Cpu32),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5036,7 +5309,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &commit_ops,
             commit::generate_commit_trace,
-            pack,
+            to(FinishedKind::Commit),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5045,7 +5318,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &keccak_ops,
             keccak::generate_keccak_trace,
-            pack,
+            to(FinishedKind::Keccak),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5060,14 +5333,25 @@ fn build_traces<I: ImageSource + Sync>(
             })
             .collect();
         // A packing build generates each chunk packed a block at a time, so it
-        // holds no 64-bit copy and takes no permit.
+        // holds no 64-bit copy.
+        let pack = to(FinishedKind::KeccakRnd);
         let (generate, pack): (fn(&[KeccakRoundOperation]) -> _, _) = if built_packed {
             (
                 |ops| {
                     keccak_rnd::generate_keccak_rnd_trace_packed(ops)
                         .unwrap_or_else(|| keccak_rnd::generate_keccak_rnd_trace(ops))
                 },
-                Packing { on: true },
+                Packing { on: true, ..pack },
+            )
+        } else if pack.on && skip.kr_wide_cap > 0 {
+            // Built wide, then packed: at most `kr_wide_cap` 64-bit chunks at
+            // once.
+            (
+                keccak_rnd::generate_keccak_rnd_trace,
+                Packing {
+                    wave: skip.kr_wide_cap,
+                    ..pack
+                },
             )
         } else {
             (keccak_rnd::generate_keccak_rnd_trace, pack)
@@ -5116,7 +5400,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &ecsm_ops,
             ecsm::generate_ecsm_trace,
-            pack,
+            to(FinishedKind::Ecsm),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5126,7 +5410,7 @@ fn build_traces<I: ImageSource + Sync>(
             generate_optional(
                 &ecdas_ops,
                 ecdas::generate_ecdas_trace,
-                pack,
+                to(FinishedKind::Ecdas),
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -5137,7 +5421,7 @@ fn build_traces<I: ImageSource + Sync>(
                 &ecdas_ops,
                 max_rows.ecdas.max(1),
                 ecdas::generate_ecdas_trace,
-                pack,
+                to(FinishedKind::Ecdas),
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -5148,7 +5432,7 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &hint_ops,
             hint::generate_hint_trace,
-            pack,
+            to(FinishedKind::Hint),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -6438,6 +6722,7 @@ impl Traces {
             l2g_memory_bookend,
             &StreamSkip::default(),
             None,
+            None,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -6518,6 +6803,179 @@ impl Traces {
             false,
             &StreamSkip::default(),
             None,
+            None,
         )
+    }
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// One column holding the ops, padded to a power of two.
+    fn table_of(ops: &[u64]) -> Table {
+        let rows = ops.len().next_power_of_two().max(4);
+        let mut data = crate::tables::types::zeroed_fe_vec(rows);
+        for (cell, &op) in data.iter_mut().zip(ops) {
+            *cell = crate::tables::types::FE::from(op);
+        }
+        TraceTable::new_main(data, 1, 1)
+    }
+
+    fn words(tables: &[Table]) -> Vec<(usize, Vec<u64>)> {
+        tables
+            .iter()
+            .map(|t| {
+                (
+                    t.main_table.width,
+                    t.main_table
+                        .row_major_data()
+                        .iter()
+                        .map(|v| v.canonical())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A build in waves (`Packing::wave`) never has more than a wave's
+    /// chunks in its generator at once, and gives the tables, in order, that
+    /// the unbounded build gives.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_build_in_waves_holds_at_most_a_wave() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let all: Vec<u64> = (1..=37).collect();
+        for wave in [0, 1, 2, 3, 37, 100] {
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let generate = |ops: &[u64]| {
+                most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let table = table_of(ops);
+                now.fetch_sub(1, SeqCst);
+                table
+            };
+            let pack = Packing {
+                on: false,
+                wave,
+                hand: None,
+            };
+            let tables = generate_chunks(
+                all.chunks(3).collect(),
+                generate,
+                pack,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .expect("generated");
+            let want: Vec<Table> = all.chunks(3).map(table_of).collect();
+            assert_eq!(words(&tables), words(&want), "wave {wave}");
+            if wave > 0 {
+                assert!(
+                    most.load(SeqCst) <= wave,
+                    "wave {wave}: {} at once",
+                    most.load(SeqCst)
+                );
+            }
+        }
+    }
+
+    /// Chunked from its segments, a list gives the tables its concatenation
+    /// gives: every split of the segments (empty ones too), chunk sizes that
+    /// cut inside and across them, with and without chunks streamed ahead
+    /// (tails or whole lists), optional or not, and an empty list.
+    #[test]
+    fn a_segmented_list_chunks_as_its_concatenation() {
+        let all: Vec<u64> = (1..=37).collect();
+        let layouts: [&[usize]; 4] = [&[37], &[0, 10, 0, 27], &[5, 5, 5, 22], &[1, 36, 0]];
+        let off = Packing {
+            on: false,
+            wave: 0,
+            hand: None,
+        };
+        for layout in layouts {
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for &n in layout {
+                parts.push(&all[at..at + n]);
+                at += n;
+            }
+            let segmented = Segmented { parts };
+            for max in [1, 4, 5, 10, 37, 100] {
+                for (skip, tails) in [(0, false), (2, true), (2, false)] {
+                    for optional in [true, false] {
+                        // With `tails`, the list is what is left past the
+                        // streamed chunks: the same list either way here.
+                        let whole = chunk_and_generate_skipping(
+                            &all,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            off,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        let split = chunk_and_generate_segmented(
+                            &segmented,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            off,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        match (whole, split) {
+                            (Ok(a), Ok(b)) => assert_eq!(
+                                words(&a),
+                                words(&b),
+                                "{layout:?} max {max} skip {skip} tails {tails} optional {optional}"
+                            ),
+                            (Err(_), Err(_)) => {}
+                            (a, b) => panic!(
+                                "{layout:?} max {max} skip {skip}: {:?} vs {:?}",
+                                a.is_ok(),
+                                b.is_ok()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let empty: Segmented<'_, u64> = Segmented {
+            parts: vec![&[], &[]],
+        };
+        for optional in [true, false] {
+            let a = chunk_and_generate_skipping(
+                &[] as &[u64],
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                off,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .unwrap();
+            let b = chunk_and_generate_segmented(
+                &empty,
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                off,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .unwrap();
+            assert_eq!(words(&a), words(&b), "empty, optional {optional}");
+        }
     }
 }
