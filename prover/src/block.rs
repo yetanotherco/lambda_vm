@@ -448,14 +448,17 @@ fn narrow_finished() -> bool {
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
-/// `LAMBDA_VM_BLOCK_PACKED_BUILD=0`: with [`narrow_finished`], the finish
-/// builds KECCAK_RND and LT at 8 bytes a cell and packs them afterwards, as
-/// the other tables ([`WindowedTraceBuilder::build_wide_then_pack`]); unset or
-/// anything else builds them packed a block at a time. The A arm of the packed
-/// builds: the words are the same either way.
+/// `LAMBDA_VM_BLOCK_PACKED_BUILD=1`: with [`narrow_finished`], the finish
+/// builds KECCAK_RND and LT packed a block at a time; unset or anything else
+/// builds them at 8 bytes a cell and packs them afterwards, as the other
+/// tables ([`WindowedTraceBuilder::build_wide_then_pack`]). The words are the
+/// same either way. Off by default: at the median block on BIG the packed
+/// builds held the peak 14.75 GiB lower but made phase B 6.3 s slower (BIG 104),
+/// over the lead's 3 s line for a default.
 fn packed_builds() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").map_or(true, |v| v.trim() != "0")
+    std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "1")
 }
+
 /// `LAMBDA_VM_BLOCK_COMMITTERS=n` (1..=8): committer threads, a measurement
 /// knob; unset is [`STREAM_COMMITTERS`].
 fn stream_committers() -> usize {
