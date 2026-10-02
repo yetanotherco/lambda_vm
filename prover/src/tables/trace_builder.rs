@@ -1178,7 +1178,8 @@ fn collect_load_op_from_cpu(
         op.timestamp,
         byte_count as u8,
         signed,
-        res_bytes.map(u64::from),
+        // Bytes: each `& 0xFF` or the 0/0xFF fill.
+        res_bytes.map(|byte| byte as u8),
     );
 
     // Update memory state
