@@ -176,9 +176,11 @@ impl BlockTimes {
 /// Levels of each plain table's tree the block's phase B does NOT keep: it
 /// keeps the rest on the host after Round 1 and recomputes the LDE alone (no
 /// second hash), rebuilding each queried subtree of `2^k` leaves at the
-/// openings (FAST 358: −4.89 s at k = 3). `LAMBDA_VM_RECOMMIT_TOP_LEVELS`
-/// overrides it (0 = the full recommit).
-pub const BLOCK_RECOMMIT_TOP_LEVELS: usize = 3;
+/// openings (FAST 358: −4.89 s at k = 3). At k = 6 the kept tops are 1/64 of
+/// each tree (FAST 503: the 1× peak −1.2 GiB, the 1.57× peak −2.3 GiB, the
+/// base unmoved). `LAMBDA_VM_RECOMMIT_TOP_LEVELS` overrides it (0 = the full
+/// recommit).
+pub const BLOCK_RECOMMIT_TOP_LEVELS: usize = 6;
 
 /// [`prove_block_with`] at the block's shape: [`block_max_rows`] and
 /// [`ResidencyMode::RecomputeLdeDevice`].
