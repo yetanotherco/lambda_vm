@@ -405,6 +405,11 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
     // materializations — the scope would otherwise hold them to the end.
     drop(read_counts);
     drop(written);
+    // The builder grew the vector by doubling, so up to half of it is slack the
+    // program would hold to its proof: 21 % of a block leaf program's bytes
+    // (`a_block_leaf_programs_host_bytes_by_part`). jemalloc shrinks a large
+    // allocation in place and frees the tail before the groups are built.
+    instrs.shrink_to_fit();
 
     let groups = emit_column_groups(&instrs, public_len);
 
