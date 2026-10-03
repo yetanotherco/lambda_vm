@@ -334,6 +334,7 @@ mod device {
                 rows_per_thread: rows,
                 block,
                 staged: false,
+                prefetch: false,
             },
             budget,
             fast: true,
@@ -347,6 +348,7 @@ mod device {
                 rows_per_thread: 1,
                 block,
                 staged: false,
+                prefetch: false,
             },
             budget,
             fast: true,
@@ -367,16 +369,29 @@ mod device {
         }
     }
 
+    fn prefetched(t: SiTuning) -> SiTuning {
+        SiTuning {
+            cfg: SiConfig {
+                staged: true,
+                prefetch: true,
+                ..t.cfg
+            },
+            ..t
+        }
+    }
+
     fn name(t: &SiTuning) -> String {
         let s = match t.cfg.store {
             SiStore::Shared => "smem",
             SiStore::Local => "local",
         };
-        let f = match (t.fast, t.cfg.staged) {
-            (true, false) => "",
-            (false, false) => "/gen",
-            (true, true) => "/ps",
-            (false, true) => "/gen/ps",
+        let f = match (t.fast, t.cfg.staged, t.cfg.prefetch) {
+            (true, _, true) => "/pp",
+            (false, _, true) => "/gen/pp",
+            (true, true, false) => "/ps",
+            (false, true, false) => "/gen/ps",
+            (true, false, false) => "",
+            (false, false, false) => "/gen",
         };
         format!(
             "{s}/r{}/t{}/b{}{f}",
@@ -486,6 +501,8 @@ mod device {
             local(64, 24),
             staged(local(128, 48)),
             staged(shared(1, 64, 48)),
+            prefetched(local(128, 48)),
+            prefetched(shared(1, 64, 24)),
         ]
     }
 
@@ -620,34 +637,32 @@ mod device {
     /// The full sweep of shapes (S1).
     fn sweep_shapes() -> Vec<SiTuning> {
         let mut v = Vec::new();
-        for block in [64, 128, 256] {
-            for budget in [24, 32, 48, 64, 96, 128] {
-                v.push(shared(1, block, budget));
-            }
-        }
+        // Shared-memory slots: occupancy is the budget's (FAST 781), so small
+        // budgets, plain, staged and staged with the prefetch.
         for block in [64, 128] {
-            for budget in [24, 32, 48, 64] {
-                v.push(shared(2, block, budget));
+            for budget in [16, 24, 32, 48] {
+                v.push(shared(1, block, budget));
+                v.push(staged(shared(1, block, budget)));
+                v.push(prefetched(shared(1, block, budget)));
             }
         }
+        for budget in [64, 96, 128] {
+            v.push(shared(1, 64, budget));
+        }
+        v.push(shared(2, 64, 24));
+        // Local-array slots.
         for block in [64, 128, 256] {
             for budget in [32, 48, 64, 128] {
                 v.push(local(block, budget));
             }
         }
-        for block in [64, 128, 256] {
-            for budget in [32, 48, 64, 128] {
-                v.push(staged(local(block, budget)));
-            }
+        for budget in [32, 48, 128] {
+            v.push(staged(local(128, budget)));
+            v.push(prefetched(local(128, budget)));
         }
-        for budget in [24, 32, 48] {
-            v.push(staged(shared(1, 64, budget)));
-        }
-        v.push(shared(1, 32, 128));
-        v.push(shared(1, 32, 96));
         // The generic opcodes at three shapes: what the specialized ones gain.
-        v.push(generic(shared(1, 128, 48)));
-        v.push(generic(shared(1, 64, 128)));
+        v.push(generic(shared(1, 64, 24)));
+        v.push(generic(prefetched(shared(1, 64, 24))));
         v.push(generic(local(128, 48)));
         v
     }
@@ -667,10 +682,12 @@ mod device {
             local(128, 64),
             local(256, 48),
             generic(shared(1, 128, 48)),
-            staged(local(128, 32)),
             staged(local(128, 48)),
-            staged(local(256, 48)),
-            staged(shared(1, 64, 32)),
+            prefetched(local(128, 48)),
+            shared(1, 64, 16),
+            prefetched(shared(1, 64, 16)),
+            prefetched(shared(1, 64, 24)),
+            prefetched(shared(1, 128, 32)),
         ]
     }
 

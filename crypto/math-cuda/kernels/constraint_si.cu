@@ -74,6 +74,15 @@ using ext3::Fe3;
 #define SI_STAGE_STRIDE blockDim.x
 #endif
 
+// The prefetching variants look this many steps ahead in the staged tile and
+// prefetch the trace cells that step will read into L1, so the read at the
+// step itself hits L1 instead of waiting on L2 or DRAM. A hint only: no value
+// depends on it.
+#define SI_LOOKAHEAD 8u
+#ifndef SI_PREFETCH_L1
+#define SI_PREFETCH_L1(p) asm volatile("prefetch.global.L1 [%0];" ::"l"(p))
+#endif
+
 // Specialized opcodes (budgeted.rs `SI_FAST`): a generic op whose operand kinds
 // the opcode fixes, so the handler loads them directly.
 #define SI_F_BADD_SS 32u
@@ -405,10 +414,37 @@ __device__ __forceinline__ void si_step(S &s, const SiInputs &in, const uint4 st
     }
 }
 
+// Prefetch the trace cells an encoded operand will read (main and aux
+// columns; every other kind reads nothing from the trace). An accumulation's
+// `b` (a root index) and a unary op's unused `b` carry kind 0 and are skipped.
+template <int R>
+__device__ __forceinline__ void si_prefetch(const SiInputs &in, uint32_t e, const uint64_t *r0,
+                                            const uint64_t *r1) {
+    const uint32_t kind = e >> SIK_SHIFT;
+    if (kind != SIK_MAIN && kind != SIK_AUX) {
+        return;
+    }
+    const uint32_t p = e & SIK_PAYLOAD_MASK;
+    const uint64_t col = p & SI_COL_MASK;
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        const uint64_t r = (p >> SI_COL_OFFSET_SHIFT) ? r1[j] : r0[j];
+        if (kind == SIK_MAIN) {
+            SI_PREFETCH_L1(&in.main[col * in.main_stride + r]);
+        } else {
+            SI_PREFETCH_L1(&in.aux[(3 * col) * in.aux_stride + r]);
+            SI_PREFETCH_L1(&in.aux[(3 * col + 1) * in.aux_stride + r]);
+            SI_PREFETCH_L1(&in.aux[(3 * col + 2) * in.aux_stride + r]);
+        }
+    }
+}
+
 // One thread's walk over the program for its R rows (`row[j]`, with their
 // frame-offset-1 rows `r1[j]`), then the interpreter's tail. Rows past the end
 // are walked on a clamped row and not written.
-template <int R, bool STAGE, class S>
+// STAGE: 0 the steps from global memory, 1 staged through shared memory, 2
+// staged and the trace cells of the step SI_LOOKAHEAD ahead prefetched.
+template <int R, int STAGE, class S>
 __device__ __forceinline__ void si_rows(
     S &s, const SiInputs &in, const uint4 *__restrict__ prog, uint32_t num_steps,
     const Fe3 *__restrict__ beta, const uint64_t *row, const bool *valid, uint64_t next_step,
@@ -428,7 +464,7 @@ __device__ __forceinline__ void si_rows(
     for (int j = 0; j < R; j++) {
         sum[j] = ext3::zero();
     }
-    if constexpr (STAGE) {
+    if constexpr (STAGE != 0) {
         // The steps tiled through shared memory: one cooperative copy a tile,
         // then every warp reads its steps there (a broadcast) instead of from
         // L2. Every thread of the block walks the same number of tiles (the
@@ -442,6 +478,13 @@ __device__ __forceinline__ void si_rows(
             }
             __syncthreads();
             for (uint32_t i = 0; i < n; i++) {
+                if constexpr (STAGE == 2) {
+                    if (i + SI_LOOKAHEAD < n) {
+                        const uint4 ahead = si_tile[i + SI_LOOKAHEAD];
+                        si_prefetch<R>(in, ahead.y, r0, r1);
+                        si_prefetch<R>(in, ahead.z, r0, r1);
+                    }
+                }
                 si_step<R>(s, in, si_tile[i], beta, sum, r0, r1);
             }
         }
@@ -495,7 +538,7 @@ __device__ __forceinline__ void si_rows(
 
 // A thread takes rows g, g + n, …, g + (R−1)·n of each tile of R·n rows
 // (n = the grid's threads), grid-striding over the tiles.
-template <int R, bool STAGE, class S>
+template <int R, int STAGE, class S>
 __device__ __forceinline__ void si_grid(S &s, SI_PARAMS) {
     SiInputs in;
     in.base_consts = d_base_consts;
@@ -521,7 +564,7 @@ __device__ __forceinline__ void si_grid(S &s, SI_PARAMS) {
     }
 }
 
-template <int R, bool STAGE> __device__ __forceinline__ void si_smem(SI_PARAMS) {
+template <int R, int STAGE> __device__ __forceinline__ void si_smem(SI_PARAMS) {
     extern __shared__ uint64_t si_smem_words[];
     SmemSlots<R> s;
     s.base = si_smem_words + threadIdx.x;
@@ -531,7 +574,7 @@ template <int R, bool STAGE> __device__ __forceinline__ void si_smem(SI_PARAMS) 
                d_b_value, d_b_beta, d_b_z_inv);
 }
 
-template <int R, int MAXW, bool STAGE> __device__ __forceinline__ void si_local(SI_PARAMS) {
+template <int R, int MAXW, int STAGE> __device__ __forceinline__ void si_local(SI_PARAMS) {
     LocalSlots<R, MAXW> s;
     si_grid<R, STAGE>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
                aux_stride, next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux,
@@ -544,20 +587,27 @@ template <int R, int MAXW, bool STAGE> __device__ __forceinline__ void si_local(
         d_b_beta, d_b_z_inv
 
 // Shared-memory slots: `num_words · R · blockDim.x` u64 of dynamic shared memory.
-extern "C" __global__ void si_smem_r1(SI_PARAMS) { si_smem<1, false>(SI_ARGS); }
-extern "C" __global__ void si_smem_r2(SI_PARAMS) { si_smem<2, false>(SI_ARGS); }
+extern "C" __global__ void si_smem_r1(SI_PARAMS) { si_smem<1, 0>(SI_ARGS); }
+extern "C" __global__ void si_smem_r2(SI_PARAMS) { si_smem<2, 0>(SI_ARGS); }
 
 // Local-array slots, one row a thread; the program's `num_words` must not
 // exceed the variant's width.
-extern "C" __global__ void si_local_w32(SI_PARAMS) { si_local<1, 32, false>(SI_ARGS); }
-extern "C" __global__ void si_local_w48(SI_PARAMS) { si_local<1, 48, false>(SI_ARGS); }
-extern "C" __global__ void si_local_w64(SI_PARAMS) { si_local<1, 64, false>(SI_ARGS); }
-extern "C" __global__ void si_local_w128(SI_PARAMS) { si_local<1, 128, false>(SI_ARGS); }
+extern "C" __global__ void si_local_w32(SI_PARAMS) { si_local<1, 32, 0>(SI_ARGS); }
+extern "C" __global__ void si_local_w48(SI_PARAMS) { si_local<1, 48, 0>(SI_ARGS); }
+extern "C" __global__ void si_local_w64(SI_PARAMS) { si_local<1, 64, 0>(SI_ARGS); }
+extern "C" __global__ void si_local_w128(SI_PARAMS) { si_local<1, 128, 0>(SI_ARGS); }
 
 // The same kernels with the steps staged through shared memory, a tile of
 // SI_TILE steps at a time (`_ps`: 4 KiB of static shared memory a block).
-extern "C" __global__ void si_smem_r1_ps(SI_PARAMS) { si_smem<1, true>(SI_ARGS); }
-extern "C" __global__ void si_local_w32_ps(SI_PARAMS) { si_local<1, 32, true>(SI_ARGS); }
-extern "C" __global__ void si_local_w48_ps(SI_PARAMS) { si_local<1, 48, true>(SI_ARGS); }
-extern "C" __global__ void si_local_w64_ps(SI_PARAMS) { si_local<1, 64, true>(SI_ARGS); }
-extern "C" __global__ void si_local_w128_ps(SI_PARAMS) { si_local<1, 128, true>(SI_ARGS); }
+extern "C" __global__ void si_smem_r1_ps(SI_PARAMS) { si_smem<1, 1>(SI_ARGS); }
+extern "C" __global__ void si_local_w32_ps(SI_PARAMS) { si_local<1, 32, 1>(SI_ARGS); }
+extern "C" __global__ void si_local_w48_ps(SI_PARAMS) { si_local<1, 48, 1>(SI_ARGS); }
+extern "C" __global__ void si_local_w64_ps(SI_PARAMS) { si_local<1, 64, 1>(SI_ARGS); }
+extern "C" __global__ void si_local_w128_ps(SI_PARAMS) { si_local<1, 128, 1>(SI_ARGS); }
+
+// Staged, with the trace cells SI_LOOKAHEAD steps ahead prefetched into L1 (`_pp`).
+extern "C" __global__ void si_smem_r1_pp(SI_PARAMS) { si_smem<1, 2>(SI_ARGS); }
+extern "C" __global__ void si_local_w32_pp(SI_PARAMS) { si_local<1, 32, 2>(SI_ARGS); }
+extern "C" __global__ void si_local_w48_pp(SI_PARAMS) { si_local<1, 48, 2>(SI_ARGS); }
+extern "C" __global__ void si_local_w64_pp(SI_PARAMS) { si_local<1, 64, 2>(SI_ARGS); }
+extern "C" __global__ void si_local_w128_pp(SI_PARAMS) { si_local<1, 128, 2>(SI_ARGS); }

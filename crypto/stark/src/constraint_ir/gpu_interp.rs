@@ -279,7 +279,8 @@ pub fn interp_si_setting(raw: Option<&str>) -> SiMode {
 /// `LAMBDA_VM_GPU_SI_SHAPE=<shared|local>:<rows a thread>:<block>:<budget words>[:<flags>]`:
 /// the bounded-slot interpreter's launch shape and word budget; flags joined
 /// by `+`: `fast` (specialized opcodes, the default) or `generic`, and
-/// `staged` (steps staged through shared memory). Default
+/// `staged` (steps staged through shared memory), `prefetch` (staged, and the
+/// trace cells of the steps ahead prefetched into L1). Default
 /// `shared:1:128:48:fast`.
 pub const SI_SHAPE_ENV: &str = "LAMBDA_VM_GPU_SI_SHAPE";
 
@@ -300,6 +301,7 @@ impl Default for SiTuning {
                 rows_per_thread: 1,
                 block: 128,
                 staged: false,
+                prefetch: false,
             },
             budget: 48,
             fast: true,
@@ -322,13 +324,15 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
     if !(4..=5).contains(&parts.len()) {
         bad();
     }
-    // Flags joined by `+`: `fast` (the default) or `generic`, and `staged`.
-    let (mut fast, mut staged) = (true, false);
+    // Flags joined by `+`: `fast` (the default) or `generic`, `staged`,
+    // `prefetch`.
+    let (mut fast, mut staged, mut prefetch) = (true, false, false);
     for flag in parts.get(4).into_iter().flat_map(|f| f.split('+')) {
         match flag {
             "fast" => fast = true,
             "generic" => fast = false,
             "staged" => staged = true,
+            "prefetch" => (staged, prefetch) = (true, true),
             _ => bad(),
         }
     }
@@ -356,6 +360,7 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
             rows_per_thread: rows,
             block,
             staged,
+            prefetch,
         },
         budget,
         fast,
@@ -931,6 +936,7 @@ mod tests {
                     rows_per_thread: 1,
                     block: 256,
                     staged: false,
+                    prefetch: false,
                 },
                 budget: 64,
                 fast: true,
@@ -939,6 +945,8 @@ mod tests {
         assert!(!si_shape_setting(Some("shared:1:128:48:generic")).fast);
         let t = si_shape_setting(Some("local:1:128:48:fast+staged"));
         assert!(t.fast && t.cfg.staged);
+        let t = si_shape_setting(Some("local:1:128:48:prefetch"));
+        assert!(t.cfg.staged && t.cfg.prefetch);
         assert_eq!(
             si_shape_setting(Some("shared:2:64:32")).cfg.rows_per_thread,
             2

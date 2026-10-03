@@ -603,28 +603,41 @@ pub struct SiConfig {
     /// The steps staged through shared memory a tile at a time (the `_ps`
     /// kernels; one row a thread only).
     pub staged: bool,
+    /// Staged, and the trace cells of the step `SI_LOOKAHEAD` ahead
+    /// prefetched into L1 (the `_pp` kernels; implies `staged`).
+    pub prefetch: bool,
 }
 
-/// The local-array widths `constraint_si.cu` is built at, plain and staged.
-const SI_LOCAL_WIDTHS: [(u32, &str, &str); 4] = [
-    (32, "si_local_w32", "si_local_w32_ps"),
-    (48, "si_local_w48", "si_local_w48_ps"),
-    (64, "si_local_w64", "si_local_w64_ps"),
-    (128, "si_local_w128", "si_local_w128_ps"),
+/// The local-array widths `constraint_si.cu` is built at: plain, staged, and
+/// staged with the prefetch.
+const SI_LOCAL_WIDTHS: [(u32, [&str; 3]); 4] = [
+    (32, ["si_local_w32", "si_local_w32_ps", "si_local_w32_pp"]),
+    (48, ["si_local_w48", "si_local_w48_ps", "si_local_w48_pp"]),
+    (64, ["si_local_w64", "si_local_w64_ps", "si_local_w64_pp"]),
+    (
+        128,
+        ["si_local_w128", "si_local_w128_ps", "si_local_w128_pp"],
+    ),
 ];
 
 impl SiConfig {
     /// The kernel for a program of `num_words` words a row, if this shape has
     /// one.
     pub fn kernel(&self, num_words: u32) -> Option<&'static str> {
-        match (self.store, self.rows_per_thread, self.staged) {
-            (SiStore::Shared, 1, false) => Some("si_smem_r1"),
-            (SiStore::Shared, 2, false) => Some("si_smem_r2"),
-            (SiStore::Shared, 1, true) => Some("si_smem_r1_ps"),
-            (SiStore::Local, 1, staged) => SI_LOCAL_WIDTHS
+        let stage = match (self.staged, self.prefetch) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (_, true) => 2,
+        };
+        match (self.store, self.rows_per_thread, stage) {
+            (SiStore::Shared, 1, _) => {
+                Some(["si_smem_r1", "si_smem_r1_ps", "si_smem_r1_pp"][stage])
+            }
+            (SiStore::Shared, 2, 0) => Some("si_smem_r2"),
+            (SiStore::Local, 1, _) => SI_LOCAL_WIDTHS
                 .iter()
-                .find(|(w, _, _)| num_words <= *w)
-                .map(|(_, k, ks)| if staged { *ks } else { *k }),
+                .find(|(w, _)| num_words <= *w)
+                .map(|(_, k)| k[stage]),
             _ => None,
         }
     }

@@ -51,6 +51,7 @@ uint64_t si_smem_words[1 << 22];
 #define SI_STAGE_TID 0u
 #define SI_STAGE_STRIDE 1u
 #define __syncthreads()
+#define SI_PREFETCH_L1(p) ((void)(p))
 
 #include "constraint_interp.cu"
 #include "constraint_si.cu"
@@ -73,6 +74,9 @@ static const Variant VARIANTS[] = {
     {"si_smem_r1_ps", si_smem_r1_ps, 0, 8, 4},   {"si_local_w32_ps", si_local_w32_ps, 32, 4, 5},
     {"si_local_w48_ps", si_local_w48_ps, 48, 4, 5}, {"si_local_w64_ps", si_local_w64_ps, 64, 4, 5},
     {"si_local_w128_ps", si_local_w128_ps, 128, 4, 5},
+    {"si_smem_r1_pp", si_smem_r1_pp, 0, 8, 4},   {"si_local_w32_pp", si_local_w32_pp, 32, 4, 5},
+    {"si_local_w48_pp", si_local_w48_pp, 48, 4, 5}, {"si_local_w64_pp", si_local_w64_pp, 64, 4, 5},
+    {"si_local_w128_pp", si_local_w128_pp, 128, 4, 5},
 };
 
 static uint64_t rng_state;
