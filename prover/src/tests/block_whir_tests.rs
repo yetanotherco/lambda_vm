@@ -662,6 +662,35 @@ fn a_byte_flipped_in_a_spilled_table_is_refused() {
     );
 }
 
+/// A spilled table whose columns never come back is refused when phase B
+/// reaches its group, before any reader meets it: a prover error naming the
+/// table, not a proof over empty columns.
+#[test]
+fn a_spilled_table_that_does_not_come_back_is_refused() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.spill = crate::block_whir::BlockSpillPolicy::Always;
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            spilled_slot_lost: true,
+            ..Deviations::default()
+        },
+    );
+    let Err(crate::Error::Prover(why)) = refused else {
+        panic!("a table that never came back was proved over");
+    };
+    assert!(
+        why.contains("SpillFailed") && why.contains("still spilled"),
+        "{why}"
+    );
+}
+
 /// A table the finish packed is laid out narrow only if its preprocessed
 /// columns are the program's, word for word: one word changed in a packed
 /// table's first preprocessed column and the layout refuses it.
