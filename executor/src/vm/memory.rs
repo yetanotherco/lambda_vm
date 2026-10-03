@@ -163,6 +163,20 @@ impl std::fmt::Debug for Pages {
 }
 
 impl Pages {
+    /// The bytes the pages and the directories take on the heap.
+    fn heap_bytes(&self) -> usize {
+        let page = std::mem::size_of::<Page>() + PAGE_SIZE + PAGE_SIZE / 4 / 64 * 8;
+        let pages = self
+            .low
+            .iter()
+            .chain(&self.high)
+            .filter(|p| p.is_some())
+            .count()
+            + self.other.len();
+        (self.low.capacity() + self.high.capacity()) * std::mem::size_of::<Option<Box<Page>>>()
+            + pages * page
+    }
+
     #[inline]
     fn page(&self, number: u64) -> Option<&Page> {
         if number < DIRECTORY_PAGES {
@@ -300,6 +314,16 @@ impl Memory {
             },
             public_output: Vec::new(),
         }
+    }
+
+    /// The bytes the memory takes on the heap: its pages (or the word map's
+    /// slots, an entry and a control byte each) and the public output.
+    pub fn heap_bytes(&self) -> usize {
+        let store = match &self.store {
+            Store::Pages(pages) => pages.heap_bytes(),
+            Store::Words(cells) => cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1),
+        };
+        store + self.public_output.capacity()
     }
 
     pub fn load_byte(&self, address: u64) -> u8 {
