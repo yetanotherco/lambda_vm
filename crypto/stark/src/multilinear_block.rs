@@ -473,7 +473,8 @@ where
         let mut incoming = groups.into_iter();
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
-        // upload (or, uploading ahead, beside this group's commit).
+        // upload (or, uploading ahead, beside this group's commit, installed
+        // once the next group's columns are up).
         let mut packing: Option<Packing> = None;
         // The next group, taken and uploaded beside this group's commit.
         let mut ahead: Option<Ahead<'a, F, E>> = None;
@@ -581,6 +582,13 @@ where
                         let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
                         (group, store, t.elapsed().as_secs_f64(), Instant::now())
                     });
+                    // The previous group's pack, installed while the commit
+                    // still runs: its wide columns go as soon as it is done,
+                    // instead of after the commit — and after the next upload,
+                    // which it must not delay.
+                    if let Some(packed) = packing.take() {
+                        packed.install(&mut tables, &mut stamps);
+                    }
                     let (committed, commit_end) = committer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -612,9 +620,6 @@ where
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
-            if upload_ahead && let Some(packed) = packing.take() {
-                packed.install(&mut tables, &mut stamps);
-            }
             packing = narrow_group(&mut group, store, narrow, &mut stamp).map(|handle| Packing {
                 first_table: tables.len(),
                 group: stamps.len(),
