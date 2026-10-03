@@ -1181,6 +1181,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
+    use math_cuda::r2split::{Cat, timed};
     let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows, 2)?;
     let n = lde_size / 2;
     if weights.len() != n || inv_2x.len() < n {
@@ -1190,14 +1191,18 @@ where
     // SAFETY: `F == GoldilocksField` (gated above); the Arc'd Vecs share layout.
     let inv_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
         unsafe { &*(inv_2x as *const _ as *const _) };
-    let inv_handle = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_conc)?;
+    let inv_handle = timed(Cat::Prep, || {
+        crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_conc)
+    })?;
 
     let two_inv_fe = FieldElement::<F>::from(2u64).inv().ok()?;
     // SAFETY: F == Goldilocks; FieldElement<Gl> is repr(transparent) over u64.
     let two_inv: u64 = unsafe { *(two_inv_fe.value() as *const _ as *const u64) };
 
-    let (slabs, stream, n_dev) =
-        math_cuda::constraint_interp::decompose_d2_into_slabs(h, &inv_handle, two_inv).ok()?;
+    let (slabs, stream, n_dev) = timed(Cat::Launch, || {
+        math_cuda::constraint_interp::decompose_d2_into_slabs(h, &inv_handle, two_inv)
+    })
+    .ok()?;
     debug_assert_eq!(n_dev, n);
 
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1221,8 +1226,12 @@ where
         return Some((vec![Vec::new(), Vec::new()], handle));
     }
 
-    let mut lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
-    let mut lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
+    let (mut lde_h0, mut lde_h1) = timed(Cat::Drain, || {
+        (
+            vec![FieldElement::<E>::zero(); lde_size],
+            vec![FieldElement::<E>::zero(); lde_size],
+        )
+    });
     let ext3_len = lde_size
         .checked_mul(3)
         .expect("ext3 output length overflow");
@@ -1264,6 +1273,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
+    use math_cuda::r2split::{Cat, timed};
     const PARTS: usize = 4;
     let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows, PARTS as u64)?;
     let q = lde_size / PARTS;
@@ -1276,16 +1286,21 @@ where
         unsafe { &*(inv_2x as *const _ as *const _) };
     let inv_2y_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
         unsafe { &*(inv_2y as *const _ as *const _) };
-    let inv_2x_dev = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2x_conc)?;
-    let inv_2y_dev = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2y_conc)?;
+    let (inv_2x_dev, inv_2y_dev) = timed(Cat::Prep, || {
+        Some((
+            crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2x_conc)?,
+            crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2y_conc)?,
+        ))
+    })?;
 
     let two_inv_fe = FieldElement::<F>::from(2u64).inv().ok()?;
     // SAFETY: F == Goldilocks; FieldElement<Gl> is repr(transparent) over u64.
     let two_inv: u64 = unsafe { *(two_inv_fe.value() as *const _ as *const u64) };
 
-    let (slabs, stream, q_dev) =
+    let (slabs, stream, q_dev) = timed(Cat::Launch, || {
         math_cuda::constraint_interp::decompose_d4_into_slabs(h, &inv_2x_dev, &inv_2y_dev, two_inv)
-            .ok()?;
+    })
+    .ok()?;
     debug_assert_eq!(q_dev, q);
 
     GPU_DECOMPOSE_D4_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1309,9 +1324,11 @@ where
         return Some((vec![Vec::new(); PARTS], handle));
     }
 
-    let mut parts: Vec<Vec<FieldElement<E>>> = (0..PARTS)
-        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
-        .collect();
+    let mut parts: Vec<Vec<FieldElement<E>>> = timed(Cat::Drain, || {
+        (0..PARTS)
+            .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+            .collect()
+    });
     let ext3_len = lde_size
         .checked_mul(3)
         .expect("ext3 output length overflow");
@@ -1378,7 +1395,10 @@ where
     // drop by RAII on any early return, in either order).
     let host = vec![download_comp_h_to_field::<E>(h)?];
 
-    let handle = math_cuda::constraint_interp::comp_h_to_slabs(h).ok()?;
+    let handle = math_cuda::r2split::timed(math_cuda::r2split::Cat::Launch, || {
+        math_cuda::constraint_interp::comp_h_to_slabs(h)
+    })
+    .ok()?;
     GPU_COMP_H_SLABS_CALLS.fetch_add(1, Ordering::Relaxed);
 
     Some((host, handle))
@@ -1390,7 +1410,9 @@ pub(crate) fn download_comp_h_to_field<E: IsField + 'static>(
     h: &math_cuda::constraint_interp::GpuCompH,
 ) -> Option<Vec<FieldElement<E>>> {
     let raw = math_cuda::constraint_interp::download_comp_h(h).ok()?;
-    crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
+    math_cuda::r2split::timed(math_cuda::r2split::Cat::Drain, || {
+        crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
+    })
 }
 
 pub(crate) static GPU_LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);

@@ -248,11 +248,14 @@ impl GpuBaseVec {
 }
 
 pub fn upload_base_vec(v: &[u64]) -> Result<GpuBaseVec> {
-    let be = backend()?;
-    let stream = be.next_stream();
-    let buf = stream.clone_htod(v)?;
-    stream.synchronize()?;
-    Ok(GpuBaseVec { buf, len: v.len() })
+    crate::r2split::add_upload_bytes(8 * v.len());
+    crate::r2split::timed(crate::r2split::Cat::Upload, || {
+        let be = backend()?;
+        let stream = be.next_stream();
+        let buf = stream.clone_htod(v)?;
+        stream.synchronize()?;
+        Ok(GpuBaseVec { buf, len: v.len() })
+    })
 }
 
 /// Launch the fused composition evaluation and return the device-resident
@@ -306,35 +309,58 @@ fn eval_composition_launch(
     main.wait_ready_on(&stream)?;
     aux.wait_ready_on(&stream)?;
 
-    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = (
-        stream.clone_htod(nodes)?,
-        stream.clone_htod(base_consts)?,
-        stream.clone_htod(ext_consts)?,
-        stream.clone_htod(roots)?,
-        stream.clone_htod(rap_challenges)?,
-        stream.clone_htod(alpha_powers)?,
-        stream.clone_htod(table_offset)?,
+    let ((d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset), uploads) =
+        crate::r2split::timed(crate::r2split::Cat::Upload, || -> Result<_> {
+            Ok((
+                (
+                    stream.clone_htod(nodes)?,
+                    stream.clone_htod(base_consts)?,
+                    stream.clone_htod(ext_consts)?,
+                    stream.clone_htod(roots)?,
+                    stream.clone_htod(rap_challenges)?,
+                    stream.clone_htod(alpha_powers)?,
+                    stream.clone_htod(table_offset)?,
+                ),
+                (
+                    stream.clone_htod(accum.beta_trans)?,
+                    stream.clone_htod(accum.z_inv)?,
+                    stream.clone_htod(accum.b_col)?,
+                    stream.clone_htod(accum.b_is_aux)?,
+                    stream.clone_htod(accum.b_value)?,
+                    stream.clone_htod(accum.b_beta)?,
+                ),
+            ))
+        })?;
+    crate::r2split::add_upload_bytes(
+        8 * (nodes.len()
+            + base_consts.len()
+            + ext_consts.len()
+            + roots.len()
+            + rap_challenges.len()
+            + alpha_powers.len()
+            + table_offset.len()
+            + accum.beta_trans.len()
+            + accum.z_inv.len()
+            + accum.b_col.len()
+            + accum.b_is_aux.len()
+            + accum.b_value.len()
+            + accum.b_beta.len()),
     );
-
-    let (d_beta_trans, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = (
-        stream.clone_htod(accum.beta_trans)?,
-        stream.clone_htod(accum.z_inv)?,
-        stream.clone_htod(accum.b_col)?,
-        stream.clone_htod(accum.b_is_aux)?,
-        stream.clone_htod(accum.b_value)?,
-        stream.clone_htod(accum.b_beta)?,
-    );
+    let (d_beta_trans, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = uploads;
     // D2D from the resident per-constraint columns into the flat
     // `b * num_rows + row` device layout — no PCIe, no flattened host copy,
     // no zeroing (the copies cover every element the kernel reads).
-    let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
-    for (b, src) in accum.b_z_inv.iter().enumerate() {
-        // Hard assert: a shorter column would leave the window's tail as
-        // uninitialized VRAM the kernel reads — a silently wrong H.
-        assert_eq!(src.len(), num_rows, "b_z_inv column length");
-        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
-        stream.memcpy_dtod(&src.buf, &mut dst)?;
-    }
+    let d_b_z_inv = crate::r2split::timed(crate::r2split::Cat::Alloc, || -> Result<_> {
+        let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
+        for (b, src) in accum.b_z_inv.iter().enumerate() {
+            // Hard assert: a shorter column would leave the window's tail as
+            // uninitialized VRAM the kernel reads — a silently wrong H.
+            assert_eq!(src.len(), num_rows, "b_z_inv column length");
+            let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+            stream.memcpy_dtod(&src.buf, &mut dst)?;
+        }
+        Ok(d_b_z_inv)
+    })?;
 
     // The interpreter's grid is capped by its per-thread slot file; a compiled
     // kernel keeps its values in registers, so it has no scratch and a grid
@@ -353,14 +379,19 @@ fn eval_composition_launch(
     };
 
     // Per-thread slot scratch, uninitialized (the walk writes before reading).
-    let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
-    let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    // Output: every row is written by the grid-stride loop.
+    let (mut d_vals_base, mut d_vals_ext, mut d_h) =
+        crate::r2split::timed(crate::r2split::Cat::Alloc, || -> Result<_> {
+            Ok((
+                unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?,
+                unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?,
+                unsafe { stream.alloc::<u64>(num_rows * 3) }?,
+            ))
+        })?;
     if COMPOSITION_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
         let bytes = 8 * (num_base_slots + 3 * num_ext_slots) * num_threads;
         COMPOSITION_SCRATCH.with(|c| c.set(c.get() + bytes as u64));
     }
-    // Output: every row is written by the grid-stride loop.
-    let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
 
     let num_nodes_u64 = num_nodes as u64;
     let num_roots_u64 = num_roots as u64;
@@ -380,6 +411,7 @@ fn eval_composition_launch(
         .as_ref()
         .unwrap_or(&be.constraint_composition_kernel);
     let timer = CompositionTimer::start(&stream)?;
+    let launch_t = crate::r2split::start();
     unsafe {
         stream
             .launch_builder(kernel)
@@ -412,6 +444,7 @@ fn eval_composition_launch(
             .arg(&mut d_vals_ext)
             .launch(cfg)?;
     }
+    crate::r2split::charge(crate::r2split::Cat::Launch, launch_t);
     timer.stop(&stream)?;
     Ok((d_h, stream))
 }
@@ -755,28 +788,52 @@ pub fn eval_composition_si_keep(
     let stream = be.next_stream();
     main.wait_ready_on(&stream)?;
     aux.wait_ready_on(&stream)?;
-    let d_steps = stream.clone_htod(prog.steps)?;
-    let d_base_consts = stream.clone_htod(if prog.base_consts.is_empty() {
+    let base_consts = if prog.base_consts.is_empty() {
         &[0u64][..]
     } else {
         prog.base_consts
+    };
+    let (
+        d_steps,
+        d_base_consts,
+        d_uni,
+        (d_beta, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta),
+    ) = crate::r2split::timed(crate::r2split::Cat::Upload, || -> Result<_> {
+        Ok((
+            stream.clone_htod(prog.steps)?,
+            stream.clone_htod(base_consts)?,
+            stream.clone_htod(prog.ext_uniforms)?,
+            (
+                stream.clone_htod(accum.beta_trans)?,
+                stream.clone_htod(accum.z_inv)?,
+                stream.clone_htod(accum.b_col)?,
+                stream.clone_htod(accum.b_is_aux)?,
+                stream.clone_htod(accum.b_value)?,
+                stream.clone_htod(accum.b_beta)?,
+            ),
+        ))
     })?;
-    let d_uni = stream.clone_htod(prog.ext_uniforms)?;
-    let (d_beta, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = (
-        stream.clone_htod(accum.beta_trans)?,
-        stream.clone_htod(accum.z_inv)?,
-        stream.clone_htod(accum.b_col)?,
-        stream.clone_htod(accum.b_is_aux)?,
-        stream.clone_htod(accum.b_value)?,
-        stream.clone_htod(accum.b_beta)?,
+    crate::r2split::add_upload_bytes(
+        4 * prog.steps.len()
+            + 8 * (base_consts.len()
+                + prog.ext_uniforms.len()
+                + accum.beta_trans.len()
+                + accum.z_inv.len()
+                + accum.b_col.len()
+                + accum.b_is_aux.len()
+                + accum.b_value.len()
+                + accum.b_beta.len()),
     );
-    let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
-    for (b, src) in accum.b_z_inv.iter().enumerate() {
-        assert_eq!(src.len(), num_rows, "b_z_inv column length");
-        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
-        stream.memcpy_dtod(&src.buf, &mut dst)?;
-    }
-    let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
+    let (d_b_z_inv, mut d_h) =
+        crate::r2split::timed(crate::r2split::Cat::Alloc, || -> Result<_> {
+            let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
+            for (b, src) in accum.b_z_inv.iter().enumerate() {
+                assert_eq!(src.len(), num_rows, "b_z_inv column length");
+                let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+                stream.memcpy_dtod(&src.buf, &mut dst)?;
+            }
+            Ok((d_b_z_inv, unsafe { stream.alloc::<u64>(num_rows * 3) }?))
+        })?;
 
     // One row (or two) a thread, every row covered: no slot file caps the grid.
     let rows_per_block = (cfg.block * cfg.rows_per_thread) as usize;
@@ -796,6 +853,7 @@ pub fn eval_composition_si_keep(
         shared_mem_bytes: smem as u32,
     };
     let timer = CompositionTimer::start(&stream)?;
+    let launch_t = crate::r2split::start();
     unsafe {
         stream
             .launch_builder(&func)
@@ -821,6 +879,7 @@ pub fn eval_composition_si_keep(
             .arg(&d_b_z_inv)
             .launch(launch)?;
     }
+    crate::r2split::charge(crate::r2split::Cat::Launch, launch_t);
     timer.stop(&stream)?;
     Ok(GpuCompH {
         buf: d_h,
@@ -908,16 +967,13 @@ pub fn upload_comp_h(h: &[u64]) -> Result<GpuCompH> {
 
 /// D2H a resident `H` (the CPU-decompose fallback bridge).
 pub fn download_comp_h(h: &GpuCompH) -> Result<Vec<u64>> {
+    use crate::r2split::{Cat, timed};
     let be = backend()?;
-    let pending = crate::device::async_dtoh_via(
-        &h.stream,
-        be.pinned_staging(),
-        &be.ctx,
-        &h.buf,
-        h.buf.len(),
-    )?;
-    let mut out = vec![0u64; h.buf.len()];
-    pending.wait_into_u64(&mut out)?;
+    let pending = timed(Cat::Stage, || {
+        crate::device::async_dtoh_via(&h.stream, be.pinned_staging(), &be.ctx, &h.buf, h.buf.len())
+    })?;
+    let mut out = timed(Cat::Drain, || vec![0u64; h.buf.len()]);
+    timed(Cat::DevWait, || pending.wait_into_u64_timed(&mut out))?;
     Ok(out)
 }
 
@@ -936,7 +992,9 @@ pub fn decompose_d2_into_slabs(
     let lde_size = h.num_rows;
     let be = backend()?;
     let stream = h.stream.clone();
-    let mut out = stream.alloc_zeros::<u64>(6 * lde_size)?;
+    let mut out = crate::r2split::timed(crate::r2split::Cat::Alloc, || {
+        stream.alloc_zeros::<u64>(6 * lde_size)
+    })?;
 
     let grid = (n as u32)
         .div_ceil(BLOCK_DIM)
@@ -982,7 +1040,9 @@ pub fn decompose_d4_into_slabs(
     let lde_size = h.num_rows;
     let be = backend()?;
     let stream = h.stream.clone();
-    let mut out = stream.alloc_zeros::<u64>(12 * lde_size)?;
+    let mut out = crate::r2split::timed(crate::r2split::Cat::Alloc, || {
+        stream.alloc_zeros::<u64>(12 * lde_size)
+    })?;
 
     let grid = (q as u32)
         .div_ceil(BLOCK_DIM)
@@ -1028,7 +1088,9 @@ pub fn comp_h_to_slabs(h: &GpuCompH) -> Result<GpuLdeExt3> {
     // The kernel writes every one of the `3 * lde_size` slab u64s, so an
     // uninitialized allocation is sound (no zero-pad tail, unlike the d=2
     // decompose which only fills the first `n` rows).
-    let mut out = unsafe { stream.alloc::<u64>(3 * lde_size) }?;
+    let mut out = crate::r2split::timed(crate::r2split::Cat::Alloc, || unsafe {
+        stream.alloc::<u64>(3 * lde_size)
+    })?;
 
     let grid = (lde_size as u32)
         .div_ceil(BLOCK_DIM)

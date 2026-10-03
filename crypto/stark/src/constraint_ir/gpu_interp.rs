@@ -748,27 +748,52 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    let LoweredCall {
-        lowered,
-        prog: gprog,
-        rap,
-        alpha,
-        offset,
-    } = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
-
-    // SAFETY: `E`/`F` are the Goldilocks tower (established in `lower_and_pack`).
-    let beta_trans = unsafe { ext3_slice_to_u64(inputs.beta_trans) };
-    let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
-    let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
-    let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
-    // SAFETY: `F` is Goldilocks (established in `lower_and_pack`);
-    // `Vec<FieldElement<F>>` and the concrete Vec share their layout.
-    let b_z_inv_conc: &[GoldilocksBZInv] = unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
-    let b_z_inv_handles = bzinv_device_handles(b_z_inv_conc)?;
+    use math_cuda::r2split::{Cat, timed};
+    // Host preparation (a first-use upload of a zerofier column inside it is
+    // charged as an upload).
+    let prep = timed(Cat::Prep, || {
+        let call = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
+        // SAFETY: `E`/`F` are the Goldilocks tower (established in `lower_and_pack`).
+        let beta_trans = unsafe { ext3_slice_to_u64(inputs.beta_trans) };
+        let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
+        let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
+        let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
+        // SAFETY: `F` is Goldilocks (established in `lower_and_pack`);
+        // `Vec<FieldElement<F>>` and the concrete Vec share their layout.
+        let b_z_inv_conc: &[GoldilocksBZInv] =
+            unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
+        let b_z_inv_handles = bzinv_device_handles(b_z_inv_conc)?;
+        let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
+        let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
+        Some((
+            call,
+            beta_trans,
+            z_inv,
+            b_value,
+            b_beta,
+            b_z_inv_handles,
+            b_col,
+            b_is_aux,
+        ))
+    });
+    let (
+        LoweredCall {
+            lowered,
+            prog: gprog,
+            rap,
+            alpha,
+            offset,
+        },
+        beta_trans,
+        z_inv,
+        b_value,
+        b_beta,
+        b_z_inv_handles,
+        b_col,
+        b_is_aux,
+    ) = prep?;
     let b_z_inv: Vec<&math_cuda::constraint_interp::GpuBaseVec> =
         b_z_inv_handles.iter().map(|h| h.as_ref()).collect();
-    let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
-    let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
 
     let accum = math_cuda::constraint_interp::CompositionAccum {
         beta_trans: &beta_trans,
@@ -793,25 +818,31 @@ where
         SiMode::Uncompiled => lowered.compiled.is_none(),
         SiMode::All => true,
     };
-    let chosen = if !si_takes {
-        None
-    } else if tuning.auto {
-        lowered.si_auto(gprog)
-    } else {
-        lowered
-            .si(gprog, tuning.budget, tuning.fast)
-            .map(|si| (tuning.cfg, si))
-    };
+    let chosen = timed(Cat::Prep, || {
+        if !si_takes {
+            None
+        } else if tuning.auto {
+            lowered.si_auto(gprog)
+        } else {
+            lowered
+                .si(gprog, tuning.budget, tuning.fast)
+                .map(|si| (tuning.cfg, si))
+        }
+    });
     if let Some((si_cfg, si)) = chosen {
         let triples = |v: &[u64]| -> Vec<[u64; 3]> {
             v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
         };
-        if let Some(uni) = si.bp.ext_uniform_table(
-            &triples(&rap),
-            &triples(&alpha),
-            [offset[0], offset[1], offset[2]],
-        ) {
-            let uni: Vec<u64> = uni.into_iter().flatten().collect();
+        let uni = timed(Cat::Prep, || {
+            si.bp
+                .ext_uniform_table(
+                    &triples(&rap),
+                    &triples(&alpha),
+                    [offset[0], offset[1], offset[2]],
+                )
+                .map(|uni| uni.into_iter().flatten().collect::<Vec<u64>>())
+        });
+        if let Some(uni) = uni {
             #[cfg(feature = "test-utils")]
             let mutated = SI_MUTATE_ACC
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -839,9 +870,11 @@ where
                 base_consts: &si.bp.base_consts,
                 ext_uniforms: &uni,
             };
-            let out = math_cuda::constraint_interp::eval_composition_si_keep(
-                si_cfg, &sp, main, aux, next_step, num_rows, &accum,
-            )
+            let out = timed(Cat::Launch, || {
+                math_cuda::constraint_interp::eval_composition_si_keep(
+                    si_cfg, &sp, main, aux, next_step, num_rows, &accum,
+                )
+            })
             .and_then(|h| {
                 if keep {
                     Ok(GpuComposition::Dev(h))
@@ -868,24 +901,26 @@ where
         (k, _) => (k, false),
     };
     let result = if keep {
-        math_cuda::constraint_interp::eval_composition_on_device_keep(
-            compiled,
-            &lowered.nodes,
-            lowered.dev.nodes.len(),
-            lowered.dev.num_base_slots as usize,
-            lowered.dev.num_ext_slots as usize,
-            &lowered.dev.base_consts,
-            &lowered.ext_consts,
-            &lowered.roots,
-            &rap,
-            &alpha,
-            &offset,
-            main,
-            aux,
-            next_step,
-            num_rows,
-            &accum,
-        )
+        timed(Cat::Launch, || {
+            math_cuda::constraint_interp::eval_composition_on_device_keep(
+                compiled,
+                &lowered.nodes,
+                lowered.dev.nodes.len(),
+                lowered.dev.num_base_slots as usize,
+                lowered.dev.num_ext_slots as usize,
+                &lowered.dev.base_consts,
+                &lowered.ext_consts,
+                &lowered.roots,
+                &rap,
+                &alpha,
+                &offset,
+                main,
+                aux,
+                next_step,
+                num_rows,
+                &accum,
+            )
+        })
         .map(GpuComposition::Dev)
     } else {
         math_cuda::constraint_interp::eval_composition_on_device(

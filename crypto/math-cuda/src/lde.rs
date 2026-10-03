@@ -3410,44 +3410,53 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     }
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
 
+    use crate::r2split::{Cat, timed};
     let be = backend()?;
     let engine = slabs_take_engine(n, blowup_factor);
-    lde_in_slabs(
-        stream,
-        be,
-        &mut buf,
-        mb,
-        n,
-        blowup_factor,
-        weights,
-        SlabInput::Evals,
-        engine,
-    )?;
+    timed(Cat::Launch, || {
+        lde_in_slabs(
+            stream,
+            be,
+            &mut buf,
+            mb,
+            n,
+            blowup_factor,
+            weights,
+            SlabInput::Evals,
+            engine,
+        )
+    })?;
 
     let ready = match outputs {
         Some(outputs) => {
-            let pending = crate::device::async_dtoh_via(
-                stream,
-                be.pinned_staging(),
-                &be.ctx,
-                &buf,
-                mb * lde_size,
-            )?;
-            pending.wait_and_read(|bytes| {
-                // SAFETY: the pinned slab is u64-aligned by construction and the
-                // copy deposited exactly `mb * lde_size` u64s.
-                let pinned = unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size)
-                };
-                unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+            let pending = timed(Cat::Stage, || {
+                crate::device::async_dtoh_via(
+                    stream,
+                    be.pinned_staging(),
+                    &be.ctx,
+                    &buf,
+                    mb * lde_size,
+                )
+            })?;
+            timed(Cat::DevWait, || {
+                pending.wait_and_read(|bytes| {
+                    timed(Cat::Drain, || {
+                        // SAFETY: the pinned slab is u64-aligned by construction and the
+                        // copy deposited exactly `mb * lde_size` u64s.
+                        let pinned = unsafe {
+                            std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size)
+                        };
+                        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+                    })
+                })
             })?;
             None
         }
-        None => {
+        None => timed(Cat::Launch, || -> Result<_> {
             let ready = be.take_event()?;
             ready.event().record(stream)?;
-            Some(Arc::new(ready))
-        }
+            Ok(Some(Arc::new(ready)))
+        })?,
     };
 
     Ok(GpuLdeExt3 {
@@ -3526,7 +3535,9 @@ fn lde_in_slabs(
     let col_stride_u64 = lde_size as u64;
     let slabs_u32 = slabs as u32;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
+    crate::r2split::add_upload_bytes(8 * weights.len());
+    let weights_dev =
+        crate::r2split::timed(crate::r2split::Cat::Upload, || stream.clone_htod(weights))?;
     if input == SlabInput::Evals {
         let inv_tw = be.inv_twiddles_for(log_n)?;
         launch_bit_reverse_batched(

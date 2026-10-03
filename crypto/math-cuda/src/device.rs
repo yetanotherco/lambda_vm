@@ -2176,6 +2176,21 @@ impl PendingD2H<'_> {
         self.wait_and_read(|src| dst.copy_from_slice(src))
     }
 
+    /// [`Self::wait_into_u64`], charging the copy out to
+    /// [`crate::r2split::Cat::Drain`] (the wait stays with the caller's region).
+    pub fn wait_into_u64_timed(self, dst: &mut [u64]) -> Result<()> {
+        assert_eq!(dst.len() * 8, self.n_bytes);
+        self.wait_and_read(|bytes| {
+            crate::r2split::timed(crate::r2split::Cat::Drain, || {
+                // SAFETY: as in `wait_into_u64`; the slab is u64-aligned by
+                // construction.
+                let src =
+                    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, dst.len()) };
+                dst.copy_from_slice(src);
+            })
+        })
+    }
+
     /// Wait and copy out as u64s. `dst.len() * 8` must equal the copied bytes.
     pub fn wait_into_u64(self, dst: &mut [u64]) -> Result<()> {
         assert_eq!(dst.len() * 8, self.n_bytes);

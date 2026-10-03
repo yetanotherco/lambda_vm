@@ -3416,6 +3416,7 @@ pub trait IsStarkProver<
         Vec<Vec<FieldElement<FieldExtension>>>,
         math_cuda::lde::GpuLdeExt3,
     )> {
+        use math_cuda::r2split::{Cat, timed};
         if number_of_parts == 1 {
             // d=1 is never device-only (`device_only_for`'s degree gate admits only
             // d=2 and d=4), so the single part is always kept on host — `want_host` must
@@ -3434,19 +3435,26 @@ pub trait IsStarkProver<
             );
             crate::gpu_lde::try_comp_h_to_slabs_dev::<Field, FieldExtension>(h_dev)
         } else if number_of_parts == 4 {
+            // The twiddle tables are built on first use, inside the R2 window.
+            let (inv_2x, inv_2y, weights) = timed(Cat::Prep, || {
+                (
+                    twiddles.inv_2x(domain),
+                    twiddles.inv_2y(domain),
+                    twiddles.d4_weights(domain),
+                )
+            });
             crate::gpu_lde::try_decompose_extend_d4_dev::<Field, FieldExtension>(
-                h_dev,
-                twiddles.inv_2x(domain),
-                twiddles.inv_2y(domain),
-                twiddles.d4_weights(domain),
-                want_host,
+                h_dev, inv_2x, inv_2y, weights, want_host,
             )
         } else {
+            let (inv_2x, weights) = timed(Cat::Prep, || {
+                (
+                    twiddles.inv_2x(domain),
+                    &twiddles.composition(domain).weights,
+                )
+            });
             crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
-                h_dev,
-                twiddles.inv_2x(domain),
-                &twiddles.composition(domain).weights,
-                want_host,
+                h_dev, inv_2x, weights, want_host,
             )
         }
     }
@@ -3661,7 +3669,9 @@ pub trait IsStarkProver<
             // decompose of a downloaded `H` and every host arm run outside
             // the lock. The force-downgrade test hook skips this fast path so
             // every device-only table exercises the host recovery below.
-            let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
+            let r2_asked = math_cuda::r2split::start();
+            let r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
+            let r2_window = math_cuda::r2split::open(r2_asked);
             if let Some(h_dev) = evaluator.evaluate_dev(
                 air,
                 lde_trace,
@@ -3689,6 +3699,14 @@ pub trait IsStarkProver<
                             crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev);
                     }
                 }
+            }
+            if let Some(w) = r2_window {
+                w.close(
+                    air.name(),
+                    trace_length,
+                    number_of_parts,
+                    r2_serial_guard.is_some(),
+                );
             }
         }
         #[cfg(feature = "cuda")]

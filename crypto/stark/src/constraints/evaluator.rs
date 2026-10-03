@@ -331,25 +331,29 @@ where
         let main = lde_trace.gpu_main()?;
         let aux = lde_trace.gpu_aux()?;
 
-        let prog = air.constraint_program();
+        let (prog, logup_alpha_powers, b_col, b_is_aux, b_value) =
+            math_cuda::r2split::timed(math_cuda::r2split::Cat::Prep, || {
+                let prog = air.constraint_program();
 
-        // LogUp alpha powers, exactly as `evaluate_transitions` derives them.
-        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
-            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(
-                    &rap_challenges[LOGUP_CHALLENGE_ALPHA],
-                    air.max_bus_elements(),
-                )
-            } else {
-                Vec::new()
-            };
+                // LogUp alpha powers, exactly as `evaluate_transitions` derives them.
+                let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+                    if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                        compute_alpha_powers(
+                            &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                            air.max_bus_elements(),
+                        )
+                    } else {
+                        Vec::new()
+                    };
 
-        // Boundary spec (aligned with `boundary_coefficients` / `boundary_z_inv`).
-        let bcs = &self.boundary_constraints.constraints;
-        let b_col: Vec<usize> = bcs.iter().map(|c| c.col).collect();
-        let b_is_aux: Vec<bool> = bcs.iter().map(|c| c.is_aux).collect();
-        let b_value: Vec<FieldElement<FieldExtension>> =
-            bcs.iter().map(|c| c.value.clone()).collect();
+                // Boundary spec (aligned with `boundary_coefficients` / `boundary_z_inv`).
+                let bcs = &self.boundary_constraints.constraints;
+                let b_col: Vec<usize> = bcs.iter().map(|c| c.col).collect();
+                let b_is_aux: Vec<bool> = bcs.iter().map(|c| c.is_aux).collect();
+                let b_value: Vec<FieldElement<FieldExtension>> =
+                    bcs.iter().map(|c| c.value.clone()).collect();
+                (prog, logup_alpha_powers, b_col, b_is_aux, b_value)
+            });
 
         let inputs = crate::constraint_ir::gpu_interp::CompositionInputs {
             beta_trans: transition_coefficients,
@@ -398,13 +402,19 @@ where
         Field: 'static,
         FieldExtension: 'static,
     {
-        let boundary_zerofiers_inverse_evaluations: Vec<std::sync::Arc<Vec<FieldElement<Field>>>> =
-            self.boundary_constraints
-                .constraints
-                .iter()
-                .map(|bc| domain.boundary_zerofier_inv(bc.step))
-                .collect();
-        let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
+        let (boundary_zerofiers_inverse_evaluations, zerofier_data) =
+            math_cuda::r2split::timed(math_cuda::r2split::Cat::Prep, || {
+                let boundary: Vec<std::sync::Arc<Vec<FieldElement<Field>>>> = self
+                    .boundary_constraints
+                    .constraints
+                    .iter()
+                    .map(|bc| domain.boundary_zerofier_inv(bc.step))
+                    .collect();
+                (
+                    boundary,
+                    air.transition_zerofier_evaluations_grouped(domain),
+                )
+            });
         match self.try_evaluate_composition_gpu(
             air,
             lde_trace,

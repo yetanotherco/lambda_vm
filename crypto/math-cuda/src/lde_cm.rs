@@ -367,7 +367,9 @@ pub(crate) fn lde_columns(
 
     // The weights at bit-reversed positions: the iNTT leaves coefficient
     // `rev(p)` at `p`, and the coefficient form gathers at the same index.
-    let mut wbr = stream.clone_htod(weights)?;
+    crate::r2split::add_upload_bytes(8 * weights.len());
+    let mut wbr =
+        crate::r2split::timed(crate::r2split::Cat::Upload, || stream.clone_htod(weights))?;
     unsafe {
         stream
             .launch_builder(&be.bit_reverse_permute)
@@ -382,7 +384,9 @@ pub(crate) fn lde_columns(
     // copy of the coefficients (so a source inside `dst` is read before the
     // chunk's output overwrites it). SAFETY: every element a later pass reads
     // is written first — by the iNTT's first pass or by the copy.
-    let scratch = unsafe { stream.alloc::<u64>(chunk * n) }?;
+    let scratch = crate::r2split::timed(crate::r2split::Cat::Alloc, || unsafe {
+        stream.alloc::<u64>(chunk * n)
+    })?;
     let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
     let (inv_roots, _ir) = tables.inv.device_ptr(stream);
     let (wtab, _wr) = wbr.device_ptr(stream);
