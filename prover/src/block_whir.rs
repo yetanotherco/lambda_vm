@@ -408,6 +408,10 @@ pub struct BlockStamps {
     /// tops and the leaves re-hashed for them. A revived commitment never
     /// builds a device tree, so nothing re-commits.
     pub top_paths: (u64, u64),
+    /// Phase B's openings, by host stage (`LAMBDA_VM_BASE_SPLIT=1`, else
+    /// empty): the WHIR chains' six stages, their query split, and the kept-top
+    /// paths' gather and re-hash, seconds on the prover's thread.
+    pub open_split: Vec<(&'static str, f64)>,
     /// A streamed build: when its windows were all collected (seconds since
     /// the build started) and how many chunks they handed out.
     pub streamed: (f64, usize),
@@ -597,6 +601,17 @@ impl BlockStamps {
             self.groups.iter().filter(|g| g.ahead_refused).count(),
             multilinear::gpu::room_commit_refusals(),
         ));
+        if !self.open_split.is_empty() {
+            let parts: Vec<String> = self
+                .open_split
+                .iter()
+                .map(|(name, v)| format!("{name} {v:.3}"))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK OPEN SPLIT (host s on the prover's thread): {}\n",
+                parts.join(" · ")
+            ));
+        }
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
@@ -2629,6 +2644,8 @@ fn prove_streamed(
             .collect();
         #[cfg(feature = "nvtx")]
         let nvtx_phase = stark::instruments::nvtx_process_range(|| "blk_phase_b".into());
+        let _ = multilinear::whir_split::take_chain();
+        let top_secs_before = multilinear::whir_commit::top_path_secs();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
         let widens_before = multilinear::narrow::host_widens();
@@ -2651,6 +2668,35 @@ fn prove_streamed(
         stamps.phase_b = t.elapsed().as_secs_f64();
         #[cfg(feature = "nvtx")]
         drop(nvtx_phase);
+        if multilinear::whir_split::enabled() {
+            let chain = multilinear::whir_split::take_chain();
+            let top_secs = multilinear::whir_commit::top_path_secs();
+            let names = [
+                "grind",
+                "sumcheck",
+                "fold",
+                "commit_folded",
+                "ood",
+                "queries",
+            ];
+            stamps.open_split = names.into_iter().zip(chain.six).collect();
+            stamps.open_split.push(("round_wall", chain.round_wall));
+            let q = [
+                "query_sample",
+                "tree_rebuild",
+                "coset_gather",
+                "open_assemble",
+            ];
+            stamps.open_split.extend(q.into_iter().zip(chain.queries));
+            stamps
+                .open_split
+                .push(("top_gather", top_secs.0 - top_secs_before.0));
+            stamps
+                .open_split
+                .push(("top_rehash", top_secs.1 - top_secs_before.1));
+            stamps.open_split.push(("chains", chain.chain_count as f64));
+            stamps.open_split.push(("rounds", chain.round_count as f64));
+        }
         let paths_after = multilinear::whir_commit::top_path_counts();
         stamps.top_paths = (
             paths_after.0 - paths_before.0,
