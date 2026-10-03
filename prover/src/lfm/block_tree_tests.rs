@@ -3169,6 +3169,9 @@ fn the_block_tree_composes_to_a_top_node() {
 
     let whole = HostSampler::start();
     let t_all = Instant::now();
+    // `LAMBDA_VM_ALLOC_DIRTY_LOG=<secs>`: where the allocator's freed pages sit,
+    // through the whole run and its verifier.
+    let _dirty_log = crate::alloc_purge::dirty_log_from_env();
 
     // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`, four
     // by default): the plan's ELF-only input (DECODE's root, recomputed on the
