@@ -415,6 +415,11 @@ where
         self.trace.install_narrow(packed)
     }
 
+    /// Whether the packed columns are out in a spill store's slot.
+    pub fn is_spilled(&self) -> bool {
+        self.trace.is_spilled()
+    }
+
     /// Packs the columns narrow on the host (see [`TraceData::pack_on_host`]).
     pub(crate) fn pack_on_host(&mut self) -> bool {
         self.trace.pack_on_host()
