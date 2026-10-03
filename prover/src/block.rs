@@ -1914,6 +1914,9 @@ pub fn prove_block_traces(
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<VmProof, Error> {
     let t = Instant::now();
+    // The heap before the AIRs exist (memlog): the setup line splits what
+    // they add from what phase A left.
+    let live_before_airs = memlog().then(heap_stats).flatten().map(|[live, ..]| live);
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         program,
@@ -1990,13 +1993,15 @@ pub fn prove_block_traces(
             g(held[3]),
         );
         if let Some([live, ..]) = heap_stats() {
-            let named = packed + wide + held.iter().sum::<usize>() + cache;
+            let airs = live_before_airs.map_or(0, |before| live.saturating_sub(before));
+            let named = packed + wide + held.iter().sum::<usize>() + cache + airs;
             eprintln!(
-                "BLOCK MEM setup: heap live {:.2} = traces {:.2} + precommits {:.2} + precomputed trees {:.2} + unnamed {:.2} (GiB)",
+                "BLOCK MEM setup: heap live {:.2} = traces {:.2} + precommits {:.2} + precomputed trees {:.2} + the AIRs and their pairing {:.2} + unnamed {:.2} (GiB)",
                 g(live),
                 g(packed + wide),
                 g(held.iter().sum()),
                 g(cache),
+                g(airs),
                 g(live.saturating_sub(named)),
             );
         }
