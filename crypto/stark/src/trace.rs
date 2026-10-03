@@ -55,6 +55,9 @@ where
     /// ([`Self::pack_main_narrow`]): `main_table` then holds no data, only its
     /// width and height, until [`Self::widen_main_on_host`].
     pub(crate) narrow_main: Option<std::sync::Arc<crate::narrow::NarrowMain>>,
+    /// The packed main trace written to a spill file ([`Self::spill_main`]),
+    /// in place of `narrow_main` until [`Self::unspill_main`].
+    pub(crate) spilled_main: Option<crate::spill::SpilledMain>,
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -197,6 +200,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -228,6 +232,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -252,6 +257,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -360,7 +366,19 @@ where
     }
 
     pub fn columns_main(&self) -> Vec<Vec<FieldElement<F>>> {
-        if let Some(narrow) = &self.narrow_main {
+        let loaded;
+        let narrow = match &self.spilled_main {
+            // A read from the spill file: the prover unspills before its
+            // readers, so only a caller outside it lands here.
+            Some(spilled) => {
+                loaded = spilled
+                    .load()
+                    .unwrap_or_else(|e| panic!("reading a spilled main trace back: {e}"));
+                Some(&loaded)
+            }
+            None => self.narrow_main.as_deref(),
+        };
+        if let Some(narrow) = narrow {
             return (0..narrow.cols())
                 .map(|c| {
                     narrow
@@ -438,6 +456,7 @@ where
     {
         if narrow.rows() != self.main_table.height
             || narrow.cols() != self.main_table.width
+            || self.spilled_main.is_some()
             || cfg!(feature = "debug-checks")
             || std::any::TypeId::of::<F>()
                 != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
@@ -464,11 +483,15 @@ where
     }
 
     /// Bring a packed main trace back to 64-bit words on the host, the words
-    /// it was packed from. A no-op on a trace that is not packed.
+    /// it was packed from (read back first when it is spilled). A no-op on a
+    /// trace that is not packed.
     pub fn widen_main_on_host(&mut self)
     where
         F: 'static,
     {
+        if let Err(e) = self.unspill_main() {
+            panic!("reading a spilled main trace back: {e}");
+        }
         let Some(narrow) = self.narrow_main.take() else {
             return;
         };
@@ -489,11 +512,93 @@ where
         copy
     }
 
-    /// Drop a packed main trace without widening it: its last reader (the
-    /// device recompute, then the aux build) is done. The table keeps its
-    /// width and height.
+    /// Drop a packed main trace without widening it, spilled or not: its last
+    /// reader (the device recompute, then the aux build) is done. The table
+    /// keeps its width and height.
     pub fn drop_narrow_main(&mut self) {
         self.narrow_main = None;
+        self.spilled_main = None;
+    }
+
+    /// Write the packed main trace to `store` and free it here
+    /// ([`crate::spill`]): the table keeps its width and height, and
+    /// [`Self::unspill_main`] (or the prover, ahead of the trace's readers)
+    /// brings the same bytes back. `false`, and the trace untouched, when it
+    /// is not packed, its packed copy is shared, or the store has failed.
+    pub fn spill_main(&mut self, store: &crate::spill::SpillStore) -> bool {
+        let Some(narrow) = self.narrow_main.take() else {
+            return false;
+        };
+        let narrow = match std::sync::Arc::try_unwrap(narrow) {
+            Ok(narrow) => narrow,
+            Err(shared) => {
+                self.narrow_main = Some(shared);
+                return false;
+            }
+        };
+        match store.spill(narrow) {
+            Ok(spilled) => {
+                self.spilled_main = Some(spilled);
+                true
+            }
+            Err(narrow) => {
+                self.narrow_main = Some(std::sync::Arc::new(narrow));
+                false
+            }
+        }
+    }
+
+    /// Whether the packed main trace is in a spill file ([`Self::spill_main`]).
+    pub fn is_main_spilled(&self) -> bool {
+        self.spilled_main.is_some()
+    }
+
+    /// Where the spilled main trace is, if it is spilled.
+    pub fn spilled_main(&self) -> Option<&crate::spill::SpilledMain> {
+        self.spilled_main.as_ref()
+    }
+
+    /// Read a spilled main trace back and hold it packed again, checked
+    /// against the digest taken before the write. A no-op on a trace that is
+    /// not spilled. On an error the trace has no main words left: the read
+    /// is the proof's, and it is refused.
+    pub fn unspill_main(&mut self) -> Result<(), crate::spill::SpillError> {
+        self.unspill_main_with(None)
+    }
+
+    /// [`Self::unspill_main`], from bytes the prover read ahead when it has
+    /// them.
+    pub(crate) fn unspill_main_with(
+        &mut self,
+        prefetched: Option<Result<crate::narrow::NarrowMain, crate::spill::SpillError>>,
+    ) -> Result<(), crate::spill::SpillError> {
+        let Some(spilled) = self.spilled_main.take() else {
+            return Ok(());
+        };
+        let narrow = match prefetched {
+            Some(read) => read?,
+            None => spilled.into_narrow()?,
+        };
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        Ok(())
+    }
+
+    /// A copy of this spilled trace holding its packed main trace (read ahead
+    /// by the prover, or read now), for a reader that leaves the trace itself
+    /// spilled: a Round-1 commit before the fused task's read.
+    pub(crate) fn with_spilled_main_loaded(
+        &self,
+        prefetched: Option<Result<crate::narrow::NarrowMain, crate::spill::SpillError>>,
+    ) -> Result<Self, crate::spill::SpillError> {
+        let narrow = match (prefetched, &self.spilled_main) {
+            (Some(read), _) => read?,
+            (None, Some(spilled)) => spilled.load()?,
+            (None, None) => return Ok(self.clone()),
+        };
+        let mut copy = self.clone();
+        copy.spilled_main = None;
+        copy.narrow_main = Some(std::sync::Arc::new(narrow));
+        Ok(copy)
     }
 
     pub fn columns_aux(&self) -> Vec<Vec<FieldElement<E>>> {

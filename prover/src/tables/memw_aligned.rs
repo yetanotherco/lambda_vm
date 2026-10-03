@@ -212,7 +212,16 @@ const _: () = assert!(std::mem::size_of::<AlignedRow>() == 48);
 pub(crate) fn generate_memw_aligned_trace(
     operations: &[AlignedRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_memw_aligned_trace_segments(&[operations])
+}
+
+/// [`generate_memw_aligned_trace`] over `segments`, the operations one after another: a chunk handed
+/// out as the window parts it lies in.
+pub(crate) fn generate_memw_aligned_trace_segments(
+    segments: &[&[AlignedRow]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -220,7 +229,7 @@ pub(crate) fn generate_memw_aligned_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, op) in operations.iter().enumerate() {
+    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         table.set_bool(row_idx, cols::IS_REGISTER, op.is_register());
 
         table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address());

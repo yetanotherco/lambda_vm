@@ -317,6 +317,40 @@ fn a_split_builder_builds_the_whole_run_tables() {
     }
 }
 
+/// The walker collects and walks a window a batch of cycles at a time; any
+/// batch (one cycle, a few, more than the window, or the whole window first)
+/// builds the whole-run tables, ops kept or dropped.
+#[test]
+fn a_batched_walk_builds_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "lw_sw_offset_odd",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [33, 1000] {
+            for batch in [1, 7, 64, 0] {
+                for drop in [false, true] {
+                    let (traces, _) =
+                        windowed_with(&program, &logs, &max_rows, window, true, |builder| {
+                            let builder = builder.walk_batch(batch);
+                            if drop {
+                                builder
+                                    .drop_streamed_ops()
+                                    .expect("before the first window")
+                            } else {
+                                builder
+                            }
+                        });
+                    same_traces(&reference, &traces);
+                }
+            }
+        }
+    }
+}
+
 /// And at the production chunk sizes, where a small program streams nothing
 /// and the builder is the whole-run build over windows.
 #[test]
@@ -499,7 +533,8 @@ fn windowed_streaming(
 
 /// ★ Dropping each streamed chunk's ops as it leaves builds the whole-run
 /// tables, table for table, at every window length, through `push` and through
-/// the split; with the MEMW-derived LT ops streamed as well it builds what that
+/// the split (with the derived LT ops kept compact, the default, or at 24
+/// bytes each); with the MEMW-derived LT ops streamed as well it builds what that
 /// builder builds, LT carrying the whole-run multiplicities. Also with CPU
 /// chunks of 24 rows, whose dropped chunks each pad 8 rows, and with chunks of 4
 /// rows (one op for the rarer tables), so that every streamed table drops
@@ -557,6 +592,16 @@ fn dropping_the_streamed_ops_builds_the_same_tables() {
                 );
                 dropped.extend(streamed);
                 same_traces(&reference, &dropping);
+                if !split {
+                    // The derived LT ops held at 24 bytes each (the compact
+                    // form's A arm): the same.
+                    let (raw, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                        b.drop_streamed_ops()
+                            .expect("before any window")
+                            .raw_memw_lt()
+                    });
+                    same_traces(&reference, &raw);
+                }
                 let (both, _) = windowed_with(&program, &logs, &max_rows, window, split, |b| {
                     b.stream_memw_lt()
                         .drop_streamed_ops()
@@ -663,7 +708,11 @@ fn widen_all(t: &mut Traces) -> usize {
         &mut t.eqs,
         &mut t.bytewises,
     ] {
-        for table in list.iter_mut().filter(|t| t.is_main_narrow()) {
+        for table in list
+            .iter_mut()
+            .filter(|t| t.is_main_narrow() || t.is_main_spilled())
+        {
+            // A spilled trace is read back first.
             table.widen_main_on_host();
             packed += 1;
         }
@@ -1134,7 +1183,6 @@ fn the_lean_walk_builds_the_whole_run_tables() {
         lean
     };
     let parts = [
-        only(|l| l.decode = true),
         only(|l| l.memory = true),
         only(|l| l.lookups = true),
         only(|l| l.route = true),
@@ -1170,6 +1218,56 @@ fn the_lean_walk_builds_the_whole_run_tables() {
                     same_traces(&reference, &traces);
                 }
             }
+        }
+    }
+}
+
+/// ★ Phase A's stream with its committed instances spilled (D-ANYBLOCK S2)
+/// builds the same traces once they are read back: every instance spilled
+/// (`always`, and a budget of 0), the finish's tables committed in phase A
+/// or B, the committers generating or generators ahead; and a budget the
+/// block never reaches spills nothing.
+#[test]
+fn the_stream_spills_and_reads_back_the_same_traces() {
+    use crate::block::{SpillPolicy, stream_config, stream_spill_for_test};
+    let opts = crate::lfm::proof::block_base_options();
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+        for (committers, generators, finish_in_a) in [(3, 0, false), (2, 3, true)] {
+            let config = stream_config(committers, generators, finish_in_a);
+            let (mut resident, mut names, _) =
+                stream_spill_for_test(&program, &opts, &max_rows, config, None).expect("resident");
+            names.sort();
+            widen_all(&mut resident);
+            for policy in [SpillPolicy::Always, SpillPolicy::Budget(0)] {
+                let (mut spilled, mut spilled_names, report) =
+                    stream_spill_for_test(&program, &opts, &max_rows, config, Some(policy))
+                        .expect("spilled");
+                assert!(
+                    report.contains(" · spilled ") && !report.contains("spilled 0 instances"),
+                    "{name}/{policy:?}: nothing spilled: {report}"
+                );
+                spilled_names.sort();
+                assert_eq!(names, spilled_names, "{name}: the instances precommitted");
+                widen_all(&mut spilled);
+                same_traces(&resident, &spilled);
+            }
+            let (_, _, report) = stream_spill_for_test(
+                &program,
+                &opts,
+                &max_rows,
+                config,
+                Some(SpillPolicy::Budget(u64::MAX / 2)),
+            )
+            .expect("a budget never reached");
+            assert!(report.contains("spilled 0 instances"), "{name}: {report}");
         }
     }
 }

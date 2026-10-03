@@ -131,8 +131,12 @@ fn record(slot: &Slot, nanos: u64) {
 // table that thread is proving. `run_admitted` takes it before the task (to
 // clear what an earlier table left) and after (to print it).
 
-/// The per-table slots a `TABLE TL` line reports, in the order they run.
-static TABLE_STAGES: [(&str, &Slot); 12] = [
+/// The per-table stage count, sub-stages included.
+const N_STAGES: usize = 14;
+
+/// The per-table slots a `TABLE TL` line reports, in the order they run (a
+/// sub-stage after the stage that holds it).
+static TABLE_STAGES: [(&str, &Slot); N_STAGES] = [
     ("recommit", &MAIN_RECOMMIT),
     ("aux_build", &AUX_BUILD),
     ("aux_commit", &AUX_COMMIT),
@@ -142,13 +146,15 @@ static TABLE_STAGES: [(&str, &Slot); 12] = [
     ("r2_commit", &R2_COMMIT),
     ("r3_ood", &R3_OOD),
     ("r3_absorb", &R3_ABSORB),
+    ("r3a_layout", &R3A_LAYOUT),
+    ("r3a_columns", &R3A_COLUMNS),
     ("r4_deep_fri", &R4_DEEP_FRI),
     ("r4_grind", &R4_GRIND),
     ("r4_queries", &R4_QUERIES),
 ];
 
 thread_local! {
-    static TABLE: std::cell::Cell<[u64; 12]> = const { std::cell::Cell::new([0; 12]) };
+    static TABLE: std::cell::Cell<[u64; N_STAGES]> = const { std::cell::Cell::new([0; N_STAGES]) };
     /// While a table is open on this thread ([`table_begin`]): each stage's
     /// (index, start, end) in unix seconds, the `PROVE SPLIT t=[..]` clock.
     static SPANS: std::cell::RefCell<Option<Vec<(usize, f64, f64)>>> =
@@ -158,7 +164,7 @@ thread_local! {
 /// Opens a table on this thread: its stage seconds start from zero, and each
 /// stage's start and end are kept until [`table_take`].
 pub fn table_begin() {
-    TABLE.with(|t| t.set([0; 12]));
+    TABLE.with(|t| t.set([0; N_STAGES]));
     SPANS.with(|spans| *spans.borrow_mut() = Some(Vec::new()));
 }
 
@@ -180,7 +186,7 @@ fn thread_label() -> String {
 /// (` thread=name/tid`) and gives each stage's span
 /// (` at=[name start-end · …]`, unix seconds).
 pub fn table_take() -> Option<String> {
-    let stages = TABLE.with(|t| t.replace([0; 12]));
+    let stages = TABLE.with(|t| t.replace([0; N_STAGES]));
     let spans = SPANS.with(|spans| spans.borrow_mut().take());
     if stages.iter().all(|&n| n == 0) {
         return None;
@@ -231,6 +237,13 @@ pub static R2_COMMIT: Slot = Slot::new();
 pub static R3_OOD: Slot = Slot::new();
 /// Host-only: absorbing the OOD values into the table's transcript fork.
 pub static R3_ABSORB: Slot = Slot::new();
+/// Inside `R3_ABSORB`: the OOD layout and the split into its two blocks.
+pub static R3A_LAYOUT: Slot = Slot::new();
+/// Inside `R3_ABSORB`: the two blocks' columns ([`Table::columns`] goes
+/// through the rayon pool unless `LAMBDA_VM_OOD_COLUMNS_ON_CALLER=1`).
+///
+/// [`Table::columns`]: crate::table::Table::columns
+pub static R3A_COLUMNS: Slot = Slot::new();
 /// Round 4: DEEP composition + the FRI commit phase.
 pub static R4_DEEP_FRI: Slot = Slot::new();
 /// Round 4: the proof-of-work grind.
