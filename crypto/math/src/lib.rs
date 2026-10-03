@@ -5,6 +5,8 @@ extern crate alloc;
 
 pub mod errors;
 pub mod field;
+#[cfg(feature = "page-bytes")]
+pub mod page_bytes;
 pub mod spill_safe;
 pub mod traits;
 pub mod unsigned_integer;

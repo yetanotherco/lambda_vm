@@ -939,6 +939,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
  "getrandom 0.2.16",
+ "memmap2",
  "num-bigint",
  "num-traits",
  "proptest",
