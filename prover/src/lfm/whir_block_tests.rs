@@ -1506,6 +1506,24 @@ fn the_whir_block_tree_on_a_real_block() {
             options.keccak_rows_log2,
             options.ecsm_rows_log2,
         );
+        // Each group's tables by AIR, in the group's order: which tables the
+        // card waited for, and where the layout's chunks went.
+        for (g, group) in proof.groups.iter().enumerate() {
+            let mut kinds: Vec<(String, usize)> = Vec::new();
+            for &index in group {
+                let name = refs[index as usize].name();
+                let kind = name.split('[').next().unwrap_or(name).to_string();
+                match kinds.last_mut() {
+                    Some((last, n)) if *last == kind => *n += 1,
+                    _ => kinds.push((kind, 1)),
+                }
+            }
+            let kinds: Vec<String> = kinds
+                .into_iter()
+                .map(|(kind, n)| if n == 1 { kind } else { format!("{kind}×{n}") })
+                .collect();
+            println!("W3 GROUP TABLES {g}: {}", kinds.join(" "));
+        }
     }
     println!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",

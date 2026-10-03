@@ -235,10 +235,13 @@ pub struct BlockOptions {
     pub drop_streamed_ops: bool,
     /// With windows: `0` lays each streamed chunk out on the layout thread as
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
-    /// order all the same, while the layout thread lays out the rest of the
-    /// run as soon as it is built. Production: 0. Three read −0.54 / −0.22 s of
-    /// base (FAST 421 / 422), but their extra host memory grows with the block
-    /// (BIG 390: +2.2 / +4.2 / +8.7 GiB at 1.0 / 1.3 / 1.8×).
+    /// order all the same (the same groups and proof bytes), while the layout
+    /// thread lays out the rest of the run as soon as it is built. Production:
+    /// 3. Once phase A uploads ahead, the inline layout closes the middle groups
+    /// after the card is free; three workers close them in time (FAST 835:
+    /// phase A −0.93 s, whole block −1.00 s, peak −0.68 GiB at 1×). Unbounded
+    /// they held more host memory as the block grew (BIG 390); `layout_ahead`
+    /// bounds them (BIG 392: flat).
     pub layout_workers: usize,
     /// With `layout_workers > 0`: `Some(k)` lets at most `k + 1` streamed
     /// chunks be laid out (or in the making) and not yet packed, where the
@@ -295,7 +298,7 @@ impl BlockOptions {
             stream_keccak_rnd: false,
             stream_memw_lt: false,
             drop_streamed_ops: true,
-            layout_workers: 0,
+            layout_workers: 3,
             layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,

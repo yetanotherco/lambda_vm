@@ -710,7 +710,9 @@ where
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     let next = next.map(|(group, store, wide, upload, uploaded)| {
                         // What the committer waited for once its commit ended:
-                        // the group's arrival, then the rest of its upload.
+                        // the group's arrival, then the rest of its upload —
+                        // never more than the upload (a commit that ended before
+                        // the upload began paid all of it, and no more).
                         let ready = arrived.max(commit_end);
                         Ahead {
                             group,
@@ -718,7 +720,10 @@ where
                             wide,
                             upload,
                             wait_paid: arrived.saturating_duration_since(commit_end).as_secs_f64(),
-                            upload_paid: uploaded.saturating_duration_since(ready).as_secs_f64(),
+                            upload_paid: uploaded
+                                .saturating_duration_since(ready)
+                                .as_secs_f64()
+                                .min(upload),
                         }
                     });
                     (committed, next)
