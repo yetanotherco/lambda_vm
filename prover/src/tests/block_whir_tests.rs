@@ -297,9 +297,12 @@ fn a_streamed_block_held_narrow_proves_and_verifies() {
 fn a_memory_log_moves_no_byte_and_its_terms_close() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    let proved = |memlog: bool| {
+    let proved = |memlog: bool, workers: usize| {
         let mut o = streamed(MaxRowsConfig::small(), 16, 3);
         o.memlog = memlog;
+        // Laid out on worker threads, the rest packed as it is laid out.
+        o.layout_workers = workers;
+        o.pack_rest_as_laid_out = workers > 0;
         let (proof, stamps) = prove_block_whir_with(
             &elf,
             &[],
@@ -315,11 +318,23 @@ fn a_memory_log_moves_no_byte_and_its_terms_close() {
             .to_vec();
         (bytes, stamps)
     };
-    let (off, off_stamps) = proved(false);
-    let (on, on_stamps) = proved(true);
+    let (off, off_stamps) = proved(false, 0);
+    let (on, on_stamps) = proved(true, 0);
+    let (_, workers_stamps) = proved(true, 3);
     assert!(off_stamps.mem_terms.is_empty());
+    for stamps in [&on_stamps, &workers_stamps] {
+        terms_close(stamps);
+    }
+    if crypto::grinding::deterministic() {
+        assert_eq!(off, on, "the memory log moved a proof byte");
+    }
+}
+
+/// Every memory term in flight is zero once the proof is done; the committed
+/// tables as held and the prepared columns are left.
+fn terms_close(stamps: &block_whir::BlockStamps) {
     let term = |name: &str| -> usize {
-        on_stamps
+        stamps
             .mem_terms
             .iter()
             .find(|(n, _)| *n == name)
@@ -354,10 +369,7 @@ fn a_memory_log_moves_no_byte_and_its_terms_close() {
     // Every table's columns, as held: eight bytes a cell when wide, its packed
     // bytes when narrow — at most eight a cell either way.
     let held = term("held_narrow") + term("held_wide");
-    assert!(held > 0 && held <= on_stamps.cells * 8, "held {held}");
-    if crypto::grinding::deterministic() {
-        assert_eq!(off, on, "the memory log moved a proof byte");
-    }
+    assert!(held > 0 && held <= stamps.cells * 8, "held {held}");
 }
 
 /// A narrow table whose width map is wrong widens to other words than were
