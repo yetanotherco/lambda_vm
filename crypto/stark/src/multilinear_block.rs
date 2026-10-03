@@ -76,7 +76,7 @@ use multilinear::{
 };
 
 use crate::multilinear_table::{
-    CommittedTable, MultiProof, TableStatement, absorb_roots_and_challenge,
+    CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots_and_challenge,
     batched::{self, BatchedArgue, ProverFaults, VerifierChecks, Where},
     check_preprocessed, contribution, global_layout, prove, verify,
 };
@@ -946,6 +946,62 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone,
 {
+    block_prove_on_forks_observed::<F, E, T, H>(
+        committed,
+        config,
+        transcript,
+        prepared,
+        deviations,
+        fork_of,
+        argue,
+        &|_| {},
+    )
+}
+
+/// One group's share of the proof, the moment its opening is done: what a
+/// consumer of the finished groups (the block tree's first leaf) reads before
+/// the rest of phase B ends. Every field is a part of the proof as
+/// [`block_prove_on_forks`] returns it.
+pub struct GroupOpened<'a, F: IsField, E: IsField> {
+    pub group: usize,
+    /// Every group's root, as the proof carries them.
+    pub roots: &'a [Commitment],
+    /// The group's batched argue (the batched format), or `None`.
+    pub argue: Option<&'a BatchedArgue<E>>,
+    /// The group's tables' proofs, in table order (the per-table format;
+    /// empty under the batched one).
+    pub tables: &'a [TableProof<E>],
+    /// The group's opening.
+    pub opening: &'a StackedProof<F, E>,
+    /// The group's prepared opening, when the group carries one.
+    pub prepared: Option<&'a StackedProof<F, E>>,
+}
+
+/// [`block_prove_on_forks`], calling `on_group` after each group's opening
+/// with that group's share of the proof ([`GroupOpened`]). The observer reads;
+/// the proof is the same with any observer.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn block_prove_on_forks_observed<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+    on_group: &dyn Fn(GroupOpened<'_, F, E>),
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone,
+{
     let BlockCommitted {
         mut tables,
         sizes,
@@ -982,6 +1038,9 @@ where
     let mut pre_uploaded: Option<Store> = None;
     for (g, (retired, &size)) in groups.into_iter().zip(&sizes).enumerate() {
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
+        let tables_before = table_proofs.len();
+        let argues_before = argues.len();
+        let prepared_before = prepared_openings.len();
         let (head, tail) = tables.split_at_mut(at + size);
         let group = &mut head[at..];
         let next = sizes.get(g + 1).map(|&n| &tail[..n]);
@@ -1139,6 +1198,16 @@ where
         }
         stamps[g].open = t.elapsed().as_secs_f64();
         stamps[g].open_reserved = multilinear::gpu::reserved_window_peak();
+        if let Some(opening) = openings.last() {
+            on_group(GroupOpened {
+                group: g,
+                roots: &roots,
+                argue: argues[argues_before..].first(),
+                tables: &table_proofs[tables_before..],
+                opening,
+                prepared: prepared_openings[prepared_before..].first(),
+            });
+        }
         drop(stacked);
         drop(columns);
         drop(handles);
