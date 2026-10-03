@@ -44,6 +44,17 @@
 //! drops at function exit. At the release point the proof holds no device
 //! allocation of its own.
 //!
+//! # Under one shared gate, no exclusion
+//!
+//! With `LAMBDA_VM_SHARED_VRAM_GATE=1` (`stark::prover::shared_vram_gate_on`)
+//! both device paths above take their bytes from ONE process-wide
+//! `VramGate`: every `multi_prove` admits its tables through it, and the
+//! artifact commit admits its device set through it
+//! (`commit_group_device_or_host_with`). That is the cross-proof running total
+//! this permit stands in for, so [`hold`] then takes no card: sibling proofs
+//! share the card by bytes, and one proof's host stages (uploads, transcript,
+//! queries) no longer leave the card idle while the others wait.
+//!
 //! # Inert until armed
 //!
 //! Unarmed, and at one worker, [`hold`] takes no lock and touches no counter on
@@ -240,7 +251,10 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // One `OnceLock` read per hold — tens of them in a whole block run, never in
     // a loop. Off, this is the only thing the probe costs anywhere.
     let probed = super::tree_probe::enabled();
-    if workers() <= 1 && !traced && !probed {
+    // Under the shared gate the bytes are the exclusion (see the module doc):
+    // no card to take, the window still traced.
+    let shared = stark::prover::shared_vram_gate_on();
+    if (workers() <= 1 || shared) && !traced && !probed {
         return CardPermit {
             guard: None,
             since: Instant::now(),
@@ -252,7 +266,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // driver holds it by construction), and the window is still exactly the
     // device phase — which is the window the sampler has to be sliced by in the
     // K=1 control too, or the two arms are compared on different definitions.
-    if workers() <= 1 {
+    if workers() <= 1 || shared {
         let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
         return CardPermit {
             guard: None,
@@ -307,6 +321,30 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ UNDER THE SHARED GATE THE PERMIT TAKES NO CARD. Armed for siblings, a
+    /// second hold on this thread would park it if the card were taken, and a
+    /// hold on another thread would trip the two-holders assert; under the
+    /// shared gate neither happens, because the bytes are the exclusion.
+    #[test]
+    fn under_the_shared_gate_the_permit_takes_no_card() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        arm(4);
+        {
+            let _a = hold_labeled("multi_prove");
+            let _b = hold_labeled("build_artifacts");
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _c = hold_labeled("multi_prove");
+                });
+            });
+        }
+        assert_eq!(take_stats().acquisitions, 0, "no card was taken");
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+    }
 
     /// `arm` is process-global, so the tests that change it run one at a time.
     static ARM: Mutex<()> = Mutex::new(());

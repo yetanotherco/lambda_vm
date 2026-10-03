@@ -1226,6 +1226,28 @@ impl VramGate {
 }
 
 #[cfg(test)]
+mod shared_vram_gate_tests {
+    use super::{pin_shared_vram_gate, shared_vram_admit, shared_vram_gate};
+
+    /// Off, the admission is inert and the caller keeps its own exclusion; on,
+    /// it holds its bytes in the one process-wide gate until dropped.
+    #[test]
+    fn the_shared_admission_holds_bytes_only_when_the_gate_is_on() {
+        pin_shared_vram_gate(Some(false));
+        assert!(shared_vram_admit(7).is_none(), "off: no admission");
+        pin_shared_vram_gate(Some(true));
+        let gate = shared_vram_gate(u64::MAX);
+        let before = *gate.used.lock().unwrap();
+        {
+            let _held = shared_vram_admit(7).expect("on: an admission");
+            assert_eq!(*gate.used.lock().unwrap(), before + 7, "the bytes are held");
+        }
+        assert_eq!(*gate.used.lock().unwrap(), before, "and released on drop");
+        pin_shared_vram_gate(None);
+    }
+}
+
+#[cfg(test)]
 mod vram_gate_packing_tests {
     use super::VramGate;
 
@@ -1692,6 +1714,85 @@ impl Drop for VramPermit<'_> {
         drop(used);
         self.gate.freed.notify_all();
     }
+}
+
+/// `LAMBDA_VM_SHARED_VRAM_GATE=1`: every [`IsStarkProver::multi_prove`] in the
+/// process admits its tables through ONE [`VramGate`] at the card's budget
+/// instead of a fresh full-budget gate per call, and device work outside a
+/// prove takes its bytes from the same gate ([`shared_vram_admit`]). Proofs in
+/// flight at once then share one running total, so a caller may run several
+/// of them in their device phases together (the block tree's sibling proofs)
+/// without two gates each budgeting the whole card. Off by default: a gate per
+/// call, and callers that run proofs concurrently serialise them.
+///
+/// Every device user that can run beside a prove takes its bytes from this
+/// gate. Phase A's committers keep their own card gate: nothing else uses the
+/// card while the block's phase A runs.
+pub fn shared_vram_gate_on() -> bool {
+    #[cfg(any(test, feature = "test-utils"))]
+    match SHARED_VRAM_GATE_PIN.load(Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_SHARED_VRAM_GATE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Test-only pin of [`shared_vram_gate_on`]: 0 reads the environment, 1 off,
+/// 2 on. Process-wide.
+#[cfg(any(test, feature = "test-utils"))]
+static SHARED_VRAM_GATE_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: pin [`shared_vram_gate_on`] for this process (`None` returns it to
+/// the environment).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn pin_shared_vram_gate(on: Option<bool>) {
+    SHARED_VRAM_GATE_PIN.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The process-wide gate behind [`shared_vram_gate_on`], at `budget` bytes the
+/// first time it is asked for (the card's budget is fixed for the process).
+fn shared_vram_gate(budget: u64) -> &'static VramGate {
+    static GATE: std::sync::OnceLock<VramGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| VramGate::new(budget))
+}
+
+/// The card's admission budget, or `u64::MAX` without a device.
+fn device_vram_budget() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::backend()
+            .map(|b| b.vram_budget_bytes())
+            .unwrap_or(u64::MAX)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        u64::MAX
+    }
+}
+
+/// Bytes of the shared gate ([`shared_vram_gate_on`]) held by device work
+/// outside a prove; released on drop.
+pub struct SharedVramPermit {
+    _permit: VramPermit<'static>,
+}
+
+/// Take `bytes` from the shared gate for device work done outside
+/// [`IsStarkProver::multi_prove`] (an artifact commit), waiting until they fit
+/// beside what the proofs in flight hold. `None` when the shared gate is off:
+/// the caller then keeps its own exclusion.
+pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
+    shared_vram_gate_on().then(|| SharedVramPermit {
+        _permit: shared_vram_gate(device_vram_budget()).acquire(bytes),
+    })
 }
 
 /// What a table's task needs on the host before it is admitted: a spilled
@@ -5831,11 +5932,26 @@ pub trait IsStarkProver<
         // number of allocations.
 
         #[cfg(any(test, feature = "test-utils"))]
+        let budget_overridden = test_overrides
+            .as_ref()
+            .is_some_and(|(o, _)| o.vram_budget.is_some());
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let budget_overridden = false;
+        #[cfg(any(test, feature = "test-utils"))]
         let vram_budget = test_overrides
             .as_ref()
             .and_then(|(o, _)| o.vram_budget)
             .unwrap_or(vram_budget);
-        let vram_gate = VramGate::new(vram_budget);
+        // One gate for every prove in the process when the caller runs proofs
+        // concurrently (`LAMBDA_VM_SHARED_VRAM_GATE`); a test's own budget
+        // keeps a gate of its own.
+        let local_gate;
+        let vram_gate: &VramGate = if shared_vram_gate_on() && !budget_overridden {
+            shared_vram_gate(vram_budget)
+        } else {
+            local_gate = VramGate::new(vram_budget);
+            &local_gate
+        };
 
         // The shapes the AIR and the domain fix, read once: the device-set
         // estimates the gate admits against derive from them
@@ -6023,7 +6139,7 @@ pub trait IsStarkProver<
             "r1",
             &main_walk_order,
             &main_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             r1_ready.as_ref().map(|r| r as &dyn AdmitReady),
             |idx| table_names[idx].clone(),
@@ -6798,7 +6914,7 @@ pub trait IsStarkProver<
             "fused",
             &peak_order,
             &peak_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             fused_ready.as_ref().map(|r| r as &dyn AdmitReady),
             |idx| table_names[idx].clone(),
@@ -6817,7 +6933,7 @@ pub trait IsStarkProver<
                 "aux",
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 fused_ready.as_ref().map(|r| r as &dyn AdmitReady),
                 |idx| table_names[idx].clone(),
@@ -6848,7 +6964,7 @@ pub trait IsStarkProver<
                 "rounds",
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 None,
                 |idx| table_names[idx].clone(),
