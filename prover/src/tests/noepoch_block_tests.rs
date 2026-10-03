@@ -254,6 +254,7 @@ fn noepoch_same_bytes_fib_160k() {
 // unchanged, proving and verifying under P1.
 // =========================================================================
 
+#[cfg(feature = "cuda")]
 fn require_p1_base() {
     assert_eq!(
         crate::hash_pin::base_hash(),
@@ -303,7 +304,8 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
         "the RPX verifier accepted a P1 proof"
     );
     let idx = build.air_index(&opts, "CPU[0]");
-    let tampers: [(&str, fn(&mut VmProof, usize)); 4] = [
+    type Tamper = fn(&mut VmProof, usize);
+    let tampers: [(&str, Tamper); 4] = [
         ("main-trace path node", |p, i| {
             p.proof.proofs[i].deep_poly_openings[0]
                 .main_trace_polys

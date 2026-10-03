@@ -117,6 +117,17 @@ pub(crate) fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
     device_hash_for(B::COMMITMENT_HASH)
 }
 
+/// Load `hash`'s device kernels now, if they load lazily (ZisK's Poseidon1:
+/// `math_cuda::p1_stark`), so the first commit under it does not pay the
+/// module load. `false` when they do not load (no device); a no-op for every
+/// hash the backend loads at start-up.
+pub fn warm_commitment_hash(hash: CommitmentHash) -> bool {
+    match device_hash_for(hash) {
+        math_cuda::DeviceHash::Poseidon1 => math_cuda::p1_stark::kernels().is_ok(),
+        _ => true,
+    }
+}
+
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
 /// `coset_lde_full_expand` completes in a few hundred microseconds and the
 /// GPU's tens of kernel launches plus H2D/D2H round-trip is a net loss. The

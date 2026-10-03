@@ -297,6 +297,11 @@ pub fn warm_base_statics(options: &stark::proof::options::ProofOptions) {
     }
     use stark::leaf_layout::LeafLayout;
     let t = std::time::Instant::now();
+    // The Poseidon1 kernels load on first use: load them here, off the clock.
+    #[cfg(feature = "cuda")]
+    if !stark::gpu_lde::warm_commitment_hash(stark::config::CommitmentHash::Poseidon1) {
+        eprintln!("BASE HASH P1: the Poseidon1 device kernels did not load");
+    }
     let mut lines = Vec::new();
     for layout in [LeafLayout::RowPair, LeafLayout::Row] {
         let roots = [

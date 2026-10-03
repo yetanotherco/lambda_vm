@@ -139,7 +139,7 @@ pub fn verify_block(
 /// [`verify_block`] under the base configuration `base` rather than this
 /// process's ([`crate::hash_pin::base_hash`]): a proof made under one base hash
 /// must be refused by the other's verifier.
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) fn verify_block_under(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
