@@ -313,6 +313,14 @@ pub struct BlockSpill {
     cells: Arc<std::sync::atomic::AtomicU64>,
     /// The read-back's report ([`Prefetch::report`]), once phase B has run.
     pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Whether phase B's let-go returns the pages of the packed columns it
+    /// drops to the system ([`release_pages`]). Under the never-purge posture
+    /// the allocator keeps a freed buffer's pages resident until it reuses
+    /// them, and the block's later allocations do not reuse most of them
+    /// (BIG 568). Off by default.
+    pub release_let_go: bool,
+    /// Bytes whose pages the let-go returned.
+    released: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BlockSpill {
@@ -324,7 +332,20 @@ impl BlockSpill {
             kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefetch: Arc::new(std::sync::Mutex::new(None)),
+            release_let_go: false,
+            released: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// With phase B's let-go returning its pages ([`Self::release_let_go`]).
+    pub fn with_let_go_release(mut self, on: bool) -> Self {
+        self.release_let_go = on;
+        self
+    }
+
+    /// Bytes whose pages phase B's let-go returned to the system.
+    pub fn released_bytes(&self) -> u64 {
+        self.released.load(Relaxed)
     }
 
     /// Whether `len` more bytes fit the writers' queue now. The committer is
@@ -334,6 +355,38 @@ impl BlockSpill {
         let stats = self.store.stats();
         let pending = stats.bytes.saturating_sub(stats.bytes_written);
         pending == 0 || pending + len <= self.queue_bytes
+    }
+}
+
+/// Returns the pages wholly inside `bytes` to the system (`MADV_DONTNEED`),
+/// for a buffer about to be freed: the allocator then holds the extent with
+/// no pages behind it, and a later allocation that reuses it faults fresh
+/// zero pages in. Every page released lies inside `bytes`, which nothing else
+/// reads; the bytes outside them are left as they are. Returns the bytes
+/// released: 0 when no whole page fits, the call fails, or off Unix.
+fn release_pages(bytes: &mut [u8]) -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` reads a constant of the system.
+        let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            p if p > 0 => p as usize,
+            _ => return 0,
+        };
+        let start = bytes.as_mut_ptr() as usize;
+        let lo = start.next_multiple_of(page);
+        let hi = (start + bytes.len()) / page * page;
+        if hi <= lo {
+            return 0;
+        }
+        // SAFETY: [lo, hi) lies inside `bytes`, borrowed mutably here, and its
+        // contents are not read again before the buffer is freed.
+        let rc = unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) };
+        if rc == 0 { (hi - lo) as u64 } else { 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bytes;
+        0
     }
 }
 
@@ -1791,11 +1844,16 @@ where
             table.drop_widened();
             // While a spill is on, a finished group's packed columns go:
             // nothing reads them after its opening.
-            if spill.is_some()
+            if let Some(spill) = &spill
                 && let Some(packed) = table.take_narrow_for_spill()
-                && let Some(mem) = &mem
             {
-                mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
+                if let Some(mem) = &mem {
+                    mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
+                }
+                if spill.release_let_go {
+                    let (_, _, mut data) = packed.into_parts();
+                    spill.released.fetch_add(release_pages(&mut data), Relaxed);
+                }
             }
         }
         drop(store);
@@ -2103,8 +2161,46 @@ where
 
 #[cfg(test)]
 mod spill_tests {
-    use super::{from_store, to_store};
+    use super::{from_store, release_pages, to_store};
     use multilinear::narrow::NarrowColumns;
+
+    /// The release returns exactly the whole pages inside a buffer, and the
+    /// bytes outside them keep their values. On Linux the released pages read
+    /// back as zeros: they were dropped, not just marked.
+    #[test]
+    fn the_release_returns_the_whole_pages_inside_a_buffer_and_nothing_else() {
+        // SAFETY: `sysconf` reads a constant of the system.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 8 * page + 123;
+        let mut buffer = vec![0u8; len + 1];
+        // An odd start: a partial page at each end.
+        let bytes = &mut buffer[1..];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8 | 1;
+        }
+        let start = bytes.as_ptr() as usize;
+        let lo = start.next_multiple_of(page) - start;
+        let hi = (start + len) / page * page - start;
+        assert_eq!(
+            release_pages(bytes),
+            (hi - lo) as u64,
+            "the whole pages inside"
+        );
+        assert!(hi - lo >= 6 * page);
+        for (i, &b) in bytes.iter().enumerate() {
+            if i < lo || i >= hi {
+                assert_eq!(
+                    b,
+                    (i % 251) as u8 | 1,
+                    "byte {i} outside the released pages"
+                );
+            } else if cfg!(target_os = "linux") {
+                assert_eq!(b, 0, "byte {i} inside a released page");
+            }
+        }
+        // Less than a page: nothing to release.
+        assert_eq!(release_pages(&mut buffer[1..page / 2]), 0);
+    }
 
     /// The packed columns move to the store's payload and back without a
     /// copy: the same bytes at the same address.

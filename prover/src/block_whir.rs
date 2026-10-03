@@ -311,6 +311,12 @@ pub struct BlockOptions {
     /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), `auto` unless
     /// set.
     pub spill: BlockSpillPolicy,
+    /// With a spill store open, whether phase B's let-go returns the pages of
+    /// the packed columns it drops to the system
+    /// ([`multilinear_block::BlockSpill::release_let_go`]) rather than leaving
+    /// them resident under the never-purge posture. The proof's bytes are the
+    /// same. Production: `LAMBDA_VM_BLOCK_RELEASE_LET_GO=1`, off unless set.
+    pub release_let_go: bool,
 }
 
 /// When a block spills its held tables ([`BlockOptions::spill`]): the policy
@@ -521,6 +527,7 @@ impl BlockOptions {
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
             spill: spill_from_env(),
+            release_let_go: std::env::var("LAMBDA_VM_BLOCK_RELEASE_LET_GO").as_deref() == Ok("1"),
         }
     }
 }
@@ -719,6 +726,9 @@ pub struct BlockStamps {
     pub spill: Option<String>,
     /// With [`BlockOptions::spill`]: the store's counters after phase B.
     pub spill_stats: Option<stark::spill::SpillStats>,
+    /// With [`BlockOptions::release_let_go`] and a store: the bytes whose
+    /// pages phase B's let-go returned to the system.
+    pub let_go_released: Option<u64>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -2878,7 +2888,10 @@ fn prove_streamed(
                         std::sync::Arc::new(move |kept, cells, bytes| {
                             spill_wanted(policy, target, kept, cells, bytes, host_bytes_now)
                         });
-                    Some(multilinear_block::BlockSpill::new(store, queue, wanted))
+                    Some(
+                        multilinear_block::BlockSpill::new(store, queue, wanted)
+                            .with_let_go_release(options.release_let_go),
+                    )
                 }
                 Err(e) => {
                     stamps.spill =
@@ -3384,8 +3397,18 @@ fn prove_streamed(
                 .clone()
                 .unwrap_or_else(|| "nothing to read back".to_string());
             let stats = spill.store.stats();
-            stamps.spill = Some(format!("{policy_name} · {stats} · read-back {read_back}"));
+            let released = spill.release_let_go.then(|| spill.released_bytes());
+            let let_go = released.map_or(String::new(), |b| {
+                format!(
+                    " · let-go released {:.2} GiB",
+                    b as f64 / (1u64 << 30) as f64
+                )
+            });
+            stamps.spill = Some(format!(
+                "{policy_name} · {stats} · read-back {read_back}{let_go}"
+            ));
             stamps.spill_stats = Some(stats);
+            stamps.let_go_released = released;
         }
         if multilinear::whir_split::enabled() {
             let chain = multilinear::whir_split::take_chain();

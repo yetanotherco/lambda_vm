@@ -64,6 +64,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        release_let_go: false,
     }
 }
 
@@ -631,6 +632,75 @@ fn a_block_spilled_to_disk_proves_the_same_bytes() {
         };
         assert_eq!(bytes(&held), bytes(&spilled), "the proof");
     }
+}
+
+/// Returning the let-go's pages moves no byte: with the release on, phase B
+/// gives the system the pages of each group's packed columns after its
+/// opening (held ones under `auto`, read-back ones under `always`), and the
+/// proof verifies with the same partition, its bytes equal under the
+/// deterministic grind. Off, nothing is counted or stamped.
+#[test]
+fn a_block_whose_let_go_returns_its_pages_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let proved = |spill: BlockSpillPolicy, release: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        o.release_let_go = release;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(
+            verify(&proof, &elf, &format),
+            "spill {spill:?}, release {release}"
+        );
+        (proof, stamps)
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (held, held_stamps) = proved(BlockSpillPolicy::Off, false);
+    assert_eq!(held_stamps.let_go_released, None);
+    for spill in [BlockSpillPolicy::Auto, BlockSpillPolicy::Always] {
+        let (released, stamps) = proved(spill, true);
+        let count = stamps.let_go_released.expect("the release's count");
+        if cfg!(unix) {
+            assert!(count > 0, "{spill:?}: no page returned");
+        }
+        assert!(
+            stamps
+                .spill
+                .as_deref()
+                .is_some_and(|line| line.contains("let-go released")),
+            "{spill:?}: {:?}",
+            stamps.spill
+        );
+        assert_eq!(held.groups, released.groups, "{spill:?}: the partition");
+        assert_eq!(held.table_num_vars, released.table_num_vars, "{spill:?}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&held), bytes(&released), "{spill:?}: the proof");
+        }
+    }
+    let (_, stamps) = proved(BlockSpillPolicy::Always, false);
+    assert_eq!(stamps.let_go_released, None);
+    assert!(
+        !stamps
+            .spill
+            .as_deref()
+            .is_some_and(|line| line.contains("let-go")),
+        "{:?}",
+        stamps.spill
+    );
 }
 
 /// The policy decides per table: a resident budget the block fits in spills

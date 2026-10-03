@@ -71,6 +71,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        release_let_go: false,
     }
 }
 
