@@ -772,10 +772,15 @@ fn gib(bytes: usize) -> f64 {
 /// chunks, under the block base's options, every leaf filled toward
 /// [`super::block_plan::LEAF_PERMS_CAP`] as the median block's are.
 fn production_height_plan() -> BlockTreePlan {
+    spread_plan(13, 40)
+}
+
+/// [`spread_fixture_shape`]'s plan under the block base's options.
+fn spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
     let opts = super::proof::block_base_options();
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
-    let shape = spread_fixture_shape(&elf, 13, 40);
+    let shape = spread_fixture_shape(&elf, chunks, cpus);
     BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives")
 }
 
@@ -1028,6 +1033,118 @@ fn late_emission_probe_over_freed_trace_sized_buffers() {
 fn late_emission_probe_over_freed_small_buffers() {
     late_emission_reuse_probe("small", &[1 << 20]);
 }
+
+/// Every program id of `plan`'s tree under the tree's wrap options, as hex:
+/// each leaf's, then each node level's in node order, the top's last. Derived
+/// one program at a time (emit, build, keep the child's derived shape, drop the
+/// program), so one program is held at once. Prints the ELF digest the plan
+/// absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so two
+/// runs that disagree can be compared group by group.
+fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
+    let wrap = super::proof::aggregation_wrap_options();
+    let words = plan.child_layout().total();
+    let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let roots = |j: usize, a: &LfmArtifacts| {
+        let slots: Vec<String> = a
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(s, r)| format!("{s}:{}", hex(r)))
+            .collect();
+        let chunks = |c: &[Commitment]| c.iter().map(hex).collect::<Vec<_>>().join(" ");
+        println!(
+            "TREE ROOTS {j}: {} · hash chunks {} · blake3 chunks {}",
+            slots.join(" "),
+            chunks(&a.hash_chunk_roots),
+            chunks(&a.blake3_chunk_roots)
+        );
+    };
+    println!("TREE ELF digest {}", hex(plan.elf_digest()));
+    let mut ids = Vec::new();
+    let mut level: Vec<DerivedChild> = Vec::new();
+    for k in 0..plan.partition().num_leaves() {
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+        roots(ids.len(), &artifacts);
+        ids.push(hex(&artifacts.program_id));
+        level.push(
+            DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the leaf derives"),
+        );
+    }
+    let levels = plan.levels();
+    for (lv, arities) in levels.iter().enumerate() {
+        let top = lv + 1 == levels.len();
+        let mut kids = level.into_iter();
+        let mut next = Vec::new();
+        for &a in &arities.arities {
+            let group: Vec<DerivedChild> = kids.by_ref().take(a).collect();
+            let program = plan.node_program(&group, top).expect("the node emits");
+            let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+            roots(ids.len(), &artifacts);
+            ids.push(hex(&artifacts.program_id));
+            next.push(
+                DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the node derives"),
+            );
+        }
+        level = next;
+    }
+    ids
+}
+
+/// ★ The compact program form changes no program: every id of a small spread
+/// plan's tree equals the one recorded at 541f4bdc2 (#1013's d740eb5d5 + the
+/// instruments), before the form changed.
+///
+/// ⚠ The pins are the LAPTOP's: the plan absorbs the ELF's digest, and the
+/// fixture ELF's bytes depend on the clang that assembled it (laptop
+/// `af87f637…`, 1264 B; FAST `bfb782e1…`, 1272 B), so a box derives other ids
+/// for the same programs (FAST 670). The box gate compares two shas on one box.
+#[test]
+#[ignore = "laptop: run with --exact"]
+fn the_compact_program_form_keeps_a_small_trees_ids() {
+    let ids = tree_ids(&spread_plan(2, 4));
+    for (j, id) in ids.iter().enumerate() {
+        println!("SMALL TREE IDS {j}: {id}");
+    }
+    assert_eq!(ids, SMALL_TREE_IDS, "a program of the tree changed");
+}
+
+/// The same at production heights ([`production_height_plan`]: 7 leaves, 2
+/// nodes and the top), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host
+/// commit. The box gates add the 1× and median trees' top ids.
+#[test]
+#[ignore = "box tier: production-height artifacts on the host, ≈ 4.7 min and 4.6 GiB"]
+fn the_compact_program_form_keeps_every_production_height_tree_id() {
+    let ids = tree_ids(&production_height_plan());
+    for (j, id) in ids.iter().enumerate() {
+        println!("TREE IDS {j}: {id}");
+    }
+    assert_eq!(
+        ids, PRODUCTION_HEIGHT_TREE_IDS,
+        "a program of the tree changed"
+    );
+}
+
+/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids at 541f4bdc2.
+const SMALL_TREE_IDS: [&str; 2] = [
+    "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
+    "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
+];
+
+/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids at
+/// 541f4bdc2.
+const PRODUCTION_HEIGHT_TREE_IDS: [&str; 10] = [
+    "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
+    "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
+    "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
+    "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
+    "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
+    "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
+    "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
+    "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
+    "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
+    "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
+];
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
 /// tied to the ELF and the options they were computed under: another ELF's, or
