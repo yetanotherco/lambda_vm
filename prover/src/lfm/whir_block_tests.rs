@@ -1370,7 +1370,7 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         Err(_) => {}
     }
-    // `BLOCK_WHIR_PACK_REST=0|1` (production 1): the rest packed as it is laid
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 0): the rest packed as it is laid
     // out.
     match std::env::var("BLOCK_WHIR_PACK_REST")
         .as_deref()

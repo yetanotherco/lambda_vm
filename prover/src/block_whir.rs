@@ -250,12 +250,10 @@ pub struct BlockOptions {
     pub layout_ahead: Option<usize>,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
-    /// of after all of them; the packing order is the same. Production: on,
-    /// with [`Self::rest_layout_bytes`]'s waves — laid out all at once, the
-    /// first table in AIR order was ready only with the last, and packing as
-    /// laid out read +0.21 s (FAST 422); in waves the AIR order's prefix is
-    /// laid out first, and since three layout workers (04984808d) phase A
-    /// waits on the groups the rest closes.
+    /// of after all of them; the packing order is the same. Production: off.
+    /// With [`Self::rest_layout_bytes`]'s waves the groups do close earlier,
+    /// but at 1× the committer is still busy when they do: on top of the waves
+    /// it read +0.01 s, and alone +0.21 s (FAST 852 / 853; +0.21 s at FAST 422).
     pub pack_rest_as_laid_out: bool,
     /// How phase A holds each group's columns once committed
     /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
@@ -312,7 +310,7 @@ impl BlockOptions {
             drop_streamed_ops: true,
             layout_workers: 3,
             layout_ahead: Some(2),
-            pack_rest_as_laid_out: true,
+            pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
             memlog: memlog::from_env(),
