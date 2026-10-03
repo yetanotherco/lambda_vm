@@ -153,7 +153,8 @@ pub struct BlockFormat {
     /// and the verifier refuses a group whose stack needs more.
     pub group_polys: usize,
     /// The most groups a block statement may declare (the verifier refuses
-    /// more). The proven bits are quoted at this count (I-NOEPOCH-W.md §8).
+    /// more, and the prover refuses as its groups close). The proven bits are
+    /// quoted at this count (I-NOEPOCH-W.md §8).
     pub max_groups: usize,
     /// Whether DECODE's and the dense genesis pages' columns are settled by
     /// prepared openings ([`prepared_tables`]) — the production format, which
@@ -172,6 +173,19 @@ pub struct BlockFormat {
 /// leaves room for larger blocks and caps what a statement can make the
 /// verifier build.
 pub const BLOCK_MAX_GROUPS: usize = 64;
+
+/// Refuses `groups` over `max_groups` ([`BlockFormat::max_groups`]). The
+/// verifier refuses a statement with more ([`block_frame`]), and the prover
+/// refuses as its groups close, so a block the verifier would refuse is not
+/// proved.
+fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
+    if groups > max_groups {
+        return Err(Error::InvalidTableCounts(format!(
+            "{groups} groups — a block takes at most {max_groups}"
+        )));
+    }
+    Ok(())
+}
 
 impl BlockFormat {
     /// The process's WHIR format (as [`crate::multilinear_prove::chain_config`]
@@ -1668,6 +1682,7 @@ pub(crate) fn prove_traces(
     let config = format.chain_config(&shapes);
     let sizes = block_groups(&shapes, config.format.stack, format.group_polys)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    check_group_count(sizes.len(), format.max_groups)?;
 
     stamps.tables = pairs.len();
     stamps.cells = shapes.iter().map(|&(w, n)| w << n).sum();
@@ -1923,6 +1938,9 @@ struct Packer<'a> {
     out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
     cap: multilinear::whir_chain::StackVars,
     max_polys: usize,
+    /// The most groups the statement may declare: the group past it is
+    /// refused as it closes.
+    max_groups: usize,
     /// The prove's clock, when each group closed, and the seconds spent
     /// waiting for phase A to take one.
     start: Instant,
@@ -1970,6 +1988,7 @@ impl<'a> Packer<'a> {
     }
 
     fn close(&mut self) -> Result<(), Error> {
+        check_group_count(self.group_keys.len() + 1, self.max_groups)?;
         if let Some(ledger) = self.ledger {
             use std::sync::atomic::Ordering::Relaxed;
             let bytes = std::mem::take(&mut self.open_bytes);
@@ -2821,6 +2840,7 @@ fn prove_streamed(
                     out: gtx,
                     cap,
                     max_polys: format.group_polys,
+                    max_groups: format.max_groups,
                     start,
                     closed_at: Vec::new(),
                     blocked: 0.0,
@@ -3371,13 +3391,7 @@ pub(crate) fn block_frame(
 
     // The groups are the statement's; their stacks are built here, from the
     // shapes and the verifier's stack cap.
-    if statement.groups.len() > format.max_groups {
-        return Err(Error::InvalidTableCounts(format!(
-            "{} groups — a block takes at most {}",
-            statement.groups.len(),
-            format.max_groups
-        )));
-    }
+    check_group_count(statement.groups.len(), format.max_groups)?;
     let order = validate_groups(statement.groups, shapes.len())?;
     let sizes: Vec<usize> = statement.groups.iter().map(Vec::len).collect();
     let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();

@@ -1020,6 +1020,44 @@ fn a_partition_over_the_group_maximum_is_refused() {
     assert!(verify(&proof, &elf, &exact));
 }
 
+/// ★ The prover refuses a partition over the group maximum as its groups
+/// close, with the verifier's own error, on the streamed path and the
+/// whole-run one, instead of proving a block the verifier refuses.
+#[test]
+fn the_prover_refuses_a_partition_over_the_group_maximum() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    for opts in [
+        streamed(MaxRowsConfig::small(), 16, 3),
+        options(MaxRowsConfig::small(), 16),
+    ] {
+        let proof = prove(&elf, &format, &opts);
+        let n = proof.groups.len();
+        assert!(n >= 2, "{n} groups");
+        let tight = BlockFormat {
+            max_groups: n - 1,
+            ..format
+        };
+        let refused = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &tight,
+            &opts,
+            &Deviations::default(),
+        );
+        let Err(crate::Error::InvalidTableCounts(prover)) = refused else {
+            panic!("the prover proved {n} groups over a maximum of {}", n - 1);
+        };
+        let Err(crate::Error::InvalidTableCounts(verifier)) =
+            verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &tight)
+        else {
+            panic!("the verifier did not refuse {n} groups");
+        };
+        assert_eq!(prover, verifier);
+    }
+}
+
 /// One table's claimed column value moved: its group's opening refuses it.
 #[test]
 fn a_tampered_column_claim_is_refused() {
