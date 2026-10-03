@@ -1126,11 +1126,43 @@ struct VramGate {
     /// The byte budget. Atomic only so the shared gate
     /// ([`arm_shared_vram_gate`]) can be calibrated in place between levels.
     budget: AtomicU64,
+    /// The proves that carry their tables' resident bytes between Round 1 and
+    /// their fused tasks ([`ResidentClaim`]): the bytes they claimed, and how
+    /// many claims are in force.
+    claims: std::sync::Mutex<(u64, usize)>,
+    claim_room: std::sync::Condvar,
+    /// `SGATE` lines on every change of the account ([`shared_gate_trace`]).
+    trace: bool,
 }
 
 struct VramPermit<'a> {
     gate: &'a VramGate,
     bytes: u64,
+}
+
+/// Bytes a table left on the device after its Round-1 task (a `Retain`
+/// prove's main LDE, its trace snapshot and its tree), held in the gate until
+/// the table's fused task is admitted, which takes them over and releases them
+/// when it ends ([`VramGate::carry`]). Dropping them also gives their share of
+/// the prove's claim back.
+struct CarriedBytes<'c, 'g> {
+    gate: &'g VramGate,
+    bytes: u64,
+    claim: Option<&'c ResidentClaim<'g>>,
+}
+
+/// A prove's claim on the gate while it carries resident bytes: an upper bound
+/// on what it holds plus what its next admission asks for, at every point
+/// from its Round 1 to its last fused task ([`resident_claim`],
+/// [`settled_claim`]). Claims are admitted only while their sum fits the
+/// budget (one claim alone always is), so whenever every prove waits, the one
+/// whose next admission is smallest relative to its claim fits beside what the
+/// others hold: carried bytes never deadlock the gate. Without claims, two
+/// proves each carrying half their Round-1 bytes can fill the budget with
+/// neither able to finish its Round 1.
+struct ResidentClaim<'g> {
+    gate: &'g VramGate,
+    bytes: AtomicU64,
 }
 
 // Permits held by this thread: a driver must hold none while it waits for a
@@ -1154,6 +1186,9 @@ impl VramGate {
             used: std::sync::Mutex::new(0),
             freed: std::sync::Condvar::new(),
             budget: AtomicU64::new(budget),
+            claims: std::sync::Mutex::new((0, 0)),
+            claim_room: std::sync::Condvar::new(),
+            trace: false,
         }
     }
 
@@ -1162,11 +1197,139 @@ impl VramGate {
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
                 *used = used.saturating_add(bytes);
+                self.trace_used(*used);
                 return VramPermit::new(self, bytes);
             }
             used = self.freed.wait(used).unwrap();
         }
     }
+
+    /// Hold `bytes` that are already on the device, without waiting: the
+    /// caller still holds the permit they were allocated under, so the account
+    /// only stops forgetting them when that permit drops.
+    /// `claim`, when given (it must be on this gate), gets the bytes' share
+    /// back when they drop.
+    fn carry<'c, 'g>(
+        &'g self,
+        bytes: u64,
+        claim: Option<&'c ResidentClaim<'g>>,
+    ) -> CarriedBytes<'c, 'g> {
+        debug_assert!(claim.is_none_or(|c| std::ptr::eq(c.gate, self)));
+        let mut used = self.used.lock().unwrap();
+        *used = used.saturating_add(bytes);
+        self.trace_used(*used);
+        drop(used);
+        CarriedBytes {
+            gate: self,
+            bytes,
+            claim,
+        }
+    }
+
+    /// Claim `bytes` for a prove that will carry resident bytes, waiting until
+    /// they fit beside the claims in force (any claim fits when none is).
+    fn claim(&self, bytes: u64) -> ResidentClaim<'_> {
+        let mut claims = self.claims.lock().unwrap();
+        while claims.1 > 0 && claims.0.saturating_add(bytes) > self.budget.load(Ordering::Relaxed) {
+            claims = self.claim_room.wait(claims).unwrap();
+        }
+        claims.0 = claims.0.saturating_add(bytes);
+        claims.1 += 1;
+        self.trace_claims(*claims);
+        ResidentClaim {
+            gate: self,
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
+    /// One `SGATE` line: the bytes admitted now.
+    fn trace_used(&self, used: u64) {
+        if self.trace {
+            eprintln!(
+                "SGATE t={:.3} used={:.3}GiB",
+                crate::prove_split::epoch_secs(),
+                used as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+
+    /// One `SGATE` line: the claims in force now.
+    fn trace_claims(&self, (bytes, n): (u64, usize)) {
+        if self.trace {
+            eprintln!(
+                "SGATE t={:.3} claimed={:.3}GiB claims={n}",
+                crate::prove_split::epoch_secs(),
+                bytes as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+}
+
+impl ResidentClaim<'_> {
+    /// Give back `bytes` of the claim (at most what is left), once the prove
+    /// can no longer need them.
+    fn shrink(&self, bytes: u64) {
+        let mut claims = self.gate.claims.lock().unwrap();
+        let left = self.bytes.load(Ordering::Relaxed);
+        let give = bytes.min(left);
+        self.bytes.store(left - give, Ordering::Relaxed);
+        claims.0 = claims.0.saturating_sub(give);
+        self.gate.trace_claims(*claims);
+        drop(claims);
+        self.gate.claim_room.notify_all();
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ResidentClaim<'_> {
+    fn drop(&mut self) {
+        let mut claims = self.gate.claims.lock().unwrap_or_else(|e| e.into_inner());
+        claims.0 = claims.0.saturating_sub(self.bytes.load(Ordering::Relaxed));
+        claims.1 = claims.1.saturating_sub(1);
+        self.gate.trace_claims(*claims);
+        drop(claims);
+        self.gate.claim_room.notify_all();
+    }
+}
+
+impl Drop for CarriedBytes<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim {
+            claim.shrink(self.bytes);
+        }
+        let mut used = self.gate.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        self.gate.trace_used(*used);
+        drop(used);
+        self.gate.freed.notify_all();
+    }
+}
+
+/// A `Retain` prove's claim before its Round 1: every table's resident bytes
+/// (`resident`, an upper bound on what its commit leaves on the device) plus
+/// the largest table's whole fused set (`peak`), which bounds any one
+/// admission the prove can wait on — a Round-1 commit or a fused task's top-up
+/// over its carried bytes — whatever its commits end up leaving resident.
+fn resident_claim(resident: &[u64], peak: &[u64]) -> u64 {
+    let held = resident.iter().fold(0u64, |a, &b| a.saturating_add(b));
+    held.saturating_add(peak.iter().copied().max().unwrap_or(0))
+}
+
+/// The same claim once Round 1 is done and `carried` is known: the bytes
+/// carried plus the largest top-up a fused task asks for. Never above
+/// [`resident_claim`] when each carried entry is at most its resident bound.
+fn settled_claim(carried: &[u64], peak: &[u64]) -> u64 {
+    let held = carried.iter().fold(0u64, |a, &b| a.saturating_add(b));
+    let top_up = peak
+        .iter()
+        .zip(carried)
+        .map(|(&p, &c)| p.saturating_sub(c))
+        .max()
+        .unwrap_or(0);
+    held.saturating_add(top_up)
 }
 
 impl VramGate {
@@ -1210,6 +1373,7 @@ impl VramGate {
                         }
                         claimed[pos] = true;
                         *used = used.saturating_add(bytes);
+                        self.trace_used(*used);
                         return Some((idx, VramPermit::new(self, bytes)));
                     }
                 }
@@ -1276,6 +1440,185 @@ mod shared_vram_gate_tests {
         }
         assert_eq!(*gate.used.lock().unwrap(), before, "and released on drop");
         pin_shared_vram_gate(None);
+    }
+}
+
+#[cfg(test)]
+mod resident_claim_tests {
+    use super::{VramGate, resident_claim, settled_claim};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// One table of a simulated prove: what its commit leaves resident, its
+    /// commit's scratch, and what its fused task adds on top of both.
+    type Table = (u64, u64, u64);
+
+    /// A prove as `multi_prove` runs one that carries: a claim first (when
+    /// `claim`), each Round-1 commit admitted for its set and its resident
+    /// bytes carried past the permit, the claim settled, then each fused task
+    /// admitted for its set less what it carries. `paused`, after that many
+    /// Round-1 tables, reports on `at_pause` and waits on `go`.
+    fn prove_like(
+        gate: &VramGate,
+        tables: &[Table],
+        claim: bool,
+        paused: usize,
+        at_pause: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    ) {
+        let resident: Vec<u64> = tables.iter().map(|t| t.0).collect();
+        let peak: Vec<u64> = tables.iter().map(|t| t.0 + t.1 + t.2).collect();
+        let claim = claim.then(|| gate.claim(resident_claim(&resident, &peak)));
+        let mut carried = Vec::new();
+        for (i, t) in tables.iter().enumerate() {
+            if i == paused {
+                let _ = at_pause.send(());
+                let _ = go.recv();
+            }
+            let permit = gate.acquire(t.0 + t.1);
+            carried.push(Some(gate.carry(t.0, claim.as_ref())));
+            drop(permit);
+        }
+        if let Some(c) = &claim {
+            c.shrink(c.bytes().saturating_sub(settled_claim(&resident, &peak)));
+        }
+        for (i, t) in tables.iter().enumerate() {
+            let permit = gate.acquire(peak[i] - t.0);
+            let _resident = carried[i].take();
+            drop(permit);
+        }
+    }
+
+    /// Two proves of three tables (resident 4, scratch 1, fused 1) on a gate
+    /// of 18 — exactly one prove's claim. The first pauses after two Round-1
+    /// commits; the second starts then, and the first goes on 200 ms later.
+    /// Whether both finish in 10 s.
+    fn two_proves_finish(claim: bool) -> bool {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(18)));
+        let tables: &'static [Table] = &[(4, 1, 1), (4, 1, 1), (4, 1, 1)];
+        let (done_tx, done_rx) = mpsc::channel();
+        let (a_paused, a_paused_rx) = mpsc::channel();
+        let (a_go, a_go_rx) = mpsc::channel();
+        let done = done_tx.clone();
+        std::thread::spawn(move || {
+            prove_like(gate, tables, claim, 2, a_paused, a_go_rx);
+            let _ = done.send(());
+        });
+        a_paused_rx.recv().unwrap();
+        std::thread::spawn(move || {
+            // Past its last table: never pauses.
+            let (b_paused, _) = mpsc::channel();
+            let (_, b_go) = mpsc::channel();
+            prove_like(gate, tables, claim, tables.len(), b_paused, b_go);
+            let _ = done_tx.send(());
+        });
+        // Without a claim the second prove carries two residents beside the
+        // first's two (16 of 18) and waits on its third commit; with one it
+        // waits on the claim instead.
+        std::thread::sleep(Duration::from_millis(200));
+        a_go.send(()).unwrap();
+        let finished = (0..2).all(|_| done_rx.recv_timeout(Duration::from_secs(10)).is_ok());
+        if !finished {
+            // Unwedge the stuck proves so their threads end.
+            gate.budget
+                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            gate.freed.notify_all();
+            gate.claim_room.notify_all();
+        }
+        finished
+    }
+
+    /// ★ Carried bytes without claims wedge the gate: each prove holds two
+    /// residents (16 of 18) and neither can commit its third table.
+    #[test]
+    fn two_proves_carrying_without_claims_wedge_the_gate() {
+        assert!(
+            !two_proves_finish(false),
+            "the unclaimed proves finished: the scenario no longer wedges, so the claim test proves nothing"
+        );
+    }
+
+    /// ★ With claims the same two proves finish: the second waits for the
+    /// first's claim instead of carrying beside it.
+    #[test]
+    fn with_claims_two_carrying_proves_finish() {
+        assert!(
+            two_proves_finish(true),
+            "the claimed proves wedged the gate"
+        );
+    }
+
+    /// Carried bytes stay in the account past the permit they were allocated
+    /// under and leave it when dropped; dropping them gives their share of the
+    /// claim back.
+    #[test]
+    fn carried_bytes_outlive_their_permit_and_give_their_claim_back() {
+        let gate = VramGate::new(10);
+        let claim = gate.claim(9);
+        let permit = gate.acquire(5);
+        let carried = gate.carry(4, Some(&claim));
+        assert_eq!(*gate.used.lock().unwrap(), 9, "the permit and the carry");
+        drop(permit);
+        assert_eq!(
+            *gate.used.lock().unwrap(),
+            4,
+            "the carry outlives the permit"
+        );
+        drop(carried);
+        assert_eq!(*gate.used.lock().unwrap(), 0);
+        assert_eq!(claim.bytes(), 5, "the carry's share of the claim went back");
+        assert_eq!(*gate.claims.lock().unwrap(), (5, 1));
+        drop(claim);
+        assert_eq!(*gate.claims.lock().unwrap(), (0, 0));
+    }
+
+    /// The claim before Round 1 bounds every admission a prove can wait on
+    /// whatever its commits leave resident; settled, it is never larger.
+    #[test]
+    fn the_claim_bounds_every_wait_and_only_settles_down() {
+        let resident = [4u64, 2, 0];
+        let peak = [6u64, 5, 3];
+        assert_eq!(resident_claim(&resident, &peak), 6 + 6);
+        for carried in [[4u64, 2, 0], [0, 0, 0], [4, 0, 0], [0, 2, 0]] {
+            let settled = settled_claim(&carried, &peak);
+            assert!(settled <= resident_claim(&resident, &peak), "{carried:?}");
+            let held: u64 = carried.iter().sum();
+            for (p, c) in peak.iter().zip(&carried) {
+                assert!(
+                    held + (p - c) <= settled,
+                    "{carried:?}: a top-up past the claim"
+                );
+            }
+        }
+    }
+
+    /// A second claim waits while the sum would pass the budget, and is
+    /// admitted when the first shrinks enough; one claim alone always is.
+    #[test]
+    fn a_claim_waits_for_room_beside_the_claims_in_force() {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(10)));
+        let big = gate.claim(25);
+        assert_eq!(
+            *gate.claims.lock().unwrap(),
+            (25, 1),
+            "alone, over the budget"
+        );
+        drop(big);
+        let first = gate.claim(7);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _second = gate.claim(4);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "7 + 4 > 10"
+        );
+        first.shrink(1);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "6 + 4 fits"
+        );
     }
 }
 
@@ -1743,9 +2086,19 @@ impl Drop for VramPermit<'_> {
         PERMITS_HELD.with(|p| p.set(p.get().saturating_sub(1)));
         let mut used = self.gate.used.lock().unwrap();
         *used = used.saturating_sub(self.bytes);
+        self.gate.trace_used(*used);
         drop(used);
         self.gate.freed.notify_all();
     }
+}
+
+/// `LAMBDA_VM_SHARED_GATE_TRACE=1`: the shared gate prints one `SGATE` line
+/// (unix seconds, the bytes admitted or the claims in force) on every change
+/// of its account, so a box run can lay it beside the card's `memory.used`.
+/// Off by default.
+fn shared_gate_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_SHARED_GATE_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// `LAMBDA_VM_SHARED_VRAM_GATE=1`, while a caller has armed it
@@ -1763,7 +2116,10 @@ impl Drop for VramPermit<'_> {
 /// only between sibling levels, never in phase A. The device's memory pool
 /// releases at each sync under the knob (`math_cuda::device::
 /// mempool_release_threshold_bytes`), so what an earlier phase freed is not
-/// left reserved outside the gate's account (FAST 473).
+/// left reserved outside the gate's account (FAST 473). A `Retain` prove's
+/// main LDEs stay on the card from Round 1 to their fused tasks; under this
+/// gate they stay in its account too ([`CarriedBytes`]), behind a claim per
+/// prove that keeps them from wedging it ([`ResidentClaim`]).
 pub fn shared_vram_gate_on() -> bool {
     #[cfg(any(test, feature = "test-utils"))]
     match SHARED_VRAM_GATE_PIN.load(Ordering::SeqCst) {
@@ -1804,7 +2160,9 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
     let gate = shared_vram_gate(configured);
     let budget = {
         let used = gate.used.lock().unwrap();
-        if *used == 0 {
+        // Never under a claim: a budget calibrated lower than the claims in
+        // force would void their guarantee.
+        if *used == 0 && gate.claims.lock().unwrap().1 == 0 {
             let free = device_free_after_trim();
             let b = calibrated_budget(configured, free, margin_bytes);
             gate.budget.store(b, Ordering::Relaxed);
@@ -1873,7 +2231,10 @@ pub fn pin_shared_vram_gate(on: Option<bool>) {
 /// first time it is asked for (the card's budget is fixed for the process).
 fn shared_vram_gate(budget: u64) -> &'static VramGate {
     static GATE: std::sync::OnceLock<VramGate> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| VramGate::new(budget))
+    GATE.get_or_init(|| VramGate {
+        trace: shared_gate_trace(),
+        ..VramGate::new(budget)
+    })
 }
 
 /// The card's admission budget, or `u64::MAX` without a device.
@@ -6056,8 +6417,9 @@ pub trait IsStarkProver<
         // One gate for every prove in the process when the caller runs proofs
         // concurrently (`LAMBDA_VM_SHARED_VRAM_GATE`); a test's own budget
         // keeps a gate of its own.
+        let gate_shared = shared_vram_gate_on() && !budget_overridden;
         let local_gate;
-        let vram_gate: &VramGate = if shared_vram_gate_on() && !budget_overridden {
+        let vram_gate: &VramGate = if gate_shared {
             shared_vram_gate(vram_budget)
         } else {
             local_gate = VramGate::new(vram_budget);
@@ -6089,7 +6451,7 @@ pub trait IsStarkProver<
         // R1 main commit: the fused commit's device set — one LDE buffer, the
         // trace snapshot, the tree and the scratch — the same model the
         // dispatch layer admits the commit against.
-        let main_estimates: Vec<u64> = table_shapes
+        let main_sets: Vec<crate::device_set::CommitDeviceSet> = table_shapes
             .iter()
             .zip(&leaf_layouts)
             .map(|(s, l)| {
@@ -6100,9 +6462,9 @@ pub trait IsStarkProver<
                     true,
                     l.rows_per_leaf(),
                 )
-                .total()
             })
             .collect();
+        let main_estimates: Vec<u64> = main_sets.iter().map(|set| set.total()).collect();
 
         // A precommitted table's Round-1 task only hands its commit over, so it
         // spends nothing at the gate.
@@ -6119,6 +6481,18 @@ pub trait IsStarkProver<
                     .get(idx)
                     .is_some_and(|c| c.lock().unwrap().is_some());
                 if pre { 0 } else { est }
+            })
+            .collect();
+
+        // R1 aux commit and rounds 2 to 4 share the peak working set: the main
+        // and aux LDEs are co-resident, plus the composition and Merkle
+        // transients (in the scratch factor). The aux width comes from the AIR
+        // layout (the aux build itself runs inside the admitted chain below).
+        let peak_estimates: Vec<u64> = table_shapes
+            .iter()
+            .zip(&leaf_layouts)
+            .map(|(shape, l)| {
+                crate::device_set::table_device_set_rpl(*shape, l.rows_per_leaf()).total()
             })
             .collect();
 
@@ -6241,11 +6615,110 @@ pub trait IsStarkProver<
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
 
+        // `Retain` leaves each device-committed table's main LDE, snapshot and
+        // tree on the card from its Round-1 task until its fused task ends.
+        // Under the shared gate those bytes stay in the account: the Round-1
+        // task carries them past its permit (`CarriedBytes`), the fused task
+        // is admitted for its set less what it carries, and takes them over.
+        // A prove that carries holds a claim on the gate first
+        // (`ResidentClaim`), so carried bytes can never wedge it; a prove
+        // whose claim alone exceeds the budget carries nothing and runs with
+        // the claim as its exclusion.
+        let carry_wanted = gate_shared && matches!(residency, ResidencyMode::Retain);
+        #[cfg(any(test, feature = "test-utils"))]
+        let carry_wanted = carry_wanted
+            || test_overrides
+                .as_ref()
+                .is_some_and(|(o, _)| o.carry_residents);
+        let resident_bounds: Vec<u64> = main_sets
+            .iter()
+            .zip(&main_estimates)
+            .map(|(set, &est)| {
+                if est == 0 {
+                    0
+                } else {
+                    set.resident(true, true)
+                }
+            })
+            .collect();
+        let claim_bytes = resident_claim(&resident_bounds, &peak_estimates);
+        let carry_residents =
+            carry_wanted && claim_bytes <= vram_gate.budget.load(Ordering::Relaxed);
+        let claim = carry_wanted.then(|| {
+            let waited = std::time::Instant::now();
+            let claim = vram_gate.claim(claim_bytes);
+            if gate_shared {
+                let (claimed, n) = *vram_gate.claims.lock().unwrap();
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                eprintln!(
+                    "[prover] shared VRAM gate claim: {:.2} GiB ({} tables, residents ≤ {:.2} GiB), waited {:.3}s; \
+                     claims in force {n} ({:.2} GiB of {:.2}){}",
+                    gib(claim_bytes),
+                    num_airs,
+                    gib(resident_bounds.iter().sum()),
+                    waited.elapsed().as_secs_f64(),
+                    gib(claimed),
+                    gib(vram_gate.budget.load(Ordering::Relaxed)),
+                    if carry_residents {
+                        ""
+                    } else {
+                        " — over the budget: carries nothing, runs alone"
+                    }
+                );
+            }
+            claim
+        });
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((_, log)) = &test_overrides {
+            log.lock().unwrap().claim = claim.as_ref().map(|c| c.bytes());
+        }
+        let carried_cells: Vec<std::sync::Mutex<Option<CarriedBytes<'_, '_>>>> =
+            (0..num_airs).map(|_| std::sync::Mutex::new(None)).collect();
+
         // All main commits with continuous VRAM admission (no chunk barriers);
         // the transcript only needs the roots absorbed in index order, done
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
         let __ps_mc = crate::prove_split::mark();
+        let r1_task = |idx: usize| -> Result<PrecommittedMain<Field, H>, ProvingError> {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some((_, log)) = &test_overrides {
+                log.lock().unwrap().r1_started.push(idx);
+            }
+            // First, so no return below can leave bytes read ahead for
+            // this table parked in the read-back's window.
+            let read = spill_prefetch
+                .as_ref()
+                .and_then(|p| p.take(crate::spill::ReadPhase::Round1, idx));
+            if let Some(pre) = precommitted_cells
+                .get(idx)
+                .and_then(|c| c.lock().unwrap().take())
+            {
+                return Ok(pre);
+            }
+            let (air, trace, _) = &air_trace_pairs[idx];
+            // A spilled trace commits from a copy holding its packed
+            // words; the trace stays spilled for its fused task.
+            let loaded;
+            let trace = if trace.is_main_spilled() {
+                loaded = trace
+                    .with_spilled_main_loaded(read)
+                    .map_err(|e| ProvingError::spilled(air.name(), e))?;
+                &loaded
+            } else {
+                &**trace
+            };
+            Self::r1_commit_table(
+                *air,
+                trace,
+                &domains[idx],
+                &twiddle_caches[idx],
+                leaf_layouts[idx],
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+                residency,
+            )
+        };
         let main_results = run_admitted(
             "r1",
             &main_walk_order,
@@ -6255,43 +6728,36 @@ pub trait IsStarkProver<
             r1_ready.as_ref().map(|r| r as &dyn AdmitReady),
             |idx| table_names[idx].clone(),
             |idx| {
-                #[cfg(any(test, feature = "test-utils"))]
-                if let Some((_, log)) = &test_overrides {
-                    log.lock().unwrap().r1_started.push(idx);
-                }
-                // First, so no return below can leave bytes read ahead for
-                // this table parked in the read-back's window.
-                let read = spill_prefetch
-                    .as_ref()
-                    .and_then(|p| p.take(crate::spill::ReadPhase::Round1, idx));
-                if let Some(pre) = precommitted_cells
-                    .get(idx)
-                    .and_then(|c| c.lock().unwrap().take())
+                let out = r1_task(idx);
+                // Carried before this task's permit drops, so the account
+                // never forgets them.
+                if carry_residents
+                    && main_estimates[idx] > 0
+                    && let Ok(pre) = &out
                 {
-                    return Ok(pre);
+                    #[cfg(feature = "cuda")]
+                    let kept = pre
+                        .gpu_main
+                        .as_ref()
+                        .map(|h| (h.trace_dev.is_some(), h.tree.is_some()));
+                    #[cfg(not(feature = "cuda"))]
+                    let kept: Option<(bool, bool)> = {
+                        let _ = pre;
+                        None
+                    };
+                    #[cfg(any(test, feature = "test-utils"))]
+                    let kept = kept.or(test_overrides
+                        .as_ref()
+                        .and_then(|(o, _)| o.carry_residents.then_some((true, true))));
+                    let bytes = kept.map_or(0, |(snapshot, tree)| {
+                        main_sets[idx].resident(snapshot, tree)
+                    });
+                    if bytes > 0 {
+                        *carried_cells[idx].lock().unwrap() =
+                            Some(vram_gate.carry(bytes, claim.as_ref()));
+                    }
                 }
-                let (air, trace, _) = &air_trace_pairs[idx];
-                // A spilled trace commits from a copy holding its packed
-                // words; the trace stays spilled for its fused task.
-                let loaded;
-                let trace = if trace.is_main_spilled() {
-                    loaded = trace
-                        .with_spilled_main_loaded(read)
-                        .map_err(|e| ProvingError::spilled(air.name(), e))?;
-                    &loaded
-                } else {
-                    &**trace
-                };
-                Self::r1_commit_table(
-                    *air,
-                    trace,
-                    &domains[idx],
-                    &twiddle_caches[idx],
-                    leaf_layouts[idx],
-                    #[cfg(feature = "disk-spill")]
-                    storage_mode,
-                    residency,
-                )
+                out
             },
         );
         crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
@@ -6338,6 +6804,35 @@ pub trait IsStarkProver<
             });
             #[cfg(feature = "cuda")]
             main_gpu_handles.push(gpu_main);
+        }
+
+        // Round 1 is done: what each table carries is known, so each fused
+        // task is admitted for its set less what it carries, and the claim
+        // settles to the carried bytes plus the largest of those top-ups.
+        let carried: Vec<u64> = carried_cells
+            .iter()
+            .map(|c| c.lock().unwrap().as_ref().map_or(0, |c| c.bytes))
+            .collect();
+        let fused_estimates: Vec<u64> = peak_estimates
+            .iter()
+            .zip(&carried)
+            .map(|(&p, &c)| p.saturating_sub(c))
+            .collect();
+        if let Some(claim) = &claim
+            && carry_residents
+        {
+            claim.shrink(
+                claim
+                    .bytes()
+                    .saturating_sub(settled_claim(&carried, &peak_estimates)),
+            );
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((_, log)) = &test_overrides {
+            let mut log = log.lock().unwrap();
+            log.carried = carried.clone();
+            log.fused_admitted = fused_estimates.clone();
+            log.settled_claim = claim.as_ref().map(|c| c.bytes());
         }
 
         #[cfg(feature = "instruments")]
@@ -6434,22 +6929,6 @@ pub trait IsStarkProver<
         );
         #[cfg(not(feature = "cuda"))]
         type AuxResult<FE, H> = (Option<TableCommit<FE, H>>, (Vec<FieldElement<FE>>, usize));
-        // R1 aux commit and rounds 2 to 4 share the peak working set: the main
-        // and aux LDEs are co-resident, plus the composition and Merkle
-        // transients (in the scratch factor). The aux width comes from the AIR
-        // layout (the aux build itself runs inside the admitted chain below).
-        let peak_estimates: Vec<u64> = air_trace_pairs
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                crate::device_set::table_device_set_rpl(
-                    table_shapes[idx],
-                    leaf_layouts[idx].rows_per_leaf(),
-                )
-                .total()
-            })
-            .collect();
-
         // Per-table slots for the fused chain: each driver takes or locks only
         // its own index, so every mutex is uncontended by construction.
         let pair_cells: Vec<std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>> =
@@ -7016,6 +7495,17 @@ pub trait IsStarkProver<
             describe_walk(&peak_order, &peak_walk_weights, &table_names)
         );
 
+        // A fused task takes its table's carried bytes over (admitted for the
+        // rest of its set): they go with its own permit when it ends.
+        let take_carried = |idx: usize| {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some((_, log)) = &test_overrides {
+                let used = *vram_gate.used.lock().unwrap();
+                log.lock().unwrap().fused_gate_used.push((idx, used));
+            }
+            carried_cells[idx].lock().unwrap().take()
+        };
+
         // One fused task per table: while a heavy table works through a
         // host-bound stretch, the others' GPU stages fill the device. The
         // shared transcript is untouched past this point (each fork is
@@ -7024,12 +7514,13 @@ pub trait IsStarkProver<
         let table_results = run_admitted(
             "fused",
             &peak_order,
-            &peak_estimates,
+            &fused_estimates,
             vram_gate,
             k,
             fused_ready.as_ref().map(|r| r as &dyn AdmitReady),
             |idx| table_names[idx].clone(),
             |idx| {
+                let _carried = take_carried(idx);
                 let (commitment, lde) = aux_stage(idx)?;
                 rounds_stage(idx, commitment, lde)
             },
@@ -7043,7 +7534,7 @@ pub trait IsStarkProver<
             let aux_outs = run_admitted(
                 "aux",
                 &peak_order,
-                &peak_estimates,
+                &fused_estimates,
                 vram_gate,
                 k,
                 fused_ready.as_ref().map(|r| r as &dyn AdmitReady),
@@ -7074,17 +7565,27 @@ pub trait IsStarkProver<
             run_admitted(
                 "rounds",
                 &peak_order,
-                &peak_estimates,
+                &fused_estimates,
                 vram_gate,
                 k,
                 None,
                 |idx| table_names[idx].clone(),
                 |idx| {
+                    let _carried = take_carried(idx);
                     let (c, l) = staged[idx].lock().unwrap().take().unwrap();
                     rounds_stage(idx, c, l)
                 },
             )
         };
+
+        // Every fused task has ended: nothing is carried any more, and the
+        // claim goes back.
+        drop(carried_cells);
+        drop(claim);
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((_, log)) = &test_overrides {
+            log.lock().unwrap().gate_used_after_fused = Some(*vram_gate.used.lock().unwrap());
+        }
 
         crate::prove_split::add(&crate::prove_split::FUSED, __ps_fused);
         if let Some(prefetch) = &spill_prefetch {

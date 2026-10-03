@@ -64,6 +64,12 @@
 //!   [`shared_margin_bytes`] (`stark::prover::arm_shared_vram_gate`), so what
 //!   no gate counts is outside the budget rather than on top of it.
 //!
+//! The tree's proves run `Retain`, which keeps each table's main LDE on the
+//! card from its Round-1 commit to its fused task. Under the shared gate those
+//! bytes stay in the gate's account for that whole stretch, and each prove
+//! first claims room for them, so the proves inside at once are also bounded
+//! by what their residents need.
+//!
 //! # Inert until armed
 //!
 //! Unarmed, and at one worker, [`hold`] takes no lock and touches no counter on

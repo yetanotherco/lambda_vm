@@ -624,6 +624,7 @@ fn a_slow_read_back_admits_in_walk_order_holding_no_permit() {
         vram_budget: Some(1),
         window: Some(1),
         drivers: Some(3),
+        ..Default::default()
     };
     for residency in RESIDENCIES {
         let want = resident(residency);
@@ -756,6 +757,7 @@ fn a_slow_read_back_admits_in_walk_order_on_the_card() {
         vram_budget: Some(1),
         window: Some(1),
         drivers: Some(3),
+        ..Default::default()
     };
     for spill in [Spill::AfterPrecommit, Spill::BeforeRoundOne] {
         let before = crate::prover::NARROW_DEVICE_WIDENS.load(Ordering::SeqCst);

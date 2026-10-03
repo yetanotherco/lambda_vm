@@ -1280,6 +1280,11 @@ pub mod test_hooks {
         pub window: Option<u64>,
         /// Driver threads per admitted phase.
         pub drivers: Option<usize>,
+        /// Carry each table's resident bytes from its Round-1 task to its
+        /// fused task on this prove's gate, as a `Retain` prove under the
+        /// shared gate does, with every commit taken to have left its LDE,
+        /// snapshot and tree on the device.
+        pub carry_residents: bool,
     }
 
     /// Per admitted phase: its walk order, and the order its tasks started in.
@@ -1289,6 +1294,19 @@ pub mod test_hooks {
         pub r1_started: Vec<usize>,
         pub fused_walk: Vec<usize>,
         pub fused_started: Vec<usize>,
+        /// The prove's claim before Round 1 and once Round 1 settled it,
+        /// when it carried resident bytes.
+        pub claim: Option<u64>,
+        pub settled_claim: Option<u64>,
+        /// Per table: the bytes carried from Round 1, and what its fused task
+        /// was admitted for.
+        pub carried: Vec<u64>,
+        pub fused_admitted: Vec<u64>,
+        /// Per fused task, in start order: its table and the gate's admitted
+        /// bytes as it started (its own permit and carried bytes included).
+        pub fused_gate_used: Vec<(usize, u64)>,
+        /// The gate's admitted bytes once every fused task ended.
+        pub gate_used_after_fused: Option<u64>,
     }
 
     type Current = Option<(ProveOverrides, Arc<Mutex<Admissions>>)>;
