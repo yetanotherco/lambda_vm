@@ -404,6 +404,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        early_install: bool,
     ) -> Result<Self, MlError> {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -416,7 +417,15 @@ where
             .iter()
             .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        Self::commit_streamed::<H>(groups, sizes, config, drop_levels, narrow, upload_ahead)
+        Self::commit_streamed::<H>(
+            groups,
+            sizes,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            early_install,
+        )
     }
 
     /// [`Self::commit`] over groups handed over one at a time, in group order —
@@ -431,6 +440,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        early_install: bool,
     ) -> Result<Self, MlError> {
         let block = Self::commit_groups::<H>(
             groups.into_iter().take(sizes.len()),
@@ -438,6 +448,7 @@ where
             drop_levels,
             narrow,
             upload_ahead,
+            early_install,
         )?;
         if block.sizes != sizes {
             return Err(MlError::QueryCountMismatch {
@@ -457,6 +468,9 @@ where
     /// while this group commits (on a thread of its own) — once the commit has
     /// asked the card for its room, so the upload only takes what is left; a
     /// store the ledger refuses is uploaded after the commit, as without it.
+    /// `early_install` (with `upload_ahead`): the previous group's pack is
+    /// installed while the commit still runs, right after the next upload,
+    /// instead of after the commit — its wide columns go sooner.
     /// The commits, their order and their bytes are the same either way.
     pub fn commit_groups<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
@@ -464,6 +478,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        early_install: bool,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
         let mut sizes = Vec::new();
@@ -473,7 +488,9 @@ where
         let mut incoming = groups.into_iter();
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
-        // upload (or, uploading ahead, beside this group's commit).
+        // upload (or, uploading ahead, beside this group's commit, installed
+        // once the next group's columns are up — or, without the early install,
+        // after the commit).
         let mut packing: Option<Packing> = None;
         // The next group, taken and uploaded beside this group's commit.
         let mut ahead: Option<Ahead<'a, F, E>> = None;
@@ -581,6 +598,13 @@ where
                         let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
                         (group, store, t.elapsed().as_secs_f64(), Instant::now())
                     });
+                    // The previous group's pack, installed while the commit
+                    // still runs: its wide columns go as soon as it is done,
+                    // instead of after the commit — and after the next upload,
+                    // which it must not delay.
+                    if early_install && let Some(packed) = packing.take() {
+                        packed.install(&mut tables, &mut stamps);
+                    }
                     let (committed, commit_end) = committer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));

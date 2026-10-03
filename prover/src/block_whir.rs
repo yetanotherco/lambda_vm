@@ -259,6 +259,11 @@ pub struct BlockOptions {
     /// ([`BlockCommitted::commit_groups`]); the commits and the proof's bytes
     /// are the same. Production: on.
     pub upload_ahead: bool,
+    /// With `upload_ahead`: install the previous group's pack while the commit
+    /// still runs (right after the next upload) instead of after it, so its
+    /// wide columns go sooner (FAST 834: otherwise phase A holds three groups'
+    /// columns at its peak). The proof's bytes are the same. Production: on.
+    pub early_install: bool,
 }
 
 impl BlockOptions {
@@ -281,6 +286,7 @@ impl BlockOptions {
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
+            early_install: true,
         }
     }
 }
@@ -310,6 +316,21 @@ pub(crate) fn upload_ahead_from_env() -> Option<bool> {
         Ok("0") => Some(false),
         Ok("1") => Some(true),
         Ok(other) => panic!("BLOCK_WHIR_UPLOAD_AHEAD={other}: 0 or 1"),
+        Err(_) => None,
+    }
+}
+
+/// `BLOCK_WHIR_EARLY_INSTALL=0|1`: the real-block tests' choice of
+/// [`BlockOptions::early_install`]; `None` leaves the production one.
+#[cfg(test)]
+pub(crate) fn early_install_from_env() -> Option<bool> {
+    match std::env::var("BLOCK_WHIR_EARLY_INSTALL")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        Ok(other) => panic!("BLOCK_WHIR_EARLY_INSTALL={other}: 0 or 1"),
         Err(_) => None,
     }
 }
@@ -1536,6 +1557,7 @@ pub(crate) fn prove_traces(
                 options.drop_levels,
                 options.narrow,
                 options.upload_ahead,
+                options.early_install,
             );
             (block, producer.join())
         });
@@ -2528,6 +2550,7 @@ fn prove_streamed(
                 options.drop_levels,
                 options.narrow,
                 options.upload_ahead,
+                options.early_install,
             );
             (block, builder.join(), layout.join(), executor.join())
         });

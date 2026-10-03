@@ -58,6 +58,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        early_install: true,
     }
 }
 
@@ -1890,6 +1891,12 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_EARLY_INSTALL=0|1` (production 1): the previous group's pack
+    // installed during the commit.
+    if let Some(early) = crate::block_whir::early_install_from_env() {
+        options.early_install = early;
+    }
+    println!("BLOCK EARLY INSTALL: {}", options.early_install);
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,
