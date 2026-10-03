@@ -355,6 +355,10 @@ fn eval_composition_launch(
     // Per-thread slot scratch, uninitialized (the walk writes before reading).
     let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
     let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    if COMPOSITION_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+        let bytes = 8 * (num_base_slots + 3 * num_ext_slots) * num_threads;
+        COMPOSITION_SCRATCH.with(|c| c.set(c.get() + bytes as u64));
+    }
     // Output: every row is written by the grid-stride loop.
     let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
 
@@ -375,6 +379,7 @@ fn eval_composition_launch(
     let kernel = compiled_fn
         .as_ref()
         .unwrap_or(&be.constraint_composition_kernel);
+    let timer = CompositionTimer::start(&stream)?;
     unsafe {
         stream
             .launch_builder(kernel)
@@ -407,6 +412,7 @@ fn eval_composition_launch(
             .arg(&mut d_vals_ext)
             .launch(cfg)?;
     }
+    timer.stop(&stream)?;
     Ok((d_h, stream))
 }
 
@@ -468,6 +474,359 @@ pub fn eval_composition_on_device(
     let mut out = vec![0u64; d_h.len()];
     pending.wait_into_u64(&mut out)?;
     Ok(out)
+}
+
+/// `LAMBDA_VM_TABLE_TIMELINE`'s composition timer: when on, every
+/// composition launch on a thread records a pair of CUDA events around its
+/// kernel on the composition stream, and [`take_composition_device_ms`] sums
+/// the kernels' device time on that thread. Off by default; no proof change.
+static COMPOSITION_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static COMPOSITION_EVENTS: std::cell::RefCell<Vec<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Bytes of slot-file scratch the slot-file interpreter allocated on this
+    /// thread since the last [`take_composition_scratch_bytes`] (timer on).
+    static COMPOSITION_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The slot-file scratch bytes (the slot-file interpreter's per-thread value
+/// files, outside the VRAM gate's estimate) this thread's compositions
+/// allocated since the last call, while the timer is on.
+pub fn take_composition_scratch_bytes() -> u64 {
+    COMPOSITION_SCRATCH.with(|c| c.replace(0))
+}
+
+/// Turn the composition timer on or off, process-wide.
+pub fn set_composition_timing(on: bool) {
+    COMPOSITION_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device milliseconds of the compositions this thread launched since the
+/// last call (`None` when it launched none, or the timer is off). Waits for
+/// their kernels; a table's driver reads it after the table is done, when they
+/// have long finished.
+pub fn take_composition_device_ms() -> Option<f64> {
+    let events = COMPOSITION_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    if events.is_empty() {
+        return None;
+    }
+    let mut ms = 0.0f64;
+    for (start, end) in &events {
+        ms += start.elapsed_ms(end).ok()? as f64;
+    }
+    Some(ms)
+}
+
+/// A start event recorded on a composition stream, when the timer is on.
+struct CompositionTimer(Option<cudarc::driver::CudaEvent>);
+
+impl CompositionTimer {
+    fn start(stream: &Arc<CudaStream>) -> Result<Self> {
+        if !COMPOSITION_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(Self(None));
+        }
+        let be = backend()?;
+        let ev = be
+            .ctx
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        ev.record(stream)?;
+        Ok(Self(Some(ev)))
+    }
+
+    fn stop(self, stream: &Arc<CudaStream>) -> Result<()> {
+        if let Some(start) = self.0 {
+            let be = backend()?;
+            let end = be
+                .ctx
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            end.record(stream)?;
+            COMPOSITION_EVENTS.with(|e| e.borrow_mut().push((start, end)));
+        }
+        Ok(())
+    }
+}
+
+/// The bounded-slot interpreter's kernels (`kernels/constraint_si.cu`), loaded
+/// on first use: a missing or unloadable module only sends programs back to
+/// the slot-file interpreter.
+const CONSTRAINT_SI_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/constraint_si.cubin"));
+
+fn si_function(name: &'static str) -> Result<CudaFunction> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MODULE: OnceLock<std::result::Result<Arc<CudaModule>, cudarc::driver::DriverError>> =
+        OnceLock::new();
+    static FUNCTIONS: OnceLock<Mutex<HashMap<&'static str, CudaFunction>>> = OnceLock::new();
+    let module = MODULE
+        .get_or_init(|| {
+            let be = backend()?;
+            be.ctx
+                .load_module(Ptx::from_binary(CONSTRAINT_SI_CUBIN.to_vec()))
+        })
+        .clone()?;
+    let mut functions = FUNCTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = functions.get(name) {
+        return Ok(f.clone());
+    }
+    let f = module.load_function(name)?;
+    // The shared-memory variants may take more than the default 48 KiB a
+    // block: allow the card's opt-in maximum once, here, so concurrent
+    // launches with different sizes never race on the attribute.
+    if name.starts_with("si_smem") {
+        let be = backend()?;
+        be.ctx.bind_to_thread()?;
+        let max = be.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )?;
+        // The staged variants hold a static tile of steps; the dynamic slots
+        // get what is left of the block's maximum.
+        let fixed = f.get_attribute(
+            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        )?;
+        f.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            max - fixed,
+        )?;
+    }
+    functions.insert(name, f.clone());
+    Ok(f)
+}
+
+/// Where the bounded-slot interpreter keeps a row's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SiStore {
+    /// Dynamic shared memory, `num_words · rows_per_thread · block` u64 a block.
+    Shared,
+    /// A per-thread local array (L1-cached local memory) of a fixed width.
+    Local,
+}
+
+/// One launch shape of the bounded-slot interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SiConfig {
+    pub store: SiStore,
+    /// Rows a thread walks the program for at once: 1 or 2 (shared only).
+    pub rows_per_thread: u32,
+    /// Threads per block.
+    pub block: u32,
+    /// The steps staged through shared memory a tile at a time (the `_ps`
+    /// kernels; one row a thread only).
+    pub staged: bool,
+    /// Staged, and the trace cells of the step `SI_LOOKAHEAD` ahead
+    /// prefetched into L1 (the `_pp` kernels; implies `staged`).
+    pub prefetch: bool,
+}
+
+/// The local-array widths `constraint_si.cu` is built at: plain, staged, and
+/// staged with the prefetch.
+const SI_LOCAL_WIDTHS: [(u32, [&str; 3]); 4] = [
+    (32, ["si_local_w32", "si_local_w32_ps", "si_local_w32_pp"]),
+    (48, ["si_local_w48", "si_local_w48_ps", "si_local_w48_pp"]),
+    (64, ["si_local_w64", "si_local_w64_ps", "si_local_w64_pp"]),
+    (
+        128,
+        ["si_local_w128", "si_local_w128_ps", "si_local_w128_pp"],
+    ),
+];
+
+impl SiConfig {
+    /// The kernel for a program of `num_words` words a row, if this shape has
+    /// one.
+    pub fn kernel(&self, num_words: u32) -> Option<&'static str> {
+        let stage = match (self.staged, self.prefetch) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (_, true) => 2,
+        };
+        match (self.store, self.rows_per_thread, stage) {
+            (SiStore::Shared, 1, _) => {
+                Some(["si_smem_r1", "si_smem_r1_ps", "si_smem_r1_pp"][stage])
+            }
+            (SiStore::Shared, 2, 0) => Some("si_smem_r2"),
+            (SiStore::Local, 1, _) => SI_LOCAL_WIDTHS
+                .iter()
+                .find(|(w, _)| num_words <= *w)
+                .map(|(_, k)| k[stage]),
+            _ => None,
+        }
+    }
+
+    /// Dynamic shared memory a block takes for `num_words` words a row.
+    pub fn shared_bytes(&self, num_words: u32) -> usize {
+        match self.store {
+            SiStore::Shared => {
+                num_words.max(1) as usize * self.rows_per_thread as usize * self.block as usize * 8
+            }
+            SiStore::Local => 0,
+        }
+    }
+}
+
+/// Blocks of `cfg` a multiprocessor keeps resident for a program of
+/// `num_words` words a row (the driver's occupancy query).
+pub fn si_blocks_per_sm(cfg: SiConfig, num_words: u32) -> Result<u32> {
+    let name = cfg.kernel(num_words).ok_or(cudarc::driver::DriverError(
+        cudarc::driver::sys::cudaError_enum::CUDA_ERROR_INVALID_VALUE,
+    ))?;
+    let func = si_function(name)?;
+    let smem = cfg.shared_bytes(num_words);
+    let be = backend()?;
+    // The occupancy query needs the context current on this thread, and
+    // cudarc does not bind it for that call.
+    be.ctx.bind_to_thread()?;
+    func.occupancy_max_active_blocks_per_multiprocessor(cfg.block, smem, None)
+}
+
+/// The card's facts the bounded-slot interpreter's shape depends on, one line.
+pub fn si_device_report() -> Result<String> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let be = backend()?;
+    be.ctx.bind_to_thread()?;
+    let at = |a| be.ctx.attribute(a);
+    Ok(format!(
+        "SMs {} · shared memory a block (opt-in) {} B · a multiprocessor {} B · registers a \
+         multiprocessor {} · L2 {} B · threads a multiprocessor {}",
+        at(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        at(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+        at(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)?,
+        at(A::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR)?,
+        at(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
+        at(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+    ))
+}
+
+/// A budgeted program in device form (`stark::constraint_ir::budgeted`).
+pub struct SiProgram<'a> {
+    /// Four `u32` a step (`op, a, b, dst`), then one padding step the kernel's
+    /// prefetch reads.
+    pub steps: &'a [u32],
+    pub num_steps: usize,
+    pub num_words: u32,
+    pub base_consts: &'a [u64],
+    /// The ext uniform table, 3 `u64` an element.
+    pub ext_uniforms: &'a [u64],
+}
+
+/// [`eval_composition_on_device_keep`] on the bounded-slot interpreter: the
+/// same `H`, bit for bit, from a budgeted program with no slot file in global
+/// memory.
+pub fn eval_composition_si_keep(
+    cfg: SiConfig,
+    prog: &SiProgram,
+    main: &GpuLdeBase,
+    aux: &GpuLdeExt3,
+    next_step: usize,
+    num_rows: usize,
+    accum: &CompositionAccum,
+) -> Result<GpuCompH> {
+    assert!(num_rows > 0, "callers gate empty domains");
+    assert_eq!(
+        prog.steps.len(),
+        4 * (prog.num_steps + 1),
+        "4 u32 a step, plus the padding step"
+    );
+    let num_boundary = accum.b_col.len();
+    assert_eq!(accum.b_z_inv.len(), num_boundary, "z_b_inv per boundary");
+    assert_eq!(accum.b_is_aux.len(), num_boundary, "b_is_aux per boundary");
+    assert_eq!(
+        accum.b_value.len(),
+        num_boundary * 3,
+        "b_value ext3 per boundary"
+    );
+    assert_eq!(
+        accum.b_beta.len(),
+        num_boundary * 3,
+        "b_beta ext3 per boundary"
+    );
+    let name = cfg
+        .kernel(prog.num_words)
+        .ok_or(cudarc::driver::DriverError(
+            cudarc::driver::sys::cudaError_enum::CUDA_ERROR_INVALID_VALUE,
+        ))?;
+    let func = si_function(name)?;
+    let smem = cfg.shared_bytes(prog.num_words);
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    main.wait_ready_on(&stream)?;
+    aux.wait_ready_on(&stream)?;
+    let d_steps = stream.clone_htod(prog.steps)?;
+    let d_base_consts = stream.clone_htod(if prog.base_consts.is_empty() {
+        &[0u64][..]
+    } else {
+        prog.base_consts
+    })?;
+    let d_uni = stream.clone_htod(prog.ext_uniforms)?;
+    let (d_beta, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = (
+        stream.clone_htod(accum.beta_trans)?,
+        stream.clone_htod(accum.z_inv)?,
+        stream.clone_htod(accum.b_col)?,
+        stream.clone_htod(accum.b_is_aux)?,
+        stream.clone_htod(accum.b_value)?,
+        stream.clone_htod(accum.b_beta)?,
+    );
+    let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
+    for (b, src) in accum.b_z_inv.iter().enumerate() {
+        assert_eq!(src.len(), num_rows, "b_z_inv column length");
+        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+        stream.memcpy_dtod(&src.buf, &mut dst)?;
+    }
+    let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
+
+    // One row (or two) a thread, every row covered: no slot file caps the grid.
+    let rows_per_block = (cfg.block * cfg.rows_per_thread) as usize;
+    let grid = num_rows
+        .div_ceil(rows_per_block)
+        .clamp(1, i32::MAX as usize) as u32;
+    let num_steps_u32 = prog.num_steps as u32;
+    let main_stride = main.lde_size as u64;
+    let aux_stride = aux.lde_size as u64;
+    let next_step_u64 = next_step as u64;
+    let num_rows_u64 = num_rows as u64;
+    let z_len_u64 = (accum.z_inv.len() as u64).max(1);
+    let num_boundary_u64 = num_boundary as u64;
+    let launch = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (cfg.block, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let timer = CompositionTimer::start(&stream)?;
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&mut d_h)
+            .arg(&d_steps)
+            .arg(&num_steps_u32)
+            .arg(&d_base_consts)
+            .arg(&d_uni)
+            .arg(&d_beta)
+            .arg(main.buf.as_ref())
+            .arg(&main_stride)
+            .arg(aux.buf.as_ref())
+            .arg(&aux_stride)
+            .arg(&next_step_u64)
+            .arg(&num_rows_u64)
+            .arg(&d_z_inv)
+            .arg(&z_len_u64)
+            .arg(&num_boundary_u64)
+            .arg(&d_b_col)
+            .arg(&d_b_is_aux)
+            .arg(&d_b_value)
+            .arg(&d_b_beta)
+            .arg(&d_b_z_inv)
+            .launch(launch)?;
+    }
+    timer.stop(&stream)?;
+    Ok(GpuCompH {
+        buf: d_h,
+        num_rows,
+        stream,
+    })
 }
 
 /// The composition evals `H` resident on device (interleaved ext3,

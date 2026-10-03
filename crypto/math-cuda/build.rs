@@ -266,6 +266,10 @@ fn main() {
         have_nvcc,
         &[],
     );
+    // The bounded-slot composition interpreter (budgeted programs; loaded on
+    // first use; the default for the programs with no compiled kernel,
+    // LAMBDA_VM_GPU_INTERP_SI=0 opts out).
+    compile_kernel("constraint_si.cu", "constraint_si.cubin", have_nvcc, &[]);
     // The BLAKE3 kernels' round count is a compile-time knob with the same
     // polarity as the host tree's `blake3-6round` feature: 7 rounds (standard
     // BLAKE3) unless the feature selects the 6-round variant. The `.cu` defaults

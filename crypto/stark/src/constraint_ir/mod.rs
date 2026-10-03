@@ -21,6 +21,9 @@
 //!   oracle).
 //! - [`codegen`]: straight-line CUDA for a lowered program, the compiled twin
 //!   of the composition interpreter.
+//! - [`budgeted`]: the register-budgeted lowering for the bounded-slot
+//!   interpreter (roots on demand, leaves as operands, a fixed word budget a
+//!   row), its symbolic validator and its host model.
 //! - [`artifact`]: the build-time serializable bundle ([`ConstraintArtifact`])
 //!   — the flat program PLUS the zerofier metadata capture discards and the
 //!   AIR's shape scalars, which is what "constraints as data" actually needs.
@@ -32,6 +35,7 @@
 //! [`DeviceProgram`]: device::DeviceProgram
 
 pub mod artifact;
+pub mod budgeted;
 pub mod builder;
 pub mod codegen;
 pub mod device;
