@@ -507,8 +507,12 @@ where
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let frontier = (1usize << (depth - dropped)) - 1;
-        let mut subtrees = Vec::with_capacity(blocks.len());
-        for (k, &block) in blocks.iter().enumerate() {
+        // Each queried block's subtree depends on its own leaves alone, so the
+        // blocks are re-hashed in parallel; the subtrees stay in block order
+        // and the first block (in that order) whose root is not the kept node
+        // is the one refused, as a serial walk would.
+        let rehash = |k: usize| -> Result<Tree<F, H>, Error> {
+            let block = blocks[k];
             let hashed: Vec<Commitment> = values[k * span..(k + 1) * span]
                 .iter()
                 .map(Backend::<F, H>::hash_data)
@@ -518,8 +522,14 @@ where
             if top.nodes.get(frontier + block) != Some(&subtree.root) {
                 return Err(Error::RecomputedCodewordMismatch { block });
             }
-            subtrees.push(subtree);
-        }
+            Ok(subtree)
+        };
+        #[cfg(feature = "parallel")]
+        let rehashed: Vec<Result<Tree<F, H>, Error>> =
+            (0..blocks.len()).into_par_iter().map(rehash).collect();
+        #[cfg(not(feature = "parallel"))]
+        let rehashed: Vec<Result<Tree<F, H>, Error>> = (0..blocks.len()).map(rehash).collect();
+        let subtrees = rehashed.into_iter().collect::<Result<Vec<_>, _>>()?;
         TOP_REHASH_NANOS.fetch_add(
             rehashing.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
