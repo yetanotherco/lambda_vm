@@ -65,12 +65,17 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 
 /// The partition's cost model, versioned: per instance the legs' closed form
 /// (`table_permutations_for` under the production wrap hash) plus
-/// [`FORK_PERMS`], leaves filled under [`LEAF_PERMS_CAP`]. The partition — and so
-/// every leaf's program and the top id — is a function of it, so prover and
-/// verifier builds must agree on it: bump this with any change to the closed
-/// form, the fork constant or the cap, as with a format change.
+/// [`FORK_PERMS`], leaves filled under [`LEAF_PERMS_CAP`] by
+/// [`partition_by_rule`]. The partition — and so every leaf's program and the
+/// top id — is a function of it, so prover and verifier builds must agree on
+/// it: bump this with any change to the closed form, the fork constant, the cap
+/// or the rule, as with a format change.
 /// `the_partition_cost_model_is_pinned_to_its_version` pins its output.
-pub const PARTITION_COST_MODEL: u32 = 1;
+///
+/// - v1: every ECDAS, ECSM and KECCAK instance seeded on leaf 1, 2 and 3.
+/// - v2: only `ECDAS[0]`, `ECSM[0]` and `KECCAK[0]` seeded there; their later
+///   chunks fill by load, so no count of them overfills one leaf.
+pub const PARTITION_COST_MODEL: u32 = 2;
 
 /// The leaf that subtracts the COMMIT-bus target.
 const CARRIER: usize = 0;
@@ -607,9 +612,9 @@ pub fn block_fan_in() -> usize {
 /// built: the accelerator shape (`BlockChunked`, the block verifier's), the
 /// private-input-page bound, the page configs (ELF pages plus the runtime
 /// ranges: aligned, non-empty, disjoint from the ELF's), the instance count
-/// against the trace lengths, the chunked tables' heights (KECCAK_RND and
-/// ECDAS under their caps) and each trace length (a power of two inside the
-/// field's two-adicity). Returns the page configs.
+/// against the trace lengths, the chunked tables' heights (KECCAK, KECCAK_RND,
+/// ECSM and ECDAS under their caps) and each trace length (a power of two
+/// inside the field's two-adicity). Returns the page configs.
 pub fn check_shape(
     elf: &executor::elf::Elf,
     opts: &crate::ProofOptions,

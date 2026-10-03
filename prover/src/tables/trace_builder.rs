@@ -4107,7 +4107,9 @@ fn chunk_and_generate_optional<T: Sync>(
 
 /// Generate a single trace table for `ops`, or none at all when `ops` is empty.
 ///
-/// The accelerator chips are not chunked: one call means one table. What they do
+/// The accelerator chips are not chunked outside the no-epoch block (whose
+/// `MaxRowsConfig` chunks KECCAK, KECCAK_RND, ECSM and ECDAS): all their ops
+/// make one table. What they do
 /// share with the chunked chips is that an empty op list should cost nothing, so
 /// this returns an empty `Vec` and the table drops out of the proof. Soundness
 /// rests on the same LogUp argument as [`chunk_and_generate_optional`].
@@ -5429,13 +5431,26 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_keccaks = || {
-        generate_optional(
-            &keccak_ops,
-            keccak::generate_keccak_trace,
-            to(FinishedKind::Keccak),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.keccak == super::KECCAK_UNCHUNKED {
+            generate_optional(
+                &keccak_ops,
+                keccak::generate_keccak_trace,
+                to(FinishedKind::Keccak),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // One row per call: a chunk holds whole calls (see
+            // `MaxRowsConfig::keccak`).
+            chunk_and_generate_optional(
+                &keccak_ops,
+                max_rows.keccak.max(1),
+                keccak::generate_keccak_trace,
+                to(FinishedKind::Keccak),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let gen_keccak_rnds = || {
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
@@ -5511,13 +5526,26 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
-        generate_optional(
-            &ecsm_ops,
-            ecsm::generate_ecsm_trace,
-            to(FinishedKind::Ecsm),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.ecsm == super::ECSM_UNCHUNKED {
+            generate_optional(
+                &ecsm_ops,
+                ecsm::generate_ecsm_trace,
+                to(FinishedKind::Ecsm),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // One row per call: a chunk holds whole calls (see
+            // `MaxRowsConfig::ecsm`).
+            chunk_and_generate_optional(
+                &ecsm_ops,
+                max_rows.ecsm.max(1),
+                ecsm::generate_ecsm_trace,
+                to(FinishedKind::Ecsm),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let gen_ecdases = || {
         if max_rows.ecdas == super::ECDAS_UNCHUNKED {
