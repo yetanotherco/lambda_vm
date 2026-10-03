@@ -624,6 +624,52 @@ mod tests {
         disarm(&g);
     }
 
+    /// ★ THE RE-ENTRY BIG 569 HIT, FORCED. A holder on a rayon worker that
+    /// waits on rayon while it holds the card — a nested `join` whose other
+    /// half was stolen, a parallel iterator, another pool's `install` — runs
+    /// queued jobs of its own pool on its own thread meanwhile. When one of
+    /// them takes the card, that is a second hold on one thread. The W3 tree
+    /// builds its leaves' artifacts as rayon jobs that each hold the card
+    /// around a build that uses rayon, so which run trips it is down to the
+    /// scheduler (568 clean, 569's arm N panicked). Here `yield_now` is the
+    /// wait and the sibling is the only queued job, so it trips every time.
+    #[test]
+    fn armed_a_holder_on_a_rayon_worker_runs_a_sibling_that_holds_again() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool");
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| {
+                rayon::join(
+                    || {
+                        let _card = hold_labeled("build_artifacts");
+                        rayon::yield_now()
+                    },
+                    || {
+                        let _card = hold_labeled("build_artifacts");
+                    },
+                )
+            })
+        }));
+        let payload = ran.expect_err("the sibling's hold must re-enter on the holder's thread");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("the card permit is not reentrant"),
+            "another panic: {message}"
+        );
+        // The first holder released the card on its way out: it is free again.
+        drop(hold());
+        disarm(&g);
+    }
+
     /// ★ A DEFERRED `multi_prove` WAITS FOR ITS LATCH, AND NOTHING ELSE DOES.
     ///
     /// The worker's artifact hold goes straight to the card; its prove hold
