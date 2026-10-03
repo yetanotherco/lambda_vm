@@ -51,6 +51,11 @@ where
     /// instead of paying the H2D inside its chain.
     #[cfg(feature = "cuda")]
     pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+    /// The main trace packed at the bytes its columns need
+    /// ([`Self::pack_main_narrow`]), column by column: `main_table` then holds
+    /// no data, only its width and height. Only the WHIR block prover packs a
+    /// trace, and it takes the packed columns as they are.
+    pub(crate) narrow_main: Option<multilinear::narrow::NarrowColumns>,
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -188,6 +193,7 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
@@ -218,6 +224,7 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
@@ -241,11 +248,54 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
         }
     }
 
     pub fn num_rows(&self) -> usize {
         self.main_table.height
+    }
+
+    /// Packs the main trace at the bytes its columns need
+    /// ([`multilinear::narrow::NarrowColumns::pack_row_major`]) and frees the
+    /// 64-bit copy; the raw words come back bit for bit. Only a Goldilocks
+    /// trace held whole in memory packs: `false` leaves the trace as it was.
+    pub fn pack_main_narrow(&mut self) -> bool
+    where
+        F: 'static,
+    {
+        if self.narrow_main.is_some() {
+            return true;
+        }
+        let table = &self.main_table;
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || table.width == 0
+            || table.data.len() != table.width * table.height
+        {
+            return false;
+        }
+        // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+        let words = unsafe {
+            core::slice::from_raw_parts(table.data.as_ptr() as *const u64, table.data.len())
+        };
+        let Some(packed) = multilinear::narrow::NarrowColumns::pack_row_major(words, table.width)
+        else {
+            return false;
+        };
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(packed);
+        true
+    }
+
+    /// The packed main trace, when [`Self::pack_main_narrow`] packed it.
+    pub fn narrow_main(&self) -> Option<&multilinear::narrow::NarrowColumns> {
+        self.narrow_main.as_ref()
+    }
+
+    /// Takes the packed main trace out, leaving the table's shape.
+    pub fn take_narrow_main(&mut self) -> Option<multilinear::narrow::NarrowColumns> {
+        self.narrow_main.take()
     }
 
     /// Store the resident (pre-LDE) LogUp aux columns, threaded to the aux commit.

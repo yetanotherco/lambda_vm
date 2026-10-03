@@ -278,6 +278,13 @@ pub struct BlockOptions {
     /// the block's high-water). The tables, their order and the groups are the
     /// same. Production: [`BLOCK_REST_LAYOUT_BYTES`].
     pub rest_layout_bytes: Option<usize>,
+    /// With windows: the finish packs each table it builds at the bytes its
+    /// columns need as the table is generated
+    /// ([`WindowedTraceBuilder::pack_finished_tables`]), and the table is laid
+    /// out narrow from that, committed from the card and never held wide on
+    /// the host. KECCAK, ECSM, ECDAS and an unchunked KECCAK_RND stay wide.
+    /// The proof's bytes are the same. Production: on.
+    pub pack_finished: bool,
 }
 
 impl BlockOptions {
@@ -303,6 +310,7 @@ impl BlockOptions {
             memlog: memlog::from_env(),
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
+            pack_finished: true,
         }
     }
 }
@@ -312,10 +320,10 @@ impl BlockOptions {
 /// tables keeps the cores busy while bounding the copies in flight.
 pub const BLOCK_REST_LAYOUT_BYTES: usize = 2 << 30;
 
-/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` and `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1`:
-/// the real-block tests' choice of [`BlockOptions::rest_layout_bytes`] and
-/// [`BlockOptions::finish_keccak_rnd_chunks`]; unset leaves the production
-/// ones.
+/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>`, `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and
+/// `BLOCK_WHIR_PACK_FINISHED=0|1`: the real-block tests' choice of
+/// [`BlockOptions::rest_layout_bytes`], [`BlockOptions::finish_keccak_rnd_chunks`]
+/// and [`BlockOptions::pack_finished`]; unset leaves the production ones.
 #[cfg(test)]
 pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
     match std::env::var("BLOCK_WHIR_REST_LAYOUT")
@@ -336,6 +344,15 @@ pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
         Ok("0") => options.finish_keccak_rnd_chunks = false,
         Ok("1") => options.finish_keccak_rnd_chunks = true,
         Ok(other) => panic!("BLOCK_WHIR_KR_FINISH_CHUNKS={other}: 0 or 1"),
+        Err(_) => {}
+    }
+    match std::env::var("BLOCK_WHIR_PACK_FINISHED")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_finished = false,
+        Ok("1") => options.pack_finished = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_FINISHED={other}: 0 or 1"),
         Err(_) => {}
     }
 }
@@ -498,6 +515,9 @@ pub struct LayoutStamps {
     /// The most streamed chunks laid out (or in the making) and not yet
     /// packed at once, under [`BlockOptions::layout_ahead`].
     pub ahead_most: usize,
+    /// The rest's tables laid out narrow from the finish's packed columns
+    /// ([`BlockOptions::pack_finished`]): how many, and their packed bytes.
+    pub packed_rest: (usize, usize),
 }
 
 impl BlockStamps {
@@ -581,6 +601,11 @@ impl BlockStamps {
             out.push_str(&format!(
                 "BLOCK REST LAYOUT: slowest tables (s) {}\n",
                 slowest.join(" · ")
+            ));
+            out.push_str(&format!(
+                "BLOCK REST PACKED: {} tables laid out narrow from the finish, {:.2} GiB\n",
+                l.packed_rest.0,
+                l.packed_rest.1 as f64 / (1u64 << 30) as f64,
             ));
         }
         out.push_str(&format!(
@@ -915,6 +940,46 @@ fn table_of<'a>(
         }
     }
     CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
+}
+
+/// [`table_of`] for a trace the finish packed as it built it
+/// ([`BlockOptions::pack_finished`]): its packed columns become the table's,
+/// held narrow from the start, with no column of field elements made; the
+/// preprocessed columns are checked word for word against the program's.
+pub(crate) fn table_of_narrow<'a>(
+    air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    trace: &mut TraceTable<F, E>,
+    (width, num_vars): (usize, usize),
+) -> Result<CommittedTable<'a, F, E>, Error> {
+    let layout = layout_of(air, width, num_vars)
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+    let packed = trace
+        .take_narrow_main()
+        .ok_or_else(|| Error::Prover(format!("{}: no packed columns", air.name())))?;
+    trace.main_table = Table::new(Vec::new(), 0);
+    if packed.cols() != width || packed.rows() != 1usize << num_vars {
+        return Err(Error::Prover(format!(
+            "{}: packed {} × {}, the table is {width} × 2^{num_vars}",
+            air.name(),
+            packed.cols(),
+            packed.rows()
+        )));
+    }
+    for (col, expected) in air.precomputed_columns().iter().enumerate() {
+        let same = col < packed.cols()
+            && packed
+                .column(col)
+                .iter()
+                .eq(expected.iter().map(|value| value.value()));
+        if !same {
+            return Err(Error::Prover(format!(
+                "{}: preprocessed column {col} is not what the program implies",
+                air.name(),
+            )));
+        }
+    }
+    CommittedTable::from_narrow(layout, packed)
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
 }
 
@@ -2216,6 +2281,8 @@ struct RestLaid<'a> {
     /// The five slowest tables to lay out and the first in AIR order, seconds.
     slowest: Vec<(String, f64)>,
     busy: f64,
+    /// [`LayoutStamps::packed_rest`].
+    packed_rest: (usize, usize),
 }
 
 /// `prepared_now`: derive the prepared columns here, before the tables are
@@ -2284,8 +2351,10 @@ fn lay_out_rest<'a>(
         .enumerate()
         .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
         .collect();
-    // Each table's seconds, for the readout.
+    // Each table's seconds, for the readout, and the tables laid out narrow.
     let timed = std::sync::Mutex::new(Vec::with_capacity(built.len()));
+    let narrow_tables = std::sync::atomic::AtomicUsize::new(0);
+    let narrow_bytes = std::sync::atomic::AtomicUsize::new(0);
     let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
         let t = Instant::now();
         let shape = (
@@ -2293,7 +2362,15 @@ fn lay_out_rest<'a>(
             trace.main_table.height.trailing_zeros() as usize,
         );
         let rows = ledger.map_or(0, |_| memlog::rows_bytes(trace));
-        let laid = table_of(air, trace, shape, true).map(|table| (i, shape, table));
+        let laid = if let Some(packed) = trace.narrow_main() {
+            use std::sync::atomic::Ordering::Relaxed;
+            narrow_tables.fetch_add(1, Relaxed);
+            narrow_bytes.fetch_add(packed.data().len(), Relaxed);
+            table_of_narrow(air, trace, shape)
+        } else {
+            table_of(air, trace, shape, true)
+        }
+        .map(|table| (i, shape, table));
         if let (Some(ledger), Ok((_, _, table))) = (ledger, &laid) {
             use std::sync::atomic::Ordering::Relaxed;
             ledger.rest.fetch_sub(rows, Relaxed);
@@ -2394,6 +2471,7 @@ fn lay_out_rest<'a>(
         marks,
         slowest,
         busy: t.elapsed().as_secs_f64(),
+        packed_rest: (narrow_tables.into_inner(), narrow_bytes.into_inner()),
     })
 }
 
@@ -2521,6 +2599,9 @@ fn prove_streamed(
                 } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
                     builder = builder
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
+                }
+                if options.pack_finished {
+                    builder = builder.pack_finished_tables();
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
@@ -2719,6 +2800,7 @@ fn prove_streamed(
                     marks: rest_marks,
                     slowest,
                     busy: rest_busy,
+                    packed_rest,
                 } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
@@ -2812,6 +2894,7 @@ fn prove_streamed(
                         chunks,
                         slowest,
                         ahead_most,
+                        packed_rest,
                     },
                 })
             });

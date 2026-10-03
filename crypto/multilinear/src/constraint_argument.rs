@@ -286,6 +286,57 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         })
     }
 
+    /// [`Self::new`] over columns held narrow from the start: the packed
+    /// columns are the committed ones, and no field element is made for them
+    /// on the host unless a host reader asks. Refused unless `F` is Goldilocks
+    /// (whose elements are their raw words), the rows are a power of two, and
+    /// the public tables are the rows' height and the ones `kinds` asks for.
+    pub fn new_narrow(
+        packed: NarrowColumns,
+        kinds: Vec<FactorKind>,
+        public: Vec<Mle<E>>,
+    ) -> Result<Self, Error> {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return Err(Error::EmptyPolynomial);
+        }
+        if packed.cols() == 0 {
+            return Err(Error::EmptyPolynomial);
+        }
+        if !packed.rows().is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(packed.rows()));
+        }
+        let num_vars = packed.rows().trailing_zeros() as usize;
+        for got in public.iter().map(Mle::num_vars) {
+            if got != num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: num_vars,
+                    got,
+                });
+            }
+        }
+        let wanted = kinds.iter().filter(|k| k.source().is_none()).count();
+        if public.len() != wanted {
+            return Err(Error::QueryCountMismatch {
+                expected: wanted,
+                got: public.len(),
+            });
+        }
+        Ok(Self {
+            num_columns: packed.cols(),
+            num_vars,
+            columns: Held::Narrow {
+                packed,
+                widened: std::sync::OnceLock::new(),
+            },
+            public,
+            device: std::sync::Mutex::new(None),
+            resident: None,
+            kinds,
+        })
+    }
+
     /// The committed columns on the host: widened here the first time a
     /// narrow table is asked ([`crate::narrow::host_widens`] counts it), and
     /// that copy kept until [`Self::drop_widened`].

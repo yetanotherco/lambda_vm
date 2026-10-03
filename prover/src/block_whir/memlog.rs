@@ -418,9 +418,12 @@ pub(crate) fn group_bytes(
     group.iter().map(table_bytes).sum()
 }
 
-/// A trace table's main columns, eight bytes a cell.
+/// A trace table's main columns as held: eight bytes a cell, or packed.
 pub(crate) fn rows_bytes(trace: &stark::trace::TraceTable<super::F, super::E>) -> usize {
-    trace.main_table.width * trace.main_table.height * std::mem::size_of::<u64>()
+    trace.narrow_main().map_or_else(
+        || trace.main_table.width * trace.main_table.height * std::mem::size_of::<u64>(),
+        |packed| packed.data().len(),
+    )
 }
 
 /// The ledger's tick every 0.1 s, and its line every half second, on a

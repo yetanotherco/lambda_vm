@@ -152,6 +152,8 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
     /// builds, 0 for one table.
     finish_keccak_rnd_rows: usize,
+    /// [`Self::pack_finished_tables`].
+    pack_finished: bool,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -209,6 +211,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             lean,
             decode,
             finish_keccak_rnd_rows: 0,
+            pack_finished: false,
         })
     }
 
@@ -277,6 +280,16 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         self.finish_keccak_rnd_rows = rows;
         Ok(self)
+    }
+
+    /// `finish` packs each table it builds at the bytes its columns need as soon
+    /// as the table is generated ([`StreamSkip::pack`]), so it never holds its
+    /// tables at eight bytes a cell; the words are the same. KECCAK, ECSM and
+    /// ECDAS stay wide (a block cuts them afterwards). The streamed chunks are
+    /// the caller's.
+    pub fn pack_finished_tables(mut self) -> Self {
+        self.pack_finished = true;
+        self
     }
 
     /// Derive each window's phase-3 LT ops (from its MEMW and MEMW_A ops) as the
@@ -406,6 +419,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept,
             stream_memw_lt,
             finish_keccak_rnd_rows,
+            pack_finished,
             ..
         } = self;
         // Chunks at the finish alone: none were handed out.
@@ -417,6 +431,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             }
         } else {
             emitted
+        };
+        let emitted = StreamSkip {
+            pack: pack_finished,
+            ..emitted
         };
         let (ops, decode_trace, skip, pre) = match kept {
             None => {

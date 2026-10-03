@@ -242,7 +242,7 @@ impl BlockMem {
     }
 
     /// Counts `tables` as held from here on, packed or wide.
-    fn hold<F, E>(&self, tables: &[CommittedTable<'_, F, E>])
+    fn hold<'t, 'a: 't, F, E>(&self, tables: impl IntoIterator<Item = &'t CommittedTable<'a, F, E>>)
     where
         F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
         E: IsField + Send + Sync + 'static,
@@ -258,8 +258,10 @@ impl BlockMem {
     }
 
     /// Stops counting `tables` as held ([`Self::hold`]'s inverse).
-    fn release<F, E>(&self, tables: &[CommittedTable<'_, F, E>])
-    where
+    fn release<'t, 'a: 't, F, E>(
+        &self,
+        tables: impl IntoIterator<Item = &'t CommittedTable<'a, F, E>>,
+    ) where
         F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
         E: IsField + Send + Sync + 'static,
         FieldElement<F>: AsBytes + Sync + Send,
@@ -272,6 +274,37 @@ impl BlockMem {
             };
         }
     }
+}
+
+/// A table's committed columns as held on the host: packed, or eight bytes a
+/// cell.
+fn held_bytes<F, E>(table: &CommittedTable<'_, F, E>) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    table
+        .narrow()
+        .map_or_else(|| wide_bytes(table), |packed| packed.data().len())
+}
+
+/// A group's columns put on the card for its commit: a group of wide tables
+/// as their field elements, one with a table held narrow (built packed) as
+/// [`upload_group`] puts it — packed, and widened on the card.
+fn upload_for_commit<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if group.iter().any(|t| t.narrow().is_some()) {
+        return upload_group(group);
+    }
+    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+    multilinear::gpu::upload_columns(&columns).map(Arc::new)
 }
 
 /// A table's committed columns at eight bytes a cell.
@@ -603,9 +636,7 @@ where
                             // with the commit's room given back.
                             stamp.ahead_refused = multilinear::gpu::reserve_budget() > 0;
                             let t = Instant::now();
-                            let columns: Vec<&Mle<F>> =
-                                next.group.iter().flat_map(|t| t.columns()).collect();
-                            let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                            let store = upload_for_commit(&next.group);
                             let secs = t.elapsed().as_secs_f64();
                             stamp.upload_a += secs;
                             stamp.upload_paid += secs;
@@ -628,15 +659,14 @@ where
                         ..Default::default()
                     };
                     let wide = mem.as_ref().map_or(0, |mem| {
-                        let wide = group.iter().map(wide_bytes).sum();
-                        mem.committing.fetch_add(wide, Relaxed);
-                        wide
+                        let held = group.iter().map(held_bytes).sum();
+                        mem.committing.fetch_add(held, Relaxed);
+                        held
                     });
                     let t = Instant::now();
-                    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
                     // Held in an `Arc` like phase B's: once the tree tops are
                     // home it goes to the group's packer, or is dropped.
-                    let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                    let store = upload_for_commit(&group);
                     stamp.upload_a = t.elapsed().as_secs_f64();
                     stamp.upload_paid = stamp.upload_a;
                     (group, stamp, store, wide)
@@ -662,7 +692,10 @@ where
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             multilinear::gpu::reset_reserved_window();
-            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+            // Handles, not field elements: a table held narrow is read on the
+            // host only by a host fallback.
+            let handles = group_columns(&group);
+            let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
             let resident = store.as_ref().map(|store| (&**store, 0));
             let committed = if upload_ahead {
                 let (committed, next) = std::thread::scope(|scope| {
@@ -672,7 +705,7 @@ where
                         let signal = move || {
                             let _ = room_tx.send(());
                         };
-                        let committed = commit_and_retire::<F, H>(
+                        let committed = commit_and_retire::<F, H, _>(
                             layout,
                             columns,
                             resident,
@@ -688,15 +721,13 @@ where
                     let arrived = Instant::now();
                     let next = next.map(|group| {
                         let wide = mem.as_ref().map_or(0, |mem| {
-                            let wide = group.iter().map(wide_bytes).sum();
-                            mem.ahead.fetch_add(wide, Relaxed);
-                            wide
+                            let held = group.iter().map(held_bytes).sum();
+                            mem.ahead.fetch_add(held, Relaxed);
+                            held
                         });
                         let _ = room_rx.recv();
                         let t = Instant::now();
-                        let columns: Vec<&Mle<F>> =
-                            group.iter().flat_map(|t| t.columns()).collect();
-                        let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                        let store = upload_for_commit(&group);
                         (
                             group,
                             store,
@@ -727,10 +758,18 @@ where
                 ahead = next;
                 committed
             } else {
-                commit_and_retire::<F, H>(layout, &columns, resident, config, drop_levels, &|| {})
+                commit_and_retire::<F, H, _>(
+                    layout,
+                    &columns,
+                    resident,
+                    config,
+                    drop_levels,
+                    &|| {},
+                )
             };
             let (group_roots, retired, commit, retire) = committed?;
             drop(columns);
+            drop(handles);
             roots.extend(group_roots);
             stamp.commit = commit;
             stamp.retire = retire;
@@ -740,22 +779,39 @@ where
             if upload_ahead && let Some(packed) = packing.take() {
                 packed.install(&mut tables, &mut stamps, mem.as_deref());
             }
+            // Which tables were committed wide (a packer's, from here on).
+            let was_wide: Vec<bool> = group.iter().map(|t| t.narrow().is_none()).collect();
             packing =
                 narrow_group(&mut group, store, narrow, &mut stamp, mem.clone()).map(|handle| {
                     Packing {
                         first_table: tables.len(),
                         group: stamps.len(),
-                        wide,
+                        wide: group
+                            .iter()
+                            .zip(&was_wide)
+                            .filter(|&(_, &w)| w)
+                            .map(|(t, _)| wide_bytes(t))
+                            .sum(),
+                        was_wide: was_wide.clone(),
                         handle,
                     }
                 });
             if let Some(mem) = &mem {
                 mem.committing.fetch_sub(wide, Relaxed);
                 mem.tree_tops.fetch_add(stamp.tree_bytes, Relaxed);
-                if packing.is_some() {
-                    mem.packing_wide.fetch_add(wide, Relaxed);
-                } else {
-                    mem.hold(&group);
+                match &packing {
+                    Some(packed) => {
+                        mem.packing_wide.fetch_add(packed.wide, Relaxed);
+                        // The tables committed narrow are held as they are.
+                        mem.hold(
+                            group
+                                .iter()
+                                .zip(&was_wide)
+                                .filter(|&(_, &w)| !w)
+                                .map(|(t, _)| t),
+                        );
+                    }
+                    None => mem.hold(group.iter()),
                 }
                 mem.mark(&format!("group {} committed", stamps.len()));
             }
@@ -830,9 +886,9 @@ where
 /// A group committed and retired: its roots, its retired stack, and the
 /// commit's and the retire's seconds. `on_room` as
 /// [`StackedCommitment::commit_signalled`].
-fn commit_and_retire<F, H>(
+fn commit_and_retire<F, H, C>(
     layout: StackedLayout,
-    columns: &[&Mle<F>],
+    columns: &[&C],
     resident: Option<(&multilinear::gpu::ResidentColumns, usize)>,
     config: &ChainConfig,
     drop_levels: usize,
@@ -841,6 +897,7 @@ fn commit_and_retire<F, H>(
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     H: WhirHash,
+    C: multilinear::narrow::HostColumn<F>,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let t = Instant::now();
@@ -867,9 +924,10 @@ type Packed = (Vec<Option<multilinear::narrow::NarrowColumns>>, f64);
 struct Packing {
     first_table: usize,
     group: usize,
-    /// The group's committed columns at eight bytes a cell (counted only for
-    /// a memory log).
+    /// The group's columns committed wide, at eight bytes a cell, and which
+    /// tables those are (counted only for a memory log).
     wide: usize,
+    was_wide: Vec<bool>,
     handle: std::thread::JoinHandle<Packed>,
 }
 
@@ -913,7 +971,13 @@ impl Packing {
         if let Some(mem) = mem {
             mem.packed_ready.fetch_sub(installed, Relaxed);
             mem.packing_wide.fetch_sub(self.wide, Relaxed);
-            mem.hold(&tables[self.first_table..]);
+            mem.hold(
+                tables[self.first_table..]
+                    .iter()
+                    .zip(&self.was_wide)
+                    .filter(|&(_, &w)| w)
+                    .map(|(t, _)| t),
+            );
             mem.mark(&format!("group {} installed", self.group));
         }
     }
@@ -947,7 +1011,10 @@ where
                 .iter()
                 .map(|table| {
                     let width = table.num_committed_columns();
-                    let run = ((width << table.num_vars()) >= min_cells).then_some((first, width));
+                    // A table built packed is held narrow already.
+                    let run = (table.narrow().is_none()
+                        && (width << table.num_vars()) >= min_cells)
+                        .then_some((first, width));
                     first += width;
                     run
                 })
@@ -1316,7 +1383,7 @@ where
     }
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
-        mem.release(&tables);
+        mem.release(tables.iter());
     }
     Ok((
         MultiProof {

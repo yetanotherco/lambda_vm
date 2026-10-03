@@ -3901,6 +3901,13 @@ pub struct StreamSkip {
     /// only from the ops past these. Zero everywhere else.
     pub memw_lt_done: usize,
     pub memw_aligned_lt_done: usize,
+    /// Pack each table the build generates at the bytes its columns need as
+    /// soon as it is generated (`TraceTable::pack_main_narrow`), so the build
+    /// never holds its tables at eight bytes a cell; the words are the same.
+    /// KECCAK, ECSM, ECDAS and a whole KECCAK_RND stay wide: the block cuts
+    /// them after the build. `false` everywhere but the WHIR block's windowed
+    /// finish.
+    pub pack: bool,
     /// The streamed tables' op lists hold only the ops past their streamed
     /// chunks (a windowed build that drops each chunk's ops as it hands the
     /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and
@@ -3963,6 +3970,7 @@ pub(crate) fn keccak_rnd_chunks(
     ops: &[KeccakRoundOperation],
     rows: usize,
     streamed: usize,
+    pack: bool,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if ops.is_empty() {
         return Ok(Vec::new());
@@ -3974,7 +3982,10 @@ pub(crate) fn keccak_rnd_chunks(
                 "{streamed} KECCAK_RND chunks were streamed but the table is one of {total} rows"
             )));
         }
-        return Ok(vec![keccak_rnd::generate_keccak_rnd_trace(ops)]);
+        return Ok(vec![packed_if(
+            pack,
+            keccak_rnd::generate_keccak_rnd_trace(ops),
+        )]);
     }
     let chunks = total / rows;
     if streamed > chunks {
@@ -3988,7 +3999,10 @@ pub(crate) fn keccak_rnd_chunks(
                 return streamed_placeholder();
             }
             let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
-            keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows)
+            packed_if(
+                pack,
+                keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows),
+            )
         })
         .collect())
 }
@@ -4004,6 +4018,26 @@ pub(crate) fn keccak_rnd_op_range(chunk: usize, rows: usize, len: usize) -> (usi
 /// The slot a streamed chunk leaves in the final build: no rows, no columns.
 pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     TraceTable::from_columns_main(Vec::new(), 1)
+}
+
+/// `generate`, each table it makes packed at the bytes its columns need as it
+/// is made when `pack` ([`StreamSkip::pack`]); `generate` itself otherwise.
+fn packed_by<T>(
+    pack: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+) -> impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync {
+    move |ops| packed_if(pack, generate(ops))
+}
+
+/// `table`, packed ([`TraceTable::pack_main_narrow`]) when `pack`.
+fn packed_if(
+    pack: bool,
+    mut table: TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    if pack {
+        table.pack_main_narrow();
+    }
+    table
 }
 
 /// [`chunk_and_generate`] / [`chunk_and_generate_optional`] (`optional`) with
@@ -4902,6 +4936,7 @@ fn build_traces<I: ImageSource + Sync>(
     // they all run in one rayon scope. Disk-spill stays sequential: its
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
+    let pack = skip.pack;
     let gen_cpus = || {
         chunk_and_generate_skipping(
             cpu_ops_ref,
@@ -4909,7 +4944,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.cpu,
             skip.tails,
             false,
-            cpu::generate_cpu_trace,
+            packed_by(pack, cpu::generate_cpu_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4921,7 +4956,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw,
             skip.tails,
             true,
-            memw::generate_memw_trace,
+            packed_by(pack, memw::generate_memw_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4933,7 +4968,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw_aligned,
             skip.tails,
             true,
-            memw_aligned::generate_memw_aligned_trace,
+            packed_by(pack, memw_aligned::generate_memw_aligned_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4947,7 +4982,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw_register,
             skip.tails,
             false,
-            memw_register::generate_memw_register_trace_from_rows,
+            packed_by(pack, memw_register::generate_memw_register_trace_from_rows),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4959,7 +4994,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.load,
             skip.tails,
             true,
-            load::generate_load_trace,
+            packed_by(pack, load::generate_load_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4971,7 +5006,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.lt,
             skip.tails,
             true,
-            lt::generate_lt_trace,
+            packed_by(pack, lt::generate_lt_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4983,7 +5018,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.shift,
             skip.tails,
             true,
-            shift::generate_shift_trace,
+            packed_by(pack, shift::generate_shift_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -4992,7 +5027,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
-            mul::generate_mul_trace,
+            packed_by(pack, mul::generate_mul_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5001,7 +5036,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
-            dvrm::generate_dvrm_trace,
+            packed_by(pack, dvrm::generate_dvrm_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5010,7 +5045,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &branch_ops,
             max_rows.branch,
-            branch::generate_branch_trace,
+            packed_by(pack, branch::generate_branch_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5021,7 +5056,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
-            eq::generate_eq_trace,
+            packed_by(pack, eq::generate_eq_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5030,7 +5065,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
-            bytewise::generate_bytewise_trace,
+            packed_by(pack, bytewise::generate_bytewise_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5042,7 +5077,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.store,
             skip.tails,
             true,
-            store::generate_store_trace,
+            packed_by(pack, store::generate_store_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5051,7 +5086,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
-            cpu32::generate_cpu32_trace,
+            packed_by(pack, cpu32::generate_cpu32_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5060,7 +5095,7 @@ fn build_traces<I: ImageSource + Sync>(
         let mut bitwise = bitwise::generate_bitwise_trace();
         // Fill the MU columns (11..=20) from the accumulated histogram.
         bitwise_histogram.fill_multiplicities(&mut bitwise);
-        bitwise
+        packed_if(pack, bitwise)
     };
     // Each CPU operation looks up the DECODE table once; padding rows look up
     // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
@@ -5070,12 +5105,12 @@ fn build_traces<I: ImageSource + Sync>(
         let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
-        decode
+        packed_if(pack, decode)
     };
     let gen_commits = || {
         generate_optional(
             &commit_ops,
-            commit::generate_commit_trace,
+            packed_by(pack, commit::generate_commit_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5098,6 +5133,7 @@ fn build_traces<I: ImageSource + Sync>(
             })
             .collect();
         if skip.keccak_rnd_rows == 0 {
+            // Whole, it may be cut after the build: it stays wide.
             return generate_optional(
                 &keccak_rnd_ops,
                 keccak_rnd::generate_keccak_rnd_trace,
@@ -5105,26 +5141,49 @@ fn build_traces<I: ImageSource + Sync>(
                 storage_mode,
             );
         }
-        keccak_rnd_chunks(&keccak_rnd_ops, skip.keccak_rnd_rows, skip.keccak_rnd)
+        keccak_rnd_chunks(&keccak_rnd_ops, skip.keccak_rnd_rows, skip.keccak_rnd, pack)
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
-    let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);
+    let gen_blake3 = || {
+        packed_if(
+            pack,
+            blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops),
+        )
+    };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
-        keccak_rc_trace
+        packed_if(pack, keccak_rc_trace)
     };
     let gen_pages = || match initial_image {
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
         // every touched cell's Memory init/fini, and every untouched PAGE row
         // self-cancels (init==fini, ts=0), so PAGE contributes nothing here.
         Some(image) if !l2g_memory_bookend => {
-            generate_page_tables(image, memory_state, private_input, l2g_memory_bookend)
+            let (pages, configs) =
+                generate_page_tables(image, memory_state, private_input, l2g_memory_bookend);
+            (
+                pages
+                    .into_iter()
+                    .map(|page| packed_if(pack, page))
+                    .collect(),
+                configs,
+            )
         }
         _ => (Vec::new(), Vec::new()),
     };
-    let gen_register = || register::generate_register_trace(&register_final_state, register_init);
-    let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+    let gen_register = || {
+        packed_if(
+            pack,
+            register::generate_register_trace(&register_final_state, register_init),
+        )
+    };
+    let gen_halt = || {
+        packed_if(
+            pack,
+            halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+        )
+    };
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
@@ -5147,7 +5206,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_hints = || {
         generate_optional(
             &hint_ops,
-            hint::generate_hint_trace,
+            packed_by(pack, hint::generate_hint_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5613,14 +5672,17 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
-    /// The bytes the main tables take, eight a cell (the page configs and
-    /// the touched cells left out). A measurement (`LAMBDA_VM_BLOCK_MEMLOG`):
+    /// The bytes the main tables take: eight a cell, or their packed bytes
+    /// (the page configs and the touched cells left out). A measurement (`LAMBDA_VM_BLOCK_MEMLOG`):
     /// every table field is named, so a new one does not compile until it is
     /// counted here.
     pub fn main_bytes(&self) -> usize {
         type T = TraceTable<GoldilocksField, GoldilocksExtension>;
         fn one(t: &T) -> usize {
-            t.main_table.width * t.main_table.height * std::mem::size_of::<u64>()
+            t.narrow_main().map_or_else(
+                || t.main_table.width * t.main_table.height * std::mem::size_of::<u64>(),
+                |packed| packed.data().len(),
+            )
         }
         fn all(ts: &[T]) -> usize {
             ts.iter().map(one).sum()

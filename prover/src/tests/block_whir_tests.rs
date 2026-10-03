@@ -62,6 +62,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // The rest laid out in waves of 1 MiB: several at a test's size.
         finish_keccak_rnd_chunks: true,
         rest_layout_bytes: Some(1 << 20),
+        pack_finished: true,
     }
 }
 
@@ -365,7 +366,8 @@ fn a_streamed_block_uploading_ahead_proves_and_verifies() {
 }
 
 /// The streamed build held narrow: each group packed as it is committed during
-/// the collect, and the proof verifies.
+/// the collect — every table but the ones the finish built packed, which are
+/// held narrow from the start — and the proof verifies.
 #[test]
 fn a_streamed_block_held_narrow_proves_and_verifies() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -382,8 +384,9 @@ fn a_streamed_block_held_narrow_proves_and_verifies() {
     )
     .expect("prove");
     assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert!(o.pack_finished && stamps.layout.packed_rest.0 > 0);
     assert_eq!(
-        stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>(),
+        stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>() + stamps.layout.packed_rest.0,
         stamps.tables
     );
     assert!(stamps.report().contains("BLOCK NARROW: Host"));
@@ -505,23 +508,27 @@ fn the_rest_is_cut_into_waves_within_the_budget() {
     assert!(block_whir::waves(Vec::<usize>::new(), 4, |&b| b).is_empty());
 }
 
-/// The rest laid out in waves and KECCAK_RND built as its tables at the finish
-/// (BlockOptions::rest_layout_bytes, finish_keccak_rnd_chunks) move no byte:
-/// the same tables, partition and statement either way, inline and on the
-/// worker layout, and the proof bytes equal under the deterministic grind.
+/// The rest laid out in waves, KECCAK_RND built as its tables at the finish
+/// (b1: BlockOptions::rest_layout_bytes, finish_keccak_rnd_chunks) and the
+/// finish's tables packed as they are built, laid out narrow and committed from
+/// the card (b2: BlockOptions::pack_finished) move no byte: the same tables,
+/// partition and statement as with all of them off, inline and on the worker
+/// layout, and the proof bytes equal under the deterministic grind.
 #[test]
-fn the_rest_in_waves_and_keccak_rnd_built_chunked_move_no_byte() {
+fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     for workers in [0usize, 3] {
-        let proved = |b1: bool| {
+        // (b1, b2)
+        let proved = |b1: bool, b2: bool| {
             // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
             let mut o = streamed(MaxRowsConfig::small(), 5, 3);
             o.layout_workers = workers;
             o.pack_rest_as_laid_out = workers > 0;
             o.finish_keccak_rnd_chunks = b1;
             o.rest_layout_bytes = b1.then_some(1 << 16);
-            let (proof, _) = prove_block_whir_with(
+            o.pack_finished = b2;
+            let (proof, stamps) = prove_block_whir_with(
                 &elf,
                 &[],
                 &ProofOptions::default_test_options(),
@@ -530,36 +537,112 @@ fn the_rest_in_waves_and_keccak_rnd_built_chunked_move_no_byte() {
                 &Deviations::default(),
             )
             .expect("prove");
-            assert!(verify(&proof, &elf, &format), "b1 {b1}, {workers} workers");
-            proof
+            assert!(
+                verify(&proof, &elf, &format),
+                "b1 {b1}, b2 {b2}, {workers} workers"
+            );
+            (proof, stamps)
         };
-        let (before, after) = (proved(false), proved(true));
+        let (before, before_stamps) = proved(false, false);
         assert!(
             before.table_counts.keccak_rnd > 1,
             "KECCAK_RND is one table: nothing was split"
         );
-        assert_eq!(
-            before.groups, after.groups,
-            "{workers} workers: the partition"
-        );
-        assert_eq!(before.table_num_vars, after.table_num_vars);
-        assert_eq!(
-            format!("{:?}", before.table_counts),
-            format!("{:?}", after.table_counts)
-        );
-        if crypto::grinding::deterministic() {
-            let bytes = |p: &BlockWhirProof| {
-                rkyv::to_bytes::<rkyv::rancor::Error>(p)
-                    .expect("serialize")
-                    .to_vec()
-            };
+        assert_eq!(before_stamps.layout.packed_rest.0, 0);
+        for (b1, b2) in [(true, false), (false, true), (true, true)] {
+            let (after, stamps) = proved(b1, b2);
+            let what = format!("b1 {b1}, b2 {b2}, {workers} workers");
+            assert_eq!(before.groups, after.groups, "{what}: the partition");
+            assert_eq!(before.table_num_vars, after.table_num_vars, "{what}");
             assert_eq!(
-                bytes(&before),
-                bytes(&after),
-                "{workers} workers: the proof"
+                format!("{:?}", before.table_counts),
+                format!("{:?}", after.table_counts),
+                "{what}"
             );
+            if b2 {
+                assert!(
+                    stamps.layout.packed_rest.0 > 0,
+                    "{what}: no table was laid out narrow"
+                );
+            }
+            if crypto::grinding::deterministic() {
+                let bytes = |p: &BlockWhirProof| {
+                    rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                        .expect("serialize")
+                        .to_vec()
+                };
+                assert_eq!(bytes(&before), bytes(&after), "{what}: the proof");
+            }
         }
     }
+}
+
+/// A table the finish packed is laid out narrow only if its preprocessed
+/// columns are the program's, word for word: one word changed in a packed
+/// table's first preprocessed column and the layout refuses it.
+#[test]
+fn a_packed_table_with_a_wrong_preprocessed_column_is_refused() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &MaxRowsConfig::small(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the traces build");
+    let opts = ProofOptions::default_test_options();
+    let counts = traces.table_counts();
+    let airs = crate::VmAirs::new(
+        &program,
+        &opts,
+        false,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let refs = airs.air_refs();
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let (air, trace) = pairs
+        .into_iter()
+        .zip(refs.iter().copied())
+        .map(|((_, trace, _), air)| (air, trace))
+        .find(|(air, trace)| !air.precomputed_columns().is_empty() && trace.main_table.width != 0)
+        .expect("a table with preprocessed columns");
+    let shape = (
+        trace.main_table.width,
+        trace.main_table.height.trailing_zeros() as usize,
+    );
+    let mut honest = trace.clone();
+    assert!(honest.pack_main_narrow(), "{}: packs", air.name());
+    block_whir::table_of_narrow(air, &mut honest, shape).expect("the honest table lays out");
+    let mut wrong = trace.clone();
+    let word = *wrong.main_table.get(0, 0);
+    wrong
+        .main_table
+        .set(0, 0, word + FieldElement::<crate::test_utils::F>::one());
+    assert!(wrong.pack_main_narrow());
+    let refused = block_whir::table_of_narrow(air, &mut wrong, shape)
+        .err()
+        .expect("a wrong preprocessed column is refused");
+    assert!(
+        format!("{refused:?}").contains("preprocessed column 0"),
+        "{refused:?}"
+    );
 }
 
 /// A narrow table whose width map is wrong widens to other words than were
@@ -2066,16 +2149,18 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
-    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048) and
-    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` (production 1): the rest's layout in
-    // waves, KECCAK_RND built as its tables.
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048),
+    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
+    // (production 1): the rest's layout in waves, KECCAK_RND built as its
+    // tables, the finish's tables packed as they are built.
     crate::block_whir::rest_layout_from_env(&mut options);
     println!(
-        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {}",
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {}",
         options
             .rest_layout_bytes
             .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
         options.finish_keccak_rnd_chunks,
+        options.pack_finished,
     );
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",

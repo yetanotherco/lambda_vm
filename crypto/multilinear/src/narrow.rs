@@ -106,6 +106,60 @@ impl NarrowColumns {
         Self::from_parts(rows, widths, data)
     }
 
+    /// [`Self::pack`] of a row-major trace: the `cols`-wide rows of words
+    /// `row_major`, packed column by column (the stark crate's
+    /// `NarrowMain::pack`, a block of rows at a time so the block stays in
+    /// cache across the columns). On the caller's thread. `None` when `cols`
+    /// is zero or does not divide the words.
+    pub fn pack_row_major(row_major: &[u64], cols: usize) -> Option<Self> {
+        const BLOCK_ROWS: usize = 1 << 10;
+        if cols == 0 || !row_major.len().is_multiple_of(cols) {
+            return None;
+        }
+        let rows = row_major.len() / cols;
+        let mut max = vec![0u64; cols];
+        for row in row_major.chunks_exact(cols) {
+            for (m, &v) in max.iter_mut().zip(row) {
+                *m = (*m).max(v);
+            }
+        }
+        let widths: Vec<u8> = max.into_iter().map(width_of).collect();
+        let total: usize = widths.iter().map(|&w| rows * w as usize).sum();
+        let mut data = vec![0u8; total];
+        let mut columns: Vec<&mut [u8]> = Vec::with_capacity(cols);
+        let mut rest = data.as_mut_slice();
+        for &w in &widths {
+            let (column, tail) = rest.split_at_mut(rows * w as usize);
+            columns.push(column);
+            rest = tail;
+        }
+        for first in (0..rows).step_by(BLOCK_ROWS) {
+            let last = (first + BLOCK_ROWS).min(rows);
+            let block = &row_major[first * cols..last * cols];
+            for (c, (column, &w)) in columns.iter_mut().zip(&widths).enumerate() {
+                let words = block.iter().skip(c).step_by(cols);
+                let w = w as usize;
+                let out = &mut column[first * w..last * w];
+                match w {
+                    1 => out.iter_mut().zip(words).for_each(|(o, &v)| *o = v as u8),
+                    2 => out
+                        .chunks_exact_mut(2)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&(v as u16).to_le_bytes())),
+                    4 => out
+                        .chunks_exact_mut(4)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&(v as u32).to_le_bytes())),
+                    _ => out
+                        .chunks_exact_mut(8)
+                        .zip(words)
+                        .for_each(|(o, &v)| o.copy_from_slice(&v.to_le_bytes())),
+                }
+            }
+        }
+        Self::from_parts(rows, widths, data)
+    }
+
     /// [`Self::pack`] of field columns. `None` unless `F` is Goldilocks, whose
     /// elements are their raw words, or the columns are not one height.
     pub fn pack_columns<F: IsField + 'static>(columns: &[Mle<F>]) -> Option<Self> {
@@ -372,6 +426,50 @@ mod tests {
         assert_eq!(narrow.widths(), &[4]);
         assert!(narrow.fault_width_map());
         assert_ne!(narrow.column(0), column);
+    }
+
+    /// A row-major trace packs to what its columns pack to, at every width
+    /// boundary and across the pack's row blocks; a width that does not divide
+    /// the words packs nothing.
+    #[test]
+    fn a_row_major_trace_packs_as_its_columns() {
+        let edges = [
+            0u64,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u64::MAX,
+        ];
+        for rows in [1usize, 7, 1024, 1025, 3000] {
+            let columns: Vec<Vec<u64>> = edges
+                .iter()
+                .map(|&edge| {
+                    (0..rows)
+                        .map(|r| {
+                            if r == rows / 2 {
+                                edge
+                            } else {
+                                (r as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % (edge / 2 + 1)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let row_major: Vec<u64> = (0..rows)
+                .flat_map(|r| columns.iter().map(move |c| c[r]))
+                .collect();
+            let raw: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
+            assert_eq!(
+                NarrowColumns::pack_row_major(&row_major, edges.len()),
+                NarrowColumns::pack(&raw),
+                "{rows} rows"
+            );
+        }
+        assert!(NarrowColumns::pack_row_major(&[1, 2, 3], 2).is_none());
+        assert!(NarrowColumns::pack_row_major(&[1, 2], 0).is_none());
     }
 
     /// Only Goldilocks columns widen to field elements: their elements are

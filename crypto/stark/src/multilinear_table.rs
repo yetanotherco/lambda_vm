@@ -308,6 +308,38 @@ where
         Ok(Self { layout, trace })
     }
 
+    /// [`Self::from_layout`] over columns held narrow from the start: `packed`
+    /// holds the layout's columns in [`column_keys`] order, each the table's
+    /// main column of that index — so only a layout whose keys are the main
+    /// columns `0..n` in order takes it.
+    ///
+    /// [`column_keys`]: TableLayout::column_keys
+    pub fn from_narrow(
+        layout: TableLayout<'a, F, E>,
+        packed: multilinear::narrow::NarrowColumns,
+    ) -> Result<Self, MlError> {
+        let in_order = layout
+            .column_keys()
+            .iter()
+            .enumerate()
+            .all(|(i, key)| key.main && key.col as usize == i);
+        if !in_order || layout.num_columns() != packed.cols() {
+            return Err(MlError::QueryCountMismatch {
+                expected: layout.num_columns(),
+                got: packed.cols(),
+            });
+        }
+        if packed.rows() != 1usize << layout.num_vars() {
+            return Err(MlError::NotPowerOfTwo(packed.rows()));
+        }
+        let trace = TraceData::new_narrow(
+            packed,
+            layout.kinds().to_vec(),
+            layout.shape().public_tables()?,
+        )?;
+        Ok(Self { layout, trace })
+    }
+
     /// The structure alone — what the verifier holds.
     pub fn layout(&self) -> &TableLayout<'a, F, E> {
         &self.layout
