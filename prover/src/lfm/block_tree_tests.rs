@@ -2193,6 +2193,105 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
     );
 }
 
+/// ★ LogUp k4 through the block's recursion (D-LOGUP S2, G2 and N6 at fixture
+/// scale): a small block proved under `LAMBDA_VM_ZF_LOGUP=k4` (tables committing
+/// four interactions per aux column, four composition parts) verifies on the
+/// host under the k4 options and is refused under the pair options (shape: the
+/// verifier's format, never the proof's). Its leaves verify the k4 base proof
+/// in the guest; the block verifier derives the tree from the k4 options and
+/// accepts the proved top, while the same top derived under the pair options is
+/// another program and is refused.
+#[test]
+#[ignore = "proves a VM block and its tree; box tier"]
+fn the_block_tree_verifies_logup_k4_and_refuses_it_under_pairs() {
+    use stark::proof::options::{LogUpPolicy, ProofFormat};
+    let pair = fixture_block_options();
+    let k4 = crate::ProofOptions {
+        format: ProofFormat {
+            logup: LogUpPolicy::K4,
+            ..pair.format
+        },
+        ..pair.clone()
+    };
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    assert_eq!(
+        wrap_opts.format.logup,
+        LogUpPolicy::Pair,
+        "the LFM chips keep pairs"
+    );
+    let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &k4);
+    let four = proof
+        .proof
+        .proofs
+        .iter()
+        .filter(|p| p.composition_poly_parts_ood_evaluation.len() == 4)
+        .count();
+    assert!(
+        four > 0,
+        "no sub-proof carries four composition parts under k4"
+    );
+    assert!(
+        matches!(
+            crate::block::verify_block(&proof, &elf_bytes, &k4),
+            Ok(true)
+        ),
+        "the k4 block proof verifies under the k4 options"
+    );
+    assert!(
+        !matches!(
+            crate::block::verify_block(&proof, &elf_bytes, &pair),
+            Ok(true)
+        ),
+        "N3: the k4 block proof must be refused under the pair options"
+    );
+    println!(
+        "BLOCK LOGUP K4 FIXTURE: {four} of {} sub-proofs carry 4 parts; host verify under k4          accepts, under pairs refuses",
+        proof.proof.proofs.len()
+    );
+
+    let shape = BlockShape::of_proof(&proof);
+    let (rb, ..) = harvest_block(&k4, &elf_bytes, &proof).expect("harvest under k4");
+    let partition = rb.plan.partition().clone();
+    let leaves: Vec<RealChild> = (0..partition.num_leaves())
+        .map(|k| {
+            prove_as_child(
+                &format!("k4 leaf {k}"),
+                &block_leaf_program(&rb, k),
+                &block_leaf_arenas(&rb, &partition, k),
+                &wrap_opts,
+            )
+        })
+        .collect();
+    let (top, top_proof, _) = compose_block_tree(&rb.plan, leaves, &wrap_opts, 1);
+    assert_top_claims_the_block(&top, &rb);
+    let verify = |opts: &crate::ProofOptions| {
+        super::block_plan::verify_block_tree_under(
+            &elf_bytes,
+            opts,
+            &wrap_opts,
+            None,
+            &shape,
+            &proof.public_output,
+            &top_proof,
+        )
+    };
+    let derived = verify(&k4).expect("the verifier accepts the k4 block tree");
+    assert_eq!(
+        derived, top.artifacts.program_id,
+        "the verifier's k4 top is the program the harness proved"
+    );
+    let under_pairs = verify(&pair);
+    assert!(
+        under_pairs.is_err(),
+        "N6: the k4 tree's top must be refused against the plan derived under pairs"
+    );
+    println!(
+        "BLOCK LOGUP K4 FIXTURE: {} leaf(s) verify the k4 base in the guest; the verifier derives          the k4 tree and accepts its top (derived = proved); under pairs it refuses ({})",
+        partition.num_leaves(),
+        under_pairs.err().unwrap_or_default()
+    );
+}
+
 /// ★ ECDAS chunked through the block's recursion: test_ecsm_multi's 42 ECDAS
 /// steps at 16 rows a chunk (three instances; the 0xABCDEF call runs through
 /// all three) prove as a block whose tree the block verifier derives and

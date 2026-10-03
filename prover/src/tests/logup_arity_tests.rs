@@ -1,7 +1,8 @@
 //! `LAMBDA_VM_ZF_LOGUP` on the production tables: the pair policy keeps every
 //! production constraint program byte for byte (a golden list taken at
-//! #1013's head before arities existed), and the wider policies give each
-//! table the layout the rule picks.
+//! #1013's head before arities existed), the wider policies give each table
+//! the layout the rule picks, and (box) a real `k4` block proof verifies while
+//! each of D-LOGUP's mutations N1–N5 is refused.
 
 use stark::constraint_ir::ConstraintArtifact;
 use stark::proof::options::{GoldilocksCubicProofOptions, LogUpPolicy, ProofFormat, ProofOptions};
@@ -248,4 +249,173 @@ fn the_wide_policies_give_each_table_its_layout() {
     wrap.fri_final_poly_log_degree = 8;
     let wrap = wide.options(wrap);
     assert_eq!(wrap.format.logup, LogUpPolicy::Pair);
+}
+
+/// ★ D-LOGUP S2 negatives on a real VM block proof under `k4` (box): a
+/// `fib_iterative_160k` block (CPU at 2^18 rows, device-only under the
+/// production thresholds, so its four parts are split on the card) proved
+/// under `LAMBDA_VM_ZF_LOGUP=k4` verifies, and each mutation is refused, never
+/// a panic:
+/// - N1 one cell of a committed k4 term column (CPU's, at the OOD point);
+/// - N2 the multiplicity of an absorbed interaction (CPU's, in the trace;
+///   the prover then commits a consistent aux trace and the bus refuses it);
+/// - N3 the k4 proof under the pair options;
+/// - N4 three or five part OODs for CPU's four-part AIR;
+/// - N5 one composition-part OOD value.
+#[test]
+#[ignore = "proves a VM program three times at blowup 4; GPU box gate (cuda)"]
+fn logup_k4_vm_proof_negatives() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use stark::lookup::{LinearTerm, LogUpLayout, Multiplicity};
+    use stark::residency_mode::ResidencyMode;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let program = Elf::load(&elf_bytes).expect("load the ELF");
+    let run = Executor::new(&program, vec![])
+        .expect("executor")
+        .run()
+        .expect("run");
+    let traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
+        &program,
+        &run.logs,
+        &crate::tables::MaxRowsConfig::default(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("build the traces");
+    let base = GoldilocksCubicProofOptions::with_params(4, 128, 0).expect("options");
+    let k4 = crate::zf_format::ZfFormat {
+        logup: LogUpPolicy::K4,
+        ..crate::zf_format::ZfFormat::DEFAULT
+    }
+    .base_options(base.clone());
+    let pair = crate::zf_format::ZfFormat::DEFAULT.base_options(base);
+    let prove = |traces: &crate::tables::trace_builder::Traces| {
+        let decode = crate::tables::decode::commitment_from_elf_device_or_host(&program, &k4)
+            .expect("DECODE commitment");
+        crate::block::prove_block_traces(
+            &elf_bytes,
+            &program,
+            &mut traces.clone(),
+            &k4,
+            Some(decode),
+            ResidencyMode::RecomputeLdeDevice,
+            Vec::new(),
+            &mut crate::block::BlockTimes::default(),
+            &mut |_| {},
+        )
+    };
+    let accepts = |proof: &crate::VmProof, opts: &ProofOptions| {
+        matches!(
+            crate::block::verify_block(proof, &elf_bytes, opts),
+            Ok(true)
+        )
+    };
+
+    let proof = prove(&traces).expect("the k4 block proves");
+    assert!(accepts(&proof, &k4), "the k4 block proof verifies");
+    let airs = crate::VmAirs::new(
+        &program,
+        &k4,
+        false,
+        &traces.page_configs,
+        &traces.table_counts(),
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let refs = airs.air_refs();
+    let idx = refs
+        .iter()
+        .position(|a| a.name() == "CPU[0]")
+        .expect("a CPU[0] table");
+    let (main, aux) = refs[idx].trace_layout();
+    assert_eq!(aux, 5, "CPU commits 4 groups of four plus the accumulator");
+    assert_eq!(
+        proof.proof.proofs[idx]
+            .composition_poly_parts_ood_evaluation
+            .len(),
+        4
+    );
+    println!("LOGUP NEG control: the k4 block verifies (CPU[0] = sub-proof {idx}, aux 5, 4 parts)");
+
+    // N3
+    assert!(
+        !accepts(&proof, &pair),
+        "N3: the pair options must refuse it"
+    );
+    println!("LOGUP NEG N3: refused under the pair options");
+    // N1
+    for term in [0, aux - 2] {
+        let mut bad = proof.clone();
+        let ood = &mut bad.proof.proofs[idx].trace_ood_evaluations;
+        let v = *ood.get(0, main + term) + crate::tables::types::FEE::one();
+        ood.set(0, main + term, v);
+        assert!(!accepts(&bad, &k4), "N1: term column {term}");
+    }
+    println!("LOGUP NEG N1: a tampered k4 term cell (first and last term column) refused");
+    // N4
+    let mut fewer = proof.clone();
+    fewer.proof.proofs[idx]
+        .composition_poly_parts_ood_evaluation
+        .pop();
+    assert!(!accepts(&fewer, &k4), "N4: three part OODs");
+    let mut more = proof.clone();
+    more.proof.proofs[idx]
+        .composition_poly_parts_ood_evaluation
+        .push(crate::tables::types::FEE::zero());
+    assert!(!accepts(&more, &k4), "N4: five part OODs");
+    println!("LOGUP NEG N4: 3 and 5 part OODs for a 4-part AIR refused");
+    // N5
+    for part in 0..4 {
+        let mut bad = proof.clone();
+        bad.proof.proofs[idx].composition_poly_parts_ood_evaluation[part] +=
+            crate::tables::types::FEE::one();
+        assert!(!accepts(&bad, &k4), "N5: part {part}");
+    }
+    println!("LOGUP NEG N5: each tampered part OOD refused");
+    // N2
+    let layout = LogUpLayout::with_arity(refs[idx].bus_interactions().to_vec(), 4);
+    assert_eq!(layout.num_term_columns + 1, aux);
+    let (k, col) = layout
+        .absorbed()
+        .iter()
+        .enumerate()
+        .find_map(|(k, it)| {
+            let col = match &it.multiplicity {
+                Multiplicity::Column(c)
+                | Multiplicity::Sum(c, _)
+                | Multiplicity::Negated(c)
+                | Multiplicity::Diff(c, _)
+                | Multiplicity::Sum3(c, _, _) => Some(*c),
+                Multiplicity::Linear(ts) => ts.iter().find_map(|t| match t {
+                    LinearTerm::Column { column, .. }
+                    | LinearTerm::ColumnUnsigned { column, .. } => Some(*column),
+                    LinearTerm::Constant(_) => None,
+                }),
+                Multiplicity::One => None,
+            };
+            col.map(|c| (k, c))
+        })
+        .expect("an absorbed CPU interaction with a column multiplicity");
+    let mut tampered = traces.clone();
+    let cell = *tampered.cpus[0].main_table.get(1, col);
+    tampered.cpus[0]
+        .main_table
+        .set(1, col, cell + crate::tables::types::FE::one());
+    let refused = match prove(&tampered) {
+        Ok(p) => !accepts(&p, &k4),
+        Err(e) => {
+            println!("    (the prover refused: {e:?})");
+            true
+        }
+    };
+    assert!(refused, "N2: a moved absorbed multiplicity must be refused");
+    println!(
+        "LOGUP NEG N2: absorbed interaction {k} of CPU (multiplicity column {col}) moved at row 1: refused"
+    );
 }
