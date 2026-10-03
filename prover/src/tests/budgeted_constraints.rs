@@ -316,7 +316,7 @@ mod device {
     use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
     use stark::constraint_ir::gpu_interp::{
         CompositionInputs, GPU_COMPOSITION_COMPILED_CALLS, GPU_COMPOSITION_SI_CALLS,
-        GpuComposition, SI_MUTATE_FIRST_ACC, SiMode, SiTuning, override_compiled_constraints,
+        GpuComposition, SI_MUTATE_ACC, SiMode, SiTuning, override_compiled_constraints,
         override_interp_si, try_eval_composition_gpu,
     };
 
@@ -512,9 +512,11 @@ mod device {
     /// ★ A proof made with the bounded-slot interpreter on every program is
     /// byte for byte the default proof, from one set of traces at grinding 0,
     /// after the control (two default proofs equal). Then the mutation
-    /// control: with every budgeted program's first accumulation taking the
+    /// control: with every accumulation of every budgeted program taking the
     /// next root's coefficient, the proof must change and fail to verify, or
-    /// the prover must refuse it.
+    /// the prover must refuse it. (Moving only the first root's coefficient
+    /// was not load-bearing: FAST 780 saw the proof unchanged, most likely
+    /// because those first roots are identically zero on this program's LDE.)
     #[test]
     #[ignore = "requires a GPU: proves a program four times"]
     fn the_si_interpreter_proves_the_same_bytes() {
@@ -554,10 +556,10 @@ mod device {
         assert!(fixed.verifies(&si, &opts), "the proof does not verify");
         println!("SI BYTES: the bounded-slot proof ({ran} compositions) equals it and verifies");
 
-        SI_MUTATE_FIRST_ACC.store(true, SeqCst);
+        SI_MUTATE_ACC.store(true, SeqCst);
         let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);
         let mutated = prove(SiMode::All);
-        SI_MUTATE_FIRST_ACC.store(false, SeqCst);
+        SI_MUTATE_ACC.store(false, SeqCst);
         let ran = GPU_COMPOSITION_SI_CALLS.load(SeqCst) - before;
         assert!(ran > 0, "the mutant never ran");
         match mutated {

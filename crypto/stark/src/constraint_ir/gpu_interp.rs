@@ -397,11 +397,12 @@ pub static GPU_COMPOSITION_SI_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// A test's mutation of every budgeted program it launches (`test-utils`
-/// builds only): the first accumulation adds its root with the next root's
-/// coefficient. The proof-bytes test's mutation control sets it.
+/// builds only): every accumulation adds its root with the next root's
+/// coefficient, so `H` moves unless every constraint is identically zero on
+/// the LDE (one root alone can be, e.g. a multiplicity-gated constraint over
+/// an unused table). The proof-bytes test's mutation control sets it.
 #[cfg(feature = "test-utils")]
-pub static SI_MUTATE_FIRST_ACC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SI_MUTATE_ACC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `LAMBDA_VM_GPU_COMPILED_CONSTRAINTS`: unset, empty or `1` (the default)
 /// evaluates the composition of every program that has a compiled kernel with
@@ -710,15 +711,18 @@ where
         ) {
             let uni: Vec<u64> = uni.into_iter().flatten().collect();
             #[cfg(feature = "test-utils")]
-            let mutated = SI_MUTATE_FIRST_ACC
+            let mutated = SI_MUTATE_ACC
                 .load(std::sync::atomic::Ordering::SeqCst)
                 .then(|| {
                     let mut steps = si.steps.clone();
                     let n = si.bp.num_roots.max(1);
-                    if let Some(k) = si.bp.steps.iter().position(|st| {
-                        matches!(st.op, super::budgeted::SI_ACC_B | super::budgeted::SI_ACC_E)
-                    }) {
-                        steps[4 * k + 2] = (steps[4 * k + 2] + 1) % n;
+                    for (k, st) in si.bp.steps.iter().enumerate() {
+                        if matches!(
+                            super::budgeted::generic_op(st),
+                            Some(super::budgeted::SI_ACC_B | super::budgeted::SI_ACC_E)
+                        ) {
+                            steps[4 * k + 2] = (steps[4 * k + 2] + 1) % n;
+                        }
                     }
                     steps
                 });
