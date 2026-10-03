@@ -276,9 +276,11 @@ pub fn interp_si_setting(raw: Option<&str>) -> SiMode {
     }
 }
 
-/// `LAMBDA_VM_GPU_SI_SHAPE=<shared|local>:<rows a thread>:<block>:<budget words>[:fast|:generic]`:
-/// the bounded-slot interpreter's launch shape, word budget and whether the
-/// lowering uses the specialized opcodes. Default `shared:1:128:48:fast`.
+/// `LAMBDA_VM_GPU_SI_SHAPE=<shared|local>:<rows a thread>:<block>:<budget words>[:<flags>]`:
+/// the bounded-slot interpreter's launch shape and word budget; flags joined
+/// by `+`: `fast` (specialized opcodes, the default) or `generic`, and
+/// `staged` (steps staged through shared memory). Default
+/// `shared:1:128:48:fast`.
 pub const SI_SHAPE_ENV: &str = "LAMBDA_VM_GPU_SI_SHAPE";
 
 /// The bounded-slot interpreter's launch shape and word budget.
@@ -297,6 +299,7 @@ impl Default for SiTuning {
                 store: math_cuda::constraint_interp::SiStore::Shared,
                 rows_per_thread: 1,
                 block: 128,
+                staged: false,
             },
             budget: 48,
             fast: true,
@@ -319,11 +322,16 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
     if !(4..=5).contains(&parts.len()) {
         bad();
     }
-    let fast = match parts.get(4) {
-        None | Some(&"fast") => true,
-        Some(&"generic") => false,
-        _ => bad(),
-    };
+    // Flags joined by `+`: `fast` (the default) or `generic`, and `staged`.
+    let (mut fast, mut staged) = (true, false);
+    for flag in parts.get(4).into_iter().flat_map(|f| f.split('+')) {
+        match flag {
+            "fast" => fast = true,
+            "generic" => fast = false,
+            "staged" => staged = true,
+            _ => bad(),
+        }
+    }
     let store = match parts[0] {
         "shared" => SiStore::Shared,
         "local" => SiStore::Local,
@@ -332,8 +340,8 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
     let num = |s: &str| s.parse::<u32>().unwrap_or_else(|_| bad());
     let (rows, block, budget) = (num(parts[1]), num(parts[2]), num(parts[3]));
     let ok_rows = matches!(
-        (store, rows),
-        (SiStore::Shared, 1 | 2) | (SiStore::Local, 1)
+        (store, rows, staged),
+        (SiStore::Shared, 1, _) | (SiStore::Shared, 2, false) | (SiStore::Local, 1, _)
     );
     if !ok_rows
         || !block.is_power_of_two()
@@ -347,6 +355,7 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
             store,
             rows_per_thread: rows,
             block,
+            staged,
         },
         budget,
         fast,
@@ -920,13 +929,16 @@ mod tests {
                 cfg: SiConfig {
                     store: SiStore::Local,
                     rows_per_thread: 1,
-                    block: 256
+                    block: 256,
+                    staged: false,
                 },
                 budget: 64,
                 fast: true,
             }
         );
         assert!(!si_shape_setting(Some("shared:1:128:48:generic")).fast);
+        let t = si_shape_setting(Some("local:1:128:48:fast+staged"));
+        assert!(t.fast && t.cfg.staged);
         assert_eq!(
             si_shape_setting(Some("shared:2:64:32")).cfg.rows_per_thread,
             2

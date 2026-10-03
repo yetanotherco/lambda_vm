@@ -569,9 +569,14 @@ fn si_function(name: &'static str) -> Result<CudaFunction> {
         let max = be.ctx.attribute(
             cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
         )?;
+        // The staged variants hold a static tile of steps; the dynamic slots
+        // get what is left of the block's maximum.
+        let fixed = f.get_attribute(
+            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        )?;
         f.set_attribute(
             cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            max,
+            max - fixed,
         )?;
     }
     functions.insert(name, f.clone());
@@ -595,27 +600,31 @@ pub struct SiConfig {
     pub rows_per_thread: u32,
     /// Threads per block.
     pub block: u32,
+    /// The steps staged through shared memory a tile at a time (the `_ps`
+    /// kernels; one row a thread only).
+    pub staged: bool,
 }
 
-/// The local-array widths `constraint_si.cu` is built at.
-const SI_LOCAL_WIDTHS: [(u32, &str); 4] = [
-    (32, "si_local_w32"),
-    (48, "si_local_w48"),
-    (64, "si_local_w64"),
-    (128, "si_local_w128"),
+/// The local-array widths `constraint_si.cu` is built at, plain and staged.
+const SI_LOCAL_WIDTHS: [(u32, &str, &str); 4] = [
+    (32, "si_local_w32", "si_local_w32_ps"),
+    (48, "si_local_w48", "si_local_w48_ps"),
+    (64, "si_local_w64", "si_local_w64_ps"),
+    (128, "si_local_w128", "si_local_w128_ps"),
 ];
 
 impl SiConfig {
     /// The kernel for a program of `num_words` words a row, if this shape has
     /// one.
     pub fn kernel(&self, num_words: u32) -> Option<&'static str> {
-        match (self.store, self.rows_per_thread) {
-            (SiStore::Shared, 1) => Some("si_smem_r1"),
-            (SiStore::Shared, 2) => Some("si_smem_r2"),
-            (SiStore::Local, 1) => SI_LOCAL_WIDTHS
+        match (self.store, self.rows_per_thread, self.staged) {
+            (SiStore::Shared, 1, false) => Some("si_smem_r1"),
+            (SiStore::Shared, 2, false) => Some("si_smem_r2"),
+            (SiStore::Shared, 1, true) => Some("si_smem_r1_ps"),
+            (SiStore::Local, 1, staged) => SI_LOCAL_WIDTHS
                 .iter()
-                .find(|(w, _)| num_words <= *w)
-                .map(|(_, k)| *k),
+                .find(|(w, _, _)| num_words <= *w)
+                .map(|(_, k, ks)| if staged { *ks } else { *k }),
             _ => None,
         }
     }

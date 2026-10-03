@@ -333,6 +333,7 @@ mod device {
                 store: SiStore::Shared,
                 rows_per_thread: rows,
                 block,
+                staged: false,
             },
             budget,
             fast: true,
@@ -345,6 +346,7 @@ mod device {
                 store: SiStore::Local,
                 rows_per_thread: 1,
                 block,
+                staged: false,
             },
             budget,
             fast: true,
@@ -355,12 +357,27 @@ mod device {
         SiTuning { fast: false, ..t }
     }
 
+    fn staged(t: SiTuning) -> SiTuning {
+        SiTuning {
+            cfg: SiConfig {
+                staged: true,
+                ..t.cfg
+            },
+            ..t
+        }
+    }
+
     fn name(t: &SiTuning) -> String {
         let s = match t.cfg.store {
             SiStore::Shared => "smem",
             SiStore::Local => "local",
         };
-        let f = if t.fast { "" } else { "/gen" };
+        let f = match (t.fast, t.cfg.staged) {
+            (true, false) => "",
+            (false, false) => "/gen",
+            (true, true) => "/ps",
+            (false, true) => "/gen/ps",
+        };
         format!(
             "{s}/r{}/t{}/b{}{f}",
             t.cfg.rows_per_thread, t.cfg.block, t.budget
@@ -467,6 +484,8 @@ mod device {
             shared(1, 64, 128),
             local(128, 48),
             local(64, 24),
+            staged(local(128, 48)),
+            staged(shared(1, 64, 48)),
         ]
     }
 
@@ -616,6 +635,14 @@ mod device {
                 v.push(local(block, budget));
             }
         }
+        for block in [64, 128, 256] {
+            for budget in [32, 48, 64, 128] {
+                v.push(staged(local(block, budget)));
+            }
+        }
+        for budget in [24, 32, 48] {
+            v.push(staged(shared(1, 64, budget)));
+        }
         v.push(shared(1, 32, 128));
         v.push(shared(1, 32, 96));
         // The generic opcodes at three shapes: what the specialized ones gain.
@@ -640,6 +667,10 @@ mod device {
             local(128, 64),
             local(256, 48),
             generic(shared(1, 128, 48)),
+            staged(local(128, 32)),
+            staged(local(128, 48)),
+            staged(local(256, 48)),
+            staged(shared(1, 64, 32)),
         ]
     }
 

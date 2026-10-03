@@ -66,6 +66,14 @@ using ext3::Fe3;
 #define SI_COL_OFFSET_SHIFT 20u
 #define SI_COL_MASK 0xFFFFFu
 
+// The staged variants' tile of steps, and who copies which step of it (the
+// host parity check builds every thread as a whole block's copier).
+#define SI_TILE 256u
+#ifndef SI_STAGE_TID
+#define SI_STAGE_TID threadIdx.x
+#define SI_STAGE_STRIDE blockDim.x
+#endif
+
 // Specialized opcodes (budgeted.rs `SI_FAST`): a generic op whose operand kinds
 // the opcode fixes, so the handler loads them directly.
 #define SI_F_BADD_SS 32u
@@ -189,10 +197,218 @@ __device__ __forceinline__ void si_put(S &s, uint32_t w, int j, const Fe3 &v) {
     s.at(w + 2, j) = v.c;
 }
 
+// One step for the thread's R rows: the op's call, the operands loaded by
+// their kinds, the result written to its words (or added to the sum).
+template <int R, class S>
+__device__ __forceinline__ void si_step(S &s, const SiInputs &in, const uint4 st,
+                                        const Fe3 *__restrict__ beta, Fe3 *sum, const uint64_t *r0,
+                                        const uint64_t *r1) {
+    const uint32_t a = st.y, b = st.z, d = st.w;
+    switch (st.x) {
+    case SI_BADD:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+            s.at(d, j) = goldilocks::add(x, y);
+        }
+        break;
+    case SI_BSUB:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+            s.at(d, j) = goldilocks::sub(x, y);
+        }
+        break;
+    case SI_BMUL:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
+            s.at(d, j) = goldilocks::mul(x, y);
+        }
+        break;
+    case SI_BNEG:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            s.at(d, j) = goldilocks::neg(si_base<R>(s, in, a, j, r0, r1));
+        }
+        break;
+    case SI_EADD:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::add(x, y));
+        }
+        break;
+    case SI_ESUB:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::sub(x, y));
+        }
+        break;
+    case SI_EMUL:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::mul(x, y));
+        }
+        break;
+    case SI_EADD_BX:
+        // {x,0,0} + y = {add(x,y.a), y.b, y.c} (add(0,v) == v).
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+            Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::make(goldilocks::add(x, y.a), y.b, y.c));
+        }
+        break;
+    case SI_ESUB_BX:
+        // {x,0,0} - y: sub(0, ·) kept literal (not bitwise neg).
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+            Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j,
+                   ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b),
+                              goldilocks::sub(0, y.c)));
+        }
+        break;
+    case SI_EMUL_BX:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            uint64_t x = si_base<R>(s, in, a, j, r0, r1);
+            Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::mul_base(y, x));
+        }
+        break;
+    case SI_EADD_XB:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+            uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::make(goldilocks::add(x.a, y), x.b, x.c));
+        }
+        break;
+    case SI_ESUB_XB:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+            uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::make(goldilocks::sub(x.a, y), x.b, x.c));
+        }
+        break;
+    case SI_EMUL_XB:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
+            uint64_t y = si_base<R>(s, in, b, j, r0, r1);
+            si_put(s, d, j, ext3::mul_base(x, y));
+        }
+        break;
+    case SI_ENEG:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            si_put(s, d, j, ext3::neg(si_ext<R>(s, in, a, j, r0, r1)));
+        }
+        break;
+    case SI_EMBED:
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            si_put(s, d, j, si_ext<R>(s, in, a, j, r0, r1));
+        }
+        break;
+    case SI_ACC_B: {
+        const Fe3 c = beta[b];
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            sum[j] = ext3::add(sum[j], ext3::mul_base(c, si_base<R>(s, in, a, j, r0, r1)));
+        }
+        break;
+    }
+    case SI_ACC_E: {
+        const Fe3 c = beta[b];
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            sum[j] = ext3::add(sum[j], ext3::mul(c, si_ext<R>(s, in, a, j, r0, r1)));
+        }
+        break;
+    }
+    // Specialized: the generic op above, with the operand kinds fixed.
+#define SI_FOR_ROWS _Pragma("unroll") for (int j = 0; j < R; j++)
+    case SI_F_BADD_SS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bs(s, a, j), ld_bs(s, b, j));
+        break;
+    case SI_F_BSUB_SS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::sub(ld_bs(s, a, j), ld_bs(s, b, j));
+        break;
+    case SI_F_BMUL_SS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_bs(s, b, j));
+        break;
+    case SI_F_BMUL_MC:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bc(in, b));
+        break;
+    case SI_F_BMUL_CM:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bc(in, a), ld_main(in, b, j, r0, r1));
+        break;
+    case SI_F_BMUL_SM:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_main(in, b, j, r0, r1));
+        break;
+    case SI_F_BMUL_MS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
+        break;
+    case SI_F_BADD_MS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
+        break;
+    case SI_F_BADD_CS:
+        SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bc(in, a), ld_bs(s, b, j));
+        break;
+    case SI_F_EADD_SS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::add(ld_es(s, a, j), ld_es(s, b, j)));
+        break;
+    case SI_F_ESUB_SS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_es(s, b, j)));
+        break;
+    case SI_F_EMUL_SS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_es(s, a, j), ld_es(s, b, j)));
+        break;
+    case SI_F_EMULBX_MU:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_main(in, a, j, r0, r1)));
+        break;
+    case SI_F_EMULBX_SU:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_bs(s, a, j)));
+        break;
+    case SI_F_EMULBX_MS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_main(in, a, j, r0, r1)));
+        break;
+    case SI_F_EMULBX_SS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_bs(s, a, j)));
+        break;
+    case SI_F_ACCB_S: {
+        const Fe3 c = beta[b];
+        SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul_base(c, ld_bs(s, a, j)));
+        break;
+    }
+    case SI_F_ACCE_S: {
+        const Fe3 c = beta[b];
+        SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul(c, ld_es(s, a, j)));
+        break;
+    }
+    case SI_F_ESUB_SA:
+        SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_aux(in, b, j, r0, r1)));
+        break;
+    case SI_F_EMUL_AS:
+        SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_aux(in, a, j, r0, r1), ld_es(s, b, j)));
+        break;
+#undef SI_FOR_ROWS
+    default:
+        break;
+    }
+}
+
 // One thread's walk over the program for its R rows (`row[j]`, with their
 // frame-offset-1 rows `r1[j]`), then the interpreter's tail. Rows past the end
 // are walked on a clamped row and not written.
-template <int R, class S>
+template <int R, bool STAGE, class S>
 __device__ __forceinline__ void si_rows(
     S &s, const SiInputs &in, const uint4 *__restrict__ prog, uint32_t num_steps,
     const Fe3 *__restrict__ beta, const uint64_t *row, const bool *valid, uint64_t next_step,
@@ -212,210 +428,30 @@ __device__ __forceinline__ void si_rows(
     for (int j = 0; j < R; j++) {
         sum[j] = ext3::zero();
     }
-    // The program is padded with one step, so the prefetch never reads past it.
-    uint4 next = __ldg(prog);
-    for (uint32_t pc = 0; pc < num_steps; pc++) {
-        uint4 st = next;
-        next = __ldg(prog + pc + 1);
-        const uint32_t a = st.y, b = st.z, d = st.w;
-        switch (st.x) {
-        case SI_BADD:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
-                s.at(d, j) = goldilocks::add(x, y);
+    if constexpr (STAGE) {
+        // The steps tiled through shared memory: one cooperative copy a tile,
+        // then every warp reads its steps there (a broadcast) instead of from
+        // L2. Every thread of the block walks the same number of tiles (the
+        // grid-stride loop is uniform), so the barriers are reached by all.
+        __shared__ uint4 si_tile[SI_TILE];
+        for (uint32_t base = 0; base < num_steps; base += SI_TILE) {
+            const uint32_t n = num_steps - base < SI_TILE ? num_steps - base : SI_TILE;
+            __syncthreads();
+            for (uint32_t k = SI_STAGE_TID; k < n; k += SI_STAGE_STRIDE) {
+                si_tile[k] = prog[base + k];
             }
-            break;
-        case SI_BSUB:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
-                s.at(d, j) = goldilocks::sub(x, y);
+            __syncthreads();
+            for (uint32_t i = 0; i < n; i++) {
+                si_step<R>(s, in, si_tile[i], beta, sum, r0, r1);
             }
-            break;
-        case SI_BMUL:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1), y = si_base<R>(s, in, b, j, r0, r1);
-                s.at(d, j) = goldilocks::mul(x, y);
-            }
-            break;
-        case SI_BNEG:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                s.at(d, j) = goldilocks::neg(si_base<R>(s, in, a, j, r0, r1));
-            }
-            break;
-        case SI_EADD:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::add(x, y));
-            }
-            break;
-        case SI_ESUB:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::sub(x, y));
-            }
-            break;
-        case SI_EMUL:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1), y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::mul(x, y));
-            }
-            break;
-        case SI_EADD_BX:
-            // {x,0,0} + y = {add(x,y.a), y.b, y.c} (add(0,v) == v).
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
-                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::make(goldilocks::add(x, y.a), y.b, y.c));
-            }
-            break;
-        case SI_ESUB_BX:
-            // {x,0,0} - y: sub(0, ·) kept literal (not bitwise neg).
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
-                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j,
-                       ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b),
-                                  goldilocks::sub(0, y.c)));
-            }
-            break;
-        case SI_EMUL_BX:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                uint64_t x = si_base<R>(s, in, a, j, r0, r1);
-                Fe3 y = si_ext<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::mul_base(y, x));
-            }
-            break;
-        case SI_EADD_XB:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
-                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::make(goldilocks::add(x.a, y), x.b, x.c));
-            }
-            break;
-        case SI_ESUB_XB:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
-                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::make(goldilocks::sub(x.a, y), x.b, x.c));
-            }
-            break;
-        case SI_EMUL_XB:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                Fe3 x = si_ext<R>(s, in, a, j, r0, r1);
-                uint64_t y = si_base<R>(s, in, b, j, r0, r1);
-                si_put(s, d, j, ext3::mul_base(x, y));
-            }
-            break;
-        case SI_ENEG:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                si_put(s, d, j, ext3::neg(si_ext<R>(s, in, a, j, r0, r1)));
-            }
-            break;
-        case SI_EMBED:
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                si_put(s, d, j, si_ext<R>(s, in, a, j, r0, r1));
-            }
-            break;
-        case SI_ACC_B: {
-            const Fe3 c = beta[b];
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                sum[j] = ext3::add(sum[j], ext3::mul_base(c, si_base<R>(s, in, a, j, r0, r1)));
-            }
-            break;
         }
-        case SI_ACC_E: {
-            const Fe3 c = beta[b];
-#pragma unroll
-            for (int j = 0; j < R; j++) {
-                sum[j] = ext3::add(sum[j], ext3::mul(c, si_ext<R>(s, in, a, j, r0, r1)));
-            }
-            break;
-        }
-        // Specialized: the generic op above, with the operand kinds fixed.
-#define SI_FOR_ROWS _Pragma("unroll") for (int j = 0; j < R; j++)
-        case SI_F_BADD_SS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bs(s, a, j), ld_bs(s, b, j));
-            break;
-        case SI_F_BSUB_SS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::sub(ld_bs(s, a, j), ld_bs(s, b, j));
-            break;
-        case SI_F_BMUL_SS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_bs(s, b, j));
-            break;
-        case SI_F_BMUL_MC:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bc(in, b));
-            break;
-        case SI_F_BMUL_CM:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bc(in, a), ld_main(in, b, j, r0, r1));
-            break;
-        case SI_F_BMUL_SM:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_bs(s, a, j), ld_main(in, b, j, r0, r1));
-            break;
-        case SI_F_BMUL_MS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::mul(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
-            break;
-        case SI_F_BADD_MS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_main(in, a, j, r0, r1), ld_bs(s, b, j));
-            break;
-        case SI_F_BADD_CS:
-            SI_FOR_ROWS s.at(d, j) = goldilocks::add(ld_bc(in, a), ld_bs(s, b, j));
-            break;
-        case SI_F_EADD_SS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::add(ld_es(s, a, j), ld_es(s, b, j)));
-            break;
-        case SI_F_ESUB_SS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_es(s, b, j)));
-            break;
-        case SI_F_EMUL_SS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_es(s, a, j), ld_es(s, b, j)));
-            break;
-        case SI_F_EMULBX_MU:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_main(in, a, j, r0, r1)));
-            break;
-        case SI_F_EMULBX_SU:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_eu(in, b), ld_bs(s, a, j)));
-            break;
-        case SI_F_EMULBX_MS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_main(in, a, j, r0, r1)));
-            break;
-        case SI_F_EMULBX_SS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul_base(ld_es(s, b, j), ld_bs(s, a, j)));
-            break;
-        case SI_F_ACCB_S: {
-            const Fe3 c = beta[b];
-            SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul_base(c, ld_bs(s, a, j)));
-            break;
-        }
-        case SI_F_ACCE_S: {
-            const Fe3 c = beta[b];
-            SI_FOR_ROWS sum[j] = ext3::add(sum[j], ext3::mul(c, ld_es(s, a, j)));
-            break;
-        }
-        case SI_F_ESUB_SA:
-            SI_FOR_ROWS si_put(s, d, j, ext3::sub(ld_es(s, a, j), ld_aux(in, b, j, r0, r1)));
-            break;
-        case SI_F_EMUL_AS:
-            SI_FOR_ROWS si_put(s, d, j, ext3::mul(ld_aux(in, a, j, r0, r1), ld_es(s, b, j)));
-            break;
-#undef SI_FOR_ROWS
-        default:
-            break;
+    } else {
+        // The program is padded with one step, so the prefetch never reads past it.
+        uint4 next = __ldg(prog);
+        for (uint32_t pc = 0; pc < num_steps; pc++) {
+            uint4 st = next;
+            next = __ldg(prog + pc + 1);
+            si_step<R>(s, in, st, beta, sum, r0, r1);
         }
     }
     // The interpreter's tail, verbatim.
@@ -459,7 +495,7 @@ __device__ __forceinline__ void si_rows(
 
 // A thread takes rows g, g + n, …, g + (R−1)·n of each tile of R·n rows
 // (n = the grid's threads), grid-striding over the tiles.
-template <int R, class S>
+template <int R, bool STAGE, class S>
 __device__ __forceinline__ void si_grid(S &s, SI_PARAMS) {
     SiInputs in;
     in.base_consts = d_base_consts;
@@ -479,24 +515,25 @@ __device__ __forceinline__ void si_grid(S &s, SI_PARAMS) {
             valid[j] = r < num_rows;
             row[j] = valid[j] ? r : 0;
         }
-        si_rows<R>(s, in, prog, num_steps, d_beta, row, valid, next_step, num_rows, d_h, d_z_inv,
-                   z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value, d_b_beta, d_b_z_inv);
+        si_rows<R, STAGE>(s, in, prog, num_steps, d_beta, row, valid, next_step, num_rows, d_h,
+                          d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value, d_b_beta,
+                          d_b_z_inv);
     }
 }
 
-template <int R> __device__ __forceinline__ void si_smem(SI_PARAMS) {
+template <int R, bool STAGE> __device__ __forceinline__ void si_smem(SI_PARAMS) {
     extern __shared__ uint64_t si_smem_words[];
     SmemSlots<R> s;
     s.base = si_smem_words + threadIdx.x;
     s.stride = blockDim.x;
-    si_grid<R>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
+    si_grid<R, STAGE>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
                aux_stride, next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux,
                d_b_value, d_b_beta, d_b_z_inv);
 }
 
-template <int R, int MAXW> __device__ __forceinline__ void si_local(SI_PARAMS) {
+template <int R, int MAXW, bool STAGE> __device__ __forceinline__ void si_local(SI_PARAMS) {
     LocalSlots<R, MAXW> s;
-    si_grid<R>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
+    si_grid<R, STAGE>(s, d_h, prog, num_steps, d_base_consts, d_uni, d_beta, d_main, main_stride, d_aux,
                aux_stride, next_step, num_rows, d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux,
                d_b_value, d_b_beta, d_b_z_inv);
 }
@@ -507,12 +544,20 @@ template <int R, int MAXW> __device__ __forceinline__ void si_local(SI_PARAMS) {
         d_b_beta, d_b_z_inv
 
 // Shared-memory slots: `num_words · R · blockDim.x` u64 of dynamic shared memory.
-extern "C" __global__ void si_smem_r1(SI_PARAMS) { si_smem<1>(SI_ARGS); }
-extern "C" __global__ void si_smem_r2(SI_PARAMS) { si_smem<2>(SI_ARGS); }
+extern "C" __global__ void si_smem_r1(SI_PARAMS) { si_smem<1, false>(SI_ARGS); }
+extern "C" __global__ void si_smem_r2(SI_PARAMS) { si_smem<2, false>(SI_ARGS); }
 
 // Local-array slots, one row a thread; the program's `num_words` must not
 // exceed the variant's width.
-extern "C" __global__ void si_local_w32(SI_PARAMS) { si_local<1, 32>(SI_ARGS); }
-extern "C" __global__ void si_local_w48(SI_PARAMS) { si_local<1, 48>(SI_ARGS); }
-extern "C" __global__ void si_local_w64(SI_PARAMS) { si_local<1, 64>(SI_ARGS); }
-extern "C" __global__ void si_local_w128(SI_PARAMS) { si_local<1, 128>(SI_ARGS); }
+extern "C" __global__ void si_local_w32(SI_PARAMS) { si_local<1, 32, false>(SI_ARGS); }
+extern "C" __global__ void si_local_w48(SI_PARAMS) { si_local<1, 48, false>(SI_ARGS); }
+extern "C" __global__ void si_local_w64(SI_PARAMS) { si_local<1, 64, false>(SI_ARGS); }
+extern "C" __global__ void si_local_w128(SI_PARAMS) { si_local<1, 128, false>(SI_ARGS); }
+
+// The same kernels with the steps staged through shared memory, a tile of
+// SI_TILE steps at a time (`_ps`: 4 KiB of static shared memory a block).
+extern "C" __global__ void si_smem_r1_ps(SI_PARAMS) { si_smem<1, true>(SI_ARGS); }
+extern "C" __global__ void si_local_w32_ps(SI_PARAMS) { si_local<1, 32, true>(SI_ARGS); }
+extern "C" __global__ void si_local_w48_ps(SI_PARAMS) { si_local<1, 48, true>(SI_ARGS); }
+extern "C" __global__ void si_local_w64_ps(SI_PARAMS) { si_local<1, 64, true>(SI_ARGS); }
+extern "C" __global__ void si_local_w128_ps(SI_PARAMS) { si_local<1, 128, true>(SI_ARGS); }
