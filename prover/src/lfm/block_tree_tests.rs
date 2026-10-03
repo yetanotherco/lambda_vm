@@ -580,24 +580,12 @@ fn the_plan_spreads_chunked_accelerators_by_load() {
     let opts = super::proof::block_base_options();
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
-    let mut shape = honest_fixture_shape(&elf);
     const CHUNKS: usize = 13;
     const CPUS: usize = 40;
-    shape.table_counts.keccak = CHUNKS;
-    shape.table_counts.ecsm = CHUNKS;
-    shape.table_counts.ecdas = CHUNKS;
-    shape.table_counts.cpu += CPUS;
+    let shape = spread_fixture_shape(&elf, CHUNKS, CPUS);
     // In AIR order after the five fixed tables: KECCAK 5–17, ECSM 18–30, ECDAS
     // 31–43, then CPU[0] (32 rows) and the 40 CPU chunks added at 2^21.
     let first_cpu = crate::FIXED_TABLE_COUNT + 3 * CHUNKS;
-    let mut lengths: Vec<usize> = shape.trace_lengths[..crate::FIXED_TABLE_COUNT].to_vec();
-    lengths.extend([crate::BLOCK_KECCAK_MAX_ROWS; CHUNKS]);
-    lengths.extend([crate::BLOCK_ECSM_MAX_ROWS; CHUNKS]);
-    lengths.extend([crate::BLOCK_ECDAS_MAX_ROWS; CHUNKS]);
-    lengths.push(shape.trace_lengths[crate::FIXED_TABLE_COUNT]);
-    lengths.extend([1 << 21; CPUS]);
-    lengths.extend_from_slice(&shape.trace_lengths[crate::FIXED_TABLE_COUNT + 1..]);
-    shape.trace_lengths = lengths;
     let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
     assert!(plan.instance(first_cpu - 1).name.starts_with("ECDAS["));
     assert!(plan.instance(first_cpu).name.starts_with("CPU["));
@@ -639,6 +627,524 @@ fn the_plan_spreads_chunked_accelerators_by_load() {
         partition.num_leaves()
     );
 }
+
+/// [`honest_fixture_shape`] at production heights: `chunks` KECCAK, ECSM and
+/// ECDAS instances at their block caps, and `cpus` more CPU chunks at 2^21 rows
+/// after `CPU[0]`.
+fn spread_fixture_shape(elf: &executor::elf::Elf, chunks: usize, cpus: usize) -> BlockShape {
+    let mut shape = honest_fixture_shape(elf);
+    shape.table_counts.keccak = chunks;
+    shape.table_counts.ecsm = chunks;
+    shape.table_counts.ecdas = chunks;
+    shape.table_counts.cpu += cpus;
+    let fixed = crate::FIXED_TABLE_COUNT;
+    let mut lengths: Vec<usize> = shape.trace_lengths[..fixed].to_vec();
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_KECCAK_MAX_ROWS, chunks));
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_ECSM_MAX_ROWS, chunks));
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_ECDAS_MAX_ROWS, chunks));
+    lengths.push(shape.trace_lengths[fixed]);
+    lengths.extend(std::iter::repeat_n(1 << 21, cpus));
+    lengths.extend_from_slice(&shape.trace_lengths[fixed + 1..]);
+    shape.trace_lengths = lengths;
+    shape
+}
+
+// ======================= (S5) the leaf programs' host bytes =================
+
+/// jemalloc's `opt.oversize_threshold` (5.3's default; the instruments read it
+/// back): an allocation of at least this many bytes comes from one arena every
+/// thread shares, a smaller one from its thread's own arena. The pages a freed
+/// buffer leaves behind serve only its arena's later requests.
+const JEMALLOC_OVERSIZE: usize = 8 << 20;
+
+/// A program's host bytes as held (capacities, not lengths), by part, and the
+/// share in allocations at or over [`JEMALLOC_OVERSIZE`]: the part that can
+/// take the pages a freed trace left in the shared arena.
+#[derive(Default, Clone, Copy)]
+struct ProgramBytes {
+    /// The instruction vector itself.
+    instrs: usize,
+    /// `Instr::BitDec`'s bit lists.
+    bitdec_heap: usize,
+    /// `KeccakF`'s and `Blake3`'s boxed operands.
+    boxed: usize,
+    /// The column groups as held: padded rows, at capacity.
+    groups: usize,
+    /// The column groups' padded rows (the committed matrices).
+    groups_padded: usize,
+    /// The column groups' real rows alone.
+    groups_real: usize,
+    /// The arena schema.
+    other: usize,
+    /// Of the total, the bytes in allocations at or over [`JEMALLOC_OVERSIZE`].
+    large: usize,
+    allocs: usize,
+}
+
+impl ProgramBytes {
+    fn of(p: &LfmProgram) -> Self {
+        use super::instr::{Addr, Blake3Operands, Instr, KeccakOperands};
+        let mut b = Self::default();
+        b.instrs = b.note(p.instrs.capacity() * size_of::<Instr>());
+        for instr in &p.instrs {
+            match instr {
+                Instr::BitDec { bits, .. } => {
+                    b.bitdec_heap += b.note(bits.capacity() * size_of::<(Addr, u64)>());
+                }
+                Instr::KeccakF(_) => b.boxed += b.note(size_of::<KeccakOperands>()),
+                Instr::Blake3(_) => b.boxed += b.note(size_of::<Blake3Operands>()),
+                _ => {}
+            }
+        }
+        for g in program_groups(p) {
+            b.groups += b.note(g.data.capacity() * size_of::<FE>());
+            b.groups_padded += g.padded_rows * g.width * size_of::<FE>();
+            b.groups_real += g.real_rows * g.width * size_of::<FE>();
+        }
+        b.other = b.note(p.arena_schema.lens.capacity() * size_of::<u32>());
+        b
+    }
+
+    /// Counts one allocation of `bytes` and returns them.
+    fn note(&mut self, bytes: usize) -> usize {
+        if bytes > 0 {
+            self.allocs += 1;
+            if bytes >= JEMALLOC_OVERSIZE {
+                self.large += bytes;
+            }
+        }
+        bytes
+    }
+
+    fn total(&self) -> usize {
+        self.instrs + self.bitdec_heap + self.boxed + self.groups + self.other
+    }
+
+    fn add(&mut self, o: &Self) {
+        self.instrs += o.instrs;
+        self.bitdec_heap += o.bitdec_heap;
+        self.boxed += o.boxed;
+        self.groups += o.groups;
+        self.groups_padded += o.groups_padded;
+        self.groups_real += o.groups_real;
+        self.other += o.other;
+        self.large += o.large;
+        self.allocs += o.allocs;
+    }
+}
+
+/// A program's column groups with their chip names, in the frozen chip order.
+fn program_groups(p: &LfmProgram) -> [&super::compiler::ColumnGroup; 11] {
+    let g = &p.groups;
+    [
+        &g.const_, &g.balu, &g.xalu, &g.select, &g.bitdec, &g.hash, &g.keccak, &g.blake3, &g.lanes,
+        &g.hint, &g.public,
+    ]
+}
+
+const PROGRAM_GROUP_NAMES: [&str; 11] = [
+    "const", "balu", "xalu", "select", "bitdec", "hash", "keccak", "blake3", "lanes", "hint",
+    "public",
+];
+
+/// The heap's live bytes (jemalloc `stats.allocated`, the epoch turned first).
+fn heap_allocated() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().expect("the jemalloc epoch turns");
+    stats::allocated::read().expect("stats.allocated reads")
+}
+
+/// The pages jemalloc holds: live, freed-and-dirty, and its metadata
+/// (`stats.resident`, an upper bound: a fresh extent counts before it is
+/// touched).
+fn heap_resident() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().expect("the jemalloc epoch turns");
+    stats::resident::read().expect("stats.resident reads")
+}
+
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// The production-height plan the S5 instruments emit from:
+/// [`spread_fixture_shape`] with 13 chunks of each accelerator and 40 CPU
+/// chunks, under the block base's options, every leaf filled toward
+/// [`super::block_plan::LEAF_PERMS_CAP`] as the median block's are.
+fn production_height_plan() -> BlockTreePlan {
+    spread_plan(13, 40)
+}
+
+/// [`spread_fixture_shape`]'s plan under the block base's options.
+fn spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
+    let opts = super::proof::block_base_options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let shape = spread_fixture_shape(&elf, chunks, cpus);
+    BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives")
+}
+
+/// ★ D-ANYBLOCK S5 §4.13 instrument (laptop): a block leaf program's host bytes
+/// by part, at production heights ([`production_height_plan`]) — the ≈ 0.34 GiB
+/// a leaf (BIG 480) the whole-block harness holds beside the base. Per leaf:
+/// the instruction vector (`size_of::<Instr>()` a row), `BitDec`'s bit lists
+/// and the boxed operands, the column groups held (padded, at capacity) against
+/// their real rows, and the share in allocations at or over jemalloc's
+/// oversize threshold. The heap's own count of each retained program (jemalloc
+/// `stats.allocated` across its emission, one leaf at a time) checks the sum.
+#[test]
+#[ignore = "laptop instrument: run alone (--exact), so the heap's delta is the program's"]
+fn a_block_leaf_programs_host_bytes_by_part() {
+    use super::instr::{Addr, Instr};
+    let plan = production_height_plan();
+    let costs = plan.costs();
+    let partition = plan.partition().clone();
+    let threshold: usize = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.oversize_threshold\0") }
+        .expect("opt.oversize_threshold reads");
+    println!(
+        "LEAF BYTES: size_of::<Instr>() {} · Addr {} · (Addr, u64) {} · FE {} · jemalloc \
+         oversize threshold {threshold} B (the instruments assume {JEMALLOC_OVERSIZE}) · {} leaves",
+        size_of::<Instr>(),
+        size_of::<Addr>(),
+        size_of::<(Addr, u64)>(),
+        size_of::<FE>(),
+        partition.num_leaves()
+    );
+    assert_eq!(
+        threshold, JEMALLOC_OVERSIZE,
+        "jemalloc's oversize threshold moved"
+    );
+    // The first emission makes the process-wide caches; drop it.
+    drop(plan.leaf_program(0).expect("leaf 0 emits"));
+
+    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    let mut sum = ProgramBytes::default();
+    let (mut perms_sum, mut heap_sum, mut instrs_sum) = (0usize, 0usize, 0usize);
+    let mut variants = std::collections::BTreeMap::<&str, usize>::new();
+    let (mut bitdecs, mut bits, mut contiguous, mut one_mult) = (0usize, 0usize, 0usize, 0usize);
+    let mut groups_held = [0usize; 11];
+    let mut groups_real = [0usize; 11];
+    for (k, leaf) in partition.leaves().iter().enumerate() {
+        let perms: usize = leaf.iter().map(|&i| costs[i]).sum();
+        let before = heap_allocated();
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let heap = heap_allocated().saturating_sub(before);
+        let b = ProgramBytes::of(&program);
+        println!(
+            "LEAF BYTES leaf {k}: {} instances · {perms} perms · {} instrs · held {:.1} MiB (instrs \
+             {:.1} for {:.1} used · bitdec bits {:.1} · boxed {:.1} · groups {:.1}, padded rows {:.1}, \
+             real rows {:.1} · other {:.2}) · ≥ oversize {:.1} % · {} allocations · heap Δ {:.1} MiB \
+             ({:+.1} % on the sum)",
+            leaf.len(),
+            program.instrs.len(),
+            mib(b.total()),
+            mib(b.instrs),
+            mib(program.instrs.len() * size_of::<Instr>()),
+            mib(b.bitdec_heap),
+            mib(b.boxed),
+            mib(b.groups),
+            mib(b.groups_padded),
+            mib(b.groups_real),
+            mib(b.other),
+            100.0 * b.large as f64 / b.total() as f64,
+            b.allocs,
+            mib(heap),
+            100.0 * (heap as f64 / b.total() as f64 - 1.0),
+        );
+        for instr in &program.instrs {
+            let name = match instr {
+                Instr::Const { .. } => "Const",
+                Instr::BaseAlu { .. } => "BaseAlu",
+                Instr::ExtAlu { .. } => "ExtAlu",
+                Instr::Select { .. } => "Select",
+                Instr::BitDec { bits: list, .. } => {
+                    bitdecs += 1;
+                    bits += list.len();
+                    if list.windows(2).all(|w| w[1].0.0 == w[0].0.0 + 1) {
+                        contiguous += 1;
+                    }
+                    if list.windows(2).all(|w| w[1].1 == w[0].1) {
+                        one_mult += 1;
+                    }
+                    "BitDec"
+                }
+                Instr::Hash { .. } => "Hash",
+                Instr::Hint { .. } => "Hint",
+                Instr::Pack { .. } => "Pack",
+                Instr::Unpack { .. } => "Unpack",
+                Instr::KeccakF(_) => "KeccakF",
+                Instr::Blake3(_) => "Blake3",
+                Instr::Public { .. } => "Public",
+            };
+            *variants.entry(name).or_default() += 1;
+        }
+        for (j, g) in program_groups(&program).iter().enumerate() {
+            groups_held[j] += g.data.capacity() * size_of::<FE>();
+            groups_real[j] += g.real_rows * g.width * size_of::<FE>();
+        }
+        sum.add(&b);
+        perms_sum += perms;
+        heap_sum += heap;
+        instrs_sum += program.instrs.len();
+    }
+    let t = sum.total() as f64;
+    let pct = |b: usize| 100.0 * b as f64 / t;
+    println!(
+        "LEAF BYTES Σ: {perms_sum} perms · {instrs_sum} instrs · held {:.1} MiB = instrs {:.1} % · \
+         bitdec bits {:.1} % · boxed {:.1} % · groups {:.1} % (capacity slack {:.1} % and row \
+         padding {:.1} % of the total) · instrs' capacity slack {:.1} % · other {:.2} % · ≥ oversize \
+         {:.1} % · heap Δ {:.1} MiB ({:+.1} %) · {:.0} B a perm, {:.1} B an instr",
+        mib(sum.total()),
+        pct(sum.instrs),
+        pct(sum.bitdec_heap),
+        pct(sum.boxed),
+        pct(sum.groups),
+        pct(sum.groups - sum.groups_padded),
+        pct(sum.groups_padded - sum.groups_real),
+        pct(sum.instrs - instrs_sum * size_of::<Instr>()),
+        pct(sum.other),
+        pct(sum.large),
+        mib(heap_sum),
+        100.0 * (heap_sum as f64 / t - 1.0),
+        t / perms_sum as f64,
+        t / instrs_sum as f64,
+    );
+    let groups: Vec<String> = PROGRAM_GROUP_NAMES
+        .iter()
+        .zip(groups_held.iter().zip(&groups_real))
+        .filter(|(_, (held, _))| **held > 0)
+        .map(|(name, (held, real))| format!("{name} {:.1}/{:.1}", mib(*held), mib(*real)))
+        .collect();
+    println!(
+        "LEAF BYTES groups (MiB held/real rows, Σ leaves): {}",
+        groups.join(" · ")
+    );
+    let mix: Vec<String> = variants
+        .iter()
+        .map(|(name, n)| format!("{name} {:.1} %", 100.0 * *n as f64 / instrs_sum as f64))
+        .collect();
+    println!(
+        "LEAF BYTES instrs: {} · BitDec {bitdecs}: {:.1} bits each, contiguous addresses {:.1} %, \
+         one multiplicity {:.1} %",
+        mix.join(" · "),
+        bits as f64 / bitdecs.max(1) as f64,
+        100.0 * contiguous as f64 / bitdecs.max(1) as f64,
+        100.0 * one_mult as f64 / bitdecs.max(1) as f64,
+    );
+}
+
+/// The S5 late-emission instruments' probe: under the posture's never-purge
+/// jemalloc, `gen` threads allocate and touch trace-like buffers of
+/// `buffer_sizes` (cycled) to ≈ 2 GiB and free them, as phase B retires the
+/// base's traces; then 4 threads of their own emit leaf programs to ≈ 1.75 GiB and
+/// hold them, as the harness's ELF-beside pool does. Reports how much of the
+/// programs' heap took pages the allocator did not already hold
+/// (`stats.resident`'s rise): the bytes a late emission still adds to the
+/// base's high-water.
+fn late_emission_reuse_probe(arm: &str, buffer_sizes: &[usize]) {
+    let dirty: isize = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0") }
+        .expect("opt.dirty_decay_ms reads");
+    assert_eq!(
+        dirty, -1,
+        "run under the posture's allocator: _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"
+    );
+    let plan = production_height_plan();
+    let first = plan.leaf_program(0).expect("leaf 0 emits");
+    let per_leaf = ProgramBytes::of(&first);
+    drop(first);
+    let leaves = (((7usize << 28) / per_leaf.total()).max(1)).min(plan.partition().num_leaves());
+    let pool = |name: &'static str, threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(move |i| format!("{name}-{i}"))
+            .build()
+            .expect("the pool builds")
+    };
+    let (gen_pool, emit_pool) = (pool("probe-gen", 6), pool("probe-emit", 4));
+    let target = 2usize << 30;
+    let mut sizes = Vec::new();
+    let mut at = 0usize;
+    while sizes.iter().sum::<usize>() < target {
+        sizes.push(buffer_sizes[at % buffer_sizes.len()]);
+        at += 1;
+    }
+    let buffers: Vec<Vec<u8>> = gen_pool.install(|| {
+        use rayon::prelude::*;
+        sizes.par_iter().map(|&n| vec![1u8; n]).collect()
+    });
+    let (resident0, live0) = (heap_resident(), heap_allocated());
+    gen_pool.install(|| {
+        use rayon::prelude::*;
+        buffers.into_par_iter().for_each(drop);
+    });
+    let (resident1, live1) = (heap_resident(), heap_allocated());
+    let programs: Vec<LfmProgram> = emit_pool.install(|| {
+        use rayon::prelude::*;
+        (0..leaves)
+            .into_par_iter()
+            .map(|k| plan.leaf_program(k).expect("the leaf emits"))
+            .collect()
+    });
+    let (resident2, live2) = (heap_resident(), heap_allocated());
+    let mut held = ProgramBytes::default();
+    for p in &programs {
+        held.add(&ProgramBytes::of(p));
+    }
+    let heap = live2.saturating_sub(live1);
+    let fresh = resident2.saturating_sub(resident1);
+    println!(
+        "LATE PROBE {arm}: {} buffers ({:.2} GiB, sizes {:?} MiB) freed: live {:.2} → {:.2} GiB, \
+         resident {:.2} → {:.2} · {leaves} leaf programs emitted on 4 threads: heap {:.2} GiB \
+         (held by count {:.2}, ≥ oversize {:.1} %) · resident {:.2} → {:.2} (+{:.2} GiB) · \
+         fresh pages {:.1} % of the programs' heap, reused {:.1} %",
+        sizes.len(),
+        gib(sizes.iter().sum()),
+        buffer_sizes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
+        gib(live0),
+        gib(live1),
+        gib(resident0),
+        gib(resident1),
+        gib(heap),
+        gib(held.total()),
+        100.0 * held.large as f64 / held.total() as f64,
+        gib(resident1),
+        gib(resident2),
+        gib(fresh),
+        100.0 * fresh as f64 / heap as f64,
+        100.0 * (1.0 - fresh as f64 / heap as f64),
+    );
+    drop(programs);
+}
+
+/// ★ S5 late emission's mechanism, the trace arm: the base's packed traces are
+/// tens to hundreds of MiB an instance (median: 56.5 GiB over 941), so phase B
+/// frees them into the shared oversize arena. Laptop, the posture's allocator:
+/// `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`, run alone.
+#[test]
+#[ignore = "laptop instrument: run alone under _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"]
+fn late_emission_probe_over_freed_trace_sized_buffers() {
+    late_emission_reuse_probe("trace-sized", &[16 << 20, 48 << 20, 128 << 20, 24 << 20]);
+}
+
+/// ★ The contrast arm: 1 MiB buffers, under the oversize threshold, so their
+/// pages stay in the freeing threads' own arenas.
+#[test]
+#[ignore = "laptop instrument: run alone under _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"]
+fn late_emission_probe_over_freed_small_buffers() {
+    late_emission_reuse_probe("small", &[1 << 20]);
+}
+
+/// Every program id of `plan`'s tree under the tree's wrap options, as hex:
+/// each leaf's, then each node level's in node order, the top's last. Derived
+/// one program at a time (emit, build, keep the child's derived shape, drop the
+/// program), so one program is held at once. Prints the ELF digest the plan
+/// absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so two
+/// runs that disagree can be compared group by group.
+fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
+    let wrap = super::proof::aggregation_wrap_options();
+    let words = plan.child_layout().total();
+    let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let roots = |j: usize, a: &LfmArtifacts| {
+        let slots: Vec<String> = a
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(s, r)| format!("{s}:{}", hex(r)))
+            .collect();
+        let chunks = |c: &[Commitment]| c.iter().map(hex).collect::<Vec<_>>().join(" ");
+        println!(
+            "TREE ROOTS {j}: {} · hash chunks {} · blake3 chunks {}",
+            slots.join(" "),
+            chunks(&a.hash_chunk_roots),
+            chunks(&a.blake3_chunk_roots)
+        );
+    };
+    println!("TREE ELF digest {}", hex(plan.elf_digest()));
+    let mut ids = Vec::new();
+    let mut level: Vec<DerivedChild> = Vec::new();
+    for k in 0..plan.partition().num_leaves() {
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+        roots(ids.len(), &artifacts);
+        ids.push(hex(&artifacts.program_id));
+        level.push(
+            DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the leaf derives"),
+        );
+    }
+    let levels = plan.levels();
+    for (lv, arities) in levels.iter().enumerate() {
+        let top = lv + 1 == levels.len();
+        let mut kids = level.into_iter();
+        let mut next = Vec::new();
+        for &a in &arities.arities {
+            let group: Vec<DerivedChild> = kids.by_ref().take(a).collect();
+            let program = plan.node_program(&group, top).expect("the node emits");
+            let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+            roots(ids.len(), &artifacts);
+            ids.push(hex(&artifacts.program_id));
+            next.push(
+                DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the node derives"),
+            );
+        }
+        level = next;
+    }
+    ids
+}
+
+/// ★ The compact program form changes no program: every id of a small spread
+/// plan's tree equals the one recorded at 541f4bdc2 (#1013's d740eb5d5 + the
+/// instruments), before the form changed.
+///
+/// ⚠ The pins are the LAPTOP's: the plan absorbs the ELF's digest, and the
+/// fixture ELF's bytes depend on the clang that assembled it (laptop
+/// `af87f637…`, 1264 B; FAST `bfb782e1…`, 1272 B), so a box derives other ids
+/// for the same programs (FAST 670). The box gate compares two shas on one box.
+#[test]
+#[ignore = "laptop: run with --exact"]
+fn the_compact_program_form_keeps_a_small_trees_ids() {
+    let ids = tree_ids(&spread_plan(2, 4));
+    for (j, id) in ids.iter().enumerate() {
+        println!("SMALL TREE IDS {j}: {id}");
+    }
+    assert_eq!(ids, SMALL_TREE_IDS, "a program of the tree changed");
+}
+
+/// The same at production heights ([`production_height_plan`]: 7 leaves, 2
+/// nodes and the top), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host
+/// commit. The box gates add the 1× and median trees' top ids.
+#[test]
+#[ignore = "box tier: production-height artifacts on the host, ≈ 4.7 min and 4.6 GiB"]
+fn the_compact_program_form_keeps_every_production_height_tree_id() {
+    let ids = tree_ids(&production_height_plan());
+    for (j, id) in ids.iter().enumerate() {
+        println!("TREE IDS {j}: {id}");
+    }
+    assert_eq!(
+        ids, PRODUCTION_HEIGHT_TREE_IDS,
+        "a program of the tree changed"
+    );
+}
+
+/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids at 541f4bdc2.
+const SMALL_TREE_IDS: [&str; 2] = [
+    "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
+    "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
+];
+
+/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids at
+/// 541f4bdc2.
+const PRODUCTION_HEIGHT_TREE_IDS: [&str; 10] = [
+    "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
+    "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
+    "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
+    "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
+    "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
+    "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
+    "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
+    "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
+    "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
+    "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
+];
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
 /// tied to the ELF and the options they were computed under: another ELF's, or
@@ -1470,6 +1976,213 @@ fn emit_window_knob() -> Option<usize> {
                     panic!("NOEPOCH_TREE_EMIT_WINDOW must be a positive integer, got `{v}`")
                 })
         })
+}
+
+/// How the pipeline emits the leaf programs beside the base
+/// (`NOEPOCH_TREE_EMIT_LATE`).
+///
+/// Late: leaf 0 at the shape, the rest once the heap's live bytes have fallen
+/// `margin` × their estimated bytes below the shape's (phase B frees each trace
+/// as its table proves), or have stopped falling, or the base has returned
+/// ([`late_trigger`]). Freed trace buffers sit in jemalloc's shared oversize
+/// arena and 99.5 % of a program's bytes are allocations that size, so the
+/// programs take the freed pages instead of raising the base's high-water. At
+/// the median, spill off, that is base-phase VmRSS −10.37 GiB, recursion −0.31
+/// s, whole −2.15 s, 98 % of the programs' bytes on reused pages (BIG 585, 2 +
+/// 2); with spill on it is inert (−1.28 GiB, +0.55 s), the room phase A leaves
+/// being elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LateMode {
+    /// `0` or `off`: every leaf program at the shape.
+    Off,
+    /// Unset, empty or `auto` (the default): late at [`LATE_MARGIN`] when the
+    /// programs' estimate reaches [`LATE_MIN_ESTIMATE`], at the shape otherwise.
+    Auto,
+    /// `<margin>`: late at that margin, whatever the estimate.
+    Margin(f64),
+}
+
+fn emit_late_knob() -> LateMode {
+    match std::env::var("NOEPOCH_TREE_EMIT_LATE").ok().as_deref() {
+        None | Some("" | "auto") => LateMode::Auto,
+        Some("0" | "off") => LateMode::Off,
+        Some(v) => LateMode::Margin(
+            v.parse()
+                .ok()
+                .filter(|m: &f64| m.is_finite() && *m > 0.0)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "NOEPOCH_TREE_EMIT_LATE must be auto, off or a positive margin, got `{v}`"
+                    )
+                }),
+        ),
+    }
+}
+
+/// The default late emission's margin over the programs' estimated bytes: the
+/// pages they need plus phase B's own transients (BIG 585).
+const LATE_MARGIN: f64 = 1.25;
+
+/// The default late emission's floor: below this estimate the programs are
+/// emitted at the shape. A small tree's programs barely move the peak, and its
+/// short phase B may not free `margin` × their bytes before the base returns,
+/// which would leave the harvest waiting on them (the record block's 7 more
+/// leaves are ≈ 3.8 GiB [I]; the median's 55 are 30.6 GiB).
+const LATE_MIN_ESTIMATE: usize = 8 << 30;
+
+/// The margin a late emission waits at, or `None` to emit at the shape.
+fn late_margin(mode: LateMode, estimate: usize) -> Option<f64> {
+    match mode {
+        LateMode::Off => None,
+        LateMode::Margin(m) => Some(m),
+        LateMode::Auto => (estimate >= LATE_MIN_ESTIMATE).then_some(LATE_MARGIN),
+    }
+}
+
+/// The other `beside - 1` leaves' programs' bytes, from leaf 0's (`first`)
+/// bytes a permutation of in-guest verification.
+fn late_estimate(plan: &BlockTreePlan, first: &LfmProgram, beside: usize) -> usize {
+    let costs = plan.costs();
+    let perms =
+        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
+    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
+    (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize
+}
+
+/// The default emits late only above its floor, a margin forces it, `off` never.
+#[test]
+fn the_default_late_emission_needs_its_floor() {
+    const G: usize = 1 << 30;
+    assert_eq!(late_margin(LateMode::Auto, 30 * G), Some(LATE_MARGIN));
+    assert_eq!(
+        late_margin(LateMode::Auto, LATE_MIN_ESTIMATE),
+        Some(LATE_MARGIN)
+    );
+    assert_eq!(late_margin(LateMode::Auto, 4 * G), None);
+    assert_eq!(late_margin(LateMode::Margin(2.0), G), Some(2.0));
+    assert_eq!(late_margin(LateMode::Off, 30 * G), None);
+}
+
+/// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
+/// by [`LATE_LOW_STEP`] for this long (spill on: phase B holds only its
+/// read-back window, so the live bytes stop falling long before the programs'
+/// bytes are freed).
+const LATE_SETTLE_SECS: f64 = 30.0;
+
+/// The step a new low of the heap's live bytes must beat the last one by.
+const LATE_LOW_STEP: usize = 1 << 30;
+
+/// When the late emission (`NOEPOCH_TREE_EMIT_LATE`) starts: once the heap's
+/// live bytes are `need` below their value at the shape (`fell`), or have made
+/// no new low for [`LATE_SETTLE_SECS`] (`settled`), or the base has returned
+/// (`base returned`); `None` keeps waiting.
+fn late_trigger(
+    live_at_shape: usize,
+    live: usize,
+    need: usize,
+    since_low_secs: f64,
+    base_done: bool,
+) -> Option<&'static str> {
+    if live_at_shape.saturating_sub(live) >= need {
+        Some("fell")
+    } else if base_done {
+        Some("base returned")
+    } else if since_low_secs >= LATE_SETTLE_SECS {
+        Some("settled")
+    } else {
+        None
+    }
+}
+
+/// The late emission's wait and what the heap did around it.
+struct LateWait {
+    margin: f64,
+    trigger: &'static str,
+    waited: f64,
+    /// Seconds since the base started, when the wait ended.
+    at: f64,
+    estimate: usize,
+    need: usize,
+    live_at_shape: usize,
+    live_at_start: usize,
+    resident_at_start: usize,
+}
+
+/// Waits for [`late_trigger`], polling the heap every 200 ms, for a fall of
+/// `margin` × `estimate` ([`late_estimate`]).
+fn wait_for_late_emission(
+    estimate: usize,
+    margin: f64,
+    live_at_shape: usize,
+    base_done: &std::sync::atomic::AtomicBool,
+    t_base0: std::time::Instant,
+) -> LateWait {
+    use std::time::Instant;
+    let need = (margin * estimate as f64) as usize;
+    let t = Instant::now();
+    let (mut low, mut low_at) = (live_at_shape, Instant::now());
+    let trigger = loop {
+        let live = heap_allocated();
+        if live + LATE_LOW_STEP <= low {
+            (low, low_at) = (live, Instant::now());
+        }
+        let done = base_done.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(why) = late_trigger(
+            live_at_shape,
+            live,
+            need,
+            low_at.elapsed().as_secs_f64(),
+            done,
+        ) {
+            break why;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    LateWait {
+        margin,
+        trigger,
+        waited: t.elapsed().as_secs_f64(),
+        at: t_base0.elapsed().as_secs_f64(),
+        estimate,
+        need,
+        live_at_shape,
+        live_at_start: heap_allocated(),
+        resident_at_start: heap_resident(),
+    }
+}
+
+/// `NOEPOCH_TREE_EMIT_LATE`'s trigger: a fall of `need` below the shape's live
+/// bytes starts the emission; otherwise the base's return or a heap that has
+/// settled does; nothing else does.
+#[test]
+fn the_late_emission_waits_for_its_room() {
+    const G: usize = 1 << 30;
+    // The median, spill off: 68 GiB live at the shape, a fall of 30 GiB needed.
+    assert_eq!(late_trigger(68 * G, 60 * G, 30 * G, 0.5, false), None);
+    assert_eq!(
+        late_trigger(68 * G, 38 * G, 30 * G, 0.5, false),
+        Some("fell")
+    );
+    // Phase B's transients lifting the live bytes over the shape's are no fall.
+    assert_eq!(late_trigger(68 * G, 70 * G, 30 * G, 0.5, false), None);
+    let settled = LATE_SETTLE_SECS;
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, settled - 0.1, false),
+        None
+    );
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, settled, false),
+        Some("settled")
+    );
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, 0.5, true),
+        Some("base returned")
+    );
+    // The fall is reported over the other two.
+    assert_eq!(
+        late_trigger(68 * G, 38 * G, 30 * G, settled, true),
+        Some("fell")
+    );
 }
 
 /// [`compose_block_tree`], each node proved from the program and artifacts
@@ -2569,6 +3282,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let emit_threads = emit_pool_knob();
     let emit_window = emit_window_knob();
     let node_emit_early = node_emit_early_knob();
+    let emit_late = emit_late_knob();
+    let base_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2577,6 +3292,7 @@ fn the_block_tree_composes_to_a_top_node() {
     let t_base0 = Instant::now();
     let consts_beside = elf_beside.map(|threads| {
         let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
+        let base_done = base_done.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
@@ -2588,8 +3304,10 @@ fn the_block_tree_composes_to_a_top_node() {
             let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
             let secs = t.elapsed().as_secs_f64();
             let mut job = None;
+            let mut late_line = None;
             let ahead = match (&consts, tree_ahead) {
                 (Ok(c), Some(mode)) => shape_rx.recv().ok().map(|shape| {
+                    let live_at_shape = (emit_late != LateMode::Off).then(heap_allocated);
                     let t = Instant::now();
                     let derived = pool.install(|| -> Result<_, String> {
                         let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
@@ -2606,13 +3324,74 @@ fn the_block_tree_composes_to_a_top_node() {
                             }
                             AheadMode::Pipe => {
                                 use rayon::prelude::*;
-                                let te = Instant::now();
                                 let n = plan.partition().num_leaves();
                                 let beside = emit_window.map_or(n, |w| w.min(n));
-                                let leaves = (0..beside)
-                                    .into_par_iter()
-                                    .map(|k| plan.leaf_program(k))
-                                    .collect::<Result<Vec<_>, String>>()?;
+                                // `NOEPOCH_TREE_EMIT_LATE`: leaf 0 now, sizing the
+                                // wait; the rest once phase B has freed their room.
+                                let mut leaves = Vec::with_capacity(beside);
+                                let late = match live_at_shape {
+                                    Some(live) if beside > 1 => {
+                                        leaves.push(plan.leaf_program(0)?);
+                                        let estimate = late_estimate(&plan, &leaves[0], beside);
+                                        match late_margin(emit_late, estimate) {
+                                            Some(margin) => Some(wait_for_late_emission(
+                                                estimate, margin, live, &base_done, t_base0,
+                                            )),
+                                            None => {
+                                                late_line = Some(format!(
+                                                    "   TREE LATE: auto, the other {} leaves' programs \
+                                                     estimated {:.2} GiB, under the {:.0} GiB floor: \
+                                                     emitted at the shape",
+                                                    beside - 1,
+                                                    gib(estimate),
+                                                    gib(LATE_MIN_ESTIMATE)
+                                                ));
+                                                None
+                                            }
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                let te = Instant::now();
+                                let first = leaves.len();
+                                leaves.extend(
+                                    (first..beside)
+                                        .into_par_iter()
+                                        .map(|k| plan.leaf_program(k))
+                                        .collect::<Result<Vec<_>, String>>()?,
+                                );
+                                if let Some(w) = late {
+                                    let mut held = ProgramBytes::default();
+                                    for p in &leaves {
+                                        held.add(&ProgramBytes::of(p));
+                                    }
+                                    let resident = heap_resident();
+                                    late_line = Some(format!(
+                                        "   TREE LATE: leaf 0 at the shape, {} more after {:.2}s ({}) \
+                                         at {:.2}s of the base, emitted in {:.2}s, done at {:.2}s · heap \
+                                         live {:.2} GiB at the shape → {:.2} at the start (need a fall of \
+                                         {:.2} = {} × {:.2} estimated) → {:.2} at the end · resident \
+                                         {:.2} → {:.2} GiB over the emission (+{:.2}) · programs held \
+                                         {:.2} GiB, ≥ oversize {:.1} %",
+                                        beside - 1,
+                                        w.waited,
+                                        w.trigger,
+                                        w.at,
+                                        te.elapsed().as_secs_f64(),
+                                        t_base0.elapsed().as_secs_f64(),
+                                        gib(w.live_at_shape),
+                                        gib(w.live_at_start),
+                                        gib(w.need),
+                                        w.margin,
+                                        gib(w.estimate),
+                                        gib(heap_allocated()),
+                                        gib(w.resident_at_start),
+                                        gib(resident),
+                                        gib(resident.saturating_sub(w.resident_at_start)),
+                                        gib(held.total()),
+                                        100.0 * held.large as f64 / held.total().max(1) as f64,
+                                    ));
+                                }
                                 let pipe = std::sync::Arc::new(Pipe::new(n, &plan.levels()));
                                 let emitted = super::block_plan::PhaseTimes {
                                     programs: leaves.len(),
@@ -2634,7 +3413,7 @@ fn the_block_tree_composes_to_a_top_node() {
                 }),
                 _ => None,
             };
-            let _ = ready_tx.send((consts, secs, ahead));
+            let _ = ready_tx.send((consts, secs, ahead, late_line));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
             Some(pipe.run_builder(
@@ -2657,6 +3436,7 @@ fn the_block_tree_composes_to_a_top_node() {
         let _ = shape_tx.send(s.clone());
     })
     .expect("the block must prove");
+    base_done.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(shape_tx);
     let base = t.elapsed().as_secs_f64();
     let (base_peak, _) = base_sampler.stop();
@@ -2682,7 +3462,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let mut pipe = None;
     let consts = consts_beside.as_ref().map(|_| {
         let tj = Instant::now();
-        let (consts, secs, ahead) = ready_rx.recv().expect("the ELF constants thread stopped");
+        let (consts, secs, ahead, late_line) =
+            ready_rx.recv().expect("the ELF constants thread stopped");
         println!(
             "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
              waited {:.2}s (counted in the harvest)",
@@ -2709,6 +3490,9 @@ fn the_block_tree_composes_to_a_top_node() {
             );
             pipe = Some(filled);
         }
+        if let Some(line) = late_line {
+            println!("{line}");
+        }
         std::sync::Arc::new(consts.expect("the ELF constants compute"))
     });
     assert!(
@@ -2716,6 +3500,16 @@ fn the_block_tree_composes_to_a_top_node() {
         "NOEPOCH_TREE_AHEAD derived no tree"
     );
     let shape = BlockShape::of_proof(&proof);
+    // `NOEPOCH_SHAPE_OUT=<file>`: the shape a consumer receives, for a verifier
+    // run in a process of its own
+    // (`the_block_verifiers_derivation_from_a_saved_shape`).
+    if let Ok(path) = std::env::var("NOEPOCH_SHAPE_OUT")
+        && !path.is_empty()
+    {
+        std::fs::write(&path, shape_to_text(&shape))
+            .unwrap_or_else(|e| panic!("NOEPOCH_SHAPE_OUT {path}: {e}"));
+        println!("   BLOCK SHAPE written to {path}");
+    }
     let (mut rb, verify, replay, beside) = if inline_verify {
         let (rb, verify, replay) =
             harvest_block_over(&inner, &elf_bytes, &proof, true, consts.as_deref())
@@ -3062,4 +3856,245 @@ fn the_block_tree_composes_to_a_top_node() {
             t.elapsed().as_secs_f64()
         );
     }
+}
+
+// ============ the block verifier's derivation in a process of its own ==========
+
+/// The fields of [`crate::TableCounts`], in declaration order, for
+/// [`shape_to_text`] and [`shape_from_text`].
+fn table_count_fields(c: &mut crate::TableCounts) -> [&mut usize; 21] {
+    [
+        &mut c.cpu,
+        &mut c.lt,
+        &mut c.memw,
+        &mut c.memw_aligned,
+        &mut c.load,
+        &mut c.mul,
+        &mut c.dvrm,
+        &mut c.shift,
+        &mut c.branch,
+        &mut c.memw_register,
+        &mut c.eq,
+        &mut c.bytewise,
+        &mut c.store,
+        &mut c.cpu32,
+        &mut c.keccak,
+        &mut c.keccak_rnd,
+        &mut c.ecsm,
+        &mut c.ecdas,
+        &mut c.hint,
+        &mut c.commit,
+        &mut c.blake3,
+    ]
+}
+
+/// A [`BlockShape`] as five lines of text: the table counts, the runtime page
+/// ranges (`base:count`), the private-input pages, the public output's length
+/// and the trace lengths.
+fn shape_to_text(shape: &BlockShape) -> String {
+    let mut counts = shape.table_counts.clone();
+    let join = |v: Vec<String>| v.join(" ");
+    format!(
+        "counts {}\nranges {}\nprivate {}\noutput {}\nlengths {}\n",
+        join(
+            table_count_fields(&mut counts)
+                .iter()
+                .map(|c| c.to_string())
+                .collect()
+        ),
+        join(
+            shape
+                .runtime_page_ranges
+                .iter()
+                .map(|r| format!("{}:{}", r.base, r.count))
+                .collect()
+        ),
+        shape.num_private_input_pages,
+        shape.public_output_len,
+        join(shape.trace_lengths.iter().map(|l| l.to_string()).collect()),
+    )
+}
+
+/// [`shape_to_text`]'s inverse.
+fn shape_from_text(text: &str) -> BlockShape {
+    let line = |key: &str| -> Vec<&str> {
+        let l = text
+            .lines()
+            .find(|l| l.split(' ').next() == Some(key))
+            .unwrap_or_else(|| panic!("the shape has no `{key}` line"));
+        l.split(' ').skip(1).filter(|w| !w.is_empty()).collect()
+    };
+    let num = |w: &str| -> u64 {
+        w.parse()
+            .unwrap_or_else(|_| panic!("`{w}` is not a number"))
+    };
+    let mut table_counts = crate::TableCounts {
+        cpu: 0,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
+        blake3: 0,
+    };
+    let counts = line("counts");
+    assert_eq!(counts.len(), 21, "the shape's counts line has 21 fields");
+    for (field, w) in table_count_fields(&mut table_counts)
+        .into_iter()
+        .zip(counts)
+    {
+        *field = num(w) as usize;
+    }
+    BlockShape {
+        table_counts,
+        runtime_page_ranges: line("ranges")
+            .into_iter()
+            .map(|w| {
+                let (base, count) = w.split_once(':').expect("a range is base:count");
+                crate::RuntimePageRange {
+                    base: num(base),
+                    count: num(count),
+                }
+            })
+            .collect(),
+        num_private_input_pages: num(line("private")[0]) as usize,
+        public_output_len: num(line("output")[0]) as usize,
+        trace_lengths: line("lengths")
+            .into_iter()
+            .map(|w| num(w) as usize)
+            .collect(),
+    }
+}
+
+/// A shape survives its text form: [`shape_from_text`] of [`shape_to_text`] is
+/// the shape, page ranges included.
+#[test]
+fn a_block_shape_round_trips_through_its_text() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let mut shape = honest_fixture_shape(&elf);
+    shape.table_counts.keccak = 3;
+    shape.table_counts.blake3 = 1;
+    shape.runtime_page_ranges = vec![
+        crate::RuntimePageRange {
+            base: 0x7000_0000,
+            count: 2,
+        },
+        crate::RuntimePageRange {
+            base: 0x8000_0000,
+            count: 1,
+        },
+    ];
+    shape.num_private_input_pages = 5;
+    shape.trace_lengths.extend([1 << 18, 1 << 17]);
+    let back = shape_from_text(&shape_to_text(&shape));
+    assert_eq!(format!("{back:?}"), format!("{shape:?}"));
+}
+
+/// The verifier's streaming derivation (each program and its artifacts dropped
+/// once its child is derived) derives the top of the tree that keeps every
+/// program ([`BlockTreePlan::derive_tree`]): a fixture plan with eight more CPU
+/// instances, cut into six leaves, so a leaf level, an interior level and the
+/// top.
+#[test]
+#[ignore = "box tier: two derivations of a six-leaf tree under the wrap preset, ≈ 2 min on the laptop"]
+fn the_streaming_derivation_derives_the_kept_trees_top() {
+    let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let mut shape = honest_fixture_shape(&elf);
+    // The CPU instances follow `CPU[0]`, right after the fixed tables.
+    shape.table_counts.cpu += 8;
+    let at = crate::FIXED_TABLE_COUNT + 1;
+    shape.trace_lengths.splice(at..at, [32; 8]);
+    let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
+    let names: Vec<&str> = plan.instances().iter().map(|i| i.name.as_str()).collect();
+    let partition = partition_by_rule(&names, &plan.costs(), 6).expect("six leaves fill");
+    let plan = plan.with_partition(partition);
+    assert_eq!(
+        plan.levels().len(),
+        2,
+        "six leaves at fan-in 4: one interior level and the top"
+    );
+    let streamed = plan.derive_top(&wrap_opts).expect("the top derives");
+    let (tree, _) = plan
+        .derive_tree(&wrap_opts, &|p| {
+            super::block_plan::artifacts_of(p, &wrap_opts)
+        })
+        .expect("the tree derives");
+    let kept = &tree.last().expect("a top level")[0].1;
+    assert_eq!(streamed.program_id, kept.program_id);
+}
+
+/// ★ The block verifier's derivation ([`BlockTreePlan::derive_top`] under the
+/// block presets, what [`super::block_plan::verify_block_tree`] runs before its
+/// final check) in a process of its own, over a shape a whole-block run saved
+/// (`NOEPOCH_SHAPE_OUT`): its host peak, where no page the tree freed hides it,
+/// and the top id, which must be the whole run's. `LAMBDA_VM_BLOCK_DERIVE_HOLD`
+/// picks how a level holds its programs.
+#[test]
+#[ignore = "box tier: NOEPOCH_ELF and NOEPOCH_SHAPE (a whole-block run's NOEPOCH_SHAPE_OUT), --features cuda"]
+fn the_block_verifiers_derivation_from_a_saved_shape() {
+    use super::per_table_aggregator_tests::HostSampler;
+    use std::time::Instant;
+    let path = |var: &str| std::env::var(var).unwrap_or_else(|_| panic!("{var} must name a file"));
+    let elf_bytes = std::fs::read(path("NOEPOCH_ELF")).expect("read NOEPOCH_ELF");
+    let shape = shape_from_text(
+        &std::fs::read_to_string(path("NOEPOCH_SHAPE")).expect("read NOEPOCH_SHAPE"),
+    );
+    let hold = std::env::var("LAMBDA_VM_BLOCK_DERIVE_HOLD").unwrap_or_default();
+    let opts = super::proof::block_base_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let sampler = HostSampler::start();
+    let t = Instant::now();
+    let consts =
+        super::block_plan::ElfConstants::compute(&elf_bytes, &opts).expect("the constants compute");
+    let constants = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let plan =
+        BlockTreePlan::derive_with(&elf_bytes, &opts, &shape, &consts).expect("the plan derives");
+    let planned = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let (top, levels) = plan.derive_top_timed(&wrap_opts).expect("the top derives");
+    let derived = t.elapsed().as_secs_f64();
+    let (peak, _) = sampler.stop();
+    let split: Vec<String> = levels
+        .iter()
+        .map(|p| {
+            format!(
+                "{} in {:.2} (emit Σ {:.2}, build Σ {:.2})",
+                p.programs, p.wall, p.emit, p.build
+            )
+        })
+        .collect();
+    println!(
+        "BLOCK VERIFIER ONLY: hold `{}` · {} leaves · constants {constants:.2}s · plan {planned:.2}s · derive \
+         {derived:.2}s ({}) · host peak {peak:.3} GiB · top program id {}",
+        if hold.is_empty() {
+            "stream"
+        } else {
+            hold.as_str()
+        },
+        plan.partition().num_leaves(),
+        split.join(" · "),
+        top.program_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 }
