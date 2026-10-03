@@ -24,6 +24,7 @@ pub mod lde;
 pub mod lde_cm;
 pub mod logup;
 pub mod merkle;
+pub mod narrow;
 pub mod ntt;
 pub mod nvtx;
 pub mod rpx;

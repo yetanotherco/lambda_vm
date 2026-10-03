@@ -48,6 +48,25 @@ impl Columns<'_> {
     }
 }
 
+/// A table's columns as they go up: as they are, or packed (each column at the
+/// bytes its words need, [`crate::narrow`]) and widened on the card.
+#[derive(Clone, Copy)]
+pub enum TableUpload<'a> {
+    /// The columns, every one the table's height.
+    Wide(&'a [&'a [u64]]),
+    Narrow(crate::narrow::NarrowInput<'a>),
+}
+
+impl TableUpload<'_> {
+    /// Words the table takes on the card.
+    pub fn cells(&self) -> usize {
+        match self {
+            Self::Wide(columns) => columns.iter().map(|c| c.len()).sum(),
+            Self::Narrow(packed) => packed.rows() * packed.cols(),
+        }
+    }
+}
+
 /// The columns themselves, laid end to end in one allocation.
 pub struct DeviceColumns {
     stream: Arc<CudaStream>,
@@ -93,8 +112,113 @@ impl DeviceColumns {
         })
     }
 
+    /// [`Self::upload`] of whole tables, each as it is held: a packed one
+    /// crosses the bus at its packed bytes and is widened on the card, column
+    /// by column, into the run its columns take — the same words, at the same
+    /// offsets, as its widened columns uploaded. `None` as for [`Self::upload`],
+    /// or when a packed table is too big for one launch.
+    pub fn upload_tables(tables: &[TableUpload<'_>]) -> Option<Self> {
+        let total: usize = tables.iter().map(TableUpload::cells).sum();
+        if total == 0
+            || tables.iter().any(|table| {
+                matches!(table, TableUpload::Narrow(_)) && u32::try_from(table.cells()).is_err()
+            })
+        {
+            return None;
+        }
+        let be = backend().ok()?;
+        let Some(room) = be.reserve(total as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
+        // The packed bytes sit on the card only while their table widens, one
+        // table at a time in stream order: promised for the largest of them.
+        let staging = tables
+            .iter()
+            .map(|table| match table {
+                TableUpload::Wide(_) => 0,
+                TableUpload::Narrow(packed) => packed.bytes() as u64,
+            })
+            .max()
+            .unwrap_or(0);
+        let _staging = match staging {
+            0 => None,
+            bytes => {
+                let Some(promise) = be.reserve(bytes) else {
+                    crate::device::note_device_fallback();
+                    return None;
+                };
+                Some(promise)
+            }
+        };
+        crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        let stream = be.next_stream();
+        // SAFETY: every element is written by the copies and widens below.
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
+        let mut spans = Vec::new();
+        let mut at = 0usize;
+        for table in tables {
+            match table {
+                TableUpload::Wide(columns) => {
+                    for column in columns.iter() {
+                        let mut slab = buffer.slice_mut(at..at + column.len());
+                        stream.memcpy_htod(*column, &mut slab).ok()?;
+                        spans.push((at, column.len()));
+                        at += column.len();
+                    }
+                }
+                TableUpload::Narrow(packed) => {
+                    let (rows, cols) = (packed.rows(), packed.cols());
+                    let mut slab = buffer.slice_mut(at..at + rows * cols);
+                    crate::narrow::widen_col_major_into(
+                        &stream, be, *packed, rows, cols, &mut slab,
+                    )
+                    .ok()?;
+                    spans.extend((0..cols).map(|k| (at + k * rows, rows)));
+                    at += rows * cols;
+                }
+            }
+        }
+        stream.synchronize().ok()?;
+        Some(Self {
+            stream,
+            buffer: Arc::new(buffer),
+            spans,
+            _room: room,
+        })
+    }
+
+    /// The run of `width` columns from `first`, packed on the card (each
+    /// column at the bytes its words need, [`crate::narrow`]): its widths and
+    /// its packed bytes, the only bytes that come back. `None` when the columns
+    /// are not a run or are too many words for one launch.
+    pub fn pack_run(&self, first: usize, width: usize) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if !self.is_run(first, width) {
+            return Ok(None);
+        }
+        let rows = self.spans[first].1;
+        if u32::try_from(rows * width).is_err() {
+            return Ok(None);
+        }
+        let be = backend()?;
+        let stream = be.next_stream();
+        crate::narrow::pack_col_major_on_stream(&stream, be, &self.view(first, width), rows, width)
+            .map(Some)
+    }
+
     pub fn num_columns(&self) -> usize {
         self.spans.len()
+    }
+
+    /// Every column back on the host, in upload order: what a test compares.
+    pub fn download(&self) -> Result<Vec<Vec<u64>>> {
+        let all = self.stream.clone_dtoh(&*self.buffer)?;
+        self.stream.synchronize()?;
+        Ok(self
+            .spans
+            .iter()
+            .map(|&(at, len)| all[at..at + len].to_vec())
+            .collect())
     }
 
     /// Whether `width` columns from `first` are a run of equal height — which
