@@ -1315,6 +1315,9 @@ pub mod test_hooks {
         /// shared gate does, with every commit taken to have left its LDE,
         /// snapshot and tree on the device.
         pub carry_residents: bool,
+        /// With the carry, claim tight: resident bounds plus a shared
+        /// headroom (`LAMBDA_VM_SHARED_GATE_CLAIMS=tight`).
+        pub tight_claims: bool,
     }
 
     /// Per admitted phase: its walk order, and the order its tasks started in.

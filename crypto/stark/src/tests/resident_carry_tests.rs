@@ -138,3 +138,44 @@ fn a_prove_that_does_not_carry_admits_whole_sets() {
     assert_eq!(a.carried, vec![0; 3]);
     assert_exact_account(&a);
 }
+
+/// ★ Tight claims: the claim is the resident bounds plus a headroom that
+/// covers every top-up, it settles to the carried bytes plus the same
+/// headroom, it is below today's claim, and the account and the proof are as
+/// with today's.
+#[test]
+fn a_tight_claim_bounds_every_top_up_and_keeps_the_proof() {
+    let want = bytes(&prove(None).0);
+    let (_, today) = prove(Some(ProveOverrides {
+        drivers: Some(1),
+        carry_residents: true,
+        ..Default::default()
+    }));
+    let (proof, a) = prove(Some(ProveOverrides {
+        drivers: Some(1),
+        carry_residents: true,
+        tight_claims: true,
+        ..Default::default()
+    }));
+    let (today, a) = (today.unwrap(), a.unwrap());
+    assert!(want == bytes(&proof), "tight claims moved the proof bytes");
+    let claim = a.claim.expect("a carrying prove claims");
+    let carried: u64 = a.carried.iter().sum();
+    let headroom = claim - carried;
+    let top_up = a.fused_admitted.iter().copied().max().unwrap();
+    assert!(
+        headroom >= top_up,
+        "headroom {headroom} below a top-up {top_up}"
+    );
+    assert_eq!(
+        a.settled_claim,
+        Some(claim),
+        "settled: the carried bytes plus the headroom"
+    );
+    assert!(
+        claim < today.claim.unwrap(),
+        "tight {claim} not below today's {:?}",
+        today.claim
+    );
+    assert_exact_account(&a);
+}
