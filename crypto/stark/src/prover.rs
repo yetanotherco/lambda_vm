@@ -2736,6 +2736,31 @@ fn arming_readout(budget: u64, margin_bytes: u64, configured: u64) {
     }
 }
 
+/// The card as a running total kept OUTSIDE this gate sees it (the block
+/// tree's derivation, `prover::lfm::derive_gate`, which arms only while the
+/// shared gate is not): the pool releases at each sync, as under the armed
+/// shared gate, and the returned budget is the one [`arm_shared_vram_gate`]
+/// would calibrate with `margin_bytes`, with the card's free bytes it read and
+/// whether the pool now releases. `(u64::MAX, None, false)` without a device.
+/// [`disarm_running_total`] puts the pool's posture back.
+pub fn arm_running_total(margin_bytes: u64) -> (u64, Option<u64>, bool) {
+    let releasing = pool_releases_while_armed(true);
+    let free = device_free_after_trim();
+    (
+        calibrated_budget(device_vram_budget(), free, margin_bytes),
+        free,
+        releasing,
+    )
+}
+
+/// Undo [`arm_running_total`]'s pool posture, unless the shared gate is armed
+/// by then and keeps it.
+pub fn disarm_running_total() {
+    if !shared_vram_gate_on() {
+        pool_releases_while_armed(false);
+    }
+}
+
 /// The shared gate's budget: the card's `free` bytes less `margin`, never above
 /// `configured`; `configured` when the card cannot be queried.
 fn calibrated_budget(configured: u64, free: Option<u64>, margin: u64) -> u64 {
