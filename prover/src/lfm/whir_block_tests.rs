@@ -1915,6 +1915,33 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         None => println!("W3 EARLY LEAF: none (W3_LEAF_DURING_PHASE_B {early_on})"),
     }
+    // Off the clock: what the device declined, and the card's peaks as the
+    // ledger and the memory pool count them (not total − free, which reads a
+    // retaining pool's blocks as used).
+    #[cfg(feature = "cuda")]
+    let (reserved_peak, pool_peak) = (
+        format!(
+            "{:.2}",
+            math_cuda::device::reserved_high_water() as f64 / (1u64 << 30) as f64
+        ),
+        math_cuda::device::pool_used_bytes().map_or("-".to_string(), |(_, high)| {
+            format!("{:.2}", high as f64 / (1u64 << 30) as f64)
+        }),
+    );
+    #[cfg(not(feature = "cuda"))]
+    let (reserved_peak, pool_peak) = ("-".to_string(), "-".to_string());
+    #[cfg(feature = "cuda")]
+    let argue_fallbacks = math_cuda::device::device_fallbacks();
+    #[cfg(not(feature = "cuda"))]
+    let argue_fallbacks = 0u64;
+    println!(
+        "W3 DEVICE: commit/encode to the host {} · device commit errors {} · openings on the host {} · argue device fallbacks {argue_fallbacks} · GKR tree refusals {} · fused declines {} · reservation peak {reserved_peak} GiB · pool live peak {pool_peak} GiB",
+        multilinear::gpu::host_fallbacks(),
+        multilinear::gpu::commit_errors(),
+        multilinear::gpu::open_host_fallbacks(),
+        multilinear::gpu::gkr_tree_refusals(),
+        multilinear::gpu_fused::fused_declines(),
+    );
     // The top proof's bytes: two runs prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
     let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
