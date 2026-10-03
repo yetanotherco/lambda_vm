@@ -15,6 +15,16 @@ use math::field::traits::IsFFTField;
 use crate::Result;
 use crate::ntt::{twiddles_forward, twiddles_inverse};
 
+/// Host bytes the pinned staging buffers hold ([`PinnedStaging`]), process
+/// wide: page-locked, so they count in the process's resident set but in no
+/// allocator's statistics.
+static PINNED_HOST_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// [`PINNED_HOST_BYTES`]: what the pinned staging buffers hold now.
+pub fn pinned_host_bytes() -> usize {
+    PINNED_HOST_BYTES.load(Ordering::Relaxed)
+}
+
 /// Reusable pinned host staging buffer. Shared across all streams via a
 /// `Mutex` (see `Backend::pinned_staging`); the LDE call holds the lock
 /// across the D2H + memcpy-to-user-Vecs window.
@@ -59,6 +69,10 @@ impl PinnedStaging {
             unsafe {
                 let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut _);
             }
+            PINNED_HOST_BYTES.fetch_sub(
+                self.capacity_elems * std::mem::size_of::<u64>(),
+                Ordering::Relaxed,
+            );
             self.ptr = std::ptr::null_mut();
             self.capacity_elems = 0;
         }
@@ -67,6 +81,7 @@ impl PinnedStaging {
         let ptr = unsafe {
             cudarc::driver::result::malloc_host(bytes, 0 /* flags: non-WC */)?
         } as *mut u64;
+        PINNED_HOST_BYTES.fetch_add(bytes, Ordering::Relaxed);
         self.ptr = ptr;
         self.capacity_elems = new_cap;
         Ok(())
@@ -116,6 +131,10 @@ impl Drop for PinnedStaging {
             unsafe {
                 let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut _);
             }
+            PINNED_HOST_BYTES.fetch_sub(
+                self.capacity_elems * std::mem::size_of::<u64>(),
+                Ordering::Relaxed,
+            );
         }
     }
 }

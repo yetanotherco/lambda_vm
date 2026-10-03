@@ -154,6 +154,13 @@ impl<T: Copy> PagedMem<T> {
         }
     }
 
+    /// The bytes its pages take on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.pages.capacity() * std::mem::size_of::<(u64, Page<T>)>()
+            + self.pages.len()
+                * (DEFAULT_PAGE_SIZE * std::mem::size_of::<T>() + OCC_WORDS * size_of::<u64>())
+    }
+
     /// Number of cells that were explicitly `set`.
     pub fn len(&self) -> usize {
         self.pages

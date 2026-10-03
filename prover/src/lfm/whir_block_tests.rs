@@ -93,6 +93,7 @@ fn small_block_cut(
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        memlog: false,
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -440,6 +441,7 @@ fn dense_block_with(
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
             upload_ahead: true,
+            memlog: false,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
