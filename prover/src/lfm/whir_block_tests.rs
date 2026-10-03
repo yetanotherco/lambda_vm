@@ -82,6 +82,9 @@ fn small_block_at(
             layout_workers: 0,
             layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
+            // Every table packed on a card, so a box run walks the narrow path at a
+            // test's size.
+            narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         },
     )
     .expect("the block proves")
@@ -422,6 +425,9 @@ fn dense_block_with(
             layout_workers: 0,
             layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
+            // Every table packed on a card, so a box run walks the narrow path at a
+            // test's size.
+            narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1293,6 +1299,11 @@ fn the_whir_block_tree_on_a_real_block() {
         Ok("0") => options.drop_streamed_ops = false,
         Ok("1") => options.drop_streamed_ops = true,
         _ => {}
+    }
+    // `BLOCK_WHIR_NARROW=wide|card|host` (production card): how phase A holds
+    // each group's columns once committed.
+    if let Some(narrow) = crate::block_whir::narrow_from_env() {
+        options.narrow = narrow;
     }
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();

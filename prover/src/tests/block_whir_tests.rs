@@ -52,6 +52,9 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         layout_workers: 0,
         layout_ahead: Some(2),
         pack_rest_as_laid_out: false,
+        // Every table packed on a card, so a box run walks the narrow path at a
+        // test's size.
+        narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
     }
 }
 
@@ -1261,6 +1264,11 @@ fn block_whir_on_a_real_block() {
         Ok("0") => options.drop_streamed_ops = false,
         Ok("1") => options.drop_streamed_ops = true,
         _ => {}
+    }
+    // `BLOCK_WHIR_NARROW=wide|card|host` (production card): how phase A holds
+    // each group's columns once committed.
+    if let Some(narrow) = crate::block_whir::narrow_from_env() {
+        options.narrow = narrow;
     }
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",

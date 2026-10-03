@@ -59,6 +59,9 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         layout_workers: 0,
         layout_ahead: Some(2),
         pack_rest_as_laid_out: false,
+        // Every table packed on a card, so a box run walks the narrow path at a
+        // test's size.
+        narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
     }
 }
 

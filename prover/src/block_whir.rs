@@ -206,6 +206,10 @@ pub struct BlockOptions {
     /// in AIR order, so a group closes once its own tables are ready instead
     /// of after all of them; the packing order is the same.
     pub pack_rest_as_laid_out: bool,
+    /// How phase A holds each group's columns once committed
+    /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
+    /// card, which leaves the proof's bytes as they are.
+    pub narrow: multilinear_block::Narrowing,
 }
 
 impl BlockOptions {
@@ -224,7 +228,22 @@ impl BlockOptions {
             layout_workers: 0,
             layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
+            narrow: multilinear_block::Narrowing::CARD,
         }
+    }
+}
+
+/// `BLOCK_WHIR_NARROW=wide|card|host`: the real-block tests' choice of
+/// [`BlockOptions::narrow`]; `None` leaves the production one.
+#[cfg(test)]
+pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
+    use multilinear_block::Narrowing;
+    match std::env::var("BLOCK_WHIR_NARROW").as_deref().map(str::trim) {
+        Ok("wide") => Some(Narrowing::Wide),
+        Ok("card") => Some(Narrowing::CARD),
+        Ok("host") => Some(Narrowing::Host),
+        Ok(other) => panic!("BLOCK_WHIR_NARROW={other}: wide, card or host"),
+        Err(_) => None,
     }
 }
 
@@ -293,6 +312,11 @@ pub struct BlockStamps {
     /// prove started), when each group closed, the seconds the packer waited
     /// on phase A and the seconds laying out chunks, summed over threads.
     pub layout: LayoutStamps,
+    /// How phase A held the committed columns, and the narrow tables phase B
+    /// widened on the host, `(tables, cells)`: a device path widens on the
+    /// card.
+    pub narrow: multilinear_block::Narrowing,
+    pub host_widens: (u64, u64),
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -416,6 +440,28 @@ impl BlockStamps {
         out.push_str(&format!(
             "BLOCK PREPARED: tables {} · derived in {:.3}\n",
             self.prepared.0, self.prepared.1
+        ));
+        let packed_cells: usize = self.groups.iter().map(|g| g.packed_cells).sum();
+        let packed_bytes: usize = self.groups.iter().map(|g| g.packed_bytes).sum();
+        let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+        out.push_str(&format!(
+            "BLOCK NARROW: {:?} · tables packed {} of {} · cells {:.3} of {:.3} G · {:.2} → {:.2} GiB ({:.2} B/cell) · pack waited {:.3}s, busy {:.3}s (phase A) · host widens {} tables, {:.3} G cells\n",
+            self.narrow,
+            self.groups.iter().map(|g| g.packed_tables).sum::<usize>(),
+            self.tables,
+            packed_cells as f64 / 1e9,
+            self.cells as f64 / 1e9,
+            gib(packed_cells * 8),
+            gib(packed_bytes),
+            if packed_cells == 0 {
+                0.0
+            } else {
+                packed_bytes as f64 / packed_cells as f64
+            },
+            sum(|g| g.pack),
+            sum(|g| g.pack_busy),
+            self.host_widens.0,
+            self.host_widens.1 as f64 / 1e9,
         ));
         out.push_str(&format!(
             "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
@@ -1005,6 +1051,10 @@ pub(crate) struct Deviations {
     /// Under the batched argue: a group argued with faults, or every group
     /// argued on the host ([`multilinear_block::ArgueDeviation`]).
     pub argue: multilinear_block::ArgueDeviation,
+    /// Between the phases, the first narrow table's width map made wrong, so
+    /// phase B widens other words than were committed
+    /// ([`BlockCommitted::fault_narrow_width_map`]).
+    pub narrow_width_map: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -1291,6 +1341,7 @@ pub(crate) fn prove_traces(
                 &sizes,
                 &config,
                 options.drop_levels,
+                options.narrow,
             );
             (block, producer.join())
         });
@@ -1298,7 +1349,10 @@ pub(crate) fn prove_traces(
         // groups only says that it did.
         let produced =
             produced.map_err(|_| Error::Prover("the block's table producer panicked".into()))??;
-        let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        if deviations.narrow_width_map && !block.fault_narrow_width_map() {
+            return Err(Error::Prover("no narrow table to break".into()));
+        }
         stamps.prep += produced;
         stamps.phase_a = t.elapsed().as_secs_f64();
         let (prepared, tampered, derive) =
@@ -1331,6 +1385,7 @@ pub(crate) fn prove_traces(
             .collect();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
+        let widens_before = multilinear::narrow::host_widens();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -1352,6 +1407,12 @@ pub(crate) fn prove_traces(
         stamps.top_paths = (
             paths_after.0 - paths_before.0,
             paths_after.1 - paths_before.1,
+        );
+        let widens_after = multilinear::narrow::host_widens();
+        stamps.narrow = options.narrow;
+        stamps.host_widens = (
+            widens_after.0 - widens_before.0,
+            widens_after.1 - widens_before.1,
         );
         stamps.groups = groups;
         (proof, argues, prepared_openings)
@@ -2265,8 +2326,12 @@ fn prove_streamed(
                 })
             });
 
-            let block =
-                BlockCommitted::commit_groups::<H>(grx.iter(), &commit_config, options.drop_levels);
+            let block = BlockCommitted::commit_groups::<H>(
+                grx.iter(),
+                &commit_config,
+                options.drop_levels,
+                options.narrow,
+            );
             (block, builder.join(), layout.join(), executor.join())
         });
         stamps.execute =
@@ -2279,7 +2344,10 @@ fn prove_streamed(
         stamps.build_marks = finish_marks;
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
-        let block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
+        if deviations.narrow_width_map && !block.fault_narrow_width_map() {
+            return Err(Error::Prover("no narrow table to break".into()));
+        }
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);
         stamps.prep = laid.busy;
@@ -2341,6 +2409,7 @@ fn prove_streamed(
             .collect();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
+        let widens_before = multilinear::narrow::host_widens();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -2362,6 +2431,12 @@ fn prove_streamed(
         stamps.top_paths = (
             paths_after.0 - paths_before.0,
             paths_after.1 - paths_before.1,
+        );
+        let widens_after = multilinear::narrow::host_widens();
+        stamps.narrow = options.narrow;
+        stamps.host_widens = (
+            widens_after.0 - widens_before.0,
+            widens_after.1 - widens_before.1,
         );
         stamps.groups = groups;
         Ok(BlockWhirProof {

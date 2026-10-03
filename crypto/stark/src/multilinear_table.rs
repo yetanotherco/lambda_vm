@@ -355,10 +355,54 @@ where
         self.trace.clear_resident();
     }
 
-    /// The committed columns themselves. The opening needs them: a stacked
-    /// polynomial is these at their offsets, and it is never assembled.
+    /// The committed columns themselves, on the host — widened there if the
+    /// table holds them narrow (see [`TraceData::columns`]). The opening needs
+    /// them: a stacked polynomial is these at their offsets, and it is never
+    /// assembled.
     pub fn columns(&self) -> &[Mle<F>] {
         self.trace.columns()
+    }
+
+    /// The table's trace: its columns' shape and, on demand, their values
+    /// ([`multilinear::narrow::HostColumns`]).
+    pub fn trace(&self) -> &TraceData<F, E> {
+        &self.trace
+    }
+
+    /// The columns as they go to the card: their field elements, or packed.
+    pub(crate) fn upload_view(&self) -> multilinear::gpu::TableColumns<'_, F> {
+        match self.trace.narrow() {
+            Some(packed) => multilinear::gpu::TableColumns::Narrow(packed),
+            None => multilinear::gpu::TableColumns::Wide(self.trace.columns()),
+        }
+    }
+
+    /// Holds the columns as `packed` from here on (see
+    /// [`TraceData::install_narrow`]).
+    pub(crate) fn install_narrow(&mut self, packed: multilinear::narrow::NarrowColumns) -> bool {
+        self.trace.install_narrow(packed)
+    }
+
+    /// Packs the columns narrow on the host (see [`TraceData::pack_on_host`]).
+    pub(crate) fn pack_on_host(&mut self) -> bool {
+        self.trace.pack_on_host()
+    }
+
+    /// Lets a host widening of narrow columns go (see
+    /// [`TraceData::drop_widened`]).
+    pub(crate) fn drop_widened(&mut self) {
+        self.trace.drop_widened();
+    }
+
+    /// The packed columns, when the table holds them narrow.
+    pub fn narrow(&self) -> Option<&multilinear::narrow::NarrowColumns> {
+        self.trace.narrow()
+    }
+
+    /// A test's hook: the packed columns, to break them.
+    #[doc(hidden)]
+    pub fn narrow_mut(&mut self) -> Option<&mut multilinear::narrow::NarrowColumns> {
+        self.trace.narrow_mut()
     }
 }
 

@@ -21,6 +21,13 @@
 //!    — no hash, the tree's top is kept — and its stack is opened at the
 //!    tables' points ([`stacked_eval::prove`]).
 //!
+//! Between the phases a group's columns can be held **narrow** ([`Narrowing`]):
+//! packed on the card right after the group's commit, each column at the bytes
+//! its words need, and widened on the card again when phase B uploads the group.
+//! The words come back bit for bit, so the proof is the same byte for byte; a
+//! widening that went wrong is refused when the opening reads a path from the
+//! kept tree top (the recomputed codeword does not hash to it).
+//!
 //! The tables whose leading preprocessed columns are settled out of band are
 //! stacked per group ([`BlockPrepared`]): each such stack's derived roots are
 //! absorbed after the groups' roots, and its opening proved on its group's fork
@@ -59,6 +66,7 @@ use math::{
 use multilinear::{
     Error as MlError,
     mle::Mle,
+    narrow::ColumnOf,
     stacked_eval::{self, Claimed, ColumnsAt, RetiredStack, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
@@ -126,7 +134,46 @@ pub struct GroupStamps {
     pub argue_reserved: u64,
     /// When the group's commit ended, seconds since phase A started.
     pub committed_at: f64,
+    /// Phase A: the group's tables packed narrow after the commit
+    /// ([`Narrowing`]) — the seconds the committer waited for the pack, the
+    /// packer's own seconds (beside the next group's upload), how many tables,
+    /// their cells and the packed bytes.
+    pub pack: f64,
+    pub pack_busy: f64,
+    pub packed_tables: usize,
+    pub packed_cells: usize,
+    pub packed_bytes: usize,
 }
+
+/// How a block holds its committed columns between phase A and phase B.
+///
+/// The proof is the same byte for byte under every choice: a narrow table
+/// keeps its raw words, each column at the bytes its largest needs (1, 2, 4 or
+/// 8), and the card widens them back into the store phase B reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Narrowing {
+    /// As field elements, eight bytes a cell.
+    #[default]
+    Wide,
+    /// Packed on the card from the group's columns there, after the group's
+    /// commit; only the packed bytes come back. A table of fewer than
+    /// `min_cells` cells, or one the card did not hold, stays wide.
+    Card { min_cells: usize },
+    /// Packed on the host after the group's commit, every table: a test's, or
+    /// a host without a card. The same packed bytes as [`Self::Card`].
+    Host,
+}
+
+impl Narrowing {
+    /// Production: on the card, every table of [`NARROW_MIN_CELLS`] or more.
+    pub const CARD: Self = Self::Card {
+        min_cells: NARROW_MIN_CELLS,
+    };
+}
+
+/// Production's smallest table packed narrow: under it a table's eight bytes
+/// a cell are little, and packing it costs the card two round trips.
+pub const NARROW_MIN_CELLS: usize = 1 << 16;
 
 /// A group's PREPARED opening in a block: one commitment, which both sides
 /// derive from the program, over the leading preprocessed columns of the
@@ -332,6 +379,7 @@ where
         sizes: &[usize],
         config: &ChainConfig,
         drop_levels: usize,
+        narrow: Narrowing,
     ) -> Result<Self, MlError> {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -344,7 +392,7 @@ where
             .iter()
             .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        Self::commit_streamed::<H>(groups, sizes, config, drop_levels)
+        Self::commit_streamed::<H>(groups, sizes, config, drop_levels, narrow)
     }
 
     /// [`Self::commit`] over groups handed over one at a time, in group order —
@@ -357,9 +405,14 @@ where
         sizes: &[usize],
         config: &ChainConfig,
         drop_levels: usize,
+        narrow: Narrowing,
     ) -> Result<Self, MlError> {
-        let block =
-            Self::commit_groups::<H>(groups.into_iter().take(sizes.len()), config, drop_levels)?;
+        let block = Self::commit_groups::<H>(
+            groups.into_iter().take(sizes.len()),
+            config,
+            drop_levels,
+            narrow,
+        )?;
         if block.sizes != sizes {
             return Err(MlError::QueryCountMismatch {
                 expected: sizes.len(),
@@ -371,11 +424,13 @@ where
 
     /// Phase A over whatever groups arrive, in arrival order, until the
     /// producer stops: the groups (and so their sizes) are the prover's, and the
-    /// statement carries them. Each group's wait for its tables is stamped.
+    /// statement carries them. Each group's wait for its tables is stamped, and
+    /// each group is held as `narrow` says once committed.
     pub fn commit_groups<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         config: &ChainConfig,
         drop_levels: usize,
+        narrow: Narrowing,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
         let mut sizes = Vec::new();
@@ -384,9 +439,12 @@ where
         let mut stamps = Vec::new();
         let mut incoming = groups.into_iter();
         let started = Instant::now();
+        // The previous group's pack on the card, running beside this group's
+        // upload.
+        let mut packing: Option<Packing> = None;
         loop {
             let waited = Instant::now();
-            let Some(group) = incoming.next() else {
+            let Some(mut group) = incoming.next() else {
                 break;
             };
             let size = group.len();
@@ -404,10 +462,13 @@ where
             };
             let t = Instant::now();
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            // Held in an `Arc` like phase B's, so the store is dropped on
-            // purpose below, as soon as the tree tops are home.
+            // Held in an `Arc` like phase B's: once the tree tops are home it
+            // goes to the group's packer, or is dropped.
             let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
             stamp.upload_a = t.elapsed().as_secs_f64();
+            if let Some(packed) = packing.take() {
+                packed.install(&mut tables, &mut stamps);
+            }
             let shapes: Vec<(usize, usize)> = group
                 .iter()
                 .map(|t| (t.num_committed_columns(), t.num_vars()))
@@ -426,14 +487,21 @@ where
             stamp.commit = t.elapsed().as_secs_f64();
             let t = Instant::now();
             let retired = stacked.retire(drop_levels, config)?;
-            drop(store);
             drop(columns);
             stamp.retire = t.elapsed().as_secs_f64();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
+            packing = narrow_group(&mut group, store, narrow, &mut stamp).map(|handle| Packing {
+                first_table: tables.len(),
+                group: stamps.len(),
+                handle,
+            });
             retired_groups.push(retired);
             stamps.push(stamp);
             tables.extend(group);
+        }
+        if let Some(packed) = packing.take() {
+            packed.install(&mut tables, &mut stamps);
         }
         Ok(Self {
             tables,
@@ -461,13 +529,131 @@ where
     pub fn stamps(&self) -> &[GroupStamps] {
         &self.stamps
     }
+
+    /// A test's fault: the first narrow table's width map made wrong
+    /// ([`multilinear::narrow::NarrowColumns::fault_width_map`]), so phase B
+    /// widens other words than were committed. Returns whether a table was
+    /// there to break.
+    #[doc(hidden)]
+    pub fn fault_narrow_width_map(&mut self) -> bool {
+        self.tables
+            .iter_mut()
+            .filter_map(|table| table.narrow_mut())
+            .any(|packed| packed.fault_width_map())
+    }
+}
+
+/// What a packer hands back: one packed table or none per table of its group,
+/// and its own seconds.
+type Packed = (Vec<Option<multilinear::narrow::NarrowColumns>>, f64);
+
+/// A group's tables being packed on the card, on a thread of their own:
+/// where the group's tables start in the block, its stamp, and the packer.
+struct Packing {
+    first_table: usize,
+    group: usize,
+    handle: std::thread::JoinHandle<Packed>,
+}
+
+impl Packing {
+    /// Waits for the packer and holds each table it packed narrow from here
+    /// on. A packer that failed leaves its tables wide.
+    fn install<F, E>(self, tables: &mut [CommittedTable<'_, F, E>], stamps: &mut [GroupStamps])
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        let t = Instant::now();
+        let joined = self.handle.join();
+        let stamp = &mut stamps[self.group];
+        stamp.pack += t.elapsed().as_secs_f64();
+        let Ok((packed, busy)) = joined else {
+            return;
+        };
+        stamp.pack_busy = busy;
+        for (table, packed) in tables[self.first_table..].iter_mut().zip(packed) {
+            let Some(packed) = packed else {
+                continue;
+            };
+            let bytes = packed.data().len();
+            if table.install_narrow(packed) {
+                stamp.packed_tables += 1;
+                stamp.packed_cells += table.num_committed_columns() << table.num_vars();
+                stamp.packed_bytes += bytes;
+            }
+        }
+    }
+}
+
+/// Holds a just-committed group's tables as `narrow` says. On the card, each
+/// table of at least `min_cells` cells is packed from its run in `store` by a
+/// thread of its own, returned for the caller to [`Packing::install`] once the
+/// next group's columns are up: the committer is phase A's critical path, and
+/// the pack's download overlaps that upload. On the host, every table is packed
+/// here. A table that cannot be packed stays as it is.
+fn narrow_group<F, E>(
+    group: &mut [CommittedTable<'_, F, E>],
+    store: Store,
+    narrow: Narrowing,
+    stamp: &mut GroupStamps,
+) -> Option<std::thread::JoinHandle<Packed>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    match (narrow, store) {
+        (Narrowing::Wide, _) | (Narrowing::Card { .. }, None) => None,
+        (Narrowing::Card { min_cells }, Some(store)) => {
+            // Each table's run in the store, if it is to be packed.
+            let mut first = 0usize;
+            let runs: Vec<Option<(usize, usize)>> = group
+                .iter()
+                .map(|table| {
+                    let width = table.num_committed_columns();
+                    let run = ((width << table.num_vars()) >= min_cells).then_some((first, width));
+                    first += width;
+                    run
+                })
+                .collect();
+            Some(std::thread::spawn(move || {
+                let t = Instant::now();
+                let packed = runs
+                    .into_iter()
+                    .map(|run| {
+                        run.and_then(|(first, width)| {
+                            multilinear::gpu::pack_resident(&store, first, width)
+                        })
+                    })
+                    .collect();
+                (packed, t.elapsed().as_secs_f64())
+            }))
+        }
+        (Narrowing::Host, _) => {
+            let t = Instant::now();
+            for table in group.iter_mut() {
+                if table.pack_on_host() {
+                    stamp.packed_tables += 1;
+                    stamp.packed_cells += table.num_committed_columns() << table.num_vars();
+                    stamp.packed_bytes += table.narrow().map_or(0, |packed| packed.data().len());
+                }
+            }
+            stamp.pack = t.elapsed().as_secs_f64();
+            stamp.pack_busy = stamp.pack;
+            None
+        }
+    }
 }
 
 /// A group's columns on the card, shared by its tables.
 type Store = Option<Arc<multilinear::gpu::ResidentColumns>>;
 
-/// Uploads a group's columns, in table order; `None` when the card declines
-/// (every reader then takes the host copy).
+/// Uploads a group's columns, in table order — a narrow table's packed, and
+/// widened on the card; `None` when the card declines (every reader then takes
+/// the host copy, widening a narrow table's there).
 fn upload_group<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -475,8 +661,32 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-    multilinear::gpu::upload_columns(&columns).map(Arc::new)
+    let tables: Vec<multilinear::gpu::TableColumns<'_, F>> =
+        group.iter().map(|t| t.upload_view()).collect();
+    multilinear::gpu::upload_tables(&tables).map(Arc::new)
+}
+
+/// A group's columns in table order, each read on the host only by a path
+/// that asks ([`multilinear::narrow::HostColumn`]): the revive and the opening take them so, and
+/// the card holds them.
+fn group_columns<'t, F, E>(
+    group: &'t [CommittedTable<'_, F, E>],
+) -> Vec<ColumnOf<'t, multilinear::constraint_argument::TraceData<F, E>>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    group
+        .iter()
+        .flat_map(|table| {
+            (0..table.num_committed_columns()).map(move |index| ColumnOf {
+                columns: table.trace(),
+                index,
+            })
+        })
+        .collect()
 }
 
 /// The fork a group proves on: `S_post` then the group's index.
@@ -676,7 +886,8 @@ where
             })?);
         }
 
-        let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+        let handles = group_columns(group);
+        let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
         let t = Instant::now();
         let stacked = retired.revive::<H, _>(
             &columns,
@@ -747,8 +958,10 @@ where
         stamps[g].open = t.elapsed().as_secs_f64();
         drop(stacked);
         drop(columns);
+        drop(handles);
         for table in group.iter_mut() {
             table.clear_resident();
+            table.drop_widened();
         }
         drop(store);
         at += size;
