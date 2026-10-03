@@ -1341,21 +1341,143 @@ impl<T> Drop for PublishGuard<'_, T> {
     }
 }
 
+/// The leaves' artifacts as their builder publishes them: per leaf, its
+/// artifacts, its derived shape and the seconds building them.
+type LeafBuilt = Vec<(super::registry::LfmArtifacts, DerivedChild, f64)>;
+
+/// Publishes an error into every slot still empty when it drops: a node
+/// builder that stops early (an error, or a panic) leaves no level waiting
+/// for a node that will never come.
+struct FailUnpublished<'a, T>(&'a [Vec<Published<T>>]);
+
+impl<T> Drop for FailUnpublished<'_, T> {
+    fn drop(&mut self) {
+        for slot in self.0.iter().flatten() {
+            let _ = slot.0.set(Err("the node builder stopped".to_string()));
+        }
+    }
+}
+
+/// A node builder that stops leaves an error in every slot it had not
+/// filled, so no level waits forever, and keeps what it published.
+#[test]
+fn a_stopped_node_builder_fails_every_empty_slot() {
+    let slots: Vec<Vec<Published<u32>>> = vec![
+        vec![Published::new(), Published::new()],
+        vec![Published::new()],
+    ];
+    {
+        let _fail = FailUnpublished(&slots);
+        let _ = slots[0][1].0.set(Ok(7));
+    }
+    // `get`, not `wait`: an empty slot must fail the test, not hang it.
+    assert_eq!(slots[0][1].0.get(), Some(&Ok(7)));
+    for (lv, j) in [(0, 0), (1, 0)] {
+        assert_eq!(
+            slots[lv][j].0.get(),
+            Some(&Err("the node builder stopped".to_string())),
+            "slot ({lv}, {j})"
+        );
+    }
+}
+
+/// The tree's node programs and artifacts, each published to its slot
+/// (level, node) as soon as it is built: a node's program is a function of its
+/// children's derived shapes, not of their proofs, so the whole tree can be
+/// built while the leaves prove. Level by level, from the leaves' artifacts.
+///
+/// With `pool` (`W3_NODE_PIPE`, on by default) a level's nodes are built
+/// together on the pool's threads — the builder's own, not the global pool, on
+/// which a prover's join could steal a build and leave the card idle (#1013's
+/// FAST 454) — and each level proves as its own nodes arrive. Without it, one
+/// after another on this thread (the control: the builder before, whose whole
+/// tree level 1 then waits for — at the median 32 s of serial builds holding
+/// level 0 open 10.7 s past its last proof, BIG 565 / 568).
+#[allow(clippy::too_many_arguments)]
+fn build_nodes(
+    plan: &WhirBlockPlan,
+    shape: &[super::per_table_aggregator::Level],
+    leaves: &Published<LeafBuilt>,
+    slots: &[Vec<Published<TreeNode>>],
+    wrap: &crate::ProofOptions,
+    words: usize,
+    t_tree: std::time::Instant,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    use rayon::prelude::*;
+    let _fail = FailUnpublished(slots);
+    let Ok(leaf_built) = leaves.wait() else {
+        return;
+    };
+    for (lv, arities) in shape.iter().enumerate() {
+        let top = lv + 1 == shape.len();
+        let below: Vec<&DerivedChild> = match lv {
+            0 => leaf_built.iter().map(|(_, d, _)| d).collect(),
+            _ => match slots[lv - 1]
+                .iter()
+                .map(|s| s.wait().map(|n| &n.derived))
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(below) => below,
+                Err(_) => return,
+            },
+        };
+        let mut at = 0usize;
+        let groups: Vec<std::ops::Range<usize>> = arities
+            .arities
+            .iter()
+            .map(|&a| {
+                at += a;
+                at - a..at
+            })
+            .collect();
+        let build = |j: usize| -> Result<TreeNode, String> {
+            let t = std::time::Instant::now();
+            let program = plan.node_program(&below[groups[j].clone()], top)?;
+            let artifacts = artifacts_of(&program, wrap);
+            let derived = DerivedChild::from_artifacts(&artifacts, wrap, words)?;
+            Ok(TreeNode {
+                program,
+                artifacts,
+                derived,
+                built: t.elapsed().as_secs_f64(),
+                built_at: t_tree.elapsed().as_secs_f64(),
+            })
+        };
+        match pool {
+            Some(pool) => pool.install(|| {
+                (0..groups.len()).into_par_iter().for_each(|j| {
+                    let _ = slots[lv][j].0.set(build(j));
+                })
+            }),
+            None => {
+                for (j, slot) in slots[lv].iter().enumerate() {
+                    let _ = slot.0.set(build(j));
+                }
+            }
+        }
+    }
+}
+
 /// The tree proved the way a prover would run it, with the leaves' programs
 /// emitted beforehand (`leaves`, while phase B ran):
 /// 1. the leaves' artifacts, in parallel, on a thread of their own (they hold
 ///    the card);
 /// 2. the nodes' programs and artifacts — functions of the leaves' artifacts,
-///    not of any proof — on a thread of their own, beside
+///    not of any proof — on a thread of their own ([`build_nodes`]), each
+///    published to its slot as it is built, beside
 /// 3. the leaves proved `siblings` at a time, each harvested without its
 ///    verify: with `beside`, each leaf executes and fills its traces while the
 ///    artifacts are built (neither reads them) and waits for them only to
 ///    prove; without, it waits for every artifact first (the order before,
 ///    `W3_EXEC_BESIDE_ARTIFACTS=0`);
-/// 4. each level above proved over the harvested children.
+/// 4. each level above proved over the harvested children, each node as soon
+///    as its own program is in its slot — or, without `node_pipe` (the
+///    control), once the builder has built the whole tree.
 ///
-/// `early`, when given, is a leaf that already executed and filled while
-/// phase B ran ([`EarlyLeaf`]): its worker joins it instead.
+/// `node_pipe` is the builder's own pool ([`build_nodes`]); `early`, when
+/// given, is a leaf that already executed and filled while phase B ran
+/// ([`EarlyLeaf`]): its worker joins it instead.
 ///
 /// Returns each level's timing and every proof with its artifacts, level by
 /// level, the top last — for the harness to verify off the clock — and the
@@ -1368,6 +1490,7 @@ fn prove_tree_pipelined(
     siblings: usize,
     beside: bool,
     early: Option<EarlyLeaf>,
+    node_pipe: Option<&rayon::ThreadPool>,
 ) -> Result<
     (
         Vec<LevelTiming>,
@@ -1382,189 +1505,192 @@ fn prove_tree_pipelined(
         std::sync::Mutex::new(None);
     let wrap = aggregation_wrap_options();
     let words = plan.child_layout().total();
-    let t_level = std::time::Instant::now();
+    let t_tree = std::time::Instant::now();
     let shape = plan.levels();
     let mut timings = Vec::with_capacity(shape.len() + 1);
     let mut proofs = Vec::new();
-    let built: Published<Vec<(super::registry::LfmArtifacts, DerivedChild, f64)>> =
-        Published::new();
+    let built: Published<LeafBuilt> = Published::new();
     let leaf_built_at: Vec<std::sync::Mutex<f64>> =
         leaves.iter().map(|_| std::sync::Mutex::new(0.0)).collect();
+    let slots: Vec<Vec<Published<TreeNode>>> = shape
+        .iter()
+        .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+        .collect();
 
-    let (leaf_proved, nodes) = std::thread::scope(|scope| {
-        // 1. the leaves' artifacts.
-        scope.spawn(|| {
-            use rayon::prelude::*;
-            let guard = PublishGuard(&built);
-            guard.publish(
-                leaves
-                    .par_iter()
-                    .zip(&leaf_built_at)
-                    .map(|(program, at)| -> Result<_, String> {
-                        let t = std::time::Instant::now();
-                        let artifacts = artifacts_of(program, &wrap);
-                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
-                        *at.lock().map_err(|_| "a built-at stamp is poisoned")? =
-                            t_level.elapsed().as_secs_f64();
-                        Ok((artifacts, derived, t.elapsed().as_secs_f64()))
-                    })
-                    .collect::<Result<_, String>>(),
-            );
+    let (leaf_built, level_proofs) = std::thread::scope(|outer| -> Result<_, String> {
+        // 2. the nodes' programs and artifacts, into their slots.
+        let builder = outer.spawn(|| {
+            build_nodes(
+                plan, &shape, &built, &slots, &wrap, words, t_tree, node_pipe,
+            )
         });
-        // 2. the nodes' programs, from the leaves' derived shapes.
-        let nodes = scope.spawn(|| -> Result<Vec<Vec<TreeNode>>, String> {
-            let leaf_built = built.wait()?;
-            let mut owned: Vec<Vec<TreeNode>> = Vec::with_capacity(shape.len());
-            for (lv, arities) in shape.iter().enumerate() {
-                let top = lv + 1 == shape.len();
-                let level = {
-                    let below: Vec<&DerivedChild> = match lv {
-                        0 => leaf_built.iter().map(|(_, d, _)| d).collect(),
-                        _ => owned[lv - 1].iter().map(|n| &n.derived).collect(),
-                    };
-                    let mut at = 0usize;
-                    let mut level = Vec::with_capacity(arities.arities.len());
-                    for &a in &arities.arities {
-                        let t = std::time::Instant::now();
-                        let program = plan.node_program(&below[at..at + a], top)?;
-                        let artifacts = artifacts_of(&program, &wrap);
-                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
-                        level.push(TreeNode {
-                            program,
-                            artifacts,
-                            derived,
-                            built: t.elapsed().as_secs_f64(),
-                            built_at: t_level.elapsed().as_secs_f64(),
-                        });
-                        at += a;
+        let leaf_proved = std::thread::scope(|scope| {
+            // 1. the leaves' artifacts.
+            scope.spawn(|| {
+                use rayon::prelude::*;
+                let guard = PublishGuard(&built);
+                guard.publish(
+                    leaves
+                        .par_iter()
+                        .zip(&leaf_built_at)
+                        .map(|(program, at)| -> Result<_, String> {
+                            let t = std::time::Instant::now();
+                            let artifacts = artifacts_of(program, &wrap);
+                            let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                            *at.lock().map_err(|_| "a built-at stamp is poisoned")? =
+                                t_tree.elapsed().as_secs_f64();
+                            Ok((artifacts, derived, t.elapsed().as_secs_f64()))
+                        })
+                        .collect::<Result<_, String>>(),
+                );
+            });
+            // 3. the leaves, `siblings` at a time.
+            in_index_order(leaves.len(), siblings, |k| -> Result<_, String> {
+                let start = t_tree.elapsed().as_secs_f64();
+                let ahead = {
+                    let mut slot = early.lock().map_err(|_| "the early slot is poisoned")?;
+                    if slot.as_ref().is_some_and(|e| e.leaf == k) {
+                        slot.take()
+                    } else {
+                        None
                     }
-                    level
                 };
-                owned.push(level);
-            }
-            Ok(owned)
-        });
-        // 3. the leaves, `siblings` at a time.
-        let proved = in_index_order(leaves.len(), siblings, |k| -> Result<_, String> {
-            let start = t_level.elapsed().as_secs_f64();
-            let ahead = {
-                let mut slot = early.lock().map_err(|_| "the early slot is poisoned")?;
-                if slot.as_ref().is_some_and(|e| e.leaf == k) {
-                    slot.take()
-                } else {
-                    None
-                }
-            };
-            let t = std::time::Instant::now();
-            let filled = match ahead {
-                Some(e) => {
-                    let (filled, arena, started, secs) = e
-                        .handle
-                        .join()
-                        .map_err(|_| format!("leaf {k}: the early executor panicked"))??;
-                    *early_out
-                        .lock()
-                        .map_err(|_| "the early readout is poisoned")? =
-                        Some((k, arena, e.complete_at, started, secs));
-                    filled
-                }
-                None => {
-                    let arenas = block_leaf_arena(plan, proof, k)?;
-                    if !beside {
-                        built.wait()?;
+                let t = std::time::Instant::now();
+                let filled = match ahead {
+                    Some(e) => {
+                        let (filled, arena, started, secs) = e
+                            .handle
+                            .join()
+                            .map_err(|_| format!("leaf {k}: the early executor panicked"))??;
+                        *early_out
+                            .lock()
+                            .map_err(|_| "the early readout is poisoned")? =
+                            Some((k, arena, e.complete_at, started, secs));
+                        filled
                     }
-                    lfm_execute_and_fill(&leaves[k], &arenas, crate::hash_pin::BLOCK_HASHER)
-                        .map_err(|e| format!("leaf {k}: {e:?}"))?
-                }
-            };
-            let artifacts = &built.wait()?[k].0;
-            let lfm = filled
-                .prove(artifacts, &wrap, decide_lfm_residency())
-                .map_err(|e| format!("leaf {k}: {e:?}"))?;
-            let prove = t.elapsed().as_secs_f64();
-            let times = ProgramTimes {
-                built_at: 0.0,
-                start,
-                end: t_level.elapsed().as_secs_f64(),
-                split: prove_split_now(),
-            };
-            let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm);
-            Ok((lfm, child, prove, times))
+                    None => {
+                        let arenas = block_leaf_arena(plan, proof, k)?;
+                        if !beside {
+                            built.wait()?;
+                        }
+                        lfm_execute_and_fill(&leaves[k], &arenas, crate::hash_pin::BLOCK_HASHER)
+                            .map_err(|e| format!("leaf {k}: {e:?}"))?
+                    }
+                };
+                let artifacts = &built.wait()?[k].0;
+                let lfm = filled
+                    .prove(artifacts, &wrap, decide_lfm_residency())
+                    .map_err(|e| format!("leaf {k}: {e:?}"))?;
+                let prove = t.elapsed().as_secs_f64();
+                let times = ProgramTimes {
+                    built_at: 0.0,
+                    start,
+                    end: t_tree.elapsed().as_secs_f64(),
+                    split: prove_split_now(),
+                };
+                let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm);
+                Ok((lfm, child, prove, times))
+            })
         });
-        (proved, nodes.join())
-    });
-    let leaf_built = built.take()?;
-    let leaf_proved: Vec<(LfmProof, RealChild, f64, ProgramTimes)> =
-        leaf_proved.into_iter().collect::<Result<_, String>>()?;
-    let nodes = nodes.map_err(|_| "the node builder panicked".to_string())??;
-    let mut times = Vec::with_capacity(leaf_proved.len());
-    for ((_, _, _, t), at) in leaf_proved.iter().zip(&leaf_built_at) {
-        let built_at = *at.lock().map_err(|_| "a built-at stamp is poisoned")?;
-        times.push(ProgramTimes { built_at, ..*t });
-    }
-    timings.push(LevelTiming {
-        wall: t_level.elapsed().as_secs_f64(),
-        programs: leaf_built
-            .iter()
-            .zip(&leaf_proved)
-            .map(|((_, _, built), (_, _, prove, _))| (*built, *prove))
-            .collect(),
-        times,
-    });
-    let t_tree = t_level;
-    let mut children: Vec<RealChild> = Vec::with_capacity(leaf_proved.len());
-    for ((lfm, child, _, _), (artifacts, _, _)) in leaf_proved.into_iter().zip(leaf_built) {
-        proofs.push((artifacts, lfm));
-        children.push(child);
-    }
-
-    // 4. the levels above.
-    for (lv, (arities, level)) in shape.iter().zip(nodes).enumerate() {
-        let t_level = std::time::Instant::now();
-        let mut at = 0usize;
-        let mut starts = Vec::with_capacity(arities.arities.len());
-        for &a in &arities.arities {
-            starts.push(at..at + a);
-            at += a;
+        // The control: level 1 waits for the whole tree's builds, as it did
+        // when the builder joined level 0.
+        if node_pipe.is_none() {
+            for slot in slots.iter().flatten() {
+                slot.wait()?;
+            }
         }
-        let proved = in_index_order(level.len(), siblings, |j| -> Result<_, String> {
-            let start = t_tree.elapsed().as_secs_f64();
-            let arenas: Vec<Vec<LfmWord>> = children[starts[j].clone()]
-                .iter()
-                .flat_map(child_arena_words)
-                .collect();
-            let t = std::time::Instant::now();
-            let lfm = lfm_prove(&level[j].program, &level[j].artifacts, &arenas, &wrap)
-                .map_err(|e| format!("level {} node {j}: {e:?}", lv + 1))?;
-            let prove = t.elapsed().as_secs_f64();
-            let times = ProgramTimes {
-                built_at: level[j].built_at,
-                start,
-                end: t_tree.elapsed().as_secs_f64(),
-                split: prove_split_now(),
-            };
-            let child = harvest_child(level[j].artifacts.clone(), wrap.clone(), &lfm);
-            Ok((lfm, child, prove, times))
-        });
-        let proved: Vec<(LfmProof, RealChild, f64, ProgramTimes)> =
-            proved.into_iter().collect::<Result<_, String>>()?;
+        let leaf_built = built.wait()?;
+        let leaf_proved: Vec<(LfmProof, RealChild, f64, ProgramTimes)> =
+            leaf_proved.into_iter().collect::<Result<_, String>>()?;
+        let mut times = Vec::with_capacity(leaf_proved.len());
+        for ((_, _, _, t), at) in leaf_proved.iter().zip(&leaf_built_at) {
+            let built_at = *at.lock().map_err(|_| "a built-at stamp is poisoned")?;
+            times.push(ProgramTimes { built_at, ..*t });
+        }
         timings.push(LevelTiming {
-            wall: t_level.elapsed().as_secs_f64(),
-            programs: level
+            wall: t_tree.elapsed().as_secs_f64(),
+            programs: leaf_built
                 .iter()
-                .zip(&proved)
-                .map(|(n, (_, _, prove, _))| (n.built, *prove))
+                .zip(&leaf_proved)
+                .map(|((_, _, built), (_, _, prove, _))| (*built, *prove))
                 .collect(),
-            times: proved.iter().map(|(_, _, _, t)| *t).collect(),
+            times,
         });
-        children = Vec::with_capacity(proved.len());
-        for ((lfm, child, _, _), node) in proved.into_iter().zip(level) {
-            proofs.push((node.artifacts, lfm));
+        let mut leaf_lfms = Vec::with_capacity(leaf_proved.len());
+        let mut children: Vec<RealChild> = Vec::with_capacity(leaf_proved.len());
+        for (lfm, child, _, _) in leaf_proved {
+            leaf_lfms.push(lfm);
             children.push(child);
         }
+
+        // 4. the levels above, each node from its slot.
+        let mut level_proofs = vec![leaf_lfms];
+        for (lv, arities) in shape.iter().enumerate() {
+            let t_level = std::time::Instant::now();
+            let level = &slots[lv];
+            let mut at = 0usize;
+            let mut starts = Vec::with_capacity(arities.arities.len());
+            for &a in &arities.arities {
+                starts.push(at..at + a);
+                at += a;
+            }
+            let proved = in_index_order(level.len(), siblings, |j| -> Result<_, String> {
+                let start = t_tree.elapsed().as_secs_f64();
+                let node = level[j].wait()?;
+                let arenas: Vec<Vec<LfmWord>> = children[starts[j].clone()]
+                    .iter()
+                    .flat_map(child_arena_words)
+                    .collect();
+                let t = std::time::Instant::now();
+                let lfm = lfm_prove(&node.program, &node.artifacts, &arenas, &wrap)
+                    .map_err(|e| format!("level {} node {j}: {e:?}", lv + 1))?;
+                let prove = t.elapsed().as_secs_f64();
+                let times = ProgramTimes {
+                    built_at: node.built_at,
+                    start,
+                    end: t_tree.elapsed().as_secs_f64(),
+                    split: prove_split_now(),
+                };
+                let child = harvest_child(node.artifacts.clone(), wrap.clone(), &lfm);
+                Ok((lfm, child, prove, node.built, times))
+            });
+            let proved: Vec<(LfmProof, RealChild, f64, f64, ProgramTimes)> =
+                proved.into_iter().collect::<Result<_, String>>()?;
+            timings.push(LevelTiming {
+                wall: t_level.elapsed().as_secs_f64(),
+                programs: proved
+                    .iter()
+                    .map(|(_, _, prove, built, _)| (*built, *prove))
+                    .collect(),
+                times: proved.iter().map(|(_, _, _, _, t)| *t).collect(),
+            });
+            children = Vec::with_capacity(proved.len());
+            let mut lfms = Vec::with_capacity(proved.len());
+            for (lfm, child, _, _, _) in proved {
+                lfms.push(lfm);
+                children.push(child);
+            }
+            level_proofs.push(lfms);
+        }
+        if children.len() != 1 {
+            return Err(format!("the tree closes to {} nodes", children.len()));
+        }
+        builder
+            .join()
+            .map_err(|_| "the node builder panicked".to_string())?;
+        Ok((leaf_built.len(), level_proofs))
+    })?;
+    // Off the clock: every proof with its artifacts, level by level.
+    let mut level_proofs = level_proofs.into_iter();
+    let leaf_lfms = level_proofs.next().unwrap_or_default();
+    debug_assert_eq!(leaf_lfms.len(), leaf_built);
+    for ((artifacts, _, _), lfm) in built.take()?.into_iter().zip(leaf_lfms) {
+        proofs.push((artifacts, lfm));
     }
-    if children.len() != 1 {
-        return Err(format!("the tree closes to {} nodes", children.len()));
+    for (level, lfms) in slots.into_iter().zip(level_proofs) {
+        for (slot, lfm) in level.into_iter().zip(lfms) {
+            proofs.push((slot.take()?.artifacts, lfm));
+        }
     }
     let early_out = early_out
         .into_inner()
@@ -1934,13 +2060,32 @@ fn the_whir_block_tree_on_a_real_block() {
     // The readouts above run on the clock, between the base and the tree: a
     // prover prints none of them, so the whole block is also given without.
     let readouts = t0.elapsed().as_secs_f64() - base;
+    // `W3_NODE_PIPE=0|1` (default 1): the nodes' programs and artifacts built
+    // on a pool of `W3_EMIT_THREADS` threads of their own (default 4), each
+    // level proving as its own nodes arrive; or (0, the control) one after
+    // another on one thread, level 1 waiting for the whole tree's builds.
+    let node_pipe = knob("W3_NODE_PIPE").is_none_or(|v| v != 0).then(|| {
+        let threads = knob("W3_EMIT_THREADS").unwrap_or(4).max(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("w3-emit-{i}"))
+            .build()
+            .expect("the node builder's pool")
+    });
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    let (timings, proofs, early_out) =
-        prove_tree_pipelined(&plan, &proof, programs, siblings, beside, early)
-            .expect("the tree proves");
+    let (timings, proofs, early_out) = prove_tree_pipelined(
+        &plan,
+        &proof,
+        programs,
+        siblings,
+        beside,
+        early,
+        node_pipe.as_ref(),
+    )
+    .expect("the tree proves");
     let top = &proofs.last().expect("a top").1;
     let tree = t.elapsed().as_secs_f64();
     let whole = t0.elapsed().as_secs_f64();
@@ -2016,6 +2161,16 @@ fn the_whir_block_tree_on_a_real_block() {
             }
         }
     }
+    println!(
+        "W3 NODE PIPE: {}",
+        match &node_pipe {
+            Some(pool) => format!(
+                "on ({} builder threads; each level proves as its own nodes arrive)",
+                pool.current_num_threads()
+            ),
+            None => "off (one builder thread; level 1 waits for the whole tree)".to_string(),
+        }
+    );
     println!(
         "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s) · leaves execute beside their artifacts {beside}",
         whole - base,
