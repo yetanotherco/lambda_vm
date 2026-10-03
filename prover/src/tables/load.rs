@@ -84,12 +84,15 @@ pub struct LoadOperation {
     /// Whether to sign-extend (true) or zero-extend (false)
     pub signed: bool,
     /// Result bytes (8 bytes, extended)
-    pub res: [u64; 8],
+    pub res: [u8; 8],
 }
+
+// The walk keeps one per load: keep it at 32 bytes.
+const _: () = assert!(std::mem::size_of::<LoadOperation>() == 32);
 
 impl LoadOperation {
     /// Create a new LOAD operation.
-    pub fn new(base_address: u64, timestamp: u64, width: u8, signed: bool, res: [u64; 8]) -> Self {
+    pub fn new(base_address: u64, timestamp: u64, width: u8, signed: bool, res: [u8; 8]) -> Self {
         Self {
             base_address,
             timestamp,
@@ -151,11 +154,26 @@ impl LoadOperation {
     /// - read4: MSB8[res[3]] -> sign_bit
     /// - read8: no MSB8 lookup needed (all 8 bytes are used)
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        self.bitwise_op().into_iter().collect()
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s lookup counted into `histogram`, with no
+    /// list built.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        if let Some(op) = self.bitwise_op() {
+            histogram.bump(op);
+        }
+    }
+
+    /// The one lookup of [`Self::collect_bitwise_ops`], if any.
+    #[inline]
+    fn bitwise_op(&self) -> Option<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
         // For width 8, no sign extension is needed
         if self.width == 8 {
-            return Vec::new();
+            return None;
         }
 
         // Get the byte index for the MSB8 lookup based on width
@@ -163,14 +181,14 @@ impl LoadOperation {
             1 => 0, // res[0] for read1
             2 => 1, // res[1] for read2
             4 => 3, // res[3] for read4
-            _ => return Vec::new(),
+            _ => return None,
         };
 
-        let input_byte = self.res[byte_idx] as u8;
-        vec![BitwiseOperation::single_byte(
+        let input_byte = self.res[byte_idx];
+        Some(BitwiseOperation::single_byte(
             BitwiseOperationType::Msb8,
             input_byte,
-        )]
+        ))
     }
 }
 
@@ -178,7 +196,16 @@ impl LoadOperation {
 pub fn generate_load_trace(
     operations: &[LoadOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_load_trace_segments(&[operations])
+}
+
+/// [`generate_load_trace`] over `segments`, the operations one after another: a chunk handed
+/// out as the window parts it lies in.
+pub(crate) fn generate_load_trace_segments(
+    segments: &[&[LoadOperation]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -186,7 +213,7 @@ pub fn generate_load_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, op) in operations.iter().enumerate() {
+    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         // Input columns
         table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
@@ -202,7 +229,7 @@ pub fn generate_load_trace(
 
         // Output: res[8]
         for i in 0..8 {
-            table.set_u64(row_idx, cols::RES[i], op.res[i]);
+            table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
         }
 
         // Auxiliary: sign_bit

@@ -19,13 +19,25 @@
 //! - [`device`]: the concrete-Goldilocks flat lowering ([`DeviceProgram`]) for
 //!   the GPU kernel, plus a CPU walker over that flat blob (the pre-GPU parity
 //!   oracle).
+//! - [`codegen`]: straight-line CUDA for a lowered program, the compiled twin
+//!   of the composition interpreter.
+//! - [`budgeted`]: the register-budgeted lowering for the bounded-slot
+//!   interpreter (roots on demand, leaves as operands, a fixed word budget a
+//!   row), its symbolic validator and its host model.
+//! - [`artifact`]: the build-time serializable bundle ([`ConstraintArtifact`])
+//!   — the flat program PLUS the zerofier metadata capture discards and the
+//!   AIR's shape scalars, which is what "constraints as data" actually needs.
 //!
+//! [`ConstraintArtifact`]: artifact::ConstraintArtifact
 //! [`ConstraintProgram`]: ir::ConstraintProgram
 //! [`Op`]: ir::Op
 //! [`Dim`]: ir::Dim
 //! [`DeviceProgram`]: device::DeviceProgram
 
+pub mod artifact;
+pub mod budgeted;
 pub mod builder;
+pub mod codegen;
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod gpu_interp;
@@ -33,8 +45,11 @@ pub mod interp;
 pub mod ir;
 
 #[cfg(test)]
+mod artifact_tests;
+#[cfg(test)]
 mod tests;
 
+pub use artifact::{AirShape, ArtifactError, ArtifactMeta, ArtifactNode, ConstraintArtifact};
 pub use builder::{Expr, IrBuilder};
 pub use device::{DeviceNode, DeviceProgram, eval_device_program};
 pub use interp::{eval_program, eval_program_base, eval_program_verifier};

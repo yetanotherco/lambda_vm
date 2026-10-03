@@ -51,6 +51,13 @@ where
     /// instead of paying the H2D inside its chain.
     #[cfg(feature = "cuda")]
     pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+    /// The main trace packed at the bytes its columns need
+    /// ([`Self::pack_main_narrow`]): `main_table` then holds no data, only its
+    /// width and height, until [`Self::widen_main_on_host`].
+    pub(crate) narrow_main: Option<std::sync::Arc<crate::narrow::NarrowMain>>,
+    /// The packed main trace written to a spill file ([`Self::spill_main`]),
+    /// in place of `narrow_main` until [`Self::unspill_main`].
+    pub(crate) spilled_main: Option<crate::spill::SpilledMain>,
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -137,6 +144,10 @@ where
 pub(crate) struct ResidentMainTrace {
     pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
     pub(crate) rows: usize,
+    /// Fires once the producer's stream has written `buf` (the LDE handle's
+    /// `ready`). The aux build reads `buf` on a stream of its own and waits on
+    /// it device-side; `None` means the producer synchronized before returning.
+    pub(crate) ready: Option<std::sync::Arc<math_cuda::device::PooledEvent>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -188,6 +199,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -218,6 +231,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -241,6 +256,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            narrow_main: None,
+            spilled_main: None,
         }
     }
 
@@ -274,14 +291,17 @@ where
 
     /// Stash the device-resident trace-domain main columns from the R1 main LDE
     /// (column-major `[col*rows + row]`) so the aux fingerprint kernel reads them
-    /// in place.
+    /// in place. `ready` is the producer's completion event (the LDE handle's):
+    /// a producer that returns without synchronizing leaves `buf` still being
+    /// written on its stream, and the aux build must wait on it.
     #[cfg(feature = "cuda")]
     pub fn set_main_trace_dev(
         &mut self,
         buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
         rows: usize,
+        ready: Option<std::sync::Arc<math_cuda::device::PooledEvent>>,
     ) {
-        self.main_trace_dev = Some(ResidentMainTrace { buf, rows });
+        self.main_trace_dev = Some(ResidentMainTrace { buf, rows, ready });
     }
 
     /// The device-resident main trace `(buffer, rows)`, if retained by R1.
@@ -314,6 +334,22 @@ where
         self.main_rowmajor_dev = None;
     }
 
+    /// Free the auxiliary columns, keeping the declared aux width.
+    ///
+    /// Called by `multi_prove` under `ResidencyMode::RecomputeLde` once a
+    /// table's proof exists: `allocate_aux_table` writes the LogUp columns into
+    /// this caller-owned trace and nothing reads them afterwards, so under that
+    /// mode they are released rather than carried to the end of the prove.
+    /// Callers that do read a trace's aux columns after proving must use
+    /// `ResidencyMode::Retain`.
+    pub fn release_aux_columns(&mut self) {
+        self.aux_table = Table::new(Vec::new(), self.aux_table.width);
+        #[cfg(feature = "cuda")]
+        {
+            self.aux_resident = None;
+        }
+    }
+
     pub fn num_steps(&self) -> usize {
         debug_assert!(self.main_table.height.is_multiple_of(self.step_size));
         self.main_table.height / self.step_size
@@ -330,7 +366,239 @@ where
     }
 
     pub fn columns_main(&self) -> Vec<Vec<FieldElement<F>>> {
+        let loaded;
+        let narrow = match &self.spilled_main {
+            // A read from the spill file: the prover unspills before its
+            // readers, so only a caller outside it lands here.
+            Some(spilled) => {
+                loaded = spilled
+                    .load()
+                    .unwrap_or_else(|e| panic!("reading a spilled main trace back: {e}"));
+                Some(&loaded)
+            }
+            None => self.narrow_main.as_deref(),
+        };
+        if let Some(narrow) = narrow {
+            return (0..narrow.cols())
+                .map(|c| {
+                    narrow
+                        .column(c)
+                        .into_iter()
+                        .map(|w| word_as_element::<F>(w))
+                        .collect()
+                })
+                .collect();
+        }
         self.main_table.columns()
+    }
+
+    /// Pack the main trace at the bytes its columns need and free the 64-bit
+    /// copy ([`crate::narrow::NarrowMain`]): the raw words come back bit for
+    /// bit from [`Self::widen_main_on_host`], or on the device from the
+    /// prover. Only a Goldilocks trace held in memory packs, and none under
+    /// `debug-checks`; `false` leaves the trace as it was.
+    pub fn pack_main_narrow(&mut self) -> bool
+    where
+        F: 'static,
+    {
+        if self.narrow_main.is_some() {
+            return true;
+        }
+        // The debug checks read the host trace after the aux build, where the
+        // packed copy is already freed.
+        if cfg!(feature = "debug-checks") {
+            return false;
+        }
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || self.main_table.data.len() != self.main_table.width * self.main_table.height
+        {
+            return false;
+        }
+        #[cfg(feature = "disk-spill")]
+        if self.main_table.mmap_backing.is_some() {
+            return false;
+        }
+        let words = elements_as_words(&self.main_table.data);
+        let narrow = crate::narrow::NarrowMain::pack(words, self.main_table.width);
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        true
+    }
+
+    /// A trace held packed from the start: `narrow`'s rows and columns, with no
+    /// 64-bit copy ever made (`narrow::NarrowBuilder`). `None` where a trace
+    /// cannot be held packed, as [`Self::pack_main_narrow`] refuses it: not
+    /// Goldilocks, or under `debug-checks`.
+    pub fn from_narrow_main(narrow: crate::narrow::NarrowMain, step_size: usize) -> Option<Self>
+    where
+        F: 'static,
+    {
+        if cfg!(feature = "debug-checks")
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return None;
+        }
+        let mut trace = Self::new_main(Vec::new(), narrow.cols(), step_size);
+        trace.main_table.height = narrow.rows();
+        trace.narrow_main = Some(std::sync::Arc::new(narrow));
+        Some(trace)
+    }
+
+    /// Take `narrow` as this trace's packed main trace (packed elsewhere, e.g.
+    /// by the device from the commit's snapshot) and free the 64-bit copy, as
+    /// [`Self::pack_main_narrow`] would. `false`, and the trace untouched, when
+    /// its shape is not this trace's or the trace could not be packed here.
+    pub fn install_main_narrow(&mut self, narrow: crate::narrow::NarrowMain) -> bool
+    where
+        F: 'static,
+    {
+        if narrow.rows() != self.main_table.height
+            || narrow.cols() != self.main_table.width
+            || self.spilled_main.is_some()
+            || cfg!(feature = "debug-checks")
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return false;
+        }
+        #[cfg(feature = "disk-spill")]
+        if self.main_table.mmap_backing.is_some() {
+            return false;
+        }
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        true
+    }
+
+    /// Whether the main trace is packed ([`Self::pack_main_narrow`]).
+    pub fn is_main_narrow(&self) -> bool {
+        self.narrow_main.is_some()
+    }
+
+    /// The packed main trace, if [`Self::pack_main_narrow`] packed it.
+    pub fn narrow_main(&self) -> Option<&crate::narrow::NarrowMain> {
+        self.narrow_main.as_deref()
+    }
+
+    /// Bring a packed main trace back to 64-bit words on the host, the words
+    /// it was packed from (read back first when it is spilled). A no-op on a
+    /// trace that is not packed.
+    pub fn widen_main_on_host(&mut self)
+    where
+        F: 'static,
+    {
+        if let Err(e) = self.unspill_main() {
+            panic!("reading a spilled main trace back: {e}");
+        }
+        let Some(narrow) = self.narrow_main.take() else {
+            return;
+        };
+        let mut words = vec![0u64; narrow.rows() * narrow.cols()];
+        narrow.widen_into(&mut words);
+        self.main_table.data = words_as_elements::<F>(words);
+    }
+
+    /// A copy of this trace with its main words on the host (widened from the
+    /// packed form when it is packed), for a path that reads them while the
+    /// trace itself stays packed.
+    pub fn widened_copy(&self) -> Self
+    where
+        F: 'static,
+    {
+        let mut copy = self.clone();
+        copy.widen_main_on_host();
+        copy
+    }
+
+    /// Drop a packed main trace without widening it, spilled or not: its last
+    /// reader (the device recompute, then the aux build) is done. The table
+    /// keeps its width and height.
+    pub fn drop_narrow_main(&mut self) {
+        self.narrow_main = None;
+        self.spilled_main = None;
+    }
+
+    /// Write the packed main trace to `store` and free it here
+    /// ([`crate::spill`]): the table keeps its width and height, and
+    /// [`Self::unspill_main`] (or the prover, ahead of the trace's readers)
+    /// brings the same bytes back. `false`, and the trace untouched, when it
+    /// is not packed, its packed copy is shared, or the store has failed.
+    pub fn spill_main(&mut self, store: &crate::spill::SpillStore) -> bool {
+        let Some(narrow) = self.narrow_main.take() else {
+            return false;
+        };
+        let narrow = match std::sync::Arc::try_unwrap(narrow) {
+            Ok(narrow) => narrow,
+            Err(shared) => {
+                self.narrow_main = Some(shared);
+                return false;
+            }
+        };
+        match store.spill(narrow) {
+            Ok(spilled) => {
+                self.spilled_main = Some(spilled);
+                true
+            }
+            Err(narrow) => {
+                self.narrow_main = Some(std::sync::Arc::new(narrow));
+                false
+            }
+        }
+    }
+
+    /// Whether the packed main trace is in a spill file ([`Self::spill_main`]).
+    pub fn is_main_spilled(&self) -> bool {
+        self.spilled_main.is_some()
+    }
+
+    /// Where the spilled main trace is, if it is spilled.
+    pub fn spilled_main(&self) -> Option<&crate::spill::SpilledMain> {
+        self.spilled_main.as_ref()
+    }
+
+    /// Read a spilled main trace back and hold it packed again, checked
+    /// against the digest taken before the write. A no-op on a trace that is
+    /// not spilled. On an error the trace has no main words left: the read
+    /// is the proof's, and it is refused.
+    pub fn unspill_main(&mut self) -> Result<(), crate::spill::SpillError> {
+        self.unspill_main_with(None)
+    }
+
+    /// [`Self::unspill_main`], from bytes the prover read ahead when it has
+    /// them.
+    pub(crate) fn unspill_main_with(
+        &mut self,
+        prefetched: Option<Result<crate::narrow::NarrowMain, crate::spill::SpillError>>,
+    ) -> Result<(), crate::spill::SpillError> {
+        let Some(spilled) = self.spilled_main.take() else {
+            return Ok(());
+        };
+        let narrow = match prefetched {
+            Some(read) => read?,
+            None => spilled.into_narrow()?,
+        };
+        self.narrow_main = Some(std::sync::Arc::new(narrow));
+        Ok(())
+    }
+
+    /// A copy of this spilled trace holding its packed main trace (read ahead
+    /// by the prover, or read now), for a reader that leaves the trace itself
+    /// spilled: a Round-1 commit before the fused task's read.
+    pub(crate) fn with_spilled_main_loaded(
+        &self,
+        prefetched: Option<Result<crate::narrow::NarrowMain, crate::spill::SpillError>>,
+    ) -> Result<Self, crate::spill::SpillError> {
+        let narrow = match (prefetched, &self.spilled_main) {
+            (Some(read), _) => read?,
+            (None, Some(spilled)) => spilled.load()?,
+            (None, None) => return Ok(self.clone()),
+        };
+        let mut copy = self.clone();
+        copy.spilled_main = None;
+        copy.narrow_main = Some(std::sync::Arc::new(narrow));
+        Ok(copy)
     }
 
     pub fn columns_aux(&self) -> Vec<Vec<FieldElement<E>>> {
@@ -841,7 +1109,11 @@ where
     E: IsField + 'static,
 {
     let n = domain.interpolation_domain_size;
-    let bf = domain.blowup_factor;
+    // The read stride is the TABLE's own blowup, not the domain's: for every
+    // existing caller the two coincide (the table was expanded at the
+    // domain's blowup), and the batched phase 4 hands a blowup-1 table that
+    // IS the stride subsample already — same values, a quarter the buffer.
+    let bf = lde_trace.blowup_factor;
     let num_main_cols = lde_trace.num_main_cols();
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
@@ -1129,4 +1401,46 @@ where
         }
     }
     evaluation_points
+}
+
+/// A Goldilocks word as a field element: the packing is only done for
+/// Goldilocks traces ([`TraceTable::pack_main_narrow`]), whose elements are the
+/// raw `u64` words.
+fn word_as_element<F: IsField>(w: u64) -> FieldElement<F> {
+    debug_assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    // SAFETY: only reached for a packed trace, which `pack_main_narrow` packs
+    // only when `F` is `GoldilocksField`, whose `FieldElement` is a
+    // `#[repr(transparent)]` `u64`.
+    unsafe { std::mem::transmute_copy::<u64, FieldElement<F>>(&w) }
+}
+
+/// A Goldilocks trace's elements as their raw words (see [`word_as_element`]).
+fn elements_as_words<F: IsField>(data: &[FieldElement<F>]) -> &[u64] {
+    assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    // SAFETY: as `word_as_element`; same size and alignment as `u64`.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len()) }
+}
+
+/// Raw words back as a Goldilocks trace's elements, without a copy.
+fn words_as_elements<F: IsField>(words: Vec<u64>) -> Vec<FieldElement<F>> {
+    assert_eq!(
+        std::mem::size_of::<FieldElement<F>>(),
+        std::mem::size_of::<u64>()
+    );
+    let mut words = std::mem::ManuallyDrop::new(words);
+    // SAFETY: as `word_as_element`; the allocation's layout (size and
+    // alignment of `u64`) is the element's.
+    unsafe {
+        Vec::from_raw_parts(
+            words.as_mut_ptr() as *mut FieldElement<F>,
+            words.len(),
+            words.capacity(),
+        )
+    }
 }

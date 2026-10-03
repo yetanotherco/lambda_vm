@@ -17,7 +17,19 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V4";
+/// V4 appended `TableCounts::blake3`, which made the BLAKE3 table conditional.
+/// [`CONTINUATION_EPOCH_TAG`] moved with it and for the same reason: the count
+/// list below is SHARED, so a continuation epoch absorbs the new u64 too.
+/// Bumping only the monolithic tag would have left continuation proofs from two
+/// encodings sharing a transcript prefix.
+///
+/// ⚠ V5 is a MERGE OF TWO INDEPENDENT V4s, and that is why it exists. The
+/// per-table lineage reached V4 by appending `blake3`; main reached its own V4
+/// by appending the six accelerator counts. Two different encodings were both
+/// called V4, so keeping either suffix would have let proofs from the two
+/// branches share a transcript prefix — the exact thing this tag prevents. The
+/// merged encoding appends all seven counts and is V5.
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V5";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -68,6 +80,13 @@ pub(crate) fn absorb_statement(
 /// hold the digest reuse it instead of a second full-ELF Keccak pass — the
 /// recursion attestation path shares one digest between the transcript absorb
 /// and the `program_id` fold (a full-ELF hash is expensive in-guest).
+///
+/// ⛔ **This statement is NOT padded to a field element boundary**, unlike the
+/// three WHIR ones — see [`absorb_statement_padding`]. Its transcript is
+/// keccak, which absorbs a byte stream and never re-slices it into field
+/// elements, so there is no straddling value to prevent; and its bytes are the
+/// univariate pipeline's, which the block identity lines pin. Padding here
+/// would move a record for nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_statement_with_digest(
     t: &mut impl IsTranscript<E>,
@@ -94,55 +113,13 @@ pub(crate) fn absorb_statement_with_digest(
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
     t.append_bytes(public_output);
 
-    // table_counts: fixed-width u64s in declared order. The exhaustive
-    // destructure makes any field added to TableCounts a compile error here —
-    // that's the signal to extend the loop below and bump DOMAIN_TAG.
-    let &TableCounts {
-        cpu,
-        lt,
-        memw,
-        memw_aligned,
-        load,
-        mul,
-        dvrm,
-        shift,
-        branch,
-        memw_register,
-        eq,
-        bytewise,
-        store,
-        cpu32,
-        keccak,
-        keccak_rnd,
-        ecsm,
-        ecdas,
-        hint,
-        commit,
-    } = table_counts;
-    for count in [
-        cpu,
-        lt,
-        memw,
-        memw_aligned,
-        load,
-        mul,
-        dvrm,
-        shift,
-        branch,
-        memw_register,
-        eq,
-        bytewise,
-        store,
-        cpu32,
-        keccak,
-        keccak_rnd,
-        ecsm,
-        ecdas,
-        hint,
-        commit,
-    ] {
-        t.append_bytes(&(count as u64).to_le_bytes());
-    }
+    // The width is for callers that pad from it; this one does not.
+    //
+    // ⚠ The exhaustive destructure that turns a new `TableCounts` field into a
+    // compile error lives in [`table_count_values`], not here. It is the same
+    // tripwire one level down, and it is what the WHIR statements inherit by
+    // calling the same helper.
+    let _ = absorb_table_counts(t, table_counts);
 
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
 
@@ -187,10 +164,204 @@ pub(crate) fn absorb_statement_with_digest(
     }
 }
 
+/// Bytes per field element, which is the granularity the algebraic transcript
+/// slices its absorbed buffer at (`rpx::sponge_leaf_bytes`).
+pub(crate) const FELT_BYTES: usize = 8;
+
+/// Zeroes for [`absorb_statement_padding`]. A pad is at most `FELT_BYTES - 1`.
+const PAD_ZEROS: [u8; FELT_BYTES - 1] = [0u8; FELT_BYTES - 1];
+
+/// Zero bytes that bring a statement of `len` bytes up to a multiple of
+/// [`FELT_BYTES`].
+pub(crate) const fn statement_padding(len: usize) -> usize {
+    (FELT_BYTES - len % FELT_BYTES) % FELT_BYTES
+}
+
+/// Closes a WHIR statement so that whatever is absorbed next starts on a field
+/// element boundary, and returns the number of bytes it added.
+///
+/// # Why a statement is padded at all
+///
+/// The transcript hashes BYTES, and the algebraic configuration's sponge
+/// re-slices everything absorbed since the last squeeze into field elements
+/// every [`FELT_BYTES`] bytes (`crypto::hash::rpx::sponge_leaf_bytes`). A value
+/// absorbed at an offset that is not a multiple of 8 therefore STRADDLES two
+/// field elements, and a field-machine verifier replaying the transcript has to
+/// bit-decompose it to reproduce the absorb.
+///
+/// Every window after the first is already aligned: a squeeze leaves the buffer
+/// holding its own 32-byte output, and everything absorbed afterwards — roots
+/// 32, extension elements 24, grind nonces 8, final values 24 — is a multiple of
+/// 8. The FIRST window is the exception, because it opens with the statement,
+/// and the roots that follow it land wherever the statement ended.
+///
+/// # Why the pad is COMPUTED and not a constant
+///
+/// A statement's roots do not sit at the end of its fixed prefix: two
+/// variable-length fields sit in between (the public output and the per-table
+/// heights). Padding the fixed prefix to a multiple of 8 would leave the roots
+/// at `(|public_output| + |table_num_vars|) mod 8` — 2 mod 8 at the shape this
+/// system runs — so it would align nothing while moving every pinned constant.
+/// The length is accumulated beside the absorbs that produce it, and the pad
+/// follows from that length.
+///
+/// # Why it is called even when the pad is empty
+///
+/// So that "one padding absorb per statement" holds for every shape. The
+/// transcript counts an empty `append_bytes` as an absorb, so an absorb count
+/// stays a function of the statement's FIELDS rather than of its lengths, and
+/// the pinned pair moves by exactly one per statement instead of by a number
+/// nobody can predict without the shapes.
+pub(crate) fn absorb_statement_padding(
+    t: &mut impl IsTranscript<E>,
+    kind: &str,
+    len: usize,
+    shape: &[(&str, usize)],
+) -> usize {
+    #[cfg(not(feature = "hash-metrics"))]
+    let _ = (kind, shape);
+
+    let pad = statement_padding(len);
+    t.append_bytes(&PAD_ZEROS[..pad]);
+    // ★ The statement is over, and the transcript is told so.
+    //
+    // `Counts::transcript_misaligned_absorbs_after_statement` reports what
+    // happens from here on, and nothing else can define that boundary: a
+    // transcript sees a byte stream and a statement is not a type. Compiles to
+    // nothing without `hash-metrics`.
+    //
+    // ⚠ It is called AFTER the pad, not before, and the difference is the whole
+    // check: the pad is what makes the next absorb aligned, so a mark placed
+    // before it would count the pad's own absorb and a mark that reset the
+    // window would report zero whether the pad worked or not.
+    t.mark_statement_end();
+
+    // A diagnostic, not a gate: it prints every variable length the pad is a
+    // function of beside the pad itself, so a run that reports a total number of
+    // padding bytes can be checked against the shapes that produced it instead
+    // of against a premise nobody measured.
+    #[cfg(feature = "hash-metrics")]
+    {
+        // ⚠ Its own label, not `WHIR`: the bench's per-arm lines already start
+        // with that, and a box launcher counting `WHIR` lines would silently
+        // pick these up as well.
+        let mut line = format!("{:<12} statement {kind}", "WHIR-PAD");
+        for (name, value) in shape {
+            line.push_str(&format!(" {name}={value}"));
+        }
+        println!("{line} len={len} pad={pad}");
+    }
+
+    pad
+}
+
+/// How many per-table counts a statement binds — one `u64` each.
+///
+/// ★ Read, never written as a literal by a caller. The transcript pin's
+/// expected absorb counts are `base + epochs * NUM_TABLE_KINDS`, because the
+/// per-table campaign added a count to this list (`TableCounts::blake3`) and a
+/// pin carrying the total would be a constant describing one branch while
+/// claiming to describe the protocol.
+///
+/// Two compile errors guard it together, and neither alone is enough: the
+/// exhaustive destructure in [`table_count_values`] fails when a field is added
+/// to [`TableCounts`], and that function's return type fails when the new field
+/// is pushed into the array without bumping this constant.
+pub(crate) const NUM_TABLE_KINDS: usize = 21;
+
+/// Every per-table count, in declared order.
+///
+/// The exhaustive destructure makes any field added to [`TableCounts`] a
+/// compile error here — that's the signal to extend the array and bump the
+/// domain tag of every statement that absorbs it.
+pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_KINDS] {
+    let &TableCounts {
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
+        keccak,
+        keccak_rnd,
+        ecsm,
+        ecdas,
+        hint,
+        commit,
+        blake3,
+    } = table_counts;
+    [
+        cpu as u64,
+        lt as u64,
+        memw as u64,
+        memw_aligned as u64,
+        load as u64,
+        mul as u64,
+        dvrm as u64,
+        shift as u64,
+        branch as u64,
+        memw_register as u64,
+        eq as u64,
+        bytewise as u64,
+        store as u64,
+        cpu32 as u64,
+        // The six accelerator chips. Counted rather than fixed, so an epoch that
+        // never reaches one carries no table for it; each is 0 or 1 today and
+        // `TableCounts::validate` refuses anything higher.
+        keccak as u64,
+        keccak_rnd as u64,
+        ecsm as u64,
+        ecdas as u64,
+        hint as u64,
+        commit as u64,
+        // 0 or 1, and the one count the verifier cannot derive for itself —
+        // binding it is what stops prover and verifier building different AIR
+        // sets from the same bytes (see `TableCounts::blake3`).
+        blake3 as u64,
+    ]
+}
+
+/// The table layout, as fixed-width u64s in declared order.
+///
+/// Returns the number of BYTES it absorbed, so a caller accumulating a
+/// statement's length does not have to know — or track — how many counts there
+/// are. A caller that does not need the length (the univariate path) ignores it.
+#[must_use]
+pub(crate) fn absorb_table_counts(
+    t: &mut impl IsTranscript<E>,
+    table_counts: &TableCounts,
+) -> usize {
+    let counts = table_count_values(table_counts);
+    for count in counts {
+        t.append_bytes(&count.to_le_bytes());
+    }
+    counts.len() * size_of::<u64>()
+}
+
+/// Domain tag for the multilinear path. A WHIR proof and a FRI proof must
+/// never share a transcript prefix.
+pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V2";
+
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V4";
-const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
+/// `pub(crate)` so the LFM statement replay emits the identical tag instead of
+/// duplicating the literal: a second copy would drift silently on a version
+/// bump, and the tag existing at all depends on both sides agreeing on it.
+///
+/// ⚠ V5 for the reason [`DOMAIN_TAG`] is: the lineage's V3 and main's V4 are
+/// different encodings of the same statement, and the merged one appends both
+/// additions. The GLOBAL tag stays at V2 — the cross-epoch statement binds no
+/// per-table counts, so nothing in its encoding moved.
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V5";
+pub(crate) const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before
 /// Phase A: the ELF (so the global proof is program-bound), the epoch count (so a

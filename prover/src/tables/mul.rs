@@ -33,7 +33,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
+use super::trace_hash::{OpMap, trace_hash_state};
 
 use super::types::{
     BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
@@ -292,7 +292,7 @@ pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
-    let mut op_map: HashMap<MulOperation, MulMultiplicities> = HashMap::new();
+    let mut op_map: OpMap<MulOperation, MulMultiplicities> = OpMap::with_hasher(trace_hash_state());
 
     for (op, wants_hi) in operations {
         let entry = op_map.entry(op.clone()).or_default();

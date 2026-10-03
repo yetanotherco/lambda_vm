@@ -55,3 +55,38 @@ fn test_pi_virtual_matches_rotate() {
         }
     }
 }
+
+/// Built packed a block at a time, the table packs to the words the 64-bit
+/// build gives, byte for byte: chunks of fewer permutations than a block, one
+/// short of a block, exactly a block, across blocks, and none.
+#[test]
+fn the_packed_build_is_the_64_bit_build_packed() {
+    let ops: Vec<KeccakRoundOperation> = (0..300u64)
+        .map(|i| {
+            let input: [u64; 25] =
+                std::array::from_fn(|j| (i * 25 + j as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut output = input;
+            keccak_f1600(&mut output);
+            KeccakRoundOperation {
+                timestamp: 1000 + 4 * i,
+                input,
+                output,
+            }
+        })
+        .collect();
+    for n in [0, 1, 127, 128, 129, 300] {
+        let mut wide = generate_keccak_rnd_trace(&ops[..n]);
+        assert!(wide.pack_main_narrow(), "{n}: the 64-bit build packs");
+        let packed = generate_keccak_rnd_trace_packed(&ops[..n]).expect("packed build");
+        assert_eq!(packed.num_rows(), wide.num_rows(), "{n} rows");
+        assert_eq!(
+            packed.num_main_columns, wide.num_main_columns,
+            "{n} columns"
+        );
+        assert_eq!(
+            packed.narrow_main(),
+            wide.narrow_main(),
+            "{n}: packed words"
+        );
+    }
+}

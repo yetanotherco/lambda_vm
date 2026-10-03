@@ -1,0 +1,89 @@
+
+  C1   base m=5 r=6 digest is 4 u32 lanes                                                                                      PASS
+  C1   base m=5 r=7 digest is 4 u32 lanes                                                                                      PASS
+  C1   deterministic                                                                                                           PASS
+  C1   cost formula matches the chain length (10 felts / rate 4)                                                               PASS
+  C2   ext3 m=3 r=6 digest well formed                                                                                         PASS
+  C2   ext3 m=3 r=7 digest well formed                                                                                         PASS
+  C2   cost formula matches the chain length (18 felts / rate 4)                                                               PASS
+  C2   same felt count, different kind -> different leaf                                                                       PASS
+  C3   HONEST leg: the true width still verifies                                                                               PASS
+  C3   a narrower opening yields a different leaf                                                                              PASS
+  C3   ★ identical felt stream, base vs ext3 -> different leaf (the main<->aux confusion, closed by the header)                PASS
+  C3   a width disagreeing with the data is refused                                                                            PASS
+  C4   ★ colliding padded felt streams separated by the header                                                                 PASS
+  C4   HONEST leg: padded leaf is deterministic                                                                                PASS
+  C4   zero-width leaf is the bare header                                                                                      PASS
+  C5   every lane is a u32 (O1 automatic)                                                                                      PASS
+  C5   cell count is header + ceil(len/16)                                                                                     PASS
+  C5   ★ b'\x01' and b'\x01\x00' encode differently                                                                            PASS
+  C5   empty string is header-only                                                                                             PASS
+  C5   absorb advances the chain                                                                                               PASS
+  C5   HONEST leg: body bytes recover the input under its length                                                               PASS
+  C6   pack is 32 bytes                                                                                                        PASS
+  C6   HONEST leg: pack -> strict_unpack round-trips                                                                           PASS
+  C6   the sixteen padding bytes are zero                                                                                      PASS
+  C6   ★ rejects a set high byte in lane 0 (the cheap forgery)                                                                 PASS
+  C6   ★ rejects a set top byte in lane 3                                                                                      PASS
+  C6   ★ rejects a lane congruent to 1 mod p                                                                                   PASS
+  C6   ★ rejects a short commitment                                                                                            PASS
+  C6   HONEST leg: an all-zero digest still decodes                                                                            PASS
+  C7   HONEST leg: a power-of-two tree builds                                                                                  PASS
+  C7   a single leaf is its own root                                                                                           PASS
+  C7   ★ a non-power-of-two leaf count is refused                                                                              PASS
+  C8   squeeze_ext_1 costs one compression                                                                                     PASS
+  C8   ★ its coordinates are u32-bounded (96 bits total)                                                                       PASS
+  C8   squeeze_ext_2 costs two compressions (+1 flat)                                                                          PASS
+  C8   its coordinates span the full field                                                                                     PASS
+  C9   ★ the wide leaf's LFML rows keep the byte-level anchor @7r                                                              PASS
+  C9   the fold is the honest LFMC socket                                                                                      PASS
+  C10  ★ a wide leaf is not the bare LFML digest                                                                               PASS
+  C10  ★ a wide leaf is not an unheaded LFMC fold                                                                              PASS
+  C10  HONEST leg: it is exactly lfml_chain_row(header, felts)                                                                 PASS
+  C11  HONEST leg: a mined nonce satisfies the difficulty                                                                      PASS
+  C11  the difficulty actually bites (mining was not trivial)                                                                  PASS
+  C11  ★ the factor is bound into the digest                                                                                   PASS
+  C11  ★ the transcript state is bound into the digest                                                                         PASS
+  C11  ★ GRIND_MARK changes the digest                                                                                         PASS
+  C11  ★★ a PoW step IS an absorb of its operand cell — separation rests on the fixed program sequence, NOT on the hash (D6a)  PASS
+  C11  ★ a PoW step is not an LFMC Merkle parent of the same cells                                                             PASS
+  C11  ★ a PoW step is not an LFML leaf of the same felts                                                                      PASS
+  C11  factor <= 32 reads lane 0 only                                                                                          PASS
+  C11  factor > 32 requires lane 0 fully zero (so this sample fails)                                                           PASS
+  C11  ★ rejects factor 0                                                                                                      PASS
+  C11  ★ rejects factor 65                                                                                                     PASS
+  C11  ★ rejects an out-of-range nonce                                                                                         PASS
+  C11  verification is ONE compression, independent of difficulty                                                              PASS
+  C12  the spec parameter is 4 felts/row with a 4-lane accumulator                                                             PASS
+  C12  ★★ the rate is a multiple of 4 (whole machine cells)                                                                    PASS
+  C12  ★★ it fits the EXISTING 2-cells-in bus contract (acc cell + one felt cell = 12 lanes + tag = 13 of 16 words)            PASS
+  C12  ★ rate is 4 felts/compression (was 2)                                                                                   PASS
+  C12  ★ that is a 2.0x improvement on the dominant cost                                                                       PASS
+  C12  ★ a full row is 52 bytes — still one BLAKE3 block (<= 64)                                                               PASS
+  C12  ★ row == plain blake3::hash(52 bytes) @7r (anchor intact)                                                               PASS
+  C12  ★ base-vs-ext3 separation survives the rate change                                                                      PASS
+  C12  ★ padding still separated by the header at rate 4                                                                       PASS
+  C12  ★ a non-canonical felt still rejects                                                                                    PASS
+  C12  ★ per-query main-tree leaf cost 6048 -> 3024 (2.00x)                                                                    PASS
+  PIN  C1.base.m5.r6 matches the pinned vector                                                                                 PASS
+  PIN  C1.base.m5.r7 matches the pinned vector                                                                                 PASS
+  PIN  C2.ext3.m3.r6 matches the pinned vector                                                                                 PASS
+  PIN  C2.ext3.m3.r7 matches the pinned vector                                                                                 PASS
+  PIN  C4.pad.m1 matches the pinned vector                                                                                     PASS
+  PIN  C4.pad.m2 matches the pinned vector                                                                                     PASS
+  PIN  C5.absorb.r6 matches the pinned vector                                                                                  PASS
+  PIN  C5.absorb.r7 matches the pinned vector                                                                                  PASS
+  PIN  C6.pack matches the pinned vector                                                                                       PASS
+  PIN  C7.root.n8.r6 matches the pinned vector                                                                                 PASS
+  PIN  C7.root.n8.r7 matches the pinned vector                                                                                 PASS
+  PIN  C8.ext1 matches the pinned vector                                                                                       PASS
+  PIN  C8.ext2 matches the pinned vector                                                                                       PASS
+  PIN  C11.pow.r6 matches the pinned vector                                                                                    PASS
+  PIN  C11.pow.r7 matches the pinned vector                                                                                    PASS
+  PIN  C12.row.r6 matches the pinned vector                                                                                    PASS
+  PIN  C12.row.r7 matches the pinned vector                                                                                    PASS
+  PIN  C12.per_query_old matches the pinned vector                                                                             PASS
+  PIN  C12.per_query_new matches the pinned vector                                                                             PASS
+
+BOARD: C1 4/4 | C2 4/4 | C3 4/4 | C4 3/3 | C5 6/6 | C6 8/8 | C7 3/3 | C8 4/4 | C9 2/2 | C10 3/3 | C11 14/14 | C12 11/11 | PIN 19/19
+TOTAL: 85/85 PASS

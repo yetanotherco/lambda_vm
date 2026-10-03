@@ -44,12 +44,11 @@ pub struct LogupDescriptor<'a> {
 }
 
 fn cfg(total: usize) -> Result<LaunchConfig> {
-    // See `batch_inverse_ext3_dev` for the rationale: a u32 grid_dim is
-    // truncated past u32::MAX / BLOCK_SIZE, which would silently launch too
-    // few blocks and leave a tail of the (uninitialized) output unwritten.
-    // Runtime Err, not debug_assert, so release builds also route to the
-    // caller's CPU fallback.
-    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+    // See `inverse::launch_total_fits` for the bound and its reasoning: past
+    // it the u32 element count would truncate and leave a tail of the
+    // (uninitialized) output unwritten. Runtime Err, not debug_assert, so
+    // release builds also route to the caller's fallback or abort.
+    if !crate::inverse::launch_total_fits(total) {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));
@@ -482,4 +481,27 @@ pub fn logup_aux_resident(
         num_rows,
         table_contribution: [l_host[0], l_host[1], l_host[2]],
     })
+}
+
+#[cfg(test)]
+mod launch_cfg_tests {
+    use super::*;
+
+    /// 6 interactions × 2^22 rows (LOCAL_TO_GLOBAL in a 2^22 epoch) launches
+    /// 98,304 blocks; it used to be refused as if it were 256× larger.
+    #[test]
+    fn the_first_refused_aux_build_shape_launches() {
+        let c = cfg(6 << 22).expect("expressible");
+        assert_eq!(c.grid_dim, (98_304, 1, 1));
+        assert_eq!(c.block_dim, (BLOCK_SIZE, 1, 1));
+    }
+
+    /// The largest expressible launch is exactly u32::MAX elements; one more
+    /// is refused with the same error the driver would have used.
+    #[test]
+    fn the_bound_is_u32_max_elements() {
+        let c = cfg(u32::MAX as usize).expect("expressible");
+        assert_eq!(c.grid_dim.0, 1 << 24);
+        assert!(cfg(u32::MAX as usize + 1).is_err());
+    }
 }
