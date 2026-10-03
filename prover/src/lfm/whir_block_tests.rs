@@ -197,7 +197,11 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
         )
         .expect("the block proves");
         let seen = seen.into_inner().expect("lock");
-        assert_eq!(seen.len(), proof.groups.len(), "{name}: one hand-over a group");
+        assert_eq!(
+            seen.len(),
+            proof.groups.len(),
+            "{name}: one hand-over a group"
+        );
         assert!(
             seen.iter().enumerate().all(|(g, m)| m.group == g),
             "{name}: the groups in order"
