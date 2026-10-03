@@ -226,12 +226,24 @@ fn where_the_rule_keeps_pairs_the_bytes_are_todays() {
 /// `L/N`, from `acc[0] = 0` around the cycle; `L` is the table's total.
 #[test]
 fn the_host_aux_build_sums_every_interaction_k4() {
-    check_aux_build_k4(ROWS);
+    check_aux_build_k4(ROWS, |_| {}, host_aux);
 }
 
-/// The T0e check at `rows` rows (at 2^10 and above a `cuda` build takes the
-/// device term-column build).
-fn check_aux_build_k4(rows: usize) {
+/// The aux columns the build wrote to the trace's host table.
+fn host_aux(t: &TraceTable<F, E>) -> Vec<Vec<FE3>> {
+    (0..t.num_rows())
+        .map(|r| (0..t.num_aux_columns).map(|c| *t.get_aux(r, c)).collect())
+        .collect()
+}
+
+/// The T0e check at `rows` rows. `prepare` sets the trace up before the build
+/// (a `cuda` build may route it to a device path); `read` returns the aux
+/// columns the build produced, row by row, wherever it left them.
+fn check_aux_build_k4(
+    rows: usize,
+    prepare: impl FnOnce(&mut TraceTable<F, E>),
+    read: impl FnOnce(&TraceTable<F, E>) -> Vec<Vec<FE3>>,
+) {
     let (pairs, idle) = (6, 1);
     let opts = options(4, LogUpPolicy::K4);
     let air = air(pairs, idle, &opts);
@@ -242,7 +254,10 @@ fn check_aux_build_k4(rows: usize) {
     }
     let main: Vec<Vec<FE>> = t.columns_main();
     let challenges = vec![FE3::from(0x1234_5678u64), FE3::from(0x9abc_def0u64)];
+    prepare(&mut t);
     let bus = air.build_auxiliary_trace(&mut t, &challenges).expect("aux");
+    let aux = read(&t);
+    assert_eq!(aux.len(), rows);
     let its = interactions(pairs, idle);
     let frac = |it: &BusInteraction, row: usize| -> FE3 {
         let (m_col, v_col) = match (&it.multiplicity, &it.values[0]) {
@@ -267,22 +282,22 @@ fn check_aux_build_k4(rows: usize) {
                 .fold(FE3::zero(), |a, b| a + b)
         })
         .collect();
-    for row in 0..rows {
-        for g in 0..groups {
+    for (row, cells) in aux.iter().enumerate() {
+        for (g, cell) in cells.iter().take(groups).enumerate() {
             let want = its[4 * g..4 * g + 4]
                 .iter()
                 .map(|it| frac(it, row))
                 .fold(FE3::zero(), |a, b| a + b);
-            assert_eq!(*t.get_aux(row, g), want, "row {row} group {g}");
+            assert_eq!(*cell, want, "row {row} group {g}");
         }
     }
     let total = row_totals.iter().fold(FE3::zero(), |a, b| a + *b);
     assert_eq!(bus.table_contribution, total, "L is the table's total");
     assert_ne!(total, FE3::zero(), "the idle sender makes L non-zero");
     let offset = total * FE3::from(rows as u64).inv().unwrap();
-    assert_eq!(*t.get_aux(0, groups), FE3::zero(), "acc[0] = 0");
+    assert_eq!(aux[0][groups], FE3::zero(), "acc[0] = 0");
     for (row, row_total) in row_totals.iter().enumerate() {
-        let step = *t.get_aux((row + 1) % rows, groups) - *t.get_aux(row, groups);
+        let step = aux[(row + 1) % rows][groups] - aux[row][groups];
         assert_eq!(step, *row_total - offset, "accumulator step at row {row}");
     }
 }
@@ -413,7 +428,7 @@ fn the_verifier_refuses_more_parts_than_the_blowup() {
 /// needs a GPU and fails loudly when the device path does not run:
 ///
 /// ```text
-/// cargo test -p stark --release --features cuda --lib \
+/// LAMBDA_VM_GPU_LDE_THRESHOLD=1024 cargo test -p stark --release --features cuda --lib \
 ///     tests::bus_tests::logup_arity_tests::device::d4_parts_ -- --ignored --test-threads=1
 /// LAMBDA_VM_GPU_LDE_THRESHOLD=1024 LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD=4096 \
 /// LAMBDA_VM_GPU_BARY_THRESHOLD=1024 cargo test -p stark --release --features cuda --lib \
@@ -439,9 +454,11 @@ mod device {
     /// ★ For trace lengths 2^8 … 2^21 at blowup 4: on random `H` (any
     /// values: the split is pointwise and the extension takes any `q` points),
     /// the device split and ×4 extension equal the host mirror limb for limb,
-    /// both drained to host and read back from the resident handle.
+    /// both drained to host and read back from the resident handle. Needs
+    /// `LAMBDA_VM_GPU_LDE_THRESHOLD=1024`: below the device floor the split
+    /// declines by design (the smallest LDE here is 2^10).
     #[test]
-    #[ignore = "requires a GPU; run with --features cuda -- --ignored"]
+    #[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD=1024; see the module doc"]
     fn d4_parts_equal_the_host_split() {
         let opts = options(4, LogUpPolicy::K4);
         let air = QuadraticAIR::<F>::new(&opts);
@@ -498,19 +515,48 @@ mod device {
         }
     }
 
-    /// The k = 4 aux build through the device term-column kernels (groups of
-    /// four in the descriptor) equals the per-interaction host reference.
+    /// The aux columns the device-resident build left on the card (row-major
+    /// ext3, `[row · num_aux_cols + col]`), downloaded.
+    fn resident_aux(t: &TraceTable<F, E>) -> Vec<Vec<FE3>> {
+        let ra = t.aux_resident().expect("the resident aux build ran");
+        let stream = math_cuda::device::backend()
+            .expect("cuda backend")
+            .next_stream();
+        let raw: Vec<u64> = stream.clone_dtoh(&*ra.buf).expect("download the aux");
+        (0..ra.num_rows)
+            .map(|r| {
+                (0..ra.num_aux_cols)
+                    .map(|c| {
+                        let o = (r * ra.num_aux_cols + c) * 3;
+                        FE3::new([FE::from(raw[o]), FE::from(raw[o + 1]), FE::from(raw[o + 2])])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The k = 4 aux build through both device paths (groups of four in the
+    /// descriptor) equals the per-interaction host reference: the term
+    /// columns built on the card and written to the host trace, and the
+    /// device-resident build the production aux commit reads.
     #[test]
     #[ignore = "requires a GPU; run with --features cuda -- --ignored"]
     fn d4_parts_gpu_aux_build_groups_by_four() {
         for rows in [1usize << 10, 1 << 13] {
             let before = crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed);
-            check_aux_build_k4(rows);
+            check_aux_build_k4(rows, |t| t.set_resident_aux_ok(false), host_aux);
             assert!(
                 crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed) > before,
-                "rows {rows}: the device aux build did not run"
+                "rows {rows}: the device term-column build did not run"
             );
-            println!("D4AUX rows={rows}: device k4 aux build == host reference");
+            println!("D4AUX rows={rows} term columns: device k4 aux build == host reference");
+            let before = crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed);
+            check_aux_build_k4(rows, |t| t.set_resident_aux_ok(true), resident_aux);
+            assert!(
+                crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed) > before,
+                "rows {rows}: the device-resident aux build did not run"
+            );
+            println!("D4AUX rows={rows} resident: device k4 aux build == host reference");
         }
     }
 
