@@ -1075,6 +1075,83 @@ mod tests {
         }
     }
 
+    /// The kept-top paths re-hash their queried blocks in parallel: with many
+    /// queries over a tall stack (tens of distinct blocks per round), the
+    /// revived opening is still EXACTLY the kept one's, and a revive over other
+    /// columns still refuses.
+    #[test]
+    fn a_retired_stack_opens_to_the_same_bytes_over_many_queried_blocks() {
+        let many = ChainConfig {
+            num_queries: 48,
+            ..config()
+        };
+        let num_vars = 10;
+        let (layout, columns) = stack_of(4, num_vars, 12);
+        let at = point(num_vars);
+        let claimed = values(&columns, &at);
+        let kept = StackedCommitment::<F, KeccakWhir>::commit(
+            layout.clone(),
+            &crate::stacking::borrow(&columns),
+            None,
+            &many,
+        )
+        .unwrap();
+        let want = format!(
+            "{:?}",
+            prove(
+                &kept,
+                &crate::stacking::borrow(&columns),
+                None,
+                &Claimed::Shared(&at),
+                &claimed,
+                &many,
+                &mut transcript(),
+            )
+            .unwrap()
+        );
+        let paths_before = crate::whir_commit::top_path_counts();
+        for drop_levels in [3, 4] {
+            let got = opened_after_retire_under(
+                &many,
+                layout.clone(),
+                &columns,
+                &columns,
+                &at,
+                &claimed,
+                drop_levels,
+            )
+            .unwrap();
+            assert_eq!(got, want, "drop {drop_levels}: the revived opening differs");
+        }
+        let paths_after = crate::whir_commit::top_path_counts();
+        // Other tests may add to the process-wide counters; this one alone
+        // re-hashes at least 2 drops x 48 queries' blocks of 8 leaves.
+        assert!(
+            paths_after.1 - paths_before.1 >= 2 * 8 * 32,
+            "too few leaves re-hashed for the test to cover many blocks: {paths_before:?} -> {paths_after:?}"
+        );
+
+        let mut other = columns.clone();
+        let mut evals = other[1].evals().to_vec();
+        evals[300] += FE::one();
+        other[1] = Mle::new(evals).unwrap();
+        for drop_levels in [3, 4] {
+            let got = opened_after_retire_under(
+                &many,
+                layout.clone(),
+                &columns,
+                &other,
+                &at,
+                &claimed,
+                drop_levels,
+            );
+            assert!(
+                matches!(got, Err(Error::RecomputedCodewordMismatch { .. })),
+                "drop {drop_levels}: {got:?}"
+            );
+        }
+    }
+
     /// The point of the module: many columns, one commitment, one opening.
     #[test]
     fn every_column_settles_against_one_commitment() {

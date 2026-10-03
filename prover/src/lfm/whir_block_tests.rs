@@ -1352,7 +1352,7 @@ fn the_whir_block_tree_on_a_real_block() {
     options.stream_memw_lt =
         std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
     // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads
-    // (production 0, the inline layout).
+    // (production 3; 0 is the inline layout).
     if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
         options.layout_workers = n;
     }
