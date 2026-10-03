@@ -339,6 +339,9 @@ fn prove_block_with_observed(
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
+    // `LAMBDA_VM_ALLOC_PURGE=phase-a`: phase A's freed pages (the finish's
+    // lists, spilled traces) back to the OS before phase B allocates.
+    crate::alloc_purge::purge_point("phase-a");
 
     let proof = prove_block_traces(
         elf_bytes,

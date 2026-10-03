@@ -10,6 +10,7 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
+pub mod alloc_purge;
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod block;

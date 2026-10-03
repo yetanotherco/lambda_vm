@@ -93,6 +93,10 @@ rkyv = { version = "0.8.10", default-features = false, features = [
 criterion = { version = "0.5", default-features = false }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+# `alloc_purge`'s `arena.<all>.purge`, a control that takes no value, which
+# `tikv-jemalloc-ctl`'s raw writes cannot express. No default features: the
+# allocator's build stays the one `tikv-jemallocator` and `-ctl` already select.
+tikv-jemalloc-sys = { version = "0.6", default-features = false }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 # The external anchor for `lfm::blake3` at 7 rounds and for the `LFM_HASH`
 # BLAKE3 socket (`blake3::hash(a ‖ b ‖ "LFMC")`). Test-only on purpose: the
