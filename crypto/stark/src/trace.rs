@@ -264,6 +264,15 @@ where
     where
         F: 'static,
     {
+        self.pack_main_narrow_with(multilinear::narrow::Backing::Heap)
+    }
+
+    /// [`Self::pack_main_narrow`], into bytes allocated as `backing` says
+    /// ([`multilinear::narrow::Backing`]).
+    pub fn pack_main_narrow_with(&mut self, backing: multilinear::narrow::Backing) -> bool
+    where
+        F: 'static,
+    {
         if self.narrow_main.is_some() {
             return true;
         }
@@ -279,7 +288,8 @@ where
         let words = unsafe {
             core::slice::from_raw_parts(table.data.as_ptr() as *const u64, table.data.len())
         };
-        let Some(packed) = multilinear::narrow::NarrowColumns::pack_row_major(words, table.width)
+        let Some(packed) =
+            multilinear::narrow::NarrowColumns::pack_row_major_with(words, table.width, backing)
         else {
             return false;
         };

@@ -17,6 +17,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsField};
+use math::page_bytes::PageBytes;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -42,8 +43,75 @@ pub fn host_widens() -> (u64, u64) {
     )
 }
 
+/// Where a table's packed bytes are allocated: the heap, as always, or pages
+/// of their own ([`PageBytes`]) while a spill may write them. An `O_DIRECT`
+/// write takes pages whole, and freeing them returns them to the system at
+/// once instead of to an allocator's free lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backing {
+    #[default]
+    Heap,
+    Pages,
+}
+
+/// A table's packed bytes, as [`Backing`] allocated them.
+pub enum NarrowBytes {
+    Heap(Vec<u8>),
+    Pages(PageBytes),
+}
+
+impl NarrowBytes {
+    /// `len` zero bytes, as `backing` says. Pages the system cannot map fall
+    /// back to the heap.
+    fn zeroed(len: usize, backing: Backing) -> Self {
+        match backing {
+            Backing::Pages => match PageBytes::zeroed(len) {
+                Ok(pages) => Self::Pages(pages),
+                Err(_) => Self::Heap(vec![0u8; len]),
+            },
+            Backing::Heap => Self::Heap(vec![0u8; len]),
+        }
+    }
+
+    /// Where the bytes live.
+    pub fn backing(&self) -> Backing {
+        match self {
+            Self::Heap(_) => Backing::Heap,
+            Self::Pages(_) => Backing::Pages,
+        }
+    }
+
+    /// The bytes as an `O_DIRECT` write takes them whole: a block-aligned
+    /// start and length, zeros past the bytes. `None` for heap bytes, whose
+    /// start is wherever the allocator put it.
+    pub fn direct(&self) -> Option<&[u8]> {
+        match self {
+            Self::Pages(pages) => Some(pages.padded()),
+            Self::Heap(_) => None,
+        }
+    }
+}
+
+impl core::ops::Deref for NarrowBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Heap(bytes) => bytes,
+            Self::Pages(pages) => pages,
+        }
+    }
+}
+
+impl core::ops::DerefMut for NarrowBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Heap(bytes) => bytes,
+            Self::Pages(pages) => pages,
+        }
+    }
+}
+
 /// A table's columns at 1, 2, 4 or 8 bytes per cell (see the module docs).
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NarrowColumns {
     rows: usize,
     /// Bytes per cell of each column.
@@ -51,7 +119,43 @@ pub struct NarrowColumns {
     /// Where each column starts in `data`.
     offsets: Vec<u64>,
     /// Column `c` is `rows × widths[c]` little-endian bytes from `offsets[c]`.
-    data: Vec<u8>,
+    data: NarrowBytes,
+}
+
+/// A copy is on the heap, wherever the original's bytes live.
+impl Clone for NarrowColumns {
+    fn clone(&self) -> Self {
+        Self {
+            rows: self.rows,
+            widths: self.widths.clone(),
+            offsets: self.offsets.clone(),
+            data: NarrowBytes::Heap(self.data.to_vec()),
+        }
+    }
+}
+
+/// The same columns, wherever their bytes live.
+impl PartialEq for NarrowColumns {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.widths == other.widths
+            && self.offsets == other.offsets
+            && self.data[..] == other.data[..]
+    }
+}
+
+impl Eq for NarrowColumns {}
+
+impl core::fmt::Debug for NarrowColumns {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NarrowColumns")
+            .field("rows", &self.rows)
+            .field("widths", &self.widths)
+            .field("offsets", &self.offsets)
+            .field("bytes", &self.data.len())
+            .field("backing", &self.data.backing())
+            .finish()
+    }
 }
 
 /// The bytes a word needs: 1, 2, 4 or 8.
@@ -69,6 +173,11 @@ impl NarrowColumns {
     /// column widths, and the columns back to back. `None` when a width is not
     /// 1, 2, 4 or 8 or the bytes are not `rows × Σ widths`.
     pub fn from_parts(rows: usize, widths: Vec<u8>, data: Vec<u8>) -> Option<Self> {
+        Self::from_bytes(rows, widths, NarrowBytes::Heap(data))
+    }
+
+    /// [`Self::from_parts`] with the bytes wherever they were allocated.
+    pub fn from_bytes(rows: usize, widths: Vec<u8>, data: NarrowBytes) -> Option<Self> {
         if widths.iter().any(|w| ![1, 2, 4, 8].contains(w)) {
             return None;
         }
@@ -112,6 +221,11 @@ impl NarrowColumns {
     /// cache across the columns). On the caller's thread. `None` when `cols`
     /// is zero or does not divide the words.
     pub fn pack_row_major(row_major: &[u64], cols: usize) -> Option<Self> {
+        Self::pack_row_major_with(row_major, cols, Backing::Heap)
+    }
+
+    /// [`Self::pack_row_major`], into bytes allocated as `backing` says.
+    pub fn pack_row_major_with(row_major: &[u64], cols: usize, backing: Backing) -> Option<Self> {
         const BLOCK_ROWS: usize = 1 << 10;
         if cols == 0 || !row_major.len().is_multiple_of(cols) {
             return None;
@@ -125,9 +239,9 @@ impl NarrowColumns {
         }
         let widths: Vec<u8> = max.into_iter().map(width_of).collect();
         let total: usize = widths.iter().map(|&w| rows * w as usize).sum();
-        let mut data = vec![0u8; total];
+        let mut data = NarrowBytes::zeroed(total, backing);
         let mut columns: Vec<&mut [u8]> = Vec::with_capacity(cols);
-        let mut rest = data.as_mut_slice();
+        let mut rest = &mut data[..];
         for &w in &widths {
             let (column, tail) = rest.split_at_mut(rows * w as usize);
             columns.push(column);
@@ -157,7 +271,7 @@ impl NarrowColumns {
                 }
             }
         }
-        Self::from_parts(rows, widths, data)
+        Self::from_bytes(rows, widths, data)
     }
 
     /// [`Self::pack`] of field columns. `None` unless `F` is Goldilocks, whose
@@ -190,6 +304,18 @@ impl NarrowColumns {
     /// The packed columns, back to back.
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// The packed bytes, with where they live ([`NarrowBytes`]).
+    pub fn bytes(&self) -> &NarrowBytes {
+        &self.data
+    }
+
+    /// The parts, for a store to move elsewhere and back
+    /// ([`Self::from_bytes`]): rows, widths and the bytes. The offsets follow
+    /// from the widths.
+    pub fn into_parts(self) -> (usize, Vec<u8>, NarrowBytes) {
+        (self.rows, self.widths, self.data)
     }
 
     /// Column `c`'s words.
@@ -470,6 +596,38 @@ mod tests {
         }
         assert!(NarrowColumns::pack_row_major(&[1, 2, 3], 2).is_none());
         assert!(NarrowColumns::pack_row_major(&[1, 2], 0).is_none());
+    }
+
+    /// Packed into pages of their own, a trace holds the same columns as on
+    /// the heap; only the pages offer a block-aligned write of the whole, and
+    /// a copy of them is on the heap and still equal.
+    #[test]
+    fn a_trace_packed_into_pages_is_the_heap_packing() {
+        for rows in [1usize, 1000, 4097] {
+            let row_major: Vec<u64> = (0..rows as u64 * 3)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (i % 3 * 24))
+                .collect();
+            let heap = NarrowColumns::pack_row_major(&row_major, 3).expect("packs");
+            let pages =
+                NarrowColumns::pack_row_major_with(&row_major, 3, Backing::Pages).expect("packs");
+            assert_eq!(pages, heap, "{rows} rows");
+            assert_eq!(heap.bytes().backing(), Backing::Heap);
+            assert_eq!(pages.bytes().backing(), Backing::Pages);
+            assert!(heap.bytes().direct().is_none());
+            let direct = pages.bytes().direct().expect("pages offer a direct write");
+            assert_eq!(direct.as_ptr() as usize % PageBytes::BLOCK, 0);
+            assert_eq!(direct.len() % PageBytes::BLOCK, 0);
+            assert_eq!(&direct[..pages.data().len()], pages.data());
+            assert!(direct[pages.data().len()..].iter().all(|&b| b == 0));
+            let copy = pages.clone();
+            assert_eq!(copy.bytes().backing(), Backing::Heap);
+            assert_eq!(copy, pages);
+            let (rows_back, widths, bytes) = pages.into_parts();
+            assert_eq!(
+                NarrowColumns::from_bytes(rows_back, widths, bytes),
+                Some(heap)
+            );
+        }
     }
 
     /// Only Goldilocks columns widen to field elements: their elements are

@@ -206,6 +206,34 @@ impl DeviceColumns {
             .map(Some)
     }
 
+    /// [`Self::pack_run`], downloading into pages of their own when `pages`
+    /// is set ([`crate::narrow::PackedData`]).
+    pub fn pack_run_to(
+        &self,
+        first: usize,
+        width: usize,
+        pages: bool,
+    ) -> Result<Option<(Vec<u8>, crate::narrow::PackedData)>> {
+        if !self.is_run(first, width) {
+            return Ok(None);
+        }
+        let rows = self.spans[first].1;
+        if u32::try_from(rows * width).is_err() {
+            return Ok(None);
+        }
+        let be = backend()?;
+        let stream = be.next_stream();
+        crate::narrow::pack_col_major_on_stream_to(
+            &stream,
+            be,
+            &self.view(first, width),
+            rows,
+            width,
+            pages,
+        )
+        .map(Some)
+    }
+
     pub fn num_columns(&self) -> usize {
         self.spans.len()
     }

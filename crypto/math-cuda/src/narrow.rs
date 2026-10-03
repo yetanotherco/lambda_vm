@@ -214,6 +214,13 @@ pub fn pack_trace_snapshot(handle: &crate::lde::GpuLdeBase) -> Result<Option<(Ve
     pack_col_major_on_stream(&stream, be, &src.slice(..rows * cols), rows, cols).map(Some)
 }
 
+/// Packed columns downloaded from the card: into the heap, or into pages of
+/// their own ([`math::page_bytes::PageBytes`]) for a spill to write whole.
+pub enum PackedData {
+    Heap(Vec<u8>),
+    Pages(math::page_bytes::PageBytes),
+}
+
 /// Pack the column-major `rows × cols` words `src` holds, on `stream`: the
 /// widths and the packed columns, downloaded. `src` is read only after the
 /// work already queued on `stream`.
@@ -224,6 +231,22 @@ pub(crate) fn pack_col_major_on_stream(
     rows: usize,
     cols: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    match pack_col_major_on_stream_to(stream, be, src, rows, cols, false)? {
+        (widths, PackedData::Heap(data)) => Ok((widths, data)),
+        (widths, PackedData::Pages(pages)) => Ok((widths, pages.to_vec())),
+    }
+}
+
+/// [`pack_col_major_on_stream`], downloading into pages of their own when
+/// `pages` is set. Pages the system cannot map fall back to the heap.
+pub(crate) fn pack_col_major_on_stream_to(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    src: &CudaView<'_, u64>,
+    rows: usize,
+    cols: usize,
+    pages: bool,
+) -> Result<(Vec<u8>, PackedData)> {
     let mut max_dev = stream.alloc_zeros::<u64>(cols)?;
     let rows_u64 = rows as u64;
     let cfg = LaunchConfig {
@@ -271,7 +294,16 @@ pub(crate) fn pack_col_major_on_stream(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let data = stream.clone_dtoh(&out)?;
+    let data = match pages
+        .then(|| math::page_bytes::PageBytes::zeroed(total as usize).ok())
+        .flatten()
+    {
+        Some(mut pages) => {
+            stream.memcpy_dtoh(&out, &mut pages[..])?;
+            PackedData::Pages(pages)
+        }
+        None => PackedData::Heap(stream.clone_dtoh(&out)?),
+    };
     stream.synchronize()?;
     Ok((widths, data))
 }

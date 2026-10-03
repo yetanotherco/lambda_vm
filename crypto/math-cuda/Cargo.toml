@@ -28,7 +28,7 @@ cudarc = { version = "0.19", default-features = false, features = [
     "cuda-12080",
     "dynamic-loading",
 ] }
-math = { path = "../math" }
+math = { path = "../math", features = ["page-bytes"] }
 rayon = "1.7"
 # NVTX range emission for Nsight timelines (dlopen'd at runtime, see src/nvtx.rs).
 libloading = { version = "0.8", optional = true }

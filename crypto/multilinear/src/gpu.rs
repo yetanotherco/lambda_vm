@@ -3877,11 +3877,46 @@ pub fn pack_resident(
     crate::narrow::NarrowColumns::from_parts(rows, widths, data)
 }
 
+/// [`pack_resident`], downloading into bytes allocated as `backing` says
+/// ([`crate::narrow::Backing`]).
+#[cfg(feature = "cuda")]
+pub fn pack_resident_to(
+    store: &ResidentColumns,
+    first: usize,
+    width: usize,
+    backing: crate::narrow::Backing,
+) -> Option<crate::narrow::NarrowColumns> {
+    use crate::narrow::{Backing, NarrowBytes};
+    if backing == Backing::Heap {
+        return pack_resident(store, first, width);
+    }
+    if width == 0 || first >= store.0.num_columns() {
+        return None;
+    }
+    let rows = store.0.span(first).1;
+    let (widths, data) = store.0.pack_run_to(first, width, true).ok()??;
+    let data = match data {
+        math_cuda::narrow::PackedData::Heap(bytes) => NarrowBytes::Heap(bytes),
+        math_cuda::narrow::PackedData::Pages(pages) => NarrowBytes::Pages(pages),
+    };
+    crate::narrow::NarrowColumns::from_bytes(rows, widths, data)
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn pack_resident(
     store: &ResidentColumns,
     _first: usize,
     _width: usize,
+) -> Option<crate::narrow::NarrowColumns> {
+    match store.0 {}
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pack_resident_to(
+    store: &ResidentColumns,
+    _first: usize,
+    _width: usize,
+    _backing: crate::narrow::Backing,
 ) -> Option<crate::narrow::NarrowColumns> {
     match store.0 {}
 }

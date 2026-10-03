@@ -12,6 +12,7 @@ math = { path = "../math", features = [
     "std",
     "lambdaworks-serde-binary",
     "rkyv",
+    "page-bytes",
 ] }
 crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
 thiserror = "1.0.38"
