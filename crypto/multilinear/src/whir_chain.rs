@@ -60,6 +60,7 @@ use crate::{
     Error,
     eq::{eq_eval, eq_mle},
     mle::Mle,
+    narrow::HostColumn,
     poly::Composed,
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
@@ -760,8 +761,9 @@ fn block_size<V: IsField>(openings: &[crate::whir_commit::CosetOpening<V>]) -> u
 /// read anyway, so the parts are handed over as they are and whoever needs a
 /// whole one builds it — which on the device path is nobody.
 pub struct Stacked<'a, F: IsField> {
-    /// `(column, offset in elements)`.
-    pub parts: Vec<(&'a Mle<F>, usize)>,
+    /// `(column, offset in elements)`; a column's values are read on the host
+    /// only by a host path ([`HostColumn`]).
+    pub parts: Vec<(&'a dyn HostColumn<F>, usize)>,
     /// The same parts as `(index into the epoch's columns, offset)`, when the
     /// card already holds them — then the scatter is a copy at device
     /// bandwidth instead of the trace crossing the bus again.
@@ -779,6 +781,7 @@ impl<F: IsField + 'static> Stacked<'_, F> {
     pub fn assemble(&self) -> Result<Mle<F>, Error> {
         let mut buffer = vec![FieldElement::<F>::zero(); 1usize << self.num_vars];
         for (column, offset) in &self.parts {
+            let column = column.host();
             buffer[*offset..*offset + column.len()].clone_from_slice(column.evals());
         }
         Mle::new(buffer)
@@ -798,7 +801,7 @@ where
 {
     commit_stacked(
         &Stacked {
-            parts: vec![(f, 0)],
+            parts: vec![(f as &dyn HostColumn<F>, 0)],
             resident: None,
             num_vars: f.num_vars(),
         },

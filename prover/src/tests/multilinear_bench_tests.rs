@@ -2731,7 +2731,7 @@ fn phases() {
         .iter()
         .flat_map(|t| t.columns())
         .collect();
-    let columns = multilinear::stacked_eval::prove::<F, E, _, KeccakWhir>(
+    let columns = multilinear::stacked_eval::prove::<F, E, _, KeccakWhir, _>(
         &committed.groups()[0],
         &group_columns,
         None,

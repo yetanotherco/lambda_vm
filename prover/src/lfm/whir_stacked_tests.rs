@@ -436,7 +436,7 @@ fn fixture(group: &Group) -> Fixture {
         .expect("the group commits");
     let roots = stacked.roots();
     let mut proving = HostTranscript::new(&[]);
-    let proof = multilinear::stacked_eval::prove::<F, E, _, RpxWhir>(
+    let proof = multilinear::stacked_eval::prove::<F, E, _, RpxWhir, _>(
         &stacked,
         &borrowed,
         None,

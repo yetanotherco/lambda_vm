@@ -40,6 +40,7 @@ use crate::{
     Error, challenge_powers,
     eq::{eq_eval, eq_evals_into},
     mle::Mle,
+    narrow::HostColumn,
     stacking::{Placement, StackedLayout},
     whir::Domain,
     whir_chain::{self, ChainConfig, ChainProof},
@@ -134,9 +135,9 @@ where
     /// Every stacked polynomial has `n_stack` variables, so they share one
     /// evaluation domain. Takes the columns as they already are — copying them
     /// into `Vec`s first would be one more resident copy of the whole trace.
-    pub fn commit(
+    pub fn commit<C: HostColumn<F>>(
         layout: StackedLayout,
-        columns: &[&Mle<F>],
+        columns: &[&C],
         resident: Option<(&crate::gpu::ResidentColumns, usize)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
@@ -150,9 +151,9 @@ where
 
     /// [`Self::commit`] with the columns' store positions named by a
     /// [`ColumnsAt`] rather than one contiguous run.
-    pub fn commit_mapped(
+    pub fn commit_mapped<C: HostColumn<F>>(
         layout: StackedLayout,
-        columns: &[&Mle<F>],
+        columns: &[&C],
         resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
@@ -173,7 +174,7 @@ where
                 parts: layout
                     .parts_of(poly)
                     .into_iter()
-                    .map(|(column, offset)| (columns[column], offset))
+                    .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
                     .collect(),
                 resident: resident.map(|(store, at)| {
                     (
@@ -351,9 +352,9 @@ where
     /// The group openable again: every codeword recomputed from `columns` —
     /// the group's columns, in the order they were committed — with no tree
     /// built. `resident` names them on the card as at the commit.
-    pub fn revive<H: WhirHash>(
+    pub fn revive<H: WhirHash, C: HostColumn<F>>(
         self,
-        columns: &[&Mle<F>],
+        columns: &[&C],
         resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
         config: &ChainConfig,
     ) -> Result<StackedCommitment<F, H>, Error> {
@@ -384,7 +385,7 @@ where
                 parts: layout
                     .parts_of(poly)
                     .into_iter()
-                    .map(|(column, offset)| (columns[column], offset))
+                    .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
                     .collect(),
                 resident: resident.map(|(store, at)| {
                     (
@@ -590,9 +591,9 @@ fn claimed<E: IsField>(
 ///
 /// The claims are absorbed before the batching challenge, so the prover cannot
 /// pick them after seeing it.
-pub fn prove<F, E, T, H>(
+pub fn prove<F, E, T, H, C>(
     stacked: &StackedCommitment<F, H>,
-    columns: &[&Mle<F>],
+    columns: &[&C],
     resident: Option<(&crate::gpu::ResidentColumns, usize)>,
     point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
@@ -606,8 +607,9 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     H: WhirHash,
+    C: HostColumn<F>,
 {
-    prove_mapped(
+    prove_mapped::<F, E, T, H, C>(
         stacked,
         columns,
         resident.map(|(store, first)| (store, ColumnsAt::From(first))),
@@ -620,9 +622,9 @@ where
 
 /// [`prove`] with the columns' store positions named by a [`ColumnsAt`] — the
 /// same map the group was committed with.
-pub fn prove_mapped<F, E, T, H>(
+pub fn prove_mapped<F, E, T, H, C>(
     stacked: &StackedCommitment<F, H>,
-    columns: &[&Mle<F>],
+    columns: &[&C],
     resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
     point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
@@ -636,6 +638,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     H: WhirHash,
+    C: HostColumn<F>,
 {
     if let Some((_, ColumnsAt::Map(map))) = resident
         && map.len() != columns.len()
@@ -677,7 +680,7 @@ where
             parts: layout
                 .parts_of(i)
                 .into_iter()
-                .map(|(column, offset)| (columns[column], offset))
+                .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
                 .collect(),
             resident: resident.map(|(store, at)| {
                 (
@@ -887,8 +890,11 @@ mod tests {
             config,
         )?
         .retire(drop_levels, config)?;
-        let revived =
-            retired.revive::<KeccakWhir>(&crate::stacking::borrow(revived_over), None, config)?;
+        let revived = retired.revive::<KeccakWhir, _>(
+            &crate::stacking::borrow(revived_over),
+            None,
+            config,
+        )?;
         let proof = prove(
             &revived,
             &crate::stacking::borrow(revived_over),
@@ -1278,7 +1284,7 @@ mod tests {
         assert_eq!(roots.len(), 1);
 
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
-        let proof = prove::<F, Ext, _, KeccakWhir>(
+        let proof = prove::<F, Ext, _, KeccakWhir, _>(
             &stacked,
             &crate::stacking::borrow(&columns),
             None,

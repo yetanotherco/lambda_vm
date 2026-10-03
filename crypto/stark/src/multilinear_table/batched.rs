@@ -737,8 +737,8 @@ where
                 .iter()
                 .filter_map(FactorKind::source)
                 .collect();
-            let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(
-                table.columns(),
+            let (reduce, reduced_point) = claim_reduce::prove::<F, E, T, _>(
+                &table.trace,
                 &sources,
                 &factor_values[t],
                 at,

@@ -120,7 +120,7 @@ fn prove_arm<H: WhirHash>(
     .unwrap();
     let (lean_before, fused_before) = (gpu::lean_open_calls(), gpu::fused_fold_calls());
     let (opens_before, folds_before) = (gpu::open_calls(), gpu::resident_fold_calls());
-    let proof = stacked_eval::prove::<F, Ext, _, H>(
+    let proof = stacked_eval::prove::<F, Ext, _, H, _>(
         &stacked,
         &columns,
         resident.map(|store| (store, 0)),

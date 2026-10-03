@@ -43,6 +43,7 @@ use crate::{
     claim_reduce::{self, FactorSource, ReduceProof},
     eq::{eq_eval, eq_mle},
     mle::Mle,
+    narrow::{HostColumns, NarrowColumns},
     stacked_eval::{self, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     sumcheck::SumcheckProof,
@@ -163,7 +164,11 @@ pub struct CommittedTrace<
 /// several tables can share one commitment, and then no single table owns it.
 #[derive(Debug)]
 pub struct TraceData<F: IsField, E: IsField> {
-    columns: Vec<Mle<F>>,
+    columns: Held<F>,
+    /// The shape, read without touching the columns: a narrow table's are not
+    /// field elements until a host reader widens them.
+    num_columns: usize,
+    num_vars: usize,
     /// The public factors' tables, in the order they appear in `kinds`. Held
     /// because they are few — selectors and the like — while the shifted views
     /// are rebuilt on demand rather than kept for the whole proof.
@@ -178,6 +183,21 @@ pub struct TraceData<F: IsField, E: IsField> {
     /// Four things read the same columns; put there once, they are read where
     /// they lie instead of uploaded again.
     resident: Option<(std::sync::Arc<crate::gpu::ResidentColumns>, usize)>,
+}
+
+/// How a table holds its committed columns between its commit and its
+/// argument.
+#[derive(Debug)]
+enum Held<F: IsField> {
+    /// A field element a cell.
+    Wide(Vec<Mle<F>>),
+    /// Each column at the bytes its words need. A host reader widens them
+    /// once, and that copy is kept until [`TraceData::drop_widened`]; the card
+    /// widens its own (`gpu::upload_tables`) and never asks.
+    Narrow {
+        packed: NarrowColumns,
+        widened: std::sync::OnceLock<Vec<Mle<F>>>,
+    },
 }
 
 impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
@@ -201,8 +221,9 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     /// The table's factors as its resident base columns, with no lift
     /// ([`crate::gpu::column_factors`]), or `None`.
     pub fn column_factors(&self) -> Option<crate::gpu::ColumnFactors> {
-        crate::gpu::column_factors(
-            &self.columns,
+        crate::gpu::column_factors::<F, E>(
+            self.num_columns,
+            1usize << self.num_vars,
             &self.kinds,
             &self.public,
             self.resident_shared(),
@@ -255,7 +276,9 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
             });
         }
         Ok(Self {
-            columns,
+            num_columns: columns.len(),
+            num_vars,
+            columns: Held::Wide(columns),
             public,
             device: std::sync::Mutex::new(None),
             resident: None,
@@ -263,8 +286,84 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         })
     }
 
+    /// The committed columns on the host: widened here the first time a
+    /// narrow table is asked ([`crate::narrow::host_widens`] counts it), and
+    /// that copy kept until [`Self::drop_widened`].
     pub fn columns(&self) -> &[Mle<F>] {
-        &self.columns
+        match &self.columns {
+            Held::Wide(columns) => columns,
+            Held::Narrow { packed, widened } => widened.get_or_init(|| {
+                crate::narrow::note_host_widen(packed.rows() * packed.cols());
+                // Only Goldilocks columns are ever held narrow
+                // (`install_narrow`), so this widens; an empty table would make
+                // a proof the verifier refuses, not a wrong one it accepts.
+                let wide = packed.widen::<F>();
+                debug_assert!(wide.is_some(), "narrow columns that do not widen");
+                wide.unwrap_or_default()
+            }),
+        }
+    }
+
+    /// How many committed columns.
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    /// The columns packed narrow, when they are held that way.
+    pub fn narrow(&self) -> Option<&NarrowColumns> {
+        match &self.columns {
+            Held::Wide(_) => None,
+            Held::Narrow { packed, .. } => Some(packed),
+        }
+    }
+
+    /// Holds the columns as `packed` from here on, letting the field elements
+    /// go. Refused (`false`, nothing changed) unless `packed` has the table's
+    /// shape and `F` is Goldilocks, whose elements are their raw words — the
+    /// caller made `packed` from these very columns, which is what makes the
+    /// widened words the committed ones.
+    pub fn install_narrow(&mut self, packed: NarrowColumns) -> bool {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || packed.cols() != self.num_columns
+            || packed.rows() != 1usize << self.num_vars
+        {
+            return false;
+        }
+        self.columns = Held::Narrow {
+            packed,
+            widened: std::sync::OnceLock::new(),
+        };
+        true
+    }
+
+    /// Packs the columns narrow here on the host ([`NarrowColumns::pack`]):
+    /// what the card does after a commit, for a test or a host without one.
+    /// `false` when they are held narrow already or cannot be.
+    pub fn pack_on_host(&mut self) -> bool {
+        let Held::Wide(columns) = &self.columns else {
+            return false;
+        };
+        match NarrowColumns::pack_columns(columns) {
+            Some(packed) => self.install_narrow(packed),
+            None => false,
+        }
+    }
+
+    /// Lets a narrow table's host widening go, keeping the packed columns.
+    pub fn drop_widened(&mut self) {
+        if let Held::Narrow { widened, .. } = &mut self.columns {
+            widened.take();
+        }
+    }
+
+    /// A test's hook: the packed columns, to break them.
+    #[doc(hidden)]
+    pub fn narrow_mut(&mut self) -> Option<&mut NarrowColumns> {
+        match &mut self.columns {
+            Held::Wide(_) => None,
+            Held::Narrow { packed, .. } => Some(packed),
+        }
     }
 
     pub fn kinds(&self) -> &[FactorKind] {
@@ -272,7 +371,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     }
 
     pub fn num_vars(&self) -> usize {
-        self.columns.first().map(Mle::num_vars).unwrap_or(0)
+        self.num_vars
     }
 
     /// The factors the sumcheck runs over: each committed column shifted by
@@ -314,7 +413,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         let mut slot = self.device.lock().ok()?;
         if slot.is_none() {
             *slot = crate::gpu::upload_factors_from_columns(
-                &self.columns,
+                self,
                 &self.kinds,
                 &self.public,
                 self.resident
@@ -331,6 +430,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         F: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
+        let columns = self.columns();
         // Which public table each public factor takes, resolved up front so the
         // factors can be built out of order.
         let mut public_at = Vec::with_capacity(self.kinds.len());
@@ -354,9 +454,9 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
                 // rotation is two runs of consecutive cells, not a modulus per
                 // cell.
                 FactorKind::Committed(s) => {
-                    let column = self.columns.get(s.column).ok_or(Error::UnknownPolynomial {
+                    let column = columns.get(s.column).ok_or(Error::UnknownPolynomial {
                         index: s.column,
-                        len: self.columns.len(),
+                        len: columns.len(),
                     })?;
                     let shift = s.offset % column.len();
                     let (wrapped, rest) = column.evals().split_at(shift);
@@ -379,6 +479,23 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
             .collect();
         #[cfg(not(feature = "parallel"))]
         return self.kinds.iter().zip(public_at.iter()).map(build).collect();
+    }
+}
+
+impl<F: IsField + 'static, E: IsField + 'static> HostColumns<F> for TraceData<F, E>
+where
+    Self: Sync,
+{
+    fn width(&self) -> usize {
+        self.num_columns
+    }
+
+    fn rows(&self) -> Option<usize> {
+        Some(1usize << self.num_vars)
+    }
+
+    fn host(&self) -> &[Mle<F>] {
+        self.columns()
     }
 }
 
@@ -480,7 +597,7 @@ where
     }
 
     pub fn num_vars(&self) -> usize {
-        self.data.columns.first().map(|c| c.num_vars()).unwrap_or(0)
+        self.data.num_vars
     }
 
     pub fn kinds(&self) -> &[FactorKind] {
@@ -498,7 +615,7 @@ where
     }
 
     pub fn columns(&self) -> &[Mle<F>] {
-        &self.data.columns
+        self.data.columns()
     }
 }
 
@@ -587,7 +704,7 @@ where
 
     // Every column's value at one shared point, so the whole trace is settled
     // against the stack in one go.
-    let columns = stacked_eval::prove::<F, E, T, H>(
+    let columns = stacked_eval::prove::<F, E, T, H, _>(
         &trace.stacked,
         &crate::stacking::borrow(trace.columns()),
         trace.data().resident(),
@@ -684,13 +801,13 @@ where
             .kinds
             .iter()
             .filter_map(FactorKind::source)
-            .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
+            .map(|source| claim_reduce::evaluate_source(trace.columns(), &source, &point))
             .collect::<Result<Vec<_>, _>>()?
     };
     crate::whir_split::add_tick(&crate::whir_split::REST_VALUES, t);
 
-    let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(
-        &trace.columns,
+    let (reduce, reduced_point) = claim_reduce::prove::<F, E, T, _>(
+        trace,
         &sources_of(&trace.kinds),
         &factor_values,
         &point,
@@ -1029,6 +1146,62 @@ mod tests {
             &config(),
             &mut transcript(),
         )
+    }
+
+    /// ★ A trace held narrow proves the same bytes as held wide: a host path
+    /// widens the packed words back, bit for bit, the first time it reads them.
+    #[test]
+    fn a_trace_held_narrow_proves_the_same_bytes() {
+        let columns = satisfying(4);
+        let wide = CommittedTrace::<F, F>::commit(columns.clone(), &config()).unwrap();
+        let mut narrow = CommittedTrace::<F, F>::commit(columns.clone(), &config()).unwrap();
+        assert!(narrow.data.pack_on_host());
+        assert!(!narrow.data.pack_on_host(), "packed once");
+        assert!(narrow.data.narrow().is_some());
+        assert_eq!((narrow.data.num_columns(), narrow.num_vars()), (3, 4));
+        let widens = crate::narrow::host_widens().0;
+        let bytes = |trace: &CommittedTrace<F, F>| {
+            let proof = prove(trace, constraint, 2, &config(), &mut transcript()).unwrap();
+            rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(bytes(&narrow), bytes(&wide));
+        assert!(
+            crate::narrow::host_widens().0 > widens,
+            "the host widened it"
+        );
+        assert_eq!(narrow.columns(), columns.as_slice());
+        narrow.data.drop_widened();
+        assert!(narrow.data.narrow().is_some(), "still packed");
+        assert_eq!(narrow.columns(), columns.as_slice());
+    }
+
+    /// Packed columns are installed only with the table's shape, and only for
+    /// Goldilocks columns, whose elements are their raw words.
+    #[test]
+    fn packed_columns_of_another_shape_or_field_are_refused() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+
+        let columns = satisfying(3);
+        let kinds = || (0..3).map(FactorKind::direct).collect::<Vec<_>>();
+        let mut trace = TraceData::<F, F>::new(columns.clone(), kinds(), Vec::new()).unwrap();
+        let fewer = NarrowColumns::pack_columns(&columns[..2]).unwrap();
+        assert!(!trace.install_narrow(fewer));
+        let shorter = NarrowColumns::pack_columns(&satisfying(2)).unwrap();
+        assert!(!trace.install_narrow(shorter));
+        assert!(trace.narrow().is_none());
+        assert!(trace.install_narrow(NarrowColumns::pack_columns(&columns).unwrap()));
+        assert_eq!(trace.columns(), columns.as_slice());
+
+        let other: Vec<Mle<Ext>> = (0..3)
+            .map(|c| Mle::new((0..8u64).map(|r| FieldElement::from(r + c)).collect()).unwrap())
+            .collect();
+        let mut trace = TraceData::<Ext, Ext>::new(other, kinds(), Vec::new()).unwrap();
+        let words: Vec<Vec<u64>> = (0..3u64).map(|c| (0..8).map(|r| r + c).collect()).collect();
+        let raw: Vec<&[u64]> = words.iter().map(Vec::as_slice).collect();
+        assert!(!trace.install_narrow(NarrowColumns::pack(&raw).unwrap()));
+        assert!(!trace.pack_on_host());
     }
 
     #[test]

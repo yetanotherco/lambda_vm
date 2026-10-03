@@ -125,7 +125,7 @@ fn both(t: &Table) -> (Proved, Proved) {
     let refs: Vec<&Mle<F>> = t.columns.iter().collect();
     let store = std::sync::Arc::new(gpu::upload_columns(&refs).expect("the columns reside"));
     let factors =
-        gpu::upload_factors_from_columns::<F, Ext>(&t.columns, &t.kinds, &[], Some((&store, 0)))
+        gpu::upload_factors_from_columns::<F, Ext, _>(&t.columns, &t.kinds, &[], Some((&store, 0)))
             .expect("the factors lift");
     let today =
         logup::resident_tree(&t.interactions, std::sync::Arc::new(factors)).expect("today's tree");
@@ -191,7 +191,7 @@ fn a_wrong_plan_changes_the_tree() {
     let refs: Vec<&Mle<F>> = t.columns.iter().collect();
     let store = std::sync::Arc::new(gpu::upload_columns(&refs).expect("the columns reside"));
     let factors =
-        gpu::upload_factors_from_columns::<F, Ext>(&t.columns, &t.kinds, &[], Some((&store, 0)))
+        gpu::upload_factors_from_columns::<F, Ext, _>(&t.columns, &t.kinds, &[], Some((&store, 0)))
             .expect("the factors lift");
     let today =
         logup::resident_tree(&t.interactions, std::sync::Arc::new(factors)).expect("today's tree");

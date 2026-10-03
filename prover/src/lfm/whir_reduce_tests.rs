@@ -117,7 +117,7 @@ fn fixture(num_vars: usize, num_columns: usize, sources: &[FactorSource]) -> Fix
         .collect();
 
     let mut proving = HostTranscript::new(&[]);
-    let (proof, _) = claim_reduce::prove::<F, E, _>(
+    let (proof, _) = claim_reduce::prove::<F, E, _, _>(
         &columns,
         sources,
         &factor_values,

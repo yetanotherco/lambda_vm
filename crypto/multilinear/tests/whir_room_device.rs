@@ -125,7 +125,7 @@ fn open(
     resident: Option<&gpu::ResidentColumns>,
 ) -> StackedProof<F, Ext> {
     let columns = multilinear::stacking::borrow(&c.columns);
-    let proof = stacked_eval::prove::<F, Ext, _, H>(
+    let proof = stacked_eval::prove::<F, Ext, _, H, _>(
         stacked,
         &columns,
         resident.map(|store| (store, 0)),

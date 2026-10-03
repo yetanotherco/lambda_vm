@@ -251,20 +251,18 @@ pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(
         return None;
     }
     let (store, first) = trace.resident_shared()?;
-    let rows = trace.columns().first()?.len();
+    if trace.num_columns() == 0 {
+        return None;
+    }
+    let rows = 1usize << trace.num_vars();
     let sources: Vec<_> = trace
         .kinds()
         .iter()
         .map(crate::constraint_argument::FactorKind::source)
         .collect();
     let plan = input_plan(interactions, &sources, rows)?;
-    let tree = crate::gpu::input_layer_tree_from_columns(
-        store,
-        first,
-        trace.columns().len(),
-        rows,
-        &plan,
-    )?;
+    let tree =
+        crate::gpu::input_layer_tree_from_columns(store, first, trace.num_columns(), rows, &plan)?;
     crate::gkr::FractionTree::from_device(tree).ok()
 }
 

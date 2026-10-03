@@ -337,7 +337,7 @@ where
 
     /// How many columns get committed — main columns only.
     pub fn num_committed_columns(&self) -> usize {
-        self.trace.columns().len()
+        self.trace.num_columns()
     }
 
     /// Points the table's columns at a device copy of them (see
@@ -2029,7 +2029,7 @@ where
                 .iter()
                 .flat_map(|t| t.trace.columns())
                 .collect();
-            columns.push(stacked_eval::prove::<F, E, T, H>(
+            columns.push(stacked_eval::prove::<F, E, T, H, _>(
                 group,
                 &group_columns,
                 committed.store.as_ref().map(|store| (&**store, column_at)),
@@ -2053,7 +2053,7 @@ where
                 .collect();
             let (at_points, at_values) = unsettled_claims(&widths, starts, skip, points, values)?;
             let map = settled_column_map(&widths, starts, skip);
-            columns.push(stacked_eval::prove_mapped::<F, E, T, H>(
+            columns.push(stacked_eval::prove_mapped::<F, E, T, H, _>(
                 group,
                 &group_columns,
                 committed
@@ -2109,7 +2109,7 @@ where
                 })
                 .collect::<Result<_, MlError>>()?;
             let (at_points, at_values) = prepared_claims(&runs, points, values)?;
-            Some(stacked_eval::prove::<F, E, T, H>(
+            Some(stacked_eval::prove::<F, E, T, H, _>(
                 prepared.commitment,
                 prepared.columns,
                 None,

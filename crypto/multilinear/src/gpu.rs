@@ -1571,8 +1571,8 @@ where
 /// tables on the host, as before.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_reduce_resident<F, E>(
-    columns: &[crate::mle::Mle<F>],
+pub(crate) fn prove_reduce_resident<F, E, C>(
+    columns: &C,
     sources: &[crate::claim_reduce::FactorSource],
     weights: &[math::field::element::FieldElement<E>],
     offsets: &[usize],
@@ -1586,6 +1586,7 @@ pub(crate) fn prove_reduce_resident<F, E>(
 where
     F: math::field::traits::IsField + math::field::traits::IsSubFieldOf<E> + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
@@ -1595,7 +1596,7 @@ where
         return None;
     }
     let (store, first) = resident?;
-    if !store.0.is_run(first, columns.len()) {
+    if !store.0.is_run(first, columns.width()) {
         return None;
     }
     let num_vars = alpha.len();
@@ -1603,7 +1604,7 @@ where
         return None;
     }
     let len = 1usize << num_vars;
-    if columns.iter().any(|column| column.len() != len) {
+    if columns.rows() != Some(len) {
         return None;
     }
     // The reduce's rule is a sum of kernel-times-column pairs: degree two.
@@ -1641,7 +1642,7 @@ where
     let mut session = math_cuda::sumcheck::reduce_session(
         &store.0,
         first,
-        columns.len(),
+        columns.width(),
         &raw_alpha,
         &groups,
         &lowered.nodes,
@@ -1662,7 +1663,11 @@ where
         for (i, &offset) in offsets.iter().enumerate() {
             let shift = crate::eq::shift_evals(alpha, offset);
             let batched = match crate::claim_reduce::batched_column(
-                columns, sources, weights, offset, num_vars,
+                columns.host(),
+                sources,
+                weights,
+                offset,
+                num_vars,
             ) {
                 Ok(batched) => batched,
                 Err(error) => return Some(Err(error)),
@@ -1712,8 +1717,8 @@ where
 
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_reduce_resident<F, E>(
-    _columns: &[crate::mle::Mle<F>],
+pub(crate) fn prove_reduce_resident<F, E, C>(
+    _columns: &C,
     _sources: &[crate::claim_reduce::FactorSource],
     _weights: &[math::field::element::FieldElement<E>],
     _offsets: &[usize],
@@ -1727,6 +1732,7 @@ pub(crate) fn prove_reduce_resident<F, E>(
 where
     F: math::field::traits::IsField + math::field::traits::IsSubFieldOf<E> + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     None
 }
@@ -2523,14 +2529,15 @@ pub(crate) fn note_xchecked(columns: usize) {
 /// that is an upload and a launch per level each. Together it is one upload
 /// and one launch per level for all of them.
 #[cfg(feature = "cuda")]
-pub(crate) fn evaluate_many_base<F, E>(
-    columns: &[crate::mle::Mle<F>],
+pub(crate) fn evaluate_many_base<F, E, C>(
+    columns: &C,
     point: &[math::field::element::FieldElement<E>],
     resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
@@ -2539,24 +2546,23 @@ where
     if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
         return None;
     }
-    let rows = columns.first()?.len();
-    if point.is_empty() || rows != 1 << point.len() {
+    let (Some(rows), width) = (columns.rows(), columns.width()) else {
+        return None;
+    };
+    if width == 0 || point.is_empty() || rows != 1 << point.len() {
         return None;
     }
     // Columns already on the card cost no upload, so under the knob a resident
     // table is worth the launches once it has the cells; any other table still
     // has to pay its upload, and is worth it only once each column is tall.
     let resident_run = argue_device_columns()
-        && resident.is_some_and(|(store, first)| store.0.is_run(first, columns.len()));
+        && resident.is_some_and(|(store, first)| store.0.is_run(first, width));
     let size = if resident_run {
-        rows.saturating_mul(columns.len())
+        rows.saturating_mul(width)
     } else {
         rows
     };
     if size < EVALUATE_THRESHOLD {
-        return None;
-    }
-    if columns.iter().any(|column| column.len() != rows) {
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2568,15 +2574,10 @@ where
     for coordinate in point {
         raw_point.extend_from_slice(&ext3_raw(coordinate)?);
     }
-    // SAFETY: `F == Gl`, a transparent wrapper over one `u64` per element.
-    let raw: Vec<&[u64]> = columns
-        .iter()
-        .map(|column| unsafe {
-            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
-        })
-        .collect();
-    let values =
-        math_cuda::sumcheck::evaluate_many_base(columns_at(resident, &raw), &raw_point).ok()?;
+    let values = with_columns_at(resident, columns, |at| {
+        math_cuda::sumcheck::evaluate_many_base(at, &raw_point).ok()
+    })
+    .flatten()?;
     EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
     crate::whir_split::bump_by(&crate::whir_split::COLUMNS_ON_CARD, values.len() as u64);
     let mut values: Vec<math::field::element::FieldElement<E>> =
@@ -2590,14 +2591,15 @@ where
 }
 
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn evaluate_many_base<F, E>(
-    _columns: &[crate::mle::Mle<F>],
+pub(crate) fn evaluate_many_base<F, E, C>(
+    _columns: &C,
     _point: &[math::field::element::FieldElement<E>],
     _resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     None
 }
@@ -3684,6 +3686,16 @@ pub struct ResidentColumns(math_cuda::columns::DeviceColumns);
 #[cfg(not(feature = "cuda"))]
 pub struct ResidentColumns(std::convert::Infallible);
 
+#[cfg(feature = "cuda")]
+impl ResidentColumns {
+    /// Every column back on the host, in upload order: a test's view of what
+    /// the card holds.
+    #[doc(hidden)]
+    pub fn download(&self) -> Option<Vec<Vec<u64>>> {
+        self.0.download().ok()
+    }
+}
+
 impl std::fmt::Debug for ResidentColumns {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ResidentColumns")
@@ -3726,22 +3738,136 @@ where
     None
 }
 
-/// Where a run of columns is, for the entry points that take either.
+/// A table's columns as they go to the card: field elements, or packed narrow
+/// ([`crate::narrow::NarrowColumns`]) and widened there.
+#[derive(Clone, Copy)]
+pub enum TableColumns<'a, F: math::field::traits::IsField> {
+    Wide(&'a [crate::mle::Mle<F>]),
+    Narrow(&'a crate::narrow::NarrowColumns),
+}
+
+/// [`upload_columns`] of whole tables, each as it is held: a narrow one crosses
+/// the bus at its packed bytes and is widened on the card into the run its
+/// columns take, so the store holds the same words at the same places as if
+/// its field elements had been uploaded.
 #[cfg(feature = "cuda")]
-fn columns_at<'a>(
-    resident: Option<(&'a ResidentColumns, usize)>,
-    host: &'a [&'a [u64]],
-) -> math_cuda::columns::Columns<'a> {
-    match resident {
-        Some((store, first)) if store.0.is_run(first, host.len()) => {
-            math_cuda::columns::Columns::Device {
-                store: &store.0,
-                first,
-                width: host.len(),
-            }
-        }
-        _ => math_cuda::columns::Columns::Host(host),
+pub fn upload_tables<F>(tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+    use math_cuda::columns::TableUpload;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
     }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some()) {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let wide: Vec<Vec<&[u64]>> = tables
+        .iter()
+        .map(|table| match table {
+            TableColumns::Wide(columns) => columns
+                .iter()
+                .map(|column| unsafe {
+                    core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+                })
+                .collect(),
+            TableColumns::Narrow(_) => Vec::new(),
+        })
+        .collect();
+    let uploads: Vec<TableUpload<'_>> = tables
+        .iter()
+        .zip(&wide)
+        .map(|(table, raw)| match table {
+            TableColumns::Wide(_) => TableUpload::Wide(raw),
+            TableColumns::Narrow(packed) => {
+                TableUpload::Narrow(math_cuda::narrow::NarrowInput::new(
+                    packed.data(),
+                    packed.offsets(),
+                    packed.widths(),
+                    packed.rows(),
+                    packed.cols(),
+                ))
+            }
+        })
+        .collect();
+    math_cuda::columns::DeviceColumns::upload_tables(&uploads).map(ResidentColumns)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_tables<F>(_tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// The run of `width` columns from `first` in `store`, packed narrow on the
+/// card ([`crate::narrow::NarrowColumns`]); only the packed bytes come back.
+/// `None` when the card cannot (they are not a run, too many words for one
+/// launch, or a device error) — the table then stays as it is held.
+#[cfg(feature = "cuda")]
+pub fn pack_resident(
+    store: &ResidentColumns,
+    first: usize,
+    width: usize,
+) -> Option<crate::narrow::NarrowColumns> {
+    if width == 0 || first >= store.0.num_columns() {
+        return None;
+    }
+    let rows = store.0.span(first).1;
+    let (widths, data) = store.0.pack_run(first, width).ok()??;
+    crate::narrow::NarrowColumns::from_parts(rows, widths, data)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pack_resident(
+    store: &ResidentColumns,
+    _first: usize,
+    _width: usize,
+) -> Option<crate::narrow::NarrowColumns> {
+    match store.0 {}
+}
+
+/// `f` over where a table's columns are, for the entry points that take
+/// either: the card's run when it holds one, or else the host's columns —
+/// widened for this if they are held narrow, which only a table the card does
+/// not hold pays. `None` when the host's are not one height. `F` must be
+/// Goldilocks (the callers check).
+#[cfg(feature = "cuda")]
+fn with_columns_at<F, C, R>(
+    resident: Option<(&ResidentColumns, usize)>,
+    columns: &C,
+    f: impl FnOnce(math_cuda::columns::Columns<'_>) -> R,
+) -> Option<R>
+where
+    F: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
+{
+    let width = columns.width();
+    if let Some((store, first)) = resident
+        && store.0.is_run(first, width)
+    {
+        return Some(f(math_cuda::columns::Columns::Device {
+            store: &store.0,
+            first,
+            width,
+        }));
+    }
+    columns.rows()?;
+    let host = columns.host();
+    // SAFETY: `F == GoldilocksField` (the callers check), a transparent
+    // wrapper over one `u64` per element.
+    let raw: Vec<&[u64]> = host
+        .iter()
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+        })
+        .collect();
+    Some(f(math_cuda::columns::Columns::Host(&raw)))
 }
 
 /// A table's factors, uploaded once for everything that walks them.
@@ -3834,7 +3960,8 @@ pub struct ColumnFactors(std::convert::Infallible);
 /// public table is base-valued, and the device would take the lifted factors.
 #[cfg(feature = "cuda")]
 pub fn column_factors<F, E>(
-    columns: &[crate::mle::Mle<F>],
+    width: usize,
+    rows: usize,
     kinds: &[crate::constraint_argument::FactorKind],
     public: &[crate::mle::Mle<E>],
     resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
@@ -3851,10 +3978,10 @@ where
         return None;
     }
     let (store, first) = resident?;
-    let rows = columns.first()?.len();
-    if kinds.is_empty()
+    if width == 0
+        || kinds.is_empty()
         || !worth_the_device(kinds.len(), rows)
-        || !store.0.is_run(first, columns.len())
+        || !store.0.is_run(first, width)
     {
         return None;
     }
@@ -3876,7 +4003,7 @@ where
     let mut next_public = 0usize;
     for kind in kinds {
         match kind.source() {
-            Some(source) if source.offset % rows == 0 && source.column < columns.len() => {
+            Some(source) if source.offset % rows == 0 && source.column < width => {
                 slots.push(math_cuda::sumcheck::ColumnSlot::Column(source.column));
             }
             Some(_) => return None,
@@ -3889,7 +4016,7 @@ where
         }
     }
     let inner = {
-        let run = store.0.view(first, columns.len());
+        let run = store.0.view(first, width);
         math_cuda::sumcheck::ColumnFactors::new(&run, rows, &slots).ok()?
     };
     COLUMN_FACTOR_TABLES.fetch_add(1, Ordering::Relaxed);
@@ -3902,7 +4029,8 @@ where
 
 #[cfg(not(feature = "cuda"))]
 pub fn column_factors<F, E>(
-    _columns: &[crate::mle::Mle<F>],
+    _width: usize,
+    _rows: usize,
     _kinds: &[crate::constraint_argument::FactorKind],
     _public: &[crate::mle::Mle<E>],
     _resident: Option<(std::sync::Arc<ResidentColumns>, usize)>,
@@ -3922,8 +4050,8 @@ where
 /// on a real proof that is most of what crosses the bus — and the host never
 /// holds the extension copy at all.
 #[cfg(feature = "cuda")]
-pub fn upload_factors_from_columns<F, E>(
-    columns: &[crate::mle::Mle<F>],
+pub fn upload_factors_from_columns<F, E, C>(
+    columns: &C,
     kinds: &[crate::constraint_argument::FactorKind],
     public: &[crate::mle::Mle<E>],
     resident: Option<(&ResidentColumns, usize)>,
@@ -3931,6 +4059,7 @@ pub fn upload_factors_from_columns<F, E>(
 where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
@@ -3939,13 +4068,13 @@ where
     if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
         return None;
     }
-    let rows = columns.first()?.len();
-    if kinds.is_empty() || !worth_the_device(kinds.len(), rows) {
+    let (Some(rows), width) = (columns.rows(), columns.width()) else {
+        return None;
+    };
+    if width == 0 || kinds.is_empty() || !worth_the_device(kinds.len(), rows) {
         return None;
     }
-    if columns.iter().any(|column| column.len() != rows)
-        || public.iter().any(|table| table.len() != rows)
-    {
+    if public.iter().any(|table| table.len() != rows) {
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3961,7 +4090,7 @@ where
     for (slot, kind) in kinds.iter().enumerate() {
         match kind.source() {
             Some(source) => {
-                if source.column >= columns.len() {
+                if source.column >= width {
                     return None;
                 }
                 plan.push((source.column * rows) as u64);
@@ -3978,14 +4107,8 @@ where
         return None;
     }
 
-    // SAFETY: `F == Gl` and `E == Ext3`, each wrapping its limbs transparently
-    // — one `u64` per base element, three per ext3.
-    let raw_columns: Vec<&[u64]> = columns
-        .iter()
-        .map(|column| unsafe {
-            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
-        })
-        .collect();
+    // SAFETY: `E == Ext3`, wrapping its limbs transparently — three `u64` per
+    // element.
     let raw_public: Vec<(usize, &[u64])> = public_slots
         .iter()
         .map(|(slot, table)| {
@@ -3995,21 +4118,18 @@ where
         })
         .collect();
 
-    let uploaded = math_cuda::sumcheck::DeviceFactors::from_columns(
-        columns_at(resident, &raw_columns),
-        &plan,
-        &raw_public,
-        rows,
-        kinds.len(),
-    )
-    .ok()?;
+    let uploaded = with_columns_at(resident, columns, |at| {
+        math_cuda::sumcheck::DeviceFactors::from_columns(at, &plan, &raw_public, rows, kinds.len())
+            .ok()
+    })
+    .flatten()?;
     FACTOR_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(DeviceFactors(uploaded))
 }
 
 #[cfg(not(feature = "cuda"))]
-pub fn upload_factors_from_columns<F, E>(
-    _columns: &[crate::mle::Mle<F>],
+pub fn upload_factors_from_columns<F, E, C>(
+    _columns: &C,
     _kinds: &[crate::constraint_argument::FactorKind],
     _public: &[crate::mle::Mle<E>],
     _resident: Option<(&ResidentColumns, usize)>,
@@ -4017,6 +4137,7 @@ pub fn upload_factors_from_columns<F, E>(
 where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
+    C: crate::narrow::HostColumns<F> + ?Sized,
 {
     None
 }
@@ -4795,15 +4916,20 @@ where
     if message
         .parts
         .iter()
-        .any(|(column, offset)| offset + column.len() > len)
+        .any(|(column, offset)| offset + column.rows() > len)
     {
         return None;
     }
-    let host_parts: Vec<(&[u64], usize)> = message
-        .parts
-        .iter()
-        .map(|(column, offset)| (raw(column), *offset))
-        .collect();
+    // Read on the host only when the card does not hold the columns: a
+    // narrow table's are widened there otherwise.
+    let host_parts: Vec<(&[u64], usize)> = match message.resident {
+        Some(_) => Vec::new(),
+        None => message
+            .parts
+            .iter()
+            .map(|(column, offset)| (raw(column.host()), *offset))
+            .collect(),
+    };
     // ★ The first rounds over the shares, when the device takes them: the
     // factors are then written at `2^(n − rounds)` instead of `2^n`. The same
     // values either way; a stack the lean path cannot read materialises as
@@ -4978,7 +5104,7 @@ impl std::fmt::Debug for DeviceCodeword {
 /// built. `parts` is `(column, offset in elements)`.
 #[cfg(feature = "cuda")]
 pub(crate) fn commit_parts<F>(
-    parts: &[(&crate::mle::Mle<F>, usize)],
+    parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     log_evals: usize,
     log_blowup: usize,
     log_folding: usize,
@@ -5003,7 +5129,7 @@ where
     // A part past the end would be an out-of-bounds device write.
     if parts
         .iter()
-        .any(|(column, offset)| offset + column.len() > (1usize << log_evals))
+        .any(|(column, offset)| offset + column.rows() > (1usize << log_evals))
     {
         return None;
     }
@@ -5011,6 +5137,7 @@ where
     let raw: Vec<(&[u64], usize)> = parts
         .iter()
         .map(|(column, offset)| unsafe {
+            let column = column.host();
             (
                 core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len()),
                 *offset,
@@ -5111,7 +5238,7 @@ pub(crate) fn encode_resident(
 /// [`encode_resident`] over columns the host holds, as [`commit_parts`].
 #[cfg(feature = "cuda")]
 pub(crate) fn encode_parts<F>(
-    parts: &[(&crate::mle::Mle<F>, usize)],
+    parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     log_evals: usize,
     log_blowup: usize,
     transient: bool,
@@ -5133,7 +5260,7 @@ where
     }
     if parts
         .iter()
-        .any(|(column, offset)| offset + column.len() > (1usize << log_evals))
+        .any(|(column, offset)| offset + column.rows() > (1usize << log_evals))
     {
         return None;
     }
@@ -5141,6 +5268,7 @@ where
     let raw: Vec<(&[u64], usize)> = parts
         .iter()
         .map(|(column, offset)| unsafe {
+            let column = column.host();
             (
                 core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len()),
                 *offset,
@@ -5170,7 +5298,7 @@ pub(crate) fn encode_resident(
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn encode_parts<F>(
-    _parts: &[(&crate::mle::Mle<F>, usize)],
+    _parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     _log_evals: usize,
     _log_blowup: usize,
     _transient: bool,
@@ -5196,7 +5324,7 @@ pub(crate) fn commit_resident(
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn commit_parts<F>(
-    _parts: &[(&crate::mle::Mle<F>, usize)],
+    _parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     _log_evals: usize,
     _log_blowup: usize,
     _log_folding: usize,

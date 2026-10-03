@@ -32,6 +32,7 @@ use crate::{
     Error, challenge_powers,
     eq::{shift_eval, shift_mle},
     mle::Mle,
+    narrow::HostColumns,
     poly::{Composed, SumcheckPolynomial},
     program::{Builder, Program},
     sumcheck::{self, SumcheckProof},
@@ -253,9 +254,10 @@ where
 ///
 /// Returns the proof and the reduced point. `factor_values[i]` must be the
 /// value of the factor `sources[i]` describes — the column shifted by its
-/// offset, evaluated at `alpha`.
-pub fn prove<F, E, T>(
-    columns: &[Mle<F>],
+/// offset, evaluated at `alpha`. The columns are read on the host only by a
+/// path the card does not take ([`HostColumns`]).
+pub fn prove<F, E, T, C>(
+    columns: &C,
     sources: &[FactorSource],
     factor_values: &[FieldElement<E>],
     alpha: &[FieldElement<E>],
@@ -266,15 +268,30 @@ where
     F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
     T: IsTranscript<E>,
+    C: HostColumns<F> + ?Sized,
 {
     let t = crate::whir_split::tick();
-    check_shape(sources, factor_values, columns.len())?;
-    for column in columns {
-        if column.num_vars() != alpha.len() {
+    check_shape(sources, factor_values, columns.width())?;
+    match columns.rows() {
+        _ if columns.width() == 0 => {}
+        Some(rows) if rows == 1usize << alpha.len() => {}
+        Some(rows) => {
             return Err(Error::VariableCountMismatch {
                 expected: alpha.len(),
-                got: column.num_vars(),
+                got: rows.trailing_zeros() as usize,
             });
+        }
+        // Columns of different heights are host columns: name the first that
+        // is not the point's.
+        None => {
+            for column in columns.host() {
+                if column.num_vars() != alpha.len() {
+                    return Err(Error::VariableCountMismatch {
+                        expected: alpha.len(),
+                        got: column.num_vars(),
+                    });
+                }
+            }
         }
     }
 
@@ -328,7 +345,7 @@ where
             for offset in offsets(sources) {
                 polys.push(shift_mle(alpha, offset)?);
                 polys.push(batched_column::<F, E>(
-                    columns,
+                    columns.host(),
                     sources,
                     &weights,
                     offset,
@@ -353,11 +370,11 @@ where
     let column_values = match crate::gpu::evaluate_many_base(columns, &point, resident) {
         Some(values) => {
             if crate::gpu::argue_xcheck() {
-                check_against_the_host(columns, &point, &values)?;
+                check_against_the_host(columns.host(), &point, &values)?;
             }
             values
         }
-        None => evaluate_each(columns, &point)?,
+        None => evaluate_each(columns.host(), &point)?,
     };
     for value in &column_values {
         transcript.append_field_element(value);

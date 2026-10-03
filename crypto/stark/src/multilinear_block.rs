@@ -678,14 +678,14 @@ where
 
         let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
         let t = Instant::now();
-        let stacked = retired.revive::<H>(
+        let stacked = retired.revive::<H, _>(
             &columns,
             store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
             config,
         )?;
         stamps[g].encode = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        openings.push(stacked_eval::prove::<F, E, T, H>(
+        openings.push(stacked_eval::prove::<F, E, T, H, _>(
             &stacked,
             &columns,
             store.as_ref().map(|store| (&**store, 0)),
@@ -734,7 +734,7 @@ where
                         .collect::<Result<_, _>>()?;
                 }
             }
-            prepared_openings.push(stacked_eval::prove::<F, E, T, H>(
+            prepared_openings.push(stacked_eval::prove::<F, E, T, H, _>(
                 p.commitment,
                 p.columns,
                 None,
