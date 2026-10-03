@@ -1356,7 +1356,6 @@ fn the_whir_block_tree_on_a_real_block() {
     if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
         options.layout_workers = n;
     }
-    // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
     // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
     // `none` lifts the bound (the reverted version, BIG 390).
     match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
@@ -1371,8 +1370,17 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         Err(_) => {}
     }
-    options.pack_rest_as_laid_out =
-        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 1): the rest packed as it is laid
+    // out.
+    match std::env::var("BLOCK_WHIR_PACK_REST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_rest_as_laid_out = false,
+        Ok("1") => options.pack_rest_as_laid_out = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
+        Err(_) => {}
+    }
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
     match std::env::var("BLOCK_WHIR_DROP_OPS")
@@ -1510,6 +1518,24 @@ fn the_whir_block_tree_on_a_real_block() {
             options.keccak_rows_log2,
             options.ecsm_rows_log2,
         );
+        // Each group's tables by AIR, in the group's order: which tables the
+        // card waited for, and where the layout's chunks went.
+        for (g, group) in proof.groups.iter().enumerate() {
+            let mut kinds: Vec<(String, usize)> = Vec::new();
+            for &index in group {
+                let name = refs[index as usize].name();
+                let kind = name.split('[').next().unwrap_or(name).to_string();
+                match kinds.last_mut() {
+                    Some((last, n)) if *last == kind => *n += 1,
+                    _ => kinds.push((kind, 1)),
+                }
+            }
+            let kinds: Vec<String> = kinds
+                .into_iter()
+                .map(|(kind, n)| if n == 1 { kind } else { format!("{kind}×{n}") })
+                .collect();
+            println!("W3 GROUP TABLES {g}: {}", kinds.join(" "));
+        }
     }
     println!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",

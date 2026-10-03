@@ -2102,7 +2102,7 @@ fn block_whir_on_a_real_block() {
     };
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
-    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
+    // `BLOCK_WHIR_PACK_REST=0|1`, as the tree's harness takes them;
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
@@ -2125,8 +2125,17 @@ fn block_whir_on_a_real_block() {
         }
         Err(_) => {}
     }
-    options.pack_rest_as_laid_out =
-        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 1): the rest packed as it is laid
+    // out.
+    match std::env::var("BLOCK_WHIR_PACK_REST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_rest_as_laid_out = false,
+        Ok("1") => options.pack_rest_as_laid_out = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
+        Err(_) => {}
+    }
     match std::env::var("BLOCK_WHIR_DROP_OPS")
         .as_deref()
         .map(str::trim)
