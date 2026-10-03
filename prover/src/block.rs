@@ -883,6 +883,15 @@ impl Spill {
         if policy == SpillPolicy::Off {
             return None;
         }
+        // `disk-spill`'s storage keeps a trace's words in an mmap of its own;
+        // a spilled trace keeps none in its table. The two are not combined
+        // (I-SPILL R13): with that feature the block runs resident.
+        if cfg!(feature = "disk-spill") {
+            eprintln!(
+                "BLOCK SPILL: {policy:?} wanted, but not with the disk-spill feature: resident"
+            );
+            return None;
+        }
         match stark::spill::SpillStore::open(stark::spill::SpillOptions::default()) {
             Ok(store) => Some(Self {
                 policy,
