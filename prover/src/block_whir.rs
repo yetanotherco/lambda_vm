@@ -1445,6 +1445,10 @@ pub(crate) struct Deviations {
     /// disk ([`BlockCommitted::fault_spilled_byte`]), so phase B reads back
     /// other bytes than were written.
     pub spilled_byte: bool,
+    /// Between the phases, the first spilled table's slot lost
+    /// ([`BlockCommitted::fault_lose_spilled_slot`]), so its columns never
+    /// come back.
+    pub spilled_slot_lost: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -3107,6 +3111,9 @@ fn prove_streamed(
         }
         if deviations.spilled_byte && !block.fault_spilled_byte() {
             return Err(Error::Prover("no spilled table to break".into()));
+        }
+        if deviations.spilled_slot_lost && !block.fault_lose_spilled_slot() {
+            return Err(Error::Prover("no spilled table to lose".into()));
         }
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);

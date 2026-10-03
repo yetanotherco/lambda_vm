@@ -1101,6 +1101,17 @@ where
             .any(|packed| packed.fault_width_map())
     }
 
+    /// A test's fault: the first spilled table's slot lost, so its columns
+    /// never come back. Returns whether a spilled table was there to lose.
+    #[doc(hidden)]
+    pub fn fault_lose_spilled_slot(&mut self) -> bool {
+        self.spilled
+            .iter_mut()
+            .find(|slot| slot.is_some())
+            .map(Option::take)
+            .is_some()
+    }
+
     /// A test's fault: one byte of the first spilled table flipped on disk,
     /// once the writers are done, so phase B reads back other bytes than were
     /// written. Returns whether a written table was there to break; `false`
@@ -1592,6 +1603,15 @@ where
                 prefetch.as_ref(),
                 mem.as_deref(),
             )?;
+            // No reader of these groups meets a table whose columns are still
+            // out: one whose slot did not come back is refused here, before
+            // its upload.
+            if let Some(k) = tables[at..end].iter().position(|t| t.is_spilled()) {
+                return Err(MlError::SpillFailed {
+                    table: at + k,
+                    reason: "its columns are still spilled when its group is read",
+                });
+            }
         }
         let (head, tail) = tables.split_at_mut(at + size);
         let group = &mut head[at..];

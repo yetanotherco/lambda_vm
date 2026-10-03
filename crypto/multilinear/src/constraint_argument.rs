@@ -200,9 +200,10 @@ enum Held<F: IsField> {
     },
     /// The packed columns are in a spill store's slot
     /// ([`TraceData::take_narrow_for_spill`]); only
-    /// [`TraceData::restore_narrow`] brings them back. A reader that finds the
-    /// table here before then gets no columns: a proof the verifier refuses,
-    /// never a wrong one it accepts.
+    /// [`TraceData::restore_narrow`] brings them back. The block prover
+    /// refuses a group holding a table still spilled before any reader runs
+    /// (`stark::multilinear_block`, `SpillFailed`); a reader that met the
+    /// table here anyway would get no columns, a proof the verifier refuses.
     Spilled,
 }
 
