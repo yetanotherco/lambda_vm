@@ -76,6 +76,9 @@ use multilinear::{
     whir_hash::WhirHash,
 };
 
+use crate::narrow::NarrowMain;
+use crate::spill::{Prefetch, ReadPhase, SpillStore, SpilledMain};
+
 use crate::multilinear_table::{
     CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots_and_challenge,
     batched::{self, BatchedArgue, ProverFaults, VerifierChecks, Where},
@@ -218,6 +221,10 @@ pub struct BlockMem {
     pub held_wide: AtomicUsize,
     /// The groups' kept tree tops.
     pub tree_tops: AtomicUsize,
+    /// Held tables' packed bytes handed to a spill store ([`BlockSpill`]):
+    /// in its writer queue until written, on disk after, and back in
+    /// `held_narrow` once phase B reads them back.
+    pub spilled: AtomicUsize,
     mark: Box<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -233,6 +240,7 @@ impl BlockMem {
             held_narrow: AtomicUsize::new(0),
             held_wide: AtomicUsize::new(0),
             tree_tops: AtomicUsize::new(0),
+            spilled: AtomicUsize::new(0),
             mark: Box::new(mark),
         }
     }
@@ -249,7 +257,7 @@ impl BlockMem {
         FieldElement<F>: AsBytes + Sync + Send,
         FieldElement<E>: AsBytes + Sync + Send,
     {
-        for table in tables {
+        for table in tables.into_iter().filter(|t| !t.is_spilled()) {
             match table.narrow() {
                 Some(packed) => self.held_narrow.fetch_add(packed.data().len(), Relaxed),
                 None => self.held_wide.fetch_add(wide_bytes(table), Relaxed),
@@ -267,13 +275,170 @@ impl BlockMem {
         FieldElement<F>: AsBytes + Sync + Send,
         FieldElement<E>: AsBytes + Sync + Send,
     {
-        for table in tables {
+        // A spilled table's bytes left the count when they were spilled, or
+        // when phase B let them go after its group.
+        for table in tables.into_iter().filter(|t| !t.is_spilled()) {
             match table.narrow() {
                 Some(packed) => self.held_narrow.fetch_sub(packed.data().len(), Relaxed),
                 None => self.held_wide.fetch_sub(wide_bytes(table), Relaxed),
             };
         }
     }
+}
+
+/// Groups phase B reads before a read-back could land: never spilled.
+const SPILL_RESIDENT_GROUPS: usize = 2;
+
+/// A block's spill ([`crate::spill`]). Phase A hands each committed group's
+/// packed tables to `store` as the group is installed, past the first
+/// [`SPILL_RESIDENT_GROUPS`] groups and never past the store's writer queue,
+/// so the committer never waits on the writers. Phase B reads them back in
+/// group order, ahead of their upload, and lets each group's go after its
+/// opening.
+#[derive(Clone)]
+pub struct BlockSpill {
+    pub store: Arc<SpillStore>,
+    /// The writer queue the store was opened with
+    /// ([`crate::spill::SpillOptions::queue_bytes`]).
+    pub queue_bytes: u64,
+    /// The read-back's report ([`Prefetch::report`]), once phase B has run.
+    pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl BlockSpill {
+    pub fn new(store: SpillStore, queue_bytes: u64) -> Self {
+        Self {
+            store: Arc::new(store),
+            queue_bytes,
+            prefetch: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Whether `len` more bytes fit the writers' queue now. The committer is
+    /// the store's one producer, so the room it sees stays: the spill that
+    /// follows does not wait.
+    fn has_room(&self, len: u64) -> bool {
+        let stats = self.store.stats();
+        let pending = stats.bytes.saturating_sub(stats.bytes_written);
+        pending == 0 || pending + len <= self.queue_bytes
+    }
+}
+
+/// Packed columns as the store's payload ([`NarrowMain`]): the same parts,
+/// the bytes moved, never copied. Both types hold the same shape checks, so
+/// columns that exist convert.
+fn to_store(packed: multilinear::narrow::NarrowColumns) -> Option<NarrowMain> {
+    let (rows, widths, data) = packed.into_parts();
+    NarrowMain::from_parts(rows, widths, data)
+}
+
+/// [`to_store`]'s inverse.
+fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
+    let (rows, widths, data) = main.into_parts();
+    multilinear::narrow::NarrowColumns::from_parts(rows, widths, data)
+}
+
+/// Hands group `g`'s narrow tables to the spill, `first` being the first's
+/// index; each spilled table's slot goes in `spilled`. A table the queue has
+/// no room for stays held, and so does one the store refuses (it has
+/// failed).
+fn spill_group<F, E>(
+    spill: &BlockSpill,
+    g: usize,
+    first: usize,
+    tables: &mut [CommittedTable<'_, F, E>],
+    spilled: &mut [Option<SpilledMain>],
+    mem: Option<&BlockMem>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if g < SPILL_RESIDENT_GROUPS {
+        return Ok(());
+    }
+    for (k, (table, slot)) in tables.iter_mut().zip(spilled.iter_mut()).enumerate() {
+        let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
+            continue;
+        };
+        if !spill.has_room(len as u64) {
+            continue;
+        }
+        let failed = || MlError::SpillFailed {
+            table: first + k,
+            reason: "its packed parts did not move to the store and back",
+        };
+        let main = table
+            .take_narrow_for_spill()
+            .and_then(to_store)
+            .ok_or_else(failed)?;
+        match spill.store.spill(main) {
+            Ok(handle) => {
+                if let Some(mem) = mem {
+                    mem.held_narrow.fetch_sub(len, Relaxed);
+                    mem.spilled.fetch_add(len, Relaxed);
+                }
+                *slot = Some(handle);
+            }
+            Err(main) => {
+                if !from_store(main).is_some_and(|packed| table.restore_narrow(packed)) {
+                    return Err(failed());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Brings `tables`' spilled columns back before their upload, `first` being
+/// the first's index: from the read-back ahead when it has them, or read
+/// here. Refused when a read fails or does not match what was written.
+fn restore_group<F, E>(
+    first: usize,
+    tables: &mut [CommittedTable<'_, F, E>],
+    spilled: &mut [Option<SpilledMain>],
+    prefetch: Option<&Prefetch>,
+    mem: Option<&BlockMem>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    for (k, (table, slot)) in tables.iter_mut().zip(spilled.iter_mut()).enumerate() {
+        let Some(handle) = slot.take() else {
+            continue;
+        };
+        let index = first + k;
+        let read = match prefetch.and_then(|p| p.take(ReadPhase::Fused, index)) {
+            Some(read) => read,
+            None => handle.into_narrow(),
+        };
+        let main = read.map_err(|e| MlError::SpillFailed {
+            table: index,
+            reason: match e {
+                crate::spill::SpillError::Mismatch => {
+                    "the bytes read back are not the ones written"
+                }
+                crate::spill::SpillError::Io(_) => "the read failed",
+            },
+        })?;
+        let len = main.data().len();
+        if !from_store(main).is_some_and(|packed| table.restore_narrow(packed)) {
+            return Err(MlError::SpillFailed {
+                table: index,
+                reason: "the bytes read back do not have the table's shape",
+            });
+        }
+        if let Some(mem) = mem {
+            mem.spilled.fetch_sub(len, Relaxed);
+            mem.held_narrow.fetch_add(len, Relaxed);
+        }
+    }
+    Ok(())
 }
 
 /// A table's committed columns as held on the host: packed, or eight bytes a
@@ -505,6 +670,9 @@ where
     stamps: Vec<GroupStamps>,
     /// A memory log's terms, counted through phase B as well.
     mem: Option<Arc<BlockMem>>,
+    /// The spill, when one is on, and each table's slot in it.
+    spill: Option<BlockSpill>,
+    spilled: Vec<Option<SpilledMain>>,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -587,7 +755,15 @@ where
         narrow: Narrowing,
         upload_ahead: bool,
     ) -> Result<Self, MlError> {
-        Self::commit_groups_logged::<H>(groups, config, drop_levels, narrow, upload_ahead, None)
+        Self::commit_groups_logged::<H>(
+            groups,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            None,
+            None,
+        )
     }
 
     /// [`Self::commit_groups`], counting where the columns are in `mem` (a
@@ -599,8 +775,10 @@ where
         narrow: Narrowing,
         upload_ahead: bool,
         mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
+        let mut spilled: Vec<Option<SpilledMain>> = Vec::new();
         let mut sizes = Vec::new();
         let mut retired_groups = Vec::new();
         let mut roots = Vec::new();
@@ -681,7 +859,15 @@ where
             }
             sizes.push(size);
             if !upload_ahead && let Some(packed) = packing.take() {
-                packed.install(&mut tables, &mut stamps, mem.as_deref());
+                install_and_spill(
+                    packed,
+                    &mut tables,
+                    &mut spilled,
+                    &mut stamps,
+                    &sizes,
+                    mem.as_deref(),
+                    spill.as_ref(),
+                )?;
             }
             let shapes: Vec<(usize, usize)> = group
                 .iter()
@@ -782,7 +968,15 @@ where
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if upload_ahead && let Some(packed) = packing.take() {
-                packed.install(&mut tables, &mut stamps, mem.as_deref());
+                install_and_spill(
+                    packed,
+                    &mut tables,
+                    &mut spilled,
+                    &mut stamps,
+                    &sizes,
+                    mem.as_deref(),
+                    spill.as_ref(),
+                )?;
             }
             // Which tables were committed wide (a packer's, from here on).
             let was_wide: Vec<bool> = group.iter().map(|t| t.narrow().is_none()).collect();
@@ -822,10 +1016,33 @@ where
             }
             retired_groups.push(retired);
             stamps.push(stamp);
+            let first = tables.len();
             tables.extend(group);
+            spilled.resize(tables.len(), None);
+            // A group no packer took is held as it is from here on.
+            if packing.is_none()
+                && let Some(spill) = &spill
+            {
+                spill_group(
+                    spill,
+                    stamps.len() - 1,
+                    first,
+                    &mut tables[first..],
+                    &mut spilled[first..],
+                    mem.as_deref(),
+                )?;
+            }
         }
         if let Some(packed) = packing.take() {
-            packed.install(&mut tables, &mut stamps, mem.as_deref());
+            install_and_spill(
+                packed,
+                &mut tables,
+                &mut spilled,
+                &mut stamps,
+                &sizes,
+                mem.as_deref(),
+                spill.as_ref(),
+            )?;
         }
         Ok(Self {
             tables,
@@ -834,6 +1051,8 @@ where
             roots,
             stamps,
             mem,
+            spill,
+            spilled,
         })
     }
 
@@ -865,6 +1084,22 @@ where
             .iter_mut()
             .filter_map(|table| table.narrow_mut())
             .any(|packed| packed.fault_width_map())
+    }
+
+    /// A test's fault: one byte of the first spilled table flipped on disk,
+    /// once the writers are done, so phase B reads back other bytes than were
+    /// written. Returns whether a written table was there to break; `false`
+    /// outside test builds.
+    #[doc(hidden)]
+    pub fn fault_spilled_byte(&mut self) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(spill) = &self.spill {
+            spill.store.flush();
+            if let Some(handle) = self.spilled.iter().flatten().next() {
+                return spill.store.corrupt_on_disk(handle, 0).unwrap_or(false);
+            }
+        }
+        false
     }
 }
 
@@ -986,6 +1221,39 @@ impl Packing {
             mem.mark(&format!("group {} installed", self.group));
         }
     }
+}
+
+/// Installs a packer's tables ([`Packing::install`]), then hands its group to
+/// the spill when one is on.
+fn install_and_spill<F, E>(
+    packed: Packing,
+    tables: &mut [CommittedTable<'_, F, E>],
+    spilled: &mut [Option<SpilledMain>],
+    stamps: &mut [GroupStamps],
+    sizes: &[usize],
+    mem: Option<&BlockMem>,
+    spill: Option<&BlockSpill>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let (g, first) = (packed.group, packed.first_table);
+    packed.install(tables, stamps, mem);
+    let Some(spill) = spill else {
+        return Ok(());
+    };
+    let end = first + sizes[g];
+    spill_group(
+        spill,
+        g,
+        first,
+        &mut tables[first..end],
+        &mut spilled[first..end],
+        mem,
+    )
 }
 
 /// Holds a just-committed group's tables as `narrow` says. On the card, each
@@ -1240,6 +1508,8 @@ where
         roots,
         mut stamps,
         mem,
+        spill,
+        mut spilled,
     } = committed;
     let starts: Vec<usize> = sizes
         .iter()
@@ -1268,11 +1538,45 @@ where
     // card idles through the argument's host glue, and a group's store is a
     // few GiB beside the argument's working set, not beside its codewords.
     let mut pre_uploaded: Option<Store> = None;
+    // The spilled tables read back in group order, two groups' bytes ahead of
+    // their uploads.
+    let prefetch = spill.as_ref().and_then(|_| {
+        let reads: Vec<(ReadPhase, usize, SpilledMain)> = spilled
+            .iter()
+            .enumerate()
+            .filter_map(|(t, slot)| slot.clone().map(|handle| (ReadPhase::Fused, t, handle)))
+            .collect();
+        let widest = starts
+            .iter()
+            .zip(&sizes)
+            .map(|(&start, &size)| {
+                spilled[start..start + size]
+                    .iter()
+                    .flatten()
+                    .map(|handle| handle.len() as u64)
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0);
+        (!reads.is_empty()).then(|| Prefetch::start(reads, 2 * widest.max(1)))
+    });
     for (g, (retired, &size)) in groups.into_iter().zip(&sizes).enumerate() {
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
         let tables_before = table_proofs.len();
         let argues_before = argues.len();
         let prepared_before = prepared_openings.len();
+        if spill.is_some() {
+            // This group's columns and the next's, back before their uploads
+            // (the next one's goes up beside this group's argue).
+            let end = (at + size + sizes.get(g + 1).copied().unwrap_or(0)).min(tables.len());
+            restore_group(
+                at,
+                &mut tables[at..end],
+                &mut spilled[at..end],
+                prefetch.as_ref(),
+                mem.as_deref(),
+            )?;
+        }
         let (head, tail) = tables.split_at_mut(at + size);
         let group = &mut head[at..];
         let next = sizes.get(g + 1).map(|&n| &tail[..n]);
@@ -1447,6 +1751,14 @@ where
         for table in group.iter_mut() {
             table.clear_resident();
             table.drop_widened();
+            // While a spill is on, a finished group's packed columns go:
+            // nothing reads them after its opening.
+            if spill.is_some()
+                && let Some(packed) = table.take_narrow_for_spill()
+                && let Some(mem) = &mem
+            {
+                mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
+            }
         }
         drop(store);
         if let Some(mem) = &mem {
@@ -1458,6 +1770,12 @@ where
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
         mem.release(tables.iter());
+    }
+    if let (Some(spill), Some(prefetch)) = (&spill, &prefetch) {
+        *spill
+            .prefetch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefetch.report());
     }
     Ok((
         MultiProof {
@@ -1743,4 +2061,25 @@ where
         return Err(MlError::BusImbalance);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::{from_store, to_store};
+    use multilinear::narrow::NarrowColumns;
+
+    /// The packed columns move to the store's payload and back without a
+    /// copy: the same bytes at the same address.
+    #[test]
+    fn the_columns_move_to_the_store_and_back_without_a_copy() {
+        let words: Vec<u64> = (0..3 * 4096u64).map(|i| i * 0x9e37_79b9 % 70_000).collect();
+        let packed = NarrowColumns::pack_row_major(&words, 3).expect("packs");
+        let copy = packed.clone();
+        let at = packed.data().as_ptr();
+        let main = to_store(packed).expect("converts");
+        assert_eq!(main.data().as_ptr(), at, "to the store");
+        let back = from_store(main).expect("converts back");
+        assert_eq!(back.data().as_ptr(), at, "back");
+        assert_eq!(back, copy);
+    }
 }

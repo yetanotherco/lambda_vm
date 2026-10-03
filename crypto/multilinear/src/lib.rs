@@ -149,6 +149,12 @@ pub enum Error {
     /// the host: the transcript has moved.
     #[error("the device failed mid-{stage}, after the transcript had moved")]
     DeviceFailed { stage: &'static str },
+    /// A spilled table's packed columns did not come back whole: the bytes
+    /// read are not the ones written, the read failed, or they do not have
+    /// the table's shape. The prover refuses rather than prove over other
+    /// columns.
+    #[error("table {table}: its spilled columns did not come back ({reason})")]
+    SpillFailed { table: usize, reason: &'static str },
     /// A commitment rebuilt from a kept tree top and a recomputed codeword:
     /// the codeword's leaves under one kept node do not hash to it, so the
     /// recomputation is not the committed codeword.

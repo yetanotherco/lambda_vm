@@ -192,6 +192,13 @@ impl NarrowColumns {
         &self.data
     }
 
+    /// The parts, for a store to move elsewhere and back
+    /// ([`Self::from_parts`]): rows, widths and the bytes. The offsets follow
+    /// from the widths.
+    pub fn into_parts(self) -> (usize, Vec<u8>, Vec<u8>) {
+        (self.rows, self.widths, self.data)
+    }
+
     /// Column `c`'s words.
     pub fn column(&self, c: usize) -> Vec<u64> {
         let w = self.widths[c] as usize;
