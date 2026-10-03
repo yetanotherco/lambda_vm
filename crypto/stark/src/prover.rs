@@ -1216,10 +1216,10 @@ struct CarriedBytes<'c, 'g> {
 /// fused task what it holds plus what its next admission asks for is at most
 /// R + H. Two forms:
 ///
-/// - today's ([`resident_claim`], [`settled_claim`]): the whole bound in R, H
-///   = 0;
-/// - tight (`LAMBDA_VM_SHARED_GATE_CLAIMS=tight`): R = the tables' resident
-///   bounds (Σ carried once Round 1 settles), H = [`tight_headroom`].
+/// - tight (the default): R = the tables' resident bounds (Σ carried once
+///   Round 1 settles), H = [`tight_headroom`];
+/// - the first form (`LAMBDA_VM_SHARED_GATE_CLAIMS=whole`, [`resident_claim`],
+///   [`settled_claim`]): the whole bound in R, H = 0.
 ///
 /// The book admits a claim only while **Σ R + max H ≤ budget** over the claims
 /// in force (one claim alone always enters). In a state where every prove
@@ -1461,14 +1461,25 @@ fn tight_headroom(resident: &[u64], peak: &[u64], scratch: &[u64]) -> u64 {
         .unwrap_or(0)
 }
 
-/// `LAMBDA_VM_SHARED_GATE_CLAIMS=tight`: a carrying prove claims its tables'
-/// resident bounds plus [`tight_headroom`], admitted by the book's shared
-/// headroom ([`ClaimBook`]), instead of [`resident_claim`]. Off by default.
+/// Tight claims (the default): a carrying prove claims its tables' resident
+/// bounds plus [`tight_headroom`], admitted by the book's shared headroom
+/// ([`ClaimBook`]). `LAMBDA_VM_SHARED_GATE_CLAIMS=whole` restores the first
+/// form ([`resident_claim`]). On by default since BIG 474: median recursion
+/// −1.25 s (t −5.4), level-0 claim waits Σ 8–10 s a run → 0, VRAM ≤ 28.7 GiB.
 fn shared_claims_tight() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("LAMBDA_VM_SHARED_GATE_CLAIMS").is_ok_and(|v| v.trim() == "tight")
+        shared_claims_setting(
+            std::env::var("LAMBDA_VM_SHARED_GATE_CLAIMS")
+                .ok()
+                .as_deref(),
+        )
     })
+}
+
+/// [`shared_claims_tight`] for a raw value: anything but `whole` is tight.
+fn shared_claims_setting(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("whole")
 }
 
 /// The same claim once Round 1 is done and `carried` is known: the bytes
@@ -1578,6 +1589,16 @@ mod shared_vram_gate_tests {
             24 * gib,
             "unknown card"
         );
+    }
+
+    /// Claims are tight unless the knob says `whole`.
+    #[test]
+    fn claims_are_tight_unless_the_knob_says_whole() {
+        use super::shared_claims_setting as setting;
+        assert!(setting(None), "tight by default");
+        assert!(setting(Some("tight")));
+        assert!(!setting(Some("whole")), "whole restores the first form");
+        assert!(!setting(Some(" whole ")));
     }
 
     /// On unless the knob says `0`.
@@ -7264,7 +7285,11 @@ pub trait IsStarkProver<
         // (`ResidentClaim`).
         let tight = shared_claims_tight();
         #[cfg(any(test, feature = "test-utils"))]
-        let tight = tight || test_overrides.as_ref().is_some_and(|(o, _)| o.tight_claims);
+        // A test that forces the carry picks the claim's form itself.
+        let tight = match &test_overrides {
+            Some((o, _)) if o.carry_residents => o.tight_claims,
+            _ => tight,
+        };
         let (claim_held, claim_headroom) = if tight {
             let scratch: Vec<u64> = main_sets.iter().map(|set| set.scratch_bytes).collect();
             (
