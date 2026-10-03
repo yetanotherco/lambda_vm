@@ -183,6 +183,182 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
     }
 }
 
+/// ★ Narrow storage moves no byte of the proof: the same traces proved with
+/// every group held wide between the phases and held narrow (packed on the
+/// host here, into the bytes the card packs) give the same proof — byte for
+/// byte when the grind is deterministic (`LAMBDA_VM_DETERMINISTIC_GRIND`, read
+/// once per process, so run this test alone to see the bytes; otherwise only
+/// the verdicts are compared) — under the per-table and the batched argue.
+/// With no card, every reader of a narrow table widens it on the host.
+#[test]
+fn narrow_storage_moves_no_byte_of_the_proof() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use stark::multilinear_block::Narrowing;
+
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &MaxRowsConfig::small(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the traces build");
+    block_whir::split_keccak_rnd(&mut traces, 16);
+    for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
+        let format = BlockFormat {
+            argue,
+            ..many_groups()
+        };
+        let mut proved = |narrow: Narrowing| {
+            let mut o = options(MaxRowsConfig::small(), 16);
+            o.narrow = narrow;
+            let mut stamps = Default::default();
+            let proof = block_whir::prove_traces(
+                &program,
+                &elf,
+                &mut traces,
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+                false,
+                &|_, _| {},
+                &mut stamps,
+            )
+            .expect("prove");
+            assert!(verify(&proof, &elf, &format), "{narrow:?} {argue:?}");
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .expect("serialize")
+                .to_vec();
+            (bytes, stamps)
+        };
+        let (wide, wide_stamps) = proved(Narrowing::Wide);
+        let (narrow, narrow_stamps) = proved(Narrowing::Host);
+        let packed = |s: &block_whir::BlockStamps| -> usize {
+            s.groups.iter().map(|g| g.packed_tables).sum()
+        };
+        assert_eq!(packed(&wide_stamps), 0);
+        assert_eq!(
+            packed(&narrow_stamps),
+            narrow_stamps.tables,
+            "every table packed"
+        );
+        // A process-wide count: other tests add to it, never take from it.
+        assert!(narrow_stamps.host_widens.0 > 0, "no card: the host widens");
+        if crypto::grinding::deterministic() {
+            assert_eq!(wide, narrow, "{argue:?}");
+        }
+    }
+}
+
+/// The streamed build held narrow: each group packed as it is committed during
+/// the collect, and the proof verifies.
+#[test]
+fn a_streamed_block_held_narrow_proves_and_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+    o.narrow = stark::multilinear_block::Narrowing::Host;
+    let (proof, stamps) = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations::default(),
+    )
+    .expect("prove");
+    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert_eq!(
+        stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>(),
+        stamps.tables
+    );
+    assert!(stamps.report().contains("BLOCK NARROW: Host"));
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// A narrow table whose width map is wrong widens to other words than were
+/// committed, and the prover refuses at the opening: the recomputed codeword
+/// does not hash to the kept tree top.
+#[test]
+fn a_wrong_narrow_width_map_is_refused_by_the_kept_tree() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let mut o = options(MaxRowsConfig::small(), 16);
+    o.narrow = stark::multilinear_block::Narrowing::Host;
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &many_groups(),
+        &o,
+        &Deviations {
+            narrow_width_map: true,
+            ..Default::default()
+        },
+    );
+    match refused {
+        Err(e) => assert!(
+            format!("{e:?}").contains("RecomputedCodewordMismatch"),
+            "refused for another reason: {e:?}"
+        ),
+        Ok(_) => panic!("a wrong width map proved"),
+    }
+}
+
+/// The same on a card: the group's tables packed there after the commit and
+/// widened there again for phase B, one width map broken in between.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "box: needs a card"]
+fn a_wrong_narrow_width_map_is_refused_on_the_card() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let o = options(MaxRowsConfig::small(), 16);
+    let (honest, stamps) = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &many_groups(),
+        &o,
+        &Deviations::default(),
+    )
+    .expect("prove");
+    assert_eq!(
+        stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>(),
+        stamps.tables,
+        "every table packed on the card"
+    );
+    // The tables too small for the card's argue are read on the host.
+    println!("NARROW CARD: host widens {:?}", stamps.host_widens);
+    assert!(verify(&honest, &elf, &many_groups()));
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &many_groups(),
+        &o,
+        &Deviations {
+            narrow_width_map: true,
+            ..Default::default()
+        },
+    );
+    match refused {
+        Err(e) => assert!(
+            format!("{e:?}").contains("RecomputedCodewordMismatch"),
+            "refused for another reason: {e:?}"
+        ),
+        Ok(_) => panic!("a wrong width map proved"),
+    }
+}
+
 #[test]
 fn a_block_proof_survives_serialization() {
     let elf = asm_elf_bytes("sub");
