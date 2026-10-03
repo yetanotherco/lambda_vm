@@ -1525,6 +1525,9 @@ fn the_whir_block_tree_on_a_real_block() {
         plan.prepared().len()
     );
 
+    // The readouts above run on the clock, between the base and the tree: a
+    // prover prints none of them, so the whole block is also given without.
+    let readouts = t0.elapsed().as_secs_f64() - base;
     let t = std::time::Instant::now();
     let (timings, proofs) =
         prove_tree_pipelined(&plan, &proof, programs, siblings).expect("the tree proves");
@@ -1544,8 +1547,17 @@ fn the_whir_block_tree_on_a_real_block() {
         );
     }
     println!(
-        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s",
-        whole - base
+        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s)",
+        whole - base,
+        whole - readouts
+    );
+    // The top proof's bytes: two runs prove the same ones under
+    // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
+    let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
+    println!(
+        "W3 TOP DIGEST: {} (blake3 of the top proof's {} bytes)",
+        &blake3::hash(&top_bytes).to_hex()[..32],
+        top_bytes.len()
     );
 
     // Off the clock: the harness's checks.
