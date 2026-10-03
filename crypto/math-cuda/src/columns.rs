@@ -188,6 +188,31 @@ impl DeviceColumns {
         })
     }
 
+    /// A store filled table by table as its tables arrive ([`ColumnsBuilder`]),
+    /// for at most `capacity` elements, promised and allocated up front. `None`
+    /// as for [`Self::upload`].
+    pub fn building(capacity: usize) -> Option<ColumnsBuilder> {
+        if capacity == 0 {
+            return None;
+        }
+        let be = backend().ok()?;
+        let Some(room) = be.reserve(capacity as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
+        let stream = be.next_stream();
+        // SAFETY: the builder writes every element a span covers before
+        // `finish` hands the store out, and no reader sees past the spans.
+        let buffer = unsafe { alloc_or_trim::<u64>(&stream, capacity) }.ok()?;
+        Some(ColumnsBuilder {
+            stream,
+            buffer,
+            spans: Vec::new(),
+            at: 0,
+            room,
+        })
+    }
+
     /// The run of `width` columns from `first`, packed on the card (each
     /// column at the bytes its words need, [`crate::narrow`]): its widths and
     /// its packed bytes, the only bytes that come back. `None` when the columns
@@ -284,5 +309,67 @@ impl DeviceColumns {
             .result()?;
         }
         Ok(())
+    }
+}
+
+/// A [`DeviceColumns`] under construction: columns appended in order, each
+/// copied to the card as it is appended, at the offset an [`DeviceColumns::upload`]
+/// of all of them at once would give it — so the finished store holds the same
+/// words at the same places.
+pub struct ColumnsBuilder {
+    stream: Arc<CudaStream>,
+    buffer: CudaSlice<u64>,
+    spans: Vec<(usize, usize)>,
+    at: usize,
+    room: DeviceReservation,
+}
+
+impl ColumnsBuilder {
+    /// Appends `columns` after the ones already in, copying them to the card.
+    /// `false` (and nothing appended) when they do not fit the capacity or a
+    /// copy fails; the builder is then of no further use.
+    pub fn push(&mut self, columns: &[&[u64]]) -> bool {
+        let total: usize = columns.iter().map(|c| c.len()).sum();
+        if self.at + total > self.buffer.len() {
+            return false;
+        }
+        let mut at = self.at;
+        for column in columns {
+            let mut slab = self.buffer.slice_mut(at..at + column.len());
+            if self.stream.memcpy_htod(*column, &mut slab).is_err() {
+                return false;
+            }
+            at += column.len();
+        }
+        let mut at = self.at;
+        for column in columns {
+            self.spans.push((at, column.len()));
+            at += column.len();
+        }
+        self.at = at;
+        true
+    }
+
+    /// The elements appended so far.
+    pub fn len(&self) -> usize {
+        self.at
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.at == 0
+    }
+
+    /// The store, once every copy has landed. The promise stays the capacity's.
+    pub fn finish(self) -> Option<DeviceColumns> {
+        if self.spans.is_empty() {
+            return None;
+        }
+        self.stream.synchronize().ok()?;
+        Some(DeviceColumns {
+            stream: self.stream,
+            buffer: Arc::new(self.buffer),
+            spans: self.spans,
+            _room: self.room,
+        })
     }
 }

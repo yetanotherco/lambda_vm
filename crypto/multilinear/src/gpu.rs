@@ -3792,6 +3792,73 @@ where
     None
 }
 
+/// A store filled as its tables arrive, ending as the [`ResidentColumns`] an
+/// [`upload_columns`] of the same columns in the same order would make.
+#[cfg(feature = "cuda")]
+pub struct ResidentBuilder(math_cuda::columns::ColumnsBuilder);
+
+/// One that could not be made. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct ResidentBuilder(std::convert::Infallible);
+
+impl ResidentBuilder {
+    /// Room for at most `cells` elements, promised now; `None` when there is
+    /// no device, the card will not promise it, or the columns are on the host
+    /// only (`LAMBDA_VM_NO_GPU_COLUMNS`).
+    #[cfg(feature = "cuda")]
+    pub fn start(cells: usize) -> Option<Self> {
+        if std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some() {
+            return None;
+        }
+        math_cuda::columns::DeviceColumns::building(cells).map(Self)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn start(_cells: usize) -> Option<Self> {
+        None
+    }
+
+    /// Appends a table's columns after the ones already in, copying them to
+    /// the card; `false` when they do not fit or the copy failed.
+    #[cfg(feature = "cuda")]
+    pub fn push<F>(&mut self, columns: &[crate::mle::Mle<F>]) -> bool
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        use math::field::goldilocks::GoldilocksField;
+        if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+            return false;
+        }
+        // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+        let raw: Vec<&[u64]> = columns
+            .iter()
+            .map(|column| unsafe {
+                core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+            })
+            .collect();
+        self.0.push(&raw)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn push<F>(&mut self, _columns: &[crate::mle::Mle<F>]) -> bool
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    /// The store, once every copy has landed.
+    #[cfg(feature = "cuda")]
+    pub fn finish(self) -> Option<ResidentColumns> {
+        self.0.finish().map(ResidentColumns)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn finish(self) -> Option<ResidentColumns> {
+        match self.0 {}
+    }
+}
+
 /// A table's columns as they go to the card: field elements, or packed narrow
 /// ([`crate::narrow::NarrowColumns`]) and widened there.
 #[derive(Clone, Copy)]
