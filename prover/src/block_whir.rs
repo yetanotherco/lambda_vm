@@ -250,7 +250,12 @@ pub struct BlockOptions {
     pub layout_ahead: Option<usize>,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
-    /// of after all of them; the packing order is the same.
+    /// of after all of them; the packing order is the same. Production: on,
+    /// with [`Self::rest_layout_bytes`]'s waves — laid out all at once, the
+    /// first table in AIR order was ready only with the last, and packing as
+    /// laid out read +0.21 s (FAST 422); in waves the AIR order's prefix is
+    /// laid out first, and since three layout workers (04984808d) phase A
+    /// waits on the groups the rest closes.
     pub pack_rest_as_laid_out: bool,
     /// How phase A holds each group's columns once committed
     /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
@@ -300,7 +305,7 @@ impl BlockOptions {
             drop_streamed_ops: true,
             layout_workers: 3,
             layout_ahead: Some(2),
-            pack_rest_as_laid_out: false,
+            pack_rest_as_laid_out: true,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
             memlog: memlog::from_env(),
@@ -501,6 +506,9 @@ pub struct LayoutStamps {
     /// The most streamed chunks laid out (or in the making) and not yet
     /// packed at once, under [`BlockOptions::layout_ahead`].
     pub ahead_most: usize,
+    /// Each table of the rest in AIR order: its name, when its layout ended
+    /// (seconds since the prove started) and its group.
+    pub rest_tables: Vec<(String, f64, usize)>,
 }
 
 impl BlockStamps {
@@ -519,7 +527,7 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
@@ -528,6 +536,7 @@ impl BlockStamps {
                 s.upload_paid,
                 s.commit,
                 s.retire,
+                s.committed_at - s.commit - s.retire,
                 s.committed_at,
                 s.upload_b,
                 s.argue,
@@ -584,6 +593,15 @@ impl BlockStamps {
             out.push_str(&format!(
                 "BLOCK REST LAYOUT: slowest tables (s) {}\n",
                 slowest.join(" · ")
+            ));
+            let tables: Vec<String> = l
+                .rest_tables
+                .iter()
+                .map(|(name, at, group)| format!("{name}@{at:.2}·g{group}"))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK REST TABLES (laid out at · group): {}\n",
+                tables.join(" ")
             ));
         }
         out.push_str(&format!(
@@ -2219,6 +2237,9 @@ struct RestLaid<'a> {
     /// The five slowest tables to lay out and the first in AIR order, seconds.
     slowest: Vec<(String, f64)>,
     busy: f64,
+    /// Each table's AIR index and when its layout ended (seconds since the
+    /// prove started), in AIR order.
+    laid_at: Vec<(usize, f64)>,
 }
 
 /// `prepared_now`: derive the prepared columns here, before the tables are
@@ -2287,8 +2308,9 @@ fn lay_out_rest<'a>(
         .enumerate()
         .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
         .collect();
-    // Each table's seconds, for the readout.
+    // Each table's seconds and when its layout ended, for the readout.
     let timed = std::sync::Mutex::new(Vec::with_capacity(built.len()));
+    let laid_at = std::sync::Mutex::new(Vec::with_capacity(built.len()));
     let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
         let t = Instant::now();
         let shape = (
@@ -2297,6 +2319,9 @@ fn lay_out_rest<'a>(
         );
         let rows = ledger.map_or(0, |_| memlog::rows_bytes(trace));
         let laid = table_of(air, trace, shape, true).map(|table| (i, shape, table));
+        if let Ok(mut laid_at) = laid_at.lock() {
+            laid_at.push((i, start.elapsed().as_secs_f64()));
+        }
         if let (Some(ledger), Ok((_, _, table))) = (ledger, &laid) {
             use std::sync::atomic::Ordering::Relaxed;
             ledger.rest.fetch_sub(rows, Relaxed);
@@ -2397,6 +2422,11 @@ fn lay_out_rest<'a>(
         marks,
         slowest,
         busy: t.elapsed().as_secs_f64(),
+        laid_at: {
+            let mut laid_at = laid_at.into_inner().unwrap_or_default();
+            laid_at.sort_unstable_by_key(|&(i, _)| i);
+            laid_at
+        },
     })
 }
 
@@ -2722,6 +2752,7 @@ fn prove_streamed(
                     marks: rest_marks,
                     slowest,
                     busy: rest_busy,
+                    laid_at,
                 } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
@@ -2798,6 +2829,16 @@ fn prove_streamed(
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let busy = chunks + rest_busy + t.elapsed().as_secs_f64();
+                let group_of = |table: usize| {
+                    groups
+                        .iter()
+                        .position(|g| g.contains(&(table as u32)))
+                        .unwrap_or(usize::MAX)
+                };
+                let rest_tables = laid_at
+                    .iter()
+                    .map(|&(i, at)| (refs[i].name().to_string(), at, group_of(i)))
+                    .collect();
                 Ok(Laid {
                     table_counts,
                     runtime_page_ranges,
@@ -2815,6 +2856,7 @@ fn prove_streamed(
                         chunks,
                         slowest,
                         ahead_most,
+                        rest_tables,
                     },
                 })
             });

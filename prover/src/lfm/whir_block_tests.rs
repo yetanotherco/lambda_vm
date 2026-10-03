@@ -1354,7 +1354,6 @@ fn the_whir_block_tree_on_a_real_block() {
     if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
         options.layout_workers = n;
     }
-    // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
     // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
     // `none` lifts the bound (the reverted version, BIG 390).
     match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
@@ -1369,8 +1368,17 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         Err(_) => {}
     }
-    options.pack_rest_as_laid_out =
-        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 1): the rest packed as it is laid
+    // out.
+    match std::env::var("BLOCK_WHIR_PACK_REST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_rest_as_laid_out = false,
+        Ok("1") => options.pack_rest_as_laid_out = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
+        Err(_) => {}
+    }
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
     match std::env::var("BLOCK_WHIR_DROP_OPS")
