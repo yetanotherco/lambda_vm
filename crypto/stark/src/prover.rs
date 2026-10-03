@@ -1242,11 +1242,18 @@ impl VramGate {
         }
     }
 
-    /// One `SGATE` line: the bytes admitted now.
+    /// One `SGATE` line: the bytes admitted now, and the device pool's live
+    /// bytes (allocated and not yet freed) to read them against.
     fn trace_used(&self, used: u64) {
         if self.trace {
+            #[cfg(feature = "cuda")]
+            let pool = math_cuda::device::pool_used_bytes()
+                .map(|(now, _)| format!(" pool={:.3}GiB", now as f64 / (1u64 << 30) as f64))
+                .unwrap_or_default();
+            #[cfg(not(feature = "cuda"))]
+            let pool = String::new();
             eprintln!(
-                "SGATE t={:.3} used={:.3}GiB",
+                "SGATE t={:.3} used={:.3}GiB{pool}",
                 crate::prove_split::epoch_secs(),
                 used as f64 / (1u64 << 30) as f64
             );
@@ -2115,8 +2122,8 @@ fn shared_gate_trace() -> bool {
 /// this gate. Phase A's committers keep their own card gate: the gate is armed
 /// only between sibling levels, never in phase A. The device's memory pool
 /// releases at each sync under the knob (`math_cuda::device::
-/// mempool_release_threshold_bytes`), so what an earlier phase freed is not
-/// left reserved outside the gate's account (FAST 473). A `Retain` prove's
+/// armed_release_threshold_bytes`) while armed, so what an earlier phase freed
+/// is not left reserved outside the gate's account (FAST 473). A `Retain` prove's
 /// main LDEs stay on the card from Round 1 to their fused tasks; under this
 /// gate they stay in its account too ([`CarriedBytes`]), behind a claim per
 /// prove that keeps them from wedging it ([`ResidentClaim`]).
@@ -2147,15 +2154,20 @@ static SHARED_VRAM_GATE_ARMED: std::sync::atomic::AtomicBool =
 /// the configured budget ([`calibrated_budget`]). What the gate cannot see
 /// (device caches, compiled modules, frees not yet released, each prove's
 /// bytes beyond its tables' estimates) is then outside the budget rather than
-/// on top of it. Returns the budget, or `None` with the knob off.
+/// on top of it. While armed, the device pool releases freed blocks at each
+/// sync; disarming restores the posture the pool was created with
+/// (`math_cuda::device::armed_release_threshold_bytes`). Returns the budget,
+/// or `None` with the knob off.
 pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
     if !shared_vram_gate_knob() {
         return None;
     }
     if !on {
         SHARED_VRAM_GATE_ARMED.store(false, Ordering::SeqCst);
+        pool_releases_while_armed(false);
         return None;
     }
+    let releasing = pool_releases_while_armed(true);
     let configured = device_vram_budget();
     let gate = shared_vram_gate(configured);
     let budget = {
@@ -2167,7 +2179,7 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
             let b = calibrated_budget(configured, free, margin_bytes);
             gate.budget.store(b, Ordering::Relaxed);
             eprintln!(
-                "[prover] shared VRAM gate armed: budget {:.2} GiB (card free {} after a pool trim, margin {:.2} GiB, configured {:.2} GiB)",
+                "[prover] shared VRAM gate armed: budget {:.2} GiB (card free {} after a pool trim, margin {:.2} GiB, configured {:.2} GiB){}",
                 b as f64 / (1u64 << 30) as f64,
                 free.map_or("unknown".to_string(), |f| format!(
                     "{:.2} GiB",
@@ -2175,14 +2187,112 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
                 )),
                 margin_bytes as f64 / (1u64 << 30) as f64,
                 configured as f64 / (1u64 << 30) as f64,
+                if releasing {
+                    "; the pool releases at each sync while armed"
+                } else {
+                    ""
+                },
             );
             b
         } else {
             gate.budget.load(Ordering::Relaxed)
         }
     };
+    if shared_gate_readout() {
+        arming_readout(budget, margin_bytes, configured);
+    }
     SHARED_VRAM_GATE_ARMED.store(true, Ordering::SeqCst);
     Some(budget)
+}
+
+/// Lower the device pool's release threshold for the armed stretch, or put
+/// the pool's own back. Whether the armed threshold is in place.
+fn pool_releases_while_armed(on: bool) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        let Some(armed) = math_cuda::device::armed_release_threshold_bytes() else {
+            return false;
+        };
+        let Ok(b) = math_cuda::device::backend() else {
+            return false;
+        };
+        let threshold = if on {
+            armed
+        } else {
+            math_cuda::device::mempool_release_threshold_bytes()
+        };
+        b.set_mempool_release_threshold(threshold) && on
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = on;
+        false
+    }
+}
+
+/// `LAMBDA_VM_SHARED_GATE_READOUT=1`: at each arming, after the calibration,
+/// one line splitting the card's used memory: before and after the pool trim,
+/// after draining every stream and trimming again (frees still queued at the
+/// arming), the pool's live and reserved bytes, what sits outside the pool,
+/// and the budget a drained context would give. It waits for the device, so it
+/// is a readout for a run off the clock. Off by default.
+fn shared_gate_readout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LAMBDA_VM_SHARED_GATE_READOUT").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// The line [`shared_gate_readout`] describes.
+fn arming_readout(budget: u64, margin_bytes: u64, configured: u64) {
+    #[cfg(feature = "cuda")]
+    {
+        let Ok(b) = math_cuda::device::backend() else {
+            return;
+        };
+        let gib = |v: u64| format!("{:.2}", v as f64 / (1u64 << 30) as f64);
+        let used = || {
+            b.device_mem_info()
+                .map(|(free, total)| total.saturating_sub(free))
+        };
+        let pool = || {
+            (
+                math_cuda::device::pool_used_bytes()
+                    .map(|(now, _)| now)
+                    .ok(),
+                math_cuda::device::pool_reserved_bytes().ok(),
+            )
+        };
+        let show = |v: Option<u64>| v.map_or("?".to_string(), gib);
+        let trimmed = used();
+        let (live, reserved) = pool();
+        b.synchronize();
+        b.trim_mempool_to(0);
+        let drained = used();
+        let (live_d, reserved_d) = pool();
+        let free_d = b.device_mem_info().map(|(free, _)| free);
+        eprintln!(
+            "[prover] shared VRAM gate readout: card used {} GiB at the arming's trim (pool live {}, reserved {}) → {} after \
+             draining and trimming (pool live {}, reserved {}, outside the pool {}); a drained budget {} GiB against this \
+             arming's {}",
+            show(trimmed),
+            show(live),
+            show(reserved),
+            show(drained),
+            show(live_d),
+            show(reserved_d),
+            match (drained, reserved_d) {
+                (Some(u), Some(r)) => gib(u.saturating_sub(r)),
+                _ => "?".to_string(),
+            },
+            gib(calibrated_budget(configured, free_d, margin_bytes)),
+            gib(budget),
+        );
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (budget, margin_bytes, configured);
+    }
 }
 
 /// The shared gate's budget: the card's `free` bytes less `margin`, never above

@@ -422,66 +422,73 @@ pub const MEMPOOL_RELEASE_ENV: &str = "LAMBDA_VM_MEMPOOL_RELEASE_MB";
 /// so `total - free` reads the live set rather than the pool.
 pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
 
-/// The environment knob of the prover's shared VRAM gate
-/// (`stark::prover::shared_vram_gate_on`), read here for the pool's posture.
-pub const SHARED_VRAM_GATE_ENV: &str = "LAMBDA_VM_SHARED_VRAM_GATE";
+/// The effective release threshold in bytes the pool is created with: the
+/// knob when set and parseable, else the default. Read once per process; the
+/// prover's diagnostics print it so every box log states the posture its run
+/// had. The prover's shared VRAM gate lowers it while armed
+/// ([`armed_release_threshold_bytes`]) and puts this back on disarming.
+pub fn mempool_release_threshold_bytes() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        release_threshold_setting(std::env::var(MEMPOOL_RELEASE_ENV).ok().as_deref())
+    })
+}
 
-/// The effective release threshold in bytes: the knob when set and parseable;
-/// else `0` under the shared VRAM gate ([`SHARED_VRAM_GATE_ENV`]); else the
-/// default. Read once per process; the prover's diagnostics print it so every
-/// box log states the posture its run had.
+/// [`mempool_release_threshold_bytes`] for a raw knob value.
+fn release_threshold_setting(knob: Option<&str>) -> u64 {
+    match knob.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(mb) => mb.saturating_mul(1024 * 1024),
+        None => DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES,
+    }
+}
+
+/// The release threshold while the prover's shared VRAM gate is armed: `0`,
+/// unless the knob ([`MEMPOOL_RELEASE_ENV`]) set one, which then holds
+/// throughout (`None`: leave the pool as created).
 ///
 /// Under the shared gate several proofs allocate at once, and the gate counts
 /// only their live bytes. A pool that retains freed blocks keeps what an
 /// earlier phase freed reserved and invisible to the gate, and requests the
 /// retained blocks cannot serve then exhaust the card (FAST 473: 31.36 GiB on
 /// a 23.44 GiB gate, the base's freed blocks still reserved). Releasing at
-/// each sync keeps the reservation at the live set.
-pub fn mempool_release_threshold_bytes() -> u64 {
-    static CACHED: OnceLock<u64> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let shared = std::env::var(SHARED_VRAM_GATE_ENV).is_ok_and(|v| v.trim() == "1");
-        release_threshold_setting(std::env::var(MEMPOOL_RELEASE_ENV).ok().as_deref(), shared)
-    })
+/// each sync keeps the reservation at the live set. Only while armed: the base
+/// runs before any arming and keeps the retained pool its allocations reuse
+/// (release 0 for the whole process cost the 1× base +0.22 s, FAST 477/478).
+pub fn armed_release_threshold_bytes() -> Option<u64> {
+    armed_release_threshold(std::env::var(MEMPOOL_RELEASE_ENV).ok().as_deref())
 }
 
-/// [`mempool_release_threshold_bytes`] for a raw knob value and the shared
-/// gate's state.
-fn release_threshold_setting(knob: Option<&str>, shared_gate: bool) -> u64 {
+/// [`armed_release_threshold_bytes`] for a raw knob value.
+fn armed_release_threshold(knob: Option<&str>) -> Option<u64> {
     match knob.and_then(|s| s.trim().parse::<u64>().ok()) {
-        Some(mb) => mb.saturating_mul(1024 * 1024),
-        None if shared_gate => 0,
-        None => DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES,
+        Some(_) => None,
+        None => Some(0),
     }
 }
 
 #[cfg(test)]
 mod release_threshold_tests {
-    use super::{DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES, release_threshold_setting};
+    use super::{
+        DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES, armed_release_threshold, release_threshold_setting,
+    };
 
-    /// The knob decides when set; unset, the shared gate releases at each
-    /// sync and everything else retains.
+    /// The knob decides when set; unset, the pool retains, and the shared
+    /// gate releases at each sync only while armed.
     #[test]
-    fn the_shared_gate_releases_unless_the_knob_says_otherwise() {
+    fn the_pool_retains_unless_armed_or_the_knob_says_otherwise() {
         assert_eq!(
-            release_threshold_setting(None, false),
+            release_threshold_setting(None),
             DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
         );
+        assert_eq!(release_threshold_setting(Some("512")), 512 << 20);
+        assert_eq!(release_threshold_setting(Some("0")), 0);
         assert_eq!(
-            release_threshold_setting(None, true),
-            0,
-            "the shared gate releases"
-        );
-        assert_eq!(
-            release_threshold_setting(Some("512"), true),
-            512 << 20,
-            "the knob wins"
-        );
-        assert_eq!(release_threshold_setting(Some("0"), false), 0);
-        assert_eq!(
-            release_threshold_setting(Some("x"), false),
+            release_threshold_setting(Some("x")),
             DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
         );
+        assert_eq!(armed_release_threshold(None), Some(0), "armed: release");
+        assert_eq!(armed_release_threshold(Some("512")), None, "the knob holds");
+        assert_eq!(armed_release_threshold(Some("x")), Some(0));
     }
 }
 
@@ -687,6 +694,29 @@ pub fn pool_used_bytes() -> Result<(u64, u64)> {
         read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
         read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
     ))
+}
+
+/// Bytes the default memory pool holds from the device right now, in use or
+/// not (`CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT`): what the card counts against
+/// this process for the pool. The card's used memory less this is what the
+/// process holds outside the pool (context, modules, synchronous allocations).
+pub fn pool_reserved_bytes() -> Result<u64> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let mut value = 0u64;
+    // SAFETY: as in `pool_used_bytes`.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut value as *mut u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(value)
 }
 
 /// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
@@ -1284,6 +1314,31 @@ impl Backend {
                     .is_ok()
             })
         }
+    }
+
+    /// Set the default memory pool's release threshold (bytes a sync keeps
+    /// reserved). Best effort: `false` when the pool cannot be set.
+    pub fn set_mempool_release_threshold(&self, bytes: u64) -> bool {
+        use cudarc::driver::sys;
+        // SAFETY: raw driver call on this backend's live context; the
+        // threshold is read as a u64.
+        unsafe {
+            default_mempool(&self.ctx).is_some_and(|pool| {
+                sys::cuMemPoolSetAttribute(
+                    pool,
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &bytes as *const u64 as *mut core::ffi::c_void,
+                )
+                .result()
+                .is_ok()
+            })
+        }
+    }
+
+    /// Block until every stream of this context is idle, so frees queued on
+    /// them have reached the pool. `false` on a driver error.
+    pub fn synchronize(&self) -> bool {
+        self.ctx.synchronize().is_ok()
     }
 
     /// Bytes the device reports free, right now.
