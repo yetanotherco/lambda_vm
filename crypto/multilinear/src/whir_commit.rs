@@ -64,6 +64,17 @@ static TOP_LEAVES_REHASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static TOP_GATHER_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TOP_REHASH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `BLOCK_WHIR_REHASH_SERIAL=1`: the kept-top paths re-hash their blocks one
+/// at a time, as before they were re-hashed in parallel. A measurement knob
+/// (the same bytes either way); read once.
+#[cfg(feature = "parallel")]
+fn rehash_serial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLOCK_WHIR_REHASH_SERIAL").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// `(seconds gathering, seconds re-hashing)` of the kept-top paths so far.
 pub fn top_path_secs() -> (f64, f64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -525,8 +536,11 @@ where
             Ok(subtree)
         };
         #[cfg(feature = "parallel")]
-        let rehashed: Vec<Result<Tree<F, H>, Error>> =
-            (0..blocks.len()).into_par_iter().map(rehash).collect();
+        let rehashed: Vec<Result<Tree<F, H>, Error>> = if rehash_serial() {
+            (0..blocks.len()).map(rehash).collect()
+        } else {
+            (0..blocks.len()).into_par_iter().map(rehash).collect()
+        };
         #[cfg(not(feature = "parallel"))]
         let rehashed: Vec<Result<Tree<F, H>, Error>> = (0..blocks.len()).map(rehash).collect();
         let subtrees = rehashed.into_iter().collect::<Result<Vec<_>, _>>()?;
