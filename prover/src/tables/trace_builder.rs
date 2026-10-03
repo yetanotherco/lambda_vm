@@ -4675,6 +4675,77 @@ pub(crate) mod build_stamps {
     }
 }
 
+/// `LAMBDA_VM_P4_SPLIT=1`: the table phase's BITWISE stage times each of its
+/// units, buckets and the final merge, and prints them (`BLOCK P4 SPLIT`). A
+/// readout: the histogram, and so every table, is the same.
+#[cfg(feature = "parallel")]
+fn p4_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_P4_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The BITWISE stage's buckets counted as the default path counts them (one
+/// histogram a bucket, on the pool), each unit timed, then merged into `base`
+/// one after another, timed apart; prints one `BLOCK P4 SPLIT` line.
+#[cfg(feature = "parallel")]
+fn p4_split_count(
+    buckets: &[Vec<Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + '_>>],
+    names: &[Vec<String>],
+    base: &mut bitwise::BitwiseHistogram,
+) {
+    use rayon::prelude::*;
+    let unix = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
+    let started = unix();
+    let t = std::time::Instant::now();
+    let counted: Vec<(bitwise::BitwiseHistogram, f64, Vec<f64>)> = buckets
+        .par_iter()
+        .map(|bucket| {
+            let whole = std::time::Instant::now();
+            let mut h = bitwise::BitwiseHistogram::new();
+            let mut times = Vec::with_capacity(bucket.len());
+            for f in bucket {
+                let one = std::time::Instant::now();
+                f(&mut h);
+                times.push(one.elapsed().as_secs_f64());
+            }
+            (h, whole.elapsed().as_secs_f64(), times)
+        })
+        .collect();
+    let mapped = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    for (h, _, _) in &counted {
+        base.merge(h);
+    }
+    let merged = t.elapsed().as_secs_f64();
+    let ended = unix();
+    let mut units: Vec<(String, f64)> = counted
+        .iter()
+        .zip(names)
+        .flat_map(|((_, _, times), names)| names.iter().cloned().zip(times.iter().copied()))
+        .collect();
+    units.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let buckets: Vec<String> = counted
+        .iter()
+        .zip(names)
+        .map(|((_, secs, _), names)| format!("{secs:.3}/{}", names.len()))
+        .collect();
+    let units: Vec<String> = units
+        .iter()
+        .map(|(name, secs)| format!("{name} {secs:.3}"))
+        .collect();
+    eprintln!(
+        "BLOCK P4 SPLIT: cap {} · pool {} · count {mapped:.3} · merge {merged:.3} · at unix {started:.3}..{ended:.3} · buckets (s/units) [{}] · units [{}]",
+        counted.len(),
+        rayon::current_num_threads(),
+        buckets.join(", "),
+        units.join(" · ")
+    );
+}
+
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
 /// `initial_image` controls PAGE table generation: `Some(image)` generates real
@@ -4838,13 +4909,34 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
+    // The collectors' names, in order, for the split readout (`LAMBDA_VM_P4_SPLIT`).
+    let mut names: Vec<&'static str> = vec![
+        "lt",
+        "mul",
+        "dvrm",
+        "branch",
+        "shift",
+        "bytewise",
+        "eq",
+        "store",
+        "memw_aligned",
+        "commit",
+        "keccak",
+        "blake3",
+        "ecsm",
+        "ecdas",
+        "hint",
+        "padding",
+    ];
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
         collectors.push(Box::new(move |h| {
             collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
         }));
+        names.push("page");
     }
+    debug_assert_eq!(names.len(), collectors.len());
 
     let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
     let (mut base, counted_iw, counted_reg) = match pre {
@@ -4866,24 +4958,33 @@ fn build_traces<I: ImageSource + Sync>(
         // add_ops/bump/merge form a commutative monoid, so any partition yields
         // byte-identical multiplicities (same as the serial fallback below).
         let cap = rayon::current_num_threads().clamp(1, 8);
+        let split = p4_split();
+        let mut unit_names: Vec<String> = Vec::new();
         let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
         let iw_chunk = uncounted_iw.len().div_ceil(cap).max(1);
-        for slice in uncounted_iw.chunks(iw_chunk) {
+        for (k, slice) in uncounted_iw.chunks(iw_chunk).enumerate() {
             units.push(Box::new(move |h| h.add_ops(slice)));
+            unit_names.push(format!("in_walk[{k}]"));
         }
         let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
-        for slice in uncounted_reg.chunks(reg_chunk) {
+        for (k, slice) in uncounted_reg.chunks(reg_chunk).enumerate() {
             units.push(Box::new(move |h| {
                 memw_register::collect_bitwise_from_memw_register(slice, h)
             }));
+            unit_names.push(format!("memw_register[{k}]"));
         }
         units.extend(collectors);
+        unit_names.extend(names.iter().map(|n| n.to_string()));
 
         let mut buckets: Vec<Vec<Collector>> = (0..cap).map(|_| Vec::new()).collect();
-        for (i, unit) in units.into_iter().enumerate() {
+        let mut bucket_names: Vec<Vec<String>> = (0..cap).map(|_| Vec::new()).collect();
+        for (i, (unit, name)) in units.into_iter().zip(unit_names).enumerate() {
             buckets[i % cap].push(unit);
+            bucket_names[i % cap].push(name);
         }
-        if let Some(reduced) = buckets
+        if split {
+            p4_split_count(&buckets, &bucket_names, &mut base);
+        } else if let Some(reduced) = buckets
             .par_iter()
             .map(|bucket| {
                 let mut h = bitwise::BitwiseHistogram::new();
