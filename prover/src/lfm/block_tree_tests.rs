@@ -4152,8 +4152,8 @@ fn the_streaming_derivation_derives_the_kept_trees_top() {
 /// under a fixed budget of half the open peak, never under the largest set.
 /// The gated derivation's running total stays within its budget and waits,
 /// and its top is the open one's; each derivation's pool high-water is
-/// printed. Then the mutation: a permit held across a build's forks is
-/// refused at the first fork.
+/// printed. Then the mutation: a permit held across each build's forks is
+/// counted there, and the tree still derives.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "box tier: --features cuda, three derivations of a six-leaf tree"]
@@ -4196,30 +4196,31 @@ fn the_derive_gate_bounds_the_derivation_on_the_card() {
     assert_eq!(gated.dispatches, open.dispatches);
     assert_eq!(gated_top, open_top, "the gate is scheduling only");
 
-    // ⛔ The mutation: each build holds a permit across its walk's forks.
+    assert_eq!((gated.reentries, gated.forks_held), (0, 0), "{gated}");
+
+    // ⛔ The mutation: each build holds a permit across its walk's forks. Every
+    // fork is counted, and a job stolen there that asks again passes through:
+    // the tree still derives, to the same top.
     pin_setting(Some(Setting::Fixed(u64::MAX)));
     let armed = super::derive_gate::arm().expect("the gate arms");
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plan.derive_tree(&wrap_opts, &|p| {
+    let (tree, _) = plan
+        .derive_tree(&wrap_opts, &|p| {
             let _held = super::derive_gate::admit(0).expect("armed");
             super::block_plan::artifacts_of(p, &wrap_opts)
         })
-    }));
+        .expect("the tree derives under the mutation");
     drop(armed);
     pin_setting(None);
-    let msg = match refused {
-        Ok(_) => panic!("a permit held across a build's forks went unnoticed"),
-        Err(e) => e
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default(),
-    };
-    // A job stolen at an earlier fork that asks again is the same hazard,
-    // refused at the gate.
+    let held = take_summary().expect("the mutation armed the gate");
+    println!("DERIVE GATE mutation (a permit around each build): {held}");
     assert!(
-        msg.contains("held across a rayon fork") || msg.contains("already holds a derive permit"),
-        "refused for: {msg}"
+        held.forks_held > 0,
+        "no fork under a held permit was counted: {held}"
+    );
+    assert_eq!(
+        tree.last().expect("a top level")[0].1.program_id,
+        open_top,
+        "the mutation changes scheduling only"
     );
 }
 

@@ -17,12 +17,15 @@
 //! around its device dispatch, which forks nothing. A holder that waited inside
 //! rayon — a `join` whose other half was stolen, a parallel iterator — would
 //! run the pool's queued jobs on its own thread meanwhile, and one of them that
-//! asks this gate again parks the thread with the bytes it holds (the count
-//! gate's hazard, and #1014's W3 hang on BIG 569). Every fork of a build
-//! asserts it ([`assert_none_held`], at `registry::map_maybe_parallel`), and
-//! so does [`ByteGate::admit`]. A waiter is a rayon worker parked on a condvar:
-//! it steals nothing, and the holders it waits for need no rayon work to
-//! finish.
+//! asks this gate again would park the thread with the bytes it holds (the
+//! count gate's hazard, and #1014's W3 hang on BIG 569). That state is made
+//! unreachable rather than fatal: a thread that holds a permit and asks again
+//! passes straight through without taking more bytes ([`ByteGate::admit`]: at
+//! worst it over-admits, never deadlocks), and every fork of a build counts a
+//! permit held across it ([`note_fork`], at `registry::map_maybe_parallel`).
+//! Both counts are in the gate's [`Summary`], and the tests read them. A
+//! waiter is a rayon worker parked on a condvar: it steals nothing, and the
+//! holders it waits for need no rayon work to finish.
 //!
 //! `LAMBDA_VM_BLOCK_DERIVE_GATE`: unset or `auto` (the default) calibrates the
 //! budget at the arming, `off` keeps no total (each commit checked alone, as
@@ -34,7 +37,7 @@
 // and the fork's assert reach it.
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -94,21 +97,20 @@ pub(crate) fn pin_setting(s: Option<Setting>) {
 }
 
 thread_local! {
-    /// [`BytePermit`]s held by this thread.
-    static HELD: Cell<usize> = const { Cell::new(0) };
+    /// The gate whose permit this thread holds, and how many permits of it
+    /// (re-entries included).
+    static HELD: RefCell<Option<(Arc<ByteGate>, usize)>> = const { RefCell::new(None) };
 }
 
-/// Panic if this thread holds a derive permit at `site`, a rayon fork: a job
-/// the thread runs while it waits there could ask the gate again and park the
-/// thread with the bytes it holds.
-pub(crate) fn assert_none_held(site: &str) {
-    assert_eq!(
-        HELD.with(Cell::get),
-        0,
-        "a derive permit is held across a rayon fork ({site}): a job this thread runs while it \
-         waits there can ask the gate again and park it; take the permit around the device \
-         dispatch alone"
-    );
+/// A rayon fork of a build: counted on the gate whose permit this thread
+/// holds, if any — a job the thread runs while it waits there could ask the
+/// gate again ([`ByteGate::admit`] lets it through).
+pub(crate) fn note_fork() {
+    HELD.with(|h| {
+        if let Some((gate, _)) = h.borrow().as_ref() {
+            gate.forks_held.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Whether a set of `bytes` enters beside `used` held under `budget`: alone,
@@ -126,12 +128,18 @@ pub(crate) struct ByteGate {
     dispatches: AtomicUsize,
     waits: AtomicUsize,
     waited_nanos: AtomicU64,
+    /// Admissions by a thread that already held a permit, let through.
+    reentries: AtomicUsize,
+    /// Rayon forks of a build made while holding a permit ([`note_fork`]).
+    forks_held: AtomicUsize,
 }
 
 /// Bytes of a [`ByteGate`], given back on drop.
 pub(crate) struct BytePermit {
     gate: Arc<ByteGate>,
     bytes: u64,
+    /// Taken by a thread that already held a permit: no bytes of its own.
+    reentry: bool,
 }
 
 impl ByteGate {
@@ -144,17 +152,30 @@ impl ByteGate {
             dispatches: AtomicUsize::new(0),
             waits: AtomicUsize::new(0),
             waited_nanos: AtomicU64::new(0),
+            reentries: AtomicUsize::new(0),
+            forks_held: AtomicUsize::new(0),
         }
     }
 
-    /// Take `bytes`, waiting until they [`fits`] beside what is held.
+    /// Take `bytes`, waiting until they [`fits`] beside what is held. A
+    /// thread that already holds a permit passes straight through with no
+    /// bytes: waiting would park it with the bytes it holds.
     pub(crate) fn admit(self: &Arc<Self>, bytes: u64) -> BytePermit {
-        assert_eq!(
-            HELD.with(Cell::get),
-            0,
-            "this thread already holds a derive permit; asking again could park it forever \
-             with the bytes it holds"
-        );
+        let reentry = HELD.with(|h| match h.borrow_mut().as_mut() {
+            Some((_, n)) => {
+                *n += 1;
+                true
+            }
+            None => false,
+        });
+        if reentry {
+            self.reentries.fetch_add(1, Ordering::Relaxed);
+            return BytePermit {
+                gate: Arc::clone(self),
+                bytes: 0,
+                reentry: true,
+            };
+        }
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         let mut since = None;
         while !fits(*used, bytes, self.budget) {
@@ -170,10 +191,11 @@ impl ByteGate {
             self.waited_nanos
                 .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        HELD.with(|h| h.set(h.get() + 1));
+        HELD.with(|h| *h.borrow_mut() = Some((Arc::clone(self), 1)));
         BytePermit {
             gate: Arc::clone(self),
             bytes,
+            reentry: false,
         }
     }
 
@@ -189,19 +211,31 @@ impl ByteGate {
             dispatches: self.dispatches.load(Ordering::Relaxed),
             waits: self.waits.load(Ordering::Relaxed),
             waited_secs: self.waited_nanos.load(Ordering::Relaxed) as f64 * 1e-9,
+            reentries: self.reentries.load(Ordering::Relaxed),
+            forks_held: self.forks_held.load(Ordering::Relaxed),
         }
     }
 }
 
 impl Drop for BytePermit {
     fn drop(&mut self) {
-        let mut used = self.gate.used.lock().unwrap_or_else(|e| e.into_inner());
-        *used = used.saturating_sub(self.bytes);
-        drop(used);
-        // All: the waiters ask for different sizes, and the one woken alone
-        // might not fit while another would.
-        self.gate.freed.notify_all();
-        HELD.with(|h| h.set(h.get().saturating_sub(1)));
+        if !self.reentry {
+            let mut used = self.gate.used.lock().unwrap_or_else(|e| e.into_inner());
+            *used = used.saturating_sub(self.bytes);
+            drop(used);
+            // All: the waiters ask for different sizes, and the one woken alone
+            // might not fit while another would.
+            self.gate.freed.notify_all();
+        }
+        HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some((_, n)) = h.as_mut() {
+                *n -= 1;
+                if *n == 0 {
+                    *h = None;
+                }
+            }
+        });
     }
 }
 
@@ -213,18 +247,23 @@ pub(crate) struct Summary {
     pub dispatches: usize,
     pub waits: usize,
     pub waited_secs: f64,
+    pub reentries: usize,
+    pub forks_held: usize,
 }
 
 impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "peak {:.2} GiB of a {:.2} GiB budget · {} device sets · {} waited (Σ {:.2}s)",
+            "peak {:.2} GiB of a {:.2} GiB budget · {} device sets · {} waited (Σ {:.2}s) · {} \
+             re-entries · {} forks under a permit",
             self.peak as f64 / GIB,
             self.budget as f64 / GIB,
             self.dispatches,
             self.waits,
-            self.waited_secs
+            self.waited_secs,
+            self.reentries,
+            self.forks_held
         )
     }
 }
@@ -305,7 +344,7 @@ impl Drop for DeriveGate {
 }
 
 /// Take `bytes` of the armed gate for one device dispatch; `None` while it is
-/// not armed. Hold the permit around the dispatch alone ([`assert_none_held`]).
+/// not armed. Hold the permit around the dispatch alone ([`note_fork`]).
 pub(crate) fn admit(bytes: u64) -> Option<BytePermit> {
     let gate = ARMED
         .lock()
@@ -353,15 +392,34 @@ mod tests {
         assert!(fits(u64::MAX - 1, 10, u64::MAX));
     }
 
+    /// A thread that holds a permit and asks again passes straight through,
+    /// with no bytes of its own, and the gate counts it.
     #[test]
-    fn a_thread_asking_twice_is_refused() {
+    fn a_thread_asking_twice_passes_through() {
         let gate = Arc::new(ByteGate::new(10));
         let held = gate.admit(1);
-        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.admit(1)));
-        assert!(again.is_err(), "a second permit on one thread is refused");
+        let again = gate.admit(1);
+        assert_eq!(
+            *gate.used.lock().unwrap(),
+            1,
+            "the second permit took no bytes"
+        );
+        drop(again);
+        assert_eq!(
+            *gate.used.lock().unwrap(),
+            1,
+            "the first still holds its byte"
+        );
         drop(held);
+        assert_eq!(*gate.used.lock().unwrap(), 0);
+        assert_eq!(gate.summary().reentries, 1);
         drop(gate.admit(1));
-        assert_eq!(HELD.with(Cell::get), 0);
+        assert_eq!(
+            gate.summary().reentries,
+            1,
+            "once released, a permit is a first one"
+        );
+        assert!(HELD.with(|h| h.borrow().is_none()));
     }
 
     /// One synthetic leaf's device sets, in `BuildPlan::walk`'s order: eleven
@@ -459,55 +517,42 @@ mod tests {
         assert!(s.peak > largest, "one set at a time: {s}");
         assert_eq!(s.dispatches, leaves.len() * 22);
         assert!(s.waits > 0, "nothing waited: {s}");
+        assert_eq!(
+            (s.reentries, s.forks_held),
+            (0, 0),
+            "held only around dispatches: {s}"
+        );
     }
 
-    /// The build's fork refuses a thread that holds a permit, before it forks.
+    /// The build's fork counts a permit its thread holds, on that permit's
+    /// gate, and nothing when it holds none.
     #[cfg(feature = "parallel")]
     #[test]
-    fn the_builds_fork_refuses_a_held_permit() {
+    fn the_builds_fork_counts_a_held_permit() {
         let gate = Arc::new(ByteGate::new(10));
         let fork = |held: bool| {
             let _p = held.then(|| gate.admit(1));
-            std::panic::catch_unwind(|| {
-                super::super::registry::map_maybe_parallel(&[1, 2, 3], |x| x + 1)
-            })
+            super::super::registry::map_maybe_parallel(&[1, 2, 3], |x| x + 1)
         };
-        assert_eq!(fork(false).ok(), Some(vec![2, 3, 4]));
-        let refused = fork(true).expect_err("a fork under a held permit is refused");
-        let msg = refused
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            msg.contains("held across a rayon fork"),
-            "refused for: {msg}"
-        );
+        assert_eq!(fork(false), vec![2, 3, 4]);
+        assert_eq!(gate.summary().forks_held, 0);
+        assert_eq!(fork(true), vec![2, 3, 4]);
+        assert_eq!(gate.summary().forks_held, 1);
     }
 
     /// ⛔ The mutation: a permit held across the walk's forks (the count gate's
-    /// placement) is refused, at the fork's assert or, when the holder ran a
-    /// stolen job that asked again first, at the gate's.
+    /// placement) is counted at every fork, and a job stolen there that asks
+    /// again passes through rather than parking the thread: the derivation
+    /// finishes.
     #[cfg(feature = "parallel")]
     #[test]
-    fn a_permit_held_across_a_rayon_fork_is_refused() {
+    fn a_permit_held_across_a_rayon_fork_is_counted() {
         let leaves = leaves();
         let gate = Arc::new(ByteGate::new(u64::MAX));
-        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool().install(|| derive(&gate, &leaves, Hold::Walk))
-        }));
-        let msg = match refused {
-            Ok(()) => panic!("a permit held across the walk's forks went unnoticed"),
-            Err(e) => e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default(),
-        };
-        assert!(
-            msg.contains("held across a rayon fork")
-                || msg.contains("already holds a derive permit"),
-            "refused for: {msg}"
-        );
+        pool().install(|| derive(&gate, &leaves, Hold::Walk));
+        let s = gate.summary();
+        // Each leaf's walk forks three row-pair windows and its one-row list.
+        assert_eq!(s.forks_held, leaves.len() * 4, "{s}");
         assert_eq!(*gate.used.lock().unwrap(), 0, "every permit was given back");
     }
 }

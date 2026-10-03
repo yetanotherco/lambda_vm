@@ -384,8 +384,8 @@ pub fn groups_in_flight() -> usize {
 /// roots land where the serial walk put them. A `for_each` writing through a
 /// shared handle would not have that property for free.
 ///
-/// ⛔ A fork: its thread must hold no derive permit here
-/// ([`super::derive_gate::assert_none_held`]).
+/// ⛔ A fork: its thread must hold no derive permit here; one held is counted
+/// on its gate ([`super::derive_gate::note_fork`]).
 pub(super) fn map_maybe_parallel<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R>
 where
     T: Sync,
@@ -394,7 +394,7 @@ where
     #[cfg(feature = "parallel")]
     if super::commit::parallel_build() {
         use rayon::prelude::*;
-        super::derive_gate::assert_none_held("an artifact build's walk");
+        super::derive_gate::note_fork();
         return items.par_iter().map(f).collect();
     }
     items.iter().map(f).collect()
