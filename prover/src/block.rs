@@ -312,6 +312,8 @@ fn prove_block_with_observed(
             ledger.line(&format!("finish {label}"))
         })));
     }
+    // A new block: no memory pressure seen yet (`alloc_purge`'s `auto`).
+    crate::alloc_purge::clear_memory_pressure();
     // The spill outlives the prove: phase B reads the spilled traces back.
     let spill = stream_phase_a()
         .then(|| Spill::open(spill_policy()))
@@ -339,8 +341,9 @@ fn prove_block_with_observed(
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
-    // `LAMBDA_VM_ALLOC_PURGE=phase-a`: phase A's freed pages (the finish's
-    // lists, spilled traces) back to the OS before phase B allocates.
+    // Phase A's freed pages (the finish's lists, spilled traces) back to the OS
+    // before phase B allocates: under memory pressure by default, or as
+    // `LAMBDA_VM_ALLOC_PURGE` names it.
     crate::alloc_purge::purge_point("phase-a");
 
     let proof = prove_block_traces(
@@ -1154,6 +1157,9 @@ impl Arming for Spill {
         });
         if plausible {
             *armed_at = Some(self.opened.elapsed().as_secs_f64());
+            // Memory is short: `auto` returns the allocator's freed pages at
+            // phase A's end and the base's end (`alloc_purge`).
+            crate::alloc_purge::note_memory_pressure();
         }
         plausible
     }
