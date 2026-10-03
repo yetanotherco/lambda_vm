@@ -251,6 +251,11 @@ pub struct BlockOptions {
     /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
     /// card, which leaves the proof's bytes as they are.
     pub narrow: multilinear_block::Narrowing,
+    /// Phase A takes the next group and puts its columns on the card while the
+    /// current group commits, when the ledger takes them
+    /// ([`BlockCommitted::commit_groups`]); the commits and the proof's bytes
+    /// are the same. Production: on.
+    pub upload_ahead: bool,
 }
 
 impl BlockOptions {
@@ -272,6 +277,7 @@ impl BlockOptions {
             layout_ahead: Some(2),
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
+            upload_ahead: true,
         }
     }
 }
@@ -286,6 +292,21 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
         Ok("card") => Some(Narrowing::CARD),
         Ok("host") => Some(Narrowing::Host),
         Ok(other) => panic!("BLOCK_WHIR_NARROW={other}: wide, card or host"),
+        Err(_) => None,
+    }
+}
+
+/// `BLOCK_WHIR_UPLOAD_AHEAD=0|1`: the real-block tests' choice of
+/// [`BlockOptions::upload_ahead`]; `None` leaves the production one.
+#[cfg(test)]
+pub(crate) fn upload_ahead_from_env() -> Option<bool> {
+    match std::env::var("BLOCK_WHIR_UPLOAD_AHEAD")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        Ok(other) => panic!("BLOCK_WHIR_UPLOAD_AHEAD={other}: 0 or 1"),
         Err(_) => None,
     }
 }
@@ -434,12 +455,13 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} commit {:.3} retire {:.3} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
                 s.wait_a,
                 s.upload_a,
+                s.upload_paid,
                 s.commit,
                 s.retire,
                 s.committed_at,
@@ -552,6 +574,26 @@ impl BlockStamps {
             multilinear::gpu::gkr_tree_refusals(),
             multilinear::gpu::open_host_fallbacks(),
         ));
+        // Phase A's ledger and its upload: what each group's upload took, what
+        // the committer paid of it, and what the commit promised beside it.
+        let hidden = sum(|g| g.upload_a - g.upload_paid);
+        let uploaded = sum(|g| g.upload_a);
+        let per_group: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| format!("{}/{}", mib(g.commit_base), mib(g.commit_reserved)))
+            .collect();
+        out.push_str(&format!(
+            "BLOCK PHASE-A LEDGER: budget {} MiB · per group base/peak [{}] MiB · upload {:.3}s, paid {:.3}s, hidden {:.3}s ({:.0} %) · stores refused beside a commit {} · commit room refusals {}\n",
+            mib(multilinear::gpu::reserve_budget()),
+            per_group.join(", "),
+            uploaded,
+            sum(|g| g.upload_paid),
+            hidden,
+            if uploaded > 0.0 { 100.0 * hidden / uploaded } else { 0.0 },
+            self.groups.iter().filter(|g| g.ahead_refused).count(),
+            multilinear::gpu::room_commit_refusals(),
+        ));
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
@@ -582,13 +624,14 @@ impl BlockStamps {
             self.host_widens.1 as f64 / 1e9,
         ));
         out.push_str(&format!(
-            "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
+            "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} paid {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
             self.execute,
             self.build,
             self.prep,
             self.phase_a,
             sum(|g| g.wait_a),
             sum(|g| g.upload_a),
+            sum(|g| g.upload_paid),
             sum(|g| g.commit),
             sum(|g| g.retire),
             self.phase_b,
@@ -1489,6 +1532,7 @@ pub(crate) fn prove_traces(
                 &config,
                 options.drop_levels,
                 options.narrow,
+                options.upload_ahead,
             );
             (block, producer.join())
         });
@@ -2480,6 +2524,7 @@ fn prove_streamed(
                 &commit_config,
                 options.drop_levels,
                 options.narrow,
+                options.upload_ahead,
             );
             (block, builder.join(), layout.join(), executor.join())
         });

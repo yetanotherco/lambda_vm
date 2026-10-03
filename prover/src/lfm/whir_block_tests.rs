@@ -92,6 +92,7 @@ fn small_block_cut(
         // Every table packed on a card, so a box run walks the narrow path at a
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+        upload_ahead: true,
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -438,6 +439,7 @@ fn dense_block_with(
             // Every table packed on a card, so a box run walks the narrow path at a
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+            upload_ahead: true,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1379,6 +1381,12 @@ fn the_whir_block_tree_on_a_real_block() {
     // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
     // ECSM split (production 2^18 / 2^17).
     crate::block_whir::chunk_cuts_from_env(&mut options);
+    // `BLOCK_WHIR_UPLOAD_AHEAD=0|1` (production 1): phase A puts each group's
+    // columns on the card beside the previous group's commit.
+    if let Some(ahead) = crate::block_whir::upload_ahead_from_env() {
+        options.upload_ahead = ahead;
+    }
+    println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);

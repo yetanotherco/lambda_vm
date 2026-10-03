@@ -157,6 +157,20 @@ where
         resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
+        Self::commit_signalled(layout, columns, resident, config, &|| {})
+    }
+
+    /// [`Self::commit_mapped`], calling `on_room` once the group's room has
+    /// been asked of the card (promised or not) and before the first commit:
+    /// a caller that uploads beside the commit waits for it, so its upload
+    /// never takes the bytes the commits were about to be promised.
+    pub fn commit_signalled<C: HostColumn<F>>(
+        layout: StackedLayout,
+        columns: &[&C],
+        resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+        config: &ChainConfig,
+        on_room: &dyn Fn(),
+    ) -> Result<Self, Error> {
         if let Some((_, ColumnsAt::Map(map))) = resident
             && map.len() != columns.len()
         {
@@ -225,8 +239,14 @@ where
             None
         } else {
             let turn = if park { Turn::Commit } else { Turn::Both };
-            crate::gpu::reserve_room(room_bytes(&layout, config, resident.is_none(), turn))
+            let room =
+                crate::gpu::reserve_room(room_bytes(&layout, config, resident.is_none(), turn));
+            if room.is_none() && crate::gpu::reserve_budget() > 0 {
+                crate::gpu::note_commit_room_refused();
+            }
+            room
         };
+        on_room();
         let transient = room.is_none();
         // A commit spends most of its wall time waiting on a device — the tree
         // coming back — with the next polynomial's transform not yet launched.

@@ -57,6 +57,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // Every table packed on a card, so a box run walks the narrow path at a
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+        upload_ahead: true,
     }
 }
 
@@ -259,6 +260,103 @@ fn narrow_storage_moves_no_byte_of_the_proof() {
         if crypto::grinding::deterministic() {
             assert_eq!(wide, narrow, "{argue:?}");
         }
+    }
+}
+
+/// ★ Uploading ahead moves no byte of the proof: the same traces proved with
+/// each group's columns put on the card beside the previous group's commit and
+/// put there after it give the same proof — byte for byte when the grind is
+/// deterministic (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once per process, so
+/// run this test alone to see the bytes; otherwise only the verdicts are
+/// compared) — under the per-table and the batched argue. Each group's paid
+/// upload is at most its upload, and without the overlap all of it.
+#[test]
+fn uploading_ahead_moves_no_byte_of_the_proof() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let logs = Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &MaxRowsConfig::small(),
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the traces build");
+    block_whir::split_keccak_rnd(&mut traces, 16);
+    for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
+        let format = BlockFormat {
+            argue,
+            ..many_groups()
+        };
+        let mut proved = |upload_ahead: bool| {
+            let mut o = options(MaxRowsConfig::small(), 16);
+            o.upload_ahead = upload_ahead;
+            let mut stamps = block_whir::BlockStamps::default();
+            let proof = block_whir::prove_traces(
+                &program,
+                &elf,
+                &mut traces,
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+                false,
+                &|_, _| {},
+                &mut stamps,
+            )
+            .expect("prove");
+            assert!(
+                verify(&proof, &elf, &format),
+                "ahead {upload_ahead} {argue:?}"
+            );
+            assert!(stamps.groups.len() >= 3, "{} groups", stamps.groups.len());
+            for g in &stamps.groups {
+                assert!(
+                    g.upload_paid <= g.upload_a + 1e-9,
+                    "paid {} of {}",
+                    g.upload_paid,
+                    g.upload_a
+                );
+                if !upload_ahead {
+                    assert_eq!(
+                        g.upload_paid, g.upload_a,
+                        "nothing hidden without the overlap"
+                    );
+                }
+            }
+            rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .expect("serialize")
+                .to_vec()
+        };
+        let after = proved(false);
+        let ahead = proved(true);
+        if crypto::grinding::deterministic() {
+            assert_eq!(after, ahead, "{argue:?}");
+        }
+    }
+}
+
+/// The streamed build uploading ahead: each group's columns go up beside the
+/// previous group's commit as the groups arrive, and the proof verifies.
+#[test]
+fn a_streamed_block_uploading_ahead_proves_and_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    for upload_ahead in [false, true] {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.upload_ahead = upload_ahead;
+        let proof = prove(&elf, &format, &o);
+        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+        assert!(verify(&proof, &elf, &format), "ahead {upload_ahead}");
     }
 }
 
@@ -1786,6 +1884,12 @@ fn block_whir_on_a_real_block() {
     // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
     // ECSM split (production 2^18 / 2^17).
     crate::block_whir::chunk_cuts_from_env(&mut options);
+    // `BLOCK_WHIR_UPLOAD_AHEAD=0|1` (production 1): phase A puts each group's
+    // columns on the card beside the previous group's commit.
+    if let Some(ahead) = crate::block_whir::upload_ahead_from_env() {
+        options.upload_ahead = ahead;
+    }
+    println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,

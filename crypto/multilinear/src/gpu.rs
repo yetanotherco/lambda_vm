@@ -114,6 +114,9 @@ static ROOM_TURN_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// codewords then promise their own working sets one at a time
 /// (`stacked_eval::StackedCommitment::revive`).
 static ROOM_REVIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// ★ Groups whose commits' room the card would not promise: each codeword
+/// then promises its own working set (`stacked_eval::StackedCommitment`).
+static ROOM_COMMIT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Rooms a group sized, for its commits or its openings' turn.
 static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones sized to the turn they cover rather than to a whole
@@ -387,6 +390,16 @@ pub(crate) fn note_revive_room_refused() {
     ROOM_REVIVE_REFUSALS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Groups whose commits' room the card would not promise.
+pub fn room_commit_refusals() -> u64 {
+    ROOM_COMMIT_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Called where a commit's room is refused.
+pub(crate) fn note_commit_room_refused() {
+    ROOM_COMMIT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// GKR fraction trees the host built because the card refused their promise.
 pub fn gkr_tree_refusals() -> u64 {
     GKR_TREE_REFUSALS.load(Ordering::Relaxed)
@@ -440,6 +453,7 @@ pub fn reset_call_counters() {
     ROOM_TURNS.store(0, Ordering::Relaxed);
     ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
     ROOM_REVIVE_REFUSALS.store(0, Ordering::Relaxed);
+    ROOM_COMMIT_REFUSALS.store(0, Ordering::Relaxed);
     ROOM_SIZINGS.store(0, Ordering::Relaxed);
     ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
 }

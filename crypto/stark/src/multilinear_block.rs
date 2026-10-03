@@ -118,6 +118,10 @@ pub struct GroupStamps {
     /// columns up, the commit, the roots, the tops home.
     pub wait_a: f64,
     pub upload_a: f64,
+    /// Of `upload_a`, the seconds the committer waited for: all of it unless
+    /// the upload ran beside the previous group's commit, when only what
+    /// outlasted that commit is paid (`upload_a − upload_paid` is hidden).
+    pub upload_paid: f64,
     pub commit: f64,
     pub retire: f64,
     /// Phase B: the columns up again, the tables' arguments, the codewords
@@ -142,6 +146,15 @@ pub struct GroupStamps {
     pub argue_base: u64,
     pub open_reserved: u64,
     pub open_room: u64,
+    /// Phase A's ledger: the promise just before the group's commit (its own
+    /// columns on the card, and the previous group's while it packs) and the
+    /// peak through the commit (the next group's columns, uploaded beside it,
+    /// included). Bytes; 0 without a device.
+    pub commit_base: u64,
+    pub commit_reserved: u64,
+    /// The group's columns were to go up beside the previous group's commit
+    /// and the ledger refused them; they went up after it.
+    pub ahead_refused: bool,
     /// When the group's commit ended, seconds since phase A started.
     pub committed_at: f64,
     /// Phase A: the group's tables packed narrow after the commit
@@ -390,6 +403,7 @@ where
         config: &ChainConfig,
         drop_levels: usize,
         narrow: Narrowing,
+        upload_ahead: bool,
     ) -> Result<Self, MlError> {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -402,7 +416,7 @@ where
             .iter()
             .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        Self::commit_streamed::<H>(groups, sizes, config, drop_levels, narrow)
+        Self::commit_streamed::<H>(groups, sizes, config, drop_levels, narrow, upload_ahead)
     }
 
     /// [`Self::commit`] over groups handed over one at a time, in group order —
@@ -416,12 +430,14 @@ where
         config: &ChainConfig,
         drop_levels: usize,
         narrow: Narrowing,
+        upload_ahead: bool,
     ) -> Result<Self, MlError> {
         let block = Self::commit_groups::<H>(
             groups.into_iter().take(sizes.len()),
             config,
             drop_levels,
             narrow,
+            upload_ahead,
         )?;
         if block.sizes != sizes {
             return Err(MlError::QueryCountMismatch {
@@ -436,11 +452,18 @@ where
     /// producer stops: the groups (and so their sizes) are the prover's, and the
     /// statement carries them. Each group's wait for its tables is stamped, and
     /// each group is held as `narrow` says once committed.
+    ///
+    /// `upload_ahead`: the next group is taken, and its columns put on the card,
+    /// while this group commits (on a thread of its own) — once the commit has
+    /// asked the card for its room, so the upload only takes what is left; a
+    /// store the ledger refuses is uploaded after the commit, as without it.
+    /// The commits, their order and their bytes are the same either way.
     pub fn commit_groups<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         config: &ChainConfig,
         drop_levels: usize,
         narrow: Narrowing,
+        upload_ahead: bool,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
         let mut sizes = Vec::new();
@@ -450,12 +473,61 @@ where
         let mut incoming = groups.into_iter();
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
-        // upload.
+        // upload (or, uploading ahead, beside this group's commit).
         let mut packing: Option<Packing> = None;
+        // The next group, taken and uploaded beside this group's commit.
+        let mut ahead: Option<Ahead<'a, F, E>> = None;
+        let mut exhausted = false;
         loop {
-            let waited = Instant::now();
-            let Some(mut group) = incoming.next() else {
-                break;
+            let (mut group, mut stamp, store) = match ahead.take() {
+                Some(next) => {
+                    let mut stamp = GroupStamps {
+                        tables: next.group.len(),
+                        wait_a: next.wait_paid,
+                        upload_a: next.upload,
+                        upload_paid: next.upload_paid,
+                        ..Default::default()
+                    };
+                    let store = match next.store {
+                        Some(store) => Some(store),
+                        None => {
+                            // Refused beside the commit (or no card): up now,
+                            // with the commit's room given back.
+                            stamp.ahead_refused = multilinear::gpu::reserve_budget() > 0;
+                            let t = Instant::now();
+                            let columns: Vec<&Mle<F>> =
+                                next.group.iter().flat_map(|t| t.columns()).collect();
+                            let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                            let secs = t.elapsed().as_secs_f64();
+                            stamp.upload_a += secs;
+                            stamp.upload_paid += secs;
+                            store
+                        }
+                    };
+                    (next.group, stamp, store)
+                }
+                None => {
+                    if exhausted {
+                        break;
+                    }
+                    let waited = Instant::now();
+                    let Some(group) = incoming.next() else {
+                        break;
+                    };
+                    let mut stamp = GroupStamps {
+                        tables: group.len(),
+                        wait_a: waited.elapsed().as_secs_f64(),
+                        ..Default::default()
+                    };
+                    let t = Instant::now();
+                    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+                    // Held in an `Arc` like phase B's: once the tree tops are
+                    // home it goes to the group's packer, or is dropped.
+                    let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                    stamp.upload_a = t.elapsed().as_secs_f64();
+                    stamp.upload_paid = stamp.upload_a;
+                    (group, stamp, store)
+                }
             };
             let size = group.len();
             if size == 0 {
@@ -465,18 +537,7 @@ where
                 });
             }
             sizes.push(size);
-            let mut stamp = GroupStamps {
-                tables: size,
-                wait_a: waited.elapsed().as_secs_f64(),
-                ..Default::default()
-            };
-            let t = Instant::now();
-            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            // Held in an `Arc` like phase B's: once the tree tops are home it
-            // goes to the group's packer, or is dropped.
-            let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
-            stamp.upload_a = t.elapsed().as_secs_f64();
-            if let Some(packed) = packing.take() {
+            if !upload_ahead && let Some(packed) = packing.take() {
                 packed.install(&mut tables, &mut stamps);
             }
             let shapes: Vec<(usize, usize)> = group
@@ -486,21 +547,74 @@ where
             stamp.cells = shapes.iter().map(|&(w, n)| w << n).sum();
             let layout = global_layout(&shapes, config.format.stack)?;
             stamp.polys = layout.num_polys();
-            let t = Instant::now();
-            let stacked = StackedCommitment::<F, H>::commit(
-                layout,
-                &columns,
-                store.as_ref().map(|store| (&**store, 0)),
-                config,
-            )?;
-            roots.extend(stacked.roots());
-            stamp.commit = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let retired = stacked.retire(drop_levels, config)?;
+            stamp.commit_base = multilinear::gpu::ledger_reserved();
+            multilinear::gpu::reset_reserved_window();
+            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+            let resident = store.as_ref().map(|store| (&**store, 0));
+            let committed = if upload_ahead {
+                let (committed, next) = std::thread::scope(|scope| {
+                    let (room_tx, room_rx) = std::sync::mpsc::channel::<()>();
+                    let columns = &columns;
+                    let committer = scope.spawn(move || {
+                        let signal = move || {
+                            let _ = room_tx.send(());
+                        };
+                        let committed = commit_and_retire::<F, H>(
+                            layout,
+                            columns,
+                            resident,
+                            config,
+                            drop_levels,
+                            &signal,
+                        );
+                        (committed, Instant::now())
+                    });
+                    // Beside the commit: the next group, then its columns once
+                    // the commit has asked for its room (or ended).
+                    let next = incoming.next();
+                    let arrived = Instant::now();
+                    let next = next.map(|group| {
+                        let _ = room_rx.recv();
+                        let t = Instant::now();
+                        let columns: Vec<&Mle<F>> =
+                            group.iter().flat_map(|t| t.columns()).collect();
+                        let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
+                        (group, store, t.elapsed().as_secs_f64(), Instant::now())
+                    });
+                    let (committed, commit_end) = committer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let next = next.map(|(group, store, upload, uploaded)| {
+                        // What the committer waited for once its commit ended:
+                        // the group's arrival, then the rest of its upload.
+                        let ready = arrived.max(commit_end);
+                        Ahead {
+                            group,
+                            store,
+                            upload,
+                            wait_paid: arrived.saturating_duration_since(commit_end).as_secs_f64(),
+                            upload_paid: uploaded.saturating_duration_since(ready).as_secs_f64(),
+                        }
+                    });
+                    (committed, next)
+                });
+                exhausted = next.is_none();
+                ahead = next;
+                committed
+            } else {
+                commit_and_retire::<F, H>(layout, &columns, resident, config, drop_levels, &|| {})
+            };
+            let (group_roots, retired, commit, retire) = committed?;
             drop(columns);
-            stamp.retire = t.elapsed().as_secs_f64();
+            roots.extend(group_roots);
+            stamp.commit = commit;
+            stamp.retire = retire;
+            stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
+            if upload_ahead && let Some(packed) = packing.take() {
+                packed.install(&mut tables, &mut stamps);
+            }
             packing = narrow_group(&mut group, store, narrow, &mut stamp).map(|handle| Packing {
                 first_table: tables.len(),
                 group: stamps.len(),
@@ -551,6 +665,55 @@ where
             .filter_map(|table| table.narrow_mut())
             .any(|packed| packed.fault_width_map())
     }
+}
+
+/// The next group, taken and uploaded beside the current group's commit
+/// ([`BlockCommitted::commit_groups`]'s `upload_ahead`): its tables, its store
+/// (`None` when the ledger refused it, or there is no card), the upload's
+/// seconds, and what of the wait and of the upload outlasted the commit.
+struct Ahead<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    group: Vec<CommittedTable<'a, F, E>>,
+    store: Store,
+    upload: f64,
+    wait_paid: f64,
+    upload_paid: f64,
+}
+
+/// A group committed and retired: its roots, its retired stack, and the
+/// commit's and the retire's seconds. `on_room` as
+/// [`StackedCommitment::commit_signalled`].
+fn commit_and_retire<F, H>(
+    layout: StackedLayout,
+    columns: &[&Mle<F>],
+    resident: Option<(&multilinear::gpu::ResidentColumns, usize)>,
+    config: &ChainConfig,
+    drop_levels: usize,
+    on_room: &dyn Fn(),
+) -> Result<(Vec<Commitment>, RetiredStack<F>, f64, f64), MlError>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let t = Instant::now();
+    let stacked = StackedCommitment::<F, H>::commit_signalled(
+        layout,
+        columns,
+        resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+        config,
+        on_room,
+    )?;
+    let roots = stacked.roots();
+    let commit = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let retired = stacked.retire(drop_levels, config)?;
+    Ok((roots, retired, commit, t.elapsed().as_secs_f64()))
 }
 
 /// What a packer hands back: one packed table or none per table of its group,
