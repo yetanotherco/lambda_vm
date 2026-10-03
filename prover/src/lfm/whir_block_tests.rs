@@ -94,6 +94,9 @@ fn small_block_cut(
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
         memlog: false,
+        // The rest laid out in waves of 1 MiB: several at a test's size.
+        finish_keccak_rnd_chunks: true,
+        rest_layout_bytes: Some(1 << 20),
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -442,6 +445,9 @@ fn dense_block_with(
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
             upload_ahead: true,
             memlog: false,
+            // The rest laid out in waves of 1 MiB: several at a test's size.
+            finish_keccak_rnd_chunks: true,
+            rest_layout_bytes: Some(1 << 20),
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1389,6 +1395,17 @@ fn the_whir_block_tree_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048) and
+    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` (production 1): the rest's layout in
+    // waves, KECCAK_RND built as its tables.
+    crate::block_whir::rest_layout_from_env(&mut options);
+    println!(
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {}",
+        options
+            .rest_layout_bytes
+            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        options.finish_keccak_rnd_chunks,
+    );
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);

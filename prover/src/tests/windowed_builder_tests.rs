@@ -431,6 +431,55 @@ fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
     }
 }
 
+/// With KECCAK_RND built as its tables at the finish alone, the windowed build
+/// hands none out and is the whole-run build with KECCAK_RND split the same
+/// way, table for table — the split's copy without the copy.
+#[test]
+fn windowed_builds_keccak_rnd_at_finish_as_the_split_whole_run_table() {
+    let max_rows = MaxRowsConfig::small();
+    for name in ["test_keccak", "test_keccak_multi"] {
+        let (program, logs) = run(name);
+        let mut reference = whole(&program, &logs, &max_rows);
+        for per in [32usize, 64, 128] {
+            let split = split_keccak_rnd(&reference, per);
+            for window in [1, 33] {
+                let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                    .expect("the builder")
+                    .keccak_rnd_chunks_at_finish(per)
+                    .expect("a chunk size");
+                let body = logs.len() - 1;
+                let cut = body - body % window;
+                let mut chunks = Vec::new();
+                for w in logs[..cut].chunks(window) {
+                    chunks.extend(builder.push(w).expect("a window"));
+                }
+                assert!(
+                    chunks.iter().all(|c| c.table != StreamTable::KeccakRnd),
+                    "{name}: a KECCAK_RND chunk was handed out"
+                );
+                let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+                traces.insert_streamed(chunks).expect("placeholders");
+                same_list(
+                    &format!("{name} KECCAK_RND/{per} at the finish, window {window}"),
+                    &split,
+                    &traces.keccak_rnds,
+                );
+                let keccak =
+                    std::mem::replace(&mut reference.keccak_rnds, traces.keccak_rnds.clone());
+                same_traces(&reference, &traces);
+                reference.keccak_rnds = keccak;
+            }
+        }
+    }
+    assert!(
+        WindowedTraceBuilder::new(&run("test_keccak").0, &[], &max_rows)
+            .expect("the builder")
+            .keccak_rnd_chunks_at_finish(16)
+            .is_err(),
+        "16 rows is under the 32 a KECCAK_RND op's rows need"
+    );
+}
+
 /// Every LT op with its multiplicity summed over all of `lts`' chunks: what LT's
 /// constraints and the bus see, whichever chunk holds an op.
 fn lt_multiplicities(lts: &[Table]) -> std::collections::BTreeMap<Vec<u64>, u64> {

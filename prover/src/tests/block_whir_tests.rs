@@ -59,6 +59,9 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
         memlog: false,
+        // The rest laid out in waves of 1 MiB: several at a test's size.
+        finish_keccak_rnd_chunks: true,
+        rest_layout_bytes: Some(1 << 20),
     }
 }
 
@@ -471,6 +474,92 @@ fn terms_close(stamps: &block_whir::BlockStamps) {
         );
     }
     assert!(term("prepared") > 0, "the prepared columns are held");
+}
+
+/// The rest's waves: consecutive, in order, each within the budget unless one
+/// item alone is larger, and every item in exactly one.
+#[test]
+fn the_rest_is_cut_into_waves_within_the_budget() {
+    let sizes = [3usize, 4, 2, 9, 1, 1, 5, 0, 6];
+    for budget in [1usize, 5, 7, 10, 100] {
+        let waves = block_whir::waves(sizes.to_vec(), budget, |&b| b);
+        assert_eq!(
+            waves.iter().flatten().copied().collect::<Vec<_>>(),
+            sizes,
+            "budget {budget}: the order or an item changed"
+        );
+        for wave in &waves {
+            let sum: usize = wave.iter().sum();
+            assert!(!wave.is_empty());
+            assert!(
+                sum <= budget || wave.len() == 1,
+                "budget {budget}: {wave:?}"
+            );
+        }
+        // A wave closes only when the next item would take it past the budget.
+        for pair in waves.windows(2) {
+            let sum: usize = pair[0].iter().sum();
+            assert!(sum + pair[1][0] > budget, "budget {budget}: {pair:?}");
+        }
+    }
+    assert!(block_whir::waves(Vec::<usize>::new(), 4, |&b| b).is_empty());
+}
+
+/// The rest laid out in waves and KECCAK_RND built as its tables at the finish
+/// (BlockOptions::rest_layout_bytes, finish_keccak_rnd_chunks) move no byte:
+/// the same tables, partition and statement either way, inline and on the
+/// worker layout, and the proof bytes equal under the deterministic grind.
+#[test]
+fn the_rest_in_waves_and_keccak_rnd_built_chunked_move_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    for workers in [0usize, 3] {
+        let proved = |b1: bool| {
+            // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = workers;
+            o.pack_rest_as_laid_out = workers > 0;
+            o.finish_keccak_rnd_chunks = b1;
+            o.rest_layout_bytes = b1.then_some(1 << 16);
+            let (proof, _) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+            )
+            .expect("prove");
+            assert!(verify(&proof, &elf, &format), "b1 {b1}, {workers} workers");
+            proof
+        };
+        let (before, after) = (proved(false), proved(true));
+        assert!(
+            before.table_counts.keccak_rnd > 1,
+            "KECCAK_RND is one table: nothing was split"
+        );
+        assert_eq!(
+            before.groups, after.groups,
+            "{workers} workers: the partition"
+        );
+        assert_eq!(before.table_num_vars, after.table_num_vars);
+        assert_eq!(
+            format!("{:?}", before.table_counts),
+            format!("{:?}", after.table_counts)
+        );
+        if crypto::grinding::deterministic() {
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(
+                bytes(&before),
+                bytes(&after),
+                "{workers} workers: the proof"
+            );
+        }
+    }
 }
 
 /// A narrow table whose width map is wrong widens to other words than were
@@ -1977,6 +2066,17 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048) and
+    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` (production 1): the rest's layout in
+    // waves, KECCAK_RND built as its tables.
+    crate::block_whir::rest_layout_from_env(&mut options);
+    println!(
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {}",
+        options
+            .rest_layout_bytes
+            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        options.finish_keccak_rnd_chunks,
+    );
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,

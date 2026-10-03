@@ -263,6 +263,21 @@ pub struct BlockOptions {
     /// measurement; it moves no proof byte. Production reads
     /// `LAMBDA_VM_BLOCK_MEMLOG=1` (off by default).
     pub memlog: bool,
+    /// With windows and KECCAK_RND not streamed: the finish builds KECCAK_RND
+    /// as its 2^`keccak_rnd_rows_log2`-row tables
+    /// ([`WindowedTraceBuilder::keccak_rnd_chunks_at_finish`]) instead of one
+    /// table that [`split_keccak_rnd`] then copies apart; the tables are the
+    /// same. Production: on (BIG 561: the split's copy is the finish's last
+    /// ≈ 6 GiB at 4.13×). A cut under 32 rows (tests) takes the split.
+    pub finish_keccak_rnd_chunks: bool,
+    /// With windows: `Some(bytes)` lays the rest of the run out in AIR order,
+    /// in waves of at most `bytes` of rows (a larger table is a wave of its
+    /// own), each wave in parallel; `None` lays every table out at once. A
+    /// table's column copy exists before its rows go, so laying out all of
+    /// them at once holds most of the rest twice (BIG 561: ≈ 20 GiB at 4.13×,
+    /// the block's high-water). The tables, their order and the groups are the
+    /// same. Production: [`BLOCK_REST_LAYOUT_BYTES`].
+    pub rest_layout_bytes: Option<usize>,
 }
 
 impl BlockOptions {
@@ -286,7 +301,42 @@ impl BlockOptions {
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
             memlog: memlog::from_env(),
+            finish_keccak_rnd_chunks: true,
+            rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
         }
+    }
+}
+
+/// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
+/// each transposition is parallel within its table, so a wave of a few
+/// tables keeps the cores busy while bounding the copies in flight.
+pub const BLOCK_REST_LAYOUT_BYTES: usize = 2 << 30;
+
+/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` and `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1`:
+/// the real-block tests' choice of [`BlockOptions::rest_layout_bytes`] and
+/// [`BlockOptions::finish_keccak_rnd_chunks`]; unset leaves the production
+/// ones.
+#[cfg(test)]
+pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
+    match std::env::var("BLOCK_WHIR_REST_LAYOUT")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("all") => options.rest_layout_bytes = None,
+        Ok(mib) => match mib.parse::<usize>() {
+            Ok(mib) if mib > 0 => options.rest_layout_bytes = Some(mib << 20),
+            _ => panic!("BLOCK_WHIR_REST_LAYOUT={mib}: all or a positive MiB count"),
+        },
+        Err(_) => {}
+    }
+    match std::env::var("BLOCK_WHIR_KR_FINISH_CHUNKS")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.finish_keccak_rnd_chunks = false,
+        Ok("1") => options.finish_keccak_rnd_chunks = true,
+        Ok(other) => panic!("BLOCK_WHIR_KR_FINISH_CHUNKS={other}: 0 or 1"),
+        Err(_) => {}
     }
 }
 
@@ -2182,6 +2232,7 @@ fn lay_out_rest<'a>(
     start: Instant,
     prepared_now: bool,
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
+    budget: Option<usize>,
     ledger: Option<&memlog::Ledger>,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
@@ -2255,12 +2306,47 @@ fn lay_out_rest<'a>(
         }
         laid
     };
-    let tables: Vec<Placed<'a>> = match sink {
-        None => built
+    let rows_of = |(_, ((_, trace, _), _)): &(usize, ((_, &mut TraceTable<F, E>, _), _))| {
+        memlog::rows_bytes(trace)
+    };
+    let tables: Vec<Placed<'a>> = match (sink, budget) {
+        (None, None) => built
             .into_par_iter()
             .map(&lay_out)
             .collect::<Result<_, Error>>()?,
-        Some(sink) => {
+        (None, Some(budget)) => {
+            let mut tables = Vec::with_capacity(built.len());
+            for wave in waves(built, budget, rows_of) {
+                tables.extend(
+                    wave.into_par_iter()
+                        .map(&lay_out)
+                        .collect::<Result<Vec<_>, Error>>()?,
+                );
+            }
+            tables
+        }
+        (Some(sink), Some(budget)) => {
+            // Each wave's tables to the packer in AIR order once it is laid
+            // out.
+            let mut k = 0usize;
+            for wave in waves(built, budget, rows_of) {
+                let laid: Vec<(f64, Result<Placed<'a>, Error>)> = wave
+                    .into_par_iter()
+                    .map(|table| {
+                        let t = Instant::now();
+                        let laid = lay_out(table);
+                        (t.elapsed().as_secs_f64(), laid)
+                    })
+                    .collect();
+                for (secs, laid) in laid {
+                    // A packer that stopped has its own error to report.
+                    let _ = sink.send((k, secs, laid));
+                    k += 1;
+                }
+            }
+            Vec::new()
+        }
+        (Some(sink), None) => {
             // FIFO: the tables that close the next group are laid out first.
             rayon::scope_fifo(|scope| {
                 for (k, table) in built.into_iter().enumerate() {
@@ -2309,6 +2395,27 @@ fn lay_out_rest<'a>(
         slowest,
         busy: t.elapsed().as_secs_f64(),
     })
+}
+
+/// `items` in order, cut into consecutive waves of at most `budget` bytes
+/// (`bytes` of an item); a wave holds at least one item.
+pub(crate) fn waves<T>(items: Vec<T>, budget: usize, bytes: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let mut waves: Vec<Vec<T>> = Vec::new();
+    let mut held = 0usize;
+    for item in items {
+        let b = bytes(&item);
+        match waves.last_mut() {
+            Some(wave) if !wave.is_empty() && held + b <= budget => {
+                held += b;
+                wave.push(item);
+            }
+            _ => {
+                held = b;
+                waves.push(vec![item]);
+            }
+        }
+    }
+    waves
 }
 
 /// What the layout thread knows once the run is built: the statement, the AIR
@@ -2411,6 +2518,9 @@ fn prove_streamed(
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 if options.stream_keccak_rnd {
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
+                    builder = builder
+                        .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
@@ -2561,7 +2671,16 @@ fn prove_streamed(
                 let inline = options.layout_workers == 0;
                 let rest_of = |traces, sink| {
                     lay_out_rest(
-                        traces, program, opts, format, run_airs, start, inline, sink, ledger,
+                        traces,
+                        program,
+                        opts,
+                        format,
+                        run_airs,
+                        start,
+                        inline,
+                        sink,
+                        options.rest_layout_bytes,
+                        ledger,
                     )
                 };
                 let (streamed, rest) = if inline {

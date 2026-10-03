@@ -149,6 +149,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// With [`WalkLean::decode`], the walk reads each cycle's decode from here,
     /// from the instruction map otherwise.
     decode: Option<DecodeTable>,
+    /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
+    /// builds, 0 for one table.
+    finish_keccak_rnd_rows: usize,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -205,6 +208,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept: None,
             lean,
             decode,
+            finish_keccak_rnd_rows: 0,
         })
     }
 
@@ -256,6 +260,22 @@ impl<'a> WindowedTraceBuilder<'a> {
             )));
         }
         self.emitted.keccak_rnd_rows = rows;
+        Ok(self)
+    }
+
+    /// `finish` builds KECCAK_RND as tables of `rows` rows — the tables the
+    /// block's split makes of the whole one, each built from the ops that reach
+    /// it — instead of one table, without handing any out during the windows
+    /// ([`Self::keccak_rnd_chunks`] does both). The whole table and its split
+    /// copy are never held: on a block, KECCAK_RND's 1,480 columns are the
+    /// largest table the finish builds. `rows` is a power of two, at least 32.
+    pub fn keccak_rnd_chunks_at_finish(mut self, rows: usize) -> Result<Self, Error> {
+        if !rows.is_power_of_two() || rows < 32 {
+            return Err(Error::Prover(format!(
+                "KECCAK_RND chunks of {rows} rows: a power of two of at least 32 is needed"
+            )));
+        }
+        self.finish_keccak_rnd_rows = rows;
         Ok(self)
     }
 
@@ -385,8 +405,19 @@ impl<'a> WindowedTraceBuilder<'a> {
             counted,
             kept,
             stream_memw_lt,
+            finish_keccak_rnd_rows,
             ..
         } = self;
+        // Chunks at the finish alone: none were handed out.
+        let emitted = if emitted.keccak_rnd_rows == 0 && finish_keccak_rnd_rows > 0 {
+            StreamSkip {
+                keccak_rnd_rows: finish_keccak_rnd_rows,
+                keccak_rnd: 0,
+                ..emitted
+            }
+        } else {
+            emitted
+        };
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
