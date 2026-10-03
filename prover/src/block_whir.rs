@@ -308,30 +308,135 @@ pub struct BlockOptions {
     /// Whether phase A hands the committed groups' packed tables to a spill
     /// store, which phase B reads back in group order
     /// ([`multilinear_block::BlockSpill`]). The proof's bytes are the same.
-    /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), off unless set.
+    /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), `auto` unless
+    /// set.
     pub spill: BlockSpillPolicy,
 }
 
-/// When a block spills its held tables ([`BlockOptions::spill`]).
+/// When a block spills its held tables ([`BlockOptions::spill`]): the policy
+/// and the rule of #1013's block pipeline (`prover/src/block.rs`,
+/// `SpillPolicy` … `spill_decision`, @ edddc6873), with #1014's reserve
+/// ([`spill_reserve_bytes`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockSpillPolicy {
-    /// Every table stays in memory, its bytes on the heap.
-    #[default]
+    /// Every table stays in memory.
     Off,
     /// Every committed group past the first two spills, as far as the store's
-    /// writer queue has room.
+    /// writer queue has room (a measurement arm).
     Always,
+    /// Keep at most this many bytes of committed packed tables; spill the
+    /// rest.
+    Budget(u64),
+    /// Spill once the host would pass the target ([`spill_target_bytes`]):
+    /// see [`spill_wanted`]. The default: a block that fits spills nothing.
+    #[default]
+    Auto,
 }
 
-/// `LAMBDA_VM_BLOCK_SPILL=always` spills ([`BlockSpillPolicy::Always`]);
-/// unset, `off`, or anything else keeps the tables in memory.
+/// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
+/// resident budget for committed packed tables). Anything else is `off`. As
+/// #1013's `parse_spill_policy`.
 pub fn spill_from_env() -> BlockSpillPolicy {
-    match std::env::var("LAMBDA_VM_BLOCK_SPILL")
-        .as_deref()
-        .map(str::trim)
+    parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
+}
+
+fn parse_spill_policy(value: Option<&str>) -> BlockSpillPolicy {
+    match value.map(str::trim) {
+        Some("always") => BlockSpillPolicy::Always,
+        Some("auto") => BlockSpillPolicy::Auto,
+        Some(gib) => gib
+            .parse::<f64>()
+            .ok()
+            .filter(|g| g.is_finite() && *g >= 0.0)
+            .map_or(BlockSpillPolicy::Off, |g| {
+                BlockSpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
+            }),
+        None => BlockSpillPolicy::Auto,
+    }
+}
+
+/// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
+/// cgroup's `memory.max` less 10 GiB, else `MemTotal` less 10 GiB (#1013's
+/// `spill_target_bytes`).
+fn spill_target_bytes() -> u64 {
+    const MARGIN: u64 = 10 << 30;
+    if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
     {
-        Ok("always") => BlockSpillPolicy::Always,
-        _ => BlockSpillPolicy::Off,
+        return (gib * (1u64 << 30) as f64) as u64;
+    }
+    let cgroup_max = cgroup_file("memory.max").and_then(|v| v.trim().parse::<u64>().ok());
+    let mem_total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kib| kib << 10)
+    });
+    cgroup_max
+        .or(mem_total)
+        .map_or(u64::MAX, |b| b.saturating_sub(MARGIN))
+}
+
+/// A file of this process's cgroup (v2), read whole (#1013's `cgroup_file`).
+fn cgroup_file(name: &str) -> Option<String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    std::fs::read_to_string(format!("/sys/fs/cgroup{}/{name}", path.trim())).ok()
+}
+
+/// What `auto` reads as the host's bytes: the larger of the process's peak
+/// resident set (`VmHWM`) and its cgroup's charge (`memory.current`, which
+/// also counts the page cache) (#1013's `host_bytes_now`).
+fn host_bytes_now() -> u64 {
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .map(|kib| kib << 10)
+        });
+    let charged = cgroup_file("memory.current").and_then(|v| v.trim().parse::<u64>().ok());
+    hwm.unwrap_or(0).max(charged.unwrap_or(0))
+}
+
+/// `auto`'s reserve beside the host's bytes: what the block still needs once
+/// the tables committed so far (`cells` main cells) are on the host. #1014's
+/// own, inferred from the median block (BIG 565, 33.5 G cells): the finish's
+/// p5 transient (25.5 GiB at its peak) and the tree's leaf programs, which
+/// live through phase B (16.3 GiB at its end), ≈ 1.25 GiB per total G cells,
+/// or ≈ 1.65 per G cells committed so far (the streamed share ≈ 0.76); plus
+/// 6 GiB for phase B's bump and the read-back window.
+fn spill_reserve_bytes(cells: u64) -> u64 {
+    const PER_G: f64 = 1.65 * (1u64 << 30) as f64;
+    (cells as f64 / 1e9 * PER_G) as u64 + (6 << 30)
+}
+
+/// The policy's choice for one committed table of `bytes` packed bytes:
+/// `kept` the committed packed bytes kept so far, `cells` the main cells
+/// committed so far (this table's included), `host` the host's bytes
+/// ([`host_bytes_now`]), read only by `auto` (#1013's `spill_decision`, with
+/// #1014's reserve).
+fn spill_wanted(
+    policy: BlockSpillPolicy,
+    target: u64,
+    kept: u64,
+    cells: u64,
+    bytes: u64,
+    host: impl FnOnce() -> u64,
+) -> bool {
+    match policy {
+        BlockSpillPolicy::Off => false,
+        BlockSpillPolicy::Always => true,
+        BlockSpillPolicy::Budget(budget) => kept + bytes > budget,
+        BlockSpillPolicy::Auto => {
+            host()
+                .saturating_add(spill_reserve_bytes(cells))
+                .saturating_add(bytes)
+                > target
+        }
     }
 }
 
@@ -2693,17 +2798,35 @@ fn prove_streamed(
         ledger.pool();
         ledger.line("start");
     }
-    // The spill (`BlockOptions::spill`): a store for this prove. A store that
-    // does not open leaves every table in memory.
-    let spill = match options.spill {
+    // The spill (`BlockOptions::spill`): a store for this prove, unless the
+    // policy is off. A store that does not open leaves every table in memory.
+    let policy = options.spill;
+    let target = spill_target_bytes();
+    let policy_name = match policy {
+        BlockSpillPolicy::Off => "off".to_string(),
+        BlockSpillPolicy::Always => "always".to_string(),
+        BlockSpillPolicy::Budget(b) => format!("budget {:.1} GiB", b as f64 / (1u64 << 30) as f64),
+        BlockSpillPolicy::Auto => format!(
+            "auto (target {:.1} GiB)",
+            target as f64 / (1u64 << 30) as f64
+        ),
+    };
+    let spill = match policy {
         BlockSpillPolicy::Off => None,
-        BlockSpillPolicy::Always => {
+        _ => {
             let store_options = stark::spill::SpillOptions::default();
             let queue = store_options.queue_bytes;
             match stark::spill::SpillStore::open(store_options) {
-                Ok(store) => Some(multilinear_block::BlockSpill::new(store, queue)),
+                Ok(store) => {
+                    let wanted: std::sync::Arc<multilinear_block::SpillWanted> =
+                        std::sync::Arc::new(move |kept, cells, bytes| {
+                            spill_wanted(policy, target, kept, cells, bytes, host_bytes_now)
+                        });
+                    Some(multilinear_block::BlockSpill::new(store, queue, wanted))
+                }
                 Err(e) => {
-                    stamps.spill = Some(format!("always · no store ({e}); every table held"));
+                    stamps.spill =
+                        Some(format!("{policy_name} · no store ({e}); every table held"));
                     None
                 }
             }
@@ -3205,7 +3328,7 @@ fn prove_streamed(
                 .clone()
                 .unwrap_or_else(|| "nothing to read back".to_string());
             let stats = spill.store.stats();
-            stamps.spill = Some(format!("always · {stats} · read-back {read_back}"));
+            stamps.spill = Some(format!("{policy_name} · {stats} · read-back {read_back}"));
             stamps.spill_stats = Some(stats);
         }
         if multilinear::whir_split::enabled() {
@@ -3644,4 +3767,72 @@ pub(crate) fn verify_block_whir_with(
         )
         .is_ok()
     }))
+}
+
+#[cfg(test)]
+mod spill_policy_tests {
+    use super::{BlockSpillPolicy, parse_spill_policy, spill_reserve_bytes, spill_wanted};
+
+    const GIB: u64 = 1 << 30;
+
+    /// `LAMBDA_VM_BLOCK_SPILL`'s values, as #1013 reads them: `auto` (and
+    /// unset), `off`, `always`, a budget in GiB; anything else is off.
+    #[test]
+    fn the_spill_knob_reads_as_on_1013() {
+        assert_eq!(parse_spill_policy(None), BlockSpillPolicy::Auto);
+        assert_eq!(parse_spill_policy(Some("auto")), BlockSpillPolicy::Auto);
+        assert_eq!(
+            parse_spill_policy(Some(" always ")),
+            BlockSpillPolicy::Always
+        );
+        assert_eq!(parse_spill_policy(Some("off")), BlockSpillPolicy::Off);
+        assert_eq!(
+            parse_spill_policy(Some("2.5")),
+            BlockSpillPolicy::Budget(5 * GIB / 2)
+        );
+        assert_eq!(parse_spill_policy(Some("-1")), BlockSpillPolicy::Off);
+        assert_eq!(parse_spill_policy(Some("nan")), BlockSpillPolicy::Off);
+        assert_eq!(BlockSpillPolicy::default(), BlockSpillPolicy::Auto);
+    }
+
+    /// `auto` spills a table only once the host, its reserve and the table
+    /// would pass the target; it reads the host only then. `off` never
+    /// spills, `always` always, a budget once the kept bytes would pass it.
+    #[test]
+    fn auto_spills_only_past_the_target() {
+        let target = 110 * GIB;
+        let cells = 10_000_000_000; // 10 G cells: a reserve of 6 + 16.5 GiB
+        assert_eq!(spill_reserve_bytes(cells), (22.5 * GIB as f64) as u64);
+        let unread = || -> u64 { panic!("only auto reads the host") };
+        assert!(!spill_wanted(
+            BlockSpillPolicy::Off,
+            target,
+            0,
+            cells,
+            GIB,
+            unread
+        ));
+        assert!(spill_wanted(
+            BlockSpillPolicy::Always,
+            target,
+            0,
+            cells,
+            GIB,
+            unread
+        ));
+        let budget = BlockSpillPolicy::Budget(4 * GIB);
+        assert!(!spill_wanted(budget, target, 3 * GIB, cells, GIB, unread));
+        assert!(spill_wanted(
+            budget,
+            target,
+            3 * GIB + 1,
+            cells,
+            GIB,
+            unread
+        ));
+        let auto = BlockSpillPolicy::Auto;
+        assert!(!spill_wanted(auto, target, 0, cells, GIB, || 86 * GIB));
+        assert!(spill_wanted(auto, target, 0, cells, GIB, || 87 * GIB));
+        assert!(!spill_wanted(auto, u64::MAX, 0, cells, GIB, || u64::MAX));
+    }
 }

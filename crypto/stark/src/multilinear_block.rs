@@ -289,27 +289,40 @@ impl BlockMem {
 /// Groups phase B reads before a read-back could land: never spilled.
 const SPILL_RESIDENT_GROUPS: usize = 2;
 
-/// A block's spill ([`crate::spill`]). Phase A hands each committed group's
-/// packed tables to `store` as the group is installed, past the first
-/// [`SPILL_RESIDENT_GROUPS`] groups and never past the store's writer queue,
-/// so the committer never waits on the writers. Phase B reads them back in
-/// group order, ahead of their upload, and lets each group's go after its
-/// opening.
+/// Whether a committed table of `bytes` packed bytes is to be spilled, given
+/// the packed bytes kept so far and the main cells committed so far (this
+/// table's included): `(kept, cells, bytes)` ([`BlockSpill::new`]).
+pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
+
+/// A block's spill ([`crate::spill`]). Phase A considers each committed
+/// group's packed tables as the group is installed: past the first
+/// [`SPILL_RESIDENT_GROUPS`] groups, a table the policy wants out and the
+/// store's writer queue has room for goes to `store`, so the committer never
+/// waits on the writers. Phase B reads them back in group order, ahead of
+/// their upload, and lets each group's go after its opening.
 #[derive(Clone)]
 pub struct BlockSpill {
     pub store: Arc<SpillStore>,
     /// The writer queue the store was opened with
     /// ([`crate::spill::SpillOptions::queue_bytes`]).
     pub queue_bytes: u64,
+    /// The policy's choice for one table.
+    pub wanted: Arc<SpillWanted>,
+    /// Packed bytes of the committed tables kept, and main cells committed.
+    kept: Arc<std::sync::atomic::AtomicU64>,
+    cells: Arc<std::sync::atomic::AtomicU64>,
     /// The read-back's report ([`Prefetch::report`]), once phase B has run.
     pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl BlockSpill {
-    pub fn new(store: SpillStore, queue_bytes: u64) -> Self {
+    pub fn new(store: SpillStore, queue_bytes: u64, wanted: Arc<SpillWanted>) -> Self {
         Self {
             store: Arc::new(store),
             queue_bytes,
+            wanted,
+            kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefetch: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -338,10 +351,11 @@ fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
     multilinear::narrow::NarrowColumns::from_parts(rows, widths, data)
 }
 
-/// Hands group `g`'s narrow tables to the spill, `first` being the first's
-/// index; each spilled table's slot goes in `spilled`. A table the queue has
-/// no room for stays held, and so does one the store refuses (it has
-/// failed).
+/// Considers group `g`'s narrow tables for the spill, `first` being the
+/// first's index; each spilled table's slot goes in `spilled`. A table the
+/// policy keeps, the queue has no room for, or the store refuses (it has
+/// failed) stays held. Every table counts toward the cells committed, and
+/// every kept one toward the bytes kept.
 fn spill_group<F, E>(
     spill: &BlockSpill,
     g: usize,
@@ -356,14 +370,17 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    if g < SPILL_RESIDENT_GROUPS {
-        return Ok(());
-    }
     for (k, (table, slot)) in tables.iter_mut().zip(spilled.iter_mut()).enumerate() {
+        let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
+        let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
         let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
             continue;
         };
-        if !spill.has_room(len as u64) {
+        if g < SPILL_RESIDENT_GROUPS
+            || !(spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
+            || !spill.has_room(len as u64)
+        {
+            spill.kept.fetch_add(len as u64, Relaxed);
             continue;
         }
         let failed = || MlError::SpillFailed {
@@ -386,6 +403,7 @@ where
                 if !from_store(main).is_some_and(|packed| table.restore_narrow(packed)) {
                     return Err(failed());
                 }
+                spill.kept.fetch_add(len as u64, Relaxed);
             }
         }
     }
