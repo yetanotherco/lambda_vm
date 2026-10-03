@@ -31,7 +31,7 @@
 //! run with `LAMBDA_VM_GPU_LDE_THRESHOLD` low enough that the LFM tables cross
 //! it (the box line sets 1024).
 
-use stark::proof::options::{FriMode, OneRowMode, ProofFormat, ProofOptions};
+use stark::proof::options::{FriMode, LogUpPolicy, OneRowMode, ProofFormat, ProofOptions};
 
 use crate::lfm::proof::{lfm_prove, verify_against_artifacts};
 use crate::lfm::registry::{LfmProgramKind, build_artifacts};
@@ -45,12 +45,14 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
+        logup: LogUpPolicy::Pair,
     };
     let production = ProofFormat {
         merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
         fri_mode: FriMode::Dp,
         one_row: OneRowMode::Auto,
         fri_schedule_override: None,
+        logup: LogUpPolicy::Pair,
     };
     assert_eq!(
         production,

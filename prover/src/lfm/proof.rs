@@ -699,11 +699,13 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 /// The STARK block's base-epoch options: the blowup-4 preset the production
 /// tree proves its epochs under, with the process's
 /// [`ZfFormat`](crate::zf_format::ZfFormat) stamped on — a PRODUCTION FORMAT
-/// SITE, like [`aggregation_wrap_options`].
+/// SITE, like [`aggregation_wrap_options`], and the only one that carries
+/// `LAMBDA_VM_ZF_LOGUP` (the base tables' LogUp arity; the LFM chips keep
+/// pairs).
 ///
 /// Not [`crate::recursion::Preset::options`] itself: that value also fixes
 /// the RV64 recursion guest's verifier, which stays on the LEGACY format
 /// (its presets name it).
 pub fn block_base_options() -> ProofOptions {
-    crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
+    crate::zf_format::ZfFormat::global().base_options(crate::recursion::Preset::Blowup4.options())
 }

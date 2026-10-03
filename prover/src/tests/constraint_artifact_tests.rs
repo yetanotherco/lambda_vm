@@ -294,6 +294,27 @@ fn all_table_artifacts_roundtrip_and_match_folders() {
     report_sizes(&sizes);
 }
 
+/// ★ The same differential under every wider LogUp policy at the block's
+/// blowup: the arity-k group and accumulator constraints are one body, so
+/// each production table's serialized artifact still evaluates
+/// bit-identically to the prover folder, the verifier/OOD folder and the
+/// flat device blob — which is what the in-guest verifier and the device
+/// interpreter run.
+#[test]
+fn all_table_artifacts_match_folders_under_wide_logup() {
+    use stark::proof::options::{LogUpPolicy, ProofFormat};
+    for policy in [LogUpPolicy::K3, LogUpPolicy::K4, LogUpPolicy::Best] {
+        let mut opts = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup=4 valid");
+        opts.format = ProofFormat {
+            logup: policy,
+            ..ProofFormat::DEFAULT
+        };
+        for (label, air) in &production_airs(&opts) {
+            check_air_artifact(&**air, &format!("{label} {policy}"));
+        }
+    }
+}
+
 /// Print the per-AIR and total artifact sizes — the recursion machine's
 /// program-length budget — and hold a ceiling so runaway growth is noticed.
 fn report_sizes(sizes: &[ArtifactSize]) {
