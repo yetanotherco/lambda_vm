@@ -1188,9 +1188,8 @@ struct VramGate {
     /// ([`arm_shared_vram_gate`]) can be calibrated in place between levels.
     budget: AtomicU64,
     /// The proves that carry their tables' resident bytes between Round 1 and
-    /// their fused tasks ([`ResidentClaim`]): the bytes they claimed, and how
-    /// many claims are in force.
-    claims: std::sync::Mutex<(u64, usize)>,
+    /// their fused tasks ([`ResidentClaim`]).
+    claims: std::sync::Mutex<ClaimBook>,
     claim_room: std::sync::Condvar,
     /// `SGATE` lines on every change of the account ([`shared_gate_trace`]).
     trace: bool,
@@ -1212,18 +1211,63 @@ struct CarriedBytes<'c, 'g> {
     claim: Option<&'c ResidentClaim<'g>>,
 }
 
-/// A prove's claim on the gate while it carries resident bytes: an upper bound
-/// on what it holds plus what its next admission asks for, at every point
-/// from its Round 1 to its last fused task ([`resident_claim`],
-/// [`settled_claim`]). Claims are admitted only while their sum fits the
-/// budget (one claim alone always is), so whenever every prove waits, the one
-/// whose next admission is smallest relative to its claim fits beside what the
-/// others hold: carried bytes never deadlock the gate. Without claims, two
-/// proves each carrying half their Round-1 bytes can fill the budget with
-/// neither able to finish its Round 1.
+/// A prove's claim on the gate while it carries resident bytes: a held part R
+/// and a headroom H, so that at every point from its Round 1 to its last
+/// fused task what it holds plus what its next admission asks for is at most
+/// R + H. Two forms:
+///
+/// - tight (the default): R = the tables' resident bounds (Σ carried once
+///   Round 1 settles), H = [`tight_headroom`];
+/// - the first form (`LAMBDA_VM_SHARED_GATE_CLAIMS=whole`, [`resident_claim`],
+///   [`settled_claim`]): the whole bound in R, H = 0.
+///
+/// The book admits a claim only while **Σ R + max H ≤ budget** over the claims
+/// in force (one claim alone always enters). In a state where every prove
+/// waits, the gate holds at most Σ R and each request is at most its prove's
+/// H ≤ max H, so every waiting prove fits; a finished table, a settle or a
+/// departure only lowers the left side. So carried bytes never deadlock the
+/// gate. Summing the headrooms (each claim R + H) is safe too, only looser;
+/// keeping the *smallest* H instead of the largest is not: once the prove
+/// with it leaves, the rest can wedge. Without claims, two proves each
+/// carrying half their Round-1 bytes can fill the budget with neither able to
+/// finish its Round 1.
 struct ResidentClaim<'g> {
     gate: &'g VramGate,
-    bytes: AtomicU64,
+    held: AtomicU64,
+    headroom: u64,
+}
+
+/// The claims in force: the sum of their held parts and each one's headroom.
+#[derive(Default)]
+struct ClaimBook {
+    held: u64,
+    headrooms: Vec<u64>,
+}
+
+impl ClaimBook {
+    fn len(&self) -> usize {
+        self.headrooms.len()
+    }
+
+    fn max_headroom(&self) -> u64 {
+        self.headrooms.iter().copied().max().unwrap_or(0)
+    }
+
+    /// What the book's invariant bounds: Σ R + max H.
+    fn total(&self) -> u64 {
+        self.held.saturating_add(self.max_headroom())
+    }
+
+    /// Whether a claim (`held`, `headroom`) enters beside the claims in force
+    /// under `budget`: any claim does when none is.
+    fn fits(&self, held: u64, headroom: u64, budget: u64) -> bool {
+        self.headrooms.is_empty()
+            || self
+                .held
+                .saturating_add(held)
+                .saturating_add(self.max_headroom().max(headroom))
+                <= budget
+    }
 }
 
 // Permits held by this thread: a driver must hold none while it waits for a
@@ -1247,7 +1291,7 @@ impl VramGate {
             used: std::sync::Mutex::new(0),
             freed: std::sync::Condvar::new(),
             budget: AtomicU64::new(budget),
-            claims: std::sync::Mutex::new((0, 0)),
+            claims: std::sync::Mutex::new(ClaimBook::default()),
             claim_room: std::sync::Condvar::new(),
             trace: false,
         }
@@ -1287,19 +1331,20 @@ impl VramGate {
         }
     }
 
-    /// Claim `bytes` for a prove that will carry resident bytes, waiting until
-    /// they fit beside the claims in force (any claim fits when none is).
-    fn claim(&self, bytes: u64) -> ResidentClaim<'_> {
+    /// Claim (`held`, `headroom`) for a prove that will carry resident bytes,
+    /// waiting until it fits beside the claims in force ([`ClaimBook::fits`]).
+    fn claim(&self, held: u64, headroom: u64) -> ResidentClaim<'_> {
         let mut claims = self.claims.lock().unwrap();
-        while claims.1 > 0 && claims.0.saturating_add(bytes) > self.budget.load(Ordering::Relaxed) {
+        while !claims.fits(held, headroom, self.budget.load(Ordering::Relaxed)) {
             claims = self.claim_room.wait(claims).unwrap();
         }
-        claims.0 = claims.0.saturating_add(bytes);
-        claims.1 += 1;
-        self.trace_claims(*claims);
+        claims.held = claims.held.saturating_add(held);
+        claims.headrooms.push(headroom);
+        self.trace_claims(&claims);
         ResidentClaim {
             gate: self,
-            bytes: AtomicU64::new(bytes),
+            held: AtomicU64::new(held),
+            headroom,
         }
     }
 
@@ -1321,43 +1366,55 @@ impl VramGate {
         }
     }
 
-    /// One `SGATE` line: the claims in force now.
-    fn trace_claims(&self, (bytes, n): (u64, usize)) {
+    /// One `SGATE` line: the claims in force now (Σ R + max H).
+    fn trace_claims(&self, claims: &ClaimBook) {
         if self.trace {
             eprintln!(
-                "SGATE t={:.3} claimed={:.3}GiB claims={n}",
+                "SGATE t={:.3} claimed={:.3}GiB claims={}",
                 crate::prove_split::epoch_secs(),
-                bytes as f64 / (1u64 << 30) as f64
+                claims.total() as f64 / (1u64 << 30) as f64,
+                claims.len()
             );
         }
     }
 }
 
 impl ResidentClaim<'_> {
-    /// Give back `bytes` of the claim (at most what is left), once the prove
-    /// can no longer need them.
+    /// Give back `bytes` of the held part (at most what is left), once the
+    /// prove can no longer need them. The headroom stays: it bounds the
+    /// prove's largest request to come, and keeping it is safe.
     fn shrink(&self, bytes: u64) {
         let mut claims = self.gate.claims.lock().unwrap();
-        let left = self.bytes.load(Ordering::Relaxed);
+        let left = self.held.load(Ordering::Relaxed);
         let give = bytes.min(left);
-        self.bytes.store(left - give, Ordering::Relaxed);
-        claims.0 = claims.0.saturating_sub(give);
-        self.gate.trace_claims(*claims);
+        self.held.store(left - give, Ordering::Relaxed);
+        claims.held = claims.held.saturating_sub(give);
+        self.gate.trace_claims(&claims);
         drop(claims);
         self.gate.claim_room.notify_all();
     }
 
+    /// The held part left.
+    fn held(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// The whole claim: held part plus headroom.
     fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+        self.held().saturating_add(self.headroom)
     }
 }
 
 impl Drop for ResidentClaim<'_> {
     fn drop(&mut self) {
         let mut claims = self.gate.claims.lock().unwrap_or_else(|e| e.into_inner());
-        claims.0 = claims.0.saturating_sub(self.bytes.load(Ordering::Relaxed));
-        claims.1 = claims.1.saturating_sub(1);
-        self.gate.trace_claims(*claims);
+        claims.held = claims
+            .held
+            .saturating_sub(self.held.load(Ordering::Relaxed));
+        if let Some(at) = claims.headrooms.iter().position(|&h| h == self.headroom) {
+            claims.headrooms.swap_remove(at);
+        }
+        self.gate.trace_claims(&claims);
         drop(claims);
         self.gate.claim_room.notify_all();
     }
@@ -1384,6 +1441,45 @@ impl Drop for CarriedBytes<'_, '_> {
 fn resident_claim(resident: &[u64], peak: &[u64]) -> u64 {
     let held = resident.iter().fold(0u64, |a, &b| a.saturating_add(b));
     held.saturating_add(peak.iter().copied().max().unwrap_or(0))
+}
+
+/// The tight claim's headroom ([`ResidentClaim`]): the largest request a
+/// carrying prove can wait on beyond its tables' resident bounds. In Round 1
+/// table i asks for its resident bound plus its commit's scratch while the
+/// prove holds at most its other tables' bounds; in its fused task it asks for
+/// its set less what it carries while the prove holds its other tables'
+/// carries plus its own. Each carry is at most its bound, so
+/// max_i max(peak_i − resident_i, scratch_i) bounds both, whatever the commits
+/// end up leaving resident (a host commit carries nothing).
+fn tight_headroom(resident: &[u64], peak: &[u64], scratch: &[u64]) -> u64 {
+    resident
+        .iter()
+        .zip(peak)
+        .zip(scratch)
+        .map(|((&r, &p), &s)| p.saturating_sub(r).max(s))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Tight claims (the default): a carrying prove claims its tables' resident
+/// bounds plus [`tight_headroom`], admitted by the book's shared headroom
+/// ([`ClaimBook`]). `LAMBDA_VM_SHARED_GATE_CLAIMS=whole` restores the first
+/// form ([`resident_claim`]). On by default since BIG 474: median recursion
+/// −1.25 s (t −5.4), level-0 claim waits Σ 8–10 s a run → 0, VRAM ≤ 28.7 GiB.
+fn shared_claims_tight() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        shared_claims_setting(
+            std::env::var("LAMBDA_VM_SHARED_GATE_CLAIMS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`shared_claims_tight`] for a raw value: anything but `whole` is tight.
+fn shared_claims_setting(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("whole")
 }
 
 /// The same claim once Round 1 is done and `carried` is known: the bytes
@@ -1495,6 +1591,16 @@ mod shared_vram_gate_tests {
         );
     }
 
+    /// Claims are tight unless the knob says `whole`.
+    #[test]
+    fn claims_are_tight_unless_the_knob_says_whole() {
+        use super::shared_claims_setting as setting;
+        assert!(setting(None), "tight by default");
+        assert!(setting(Some("tight")));
+        assert!(!setting(Some("whole")), "whole restores the first form");
+        assert!(!setting(Some(" whole ")));
+    }
+
     /// On unless the knob says `0`.
     #[test]
     fn the_gate_is_on_unless_the_knob_says_zero() {
@@ -1526,81 +1632,144 @@ mod shared_vram_gate_tests {
 
 #[cfg(test)]
 mod resident_claim_tests {
-    use super::{VramGate, resident_claim, settled_claim};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use super::{VramGate, resident_claim, settled_claim, tight_headroom};
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
-    /// One table of a simulated prove: what its commit leaves resident, its
-    /// commit's scratch, and what its fused task adds on top of both.
-    type Table = (u64, u64, u64);
+    /// How a simulated prove claims: not at all, today's whole bound, or tight
+    /// (resident bounds plus a shared headroom).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Mode {
+        Unclaimed,
+        Today,
+        Tight,
+    }
 
-    /// A prove as `multi_prove` runs one that carries: a claim first (when
-    /// `claim`), each Round-1 commit admitted for its set and its resident
-    /// bytes carried past the permit, the claim settled, then each fused task
-    /// admitted for its set less what it carries. `paused`, after that many
-    /// Round-1 tables, reports on `at_pause` and waits on `go`.
-    fn prove_like(
+    /// One table of a simulated prove: its resident bound, its commit's
+    /// scratch, what its fused set adds on top of both, and whether its commit
+    /// keeps its residents (carries its bound) or falls back to the host
+    /// (carries nothing).
+    #[derive(Clone, Copy, Debug)]
+    struct Table {
+        r: u64,
+        s: u64,
+        e: u64,
+        keeps: bool,
+    }
+
+    const fn t(r: u64, s: u64, e: u64) -> Table {
+        Table {
+            r,
+            s,
+            e,
+            keeps: true,
+        }
+    }
+
+    /// A simulated prove (or several in sequence) to run on its own thread.
+    type ProveJob = Box<dyn FnOnce(&VramGate) + Send>;
+
+    /// A meeting point for `n` threads that gives up after `wait`.
+    struct Meet {
+        arrived: Mutex<usize>,
+        all: Condvar,
+        n: usize,
+        wait: Duration,
+    }
+
+    impl Meet {
+        fn new(n: usize, wait: Duration) -> Self {
+            Self {
+                arrived: Mutex::new(0),
+                all: Condvar::new(),
+                n,
+                wait,
+            }
+        }
+
+        fn meet(&self) {
+            let mut a = self.arrived.lock().unwrap();
+            *a += 1;
+            self.all.notify_all();
+            let deadline = Instant::now() + self.wait;
+            while *a < self.n {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return;
+                }
+                a = self.all.wait_timeout(a, left).unwrap().0;
+            }
+        }
+    }
+
+    /// A prove as `multi_prove` runs one that carries: a claim first (by
+    /// `mode`; a claim alone over the budget carries nothing), each Round-1
+    /// commit admitted for its resident bound plus scratch and what it keeps
+    /// carried past the permit, `after_r1` (a pause point), the claim settled,
+    /// then each fused task admitted for its set less what it carries.
+    /// `before[i]` runs before table i's Round-1 commit.
+    fn prove_with(
         gate: &VramGate,
         tables: &[Table],
-        claim: bool,
-        paused: usize,
-        at_pause: mpsc::Sender<()>,
-        go: mpsc::Receiver<()>,
+        mode: Mode,
+        before: &dyn Fn(usize),
+        after_r1: &dyn Fn(),
     ) {
-        let resident: Vec<u64> = tables.iter().map(|t| t.0).collect();
-        let peak: Vec<u64> = tables.iter().map(|t| t.0 + t.1 + t.2).collect();
-        let claim = claim.then(|| gate.claim(resident_claim(&resident, &peak)));
+        let r: Vec<u64> = tables.iter().map(|t| t.r).collect();
+        let s: Vec<u64> = tables.iter().map(|t| t.s).collect();
+        let peak: Vec<u64> = tables.iter().map(|t| t.r + t.s + t.e).collect();
+        let (held, headroom) = match mode {
+            Mode::Unclaimed => (0, 0),
+            Mode::Today => (resident_claim(&r, &peak), 0),
+            Mode::Tight => (r.iter().sum(), tight_headroom(&r, &peak, &s)),
+        };
+        let budget = gate.budget.load(std::sync::atomic::Ordering::Relaxed);
+        let carry = held + headroom <= budget;
+        let claim = (mode != Mode::Unclaimed).then(|| gate.claim(held, headroom));
         let mut carried = Vec::new();
+        let mut kept = Vec::new();
         for (i, t) in tables.iter().enumerate() {
-            if i == paused {
-                let _ = at_pause.send(());
-                let _ = go.recv();
-            }
-            let permit = gate.acquire(t.0 + t.1);
-            carried.push(Some(gate.carry(t.0, claim.as_ref())));
+            before(i);
+            let permit = gate.acquire(t.r + t.s);
+            let c = if carry && t.keeps { t.r } else { 0 };
+            kept.push(c);
+            carried.push((c > 0).then(|| gate.carry(c, claim.as_ref())));
             drop(permit);
         }
-        if let Some(c) = &claim {
-            c.shrink(c.bytes().saturating_sub(settled_claim(&resident, &peak)));
+        after_r1();
+        if let Some(cl) = &claim
+            && carry
+        {
+            let settled = match mode {
+                Mode::Tight => kept.iter().sum(),
+                _ => settled_claim(&kept, &peak),
+            };
+            cl.shrink(cl.held().saturating_sub(settled));
         }
-        for (i, t) in tables.iter().enumerate() {
-            let permit = gate.acquire(peak[i] - t.0);
+        for (i, _) in tables.iter().enumerate() {
+            let permit = gate.acquire(peak[i] - kept[i]);
             let _resident = carried[i].take();
             drop(permit);
         }
     }
 
-    /// Two proves of three tables (resident 4, scratch 1, fused 1) on a gate
-    /// of 18 — exactly one prove's claim. The first pauses after two Round-1
-    /// commits; the second starts then, and the first goes on 200 ms later.
-    /// Whether both finish in 10 s.
-    fn two_proves_finish(claim: bool) -> bool {
-        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(18)));
-        let tables: &'static [Table] = &[(4, 1, 1), (4, 1, 1), (4, 1, 1)];
-        let (done_tx, done_rx) = mpsc::channel();
-        let (a_paused, a_paused_rx) = mpsc::channel();
-        let (a_go, a_go_rx) = mpsc::channel();
-        let done = done_tx.clone();
-        std::thread::spawn(move || {
-            prove_like(gate, tables, claim, 2, a_paused, a_go_rx);
-            let _ = done.send(());
-        });
-        a_paused_rx.recv().unwrap();
-        std::thread::spawn(move || {
-            // Past its last table: never pauses.
-            let (b_paused, _) = mpsc::channel();
-            let (_, b_go) = mpsc::channel();
-            prove_like(gate, tables, claim, tables.len(), b_paused, b_go);
-            let _ = done_tx.send(());
-        });
-        // Without a claim the second prove carries two residents beside the
-        // first's two (16 of 18) and waits on its third commit; with one it
-        // waits on the claim instead.
-        std::thread::sleep(Duration::from_millis(200));
-        a_go.send(()).unwrap();
-        let finished = (0..2).all(|_| done_rx.recv_timeout(Duration::from_secs(10)).is_ok());
+    /// Whether every prove in `proves` (each run on its own thread, started in
+    /// order `gap` apart) finishes within 10 s; a wedged gate is opened
+    /// afterwards so the threads end.
+    #[allow(clippy::type_complexity)]
+    fn all_finish(gate: &'static VramGate, proves: Vec<ProveJob>, gap: Duration) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let n = proves.len();
+        for p in proves {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                p(gate);
+                let _ = tx.send(());
+            });
+            std::thread::sleep(gap);
+        }
+        let finished = (0..n).all(|_| rx.recv_timeout(Duration::from_secs(10)).is_ok());
         if !finished {
-            // Unwedge the stuck proves so their threads end.
             gate.budget
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
             gate.freed.notify_all();
@@ -1609,33 +1778,206 @@ mod resident_claim_tests {
         finished
     }
 
+    /// Two proves of three tables (resident 4, scratch 1, fused 1) on a gate
+    /// of 18. The first pauses before its third Round-1 commit until the
+    /// second has carried two tables or 200 ms have passed. Whether both
+    /// finish.
+    fn two_proves_finish(mode: Mode) -> bool {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(18)));
+        let meet: &'static Meet = Box::leak(Box::new(Meet::new(2, Duration::from_millis(200))));
+        const TABLES: [Table; 3] = [t(4, 1, 1), t(4, 1, 1), t(4, 1, 1)];
+        all_finish(
+            gate,
+            vec![
+                Box::new(move |g| {
+                    prove_with(
+                        g,
+                        &TABLES,
+                        mode,
+                        &|i| {
+                            if i == 2 {
+                                meet.meet()
+                            }
+                        },
+                        &|| {},
+                    )
+                }),
+                Box::new(move |g| {
+                    prove_with(
+                        g,
+                        &TABLES,
+                        mode,
+                        &|i| {
+                            if i == 2 {
+                                meet.meet()
+                            }
+                        },
+                        &|| {},
+                    )
+                }),
+            ],
+            Duration::from_millis(20),
+        )
+    }
+
     /// ★ Carried bytes without claims wedge the gate: each prove holds two
     /// residents (16 of 18) and neither can commit its third table.
     #[test]
     fn two_proves_carrying_without_claims_wedge_the_gate() {
         assert!(
-            !two_proves_finish(false),
-            "the unclaimed proves finished: the scenario no longer wedges, so the claim test proves nothing"
+            !two_proves_finish(Mode::Unclaimed),
+            "the unclaimed proves finished: the scenario no longer wedges, so the claim tests prove nothing"
         );
     }
 
-    /// ★ With claims the same two proves finish: the second waits for the
-    /// first's claim instead of carrying beside it.
+    /// ★ With today's claims, and with tight claims under the shared
+    /// headroom, the same two proves finish.
     #[test]
     fn with_claims_two_carrying_proves_finish() {
         assert!(
-            two_proves_finish(true),
-            "the claimed proves wedged the gate"
+            two_proves_finish(Mode::Today),
+            "today's claims wedged the gate"
         );
+        assert!(
+            two_proves_finish(Mode::Tight),
+            "tight claims wedged the gate"
+        );
+    }
+
+    /// ★ The shared headroom is what keeps two tight claims apart: each prove
+    /// holds 4 resident and will ask for 3 more (B = 10). Σ R alone (8) would
+    /// admit both; both would carry their 4 and ask for 3 beside the other's 4
+    /// (11 > 10), and neither could go on. Σ R + max H (11) makes the second
+    /// wait.
+    #[test]
+    fn the_shared_headroom_keeps_two_top_ups_from_wedging() {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(10)));
+        let meet: &'static Meet = Box::leak(Box::new(Meet::new(2, Duration::from_millis(300))));
+        const ONE: [Table; 1] = [t(4, 0, 3)];
+        assert!(
+            all_finish(
+                gate,
+                vec![
+                    Box::new(move |g| prove_with(g, &ONE, Mode::Tight, &|_| {}, &|| meet.meet())),
+                    Box::new(move |g| prove_with(g, &ONE, Mode::Tight, &|_| {}, &|| meet.meet())),
+                ],
+                Duration::from_millis(20),
+            ),
+            "two tight claims wedged on their top-ups"
+        );
+    }
+
+    /// ★ The book keeps the LARGEST headroom, not the smallest: X (held 2,
+    /// headroom 1), then Y and Z (held 10, headroom 10 each), B = 23. With the
+    /// smallest, Y and Z both enter beside X (2 + 20 + 1 ≤ 23); once X leaves
+    /// they each carry 10 and ask for 10 more (30 > 23): wedged. With the
+    /// largest, Z waits for Y.
+    #[test]
+    fn the_book_keeps_the_largest_headroom() {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(23)));
+        let meet: &'static Meet = Box::leak(Box::new(Meet::new(2, Duration::from_millis(300))));
+        const X: [Table; 1] = [t(2, 0, 1)];
+        const YZ: [Table; 1] = [t(10, 0, 10)];
+        let x_holds = Box::leak(Box::new(Meet::new(2, Duration::from_millis(150))));
+        let x_holds: &'static Meet = x_holds;
+        assert!(
+            all_finish(
+                gate,
+                vec![
+                    // X holds its claim until Y and Z have tried theirs.
+                    Box::new(move |g| prove_with(g, &X, Mode::Tight, &|_| x_holds.meet(), &|| {})),
+                    Box::new(move |g| prove_with(g, &YZ, Mode::Tight, &|_| {}, &|| meet.meet())),
+                    Box::new(move |g| prove_with(g, &YZ, Mode::Tight, &|_| {}, &|| meet.meet())),
+                ],
+                Duration::from_millis(20),
+            ),
+            "the book admitted Y and Z beside X and they wedged once X left"
+        );
+    }
+
+    /// ★ Randomized: four threads each run six proves of 1–5 tables with
+    /// random resident bounds, scratch, fused sets and host fallbacks, under
+    /// tight claims on one gate whose budget fits at least one prove's claim.
+    /// Every prove finishes, and whenever two or more claims are in force,
+    /// Σ R + max H ≤ B.
+    #[test]
+    fn tight_claims_never_wedge_random_proves() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..4 {
+            let mut plans: Vec<Vec<Vec<Table>>> = Vec::new();
+            let mut biggest = 0;
+            for _ in 0..4 {
+                let mut proves = Vec::new();
+                for _ in 0..6 {
+                    let n = 1 + (next() % 5) as usize;
+                    let tables: Vec<Table> = (0..n)
+                        .map(|_| Table {
+                            r: next() % 7,
+                            s: next() % 3,
+                            e: next() % 7,
+                            keeps: next() % 4 != 0,
+                        })
+                        .collect();
+                    let r: Vec<u64> = tables.iter().map(|t| t.r).collect();
+                    let sc: Vec<u64> = tables.iter().map(|t| t.s).collect();
+                    let p: Vec<u64> = tables.iter().map(|t| t.r + t.s + t.e).collect();
+                    biggest = biggest.max(r.iter().sum::<u64>() + tight_headroom(&r, &p, &sc));
+                    proves.push(tables);
+                }
+                plans.push(proves);
+            }
+            let budget = biggest + next() % (biggest + 1);
+            let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(budget)));
+            let worst = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+            let worst: &'static std::sync::atomic::AtomicU64 = worst;
+            let threads: Vec<ProveJob> = plans
+                .into_iter()
+                .map(|proves| {
+                    Box::new(move |g: &VramGate| {
+                        for tables in proves {
+                            prove_with(
+                                g,
+                                &tables,
+                                Mode::Tight,
+                                &|_| std::thread::sleep(Duration::from_micros(200)),
+                                &|| {
+                                    let book = g.claims.lock().unwrap();
+                                    if book.len() > 1 {
+                                        worst.fetch_max(
+                                            book.total(),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    }) as ProveJob
+                })
+                .collect();
+            assert!(
+                all_finish(gate, threads, Duration::from_millis(1)),
+                "round {round}: random tight proves wedged (budget {budget})"
+            );
+            assert!(
+                worst.load(std::sync::atomic::Ordering::Relaxed) <= budget,
+                "round {round}: Σ R + max H passed the budget with two claims in force"
+            );
+        }
     }
 
     /// Carried bytes stay in the account past the permit they were allocated
     /// under and leave it when dropped; dropping them gives their share of the
-    /// claim back.
+    /// claim's held part back, and the claim's headroom leaves with the claim.
     #[test]
     fn carried_bytes_outlive_their_permit_and_give_their_claim_back() {
         let gate = VramGate::new(10);
-        let claim = gate.claim(9);
+        let claim = gate.claim(7, 2);
         let permit = gate.acquire(5);
         let carried = gate.carry(4, Some(&claim));
         assert_eq!(*gate.used.lock().unwrap(), 9, "the permit and the carry");
@@ -1647,58 +1989,73 @@ mod resident_claim_tests {
         );
         drop(carried);
         assert_eq!(*gate.used.lock().unwrap(), 0);
-        assert_eq!(claim.bytes(), 5, "the carry's share of the claim went back");
-        assert_eq!(*gate.claims.lock().unwrap(), (5, 1));
+        assert_eq!(claim.held(), 3, "the carry's share of the claim went back");
+        assert_eq!(claim.bytes(), 5, "held plus headroom");
+        {
+            let book = gate.claims.lock().unwrap();
+            assert_eq!((book.held, book.len(), book.total()), (3, 1, 5));
+        }
         drop(claim);
-        assert_eq!(*gate.claims.lock().unwrap(), (0, 0));
+        let book = gate.claims.lock().unwrap();
+        assert_eq!((book.held, book.len(), book.total()), (0, 0, 0));
     }
 
-    /// The claim before Round 1 bounds every admission a prove can wait on
-    /// whatever its commits leave resident; settled, it is never larger.
+    /// Today's claim before Round 1 bounds every admission a prove can wait on
+    /// whatever its commits leave resident; settled, it is never larger. The
+    /// tight headroom bounds them too, beside the resident bounds.
     #[test]
-    fn the_claim_bounds_every_wait_and_only_settles_down() {
+    fn the_claims_bound_every_wait_and_only_settle_down() {
         let resident = [4u64, 2, 0];
         let peak = [6u64, 5, 3];
+        let scratch = [1u64, 1, 1];
         assert_eq!(resident_claim(&resident, &peak), 6 + 6);
+        let h = tight_headroom(&resident, &peak, &scratch);
+        assert_eq!(h, 3, "max(6 − 4, 5 − 2, 3 − 0, 1)");
         for carried in [[4u64, 2, 0], [0, 0, 0], [4, 0, 0], [0, 2, 0]] {
             let settled = settled_claim(&carried, &peak);
             assert!(settled <= resident_claim(&resident, &peak), "{carried:?}");
             let held: u64 = carried.iter().sum();
-            for (p, c) in peak.iter().zip(&carried) {
+            for (i, (p, c)) in peak.iter().zip(&carried).enumerate() {
                 assert!(
                     held + (p - c) <= settled,
                     "{carried:?}: a top-up past the claim"
+                );
+                // Tight: the other tables' carries plus this table's set.
+                let others: u64 = held - c;
+                assert!(
+                    others + p <= resident.iter().sum::<u64>() + h,
+                    "{carried:?}, table {i}"
                 );
             }
         }
     }
 
-    /// A second claim waits while the sum would pass the budget, and is
-    /// admitted when the first shrinks enough; one claim alone always is.
+    /// A second claim waits while Σ held + max headroom would pass the budget,
+    /// and enters once the first shrinks enough; one claim alone always does.
     #[test]
     fn a_claim_waits_for_room_beside_the_claims_in_force() {
         let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(10)));
-        let big = gate.claim(25);
+        let big = gate.claim(25, 0);
         assert_eq!(
-            *gate.claims.lock().unwrap(),
-            (25, 1),
+            gate.claims.lock().unwrap().total(),
+            25,
             "alone, over the budget"
         );
         drop(big);
-        let first = gate.claim(7);
+        let first = gate.claim(5, 3);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _second = gate.claim(4);
+            let _second = gate.claim(3, 1);
             let _ = tx.send(());
         });
         assert!(
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "7 + 4 > 10"
+            "5 + 3 + max(3, 1) = 11 > 10"
         );
         first.shrink(1);
         assert!(
             rx.recv_timeout(Duration::from_secs(10)).is_ok(),
-            "6 + 4 fits"
+            "4 + 3 + 3 = 10 fits"
         );
     }
 }
@@ -2258,7 +2615,7 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
         let used = gate.used.lock().unwrap();
         // Never under a claim: a budget calibrated lower than the claims in
         // force would void their guarantee.
-        if *used == 0 && gate.claims.lock().unwrap().1 == 0 {
+        if *used == 0 && gate.claims.lock().unwrap().len() == 0 {
             let free = device_free_after_trim();
             let b = calibrated_budget(configured, free, margin_bytes);
             gate.budget.store(b, Ordering::Relaxed);
@@ -6923,21 +7280,50 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
-        let claim_bytes = resident_claim(&resident_bounds, &peak_estimates);
+        // Today's claim holds its whole bound; the tight one holds the
+        // resident bounds and shares its headroom with the claims in force
+        // (`ResidentClaim`).
+        let tight = shared_claims_tight();
+        #[cfg(any(test, feature = "test-utils"))]
+        // A test that forces the carry picks the claim's form itself.
+        let tight = match &test_overrides {
+            Some((o, _)) if o.carry_residents => o.tight_claims,
+            _ => tight,
+        };
+        let (claim_held, claim_headroom) = if tight {
+            let scratch: Vec<u64> = main_sets.iter().map(|set| set.scratch_bytes).collect();
+            (
+                resident_bounds
+                    .iter()
+                    .fold(0u64, |a, &b| a.saturating_add(b)),
+                tight_headroom(&resident_bounds, &peak_estimates, &scratch),
+            )
+        } else {
+            (resident_claim(&resident_bounds, &peak_estimates), 0)
+        };
+        let claim_bytes = claim_held.saturating_add(claim_headroom);
         let carry_residents =
             carry_wanted && claim_bytes <= vram_gate.budget.load(Ordering::Relaxed);
         let claim = carry_wanted.then(|| {
             let waited = std::time::Instant::now();
-            let claim = vram_gate.claim(claim_bytes);
+            let claim = vram_gate.claim(claim_held, claim_headroom);
             if gate_shared {
-                let (claimed, n) = *vram_gate.claims.lock().unwrap();
+                let (claimed, n) = {
+                    let book = vram_gate.claims.lock().unwrap();
+                    (book.total(), book.len())
+                };
                 let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                 eprintln!(
-                    "[prover] shared VRAM gate claim: {:.2} GiB ({} tables, residents ≤ {:.2} GiB), waited {:.3}s; \
+                    "[prover] shared VRAM gate claim: {:.2} GiB ({} tables, residents ≤ {:.2} GiB{}), waited {:.3}s; \
                      claims in force {n} ({:.2} GiB of {:.2}){}",
                     gib(claim_bytes),
                     num_airs,
                     gib(resident_bounds.iter().sum()),
+                    if tight {
+                        format!(", shared headroom {:.2} GiB", gib(claim_headroom))
+                    } else {
+                        String::new()
+                    },
                     waited.elapsed().as_secs_f64(),
                     gib(claimed),
                     gib(vram_gate.budget.load(Ordering::Relaxed)),
@@ -7103,11 +7489,15 @@ pub trait IsStarkProver<
         if let Some(claim) = &claim
             && carry_residents
         {
-            claim.shrink(
-                claim
-                    .bytes()
-                    .saturating_sub(settled_claim(&carried, &peak_estimates)),
-            );
+            // Today's: down to the carried bytes plus the largest top-up. The
+            // tight one: the held part down to the carried bytes; its headroom
+            // already bounds every top-up.
+            let settled = if tight {
+                carried.iter().fold(0u64, |a, &b| a.saturating_add(b))
+            } else {
+                settled_claim(&carried, &peak_estimates)
+            };
+            claim.shrink(claim.held().saturating_sub(settled));
         }
         #[cfg(any(test, feature = "test-utils"))]
         if let Some((_, log)) = &test_overrides {
