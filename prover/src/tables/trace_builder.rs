@@ -3993,19 +3993,35 @@ pub(crate) fn keccak_rnd_chunks(
             "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"
         )));
     }
-    Ok((0..chunks)
-        .map(|c| {
-            if c < streamed {
-                return streamed_placeholder();
-            }
-            let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
-            packed_if(
-                pack,
-                keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows),
-            )
-        })
-        .collect())
+    let chunk = |c: usize| {
+        if c < streamed {
+            return streamed_placeholder();
+        }
+        let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
+        packed_if(
+            pack,
+            keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows),
+        )
+    };
+    // Packed, a few chunks at a time in parallel: each chunk's pack is serial,
+    // and one task building them all one after another would be the finish's
+    // last; at most `KECCAK_RND_PACK_WAVE` chunks are wide at once.
+    #[cfg(feature = "parallel")]
+    if pack {
+        let mut tables = Vec::with_capacity(chunks);
+        let all: Vec<usize> = (0..chunks).collect();
+        for wave in all.chunks(KECCAK_RND_PACK_WAVE) {
+            tables.par_extend(wave.par_iter().map(|&c| chunk(c)));
+        }
+        return Ok(tables);
+    }
+    Ok((0..chunks).map(chunk).collect())
 }
+
+/// KECCAK_RND chunks built and packed at once ([`keccak_rnd_chunks`]): each is
+/// ≈ 0.8 GiB at eight bytes a cell (1,480 columns of 2^16 rows) before its pack.
+#[cfg(feature = "parallel")]
+const KECCAK_RND_PACK_WAVE: usize = 4;
 
 /// The ops whose rows reach KECCAK_RND chunk `chunk` of `rows` rows (24 rows an
 /// op), clamped to the `len` ops there are.
