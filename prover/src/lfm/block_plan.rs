@@ -479,11 +479,14 @@ impl BlockTreePlan {
 
     /// [`Self::derive_top`] and its stopwatch, one [`PhaseTimes`] per level (the
     /// leaves, then each node level). A level's programs are emitted and built
-    /// in parallel.
+    /// in parallel, their device commits under the derive gate's running total
+    /// ([`super::derive_gate`]), which this arms: the block verifier's
+    /// derivation, with no prove beside it.
     pub(crate) fn derive_top_timed(
         &self,
         wrap_opts: &crate::ProofOptions,
     ) -> Result<(LfmArtifacts, Vec<PhaseTimes>), String> {
+        let _gate = super::derive_gate::arm();
         let (mut tree, phases) = self.derive_levels(
             wrap_opts,
             &|program| artifacts_of(program, wrap_opts),
@@ -723,15 +726,18 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
 /// leaf order, then each node level, the top last.
 pub(crate) type TreePrograms = Vec<Vec<(LfmProgram, LfmArtifacts)>>;
 
-/// `LAMBDA_VM_BLOCK_DERIVE_BUILDS=<n>`: at most `n` of a level's artifact builds
-/// run at once while a tree is derived ([`BlockTreePlan::derive_top`], so the
-/// block verifier, and [`BlockTreePlan::derive_tree`]); unset, as many as the
-/// pool runs. A build's device commits are admitted per dispatch against the
-/// whole card, with no running total, so an unbounded level puts as many builds
-/// on the card as there are threads: the median block's verifier peaked at
-/// 31.85 GiB of a 32 GiB card (BIG 480). Scheduling only: every artifact is a
-/// pure function of its program and the options, so the derived tree and the
-/// top program do not depend on it.
+/// `LAMBDA_VM_BLOCK_DERIVE_BUILDS=<n>`: a level's items are emitted and built
+/// in windows of `n` while a tree is derived ([`BlockTreePlan::derive_top`],
+/// so the block verifier, and [`BlockTreePlan::derive_tree`]), each window in
+/// parallel; unset, the whole level is one window. Nothing is held while a
+/// window runs: a place taken in a rayon job and held across the build, which
+/// waits inside rayon, can be asked for again by a job its thread steals there
+/// (#1014's W3 hang, BIG 569). The card's bound is the derive gate's running
+/// total in bytes ([`super::derive_gate`]), not this count: the median block's
+/// unbounded verifier peaked at 31.85 GiB of a 32 GiB card (BIG 480), the p90
+/// block's ran out (BIG 123). Scheduling only: every artifact is a pure
+/// function of its program and the options, so the derived tree and the top
+/// program do not depend on it.
 fn derive_builds_bound() -> Option<usize> {
     static BOUND: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *BOUND.get_or_init(|| match std::env::var("LAMBDA_VM_BLOCK_DERIVE_BUILDS") {
@@ -742,38 +748,29 @@ fn derive_builds_bound() -> Option<usize> {
     })
 }
 
-/// At most `n` holders at once; [`BuildGate::enter`] waits for a place.
-struct BuildGate {
-    free: std::sync::Mutex<usize>,
-    freed: std::sync::Condvar,
-}
-
-/// A place in a [`BuildGate`], given back on drop.
-struct BuildPlace<'a>(&'a BuildGate);
-
-impl BuildGate {
-    fn new(n: usize) -> Self {
-        Self {
-            free: std::sync::Mutex::new(n),
-            freed: std::sync::Condvar::new(),
+/// `f` over `items` in order, in windows of `window` (all of them at once when
+/// `None`), each window in parallel where there is a pool; the first error
+/// stops it.
+fn map_in_windows<T: Sync, R: Send>(
+    items: &[T],
+    window: Option<usize>,
+    f: impl Fn(&T) -> Result<R, String> + Sync + Send,
+) -> Result<Vec<R>, String> {
+    let mut done = Vec::with_capacity(items.len());
+    for part in items.chunks(window.unwrap_or(items.len()).max(1)) {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            done.extend(
+                part.par_iter()
+                    .map(&f)
+                    .collect::<Result<Vec<_>, String>>()?,
+            );
         }
+        #[cfg(not(feature = "parallel"))]
+        done.extend(part.iter().map(&f).collect::<Result<Vec<_>, String>>()?);
     }
-
-    fn enter(&self) -> BuildPlace<'_> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
-        while *free == 0 {
-            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
-        }
-        *free -= 1;
-        BuildPlace(self)
-    }
-}
-
-impl Drop for BuildPlace<'_> {
-    fn drop(&mut self) {
-        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.0.freed.notify_one();
-    }
+    Ok(done)
 }
 
 /// `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`: [`BlockTreePlan::derive_top`] holds each
@@ -800,7 +797,7 @@ type DerivedItem = (Option<(LfmProgram, LfmArtifacts)>, DerivedChild);
 
 /// One level of a tree's derivation: each item's program emitted, its artifacts
 /// built by `build` and its shape as a child derived, in parallel and in order,
-/// at most [`derive_builds_bound`] builds at once. Without `keep`, each item's
+/// in windows of [`derive_builds_bound`]. Without `keep`, each item's
 /// program and artifacts are dropped as soon as its child is derived.
 /// Pushes the level's stopwatch onto `phases`.
 fn derive_level<T: Sync>(
@@ -814,15 +811,12 @@ fn derive_level<T: Sync>(
 ) -> Result<Vec<DerivedItem>, String> {
     let t = Instant::now();
     type Derived = (DerivedItem, f64, f64);
-    let gate = derive_builds_bound().map(BuildGate::new);
     let one = |item: &T| -> Result<Derived, String> {
         let t = Instant::now();
         let program = emit(item)?;
         let emitted = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let place = gate.as_ref().map(BuildGate::enter);
         let artifacts = build(&program);
-        drop(place);
         let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
         let built = t.elapsed().as_secs_f64();
         Ok((
@@ -831,13 +825,7 @@ fn derive_level<T: Sync>(
             built,
         ))
     };
-    #[cfg(feature = "parallel")]
-    let done: Vec<_> = {
-        use rayon::prelude::*;
-        items.par_iter().map(one).collect::<Result<_, String>>()?
-    };
-    #[cfg(not(feature = "parallel"))]
-    let done: Vec<_> = items.iter().map(one).collect::<Result<_, String>>()?;
+    let done = map_in_windows(items, derive_builds_bound(), one)?;
     let mut phase = PhaseTimes {
         programs: done.len(),
         ..PhaseTimes::default()
@@ -1056,31 +1044,34 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The derive's build gate lets at most its bound through at once, and every
-    /// waiter through in the end.
+    /// The count cap's windows: at most `n` items at once, every item once,
+    /// in order, and the first error stops the level.
     #[test]
-    fn the_build_gate_holds_its_bound() {
-        let gate = BuildGate::new(2);
-        let inside = AtomicUsize::new(0);
-        let most = AtomicUsize::new(0);
-        let done = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
-                    let _place = gate.enter();
-                    let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                    most.fetch_max(now, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    inside.fetch_sub(1, Ordering::SeqCst);
-                    done.fetch_add(1, Ordering::SeqCst);
-                });
+    fn a_level_in_windows_holds_its_bound_and_its_order() {
+        let items: Vec<usize> = (0..23).collect();
+        for window in [None, Some(1), Some(2), Some(5), Some(64)] {
+            let inside = AtomicUsize::new(0);
+            let most = AtomicUsize::new(0);
+            let done = map_in_windows(&items, window, |&i| {
+                let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                inside.fetch_sub(1, Ordering::SeqCst);
+                Ok(i * 3)
+            })
+            .expect("no item fails");
+            assert_eq!(done, items.iter().map(|i| i * 3).collect::<Vec<_>>());
+            if let Some(n) = window {
+                assert!(most.load(Ordering::SeqCst) <= n, "window {n}");
+            }
+        }
+        let failed = map_in_windows(&items, Some(4), |&i| {
+            if i == 9 {
+                Err(format!("item {i}"))
+            } else {
+                Ok(i)
             }
         });
-        assert_eq!(done.load(Ordering::SeqCst), 8, "every holder got through");
-        assert_eq!(
-            most.load(Ordering::SeqCst),
-            2,
-            "never more than the bound at once"
-        );
+        assert_eq!(failed, Err("item 9".to_string()));
     }
 }

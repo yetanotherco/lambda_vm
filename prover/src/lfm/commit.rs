@@ -268,8 +268,14 @@ pub fn commit_group_device_or_host_with(
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
         // Under the shared gate (`LAMBDA_VM_SHARED_VRAM_GATE`) the commit's
         // device set is admitted beside the proofs in flight; otherwise the
-        // caller's card permit is the exclusion.
+        // caller's card permit is the exclusion. Outside it, the block tree's
+        // derivation keeps its own running total (`derive_gate`), held around
+        // this dispatch alone: nothing below forks rayon.
         let _bytes = stark::prover::shared_vram_admit(set.total());
+        let _derive = match _bytes {
+            None => super::derive_gate::admit(set.total()),
+            Some(_) => None,
+        };
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,

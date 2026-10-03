@@ -35,6 +35,7 @@ pub mod commit;
 pub mod compiler;
 pub mod constraints;
 pub mod deep;
+pub(crate) mod derive_gate;
 pub mod device_permit;
 pub mod edsl;
 pub mod epoch;
