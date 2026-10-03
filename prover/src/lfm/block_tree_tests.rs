@@ -1861,6 +1861,158 @@ fn emit_window_knob() -> Option<usize> {
         })
 }
 
+/// `NOEPOCH_TREE_EMIT_LATE=<margin>`: in the pipeline mode, the leaf programs
+/// beside the base are emitted late in its prove instead of at the shape: leaf
+/// 0 at the shape, the rest once the heap's live bytes have fallen `margin` ×
+/// their estimated bytes below the shape's (phase B frees each trace as its
+/// table proves), or have stopped falling, or the base has returned
+/// ([`late_trigger`]). Freed trace buffers sit in jemalloc's shared oversize
+/// arena and 99.5 % of a program's bytes are allocations that size, so the
+/// programs then take the freed pages instead of raising the base's high-water
+/// (laptop probe: 90 % reused; emitted at the shape they took fresh pages, +18.5
+/// GiB at the median, BIG 480). Unset (the default) emits them all at the shape.
+fn emit_late_knob() -> Option<f64> {
+    std::env::var("NOEPOCH_TREE_EMIT_LATE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|m: &f64| m.is_finite() && *m > 0.0)
+                .unwrap_or_else(|| {
+                    panic!("NOEPOCH_TREE_EMIT_LATE must be a positive margin, got `{v}`")
+                })
+        })
+}
+
+/// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
+/// by [`LATE_LOW_STEP`] for this long (spill on: phase B holds only its
+/// read-back window, so the live bytes stop falling long before the programs'
+/// bytes are freed).
+const LATE_SETTLE_SECS: f64 = 30.0;
+
+/// The step a new low of the heap's live bytes must beat the last one by.
+const LATE_LOW_STEP: usize = 1 << 30;
+
+/// When the late emission (`NOEPOCH_TREE_EMIT_LATE`) starts: once the heap's
+/// live bytes are `need` below their value at the shape (`fell`), or have made
+/// no new low for [`LATE_SETTLE_SECS`] (`settled`), or the base has returned
+/// (`base returned`); `None` keeps waiting.
+fn late_trigger(
+    live_at_shape: usize,
+    live: usize,
+    need: usize,
+    since_low_secs: f64,
+    base_done: bool,
+) -> Option<&'static str> {
+    if live_at_shape.saturating_sub(live) >= need {
+        Some("fell")
+    } else if base_done {
+        Some("base returned")
+    } else if since_low_secs >= LATE_SETTLE_SECS {
+        Some("settled")
+    } else {
+        None
+    }
+}
+
+/// The late emission's wait and what the heap did around it.
+struct LateWait {
+    trigger: &'static str,
+    waited: f64,
+    /// Seconds since the base started, when the wait ended.
+    at: f64,
+    estimate: usize,
+    need: usize,
+    live_at_shape: usize,
+    live_at_start: usize,
+    resident_at_start: usize,
+}
+
+/// Waits for [`late_trigger`], polling the heap every 200 ms. `first` is leaf
+/// 0's program; the other `beside - 1` leaves' bytes are estimated from its
+/// bytes a permutation of in-guest verification.
+fn wait_for_late_emission(
+    plan: &BlockTreePlan,
+    first: &LfmProgram,
+    beside: usize,
+    margin: f64,
+    live_at_shape: usize,
+    base_done: &std::sync::atomic::AtomicBool,
+    t_base0: std::time::Instant,
+) -> LateWait {
+    use std::time::Instant;
+    let costs = plan.costs();
+    let perms =
+        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
+    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
+    let estimate = (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize;
+    let need = (margin * estimate as f64) as usize;
+    let t = Instant::now();
+    let (mut low, mut low_at) = (live_at_shape, Instant::now());
+    let trigger = loop {
+        let live = heap_allocated();
+        if live + LATE_LOW_STEP <= low {
+            (low, low_at) = (live, Instant::now());
+        }
+        let done = base_done.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(why) = late_trigger(
+            live_at_shape,
+            live,
+            need,
+            low_at.elapsed().as_secs_f64(),
+            done,
+        ) {
+            break why;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    LateWait {
+        trigger,
+        waited: t.elapsed().as_secs_f64(),
+        at: t_base0.elapsed().as_secs_f64(),
+        estimate,
+        need,
+        live_at_shape,
+        live_at_start: heap_allocated(),
+        resident_at_start: heap_resident(),
+    }
+}
+
+/// `NOEPOCH_TREE_EMIT_LATE`'s trigger: a fall of `need` below the shape's live
+/// bytes starts the emission; otherwise the base's return or a heap that has
+/// settled does; nothing else does.
+#[test]
+fn the_late_emission_waits_for_its_room() {
+    const G: usize = 1 << 30;
+    // The median, spill off: 68 GiB live at the shape, a fall of 30 GiB needed.
+    assert_eq!(late_trigger(68 * G, 60 * G, 30 * G, 0.5, false), None);
+    assert_eq!(
+        late_trigger(68 * G, 38 * G, 30 * G, 0.5, false),
+        Some("fell")
+    );
+    // Phase B's transients lifting the live bytes over the shape's are no fall.
+    assert_eq!(late_trigger(68 * G, 70 * G, 30 * G, 0.5, false), None);
+    let settled = LATE_SETTLE_SECS;
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, settled - 0.1, false),
+        None
+    );
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, settled, false),
+        Some("settled")
+    );
+    assert_eq!(
+        late_trigger(68 * G, 60 * G, 30 * G, 0.5, true),
+        Some("base returned")
+    );
+    // The fall is reported over the other two.
+    assert_eq!(
+        late_trigger(68 * G, 38 * G, 30 * G, settled, true),
+        Some("fell")
+    );
+}
+
 /// [`compose_block_tree`], each node proved from the program and artifacts
 /// derived ahead when `ahead` holds the node levels, and each node below the top
 /// verified on `beside` when given (the top is verified inline).
@@ -2859,6 +3011,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let emit_threads = emit_pool_knob();
     let emit_window = emit_window_knob();
     let node_emit_early = node_emit_early_knob();
+    let emit_late = emit_late_knob();
+    let base_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2867,6 +3021,7 @@ fn the_block_tree_composes_to_a_top_node() {
     let t_base0 = Instant::now();
     let consts_beside = elf_beside.map(|threads| {
         let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
+        let base_done = base_done.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
@@ -2878,8 +3033,10 @@ fn the_block_tree_composes_to_a_top_node() {
             let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
             let secs = t.elapsed().as_secs_f64();
             let mut job = None;
+            let mut late_line = None;
             let ahead = match (&consts, tree_ahead) {
                 (Ok(c), Some(mode)) => shape_rx.recv().ok().map(|shape| {
+                    let live_at_shape = emit_late.map(|_| heap_allocated());
                     let t = Instant::now();
                     let derived = pool.install(|| -> Result<_, String> {
                         let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
@@ -2896,13 +3053,61 @@ fn the_block_tree_composes_to_a_top_node() {
                             }
                             AheadMode::Pipe => {
                                 use rayon::prelude::*;
-                                let te = Instant::now();
                                 let n = plan.partition().num_leaves();
                                 let beside = emit_window.map_or(n, |w| w.min(n));
-                                let leaves = (0..beside)
-                                    .into_par_iter()
-                                    .map(|k| plan.leaf_program(k))
-                                    .collect::<Result<Vec<_>, String>>()?;
+                                // `NOEPOCH_TREE_EMIT_LATE`: leaf 0 now, sizing the
+                                // wait; the rest once phase B has freed their room.
+                                let mut leaves = Vec::with_capacity(beside);
+                                let late = match (emit_late, live_at_shape) {
+                                    (Some(margin), Some(live)) if beside > 1 => {
+                                        leaves.push(plan.leaf_program(0)?);
+                                        Some(wait_for_late_emission(
+                                            &plan, &leaves[0], beside, margin, live, &base_done,
+                                            t_base0,
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                let te = Instant::now();
+                                let first = leaves.len();
+                                leaves.extend(
+                                    (first..beside)
+                                        .into_par_iter()
+                                        .map(|k| plan.leaf_program(k))
+                                        .collect::<Result<Vec<_>, String>>()?,
+                                );
+                                if let Some(w) = late {
+                                    let mut held = ProgramBytes::default();
+                                    for p in &leaves {
+                                        held.add(&ProgramBytes::of(p));
+                                    }
+                                    let resident = heap_resident();
+                                    late_line = Some(format!(
+                                        "   TREE LATE: leaf 0 at the shape, {} more after {:.2}s ({}) \
+                                         at {:.2}s of the base, emitted in {:.2}s, done at {:.2}s · heap \
+                                         live {:.2} GiB at the shape → {:.2} at the start (need a fall of \
+                                         {:.2} = {} × {:.2} estimated) → {:.2} at the end · resident \
+                                         {:.2} → {:.2} GiB over the emission (+{:.2}) · programs held \
+                                         {:.2} GiB, ≥ oversize {:.1} %",
+                                        beside - 1,
+                                        w.waited,
+                                        w.trigger,
+                                        w.at,
+                                        te.elapsed().as_secs_f64(),
+                                        t_base0.elapsed().as_secs_f64(),
+                                        gib(w.live_at_shape),
+                                        gib(w.live_at_start),
+                                        gib(w.need),
+                                        emit_late.unwrap_or(0.0),
+                                        gib(w.estimate),
+                                        gib(heap_allocated()),
+                                        gib(w.resident_at_start),
+                                        gib(resident),
+                                        gib(resident.saturating_sub(w.resident_at_start)),
+                                        gib(held.total()),
+                                        100.0 * held.large as f64 / held.total().max(1) as f64,
+                                    ));
+                                }
                                 let pipe = std::sync::Arc::new(Pipe::new(n, &plan.levels()));
                                 let emitted = super::block_plan::PhaseTimes {
                                     programs: leaves.len(),
@@ -2924,7 +3129,7 @@ fn the_block_tree_composes_to_a_top_node() {
                 }),
                 _ => None,
             };
-            let _ = ready_tx.send((consts, secs, ahead));
+            let _ = ready_tx.send((consts, secs, ahead, late_line));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
             Some(pipe.run_builder(
@@ -2947,6 +3152,7 @@ fn the_block_tree_composes_to_a_top_node() {
         let _ = shape_tx.send(s.clone());
     })
     .expect("the block must prove");
+    base_done.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(shape_tx);
     let base = t.elapsed().as_secs_f64();
     let (base_peak, _) = base_sampler.stop();
@@ -2972,7 +3178,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let mut pipe = None;
     let consts = consts_beside.as_ref().map(|_| {
         let tj = Instant::now();
-        let (consts, secs, ahead) = ready_rx.recv().expect("the ELF constants thread stopped");
+        let (consts, secs, ahead, late_line) =
+            ready_rx.recv().expect("the ELF constants thread stopped");
         println!(
             "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
              waited {:.2}s (counted in the harvest)",
@@ -2998,6 +3205,9 @@ fn the_block_tree_composes_to_a_top_node() {
                 split.join(" · ")
             );
             pipe = Some(filled);
+        }
+        if let Some(line) = late_line {
+            println!("{line}");
         }
         std::sync::Arc::new(consts.expect("the ELF constants compute"))
     });
