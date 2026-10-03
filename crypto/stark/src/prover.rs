@@ -2149,10 +2149,11 @@ static SHARED_VRAM_GATE_ARMED: std::sync::atomic::AtomicBool =
 
 /// Arm the shared gate (under its knob) for proofs a caller is about to run
 /// concurrently, or disarm it (`on = false`). Arming CALIBRATES the gate while
-/// it holds nothing: the device pool's unused memory is handed back, and the
-/// budget becomes the card's free memory then, less `margin_bytes`, capped at
-/// the configured budget ([`calibrated_budget`]). What the gate cannot see
-/// (device caches, compiled modules, frees not yet released, each prove's
+/// it holds nothing: the device's streams are drained, the pool's unused
+/// memory is handed back, and the budget becomes the card's free memory then,
+/// less `margin_bytes`, capped at the configured budget
+/// ([`calibrated_budget`]). What the gate cannot see (device caches, compiled
+/// modules, frees not yet released, each prove's
 /// bytes beyond its tables' estimates) is then outside the budget rather than
 /// on top of it. While armed, the device pool releases freed blocks at each
 /// sync; disarming restores the posture the pool was created with
@@ -2179,7 +2180,7 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
             let b = calibrated_budget(configured, free, margin_bytes);
             gate.budget.store(b, Ordering::Relaxed);
             eprintln!(
-                "[prover] shared VRAM gate armed: budget {:.2} GiB (card free {} after a pool trim, margin {:.2} GiB, configured {:.2} GiB){}",
+                "[prover] shared VRAM gate armed: budget {:.2} GiB (card free {} after a drain and a pool trim, margin {:.2} GiB, configured {:.2} GiB){}",
                 b as f64 / (1u64 << 30) as f64,
                 free.map_or("unknown".to_string(), |f| format!(
                     "{:.2} GiB",
@@ -2304,11 +2305,17 @@ fn calibrated_budget(configured: u64, free: Option<u64>, margin: u64) -> u64 {
     }
 }
 
-/// The card's free bytes after handing the device pool's unused memory back.
+/// The card's free bytes after draining every stream and handing the device
+/// pool's unused memory back. The drain comes first: a free still queued on a
+/// stream holds its block until the stream reaches it, and the trim cannot
+/// hand back what the pool has not been given (FAST 479: 11.6–12.8 GiB used
+/// at the level-0 arming after a trim alone, 1.3–1.5 GiB after a drain, 0.33
+/// of it live).
 fn device_free_after_trim() -> Option<u64> {
     #[cfg(feature = "cuda")]
     {
         let b = math_cuda::device::backend().ok()?;
+        b.synchronize();
         b.trim_mempool_to(0);
         b.device_mem_info().map(|(free, _)| free)
     }
