@@ -23,12 +23,13 @@ use super::executor::execute;
 use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, publics_arena};
 use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child_timed};
 use super::proof::{
-    LfmProof, aggregation_wrap_options, decide_lfm_residency, lfm_execute_and_fill, lfm_prove,
+    LfmFilled, LfmProof, aggregation_wrap_options, decide_lfm_residency, lfm_execute_and_fill,
+    lfm_prove,
 };
 use super::whir_block::{
     BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
-    block_leaf_arena, emit_share, id_words, leaf_partition, leaf_program_with, out_halves,
-    partition_groups, verify_block_tree, verify_block_tree_under,
+    block_leaf_arena, emit_share, group_arena_words, id_words, leaf_arena, leaf_partition,
+    leaf_program_with, out_halves, partition_groups, verify_block_tree, verify_block_tree_under,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -151,6 +152,103 @@ fn leaves_words(plan: &WhirBlockPlan, proof: &BlockWhirProof) -> Vec<Vec<LfmWord
 
 fn ext_of(word: &LfmWord) -> FEE {
     word_as_ext(word).expect("an extension word")
+}
+
+/// ★ What phase B hands over as each group's opening ends is the finished
+/// proof's share of that group: built from the observer's groups alone, every
+/// leaf's arena is the one the proof gives, under both argue formats, for a
+/// streamed block (the production path).
+#[test]
+#[ignore = "proves small blocks; box tier"]
+fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
+    for (format, name) in [
+        (small_format(), "all_instructions_64"),
+        (small_batched(), "all_instructions_64"),
+        (small_batched(), "test_keccak"),
+    ] {
+        let elf = asm_elf_bytes(name);
+        let opts = ProofOptions::default_test_options();
+        let mut options = BlockOptions::production();
+        options.max_rows = MaxRowsConfig::small();
+        options.keccak_rnd_rows_log2 = 3;
+        options.drop_levels = 3;
+        options.window_log2 = Some(4);
+        options.narrow = stark::multilinear_block::Narrowing::Card { min_cells: 0 };
+        let seen = std::sync::Mutex::new(Vec::<GroupMsg>::new());
+        let on_group = |opened: stark::multilinear_block::GroupOpened<'_, _, _>| {
+            seen.lock().expect("lock").push(GroupMsg {
+                group: opened.group,
+                roots: opened.roots.to_vec(),
+                tables: opened.tables.to_vec(),
+                argue: opened.argue.cloned(),
+                opening: opened.opening.clone(),
+                prepared: opened.prepared.cloned(),
+                at: 0.0,
+            });
+        };
+        let (proof, _) = block_whir::prove_block_whir_observed_groups(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &options,
+            &|_, _| {},
+            &on_group,
+        )
+        .expect("the block proves");
+        let seen = seen.into_inner().expect("lock");
+        assert_eq!(seen.len(), proof.groups.len(), "{name}: one hand-over a group");
+        assert!(
+            seen.iter().enumerate().all(|(g, m)| m.group == g),
+            "{name}: the groups in order"
+        );
+        let plan = plan_of(&elf, &proof, &format, None);
+        let words: Vec<Vec<LfmWord>> = seen
+            .iter()
+            .map(|m| {
+                group_arena_words(
+                    &plan,
+                    m.group,
+                    &m.tables,
+                    m.argue.as_ref(),
+                    &m.opening,
+                    m.prepared.as_ref(),
+                )
+                .expect("the group's words")
+            })
+            .collect();
+        for k in 0..plan.partition().num_leaves() {
+            let streamed = leaf_arena(
+                &seen[0].roots,
+                plan.partition()
+                    .leaf(k)
+                    .iter()
+                    .map(|&g| words[g].clone())
+                    .collect(),
+            );
+            assert_eq!(
+                streamed,
+                block_leaf_arena(&plan, &proof, k).expect("the arena"),
+                "{name} leaf {k}: the streamed arena is the proof's"
+            );
+        }
+        // A group handed over with another group's opening is refused or
+        // differs: the arena is a function of each group's own share.
+        if seen.len() >= 2 {
+            let swapped = group_arena_words(
+                &plan,
+                0,
+                &seen[0].tables,
+                seen[0].argue.as_ref(),
+                &seen[1].opening,
+                seen[0].prepared.as_ref(),
+            );
+            assert!(
+                swapped.as_ref().map_or(true, |w| *w != words[0]),
+                "{name}: group 1's opening does not pass for group 0's"
+            );
+        }
+    }
 }
 
 // ============================== the partition =============================
@@ -1135,6 +1233,41 @@ struct LevelTiming {
     programs: Vec<(f64, f64)>,
 }
 
+/// One group's share of the proof, owned, as phase B hands it over
+/// ([`block_whir::GroupObserver`]).
+struct GroupMsg {
+    group: usize,
+    roots: Vec<multilinear::whir_commit::Commitment>,
+    tables: Vec<stark::multilinear_table::TableProof<crate::tables::types::GoldilocksExtension>>,
+    argue:
+        Option<stark::multilinear_table::BatchedArgue<crate::tables::types::GoldilocksExtension>>,
+    opening: multilinear::stacked_eval::StackedProof<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >,
+    prepared: Option<
+        multilinear::stacked_eval::StackedProof<
+            crate::tables::types::GoldilocksField,
+            crate::tables::types::GoldilocksExtension,
+        >,
+    >,
+    at: f64,
+}
+
+/// What the early leaf's thread hands back: the filled leaf, its arena (for
+/// the off-the-clock check against the finished proof's), and when its
+/// execute + fill ran.
+type EarlyOut = (LfmFilled, Vec<Vec<LfmWord>>, f64, f64);
+
+/// The first leaf whose groups phase B finished while another group was
+/// still to come, executing and filling on a thread of its own.
+struct EarlyLeaf {
+    leaf: usize,
+    /// When its last group's opening ended (seconds since the prove started).
+    complete_at: f64,
+    handle: std::thread::JoinHandle<Result<EarlyOut, String>>,
+}
+
 /// A value one thread publishes once and others wait for. A publisher that
 /// unwinds before publishing leaves an error behind ([`PublishGuard`]), so no
 /// waiter blocks on a value that will never come.
@@ -1184,23 +1317,32 @@ impl<T> Drop for PublishGuard<'_, T> {
 ///    `W3_EXEC_BESIDE_ARTIFACTS=0`);
 /// 4. each level above proved over the harvested children.
 ///
+/// `early`, when given, is a leaf that already executed and filled while
+/// phase B ran ([`EarlyLeaf`]): its worker joins it instead.
+///
 /// Returns each level's timing and every proof with its artifacts, level by
-/// level, the top last — for the harness to verify off the clock.
+/// level, the top last — for the harness to verify off the clock — and the
+/// early leaf's arena, if any.
 #[allow(clippy::type_complexity)]
 fn prove_tree_pipelined(
     plan: &WhirBlockPlan,
     proof: &BlockWhirProof,
-    leaves: Vec<LfmProgram>,
+    leaves: Vec<std::sync::Arc<LfmProgram>>,
     siblings: usize,
     beside: bool,
+    early: Option<EarlyLeaf>,
 ) -> Result<
     (
         Vec<LevelTiming>,
         Vec<(super::registry::LfmArtifacts, LfmProof)>,
+        Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>,
     ),
     String,
 > {
     use super::per_table_aggregator_tests::{harvest_child, in_index_order};
+    let early = std::sync::Mutex::new(early);
+    let early_out: std::sync::Mutex<Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>> =
+        std::sync::Mutex::new(None);
     let wrap = aggregation_wrap_options();
     let words = plan.child_layout().total();
     let t_level = std::time::Instant::now();
@@ -1261,13 +1403,36 @@ fn prove_tree_pipelined(
         });
         // 3. the leaves, `siblings` at a time.
         let proved = in_index_order(leaves.len(), siblings, |k| -> Result<_, String> {
-            let arenas = block_leaf_arena(plan, proof, k)?;
-            if !beside {
-                built.wait()?;
-            }
+            let ahead = {
+                let mut slot = early.lock().map_err(|_| "the early slot is poisoned")?;
+                if slot.as_ref().is_some_and(|e| e.leaf == k) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
             let t = std::time::Instant::now();
-            let filled = lfm_execute_and_fill(&leaves[k], &arenas, crate::hash_pin::BLOCK_HASHER)
-                .map_err(|e| format!("leaf {k}: {e:?}"))?;
+            let filled = match ahead {
+                Some(e) => {
+                    let (filled, arena, started, secs) = e
+                        .handle
+                        .join()
+                        .map_err(|_| format!("leaf {k}: the early executor panicked"))??;
+                    *early_out
+                        .lock()
+                        .map_err(|_| "the early readout is poisoned")? =
+                        Some((k, arena, e.complete_at, started, secs));
+                    filled
+                }
+                None => {
+                    let arenas = block_leaf_arena(plan, proof, k)?;
+                    if !beside {
+                        built.wait()?;
+                    }
+                    lfm_execute_and_fill(&leaves[k], &arenas, crate::hash_pin::BLOCK_HASHER)
+                        .map_err(|e| format!("leaf {k}: {e:?}"))?
+                }
+            };
             let artifacts = &built.wait()?[k].0;
             let lfm = filled
                 .prove(artifacts, &wrap, decide_lfm_residency())
@@ -1336,7 +1501,10 @@ fn prove_tree_pipelined(
     if children.len() != 1 {
         return Err(format!("the tree closes to {} nodes", children.len()));
     }
-    Ok((timings, proofs))
+    let early_out = early_out
+        .into_inner()
+        .map_err(|_| "the early readout is poisoned")?;
+    Ok((timings, proofs, early_out))
 }
 
 /// ★ W3's readout on a real block (box only, `--ignored`, `--features cuda`,
@@ -1373,6 +1541,10 @@ fn the_whir_block_tree_on_a_real_block() {
     // `W3_EXEC_BESIDE_ARTIFACTS=0|1` (default 1): the leaves execute and fill
     // while their artifacts are built, or (0, the control) after all of them.
     let beside = knob("W3_EXEC_BESIDE_ARTIFACTS").is_none_or(|v| v != 0);
+    // `W3_LEAF_DURING_PHASE_B=0|1` (default 1): the first leaf whose groups
+    // phase B finished while another group was still to come executes and
+    // fills right then, or (0, the control) with the others after the base.
+    let early_on = knob("W3_LEAF_DURING_PHASE_B").is_none_or(|v| v != 0);
     // `BLOCK_WHIR_ARGUE=batched|per-table` (production: batched): each group's
     // tables argued together, at the format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k`
     // for 2^k), or each on its own.
@@ -1479,10 +1651,39 @@ fn the_whir_block_tree_on_a_real_block() {
             let _ = tx.send((statement.to_owned(), roots.to_vec()));
         }
     };
+    // Each group's share of the proof as its opening ends, for the early leaf.
+    let group_sender = std::sync::Mutex::new(None::<std::sync::mpsc::Sender<GroupMsg>>);
+    let (gtx, grx) = std::sync::mpsc::channel::<GroupMsg>();
+    // Without the early leaf no sender is kept, so the planner's loop ends
+    // at once.
+    *group_sender.lock().expect("lock") = early_on.then_some(gtx);
+    let on_group = |opened: stark::multilinear_block::GroupOpened<'_, _, _>| {
+        if let Some(tx) = group_sender.lock().expect("lock").as_ref() {
+            let _ = tx.send(GroupMsg {
+                group: opened.group,
+                roots: opened.roots.to_vec(),
+                tables: opened.tables.to_vec(),
+                argue: opened.argue.cloned(),
+                opening: opened.opening.clone(),
+                prepared: opened.prepared.cloned(),
+                at: t0.elapsed().as_secs_f64(),
+            });
+        }
+    };
     let (elf_ref, opts_ref, format_ref) = (&elf, &opts, &format);
+    #[allow(clippy::type_complexity)]
     let (proved, pre) = std::thread::scope(|scope| {
         let pre = scope.spawn(
-            move || -> Result<(WhirBlockPlan, Vec<LfmProgram>, f64, f64), String> {
+            move || -> Result<
+                (
+                    WhirBlockPlan,
+                    Vec<std::sync::Arc<LfmProgram>>,
+                    f64,
+                    f64,
+                    Option<EarlyLeaf>,
+                ),
+                String,
+            > {
                 let (statement, roots) = rx
                     .recv()
                     .map_err(|_| "the prover never stated".to_string())?;
@@ -1512,18 +1713,78 @@ fn the_whir_block_tree_on_a_real_block() {
                         })
                         .collect::<Result<_, String>>()
                 })?;
-                Ok((plan, programs, at, t0.elapsed().as_secs_f64()))
+                let programs: Vec<std::sync::Arc<LfmProgram>> =
+                    programs.into_iter().map(std::sync::Arc::new).collect();
+                let ready = t0.elapsed().as_secs_f64();
+                // The groups as phase B finishes them (none unless `early_on`):
+                // the first leaf complete while a group is still to come runs
+                // its execute + fill now, on a thread of its own.
+                let mut early = None;
+                let mut words: Vec<Option<Vec<LfmWord>>> =
+                    (0..plan.num_groups()).map(|_| None).collect();
+                let mut block_roots = Vec::new();
+                let mut done = 0usize;
+                while let Ok(msg) = grx.recv() {
+                    done += 1;
+                    let g = msg.group;
+                    let slot = words.get_mut(g).ok_or("a group the plan does not hold")?;
+                    *slot = Some(group_arena_words(
+                        &plan,
+                        g,
+                        &msg.tables,
+                        msg.argue.as_ref(),
+                        &msg.opening,
+                        msg.prepared.as_ref(),
+                    )?);
+                    if block_roots.is_empty() {
+                        block_roots = msg.roots;
+                    }
+                    if early.is_some() || done >= plan.num_groups() {
+                        continue;
+                    }
+                    let partition = plan.partition();
+                    let complete = (0..partition.num_leaves())
+                        .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()));
+                    if let Some(k) = complete {
+                        let groups: Vec<Vec<LfmWord>> = partition
+                            .leaf(k)
+                            .iter()
+                            .map(|&g| words[g].clone().unwrap_or_default())
+                            .collect();
+                        let arena = leaf_arena(&block_roots, groups);
+                        let program = std::sync::Arc::clone(&programs[k]);
+                        let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
+                            let started = t0.elapsed().as_secs_f64();
+                            let t = std::time::Instant::now();
+                            let filled = lfm_execute_and_fill(
+                                &program,
+                                &arena,
+                                crate::hash_pin::BLOCK_HASHER,
+                            )
+                            .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                            Ok((filled, arena, started, t.elapsed().as_secs_f64()))
+                        });
+                        early = Some(EarlyLeaf {
+                            leaf: k,
+                            complete_at: msg.at,
+                            handle,
+                        });
+                    }
+                }
+                Ok((plan, programs, at, ready, early))
             },
         );
-        let proved =
-            block_whir::prove_block_whir_observed(&elf, &input, &opts, &format, &options, &observe);
+        let proved = block_whir::prove_block_whir_observed_groups(
+            &elf, &input, &opts, &format, &options, &observe, &on_group,
+        );
         // A prover that failed before stating must not leave the planner waiting.
         *sender.lock().expect("lock") = None;
+        *group_sender.lock().expect("lock") = None;
         (proved, pre.join())
     });
     let (proof, stamps) = proved.expect("the block proves");
     let base = t0.elapsed().as_secs_f64();
-    let (plan, programs, stated_at, ready_at) = pre
+    let (plan, programs, stated_at, ready_at, early) = pre
         .expect("the planner did not panic")
         .expect("the plan and the leaves derive");
     print!("{}", stamps.report());
@@ -1588,8 +1849,9 @@ fn the_whir_block_tree_on_a_real_block() {
     // prover prints none of them, so the whole block is also given without.
     let readouts = t0.elapsed().as_secs_f64() - base;
     let t = std::time::Instant::now();
-    let (timings, proofs) =
-        prove_tree_pipelined(&plan, &proof, programs, siblings, beside).expect("the tree proves");
+    let (timings, proofs, early_out) =
+        prove_tree_pipelined(&plan, &proof, programs, siblings, beside, early)
+            .expect("the tree proves");
     let top = &proofs.last().expect("a top").1;
     let tree = t.elapsed().as_secs_f64();
     let whole = t0.elapsed().as_secs_f64();
@@ -1610,6 +1872,18 @@ fn the_whir_block_tree_on_a_real_block() {
         whole - base,
         whole - readouts
     );
+    // Off the clock: the early leaf's arena, built from the groups as phase B
+    // handed them over, is the one the finished proof gives.
+    match &early_out {
+        Some((k, arena, complete_at, started, secs)) => {
+            let same = block_leaf_arena(&plan, &proof, *k).expect("the leaf's arena") == *arena;
+            println!(
+                "W3 EARLY LEAF: leaf {k} complete at {complete_at:.2}s · execute + fill from {started:.2}s for {secs:.2}s (base ended {base:.2}s) · arena = the proof's {same}"
+            );
+            assert!(same, "the early leaf's arena is the finished proof's");
+        }
+        None => println!("W3 EARLY LEAF: none (W3_LEAF_DURING_PHASE_B {early_on})"),
+    }
     // The top proof's bytes: two runs prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
     let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
