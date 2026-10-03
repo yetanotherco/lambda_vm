@@ -552,8 +552,10 @@ mod device {
     }
 
     /// ★ A proof made with the bounded-slot interpreter on every program is
-    /// byte for byte the default proof, from one set of traces at grinding 0,
-    /// after the control (two default proofs equal). Then the mutation
+    /// byte for byte the proof made with it off (`LAMBDA_VM_GPU_INTERP_SI=0`:
+    /// the compiled kernels and the slot-file interpreter), from one set of
+    /// traces at grinding 0, after the control (two such proofs equal). Then the
+    /// mutation
     /// control: with every accumulation of every budgeted program taking the
     /// next root's coefficient, the proof must change and fail to verify, or
     /// the prover must refuse it. (Moving only the first root's coefficient
@@ -573,9 +575,12 @@ mod device {
         };
         let control = proof_bytes(&prove(SiMode::Off).expect("prove"));
         let default = proof_bytes(&prove(SiMode::Off).expect("prove"));
-        assert!(control == default, "the control: two default proofs differ");
+        assert!(
+            control == default,
+            "the control: two proofs with the bounded-slot interpreter off differ"
+        );
         println!(
-            "SI BYTES: the control, two default proofs of one set of traces: {} bytes each, equal",
+            "SI BYTES: the control, two proofs of one set of traces with it off: {} bytes each, equal",
             default.len()
         );
         let before = GPU_COMPOSITION_SI_CALLS.load(SeqCst);

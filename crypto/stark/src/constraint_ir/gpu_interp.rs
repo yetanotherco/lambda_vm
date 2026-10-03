@@ -263,10 +263,20 @@ impl LoweredProgram {
 
 /// `LAMBDA_VM_GPU_INTERP_SI`: which compositions run the bounded-slot
 /// interpreter (`kernels/constraint_si.cu`, budgeted programs from
-/// [`super::budgeted`]). Unset, empty or `0` (the default): none, today's
-/// path; `1`: the programs with no compiled kernel; `all`: every program, the
-/// compiled ones included. Anything else stops the run. The same `H`, bit for
-/// bit, either way.
+/// [`super::budgeted`]). Unset, empty or `1` (the default): the programs with
+/// no compiled kernel (KECCAK_RND, ECDAS, KECCAK); `0`: none, the slot-file
+/// interpreter runs them; `all`: every program, the compiled ones included.
+/// Anything else stops the run. The same `H`, bit for bit, either way.
+///
+/// ⛔ WHY. The slot-file interpreter keeps every value of a row in a per-thread
+/// file in global memory (4,350 words for KECCAK_RND: 2.12 GiB a composition),
+/// which the VRAM gate's per-table estimate does not count. The bounded-slot
+/// interpreter keeps a row in 16–128 words of shared memory or a local array:
+/// KECCAK_RND and ECDAS run 0.58–0.63× the slot-file interpreter's time (FAST
+/// 782), the median's composition time 0.59×, its slot-file scratch 80 GiB a
+/// run → 0 and its phase-B device peak −1.9 GiB, at no cost in total time
+/// (BIG 540, FAST 783). Every program on it (`all`) is slower than the compiled
+/// kernels (1.25–2.1×, FAST 783: +0.155 s at 1×).
 pub const INTERP_SI_ENV: &str = "LAMBDA_VM_GPU_INTERP_SI";
 
 /// Which compositions the bounded-slot interpreter runs.
@@ -283,8 +293,8 @@ pub enum SiMode {
 /// [`INTERP_SI_ENV`] for a raw value.
 pub fn interp_si_setting(raw: Option<&str>) -> SiMode {
     match raw.map(str::trim) {
-        None | Some("") | Some("0") => SiMode::Off,
-        Some("1") => SiMode::Uncompiled,
+        None | Some("") | Some("1") => SiMode::Uncompiled,
+        Some("0") => SiMode::Off,
         Some("all") => SiMode::All,
         Some(other) => panic!("{INTERP_SI_ENV} must be 0, 1 or all, got {other:?}"),
     }
@@ -449,22 +459,25 @@ pub fn interp_si() -> (SiMode, SiTuning) {
     *ENV.get_or_init(|| {
         let mode = interp_si_setting(std::env::var(INTERP_SI_ENV).ok().as_deref());
         let tuning = si_shape_setting(std::env::var(SI_SHAPE_ENV).ok().as_deref());
-        if mode != SiMode::Off {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(
-                format!(
-                    "[gpu] constraint composition: the bounded-slot interpreter for {} \
-                     ({INTERP_SI_ENV}), {:?} within {} words a row\n",
-                    match mode {
-                        SiMode::All => "every program",
-                        _ => "the programs with no compiled kernel",
-                    },
-                    tuning.cfg,
-                    tuning.budget
-                )
-                .as_bytes(),
-            );
-        }
+        let who = match mode {
+            SiMode::Off => format!("none ({INTERP_SI_ENV}=0): the slot-file interpreter"),
+            SiMode::Uncompiled => format!(
+                "the programs with no compiled kernel (the default; {INTERP_SI_ENV}=0 opts out)"
+            ),
+            SiMode::All => format!("every program ({INTERP_SI_ENV}=all)"),
+        };
+        let shape = if tuning.auto {
+            "the automatic shape".to_string()
+        } else {
+            format!("{:?} within {} words a row", tuning.cfg, tuning.budget)
+        };
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(
+            format!(
+                "[gpu] constraint composition: the bounded-slot interpreter for {who}, {shape}\n"
+            )
+            .as_bytes(),
+        );
         (mode, tuning)
     })
 }
@@ -772,9 +785,12 @@ where
     // miss (no lowering within the budget, a device error) falls through to
     // the path below.
     let (mode, tuning) = interp_si();
+    // `Uncompiled` asks whether the program HAS a compiled kernel, whatever the
+    // compiled-kernel switch says: with that switch off, the programs that have
+    // a kernel run the slot-file interpreter, as the switch documents.
     let si_takes = match mode {
         SiMode::Off => false,
-        SiMode::Uncompiled => compiled.is_none(),
+        SiMode::Uncompiled => lowered.compiled.is_none(),
         SiMode::All => true,
     };
     let chosen = if !si_takes {
@@ -977,15 +993,17 @@ mod tests {
         compiled_constraints_setting(Some("on"));
     }
 
-    /// The bounded-slot interpreter is off by default; `1` takes the
-    /// uncompiled programs, `all` every program.
+    /// The bounded-slot interpreter takes the programs with no compiled kernel
+    /// by default; `0` returns them to the slot-file interpreter, `all` gives
+    /// it every program.
     #[test]
-    fn the_bounded_slot_interpreter_is_off_by_default() {
+    fn the_bounded_slot_interpreter_takes_the_uncompiled_programs_by_default() {
         use super::{SiMode, interp_si_setting};
-        assert_eq!(interp_si_setting(None), SiMode::Off);
-        assert_eq!(interp_si_setting(Some("")), SiMode::Off);
-        assert_eq!(interp_si_setting(Some("0")), SiMode::Off);
+        assert_eq!(interp_si_setting(None), SiMode::Uncompiled);
+        assert_eq!(interp_si_setting(Some("")), SiMode::Uncompiled);
         assert_eq!(interp_si_setting(Some(" 1 ")), SiMode::Uncompiled);
+        assert_eq!(interp_si_setting(Some("0")), SiMode::Off);
+        assert_eq!(interp_si_setting(Some(" 0\n")), SiMode::Off);
         assert_eq!(interp_si_setting(Some("all")), SiMode::All);
     }
 
