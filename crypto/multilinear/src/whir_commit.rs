@@ -59,6 +59,19 @@ where
 /// these two are all a phase-B opening spends on its first round's tree.
 static TOP_PATH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TOP_LEAVES_REHASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds the kept-top paths spent gathering their blocks from the
+/// codeword, and re-hashing them on the host (the subtrees and their check).
+static TOP_GATHER_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_REHASH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(seconds gathering, seconds re-hashing)` of the kept-top paths so far.
+pub fn top_path_secs() -> (f64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TOP_GATHER_NANOS.load(Relaxed) as f64 / 1e9,
+        TOP_REHASH_NANOS.load(Relaxed) as f64 / 1e9,
+    )
+}
 
 /// `(open_many calls served from a kept top, leaves re-hashed for them)`.
 pub fn top_path_counts() -> (u64, u64) {
@@ -484,7 +497,13 @@ where
             .iter()
             .flat_map(|block| (block << dropped)..((block + 1) << dropped))
             .collect();
+        let gathering = std::time::Instant::now();
         let values = self.gather(&leaves)?;
+        TOP_GATHER_NANOS.fetch_add(
+            gathering.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let rehashing = std::time::Instant::now();
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let frontier = (1usize << (depth - dropped)) - 1;
@@ -501,6 +520,10 @@ where
             }
             subtrees.push(subtree);
         }
+        TOP_REHASH_NANOS.fetch_add(
+            rehashing.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         indices
             .iter()
             .map(|&index| {
