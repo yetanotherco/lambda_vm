@@ -422,18 +422,67 @@ pub const MEMPOOL_RELEASE_ENV: &str = "LAMBDA_VM_MEMPOOL_RELEASE_MB";
 /// so `total - free` reads the live set rather than the pool.
 pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
 
-/// The effective release threshold in bytes: the knob when set and parseable,
-/// the default otherwise. Read once per process; the prover's diagnostics
-/// print it so every box log states the posture its run had.
+/// The environment knob of the prover's shared VRAM gate
+/// (`stark::prover::shared_vram_gate_on`), read here for the pool's posture.
+pub const SHARED_VRAM_GATE_ENV: &str = "LAMBDA_VM_SHARED_VRAM_GATE";
+
+/// The effective release threshold in bytes: the knob when set and parseable;
+/// else `0` under the shared VRAM gate ([`SHARED_VRAM_GATE_ENV`]); else the
+/// default. Read once per process; the prover's diagnostics print it so every
+/// box log states the posture its run had.
+///
+/// Under the shared gate several proofs allocate at once, and the gate counts
+/// only their live bytes. A pool that retains freed blocks keeps what an
+/// earlier phase freed reserved and invisible to the gate, and requests the
+/// retained blocks cannot serve then exhaust the card (FAST 473: 31.36 GiB on
+/// a 23.44 GiB gate, the base's freed blocks still reserved). Releasing at
+/// each sync keeps the reservation at the live set.
 pub fn mempool_release_threshold_bytes() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var(MEMPOOL_RELEASE_ENV)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES)
+        let shared = std::env::var(SHARED_VRAM_GATE_ENV).is_ok_and(|v| v.trim() == "1");
+        release_threshold_setting(std::env::var(MEMPOOL_RELEASE_ENV).ok().as_deref(), shared)
     })
+}
+
+/// [`mempool_release_threshold_bytes`] for a raw knob value and the shared
+/// gate's state.
+fn release_threshold_setting(knob: Option<&str>, shared_gate: bool) -> u64 {
+    match knob.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(mb) => mb.saturating_mul(1024 * 1024),
+        None if shared_gate => 0,
+        None => DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES,
+    }
+}
+
+#[cfg(test)]
+mod release_threshold_tests {
+    use super::{DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES, release_threshold_setting};
+
+    /// The knob decides when set; unset, the shared gate releases at each
+    /// sync and everything else retains.
+    #[test]
+    fn the_shared_gate_releases_unless_the_knob_says_otherwise() {
+        assert_eq!(
+            release_threshold_setting(None, false),
+            DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            release_threshold_setting(None, true),
+            0,
+            "the shared gate releases"
+        );
+        assert_eq!(
+            release_threshold_setting(Some("512"), true),
+            512 << 20,
+            "the knob wins"
+        );
+        assert_eq!(release_threshold_setting(Some("0"), false), 0);
+        assert_eq!(
+            release_threshold_setting(Some("x"), false),
+            DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES
+        );
+    }
 }
 
 /// The device default memory pool, or `None` on a device/driver without

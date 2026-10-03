@@ -55,6 +55,15 @@
 //! share the card by bytes, and one proof's host stages (uploads, transcript,
 //! queries) no longer leave the card idle while the others wait.
 //!
+//! Two bounds keep that within the card (FAST 473, 474: six or seven proves at
+//! once overran it with the budget alone):
+//! - at most [`shared_proves`] proofs are inside `multi_prove` at once, so the
+//!   bytes each prove holds beyond its tables' estimates multiply by a small
+//!   number;
+//! - [`arm`] calibrates the shared gate to the card's free memory less
+//!   [`shared_margin_bytes`] (`stark::prover::arm_shared_vram_gate`), so what
+//!   no gate counts is outside the budget rather than on top of it.
+//!
 //! # Inert until armed
 //!
 //! Unarmed, and at one worker, [`hold`] takes no lock and touches no counter on
@@ -126,9 +135,60 @@ thread_local! {
 }
 
 /// Arm the permit for `workers` concurrent proofs. `workers <= 1` leaves it
-/// inert, which is the control arm on the same binary.
+/// inert, which is the control arm on the same binary. Under the shared gate's
+/// knob it also arms (and calibrates) or disarms that gate.
 pub fn arm(workers: usize) {
     WORKERS.store(workers.max(1), Ordering::Relaxed);
+    stark::prover::arm_shared_vram_gate(workers > 1, shared_margin_bytes());
+}
+
+/// `LAMBDA_VM_SHARED_GATE_PROVES=n` (n ≥ 1): the proofs that may be inside
+/// `multi_prove` at once under the shared gate. Unset: 3.
+pub fn shared_proves() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LAMBDA_VM_SHARED_GATE_PROVES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(3)
+    })
+}
+
+/// The shared gate's margin below the card's free memory: 2 GiB, plus 0.5 GiB
+/// per proof allowed inside `multi_prove` at once (what each holds beyond its
+/// tables' estimates, FAST 474).
+pub fn shared_margin_bytes() -> u64 {
+    (2u64 << 30) + (shared_proves() as u64) * (1u64 << 29)
+}
+
+/// Proofs inside `multi_prove` under the shared gate right now, and the wait
+/// for a place.
+static PROVES_IN: Mutex<usize> = Mutex::new(0);
+static PROVE_ROOM: std::sync::Condvar = std::sync::Condvar::new();
+
+/// A place among [`shared_proves`], released on drop.
+struct ProveSlot;
+
+impl ProveSlot {
+    fn take() -> Self {
+        let cap = shared_proves();
+        let mut n = PROVES_IN.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= cap {
+            n = PROVE_ROOM.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        ProveSlot
+    }
+}
+
+impl Drop for ProveSlot {
+    fn drop(&mut self) {
+        let mut n = PROVES_IN.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        drop(n);
+        PROVE_ROOM.notify_one();
+    }
 }
 
 /// How many sibling proofs the driver is running at once.
@@ -178,9 +238,12 @@ impl PermitStats {
     }
 }
 
-/// Exclusive use of the card, for as long as it is held.
+/// Exclusive use of the card, for as long as it is held (under the shared
+/// gate: one of its proof places, for a `multi_prove`).
 pub struct CardPermit {
     guard: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Under the shared gate, a `multi_prove`'s place among [`shared_proves`].
+    _slot: Option<ProveSlot>,
     since: Instant,
     /// ⛔ ROUND-3 TREE PROBE ONLY, `None` unless `LAMBDA_VM_TREE_BUSY_PROBE` is
     /// set: which device phase this hold is, and the nanoseconds its holder
@@ -252,11 +315,33 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // a loop. Off, this is the only thing the probe costs anywhere.
     let probed = super::tree_probe::enabled();
     // Under the shared gate the bytes are the exclusion (see the module doc):
-    // no card to take, the window still traced.
+    // no card to take, a `multi_prove` takes a proof place, and the window is
+    // still traced.
     let shared = stark::prover::shared_vram_gate_on();
-    if (workers() <= 1 || shared) && !traced && !probed {
+    if shared {
+        let blocked_from = Instant::now();
+        let slot = (phase == "multi_prove").then(ProveSlot::take);
+        let waited = blocked_from.elapsed();
+        WAITED_NANOS.with(|w| w.set(w.get() + waited.as_nanos() as u64));
         return CardPermit {
             guard: None,
+            _slot: slot,
+            since: Instant::now(),
+            probe: probed.then_some((phase, waited.as_nanos() as u64)),
+            trace: traced.then(|| {
+                (
+                    phase,
+                    waited.as_secs_f64(),
+                    TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+                    stark::prove_split::epoch_secs(),
+                )
+            }),
+        };
+    }
+    if workers() <= 1 && !traced && !probed {
+        return CardPermit {
+            guard: None,
+            _slot: None,
             since: Instant::now(),
             probe: None,
             trace: None,
@@ -266,10 +351,11 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // driver holds it by construction), and the window is still exactly the
     // device phase — which is the window the sampler has to be sliced by in the
     // K=1 control too, or the two arms are compared on different definitions.
-    if workers() <= 1 || shared {
+    if workers() <= 1 {
         let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
         return CardPermit {
             guard: None,
+            _slot: None,
             since: Instant::now(),
             probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
@@ -302,6 +388,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     );
     CardPermit {
         guard: Some(guard),
+        _slot: None,
         since: Instant::now(),
         // ⚠ The SAME `waited` the trace line and `WAITED_NANOS` carry, not a
         // second reading of the clock — three accountings of one wait that
@@ -321,6 +408,58 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ UNDER THE SHARED GATE AT MOST `shared_proves` PROOFS ARE INSIDE
+    /// `multi_prove`. With the places full, one more `multi_prove` waits until a
+    /// place is released, while an artifact build takes no place.
+    #[test]
+    fn under_the_shared_gate_a_prove_waits_for_a_place() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        let cap = shared_proves();
+        // `cap` holders, each on its own thread (a permit is not `Send`),
+        // holding until told to release.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(Mutex::new(release_rx));
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel::<()>();
+        let holders: Vec<_> = (0..cap)
+            .map(|_| {
+                let (rx, taken) = (release_rx.clone(), taken_tx.clone());
+                std::thread::spawn(move || {
+                    let _p = hold_labeled("multi_prove");
+                    taken.send(()).expect("the test is listening");
+                    let _ = rx.lock().expect("never poisoned").recv();
+                })
+            })
+            .collect();
+        for _ in 0..cap {
+            taken_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a place is free");
+        }
+        let _artifacts = hold_labeled("build_artifacts");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _p = hold_labeled("multi_prove");
+            tx.send(()).expect("the test is listening");
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a prove beyond the places must wait"
+        );
+        release_tx.send(()).expect("a holder is listening");
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a released place lets it in");
+        waiter.join().expect("the waiter finishes");
+        drop(release_tx);
+        for h in holders {
+            h.join().expect("a holder finishes");
+        }
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+    }
 
     /// ★ UNDER THE SHARED GATE THE PERMIT TAKES NO CARD. Armed for siblings, a
     /// second hold on this thread would park it if the card were taken, and a
