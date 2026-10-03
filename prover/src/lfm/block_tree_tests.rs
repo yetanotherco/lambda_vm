@@ -3861,6 +3861,19 @@ fn the_block_tree_composes_to_a_top_node() {
     // verifies the top proof against that program, and checks its words against
     // the ELF's id and the output. A forced partition is another tree: then the
     // harness's own plan derives its top instead.
+    // Its own device high-water, from the pool (a drain and a trim first, then
+    // the high-water restarted), not the card: what the run left reserved
+    // would otherwise read as the verifier's.
+    #[cfg(feature = "cuda")]
+    let pool_at_start = {
+        let _ = math_cuda::device::drain_and_trim();
+        let live = math_cuda::device::pool_used_bytes()
+            .ok()
+            .map(|(now, _)| now);
+        let _ = math_cuda::device::reset_pool_high_water();
+        let _ = super::derive_gate::take_summary();
+        live
+    };
     let t = Instant::now();
     let mut split = None;
     let derived = match forced {
@@ -3906,6 +3919,25 @@ fn the_block_tree_composes_to_a_top_node() {
     );
     if let Some(split) = split {
         println!("   BLOCK VERIFIER split (cold): {split}");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let gib = |b: u64| format!("{:.2}", b as f64 / (1u64 << 30) as f64);
+        let show = |b: Option<u64>| b.map_or("?".to_string(), gib);
+        let (now, high) = math_cuda::device::pool_used_bytes()
+            .ok()
+            .map_or((None, None), |(now, high)| {
+                (Some(now), Some(high.max(pool_at_start.unwrap_or(0))))
+            });
+        println!(
+            "   BLOCK VERIFIER DEVICE (cold): pool high-water {} GiB (live {} at the start after a \
+             drain and a trim, {} at the end, reserved {}) · derive gate: {}",
+            show(high),
+            show(pool_at_start),
+            show(now),
+            show(math_cuda::device::pool_reserved_bytes().ok()),
+            super::derive_gate::take_summary().map_or("not armed".to_string(), |s| s.to_string())
+        );
     }
     // Warm: the ELF constants a consumer caches per ELF (the harness's, computed
     // beside the base under the same options).
@@ -4074,16 +4106,10 @@ fn a_block_shape_round_trips_through_its_text() {
     assert_eq!(format!("{back:?}"), format!("{shape:?}"));
 }
 
-/// The verifier's streaming derivation (each program and its artifacts dropped
-/// once its child is derived) derives the top of the tree that keeps every
-/// program ([`BlockTreePlan::derive_tree`]): a fixture plan with eight more CPU
-/// instances, cut into six leaves, so a leaf level, an interior level and the
-/// top.
-#[test]
-#[ignore = "box tier: two derivations of a six-leaf tree under the wrap preset, ≈ 2 min on the laptop"]
-fn the_streaming_derivation_derives_the_kept_trees_top() {
+/// A fixture plan with eight more CPU instances, cut into six leaves, so a
+/// leaf level, an interior level and the top.
+fn six_leaf_fixture_plan() -> BlockTreePlan {
     let opts = fixture_block_options();
-    let wrap_opts = super::proof::aggregation_wrap_options();
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
     let mut shape = honest_fixture_shape(&elf);
@@ -4100,6 +4126,17 @@ fn the_streaming_derivation_derives_the_kept_trees_top() {
         2,
         "six leaves at fan-in 4: one interior level and the top"
     );
+    plan
+}
+
+/// The verifier's streaming derivation (each program and its artifacts dropped
+/// once its child is derived) derives the top of the tree that keeps every
+/// program ([`BlockTreePlan::derive_tree`]), over [`six_leaf_fixture_plan`].
+#[test]
+#[ignore = "box tier: two derivations of a six-leaf tree under the wrap preset, ≈ 2 min on the laptop"]
+fn the_streaming_derivation_derives_the_kept_trees_top() {
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let plan = six_leaf_fixture_plan();
     let streamed = plan.derive_top(&wrap_opts).expect("the top derives");
     let (tree, _) = plan
         .derive_tree(&wrap_opts, &|p| {
@@ -4108,6 +4145,82 @@ fn the_streaming_derivation_derives_the_kept_trees_top() {
         .expect("the tree derives");
     let kept = &tree.last().expect("a top level")[0].1;
     assert_eq!(streamed.program_id, kept.program_id);
+}
+
+/// ★ The derive gate on the card ([`super::derive_gate`]), over
+/// [`six_leaf_fixture_plan`]: derived open (a budget nothing reaches), then
+/// under a fixed budget of half the open peak, never under the largest set.
+/// The gated derivation's running total stays within its budget and waits,
+/// and its top is the open one's; each derivation's pool high-water is
+/// printed. Then the mutation: a permit held across a build's forks is
+/// refused at the first fork.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "box tier: --features cuda, three derivations of a six-leaf tree"]
+fn the_derive_gate_bounds_the_derivation_on_the_card() {
+    use super::derive_gate::{Setting, pin_setting, take_summary};
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let plan = six_leaf_fixture_plan();
+    let derive = |setting: Setting| {
+        pin_setting(Some(setting));
+        let _ = math_cuda::device::drain_and_trim();
+        let start = math_cuda::device::pool_used_bytes().map_or(0, |(now, _)| now);
+        let _ = math_cuda::device::reset_pool_high_water();
+        let top = plan.derive_top(&wrap_opts).expect("the top derives");
+        let high = math_cuda::device::pool_used_bytes().map_or(0, |(_, high)| high.max(start));
+        let summary = take_summary().expect("the derivation armed the gate");
+        println!(
+            "DERIVE GATE {setting:?}: {summary} · pool high-water {:.3} GiB (live {:.3} at the start)",
+            gib(high),
+            gib(start)
+        );
+        (top.program_id, summary)
+    };
+    let (open_top, open) = derive(Setting::Fixed(u64::MAX));
+    assert!(
+        open.dispatches > 0,
+        "no device set reached the card: the gate is untested here"
+    );
+    let largest = super::commit::device_artifact_peak_bytes();
+    let budget = (open.peak / 2).max(largest);
+    assert!(
+        open.peak > budget,
+        "the open peak {:.3} GiB is one set ({:.3} GiB): no budget binds",
+        gib(open.peak),
+        gib(largest)
+    );
+    let (gated_top, gated) = derive(Setting::Fixed(budget));
+    assert!(gated.peak <= budget, "the gate held {gated}");
+    assert!(gated.waits > 0, "nothing waited: {gated}");
+    assert_eq!(gated.dispatches, open.dispatches);
+    assert_eq!(gated_top, open_top, "the gate is scheduling only");
+
+    // ⛔ The mutation: each build holds a permit across its walk's forks.
+    pin_setting(Some(Setting::Fixed(u64::MAX)));
+    let armed = super::derive_gate::arm().expect("the gate arms");
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        plan.derive_tree(&wrap_opts, &|p| {
+            let _held = super::derive_gate::admit(0).expect("armed");
+            super::block_plan::artifacts_of(p, &wrap_opts)
+        })
+    }));
+    drop(armed);
+    pin_setting(None);
+    let msg = match refused {
+        Ok(_) => panic!("a permit held across a build's forks went unnoticed"),
+        Err(e) => e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    };
+    // A job stolen at an earlier fork that asks again is the same hazard,
+    // refused at the gate.
+    assert!(
+        msg.contains("held across a rayon fork") || msg.contains("already holds a derive permit"),
+        "refused for: {msg}"
+    );
 }
 
 /// ★ The block verifier's derivation ([`BlockTreePlan::derive_top`] under the
