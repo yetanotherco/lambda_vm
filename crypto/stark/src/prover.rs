@@ -1497,6 +1497,9 @@ mod shared_vram_gate_tests {
 
     #[test]
     fn the_shared_admission_holds_bytes_only_when_the_gate_is_on() {
+        let _serial = super::SHARED_GATE_PIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pin_shared_vram_gate(Some(false));
         assert!(shared_vram_admit(7).is_none(), "off: no admission");
         pin_shared_vram_gate(Some(true));
@@ -2390,6 +2393,13 @@ fn device_free_after_trim() -> Option<u64> {
 /// 2 on. Process-wide.
 #[cfg(any(test, feature = "test-utils"))]
 static SHARED_VRAM_GATE_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: serialises the tests that pin the shared gate
+/// ([`pin_shared_vram_gate`]) against the tests whose proves read which gate
+/// they get. The pin is process-wide, so under `cargo test`'s threads a pin
+/// would otherwise reach a concurrent test's prove.
+#[cfg(test)]
+pub(crate) static SHARED_GATE_PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Test-only: pin [`shared_vram_gate_on`] for this process (`None` returns it to
 /// the environment).

@@ -34,6 +34,10 @@ fn test_options() -> ProofOptions {
 }
 
 fn prove(overrides: Option<ProveOverrides>) -> (MultiProof<F, E, ()>, Option<Admissions>) {
+    // A concurrent test's pin of the shared gate would hand this prove that gate.
+    let _serial = crate::prover::SHARED_GATE_PIN_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let run = || {
         let (mut cpu_trace, mut add_trace, mut mul_trace) = traces();
         let o = test_options();
