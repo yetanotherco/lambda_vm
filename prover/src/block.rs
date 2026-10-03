@@ -754,7 +754,7 @@ impl StreamConfig {
 /// no proof byte depends on the policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SpillPolicy {
-    /// Keep every trace (the default).
+    /// Keep every trace.
     Off,
     /// Spill every committed instance that is packed (a measurement arm).
     Always,
@@ -762,11 +762,11 @@ pub(crate) enum SpillPolicy {
     /// spill the rest.
     Budget(u64),
     /// Spill once the host would pass the target ([`spill_target_bytes`]):
-    /// see [`spill_decision`].
+    /// see [`spill_decision`]. The default: a block that fits spills nothing.
     Auto,
 }
 
-/// `LAMBDA_VM_BLOCK_SPILL`: `off` (and unset) | `always` | `auto` | `<GiB>` (a
+/// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
 /// resident budget for committed packed traces). Anything else is `off`.
 fn spill_policy() -> SpillPolicy {
     parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
@@ -783,7 +783,7 @@ fn parse_spill_policy(value: Option<&str>) -> SpillPolicy {
             .map_or(SpillPolicy::Off, |g| {
                 SpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
             }),
-        None => SpillPolicy::Off,
+        None => SpillPolicy::Auto,
     }
 }
 
@@ -2244,11 +2244,11 @@ mod spill_policy_tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// `LAMBDA_VM_BLOCK_SPILL`'s values: off, always, auto, a budget in GiB;
-    /// anything else (and unset) is off.
+    /// `LAMBDA_VM_BLOCK_SPILL`'s values: auto (and unset), off, always, a
+    /// budget in GiB; anything else is off.
     #[test]
     fn the_spill_policy_reads_its_knob() {
-        assert_eq!(parse_spill_policy(None), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(None), SpillPolicy::Auto);
         assert_eq!(parse_spill_policy(Some("off")), SpillPolicy::Off);
         assert_eq!(parse_spill_policy(Some("always")), SpillPolicy::Always);
         assert_eq!(parse_spill_policy(Some(" auto ")), SpillPolicy::Auto);

@@ -1268,6 +1268,19 @@ fn the_stream_spills_and_reads_back_the_same_traces() {
             )
             .expect("a budget never reached");
             assert!(report.contains("spilled 0 instances"), "{name}: {report}");
+            // The default policy: whatever it decides on this host, the
+            // traces are the resident ones.
+            let (mut auto, mut auto_names, report) =
+                stream_spill_for_test(&program, &opts, &max_rows, config, Some(SpillPolicy::Auto))
+                    .expect("auto");
+            assert!(report.starts_with("Auto · "), "{name}: {report}");
+            auto_names.sort();
+            assert_eq!(
+                names, auto_names,
+                "{name}: the instances precommitted under auto"
+            );
+            widen_all(&mut auto);
+            same_traces(&resident, &auto);
         }
     }
 }
