@@ -2572,6 +2572,10 @@ fn the_block_tree_composes_to_a_top_node() {
         pct(base_peak)
     );
 
+    // `LAMBDA_VM_ALLOC_PURGE=base`: the base's freed pages back to the OS before
+    // the tree allocates (counted in the whole run, in no phase's wall).
+    crate::alloc_purge::purge_point("base");
+
     // ---- the harvest. Production's verify of the base is a harness assert, not
     // work a driver does, so by default it runs on a helper thread beside level 0
     // and is joined before anything is reported: a refused block still fails the
@@ -2892,6 +2896,9 @@ fn the_block_tree_composes_to_a_top_node() {
         harvest + level0 + interior
     );
     println!("★★★ WHOLE RUN: host peak {peak:.3} GiB at t={at:.1}, {total:.1}s total");
+    // `LAMBDA_VM_ALLOC_PURGE=tree`: the tree's freed pages back to the OS before
+    // the verifier derives its programs (after the whole run's stopwatch).
+    crate::alloc_purge::purge_point("tree");
 
     // ---- the block VERIFIER, outside the whole run (a consumer's work, not the
     // prover's): `verify_block_tree` under the block presets derives the plan and
