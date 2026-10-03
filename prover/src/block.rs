@@ -801,8 +801,8 @@ fn spill_target_bytes() -> u64 {
     let limit = cgroup_memory(
         &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
         std::path::Path::new(CGROUP_ROOT),
-        "memory.max",
-        "memory.limit_in_bytes",
+        CgroupValue::File("memory.max"),
+        CgroupValue::File("memory.limit_in_bytes"),
     );
     let mem_total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
         m.lines()
@@ -829,21 +829,49 @@ fn spill_target_from(limit: Option<u64>, mem_total: Option<u64>) -> u64 {
 /// Where the cgroup filesystem is mounted.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// A number from this process's cgroup memory files: the v2 file `v2` under
-/// the unified hierarchy (`memory.max`, `memory.current`), else the v1 file
-/// `v1` under the memory controller (`memory.limit_in_bytes`,
-/// `memory.usage_in_bytes`). `proc_cgroup` is `/proc/self/cgroup`, `root` the
-/// cgroup mount. Each is read at the process's cgroup path, then at its
-/// hierarchy's root, which a container without a cgroup namespace sees as its
-/// own cgroup. `None` where neither reads as a number (v2's `max` included).
-fn cgroup_memory(proc_cgroup: &str, root: &std::path::Path, v2: &str, v1: &str) -> Option<u64> {
-    let read = |dir: &std::path::Path, file: &str| {
-        std::fs::read_to_string(dir.join(file))
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    };
-    let at = |base: &std::path::Path, path: &str, file: &str| {
-        read(&base.join(path.trim().trim_start_matches('/')), file).or_else(|| read(base, file))
+/// One number of a cgroup's memory files: a file that holds just the number,
+/// or one `key value` line of `memory.stat`.
+#[derive(Clone, Copy)]
+enum CgroupValue<'a> {
+    File(&'a str),
+    Stat(&'a str),
+}
+
+impl CgroupValue<'_> {
+    fn read(self, dir: &std::path::Path) -> Option<u64> {
+        let (file, key) = match self {
+            CgroupValue::File(file) => (file, None),
+            CgroupValue::Stat(key) => ("memory.stat", Some(key)),
+        };
+        let text = std::fs::read_to_string(dir.join(file)).ok()?;
+        match key {
+            None => text.trim().parse::<u64>().ok(),
+            Some(key) => text.lines().find_map(|l| {
+                let (k, v) = l.split_once(' ')?;
+                (k == key).then(|| v.trim().parse::<u64>().ok()).flatten()
+            }),
+        }
+    }
+}
+
+/// A number from this process's cgroup memory files: `v2` under the unified
+/// hierarchy (`memory.max`, `memory.current`, `memory.stat`'s `inactive_file`),
+/// else `v1` under the memory controller (`memory.limit_in_bytes`,
+/// `memory.usage_in_bytes`, `memory.stat`'s `total_inactive_file`).
+/// `proc_cgroup` is `/proc/self/cgroup`, `root` the cgroup mount. Each is read
+/// at the process's cgroup path, then at its hierarchy's root, which a
+/// container without a cgroup namespace sees as its own cgroup. `None` where
+/// neither reads as a number (v2's `max` included).
+fn cgroup_memory(
+    proc_cgroup: &str,
+    root: &std::path::Path,
+    v2: CgroupValue,
+    v1: CgroupValue,
+) -> Option<u64> {
+    let at = |base: &std::path::Path, path: &str, value: CgroupValue| {
+        value
+            .read(&base.join(path.trim().trim_start_matches('/')))
+            .or_else(|| value.read(base))
     };
     let (mut unified, mut memory) = (None, None);
     for line in proc_cgroup.lines() {
@@ -864,27 +892,60 @@ fn cgroup_memory(proc_cgroup: &str, root: &std::path::Path, v2: &str, v1: &str) 
         .or_else(|| memory.and_then(|path| at(&root.join("memory"), path, v1)))
 }
 
-/// What `auto` reads as the host's bytes: the larger of the process's peak
-/// resident set (`VmHWM`; the resident set itself is not monotone under the
-/// allocator's posture, which drops and re-faults recycled extents) and its
-/// cgroup's charge (`memory.current`, or v1's `memory.usage_in_bytes`; both
-/// count the page cache).
-fn host_bytes_now() -> u64 {
-    let hwm = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("VmHWM:"))
-                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-                .map(|kib| kib << 10)
-        });
-    let charged = cgroup_memory(
-        &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
-        std::path::Path::new(CGROUP_ROOT),
-        "memory.current",
-        "memory.usage_in_bytes",
-    );
-    hwm.unwrap_or(0).max(charged.unwrap_or(0))
+/// What `auto` reads of the host ([`HostReading::bytes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HostReading {
+    /// The process's peak resident set (`VmHWM`).
+    hwm: u64,
+    /// The cgroup's charge (`memory.current`, or v1's `memory.usage_in_bytes`),
+    /// page cache included.
+    charged: u64,
+    /// Its inactive file pages (`memory.stat`'s `inactive_file`, or v1's
+    /// `total_inactive_file`): the page cache the kernel reclaims first.
+    inactive_file: u64,
+}
+
+impl HostReading {
+    fn now() -> Self {
+        let hwm = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                    .map(|kib| kib << 10)
+            });
+        let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let root = std::path::Path::new(CGROUP_ROOT);
+        let charged = cgroup_memory(
+            &proc_cgroup,
+            root,
+            CgroupValue::File("memory.current"),
+            CgroupValue::File("memory.usage_in_bytes"),
+        );
+        let inactive_file = cgroup_memory(
+            &proc_cgroup,
+            root,
+            CgroupValue::Stat("inactive_file"),
+            CgroupValue::Stat("total_inactive_file"),
+        );
+        Self {
+            hwm: hwm.unwrap_or(0),
+            charged: charged.unwrap_or(0),
+            inactive_file: inactive_file.unwrap_or(0),
+        }
+    }
+
+    /// The host's bytes: the larger of the peak resident set (the resident set
+    /// itself is not monotone under the allocator's posture, which drops and
+    /// re-faults recycled extents) and the cgroup's working set, its charge
+    /// less its inactive file pages (the kubelet's measure). Page cache the
+    /// kernel would give back first is not counted; active file pages are,
+    /// and the target's 10 GiB margin covers them.
+    fn bytes(&self) -> u64 {
+        self.hwm
+            .max(self.charged.saturating_sub(self.inactive_file))
+    }
 }
 
 /// `auto`'s reserve beside the host's bytes: what the rest of the block will
@@ -901,7 +962,7 @@ fn spill_reserve_bytes(cells: u64) -> u64 {
 /// The policy's choice for one committed instance of `bytes` packed bytes:
 /// `resident` are the committed packed bytes kept so far, `cells` the main
 /// cells committed so far (this instance's included), `host` the host's bytes
-/// ([`host_bytes_now`]), read only by `auto`.
+/// ([`HostReading::bytes`]), read only by `auto`.
 fn spill_decision(
     policy: SpillPolicy,
     target: u64,
@@ -940,6 +1001,8 @@ struct Spill {
     cells: std::sync::atomic::AtomicU64,
     /// (instances, bytes) spilled, and instances kept.
     spilled: std::sync::Mutex<(u64, u64, u64)>,
+    /// The largest host reading `auto` decided on.
+    host_most: std::sync::Mutex<Option<HostReading>>,
 }
 
 impl Spill {
@@ -967,6 +1030,7 @@ impl Spill {
                 resident: std::sync::atomic::AtomicU64::new(0),
                 cells: std::sync::atomic::AtomicU64::new(0),
                 spilled: std::sync::Mutex::new((0, 0, 0)),
+                host_most: std::sync::Mutex::new(None),
             }),
             Err(e) => {
                 eprintln!(
@@ -993,7 +1057,14 @@ impl Spill {
             resident,
             cells,
             bytes as u64,
-            host_bytes_now,
+            || {
+                let reading = HostReading::now();
+                let mut most = self.host_most.lock().unwrap_or_else(|e| e.into_inner());
+                if most.is_none_or(|m| reading.bytes() > m.bytes()) {
+                    *most = Some(reading);
+                }
+                reading.bytes()
+            },
         );
         let mut s = self.spilled.lock().unwrap_or_else(|e| e.into_inner());
         if wanted && trace.spill_main(&self.store) {
@@ -1011,8 +1082,18 @@ impl Spill {
     fn report(&self) -> String {
         let (n, bytes, kept) = *self.spilled.lock().unwrap_or_else(|e| e.into_inner());
         let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let host = match *self.host_most.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(h) => format!(
+                " · host at most {:.2} GiB (VmHWM {:.2} · charge {:.2} − inactive file {:.2})",
+                g(h.bytes()),
+                g(h.hwm),
+                g(h.charged),
+                g(h.inactive_file),
+            ),
+            None => String::new(),
+        };
         format!(
-            "{:?} · target {:.1} GiB · spilled {n} instances {:.2} GiB · kept {kept} ({:.2} GiB packed) · {}",
+            "{:?} · target {:.1} GiB · spilled {n} instances {:.2} GiB · kept {kept} ({:.2} GiB packed){host} · {}",
             self.policy,
             g(self.target),
             g(bytes),
@@ -2294,8 +2375,8 @@ pub(crate) fn stream_config(
 #[cfg(test)]
 mod spill_policy_tests {
     use super::{
-        SpillPolicy, cgroup_memory, parse_spill_policy, spill_decision, spill_reserve_bytes,
-        spill_target_from,
+        CgroupValue, HostReading, SpillPolicy, cgroup_memory, parse_spill_policy, spill_decision,
+        spill_reserve_bytes, spill_target_from,
     };
 
     const GIB: u64 = 1 << 30;
@@ -2333,35 +2414,59 @@ mod spill_policy_tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(file), value).unwrap();
         };
+        let read = |proc_cgroup: &str, v2, v1| cgroup_memory(proc_cgroup, &root, v2, v1);
         let limit = |proc_cgroup: &str| {
-            cgroup_memory(proc_cgroup, &root, "memory.max", "memory.limit_in_bytes")
+            read(
+                proc_cgroup,
+                CgroupValue::File("memory.max"),
+                CgroupValue::File("memory.limit_in_bytes"),
+            )
         };
-        // v2 at the process's path.
+        let charge = |proc_cgroup: &str| {
+            read(
+                proc_cgroup,
+                CgroupValue::File("memory.current"),
+                CgroupValue::File("memory.usage_in_bytes"),
+            )
+        };
+        let inactive = |proc_cgroup: &str| {
+            read(
+                proc_cgroup,
+                CgroupValue::Stat("inactive_file"),
+                CgroupValue::Stat("total_inactive_file"),
+            )
+        };
+        // v2 at the process's path, its charge and its inactive file pages,
+        // read by their exact key (a decoy ending in the same name comes
+        // first).
         put("a/b", "memory.max", "129584070656\n");
         put("a/b", "memory.current", "4096\n");
-        assert_eq!(limit("0::/a/b\n"), Some(129_584_070_656));
-        assert_eq!(
-            cgroup_memory(
-                "0::/a/b\n",
-                &root,
-                "memory.current",
-                "memory.usage_in_bytes"
-            ),
-            Some(4096)
+        put(
+            "a/b",
+            "memory.stat",
+            "anon 100\nfile 9000\nx_inactive_file 1\nactive_file 10\ninactive_file 8192\n",
         );
+        assert_eq!(limit("0::/a/b\n"), Some(129_584_070_656));
+        assert_eq!(charge("0::/a/b\n"), Some(4096));
+        assert_eq!(inactive("0::/a/b\n"), Some(8192));
         // v2 unlimited and no v1: no limit.
         put("c", "memory.max", "max\n");
         assert_eq!(limit("0::/c\n"), None);
         // A hybrid host, as FAST: the unified line names a path with no
         // memory files, and the memory controller's own cgroup is its root.
+        // v1's inactive file pages are its hierarchical key, not the local
+        // one that ends in the same name.
         put("memory", "memory.limit_in_bytes", "61774757888\n");
         put("memory", "memory.usage_in_bytes", "17855025152\n");
+        put(
+            "memory",
+            "memory.stat",
+            "cache 16000\ninactive_file 5\ntotal_cache 16000\ntotal_inactive_file 15180000000\n",
+        );
         let fast = "12:memory:/docker/d005\n9:cpu,cpuacct:/docker/d005\n0::/docker/d005\n";
         assert_eq!(limit(fast), Some(61_774_757_888));
-        assert_eq!(
-            cgroup_memory(fast, &root, "memory.current", "memory.usage_in_bytes"),
-            Some(17_855_025_152)
-        );
+        assert_eq!(charge(fast), Some(17_855_025_152));
+        assert_eq!(inactive(fast), Some(15_180_000_000));
         // v1 at the process's path wins over the controller's root, and a
         // controller sharing its hierarchy is found.
         put("memory/docker/d005", "memory.limit_in_bytes", "777\n");
@@ -2373,7 +2478,29 @@ mod spill_policy_tests {
         // Nothing readable.
         assert_eq!(limit(""), None);
         assert_eq!(limit("5:pids:/x\n"), None);
+        assert_eq!(inactive("0::/c\n"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `auto`'s host bytes: the larger of the peak resident set and the
+    /// cgroup's working set (its charge less its inactive file pages). FAST at
+    /// 17:28Z: 40.58 GB charged with 15.18 GB inactive file reads 25.40 GB, not
+    /// 40.58; inactive pages past the charge read zero; the peak resident set
+    /// wins when it is larger.
+    #[test]
+    fn auto_reads_the_hosts_working_set() {
+        let reading = |hwm, charged, inactive_file| HostReading {
+            hwm,
+            charged,
+            inactive_file,
+        };
+        assert_eq!(
+            reading(24_680_000_000, 40_580_000_000, 15_180_000_000).bytes(),
+            25_400_000_000
+        );
+        assert_eq!(reading(0, 4 * GIB, 6 * GIB).bytes(), 0);
+        assert_eq!(reading(30 * GIB, 40 * GIB, 15 * GIB).bytes(), 30 * GIB);
+        assert_eq!(reading(0, 120 * GIB, 0).bytes(), 120 * GIB);
     }
 
     /// The target is the smaller of the cgroup limit and `MemTotal`, less
