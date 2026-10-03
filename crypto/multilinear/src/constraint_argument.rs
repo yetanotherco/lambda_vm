@@ -198,6 +198,12 @@ enum Held<F: IsField> {
         packed: NarrowColumns,
         widened: std::sync::OnceLock<Vec<Mle<F>>>,
     },
+    /// The packed columns are in a spill store's slot
+    /// ([`TraceData::take_narrow_for_spill`]); only
+    /// [`TraceData::restore_narrow`] brings them back. A reader that finds the
+    /// table here before then gets no columns: a proof the verifier refuses,
+    /// never a wrong one it accepts.
+    Spilled,
 }
 
 impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
@@ -352,6 +358,10 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
                 debug_assert!(wide.is_some(), "narrow columns that do not widen");
                 wide.unwrap_or_default()
             }),
+            Held::Spilled => {
+                debug_assert!(false, "a spilled table read before its columns came back");
+                &[]
+            }
         }
     }
 
@@ -363,9 +373,34 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     /// The columns packed narrow, when they are held that way.
     pub fn narrow(&self) -> Option<&NarrowColumns> {
         match &self.columns {
-            Held::Wide(_) => None,
+            Held::Wide(_) | Held::Spilled => None,
             Held::Narrow { packed, .. } => Some(packed),
         }
+    }
+
+    /// Whether the packed columns are out in a spill store's slot.
+    pub fn is_spilled(&self) -> bool {
+        matches!(self.columns, Held::Spilled)
+    }
+
+    /// Hands a narrow table's packed columns to a spill store, leaving the
+    /// table spilled until [`Self::restore_narrow`]. `None`, and nothing
+    /// changed, unless the table holds them narrow.
+    pub fn take_narrow_for_spill(&mut self) -> Option<NarrowColumns> {
+        if !matches!(self.columns, Held::Narrow { .. }) {
+            return None;
+        }
+        match std::mem::replace(&mut self.columns, Held::Spilled) {
+            Held::Narrow { packed, .. } => Some(packed),
+            _ => None,
+        }
+    }
+
+    /// Brings a spilled table's packed columns back from its store. Refused
+    /// (`false`, nothing changed) unless the table is spilled and `packed` has
+    /// its shape (as [`Self::install_narrow`] checks).
+    pub fn restore_narrow(&mut self, packed: NarrowColumns) -> bool {
+        self.is_spilled() && self.install_narrow(packed)
     }
 
     /// Holds the columns as `packed` from here on, letting the field elements
@@ -412,7 +447,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     #[doc(hidden)]
     pub fn narrow_mut(&mut self) -> Option<&mut NarrowColumns> {
         match &mut self.columns {
-            Held::Wide(_) => None,
+            Held::Wide(_) | Held::Spilled => None,
             Held::Narrow { packed, .. } => Some(packed),
         }
     }
@@ -1253,6 +1288,36 @@ mod tests {
         let raw: Vec<&[u64]> = words.iter().map(Vec::as_slice).collect();
         assert!(!trace.install_narrow(NarrowColumns::pack(&raw).unwrap()));
         assert!(!trace.pack_on_host());
+    }
+
+    /// A narrow table's packed columns go to a spill store and come back: in
+    /// between the table offers no columns, and only its own shape returns.
+    #[test]
+    fn a_spilled_table_holds_nothing_until_its_columns_come_back() {
+        let columns = satisfying(3);
+        let kinds = || (0..3).map(FactorKind::direct).collect::<Vec<_>>();
+        let mut trace = TraceData::<F, F>::new(columns.clone(), kinds(), Vec::new()).unwrap();
+        assert!(
+            trace.take_narrow_for_spill().is_none(),
+            "a wide table has none"
+        );
+        assert!(!trace.is_spilled());
+        assert!(trace.pack_on_host());
+        let held = trace.narrow().cloned().unwrap();
+        let packed = trace.take_narrow_for_spill().expect("narrow, so it spills");
+        assert_eq!(packed, held);
+        assert!(trace.is_spilled());
+        assert!(trace.narrow().is_none());
+        assert!(trace.take_narrow_for_spill().is_none(), "spilled once");
+        assert!(!trace.pack_on_host());
+        let shorter = NarrowColumns::pack_columns(&satisfying(2)).unwrap();
+        assert!(!trace.restore_narrow(shorter));
+        assert!(trace.is_spilled(), "a refused restore leaves it spilled");
+        assert!(trace.restore_narrow(packed));
+        assert!(!trace.is_spilled());
+        assert_eq!(trace.narrow(), Some(&held));
+        assert_eq!(trace.columns(), columns.as_slice());
+        assert!(!trace.restore_narrow(held), "only a spilled table restores");
     }
 
     #[test]
