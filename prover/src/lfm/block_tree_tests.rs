@@ -1861,28 +1861,89 @@ fn emit_window_knob() -> Option<usize> {
         })
 }
 
-/// `NOEPOCH_TREE_EMIT_LATE=<margin>`: in the pipeline mode, the leaf programs
-/// beside the base are emitted late in its prove instead of at the shape: leaf
-/// 0 at the shape, the rest once the heap's live bytes have fallen `margin` ×
-/// their estimated bytes below the shape's (phase B frees each trace as its
-/// table proves), or have stopped falling, or the base has returned
+/// How the pipeline emits the leaf programs beside the base
+/// (`NOEPOCH_TREE_EMIT_LATE`).
+///
+/// Late: leaf 0 at the shape, the rest once the heap's live bytes have fallen
+/// `margin` × their estimated bytes below the shape's (phase B frees each trace
+/// as its table proves), or have stopped falling, or the base has returned
 /// ([`late_trigger`]). Freed trace buffers sit in jemalloc's shared oversize
 /// arena and 99.5 % of a program's bytes are allocations that size, so the
-/// programs then take the freed pages instead of raising the base's high-water
-/// (laptop probe: 90 % reused; emitted at the shape they took fresh pages, +18.5
-/// GiB at the median, BIG 480). Unset (the default) emits them all at the shape.
-fn emit_late_knob() -> Option<f64> {
-    std::env::var("NOEPOCH_TREE_EMIT_LATE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| {
+/// programs take the freed pages instead of raising the base's high-water. At
+/// the median, spill off, that is base-phase VmRSS −10.37 GiB, recursion −0.31
+/// s, whole −2.15 s, 98 % of the programs' bytes on reused pages (BIG 585, 2 +
+/// 2); with spill on it is inert (−1.28 GiB, +0.55 s), the room phase A leaves
+/// being elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LateMode {
+    /// `0` or `off`: every leaf program at the shape.
+    Off,
+    /// Unset, empty or `auto` (the default): late at [`LATE_MARGIN`] when the
+    /// programs' estimate reaches [`LATE_MIN_ESTIMATE`], at the shape otherwise.
+    Auto,
+    /// `<margin>`: late at that margin, whatever the estimate.
+    Margin(f64),
+}
+
+fn emit_late_knob() -> LateMode {
+    match std::env::var("NOEPOCH_TREE_EMIT_LATE").ok().as_deref() {
+        None | Some("" | "auto") => LateMode::Auto,
+        Some("0" | "off") => LateMode::Off,
+        Some(v) => LateMode::Margin(
             v.parse()
                 .ok()
                 .filter(|m: &f64| m.is_finite() && *m > 0.0)
                 .unwrap_or_else(|| {
-                    panic!("NOEPOCH_TREE_EMIT_LATE must be a positive margin, got `{v}`")
-                })
-        })
+                    panic!(
+                        "NOEPOCH_TREE_EMIT_LATE must be auto, off or a positive margin, got `{v}`"
+                    )
+                }),
+        ),
+    }
+}
+
+/// The default late emission's margin over the programs' estimated bytes: the
+/// pages they need plus phase B's own transients (BIG 585).
+const LATE_MARGIN: f64 = 1.25;
+
+/// The default late emission's floor: below this estimate the programs are
+/// emitted at the shape. A small tree's programs barely move the peak, and its
+/// short phase B may not free `margin` × their bytes before the base returns,
+/// which would leave the harvest waiting on them (the record block's 7 more
+/// leaves are ≈ 3.8 GiB [I]; the median's 55 are 30.6 GiB).
+const LATE_MIN_ESTIMATE: usize = 8 << 30;
+
+/// The margin a late emission waits at, or `None` to emit at the shape.
+fn late_margin(mode: LateMode, estimate: usize) -> Option<f64> {
+    match mode {
+        LateMode::Off => None,
+        LateMode::Margin(m) => Some(m),
+        LateMode::Auto => (estimate >= LATE_MIN_ESTIMATE).then_some(LATE_MARGIN),
+    }
+}
+
+/// The other `beside - 1` leaves' programs' bytes, from leaf 0's (`first`)
+/// bytes a permutation of in-guest verification.
+fn late_estimate(plan: &BlockTreePlan, first: &LfmProgram, beside: usize) -> usize {
+    let costs = plan.costs();
+    let perms =
+        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
+    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
+    (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize
+}
+
+/// The default emits late only above its floor, a margin forces it, `off` never.
+#[test]
+fn the_default_late_emission_needs_its_floor() {
+    const G: usize = 1 << 30;
+    assert_eq!(late_margin(LateMode::Auto, 30 * G), Some(LATE_MARGIN));
+    assert_eq!(
+        late_margin(LateMode::Auto, LATE_MIN_ESTIMATE),
+        Some(LATE_MARGIN)
+    );
+    assert_eq!(late_margin(LateMode::Auto, 4 * G), None);
+    assert_eq!(late_margin(LateMode::Margin(2.0), G), Some(2.0));
+    assert_eq!(late_margin(LateMode::Off, 30 * G), None);
 }
 
 /// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
@@ -1918,6 +1979,7 @@ fn late_trigger(
 
 /// The late emission's wait and what the heap did around it.
 struct LateWait {
+    margin: f64,
     trigger: &'static str,
     waited: f64,
     /// Seconds since the base started, when the wait ended.
@@ -1929,24 +1991,16 @@ struct LateWait {
     resident_at_start: usize,
 }
 
-/// Waits for [`late_trigger`], polling the heap every 200 ms. `first` is leaf
-/// 0's program; the other `beside - 1` leaves' bytes are estimated from its
-/// bytes a permutation of in-guest verification.
+/// Waits for [`late_trigger`], polling the heap every 200 ms, for a fall of
+/// `margin` × `estimate` ([`late_estimate`]).
 fn wait_for_late_emission(
-    plan: &BlockTreePlan,
-    first: &LfmProgram,
-    beside: usize,
+    estimate: usize,
     margin: f64,
     live_at_shape: usize,
     base_done: &std::sync::atomic::AtomicBool,
     t_base0: std::time::Instant,
 ) -> LateWait {
     use std::time::Instant;
-    let costs = plan.costs();
-    let perms =
-        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
-    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
-    let estimate = (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize;
     let need = (margin * estimate as f64) as usize;
     let t = Instant::now();
     let (mut low, mut low_at) = (live_at_shape, Instant::now());
@@ -1968,6 +2022,7 @@ fn wait_for_late_emission(
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     LateWait {
+        margin,
         trigger,
         waited: t.elapsed().as_secs_f64(),
         at: t_base0.elapsed().as_secs_f64(),
@@ -3036,7 +3091,7 @@ fn the_block_tree_composes_to_a_top_node() {
             let mut late_line = None;
             let ahead = match (&consts, tree_ahead) {
                 (Ok(c), Some(mode)) => shape_rx.recv().ok().map(|shape| {
-                    let live_at_shape = emit_late.map(|_| heap_allocated());
+                    let live_at_shape = (emit_late != LateMode::Off).then(heap_allocated);
                     let t = Instant::now();
                     let derived = pool.install(|| -> Result<_, String> {
                         let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
@@ -3058,13 +3113,26 @@ fn the_block_tree_composes_to_a_top_node() {
                                 // `NOEPOCH_TREE_EMIT_LATE`: leaf 0 now, sizing the
                                 // wait; the rest once phase B has freed their room.
                                 let mut leaves = Vec::with_capacity(beside);
-                                let late = match (emit_late, live_at_shape) {
-                                    (Some(margin), Some(live)) if beside > 1 => {
+                                let late = match live_at_shape {
+                                    Some(live) if beside > 1 => {
                                         leaves.push(plan.leaf_program(0)?);
-                                        Some(wait_for_late_emission(
-                                            &plan, &leaves[0], beside, margin, live, &base_done,
-                                            t_base0,
-                                        ))
+                                        let estimate = late_estimate(&plan, &leaves[0], beside);
+                                        match late_margin(emit_late, estimate) {
+                                            Some(margin) => Some(wait_for_late_emission(
+                                                estimate, margin, live, &base_done, t_base0,
+                                            )),
+                                            None => {
+                                                late_line = Some(format!(
+                                                    "   TREE LATE: auto, the other {} leaves' programs \
+                                                     estimated {:.2} GiB, under the {:.0} GiB floor: \
+                                                     emitted at the shape",
+                                                    beside - 1,
+                                                    gib(estimate),
+                                                    gib(LATE_MIN_ESTIMATE)
+                                                ));
+                                                None
+                                            }
+                                        }
                                     }
                                     _ => None,
                                 };
@@ -3098,7 +3166,7 @@ fn the_block_tree_composes_to_a_top_node() {
                                         gib(w.live_at_shape),
                                         gib(w.live_at_start),
                                         gib(w.need),
-                                        emit_late.unwrap_or(0.0),
+                                        w.margin,
                                         gib(w.estimate),
                                         gib(heap_allocated()),
                                         gib(w.resident_at_start),
