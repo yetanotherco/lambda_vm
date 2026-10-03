@@ -123,6 +123,9 @@ pub struct GroupStamps {
     /// the upload ran beside the previous group's commit, when only what
     /// outlasted that commit is paid (`upload_a − upload_paid` is hidden).
     pub upload_paid: f64,
+    /// The group's store came with it, its columns copied as it filled
+    /// ([`GroupIn::early`]).
+    pub early_store: bool,
     pub commit: f64,
     pub retire: f64,
     /// Phase B: the columns up again, the tables' arguments, the codewords
@@ -581,7 +584,7 @@ where
     /// store the ledger refuses is uploaded after the commit, as without it.
     /// The commits, their order and their bytes are the same either way.
     pub fn commit_groups<H: WhirHash>(
-        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        groups: impl IntoIterator<Item = impl Into<GroupIn<'a, F, E>>>,
         config: &ChainConfig,
         drop_levels: usize,
         narrow: Narrowing,
@@ -592,8 +595,12 @@ where
 
     /// [`Self::commit_groups`], counting where the columns are in `mem` (a
     /// memory log, through phase B too) as they move. The commits are the same.
+    ///
+    /// A group that arrives with its store already on the card
+    /// ([`GroupIn::early`]) is not uploaded again: the store holds the same words
+    /// at the same places, so the commit is the same.
     pub fn commit_groups_logged<H: WhirHash>(
-        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        groups: impl IntoIterator<Item = impl Into<GroupIn<'a, F, E>>>,
         config: &ChainConfig,
         drop_levels: usize,
         narrow: Narrowing,
@@ -605,7 +612,7 @@ where
         let mut retired_groups = Vec::new();
         let mut roots = Vec::new();
         let mut stamps = Vec::new();
-        let mut incoming = groups.into_iter();
+        let mut incoming = groups.into_iter().map(Into::<GroupIn<'a, F, E>>::into);
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
         // upload (or, uploading ahead, beside this group's commit).
@@ -650,7 +657,11 @@ where
                         break;
                     }
                     let waited = Instant::now();
-                    let Some(group) = incoming.next() else {
+                    let Some(GroupIn {
+                        tables: group,
+                        early,
+                    }) = incoming.next()
+                    else {
                         break;
                     };
                     let mut stamp = GroupStamps {
@@ -663,12 +674,25 @@ where
                         mem.committing.fetch_add(held, Relaxed);
                         held
                     });
-                    let t = Instant::now();
-                    // Held in an `Arc` like phase B's: once the tree tops are
-                    // home it goes to the group's packer, or is dropped.
-                    let store = upload_for_commit(&group);
-                    stamp.upload_a = t.elapsed().as_secs_f64();
-                    stamp.upload_paid = stamp.upload_a;
+                    let store = match early {
+                        // Its columns went to the card as the group filled.
+                        Some(early) => {
+                            stamp.upload_a = early.upload_secs;
+                            stamp.upload_paid = early.paid_secs;
+                            stamp.early_store = true;
+                            Some(early.store)
+                        }
+                        None => {
+                            let t = Instant::now();
+                            // Held in an `Arc` like phase B's: once the tree
+                            // tops are home it goes to the group's packer, or
+                            // is dropped.
+                            let store = upload_for_commit(&group);
+                            stamp.upload_a = t.elapsed().as_secs_f64();
+                            stamp.upload_paid = stamp.upload_a;
+                            store
+                        }
+                    };
                     (group, stamp, store, wide)
                 }
             };
@@ -719,23 +743,37 @@ where
                     // the commit has asked for its room (or ended).
                     let next = incoming.next();
                     let arrived = Instant::now();
-                    let next = next.map(|group| {
-                        let wide = mem.as_ref().map_or(0, |mem| {
-                            let held = group.iter().map(held_bytes).sum();
-                            mem.ahead.fetch_add(held, Relaxed);
-                            held
-                        });
-                        let _ = room_rx.recv();
-                        let t = Instant::now();
-                        let store = upload_for_commit(&group);
-                        (
-                            group,
-                            store,
-                            wide,
-                            t.elapsed().as_secs_f64(),
-                            Instant::now(),
-                        )
-                    });
+                    let next = next.map(
+                        |GroupIn {
+                             tables: group,
+                             early,
+                         }| {
+                            let wide = mem.as_ref().map_or(0, |mem| {
+                                let held = group.iter().map(held_bytes).sum();
+                                mem.ahead.fetch_add(held, Relaxed);
+                                held
+                            });
+                            if let Some(early) = early {
+                                return (
+                                    group,
+                                    Some(early.store),
+                                    wide,
+                                    early.upload_secs,
+                                    Instant::now(),
+                                );
+                            }
+                            let _ = room_rx.recv();
+                            let t = Instant::now();
+                            let store = upload_for_commit(&group);
+                            (
+                                group,
+                                store,
+                                wide,
+                                t.elapsed().as_secs_f64(),
+                                Instant::now(),
+                            )
+                        },
+                    );
                     let (committed, commit_end) = committer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -872,6 +910,43 @@ where
 /// ([`BlockCommitted::commit_groups`]'s `upload_ahead`): its tables, its store
 /// (`None` when the ledger refused it, or there is no card), the upload's
 /// seconds, and what of the wait and of the upload outlasted the commit.
+/// A group as it reaches phase A: its tables and, when they were put on the
+/// card as they arrived, the store an upload of all of them would have made.
+pub struct GroupIn<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    pub tables: Vec<CommittedTable<'a, F, E>>,
+    pub early: Option<EarlyStore>,
+}
+
+/// A group's columns already on the card ([`GroupIn::early`]): the store, the
+/// seconds its copies took while the group filled, and the seconds the group
+/// waited for the last of them once closed.
+pub struct EarlyStore {
+    pub store: Arc<multilinear::gpu::ResidentColumns>,
+    pub upload_secs: f64,
+    pub paid_secs: f64,
+}
+
+impl<'a, F, E> From<Vec<CommittedTable<'a, F, E>>> for GroupIn<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    fn from(tables: Vec<CommittedTable<'a, F, E>>) -> Self {
+        Self {
+            tables,
+            early: None,
+        }
+    }
+}
+
 struct Ahead<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
