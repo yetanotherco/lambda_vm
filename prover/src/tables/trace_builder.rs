@@ -4684,12 +4684,66 @@ fn p4_split() -> bool {
     *ON.get_or_init(|| std::env::var("LAMBDA_VM_P4_SPLIT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `LAMBDA_VM_P4_BALANCE=0|1` (production 1): the table phase's BITWISE stage
+/// cuts every source that is a sum over its ops into slices of whole ops
+/// ([`add_bitwise_source`]); `0` keeps each such source one unit. Either way
+/// the histogram, and so every table, is the same.
+pub(crate) fn p4_balance() -> bool {
+    #[cfg(test)]
+    if let Some(on) = p4_test::knobs().balance {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_P4_BALANCE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// One unit of the BITWISE stage: it counts its lookups into the histogram it
+/// is handed.
+type BitwiseUnit<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
+
+/// Adds a source that is a sum over its `ops` to the BITWISE stage's units:
+/// one unit per `per` ops (each named `name[k]`), or, `per` `None`, one unit
+/// for them all (named `name`). Every op's lookups depend on that op alone
+/// (MUL's and DVRM's on their instance, so their `per` is an instance's rows),
+/// and the histogram is a commutative sum, so any such cut counts the same.
+fn add_bitwise_source<'a, T: Sync>(
+    units: &mut Vec<(String, BitwiseUnit<'a>)>,
+    name: &str,
+    ops: &'a [T],
+    per: Option<usize>,
+    count: impl Fn(&'a [T], &mut bitwise::BitwiseHistogram) + Copy + Sync + 'a,
+) {
+    let Some(per) = per else {
+        units.push((name.to_string(), Box::new(move |h| count(ops, h))));
+        return;
+    };
+    let slices = ops.chunks(per.max(1));
+    #[cfg(test)]
+    let slices = {
+        let n = ops.len().div_ceil(per.max(1));
+        slices.take(if p4_test::knobs().drop == Some(name) {
+            n.saturating_sub(1)
+        } else {
+            n
+        })
+    };
+    for (k, slice) in slices.enumerate() {
+        units.push((format!("{name}[{k}]"), Box::new(move |h| count(slice, h))));
+    }
+}
+
+/// The ops per slice of a balanced source (a test may override it).
+fn p4_ops_per(per: usize) -> usize {
+    #[cfg(test)]
+    if let Some(per) = p4_test::knobs().per {
+        return per;
+    }
+    per
+}
+
 /// The BITWISE stage's buckets counted as the default path counts them (one
 /// histogram a bucket, on the pool), each unit timed, then merged into `base`
 /// one after another, timed apart; prints one `BLOCK P4 SPLIT` line.
-#[cfg(feature = "parallel")]
-type BitwiseUnit<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
-
 #[cfg(feature = "parallel")]
 fn p4_split_count(
     buckets: &[Vec<BitwiseUnit<'_>>],
@@ -4870,35 +4924,91 @@ fn build_traces<I: ImageSource + Sync>(
     // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
     // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
     // independent of accumulation order.
-    type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
-    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
-    // split into row-ranges in the parallel path below) stays a single whole-source collector.
-    let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
-        Box::new(|h| {
-            for op in &bytewise_ops {
+    // Balanced (`p4_balance`, production), every source that is a sum over its ops is cut into
+    // slices of whole ops, so the parallel path's buckets share it (a whole source is one
+    // bucket's long pole: KECCAK, at a mainnet block) and no slice's list of lookups grows
+    // with the run; MUL and DVRM deduplicate per instance, so each of their slices is one
+    // instance. Unbalanced, each such source is one unit. The in-walk lookups and MEMW_R are
+    // split in the parallel path below either way; the rest stay one unit each. Every unit is
+    // named, for the split readout.
+    let balance = p4_balance();
+    let ops_per = |per: usize| balance.then(|| p4_ops_per(per));
+    let mut collectors: Vec<(String, BitwiseUnit)> = Vec::new();
+    add_bitwise_source(&mut collectors, "lt", &lt_ops, ops_per(1 << 20), |s, h| {
+        h.add_ops(&collect_bitwise_from_lt(s))
+    });
+    let mul_per = balance.then_some(mul_chunk.max(1));
+    add_bitwise_source(&mut collectors, "mul", &mul_ops, mul_per, |s, h| {
+        h.add_ops(&collect_bitwise_from_mul(s, mul_chunk))
+    });
+    let dvrm_per = balance.then_some(dvrm_chunk.max(1));
+    add_bitwise_source(&mut collectors, "dvrm", &dvrm_ops, dvrm_per, |s, h| {
+        h.add_ops(&collect_bitwise_from_dvrm(s, dvrm_chunk))
+    });
+    add_bitwise_source(
+        &mut collectors,
+        "branch",
+        &branch_ops,
+        ops_per(1 << 20),
+        |s, h| h.add_ops(&collect_bitwise_from_branch(s)),
+    );
+    add_bitwise_source(
+        &mut collectors,
+        "shift",
+        &shift_ops,
+        ops_per(1 << 20),
+        |s, h| h.add_ops(&shift::collect_bitwise_from_shift(s)),
+    );
+    add_bitwise_source(
+        &mut collectors,
+        "bytewise",
+        &bytewise_ops,
+        ops_per(1 << 20),
+        |s, h| {
+            for op in s {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &eq_ops {
+        },
+    );
+    add_bitwise_source(&mut collectors, "eq", &eq_ops, ops_per(1 << 20), |s, h| {
+        for op in s {
+            h.add_ops(&op.collect_bitwise_ops());
+        }
+    });
+    add_bitwise_source(
+        &mut collectors,
+        "store",
+        &store_ops,
+        ops_per(1 << 20),
+        |s, h| {
+            for op in s {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-        }),
-        Box::new(|h| {
-            for op in &store_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
+        },
+    );
+    add_bitwise_source(
+        &mut collectors,
+        "memw_aligned",
+        &memw_aligned_ops,
+        ops_per(1 << 22),
+        |s, h| h.add_ops(&collect_bitwise_from_memw_aligned(s)),
+    );
+    collectors.push((
+        "commit".to_string(),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+    ));
+    // About 5,000 lookups per permutation.
+    add_bitwise_source(
+        &mut collectors,
+        "keccak",
+        &keccak_ops,
+        ops_per(1 << 11),
+        |s, h| h.add_ops(&collect_bitwise_from_keccak(s)),
+    );
+    collectors.push((
+        "blake3".to_string(),
         Box::new(|h| {
             if !strip_blake3_side_effects() {
                 h.add_ops(&collect_bitwise_from_blake3(
@@ -4907,39 +5017,36 @@ fn build_traces<I: ImageSource + Sync>(
                 ));
             }
         }),
+    ));
+    collectors.push((
+        "ecsm".to_string(),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
-        Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
-    ];
-    // The collectors' names, in order, for the split readout (`LAMBDA_VM_P4_SPLIT`).
-    let mut names: Vec<&'static str> = vec![
-        "lt",
-        "mul",
-        "dvrm",
-        "branch",
-        "shift",
-        "bytewise",
-        "eq",
-        "store",
-        "memw_aligned",
-        "commit",
-        "keccak",
-        "blake3",
-        "ecsm",
+    ));
+    add_bitwise_source(
+        &mut collectors,
         "ecdas",
-        "hint",
-        "padding",
-    ];
+        &ecdas_ops,
+        ops_per(1 << 16),
+        |s, h| h.add_ops(&collect_bitwise_from_ecdas(s)),
+    );
+    collectors.push((
+        "hint".to_string(),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
+    ));
+    collectors.push((
+        "padding".to_string(),
+        Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
+    ));
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
-        collectors.push(Box::new(move |h| {
-            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
-        }));
-        names.push("page");
+        collectors.push((
+            "page".to_string(),
+            Box::new(move |h| {
+                collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
+            }),
+        ));
     }
-    debug_assert_eq!(names.len(), collectors.len());
 
     let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
     let (mut base, counted_iw, counted_reg) = match pre {
@@ -4962,26 +5069,25 @@ fn build_traces<I: ImageSource + Sync>(
         // byte-identical multiplicities (same as the serial fallback below).
         let cap = rayon::current_num_threads().clamp(1, 8);
         let split = p4_split();
-        let mut unit_names: Vec<String> = Vec::new();
-        let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
+        let mut units: Vec<(String, BitwiseUnit)> = Vec::with_capacity(collectors.len() + 2 * cap);
         let iw_chunk = uncounted_iw.len().div_ceil(cap).max(1);
         for (k, slice) in uncounted_iw.chunks(iw_chunk).enumerate() {
-            units.push(Box::new(move |h| h.add_ops(slice)));
-            unit_names.push(format!("in_walk[{k}]"));
+            units.push((format!("in_walk[{k}]"), Box::new(move |h| h.add_ops(slice))));
         }
         let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
         for (k, slice) in uncounted_reg.chunks(reg_chunk).enumerate() {
-            units.push(Box::new(move |h| {
-                memw_register::collect_bitwise_from_memw_register(slice, h)
-            }));
-            unit_names.push(format!("memw_register[{k}]"));
+            units.push((
+                format!("memw_register[{k}]"),
+                Box::new(move |h| memw_register::collect_bitwise_from_memw_register(slice, h)),
+            ));
         }
         units.extend(collectors);
-        unit_names.extend(names.iter().map(|n| n.to_string()));
+        #[cfg(test)]
+        p4_test::record(units.iter().map(|(name, _)| name.clone()).collect());
 
-        let mut buckets: Vec<Vec<Collector>> = (0..cap).map(|_| Vec::new()).collect();
+        let mut buckets: Vec<Vec<BitwiseUnit>> = (0..cap).map(|_| Vec::new()).collect();
         let mut bucket_names: Vec<Vec<String>> = (0..cap).map(|_| Vec::new()).collect();
-        for (i, (unit, name)) in units.into_iter().zip(unit_names).enumerate() {
+        for (i, (name, unit)) in units.into_iter().enumerate() {
             buckets[i % cap].push(unit);
             bucket_names[i % cap].push(name);
         }
@@ -5008,7 +5114,9 @@ fn build_traces<I: ImageSource + Sync>(
     {
         base.add_ops(uncounted_iw);
         memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
-        for f in &collectors {
+        #[cfg(test)]
+        p4_test::record(collectors.iter().map(|(name, _)| name.clone()).collect());
+        for (_, f) in &collectors {
             f(&mut base);
         }
     }
@@ -6789,5 +6897,54 @@ impl Traces {
             &StreamSkip::default(),
             None,
         )
+    }
+}
+
+/// The BITWISE stage's knobs in a test, for the builds on this thread.
+#[cfg(test)]
+pub(crate) mod p4_test {
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct Knobs {
+        /// Overrides [`super::p4_balance`].
+        pub(crate) balance: Option<bool>,
+        /// Overrides the ops per slice of every balanced source but MUL and
+        /// DVRM (whose slice is their instance).
+        pub(crate) per: Option<usize>,
+        /// A mutation: the balanced source of this name loses its last slice.
+        pub(crate) drop: Option<&'static str>,
+    }
+
+    thread_local! {
+        static KNOBS: Cell<Knobs> = Cell::new(Knobs::default());
+        static UNITS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn knobs() -> Knobs {
+        KNOBS.with(Cell::get)
+    }
+
+    /// Sets the knobs until the guard drops.
+    pub(crate) fn set(knobs: Knobs) -> Guard {
+        KNOBS.with(|k| k.set(knobs));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            KNOBS.with(|k| k.set(Knobs::default()));
+        }
+    }
+
+    pub(super) fn record(names: Vec<String>) {
+        UNITS.with(|u| *u.borrow_mut() = names);
+    }
+
+    /// The units of the last BITWISE stage built on this thread, by name.
+    pub(crate) fn units() -> Vec<String> {
+        UNITS.with(|u| u.borrow().clone())
     }
 }

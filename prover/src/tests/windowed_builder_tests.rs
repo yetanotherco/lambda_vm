@@ -328,6 +328,108 @@ fn windowed_builds_the_whole_run_tables_at_production_sizes() {
     same_traces(&reference, &traces);
 }
 
+/// The BITWISE stage's unit names that are a slice of a per-op source (the
+/// in-walk lookups and MEMW_R are sliced either way).
+fn sliced_sources(units: &[String]) -> Vec<&str> {
+    units
+        .iter()
+        .filter(|u| {
+            u.ends_with(']') && !u.starts_with("in_walk[") && !u.starts_with("memw_register[")
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// ★ The BITWISE stage balanced (`trace_builder::p4_balance`, production: every
+/// per-op source cut into slices of whole ops, MUL's and DVRM's one an
+/// instance) builds the unbalanced tables, BITWISE's multiplicities included —
+/// whole-run and windowed, at the production cuts and at a slice per op or per
+/// seven ops, where every per-op source is many units.
+#[test]
+fn the_balanced_bitwise_stage_builds_the_unbalanced_tables() {
+    use crate::tables::trace_builder::p4_test::{self, Knobs};
+    let max_rows = MaxRowsConfig::small();
+    for (name, many) in [
+        ("all_instructions_64", ["lt[1]", "shift[1]", "bytewise[1]"]),
+        (
+            "test_keccak_multi",
+            ["lt[1]", "keccak[1]", "memw_aligned[1]"],
+        ),
+    ] {
+        let (program, logs) = run(name);
+        let reference = {
+            let _off = p4_test::set(Knobs {
+                balance: Some(false),
+                ..Knobs::default()
+            });
+            let reference = whole(&program, &logs, &max_rows);
+            let units = p4_test::units();
+            assert!(units.iter().any(|u| u == "lt"), "{name}: {units:?}");
+            assert!(sliced_sources(&units).is_empty(), "{name}: {units:?}");
+            reference
+        };
+        for per in [None, Some(1), Some(7)] {
+            let _on = p4_test::set(Knobs {
+                balance: Some(true),
+                per,
+                drop: None,
+            });
+            same_traces(&reference, &whole(&program, &logs, &max_rows));
+            let units = p4_test::units();
+            assert!(!units.iter().any(|u| u == "lt"), "{name}: {units:?}");
+            if per == Some(1) {
+                for unit in many {
+                    assert!(
+                        units.iter().any(|u| u == unit),
+                        "{name}: no {unit} in {units:?}"
+                    );
+                }
+            }
+            for window in [7, 33] {
+                let (traces, _) = windowed(&program, &logs, &max_rows, window);
+                same_traces(&reference, &traces);
+                assert_eq!(
+                    sliced_sources(&p4_test::units()).is_empty(),
+                    sliced_sources(&units).is_empty(),
+                    "{name}, window {window}: the windowed finish was not balanced"
+                );
+            }
+        }
+    }
+}
+
+/// The mutation that shows the test above can fail: a balanced source short of
+/// its last slice (one op at a slice per op; MUL its last instance) moves
+/// BITWISE's multiplicities.
+#[test]
+fn a_balanced_source_short_of_a_slice_moves_bitwise() {
+    use crate::tables::trace_builder::p4_test::{self, Knobs};
+    let max_rows = MaxRowsConfig::small();
+    for (name, source) in [
+        ("all_instructions_64", "lt"),
+        ("all_instructions_64", "mul"),
+        ("all_instructions_64", "shift"),
+        ("test_keccak_multi", "keccak"),
+    ] {
+        let (program, logs) = run(name);
+        let build = |drop| {
+            let _on = p4_test::set(Knobs {
+                balance: Some(true),
+                per: Some(1),
+                drop,
+            });
+            whole(&program, &logs, &max_rows)
+        };
+        let reference = build(None);
+        let mutated = build(Some(source));
+        same("CPU[0]", &reference.cpus[0], &mutated.cpus[0]);
+        assert!(
+            rows(&reference.bitwise) != rows(&mutated.bitwise),
+            "{name}: {source} short of a slice left BITWISE as it was"
+        );
+    }
+}
+
 /// The whole-run KECCAK_RND table cut into tables of `rows` rows — rows
 /// `[k·rows, (k+1)·rows)`, as the block proof splits it.
 fn split_keccak_rnd(t: &Traces, per: usize) -> Vec<Table> {
