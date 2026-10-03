@@ -265,11 +265,6 @@ fn conf_line() -> Option<String> {
     ))
 }
 
-#[cfg(not(test))]
-fn conf_line() -> Option<String> {
-    None
-}
-
 /// Reads every arena's dirty pages (`stats.arenas.<i>.pdirty` × `arenas.page`)
 /// and large allocations (`stats.arenas.<i>.lextents.<j>.nmalloc` ×
 /// `arenas.lextent.<j>.size`). The shared oversize arena is the one after the
