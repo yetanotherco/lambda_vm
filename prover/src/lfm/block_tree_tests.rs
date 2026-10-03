@@ -1438,15 +1438,17 @@ fn emit_pool_knob() -> usize {
     }
 }
 
-/// `NOEPOCH_TREE_NODE_EMIT=early`: in the pipeline mode, the builder emits each
-/// node's program as soon as its children's artifacts exist, during the level
-/// below; `level` or unset (the default) emits a level's programs together once
-/// the whole level below is built, which at the median block leaves the card
-/// idle 8.9 s between level 0's last hold and level 1's first (BIG 481).
+/// `NOEPOCH_TREE_NODE_EMIT`: in the pipeline mode, `early` or unset (the
+/// default) emits each node's program as soon as its children's artifacts
+/// exist, during the level below; `level` emits a level's programs together
+/// once the whole level below is built. Per level, the median block's card sat
+/// idle 8.9 s between level 0's last hold and level 1's first (BIG 481); early
+/// takes the median's recursion −7.32 s (BIG 483, 2 + 2) and 1× −0.15 s (FAST
+/// 668, 4 + 4), the programs and the top unchanged.
 fn node_emit_early_knob() -> bool {
     match std::env::var("NOEPOCH_TREE_NODE_EMIT").ok().as_deref() {
-        None | Some("" | "level") => false,
-        Some("early") => true,
+        None | Some("" | "early") => true,
+        Some("level") => false,
         Some(v) => panic!("NOEPOCH_TREE_NODE_EMIT must be early or level, got `{v}`"),
     }
 }

@@ -182,10 +182,10 @@ impl Pipe {
     /// of its builds (`NOEPOCH_TREE_EMIT_WINDOW`): the same programs, emitted
     /// later, so they do not all sit in memory beside the base.
     ///
-    /// With `node_emit_early` (`NOEPOCH_TREE_NODE_EMIT=early`) each node's
-    /// program is emitted as soon as its children's artifacts exist, during the
-    /// level below, instead of a level's programs together once the whole level
-    /// below is built. The build order is the same; the programs are the same (a
+    /// With `node_emit_early` (`NOEPOCH_TREE_NODE_EMIT`, early by default) each
+    /// node's program is emitted as soon as its children's artifacts exist,
+    /// during the level below, instead of a level's programs together once the
+    /// whole level below is built (`=level`). The build order is the same; the programs are the same (a
     /// node's program is a function of its children's derived shapes); only the
     /// moment each is emitted moves. At the median block the per-level emission
     /// leaves the card idle 8.9 s between level 0's last hold and level 1's
