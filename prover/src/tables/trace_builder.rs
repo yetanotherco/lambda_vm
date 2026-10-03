@@ -3905,9 +3905,10 @@ pub struct StreamSkip {
     /// soon as it is generated (`TraceTable::pack_main_narrow`), so the build
     /// never holds its tables at eight bytes a cell; the words are the same.
     /// KECCAK, ECSM, ECDAS and a whole KECCAK_RND stay wide: the block cuts
-    /// them after the build. `false` everywhere but the WHIR block's windowed
-    /// finish.
-    pub pack: bool,
+    /// them after the build. The packed bytes go where the backing says (the
+    /// heap, or pages of their own while a spill is on). `None` everywhere but
+    /// the WHIR block's windowed finish.
+    pub pack: Option<multilinear::narrow::Backing>,
     /// The streamed tables' op lists hold only the ops past their streamed
     /// chunks (a windowed build that drops each chunk's ops as it hands the
     /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and
@@ -3970,7 +3971,7 @@ pub(crate) fn keccak_rnd_chunks(
     ops: &[KeccakRoundOperation],
     rows: usize,
     streamed: usize,
-    pack: bool,
+    pack: Option<multilinear::narrow::Backing>,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if ops.is_empty() {
         return Ok(Vec::new());
@@ -4007,7 +4008,7 @@ pub(crate) fn keccak_rnd_chunks(
     // and one task building them all one after another would be the finish's
     // last; at most `KECCAK_RND_PACK_WAVE` chunks are wide at once.
     #[cfg(feature = "parallel")]
-    if pack {
+    if pack.is_some() {
         let mut tables = Vec::with_capacity(chunks);
         let all: Vec<usize> = (0..chunks).collect();
         for wave in all.chunks(KECCAK_RND_PACK_WAVE) {
@@ -4039,19 +4040,20 @@ pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksEx
 /// `generate`, each table it makes packed at the bytes its columns need as it
 /// is made when `pack` ([`StreamSkip::pack`]); `generate` itself otherwise.
 fn packed_by<T>(
-    pack: bool,
+    pack: Option<multilinear::narrow::Backing>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
 ) -> impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync {
     move |ops| packed_if(pack, generate(ops))
 }
 
-/// `table`, packed ([`TraceTable::pack_main_narrow`]) when `pack`.
+/// `table`, packed ([`TraceTable::pack_main_narrow_with`]) into the backing
+/// `pack` names, if it names one.
 fn packed_if(
-    pack: bool,
+    pack: Option<multilinear::narrow::Backing>,
     mut table: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    if pack {
-        table.pack_main_narrow();
+    if let Some(backing) = pack {
+        table.pack_main_narrow_with(backing);
     }
     table
 }

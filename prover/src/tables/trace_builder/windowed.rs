@@ -152,8 +152,8 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
     /// builds, 0 for one table.
     finish_keccak_rnd_rows: usize,
-    /// [`Self::pack_finished_tables`].
-    pack_finished: bool,
+    /// [`Self::pack_finished_tables`]: where the finish's packed bytes go.
+    pack_finished: Option<multilinear::narrow::Backing>,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -211,7 +211,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             lean,
             decode,
             finish_keccak_rnd_rows: 0,
-            pack_finished: false,
+            pack_finished: None,
         })
     }
 
@@ -287,8 +287,14 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// tables at eight bytes a cell; the words are the same. KECCAK, ECSM and
     /// ECDAS stay wide (a block cuts them afterwards). The streamed chunks are
     /// the caller's.
-    pub fn pack_finished_tables(mut self) -> Self {
-        self.pack_finished = true;
+    pub fn pack_finished_tables(self) -> Self {
+        self.pack_finished_tables_into(multilinear::narrow::Backing::Heap)
+    }
+
+    /// [`Self::pack_finished_tables`], the packed bytes allocated as
+    /// `backing` says (pages of their own while a spill is on).
+    pub fn pack_finished_tables_into(mut self, backing: multilinear::narrow::Backing) -> Self {
+        self.pack_finished = Some(backing);
         self
     }
 

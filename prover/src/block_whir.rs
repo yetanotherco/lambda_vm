@@ -305,6 +305,34 @@ pub struct BlockOptions {
     /// the host. KECCAK, ECSM, ECDAS and an unchunked KECCAK_RND stay wide.
     /// The proof's bytes are the same. Production: on.
     pub pack_finished: bool,
+    /// Whether phase A hands the committed groups' packed tables to a spill
+    /// store, which phase B reads back in group order
+    /// ([`multilinear_block::BlockSpill`]). The proof's bytes are the same.
+    /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), off unless set.
+    pub spill: BlockSpillPolicy,
+}
+
+/// When a block spills its held tables ([`BlockOptions::spill`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockSpillPolicy {
+    /// Every table stays in memory, its bytes on the heap.
+    #[default]
+    Off,
+    /// Every committed group past the first two spills, as far as the store's
+    /// writer queue has room; the packed bytes go in pages of their own.
+    Always,
+}
+
+/// `LAMBDA_VM_BLOCK_SPILL=always` spills ([`BlockSpillPolicy::Always`]);
+/// unset, `off`, or anything else keeps the tables in memory.
+pub fn spill_from_env() -> BlockSpillPolicy {
+    match std::env::var("LAMBDA_VM_BLOCK_SPILL")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("always") => BlockSpillPolicy::Always,
+        _ => BlockSpillPolicy::Off,
+    }
 }
 
 impl BlockOptions {
@@ -331,6 +359,7 @@ impl BlockOptions {
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
+            spill: spill_from_env(),
         }
     }
 }
@@ -524,6 +553,11 @@ pub struct BlockStamps {
     /// With [`BlockOptions::memlog`]: every memory term when the proof is
     /// done, bytes; empty without.
     pub mem_terms: Vec<(&'static str, usize)>,
+    /// With [`BlockOptions::spill`]: the store's counters and the read-back's
+    /// report, or why no store opened.
+    pub spill: Option<String>,
+    /// With [`BlockOptions::spill`]: the store's counters after phase B.
+    pub spill_stats: Option<stark::spill::SpillStats>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -775,6 +809,9 @@ impl BlockStamps {
             sum(|g| g.upload_b),
             sum(|g| g.encode),
         ));
+        if let Some(spill) = &self.spill {
+            out.push_str(&format!("BLOCK SPILL: {spill}\n"));
+        }
         out
     }
 }
@@ -1404,6 +1441,10 @@ pub(crate) struct Deviations {
     /// phase B widens other words than were committed
     /// ([`BlockCommitted::fault_narrow_width_map`]).
     pub narrow_width_map: bool,
+    /// Between the phases, one byte of the first spilled table flipped on
+    /// disk ([`BlockCommitted::fault_spilled_byte`]), so phase B reads back
+    /// other bytes than were written.
+    pub spilled_byte: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2648,6 +2689,28 @@ fn prove_streamed(
         ledger.pool();
         ledger.line("start");
     }
+    // The spill (`BlockOptions::spill`): a store for this prove, and the
+    // packed bytes in pages of their own while it is open. A store that does
+    // not open leaves every table in memory.
+    let spill = match options.spill {
+        BlockSpillPolicy::Off => None,
+        BlockSpillPolicy::Always => {
+            let store_options = stark::spill::SpillOptions::default();
+            let queue = store_options.queue_bytes;
+            match stark::spill::SpillStore::open(store_options) {
+                Ok(store) => Some(multilinear_block::BlockSpill::new(store, queue)),
+                Err(e) => {
+                    stamps.spill = Some(format!("always · no store ({e}); every table held"));
+                    None
+                }
+            }
+        }
+    };
+    let backing = if spill.is_some() {
+        multilinear::narrow::Backing::Pages
+    } else {
+        multilinear::narrow::Backing::Heap
+    };
 
     crate::with_whir_hash!(|H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
@@ -2700,7 +2763,7 @@ fn prove_streamed(
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
                 if options.pack_finished {
-                    builder = builder.pack_finished_tables();
+                    builder = builder.pack_finished_tables_into(backing);
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
@@ -3024,6 +3087,7 @@ fn prove_streamed(
                 options.narrow,
                 options.upload_ahead,
                 ledger.map(|ledger| ledger.block.clone()),
+                spill.clone(),
             );
             (block, builder.join(), layout.join(), executor.join())
         });
@@ -3040,6 +3104,9 @@ fn prove_streamed(
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
+        }
+        if deviations.spilled_byte && !block.fault_spilled_byte() {
+            return Err(Error::Prover("no spilled table to break".into()));
         }
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);
@@ -3129,6 +3196,17 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        if let Some(spill) = &spill {
+            let read_back = spill
+                .prefetch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| "nothing to read back".to_string());
+            let stats = spill.store.stats();
+            stamps.spill = Some(format!("always · {stats} · read-back {read_back}"));
+            stamps.spill_stats = Some(stats);
+        }
         if multilinear::whir_split::enabled() {
             let chain = multilinear::whir_split::take_chain();
             let top_secs = multilinear::whir_commit::top_path_secs();
