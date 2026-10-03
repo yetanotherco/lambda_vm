@@ -1495,6 +1495,16 @@ mod shared_vram_gate_tests {
         );
     }
 
+    /// On unless the knob says `0`.
+    #[test]
+    fn the_gate_is_on_unless_the_knob_says_zero() {
+        use super::shared_vram_gate_setting as setting;
+        assert!(setting(None), "on by default");
+        assert!(setting(Some("1")));
+        assert!(!setting(Some("0")), "0 turns it off");
+        assert!(!setting(Some(" 0 ")));
+    }
+
     #[test]
     fn the_shared_admission_holds_bytes_only_when_the_gate_is_on() {
         pin_shared_vram_gate(Some(false));
@@ -2169,8 +2179,8 @@ fn shared_gate_trace() -> bool {
     *ON.get_or_init(|| std::env::var("LAMBDA_VM_SHARED_GATE_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// `LAMBDA_VM_SHARED_VRAM_GATE=1`, while a caller has armed it
-/// ([`arm_shared_vram_gate`]): every [`IsStarkProver::multi_prove`] admits its
+/// On by default (`LAMBDA_VM_SHARED_VRAM_GATE=0` turns it off), while a caller
+/// has armed it ([`arm_shared_vram_gate`]): every [`IsStarkProver::multi_prove`] admits its
 /// tables through ONE [`VramGate`] instead of a fresh full-budget gate per
 /// call, and device work outside a prove takes its bytes from the same gate
 /// ([`shared_vram_admit`]). Proofs in flight at once then share one running
@@ -2198,10 +2208,19 @@ pub fn shared_vram_gate_on() -> bool {
     shared_vram_gate_knob() && SHARED_VRAM_GATE_ARMED.load(Ordering::SeqCst)
 }
 
-/// The knob alone.
+/// The knob alone: on unless `LAMBDA_VM_SHARED_VRAM_GATE=0`. On by default
+/// since FAST 479 (P8: 1× recursion −0.59 s, whole −0.51, base −0.02 against
+/// the exclusive card, every run passing, VRAM ≤ 26.1 GiB).
 fn shared_vram_gate_knob() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LAMBDA_VM_SHARED_VRAM_GATE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| {
+        shared_vram_gate_setting(std::env::var("LAMBDA_VM_SHARED_VRAM_GATE").ok().as_deref())
+    })
+}
+
+/// [`shared_vram_gate_knob`] for a raw value: anything but `0` is on.
+fn shared_vram_gate_setting(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("0")
 }
 
 /// Whether a caller armed the shared gate ([`arm_shared_vram_gate`]).
