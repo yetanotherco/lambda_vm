@@ -2367,7 +2367,11 @@ fn prove_streamed(
                 ))
             });
 
-            let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
+            // One closed group may wait for phase A — in the channel, or, uploading
+            // ahead, in phase A's hands beside the commit; never both, so the
+            // groups held between the layout and the card are as many either way.
+            let held = usize::from(!options.upload_ahead);
+            let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(held);
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
