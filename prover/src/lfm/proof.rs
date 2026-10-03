@@ -171,6 +171,32 @@ pub(crate) fn lfm_prove_with_residency(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<LfmProof, LfmProveError> {
+    lfm_execute_and_fill(program, arenas, hasher)?.prove(artifacts, options, residency)
+}
+
+/// A program executed and its traces filled: everything [`lfm_prove`] does
+/// before the card, held for [`LfmFilled::prove`].
+///
+/// Split out so a driver can run the host phase while the program's artifacts
+/// are still being built (they hold the card; the execution and the fill do
+/// not read them). The two halves are [`lfm_prove_with_residency`] cut in
+/// two, in the same order, on whatever thread calls each.
+pub(crate) struct LfmFilled {
+    traces: LfmTraces,
+    public_words: Vec<(u32, LfmWord)>,
+    hasher: HasherKind,
+    execute_secs: f64,
+    fill_secs: f64,
+    exec_split: super::executor::ExecSplit,
+}
+
+/// The host half of [`lfm_prove_with_residency`]: execute `program` over
+/// `arenas` and fill its traces for `hasher`.
+pub(crate) fn lfm_execute_and_fill(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    hasher: HasherKind,
+) -> Result<LfmFilled, LfmProveError> {
     // ★ THE SPLIT OF THE `prove` FIELD. The driver's per-node TIMING line prints
     // this whole function as one number, and the three statements below are
     // three different machines: `execute` is a single-threaded interpreter,
@@ -203,44 +229,77 @@ pub(crate) fn lfm_prove_with_residency(
     drop(memory);
 
     let t = Instant::now();
-    let mut traces = build_traces_with_hasher(program, &records, hasher);
+    let traces = build_traces_with_hasher(program, &records, hasher);
     let fill_secs = t.elapsed().as_secs_f64();
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
     // here on; holding the records as well doubles the values through the card
     // phase.
     drop(records);
-
-    let t = Instant::now();
-    let waited_before = super::device_permit::waited_secs();
-    let proof = prove_traces_with_hasher(
-        artifacts,
-        &mut traces,
-        &public_words,
-        options,
-        hasher,
-        residency,
-    )
-    .map_err(LfmProveError::Prover)?;
-    // The wait is SUBTRACTED rather than left inside, so `multi_prove` means
-    // the same thing at one worker and at two.
-    let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
-    let multi_prove_secs = (t.elapsed().as_secs_f64() - permit_wait).max(0.0);
-
-    LAST_PROVE_SPLIT.with(|c| {
-        c.set(Some(ProveSplit {
-            execute: execute_secs,
-            fill: fill_secs,
-            multi_prove: multi_prove_secs,
-            permit_wait,
-            exec: exec_split,
-        }))
-    });
-
-    Ok(LfmProof {
-        proof,
+    Ok(LfmFilled {
+        traces,
         public_words,
+        hasher,
+        execute_secs,
+        fill_secs,
+        exec_split,
     })
+}
+
+impl LfmFilled {
+    /// The card half of [`lfm_prove_with_residency`]: prove the filled traces
+    /// against `artifacts`, which must be built for the hasher they were
+    /// filled with (the same agreement [`lfm_prove_with_hasher`] asserts).
+    pub(crate) fn prove(
+        self,
+        artifacts: &LfmArtifacts,
+        options: &ProofOptions,
+        residency: ResidencyMode,
+    ) -> Result<LfmProof, LfmProveError> {
+        let LfmFilled {
+            mut traces,
+            public_words,
+            hasher,
+            execute_secs,
+            fill_secs,
+            exec_split,
+        } = self;
+        assert_eq!(
+            artifacts.hasher, hasher,
+            "artifacts were built for {:?} but the traces were filled for {hasher:?}",
+            artifacts.hasher
+        );
+        let t = Instant::now();
+        let waited_before = super::device_permit::waited_secs();
+        let proof = prove_traces_with_hasher(
+            artifacts,
+            &mut traces,
+            &public_words,
+            options,
+            hasher,
+            residency,
+        )
+        .map_err(LfmProveError::Prover)?;
+        // The wait is SUBTRACTED rather than left inside, so `multi_prove` means
+        // the same thing at one worker and at two.
+        let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
+        let multi_prove_secs = (t.elapsed().as_secs_f64() - permit_wait).max(0.0);
+
+        LAST_PROVE_SPLIT.with(|c| {
+            c.set(Some(ProveSplit {
+                execute: execute_secs,
+                fill: fill_secs,
+                multi_prove: multi_prove_secs,
+                permit_wait,
+                exec: exec_split,
+            }))
+        });
+
+        Ok(LfmProof {
+            proof,
+            public_words,
+        })
+    }
 }
 
 /// Proves an already-built trace set against `artifacts`.
