@@ -52,6 +52,8 @@ use crate::{
     Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange, TableCounts, VmAirs,
 };
 
+mod memlog;
+
 /// How many stacked polynomials a group may take. A format constant: both sides
 /// derive the groups from it ([`block_groups`]). Three is today's heaviest
 /// epoch (three 2^27 polynomials, epochs 3–6 and 13 of block 25368371), so no
@@ -248,7 +250,10 @@ pub struct BlockOptions {
     pub layout_ahead: Option<usize>,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
-    /// of after all of them; the packing order is the same.
+    /// of after all of them; the packing order is the same. Production: off.
+    /// With [`Self::rest_layout_bytes`]'s waves the groups do close earlier,
+    /// but at 1× the committer is still busy when they do: on top of the waves
+    /// it read +0.01 s, and alone +0.21 s (FAST 852 / 853; +0.21 s at FAST 422).
     pub pack_rest_as_laid_out: bool,
     /// How phase A holds each group's columns once committed
     /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
@@ -259,6 +264,26 @@ pub struct BlockOptions {
     /// ([`BlockCommitted::commit_groups`]); the commits and the proof's bytes
     /// are the same. Production: on.
     pub upload_ahead: bool,
+    /// With windows: print where the host memory is, term by term, every half
+    /// second and at each mark ([`memlog`]'s `BLOCK MEM` lines). A
+    /// measurement; it moves no proof byte. Production reads
+    /// `LAMBDA_VM_BLOCK_MEMLOG=1` (off by default).
+    pub memlog: bool,
+    /// With windows and KECCAK_RND not streamed: the finish builds KECCAK_RND
+    /// as its 2^`keccak_rnd_rows_log2`-row tables
+    /// ([`WindowedTraceBuilder::keccak_rnd_chunks_at_finish`]) instead of one
+    /// table that [`split_keccak_rnd`] then copies apart; the tables are the
+    /// same. Production: on (BIG 561: the split's copy is the finish's last
+    /// ≈ 6 GiB at 4.13×). A cut under 32 rows (tests) takes the split.
+    pub finish_keccak_rnd_chunks: bool,
+    /// With windows: `Some(bytes)` lays the rest of the run out in AIR order,
+    /// in waves of at most `bytes` of rows (a larger table is a wave of its
+    /// own), each wave in parallel; `None` lays every table out at once. A
+    /// table's column copy exists before its rows go, so laying out all of
+    /// them at once holds most of the rest twice (BIG 561: ≈ 20 GiB at 4.13×,
+    /// the block's high-water). The tables, their order and the groups are the
+    /// same. Production: [`BLOCK_REST_LAYOUT_BYTES`].
+    pub rest_layout_bytes: Option<usize>,
 }
 
 impl BlockOptions {
@@ -281,7 +306,43 @@ impl BlockOptions {
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
+            memlog: memlog::from_env(),
+            finish_keccak_rnd_chunks: true,
+            rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
         }
+    }
+}
+
+/// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
+/// each transposition is parallel within its table, so a wave of a few
+/// tables keeps the cores busy while bounding the copies in flight.
+pub const BLOCK_REST_LAYOUT_BYTES: usize = 2 << 30;
+
+/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` and `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1`:
+/// the real-block tests' choice of [`BlockOptions::rest_layout_bytes`] and
+/// [`BlockOptions::finish_keccak_rnd_chunks`]; unset leaves the production
+/// ones.
+#[cfg(test)]
+pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
+    match std::env::var("BLOCK_WHIR_REST_LAYOUT")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("all") => options.rest_layout_bytes = None,
+        Ok(mib) => match mib.parse::<usize>() {
+            Ok(mib) if mib > 0 => options.rest_layout_bytes = Some(mib << 20),
+            _ => panic!("BLOCK_WHIR_REST_LAYOUT={mib}: all or a positive MiB count"),
+        },
+        Err(_) => {}
+    }
+    match std::env::var("BLOCK_WHIR_KR_FINISH_CHUNKS")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.finish_keccak_rnd_chunks = false,
+        Ok("1") => options.finish_keccak_rnd_chunks = true,
+        Ok(other) => panic!("BLOCK_WHIR_KR_FINISH_CHUNKS={other}: 0 or 1"),
+        Err(_) => {}
     }
 }
 
@@ -429,6 +490,9 @@ pub struct BlockStamps {
     /// card.
     pub narrow: multilinear_block::Narrowing,
     pub host_widens: (u64, u64),
+    /// With [`BlockOptions::memlog`]: every memory term when the proof is
+    /// done, bytes; empty without.
+    pub mem_terms: Vec<(&'static str, usize)>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -444,6 +508,9 @@ pub struct LayoutStamps {
     /// The most streamed chunks laid out (or in the making) and not yet
     /// packed at once, under [`BlockOptions::layout_ahead`].
     pub ahead_most: usize,
+    /// Each table of the rest in AIR order: its name, when its layout ended
+    /// (seconds since the prove started) and its group.
+    pub rest_tables: Vec<(String, f64, usize)>,
 }
 
 impl BlockStamps {
@@ -462,7 +529,7 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
@@ -471,6 +538,7 @@ impl BlockStamps {
                 s.upload_paid,
                 s.commit,
                 s.retire,
+                s.committed_at - s.commit - s.retire,
                 s.committed_at,
                 s.upload_b,
                 s.argue,
@@ -527,6 +595,15 @@ impl BlockStamps {
             out.push_str(&format!(
                 "BLOCK REST LAYOUT: slowest tables (s) {}\n",
                 slowest.join(" · ")
+            ));
+            let tables: Vec<String> = l
+                .rest_tables
+                .iter()
+                .map(|(name, at, group)| format!("{name}@{at:.2}·g{group}"))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK REST TABLES (laid out at · group): {}\n",
+                tables.join(" ")
             ));
         }
         out.push_str(&format!(
@@ -878,6 +955,15 @@ fn table_of<'a>(
 /// A prepared table's index in [`VmAirs::air_refs`] order and the columns its
 /// opening settles.
 pub(crate) type PreparedColumns = (usize, Vec<Vec<FieldElement<F>>>);
+
+/// The prepared tables' columns' bytes, at their capacities.
+fn prepared_bytes(prepared: &[PreparedColumns]) -> usize {
+    prepared
+        .iter()
+        .flat_map(|(_, columns)| columns)
+        .map(crate::tables::trace_builder::vec_heap_bytes)
+        .sum()
+}
 
 /// One group's PREPARED commitment ([`multilinear_block::BlockPrepared`]): the
 /// leading preprocessed columns of the group's prepared tables, stacked in the
@@ -1777,6 +1863,9 @@ struct Packer<'a> {
     start: Instant,
     closed_at: Vec<f64>,
     blocked: f64,
+    /// A memory log, and the open group's bytes in it.
+    ledger: Option<&'a memlog::Ledger>,
+    open_bytes: usize,
 }
 
 impl<'a> Packer<'a> {
@@ -1797,12 +1886,31 @@ impl<'a> Packer<'a> {
             self.open_shapes.push(shape);
             self.close()?;
         }
+        if let Some(ledger) = self.ledger {
+            let bytes = memlog::table_bytes(&table);
+            // A table of the run's AIR order comes from the rest's layout.
+            if let Key::Air(_) = key {
+                ledger
+                    .rest_laid
+                    .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+            ledger
+                .open
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            self.open_bytes += bytes;
+        }
         self.open.push(table);
         self.open_keys.push(key);
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), Error> {
+        if let Some(ledger) = self.ledger {
+            use std::sync::atomic::Ordering::Relaxed;
+            let bytes = std::mem::take(&mut self.open_bytes);
+            ledger.open.fetch_sub(bytes, Relaxed);
+            ledger.sent.fetch_add(bytes, Relaxed);
+        }
         self.group_keys.push(std::mem::take(&mut self.open_keys));
         self.closed_at.push(self.start.elapsed().as_secs_f64());
         let t = Instant::now();
@@ -1831,15 +1939,36 @@ type Packed = (Vec<Vec<Key>>, Vec<f64>, f64);
 /// A streamed chunk laid out: its table, its index, its shape and the table.
 type LaidChunk<'a> = (StreamTable, usize, (usize, usize), CommittedTable<'a, F, E>);
 
-fn lay_out_chunk<'a>(airs: &'a StreamAirs, job: ChunkJob) -> Result<LaidChunk<'a>, Error> {
+fn lay_out_chunk<'a>(
+    airs: &'a StreamAirs,
+    job: ChunkJob,
+    ledger: Option<&memlog::Ledger>,
+) -> Result<LaidChunk<'a>, Error> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // A memory log: the job leaves the queue as its ops, then its trace.
+    let ops = ledger.map_or(0, |ledger| {
+        let ops = job.op_bytes();
+        ledger.jobs.fetch_sub(ops, Relaxed);
+        ledger.laying.fetch_add(ops, Relaxed);
+        ops
+    });
     let mut chunk = job.generate();
+    let rows = ledger.map_or(0, |ledger| {
+        let rows = memlog::rows_bytes(&chunk.trace);
+        ledger.laying.fetch_add(rows, Relaxed);
+        ledger.laying.fetch_sub(ops, Relaxed);
+        rows
+    });
     let height = chunk.trace.main_table.height;
     let shape = (
         chunk.trace.main_table.width,
         height.trailing_zeros() as usize,
     );
-    let table = table_of(airs.of(chunk.table), &mut chunk.trace, shape, true)?;
-    Ok((chunk.table, chunk.index, shape, table))
+    let table = table_of(airs.of(chunk.table), &mut chunk.trace, shape, true);
+    if let Some(ledger) = ledger {
+        ledger.laying.fetch_sub(rows, Relaxed);
+    }
+    Ok((chunk.table, chunk.index, shape, table?))
 }
 
 /// The streamed chunks, packed in arrival order: the packer, each chunk's
@@ -1870,11 +1999,12 @@ fn stream_inline<'a>(
 ) -> Result<(StreamLaid<'a>, Box<Traces>), Error> {
     let mut shapes = Vec::new();
     let mut chunks = 0.0;
+    let ledger = packer.ledger;
     for item in brx {
         match item {
             Built::Job(job) => {
                 let t = Instant::now();
-                let (table, index, shape, laid) = lay_out_chunk(airs, *job)?;
+                let (table, index, shape, laid) = lay_out_chunk(airs, *job, ledger)?;
                 chunks += t.elapsed().as_secs_f64();
                 shapes.push((table, index, shape));
                 packer.place(Key::Streamed(table, index), shape, laid)?;
@@ -2002,6 +2132,7 @@ fn stream_pipelined<'a, R>(
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
     let permits = ahead.map(|k| Permits::new(k + 1));
     let permits = permits.as_ref();
+    let ledger = packer.ledger;
     std::thread::scope(|scope| {
         let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Box<ChunkJob>)>(workers);
         let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
@@ -2029,7 +2160,7 @@ fn stream_pipelined<'a, R>(
                         return;
                     };
                     let t = Instant::now();
-                    let laid = lay_out_chunk(airs, *job);
+                    let laid = lay_out_chunk(airs, *job, ledger);
                     if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
                         return;
                     }
@@ -2152,6 +2283,9 @@ struct RestLaid<'a> {
     /// The five slowest tables to lay out and the first in AIR order, seconds.
     slowest: Vec<(String, f64)>,
     busy: f64,
+    /// Each table's AIR index and when its layout ended (seconds since the
+    /// prove started), in AIR order.
+    laid_at: Vec<(usize, f64)>,
 }
 
 /// `prepared_now`: derive the prepared columns here, before the tables are
@@ -2168,6 +2302,8 @@ fn lay_out_rest<'a>(
     start: Instant,
     prepared_now: bool,
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
+    budget: Option<usize>,
+    ledger: Option<&memlog::Ledger>,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
     let at = || start.elapsed().as_secs_f64();
@@ -2199,6 +2335,12 @@ fn lay_out_rest<'a>(
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
         marks.push(("prepared", at()));
+        if let Some(ledger) = ledger {
+            ledger.prepared.store(
+                prepared_bytes(&prepared),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Some(prepared)
     } else {
         None
@@ -2212,26 +2354,73 @@ fn lay_out_rest<'a>(
         .enumerate()
         .filter(|(_, ((_, trace, _), _))| trace.main_table.width != 0)
         .collect();
-    // Each table's seconds, for the readout.
+    // Each table's seconds and when its layout ended, for the readout.
     let timed = std::sync::Mutex::new(Vec::with_capacity(built.len()));
+    let laid_at = std::sync::Mutex::new(Vec::with_capacity(built.len()));
     let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
         let t = Instant::now();
         let shape = (
             trace.main_table.width,
             trace.main_table.height.trailing_zeros() as usize,
         );
+        let rows = ledger.map_or(0, |_| memlog::rows_bytes(trace));
         let laid = table_of(air, trace, shape, true).map(|table| (i, shape, table));
+        if let Ok(mut laid_at) = laid_at.lock() {
+            laid_at.push((i, start.elapsed().as_secs_f64()));
+        }
+        if let (Some(ledger), Ok((_, _, table))) = (ledger, &laid) {
+            use std::sync::atomic::Ordering::Relaxed;
+            ledger.rest.fetch_sub(rows, Relaxed);
+            ledger
+                .rest_laid
+                .fetch_add(memlog::table_bytes(table), Relaxed);
+        }
         if let Ok(mut timed) = timed.lock() {
             timed.push((i, t.elapsed().as_secs_f64()));
         }
         laid
     };
-    let tables: Vec<Placed<'a>> = match sink {
-        None => built
+    let rows_of = |(_, ((_, trace, _), _)): &(usize, ((_, &mut TraceTable<F, E>, _), _))| {
+        memlog::rows_bytes(trace)
+    };
+    let tables: Vec<Placed<'a>> = match (sink, budget) {
+        (None, None) => built
             .into_par_iter()
             .map(&lay_out)
             .collect::<Result<_, Error>>()?,
-        Some(sink) => {
+        (None, Some(budget)) => {
+            let mut tables = Vec::with_capacity(built.len());
+            for wave in waves(built, budget, rows_of) {
+                tables.extend(
+                    wave.into_par_iter()
+                        .map(&lay_out)
+                        .collect::<Result<Vec<_>, Error>>()?,
+                );
+            }
+            tables
+        }
+        (Some(sink), Some(budget)) => {
+            // Each wave's tables to the packer in AIR order once it is laid
+            // out.
+            let mut k = 0usize;
+            for wave in waves(built, budget, rows_of) {
+                let laid: Vec<(f64, Result<Placed<'a>, Error>)> = wave
+                    .into_par_iter()
+                    .map(|table| {
+                        let t = Instant::now();
+                        let laid = lay_out(table);
+                        (t.elapsed().as_secs_f64(), laid)
+                    })
+                    .collect();
+                for (secs, laid) in laid {
+                    // A packer that stopped has its own error to report.
+                    let _ = sink.send((k, secs, laid));
+                    k += 1;
+                }
+            }
+            Vec::new()
+        }
+        (Some(sink), None) => {
             // FIFO: the tables that close the next group are laid out first.
             rayon::scope_fifo(|scope| {
                 for (k, table) in built.into_iter().enumerate() {
@@ -2249,6 +2438,12 @@ fn lay_out_rest<'a>(
         }
     };
     marks.push(("rest laid out", at()));
+    if let Some(ledger) = ledger {
+        // What is left of the run's tables (those no AIR proves: a padded
+        // table of an unused chip) goes with `traces` as this returns.
+        ledger.rest.store(0, std::sync::atomic::Ordering::Relaxed);
+        ledger.line("rest laid out");
+    }
     let mut timed = timed.into_inner().unwrap_or_default();
     let first = timed.iter().map(|&(i, _)| i).min();
     timed.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -2273,7 +2468,33 @@ fn lay_out_rest<'a>(
         marks,
         slowest,
         busy: t.elapsed().as_secs_f64(),
+        laid_at: {
+            let mut laid_at = laid_at.into_inner().unwrap_or_default();
+            laid_at.sort_unstable_by_key(|&(i, _)| i);
+            laid_at
+        },
     })
+}
+
+/// `items` in order, cut into consecutive waves of at most `budget` bytes
+/// (`bytes` of an item); a wave holds at least one item.
+pub(crate) fn waves<T>(items: Vec<T>, budget: usize, bytes: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let mut waves: Vec<Vec<T>> = Vec::new();
+    let mut held = 0usize;
+    for item in items {
+        let b = bytes(&item);
+        match waves.last_mut() {
+            Some(wave) if !wave.is_empty() && held + b <= budget => {
+                held += b;
+                wave.push(item);
+            }
+            _ => {
+                held = b;
+                waves.push(vec![item]);
+            }
+        }
+    }
+    waves
 }
 
 /// What the layout thread knows once the run is built: the statement, the AIR
@@ -2320,36 +2541,76 @@ fn prove_streamed(
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
+    // A memory log (`BlockOptions::memlog`): its sampler runs until the
+    // function returns.
+    let logged = options.memlog.then(|| memlog::Ledger::new(start));
+    let _sampler = logged.clone().map(memlog::Sampler::start);
+    let ledger = logged.as_deref();
+    if let Some(ledger) = ledger {
+        ledger.thread("prove");
+        ledger.pool();
+        ledger.line("start");
+    }
 
     crate::with_whir_hash!(|H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
+            use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk.
             let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
             let executor = scope.spawn(move || -> Result<f64, Error> {
+                if let Some(ledger) = ledger {
+                    ledger.thread("executor");
+                }
                 let mut executor = Executor::new(program, private_inputs.to_vec())
                     .map_err(|e| Error::Execution(format!("{e}")))?;
                 while let Some(logs) = executor
                     .resume_with_limit(window)
                     .map_err(|e| Error::Execution(format!("{e}")))?
                 {
-                    if ltx.send(logs.to_vec()).is_err() {
+                    let logs = logs.to_vec();
+                    if let Some(ledger) = ledger {
+                        // The executor keeps a window of logs of its own.
+                        let bytes = memlog::logs_bytes(&logs);
+                        ledger.logs.fetch_add(bytes, Relaxed);
+                        ledger
+                            .exec
+                            .store(executor.memory().heap_bytes() + bytes, Relaxed);
+                    }
+                    if ltx.send(logs).is_err() {
                         break;
                     }
                 }
-                Ok(start.elapsed().as_secs_f64())
+                let executed = start.elapsed().as_secs_f64();
+                drop(executor);
+                if let Some(ledger) = ledger {
+                    ledger.exec.store(0, Relaxed);
+                    ledger.line("executor done");
+                }
+                Ok(executed)
             });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
+            let finish_ledger = logged.clone();
             let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
+                if let Some(ledger) = ledger {
+                    ledger.thread("builder");
+                }
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
                 if options.stream_keccak_rnd {
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
+                    builder = builder
+                        .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
                 }
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
+                }
+                if let Some(ledger) = ledger {
+                    ledger.image.store(builder.image_bytes(), Relaxed);
+                    ledger.line("builder created");
                 }
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
@@ -2360,15 +2621,25 @@ fn prove_streamed(
                     std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
                         let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
                         let walking = inner.spawn(move || -> Result<_, Error> {
+                            if let Some(ledger) = ledger {
+                                ledger.thread("walker");
+                            }
                             // One window held back: only the run's last window
                             // is `finish`'s, and it is the last only once the
                             // executor stops.
                             let mut held: Option<Vec<executor::vm::logs::Log>> = None;
                             for logs in lrx {
-                                if let Some(w) = held.replace(logs)
-                                    && wtx.send(walker.walk(&w)?).is_err()
-                                {
-                                    break;
+                                if let Some(w) = held.replace(logs) {
+                                    let walked = walker.walk(&w)?;
+                                    if let Some(ledger) = ledger {
+                                        ledger.walk.store(walker.state_bytes(), Relaxed);
+                                        ledger.logs.fetch_sub(memlog::logs_bytes(&w), Relaxed);
+                                        ledger.walked.fetch_add(walked.heap_bytes(), Relaxed);
+                                    }
+                                    drop(w);
+                                    if wtx.send(walked).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                             held.ok_or_else(|| {
@@ -2376,11 +2647,20 @@ fn prove_streamed(
                             })
                         });
                         for walked in wrx {
+                            if let Some(ledger) = ledger {
+                                ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
+                            }
                             for job in accumulator.absorb(walked) {
                                 streamed += 1;
+                                if let Some(ledger) = ledger {
+                                    ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
+                                }
                                 if btx.send(Built::Job(Box::new(job))).is_err() {
                                     return Err(Error::Prover("the layout thread stopped".into()));
                                 }
+                            }
+                            if let Some(ledger) = ledger {
+                                ledger.builder.store(accumulator.held_bytes(), Relaxed);
                             }
                         }
                         walking
@@ -2390,9 +2670,27 @@ fn prove_streamed(
                 };
                 let windows_done = start.elapsed().as_secs_f64();
                 let window_stamps = builder.stamps();
+                if let Some(ledger) = ledger {
+                    ledger.line("windows walked");
+                    ledger.parts("builder", builder.heap_parts());
+                }
                 // The table phase's marks, for `finish` alone.
                 crate::tables::trace_builder::build_stamps::start();
-                let mut rest = builder.finish(&last)?;
+                if let Some(ledger) = finish_ledger {
+                    crate::tables::trace_builder::build_stamps::set_hook(Some(
+                        std::sync::Arc::new(move |label: &str| {
+                            ledger.line(&format!("finish {label}"))
+                        }),
+                    ));
+                }
+                let built_rest = builder.finish(&last);
+                if let Some(ledger) = ledger {
+                    crate::tables::trace_builder::build_stamps::set_hook(None);
+                    ledger.builder.store(0, Relaxed);
+                    ledger.walk.store(0, Relaxed);
+                    ledger.image.store(0, Relaxed);
+                }
+                let mut rest = built_rest?;
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 split_ecdas(&mut rest, options.ecdas_rows_log2);
@@ -2409,7 +2707,15 @@ fn prove_streamed(
                     rest.keccak_rnds.remove(0);
                 }
                 let finished = start.elapsed().as_secs_f64();
+                if let Some(ledger) = ledger {
+                    ledger.rest.store(rest.main_bytes(), Relaxed);
+                    ledger.line("finish done");
+                }
                 let _ = btx.send(Built::Rest(Box::new(rest)));
+                if let Some(ledger) = ledger {
+                    // The run's last window goes as this thread ends.
+                    ledger.logs.fetch_sub(memlog::logs_bytes(&last), Relaxed);
+                }
                 Ok((
                     windows_done,
                     finished,
@@ -2423,6 +2729,9 @@ fn prove_streamed(
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
+                if let Some(ledger) = ledger {
+                    ledger.thread("layout");
+                }
                 let packer = Packer {
                     open: Vec::new(),
                     open_shapes: Vec::new(),
@@ -2434,12 +2743,25 @@ fn prove_streamed(
                     start,
                     closed_at: Vec::new(),
                     blocked: 0.0,
+                    ledger,
+                    open_bytes: 0,
                 };
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
                 let inline = options.layout_workers == 0;
                 let rest_of = |traces, sink| {
-                    lay_out_rest(traces, program, opts, format, run_airs, start, inline, sink)
+                    lay_out_rest(
+                        traces,
+                        program,
+                        opts,
+                        format,
+                        run_airs,
+                        start,
+                        inline,
+                        sink,
+                        options.rest_layout_bytes,
+                        ledger,
+                    )
                 };
                 let (streamed, rest) = if inline {
                     let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
@@ -2477,6 +2799,7 @@ fn prove_streamed(
                     marks: rest_marks,
                     slowest,
                     busy: rest_busy,
+                    laid_at,
                 } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
                     .iter()
@@ -2513,6 +2836,9 @@ fn prove_streamed(
                     None => {
                         let prepared = prepared_tables(airs, &page_configs, format)?;
                         marks.push(("prepared", start.elapsed().as_secs_f64()));
+                        if let Some(ledger) = ledger {
+                            ledger.prepared.store(prepared_bytes(&prepared), Relaxed);
+                        }
                         prepared
                     }
                 };
@@ -2550,6 +2876,16 @@ fn prove_streamed(
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let busy = chunks + rest_busy + t.elapsed().as_secs_f64();
+                let group_of = |table: usize| {
+                    groups
+                        .iter()
+                        .position(|g| g.contains(&(table as u32)))
+                        .unwrap_or(usize::MAX)
+                };
+                let rest_tables = laid_at
+                    .iter()
+                    .map(|&(i, at)| (refs[i].name().to_string(), at, group_of(i)))
+                    .collect();
                 Ok(Laid {
                     table_counts,
                     runtime_page_ranges,
@@ -2567,16 +2903,24 @@ fn prove_streamed(
                         chunks,
                         slowest,
                         ahead_most,
+                        rest_tables,
                     },
                 })
             });
 
-            let block = BlockCommitted::commit_groups::<H>(
-                grx.iter(),
+            // A memory log: a group leaves the channel as the committer takes
+            // it.
+            let block = BlockCommitted::commit_groups_logged::<H>(
+                grx.iter().inspect(|group| {
+                    if let Some(ledger) = ledger {
+                        ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
+                    }
+                }),
                 &commit_config,
                 options.drop_levels,
                 options.narrow,
                 options.upload_ahead,
+                ledger.map(|ledger| ledger.block.clone()),
             );
             (block, builder.join(), layout.join(), executor.join())
         });
@@ -2599,6 +2943,9 @@ fn prove_streamed(
         stamps.prep = laid.busy;
         stamps.layout = laid.layout.clone();
         stamps.phase_a = start.elapsed().as_secs_f64();
+        if let Some(ledger) = ledger {
+            ledger.line("phase A end");
+        }
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
@@ -2628,6 +2975,9 @@ fn prove_streamed(
         let (prepared, tampered, derive) =
             prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
+        if let Some(ledger) = ledger {
+            ledger.line("prepared committed");
+        }
         on_statement(
             BlockStatement {
                 table_num_vars: &table_num_vars,
@@ -2717,6 +3067,11 @@ fn prove_streamed(
             widens_after.1 - widens_before.1,
         );
         stamps.groups = groups;
+        if let Some(ledger) = ledger {
+            ledger.line("proof done");
+            ledger.report();
+            stamps.mem_terms = ledger.terms();
+        }
         Ok(BlockWhirProof {
             proof,
             table_num_vars,

@@ -65,6 +65,10 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        memlog: false,
+        // The rest laid out in waves of 1 MiB: several at a test's size.
+        finish_keccak_rnd_chunks: true,
+        rest_layout_bytes: Some(1 << 20),
     }
 }
 

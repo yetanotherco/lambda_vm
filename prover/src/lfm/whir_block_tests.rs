@@ -96,6 +96,10 @@ fn small_block_cut(
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        memlog: false,
+        // The rest laid out in waves of 1 MiB: several at a test's size.
+        finish_keccak_rnd_chunks: true,
+        rest_layout_bytes: Some(1 << 20),
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -544,6 +548,10 @@ fn dense_block_with(
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
             upload_ahead: true,
+            memlog: false,
+            // The rest laid out in waves of 1 MiB: several at a test's size.
+            finish_keccak_rnd_chunks: true,
+            rest_layout_bytes: Some(1 << 20),
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
@@ -1581,7 +1589,6 @@ fn the_whir_block_tree_on_a_real_block() {
     if let Some(n) = knob("BLOCK_WHIR_LAYOUT_WORKERS") {
         options.layout_workers = n;
     }
-    // `BLOCK_WHIR_PACK_REST=1`: the rest of the run packed as it is laid out.
     // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
     // `none` lifts the bound (the reverted version, BIG 390).
     match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
@@ -1596,8 +1603,17 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         Err(_) => {}
     }
-    options.pack_rest_as_laid_out =
-        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 0): the rest packed as it is laid
+    // out.
+    match std::env::var("BLOCK_WHIR_PACK_REST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_rest_as_laid_out = false,
+        Ok("1") => options.pack_rest_as_laid_out = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
+        Err(_) => {}
+    }
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
     match std::env::var("BLOCK_WHIR_DROP_OPS")
@@ -1622,6 +1638,17 @@ fn the_whir_block_tree_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048) and
+    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` (production 1): the rest's layout in
+    // waves, KECCAK_RND built as its tables.
+    crate::block_whir::rest_layout_from_env(&mut options);
+    println!(
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {}",
+        options
+            .rest_layout_bytes
+            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        options.finish_keccak_rnd_chunks,
+    );
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);

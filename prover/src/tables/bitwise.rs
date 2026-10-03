@@ -750,6 +750,11 @@ impl BitwiseHistogram {
         self.counters[idx] += n;
     }
 
+    /// The bytes its counters take on the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.counters)
+    }
+
     /// Fold a slice of lookups into the histogram.
     #[inline]
     pub(crate) fn add_ops(&mut self, ops: &[BitwiseOperation]) {

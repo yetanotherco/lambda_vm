@@ -58,6 +58,10 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        memlog: false,
+        // The rest laid out in waves of 1 MiB: several at a test's size.
+        finish_keccak_rnd_chunks: true,
+        rest_layout_bytes: Some(1 << 20),
     }
 }
 
@@ -384,6 +388,178 @@ fn a_streamed_block_held_narrow_proves_and_verifies() {
     );
     assert!(stamps.report().contains("BLOCK NARROW: Host"));
     assert!(verify(&proof, &elf, &format));
+}
+
+/// The memory log (`BlockOptions::memlog`) moves no byte of the proof — the
+/// bytes are compared when the grind is deterministic
+/// (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once per process), the verdicts
+/// always — and its accounting closes: when the proof is done every term in
+/// flight and the committed tables are back at zero, and what is left is the
+/// prepared columns.
+#[test]
+fn a_memory_log_moves_no_byte_and_its_terms_close() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proved = |memlog: bool, workers: usize| {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.memlog = memlog;
+        // Laid out on worker threads, the rest packed as it is laid out.
+        o.layout_workers = workers;
+        o.pack_rest_as_laid_out = workers > 0;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "memlog {memlog}");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .expect("serialize")
+            .to_vec();
+        (bytes, stamps)
+    };
+    let (off, off_stamps) = proved(false, 0);
+    let (on, on_stamps) = proved(true, 0);
+    let (_, workers_stamps) = proved(true, 3);
+    assert!(off_stamps.mem_terms.is_empty());
+    for stamps in [&on_stamps, &workers_stamps] {
+        terms_close(stamps);
+    }
+    if crypto::grinding::deterministic() {
+        assert_eq!(off, on, "the memory log moved a proof byte");
+    }
+}
+
+/// Every memory term in flight, and the committed tables as held, are zero once
+/// the proof is done; the prepared columns are left.
+fn terms_close(stamps: &block_whir::BlockStamps) {
+    let term = |name: &str| -> usize {
+        stamps
+            .mem_terms
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no term {name}"))
+            .1
+    };
+    for name in [
+        "exec",
+        "logs",
+        "walk",
+        "walked",
+        "builder",
+        "image",
+        "jobs",
+        "laying",
+        "open",
+        "sent",
+        "rest",
+        "rest_laid",
+        "committing",
+        "ahead",
+        "pack_wide",
+        "pack_ready",
+        "tops",
+        // Phase B lets the tables go; a release that took more than was held
+        // would wrap past zero.
+        "held_narrow",
+        "held_wide",
+    ] {
+        assert_eq!(
+            term(name),
+            0,
+            "{name} is still counted when the proof is done"
+        );
+    }
+    assert!(term("prepared") > 0, "the prepared columns are held");
+}
+
+/// The rest's waves: consecutive, in order, each within the budget unless one
+/// item alone is larger, and every item in exactly one.
+#[test]
+fn the_rest_is_cut_into_waves_within_the_budget() {
+    let sizes = [3usize, 4, 2, 9, 1, 1, 5, 0, 6];
+    for budget in [1usize, 5, 7, 10, 100] {
+        let waves = block_whir::waves(sizes.to_vec(), budget, |&b| b);
+        assert_eq!(
+            waves.iter().flatten().copied().collect::<Vec<_>>(),
+            sizes,
+            "budget {budget}: the order or an item changed"
+        );
+        for wave in &waves {
+            let sum: usize = wave.iter().sum();
+            assert!(!wave.is_empty());
+            assert!(
+                sum <= budget || wave.len() == 1,
+                "budget {budget}: {wave:?}"
+            );
+        }
+        // A wave closes only when the next item would take it past the budget.
+        for pair in waves.windows(2) {
+            let sum: usize = pair[0].iter().sum();
+            assert!(sum + pair[1][0] > budget, "budget {budget}: {pair:?}");
+        }
+    }
+    assert!(block_whir::waves(Vec::<usize>::new(), 4, |&b| b).is_empty());
+}
+
+/// The rest laid out in waves and KECCAK_RND built as its tables at the finish
+/// (BlockOptions::rest_layout_bytes, finish_keccak_rnd_chunks) move no byte:
+/// the same tables, partition and statement either way, inline and on the
+/// worker layout, and the proof bytes equal under the deterministic grind.
+#[test]
+fn the_rest_in_waves_and_keccak_rnd_built_chunked_move_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    for workers in [0usize, 3] {
+        let proved = |b1: bool| {
+            // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = workers;
+            o.pack_rest_as_laid_out = workers > 0;
+            o.finish_keccak_rnd_chunks = b1;
+            o.rest_layout_bytes = b1.then_some(1 << 16);
+            let (proof, _) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+            )
+            .expect("prove");
+            assert!(verify(&proof, &elf, &format), "b1 {b1}, {workers} workers");
+            proof
+        };
+        let (before, after) = (proved(false), proved(true));
+        assert!(
+            before.table_counts.keccak_rnd > 1,
+            "KECCAK_RND is one table: nothing was split"
+        );
+        assert_eq!(
+            before.groups, after.groups,
+            "{workers} workers: the partition"
+        );
+        assert_eq!(before.table_num_vars, after.table_num_vars);
+        assert_eq!(
+            format!("{:?}", before.table_counts),
+            format!("{:?}", after.table_counts)
+        );
+        if crypto::grinding::deterministic() {
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(
+                bytes(&before),
+                bytes(&after),
+                "{workers} workers: the proof"
+            );
+        }
+    }
 }
 
 /// A narrow table whose width map is wrong widens to other words than were
@@ -1843,7 +2019,7 @@ fn block_whir_on_a_real_block() {
     };
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 3; 0 is the inline layout) and
-    // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
+    // `BLOCK_WHIR_PACK_REST=0|1`, as the tree's harness takes them;
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
@@ -1866,8 +2042,17 @@ fn block_whir_on_a_real_block() {
         }
         Err(_) => {}
     }
-    options.pack_rest_as_laid_out =
-        std::env::var("BLOCK_WHIR_PACK_REST").is_ok_and(|v| v.trim() == "1");
+    // `BLOCK_WHIR_PACK_REST=0|1` (production 0): the rest packed as it is laid
+    // out.
+    match std::env::var("BLOCK_WHIR_PACK_REST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => options.pack_rest_as_laid_out = false,
+        Ok("1") => options.pack_rest_as_laid_out = true,
+        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
+        Err(_) => {}
+    }
     match std::env::var("BLOCK_WHIR_DROP_OPS")
         .as_deref()
         .map(str::trim)
@@ -1890,6 +2075,17 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048) and
+    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` (production 1): the rest's layout in
+    // waves, KECCAK_RND built as its tables.
+    crate::block_whir::rest_layout_from_env(&mut options);
+    println!(
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {}",
+        options
+            .rest_layout_bytes
+            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        options.finish_keccak_rnd_chunks,
+    );
     println!(
         "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,

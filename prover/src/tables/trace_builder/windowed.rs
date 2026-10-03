@@ -149,6 +149,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// With [`WalkLean::decode`], the walk reads each cycle's decode from here,
     /// from the instruction map otherwise.
     decode: Option<DecodeTable>,
+    /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
+    /// builds, 0 for one table.
+    finish_keccak_rnd_rows: usize,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -205,6 +208,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept: None,
             lean,
             decode,
+            finish_keccak_rnd_rows: 0,
         })
     }
 
@@ -256,6 +260,22 @@ impl<'a> WindowedTraceBuilder<'a> {
             )));
         }
         self.emitted.keccak_rnd_rows = rows;
+        Ok(self)
+    }
+
+    /// `finish` builds KECCAK_RND as tables of `rows` rows — the tables the
+    /// block's split makes of the whole one, each built from the ops that reach
+    /// it — instead of one table, without handing any out during the windows
+    /// ([`Self::keccak_rnd_chunks`] does both). The whole table and its split
+    /// copy are never held: on a block, KECCAK_RND's 1,480 columns are the
+    /// largest table the finish builds. `rows` is a power of two, at least 32.
+    pub fn keccak_rnd_chunks_at_finish(mut self, rows: usize) -> Result<Self, Error> {
+        if !rows.is_power_of_two() || rows < 32 {
+            return Err(Error::Prover(format!(
+                "KECCAK_RND chunks of {rows} rows: a power of two of at least 32 is needed"
+            )));
+        }
+        self.finish_keccak_rnd_rows = rows;
         Ok(self)
     }
 
@@ -311,6 +331,12 @@ impl<'a> WindowedTraceBuilder<'a> {
         ])
     }
 
+    /// The bytes the initial memory image (a map of bytes) takes on the heap,
+    /// at about one entry and one control byte per slot.
+    pub fn image_bytes(&self) -> usize {
+        self.image.capacity() * (std::mem::size_of::<(u64, u8)>() + 1)
+    }
+
     /// The time the windows took so far.
     pub fn stamps(&self) -> WindowStamps {
         self.stamps
@@ -319,6 +345,22 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// How many chunks of each streamed table have been handed out.
     pub fn streamed(&self) -> StreamSkip {
         self.emitted
+    }
+
+    /// What the builder holds on the heap, list by list (capacities): the
+    /// kept tails and lists, the kept windows, the routed segments, what was
+    /// counted ahead and the walk's memory state. A measurement
+    /// (`LAMBDA_VM_BLOCK_MEMLOG`); it changes nothing.
+    pub fn heap_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = self.kept.as_ref().map_or_else(Vec::new, Kept::heap_parts);
+        parts.push((
+            "windows".to_string(),
+            self.windows.iter().map(WalkedWindow::heap_bytes).sum(),
+        ));
+        parts.extend(self.segments.heap_parts());
+        parts.extend(self.counted.heap_parts());
+        parts.push(("memory state".to_string(), self.memory_state.heap_bytes()));
+        parts
     }
 
     /// Collects the run's last window and builds every table the windows did
@@ -363,8 +405,19 @@ impl<'a> WindowedTraceBuilder<'a> {
             counted,
             kept,
             stream_memw_lt,
+            finish_keccak_rnd_rows,
             ..
         } = self;
+        // Chunks at the finish alone: none were handed out.
+        let emitted = if emitted.keccak_rnd_rows == 0 && finish_keccak_rnd_rows > 0 {
+            StreamSkip {
+                keccak_rnd_rows: finish_keccak_rnd_rows,
+                keccak_rnd: 0,
+                ..emitted
+            }
+        } else {
+            emitted
+        };
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
@@ -474,6 +527,13 @@ pub struct WalkedWindow {
     walk: WalkOutputs,
 }
 
+impl WalkedWindow {
+    /// The bytes its lists take on the heap (capacities).
+    pub fn heap_bytes(&self) -> usize {
+        super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
+    }
+}
+
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
 pub struct Walker<'b> {
     artifacts: &'b DecodeArtifacts,
@@ -513,6 +573,11 @@ impl Walker<'_> {
         *self.windows += 1;
         Ok(WalkedWindow { cpu_ops, walk })
     }
+
+    /// The bytes the walk's carried memory state takes on the heap.
+    pub fn state_bytes(&self) -> usize {
+        self.memory_state.heap_bytes()
+    }
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -533,6 +598,21 @@ pub struct Accumulator<'b> {
 }
 
 impl Accumulator<'_> {
+    /// The bytes the builder's run so far takes on the heap: the kept windows
+    /// or tails, the routed segments and what was counted ahead (lists at
+    /// their capacities).
+    pub fn held_bytes(&self) -> usize {
+        let windows: usize = self
+            .windows
+            .iter()
+            .map(|w| super::vec_heap_bytes(&w.cpu_ops) + w.walk.heap_bytes())
+            .sum();
+        self.kept.as_deref().map_or(0, Kept::heap_bytes)
+            + windows
+            + self.segments.heap_bytes()
+            + self.counted.heap_bytes()
+    }
+
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
@@ -790,6 +870,11 @@ impl<T: Clone> Tail<T> {
         (self.len, self.len + self.start)
     }
 
+    /// The bytes its parts take on the heap.
+    fn heap_bytes(&self) -> usize {
+        self.parts.iter().map(super::vec_heap_bytes).sum()
+    }
+
     /// The ops not handed out, as one list.
     fn into_vec(mut self) -> Vec<T> {
         if self.start == 0 && self.parts.len() == 1 {
@@ -832,6 +917,39 @@ impl Kept {
             rest: WalkOutputs::with_capacity(0),
             decode,
         }
+    }
+
+    /// The bytes the run so far takes on the heap: the tails, the other lists
+    /// and DECODE.
+    fn heap_bytes(&self) -> usize {
+        self.cpu.heap_bytes()
+            + self.register_rows.heap_bytes()
+            + self.aligned.heap_bytes()
+            + self.general.heap_bytes()
+            + self.load.heap_bytes()
+            + self.lt.heap_bytes()
+            + self.shift.heap_bytes()
+            + self.rest.heap_bytes()
+            + self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>()
+    }
+
+    /// [`Self::heap_bytes`] list by list, each named `kept {list}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = vec![
+            ("kept cpu".to_string(), self.cpu.heap_bytes()),
+            ("kept memw_r".to_string(), self.register_rows.heap_bytes()),
+            ("kept memw_a".to_string(), self.aligned.heap_bytes()),
+            ("kept memw".to_string(), self.general.heap_bytes()),
+            ("kept load".to_string(), self.load.heap_bytes()),
+            ("kept lt".to_string(), self.lt.heap_bytes()),
+            ("kept shift".to_string(), self.shift.heap_bytes()),
+            (
+                "kept decode".to_string(),
+                self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
+            ),
+        ];
+        parts.extend(self.rest.heap_parts("kept rest "));
+        parts
     }
 
     /// A walked window's lists, appended in run order.
@@ -1180,6 +1298,22 @@ enum ChunkOps {
 }
 
 impl ChunkJob {
+    /// The bytes its ops take on the heap.
+    pub fn op_bytes(&self) -> usize {
+        use super::vec_heap_bytes as b;
+        match &self.ops {
+            ChunkOps::Cpu(ops) => b(ops),
+            ChunkOps::MemwRegister(ops) => b(ops),
+            ChunkOps::MemwAligned(ops) => b(ops),
+            ChunkOps::Memw(ops) => b(ops),
+            ChunkOps::Load(ops) => b(ops),
+            ChunkOps::Lt(ops) => b(ops),
+            ChunkOps::Shift(ops) => b(ops),
+            ChunkOps::Store(ops) => b(ops),
+            ChunkOps::KeccakRnd { ops, .. } => b(ops),
+        }
+    }
+
     pub fn generate(self) -> StreamedChunk {
         let trace = match &self.ops {
             ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(ops),
