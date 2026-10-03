@@ -423,15 +423,18 @@ fn p1_bare_trees_match_the_host() {
 
 type P1Grind = stark::config::GrindingDigest<P1StarkHash>;
 
-/// A real launch returns the smallest nonce the host predicate accepts.
+/// A real launch returns the smallest nonce the host predicate accepts, at
+/// factors from the device floor (`GRIND_MIN_FACTOR`) up; below it the device
+/// declines (`None`) and the dispatcher's host search takes the grind.
 #[test]
 fn p1_gpu_grind_returns_the_smallest_valid_nonce() {
-    for (seed, factor) in [([14u8; 32], 14u8), ([3u8; 32], 10), ([77u8; 32], 16)] {
+    let floor = math_cuda::grinding::GRIND_MIN_FACTOR;
+    for (seed, factor) in [([14u8; 32], floor), ([3u8; 32], 14u8), ([77u8; 32], 16)] {
         let nonce = math_cuda::grinding::generate_nonce_p1_gpu(
             &stark::grinding::inner_hash_felts::<P1Grind>(&seed, factor),
             factor,
         )
-        .expect("GPU P1 grind (needs a GPU)");
+        .unwrap_or_else(|| panic!("GPU P1 grind at factor {factor} (needs a GPU)"));
         assert!(
             stark::grinding::is_valid_nonce::<P1Grind>(&seed, nonce, factor),
             "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
@@ -441,6 +444,15 @@ fn p1_gpu_grind_returns_the_smallest_valid_nonce() {
             "GPU nonce {nonce} is not the smallest (factor {factor})"
         );
     }
+    let below = floor - 2;
+    assert!(
+        math_cuda::grinding::generate_nonce_p1_gpu(
+            &stark::grinding::inner_hash_felts::<P1Grind>(&[3u8; 32], below),
+            below,
+        )
+        .is_none(),
+        "the device grind must decline factor {below}, below its floor {floor}"
+    );
 }
 
 /// The production dispatch reaches the Poseidon1 kernel: the P1 counter moves,
