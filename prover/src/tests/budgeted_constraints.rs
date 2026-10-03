@@ -644,16 +644,24 @@ mod device {
     }
 
     /// The LDE rows a program is timed at: the interpreted programs at the
-    /// sizes D-INTERP's gate names, every other program at 2^20.
-    fn bench_rows(labels: &[String]) -> usize {
+    /// sizes D-INTERP's gate names, every other program at 2^20; halved until
+    /// its random LDE columns fit in 6 GiB (the wide LFM chips; FAST 781 ran
+    /// out of device memory on LFM_BLAKE3 at 2^20).
+    fn bench_rows(labels: &[String], p: &Program) -> usize {
         let has = |n: &str| labels.iter().any(|l| l == n);
-        if has("KECCAK_RND") || has("KECCAK") || has("ECSM") {
+        let mut rows = if has("KECCAK_RND") || has("KECCAK") || has("ECSM") {
             1 << 18
         } else if has("ECDAS") {
             1 << 19
         } else {
             1 << 20
+        };
+        let (mc, ac, _, _) = footprint(p);
+        let per_row = mc * 8 + ac * 24 + 16;
+        while rows > 4096 && rows * per_row > 6 << 30 {
+            rows /= 2;
         }
+        rows
     }
 
     /// S1: kernel time per program, the slot-file interpreter and the compiled
@@ -684,7 +692,7 @@ mod device {
             {
                 continue; // one L2G program is enough
             }
-            let rows = bench_rows(&labels);
+            let rows = bench_rows(&labels, &p);
             let x = inputs(&p, rows, key);
             override_interp_si(Some((SiMode::Off, SiTuning::default())));
             override_compiled_constraints(Some(false));
