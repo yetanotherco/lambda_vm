@@ -19,7 +19,7 @@ use stark::constraint_ir::{
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-use crate::tests::compiled_constraints::production_programs;
+use crate::tests::compiled_constraints::{compiled_option_sets, production_programs};
 
 type Program = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
 type Fp = FieldElement<GoldilocksField>;
@@ -39,13 +39,14 @@ impl SplitMix64 {
     }
 }
 
-/// Every distinct production program (blowups 2 and 4), keyed by the
-/// structural key of its device lowering, with every label that has it.
+/// Every distinct production program (blowups 2 and 4, and the VM tables
+/// under `LAMBDA_VM_ZF_LOGUP=k4`: the option sets the compiled kernels cover),
+/// keyed by the structural key of its device lowering, with every label that
+/// has it.
 fn distinct_programs() -> BTreeMap<u64, (Vec<String>, Program)> {
     let mut out: BTreeMap<u64, (Vec<String>, Program)> = BTreeMap::new();
-    for blowup in [2, 4] {
-        let opts = GoldilocksCubicProofOptions::with_blowup(blowup).expect("a valid blowup");
-        for (label, program) in production_programs(&opts) {
+    for (opts, extras, suffix) in compiled_option_sets() {
+        for (label, program) in production_programs(&opts, extras, suffix) {
             let key = codegen::structural_key(&DeviceProgram::lower(&program));
             let entry = out.entry(key).or_insert_with(|| (Vec::new(), program));
             if !entry.0.contains(&label) {
@@ -171,7 +172,7 @@ fn every_production_program_lowers_and_matches_the_device_walk() {
 #[test]
 fn the_large_programs_cost_about_the_census_or_less() {
     let opts = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4");
-    let programs = production_programs(&opts);
+    let programs = production_programs(&opts, true, "");
     let find = |name: &str| {
         programs
             .iter()
@@ -842,7 +843,7 @@ fn budgeted_opcode_mix() {
     };
     let opts = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4");
     let kinds = ["bslot", "eslot", "main", "aux", "bconst", "euni", "?", "?"];
-    for (label, p) in production_programs(&opts) {
+    for (label, p) in production_programs(&opts, true, "") {
         if !["CPU", "KECCAK_RND", "ECDAS", "MEMW_R", "LT", "MEMW_A"].contains(&label.as_str()) {
             continue;
         }

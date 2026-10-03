@@ -611,6 +611,12 @@ pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
 }
 
+/// Device four-part composition decompositions ([`try_decompose_extend_d4_dev`]).
+pub(crate) static GPU_DECOMPOSE_D4_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_decompose_d4_calls() -> u64 {
+    GPU_DECOMPOSE_D4_CALLS.load(Ordering::Relaxed)
+}
+
 /// Device-resident num_parts==1 composition-parts dispatches: one per table
 /// whose single composition part (`H` itself) was de-interleaved into a slab
 /// [`math_cuda::lde::GpuLdeExt3`] on device instead of the host arm. Nonzero
@@ -1132,11 +1138,11 @@ where
 
 /// Shared admission gate for the device composition-parts producers: the tower
 /// must be the Goldilocks/ext3 pair the kernels are written for, the LDE must
-/// be a power of two, and the two ext3 part slabs the decompose allocates must
-/// clear [`admit`]. Returns the validated LDE size so callers can derive from
-/// it. Kept in one place so a future condition (a tower widening) cannot land
-/// on only one of the d=1/d=2 arms.
-fn dev_comp_parts_gate<F, E>(num_rows: usize) -> Option<usize>
+/// be a power of two, and the `parts` ext3 part slabs the decompose allocates
+/// must clear [`admit`]. Returns the validated LDE size so callers can derive
+/// from it. Kept in one place so a future condition (a tower widening) cannot
+/// land on only one of the d=1/d=2/d=4 arms.
+fn dev_comp_parts_gate<F, E>(num_rows: usize, parts: u64) -> Option<usize>
 where
     F: IsField + 'static,
     E: IsField + 'static,
@@ -1150,7 +1156,7 @@ where
     if !num_rows.is_power_of_two() {
         return None;
     }
-    if !admit_transient(num_rows, ext3_bytes(num_rows as u64, 2), "R2 decompose") {
+    if !admit_transient(num_rows, ext3_bytes(num_rows as u64, parts), "R2 decompose") {
         return None;
     }
     Some(num_rows)
@@ -1175,7 +1181,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows)?;
+    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows, 2)?;
     let n = lde_size / 2;
     if weights.len() != n || inv_2x.len() < n {
         return None;
@@ -1238,6 +1244,97 @@ where
     Some((vec![lde_h0, lde_h1], handle))
 }
 
+/// Fully device-resident four-part decomposition (a degree-5 AIR: LogUp
+/// groups of four): the radix-2 split of [`try_decompose_extend_d2_dev`]
+/// applied twice on device (`decompose_d4_ext3`), then each part LDE-extended
+/// from its `lde_size/4` points on the g⁴-coset to the full LDE coset (ratio 4,
+/// `weights` = `g^(−3k)/(lde_size/4)`), kept as a `GpuLdeExt3` with `m = 4`.
+/// The same contract as the d=2 arm: with `want_host` the evaluations are
+/// also drained to host; without it (device-only) the returned part Vecs are
+/// empty placeholders. `None` → the caller downloads `H` and runs the host
+/// four-part split.
+pub(crate) fn try_decompose_extend_d4_dev<F, E>(
+    h: &math_cuda::constraint_interp::GpuCompH,
+    inv_2x: &std::sync::Arc<Vec<FieldElement<F>>>,
+    inv_2y: &std::sync::Arc<Vec<FieldElement<F>>>,
+    weights: &[FieldElement<F>],
+    want_host: bool,
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    const PARTS: usize = 4;
+    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows, PARTS as u64)?;
+    let q = lde_size / PARTS;
+    if weights.len() != q || inv_2x.len() < 2 * q || inv_2y.len() < q {
+        return None;
+    }
+
+    // SAFETY: `F == GoldilocksField` (gated above); the Arc'd Vecs share layout.
+    let inv_2x_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
+        unsafe { &*(inv_2x as *const _ as *const _) };
+    let inv_2y_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
+        unsafe { &*(inv_2y as *const _ as *const _) };
+    let inv_2x_dev = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2x_conc)?;
+    let inv_2y_dev = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_2y_conc)?;
+
+    let two_inv_fe = FieldElement::<F>::from(2u64).inv().ok()?;
+    // SAFETY: F == Goldilocks; FieldElement<Gl> is repr(transparent) over u64.
+    let two_inv: u64 = unsafe { *(two_inv_fe.value() as *const _ as *const u64) };
+
+    let (slabs, stream, q_dev) =
+        math_cuda::constraint_interp::decompose_d4_into_slabs(h, &inv_2x_dev, &inv_2y_dev, two_inv)
+            .ok()?;
+    debug_assert_eq!(q_dev, q);
+
+    GPU_DECOMPOSE_D4_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add((3 * PARTS) as u64, Ordering::Relaxed);
+
+    // SAFETY: F == Goldilocks (repr u64); ext3 outputs are [u64; 3] per element.
+    let weights_u64: &[u64] =
+        unsafe { from_raw_parts(weights.as_ptr() as *const u64, weights.len()) };
+
+    if !want_host {
+        let handle = math_cuda::lde::coset_lde_batch_ext3_slabs_keep(
+            &stream,
+            slabs,
+            PARTS,
+            q,
+            PARTS,
+            weights_u64,
+            None,
+        )
+        .ok()?;
+        return Some((vec![Vec::new(); PARTS], handle));
+    }
+
+    let mut parts: Vec<Vec<FieldElement<E>>> = (0..PARTS)
+        .map(|_| vec![FieldElement::<E>::zero(); lde_size])
+        .collect();
+    let ext3_len = lde_size
+        .checked_mul(3)
+        .expect("ext3 output length overflow");
+    let mut outputs: Vec<&mut [u64]> = parts
+        .iter_mut()
+        // SAFETY: an ext3 FieldElement is [u64; 3]; each Vec holds `lde_size`.
+        .map(|p| unsafe { from_raw_parts_mut(p.as_mut_ptr() as *mut u64, ext3_len) })
+        .collect();
+    let handle = math_cuda::lde::coset_lde_batch_ext3_slabs_keep(
+        &stream,
+        slabs,
+        PARTS,
+        q,
+        PARTS,
+        weights_u64,
+        Some(&mut outputs),
+    )
+    .ok()?;
+    drop(outputs);
+
+    Some((parts, handle))
+}
+
 /// Fully device-resident num_parts==1 composition-parts path: `H` itself is the
 /// single part, already on the LDE coset, so — unlike [`try_comp_h_to_slabs_dev`]'s
 /// d=2 sibling [`try_decompose_extend_d2_dev`] — there is no decompose and no
@@ -1257,7 +1354,7 @@ where
 ///
 /// The single part is always drained to host — not just because it can be
 /// (num_parts==1 tables are never device-only; `device_only_for`'s degree gate admits
-/// only d=2), but because that host part is what feeds the query-0
+/// only d=2 and d=4), but because that host part is what feeds the query-0
 /// composition-opening canary: release-active for `qi == 0` and guarded on a
 /// non-empty host part, it is the only *in-prove* check that the device m=1 gather is
 /// correct. It does not cover DEEP or FRI, which consume separate downstream buffers;
@@ -1272,7 +1369,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    dev_comp_parts_gate::<F, E>(h.num_rows)?;
+    dev_comp_parts_gate::<F, E>(h.num_rows, 2)?;
 
     // The interleaved `H` download IS the single composition part on the LDE
     // coset — same values the slab handle holds, just interleaved. Downloading

@@ -891,6 +891,21 @@ pub fn eval_composition_on_device_keep(
     })
 }
 
+/// H2D a host `H` (interleaved ext3, `3 * num_rows` u64) as a resident
+/// [`GpuCompH`]: the input side of the decomposition parity tests, which feed
+/// the device and host splits the same evaluations.
+pub fn upload_comp_h(h: &[u64]) -> Result<GpuCompH> {
+    assert_eq!(h.len() % 3, 0, "H is interleaved ext3");
+    let be = backend()?;
+    let stream = be.next_stream();
+    let buf = stream.clone_htod(h)?;
+    Ok(GpuCompH {
+        buf,
+        num_rows: h.len() / 3,
+        stream,
+    })
+}
+
 /// D2H a resident `H` (the CPU-decompose fallback bridge).
 pub fn download_comp_h(h: &GpuCompH) -> Result<Vec<u64>> {
     let be = backend()?;
@@ -945,6 +960,53 @@ pub fn decompose_d2_into_slabs(
             .launch(cfg)?;
     }
     Ok((out, stream, n))
+}
+
+/// Four-part quotient decomposition on device (`decompose_d4_ext3`): splits a
+/// resident `H` (`4q` rows) into `H0..H3` with `H(x) = Σ_j x^j·H_j(x^4)`,
+/// written in zero-padded slab layout (12 slabs of `lde_size = 4q` u64, first
+/// `q` filled, part `j` at slabs `3j..3j+3`) ready for the batched slab LDE at
+/// ratio 4. `inv_2x` covers the LDE/2 coset (`1/(2·g·w^i)`), `inv_2y` the
+/// LDE/4 one (`1/(2·g²·w^{2i})`). Returns the slab buffer, the producing
+/// stream, and `q`.
+pub fn decompose_d4_into_slabs(
+    h: &GpuCompH,
+    inv_2x: &GpuBaseVec,
+    inv_2y: &GpuBaseVec,
+    two_inv: u64,
+) -> Result<(CudaSlice<u64>, Arc<CudaStream>, usize)> {
+    let q = h.num_rows / 4;
+    assert_eq!(h.num_rows, q * 4, "H row count must be a multiple of 4");
+    assert!(inv_2x.len() >= 2 * q, "inv_2x must cover the half domain");
+    assert!(inv_2y.len() >= q, "inv_2y must cover the quarter domain");
+    let lde_size = h.num_rows;
+    let be = backend()?;
+    let stream = h.stream.clone();
+    let mut out = stream.alloc_zeros::<u64>(12 * lde_size)?;
+
+    let grid = (q as u32)
+        .div_ceil(BLOCK_DIM)
+        .clamp(1, MAX_THREADS / BLOCK_DIM);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let q_u64 = q as u64;
+    let stride_u64 = lde_size as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.decompose_d4_kernel)
+            .arg(&h.buf)
+            .arg(&inv_2x.buf)
+            .arg(&inv_2y.buf)
+            .arg(&two_inv)
+            .arg(&q_u64)
+            .arg(&stride_u64)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+    Ok((out, stream, q))
 }
 
 /// Degree-1 (num_parts==1) composition part: `H` is already the single part on

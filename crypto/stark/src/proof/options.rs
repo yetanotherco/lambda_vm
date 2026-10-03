@@ -104,6 +104,10 @@ pub struct ProofFormat {
     /// schedule that does not cover the table's committed folds exactly is a
     /// proving error and a verification failure, never a silent fallback.
     pub fri_schedule_override: Option<FriScheduleOverride>,
+    /// How many LogUp interactions one aux term column commits (the arity
+    /// each `AirWithBuses` picks by [`crate::lookup::logup_arity`]). `Pair` =
+    /// today: two per column.
+    pub logup: LogUpPolicy,
 }
 
 impl ProofFormat {
@@ -123,6 +127,7 @@ impl ProofFormat {
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
+        logup: LogUpPolicy::Pair,
     };
 
     /// True when this is this crate's default format, [`Self::LEGACY`]
@@ -138,6 +143,7 @@ impl ProofFormat {
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
             && self.fri_schedule_override.is_none()
+            && self.logup == LogUpPolicy::Pair
     }
 }
 
@@ -253,6 +259,76 @@ impl FromStr for OneRowMode {
     }
 }
 
+/// Which LogUp arities `k` (interactions per committed aux term column) a
+/// table may pick. Each `AirWithBuses` picks, from this set, the `k` that
+/// commits the fewest extension columns (term columns plus composition parts)
+/// under the degree budget its blowup buys; ties go to the smaller `k`
+/// ([`crate::lookup::logup_arity`]). A pure function of public shape data, so
+/// prover and verifier derive the same layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LogUpPolicy {
+    /// `{2}`: two interactions per column. Today's format.
+    #[default]
+    Pair,
+    /// `{2, 3}`.
+    K3,
+    /// `{2, 4}`.
+    K4,
+    /// `{2, 3, 4}`.
+    Best,
+}
+
+impl LogUpPolicy {
+    /// The knob spelling (`LAMBDA_VM_ZF_LOGUP`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pair => "pair",
+            Self::K3 => "k3",
+            Self::K4 => "k4",
+            Self::Best => "best",
+        }
+    }
+
+    /// The arities a table may pick, ascending (ties go to the first).
+    pub const fn arities(self) -> &'static [usize] {
+        match self {
+            Self::Pair => &[2],
+            Self::K3 => &[2, 3],
+            Self::K4 => &[2, 4],
+            Self::Best => &[2, 3, 4],
+        }
+    }
+
+    /// Whether THIS build can prove the policy on every path (see
+    /// [`LOGUP_K4_IMPLEMENTED`] and [`LOGUP_K3_IMPLEMENTED`]).
+    pub const fn is_implemented(self) -> bool {
+        match self {
+            Self::Pair => true,
+            Self::K4 => LOGUP_K4_IMPLEMENTED,
+            Self::K3 | Self::Best => LOGUP_K3_IMPLEMENTED,
+        }
+    }
+}
+
+impl fmt::Display for LogUpPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for LogUpPolicy {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "pair" => Ok(Self::Pair),
+            "k3" => Ok(Self::K3),
+            "k4" => Ok(Self::K4),
+            "best" => Ok(Self::Best),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Which format levers THIS build implements. A lever that is only parsed —
 /// its field exists so the option structs and the `ZF FORMAT` banner stay
 /// stable before the lever lands — must not be selectable, or a run
@@ -310,6 +386,25 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 /// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and
 /// LFM proofs but cannot recurse over one-row STARK proofs yet.
 pub const ONE_ROW_IMPLEMENTED: bool = true;
+
+/// [`LogUpPolicy::K4`] (four interactions per column, degree-5 groups, four
+/// composition parts) is implemented:
+/// - the layout and the group constraints: one body for the prover folder,
+///   the verifier folder and the IR capture, so the in-guest (LFM) verifier
+///   and the device interpreter follow;
+/// - the host and device aux builds (the descriptor groups by arity);
+/// - the composition's four-part split on the host
+///   (`decompose_and_extend_d4`) and on the card
+///   (`gpu_lde::try_decompose_extend_d4_dev`, the radix-2 split twice), so a
+///   four-part table may be device-only like a two-part one;
+/// - the host verifier, which refuses an AIR whose parts exceed the blowup.
+pub const LOGUP_K4_IMPLEMENTED: bool = true;
+
+/// [`LogUpPolicy::K3`] and [`LogUpPolicy::Best`]: as for `K4`, plus the three
+/// composition parts a degree-4 group needs. NOT implemented on the device
+/// (three parts have no radix-2 split): a three-part table is never
+/// device-only and composes on the host.
+pub const LOGUP_K3_IMPLEMENTED: bool = false;
 
 impl ProofOptions {
     /// True when every format field is at this crate's default (the legacy

@@ -1731,6 +1731,18 @@ pub trait IsStarkVerifier<
             {
                 return false;
             }
+            // A degree-d AIR's quotient has degree (d−1)·n − d; the blowup·n LDE
+            // coset determines it only while d ≤ blowup + 1, i.e. parts ≤ blowup.
+            // An AIR past that (the verifier's own, never the proof's) has no
+            // sound proof at these options.
+            let num_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+            if num_parts > air.options().blowup_factor as usize {
+                error!(
+                    "Table {idx}: {num_parts} composition parts exceed the blowup {}",
+                    air.options().blowup_factor
+                );
+                return false;
+            }
             // The archive is read in place without validation, so both OOD blocks
             // must be shape-checked here — before Round 3 absorbs the next-row
             // block and before any row access indexes into either. The width check

@@ -8,16 +8,18 @@
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! LAMBDA_VM_ZF_WHIR_STACK  25 | 26 | 27                   WHIR stack cap, in variables (S2)
 //! LAMBDA_VM_ZF_WHIR_GRIND  query | all                    WHIR proof of work: before the queries only, or all three (P2)
+//! LAMBDA_VM_ZF_LOGUP       pair | k3 | k4 | best          LogUp interactions per aux column, STARK base tables only
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query`.
+//! `cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query
+//! logup=pair`.
 //! Each lever was measured net positive on block runs before it became the
 //! default (`one_row=auto` on the STARK pipeline: see [`ZfFormat::DEFAULT`]).
 //! Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
-//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`), so setting
-//! all seven to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
-//! byte — for rollback and for A/B arms. The crypto crates' own defaults
+//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`,
+//! `logup=pair`), so setting all eight to off reproduces [`ZfFormat::LEGACY`] — the format
+//! before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
 //! library value built without a format is the legacy one, and the production
@@ -29,7 +31,9 @@
 //! production format value is built — [`crate::lfm::proof::aggregation_wrap_options`]
 //! (every LFM proof: wraps, nodes, the root), [`crate::multilinear_prove::chain_config`]
 //! (the WHIR base proofs) and [`crate::lfm::proof::block_base_options`] (the
-//! STARK block's base epochs). From there it travels inside the option types
+//! STARK block's base epochs). `LAMBDA_VM_ZF_LOGUP` reaches the last site only:
+//! [`ZfFormat::proof_format`] (the LFM chips' format) keeps the pair layout,
+//! and [`ZfFormat::base_proof_format`] adds the base tables' arity. From there it travels inside the option types
 //! the crypto crates already take — `stark::ProofOptions` and
 //! `multilinear::ChainConfig` — which never read the environment themselves.
 //! Host verification reads nothing global: it uses the options it is given.
@@ -48,7 +52,7 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query logup=pair`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -56,7 +60,9 @@ use std::sync::OnceLock;
 use multilinear::whir_chain::{
     ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
 };
-use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
+use stark::proof::options::{
+    CapPolicy, FriMode, LogUpPolicy, OneRowMode, ProofFormat, ProofOptions,
+};
 
 /// The knob names, in banner order.
 pub const ENV_CAP: &str = "LAMBDA_VM_ZF_CAP";
@@ -66,6 +72,7 @@ pub const ENV_ONE_ROW: &str = "LAMBDA_VM_ZF_ONE_ROW";
 pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
+pub const ENV_LOGUP: &str = "LAMBDA_VM_ZF_LOGUP";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
@@ -95,6 +102,9 @@ pub struct ZfFormat {
     pub whir_stack: StackVars,
     /// P2: where the WHIR base chains grind.
     pub whir_grind: WhirGrind,
+    /// LogUp interactions per aux term column, on the STARK base tables only
+    /// ([`Self::base_proof_format`]); the LFM chips keep pairs.
+    pub logup: LogUpPolicy,
 }
 
 /// Where the WHIR base chains grind (P2), and so which nonces their rounds
@@ -208,9 +218,10 @@ impl ZfFormat {
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
+        logup: LogUpPolicy::Pair,
     };
 
-    /// The legacy format: every lever off. What all seven knobs at their
+    /// The legacy format: every lever off. What all eight knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -221,6 +232,7 @@ impl ZfFormat {
         whir_folds: WhirFolds::Uniform,
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
+        logup: LogUpPolicy::Pair,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -233,9 +245,10 @@ impl ZfFormat {
             && self.whir_folds == WhirFolds::Uniform
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
+            && self.logup == LogUpPolicy::Pair
     }
 
-    /// Parse the seven knobs through `lookup` (the process environment in
+    /// Parse the eight knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
@@ -268,6 +281,11 @@ impl ZfFormat {
             format.whir_grind = v
                 .parse()
                 .map_err(|()| format!("{ENV_WHIR_GRIND}={v:?}: expected `query` or `all`"))?;
+        }
+        if let Some(v) = get(ENV_LOGUP) {
+            format.logup = v.parse().map_err(|()| {
+                format!("{ENV_LOGUP}={v:?}: expected `pair`, `k3`, `k4` or `best`")
+            })?;
         }
         Ok(format)
     }
@@ -314,6 +332,9 @@ impl ZfFormat {
         {
             out.push(ENV_WHIR_STACK);
         }
+        if !self.logup.is_implemented() {
+            out.push(ENV_LOGUP);
+        }
         out
     }
 
@@ -349,18 +370,19 @@ impl ZfFormat {
     }
 
     /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…
-    /// whir_grind=…`, each value in the spelling its knob accepts.
+    /// whir_grind=… logup=…`, each value in the spelling its knob accepts.
     pub fn banner(&self) -> String {
         format!(
             "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={} whir_stack={} \
-             whir_grind={}",
+             whir_grind={} logup={}",
             self.cap,
             self.whir_cap,
             self.fri,
             self.one_row,
             whir_folds_name(&self.whir_folds),
             self.whir_stack.get(),
-            self.whir_grind
+            self.whir_grind,
+            self.logup
         )
     }
 
@@ -382,7 +404,9 @@ impl ZfFormat {
         )
     }
 
-    /// The univariate part: what `stark::ProofOptions` carries.
+    /// The univariate part every LFM proof carries (wraps, nodes, the root):
+    /// what `stark::ProofOptions` carries, with the LogUp pair layout. The
+    /// LFM chips keep pairs whatever `LAMBDA_VM_ZF_LOGUP` says.
     pub fn proof_format(&self) -> ProofFormat {
         ProofFormat {
             merkle_cap: self.cap,
@@ -390,6 +414,16 @@ impl ZfFormat {
             one_row: self.one_row,
             // A test hook only; no knob sets it.
             fri_schedule_override: None,
+            logup: LogUpPolicy::Pair,
+        }
+    }
+
+    /// The univariate part the STARK block's base tables carry: the LFM
+    /// format plus the base tables' LogUp arity policy.
+    pub fn base_proof_format(&self) -> ProofFormat {
+        ProofFormat {
+            logup: self.logup,
+            ..self.proof_format()
         }
     }
 
@@ -413,6 +447,13 @@ impl ZfFormat {
     /// `options` with this format's univariate fields.
     pub fn options(&self, mut options: ProofOptions) -> ProofOptions {
         self.apply_to_options(&mut options);
+        options
+    }
+
+    /// `options` with this format's base-table univariate fields
+    /// ([`Self::base_proof_format`]).
+    pub fn base_options(&self, mut options: ProofOptions) -> ProofOptions {
+        options.format = self.base_proof_format();
         options
     }
 
@@ -524,18 +565,19 @@ mod tests {
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
+                logup: LogUpPolicy::Pair,
             }
         );
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query"
+             whir_grind=query logup=pair"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
     }
 
-    /// Every knob keeps its OFF spelling, and all seven at off are the legacy
+    /// Every knob keeps its OFF spelling, and all eight at off are the legacy
     /// format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
@@ -547,6 +589,7 @@ mod tests {
             (ENV_WHIR_FOLDS, "uniform4"),
             (ENV_WHIR_STACK, "25"),
             (ENV_WHIR_GRIND, "all"),
+            (ENV_LOGUP, "pair"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
@@ -554,7 +597,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
-             whir_grind=all"
+             whir_grind=all logup=pair"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -730,6 +773,13 @@ mod tests {
             (ENV_WHIR_GRIND, "off"),
             (ENV_WHIR_GRIND, "query-only"),
             (ENV_WHIR_GRIND, "20"),
+            (ENV_LOGUP, ""),
+            (ENV_LOGUP, "k2"),
+            (ENV_LOGUP, "k5"),
+            (ENV_LOGUP, "4"),
+            (ENV_LOGUP, "off"),
+            (ENV_LOGUP, "pairs"),
+            (ENV_LOGUP, "auto"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
@@ -746,11 +796,12 @@ mod tests {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
+            logup: LogUpPolicy::K4,
         };
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all"
+             whir_grind=all logup=k4"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -768,6 +819,7 @@ mod tests {
             (ENV_WHIR_FOLDS, fields["whir_folds"]),
             (ENV_WHIR_STACK, fields["whir_stack"]),
             (ENV_WHIR_GRIND, fields["whir_grind"]),
+            (ENV_LOGUP, fields["logup"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -813,7 +865,7 @@ mod tests {
                 .unwrap()
                 .banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query"
+             whir_grind=query logup=pair"
         );
     }
 
@@ -1246,7 +1298,9 @@ mod tests {
             let f = parse(&[(ENV_WHIR_GRIND, v)]).unwrap();
             assert!(f.unimplemented_levers().is_empty(), "{v}");
             assert!(
-                f.banner().ends_with(&format!(" whir_grind={v}")),
+                f.banner()
+                    .split(' ')
+                    .any(|kv| kv == format!("whir_grind={v}")),
                 "{}",
                 f.banner()
             );
@@ -1327,6 +1381,108 @@ mod tests {
                 "{shapes:?}"
             );
         }
+    }
+
+    /// `LAMBDA_VM_ZF_LOGUP`: every spelling parses to its policy and moves no
+    /// other field; `pair` is the default and the legacy value. A policy whose
+    /// device path this build lacks is reported (and so aborts at
+    /// [`ZfFormat::global`]), never proved as another format.
+    #[test]
+    fn the_logup_knob_parses_and_unbuilt_policies_are_refused() {
+        assert_eq!(ZfFormat::DEFAULT.logup, LogUpPolicy::Pair);
+        assert_eq!(ZfFormat::LEGACY.logup, LogUpPolicy::Pair);
+        for (v, want) in [
+            ("pair", LogUpPolicy::Pair),
+            ("k3", LogUpPolicy::K3),
+            ("k4", LogUpPolicy::K4),
+            ("best", LogUpPolicy::Best),
+            (" K4 ", LogUpPolicy::K4),
+        ] {
+            let f = parse(&[(ENV_LOGUP, v)]).unwrap();
+            assert_eq!(f.logup, want, "{v:?}");
+            assert_eq!(
+                ZfFormat {
+                    logup: ZfFormat::DEFAULT.logup,
+                    ..f
+                },
+                ZfFormat::DEFAULT,
+                "the knob moves the LogUp policy and nothing else"
+            );
+            assert!(
+                f.banner().ends_with(&format!(" logup={}", want.name())),
+                "{}",
+                f.banner()
+            );
+            assert_eq!(
+                f.unimplemented_levers().contains(&ENV_LOGUP),
+                !want.is_implemented(),
+                "{v:?}"
+            );
+        }
+        assert!(
+            parse(&[(ENV_LOGUP, "pair")])
+                .unwrap()
+                .unimplemented_levers()
+                .is_empty()
+        );
+        // The card splits four composition parts: `k4` is selectable. Three
+        // parts have no device split yet: `k3` and `best` must abort.
+        const { assert!(stark::proof::options::LOGUP_K4_IMPLEMENTED) };
+        const { assert!(!stark::proof::options::LOGUP_K3_IMPLEMENTED) };
+        assert!(
+            parse(&[(ENV_LOGUP, "k4")])
+                .unwrap()
+                .unimplemented_levers()
+                .is_empty()
+        );
+        for v in ["k3", "best"] {
+            assert_eq!(
+                parse(&[(ENV_LOGUP, v)]).unwrap().unimplemented_levers(),
+                vec![ENV_LOGUP],
+                "{v}"
+            );
+        }
+    }
+
+    /// The LogUp policy reaches the STARK block's base options and nothing
+    /// else: every LFM proof (`proof_format`, `options`) keeps the pair
+    /// layout under every policy, and the base format differs from the LFM
+    /// one in the policy alone.
+    #[test]
+    fn the_logup_policy_reaches_the_base_options_only() {
+        let base = crate::recursion::Preset::Blowup4.options();
+        for policy in [
+            LogUpPolicy::Pair,
+            LogUpPolicy::K3,
+            LogUpPolicy::K4,
+            LogUpPolicy::Best,
+        ] {
+            let f = ZfFormat {
+                logup: policy,
+                ..ZfFormat::DEFAULT
+            };
+            assert_eq!(f.proof_format().logup, LogUpPolicy::Pair, "{policy}");
+            assert_eq!(f.options(base.clone()).format.logup, LogUpPolicy::Pair);
+            assert_eq!(f.base_proof_format().logup, policy);
+            assert_eq!(f.base_options(base.clone()).format.logup, policy);
+            assert_eq!(
+                ProofFormat {
+                    logup: LogUpPolicy::Pair,
+                    ..f.base_proof_format()
+                },
+                f.proof_format()
+            );
+            assert_eq!(f.proof_format(), ZfFormat::DEFAULT.proof_format());
+        }
+        // No knob set: the production base options are the pair layout.
+        assert_eq!(
+            crate::lfm::proof::block_base_options().format.logup,
+            LogUpPolicy::Pair
+        );
+        assert_eq!(
+            crate::lfm::proof::aggregation_wrap_options().format.logup,
+            LogUpPolicy::Pair
+        );
     }
 
     /// The STARK pipeline has nothing to adopt: it grinds only before its

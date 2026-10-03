@@ -54,11 +54,17 @@ pub(crate) const BYTES_PROGRAM: &str = "add";
 
 type Program = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
 
-/// Every production program, labelled, under the options it is built with.
-pub(crate) fn production_programs(opts: &ProofOptions) -> Vec<(String, Program)> {
+/// Every production program, labelled, under the options it is built with:
+/// the VM tables and, with `extras`, the per-epoch local-to-global table and
+/// the LFM chips. `suffix` is appended to every label.
+pub(crate) fn production_programs(
+    opts: &ProofOptions,
+    extras: bool,
+    suffix: &str,
+) -> Vec<(String, Program)> {
     let mut out = Vec::new();
     let mut push = |label: String, air: DynAir<'_>| {
-        out.push((label, air.constraint_program().clone()));
+        out.push((format!("{label}{suffix}"), air.constraint_program().clone()));
     };
     push("CPU".into(), &create_cpu_air(opts));
     push("BITWISE".into(), &create_bitwise_air(opts));
@@ -85,6 +91,9 @@ pub(crate) fn production_programs(opts: &ProofOptions) -> Vec<(String, Program)>
     push("KECCAK_RC".into(), &create_keccak_rc_air(opts));
     push("ECSM".into(), &create_ecsm_air(opts));
     push("ECDAS".into(), &create_ecdas_air(opts));
+    if !extras {
+        return out;
+    }
     for label in 1..=L2G_LABELS {
         push(
             format!("L2G[{label}]"),
@@ -105,6 +114,22 @@ pub(crate) fn production_programs(opts: &ProofOptions) -> Vec<(String, Program)>
     out
 }
 
+/// The option sets the compiled kernels cover: the legacy format at blowup 2
+/// and 4 (every program the pair layout builds), and the VM tables under
+/// `LAMBDA_VM_ZF_LOGUP=k4` at the block's blowup 4 (the tables the rule moves
+/// to four interactions per column get their own programs; the LFM chips keep
+/// pairs under every policy and the local-to-global tables are too narrow to
+/// move, so neither is rebuilt).
+pub(crate) fn compiled_option_sets() -> Vec<(ProofOptions, bool, &'static str)> {
+    let at = |blowup| GoldilocksCubicProofOptions::with_blowup(blowup).expect("a valid blowup");
+    let mut k4 = at(4);
+    k4.format = stark::proof::options::ProofFormat {
+        logup: stark::proof::options::LogUpPolicy::K4,
+        ..k4.format
+    };
+    vec![(at(2), true, ""), (at(4), true, ""), (k4, false, " k4")]
+}
+
 /// One compiled program: every label that lowers to it, its lowering, and
 /// the captured program it came from (the first label's).
 pub(crate) struct Compiled {
@@ -117,9 +142,8 @@ pub(crate) struct Compiled {
 /// The compiled set: one kernel per distinct worthwhile program, by key.
 pub(crate) fn compiled_set() -> BTreeMap<u64, Compiled> {
     let mut set: BTreeMap<u64, Compiled> = BTreeMap::new();
-    for blowup in [2, 4] {
-        let opts = GoldilocksCubicProofOptions::with_blowup(blowup).expect("a valid blowup");
-        for (label, program) in production_programs(&opts) {
+    for (opts, extras, suffix) in compiled_option_sets() {
+        for (label, program) in production_programs(&opts, extras, suffix) {
             let dev = DeviceProgram::lower(&program);
             if !codegen::worth_compiling(&dev) {
                 continue;
@@ -243,13 +267,30 @@ fn the_compiled_set_covers_the_hot_tables() {
         "LFM LFM_XALU",
         "LFM LFM_SELECT",
         "LFM LFM_LANES",
+        // Under `k4` the moved tables keep a compiled kernel, or they fall to
+        // the interpreter and pay more than the lever saves.
+        "CPU k4",
+        "MEMW_A k4",
+        "MEMW_R k4",
+        "LT k4",
+        "SHIFT k4",
+        "MEMW k4",
+        "LOAD k4",
+        "STORE k4",
     ] {
         assert!(
             covered.iter().any(|l| l.as_str() == hot),
             "{hot} has no compiled kernel; covered: {covered:?}"
         );
     }
-    for cold in ["KECCAK_RND", "ECDAS", "ECSM"] {
+    for cold in [
+        "KECCAK_RND",
+        "ECDAS",
+        "ECSM",
+        "KECCAK_RND k4",
+        "ECDAS k4",
+        "ECSM k4",
+    ] {
         assert!(
             !covered.iter().any(|l| l.as_str() == cold),
             "{cold} is too large to compile and must stay interpreted"

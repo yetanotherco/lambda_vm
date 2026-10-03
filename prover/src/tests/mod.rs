@@ -69,6 +69,8 @@ pub mod load_tests;
 #[cfg(test)]
 pub mod local_to_global_bus_tests;
 #[cfg(test)]
+pub mod logup_arity_tests;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;

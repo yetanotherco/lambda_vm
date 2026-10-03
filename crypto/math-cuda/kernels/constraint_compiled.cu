@@ -874,6 +874,413 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_1a458e9093b449b7
     }
 }
 
+// MEMW_A k4: 350 nodes, 13 roots, 34 base / 24 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_1d68f673f06322bc(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)27 * main_stride + r0];
+        b1 = d_main[(uint64_t)28 * main_stride + r0];
+        b2 = goldilocks::add(b0, b1);
+        b3 = goldilocks::sub(d_base_consts[1], b2);
+        b4 = goldilocks::mul(b2, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b4));
+        b5 = d_main[(uint64_t)14 * main_stride + r0];
+        b6 = d_main[(uint64_t)15 * main_stride + r0];
+        b7 = goldilocks::add(b5, b6);
+        b8 = d_main[(uint64_t)16 * main_stride + r0];
+        b7 = goldilocks::add(b7, b8);
+        b3 = goldilocks::mul(b7, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b3));
+        b9 = goldilocks::sub(d_base_consts[1], b0);
+        b9 = goldilocks::mul(b0, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b9));
+        b10 = goldilocks::sub(d_base_consts[1], b1);
+        b10 = goldilocks::mul(b1, b10);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b10));
+        b11 = goldilocks::sub(d_base_consts[1], b5);
+        b11 = goldilocks::mul(b5, b11);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b11));
+        b12 = goldilocks::sub(d_base_consts[1], b6);
+        b12 = goldilocks::mul(b6, b12);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b12));
+        b13 = goldilocks::sub(d_base_consts[1], b8);
+        b13 = goldilocks::mul(b8, b13);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b13));
+        b14 = goldilocks::sub(d_base_consts[1], b7);
+        b14 = goldilocks::mul(b7, b14);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b14));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b15 = d_main[(uint64_t)1 * main_stride + r0];
+        b15 = goldilocks::mul(b15, d_base_consts[1]);
+        b15 = goldilocks::add(d_base_consts[0], b15);
+        b16 = goldilocks::mul(b5, d_base_consts[1]);
+        b16 = goldilocks::add(b15, b16);
+        b17 = goldilocks::mul(b6, d_base_consts[2]);
+        b17 = goldilocks::add(b16, b17);
+        b16 = goldilocks::mul(b8, d_base_consts[3]);
+        b16 = goldilocks::add(b17, b16);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = d_base_consts[4]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b16 = d_main[(uint64_t)25 * main_stride + r0];
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        b17 = d_main[(uint64_t)26 * main_stride + r0];
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        b18 = d_main[(uint64_t)12 * main_stride + r0];
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[3]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        b19 = d_main[(uint64_t)13 * main_stride + r0];
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        b20 = goldilocks::add(d_base_consts[0], d_base_consts[5]);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[5]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        b20 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[6]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        b20 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[7]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        e1 = ext3::mul(e2, e3);
+        { uint64_t x = d_base_consts[6]; Fe3 y = d_rap_challenges[0]; e4 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e4 = ext3::neg(e4);
+        b20 = d_main[(uint64_t)0 * main_stride + r0];
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e5);
+        b21 = d_main[(uint64_t)2 * main_stride + r0];
+        b21 = goldilocks::mul(b21, d_base_consts[7]);
+        b21 = goldilocks::add(b15, b21);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[2]; e6 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e4, e6);
+        b15 = d_main[(uint64_t)3 * main_stride + r0];
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[3]; e8 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e7, e8);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[4]; e9 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e7, e9);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[5]; e11 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e10, e11);
+        b17 = d_main[(uint64_t)17 * main_stride + r0];
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e10, e12);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e7, e10);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[5]; e13 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e7, e13);
+        b16 = d_main[(uint64_t)4 * main_stride + r0];
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e7, e14);
+        e7 = ext3::mul(e12, e14);
+        e15 = ext3::mul(e1, e7);
+        e15 = ext3::mul(e0, e15);
+        { uint64_t x = b2; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b2; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e3, e2);
+        e7 = ext3::mul(e2, e7);
+        { uint64_t x = b2; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        b2 = goldilocks::neg(b2);
+        { uint64_t x = b2; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::add(e14, e12);
+        e1 = ext3::mul(e12, e1);
+        e1 = ext3::add(e7, e1);
+        e1 = ext3::sub(e15, e1);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[8], e1));
+        e15 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        b2 = goldilocks::add(b21, d_base_consts[1]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e4, e7);
+        e7 = ext3::sub(e7, e8);
+        e12 = ext3::sub(e7, e9);
+        e12 = ext3::sub(e12, e11);
+        b2 = d_main[(uint64_t)18 * main_stride + r0];
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e12, e14);
+        e7 = ext3::sub(e7, e10);
+        e7 = ext3::sub(e7, e13);
+        b22 = d_main[(uint64_t)5 * main_stride + r0];
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e7, e12);
+        e7 = ext3::mul(e14, e12);
+        b23 = goldilocks::add(b21, d_base_consts[8]);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[2]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e4, e2);
+        e2 = ext3::sub(e2, e8);
+        e3 = ext3::sub(e2, e9);
+        e3 = ext3::sub(e3, e11);
+        b23 = d_main[(uint64_t)19 * main_stride + r0];
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[6]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e3, e16);
+        e2 = ext3::sub(e2, e10);
+        e2 = ext3::sub(e2, e13);
+        b24 = d_main[(uint64_t)6 * main_stride + r0];
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[6]; e3 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e2, e3);
+        e17 = ext3::mul(e16, e2);
+        e18 = ext3::mul(e7, e17);
+        e18 = ext3::mul(e15, e18);
+        { uint64_t x = b7; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        b7 = goldilocks::neg(b7);
+        { uint64_t x = b7; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e12, e14);
+        e17 = ext3::mul(e14, e17);
+        b7 = goldilocks::add(b6, b8);
+        { uint64_t x = b7; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        b25 = goldilocks::neg(b7);
+        { uint64_t x = b25; Fe3 y = e16; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::add(e2, e16);
+        e7 = ext3::mul(e16, e7);
+        e7 = ext3::add(e17, e7);
+        e7 = ext3::sub(e18, e7);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[9], e7));
+        e18 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        b26 = goldilocks::add(b21, d_base_consts[2]);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[2]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e4, e17);
+        e17 = ext3::sub(e17, e8);
+        e16 = ext3::sub(e17, e9);
+        e16 = ext3::sub(e16, e11);
+        b26 = d_main[(uint64_t)20 * main_stride + r0];
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[6]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e16, e2);
+        e17 = ext3::sub(e17, e10);
+        e17 = ext3::sub(e17, e13);
+        b27 = d_main[(uint64_t)7 * main_stride + r0];
+        { uint64_t x = b27; Fe3 y = d_alpha_powers[6]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e17, e16);
+        e17 = ext3::mul(e2, e16);
+        b28 = goldilocks::add(b21, d_base_consts[5]);
+        { uint64_t x = b28; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e4, e14);
+        e14 = ext3::sub(e14, e8);
+        e12 = ext3::sub(e14, e9);
+        e12 = ext3::sub(e12, e11);
+        b28 = d_main[(uint64_t)21 * main_stride + r0];
+        { uint64_t x = b28; Fe3 y = d_alpha_powers[6]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e12, e19);
+        e14 = ext3::sub(e14, e10);
+        e14 = ext3::sub(e14, e13);
+        b29 = d_main[(uint64_t)8 * main_stride + r0];
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e14, e12);
+        e14 = ext3::mul(e19, e12);
+        e20 = ext3::mul(e17, e14);
+        e20 = ext3::mul(e18, e20);
+        { uint64_t x = b7; Fe3 y = e16; e16 = ext3::mul_base(y, x); }
+        { uint64_t x = b25; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e16, e2);
+        e14 = ext3::mul(e2, e14);
+        { uint64_t x = b8; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        b25 = goldilocks::neg(b8);
+        { uint64_t x = b25; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::add(e12, e19);
+        e17 = ext3::mul(e19, e17);
+        e17 = ext3::add(e14, e17);
+        e17 = ext3::sub(e20, e17);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[10], e17));
+        e20 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        b7 = goldilocks::add(b21, d_base_consts[9]);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e4, e14);
+        e14 = ext3::sub(e14, e8);
+        e19 = ext3::sub(e14, e9);
+        e19 = ext3::sub(e19, e11);
+        b7 = d_main[(uint64_t)22 * main_stride + r0];
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e19, e12);
+        e14 = ext3::sub(e14, e10);
+        e14 = ext3::sub(e14, e13);
+        b7 = d_main[(uint64_t)9 * main_stride + r0];
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[6]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e14, e2);
+        e14 = ext3::mul(e19, e2);
+        b30 = goldilocks::add(b21, d_base_consts[10]);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[2]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        e16 = ext3::sub(e16, e8);
+        e21 = ext3::sub(e16, e9);
+        e21 = ext3::sub(e21, e11);
+        b30 = d_main[(uint64_t)23 * main_stride + r0];
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[6]; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e21, e22);
+        e16 = ext3::sub(e16, e10);
+        e16 = ext3::sub(e16, e13);
+        b31 = d_main[(uint64_t)10 * main_stride + r0];
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[6]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e16, e21);
+        e16 = ext3::mul(e22, e21);
+        e23 = ext3::mul(e14, e16);
+        e23 = ext3::mul(e20, e23);
+        { uint64_t x = b8; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b25; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::add(e2, e19);
+        e16 = ext3::mul(e19, e16);
+        { uint64_t x = b8; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        { uint64_t x = b25; Fe3 y = e22; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::add(e21, e22);
+        e14 = ext3::mul(e22, e14);
+        e14 = ext3::add(e16, e14);
+        e14 = ext3::sub(e23, e14);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[11], e14));
+        e23 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r1], d_aux[(uint64_t)13 * aux_stride + r1], d_aux[(uint64_t)14 * aux_stride + r1]);
+        e16 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        e16 = ext3::sub(e23, e16);
+        e0 = ext3::sub(e16, e0);
+        e15 = ext3::sub(e0, e15);
+        e18 = ext3::sub(e15, e18);
+        e20 = ext3::sub(e18, e20);
+        e20 = ext3::add(e20, u_offset);
+        b32 = goldilocks::add(b21, d_base_consts[3]);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[2]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e4, e18);
+        e18 = ext3::sub(e18, e8);
+        e9 = ext3::sub(e18, e9);
+        e11 = ext3::sub(e9, e11);
+        b32 = d_main[(uint64_t)24 * main_stride + r0];
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[6]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e11, e9);
+        e10 = ext3::sub(e18, e10);
+        e13 = ext3::sub(e10, e13);
+        b33 = d_main[(uint64_t)11 * main_stride + r0];
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e13, e10);
+        e13 = ext3::mul(e9, e10);
+        { uint64_t x = d_base_consts[11]; Fe3 y = d_rap_challenges[0]; e18 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e18 = ext3::neg(e18);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e18, e11);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e11, e4);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[3]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e4, e11);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[4]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e11, e4);
+        { uint64_t x = b28; Fe3 y = d_alpha_powers[5]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e4, e11);
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[7]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[8]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[9]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[10]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[11]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[12]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[13]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[14]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b27; Fe3 y = d_alpha_powers[15]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[16]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[17]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[18]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[19]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[20]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[21]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[22]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[23]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[24]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        e5 = ext3::sub(e18, e5);
+        e6 = ext3::sub(e5, e6);
+        e8 = ext3::sub(e6, e8);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[4]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e8, e6);
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[5]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e6, e8);
+        e3 = ext3::sub(e8, e3);
+        { uint64_t x = b27; Fe3 y = d_alpha_powers[7]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[8]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e8, e3);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[9]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[10]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e8, e3);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[11]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[12]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e8, e3);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[13]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[14]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e8, e3);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[15]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[16]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e8, e3);
+        e8 = ext3::mul(e12, e3);
+        e6 = ext3::mul(e13, e8);
+        e6 = ext3::mul(e20, e6);
+        { uint64_t x = b8; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        { uint64_t x = b25; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::add(e10, e9);
+        e8 = ext3::mul(e9, e8);
+        b0 = goldilocks::neg(b0);
+        { uint64_t x = b0; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        b1 = goldilocks::neg(b1);
+        { uint64_t x = b1; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::add(e3, e12);
+        e13 = ext3::mul(e12, e13);
+        e13 = ext3::add(e8, e13);
+        e13 = ext3::sub(e6, e13);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[12], e13));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
 // MUL: 361 nodes, 20 roots, 36 base / 25 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_1e40c43b2b34aa31(
     Fe3 *__restrict__ d_h,
@@ -2908,7 +3315,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_1ef6d8f344207360
     }
 }
 
-// BRANCH: 128 nodes, 8 roots, 22 base / 7 ext slots
+// BRANCH, BRANCH k4: 128 nodes, 8 roots, 22 base / 7 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_234e065bfd09425a(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -5827,7 +6234,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_4651c627df5c3d6b
     }
 }
 
-// DECODE: 26 nodes, 1 roots, 2 base / 3 ext slots
+// DECODE, DECODE k4: 26 nodes, 1 roots, 2 base / 3 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_4d386cb74b75d3b9(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -6355,7 +6762,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_530c0f77a3539dfa
     }
 }
 
-// BITWISE, LFM BITWISE: 142 nodes, 5 roots, 5 base / 14 ext slots
+// BITWISE, LFM BITWISE, BITWISE k4: 142 nodes, 5 roots, 5 base / 14 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_6ba23d3dacf14f46(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -6546,7 +6953,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_6ba23d3dacf14f46
     }
 }
 
-// EQ: 106 nodes, 7 roots, 18 base / 7 ext slots
+// EQ, EQ k4: 106 nodes, 7 roots, 18 base / 7 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_7291cee4e3b00ed5(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -6703,7 +7110,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_7291cee4e3b00ed5
     }
 }
 
-// REGISTER: 38 nodes, 1 roots, 2 base / 4 ext slots
+// REGISTER, REGISTER k4: 38 nodes, 1 roots, 2 base / 4 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_8e659483a146c1d8(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -6786,7 +7193,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_8e659483a146c1d8
     }
 }
 
-// BYTEWISE: 170 nodes, 5 roots, 26 base / 11 ext slots
+// BYTEWISE, BYTEWISE k4: 170 nodes, 5 roots, 26 base / 11 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_9479e5b0e116eb74(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -7326,7 +7733,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_a68147bfffbb2785
     }
 }
 
-// LT: 141 nodes, 11 roots, 23 base / 11 ext slots
+// LT, LT k4: 141 nodes, 11 roots, 23 base / 11 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_aa5e580b19c19c4e(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -7522,7 +7929,1016 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_aa5e580b19c19c4e
     }
 }
 
-// LOAD: 185 nodes, 16 roots, 33 base / 8 ext slots
+// MEMW k4: 510 nodes, 22 roots, 60 base / 24 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_aa7e89919f7c228b(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)47 * main_stride + r0];
+        b1 = d_main[(uint64_t)48 * main_stride + r0];
+        b2 = goldilocks::add(b0, b1);
+        b3 = goldilocks::sub(d_base_consts[1], b2);
+        b4 = goldilocks::mul(b2, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b4));
+        b5 = d_main[(uint64_t)13 * main_stride + r0];
+        b6 = d_main[(uint64_t)14 * main_stride + r0];
+        b7 = goldilocks::add(b5, b6);
+        b8 = d_main[(uint64_t)15 * main_stride + r0];
+        b7 = goldilocks::add(b7, b8);
+        b3 = goldilocks::mul(b7, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b3));
+        b9 = goldilocks::sub(d_base_consts[1], b0);
+        b9 = goldilocks::mul(b0, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b9));
+        b10 = goldilocks::sub(d_base_consts[1], b1);
+        b10 = goldilocks::mul(b1, b10);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b10));
+        b11 = d_main[(uint64_t)24 * main_stride + r0];
+        b12 = goldilocks::sub(d_base_consts[1], b11);
+        b12 = goldilocks::mul(b11, b12);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b12));
+        b13 = d_main[(uint64_t)25 * main_stride + r0];
+        b14 = goldilocks::sub(d_base_consts[1], b13);
+        b14 = goldilocks::mul(b13, b14);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b14));
+        b15 = d_main[(uint64_t)26 * main_stride + r0];
+        b16 = goldilocks::sub(d_base_consts[1], b15);
+        b16 = goldilocks::mul(b15, b16);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b16));
+        b17 = d_main[(uint64_t)27 * main_stride + r0];
+        b18 = goldilocks::sub(d_base_consts[1], b17);
+        b18 = goldilocks::mul(b17, b18);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b18));
+        b19 = d_main[(uint64_t)28 * main_stride + r0];
+        b20 = goldilocks::sub(d_base_consts[1], b19);
+        b20 = goldilocks::mul(b19, b20);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[8], b20));
+        b21 = d_main[(uint64_t)29 * main_stride + r0];
+        b22 = goldilocks::sub(d_base_consts[1], b21);
+        b22 = goldilocks::mul(b21, b22);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[9], b22));
+        b23 = d_main[(uint64_t)30 * main_stride + r0];
+        b24 = goldilocks::sub(d_base_consts[1], b23);
+        b24 = goldilocks::mul(b23, b24);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[10], b24));
+        b25 = goldilocks::sub(d_base_consts[1], b5);
+        b25 = goldilocks::mul(b5, b25);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[11], b25));
+        b26 = goldilocks::sub(d_base_consts[1], b6);
+        b26 = goldilocks::mul(b6, b26);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[12], b26));
+        b27 = goldilocks::sub(d_base_consts[1], b8);
+        b27 = goldilocks::mul(b8, b27);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[13], b27));
+        b28 = goldilocks::sub(d_base_consts[1], b7);
+        b28 = goldilocks::mul(b7, b28);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[14], b28));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[2]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b29 = d_main[(uint64_t)0 * main_stride + r0];
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e2);
+        b30 = d_main[(uint64_t)1 * main_stride + r0];
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e1, e3);
+        b31 = d_main[(uint64_t)2 * main_stride + r0];
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[3]; e5 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e5);
+        b32 = d_main[(uint64_t)31 * main_stride + r0];
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[4]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e4, e6);
+        b33 = d_main[(uint64_t)32 * main_stride + r0];
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[5]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e6, e7);
+        b34 = d_main[(uint64_t)16 * main_stride + r0];
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[6]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e7, e6);
+        b35 = d_main[(uint64_t)11 * main_stride + r0];
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[4]; e7 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e7);
+        b36 = d_main[(uint64_t)12 * main_stride + r0];
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[5]; e8 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e8);
+        b37 = d_main[(uint64_t)3 * main_stride + r0];
+        { uint64_t x = b37; Fe3 y = d_alpha_powers[6]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e4, e9);
+        e4 = ext3::mul(e6, e9);
+        b38 = goldilocks::mul(b30, d_base_consts[1]);
+        b38 = goldilocks::add(d_base_consts[0], b38);
+        b39 = goldilocks::add(b38, d_base_consts[1]);
+        b40 = goldilocks::mul(b11, d_base_consts[3]);
+        b40 = goldilocks::add(b39, b40);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[2]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e1, e10);
+        b40 = goldilocks::mul(b31, d_base_consts[1]);
+        b40 = goldilocks::add(d_base_consts[0], b40);
+        b11 = goldilocks::mul(b11, d_base_consts[1]);
+        b11 = goldilocks::add(b40, b11);
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[3]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e10, e11);
+        b11 = d_main[(uint64_t)33 * main_stride + r0];
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e11, e10);
+        b39 = d_main[(uint64_t)34 * main_stride + r0];
+        { uint64_t x = b39; Fe3 y = d_alpha_powers[5]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e10, e12);
+        b41 = d_main[(uint64_t)17 * main_stride + r0];
+        { uint64_t x = b41; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e12, e10);
+        e11 = ext3::sub(e11, e7);
+        e11 = ext3::sub(e11, e8);
+        b42 = d_main[(uint64_t)4 * main_stride + r0];
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        e11 = ext3::mul(e10, e12);
+        e13 = ext3::mul(e4, e11);
+        e13 = ext3::mul(e0, e13);
+        { uint64_t x = b2; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        b43 = goldilocks::neg(b2);
+        { uint64_t x = b43; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::add(e9, e6);
+        e11 = ext3::mul(e6, e11);
+        { uint64_t x = b7; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        b43 = goldilocks::neg(b7);
+        { uint64_t x = b43; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::add(e12, e10);
+        e4 = ext3::mul(e10, e4);
+        e4 = ext3::add(e11, e4);
+        e4 = ext3::sub(e13, e4);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[15], e4));
+        e13 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        b43 = goldilocks::add(b38, d_base_consts[4]);
+        b44 = goldilocks::mul(b13, d_base_consts[3]);
+        b44 = goldilocks::add(b43, b44);
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[2]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e1, e11);
+        b13 = goldilocks::mul(b13, d_base_consts[1]);
+        b13 = goldilocks::add(b40, b13);
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[3]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e11, e10);
+        b13 = d_main[(uint64_t)35 * main_stride + r0];
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[4]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e10, e11);
+        b44 = d_main[(uint64_t)36 * main_stride + r0];
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[5]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        b43 = d_main[(uint64_t)18 * main_stride + r0];
+        { uint64_t x = b43; Fe3 y = d_alpha_powers[6]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        e10 = ext3::sub(e10, e7);
+        e10 = ext3::sub(e10, e8);
+        b45 = d_main[(uint64_t)5 * main_stride + r0];
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[6]; e12 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e10, e12);
+        e6 = ext3::mul(e11, e10);
+        b46 = goldilocks::add(b38, d_base_consts[5]);
+        b47 = goldilocks::mul(b15, d_base_consts[3]);
+        b47 = goldilocks::add(b46, b47);
+        { uint64_t x = b47; Fe3 y = d_alpha_powers[2]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e1, e9);
+        b15 = goldilocks::mul(b15, d_base_consts[1]);
+        b15 = goldilocks::add(b40, b15);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[3]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e9, e14);
+        b15 = d_main[(uint64_t)37 * main_stride + r0];
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[4]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e14, e9);
+        b47 = d_main[(uint64_t)38 * main_stride + r0];
+        { uint64_t x = b47; Fe3 y = d_alpha_powers[5]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e9, e15);
+        b46 = d_main[(uint64_t)19 * main_stride + r0];
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[6]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e15, e9);
+        e14 = ext3::sub(e14, e7);
+        e14 = ext3::sub(e14, e8);
+        b48 = d_main[(uint64_t)6 * main_stride + r0];
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[6]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        e14 = ext3::mul(e9, e15);
+        e16 = ext3::mul(e6, e14);
+        e16 = ext3::mul(e13, e16);
+        b49 = goldilocks::add(b6, b8);
+        { uint64_t x = b49; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        b50 = goldilocks::neg(b49);
+        { uint64_t x = b50; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e10, e11);
+        e14 = ext3::mul(e11, e14);
+        { uint64_t x = b49; Fe3 y = e15; e15 = ext3::mul_base(y, x); }
+        { uint64_t x = b50; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::add(e15, e9);
+        e6 = ext3::mul(e9, e6);
+        e6 = ext3::add(e14, e6);
+        e6 = ext3::sub(e16, e6);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[16], e6));
+        e16 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        b50 = goldilocks::add(b38, d_base_consts[6]);
+        b51 = goldilocks::mul(b17, d_base_consts[3]);
+        b51 = goldilocks::add(b50, b51);
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        b17 = goldilocks::mul(b17, d_base_consts[1]);
+        b17 = goldilocks::add(b40, b17);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[3]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e14, e9);
+        b17 = d_main[(uint64_t)39 * main_stride + r0];
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[4]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e9, e14);
+        b51 = d_main[(uint64_t)40 * main_stride + r0];
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[5]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        b50 = d_main[(uint64_t)20 * main_stride + r0];
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e15, e14);
+        e9 = ext3::sub(e9, e7);
+        e9 = ext3::sub(e9, e8);
+        b52 = d_main[(uint64_t)7 * main_stride + r0];
+        { uint64_t x = b52; Fe3 y = d_alpha_powers[6]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e9, e15);
+        e9 = ext3::mul(e14, e15);
+        b53 = goldilocks::add(b38, d_base_consts[7]);
+        b54 = goldilocks::mul(b19, d_base_consts[3]);
+        b54 = goldilocks::add(b53, b54);
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[2]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e1, e11);
+        b19 = goldilocks::mul(b19, d_base_consts[1]);
+        b19 = goldilocks::add(b40, b19);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[3]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e11, e10);
+        b19 = d_main[(uint64_t)41 * main_stride + r0];
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[4]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e10, e11);
+        b54 = d_main[(uint64_t)42 * main_stride + r0];
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[5]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e11, e17);
+        b53 = d_main[(uint64_t)21 * main_stride + r0];
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[6]; e11 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e11);
+        e10 = ext3::sub(e10, e7);
+        e10 = ext3::sub(e10, e8);
+        b53 = d_main[(uint64_t)8 * main_stride + r0];
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[6]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e10, e18);
+        e10 = ext3::mul(e17, e18);
+        e19 = ext3::mul(e9, e10);
+        e19 = ext3::mul(e16, e19);
+        { uint64_t x = b8; Fe3 y = e15; e15 = ext3::mul_base(y, x); }
+        b55 = goldilocks::neg(b8);
+        { uint64_t x = b55; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e15, e14);
+        e10 = ext3::mul(e14, e10);
+        { uint64_t x = b8; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        { uint64_t x = b55; Fe3 y = e17; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::add(e18, e17);
+        e9 = ext3::mul(e17, e9);
+        e9 = ext3::add(e10, e9);
+        e9 = ext3::sub(e19, e9);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[17], e9));
+        e19 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        b56 = goldilocks::add(b38, d_base_consts[8]);
+        b57 = goldilocks::mul(b21, d_base_consts[3]);
+        b57 = goldilocks::add(b56, b57);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[2]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e1, e10);
+        b21 = goldilocks::mul(b21, d_base_consts[1]);
+        b21 = goldilocks::add(b40, b21);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[3]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e10, e17);
+        b21 = d_main[(uint64_t)43 * main_stride + r0];
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e17, e10);
+        b57 = d_main[(uint64_t)44 * main_stride + r0];
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[5]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e10, e18);
+        b56 = d_main[(uint64_t)22 * main_stride + r0];
+        { uint64_t x = b56; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e18, e10);
+        e17 = ext3::sub(e17, e7);
+        e17 = ext3::sub(e17, e8);
+        b58 = d_main[(uint64_t)9 * main_stride + r0];
+        { uint64_t x = b58; Fe3 y = d_alpha_powers[6]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e17, e18);
+        e17 = ext3::mul(e10, e18);
+        b38 = goldilocks::add(b38, d_base_consts[9]);
+        b59 = goldilocks::mul(b23, d_base_consts[3]);
+        b59 = goldilocks::add(b38, b59);
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        b23 = goldilocks::mul(b23, d_base_consts[1]);
+        b23 = goldilocks::add(b40, b23);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[3]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e14, e1);
+        b23 = d_main[(uint64_t)45 * main_stride + r0];
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[4]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        b40 = d_main[(uint64_t)46 * main_stride + r0];
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[5]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        b59 = d_main[(uint64_t)23 * main_stride + r0];
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e15, e14);
+        e7 = ext3::sub(e1, e7);
+        e8 = ext3::sub(e7, e8);
+        b38 = d_main[(uint64_t)10 * main_stride + r0];
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[6]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e8, e7);
+        e8 = ext3::mul(e14, e7);
+        e1 = ext3::mul(e17, e8);
+        e1 = ext3::mul(e19, e1);
+        { uint64_t x = b8; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        { uint64_t x = b55; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::add(e18, e10);
+        e8 = ext3::mul(e10, e8);
+        { uint64_t x = b8; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        { uint64_t x = b55; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e7, e14);
+        e17 = ext3::mul(e14, e17);
+        e17 = ext3::add(e8, e17);
+        e17 = ext3::sub(e1, e17);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[18], e17));
+        e1 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[10]; Fe3 y = d_rap_challenges[0]; e8 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e8 = ext3::neg(e8);
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e8, e14);
+        { uint64_t x = b41; Fe3 y = d_alpha_powers[2]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e14, e7);
+        { uint64_t x = b43; Fe3 y = d_alpha_powers[3]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e7, e14);
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[4]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e14, e7);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[5]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e7, e14);
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b56; Fe3 y = d_alpha_powers[7]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[8]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[9]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[10]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[11]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b37; Fe3 y = d_alpha_powers[12]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[13]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[14]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[15]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b52; Fe3 y = d_alpha_powers[16]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[17]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b58; Fe3 y = d_alpha_powers[18]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[19]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[20]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[21]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[22]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[23]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e11, e14);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[24]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e14, e11);
+        e2 = ext3::sub(e8, e2);
+        e3 = ext3::sub(e2, e3);
+        e5 = ext3::sub(e3, e5);
+        { uint64_t x = b37; Fe3 y = d_alpha_powers[4]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e5, e3);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[5]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e3, e5);
+        e12 = ext3::sub(e5, e12);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[7]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e12, e5);
+        { uint64_t x = b52; Fe3 y = d_alpha_powers[8]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e5, e12);
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[9]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e12, e5);
+        { uint64_t x = b58; Fe3 y = d_alpha_powers[10]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e5, e12);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[11]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e12, e5);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[12]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e5, e12);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[13]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e12, e5);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[14]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e5, e12);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[15]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e12, e5);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[16]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e5, e12);
+        e5 = ext3::mul(e11, e12);
+        { uint64_t x = d_base_consts[11]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e3, e2);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[2]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e2, e8);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[3]; e2 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e2);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[4]; e14 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e14);
+        b36 = goldilocks::add(d_base_consts[0], d_base_consts[6]);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[5]; e7 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e7);
+        b36 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e10);
+        b36 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[7]; e18 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e18);
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[1]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e3, e15);
+        { uint64_t x = b39; Fe3 y = d_alpha_powers[2]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e15, e20);
+        e20 = ext3::sub(e20, e2);
+        e20 = ext3::sub(e20, e14);
+        e20 = ext3::sub(e20, e7);
+        e20 = ext3::sub(e20, e10);
+        e20 = ext3::sub(e20, e18);
+        e15 = ext3::mul(e8, e20);
+        e21 = ext3::mul(e5, e15);
+        e21 = ext3::mul(e1, e21);
+        b0 = goldilocks::neg(b0);
+        { uint64_t x = b0; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        b1 = goldilocks::neg(b1);
+        { uint64_t x = b1; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e12, e11);
+        e15 = ext3::mul(e11, e15);
+        { uint64_t x = b2; Fe3 y = e20; e20 = ext3::mul_base(y, x); }
+        { uint64_t x = b7; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e20, e8);
+        e5 = ext3::mul(e8, e5);
+        e5 = ext3::add(e15, e5);
+        e5 = ext3::sub(e21, e5);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[19], e5));
+        e21 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r0], d_aux[(uint64_t)16 * aux_stride + r0], d_aux[(uint64_t)17 * aux_stride + r0]);
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[1]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e3, e15);
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[2]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e15, e8);
+        e8 = ext3::sub(e8, e2);
+        e8 = ext3::sub(e8, e14);
+        e8 = ext3::sub(e8, e7);
+        e8 = ext3::sub(e8, e10);
+        e8 = ext3::sub(e8, e18);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[1]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e3, e15);
+        { uint64_t x = b47; Fe3 y = d_alpha_powers[2]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e15, e20);
+        e20 = ext3::sub(e20, e2);
+        e20 = ext3::sub(e20, e14);
+        e20 = ext3::sub(e20, e7);
+        e20 = ext3::sub(e20, e10);
+        e20 = ext3::sub(e20, e18);
+        e15 = ext3::mul(e8, e20);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[2]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        e12 = ext3::sub(e12, e2);
+        e12 = ext3::sub(e12, e14);
+        e12 = ext3::sub(e12, e7);
+        e12 = ext3::sub(e12, e10);
+        e12 = ext3::sub(e12, e18);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[2]; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e11, e22);
+        e22 = ext3::sub(e22, e2);
+        e22 = ext3::sub(e22, e14);
+        e22 = ext3::sub(e22, e7);
+        e22 = ext3::sub(e22, e10);
+        e22 = ext3::sub(e22, e18);
+        e11 = ext3::mul(e12, e22);
+        e23 = ext3::mul(e15, e11);
+        e23 = ext3::mul(e21, e23);
+        { uint64_t x = b49; Fe3 y = e20; e20 = ext3::mul_base(y, x); }
+        { uint64_t x = b49; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e20, e8);
+        e11 = ext3::mul(e8, e11);
+        { uint64_t x = b8; Fe3 y = e22; e22 = ext3::mul_base(y, x); }
+        { uint64_t x = b8; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::add(e22, e12);
+        e15 = ext3::mul(e12, e15);
+        e15 = ext3::add(e11, e15);
+        e15 = ext3::sub(e23, e15);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[20], e15));
+        e23 = ext3::make(d_aux[(uint64_t)18 * aux_stride + r1], d_aux[(uint64_t)19 * aux_stride + r1], d_aux[(uint64_t)20 * aux_stride + r1]);
+        e11 = ext3::make(d_aux[(uint64_t)18 * aux_stride + r0], d_aux[(uint64_t)19 * aux_stride + r0], d_aux[(uint64_t)20 * aux_stride + r0]);
+        e11 = ext3::sub(e23, e11);
+        e0 = ext3::sub(e11, e0);
+        e13 = ext3::sub(e0, e13);
+        e16 = ext3::sub(e13, e16);
+        e19 = ext3::sub(e16, e19);
+        e1 = ext3::sub(e19, e1);
+        e21 = ext3::sub(e1, e21);
+        e21 = ext3::add(e21, u_offset);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[1]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[2]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e1, e19);
+        e19 = ext3::sub(e19, e2);
+        e19 = ext3::sub(e19, e14);
+        e19 = ext3::sub(e19, e7);
+        e19 = ext3::sub(e19, e10);
+        e19 = ext3::sub(e19, e18);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[1]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        e2 = ext3::sub(e3, e2);
+        e14 = ext3::sub(e2, e14);
+        e7 = ext3::sub(e14, e7);
+        e10 = ext3::sub(e7, e10);
+        e18 = ext3::sub(e10, e18);
+        e10 = ext3::mul(e19, e18);
+        e10 = ext3::mul(e21, e10);
+        { uint64_t x = b8; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        { uint64_t x = b8; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::add(e18, e19);
+        e19 = ext3::sub(e10, e19);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[21], e19));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// SHIFT k4: 365 nodes, 24 roots, 49 base / 18 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_ae3b48ae373b7c1e(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)5 * main_stride + r0];
+        b1 = d_main[(uint64_t)25 * main_stride + r0];
+        b2 = goldilocks::sub(d_base_consts[1], b1);
+        b2 = goldilocks::mul(b0, b2);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b2));
+        b3 = d_main[(uint64_t)12 * main_stride + r0];
+        b4 = d_main[(uint64_t)13 * main_stride + r0];
+        b5 = d_main[(uint64_t)0 * main_stride + r0];
+        b6 = goldilocks::sub(b1, b0);
+        b7 = goldilocks::mul(b5, b6);
+        b7 = goldilocks::sub(b4, b7);
+        b7 = goldilocks::mul(b3, b7);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b7));
+        b8 = d_main[(uint64_t)14 * main_stride + r0];
+        b9 = d_main[(uint64_t)1 * main_stride + r0];
+        b10 = goldilocks::mul(b9, b6);
+        b10 = goldilocks::sub(b8, b10);
+        b10 = goldilocks::mul(b3, b10);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b10));
+        b11 = d_main[(uint64_t)15 * main_stride + r0];
+        b12 = d_main[(uint64_t)2 * main_stride + r0];
+        b13 = goldilocks::mul(b12, b6);
+        b13 = goldilocks::sub(b11, b13);
+        b13 = goldilocks::mul(b3, b13);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b13));
+        b14 = d_main[(uint64_t)16 * main_stride + r0];
+        b15 = d_main[(uint64_t)3 * main_stride + r0];
+        b16 = goldilocks::mul(b15, b6);
+        b16 = goldilocks::sub(b14, b16);
+        b16 = goldilocks::mul(b3, b16);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b16));
+        b17 = d_main[(uint64_t)17 * main_stride + r0];
+        b18 = goldilocks::mul(b3, b17);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b18));
+        b19 = d_main[(uint64_t)18 * main_stride + r0];
+        b20 = goldilocks::mul(b5, b0);
+        b20 = goldilocks::sub(b19, b20);
+        b20 = goldilocks::mul(b3, b20);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b20));
+        b21 = d_main[(uint64_t)19 * main_stride + r0];
+        b22 = goldilocks::mul(b9, b0);
+        b22 = goldilocks::sub(b21, b22);
+        b22 = goldilocks::mul(b3, b22);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b22));
+        b23 = d_main[(uint64_t)20 * main_stride + r0];
+        b24 = goldilocks::mul(b12, b0);
+        b24 = goldilocks::sub(b23, b24);
+        b24 = goldilocks::mul(b3, b24);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[8], b24));
+        b25 = d_main[(uint64_t)21 * main_stride + r0];
+        b26 = goldilocks::mul(b15, b0);
+        b26 = goldilocks::sub(b25, b26);
+        b26 = goldilocks::mul(b3, b26);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[9], b26));
+        b27 = d_main[(uint64_t)22 * main_stride + r0];
+        b28 = goldilocks::sub(d_base_consts[1], b27);
+        b29 = goldilocks::mul(b27, b28);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[10], b29));
+        b30 = d_main[(uint64_t)23 * main_stride + r0];
+        b31 = goldilocks::sub(d_base_consts[1], b30);
+        b31 = goldilocks::mul(b30, b31);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[11], b31));
+        b32 = d_main[(uint64_t)24 * main_stride + r0];
+        b33 = goldilocks::sub(d_base_consts[1], b32);
+        b33 = goldilocks::mul(b32, b33);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[12], b33));
+        b28 = goldilocks::sub(b28, b30);
+        b28 = goldilocks::sub(b28, b32);
+        b34 = goldilocks::sub(d_base_consts[1], b28);
+        b34 = goldilocks::mul(b28, b34);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[13], b34));
+        b35 = d_main[(uint64_t)8 * main_stride + r0];
+        b36 = goldilocks::mul(b27, b4);
+        b36 = goldilocks::add(d_base_consts[0], b36);
+        b36 = goldilocks::mul(b6, b36);
+        b37 = goldilocks::add(b19, b8);
+        b37 = goldilocks::mul(b27, b37);
+        b37 = goldilocks::add(d_base_consts[0], b37);
+        b38 = goldilocks::add(b21, b11);
+        b39 = goldilocks::mul(b30, b38);
+        b39 = goldilocks::add(b37, b39);
+        b37 = goldilocks::add(b23, b14);
+        b40 = goldilocks::mul(b32, b37);
+        b40 = goldilocks::add(b39, b40);
+        b39 = goldilocks::add(b25, b17);
+        b41 = goldilocks::mul(b28, b39);
+        b41 = goldilocks::add(b40, b41);
+        b40 = d_main[(uint64_t)10 * main_stride + r0];
+        b42 = goldilocks::mul(b40, d_base_consts[2]);
+        b43 = goldilocks::mul(b42, d_base_consts[0]);
+        b43 = goldilocks::add(b41, b43);
+        b43 = goldilocks::mul(b0, b43);
+        b43 = goldilocks::add(b36, b43);
+        b43 = goldilocks::sub(b35, b43);
+        b36 = goldilocks::add(b8, b19);
+        b41 = goldilocks::mul(b27, b36);
+        b41 = goldilocks::add(d_base_consts[0], b41);
+        b44 = goldilocks::mul(b30, b4);
+        b44 = goldilocks::add(b41, b44);
+        b44 = goldilocks::mul(b6, b44);
+        b38 = goldilocks::mul(b27, b38);
+        b38 = goldilocks::add(d_base_consts[0], b38);
+        b41 = goldilocks::mul(b30, b37);
+        b41 = goldilocks::add(b38, b41);
+        b38 = goldilocks::mul(b32, b39);
+        b38 = goldilocks::add(b41, b38);
+        b41 = goldilocks::add(d_base_consts[0], b28);
+        b41 = goldilocks::mul(b42, b41);
+        b41 = goldilocks::add(b38, b41);
+        b41 = goldilocks::mul(b0, b41);
+        b41 = goldilocks::add(b44, b41);
+        b41 = goldilocks::mul(b41, d_base_consts[3]);
+        b41 = goldilocks::sub(b43, b41);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[14], b41));
+        b43 = d_main[(uint64_t)9 * main_stride + r0];
+        b44 = goldilocks::add(b11, b21);
+        b38 = goldilocks::mul(b27, b44);
+        b38 = goldilocks::add(d_base_consts[0], b38);
+        b45 = goldilocks::mul(b30, b36);
+        b45 = goldilocks::add(b38, b45);
+        b38 = goldilocks::mul(b32, b4);
+        b38 = goldilocks::add(b45, b38);
+        b38 = goldilocks::mul(b6, b38);
+        b37 = goldilocks::mul(b27, b37);
+        b37 = goldilocks::add(d_base_consts[0], b37);
+        b45 = goldilocks::mul(b30, b39);
+        b45 = goldilocks::add(b37, b45);
+        b37 = goldilocks::add(d_base_consts[0], b32);
+        b37 = goldilocks::add(b37, b28);
+        b37 = goldilocks::mul(b42, b37);
+        b37 = goldilocks::add(b45, b37);
+        b37 = goldilocks::mul(b0, b37);
+        b37 = goldilocks::add(b38, b37);
+        b37 = goldilocks::sub(b43, b37);
+        b38 = goldilocks::add(b14, b23);
+        b38 = goldilocks::mul(b27, b38);
+        b38 = goldilocks::add(d_base_consts[0], b38);
+        b44 = goldilocks::mul(b30, b44);
+        b44 = goldilocks::add(b38, b44);
+        b36 = goldilocks::mul(b32, b36);
+        b36 = goldilocks::add(b44, b36);
+        b44 = goldilocks::mul(b28, b4);
+        b44 = goldilocks::add(b36, b44);
+        b44 = goldilocks::mul(b6, b44);
+        b39 = goldilocks::mul(b27, b39);
+        b39 = goldilocks::add(d_base_consts[0], b39);
+        b36 = goldilocks::add(d_base_consts[0], b30);
+        b36 = goldilocks::add(b36, b32);
+        b28 = goldilocks::add(b36, b28);
+        b28 = goldilocks::mul(b42, b28);
+        b28 = goldilocks::add(b39, b28);
+        b28 = goldilocks::mul(b0, b28);
+        b28 = goldilocks::add(b44, b28);
+        b28 = goldilocks::mul(b28, d_base_consts[3]);
+        b28 = goldilocks::sub(b37, b28);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[15], b28));
+        b37 = goldilocks::sub(d_base_consts[1], b0);
+        b37 = goldilocks::mul(b0, b37);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[16], b37));
+        b44 = d_main[(uint64_t)6 * main_stride + r0];
+        b39 = goldilocks::sub(d_base_consts[1], b44);
+        b39 = goldilocks::mul(b44, b39);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[17], b39));
+        b36 = d_main[(uint64_t)7 * main_stride + r0];
+        b38 = goldilocks::sub(d_base_consts[1], b36);
+        b38 = goldilocks::mul(b36, b38);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[18], b38));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[4]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e2);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        { uint64_t x = d_base_consts[5]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b40 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e1, e4);
+        b45 = d_main[(uint64_t)4 * main_stride + r0];
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e4, e1);
+        b46 = goldilocks::add(d_base_consts[0], d_base_consts[6]);
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[3]; e5 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e1, e5);
+        b46 = d_main[(uint64_t)11 * main_stride + r0];
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[4]; e7 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e7);
+        e8 = ext3::mul(e3, e6);
+        b47 = goldilocks::add(d_base_consts[0], d_base_consts[7]);
+        b48 = goldilocks::mul(b3, d_base_consts[8]);
+        b48 = goldilocks::add(b47, b48);
+        b47 = goldilocks::mul(b45, d_base_consts[9]);
+        b47 = goldilocks::add(b48, b47);
+        { uint64_t x = b47; Fe3 y = d_alpha_powers[2]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e4, e9);
+        e5 = ext3::sub(e9, e5);
+        e7 = ext3::sub(e5, e7);
+        { uint64_t x = d_base_consts[10]; Fe3 y = d_rap_challenges[0]; e5 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e5 = ext3::neg(e5);
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[1]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e5, e9);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[2]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e9, e5);
+        e9 = ext3::mul(e7, e5);
+        e4 = ext3::mul(e8, e9);
+        e4 = ext3::mul(e0, e4);
+        { uint64_t x = b44; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = b6; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::add(e6, e3);
+        e9 = ext3::mul(e3, e9);
+        { uint64_t x = b0; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::add(e5, e7);
+        e8 = ext3::mul(e7, e8);
+        e8 = ext3::add(e9, e8);
+        e8 = ext3::sub(e4, e8);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[19], e8));
+        e4 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[11]; Fe3 y = d_rap_challenges[0]; e9 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e9 = ext3::neg(e9);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e9, e7);
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e5, e3);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[3]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e5, e6);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[4]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e6, e5);
+        { uint64_t x = b9; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e9, e6);
+        e10 = ext3::sub(e10, e3);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[3]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e10, e11);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e11, e10);
+        e11 = ext3::mul(e5, e10);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[1]; e12 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e9, e12);
+        e13 = ext3::sub(e13, e3);
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[3]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e13, e14);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[4]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e14, e13);
+        e14 = ext3::sub(e9, e2);
+        e14 = ext3::sub(e14, e3);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[3]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[4]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e15, e14);
+        e15 = ext3::mul(e13, e14);
+        e16 = ext3::mul(e11, e15);
+        e16 = ext3::mul(e4, e16);
+        b3 = goldilocks::sub(d_base_consts[1], b3);
+        { uint64_t x = b3; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        { uint64_t x = b3; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::add(e10, e5);
+        e15 = ext3::mul(e5, e15);
+        { uint64_t x = b3; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        { uint64_t x = b3; Fe3 y = e13; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::add(e14, e13);
+        e11 = ext3::mul(e13, e11);
+        e11 = ext3::add(e15, e11);
+        e11 = ext3::sub(e16, e11);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[20], e11));
+        e16 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        b42 = goldilocks::add(d_base_consts[0], b42);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[1]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e9, e15);
+        e3 = ext3::sub(e15, e3);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[3]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e3, e15);
+        b17 = goldilocks::mul(b17, d_base_consts[9]);
+        b17 = goldilocks::add(b42, b17);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[4]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e15, e3);
+        b17 = goldilocks::add(d_base_consts[0], d_base_consts[12]);
+        b42 = goldilocks::mul(b36, d_base_consts[13]);
+        b42 = goldilocks::add(b17, b42);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[3]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e1, e15);
+        b27 = goldilocks::mul(b27, d_base_consts[14]);
+        b27 = goldilocks::add(b17, b27);
+        b30 = goldilocks::mul(b30, d_base_consts[13]);
+        b30 = goldilocks::add(b27, b30);
+        b32 = goldilocks::mul(b32, d_base_consts[8]);
+        b32 = goldilocks::add(b30, b32);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e15, e1);
+        e15 = ext3::mul(e3, e1);
+        { uint64_t x = d_base_consts[15]; Fe3 y = d_rap_challenges[0]; e9 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e9 = ext3::neg(e9);
+        b9 = goldilocks::mul(b9, d_base_consts[3]);
+        b9 = goldilocks::add(b5, b9);
+        { uint64_t x = b9; Fe3 y = d_alpha_powers[1]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e9, e13);
+        b15 = goldilocks::mul(b15, d_base_consts[3]);
+        b15 = goldilocks::add(b12, b15);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[2]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e13, e9);
+        b15 = goldilocks::mul(b45, d_base_consts[1]);
+        b15 = goldilocks::add(d_base_consts[0], b15);
+        b12 = d_main[(uint64_t)26 * main_stride + r0];
+        b9 = goldilocks::mul(b12, d_base_consts[7]);
+        b9 = goldilocks::add(b15, b9);
+        b15 = d_main[(uint64_t)27 * main_stride + r0];
+        b5 = goldilocks::mul(b15, d_base_consts[3]);
+        b5 = goldilocks::add(b9, b5);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[3]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e9, e13);
+        b5 = d_main[(uint64_t)28 * main_stride + r0];
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[4]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e13, e9);
+        b5 = goldilocks::add(d_base_consts[0], d_base_consts[16]);
+        b36 = goldilocks::mul(b36, d_base_consts[1]);
+        b36 = goldilocks::add(b5, b36);
+        b44 = goldilocks::mul(b44, d_base_consts[17]);
+        b44 = goldilocks::add(b36, b44);
+        b0 = goldilocks::mul(b0, d_base_consts[18]);
+        b0 = goldilocks::add(b44, b0);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[5]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e9, e13);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[6]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e13, e9);
+        { uint64_t x = b43; Fe3 y = d_alpha_powers[7]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e9, e13);
+        { uint64_t x = d_base_consts[0]; Fe3 y = d_rap_challenges[0]; e9 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e9 = ext3::neg(e9);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e9, e14);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[2]; e5 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e14, e5);
+        e10 = ext3::mul(e13, e14);
+        e17 = ext3::mul(e15, e10);
+        e17 = ext3::mul(e16, e17);
+        { uint64_t x = b3; Fe3 y = e1; e1 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::add(e1, e3);
+        e10 = ext3::mul(e3, e10);
+        b3 = goldilocks::neg(b1);
+        { uint64_t x = b3; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e13; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::add(e14, e13);
+        e15 = ext3::mul(e13, e15);
+        e15 = ext3::add(e10, e15);
+        e15 = ext3::sub(e17, e15);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[21], e15));
+        e17 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[1]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e9, e10);
+        e5 = ext3::sub(e10, e5);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e10 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e10 = ext3::neg(e10);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[1]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e10, e9);
+        e13 = ext3::mul(e5, e9);
+        e7 = ext3::sub(e10, e7);
+        e6 = ext3::sub(e10, e6);
+        e14 = ext3::mul(e7, e6);
+        e3 = ext3::mul(e13, e14);
+        e3 = ext3::mul(e17, e3);
+        { uint64_t x = b1; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::add(e9, e5);
+        e14 = ext3::mul(e5, e14);
+        { uint64_t x = b1; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::add(e6, e7);
+        e13 = ext3::mul(e7, e13);
+        e13 = ext3::add(e14, e13);
+        e13 = ext3::sub(e3, e13);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[22], e13));
+        e3 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r1], d_aux[(uint64_t)13 * aux_stride + r1], d_aux[(uint64_t)14 * aux_stride + r1]);
+        e14 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        e14 = ext3::sub(e3, e14);
+        e0 = ext3::sub(e14, e0);
+        e4 = ext3::sub(e0, e4);
+        e16 = ext3::sub(e4, e16);
+        e17 = ext3::sub(e16, e17);
+        e17 = ext3::add(e17, u_offset);
+        e12 = ext3::sub(e10, e12);
+        e2 = ext3::sub(e10, e2);
+        e10 = ext3::mul(e12, e2);
+        e10 = ext3::mul(e17, e10);
+        { uint64_t x = b1; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b1; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::add(e2, e12);
+        e12 = ext3::sub(e10, e12);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[23], e12));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// LOAD, LOAD k4: 185 nodes, 16 roots, 33 base / 8 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_b74207f572aadcf2(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -7837,6 +9253,425 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_b754c8a737387c87
     }
 }
 
+// MUL k4: 361 nodes, 14 roots, 36 base / 17 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_bb4ac262534a479c(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)4 * main_stride + r0];
+        b1 = goldilocks::sub(d_base_consts[1], b0);
+        b2 = goldilocks::mul(b0, b1);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b2));
+        b3 = d_main[(uint64_t)9 * main_stride + r0];
+        b4 = goldilocks::sub(d_base_consts[1], b3);
+        b5 = goldilocks::mul(b3, b4);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b5));
+        b6 = d_main[(uint64_t)18 * main_stride + r0];
+        b1 = goldilocks::mul(b1, b6);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b1));
+        b7 = d_main[(uint64_t)19 * main_stride + r0];
+        b4 = goldilocks::mul(b4, b7);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b4));
+        b8 = d_main[(uint64_t)20 * main_stride + r0];
+        b9 = d_main[(uint64_t)0 * main_stride + r0];
+        b10 = d_main[(uint64_t)5 * main_stride + r0];
+        b11 = goldilocks::mul(b9, b10);
+        b11 = goldilocks::add(d_base_consts[0], b11);
+        b11 = goldilocks::add(d_base_consts[0], b11);
+        b12 = d_main[(uint64_t)6 * main_stride + r0];
+        b13 = goldilocks::mul(b9, b12);
+        b13 = goldilocks::add(d_base_consts[0], b13);
+        b14 = d_main[(uint64_t)1 * main_stride + r0];
+        b15 = goldilocks::mul(b14, b10);
+        b15 = goldilocks::add(b13, b15);
+        b15 = goldilocks::mul(b15, d_base_consts[2]);
+        b15 = goldilocks::add(b11, b15);
+        b15 = goldilocks::sub(b8, b15);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b15));
+        b11 = d_main[(uint64_t)21 * main_stride + r0];
+        b13 = d_main[(uint64_t)7 * main_stride + r0];
+        b16 = goldilocks::mul(b9, b13);
+        b16 = goldilocks::add(d_base_consts[0], b16);
+        b17 = goldilocks::mul(b14, b12);
+        b17 = goldilocks::add(b16, b17);
+        b16 = d_main[(uint64_t)2 * main_stride + r0];
+        b18 = goldilocks::mul(b16, b10);
+        b18 = goldilocks::add(b17, b18);
+        b18 = goldilocks::add(d_base_consts[0], b18);
+        b17 = d_main[(uint64_t)8 * main_stride + r0];
+        b19 = goldilocks::mul(b9, b17);
+        b19 = goldilocks::add(d_base_consts[0], b19);
+        b20 = goldilocks::mul(b14, b13);
+        b20 = goldilocks::add(b19, b20);
+        b19 = goldilocks::mul(b16, b12);
+        b19 = goldilocks::add(b20, b19);
+        b20 = d_main[(uint64_t)3 * main_stride + r0];
+        b21 = goldilocks::mul(b20, b10);
+        b21 = goldilocks::add(b19, b21);
+        b21 = goldilocks::mul(b21, d_base_consts[2]);
+        b21 = goldilocks::add(b18, b21);
+        b21 = goldilocks::sub(b11, b21);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b21));
+        b18 = d_main[(uint64_t)22 * main_stride + r0];
+        b19 = goldilocks::mul(d_base_consts[3], b7);
+        b22 = goldilocks::mul(b9, b19);
+        b22 = goldilocks::add(d_base_consts[0], b22);
+        b23 = goldilocks::mul(b14, b17);
+        b23 = goldilocks::add(b22, b23);
+        b24 = goldilocks::mul(b16, b13);
+        b24 = goldilocks::add(b23, b24);
+        b23 = goldilocks::mul(b20, b12);
+        b23 = goldilocks::add(b24, b23);
+        b24 = goldilocks::mul(d_base_consts[3], b6);
+        b25 = goldilocks::mul(b24, b10);
+        b23 = goldilocks::add(b23, b25);
+        b23 = goldilocks::add(d_base_consts[0], b23);
+        b26 = goldilocks::mul(b14, b19);
+        b26 = goldilocks::add(b22, b26);
+        b22 = goldilocks::mul(b16, b17);
+        b22 = goldilocks::add(b26, b22);
+        b27 = goldilocks::mul(b20, b13);
+        b27 = goldilocks::add(b22, b27);
+        b22 = goldilocks::mul(b24, b12);
+        b27 = goldilocks::add(b27, b22);
+        b27 = goldilocks::add(b27, b25);
+        b27 = goldilocks::mul(b27, d_base_consts[2]);
+        b27 = goldilocks::add(b23, b27);
+        b27 = goldilocks::sub(b18, b27);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b27));
+        b23 = d_main[(uint64_t)23 * main_stride + r0];
+        b28 = goldilocks::mul(b16, b19);
+        b28 = goldilocks::add(b26, b28);
+        b26 = goldilocks::mul(b20, b17);
+        b26 = goldilocks::add(b28, b26);
+        b29 = goldilocks::mul(b24, b13);
+        b26 = goldilocks::add(b26, b29);
+        b26 = goldilocks::add(b26, b22);
+        b26 = goldilocks::add(b26, b25);
+        b26 = goldilocks::add(d_base_consts[0], b26);
+        b19 = goldilocks::mul(b20, b19);
+        b19 = goldilocks::add(b28, b19);
+        b24 = goldilocks::mul(b24, b17);
+        b24 = goldilocks::add(b19, b24);
+        b29 = goldilocks::add(b24, b29);
+        b22 = goldilocks::add(b29, b22);
+        b25 = goldilocks::add(b22, b25);
+        b25 = goldilocks::mul(b25, d_base_consts[2]);
+        b25 = goldilocks::add(b26, b25);
+        b25 = goldilocks::sub(b23, b25);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b25));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[4]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e2);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e3, e4);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e3);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[2]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        e1 = ext3::mul(e4, e5);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e6 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e6 = ext3::neg(e6);
+        { uint64_t x = b9; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e6, e7);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e6, e8);
+        e9 = ext3::mul(e7, e8);
+        e10 = ext3::mul(e1, e9);
+        e10 = ext3::mul(e0, e10);
+        { uint64_t x = b0; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        { uint64_t x = b3; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e5, e4);
+        e9 = ext3::mul(e4, e9);
+        b7 = d_main[(uint64_t)24 * main_stride + r0];
+        b6 = d_main[(uint64_t)25 * main_stride + r0];
+        b26 = goldilocks::add(b7, b6);
+        { uint64_t x = b26; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::add(e8, e7);
+        e1 = ext3::mul(e7, e1);
+        e1 = ext3::add(e9, e1);
+        e1 = ext3::sub(e10, e1);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[8], e1));
+        e10 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[1]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e6, e9);
+        e2 = ext3::sub(e6, e2);
+        e7 = ext3::mul(e9, e2);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e6, e8);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e6, e4);
+        e5 = ext3::mul(e8, e4);
+        e11 = ext3::mul(e7, e5);
+        e11 = ext3::mul(e10, e11);
+        { uint64_t x = b26; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::add(e2, e9);
+        e5 = ext3::mul(e9, e5);
+        { uint64_t x = b26; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e4, e8);
+        e7 = ext3::mul(e8, e7);
+        e7 = ext3::add(e5, e7);
+        e7 = ext3::sub(e11, e7);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[9], e7));
+        e11 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e6, e5);
+        e3 = ext3::sub(e6, e3);
+        e8 = ext3::mul(e5, e3);
+        b22 = d_main[(uint64_t)10 * main_stride + r0];
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e6, e4);
+        b29 = d_main[(uint64_t)11 * main_stride + r0];
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[1]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e6, e9);
+        e2 = ext3::mul(e4, e9);
+        e12 = ext3::mul(e8, e2);
+        e12 = ext3::mul(e11, e12);
+        { uint64_t x = b26; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::add(e3, e5);
+        e2 = ext3::mul(e5, e2);
+        { uint64_t x = b26; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e9, e4);
+        e8 = ext3::mul(e4, e8);
+        e8 = ext3::add(e2, e8);
+        e8 = ext3::sub(e12, e8);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[10], e8));
+        e12 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        b24 = d_main[(uint64_t)12 * main_stride + r0];
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e6, e2);
+        b19 = d_main[(uint64_t)13 * main_stride + r0];
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e6, e4);
+        e9 = ext3::mul(e2, e4);
+        b28 = d_main[(uint64_t)14 * main_stride + r0];
+        { uint64_t x = b28; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e6, e5);
+        b30 = d_main[(uint64_t)15 * main_stride + r0];
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e6, e3);
+        e13 = ext3::mul(e5, e3);
+        e14 = ext3::mul(e9, e13);
+        e14 = ext3::mul(e12, e14);
+        { uint64_t x = b26; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e4, e2);
+        e13 = ext3::mul(e2, e13);
+        { uint64_t x = b26; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::add(e3, e5);
+        e9 = ext3::mul(e5, e9);
+        e9 = ext3::add(e13, e9);
+        e9 = ext3::sub(e14, e9);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[11], e9));
+        e14 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        b31 = d_main[(uint64_t)16 * main_stride + r0];
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[1]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e6, e13);
+        b32 = d_main[(uint64_t)17 * main_stride + r0];
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e6, e5);
+        e6 = ext3::mul(e13, e5);
+        { uint64_t x = d_base_consts[5]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        b33 = goldilocks::mul(b8, d_base_consts[6]);
+        b33 = goldilocks::add(d_base_consts[0], b33);
+        b34 = goldilocks::mul(b22, d_base_consts[7]);
+        b34 = goldilocks::add(b33, b34);
+        b33 = goldilocks::mul(b29, d_base_consts[8]);
+        b33 = goldilocks::add(b34, b33);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e3, e2);
+        b33 = goldilocks::mul(b11, d_base_consts[6]);
+        b33 = goldilocks::add(d_base_consts[0], b33);
+        b34 = goldilocks::mul(b8, d_base_consts[9]);
+        b34 = goldilocks::add(b33, b34);
+        b33 = goldilocks::mul(b22, d_base_consts[10]);
+        b33 = goldilocks::add(b34, b33);
+        b34 = goldilocks::mul(b29, d_base_consts[11]);
+        b34 = goldilocks::add(b33, b34);
+        b33 = goldilocks::mul(b24, d_base_consts[7]);
+        b33 = goldilocks::add(b34, b33);
+        b34 = goldilocks::mul(b19, d_base_consts[8]);
+        b34 = goldilocks::add(b33, b34);
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e3, e4);
+        e15 = ext3::mul(e2, e4);
+        e16 = ext3::mul(e6, e15);
+        e16 = ext3::mul(e14, e16);
+        { uint64_t x = b26; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e13; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::add(e5, e13);
+        e15 = ext3::mul(e13, e15);
+        { uint64_t x = b26; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e4, e2);
+        e6 = ext3::mul(e2, e6);
+        e6 = ext3::add(e15, e6);
+        e6 = ext3::sub(e16, e6);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[12], e6));
+        e16 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r1], d_aux[(uint64_t)16 * aux_stride + r1], d_aux[(uint64_t)17 * aux_stride + r1]);
+        e15 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r0], d_aux[(uint64_t)16 * aux_stride + r0], d_aux[(uint64_t)17 * aux_stride + r0]);
+        e15 = ext3::sub(e16, e15);
+        e0 = ext3::sub(e15, e0);
+        e10 = ext3::sub(e0, e10);
+        e11 = ext3::sub(e10, e11);
+        e12 = ext3::sub(e11, e12);
+        e14 = ext3::sub(e12, e14);
+        e14 = ext3::add(e14, u_offset);
+        b34 = goldilocks::mul(b18, d_base_consts[6]);
+        b34 = goldilocks::add(d_base_consts[0], b34);
+        b33 = goldilocks::mul(b11, d_base_consts[9]);
+        b33 = goldilocks::add(b34, b33);
+        b34 = goldilocks::mul(b8, d_base_consts[12]);
+        b34 = goldilocks::add(b33, b34);
+        b33 = goldilocks::mul(b22, d_base_consts[1]);
+        b33 = goldilocks::add(b34, b33);
+        b34 = goldilocks::mul(b29, d_base_consts[2]);
+        b33 = goldilocks::add(b33, b34);
+        b35 = goldilocks::mul(b24, d_base_consts[10]);
+        b35 = goldilocks::add(b33, b35);
+        b33 = goldilocks::mul(b19, d_base_consts[11]);
+        b33 = goldilocks::add(b35, b33);
+        b35 = goldilocks::mul(b28, d_base_consts[7]);
+        b35 = goldilocks::add(b33, b35);
+        b33 = goldilocks::mul(b30, d_base_consts[8]);
+        b33 = goldilocks::add(b35, b33);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[1]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e3, e12);
+        b23 = goldilocks::mul(b23, d_base_consts[6]);
+        b23 = goldilocks::add(d_base_consts[0], b23);
+        b18 = goldilocks::mul(b18, d_base_consts[9]);
+        b18 = goldilocks::add(b23, b18);
+        b11 = goldilocks::mul(b11, d_base_consts[12]);
+        b11 = goldilocks::add(b18, b11);
+        b8 = goldilocks::mul(b8, d_base_consts[7]);
+        b8 = goldilocks::add(b11, b8);
+        b11 = goldilocks::mul(b22, d_base_consts[6]);
+        b11 = goldilocks::add(b8, b11);
+        b29 = goldilocks::mul(b29, d_base_consts[13]);
+        b29 = goldilocks::add(b11, b29);
+        b11 = goldilocks::mul(b24, d_base_consts[1]);
+        b11 = goldilocks::add(b29, b11);
+        b19 = goldilocks::mul(b19, d_base_consts[2]);
+        b11 = goldilocks::add(b11, b19);
+        b29 = goldilocks::mul(b28, d_base_consts[10]);
+        b29 = goldilocks::add(b11, b29);
+        b11 = goldilocks::mul(b30, d_base_consts[11]);
+        b11 = goldilocks::add(b29, b11);
+        b29 = goldilocks::mul(b31, d_base_consts[7]);
+        b29 = goldilocks::add(b11, b29);
+        b11 = goldilocks::mul(b32, d_base_consts[8]);
+        b11 = goldilocks::add(b29, b11);
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        e3 = ext3::mul(e12, e11);
+        { uint64_t x = d_base_consts[14]; Fe3 y = d_rap_challenges[0]; e10 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e10 = ext3::neg(e10);
+        b14 = goldilocks::mul(b14, d_base_consts[2]);
+        b14 = goldilocks::add(b9, b14);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[1]; e0 = ext3::mul_base(y, x); }
+        e0 = ext3::sub(e10, e0);
+        b20 = goldilocks::mul(b20, d_base_consts[2]);
+        b20 = goldilocks::add(b16, b20);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[2]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e0, e10);
+        b12 = goldilocks::mul(b12, d_base_consts[2]);
+        b12 = goldilocks::add(b10, b12);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[3]; e0 = ext3::mul_base(y, x); }
+        e0 = ext3::sub(e10, e0);
+        b17 = goldilocks::mul(b17, d_base_consts[2]);
+        b17 = goldilocks::add(b13, b17);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e0, e10);
+        b17 = goldilocks::add(d_base_consts[0], d_base_consts[4]);
+        b0 = goldilocks::mul(b0, d_base_consts[15]);
+        b17 = goldilocks::add(b17, b0);
+        b3 = goldilocks::mul(b3, d_base_consts[16]);
+        b17 = goldilocks::add(b17, b3);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[5]; e0 = ext3::mul_base(y, x); }
+        e0 = ext3::sub(e10, e0);
+        b34 = goldilocks::add(b22, b34);
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[6]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e0, e15);
+        b19 = goldilocks::add(b24, b19);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[7]; e0 = ext3::mul_base(y, x); }
+        e0 = ext3::sub(e15, e0);
+        b19 = goldilocks::add(d_base_consts[0], d_base_consts[17]);
+        b0 = goldilocks::add(b19, b0);
+        b3 = goldilocks::add(b0, b3);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[5]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e10, e15);
+        b30 = goldilocks::mul(b30, d_base_consts[2]);
+        b30 = goldilocks::add(b28, b30);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e15, e10);
+        b32 = goldilocks::mul(b32, d_base_consts[2]);
+        b32 = goldilocks::add(b31, b32);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[7]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e10, e15);
+        e10 = ext3::mul(e0, e15);
+        e16 = ext3::mul(e3, e10);
+        e16 = ext3::mul(e14, e16);
+        { uint64_t x = b26; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        { uint64_t x = b26; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::add(e11, e12);
+        e10 = ext3::mul(e12, e10);
+        b7 = goldilocks::neg(b7);
+        { uint64_t x = b7; Fe3 y = e15; e15 = ext3::mul_base(y, x); }
+        b6 = goldilocks::neg(b6);
+        { uint64_t x = b6; Fe3 y = e0; e0 = ext3::mul_base(y, x); }
+        e0 = ext3::add(e15, e0);
+        e3 = ext3::mul(e0, e3);
+        e3 = ext3::add(e10, e3);
+        e3 = ext3::sub(e16, e3);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[13], e3));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
 // LFM LFM_RANGE: 14 nodes, 1 roots, 2 base / 3 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_c53bbcfd3915c1bd(
     Fe3 *__restrict__ d_h,
@@ -7890,6 +9725,635 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_c53bbcfd3915c1bd
         { uint64_t x = b0; Fe3 y = e2; e2 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
         e2 = ext3::neg(e2);
         sum = ext3::add(sum, ext3::mul(d_beta_trans[0], e2));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// CPU k4: 541 nodes, 44 roots, 78 base / 31 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_c938b457fbd5ab28(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61, b62, b63, b64, b65, b66, b67, b68, b69, b70, b71, b72, b73, b74, b75, b76, b77;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27, e28, e29, e30;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)6 * main_stride + r0];
+        b1 = goldilocks::sub(d_base_consts[1], b0);
+        b2 = goldilocks::mul(b0, b1);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b2));
+        b3 = d_main[(uint64_t)7 * main_stride + r0];
+        b4 = goldilocks::sub(d_base_consts[1], b3);
+        b5 = goldilocks::mul(b3, b4);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b5));
+        b6 = d_main[(uint64_t)8 * main_stride + r0];
+        b7 = goldilocks::sub(d_base_consts[1], b6);
+        b7 = goldilocks::mul(b6, b7);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b7));
+        b8 = d_main[(uint64_t)12 * main_stride + r0];
+        b9 = goldilocks::sub(d_base_consts[1], b8);
+        b10 = goldilocks::mul(b8, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b10));
+        b11 = d_main[(uint64_t)13 * main_stride + r0];
+        b12 = goldilocks::sub(d_base_consts[1], b11);
+        b12 = goldilocks::mul(b11, b12);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b12));
+        b13 = d_main[(uint64_t)15 * main_stride + r0];
+        b14 = goldilocks::sub(d_base_consts[1], b13);
+        b14 = goldilocks::mul(b13, b14);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b14));
+        b15 = d_main[(uint64_t)16 * main_stride + r0];
+        b16 = goldilocks::sub(d_base_consts[1], b15);
+        b16 = goldilocks::mul(b15, b16);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b16));
+        b17 = d_main[(uint64_t)17 * main_stride + r0];
+        b18 = goldilocks::sub(d_base_consts[1], b17);
+        b19 = goldilocks::mul(b17, b18);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b19));
+        b20 = d_main[(uint64_t)19 * main_stride + r0];
+        b21 = goldilocks::sub(d_base_consts[1], b20);
+        b21 = goldilocks::mul(b20, b21);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[8], b21));
+        b22 = d_main[(uint64_t)20 * main_stride + r0];
+        b23 = goldilocks::sub(d_base_consts[1], b22);
+        b23 = goldilocks::mul(b22, b23);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[9], b23));
+        b24 = d_main[(uint64_t)26 * main_stride + r0];
+        b25 = goldilocks::sub(d_base_consts[1], b24);
+        b25 = goldilocks::mul(b24, b25);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[10], b25));
+        b26 = d_main[(uint64_t)25 * main_stride + r0];
+        b27 = goldilocks::sub(d_base_consts[1], b26);
+        b27 = goldilocks::mul(b26, b27);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[11], b27));
+        b28 = goldilocks::add(d_base_consts[0], b13);
+        b29 = d_main[(uint64_t)27 * main_stride + r0];
+        b30 = d_main[(uint64_t)31 * main_stride + r0];
+        b31 = goldilocks::add(b29, b30);
+        b32 = d_main[(uint64_t)33 * main_stride + r0];
+        b33 = goldilocks::mul(b32, d_base_consts[1]);
+        b33 = goldilocks::add(d_base_consts[0], b33);
+        b34 = d_main[(uint64_t)34 * main_stride + r0];
+        b35 = goldilocks::mul(b34, d_base_consts[2]);
+        b33 = goldilocks::add(b33, b35);
+        b31 = goldilocks::sub(b31, b33);
+        b31 = goldilocks::mul(b31, d_base_consts[3]);
+        b36 = goldilocks::mul(b28, b31);
+        b37 = goldilocks::sub(d_base_consts[1], b31);
+        b37 = goldilocks::mul(b36, b37);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[12], b37));
+        b36 = d_main[(uint64_t)28 * main_stride + r0];
+        b38 = d_main[(uint64_t)32 * main_stride + r0];
+        b39 = goldilocks::add(b36, b38);
+        b31 = goldilocks::add(b39, b31);
+        b39 = d_main[(uint64_t)35 * main_stride + r0];
+        b40 = goldilocks::mul(b39, d_base_consts[1]);
+        b40 = goldilocks::add(d_base_consts[0], b40);
+        b41 = d_main[(uint64_t)36 * main_stride + r0];
+        b42 = goldilocks::mul(b41, d_base_consts[2]);
+        b40 = goldilocks::add(b40, b42);
+        b31 = goldilocks::sub(b31, b40);
+        b31 = goldilocks::mul(b31, d_base_consts[3]);
+        b28 = goldilocks::mul(b28, b31);
+        b31 = goldilocks::sub(d_base_consts[1], b31);
+        b31 = goldilocks::mul(b28, b31);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[13], b31));
+        b28 = goldilocks::add(d_base_consts[0], b15);
+        b33 = goldilocks::add(b30, b33);
+        b33 = goldilocks::sub(b33, b29);
+        b33 = goldilocks::mul(b33, d_base_consts[3]);
+        b43 = goldilocks::mul(b28, b33);
+        b44 = goldilocks::sub(d_base_consts[1], b33);
+        b44 = goldilocks::mul(b43, b44);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[14], b44));
+        b40 = goldilocks::add(b38, b40);
+        b33 = goldilocks::add(b40, b33);
+        b33 = goldilocks::sub(b33, b36);
+        b33 = goldilocks::mul(b33, d_base_consts[3]);
+        b28 = goldilocks::mul(b28, b33);
+        b33 = goldilocks::sub(d_base_consts[1], b33);
+        b33 = goldilocks::mul(b28, b33);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[15], b33));
+        b28 = goldilocks::mul(b8, b17);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[16], b28));
+        b40 = goldilocks::mul(b8, b20);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[17], b40));
+        b43 = goldilocks::mul(b8, b22);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[18], b43));
+        b45 = goldilocks::mul(b8, b6);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[19], b45));
+        b46 = goldilocks::mul(b8, b0);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[20], b46));
+        b47 = goldilocks::mul(b8, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[21], b47));
+        b48 = d_main[(uint64_t)9 * main_stride + r0];
+        b49 = goldilocks::mul(b17, b48);
+        b50 = d_main[(uint64_t)29 * main_stride + r0];
+        b51 = goldilocks::mul(b20, b50);
+        b51 = goldilocks::add(b49, b51);
+        b49 = goldilocks::sub(b18, b20);
+        b52 = goldilocks::add(b50, b48);
+        b52 = goldilocks::mul(b49, b52);
+        b52 = goldilocks::add(b51, b52);
+        b52 = goldilocks::sub(b30, b52);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[22], b52));
+        b51 = d_main[(uint64_t)10 * main_stride + r0];
+        b53 = goldilocks::mul(b17, b51);
+        b54 = d_main[(uint64_t)30 * main_stride + r0];
+        b55 = goldilocks::mul(b20, b54);
+        b55 = goldilocks::add(b53, b55);
+        b53 = goldilocks::add(b54, b51);
+        b53 = goldilocks::mul(b49, b53);
+        b53 = goldilocks::add(b55, b53);
+        b53 = goldilocks::sub(b38, b53);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[23], b53));
+        b55 = goldilocks::mul(b1, b29);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[24], b55));
+        b1 = goldilocks::mul(b1, b36);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[25], b1));
+        b56 = goldilocks::mul(b4, b50);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[26], b56));
+        b4 = goldilocks::mul(b4, b54);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[27], b4));
+        b57 = d_main[(uint64_t)23 * main_stride + r0];
+        b35 = goldilocks::add(b32, b35);
+        b58 = goldilocks::sub(b57, b35);
+        b58 = goldilocks::mul(b49, b58);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[28], b58));
+        b59 = d_main[(uint64_t)24 * main_stride + r0];
+        b42 = goldilocks::add(b39, b42);
+        b60 = goldilocks::sub(b59, b42);
+        b60 = goldilocks::mul(b49, b60);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[29], b60));
+        b61 = d_main[(uint64_t)1 * main_stride + r0];
+        b62 = d_main[(uint64_t)11 * main_stride + r0];
+        b63 = goldilocks::add(b62, b62);
+        b63 = goldilocks::add(b61, b63);
+        b64 = goldilocks::sub(b63, b57);
+        b64 = goldilocks::mul(b64, d_base_consts[3]);
+        b65 = goldilocks::mul(b20, b64);
+        b66 = goldilocks::sub(d_base_consts[1], b64);
+        b66 = goldilocks::mul(b65, b66);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[30], b66));
+        b65 = d_main[(uint64_t)2 * main_stride + r0];
+        b64 = goldilocks::add(b65, b64);
+        b64 = goldilocks::sub(b64, b59);
+        b64 = goldilocks::mul(b64, d_base_consts[3]);
+        b67 = goldilocks::mul(b20, b64);
+        b64 = goldilocks::sub(d_base_consts[1], b64);
+        b64 = goldilocks::mul(b67, b64);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[31], b64));
+        b67 = d_main[(uint64_t)37 * main_stride + r0];
+        b68 = d_main[(uint64_t)18 * main_stride + r0];
+        b69 = goldilocks::mul(b20, b68);
+        b70 = goldilocks::sub(d_base_consts[1], b68);
+        b71 = goldilocks::mul(b20, b70);
+        b71 = goldilocks::mul(b71, b32);
+        b71 = goldilocks::add(b69, b71);
+        b71 = goldilocks::sub(b67, b71);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[32], b71));
+        b69 = goldilocks::sub(d_base_consts[1], b67);
+        b72 = d_main[(uint64_t)21 * main_stride + r0];
+        b63 = goldilocks::sub(b63, b72);
+        b63 = goldilocks::mul(b63, d_base_consts[3]);
+        b73 = goldilocks::mul(b69, b63);
+        b74 = goldilocks::sub(d_base_consts[1], b63);
+        b74 = goldilocks::mul(b73, b74);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[33], b74));
+        b63 = goldilocks::add(b65, b63);
+        b73 = d_main[(uint64_t)22 * main_stride + r0];
+        b63 = goldilocks::sub(b63, b73);
+        b63 = goldilocks::mul(b63, d_base_consts[3]);
+        b69 = goldilocks::mul(b69, b63);
+        b63 = goldilocks::sub(d_base_consts[1], b63);
+        b63 = goldilocks::mul(b69, b63);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[34], b63));
+        b69 = goldilocks::mul(b17, b20);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[35], b69));
+        b49 = goldilocks::mul(b49, b3);
+        b75 = goldilocks::mul(b49, b48);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[36], b75));
+        b49 = goldilocks::mul(b49, b51);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[37], b49));
+        b18 = goldilocks::mul(b18, b68);
+        b70 = goldilocks::mul(b18, b70);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[38], b70));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[4]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b61; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e2, e1);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[3]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e2, e1);
+        b18 = goldilocks::mul(b0, d_base_consts[1]);
+        b18 = goldilocks::add(d_base_consts[0], b18);
+        b76 = goldilocks::mul(b3, d_base_consts[5]);
+        b76 = goldilocks::add(b18, b76);
+        b18 = goldilocks::mul(b6, d_base_consts[6]);
+        b18 = goldilocks::add(b76, b18);
+        b76 = goldilocks::mul(b8, d_base_consts[7]);
+        b76 = goldilocks::add(b18, b76);
+        b18 = goldilocks::mul(b11, d_base_consts[8]);
+        b18 = goldilocks::add(b76, b18);
+        b13 = goldilocks::mul(b13, d_base_consts[9]);
+        b13 = goldilocks::add(b18, b13);
+        b15 = goldilocks::mul(b15, d_base_consts[10]);
+        b15 = goldilocks::add(b13, b15);
+        b13 = goldilocks::mul(b17, d_base_consts[11]);
+        b13 = goldilocks::add(b15, b13);
+        b20 = goldilocks::mul(b20, d_base_consts[12]);
+        b20 = goldilocks::add(b13, b20);
+        b13 = goldilocks::mul(b22, d_base_consts[13]);
+        b13 = goldilocks::add(b20, b13);
+        b20 = d_main[(uint64_t)3 * main_stride + r0];
+        b15 = goldilocks::mul(b20, d_base_consts[14]);
+        b15 = goldilocks::add(b13, b15);
+        b13 = d_main[(uint64_t)4 * main_stride + r0];
+        b18 = goldilocks::mul(b13, d_base_consts[15]);
+        b18 = goldilocks::add(b15, b18);
+        b15 = d_main[(uint64_t)5 * main_stride + r0];
+        b76 = goldilocks::mul(b15, d_base_consts[16]);
+        b76 = goldilocks::add(b18, b76);
+        b18 = goldilocks::mul(b62, d_base_consts[17]);
+        b18 = goldilocks::add(b76, b18);
+        b76 = d_main[(uint64_t)14 * main_stride + r0];
+        b77 = goldilocks::mul(b76, d_base_consts[18]);
+        b77 = goldilocks::add(b18, b77);
+        b18 = goldilocks::mul(b68, d_base_consts[19]);
+        b18 = goldilocks::add(b77, b18);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[5]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = d_base_consts[20]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e3);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[2]; e4 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e4);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[3]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e5, e1);
+        { uint64_t x = b76; Fe3 y = d_alpha_powers[5]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[6]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e5, e1);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[7]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        e1 = ext3::mul(e2, e5);
+        { uint64_t x = d_base_consts[21]; Fe3 y = d_rap_challenges[0]; e6 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e6 = ext3::neg(e6);
+        b38 = d_main[(uint64_t)0 * main_stride + r0];
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e7);
+        b30 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[2]; e8 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e8);
+        { uint64_t x = b61; Fe3 y = d_alpha_powers[3]; e9 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e9);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[4]; e10 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e10);
+        { uint64_t x = b62; Fe3 y = d_alpha_powers[5]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e6, e11);
+        { uint64_t x = d_base_consts[22]; Fe3 y = d_rap_challenges[0]; e6 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e6 = ext3::neg(e6);
+        e3 = ext3::sub(e6, e3);
+        e4 = ext3::sub(e3, e4);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[3]; e3 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e3);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[4]; e12 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e12);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[5]; e13 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e13);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e14);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[7]; e15 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e15);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[8]; e16 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e16);
+        b18 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[9]; e17 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e17);
+        b77 = goldilocks::mul(b20, d_base_consts[5]);
+        b77 = goldilocks::add(d_base_consts[0], b77);
+        { uint64_t x = b77; Fe3 y = d_alpha_powers[10]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e4, e18);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[11]; e4 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e4);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[12]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e18, e19);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[13]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e19, e18);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[14]; e19 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e19);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[15]; e20 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e20);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[16]; e21 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e21);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[17]; e22 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e22);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[18]; e23 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e23);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[19]; e24 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e24);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[20]; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e18, e25);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[21]; e18 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e25, e18);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[22]; e26 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e25, e26);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[23]; e27 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e25, e27);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[24]; e28 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e25, e28);
+        e29 = ext3::mul(e11, e25);
+        e30 = ext3::mul(e1, e29);
+        e30 = ext3::mul(e0, e30);
+        { uint64_t x = b9; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        { uint64_t x = b11; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e5, e2);
+        e29 = ext3::mul(e2, e29);
+        { uint64_t x = b8; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        { uint64_t x = b0; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e25, e11);
+        e1 = ext3::mul(e11, e1);
+        e1 = ext3::add(e29, e1);
+        e1 = ext3::sub(e30, e1);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[39], e1));
+        e30 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[1]; e29 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e6, e29);
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[2]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e29, e11);
+        e11 = ext3::sub(e11, e3);
+        e12 = ext3::sub(e11, e12);
+        e12 = ext3::sub(e12, e13);
+        e12 = ext3::sub(e12, e14);
+        e12 = ext3::sub(e12, e15);
+        e12 = ext3::sub(e12, e16);
+        e17 = ext3::sub(e12, e17);
+        b0 = goldilocks::mul(b13, d_base_consts[5]);
+        b0 = goldilocks::add(d_base_consts[0], b0);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[10]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e17, e12);
+        e12 = ext3::sub(e12, e4);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[12]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e12, e17);
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[13]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e17, e12);
+        e19 = ext3::sub(e12, e19);
+        e19 = ext3::sub(e19, e20);
+        e19 = ext3::sub(e19, e21);
+        e22 = ext3::sub(e19, e22);
+        e23 = ext3::sub(e22, e23);
+        e24 = ext3::sub(e23, e24);
+        b38 = goldilocks::mul(b38, d_base_consts[1]);
+        b38 = goldilocks::add(d_base_consts[0], b38);
+        b0 = goldilocks::add(b38, d_base_consts[1]);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[20]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e24, e23);
+        e18 = ext3::sub(e23, e18);
+        e26 = ext3::sub(e18, e26);
+        e27 = ext3::sub(e26, e27);
+        e28 = ext3::sub(e27, e28);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[1]; e27 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e27);
+        b8 = goldilocks::mul(b15, d_base_consts[5]);
+        b8 = goldilocks::add(d_base_consts[0], b8);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[2]; e26 = ext3::mul_base(y, x); }
+        e26 = ext3::sub(e6, e26);
+        e26 = ext3::sub(e26, e3);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[4]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e26, e6);
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[5]; e26 = ext3::mul_base(y, x); }
+        e26 = ext3::sub(e6, e26);
+        e14 = ext3::sub(e26, e14);
+        e15 = ext3::sub(e14, e15);
+        e16 = ext3::sub(e15, e16);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[9]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e16, e15);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[10]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e15, e16);
+        e4 = ext3::sub(e16, e4);
+        b8 = goldilocks::add(b38, d_base_consts[5]);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[12]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[13]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[14]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        e20 = ext3::sub(e16, e20);
+        e21 = ext3::sub(e20, e21);
+        e20 = ext3::mul(e28, e21);
+        { uint64_t x = d_base_consts[23]; Fe3 y = d_rap_challenges[0]; e16 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e16 = ext3::neg(e16);
+        e16 = ext3::sub(e16, e7);
+        e16 = ext3::sub(e16, e8);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[3]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[4]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[5]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        { uint64_t x = b54; Fe3 y = d_alpha_powers[6]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        { uint64_t x = b68; Fe3 y = d_alpha_powers[7]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[8]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e4, e16);
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[9]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        { uint64_t x = d_base_consts[8]; Fe3 y = d_rap_challenges[0]; e16 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e16 = ext3::neg(e16);
+        e27 = ext3::sub(e16, e27);
+        b59 = goldilocks::add(d_base_consts[0], d_base_consts[24]);
+        { uint64_t x = b59; Fe3 y = d_alpha_powers[2]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e27, e16);
+        e16 = ext3::sub(e16, e3);
+        b38 = goldilocks::add(b38, d_base_consts[25]);
+        b24 = goldilocks::mul(b24, d_base_consts[26]);
+        b24 = goldilocks::add(b38, b24);
+        b38 = goldilocks::mul(b26, d_base_consts[27]);
+        b38 = goldilocks::add(b24, b38);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[4]; e15 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e16, e15);
+        b26 = goldilocks::mul(b26, d_base_consts[28]);
+        b26 = goldilocks::add(d_base_consts[0], b26);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[5]; e26 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e14, e26);
+        { uint64_t x = b61; Fe3 y = d_alpha_powers[6]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e14, e6);
+        e14 = ext3::mul(e4, e6);
+        e18 = ext3::mul(e20, e14);
+        e18 = ext3::mul(e30, e18);
+        { uint64_t x = b3; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        { uint64_t x = b6; Fe3 y = e28; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::add(e21, e28);
+        e14 = ext3::mul(e28, e14);
+        { uint64_t x = b17; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[1]; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e6, e4);
+        e20 = ext3::mul(e4, e20);
+        e20 = ext3::add(e14, e20);
+        e20 = ext3::sub(e18, e20);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[40], e20));
+        e18 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[4]; e14 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e16, e14);
+        e16 = ext3::sub(e16, e13);
+        { uint64_t x = b72; Fe3 y = d_alpha_powers[6]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e16, e4);
+        b0 = goldilocks::add(d_base_consts[0], d_base_consts[29]);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[2]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e27, e16);
+        e3 = ext3::sub(e16, e3);
+        e15 = ext3::sub(e3, e15);
+        e26 = ext3::sub(e15, e26);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[6]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e26, e15);
+        e26 = ext3::mul(e4, e15);
+        e14 = ext3::sub(e3, e14);
+        e13 = ext3::sub(e14, e13);
+        { uint64_t x = b73; Fe3 y = d_alpha_powers[6]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e13, e14);
+        { uint64_t x = d_base_consts[30]; Fe3 y = d_rap_challenges[0]; e13 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e13 = ext3::neg(e13);
+        { uint64_t x = b72; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e13, e3);
+        { uint64_t x = b73; Fe3 y = d_alpha_powers[2]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e3, e13);
+        e9 = ext3::sub(e13, e9);
+        e10 = ext3::sub(e9, e10);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[5]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e10, e9);
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[6]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e9, e10);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[7]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e10, e9);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[8]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e9, e10);
+        { uint64_t x = b68; Fe3 y = d_alpha_powers[9]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e10, e9);
+        e10 = ext3::mul(e14, e9);
+        e13 = ext3::mul(e26, e10);
+        e13 = ext3::mul(e18, e13);
+        b51 = goldilocks::neg(d_base_consts[1]);
+        { uint64_t x = b51; Fe3 y = e15; e15 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[1]; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e15, e4);
+        e10 = ext3::mul(e4, e10);
+        { uint64_t x = b51; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        { uint64_t x = b67; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e9, e14);
+        e26 = ext3::mul(e14, e26);
+        e26 = ext3::add(e10, e26);
+        e26 = ext3::sub(e13, e26);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[41], e26));
+        e13 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[0]; Fe3 y = d_rap_challenges[0]; e10 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e10 = ext3::neg(e10);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e10, e14);
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[2]; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::sub(e14, e9);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e10, e14);
+        { uint64_t x = b62; Fe3 y = d_alpha_powers[2]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e14, e4);
+        e14 = ext3::mul(e9, e4);
+        { uint64_t x = b76; Fe3 y = d_alpha_powers[1]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e10, e15);
+        { uint64_t x = b68; Fe3 y = d_alpha_powers[2]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e15, e10);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e15 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e15 = ext3::neg(e15);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e15, e3);
+        e16 = ext3::mul(e10, e3);
+        e27 = ext3::mul(e14, e16);
+        e27 = ext3::mul(e13, e27);
+        { uint64_t x = d_base_consts[1]; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[1]; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        e9 = ext3::add(e4, e9);
+        e16 = ext3::mul(e9, e16);
+        { uint64_t x = d_base_consts[1]; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[1]; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::add(e3, e10);
+        e14 = ext3::mul(e10, e14);
+        e14 = ext3::add(e16, e14);
+        e14 = ext3::sub(e27, e14);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[42], e14));
+        e27 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r1], d_aux[(uint64_t)13 * aux_stride + r1], d_aux[(uint64_t)14 * aux_stride + r1]);
+        e16 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        e16 = ext3::sub(e27, e16);
+        e0 = ext3::sub(e16, e0);
+        e30 = ext3::sub(e0, e30);
+        e18 = ext3::sub(e30, e18);
+        e13 = ext3::sub(e18, e13);
+        e13 = ext3::add(e13, u_offset);
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[1]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e15, e18);
+        { uint64_t x = b39; Fe3 y = d_alpha_powers[1]; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::sub(e15, e30);
+        e0 = ext3::mul(e18, e30);
+        { uint64_t x = b41; Fe3 y = d_alpha_powers[1]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e15, e16);
+        { uint64_t x = d_base_consts[31]; Fe3 y = d_rap_challenges[0]; e15 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e15 = ext3::neg(e15);
+        e7 = ext3::sub(e15, e7);
+        e8 = ext3::sub(e7, e8);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[3]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e8, e7);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[4]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e7, e8);
+        e7 = ext3::mul(e16, e8);
+        e15 = ext3::mul(e0, e7);
+        e15 = ext3::mul(e13, e15);
+        { uint64_t x = d_base_consts[1]; Fe3 y = e30; e30 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[1]; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::add(e30, e18);
+        e7 = ext3::mul(e18, e7);
+        { uint64_t x = d_base_consts[1]; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b22; Fe3 y = e16; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::add(e8, e16);
+        e0 = ext3::mul(e16, e0);
+        e0 = ext3::add(e7, e0);
+        e0 = ext3::sub(e15, e0);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[43], e0));
         d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
                                 d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
                                 d_b_beta, d_b_z_inv);
@@ -8018,6 +10482,555 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_cd82d7b251a1cc1a
         { uint64_t x = b0; Fe3 y = e0; e0 = ext3::mul_base(y, x); }
         e0 = ext3::sub(e2, e0);
         sum = ext3::add(sum, ext3::mul(d_beta_trans[3], e0));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// CPU32 k4: 467 nodes, 38 roots, 68 base / 35 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_d1e49b861c1fcbb7(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61, b62, b63, b64, b65, b66, b67;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27, e28, e29, e30, e31, e32, e33, e34;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)5 * main_stride + r0];
+        b1 = goldilocks::sub(d_base_consts[1], b0);
+        b2 = goldilocks::mul(b0, b1);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b2));
+        b3 = d_main[(uint64_t)13 * main_stride + r0];
+        b4 = goldilocks::sub(d_base_consts[1], b3);
+        b5 = goldilocks::mul(b3, b4);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b5));
+        b6 = d_main[(uint64_t)28 * main_stride + r0];
+        b7 = goldilocks::sub(d_base_consts[1], b6);
+        b7 = goldilocks::mul(b6, b7);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b7));
+        b8 = d_main[(uint64_t)31 * main_stride + r0];
+        b9 = goldilocks::sub(d_base_consts[1], b8);
+        b9 = goldilocks::mul(b8, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b9));
+        b10 = d_main[(uint64_t)33 * main_stride + r0];
+        b11 = goldilocks::sub(d_base_consts[1], b10);
+        b11 = goldilocks::mul(b10, b11);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b11));
+        b12 = d_main[(uint64_t)34 * main_stride + r0];
+        b13 = goldilocks::sub(d_base_consts[1], b12);
+        b13 = goldilocks::mul(b12, b13);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b13));
+        b14 = d_main[(uint64_t)37 * main_stride + r0];
+        b15 = goldilocks::sub(d_base_consts[1], b14);
+        b16 = goldilocks::mul(b14, b15);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b16));
+        b17 = goldilocks::add(d_base_consts[0], b10);
+        b18 = d_main[(uint64_t)10 * main_stride + r0];
+        b19 = d_main[(uint64_t)20 * main_stride + r0];
+        b20 = goldilocks::add(b18, b19);
+        b21 = d_main[(uint64_t)22 * main_stride + r0];
+        b22 = goldilocks::mul(b21, d_base_consts[1]);
+        b22 = goldilocks::add(d_base_consts[0], b22);
+        b23 = d_main[(uint64_t)23 * main_stride + r0];
+        b24 = goldilocks::mul(b23, d_base_consts[2]);
+        b22 = goldilocks::add(b22, b24);
+        b20 = goldilocks::sub(b20, b22);
+        b20 = goldilocks::mul(b20, d_base_consts[3]);
+        b25 = goldilocks::mul(b17, b20);
+        b26 = goldilocks::sub(d_base_consts[1], b20);
+        b26 = goldilocks::mul(b25, b26);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b26));
+        b25 = d_main[(uint64_t)11 * main_stride + r0];
+        b27 = d_main[(uint64_t)21 * main_stride + r0];
+        b28 = goldilocks::add(b25, b27);
+        b20 = goldilocks::add(b28, b20);
+        b28 = d_main[(uint64_t)24 * main_stride + r0];
+        b29 = goldilocks::mul(b28, d_base_consts[1]);
+        b29 = goldilocks::add(d_base_consts[0], b29);
+        b30 = d_main[(uint64_t)25 * main_stride + r0];
+        b31 = goldilocks::mul(b30, d_base_consts[2]);
+        b29 = goldilocks::add(b29, b31);
+        b20 = goldilocks::sub(b20, b29);
+        b20 = goldilocks::mul(b20, d_base_consts[3]);
+        b17 = goldilocks::mul(b17, b20);
+        b20 = goldilocks::sub(d_base_consts[1], b20);
+        b20 = goldilocks::mul(b17, b20);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[8], b20));
+        b17 = goldilocks::add(d_base_consts[0], b12);
+        b22 = goldilocks::add(b19, b22);
+        b22 = goldilocks::sub(b22, b18);
+        b22 = goldilocks::mul(b22, d_base_consts[3]);
+        b32 = goldilocks::mul(b17, b22);
+        b33 = goldilocks::sub(d_base_consts[1], b22);
+        b33 = goldilocks::mul(b32, b33);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[9], b33));
+        b29 = goldilocks::add(b27, b29);
+        b22 = goldilocks::add(b29, b22);
+        b22 = goldilocks::sub(b22, b25);
+        b22 = goldilocks::mul(b22, d_base_consts[3]);
+        b17 = goldilocks::mul(b17, b22);
+        b22 = goldilocks::sub(d_base_consts[1], b22);
+        b22 = goldilocks::mul(b17, b22);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[10], b22));
+        b17 = d_main[(uint64_t)6 * main_stride + r0];
+        b29 = goldilocks::mul(b1, b17);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[11], b29));
+        b32 = d_main[(uint64_t)7 * main_stride + r0];
+        b34 = goldilocks::mul(b1, b32);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[12], b34));
+        b35 = d_main[(uint64_t)8 * main_stride + r0];
+        b1 = goldilocks::mul(b1, b35);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[13], b1));
+        b36 = d_main[(uint64_t)14 * main_stride + r0];
+        b37 = goldilocks::mul(b4, b36);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[14], b37));
+        b38 = d_main[(uint64_t)15 * main_stride + r0];
+        b39 = goldilocks::mul(b4, b38);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[15], b39));
+        b40 = d_main[(uint64_t)16 * main_stride + r0];
+        b4 = goldilocks::mul(b4, b40);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[16], b4));
+        b41 = goldilocks::sub(b18, b17);
+        b42 = goldilocks::mul(d_base_consts[2], b32);
+        b42 = goldilocks::sub(b41, b42);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[17], b42));
+        b41 = d_main[(uint64_t)9 * main_stride + r0];
+        b43 = goldilocks::mul(d_base_consts[4], b41);
+        b43 = goldilocks::sub(b25, b43);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[18], b43));
+        b44 = goldilocks::sub(b19, b36);
+        b45 = goldilocks::mul(d_base_consts[2], b38);
+        b45 = goldilocks::sub(b44, b45);
+        b44 = d_main[(uint64_t)18 * main_stride + r0];
+        b45 = goldilocks::sub(b45, b44);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[19], b45));
+        b46 = d_main[(uint64_t)17 * main_stride + r0];
+        b47 = goldilocks::mul(d_base_consts[4], b46);
+        b47 = goldilocks::sub(b27, b47);
+        b48 = d_main[(uint64_t)19 * main_stride + r0];
+        b47 = goldilocks::sub(b47, b48);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[20], b47));
+        b49 = d_main[(uint64_t)29 * main_stride + r0];
+        b50 = goldilocks::sub(b49, b21);
+        b51 = goldilocks::mul(d_base_consts[2], b23);
+        b51 = goldilocks::sub(b50, b51);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[21], b51));
+        b50 = d_main[(uint64_t)30 * main_stride + r0];
+        b52 = d_main[(uint64_t)26 * main_stride + r0];
+        b53 = goldilocks::mul(d_base_consts[4], b52);
+        b53 = goldilocks::sub(b50, b53);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[22], b53));
+        b54 = d_main[(uint64_t)36 * main_stride + r0];
+        b55 = goldilocks::sub(d_base_consts[1], b54);
+        b56 = goldilocks::mul(b55, b41);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[23], b56));
+        b55 = goldilocks::mul(b55, b46);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[24], b55));
+        b57 = goldilocks::mul(b3, b44);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[25], b57));
+        b58 = goldilocks::mul(b3, b48);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[26], b58));
+        b59 = goldilocks::mul(b15, b0);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[27], b59));
+        b60 = goldilocks::mul(b15, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[28], b60));
+        b61 = goldilocks::mul(b15, b6);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[29], b61));
+        b62 = goldilocks::mul(b15, b54);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[30], b62));
+        b15 = goldilocks::mul(b15, b52);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[31], b15));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[5]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b63 = d_main[(uint64_t)2 * main_stride + r0];
+        { uint64_t x = b63; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        b64 = d_main[(uint64_t)3 * main_stride + r0];
+        { uint64_t x = b64; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e2, e1);
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[3]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e2, e1);
+        b48 = goldilocks::mul(b0, d_base_consts[1]);
+        b48 = goldilocks::add(d_base_consts[0], b48);
+        b44 = goldilocks::mul(b3, d_base_consts[6]);
+        b44 = goldilocks::add(b48, b44);
+        b48 = goldilocks::mul(b6, d_base_consts[7]);
+        b48 = goldilocks::add(b44, b48);
+        b48 = goldilocks::add(b48, d_base_consts[8]);
+        b44 = goldilocks::mul(b8, d_base_consts[9]);
+        b44 = goldilocks::add(b48, b44);
+        b10 = goldilocks::mul(b10, d_base_consts[10]);
+        b10 = goldilocks::add(b44, b10);
+        b12 = goldilocks::mul(b12, d_base_consts[11]);
+        b12 = goldilocks::add(b10, b12);
+        b10 = d_main[(uint64_t)4 * main_stride + r0];
+        b44 = goldilocks::mul(b10, d_base_consts[12]);
+        b44 = goldilocks::add(b12, b44);
+        b12 = d_main[(uint64_t)12 * main_stride + r0];
+        b48 = goldilocks::mul(b12, d_base_consts[13]);
+        b48 = goldilocks::add(b44, b48);
+        b44 = d_main[(uint64_t)27 * main_stride + r0];
+        b65 = goldilocks::mul(b44, d_base_consts[14]);
+        b65 = goldilocks::add(b48, b65);
+        b48 = d_main[(uint64_t)35 * main_stride + r0];
+        b66 = goldilocks::mul(b48, d_base_consts[15]);
+        b66 = goldilocks::add(b65, b66);
+        b65 = d_main[(uint64_t)32 * main_stride + r0];
+        b67 = goldilocks::mul(b65, d_base_consts[16]);
+        b67 = goldilocks::add(b66, b67);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[5]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = d_base_consts[0]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        b67 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[2]; e4 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e4);
+        e5 = ext3::mul(e2, e3);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e1, e6);
+        e6 = ext3::sub(e6, e4);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e1, e7);
+        e7 = ext3::sub(e7, e4);
+        e8 = ext3::mul(e6, e7);
+        e9 = ext3::mul(e5, e8);
+        e9 = ext3::mul(e0, e9);
+        { uint64_t x = b14; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e3, e2);
+        e8 = ext3::mul(e2, e8);
+        { uint64_t x = b14; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::add(e7, e6);
+        e5 = ext3::mul(e6, e5);
+        e5 = ext3::add(e8, e5);
+        e5 = ext3::sub(e9, e5);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[32], e5));
+        e9 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        e8 = ext3::sub(e8, e4);
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e1, e6);
+        e4 = ext3::sub(e6, e4);
+        e6 = ext3::mul(e8, e4);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e1, e7);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e2);
+        e10 = ext3::mul(e7, e3);
+        e11 = ext3::mul(e6, e10);
+        e11 = ext3::mul(e9, e11);
+        { uint64_t x = b14; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e4, e8);
+        e10 = ext3::mul(e8, e10);
+        { uint64_t x = b14; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::add(e3, e7);
+        e6 = ext3::mul(e7, e6);
+        e6 = ext3::add(e10, e6);
+        e6 = ext3::sub(e11, e6);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[33], e6));
+        e11 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[1]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e1, e10);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e7);
+        e8 = ext3::mul(e10, e3);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e1, e4);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[1]; e12 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e1, e12);
+        e14 = ext3::mul(e4, e13);
+        e15 = ext3::mul(e8, e14);
+        e15 = ext3::mul(e11, e15);
+        { uint64_t x = b14; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::add(e3, e10);
+        e14 = ext3::mul(e10, e14);
+        { uint64_t x = b14; Fe3 y = e13; e13 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e13, e4);
+        e8 = ext3::mul(e4, e8);
+        e8 = ext3::add(e14, e8);
+        e8 = ext3::sub(e15, e8);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[34], e8));
+        e15 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        { uint64_t x = b28; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e1, e4);
+        e1 = ext3::mul(e14, e4);
+        { uint64_t x = d_base_consts[17]; Fe3 y = d_rap_challenges[0]; e13 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e13 = ext3::neg(e13);
+        b17 = goldilocks::mul(b17, d_base_consts[1]);
+        b17 = goldilocks::add(d_base_consts[0], b17);
+        b32 = goldilocks::mul(b32, d_base_consts[2]);
+        b32 = goldilocks::add(b17, b32);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[1]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e13, e10);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e10, e3);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[3]; e10 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e10);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[4]; e16 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e16);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[5]; e17 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e17);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[6]; e18 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e18);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[7]; e19 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e19);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[8]; e20 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e20);
+        b17 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[9]; e21 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e3, e21);
+        b10 = goldilocks::mul(b10, d_base_consts[6]);
+        b10 = goldilocks::add(d_base_consts[0], b10);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[10]; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e3, e22);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[11]; e3 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e3);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[12]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e22, e23);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[13]; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e23, e22);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[14]; e23 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e23);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[15]; e24 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e24);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[16]; e25 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e25);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[17]; e26 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e26);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[18]; e27 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e27);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[19]; e28 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e22, e28);
+        b35 = d_main[(uint64_t)0 * main_stride + r0];
+        b32 = goldilocks::mul(b35, d_base_consts[1]);
+        b32 = goldilocks::add(d_base_consts[0], b32);
+        b10 = goldilocks::add(b32, d_base_consts[0]);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[20]; e29 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e22, e29);
+        b10 = d_main[(uint64_t)1 * main_stride + r0];
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[21]; e22 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e29, e22);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[22]; e30 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e29, e30);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[23]; e31 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e29, e31);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[24]; e32 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e29, e32);
+        b36 = goldilocks::mul(b36, d_base_consts[1]);
+        b36 = goldilocks::add(d_base_consts[0], b36);
+        b38 = goldilocks::mul(b38, d_base_consts[2]);
+        b38 = goldilocks::add(b36, b38);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[1]; e33 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e13, e33);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[2]; e34 = ext3::mul_base(y, x); }
+        e34 = ext3::sub(e33, e34);
+        e34 = ext3::sub(e34, e10);
+        e16 = ext3::sub(e34, e16);
+        e17 = ext3::sub(e16, e17);
+        e17 = ext3::sub(e17, e18);
+        e17 = ext3::sub(e17, e19);
+        e17 = ext3::sub(e17, e20);
+        e21 = ext3::sub(e17, e21);
+        b12 = goldilocks::mul(b12, d_base_consts[6]);
+        b12 = goldilocks::add(d_base_consts[0], b12);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[10]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e21, e17);
+        e17 = ext3::sub(e17, e3);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[12]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e17, e21);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[13]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e21, e17);
+        e23 = ext3::sub(e17, e23);
+        e23 = ext3::sub(e23, e24);
+        e23 = ext3::sub(e23, e25);
+        e26 = ext3::sub(e23, e26);
+        e27 = ext3::sub(e26, e27);
+        e28 = ext3::sub(e27, e28);
+        b40 = goldilocks::add(b32, d_base_consts[1]);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[20]; e27 = ext3::mul_base(y, x); }
+        e27 = ext3::sub(e28, e27);
+        e22 = ext3::sub(e27, e22);
+        e30 = ext3::sub(e22, e30);
+        e31 = ext3::sub(e30, e31);
+        e32 = ext3::sub(e31, e32);
+        e31 = ext3::mul(e29, e32);
+        e30 = ext3::mul(e1, e31);
+        e30 = ext3::mul(e15, e30);
+        { uint64_t x = b14; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e4, e14);
+        e31 = ext3::mul(e14, e31);
+        { uint64_t x = b0; Fe3 y = e32; e32 = ext3::mul_base(y, x); }
+        { uint64_t x = b3; Fe3 y = e29; e29 = ext3::mul_base(y, x); }
+        e29 = ext3::add(e32, e29);
+        e1 = ext3::mul(e29, e1);
+        e1 = ext3::add(e31, e1);
+        e1 = ext3::sub(e30, e1);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[35], e1));
+        e30 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e31 = ext3::mul_base(y, x); }
+        e31 = ext3::sub(e13, e31);
+        b44 = goldilocks::mul(b44, d_base_consts[6]);
+        b44 = goldilocks::add(d_base_consts[0], b44);
+        { uint64_t x = b44; Fe3 y = d_alpha_powers[2]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e31, e13);
+        e10 = ext3::sub(e13, e10);
+        { uint64_t x = b49; Fe3 y = d_alpha_powers[4]; e13 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e10, e13);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[5]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e13, e10);
+        e18 = ext3::sub(e10, e18);
+        e19 = ext3::sub(e18, e19);
+        e20 = ext3::sub(e19, e20);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[9]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e20, e19);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[10]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e19, e20);
+        e3 = ext3::sub(e20, e3);
+        b32 = goldilocks::add(b32, d_base_consts[6]);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[12]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e3, e20);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[13]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e20, e3);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[14]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e3, e20);
+        e24 = ext3::sub(e20, e24);
+        e25 = ext3::sub(e24, e25);
+        { uint64_t x = d_base_consts[18]; Fe3 y = d_rap_challenges[0]; e24 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e24 = ext3::neg(e24);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[1]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e24, e20);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[2]; e24 = ext3::mul_base(y, x); }
+        e24 = ext3::sub(e20, e24);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[3]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e24, e20);
+        { uint64_t x = b27; Fe3 y = d_alpha_powers[4]; e24 = ext3::mul_base(y, x); }
+        e24 = ext3::sub(e20, e24);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[5]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e24, e20);
+        b24 = goldilocks::add(b21, b24);
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[6]; e24 = ext3::mul_base(y, x); }
+        e24 = ext3::sub(e20, e24);
+        b31 = goldilocks::add(b28, b31);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[7]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e24, e20);
+        e24 = ext3::mul(e25, e20);
+        { uint64_t x = d_base_consts[19]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[1]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e3, e19);
+        b67 = goldilocks::add(d_base_consts[0], d_base_consts[10]);
+        { uint64_t x = b67; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e19, e3);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[3]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e3, e19);
+        b65 = goldilocks::mul(b54, d_base_consts[10]);
+        b65 = goldilocks::add(d_base_consts[0], b65);
+        { uint64_t x = b65; Fe3 y = d_alpha_powers[4]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e19, e3);
+        { uint64_t x = d_base_consts[20]; Fe3 y = d_rap_challenges[0]; e19 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e19 = ext3::neg(e19);
+        e2 = ext3::sub(e19, e2);
+        { uint64_t x = b41; Fe3 y = d_alpha_powers[2]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e2, e18);
+        e2 = ext3::mul(e3, e18);
+        e10 = ext3::mul(e24, e2);
+        e10 = ext3::mul(e30, e10);
+        { uint64_t x = b6; Fe3 y = e20; e20 = ext3::mul_base(y, x); }
+        { uint64_t x = b8; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::add(e20, e25);
+        e2 = ext3::mul(e25, e2);
+        { uint64_t x = b14; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        { uint64_t x = b54; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::add(e18, e3);
+        e24 = ext3::mul(e3, e24);
+        e24 = ext3::add(e2, e24);
+        e24 = ext3::sub(e10, e24);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[36], e24));
+        e10 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r1], d_aux[(uint64_t)16 * aux_stride + r1], d_aux[(uint64_t)17 * aux_stride + r1]);
+        e2 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r0], d_aux[(uint64_t)16 * aux_stride + r0], d_aux[(uint64_t)17 * aux_stride + r0]);
+        e2 = ext3::sub(e10, e2);
+        e0 = ext3::sub(e2, e0);
+        e9 = ext3::sub(e0, e9);
+        e11 = ext3::sub(e9, e11);
+        e15 = ext3::sub(e11, e15);
+        e30 = ext3::sub(e15, e30);
+        e30 = ext3::add(e30, u_offset);
+        e12 = ext3::sub(e19, e12);
+        { uint64_t x = b52; Fe3 y = d_alpha_powers[2]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e12, e15);
+        { uint64_t x = d_base_consts[21]; Fe3 y = d_rap_challenges[0]; e12 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e12 = ext3::neg(e12);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[2]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b63; Fe3 y = d_alpha_powers[3]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        { uint64_t x = b64; Fe3 y = d_alpha_powers[4]; e12 = ext3::mul_base(y, x); }
+        e12 = ext3::sub(e11, e12);
+        { uint64_t x = b48; Fe3 y = d_alpha_powers[5]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e12, e11);
+        e12 = ext3::mul(e15, e11);
+        e7 = ext3::sub(e19, e7);
+        { uint64_t x = b46; Fe3 y = d_alpha_powers[2]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e7, e19);
+        e7 = ext3::mul(e12, e19);
+        e7 = ext3::mul(e30, e7);
+        { uint64_t x = b54; Fe3 y = e12; e12 = ext3::mul_base(y, x); }
+        { uint64_t x = b14; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        b14 = goldilocks::neg(b14);
+        { uint64_t x = b14; Fe3 y = e15; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::add(e11, e15);
+        e19 = ext3::mul(e15, e19);
+        e19 = ext3::add(e12, e19);
+        e19 = ext3::sub(e7, e19);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[37], e19));
         d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
                                 d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
                                 d_b_beta, d_b_z_inv);
@@ -8659,7 +11672,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_d81ae59843b2ec1a
     }
 }
 
-// MEMW_R: 170 nodes, 7 roots, 15 base / 18 ext slots
+// MEMW_R, MEMW_R k4: 170 nodes, 7 roots, 15 base / 18 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_dc9d708be8a921d4(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -13269,6 +16282,560 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_e03c768558fc5b71
     }
 }
 
+// DVRM k4: 482 nodes, 28 roots, 62 base / 23 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_e2cb2ef476d52ca8(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)8 * main_stride + r0];
+        b1 = goldilocks::sub(d_base_consts[1], b0);
+        b2 = goldilocks::mul(b0, b1);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b2));
+        b3 = d_main[(uint64_t)13 * main_stride + r0];
+        b4 = d_main[(uint64_t)14 * main_stride + r0];
+        b5 = goldilocks::add(b3, b4);
+        b6 = d_main[(uint64_t)15 * main_stride + r0];
+        b5 = goldilocks::add(b5, b6);
+        b7 = d_main[(uint64_t)16 * main_stride + r0];
+        b5 = goldilocks::add(b5, b7);
+        b8 = d_main[(uint64_t)31 * main_stride + r0];
+        b9 = d_main[(uint64_t)28 * main_stride + r0];
+        b10 = goldilocks::sub(b8, b9);
+        b10 = goldilocks::mul(b5, b10);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b10));
+        b5 = goldilocks::sub(d_base_consts[1], b8);
+        b11 = d_main[(uint64_t)19 * main_stride + r0];
+        b12 = goldilocks::mul(b4, d_base_consts[2]);
+        b12 = goldilocks::add(b3, b12);
+        b13 = goldilocks::sub(b11, b12);
+        b13 = goldilocks::mul(b5, b13);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b13));
+        b14 = d_main[(uint64_t)20 * main_stride + r0];
+        b15 = goldilocks::mul(b7, d_base_consts[2]);
+        b15 = goldilocks::add(b6, b15);
+        b16 = goldilocks::sub(b14, b15);
+        b16 = goldilocks::mul(b5, b16);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b16));
+        b5 = d_main[(uint64_t)29 * main_stride + r0];
+        b17 = goldilocks::sub(d_base_consts[1], b5);
+        b18 = d_main[(uint64_t)21 * main_stride + r0];
+        b19 = d_main[(uint64_t)4 * main_stride + r0];
+        b20 = d_main[(uint64_t)5 * main_stride + r0];
+        b21 = goldilocks::mul(b20, d_base_consts[2]);
+        b21 = goldilocks::add(b19, b21);
+        b22 = goldilocks::sub(b18, b21);
+        b22 = goldilocks::mul(b17, b22);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b22));
+        b23 = d_main[(uint64_t)22 * main_stride + r0];
+        b24 = d_main[(uint64_t)6 * main_stride + r0];
+        b25 = d_main[(uint64_t)7 * main_stride + r0];
+        b26 = goldilocks::mul(b25, d_base_consts[2]);
+        b26 = goldilocks::add(b24, b26);
+        b27 = goldilocks::sub(b23, b26);
+        b27 = goldilocks::mul(b17, b27);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b27));
+        b17 = d_main[(uint64_t)18 * main_stride + r0];
+        b28 = goldilocks::sub(d_base_consts[1], b17);
+        b28 = goldilocks::mul(b0, b28);
+        b29 = d_main[(uint64_t)30 * main_stride + r0];
+        b28 = goldilocks::sub(b28, b29);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b28));
+        b30 = d_main[(uint64_t)23 * main_stride + r0];
+        b31 = d_main[(uint64_t)24 * main_stride + r0];
+        b32 = goldilocks::mul(b31, d_base_consts[2]);
+        b32 = goldilocks::add(b30, b32);
+        b33 = goldilocks::add(b32, b12);
+        b34 = d_main[(uint64_t)0 * main_stride + r0];
+        b35 = d_main[(uint64_t)1 * main_stride + r0];
+        b36 = goldilocks::mul(b35, d_base_consts[2]);
+        b36 = goldilocks::add(b34, b36);
+        b33 = goldilocks::sub(b33, b36);
+        b33 = goldilocks::mul(b33, d_base_consts[3]);
+        b37 = goldilocks::sub(d_base_consts[1], b33);
+        b37 = goldilocks::mul(b33, b37);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b37));
+        b38 = d_main[(uint64_t)25 * main_stride + r0];
+        b39 = d_main[(uint64_t)26 * main_stride + r0];
+        b40 = goldilocks::mul(b39, d_base_consts[2]);
+        b40 = goldilocks::add(b38, b40);
+        b41 = goldilocks::add(b40, b15);
+        b33 = goldilocks::add(b41, b33);
+        b41 = d_main[(uint64_t)2 * main_stride + r0];
+        b42 = d_main[(uint64_t)3 * main_stride + r0];
+        b43 = goldilocks::mul(b42, d_base_consts[2]);
+        b43 = goldilocks::add(b41, b43);
+        b33 = goldilocks::sub(b33, b43);
+        b33 = goldilocks::mul(b33, d_base_consts[3]);
+        b44 = goldilocks::sub(d_base_consts[1], b33);
+        b44 = goldilocks::mul(b33, b44);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[8], b44));
+        b45 = d_main[(uint64_t)27 * main_stride + r0];
+        b46 = goldilocks::mul(b45, d_base_consts[4]);
+        b47 = goldilocks::mul(b46, d_base_consts[2]);
+        b47 = goldilocks::add(b46, b47);
+        b46 = goldilocks::mul(b8, d_base_consts[4]);
+        b48 = goldilocks::mul(b46, d_base_consts[2]);
+        b48 = goldilocks::add(b46, b48);
+        b48 = goldilocks::add(b47, b48);
+        b33 = goldilocks::add(b48, b33);
+        b47 = goldilocks::mul(b9, d_base_consts[4]);
+        b46 = goldilocks::mul(b47, d_base_consts[2]);
+        b46 = goldilocks::add(b47, b46);
+        b33 = goldilocks::sub(b33, b46);
+        b33 = goldilocks::mul(b33, d_base_consts[3]);
+        b47 = goldilocks::sub(d_base_consts[1], b33);
+        b47 = goldilocks::mul(b33, b47);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[9], b47));
+        b33 = goldilocks::add(b48, b33);
+        b46 = goldilocks::sub(b33, b46);
+        b46 = goldilocks::mul(b46, d_base_consts[3]);
+        b33 = goldilocks::sub(d_base_consts[1], b46);
+        b33 = goldilocks::mul(b46, b33);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[10], b33));
+        b46 = goldilocks::sub(d_base_consts[1], b45);
+        b46 = goldilocks::mul(b45, b46);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[11], b46));
+        b48 = goldilocks::mul(b1, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[12], b48));
+        b49 = goldilocks::mul(b1, b8);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[13], b49));
+        b1 = goldilocks::mul(b1, b5);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[14], b1));
+        b50 = d_main[(uint64_t)17 * main_stride + r0];
+        b51 = d_main[(uint64_t)9 * main_stride + r0];
+        b52 = goldilocks::sub(b51, d_base_consts[4]);
+        b52 = goldilocks::mul(b50, b52);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[15], b52));
+        b53 = d_main[(uint64_t)10 * main_stride + r0];
+        b54 = goldilocks::sub(b53, d_base_consts[4]);
+        b54 = goldilocks::mul(b50, b54);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[16], b54));
+        b55 = d_main[(uint64_t)11 * main_stride + r0];
+        b56 = goldilocks::sub(b55, d_base_consts[4]);
+        b56 = goldilocks::mul(b50, b56);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[17], b56));
+        b57 = d_main[(uint64_t)12 * main_stride + r0];
+        b58 = goldilocks::sub(b57, d_base_consts[4]);
+        b58 = goldilocks::mul(b50, b58);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[18], b58));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        { uint64_t x = b34; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = b35; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e1, e3);
+        e4 = ext3::mul(e2, e3);
+        { uint64_t x = b41; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        { uint64_t x = b42; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e1, e6);
+        e8 = ext3::mul(e5, e7);
+        e9 = ext3::mul(e4, e8);
+        e9 = ext3::mul(e0, e9);
+        b59 = d_main[(uint64_t)32 * main_stride + r0];
+        b60 = d_main[(uint64_t)33 * main_stride + r0];
+        b61 = goldilocks::add(b59, b60);
+        { uint64_t x = b61; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e3, e2);
+        e8 = ext3::mul(e2, e8);
+        { uint64_t x = b61; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::add(e7, e5);
+        e4 = ext3::mul(e5, e4);
+        e4 = ext3::add(e8, e4);
+        e4 = ext3::sub(e9, e4);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[19], e4));
+        e9 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e1, e5);
+        e7 = ext3::mul(e8, e5);
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[1]; e3 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e1, e3);
+        e11 = ext3::mul(e2, e10);
+        e12 = ext3::mul(e7, e11);
+        e12 = ext3::mul(e9, e12);
+        { uint64_t x = b61; Fe3 y = e5; e5 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e5, e8);
+        e11 = ext3::mul(e8, e11);
+        { uint64_t x = b61; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e10, e2);
+        e7 = ext3::mul(e2, e7);
+        e7 = ext3::add(e11, e7);
+        e7 = ext3::sub(e12, e7);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[20], e7));
+        e12 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e1, e11);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        e10 = ext3::mul(e11, e2);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[1]; e5 = ext3::mul_base(y, x); }
+        e13 = ext3::sub(e1, e5);
+        e14 = ext3::mul(e8, e13);
+        e15 = ext3::mul(e10, e14);
+        e15 = ext3::mul(e12, e15);
+        { uint64_t x = b61; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e2, e11);
+        e14 = ext3::mul(e11, e14);
+        { uint64_t x = b61; Fe3 y = e13; e13 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e13, e8);
+        e10 = ext3::mul(e8, e10);
+        e10 = ext3::add(e14, e10);
+        e10 = ext3::sub(e15, e10);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[21], e10));
+        e15 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        e13 = ext3::mul(e14, e8);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e1, e11);
+        { uint64_t x = b39; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        e16 = ext3::mul(e11, e2);
+        e17 = ext3::mul(e13, e16);
+        e17 = ext3::mul(e15, e17);
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e8, e14);
+        e16 = ext3::mul(e14, e16);
+        { uint64_t x = b61; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e2, e11);
+        e13 = ext3::mul(e11, e13);
+        e13 = ext3::add(e16, e13);
+        e13 = ext3::sub(e17, e13);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[22], e13));
+        e17 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        { uint64_t x = b51; Fe3 y = d_alpha_powers[1]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e1, e16);
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e1, e11);
+        e2 = ext3::mul(e16, e11);
+        { uint64_t x = b55; Fe3 y = d_alpha_powers[1]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e1, e14);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        e1 = ext3::mul(e14, e8);
+        e18 = ext3::mul(e2, e1);
+        e18 = ext3::mul(e17, e18);
+        { uint64_t x = b61; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e16; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::add(e11, e16);
+        e1 = ext3::mul(e16, e1);
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e8, e14);
+        e2 = ext3::mul(e14, e2);
+        e2 = ext3::add(e1, e2);
+        e2 = ext3::sub(e18, e2);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[23], e2));
+        e18 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r0], d_aux[(uint64_t)16 * aux_stride + r0], d_aux[(uint64_t)17 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[5]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        e6 = ext3::sub(e1, e6);
+        { uint64_t x = b9; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e6, e14);
+        e5 = ext3::sub(e1, e5);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[2]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e5, e6);
+        e5 = ext3::mul(e14, e6);
+        e3 = ext3::sub(e1, e3);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e3, e1);
+        { uint64_t x = d_base_consts[6]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        { uint64_t x = b11; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[2]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e8, e16);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[3]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e16, e8);
+        { uint64_t x = b23; Fe3 y = d_alpha_powers[4]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e8, e16);
+        b39 = goldilocks::add(d_base_consts[0], d_base_consts[7]);
+        { uint64_t x = b39; Fe3 y = d_alpha_powers[5]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e16, e8);
+        b39 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        b38 = goldilocks::mul(b50, d_base_consts[8]);
+        b38 = goldilocks::add(b39, b38);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[6]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e8, e16);
+        b38 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b38; Fe3 y = d_alpha_powers[7]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e16, e8);
+        e16 = ext3::mul(e1, e8);
+        e11 = ext3::mul(e5, e16);
+        e11 = ext3::mul(e18, e11);
+        { uint64_t x = b0; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = b0; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e6, e14);
+        e16 = ext3::mul(e14, e16);
+        { uint64_t x = b0; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e1; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::add(e8, e1);
+        e5 = ext3::mul(e1, e5);
+        e5 = ext3::add(e16, e5);
+        e5 = ext3::sub(e11, e5);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[24], e5));
+        e11 = ext3::make(d_aux[(uint64_t)18 * aux_stride + r0], d_aux[(uint64_t)19 * aux_stride + r0], d_aux[(uint64_t)20 * aux_stride + r0]);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[1]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e3, e16);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e16, e1);
+        b53 = goldilocks::mul(b53, d_base_consts[2]);
+        b53 = goldilocks::add(b51, b53);
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[3]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e1, e16);
+        b57 = goldilocks::mul(b57, d_base_consts[2]);
+        b57 = goldilocks::add(b55, b57);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e16, e1);
+        b55 = goldilocks::add(d_base_consts[0], d_base_consts[5]);
+        b0 = goldilocks::mul(b0, d_base_consts[9]);
+        b55 = goldilocks::add(b55, b0);
+        b29 = goldilocks::mul(b29, d_base_consts[10]);
+        b55 = goldilocks::add(b55, b29);
+        { uint64_t x = b55; Fe3 y = d_alpha_powers[5]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e1, e16);
+        { uint64_t x = b32; Fe3 y = d_alpha_powers[6]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e16, e8);
+        { uint64_t x = b40; Fe3 y = d_alpha_powers[7]; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::sub(e8, e16);
+        b40 = goldilocks::add(d_base_consts[0], d_base_consts[11]);
+        b40 = goldilocks::add(b40, b0);
+        b29 = goldilocks::add(b40, b29);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[5]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        b45 = goldilocks::mul(b45, d_base_consts[12]);
+        b45 = goldilocks::add(d_base_consts[0], b45);
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[6]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e8, e1);
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[7]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e1, e8);
+        e1 = ext3::mul(e16, e8);
+        { uint64_t x = d_base_consts[13]; Fe3 y = d_rap_challenges[0]; e14 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e14 = ext3::neg(e14);
+        b45 = goldilocks::mul(b3, d_base_consts[1]);
+        b45 = goldilocks::add(d_base_consts[0], b45);
+        b29 = goldilocks::mul(b4, d_base_consts[1]);
+        b29 = goldilocks::add(b45, b29);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e14, e6);
+        b45 = goldilocks::mul(b11, d_base_consts[12]);
+        b45 = goldilocks::add(b39, b45);
+        b40 = goldilocks::mul(b3, d_base_consts[12]);
+        b40 = goldilocks::add(b45, b40);
+        b45 = goldilocks::mul(b4, d_base_consts[14]);
+        b45 = goldilocks::add(b40, b45);
+        { uint64_t x = b45; Fe3 y = d_alpha_powers[2]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e6, e19);
+        b45 = goldilocks::mul(b6, d_base_consts[1]);
+        b45 = goldilocks::add(b29, b45);
+        b29 = goldilocks::mul(b7, d_base_consts[1]);
+        b29 = goldilocks::add(b45, b29);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e14, e6);
+        b14 = goldilocks::mul(b14, d_base_consts[12]);
+        b14 = goldilocks::add(b39, b14);
+        b6 = goldilocks::mul(b6, d_base_consts[12]);
+        b6 = goldilocks::add(b14, b6);
+        b7 = goldilocks::mul(b7, d_base_consts[14]);
+        b7 = goldilocks::add(b6, b7);
+        b11 = goldilocks::mul(b11, d_base_consts[15]);
+        b11 = goldilocks::add(b7, b11);
+        b3 = goldilocks::mul(b3, d_base_consts[15]);
+        b3 = goldilocks::add(b11, b3);
+        b4 = goldilocks::mul(b4, d_base_consts[16]);
+        b4 = goldilocks::add(b3, b4);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[2]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e6, e20);
+        e6 = ext3::mul(e19, e20);
+        e21 = ext3::mul(e1, e6);
+        e21 = ext3::mul(e11, e21);
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e16; e16 = ext3::mul_base(y, x); }
+        e16 = ext3::add(e8, e16);
+        e6 = ext3::mul(e16, e6);
+        { uint64_t x = b8; Fe3 y = e20; e20 = ext3::mul_base(y, x); }
+        { uint64_t x = b8; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::add(e20, e19);
+        e1 = ext3::mul(e19, e1);
+        e1 = ext3::add(e6, e1);
+        e1 = ext3::sub(e21, e1);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[25], e1));
+        e21 = ext3::make(d_aux[(uint64_t)21 * aux_stride + r0], d_aux[(uint64_t)22 * aux_stride + r0], d_aux[(uint64_t)23 * aux_stride + r0]);
+        b8 = goldilocks::mul(b19, d_base_consts[1]);
+        b8 = goldilocks::add(d_base_consts[0], b8);
+        b4 = goldilocks::mul(b20, d_base_consts[1]);
+        b4 = goldilocks::add(b8, b4);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e14, e6);
+        b8 = goldilocks::mul(b18, d_base_consts[12]);
+        b8 = goldilocks::add(b39, b8);
+        b3 = goldilocks::mul(b19, d_base_consts[12]);
+        b3 = goldilocks::add(b8, b3);
+        b8 = goldilocks::mul(b20, d_base_consts[14]);
+        b8 = goldilocks::add(b3, b8);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[2]; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::sub(e6, e19);
+        b8 = goldilocks::mul(b24, d_base_consts[1]);
+        b8 = goldilocks::add(b4, b8);
+        b4 = goldilocks::mul(b25, d_base_consts[1]);
+        b4 = goldilocks::add(b8, b4);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e14, e6);
+        b23 = goldilocks::mul(b23, d_base_consts[12]);
+        b23 = goldilocks::add(b39, b23);
+        b39 = goldilocks::mul(b24, d_base_consts[12]);
+        b39 = goldilocks::add(b23, b39);
+        b23 = goldilocks::mul(b25, d_base_consts[14]);
+        b23 = goldilocks::add(b39, b23);
+        b18 = goldilocks::mul(b18, d_base_consts[15]);
+        b18 = goldilocks::add(b23, b18);
+        b23 = goldilocks::mul(b19, d_base_consts[15]);
+        b23 = goldilocks::add(b18, b23);
+        b18 = goldilocks::mul(b20, d_base_consts[16]);
+        b18 = goldilocks::add(b23, b18);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[2]; e20 = ext3::mul_base(y, x); }
+        e20 = ext3::sub(e6, e20);
+        e16 = ext3::mul(e19, e20);
+        b34 = goldilocks::mul(b34, d_base_consts[1]);
+        b34 = goldilocks::add(d_base_consts[0], b34);
+        b35 = goldilocks::mul(b35, d_base_consts[1]);
+        b35 = goldilocks::add(b34, b35);
+        b41 = goldilocks::mul(b41, d_base_consts[1]);
+        b41 = goldilocks::add(b35, b41);
+        b42 = goldilocks::mul(b42, d_base_consts[1]);
+        b42 = goldilocks::add(b41, b42);
+        b9 = goldilocks::mul(b9, d_base_consts[17]);
+        b9 = goldilocks::add(b42, b9);
+        b9 = goldilocks::add(b9, d_base_consts[18]);
+        b19 = goldilocks::mul(b19, d_base_consts[8]);
+        b19 = goldilocks::add(b9, b19);
+        b20 = goldilocks::mul(b20, d_base_consts[8]);
+        b20 = goldilocks::add(b19, b20);
+        b24 = goldilocks::mul(b24, d_base_consts[8]);
+        b24 = goldilocks::add(b20, b24);
+        b25 = goldilocks::mul(b25, d_base_consts[8]);
+        b25 = goldilocks::add(b24, b25);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e14, e8);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[2]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e8, e14);
+        { uint64_t x = b50; Fe3 y = d_alpha_powers[2]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e6, e8);
+        e6 = ext3::mul(e14, e8);
+        e22 = ext3::mul(e16, e6);
+        e22 = ext3::mul(e21, e22);
+        { uint64_t x = b5; Fe3 y = e20; e20 = ext3::mul_base(y, x); }
+        { uint64_t x = b5; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        e19 = ext3::add(e20, e19);
+        e6 = ext3::mul(e19, e6);
+        { uint64_t x = b61; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        { uint64_t x = b61; Fe3 y = e14; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::add(e8, e14);
+        e16 = ext3::mul(e14, e16);
+        e16 = ext3::add(e6, e16);
+        e16 = ext3::sub(e22, e16);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[26], e16));
+        e22 = ext3::make(d_aux[(uint64_t)24 * aux_stride + r1], d_aux[(uint64_t)25 * aux_stride + r1], d_aux[(uint64_t)26 * aux_stride + r1]);
+        e6 = ext3::make(d_aux[(uint64_t)24 * aux_stride + r0], d_aux[(uint64_t)25 * aux_stride + r0], d_aux[(uint64_t)26 * aux_stride + r0]);
+        e6 = ext3::sub(e22, e6);
+        e0 = ext3::sub(e6, e0);
+        e9 = ext3::sub(e0, e9);
+        e12 = ext3::sub(e9, e12);
+        e15 = ext3::sub(e12, e15);
+        e17 = ext3::sub(e15, e17);
+        e18 = ext3::sub(e17, e18);
+        e11 = ext3::sub(e18, e11);
+        e21 = ext3::sub(e11, e21);
+        e21 = ext3::add(e21, u_offset);
+        { uint64_t x = b36; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        { uint64_t x = b43; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e11, e3);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[3]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[4]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e11, e3);
+        b26 = goldilocks::add(d_base_consts[0], d_base_consts[13]);
+        b26 = goldilocks::add(b26, b0);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[5]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e3, e11);
+        { uint64_t x = b53; Fe3 y = d_alpha_powers[6]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e11, e18);
+        { uint64_t x = b57; Fe3 y = d_alpha_powers[7]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e18, e11);
+        b57 = goldilocks::add(d_base_consts[0], d_base_consts[19]);
+        b0 = goldilocks::add(b57, b0);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[5]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e3, e18);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[6]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e18, e3);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[7]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e3, e18);
+        e3 = ext3::mul(e11, e18);
+        e3 = ext3::mul(e21, e3);
+        b59 = goldilocks::neg(b59);
+        { uint64_t x = b59; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        b60 = goldilocks::neg(b60);
+        { uint64_t x = b60; Fe3 y = e11; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::add(e18, e11);
+        e11 = ext3::sub(e3, e11);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[27], e11));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
 // LFM LFM_BALU: 100 nodes, 8 roots, 16 base / 9 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_e78a854a5175b7d6(
     Fe3 *__restrict__ d_h,
@@ -13421,7 +16988,819 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_e78a854a5175b7d6
     }
 }
 
-// STORE: 173 nodes, 11 roots, 23 base / 12 ext slots
+// HALT k4: 759 nodes, 9 roots, 7 base / 36 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_e998e426754c7b64(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27, e28, e29, e30, e31, e32, e33, e34, e35;
+        Fe3 sum = ext3::zero();
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b0 = d_main[(uint64_t)0 * main_stride + r0];
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        b1 = d_main[(uint64_t)1 * main_stride + r0];
+        { uint64_t x = b1; Fe3 y = d_alpha_powers[2]; e1 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e2, e1);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[2]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[3]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e1, e2);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e2, e1);
+        { uint64_t x = d_base_consts[3]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        b3 = goldilocks::add(d_base_consts[0], d_base_consts[4]);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e3, e4);
+        b4 = goldilocks::add(d_base_consts[0], d_base_consts[5]);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[2]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e5, e6);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[3]; e7 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e7);
+        e6 = ext3::sub(e6, e1);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[5]; e8 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e8);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[6]; e9 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e9);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[7]; e10 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e10);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[8]; e11 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e11);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[9]; e12 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e12);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[10]; e13 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e13);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[11]; e14 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e14);
+        b4 = goldilocks::add(d_base_consts[0], d_base_consts[6]);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[12]; e15 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e15);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[13]; e16 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e16);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[14]; e17 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e17);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[15]; e18 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e18);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[16]; e19 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e6, e19);
+        e20 = ext3::mul(e2, e6);
+        b5 = goldilocks::add(d_base_consts[0], d_base_consts[7]);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        b5 = goldilocks::add(d_base_consts[0], d_base_consts[8]);
+        { uint64_t x = b5; Fe3 y = d_alpha_powers[2]; e22 = ext3::mul_base(y, x); }
+        e22 = ext3::sub(e5, e22);
+        e22 = ext3::sub(e22, e7);
+        e22 = ext3::sub(e22, e1);
+        e22 = ext3::sub(e22, e8);
+        e22 = ext3::sub(e22, e9);
+        e22 = ext3::sub(e22, e10);
+        e22 = ext3::sub(e22, e11);
+        e22 = ext3::sub(e22, e12);
+        e22 = ext3::sub(e22, e13);
+        e22 = ext3::sub(e22, e14);
+        e22 = ext3::sub(e22, e15);
+        e22 = ext3::sub(e22, e16);
+        e22 = ext3::sub(e22, e17);
+        e22 = ext3::sub(e22, e18);
+        e22 = ext3::sub(e22, e19);
+        e23 = ext3::mul(e21, e22);
+        e24 = ext3::mul(e20, e23);
+        e24 = ext3::mul(e0, e24);
+        b5 = goldilocks::neg(d_base_consts[4]);
+        { uint64_t x = b5; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e6, e2);
+        e23 = ext3::mul(e2, e23);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e22; e22 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::add(e22, e21);
+        e20 = ext3::mul(e21, e20);
+        e20 = ext3::add(e23, e20);
+        e20 = ext3::sub(e24, e20);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[0], e20));
+        e24 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[9]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e5, e23);
+        e23 = ext3::sub(e23, e7);
+        e23 = ext3::sub(e23, e1);
+        e23 = ext3::sub(e23, e8);
+        e23 = ext3::sub(e23, e9);
+        e23 = ext3::sub(e23, e10);
+        e23 = ext3::sub(e23, e11);
+        e23 = ext3::sub(e23, e12);
+        e23 = ext3::sub(e23, e13);
+        e23 = ext3::sub(e23, e14);
+        e23 = ext3::sub(e23, e15);
+        e23 = ext3::sub(e23, e16);
+        e23 = ext3::sub(e23, e17);
+        e23 = ext3::sub(e23, e18);
+        e23 = ext3::sub(e23, e19);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[10]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        e22 = ext3::mul(e23, e21);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[11]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e5, e2);
+        e2 = ext3::sub(e2, e7);
+        e2 = ext3::sub(e2, e1);
+        e2 = ext3::sub(e2, e8);
+        e2 = ext3::sub(e2, e9);
+        e2 = ext3::sub(e2, e10);
+        e2 = ext3::sub(e2, e11);
+        e2 = ext3::sub(e2, e12);
+        e2 = ext3::sub(e2, e13);
+        e2 = ext3::sub(e2, e14);
+        e2 = ext3::sub(e2, e15);
+        e2 = ext3::sub(e2, e16);
+        e2 = ext3::sub(e2, e17);
+        e2 = ext3::sub(e2, e18);
+        e2 = ext3::sub(e2, e19);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[3]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e5, e6);
+        e6 = ext3::sub(e6, e7);
+        e6 = ext3::sub(e6, e1);
+        e6 = ext3::sub(e6, e8);
+        e6 = ext3::sub(e6, e9);
+        e6 = ext3::sub(e6, e10);
+        e6 = ext3::sub(e6, e11);
+        e6 = ext3::sub(e6, e12);
+        e6 = ext3::sub(e6, e13);
+        e6 = ext3::sub(e6, e14);
+        e6 = ext3::sub(e6, e15);
+        e6 = ext3::sub(e6, e16);
+        e6 = ext3::sub(e6, e17);
+        e6 = ext3::sub(e6, e18);
+        e6 = ext3::sub(e6, e19);
+        e25 = ext3::mul(e2, e6);
+        e26 = ext3::mul(e22, e25);
+        e26 = ext3::mul(e24, e26);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e23; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::add(e21, e23);
+        e25 = ext3::mul(e23, e25);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::add(e6, e2);
+        e22 = ext3::mul(e2, e22);
+        e22 = ext3::add(e25, e22);
+        e22 = ext3::sub(e26, e22);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[1], e22));
+        e26 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[12]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e5, e25);
+        e25 = ext3::sub(e25, e7);
+        e25 = ext3::sub(e25, e1);
+        e25 = ext3::sub(e25, e8);
+        e25 = ext3::sub(e25, e9);
+        e25 = ext3::sub(e25, e10);
+        e25 = ext3::sub(e25, e11);
+        e25 = ext3::sub(e25, e12);
+        e25 = ext3::sub(e25, e13);
+        e25 = ext3::sub(e25, e14);
+        e25 = ext3::sub(e25, e15);
+        e25 = ext3::sub(e25, e16);
+        e25 = ext3::sub(e25, e17);
+        e25 = ext3::sub(e25, e18);
+        e25 = ext3::sub(e25, e19);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[13]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[2]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e5, e2);
+        e2 = ext3::sub(e2, e7);
+        e2 = ext3::sub(e2, e1);
+        e2 = ext3::sub(e2, e8);
+        e2 = ext3::sub(e2, e9);
+        e2 = ext3::sub(e2, e10);
+        e2 = ext3::sub(e2, e11);
+        e2 = ext3::sub(e2, e12);
+        e2 = ext3::sub(e2, e13);
+        e2 = ext3::sub(e2, e14);
+        e2 = ext3::sub(e2, e15);
+        e2 = ext3::sub(e2, e16);
+        e2 = ext3::sub(e2, e17);
+        e2 = ext3::sub(e2, e18);
+        e2 = ext3::sub(e2, e19);
+        e6 = ext3::mul(e25, e2);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[1]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        e3 = ext3::sub(e3, e7);
+        e3 = ext3::sub(e3, e1);
+        e3 = ext3::sub(e3, e8);
+        e3 = ext3::sub(e3, e9);
+        e3 = ext3::sub(e3, e10);
+        e3 = ext3::sub(e3, e11);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[9]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        b6 = goldilocks::add(d_base_consts[0], d_base_consts[14]);
+        { uint64_t x = b6; Fe3 y = d_alpha_powers[10]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        e3 = ext3::sub(e3, e14);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[12]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[13]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[14]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        e23 = ext3::sub(e23, e18);
+        e23 = ext3::sub(e23, e19);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[17]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[18]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[19]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[20]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[21]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[22]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[23]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e23, e3);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[24]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e3, e23);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[15]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e5, e3);
+        e3 = ext3::sub(e3, e7);
+        e3 = ext3::sub(e3, e1);
+        e3 = ext3::sub(e3, e8);
+        e3 = ext3::sub(e3, e9);
+        e3 = ext3::sub(e3, e10);
+        e3 = ext3::sub(e3, e11);
+        e3 = ext3::sub(e3, e12);
+        e3 = ext3::sub(e3, e13);
+        e3 = ext3::sub(e3, e14);
+        e3 = ext3::sub(e3, e15);
+        e3 = ext3::sub(e3, e16);
+        e3 = ext3::sub(e3, e17);
+        e3 = ext3::sub(e3, e18);
+        e3 = ext3::sub(e3, e19);
+        e21 = ext3::mul(e23, e3);
+        e27 = ext3::mul(e6, e21);
+        e27 = ext3::mul(e26, e27);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::add(e2, e25);
+        e21 = ext3::mul(e25, e21);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e23; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::add(e3, e23);
+        e6 = ext3::mul(e23, e6);
+        e6 = ext3::add(e21, e6);
+        e6 = ext3::sub(e27, e6);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[2], e6));
+        e27 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[16]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[17]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e5, e23);
+        e23 = ext3::sub(e23, e7);
+        e23 = ext3::sub(e23, e1);
+        e23 = ext3::sub(e23, e8);
+        e23 = ext3::sub(e23, e9);
+        e23 = ext3::sub(e23, e10);
+        e23 = ext3::sub(e23, e11);
+        e23 = ext3::sub(e23, e12);
+        e23 = ext3::sub(e23, e13);
+        e23 = ext3::sub(e23, e14);
+        e23 = ext3::sub(e23, e15);
+        e23 = ext3::sub(e23, e16);
+        e23 = ext3::sub(e23, e17);
+        e23 = ext3::sub(e23, e18);
+        e23 = ext3::sub(e23, e19);
+        e3 = ext3::mul(e21, e23);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[18]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e5, e25);
+        e25 = ext3::sub(e25, e7);
+        e25 = ext3::sub(e25, e1);
+        e25 = ext3::sub(e25, e8);
+        e25 = ext3::sub(e25, e9);
+        e25 = ext3::sub(e25, e10);
+        e25 = ext3::sub(e25, e11);
+        e25 = ext3::sub(e25, e12);
+        e25 = ext3::sub(e25, e13);
+        e25 = ext3::sub(e25, e14);
+        e25 = ext3::sub(e25, e15);
+        e25 = ext3::sub(e25, e16);
+        e25 = ext3::sub(e25, e17);
+        e25 = ext3::sub(e25, e18);
+        e25 = ext3::sub(e25, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[19]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e5, e2);
+        e2 = ext3::sub(e2, e7);
+        e2 = ext3::sub(e2, e1);
+        e2 = ext3::sub(e2, e8);
+        e2 = ext3::sub(e2, e9);
+        e2 = ext3::sub(e2, e10);
+        e2 = ext3::sub(e2, e11);
+        e2 = ext3::sub(e2, e12);
+        e2 = ext3::sub(e2, e13);
+        e2 = ext3::sub(e2, e14);
+        e2 = ext3::sub(e2, e15);
+        e2 = ext3::sub(e2, e16);
+        e2 = ext3::sub(e2, e17);
+        e2 = ext3::sub(e2, e18);
+        e2 = ext3::sub(e2, e19);
+        e28 = ext3::mul(e25, e2);
+        e29 = ext3::mul(e3, e28);
+        e29 = ext3::mul(e27, e29);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e23; e23 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::add(e23, e21);
+        e28 = ext3::mul(e21, e28);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::add(e2, e25);
+        e3 = ext3::mul(e25, e3);
+        e3 = ext3::add(e28, e3);
+        e3 = ext3::sub(e29, e3);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[3], e3));
+        e29 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[20]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::sub(e5, e28);
+        e28 = ext3::sub(e28, e7);
+        e28 = ext3::sub(e28, e1);
+        e28 = ext3::sub(e28, e8);
+        e28 = ext3::sub(e28, e9);
+        e28 = ext3::sub(e28, e10);
+        e28 = ext3::sub(e28, e11);
+        e28 = ext3::sub(e28, e12);
+        e28 = ext3::sub(e28, e13);
+        e28 = ext3::sub(e28, e14);
+        e28 = ext3::sub(e28, e15);
+        e28 = ext3::sub(e28, e16);
+        e28 = ext3::sub(e28, e17);
+        e28 = ext3::sub(e28, e18);
+        e28 = ext3::sub(e28, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[21]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e5, e25);
+        e25 = ext3::sub(e25, e7);
+        e25 = ext3::sub(e25, e1);
+        e25 = ext3::sub(e25, e8);
+        e25 = ext3::sub(e25, e9);
+        e25 = ext3::sub(e25, e10);
+        e25 = ext3::sub(e25, e11);
+        e25 = ext3::sub(e25, e12);
+        e25 = ext3::sub(e25, e13);
+        e25 = ext3::sub(e25, e14);
+        e25 = ext3::sub(e25, e15);
+        e25 = ext3::sub(e25, e16);
+        e25 = ext3::sub(e25, e17);
+        e25 = ext3::sub(e25, e18);
+        e25 = ext3::sub(e25, e19);
+        e2 = ext3::mul(e28, e25);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[22]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[23]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e23 = ext3::mul_base(y, x); }
+        e23 = ext3::sub(e5, e23);
+        e23 = ext3::sub(e23, e7);
+        e23 = ext3::sub(e23, e1);
+        e23 = ext3::sub(e23, e8);
+        e23 = ext3::sub(e23, e9);
+        e23 = ext3::sub(e23, e10);
+        e23 = ext3::sub(e23, e11);
+        e23 = ext3::sub(e23, e12);
+        e23 = ext3::sub(e23, e13);
+        e23 = ext3::sub(e23, e14);
+        e23 = ext3::sub(e23, e15);
+        e23 = ext3::sub(e23, e16);
+        e23 = ext3::sub(e23, e17);
+        e23 = ext3::sub(e23, e18);
+        e23 = ext3::sub(e23, e19);
+        e30 = ext3::mul(e21, e23);
+        e31 = ext3::mul(e2, e30);
+        e31 = ext3::mul(e29, e31);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e28; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::add(e25, e28);
+        e30 = ext3::mul(e28, e30);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e23; e23 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::add(e23, e21);
+        e2 = ext3::mul(e21, e2);
+        e2 = ext3::add(e30, e2);
+        e2 = ext3::sub(e31, e2);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[4], e2));
+        e31 = ext3::make(d_aux[(uint64_t)15 * aux_stride + r0], d_aux[(uint64_t)16 * aux_stride + r0], d_aux[(uint64_t)17 * aux_stride + r0]);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[24]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::sub(e5, e30);
+        e30 = ext3::sub(e30, e7);
+        e30 = ext3::sub(e30, e1);
+        e30 = ext3::sub(e30, e8);
+        e30 = ext3::sub(e30, e9);
+        e30 = ext3::sub(e30, e10);
+        e30 = ext3::sub(e30, e11);
+        e30 = ext3::sub(e30, e12);
+        e30 = ext3::sub(e30, e13);
+        e30 = ext3::sub(e30, e14);
+        e30 = ext3::sub(e30, e15);
+        e30 = ext3::sub(e30, e16);
+        e30 = ext3::sub(e30, e17);
+        e30 = ext3::sub(e30, e18);
+        e30 = ext3::sub(e30, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[25]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        e23 = ext3::mul(e30, e21);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[26]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::sub(e5, e28);
+        e28 = ext3::sub(e28, e7);
+        e28 = ext3::sub(e28, e1);
+        e28 = ext3::sub(e28, e8);
+        e28 = ext3::sub(e28, e9);
+        e28 = ext3::sub(e28, e10);
+        e28 = ext3::sub(e28, e11);
+        e28 = ext3::sub(e28, e12);
+        e28 = ext3::sub(e28, e13);
+        e28 = ext3::sub(e28, e14);
+        e28 = ext3::sub(e28, e15);
+        e28 = ext3::sub(e28, e16);
+        e28 = ext3::sub(e28, e17);
+        e28 = ext3::sub(e28, e18);
+        e28 = ext3::sub(e28, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[27]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e25 = ext3::mul_base(y, x); }
+        e25 = ext3::sub(e5, e25);
+        e25 = ext3::sub(e25, e7);
+        e25 = ext3::sub(e25, e1);
+        e25 = ext3::sub(e25, e8);
+        e25 = ext3::sub(e25, e9);
+        e25 = ext3::sub(e25, e10);
+        e25 = ext3::sub(e25, e11);
+        e25 = ext3::sub(e25, e12);
+        e25 = ext3::sub(e25, e13);
+        e25 = ext3::sub(e25, e14);
+        e25 = ext3::sub(e25, e15);
+        e25 = ext3::sub(e25, e16);
+        e25 = ext3::sub(e25, e17);
+        e25 = ext3::sub(e25, e18);
+        e25 = ext3::sub(e25, e19);
+        e32 = ext3::mul(e28, e25);
+        e33 = ext3::mul(e23, e32);
+        e33 = ext3::mul(e31, e33);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e30; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::add(e21, e30);
+        e32 = ext3::mul(e30, e32);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e25; e25 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e28; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::add(e25, e28);
+        e23 = ext3::mul(e28, e23);
+        e23 = ext3::add(e32, e23);
+        e23 = ext3::sub(e33, e23);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[5], e23));
+        e33 = ext3::make(d_aux[(uint64_t)18 * aux_stride + r0], d_aux[(uint64_t)19 * aux_stride + r0], d_aux[(uint64_t)20 * aux_stride + r0]);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[28]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::sub(e5, e32);
+        e32 = ext3::sub(e32, e7);
+        e32 = ext3::sub(e32, e1);
+        e32 = ext3::sub(e32, e8);
+        e32 = ext3::sub(e32, e9);
+        e32 = ext3::sub(e32, e10);
+        e32 = ext3::sub(e32, e11);
+        e32 = ext3::sub(e32, e12);
+        e32 = ext3::sub(e32, e13);
+        e32 = ext3::sub(e32, e14);
+        e32 = ext3::sub(e32, e15);
+        e32 = ext3::sub(e32, e16);
+        e32 = ext3::sub(e32, e17);
+        e32 = ext3::sub(e32, e18);
+        e32 = ext3::sub(e32, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[29]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::sub(e5, e28);
+        e28 = ext3::sub(e28, e7);
+        e28 = ext3::sub(e28, e1);
+        e28 = ext3::sub(e28, e8);
+        e28 = ext3::sub(e28, e9);
+        e28 = ext3::sub(e28, e10);
+        e28 = ext3::sub(e28, e11);
+        e28 = ext3::sub(e28, e12);
+        e28 = ext3::sub(e28, e13);
+        e28 = ext3::sub(e28, e14);
+        e28 = ext3::sub(e28, e15);
+        e28 = ext3::sub(e28, e16);
+        e28 = ext3::sub(e28, e17);
+        e28 = ext3::sub(e28, e18);
+        e28 = ext3::sub(e28, e19);
+        e25 = ext3::mul(e32, e28);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[30]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::sub(e5, e30);
+        e30 = ext3::sub(e30, e7);
+        e30 = ext3::sub(e30, e1);
+        e30 = ext3::sub(e30, e8);
+        e30 = ext3::sub(e30, e9);
+        e30 = ext3::sub(e30, e10);
+        e30 = ext3::sub(e30, e11);
+        e30 = ext3::sub(e30, e12);
+        e30 = ext3::sub(e30, e13);
+        e30 = ext3::sub(e30, e14);
+        e30 = ext3::sub(e30, e15);
+        e30 = ext3::sub(e30, e16);
+        e30 = ext3::sub(e30, e17);
+        e30 = ext3::sub(e30, e18);
+        e30 = ext3::sub(e30, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[31]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e21 = ext3::mul_base(y, x); }
+        e21 = ext3::sub(e5, e21);
+        e21 = ext3::sub(e21, e7);
+        e21 = ext3::sub(e21, e1);
+        e21 = ext3::sub(e21, e8);
+        e21 = ext3::sub(e21, e9);
+        e21 = ext3::sub(e21, e10);
+        e21 = ext3::sub(e21, e11);
+        e21 = ext3::sub(e21, e12);
+        e21 = ext3::sub(e21, e13);
+        e21 = ext3::sub(e21, e14);
+        e21 = ext3::sub(e21, e15);
+        e21 = ext3::sub(e21, e16);
+        e21 = ext3::sub(e21, e17);
+        e21 = ext3::sub(e21, e18);
+        e21 = ext3::sub(e21, e19);
+        e34 = ext3::mul(e30, e21);
+        e35 = ext3::mul(e25, e34);
+        e35 = ext3::mul(e33, e35);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e28; e28 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e32; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::add(e28, e32);
+        e34 = ext3::mul(e32, e34);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e21; e21 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e30; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::add(e21, e30);
+        e25 = ext3::mul(e30, e25);
+        e25 = ext3::add(e34, e25);
+        e25 = ext3::sub(e35, e25);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[6], e25));
+        e35 = ext3::make(d_aux[(uint64_t)21 * aux_stride + r0], d_aux[(uint64_t)22 * aux_stride + r0], d_aux[(uint64_t)23 * aux_stride + r0]);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[32]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e34 = ext3::mul_base(y, x); }
+        e34 = ext3::sub(e5, e34);
+        e34 = ext3::sub(e34, e7);
+        e34 = ext3::sub(e34, e1);
+        e34 = ext3::sub(e34, e8);
+        e34 = ext3::sub(e34, e9);
+        e34 = ext3::sub(e34, e10);
+        e34 = ext3::sub(e34, e11);
+        e34 = ext3::sub(e34, e12);
+        e34 = ext3::sub(e34, e13);
+        e34 = ext3::sub(e34, e14);
+        e34 = ext3::sub(e34, e15);
+        e34 = ext3::sub(e34, e16);
+        e34 = ext3::sub(e34, e17);
+        e34 = ext3::sub(e34, e18);
+        e34 = ext3::sub(e34, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[33]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::sub(e5, e30);
+        e30 = ext3::sub(e30, e7);
+        e30 = ext3::sub(e30, e1);
+        e30 = ext3::sub(e30, e8);
+        e30 = ext3::sub(e30, e9);
+        e30 = ext3::sub(e30, e10);
+        e30 = ext3::sub(e30, e11);
+        e30 = ext3::sub(e30, e12);
+        e30 = ext3::sub(e30, e13);
+        e30 = ext3::sub(e30, e14);
+        e30 = ext3::sub(e30, e15);
+        e30 = ext3::sub(e30, e16);
+        e30 = ext3::sub(e30, e17);
+        e30 = ext3::sub(e30, e18);
+        e30 = ext3::sub(e30, e19);
+        e21 = ext3::mul(e34, e30);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[34]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::sub(e5, e32);
+        e32 = ext3::sub(e32, e7);
+        e32 = ext3::sub(e32, e1);
+        e32 = ext3::sub(e32, e8);
+        e32 = ext3::sub(e32, e9);
+        e32 = ext3::sub(e32, e10);
+        e32 = ext3::sub(e32, e11);
+        e32 = ext3::sub(e32, e12);
+        e32 = ext3::sub(e32, e13);
+        e32 = ext3::sub(e32, e14);
+        e32 = ext3::sub(e32, e15);
+        e32 = ext3::sub(e32, e16);
+        e32 = ext3::sub(e32, e17);
+        e32 = ext3::sub(e32, e18);
+        e32 = ext3::sub(e32, e19);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[35]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::sub(e5, e28);
+        e28 = ext3::sub(e28, e7);
+        e1 = ext3::sub(e28, e1);
+        e8 = ext3::sub(e1, e8);
+        e8 = ext3::sub(e8, e9);
+        e10 = ext3::sub(e8, e10);
+        e11 = ext3::sub(e10, e11);
+        e12 = ext3::sub(e11, e12);
+        e13 = ext3::sub(e12, e13);
+        e14 = ext3::sub(e13, e14);
+        e15 = ext3::sub(e14, e15);
+        e16 = ext3::sub(e15, e16);
+        e17 = ext3::sub(e16, e17);
+        e18 = ext3::sub(e17, e18);
+        e19 = ext3::sub(e18, e19);
+        e18 = ext3::mul(e32, e19);
+        e17 = ext3::mul(e21, e18);
+        e17 = ext3::mul(e35, e17);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e30; e30 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e34; e34 = ext3::mul_base(y, x); }
+        e34 = ext3::add(e30, e34);
+        e18 = ext3::mul(e34, e18);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e19; e19 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e32; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::add(e19, e32);
+        e21 = ext3::mul(e32, e21);
+        e21 = ext3::add(e18, e21);
+        e21 = ext3::sub(e17, e21);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[7], e21));
+        e17 = ext3::make(d_aux[(uint64_t)24 * aux_stride + r1], d_aux[(uint64_t)25 * aux_stride + r1], d_aux[(uint64_t)26 * aux_stride + r1]);
+        e18 = ext3::make(d_aux[(uint64_t)24 * aux_stride + r0], d_aux[(uint64_t)25 * aux_stride + r0], d_aux[(uint64_t)26 * aux_stride + r0]);
+        e18 = ext3::sub(e17, e18);
+        e0 = ext3::sub(e18, e0);
+        e24 = ext3::sub(e0, e24);
+        e26 = ext3::sub(e24, e26);
+        e27 = ext3::sub(e26, e27);
+        e29 = ext3::sub(e27, e29);
+        e31 = ext3::sub(e29, e31);
+        e33 = ext3::sub(e31, e33);
+        e35 = ext3::sub(e33, e35);
+        e35 = ext3::add(e35, u_offset);
+        { uint64_t x = d_base_consts[12]; Fe3 y = d_rap_challenges[0]; e33 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e33 = ext3::neg(e33);
+        e4 = ext3::sub(e33, e4);
+        b2 = goldilocks::add(d_base_consts[0], d_base_consts[36]);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e33 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e4, e33);
+        e33 = ext3::sub(e33, e7);
+        b0 = goldilocks::mul(b0, d_base_consts[4]);
+        b0 = goldilocks::add(d_base_consts[0], b0);
+        b0 = goldilocks::add(b0, d_base_consts[4]);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[4]; e31 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e33, e31);
+        { uint64_t x = b1; Fe3 y = d_alpha_powers[5]; e29 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e33, e29);
+        b1 = d_main[(uint64_t)2 * main_stride + r0];
+        { uint64_t x = b1; Fe3 y = d_alpha_powers[6]; e27 = ext3::mul_base(y, x); }
+        e27 = ext3::sub(e33, e27);
+        b1 = goldilocks::add(d_base_consts[0], d_base_consts[37]);
+        { uint64_t x = b1; Fe3 y = d_alpha_powers[2]; e26 = ext3::mul_base(y, x); }
+        e26 = ext3::sub(e4, e26);
+        e7 = ext3::sub(e26, e7);
+        e31 = ext3::sub(e7, e31);
+        e29 = ext3::sub(e31, e29);
+        b1 = d_main[(uint64_t)3 * main_stride + r0];
+        { uint64_t x = b1; Fe3 y = d_alpha_powers[6]; e31 = ext3::mul_base(y, x); }
+        e31 = ext3::sub(e29, e31);
+        e7 = ext3::mul(e27, e31);
+        { uint64_t x = b3; Fe3 y = d_alpha_powers[6]; e26 = ext3::mul_base(y, x); }
+        e26 = ext3::sub(e33, e26);
+        e9 = ext3::sub(e29, e9);
+        e29 = ext3::mul(e26, e9);
+        e33 = ext3::mul(e7, e29);
+        e33 = ext3::mul(e35, e33);
+        { uint64_t x = d_base_consts[4]; Fe3 y = e31; e31 = ext3::mul_base(y, x); }
+        { uint64_t x = d_base_consts[4]; Fe3 y = e27; e27 = ext3::mul_base(y, x); }
+        e27 = ext3::add(e31, e27);
+        e29 = ext3::mul(e27, e29);
+        { uint64_t x = b5; Fe3 y = e9; e9 = ext3::mul_base(y, x); }
+        { uint64_t x = b5; Fe3 y = e26; e26 = ext3::mul_base(y, x); }
+        e26 = ext3::add(e9, e26);
+        e7 = ext3::mul(e26, e7);
+        e7 = ext3::add(e29, e7);
+        e7 = ext3::sub(e33, e7);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[8], e7));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// STORE, STORE k4: 173 nodes, 11 roots, 23 base / 12 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_eebea8979413dd08(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -14211,7 +18590,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_f577186fb528b4f9
     }
 }
 
-// KECCAK_RC, LFM KECCAK_RC: 38 nodes, 1 roots, 2 base / 3 ext slots
+// KECCAK_RC, LFM KECCAK_RC, KECCAK_RC k4: 38 nodes, 1 roots, 2 base / 3 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_f6ed0cd42a754a55(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -14364,7 +18743,460 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_fc7726040983ca7f
     }
 }
 
-// PAGE: 51 nodes, 2 roots, 5 base / 6 ext slots
+// COMMIT k4: 396 nodes, 13 roots, 34 base / 35 ext slots
+extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_feb63d2be71a2bf3(
+    Fe3 *__restrict__ d_h,
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    const Fe3 *__restrict__ d_beta_trans,
+    const uint64_t *__restrict__ d_z_inv,
+    uint64_t z_len,
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,
+    const uint64_t *__restrict__ d_b_is_aux,
+    const Fe3 *__restrict__ d_b_value,
+    const Fe3 *__restrict__ d_b_beta,
+    const uint64_t *__restrict__ d_b_z_inv,
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
+    (void)d_nodes; (void)num_nodes; (void)d_roots; (void)num_roots; (void)d_vals_base; (void)d_vals_ext;
+    const Fe3 u_offset = *d_table_offset;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < num_rows; row += stride) {
+        const uint64_t r0 = ccomp_frame_row(row, 0, next_step, num_rows);
+        const uint64_t r1 = ccomp_frame_row(row, 1, next_step, num_rows);
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33;
+        Fe3 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27, e28, e29, e30, e31, e32, e33, e34;
+        Fe3 sum = ext3::zero();
+        b0 = d_main[(uint64_t)15 * main_stride + r0];
+        b1 = goldilocks::sub(d_base_consts[1], b0);
+        b1 = goldilocks::mul(b0, b1);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[0], b1));
+        b2 = d_main[(uint64_t)16 * main_stride + r0];
+        b3 = goldilocks::sub(d_base_consts[1], b2);
+        b3 = goldilocks::mul(b2, b3);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[1], b3));
+        b4 = d_main[(uint64_t)18 * main_stride + r0];
+        b5 = goldilocks::sub(d_base_consts[1], b4);
+        b6 = goldilocks::mul(b4, b5);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[2], b6));
+        b7 = goldilocks::add(b0, b2);
+        b5 = goldilocks::mul(b7, b5);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[3], b5));
+        b7 = d_main[(uint64_t)3 * main_stride + r0];
+        b8 = goldilocks::add(d_base_consts[0], d_base_consts[1]);
+        b9 = goldilocks::add(b7, b8);
+        b10 = d_main[(uint64_t)5 * main_stride + r0];
+        b11 = goldilocks::mul(b10, d_base_consts[1]);
+        b11 = goldilocks::add(d_base_consts[0], b11);
+        b12 = d_main[(uint64_t)6 * main_stride + r0];
+        b13 = goldilocks::mul(b12, d_base_consts[2]);
+        b11 = goldilocks::add(b11, b13);
+        b11 = goldilocks::sub(b9, b11);
+        b11 = goldilocks::mul(b11, d_base_consts[3]);
+        b9 = goldilocks::sub(d_base_consts[1], b11);
+        b9 = goldilocks::mul(b11, b9);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[4], b9));
+        b14 = d_main[(uint64_t)4 * main_stride + r0];
+        b15 = goldilocks::add(b14, d_base_consts[0]);
+        b11 = goldilocks::add(b15, b11);
+        b15 = d_main[(uint64_t)7 * main_stride + r0];
+        b16 = goldilocks::mul(b15, d_base_consts[1]);
+        b16 = goldilocks::add(d_base_consts[0], b16);
+        b17 = d_main[(uint64_t)8 * main_stride + r0];
+        b18 = goldilocks::mul(b17, d_base_consts[2]);
+        b16 = goldilocks::add(b16, b18);
+        b16 = goldilocks::sub(b11, b16);
+        b16 = goldilocks::mul(b16, d_base_consts[3]);
+        b11 = goldilocks::sub(d_base_consts[1], b16);
+        b11 = goldilocks::mul(b16, b11);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[5], b11));
+        b16 = d_main[(uint64_t)11 * main_stride + r0];
+        b19 = goldilocks::mul(b16, d_base_consts[1]);
+        b19 = goldilocks::add(d_base_consts[0], b19);
+        b20 = d_main[(uint64_t)12 * main_stride + r0];
+        b21 = goldilocks::mul(b20, d_base_consts[2]);
+        b19 = goldilocks::add(b19, b21);
+        b19 = goldilocks::add(b19, b8);
+        b22 = d_main[(uint64_t)9 * main_stride + r0];
+        b19 = goldilocks::sub(b19, b22);
+        b19 = goldilocks::mul(b19, d_base_consts[3]);
+        b23 = goldilocks::sub(d_base_consts[1], b19);
+        b23 = goldilocks::mul(b19, b23);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[6], b23));
+        b24 = d_main[(uint64_t)13 * main_stride + r0];
+        b25 = goldilocks::mul(b24, d_base_consts[1]);
+        b25 = goldilocks::add(d_base_consts[0], b25);
+        b26 = d_main[(uint64_t)14 * main_stride + r0];
+        b27 = goldilocks::mul(b26, d_base_consts[2]);
+        b25 = goldilocks::add(b25, b27);
+        b25 = goldilocks::add(b25, d_base_consts[0]);
+        b19 = goldilocks::add(b25, b19);
+        b25 = d_main[(uint64_t)10 * main_stride + r0];
+        b19 = goldilocks::sub(b19, b25);
+        b19 = goldilocks::mul(b19, d_base_consts[3]);
+        b28 = goldilocks::sub(d_base_consts[1], b19);
+        b28 = goldilocks::mul(b19, b28);
+        sum = ext3::add(sum, ext3::mul_base(d_beta_trans[7], b28));
+        e0 = ext3::make(d_aux[(uint64_t)0 * aux_stride + r0], d_aux[(uint64_t)1 * aux_stride + r0], d_aux[(uint64_t)2 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[4]; Fe3 y = d_rap_challenges[0]; e1 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e1 = ext3::neg(e1);
+        b19 = d_main[(uint64_t)0 * main_stride + r0];
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e2);
+        b29 = d_main[(uint64_t)1 * main_stride + r0];
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e1 = ext3::sub(e1, e3);
+        b30 = goldilocks::add(d_base_consts[0], d_base_consts[5]);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[3]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e1, e4);
+        b30 = goldilocks::add(d_base_consts[0], d_base_consts[0]);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[4]; e1 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e4, e1);
+        { uint64_t x = d_base_consts[6]; Fe3 y = d_rap_challenges[0]; e5 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e5 = ext3::neg(e5);
+        e2 = ext3::sub(e5, e2);
+        e3 = ext3::sub(e2, e3);
+        b31 = d_main[(uint64_t)2 * main_stride + r0];
+        b32 = goldilocks::mul(b31, d_base_consts[1]);
+        b32 = goldilocks::add(d_base_consts[0], b32);
+        b33 = goldilocks::add(b32, d_base_consts[1]);
+        { uint64_t x = b33; Fe3 y = d_alpha_powers[3]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e3, e2);
+        b13 = goldilocks::add(b10, b13);
+        { uint64_t x = b13; Fe3 y = d_alpha_powers[4]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e2, e5);
+        b18 = goldilocks::add(b15, b18);
+        { uint64_t x = b18; Fe3 y = d_alpha_powers[5]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e5, e2);
+        b21 = goldilocks::add(b16, b21);
+        { uint64_t x = b21; Fe3 y = d_alpha_powers[6]; e5 = ext3::mul_base(y, x); }
+        e5 = ext3::sub(e2, e5);
+        b27 = goldilocks::add(b24, b27);
+        { uint64_t x = b27; Fe3 y = d_alpha_powers[7]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e5, e2);
+        e5 = ext3::mul(e4, e2);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[3]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e3, e6);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[4]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e6, e3);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[5]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e3, e6);
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[6]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e6, e3);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[7]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e3, e6);
+        { uint64_t x = d_base_consts[1]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        { uint64_t x = b16; Fe3 y = d_alpha_powers[1]; e7 = ext3::mul_base(y, x); }
+        e7 = ext3::sub(e3, e7);
+        e8 = ext3::mul(e6, e7);
+        e9 = ext3::mul(e5, e8);
+        e9 = ext3::mul(e0, e9);
+        b27 = goldilocks::neg(b0);
+        { uint64_t x = b27; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        b27 = goldilocks::sub(b4, b2);
+        { uint64_t x = b27; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e2, e4);
+        e8 = ext3::mul(e4, e8);
+        b21 = goldilocks::sub(b4, b0);
+        b21 = goldilocks::neg(b21);
+        { uint64_t x = b21; Fe3 y = e7; e7 = ext3::mul_base(y, x); }
+        { uint64_t x = b4; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::add(e7, e6);
+        e5 = ext3::mul(e6, e5);
+        e5 = ext3::add(e8, e5);
+        e5 = ext3::sub(e9, e5);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[8], e5));
+        e9 = ext3::make(d_aux[(uint64_t)3 * aux_stride + r0], d_aux[(uint64_t)4 * aux_stride + r0], d_aux[(uint64_t)5 * aux_stride + r0]);
+        { uint64_t x = b20; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = b24; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e3, e6);
+        e7 = ext3::mul(e8, e6);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e3, e4);
+        { uint64_t x = b10; Fe3 y = d_alpha_powers[1]; e2 = ext3::mul_base(y, x); }
+        e2 = ext3::sub(e3, e2);
+        e10 = ext3::mul(e4, e2);
+        e11 = ext3::mul(e7, e10);
+        e11 = ext3::mul(e9, e11);
+        { uint64_t x = b4; Fe3 y = e6; e6 = ext3::mul_base(y, x); }
+        { uint64_t x = b4; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e6, e8);
+        e10 = ext3::mul(e8, e10);
+        { uint64_t x = b4; Fe3 y = e2; e2 = ext3::mul_base(y, x); }
+        { uint64_t x = b4; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::add(e2, e4);
+        e7 = ext3::mul(e4, e7);
+        e7 = ext3::add(e10, e7);
+        e7 = ext3::sub(e11, e7);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[9], e7));
+        e11 = ext3::make(d_aux[(uint64_t)6 * aux_stride + r0], d_aux[(uint64_t)7 * aux_stride + r0], d_aux[(uint64_t)8 * aux_stride + r0]);
+        { uint64_t x = b12; Fe3 y = d_alpha_powers[1]; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::sub(e3, e10);
+        { uint64_t x = b15; Fe3 y = d_alpha_powers[1]; e4 = ext3::mul_base(y, x); }
+        e4 = ext3::sub(e3, e4);
+        e2 = ext3::mul(e10, e4);
+        { uint64_t x = b17; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e3, e8);
+        { uint64_t x = d_base_consts[7]; Fe3 y = d_rap_challenges[0]; e3 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e3 = ext3::neg(e3);
+        b17 = goldilocks::add(d_base_consts[0], d_base_consts[8]);
+        b16 = goldilocks::mul(b16, d_base_consts[9]);
+        b16 = goldilocks::add(b17, b16);
+        b20 = goldilocks::mul(b20, d_base_consts[9]);
+        b20 = goldilocks::add(b16, b20);
+        b24 = goldilocks::mul(b24, d_base_consts[9]);
+        b24 = goldilocks::add(b20, b24);
+        b26 = goldilocks::mul(b26, d_base_consts[9]);
+        b26 = goldilocks::add(b24, b26);
+        { uint64_t x = b26; Fe3 y = d_alpha_powers[1]; e6 = ext3::mul_base(y, x); }
+        e6 = ext3::sub(e3, e6);
+        { uint64_t x = b2; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e3 = ext3::sub(e6, e3);
+        e6 = ext3::mul(e8, e3);
+        e12 = ext3::mul(e2, e6);
+        e12 = ext3::mul(e11, e12);
+        { uint64_t x = b4; Fe3 y = e4; e4 = ext3::mul_base(y, x); }
+        { uint64_t x = b4; Fe3 y = e10; e10 = ext3::mul_base(y, x); }
+        e10 = ext3::add(e4, e10);
+        e6 = ext3::mul(e10, e6);
+        { uint64_t x = b4; Fe3 y = e3; e3 = ext3::mul_base(y, x); }
+        { uint64_t x = b4; Fe3 y = e8; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::add(e3, e8);
+        e2 = ext3::mul(e8, e2);
+        e2 = ext3::add(e6, e2);
+        e2 = ext3::sub(e12, e2);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[10], e2));
+        e12 = ext3::make(d_aux[(uint64_t)9 * aux_stride + r0], d_aux[(uint64_t)10 * aux_stride + r0], d_aux[(uint64_t)11 * aux_stride + r0]);
+        { uint64_t x = d_base_consts[10]; Fe3 y = d_rap_challenges[0]; e6 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e6 = ext3::neg(e6);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[1]; e8 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e6, e8);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[2]; e3 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e3);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[3]; e10 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e10);
+        e8 = ext3::sub(e8, e1);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[5]; e4 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e4);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[6]; e13 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e13);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[7]; e14 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e14);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[8]; e15 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e15);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[9]; e16 = ext3::mul_base(y, x); }
+        e8 = ext3::sub(e8, e16);
+        b4 = goldilocks::add(d_base_consts[0], d_base_consts[6]);
+        { uint64_t x = b4; Fe3 y = d_alpha_powers[10]; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e8, e17);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[11]; e8 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e8);
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[12]; e18 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e18);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[13]; e19 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e19);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[14]; e20 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e20);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[15]; e21 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e21);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[16]; e22 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e22);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[17]; e23 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e23);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[18]; e24 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e24);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[19]; e25 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e25);
+        { uint64_t x = b19; Fe3 y = d_alpha_powers[20]; e26 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e26);
+        { uint64_t x = b29; Fe3 y = d_alpha_powers[21]; e27 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e27);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[22]; e28 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e28);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[23]; e29 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e29);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[24]; e30 = ext3::mul_base(y, x); }
+        e17 = ext3::sub(e17, e30);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[1]; e31 = ext3::mul_base(y, x); }
+        e31 = ext3::sub(e6, e31);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[2]; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::sub(e31, e32);
+        e32 = ext3::sub(e32, e10);
+        e32 = ext3::sub(e32, e1);
+        e32 = ext3::sub(e32, e4);
+        e32 = ext3::sub(e32, e13);
+        e32 = ext3::sub(e32, e14);
+        e32 = ext3::sub(e32, e15);
+        e32 = ext3::sub(e32, e16);
+        b8 = goldilocks::add(d_base_consts[0], d_base_consts[11]);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[10]; e31 = ext3::mul_base(y, x); }
+        e31 = ext3::sub(e32, e31);
+        e31 = ext3::sub(e31, e8);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[12]; e32 = ext3::mul_base(y, x); }
+        e32 = ext3::sub(e31, e32);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[13]; e31 = ext3::mul_base(y, x); }
+        e31 = ext3::sub(e32, e31);
+        e31 = ext3::sub(e31, e20);
+        e31 = ext3::sub(e31, e21);
+        e31 = ext3::sub(e31, e22);
+        e31 = ext3::sub(e31, e23);
+        e31 = ext3::sub(e31, e24);
+        e31 = ext3::sub(e31, e25);
+        e31 = ext3::sub(e31, e26);
+        e31 = ext3::sub(e31, e27);
+        e31 = ext3::sub(e31, e28);
+        e31 = ext3::sub(e31, e29);
+        e31 = ext3::sub(e31, e30);
+        e32 = ext3::mul(e17, e31);
+        { uint64_t x = b22; Fe3 y = d_alpha_powers[1]; e33 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e6, e33);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[2]; e34 = ext3::mul_base(y, x); }
+        e34 = ext3::sub(e33, e34);
+        e34 = ext3::sub(e34, e10);
+        e34 = ext3::sub(e34, e1);
+        e34 = ext3::sub(e34, e4);
+        e34 = ext3::sub(e34, e13);
+        e34 = ext3::sub(e34, e14);
+        e34 = ext3::sub(e34, e15);
+        e34 = ext3::sub(e34, e16);
+        b8 = goldilocks::add(d_base_consts[0], d_base_consts[12]);
+        { uint64_t x = b8; Fe3 y = d_alpha_powers[10]; e33 = ext3::mul_base(y, x); }
+        e33 = ext3::sub(e34, e33);
+        e33 = ext3::sub(e33, e8);
+        e18 = ext3::sub(e33, e18);
+        e19 = ext3::sub(e18, e19);
+        e19 = ext3::sub(e19, e20);
+        e19 = ext3::sub(e19, e21);
+        e19 = ext3::sub(e19, e22);
+        e19 = ext3::sub(e19, e23);
+        e19 = ext3::sub(e19, e24);
+        e19 = ext3::sub(e19, e25);
+        e19 = ext3::sub(e19, e26);
+        e19 = ext3::sub(e19, e27);
+        e28 = ext3::sub(e19, e28);
+        e28 = ext3::sub(e28, e29);
+        e28 = ext3::sub(e28, e30);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[1]; e19 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e6, e19);
+        e18 = ext3::sub(e18, e3);
+        e18 = ext3::sub(e18, e10);
+        e18 = ext3::sub(e18, e1);
+        e18 = ext3::sub(e18, e4);
+        e18 = ext3::sub(e18, e13);
+        e18 = ext3::sub(e18, e14);
+        e18 = ext3::sub(e18, e15);
+        e16 = ext3::sub(e18, e16);
+        b31 = goldilocks::add(d_base_consts[0], d_base_consts[13]);
+        { uint64_t x = b31; Fe3 y = d_alpha_powers[10]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e16, e18);
+        e8 = ext3::sub(e18, e8);
+        b22 = goldilocks::mul(b22, d_base_consts[1]);
+        b22 = goldilocks::add(b32, b22);
+        b25 = goldilocks::mul(b25, d_base_consts[14]);
+        b25 = goldilocks::add(b22, b25);
+        { uint64_t x = b25; Fe3 y = d_alpha_powers[12]; e18 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e8, e18);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[13]; e8 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e8);
+        e18 = ext3::sub(e18, e20);
+        e18 = ext3::sub(e18, e21);
+        e18 = ext3::sub(e18, e22);
+        e18 = ext3::sub(e18, e23);
+        e18 = ext3::sub(e18, e24);
+        e18 = ext3::sub(e18, e25);
+        e18 = ext3::sub(e18, e26);
+        e18 = ext3::sub(e18, e27);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[22]; e16 = ext3::mul_base(y, x); }
+        e18 = ext3::sub(e18, e16);
+        e18 = ext3::sub(e18, e29);
+        e18 = ext3::sub(e18, e30);
+        e33 = ext3::mul(e28, e18);
+        e34 = ext3::mul(e32, e33);
+        e34 = ext3::mul(e12, e34);
+        { uint64_t x = b0; Fe3 y = e31; e31 = ext3::mul_base(y, x); }
+        { uint64_t x = b0; Fe3 y = e17; e17 = ext3::mul_base(y, x); }
+        e17 = ext3::add(e31, e17);
+        e33 = ext3::mul(e17, e33);
+        { uint64_t x = b0; Fe3 y = e18; e18 = ext3::mul_base(y, x); }
+        { uint64_t x = b0; Fe3 y = e28; e28 = ext3::mul_base(y, x); }
+        e28 = ext3::add(e18, e28);
+        e32 = ext3::mul(e28, e32);
+        e32 = ext3::add(e33, e32);
+        e32 = ext3::sub(e34, e32);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[11], e32));
+        e34 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r1], d_aux[(uint64_t)13 * aux_stride + r1], d_aux[(uint64_t)14 * aux_stride + r1]);
+        e33 = ext3::make(d_aux[(uint64_t)12 * aux_stride + r0], d_aux[(uint64_t)13 * aux_stride + r0], d_aux[(uint64_t)14 * aux_stride + r0]);
+        e33 = ext3::sub(e34, e33);
+        e0 = ext3::sub(e33, e0);
+        e9 = ext3::sub(e0, e9);
+        e11 = ext3::sub(e9, e11);
+        e12 = ext3::sub(e11, e12);
+        e12 = ext3::add(e12, u_offset);
+        b0 = d_main[(uint64_t)17 * main_stride + r0];
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[1]; e11 = ext3::mul_base(y, x); }
+        e11 = ext3::sub(e6, e11);
+        e3 = ext3::sub(e11, e3);
+        e10 = ext3::sub(e3, e10);
+        e1 = ext3::sub(e10, e1);
+        e4 = ext3::sub(e1, e4);
+        e13 = ext3::sub(e4, e13);
+        e14 = ext3::sub(e13, e14);
+        e15 = ext3::sub(e14, e15);
+        { uint64_t x = b30; Fe3 y = d_alpha_powers[9]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e15, e14);
+        { uint64_t x = b7; Fe3 y = d_alpha_powers[10]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        { uint64_t x = b14; Fe3 y = d_alpha_powers[11]; e14 = ext3::mul_base(y, x); }
+        e14 = ext3::sub(e15, e14);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[12]; e15 = ext3::mul_base(y, x); }
+        e15 = ext3::sub(e14, e15);
+        e8 = ext3::sub(e15, e8);
+        e20 = ext3::sub(e8, e20);
+        e21 = ext3::sub(e20, e21);
+        e22 = ext3::sub(e21, e22);
+        e23 = ext3::sub(e22, e23);
+        e24 = ext3::sub(e23, e24);
+        e25 = ext3::sub(e24, e25);
+        e26 = ext3::sub(e25, e26);
+        e27 = ext3::sub(e26, e27);
+        e16 = ext3::sub(e27, e16);
+        e29 = ext3::sub(e16, e29);
+        e30 = ext3::sub(e29, e30);
+        { uint64_t x = d_base_consts[15]; Fe3 y = d_rap_challenges[0]; e29 = ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b), goldilocks::sub(0, y.c)); }
+        e29 = ext3::neg(e29);
+        e19 = ext3::sub(e29, e19);
+        { uint64_t x = b0; Fe3 y = d_alpha_powers[2]; e29 = ext3::mul_base(y, x); }
+        e29 = ext3::sub(e19, e29);
+        e19 = ext3::mul(e30, e29);
+        e19 = ext3::mul(e12, e19);
+        { uint64_t x = b27; Fe3 y = e29; e29 = ext3::mul_base(y, x); }
+        { uint64_t x = b27; Fe3 y = e30; e30 = ext3::mul_base(y, x); }
+        e30 = ext3::add(e29, e30);
+        e30 = ext3::sub(e19, e30);
+        sum = ext3::add(sum, ext3::mul(d_beta_trans[12], e30));
+        d_h[row] = ccomp_finish(sum, row, d_main, main_stride, d_aux, aux_stride, num_rows,
+                                d_z_inv, z_len, num_boundary, d_b_col, d_b_is_aux, d_b_value,
+                                d_b_beta, d_b_z_inv);
+    }
+}
+
+// PAGE, PAGE k4: 51 nodes, 2 roots, 5 base / 6 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_ffde99f64d0534c9(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
@@ -14463,7 +19295,7 @@ extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_ffde99f64d0534c9
 
 // MUTANT, for the proof-bytes test's mutation control only: no key maps to it,
 // so no program runs it.
-// BITWISE, LFM BITWISE: 142 nodes, 5 roots, 5 base / 14 ext slots
+// BITWISE, LFM BITWISE, BITWISE k4: 142 nodes, 5 roots, 5 base / 14 ext slots
 extern "C" __global__ void __launch_bounds__(CCOMP_BLOCK) ccomp_6ba23d3dacf14f46_mutant(
     Fe3 *__restrict__ d_h,
     const uint64_t *__restrict__ d_nodes,
