@@ -1037,16 +1037,35 @@ fn late_emission_probe_over_freed_small_buffers() {
 /// Every program id of `plan`'s tree under the tree's wrap options, as hex:
 /// each leaf's, then each node level's in node order, the top's last. Derived
 /// one program at a time (emit, build, keep the child's derived shape, drop the
-/// program), so one program is held at once.
+/// program), so one program is held at once. Prints the ELF digest the plan
+/// absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so two
+/// runs that disagree can be compared group by group.
 fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
     let wrap = super::proof::aggregation_wrap_options();
     let words = plan.child_layout().total();
     let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let roots = |j: usize, a: &LfmArtifacts| {
+        let slots: Vec<String> = a
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(s, r)| format!("{s}:{}", hex(r)))
+            .collect();
+        let chunks = |c: &[Commitment]| c.iter().map(hex).collect::<Vec<_>>().join(" ");
+        println!(
+            "TREE ROOTS {j}: {} · hash chunks {} · blake3 chunks {}",
+            slots.join(" "),
+            chunks(&a.hash_chunk_roots),
+            chunks(&a.blake3_chunk_roots)
+        );
+    };
+    println!("TREE ELF digest {}", hex(plan.elf_digest()));
     let mut ids = Vec::new();
     let mut level: Vec<DerivedChild> = Vec::new();
     for k in 0..plan.partition().num_leaves() {
         let program = plan.leaf_program(k).expect("the leaf emits");
         let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+        roots(ids.len(), &artifacts);
         ids.push(hex(&artifacts.program_id));
         level.push(
             DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the leaf derives"),
@@ -1061,6 +1080,7 @@ fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
             let group: Vec<DerivedChild> = kids.by_ref().take(a).collect();
             let program = plan.node_program(&group, top).expect("the node emits");
             let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+            roots(ids.len(), &artifacts);
             ids.push(hex(&artifacts.program_id));
             next.push(
                 DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("the node derives"),
@@ -1074,6 +1094,11 @@ fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
 /// ★ The compact program form changes no program: every id of a small spread
 /// plan's tree equals the one recorded at 541f4bdc2 (#1013's d740eb5d5 + the
 /// instruments), before the form changed.
+///
+/// ⚠ The pins are the LAPTOP's: the plan absorbs the ELF's digest, and the
+/// fixture ELF's bytes depend on the clang that assembled it (laptop
+/// `af87f637…`, 1264 B; FAST `bfb782e1…`, 1272 B), so a box derives other ids
+/// for the same programs (FAST 670). The box gate compares two shas on one box.
 #[test]
 #[ignore = "laptop: run with --exact"]
 fn the_compact_program_form_keeps_a_small_trees_ids() {
