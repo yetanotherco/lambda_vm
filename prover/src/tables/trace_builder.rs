@@ -137,6 +137,11 @@ impl MemoryState {
         }
     }
 
+    /// The bytes its pages take on the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.cells.heap_bytes()
+    }
+
     /// Number of distinct pages that contain at least one cell.
     #[cfg(feature = "disk-spill")]
     fn unique_page_count(&self, page_size: u64) -> u64 {
@@ -650,6 +655,12 @@ impl MemwBuckets {
         }
     }
 
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.register_rows)
+            + vec_heap_bytes(&self.aligned)
+            + vec_heap_bytes(&self.general)
+    }
+
     #[inline]
     fn push(&mut self, op: MemwOperation) {
         match classify_memw(&op) {
@@ -866,6 +877,53 @@ impl WalkOutputs {
             hint_ops: Vec::new(),
         }
     }
+
+    /// The bytes its lists take on the heap (capacities, not lengths).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.memw.heap_bytes()
+            + vec_heap_bytes(&self.load_ops)
+            + vec_heap_bytes(&self.lt_ops)
+            + vec_heap_bytes(&self.shift_ops)
+            + vec_heap_bytes(&self.bitwise_ops)
+            + vec_heap_bytes(&self.commit_ops)
+            + vec_heap_bytes(&self.keccak_ops)
+            + vec_heap_bytes(&self.blake3_ops)
+            + vec_heap_bytes(&self.blake3_absorb_ops)
+            + vec_heap_bytes(&self.cpu32_ops)
+            + vec_heap_bytes(&self.ecsm_ops)
+            + vec_heap_bytes(&self.ecdas_ops)
+            + vec_heap_bytes(&self.hint_ops)
+    }
+
+    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
+    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
+        [
+            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
+            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
+            ("memw", vec_heap_bytes(&self.memw.general)),
+            ("load", vec_heap_bytes(&self.load_ops)),
+            ("lt", vec_heap_bytes(&self.lt_ops)),
+            ("shift", vec_heap_bytes(&self.shift_ops)),
+            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
+            ("commit", vec_heap_bytes(&self.commit_ops)),
+            ("keccak", vec_heap_bytes(&self.keccak_ops)),
+            ("blake3", vec_heap_bytes(&self.blake3_ops)),
+            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
+            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
+            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
+            ("hint", vec_heap_bytes(&self.hint_ops)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
+        .collect()
+    }
+}
+
+/// The bytes `list`'s buffer takes on the heap: its capacity, not its length.
+/// Elements that own heap memory of their own are counted at their inline size.
+pub(crate) fn vec_heap_bytes<T>(list: &Vec<T>) -> usize {
+    list.capacity() * std::mem::size_of::<T>()
 }
 
 /// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). Without
@@ -3875,6 +3933,27 @@ pub(crate) struct PreCounted {
     pub(crate) memw_aligned_lt: Vec<LtOperation>,
 }
 
+impl PreCounted {
+    /// The bytes it takes on the heap: the histogram and the derived LT ops.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.histogram.heap_bytes()
+            + vec_heap_bytes(&self.memw_lt)
+            + vec_heap_bytes(&self.memw_aligned_lt)
+    }
+
+    /// [`Self::heap_bytes`] part by part.
+    pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            (
+                "counted memw_a_lt".to_string(),
+                vec_heap_bytes(&self.memw_aligned_lt),
+            ),
+        ]
+    }
+}
+
 /// KECCAK_RND cut into tables of `rows` rows, the first `streamed` of them left
 /// as placeholders: the tables `split_rows` makes of the whole table
 /// ([`keccak_rnd::generate_keccak_rnd_trace`]), each built from the ops that
@@ -4109,6 +4188,47 @@ struct RoutedSegments {
 }
 
 impl RoutedSegments {
+    /// The bytes its segments take on the heap.
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.branch_ops)
+            + vec_heap_bytes(&self.mul_filter)
+            + vec_heap_bytes(&self.dvrm_filter)
+            + vec_heap_bytes(&self.eq_ops)
+            + vec_heap_bytes(&self.bytewise_ops)
+            + vec_heap_bytes(&self.store_ops)
+            + vec_heap_bytes(&self.shift_cpu32)
+            + vec_heap_bytes(&self.mul_cpu32)
+            + vec_heap_bytes(&self.dvrm_cpu32)
+            + vec_heap_bytes(&self.bitwise_cpu32)
+            + vec_heap_bytes(&self.lt_dvrm_filter)
+            + vec_heap_bytes(&self.lt_dvrm_cpu32)
+            + vec_heap_bytes(&self.mul_dvrm_filter)
+            + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        [
+            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
+            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
+            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("store", vec_heap_bytes(&self.store_ops)),
+            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
+            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
+            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
+            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
+            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
+            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
+            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
+            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("segments {name}"), bytes))
+        .collect()
+    }
+
     /// Appends a later window's segments, segment by segment.
     fn append(&mut self, other: Self) {
         self.branch_ops.extend(other.branch_ops);
@@ -4454,6 +4574,19 @@ pub(crate) mod build_stamps {
 
     static ON: AtomicBool = AtomicBool::new(false);
     static LOG: Mutex<Option<Marks>> = Mutex::new(None);
+    /// Called with each mark's label while a build records: a memory log's
+    /// line at each phase end (`LAMBDA_VM_BLOCK_MEMLOG`).
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) type Hook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+    /// Sets (or, `None`, clears) the hook every mark calls.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn set_hook(hook: Option<Hook>) {
+        if let Ok(mut slot) = HOOK.lock() {
+            *slot = hook;
+        }
+    }
 
     /// Starts recording, clearing what an earlier build left.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -4473,6 +4606,10 @@ pub(crate) mod build_stamps {
         {
             let at = t0.elapsed().as_secs_f64();
             marks.push((label.to_string(), at));
+        }
+        let hook = HOOK.lock().ok().and_then(|slot| slot.clone());
+        if let Some(hook) = hook {
+            hook(label);
         }
     }
 
@@ -5476,6 +5613,92 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
+    /// The bytes the main tables take, eight a cell (the page configs and
+    /// the touched cells left out). A measurement (`LAMBDA_VM_BLOCK_MEMLOG`):
+    /// every table field is named, so a new one does not compile until it is
+    /// counted here.
+    pub fn main_bytes(&self) -> usize {
+        type T = TraceTable<GoldilocksField, GoldilocksExtension>;
+        fn one(t: &T) -> usize {
+            t.main_table.width * t.main_table.height * std::mem::size_of::<u64>()
+        }
+        fn all(ts: &[T]) -> usize {
+            ts.iter().map(one).sum()
+        }
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            page_configs: _,
+            register,
+            public_output_bytes: _,
+            branches,
+            halt,
+            commits,
+            keccaks,
+            keccak_rnds,
+            keccak_rc,
+            blake3,
+            num_blake3_ops: _,
+            ecsms,
+            ecdases,
+            hints,
+            memw_registers,
+            local_to_global,
+            touched_memory_cells: _,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
+        } = self;
+        [
+            cpus,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            muls,
+            dvrms,
+            pages,
+            branches,
+            commits,
+            keccaks,
+            keccak_rnds,
+            ecsms,
+            ecdases,
+            hints,
+            memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
+        ]
+        .into_iter()
+        .map(|ts| all(ts))
+        .sum::<usize>()
+            + [
+                bitwise,
+                decode,
+                register,
+                halt,
+                keccak_rc,
+                blake3,
+                local_to_global,
+            ]
+            .into_iter()
+            .map(one)
+            .sum::<usize>()
+    }
+
     /// Pre-upload the epoch's biggest main traces to device, called from the
     /// epoch pipeline's builder thread (idle slack ahead of the prover) so the
     /// R1 main commits D2D-copy instead of paying the H2D inside their chains.

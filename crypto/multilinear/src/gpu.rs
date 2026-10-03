@@ -627,6 +627,18 @@ fn budget_headroom() -> String {
     "no device".to_string()
 }
 
+/// Host bytes the card's pinned staging buffers hold
+/// ([`math_cuda::device::pinned_host_bytes`]); 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn pinned_host_bytes() -> usize {
+    math_cuda::device::pinned_host_bytes()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pinned_host_bytes() -> usize {
+    0
+}
+
 /// Opens a window over the device ledger's peak
 /// ([`math_cuda::device::reset_window_high_water`]); nothing without a device.
 #[cfg(feature = "cuda")]
