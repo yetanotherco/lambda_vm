@@ -1382,26 +1382,32 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
 }
 
 /// A tree's nodes built level by level from the leaves' shapes `leaves`, each
-/// published to its slot (level, node) as soon as `build` returns it: `build`
-/// takes the level, the node's index, its children's shapes (in order) and
-/// whether it is the top; `shape_of` gives a built node's shape for the level
-/// above. A node depends on its children's shapes, never on their proofs, so
-/// the whole tree can be built while the leaves prove.
+/// published to its slot (level, node) as soon as it is built: `emit` makes a
+/// node's program from its level, index, children's shapes (in order) and
+/// whether it is the top; `finish` builds the rest of the node from it (its
+/// artifacts: it may take the card); `shape_of` gives a built node's shape for
+/// the level above. A node depends on its children's shapes, never on their
+/// proofs, so the whole tree can be built while the leaves prove.
 ///
-/// With `pool`, a level's nodes are built together on the pool's threads and
-/// each is published into ITS OWN slot whatever order they finish in; without,
-/// one after another on this thread. A build that fails leaves its error in its
-/// slot, and every slot still empty when this returns or unwinds gets one
+/// With `pool`, a level's programs are emitted together on the pool's threads,
+/// and this thread finishes each as its emission ends and publishes it into
+/// ITS OWN slot, whatever order they finish in; without, emitted and finished
+/// one after another here. `finish` always runs on this thread, never on a
+/// rayon worker: a worker that waits inside rayon while it holds the card runs
+/// queued jobs meanwhile, and a sibling that takes the card is a second hold on
+/// one thread (BIG 569). A build that fails leaves its error in its slot, and
+/// every slot still empty when this returns or unwinds gets one
 /// ([`FailUnpublished`]).
-fn build_levels<C: Sync, N: Send + Sync>(
+#[allow(clippy::too_many_arguments)]
+fn build_levels<C: Sync, P: Send, N: Send + Sync>(
     shape: &[super::per_table_aggregator::Level],
     leaves: &[&C],
     slots: &[Vec<Published<N>>],
     shape_of: impl Fn(&N) -> &C + Sync,
-    build: impl Fn(usize, usize, &[&C], bool) -> Result<N, String> + Sync,
+    emit: impl Fn(usize, usize, &[&C], bool) -> Result<P, String> + Sync,
+    finish: impl Fn(usize, usize, P) -> Result<N, String>,
     pool: Option<&rayon::ThreadPool>,
 ) {
-    use rayon::prelude::*;
     let _fail = FailUnpublished(slots);
     for (lv, arities) in shape.iter().enumerate() {
         let top = lv + 1 == shape.len();
@@ -1433,14 +1439,31 @@ fn build_levels<C: Sync, N: Send + Sync>(
             )));
             return;
         }
-        let one = |j: usize| {
-            let _ = slots[lv][j]
-                .0
-                .set(build(lv, j, &below[groups[j].clone()], top));
-        };
         match pool {
-            Some(pool) => pool.install(|| (0..groups.len()).into_par_iter().for_each(one)),
-            None => (0..groups.len()).for_each(one),
+            Some(pool) => {
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<P, String>)>();
+                pool.in_place_scope(|scope| {
+                    for (j, kids) in groups.iter().enumerate() {
+                        let (tx, emit, kids) = (tx.clone(), &emit, &below[kids.clone()]);
+                        scope.spawn(move |_| {
+                            let _ = tx.send((j, emit(lv, j, kids, top)));
+                        });
+                    }
+                    drop(tx);
+                    // This thread, not a pool worker, finishes each node as
+                    // its program arrives.
+                    for (j, program) in rx {
+                        let _ = slots[lv][j].0.set(program.and_then(|p| finish(lv, j, p)));
+                    }
+                });
+            }
+            None => {
+                for (j, kids) in groups.iter().enumerate() {
+                    let node =
+                        emit(lv, j, &below[kids.clone()], top).and_then(|p| finish(lv, j, p));
+                    let _ = slots[lv][j].0.set(node);
+                }
+            }
         }
     }
 }
@@ -1497,6 +1520,11 @@ fn toy_tree(
                 kids.join(",")
             ))
         },
+        // The finish is where a node takes the card: never on a rayon worker.
+        |lv, j, program: String| match rayon::current_thread_index() {
+            None => Ok(program),
+            Some(w) => Err(format!("node ({lv}, {j}) finished on rayon worker {w}")),
+        },
         pool.as_ref(),
     );
     let got = slots
@@ -1507,9 +1535,10 @@ fn toy_tree(
 }
 
 /// ★ The node pipe builds the serial builder's nodes, each in its own slot,
-/// whatever order a level's builds finish in: the median's shape (23 leaves at
-/// fan-in 3), on pools of 2 to 4 threads, where each level's builds finish out
-/// of order, and serially.
+/// whatever order a level's emissions finish in, and finishes every node (where
+/// it takes the card) off the rayon workers: the median's shape (23 leaves at
+/// fan-in 3), on pools of 2 to 4 threads, where each level's emissions finish
+/// out of order, and serially.
 #[test]
 fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
     let arities = vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]];
@@ -1581,13 +1610,14 @@ fn a_failing_node_build_fails_every_node_above_it() {
 /// The tree's node programs and artifacts ([`build_levels`] over the leaves'
 /// derived shapes), each published to its slot as soon as it is built.
 ///
-/// With `pool` (`W3_NODE_PIPE`, on by default) a level's nodes are built
+/// With `pool` (`W3_NODE_PIPE`, on by default) a level's programs are emitted
 /// together on the pool's threads — the builder's own, not the global pool, on
-/// which a prover's join could steal a build and leave the card idle (#1013's
-/// FAST 454) — and each level proves as its own nodes arrive. Without it, one
-/// after another on this thread (the control: the builder before, whose whole
-/// tree level 1 then waits for — at the median 32 s of serial builds holding
-/// level 0 open 10.7 s past its last proof, BIG 565 / 568).
+/// which a prover's join could steal an emission and leave the card idle
+/// (#1013's FAST 454) — and this thread builds each one's artifacts (holding
+/// the card) as it arrives; each level proves as its own nodes arrive. Without
+/// it, one after another on this thread (the control: the builder before,
+/// whose whole tree level 1 then waits for — at the median 32 s of serial
+/// builds holding level 0 open 10.7 s past its last proof, BIG 565 / 568).
 #[allow(clippy::too_many_arguments)]
 fn build_nodes(
     plan: &WhirBlockPlan,
@@ -1609,16 +1639,20 @@ fn build_nodes(
         &leaf_shapes,
         slots,
         |node: &TreeNode| &node.derived,
-        |_, _, kids: &[&DerivedChild], top| -> Result<TreeNode, String> {
+        |_, _, kids: &[&DerivedChild], top| -> Result<(LfmProgram, f64), String> {
             let t = std::time::Instant::now();
             let program = plan.node_program(kids, top)?;
+            Ok((program, t.elapsed().as_secs_f64()))
+        },
+        |_, _, (program, emitted): (LfmProgram, f64)| -> Result<TreeNode, String> {
+            let t = std::time::Instant::now();
             let artifacts = artifacts_of(&program, wrap);
             let derived = DerivedChild::from_artifacts(&artifacts, wrap, words)?;
             Ok(TreeNode {
                 program,
                 artifacts,
                 derived,
-                built: t.elapsed().as_secs_f64(),
+                built: emitted + t.elapsed().as_secs_f64(),
                 built_at: t_tree.elapsed().as_secs_f64(),
             })
         },
@@ -1628,8 +1662,8 @@ fn build_nodes(
 
 /// The tree proved the way a prover would run it, with the leaves' programs
 /// emitted beforehand (`leaves`, while phase B ran):
-/// 1. the leaves' artifacts, in parallel, on a thread of their own (they hold
-///    the card);
+/// 1. the leaves' artifacts, one after another on a thread of their own (each
+///    holds the card);
 /// 2. the nodes' programs and artifacts — functions of the leaves' artifacts,
 ///    not of any proof — on a thread of their own ([`build_nodes`]), each
 ///    published to its slot as it is built, beside
@@ -1692,13 +1726,15 @@ fn prove_tree_pipelined(
             )
         });
         let leaf_proved = std::thread::scope(|scope| {
-            // 1. the leaves' artifacts.
+            // 1. the leaves' artifacts, one after another on this thread: each
+            // build holds the card throughout (armed), so building them as
+            // rayon jobs bought no overlap, and a holder on a rayon worker can
+            // run a sibling build that takes the card again (BIG 569).
             scope.spawn(|| {
-                use rayon::prelude::*;
                 let guard = PublishGuard(&built);
                 guard.publish(
                     leaves
-                        .par_iter()
+                        .iter()
                         .zip(&leaf_built_at)
                         .map(|(program, at)| -> Result<_, String> {
                             let t = std::time::Instant::now();
@@ -2391,7 +2427,11 @@ fn the_whir_block_tree_on_a_real_block() {
         top_bytes.len()
     );
 
-    // Off the clock: the harness's checks.
+    // Off the clock: the harness's checks, the permit disarmed first. The
+    // verifier derives the tree's programs and artifacts as rayon jobs
+    // (`WhirBlockPlan::programs`), which must not take an armed card from a
+    // rayon worker (BIG 569); nothing proves beside them now.
+    super::device_permit::arm(1);
     let t = std::time::Instant::now();
     for (i, (artifacts, lfm)) in proofs.iter().enumerate() {
         assert!(

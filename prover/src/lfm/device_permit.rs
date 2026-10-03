@@ -442,6 +442,19 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
             },
         };
     }
+    // ⛔ Never from a rayon worker. A holder that waits inside rayon — a nested
+    // `join` whose other half was stolen, a parallel iterator, another pool's
+    // `install` — runs its pool's queued jobs on its own thread meanwhile, and
+    // one of them that takes the card is a second hold on this thread (BIG 569's
+    // arm N parked there; which run trips it is the scheduler's choice). Taken
+    // from a plain thread, the card is held while rayon builds under it, and
+    // that thread blocks instead of running anyone's jobs.
+    #[cfg(feature = "parallel")]
+    assert!(
+        rayon::current_thread_index().is_none(),
+        "the card permit is taken on a rayon worker ({phase}): a job it runs while it \
+         waits inside rayon could take it again; take it from a plain thread"
+    );
     assert!(
         !HELD_HERE.with(|h| h.get()),
         "the card permit is not reentrant and this thread already holds it; \
@@ -624,17 +637,21 @@ mod tests {
         disarm(&g);
     }
 
-    /// ★ THE RE-ENTRY BIG 569 HIT, FORCED. A holder on a rayon worker that
-    /// waits on rayon while it holds the card — a nested `join` whose other
-    /// half was stolen, a parallel iterator, another pool's `install` — runs
-    /// queued jobs of its own pool on its own thread meanwhile. When one of
-    /// them takes the card, that is a second hold on one thread. The W3 tree
-    /// builds its leaves' artifacts as rayon jobs that each hold the card
-    /// around a build that uses rayon, so which run trips it is down to the
-    /// scheduler (568 clean, 569's arm N panicked). Here `yield_now` is the
-    /// wait and the sibling is the only queued job, so it trips every time.
+    /// ★ THE RE-ENTRY BIG 569 HIT, FORCED — and now refused at its first hold.
+    /// A holder on a rayon worker that waits on rayon while it holds the card —
+    /// a nested `join` whose other half was stolen, a parallel iterator, another
+    /// pool's `install` — runs queued jobs of its own pool on its own thread
+    /// meanwhile, and one of them that takes the card is a second hold on one
+    /// thread. The W3 tree built its leaves' artifacts as rayon jobs that each
+    /// held the card around a build that uses rayon, so which run tripped it was
+    /// down to the scheduler (568 clean, 569's arm N parked). Here `yield_now` is
+    /// the wait and the sibling the only queued job: before the guard the
+    /// sibling's hold re-entered every time (i-m4b's repro, m4b/permit-reentry);
+    /// with it, the first hold on the worker is refused, before the card is
+    /// taken, so nothing can re-enter.
+    #[cfg(feature = "parallel")]
     #[test]
-    fn armed_a_holder_on_a_rayon_worker_runs_a_sibling_that_holds_again() {
+    fn armed_a_hold_on_a_rayon_worker_is_refused_before_a_sibling_can_take_it_again() {
         let g = ARM.lock().expect("the arm guard is never poisoned");
         disarm(&g);
         arm(2);
@@ -655,18 +672,44 @@ mod tests {
                 )
             })
         }));
-        let payload = ran.expect_err("the sibling's hold must re-enter on the holder's thread");
+        let payload = ran.expect_err("a hold on a rayon worker must be refused");
         let message = payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
         assert!(
-            message.contains("the card permit is not reentrant"),
+            message.contains("the card permit is taken on a rayon worker"),
             "another panic: {message}"
         );
-        // The first holder released the card on its way out: it is free again.
+        // Refused before the card was taken: it is free.
         drop(hold());
+        disarm(&g);
+    }
+
+    /// The other half: armed, a PLAIN thread holds the card while rayon works
+    /// under it (a parallel build, as an artifact build does), and a second
+    /// plain thread's hold waits for it rather than entering beside it.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn armed_a_plain_thread_holds_the_card_while_rayon_builds_under_it() {
+        use rayon::prelude::*;
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        arm(2);
+        let sum = std::thread::scope(|scope| {
+            let card = hold_labeled("build_artifacts");
+            let other = scope.spawn(|| {
+                let _card = hold_labeled("build_artifacts");
+                IN_FLIGHT.load(Ordering::SeqCst)
+            });
+            let sum: u64 = (0..10_000u64).into_par_iter().map(|x| x * x).sum();
+            std::thread::sleep(Duration::from_millis(20));
+            drop(card);
+            assert_eq!(other.join().expect("the second holder"), 1);
+            sum
+        });
+        assert_eq!(sum, (0..10_000u64).map(|x| x * x).sum::<u64>());
         disarm(&g);
     }
 
