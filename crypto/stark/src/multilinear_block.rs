@@ -132,6 +132,16 @@ pub struct GroupStamps {
     /// argue's own and the next group's columns uploaded beside it. Bytes; 0
     /// without a device.
     pub argue_reserved: u64,
+    /// The ledger's promise just before the group's argue (its own columns
+    /// on the card), and the ledger's peak through its revive and openings
+    /// (the next group's columns, uploaded beside the argue, included), with
+    /// what the revive itself added (the openings' room). Bytes; 0 without a
+    /// device. Phase B's overlap reads them: group g's openings beside group
+    /// g + 1's argue would hold about `open_reserved[g] + argue_reserved[g+1]
+    /// − argue_base[g+1]`.
+    pub argue_base: u64,
+    pub open_reserved: u64,
+    pub open_room: u64,
     /// When the group's commit ended, seconds since phase A started.
     pub committed_at: f64,
     /// Phase A: the group's tables packed narrow after the commit
@@ -826,6 +836,7 @@ where
         // claimed at its own point — or, batched, all of them in one argue —
         // with the next group's upload beside them.
         let t = Instant::now();
+        stamps[g].argue_base = multilinear::gpu::ledger_reserved();
         multilinear::gpu::reset_reserved_window();
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
@@ -889,12 +900,15 @@ where
         let handles = group_columns(group);
         let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
         let t = Instant::now();
+        multilinear::gpu::reset_reserved_window();
+        let before_revive = multilinear::gpu::ledger_reserved();
         let stacked = retired.revive::<H, _>(
             &columns,
             store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
             config,
         )?;
         stamps[g].encode = t.elapsed().as_secs_f64();
+        stamps[g].open_room = multilinear::gpu::ledger_reserved().saturating_sub(before_revive);
         let t = Instant::now();
         openings.push(stacked_eval::prove::<F, E, T, H, _>(
             &stacked,
@@ -956,6 +970,7 @@ where
             )?);
         }
         stamps[g].open = t.elapsed().as_secs_f64();
+        stamps[g].open_reserved = multilinear::gpu::reserved_window_peak();
         drop(stacked);
         drop(columns);
         drop(handles);

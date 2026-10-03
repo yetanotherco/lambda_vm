@@ -110,6 +110,10 @@ static ROOM_TURNS: AtomicU64 = AtomicU64::new(0);
 /// ★ Group openings whose room the card would not give back — see
 /// [`take_turn`] for what the opening does then.
 static ROOM_TURN_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// ★ Revived groups whose openings' room the card would not promise: their
+/// codewords then promise their own working sets one at a time
+/// (`stacked_eval::StackedCommitment::revive`).
+static ROOM_REVIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Rooms a group sized, for its commits or its openings' turn.
 static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones sized to the turn they cover rather than to a whole
@@ -373,6 +377,16 @@ pub fn room_turn_refusals() -> u64 {
     ROOM_TURN_REFUSALS.load(Ordering::Relaxed)
 }
 
+/// Revived groups whose openings' room the card would not promise.
+pub fn room_revive_refusals() -> u64 {
+    ROOM_REVIVE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Called where a revive's room is refused.
+pub(crate) fn note_revive_room_refused() {
+    ROOM_REVIVE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// GKR fraction trees the host built because the card refused their promise.
 pub fn gkr_tree_refusals() -> u64 {
     GKR_TREE_REFUSALS.load(Ordering::Relaxed)
@@ -425,6 +439,7 @@ pub fn reset_call_counters() {
     ROOM_PARKS.store(0, Ordering::Relaxed);
     ROOM_TURNS.store(0, Ordering::Relaxed);
     ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
+    ROOM_REVIVE_REFUSALS.store(0, Ordering::Relaxed);
     ROOM_SIZINGS.store(0, Ordering::Relaxed);
     ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
 }
@@ -645,6 +660,19 @@ pub fn reserved_window_peak() -> u64 {
 
 #[cfg(not(feature = "cuda"))]
 pub fn reserved_window_peak() -> u64 {
+    0
+}
+
+/// What the ledger has promised right now; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn ledger_reserved() -> u64 {
+    math_cuda::device::backend()
+        .map(|be| be.reserved_bytes())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn ledger_reserved() -> u64 {
     0
 }
 

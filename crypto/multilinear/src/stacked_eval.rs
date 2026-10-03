@@ -376,7 +376,16 @@ where
         let room = if retired.is_empty() {
             None
         } else {
-            crate::gpu::reserve_room(room_bytes(&layout, config, resident.is_none(), Turn::Open))
+            let room = crate::gpu::reserve_room(room_bytes(
+                &layout,
+                config,
+                resident.is_none(),
+                Turn::Open,
+            ));
+            if room.is_none() && crate::gpu::reserve_budget() > 0 {
+                crate::gpu::note_revive_room_refused();
+            }
+            room
         };
         let transient = room.is_none();
         let mut commitments = Vec::with_capacity(retired.len());

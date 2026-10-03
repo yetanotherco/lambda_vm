@@ -518,6 +518,40 @@ impl BlockStamps {
                 .unwrap_or(0),
             reserved.join(", "),
         ));
+        // Phase B's ledger, for an overlap of group g's openings with group
+        // g + 1's argue: what the two would hold at once, against the budget.
+        let mib = |b: u64| b >> 20;
+        let per_group: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "{}/{}/{}/{}",
+                    mib(g.argue_base),
+                    mib(g.argue_reserved),
+                    mib(g.open_room),
+                    mib(g.open_reserved)
+                )
+            })
+            .collect();
+        let overlap: Vec<String> = self
+            .groups
+            .windows(2)
+            .map(|w| {
+                let both = w[0].open_reserved + w[1].argue_reserved.saturating_sub(w[1].argue_base);
+                format!("{}", mib(both))
+            })
+            .collect();
+        out.push_str(&format!(
+            "BLOCK PHASE-B LEDGER: budget {} MiB · per group base/argue/room/open [{}] MiB · open(g) beside argue(g+1) [{}] MiB · revive room refusals {} · turn refusals {} · GKR tree refusals {} · openings on the host {}\n",
+            mib(multilinear::gpu::reserve_budget()),
+            per_group.join(", "),
+            overlap.join(", "),
+            multilinear::gpu::room_revive_refusals(),
+            multilinear::gpu::room_turn_refusals(),
+            multilinear::gpu::gkr_tree_refusals(),
+            multilinear::gpu::open_host_fallbacks(),
+        ));
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
