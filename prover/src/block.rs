@@ -558,8 +558,13 @@ fn stream_committers() -> usize {
         .unwrap_or(STREAM_COMMITTERS)
 }
 
-/// Generator threads for the streamed instances ([`stream_generators`]).
-const STREAM_GENERATORS: usize = 6;
+/// Generator threads for the streamed instances ([`stream_generators`]):
+/// eight. Six fall behind the producer's walk levers (BIG 467: 125 chunks
+/// waiting at windows walked). At the median block on BIG the walk levers with
+/// eight generators end phase A 3.45 s sooner than without them on six; with
+/// ten, 2.23 s sooner, the walk itself 2.1 s slower beside the extra threads
+/// (BIG 468).
+const STREAM_GENERATORS: usize = 8;
 
 /// `LAMBDA_VM_BLOCK_GENERATORS=n` (0..=16): `n` threads generate each streamed
 /// chunk, and pack it on the host under narrow storage, before a committer
