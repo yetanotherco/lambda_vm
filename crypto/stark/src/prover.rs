@@ -167,21 +167,42 @@ where
 
 /// A committed Merkle tree's top levels, heap order (the root first, each
 /// level contiguous): levels `0..=top_level` of a tree over `leaves` leaves.
+///
+/// A 4-ary tree (`arity` 4, `math_cuda::p1_stark`) keeps its levels in the
+/// arity-4 layout instead, which is also top-down: the kept nodes are the
+/// node buffer's prefix down to the level `top_level` levels above the leaves
+/// (counted in 4-ary levels from the leaves, not from the root), whose nodes
+/// each root a subtree of `4^top_level` leaves.
 #[cfg(feature = "cuda")]
 pub(crate) struct TopTree {
     nodes: Vec<Commitment>,
     leaves: usize,
     top_level: usize,
+    arity: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl TopTree {
     /// Levels `0..=depth − subtree_levels` of `tree` (all of it but the
     /// bottom `subtree_levels`; just the root when the tree is that short).
+    /// At arity 4 the bottom `⌊subtree_levels / 2⌋` 4-ary levels are dropped
+    /// (the same leaves a subtree, `2^subtree_levels`, at an even count).
     fn from_device(
         tree: &math_cuda::lde::GpuMerkleTree,
         subtree_levels: usize,
     ) -> math_cuda::Result<Self> {
+        if tree.arity == math_cuda::p1_stark::ARITY {
+            let depth4 = math_cuda::p1_stark::depth(tree.leaves_len);
+            let sub = (subtree_levels / 2).min(depth4);
+            let kept = math_cuda::p1_stark::top_levels_nodes(tree.leaves_len, depth4 - sub + 1);
+            let nodes = crate::gpu_lde::download_tree_prefix(tree, kept)?;
+            return Ok(Self {
+                nodes,
+                leaves: tree.leaves_len,
+                top_level: sub,
+                arity: tree.arity,
+            });
+        }
         let depth = tree.leaves_len.trailing_zeros() as usize;
         let top_level = depth.saturating_sub(subtree_levels);
         let nodes = crate::gpu_lde::download_tree_prefix(tree, (2usize << top_level) - 1)?;
@@ -189,11 +210,15 @@ impl TopTree {
             nodes,
             leaves: tree.leaves_len,
             top_level,
+            arity: tree.arity,
         })
     }
 
     /// Leaves under one node of the deepest kept level.
     fn subtree_leaves(&self) -> usize {
+        if self.arity == math_cuda::p1_stark::ARITY {
+            return (1usize << (2 * self.top_level)).min(self.leaves);
+        }
         self.leaves >> self.top_level
     }
 
@@ -202,8 +227,65 @@ impl TopTree {
         self.nodes.get((1usize << level) - 1 + j)
     }
 
-    /// The `2^c` nodes of level `c`, when it is kept.
+    /// The root of subtree `b` (node `b` of the deepest kept level).
+    fn subtree_root(&self, b: usize) -> Option<&Commitment> {
+        if self.arity == math_cuda::p1_stark::ARITY {
+            let (sizes, offsets) = self.layout4();
+            return (b < sizes[self.top_level])
+                .then(|| self.nodes.get(offsets[self.top_level] + b))
+                .flatten();
+        }
+        self.node(self.top_level, b)
+    }
+
+    /// Arity 4: the whole tree's level sizes (leaves first) and where each
+    /// level starts in the top-down node buffer, whose prefix `nodes` is.
+    fn layout4(&self) -> (Vec<usize>, Vec<usize>) {
+        let sizes = math_cuda::p1_stark::level_sizes(self.leaves);
+        let mut offsets = vec![0; sizes.len()];
+        for j in (0..sizes.len().saturating_sub(1)).rev() {
+            offsets[j] = offsets[j + 1] + sizes[j + 1];
+        }
+        (sizes, offsets)
+    }
+
+    /// The siblings of subtree `b`'s root and of each node above it up to the
+    /// root, pushed onto `path`: the kept part of a full path.
+    fn push_path_above(&self, b: usize, path: &mut Vec<Commitment>) {
+        if self.arity == math_cuda::p1_stark::ARITY {
+            let (sizes, offsets) = self.layout4();
+            let mut i = b;
+            for level in self.top_level..sizes.len() - 1 {
+                let first = i / 4 * 4;
+                for c in (first..first + 4).filter(|&c| c != i) {
+                    path.push(if c < sizes[level] {
+                        self.nodes[offsets[level] + c]
+                    } else {
+                        [0u8; 32]
+                    });
+                }
+                i /= 4;
+            }
+            return;
+        }
+        let mut pos = (1usize << self.top_level) - 1 + b;
+        while pos != 0 {
+            let sibling = if pos.is_multiple_of(2) {
+                pos - 1
+            } else {
+                pos + 1
+            };
+            path.push(self.nodes[sibling]);
+            pos = (pos - 1) / 2;
+        }
+    }
+
+    /// The `2^c` nodes of level `c`, when it is kept. A 4-ary tree has no cap
+    /// above height 0 (its root).
     fn cap(&self, c: usize) -> Option<Vec<Commitment>> {
+        if self.arity == math_cuda::p1_stark::ARITY {
+            return (c == 0).then(|| vec![self.nodes[0]]);
+        }
         (c <= self.top_level).then(|| self.nodes[(1usize << c) - 1..(2usize << c) - 1].to_vec())
     }
 }
@@ -2496,7 +2578,11 @@ pub trait IsStarkProver<
         let ncols = handle.m;
         let rpl = layout.rows_per_leaf();
         let byte_len = <FieldElement<Field> as ByteConversion>::BYTE_LEN;
-        // Every level of one rebuilt subtree, leaves first, and its root.
+        // Every level of one rebuilt subtree, leaves first, and its root. A
+        // 4-ary subtree groups by four, a short group padded with the backend's
+        // padding digest (only the whole-tree subtree of a 2^odd-leaf tree
+        // has one), as the committed tree's build does.
+        let arity4 = top.arity == 4;
         let rebuild = |bi: usize| -> (Vec<Vec<Commitment>>, Commitment) {
             let mut buf = vec![0u8; rpl * ncols * byte_len];
             let mut level: Vec<Commitment> = (0..per)
@@ -2510,12 +2596,33 @@ pub trait IsStarkProver<
                 .collect();
             let mut levels = Vec::new();
             while level.len() > 1 {
-                let up: Vec<Commitment> = level
-                    .chunks_exact(2)
-                    .map(|p| {
-                        <H::Batched<Field> as IsMerkleTreeBackend>::hash_new_parent(&p[0], &p[1])
-                    })
-                    .collect();
+                let up: Vec<Commitment> = if arity4 {
+                    level
+                        .chunks(4)
+                        .map(|g| {
+                            let child = |c: usize| {
+                                g.get(c).copied().unwrap_or_else(
+                                    <H::Batched<Field> as IsMerkleTreeBackend>::padding_node,
+                                )
+                            };
+                            <H::Batched<Field> as IsMerkleTreeBackend>::hash_four(&[
+                                child(0),
+                                child(1),
+                                child(2),
+                                child(3),
+                            ])
+                        })
+                        .collect()
+                } else {
+                    level
+                        .chunks_exact(2)
+                        .map(|p| {
+                            <H::Batched<Field> as IsMerkleTreeBackend>::hash_new_parent(
+                                &p[0], &p[1],
+                            )
+                        })
+                        .collect()
+                };
                 levels.push(std::mem::replace(&mut level, up));
             }
             (levels, level[0])
@@ -2528,7 +2635,7 @@ pub trait IsStarkProver<
             (0..bases.len()).map(rebuild).collect();
         let mut subtrees: Vec<Vec<Vec<Commitment>>> = Vec::with_capacity(bases.len());
         for (&b, (levels, root)) in bases.iter().zip(rebuilt) {
-            if top.node(top.top_level, b) != Some(&root) {
+            if top.subtree_root(b) != Some(&root) {
                 return Err(ProvingError::RecomputedCommitmentMismatch(format!(
                     "the rebuilt subtree {b} (2^{} leaves) does not match the kept tree",
                     per.trailing_zeros()
@@ -2541,22 +2648,23 @@ pub trait IsStarkProver<
             .map(|&q| {
                 let b = q / per;
                 let levels = &subtrees[bases.binary_search(&b).expect("every base was rebuilt")];
-                let mut path = Vec::with_capacity(levels.len() + top.top_level);
+                let mut path = Vec::with_capacity(3 * (levels.len() + top.top_level));
                 let mut i = q - b * per;
                 for level in levels {
-                    path.push(level[i ^ 1]);
-                    i >>= 1;
-                }
-                let mut pos = (1usize << top.top_level) - 1 + b;
-                while pos != 0 {
-                    let sibling = if pos.is_multiple_of(2) {
-                        pos - 1
+                    if arity4 {
+                        let first = i / 4 * 4;
+                        for c in (first..first + 4).filter(|&c| c != i) {
+                            path.push(level.get(c).copied().unwrap_or_else(
+                                <H::Batched<Field> as IsMerkleTreeBackend>::padding_node,
+                            ));
+                        }
+                        i /= 4;
                     } else {
-                        pos + 1
-                    };
-                    path.push(top.nodes[sibling]);
-                    pos = (pos - 1) / 2;
+                        path.push(level[i ^ 1]);
+                        i >>= 1;
+                    }
                 }
+                top.push_path_above(b, &mut path);
                 Proof { merkle_path: path }
             })
             .collect())

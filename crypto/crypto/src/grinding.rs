@@ -194,12 +194,24 @@ pub fn gpu_grind_calls_rpx() -> u64 {
     GPU_GRIND_CALLS_RPX.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The same for ZisK's Poseidon1 (`p1/*` exploration branch), counted apart
+/// for the reason the RPX counter is.
+#[cfg(feature = "cuda")]
+static GPU_GRIND_CALLS_P1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Successful Poseidon1 device grinds.
+#[cfg(feature = "cuda")]
+pub fn gpu_grind_calls_p1() -> u64 {
+    GPU_GRIND_CALLS_P1.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Zeroes BOTH counters — a measuring caller resets once and reads both, so an
 /// arm cannot inherit the previous arm's count.
 #[cfg(feature = "cuda")]
 pub fn reset_gpu_grind_calls() {
     GPU_GRIND_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
     GPU_GRIND_CALLS_RPX.store(0, core::sync::atomic::Ordering::Relaxed);
+    GPU_GRIND_CALLS_P1.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Which device grind kernel a digest takes, if it has one.
@@ -214,6 +226,9 @@ pub enum DeviceGrindKey {
     Keccak256,
     /// `math_cuda::grinding::generate_nonce_rpx_gpu`, big-endian felts.
     Rpx256,
+    /// `math_cuda::grinding::generate_nonce_p1_gpu`, big-endian felts (ZisK's
+    /// width-8 Poseidon1, `p1/*` exploration branch).
+    Poseidon1,
 }
 
 /// ★ A grinding digest, and the device arm it takes — stated BY THE DIGEST.
@@ -318,6 +333,10 @@ where
             &inner_hash_felts::<D>(seed, grinding_factor),
             grinding_factor,
         ),
+        DeviceGrindKey::Poseidon1 => math_cuda::grinding::generate_nonce_p1_gpu(
+            &inner_hash_felts::<D>(seed, grinding_factor),
+            grinding_factor,
+        ),
     };
 
     if let Some(nonce) = found {
@@ -333,6 +352,9 @@ where
                 }
                 DeviceGrindKey::Rpx256 => {
                     GPU_GRIND_CALLS_RPX.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                }
+                DeviceGrindKey::Poseidon1 => {
+                    GPU_GRIND_CALLS_P1.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                 }
             };
             return Some(nonce);
