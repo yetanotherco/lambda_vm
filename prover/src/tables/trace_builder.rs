@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 #[cfg(feature = "disk-spill")]
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
@@ -44,9 +45,10 @@ use super::blake3::{self, Blake3Operation};
 use super::branch::{self, BranchOperation};
 use super::bytewise;
 use super::commit::{self, CommitOperation};
-use super::cpu::{self, CpuOperation};
+use super::cpu::{self, CpuOp, CpuOperation};
 use super::cpu32;
 use super::decode;
+use super::decode::DecodeTable;
 use super::dvrm::{self, DvrmOperation};
 use super::ecdas;
 use super::ecsm;
@@ -67,7 +69,7 @@ use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
+use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
@@ -395,7 +397,7 @@ impl RegisterState {
 // =============================================================================
 
 /// Get byte count and signed flag from CpuOperation memory flags.
-fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
+fn cpu_op_to_bytes_and_signed(op: CpuOp<'_>) -> (usize, bool) {
     let f = &op.decode.fields;
     (f.mem_bytes(), f.mem_signed())
 }
@@ -420,14 +422,12 @@ fn pack_register_value(value: u64) -> [u32; 8] {
 // Phase 1: Logs → CPU ops
 // =============================================================================
 
-/// Collects CPU operations from execution logs.
+/// Collects CPU operations from execution logs, each holding its DECODE row
+/// in `decode`.
 ///
 /// Returns a vector of CpuOperation, one per log entry.
-fn collect_cpu_ops(
-    logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<CpuOperation>, Error> {
-    collect_cpu_ops_from(logs, instructions, 0)
+fn collect_cpu_ops(logs: &[Log], decode: &DecodeTable) -> Result<Vec<CpuOperation>, Error> {
+    collect_cpu_ops_from(logs, decode, 0)
 }
 
 /// [`collect_cpu_ops`] for logs that start at cycle `first` of the run: the
@@ -435,18 +435,18 @@ fn collect_cpu_ops(
 /// whole-run collect would.
 fn collect_cpu_ops_from(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    decode: &DecodeTable,
     first: usize,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
-    collect_cpu_ops_into(logs, instructions, first, &mut cpu_ops)?;
+    collect_cpu_ops_into(logs, decode, first, &mut cpu_ops)?;
     Ok(cpu_ops)
 }
 
 /// [`collect_cpu_ops_from`], appending to `cpu_ops`.
 fn collect_cpu_ops_into(
     logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
+    decode: &DecodeTable,
     first: usize,
     cpu_ops: &mut Vec<CpuOperation>,
 ) -> Result<(), Error> {
@@ -457,23 +457,25 @@ fn collect_cpu_ops_into(
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = ((first + i) as u64) * 4 + 4;
-        let instruction = instructions
-            .get(&log.current_pc)
-            .copied()
+        let row = decode
+            .row(log.current_pc)
             .ok_or(Error::MissingInstruction(log.current_pc))?;
-
-        let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
-        cpu_ops.push(op);
+        cpu_ops.push(CpuOperation::from_log(
+            log,
+            timestamp,
+            decode.entry(row),
+            row,
+        ));
     }
     Ok(())
 }
 
 /// The parts of the lean walk a windowed build uses (D-EXEC E1). The tables are
-/// the same with any of them; the whole-run build uses none.
+/// the same with any of them; the whole-run build uses none. (Each cycle's
+/// decode is always read from the [`DecodeTable`]: a CPU op holds its DECODE
+/// row.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WalkLean {
-    /// Each cycle's decode read from a [`DecodeTable`].
-    pub(crate) decode: bool,
     /// Memory accesses through [`MemoryState`]'s page-found paths.
     pub(crate) memory: bool,
     /// The in-walk BITWISE lookups counted by the accumulator from the CPU and
@@ -485,21 +487,19 @@ pub(crate) struct WalkLean {
 
 impl WalkLean {
     pub(crate) const ALL: Self = Self {
-        decode: true,
         memory: true,
         lookups: true,
         route: true,
     };
     pub(crate) const NONE: Self = Self {
-        decode: false,
         memory: false,
         lookups: false,
         route: false,
     };
 
     /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
-    /// of `decode`, `memory`, `lookups`, `route`. Read once; any other value is
-    /// refused.
+    /// of `memory`, `lookups`, `route` (`decode` is accepted and always on).
+    /// Read once; any other value is refused.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
         LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
@@ -523,7 +523,7 @@ impl WalkLean {
         let mut lean = Self::NONE;
         for part in v.split(',').map(str::trim) {
             match part {
-                "decode" => lean.decode = true,
+                "decode" => {}
                 "memory" => lean.memory = true,
                 "lookups" => lean.lookups = true,
                 "route" => lean.route = true,
@@ -532,68 +532,6 @@ impl WalkLean {
         }
         Some(lean)
     }
-}
-
-/// Every pc of the instruction map decoded once, in dense runs of consecutive
-/// pcs (4 bytes apart): a cycle's [`DecodeEntry`] is one indexed read instead of
-/// a hash lookup and a decode of its instruction. Built from the map, so it holds
-/// exactly the pcs the map holds, each decoded as
-/// [`CpuOperation::from_log_and_instruction`] decodes it.
-pub(crate) struct DecodeTable {
-    /// `(first pc, the entries of pc, pc + 4, …)`, ascending.
-    runs: Vec<(u64, Vec<DecodeEntry>)>,
-}
-
-impl DecodeTable {
-    pub(crate) fn from_instructions(instructions: &U64HashMap<Instruction>) -> Self {
-        let mut pcs: Vec<u64> = instructions.keys().copied().collect();
-        pcs.sort_unstable();
-        let mut runs: Vec<(u64, Vec<DecodeEntry>)> = Vec::new();
-        for pc in pcs {
-            let entry = DecodeEntry::from_instruction(pc, instructions[&pc], 4);
-            match runs.last_mut() {
-                Some((first, entries))
-                    if first.checked_add(4 * entries.len() as u64) == Some(pc) =>
-                {
-                    entries.push(entry)
-                }
-                _ => runs.push((pc, vec![entry])),
-            }
-        }
-        Self { runs }
-    }
-
-    /// The decode of the instruction at `pc`, if the map holds one.
-    #[inline]
-    fn get(&self, pc: u64) -> Option<&DecodeEntry> {
-        self.runs.iter().find_map(|(first, entries)| {
-            let offset = pc.wrapping_sub(*first);
-            if offset % 4 != 0 {
-                return None;
-            }
-            entries.get(usize::try_from(offset / 4).ok()?)
-        })
-    }
-}
-
-/// [`collect_cpu_ops_from`] with each cycle's decode read from `table`: the same
-/// ops.
-fn collect_cpu_ops_from_table(
-    logs: &[Log],
-    table: &DecodeTable,
-    first: usize,
-) -> Result<Vec<CpuOperation>, Error> {
-    let mut cpu_ops = Vec::with_capacity(logs.len());
-    for (i, log) in logs.iter().enumerate() {
-        // As `collect_cpu_ops_into`.
-        let timestamp = ((first + i) as u64) * 4 + 4;
-        let decode = table
-            .get(log.current_pc)
-            .ok_or(Error::MissingInstruction(log.current_pc))?
-            .clone();
-        cpu_ops.push(CpuOperation::from_log(log, timestamp, decode));
-    }
-    Ok(cpu_ops)
 }
 
 // =============================================================================
@@ -782,6 +720,7 @@ fn build_reg_fallback(
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
@@ -800,7 +739,14 @@ fn collect_ops_from_cpu(
     Vec<hint::HintOperation>,
 ) {
     let mut out = WalkOutputs::with_capacity(cpu_ops.len());
-    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out, true);
+    collect_ops_from_cpu_into(
+        cpu_ops,
+        decode,
+        memory_state,
+        register_state,
+        &mut out,
+        true,
+    );
     let WalkOutputs {
         memw,
         load_ops,
@@ -927,13 +873,14 @@ pub(crate) fn vec_heap_bytes<T>(list: &Vec<T>) -> usize {
     list.capacity() * std::mem::size_of::<T>()
 }
 
-/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). Without
-/// `lookups` the walk leaves out the in-walk BITWISE lookups (each CPU op's and
-/// each LOAD op's), which are a function of the CPU and LOAD ops it emits: the
-/// caller counts them from those ([`CpuOperation::count_bitwise_into`],
-/// [`LoadOperation::count_bitwise_into`]).
+/// The walk over `cpu_ops` (read with `decode`), appended to `out` (see
+/// [`WalkOutputs`]). Without `lookups` the walk leaves out the in-walk BITWISE
+/// lookups (each CPU op's and each LOAD op's), which are a function of the CPU
+/// and LOAD ops it emits: the caller counts them from those
+/// ([`CpuOp::count_bitwise_into`], [`LoadOperation::count_bitwise_into`]).
 fn collect_ops_from_cpu_into(
     cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
@@ -965,6 +912,7 @@ fn collect_ops_from_cpu_into(
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
+        let op = decode.op(op);
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
         // collector below so the MEMW table balances).
@@ -1184,7 +1132,7 @@ fn collect_ops_from_cpu_into(
 /// Returns: (memw_op, load_op); the LOAD op's BITWISE lookups are
 /// [`LoadOperation::collect_bitwise_ops`].
 fn collect_load_op_from_cpu(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     memory_state: &mut MemoryState,
 ) -> (MemwOperation, LoadOperation) {
     // res contains the effective address (base + offset)
@@ -1230,7 +1178,8 @@ fn collect_load_op_from_cpu(
         op.timestamp,
         byte_count as u8,
         signed,
-        res_bytes.map(u64::from),
+        // Bytes: each `& 0xFF` or the 0/0xFF fill.
+        res_bytes.map(|byte| byte as u8),
     );
 
     // Update memory state
@@ -1242,7 +1191,7 @@ fn collect_load_op_from_cpu(
 /// Collects a STORE operation as a MEMW write from CpuOperation.
 ///
 /// Returns: memw_op
-fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) -> MemwOperation {
+fn collect_store_op_from_cpu(op: CpuOp<'_>, memory_state: &mut MemoryState) -> MemwOperation {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
@@ -1292,7 +1241,7 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 /// accesses always observe a strictly smaller old timestamp.
 #[allow(clippy::needless_range_loop)]
 fn collect_ecsm_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
@@ -1427,7 +1376,7 @@ fn collect_ecsm_ops(
 /// the guest supplied the input via ordinary stores). The value itself is
 /// unconstrained — soundness lives in the guest's in-circuit verify.
 fn collect_hint_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (Vec<MemwOperation>, hint::HintOperation) {
@@ -1491,7 +1440,7 @@ fn collect_hint_ops(
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
 /// pushing them into `memw_ops`.
 fn collect_register_ops_from_cpu<S: MemwSink>(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     register_state: &mut RegisterState,
     memw_ops: &mut S,
 ) {
@@ -1614,7 +1563,7 @@ fn cpu32_res(c: &cpu32::Cpu32Operation, arg1: u64, arg2: u64) -> u64 {
 
 /// Builds the CPU32 row for a word (`*W`) instruction. `op.rv1/rv2/rvd` carry the
 /// real register values (the main CPU delegate row zeroes its own columns).
-fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
+fn build_cpu32_op(op: CpuOp<'_>) -> cpu32::Cpu32Operation {
     let f = &op.decode.fields;
     let mut c = cpu32::Cpu32Operation {
         timestamp: op.timestamp,
@@ -1737,7 +1686,7 @@ fn cpu32_chip_op(
 ///
 /// Returns: Vec of MEMW operations
 fn collect_commit_memw_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     register_state: &mut RegisterState,
     memory_state: &mut MemoryState,
 ) -> Vec<MemwOperation> {
@@ -1895,7 +1844,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 /// Generates 25 read operations (input lanes at timestamp) and 25 write
 /// operations (output lanes at timestamp+1). Each operation is 8 bytes wide.
 fn collect_keccak_memw_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     input: &[u64; 25],
     output: &[u64; 25],
     memory_state: &mut MemoryState,
@@ -2013,7 +1962,7 @@ pub(crate) fn strip_blake3_side_effects() -> bool {
 /// The message is read but never written, so `memory_state` is untouched by the
 /// block reads; only `cv_out` advances it.
 fn collect_blake3_absorb_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (Vec<MemwOperation>, blake3::Blake3AbsorbOperation) {
@@ -2125,7 +2074,7 @@ fn collect_blake3_absorb_ops(
 /// `ts` like a LOAD), the 8 output dwords write the compression output over
 /// the previous content.
 fn collect_blake3_memw_ops(
-    op: &CpuOperation,
+    op: CpuOp<'_>,
     words: &[u32; 28],
     out: &[u32; 16],
     memory_state: &mut MemoryState,
@@ -2849,11 +2798,12 @@ pub(crate) fn epoch_touched_cells<I: ImageSource>(
 ) -> Result<Vec<(u64, u64, u64)>, Error> {
     let instructions = decode::instructions_from_elf(elf)
         .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-    let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+    let decode = DecodeTable::from_instructions(&instructions);
+    let cpu_ops = collect_cpu_ops(logs, &decode)?;
 
     let mut memory_state = MemoryState::from_image(initial_image);
     let mut register_state = RegisterState::from_init(register_init);
-    let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+    let _ = collect_ops_from_cpu(&cpu_ops, &decode, &mut memory_state, &mut register_state);
 
     Ok(touched_cells_from_memory_state(&memory_state))
 }
@@ -2936,7 +2886,7 @@ fn collect_bitwise_from_page<I: ImageSource>(
 /// Expand one Commit ECALL into its per-byte COMMIT rows using the memory state
 /// at the moment the ECALL executes.
 fn expand_commit_operations_for_ecall(
-    ecall: &CpuOperation,
+    ecall: CpuOp<'_>,
     memory_state: &MemoryState,
     start_index: u64,
 ) -> Vec<CommitOperation> {
@@ -3673,9 +3623,10 @@ fn generate_page_tables<I: ImageSource>(
 /// build ([`Traces::from_image_and_logs_with_decode`]) instead of re-parsing
 /// the ELF and regenerating the trace per epoch.
 pub struct DecodeArtifacts {
-    instructions: U64HashMap<Instruction>,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: decode::PcToRow,
+    /// Every instruction's decode by DECODE row: what the CPU ops are read
+    /// with (shared with the threads that generate CPU chunks).
+    decode: Arc<DecodeTable>,
 }
 
 impl DecodeArtifacts {
@@ -3687,11 +3638,11 @@ impl DecodeArtifacts {
     pub fn from_elf(elf: &Elf) -> Result<Self, Error> {
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        let (decode_trace, _) = decode::generate_decode_trace(&instructions);
+        let decode = Arc::new(DecodeTable::from_instructions(&instructions));
         Ok(Self {
-            instructions,
             decode_trace,
-            decode_pc_to_row,
+            decode,
         })
     }
 }
@@ -4009,26 +3960,24 @@ pub(crate) struct PreCounted {
     /// longer in their lists ([`StreamSkip::tails`] without the MEMW-derived LT
     /// ops streamed), in list order: phase 3 puts each before the LT ops of the
     /// list it derives from the ops left.
-    pub(crate) memw_lt: Vec<LtOperation>,
-    pub(crate) memw_aligned_lt: Vec<LtOperation>,
+    pub(crate) memw_lt: CompactLt,
+    pub(crate) memw_aligned_lt: CompactLt,
 }
 
 impl PreCounted {
     /// The bytes it takes on the heap: the histogram and the derived LT ops.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.histogram.heap_bytes()
-            + vec_heap_bytes(&self.memw_lt)
-            + vec_heap_bytes(&self.memw_aligned_lt)
+        self.histogram.heap_bytes() + self.memw_lt.heap_bytes() + self.memw_aligned_lt.heap_bytes()
     }
 
     /// [`Self::heap_bytes`] part by part.
     pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
         vec![
             ("counted histogram".to_string(), self.histogram.heap_bytes()),
-            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            ("counted memw_lt".to_string(), self.memw_lt.heap_bytes()),
             (
                 "counted memw_a_lt".to_string(),
-                vec_heap_bytes(&self.memw_aligned_lt),
+                self.memw_aligned_lt.heap_bytes(),
             ),
         ]
     }
@@ -4158,7 +4107,9 @@ fn chunk_and_generate_optional<T: Sync>(
 
 /// Generate a single trace table for `ops`, or none at all when `ops` is empty.
 ///
-/// The accelerator chips are not chunked: one call means one table. What they do
+/// The accelerator chips are not chunked outside the no-epoch block (whose
+/// `MaxRowsConfig` chunks KECCAK, KECCAK_RND, ECSM and ECDAS): all their ops
+/// make one table. What they do
 /// share with the chunked chips is that an empty op list should cost nothing, so
 /// this returns an empty `Vec` and the table drops out of the proof. Soundness
 /// rests on the same LogUp argument as [`chunk_and_generate_optional`].
@@ -4262,23 +4213,54 @@ fn generate_chunks_with<C: Send, T>(
 /// (phase 3's LT ops: the kept tail, the MEMW and MEMW_A prefixes and what the
 /// finish derives, each a list of its own).
 struct Segmented<'a, T> {
-    parts: Vec<&'a [T]>,
+    parts: Vec<Part<'a, T>>,
+}
+
+/// One segment of a [`Segmented`] list: ops in memory, or ops kept in a
+/// compact form that expands any range of them ([`CompactLt`]).
+enum Part<'a, T> {
+    Ops(&'a [T]),
+    Compact(&'a (dyn Expand<T> + Sync)),
+}
+
+impl<T> Clone for Part<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Part<'_, T> {}
+
+impl<T> Part<'_, T> {
+    fn len(&self) -> usize {
+        match self {
+            Part::Ops(ops) => ops.len(),
+            Part::Compact(c) => c.len(),
+        }
+    }
+}
+
+/// Ops kept in a compact form: how many, and any range of them expanded.
+trait Expand<T> {
+    fn len(&self) -> usize;
+    /// Ops `start..end`, appended to `out`.
+    fn expand_into(&self, start: usize, end: usize, out: &mut Vec<T>);
 }
 
 impl<'a, T: Clone> Segmented<'a, T> {
     fn len(&self) -> usize {
-        self.parts.iter().map(|p| p.len()).sum()
+        self.parts.iter().map(Part::len).sum()
     }
 
-    /// Ops `start..end` of the concatenation: borrowed when one segment holds
-    /// them, copied when they straddle segments.
+    /// Ops `start..end` of the concatenation: borrowed when one in-memory
+    /// segment holds them, copied (or expanded) otherwise.
     fn range(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
         let mut at = 0usize;
-        let mut pieces: Vec<&'a [T]> = Vec::new();
+        let mut pieces: Vec<(Part<'a, T>, usize, usize)> = Vec::new();
         for part in &self.parts {
             let (lo, hi) = (at, at + part.len());
             if hi > start && lo < end {
-                pieces.push(&part[start.max(lo) - lo..end.min(hi) - lo]);
+                pieces.push((*part, start.max(lo) - lo, end.min(hi) - lo));
             }
             at = hi;
             if at >= end {
@@ -4287,8 +4269,124 @@ impl<'a, T: Clone> Segmented<'a, T> {
         }
         match pieces.as_slice() {
             [] => std::borrow::Cow::Borrowed(&[]),
-            [one] => std::borrow::Cow::Borrowed(one),
-            _ => std::borrow::Cow::Owned(pieces.concat()),
+            [(Part::Ops(ops), lo, hi)] => std::borrow::Cow::Borrowed(&ops[*lo..*hi]),
+            _ => {
+                let mut out = Vec::with_capacity(end.saturating_sub(start));
+                for (part, lo, hi) in pieces {
+                    match part {
+                        Part::Ops(ops) => out.extend_from_slice(&ops[lo..hi]),
+                        Part::Compact(c) => c.expand_into(lo, hi, &mut out),
+                    }
+                }
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+}
+
+/// LT ops with `signed` and `invert` false — the timestamp checks phase 3
+/// derives from MEMW and MEMW_A ops — kept as a stream of zigzag LEB128
+/// deltas, `rhs` from the previous op's and `lhs` from its own `rhs`: a few
+/// bytes an op instead of 24. Every [`COMPACT_LT_BLOCK`] ops a sparse index
+/// records where the stream stands, so any range expands on its own. The
+/// ops expand exactly as pushed, in order.
+#[derive(Default)]
+pub(crate) struct CompactLt {
+    bytes: Vec<u8>,
+    /// (byte offset, previous `rhs`) at op `k * COMPACT_LT_BLOCK`.
+    index: Vec<(usize, u64)>,
+    len: usize,
+    last_rhs: u64,
+    /// The ops as they are, 24 bytes each, instead of the stream (the A arm,
+    /// `LAMBDA_VM_BLOCK_COMPACT_LT=0`).
+    raw: Option<Vec<LtOperation>>,
+}
+
+const COMPACT_LT_BLOCK: usize = 4096;
+
+impl CompactLt {
+    /// A list that keeps its ops as they are (the A arm of the compact form).
+    pub(crate) fn raw() -> Self {
+        Self {
+            raw: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Append `ops` (each with `signed` and `invert` false).
+    pub(crate) fn extend(&mut self, ops: &[LtOperation]) {
+        if let Some(raw) = &mut self.raw {
+            raw.extend_from_slice(ops);
+            return;
+        }
+        fn put(out: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                out.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let zigzag = |d: u64| (d << 1) ^ ((d as i64 >> 63) as u64);
+        for op in ops {
+            debug_assert!(
+                !op.signed && !op.invert,
+                "a compact LT op is unsigned, not inverted"
+            );
+            if self.len.is_multiple_of(COMPACT_LT_BLOCK) {
+                self.index.push((self.bytes.len(), self.last_rhs));
+            }
+            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(self.last_rhs)));
+            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(op.lhs)));
+            self.last_rhs = op.rhs;
+            self.len += 1;
+        }
+    }
+
+    /// The bytes it takes on the heap (capacities).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.raw.as_ref().map_or(0, vec_heap_bytes)
+            + self.bytes.capacity()
+            + self.index.capacity() * std::mem::size_of::<(usize, u64)>()
+    }
+}
+
+impl Expand<LtOperation> for CompactLt {
+    fn len(&self) -> usize {
+        self.raw.as_ref().map_or(self.len, Vec::len)
+    }
+
+    fn expand_into(&self, start: usize, end: usize, out: &mut Vec<LtOperation>) {
+        if let Some(raw) = &self.raw {
+            out.extend_from_slice(&raw[start.min(raw.len())..end.min(raw.len())]);
+            return;
+        }
+        let end = end.min(self.len);
+        if start >= end {
+            return;
+        }
+        let get = |at: &mut usize| {
+            let (mut v, mut shift) = (0u64, 0u32);
+            loop {
+                let b = self.bytes[*at];
+                *at += 1;
+                v |= u64::from(b & 0x7f) << shift;
+                if b < 0x80 {
+                    return v;
+                }
+                shift += 7;
+            }
+        };
+        let unzigzag = |z: u64| (z >> 1) ^ (z & 1).wrapping_neg();
+        let block = start / COMPACT_LT_BLOCK;
+        let (mut at, mut prev) = self.index[block];
+        out.reserve(end - start);
+        for k in block * COMPACT_LT_BLOCK..end {
+            let rhs = prev.wrapping_add(unzigzag(get(&mut at)));
+            let lhs = rhs.wrapping_sub(unzigzag(get(&mut at)));
+            prev = rhs;
+            if k >= start {
+                out.push(LtOperation::new(lhs, rhs, false));
+            }
         }
     }
 }
@@ -4432,39 +4530,40 @@ impl RoutedSegments {
     }
 }
 
-/// The routing of [`collect_all_ops`], segment by segment ([`RoutedSegments`]).
-fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> RoutedSegments {
+/// The routing of [`collect_all_ops`], segment by segment ([`RoutedSegments`]),
+/// each CPU op read with `decode`.
+fn route_ops(
+    cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
+    cpu32_ops: &[cpu32::Cpu32Operation],
+) -> RoutedSegments {
+    let ops = || cpu_ops.iter().map(|op| decode.op(op));
     // Collect BRANCH operations from CPU ops where branch_cond = true
-    let branch_ops: Vec<BranchOperation> = cpu_ops
-        .iter()
+    let branch_ops: Vec<BranchOperation> = ops()
         .filter(|op| op.branch_cond())
         .map(route_branch)
         .collect();
 
     // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
     // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
-    let mul_filter: Vec<(MulOperation, bool)> = cpu_ops
-        .iter()
+    let mul_filter: Vec<(MulOperation, bool)> = ops()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
         .map(route_mul)
         .collect();
 
     // Collect DVRM operations from non-word DIV/REM instructions.
-    let dvrm_filter: Vec<(DvrmOperation, bool)> = cpu_ops
-        .iter()
+    let dvrm_filter: Vec<(DvrmOperation, bool)> = ops()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
         .map(route_dvrm)
         .collect();
 
     // Collect the ALU/MEMORY chip ops (non-word rows).
     // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
+    let eq_ops: Vec<eq::EqOperation> = ops()
         .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
         .map(route_eq)
         .collect();
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = ops()
         .filter(|op| {
             let f = &op.decode.fields;
             !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
@@ -4474,8 +4573,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
     // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
     // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
     // table row).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
+    let store_ops: Vec<store::StoreOperation> = ops()
         .filter(|op| op.decode.fields.is_store())
         .map(route_store)
         .collect();
@@ -4496,6 +4594,7 @@ fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> R
 /// filter's order — the same segments.
 fn route_ops_one_pass(
     cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
     cpu32_ops: &[cpu32::Cpu32Operation],
 ) -> RoutedSegments {
     let mut branch_ops = Vec::new();
@@ -4505,6 +4604,7 @@ fn route_ops_one_pass(
     let mut bytewise_ops = Vec::new();
     let mut store_ops = Vec::new();
     for op in cpu_ops {
+        let op = decode.op(op);
         let f = &op.decode.fields;
         if op.branch_cond() {
             branch_ops.push(route_branch(op));
@@ -4539,7 +4639,7 @@ fn route_ops_one_pass(
 }
 
 // [`route_ops`]'s op for each segment it filters out of the CPU ops.
-fn route_branch(op: &CpuOperation) -> BranchOperation {
+fn route_branch(op: CpuOp<'_>) -> BranchOperation {
     BranchOperation::new(
         op.decode.pc,
         op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
@@ -4547,27 +4647,27 @@ fn route_branch(op: &CpuOperation) -> BranchOperation {
         op.decode.fields.jalr(),
     )
 }
-fn route_mul(op: &CpuOperation) -> (MulOperation, bool) {
+fn route_mul(op: CpuOp<'_>) -> (MulOperation, bool) {
     let f = op.decode.fields;
     (
         MulOperation::new(op.rv1, f.alu_signed(), op.arg2(), f.alu_signed2_or_invert()),
         f.alu_muldiv(),
     )
 }
-fn route_dvrm(op: &CpuOperation) -> (DvrmOperation, bool) {
+fn route_dvrm(op: CpuOp<'_>) -> (DvrmOperation, bool) {
     let f = op.decode.fields;
     (
         DvrmOperation::new(op.rv1, op.arg2(), f.alu_signed()),
         f.alu_muldiv(),
     )
 }
-fn route_eq(op: &CpuOperation) -> eq::EqOperation {
+fn route_eq(op: CpuOp<'_>) -> eq::EqOperation {
     eq::EqOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_signed2_or_invert())
 }
-fn route_bytewise(op: &CpuOperation) -> bytewise::BytewiseOperation {
+fn route_bytewise(op: CpuOp<'_>) -> bytewise::BytewiseOperation {
     bytewise::BytewiseOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_op())
 }
-fn route_store(op: &CpuOperation) -> store::StoreOperation {
+fn route_store(op: CpuOp<'_>) -> store::StoreOperation {
     // The MEMORY bus and the STORE chip's MEMW write share the base
     // timestamp (spec store.toml uses one `timestamp` for both).
     store::StoreOperation::new(
@@ -4653,6 +4753,7 @@ fn route_from_cpu_segments(
 #[allow(clippy::too_many_arguments)]
 fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
+    decode: &DecodeTable,
     mut memw: MemwBuckets,
     load_ops: Vec<LoadOperation>,
     mut lt_ops: Vec<LtOperation>,
@@ -4704,7 +4805,7 @@ fn collect_all_ops(
         lt_dvrm_cpu32,
         mul_dvrm_filter,
         mul_dvrm_cpu32,
-    } = route_ops(&cpu_ops, &cpu32_ops);
+    } = route_ops(&cpu_ops, decode, &cpu32_ops);
     // The lists are the segments in the order the routing always produced them:
     // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies.
     shift_ops.extend(shift_cpu32);
@@ -4756,7 +4857,7 @@ fn build_traces<I: ImageSource + Sync>(
     memory_state: &MemoryState,
     register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: &decode::PcToRow,
+    decode_table: &DecodeTable,
     mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -4833,24 +4934,24 @@ fn build_traces<I: ImageSource + Sync>(
     let lt_concat: Vec<LtOperation>;
     let lt_ops = if skip.concat_lt {
         let mut all = lt_ops;
-        all.extend(memw_lt);
+        memw_lt.expand_into(0, memw_lt.len(), &mut all);
         all.extend(lt_from_memw);
-        all.extend(memw_aligned_lt);
+        memw_aligned_lt.expand_into(0, memw_aligned_lt.len(), &mut all);
         all.extend(lt_from_memw_aligned);
         all.extend(lt_from_hints);
         lt_concat = all;
         Segmented {
-            parts: vec![&lt_concat[..]],
+            parts: vec![Part::Ops(&lt_concat[..])],
         }
     } else {
         Segmented {
             parts: vec![
-                &lt_ops[..],
-                &memw_lt,
-                &lt_from_memw,
-                &memw_aligned_lt,
-                &lt_from_memw_aligned,
-                &lt_from_hints,
+                Part::Ops(&lt_ops[..]),
+                Part::Compact(&memw_lt),
+                Part::Ops(&lt_from_memw),
+                Part::Compact(&memw_aligned_lt),
+                Part::Ops(&lt_from_memw_aligned),
+                Part::Ops(&lt_from_hints),
             ],
         }
     };
@@ -4913,10 +5014,25 @@ fn build_traces<I: ImageSource + Sync>(
     // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
     // below; the rest stay one collector each.
     let mut collectors: Vec<Collector> = Vec::new();
-    for slice in lt_ops.parts.iter().flat_map(|part| part.chunks(1 << 20)) {
-        collectors.push(Box::new(move |h| {
-            h.add_ops(&collect_bitwise_from_lt(slice))
-        }));
+    for part in &lt_ops.parts {
+        match *part {
+            Part::Ops(ops) => {
+                for slice in ops.chunks(1 << 20) {
+                    collectors.push(Box::new(move |h| {
+                        h.add_ops(&collect_bitwise_from_lt(slice))
+                    }));
+                }
+            }
+            Part::Compact(compact) => {
+                for start in (0..compact.len()).step_by(1 << 20) {
+                    collectors.push(Box::new(move |h| {
+                        let mut slice = Vec::new();
+                        compact.expand_into(start, start + (1 << 20), &mut slice);
+                        h.add_ops(&collect_bitwise_from_lt(&slice))
+                    }));
+                }
+            }
+        }
     }
     for slice in mul_ops.chunks(mul_chunk.max(1)) {
         collectors.push(Box::new(move |h| {
@@ -5083,7 +5199,7 @@ fn build_traces<I: ImageSource + Sync>(
         let (halt_timestamp, halt_next_pc) = cpu_ops
             .iter()
             .rev()
-            .find(|op| op.decode.fields.ecall)
+            .find(|op| decode_table.entry(op.decode_row).fields.ecall)
             .map(|op| (op.timestamp, op.next_pc))
             .or(streamed_last_ecall)
             .ok_or(Error::MissingHaltEcall)?;
@@ -5112,7 +5228,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.cpu,
             skip.tails,
             false,
-            cpu::generate_cpu_trace,
+            |ops| cpu::generate_cpu_trace(ops, decode_table),
             to(FinishedKind::Cpu),
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5300,9 +5416,9 @@ fn build_traces<I: ImageSource + Sync>(
     // independently.
     let gen_decode = move || {
         let mut decode = decode_trace;
-        let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
+        let rows = cpu_ops_ref.iter().map(|op| op.decode_row as usize);
+        let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
+        decode::count_rows(&mut decode, rows.chain(padding));
         decode
     };
     let gen_commits = || {
@@ -5315,13 +5431,26 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_keccaks = || {
-        generate_optional(
-            &keccak_ops,
-            keccak::generate_keccak_trace,
-            to(FinishedKind::Keccak),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.keccak == super::KECCAK_UNCHUNKED {
+            generate_optional(
+                &keccak_ops,
+                keccak::generate_keccak_trace,
+                to(FinishedKind::Keccak),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // One row per call: a chunk holds whole calls (see
+            // `MaxRowsConfig::keccak`).
+            chunk_and_generate_optional(
+                &keccak_ops,
+                max_rows.keccak.max(1),
+                keccak::generate_keccak_trace,
+                to(FinishedKind::Keccak),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let gen_keccak_rnds = || {
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
@@ -5397,13 +5526,26 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
-        generate_optional(
-            &ecsm_ops,
-            ecsm::generate_ecsm_trace,
-            to(FinishedKind::Ecsm),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        if max_rows.ecsm == super::ECSM_UNCHUNKED {
+            generate_optional(
+                &ecsm_ops,
+                ecsm::generate_ecsm_trace,
+                to(FinishedKind::Ecsm),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            // One row per call: a chunk holds whole calls (see
+            // `MaxRowsConfig::ecsm`).
+            chunk_and_generate_optional(
+                &ecsm_ops,
+                max_rows.ecsm.max(1),
+                ecsm::generate_ecsm_trace,
+                to(FinishedKind::Ecsm),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let gen_ecdases = || {
         if max_rows.ecdas == super::ECDAS_UNCHUNKED {
@@ -5739,19 +5881,20 @@ pub fn count_table_lengths(
         }
     };
 
+    let decode = DecodeTable::from_instructions(&instructions);
     let mut reg_memw_scratch: Vec<MemwOperation> = Vec::with_capacity(4);
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = instructions
-            .get(&log.current_pc)
-            .copied()
+        let row = decode
+            .row(log.current_pc)
             .ok_or(Error::MissingInstruction(log.current_pc))?;
-        let cpu_op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
+        let op = CpuOperation::from_log(log, timestamp, decode.entry(row), row);
+        let cpu_op = decode.op(&op);
         cpu_count += 1;
 
         // Memory ops from load/store
         if cpu_op.decode.fields.is_load() {
-            let (memw_op, _load_op) = collect_load_op_from_cpu(&cpu_op, &mut memory_state);
+            let (memw_op, _load_op) = collect_load_op_from_cpu(cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
                 &mut memw_by_width,
@@ -5760,7 +5903,7 @@ pub fn count_table_lengths(
             );
             load_count += 1;
         } else if cpu_op.decode.fields.is_store() {
-            let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
+            let memw_op = collect_store_op_from_cpu(cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
                 &mut memw_by_width,
@@ -5771,7 +5914,7 @@ pub fn count_table_lengths(
 
         // Register accesses.
         reg_memw_scratch.clear();
-        collect_register_ops_from_cpu(&cpu_op, &mut register_state, &mut reg_memw_scratch);
+        collect_register_ops_from_cpu(cpu_op, &mut register_state, &mut reg_memw_scratch);
         for memw_op in &reg_memw_scratch {
             partition_memw(
                 memw_op,
@@ -5789,7 +5932,7 @@ pub fn count_table_lengths(
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
-                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
+                collect_commit_memw_ops(cpu_op, &mut register_state, &mut memory_state);
             for memw_op in &reg_commit_ops {
                 partition_memw(
                     memw_op,
@@ -5812,7 +5955,7 @@ pub fn count_table_lengths(
             // here keeps memory/register state in sync with generation, exactly like
             // commit above.
             let (hint_memw, _hint_op) =
-                collect_hint_ops(&cpu_op, &mut memory_state, &mut register_state);
+                collect_hint_ops(cpu_op, &mut memory_state, &mut register_state);
             for memw_op in &hint_memw {
                 partition_memw(
                     memw_op,
@@ -6619,7 +6762,7 @@ impl Traces {
         // Phase 1: Logs → CPU operations
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p1_cpu_ops");
-        let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &artifacts.decode)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -6642,7 +6785,12 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        ) = collect_ops_from_cpu(
+            &cpu_ops,
+            &artifacts.decode,
+            &mut memory_state,
+            &mut register_state,
+        );
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -6650,6 +6798,7 @@ impl Traces {
         let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
             cpu_ops,
+            &artifacts.decode,
             memw_ops,
             load_ops,
             lt_ops,
@@ -6699,7 +6848,6 @@ impl Traces {
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p0_decode");
         let decode_trace = artifacts.decode_trace.clone();
-        let decode_pc_to_row = &artifacts.decode_pc_to_row;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -6712,7 +6860,7 @@ impl Traces {
             &collected.memory_state,
             register_init,
             decode_trace,
-            decode_pc_to_row,
+            &artifacts.decode,
             collected.register_state,
             max_rows,
             #[cfg(feature = "disk-spill")]
@@ -6741,11 +6889,14 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Phase 1: Logs → CPU operations
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let decode_table = DecodeTable::from_instructions(&instructions);
+        let cpu_ops = collect_cpu_ops(logs, &decode_table)?;
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::new();
-        let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
+        let entry_point = cpu_ops
+            .first()
+            .map_or(0, |op| decode_table.entry(op.decode_row).pc);
         let register_init = register::register_init_from_entry_point(entry_point);
         let mut register_state = RegisterState::new(entry_point);
         let (
@@ -6762,10 +6913,16 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        ) = collect_ops_from_cpu(
+            &cpu_ops,
+            &decode_table,
+            &mut memory_state,
+            &mut register_state,
+        );
 
         let ops = collect_all_ops(
             cpu_ops,
+            &decode_table,
             memw_ops,
             load_ops,
             lt_ops,
@@ -6784,7 +6941,7 @@ impl Traces {
         );
 
         // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
-        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        let (decode_trace, _) = decode::generate_decode_trace(&instructions);
 
         // Phases 3-5 (elf=None → empty PAGE tables)
         build_traces(
@@ -6793,7 +6950,7 @@ impl Traces {
             &memory_state,
             &register_init,
             decode_trace,
-            &decode_pc_to_row,
+            &decode_table,
             register_state,
             max_rows,
             #[cfg(feature = "disk-spill")]
@@ -6882,6 +7039,146 @@ mod segmented_tests {
         }
     }
 
+    /// LT ops with every kind of delta: increasing and decreasing `rhs`, `lhs`
+    /// above and below it, both ends of `u64`, and runs sharing one `rhs` (a
+    /// MEMW op's checks).
+    fn lt_ops(n: usize) -> Vec<LtOperation> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rhs = 1000u64;
+        (0..n)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (lhs, rhs) = match i % 7 {
+                    0 => (0, u64::MAX),
+                    1 => (u64::MAX, 0),
+                    2 => (x, x >> 3),
+                    3 | 4 => {
+                        rhs += x % 9;
+                        (rhs - x % 1000, rhs)
+                    }
+                    5 => (rhs - x % (1 << 40), rhs),
+                    _ => (x >> 1, rhs),
+                };
+                LtOperation::new(lhs, rhs, false)
+            })
+            .collect()
+    }
+
+    fn same_lt(a: &[LtOperation], b: &[LtOperation]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                (x.lhs, x.rhs, x.signed, x.invert) == (y.lhs, y.rhs, y.signed, y.invert)
+            })
+    }
+
+    /// The compact LT list expands to exactly the ops pushed, over any range:
+    /// within one index block, across blocks, from the start, to the end, past
+    /// it, and empty; pushed all at once or in pieces.
+    #[test]
+    fn compact_lt_ops_expand_to_what_was_pushed() {
+        let n = 3 * COMPACT_LT_BLOCK + 123;
+        let ops = lt_ops(n);
+        let mut whole = CompactLt::default();
+        whole.extend(&ops);
+        let mut pieces = CompactLt::default();
+        for piece in ops.chunks(1000) {
+            pieces.extend(piece);
+        }
+        assert!(whole.heap_bytes() < n * std::mem::size_of::<LtOperation>());
+        for compact in [&whole, &pieces] {
+            assert_eq!(Expand::len(compact), n);
+            for (start, end) in [
+                (0, n),
+                (0, 1),
+                (5, 17),
+                (COMPACT_LT_BLOCK - 3, COMPACT_LT_BLOCK + 3),
+                (COMPACT_LT_BLOCK, 2 * COMPACT_LT_BLOCK),
+                (2 * COMPACT_LT_BLOCK + 1, n),
+                (n - 1, n + 50),
+                (7, 7),
+            ] {
+                let mut out = Vec::new();
+                compact.expand_into(start, end, &mut out);
+                assert!(
+                    same_lt(&out, &ops[start.min(n)..end.min(n)]),
+                    "{start}..{end}"
+                );
+            }
+        }
+    }
+
+    /// LT generated as a table per chunk, its first column the lhs and its
+    /// second the rhs.
+    fn lt_table(ops: &[LtOperation]) -> Table {
+        let rows = ops.len().next_power_of_two().max(4);
+        let mut data = crate::tables::types::zeroed_fe_vec(rows * 2);
+        for (r, op) in ops.iter().enumerate() {
+            data[2 * r] = crate::tables::types::FE::from(op.lhs);
+            data[2 * r + 1] = crate::tables::types::FE::from(op.rhs);
+        }
+        TraceTable::new_main(data, 2, 1)
+    }
+
+    /// A list with compact segments chunks as its concatenation, as the
+    /// phase-3 LT list does with its MEMW-derived segments kept compact.
+    #[test]
+    fn a_list_with_compact_segments_chunks_as_its_concatenation() {
+        let all = lt_ops(2 * COMPACT_LT_BLOCK + 77);
+        let (a, b, c) = (
+            &all[..100],
+            &all[100..COMPACT_LT_BLOCK + 300],
+            &all[COMPACT_LT_BLOCK + 300..],
+        );
+        let mut compact_b = CompactLt::default();
+        compact_b.extend(b);
+        let mut compact_c = CompactLt::default();
+        compact_c.extend(c);
+        let off = Packing {
+            on: false,
+            wave: 0,
+            hand: None,
+        };
+        let segmented = Segmented {
+            parts: vec![
+                Part::Ops(a),
+                Part::Compact(&compact_b),
+                Part::Ops(&[]),
+                Part::Compact(&compact_c),
+            ],
+        };
+        for max in [1, 64, 1000, COMPACT_LT_BLOCK, 1 << 20] {
+            for (skip, tails) in [(0, false), (1, false)] {
+                let whole = chunk_and_generate_skipping(
+                    &all,
+                    max,
+                    skip,
+                    tails,
+                    true,
+                    lt_table,
+                    off,
+                    #[cfg(feature = "disk-spill")]
+                    StorageMode::Ram,
+                )
+                .expect("whole");
+                let split = chunk_and_generate_segmented(
+                    &segmented,
+                    max,
+                    skip,
+                    tails,
+                    true,
+                    lt_table,
+                    off,
+                    #[cfg(feature = "disk-spill")]
+                    StorageMode::Ram,
+                )
+                .expect("segmented");
+                assert_eq!(words(&whole), words(&split), "max {max} skip {skip}");
+            }
+        }
+    }
+
     /// Chunked from its segments, a list gives the tables its concatenation
     /// gives: every split of the segments (empty ones too), chunk sizes that
     /// cut inside and across them, with and without chunks streamed ahead
@@ -6899,7 +7196,7 @@ mod segmented_tests {
             let mut parts = Vec::new();
             let mut at = 0;
             for &n in layout {
-                parts.push(&all[at..at + n]);
+                parts.push(Part::Ops(&all[at..at + n]));
                 at += n;
             }
             let segmented = Segmented { parts };
@@ -6948,7 +7245,7 @@ mod segmented_tests {
             }
         }
         let empty: Segmented<'_, u64> = Segmented {
-            parts: vec![&[], &[]],
+            parts: vec![Part::Ops(&[]), Part::Ops(&[])],
         };
         for optional in [true, false] {
             let a = chunk_and_generate_skipping(
