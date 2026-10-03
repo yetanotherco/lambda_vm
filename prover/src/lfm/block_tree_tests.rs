@@ -1091,59 +1091,119 @@ fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
     ids
 }
 
-/// ★ The compact program form changes no program: every id of a small spread
-/// plan's tree equals the one recorded at 541f4bdc2 (#1013's d740eb5d5 + the
-/// instruments), before the form changed.
-///
-/// ⚠ The pins are the LAPTOP's: the plan absorbs the ELF's digest, and the
-/// fixture ELF's bytes depend on the clang that assembled it (laptop
-/// `af87f637…`, 1264 B; FAST `bfb782e1…`, 1272 B), so a box derives other ids
-/// for the same programs (FAST 670). The box gate compares two shas on one box.
-#[test]
-#[ignore = "laptop: run with --exact"]
-fn the_compact_program_form_keeps_a_small_trees_ids() {
-    let ids = tree_ids(&spread_plan(2, 4));
+/// The pinned ids of `plan`'s tree for the ELF the plan absorbs, checked against
+/// [`tree_ids`]: one pin set per fixture-ELF digest, since the fixture ELF's
+/// bytes depend on the clang that assembled it (laptop `af87f637…`, 1264 B;
+/// FAST `bfb782e1…`, 1272 B) and every leaf absorbs the digest (FAST 670). An
+/// ELF with no pins refuses, naming its digest.
+fn check_pinned_tree_ids(label: &str, plan: &BlockTreePlan, pins: &[(&str, &[&str])]) {
+    let digest = plan
+        .elf_digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let Some((_, want)) = pins.iter().find(|(d, _)| *d == digest) else {
+        panic!(
+            "no pinned ids for the fixture ELF's digest {digest}: its bytes depend on the clang that \
+             assembled it; record this machine's ids at a base sha and add them"
+        );
+    };
+    let ids = tree_ids(plan);
     for (j, id) in ids.iter().enumerate() {
-        println!("SMALL TREE IDS {j}: {id}");
+        println!("{label} {j}: {id}");
     }
-    assert_eq!(ids, SMALL_TREE_IDS, "a program of the tree changed");
+    assert_eq!(
+        ids, *want,
+        "a program of the tree changed (ELF digest {digest})"
+    );
+}
+
+/// An ELF the pins do not know is refused by name, before any program is
+/// derived, rather than read as a changed program.
+#[test]
+#[should_panic(expected = "no pinned ids for the fixture ELF's digest")]
+fn pinned_tree_ids_refuse_an_elf_they_do_not_know() {
+    check_pinned_tree_ids("NONE", &spread_plan(2, 4), &[("00", &[])]);
+}
+
+/// The fixture ELF's digest on the laptop (macOS clang) and on FAST.
+const LAPTOP_ELF_DIGEST: &str = "3b39e219ec8e9d539067daf43e89cf56c58677134c0fdbc7373ece7d042eadde";
+const FAST_ELF_DIGEST: &str = "f5e120d0eaa369d7ebdec2767b8d0c0559ceeac138edf0970d47753105df8069";
+
+/// ★ The compact program form changes no program: every id of a small spread
+/// plan's tree equals the one recorded before the form changed — on the laptop
+/// at 541f4bdc2 (#1013's d740eb5d5 + the instruments), on FAST at fe1fb1691
+/// (FAST 672, where the new sha's ids matched it, device and host).
+#[test]
+#[ignore = "laptop or box: run with --exact"]
+fn the_compact_program_form_keeps_a_small_trees_ids() {
+    check_pinned_tree_ids("SMALL TREE IDS", &spread_plan(2, 4), &SMALL_TREE_IDS);
 }
 
 /// The same at production heights ([`production_height_plan`]: 7 leaves, 2
 /// nodes and the top), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host
 /// commit. The box gates add the 1× and median trees' top ids.
 #[test]
-#[ignore = "box tier: production-height artifacts on the host, ≈ 4.7 min and 4.6 GiB"]
+#[ignore = "box tier: production-height artifacts, ≈ 4.7 min and 4.6 GiB on the laptop's host commit"]
 fn the_compact_program_form_keeps_every_production_height_tree_id() {
-    let ids = tree_ids(&production_height_plan());
-    for (j, id) in ids.iter().enumerate() {
-        println!("TREE IDS {j}: {id}");
-    }
-    assert_eq!(
-        ids, PRODUCTION_HEIGHT_TREE_IDS,
-        "a program of the tree changed"
+    check_pinned_tree_ids(
+        "TREE IDS",
+        &production_height_plan(),
+        &PRODUCTION_HEIGHT_TREE_IDS,
     );
 }
 
-/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids at 541f4bdc2.
-const SMALL_TREE_IDS: [&str; 2] = [
-    "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
-    "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
+/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest.
+const SMALL_TREE_IDS: [(&str, &[&str]); 2] = [
+    (
+        LAPTOP_ELF_DIGEST,
+        &[
+            "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
+            "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
+        ],
+    ),
+    (
+        FAST_ELF_DIGEST,
+        &[
+            "739667a9adcb14185565133c71d8c788215133379a6d8eb6c371c2c6233ff9a8",
+            "71600bdb4c4ee9098105cd0166d4580fd64cdf8f21509b6e054e71ccc5eb79a1",
+        ],
+    ),
 ];
 
-/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids at
-/// 541f4bdc2.
-const PRODUCTION_HEIGHT_TREE_IDS: [&str; 10] = [
-    "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
-    "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
-    "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
-    "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
-    "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
-    "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
-    "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
-    "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
-    "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
-    "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
+/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids by
+/// ELF digest.
+const PRODUCTION_HEIGHT_TREE_IDS: [(&str, &[&str]); 2] = [
+    (
+        LAPTOP_ELF_DIGEST,
+        &[
+            "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
+            "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
+            "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
+            "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
+            "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
+            "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
+            "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
+            "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
+            "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
+            "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
+        ],
+    ),
+    (
+        FAST_ELF_DIGEST,
+        &[
+            "93cc53931a1160fc8c109eb6d5f81ecc0cd828223367fcb0a6d2851c0810bb14",
+            "2b0b474e7b7f771bb37329b9b752b9c5625e98ba4293b6a6cbc164005cb6a1c1",
+            "0ed61e2212f08cf3fb039335af80d5c3145b65a2c74d057ea6a2692398bdef08",
+            "092289d251a74532e006eedfd89d111fe5420e20d3eb99f83cbce71d620b812d",
+            "7033ec9d5130aa89831052e30c027ac7cb6aeede9bba093654a19705d0ae9fb0",
+            "4b398b930a6f65e84762f90909eec00eced87f6159271d986e7e287b32a79cd6",
+            "100d981243118b7bded7b4989e377827124c9c435286f23713cb882d46473dea",
+            "b9fa1c3e7fd580f0d7fc87f733d282de0fbaab94b6f535475852fae48186be15",
+            "95e17686fd5a5b11dab21fd18e1cdd6cc06bf8d185ffbd72f31dad322be40b30",
+            "6e1111f64f288f6b4b94ef9baa1277a184ccc976b876ab9ec3e3519d31e64241",
+        ],
+    ),
 ];
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
