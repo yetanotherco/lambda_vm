@@ -59,6 +59,30 @@ where
 /// these two are all a phase-B opening spends on its first round's tree.
 static TOP_PATH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TOP_LEAVES_REHASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds the kept-top paths spent gathering their blocks from the
+/// codeword, and re-hashing them on the host (the subtrees and their check).
+static TOP_GATHER_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_REHASH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `BLOCK_WHIR_REHASH_SERIAL=1`: the kept-top paths re-hash their blocks one
+/// at a time, as before they were re-hashed in parallel. A measurement knob
+/// (the same bytes either way); read once.
+#[cfg(feature = "parallel")]
+fn rehash_serial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLOCK_WHIR_REHASH_SERIAL").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// `(seconds gathering, seconds re-hashing)` of the kept-top paths so far.
+pub fn top_path_secs() -> (f64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TOP_GATHER_NANOS.load(Relaxed) as f64 / 1e9,
+        TOP_REHASH_NANOS.load(Relaxed) as f64 / 1e9,
+    )
+}
 
 /// `(open_many calls served from a kept top, leaves re-hashed for them)`.
 pub fn top_path_counts() -> (u64, u64) {
@@ -484,12 +508,22 @@ where
             .iter()
             .flat_map(|block| (block << dropped)..((block + 1) << dropped))
             .collect();
+        let gathering = std::time::Instant::now();
         let values = self.gather(&leaves)?;
+        TOP_GATHER_NANOS.fetch_add(
+            gathering.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let rehashing = std::time::Instant::now();
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let frontier = (1usize << (depth - dropped)) - 1;
-        let mut subtrees = Vec::with_capacity(blocks.len());
-        for (k, &block) in blocks.iter().enumerate() {
+        // Each queried block's subtree depends on its own leaves alone, so the
+        // blocks are re-hashed in parallel; the subtrees stay in block order
+        // and the first block (in that order) whose root is not the kept node
+        // is the one refused, as a serial walk would.
+        let rehash = |k: usize| -> Result<Tree<F, H>, Error> {
+            let block = blocks[k];
             let hashed: Vec<Commitment> = values[k * span..(k + 1) * span]
                 .iter()
                 .map(Backend::<F, H>::hash_data)
@@ -499,8 +533,21 @@ where
             if top.nodes.get(frontier + block) != Some(&subtree.root) {
                 return Err(Error::RecomputedCodewordMismatch { block });
             }
-            subtrees.push(subtree);
-        }
+            Ok(subtree)
+        };
+        #[cfg(feature = "parallel")]
+        let rehashed: Vec<Result<Tree<F, H>, Error>> = if rehash_serial() {
+            (0..blocks.len()).map(rehash).collect()
+        } else {
+            (0..blocks.len()).into_par_iter().map(rehash).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let rehashed: Vec<Result<Tree<F, H>, Error>> = (0..blocks.len()).map(rehash).collect();
+        let subtrees = rehashed.into_iter().collect::<Result<Vec<_>, _>>()?;
+        TOP_REHASH_NANOS.fetch_add(
+            rehashing.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         indices
             .iter()
             .map(|&index| {
