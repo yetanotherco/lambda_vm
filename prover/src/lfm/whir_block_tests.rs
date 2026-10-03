@@ -22,7 +22,9 @@ use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, publics_arena};
 use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child_timed};
-use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
+use super::proof::{
+    LfmProof, aggregation_wrap_options, decide_lfm_residency, lfm_execute_and_fill, lfm_prove,
+};
 use super::whir_block::{
     BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
     block_leaf_arena, emit_share, id_words, leaf_partition, leaf_program_with, out_halves,
@@ -1143,13 +1145,53 @@ struct LevelTiming {
     programs: Vec<(f64, f64)>,
 }
 
+/// A value one thread publishes once and others wait for. A publisher that
+/// unwinds before publishing leaves an error behind ([`PublishGuard`]), so no
+/// waiter blocks on a value that will never come.
+struct Published<T>(std::sync::OnceLock<Result<T, String>>);
+
+impl<T> Published<T> {
+    fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    fn wait(&self) -> Result<&T, String> {
+        self.0.wait().as_ref().map_err(Clone::clone)
+    }
+
+    fn take(self) -> Result<T, String> {
+        self.0
+            .into_inner()
+            .unwrap_or_else(|| Err("never published".to_string()))
+    }
+}
+
+/// Publishes an error on drop unless [`PublishGuard::publish`] ran first.
+struct PublishGuard<'a, T>(&'a Published<T>);
+
+impl<T> PublishGuard<'_, T> {
+    fn publish(self, value: Result<T, String>) {
+        let _ = self.0.0.set(value);
+    }
+}
+
+impl<T> Drop for PublishGuard<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.0.0.set(Err("the publisher unwound".to_string()));
+    }
+}
+
 /// The tree proved the way a prover would run it, with the leaves' programs
 /// emitted beforehand (`leaves`, while phase B ran):
-/// 1. the leaves' artifacts, in parallel;
+/// 1. the leaves' artifacts, in parallel, on a thread of their own (they hold
+///    the card);
 /// 2. the nodes' programs and artifacts — functions of the leaves' artifacts,
 ///    not of any proof — on a thread of their own, beside
 /// 3. the leaves proved `siblings` at a time, each harvested without its
-///    verify;
+///    verify: with `beside`, each leaf executes and fills its traces while the
+///    artifacts are built (neither reads them) and waits for them only to
+///    prove; without, it waits for every artifact first (the order before,
+///    `W3_EXEC_BESIDE_ARTIFACTS=0`);
 /// 4. each level above proved over the harvested children.
 ///
 /// Returns each level's timing and every proof with its artifacts, level by
@@ -1160,6 +1202,7 @@ fn prove_tree_pipelined(
     proof: &BlockWhirProof,
     leaves: Vec<LfmProgram>,
     siblings: usize,
+    beside: bool,
 ) -> Result<
     (
         Vec<LevelTiming>,
@@ -1171,27 +1214,32 @@ fn prove_tree_pipelined(
     let wrap = aggregation_wrap_options();
     let words = plan.child_layout().total();
     let t_level = std::time::Instant::now();
-
-    // 1. the leaves' artifacts.
-    let leaf_built: Vec<(super::registry::LfmArtifacts, DerivedChild, f64)> = {
-        use rayon::prelude::*;
-        leaves
-            .par_iter()
-            .map(|program| -> Result<_, String> {
-                let t = std::time::Instant::now();
-                let artifacts = artifacts_of(program, &wrap);
-                let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
-                Ok((artifacts, derived, t.elapsed().as_secs_f64()))
-            })
-            .collect::<Result<_, String>>()?
-    };
     let shape = plan.levels();
     let mut timings = Vec::with_capacity(shape.len() + 1);
     let mut proofs = Vec::new();
+    let built: Published<Vec<(super::registry::LfmArtifacts, DerivedChild, f64)>> =
+        Published::new();
 
     let (leaf_proved, nodes) = std::thread::scope(|scope| {
+        // 1. the leaves' artifacts.
+        scope.spawn(|| {
+            use rayon::prelude::*;
+            let guard = PublishGuard(&built);
+            guard.publish(
+                leaves
+                    .par_iter()
+                    .map(|program| -> Result<_, String> {
+                        let t = std::time::Instant::now();
+                        let artifacts = artifacts_of(program, &wrap);
+                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                        Ok((artifacts, derived, t.elapsed().as_secs_f64()))
+                    })
+                    .collect::<Result<_, String>>(),
+            );
+        });
         // 2. the nodes' programs, from the leaves' derived shapes.
         let nodes = scope.spawn(|| -> Result<Vec<Vec<TreeNode>>, String> {
+            let leaf_built = built.wait()?;
             let mut owned: Vec<Vec<TreeNode>> = Vec::with_capacity(shape.len());
             for (lv, arities) in shape.iter().enumerate() {
                 let top = lv + 1 == shape.len();
@@ -1224,15 +1272,23 @@ fn prove_tree_pipelined(
         // 3. the leaves, `siblings` at a time.
         let proved = in_index_order(leaves.len(), siblings, |k| -> Result<_, String> {
             let arenas = block_leaf_arena(plan, proof, k)?;
+            if !beside {
+                built.wait()?;
+            }
             let t = std::time::Instant::now();
-            let lfm = lfm_prove(&leaves[k], &leaf_built[k].0, &arenas, &wrap)
+            let filled = lfm_execute_and_fill(&leaves[k], &arenas, crate::hash_pin::BLOCK_HASHER)
+                .map_err(|e| format!("leaf {k}: {e:?}"))?;
+            let artifacts = &built.wait()?[k].0;
+            let lfm = filled
+                .prove(artifacts, &wrap, decide_lfm_residency())
                 .map_err(|e| format!("leaf {k}: {e:?}"))?;
             let prove = t.elapsed().as_secs_f64();
-            let child = harvest_child(leaf_built[k].0.clone(), wrap.clone(), &lfm);
+            let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm);
             Ok((lfm, child, prove))
         });
         (proved, nodes.join())
     });
+    let leaf_built = built.take()?;
     let leaf_proved: Vec<(LfmProof, RealChild, f64)> =
         leaf_proved.into_iter().collect::<Result<_, String>>()?;
     let nodes = nodes.map_err(|_| "the node builder panicked".to_string())??;
@@ -1324,6 +1380,9 @@ fn the_whir_block_tree_on_a_real_block() {
     let leaves = knob("W3_LEAVES");
     let siblings = knob("W3_SIBLINGS").unwrap_or(3);
     let fan_in = knob("W3_FAN_IN").unwrap_or(BLOCK_FAN_IN);
+    // `W3_EXEC_BESIDE_ARTIFACTS=0|1` (default 1): the leaves execute and fill
+    // while their artifacts are built, or (0, the control) after all of them.
+    let beside = knob("W3_EXEC_BESIDE_ARTIFACTS").is_none_or(|v| v != 0);
     // `BLOCK_WHIR_ARGUE=batched|per-table` (production: batched): each group's
     // tables argued together, at the format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k`
     // for 2^k), or each on its own.
@@ -1556,9 +1615,12 @@ fn the_whir_block_tree_on_a_real_block() {
         plan.prepared().len()
     );
 
+    // The readouts above run on the clock, between the base and the tree: a
+    // prover prints none of them, so the whole block is also given without.
+    let readouts = t0.elapsed().as_secs_f64() - base;
     let t = std::time::Instant::now();
     let (timings, proofs) =
-        prove_tree_pipelined(&plan, &proof, programs, siblings).expect("the tree proves");
+        prove_tree_pipelined(&plan, &proof, programs, siblings, beside).expect("the tree proves");
     let top = &proofs.last().expect("a top").1;
     let tree = t.elapsed().as_secs_f64();
     let whole = t0.elapsed().as_secs_f64();
@@ -1575,8 +1637,17 @@ fn the_whir_block_tree_on_a_real_block() {
         );
     }
     println!(
-        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s",
-        whole - base
+        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s) · leaves execute beside their artifacts {beside}",
+        whole - base,
+        whole - readouts
+    );
+    // The top proof's bytes: two runs prove the same ones under
+    // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
+    let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
+    println!(
+        "W3 TOP DIGEST: {} (blake3 of the top proof's {} bytes)",
+        &blake3::hash(&top_bytes).to_hex()[..32],
+        top_bytes.len()
     );
 
     // Off the clock: the harness's checks.
