@@ -220,8 +220,11 @@ impl P1GrindDigest {
 }
 
 impl stark::grinding::GrindDigest for P1GrindDigest {
-    /// No device nonce search is wired yet: the host search is the only arm.
-    const DEVICE_GRIND: Option<stark::grinding::DeviceGrindKey> = None;
+    /// `math_cuda::grinding::generate_nonce_p1_gpu` (`p1s_grind_w8`): one
+    /// width-8 permutation of `[inner0..3, nonce, 0, 0, 0]` per nonce, the
+    /// per-nonce half of [`Self::finalize_digest`] over 40 bytes.
+    const DEVICE_GRIND: Option<stark::grinding::DeviceGrindKey> =
+        Some(stark::grinding::DeviceGrindKey::Poseidon1);
 }
 
 impl digest::HashMarker for P1GrindDigest {}

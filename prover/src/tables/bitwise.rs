@@ -479,6 +479,11 @@ pub fn compute_preprocessed_commitment_with(
 /// the static bytes were generated for); on miss — either a non-3 coset or a
 /// `blowup_factor` outside `STATIC_BLOWUP_FACTORS` — recomputes from scratch.
 pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 {
+        return crate::hash_pin::p1_static_root("bitwise", options, LeafLayout::RowPair, || {
+            compute_preprocessed_commitment(options)
+        });
+    }
     if options.coset_offset == 3
         && let Some(commitment) = static_commitment(options.blowup_factor)
     {
@@ -505,6 +510,11 @@ pub fn preprocessed_commitment_for(
 ) -> Option<Commitment> {
     match layout {
         LeafLayout::RowPair => Some(preprocessed_commitment(options)),
+        LeafLayout::Row if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 => Some(
+            crate::hash_pin::p1_static_root("bitwise", options, LeafLayout::Row, || {
+                compute_preprocessed_commitment_with(options, LeafLayout::Row)
+            }),
+        ),
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_commitment_one_row(options.blowup_factor))
             .flatten(),

@@ -41,8 +41,8 @@ pub type Trace = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 /// A table's Round-1 commit made ahead of the prove
 /// ([`IsStarkProver::precommit_main`]).
-pub type Precommit =
-    stark::prover::PrecommittedMain<GoldilocksField, crate::hash_pin::BlockStarkHash>;
+pub type Precommit<C = crate::hash_pin::RpxBlock> =
+    stark::prover::PrecommittedMain<GoldilocksField, <C as crate::hash_pin::BlockHash>::H>;
 
 /// The plain tables a finish may hand off: every table [`Traces`] holds in a
 /// `Vec` whose AIR has no preprocessed columns.
@@ -290,8 +290,17 @@ pub fn precommit_finished(
     opts: &ProofOptions,
     residency: ResidencyMode,
 ) -> Result<(String, Precommit), Error> {
+    precommit_finished_with::<crate::hash_pin::RpxBlock>(table, opts, residency)
+}
+
+/// [`precommit_finished`] under the base configuration `C`.
+pub fn precommit_finished_with<C: crate::hash_pin::BlockHash>(
+    table: &FinishedTable,
+    opts: &ProofOptions,
+    residency: ResidencyMode,
+) -> Result<(String, Precommit<C>), Error> {
     let air = air_for(table.kind, table.index, opts);
-    let pre = crate::hash_pin::BlockProver::precommit_main(
+    let pre = crate::hash_pin::BlockProverOf::<C, _, _, _>::precommit_main(
         air.as_ref(),
         &table.trace,
         #[cfg(feature = "disk-spill")]
