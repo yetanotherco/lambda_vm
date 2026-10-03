@@ -1162,6 +1162,45 @@ fn the_block_caps_the_chunked_tables_heights() {
     }
 }
 
+/// ★ Every chunked table's cap is the tallest power of two at which its
+/// columns fill at most one polynomial of the format's 2^27 stack: KECCAK
+/// 511 × 2^18, KECCAK_RND 1,480 × 2^16, ECSM 667 × 2^17, ECDAS 521 × 2^17. One
+/// doubling past a cap would stack the table into two polynomials.
+///
+/// Mutation (laptop): the KECCAK or the ECSM cap lifted, and this test fails
+/// (the caps test reads the constants, so it cannot see a lifted cap).
+#[test]
+fn every_chunked_cap_is_the_tallest_table_one_stacked_polynomial_holds() {
+    use crate::tables::{ecdas, ecsm, keccak, keccak_rnd};
+    let stack = ZfFormat::DEFAULT.whir_stack.get();
+    let widths = [
+        ("KECCAK", keccak::cols::NUM_COLUMNS),
+        ("KECCAK_RND", keccak_rnd::cols::NUM_COLUMNS),
+        ("ECSM", ecsm::cols::NUM_COLUMNS),
+        ("ECDAS", ecdas::cols::NUM_COLUMNS),
+    ];
+    for ((name, _, cap), (table, width)) in block_whir::chunked_table_ranges(&chunked_counts())
+        .into_iter()
+        .zip(widths)
+    {
+        assert_eq!(name, table);
+        let cells = |vars: usize| width << vars;
+        assert!(
+            cells(cap) <= 1 << stack,
+            "{name}: {width} columns at 2^{cap} rows must fit one polynomial of 2^{stack}"
+        );
+        assert!(
+            cells(cap + 1) > 1 << stack,
+            "{name}: 2^{cap} rows must be the tallest that fits one polynomial of 2^{stack}"
+        );
+        println!(
+            "BLOCK WHIR CAP {name}: {width} columns × 2^{cap} = {} ≤ 2^{stack} < {width} × 2^{}",
+            cells(cap),
+            cap + 1
+        );
+    }
+}
+
 /// ★ G2: no table may be stated taller than [`block_whir::BLOCK_MAX_TABLE_VARS`]
 /// (2^27), so no chain is taller than the 2^27 stack; at the cap it passes.
 #[test]
