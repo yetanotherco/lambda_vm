@@ -171,8 +171,9 @@ pub struct BlockFormat {
 
 /// The most groups a block statement may declare. The block has 9; the bound
 /// leaves room for larger blocks and caps what a statement can make the
-/// verifier build.
-pub const BLOCK_MAX_GROUPS: usize = 64;
+/// verifier build. Exploration branch only (CRYPTO-REVIEW W-7, Mauro's call):
+/// 128 instead of 64, to measure the median block (90 groups) end to end.
+pub const BLOCK_MAX_GROUPS: usize = 128;
 
 /// Refuses `groups` over `max_groups` ([`BlockFormat::max_groups`]). The
 /// verifier refuses a statement with more ([`block_frame`]), and the prover
