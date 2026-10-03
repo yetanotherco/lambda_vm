@@ -991,6 +991,34 @@ fn spill_decision(
 const SPILL_QUEUE_BYTES: usize = 4 << 30;
 const SPILL_READY_BYTES: usize = 2 << 30;
 
+/// The budgets above arm only once a spill is plausible: always under a policy
+/// that spills regardless of the host (`always`, a budget), and under `auto`
+/// once the host and the reserve reach this share of the target. Where nothing
+/// can spill (a block far below the target) the queues run as with the spill
+/// off.
+const SPILL_ARM_SHARE: f64 = 0.85;
+
+/// Whether a spill is plausible ([`SPILL_ARM_SHARE`]): `host` the host's bytes
+/// ([`HostReading::bytes`]), `reserve` [`spill_reserve_bytes`], read only by
+/// `auto`.
+fn spill_plausible(
+    policy: SpillPolicy,
+    target: u64,
+    host_and_reserve: impl FnOnce() -> u64,
+) -> bool {
+    match policy {
+        SpillPolicy::Off => false,
+        SpillPolicy::Always | SpillPolicy::Budget(_) => true,
+        SpillPolicy::Auto => host_and_reserve() as f64 >= SPILL_ARM_SHARE * target as f64,
+    }
+}
+
+/// What arms a queue's byte budget ([`QueueRoom::admit`]).
+trait Arming: Sync {
+    /// Whether the budget binds now. Once true it stays true.
+    fn armed(&self) -> bool;
+}
+
 /// Phase A's spill: the policy, its store, and what it decided.
 struct Spill {
     policy: SpillPolicy,
@@ -1003,6 +1031,10 @@ struct Spill {
     spilled: std::sync::Mutex<(u64, u64, u64)>,
     /// The largest host reading `auto` decided on.
     host_most: std::sync::Mutex<Option<HostReading>>,
+    /// When the store opened, and the seconds after it at which the queue
+    /// budgets armed ([`Arming`]).
+    opened: Instant,
+    armed_at: std::sync::Mutex<Option<f64>>,
 }
 
 impl Spill {
@@ -1031,6 +1063,8 @@ impl Spill {
                 cells: std::sync::atomic::AtomicU64::new(0),
                 spilled: std::sync::Mutex::new((0, 0, 0)),
                 host_most: std::sync::Mutex::new(None),
+                opened: Instant::now(),
+                armed_at: std::sync::Mutex::new(None),
             }),
             Err(e) => {
                 eprintln!(
@@ -1103,27 +1137,57 @@ impl Spill {
     }
 }
 
+impl Arming for Spill {
+    fn armed(&self) -> bool {
+        let mut armed_at = self.armed_at.lock().unwrap_or_else(|e| e.into_inner());
+        if armed_at.is_some() {
+            return true;
+        }
+        let plausible = spill_plausible(self.policy, self.target, || {
+            let cells = self.cells.load(std::sync::atomic::Ordering::Relaxed);
+            HostReading::now()
+                .bytes()
+                .saturating_add(spill_reserve_bytes(cells))
+        });
+        if plausible {
+            *armed_at = Some(self.opened.elapsed().as_secs_f64());
+        }
+        plausible
+    }
+}
+
+impl Spill {
+    /// The `BLOCK QUEUE` line's word on the budgets.
+    fn arming_report(&self) -> String {
+        match *self.armed_at.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(t) => format!(" · budgets armed at {t:.1} s"),
+            None => " · budgets never armed".to_string(),
+        }
+    }
+}
+
 /// The streamed chunks waiting for a committer (or, generated, for a
 /// committer to take them), by their bytes: the most held at once is reported.
 /// A chunk leaves once it is generated (its ops are freed then), or once a
 /// committer takes it.
-struct QueueRoom {
+struct QueueRoom<'a> {
     /// (bytes, chunks) held now.
     held: std::sync::Mutex<(usize, usize)>,
     /// The most bytes, and the most chunks, held at once.
     most: std::sync::Mutex<(usize, usize)>,
-    /// With a budget, [`Self::admit`] waits until the chunk fits beside what is
-    /// held (a chunk alone always fits): the spill's back-pressure upstream,
-    /// so a disk slower than the stream throttles the walk instead of piling
-    /// ops and generated chunks up ([`SPILL_QUEUE_BYTES`]).
-    budget: Option<usize>,
+    /// With a budget, once it is armed, [`Self::admit`] waits until the chunk
+    /// fits beside what is held (a chunk alone always fits): the spill's
+    /// back-pressure upstream, so a disk slower than the stream throttles the
+    /// walk instead of piling ops and generated chunks up
+    /// ([`SPILL_QUEUE_BYTES`], [`SPILL_ARM_SHARE`]).
+    budget: Option<(usize, &'a dyn Arming)>,
     room: std::sync::Condvar,
     /// Seconds spent waiting for room.
     waited: std::sync::Mutex<f64>,
 }
 
-impl QueueRoom {
-    fn with_budget(budget: Option<usize>) -> Self {
+impl<'a> QueueRoom<'a> {
+    fn with_budget(budget: Option<(usize, &'a dyn Arming)>) -> Self {
         Self {
             held: std::sync::Mutex::new((0, 0)),
             most: std::sync::Mutex::new((0, 0)),
@@ -1137,10 +1201,10 @@ impl QueueRoom {
     fn admit(&self, bytes: usize) {
         let t = Instant::now();
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        while self
-            .budget
-            .is_some_and(|budget| held.0 > 0 && held.0 + bytes > budget)
-        {
+        while let Some((budget, arming)) = self.budget {
+            if held.0 == 0 || held.0 + bytes <= budget || !arming.armed() {
+                break;
+            }
             held = self.room.wait(held).unwrap_or_else(|e| e.into_inner());
         }
         held.0 += bytes;
@@ -1538,9 +1602,9 @@ fn build_streamed(
     let committer_count = stream.committers;
     // While spilling, both queues have a byte budget: a slow disk throttles
     // the walk ([`SPILL_QUEUE_BYTES`]).
-    let queue = QueueRoom::with_budget(spill.map(|_| SPILL_QUEUE_BYTES));
+    let queue = QueueRoom::with_budget(spill.map(|s| (SPILL_QUEUE_BYTES, s as &dyn Arming)));
     let generators = stream.generators;
-    let ready = QueueRoom::with_budget(spill.map(|_| SPILL_READY_BYTES));
+    let ready = QueueRoom::with_budget(spill.map(|s| (SPILL_READY_BYTES, s as &dyn Arming)));
     let (ready_tx, ready_rx) = mpsc::channel::<ToCommit>();
     let ready_rx = Mutex::new(ready_rx);
     // Phase A's card gate ([`card_gate_budget`]): every commit admitted by its
@@ -2020,11 +2084,12 @@ fn build_streamed(
         eprintln!(
             "BLOCK QUEUE: {committer_count} committers · {generators} generators · at most {:.2} GiB in \
              {most_chunks} chunks waiting as ops · at most {:.2} GiB in {ready_chunks} chunks waiting \
-             generated · waited for room {:.2} s (ops) {:.2} s (generated)",
+             generated · waited for room {:.2} s (ops) {:.2} s (generated){}",
             most_bytes as f64 / (1u64 << 30) as f64,
             ready_bytes as f64 / (1u64 << 30) as f64,
             *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
             *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
+            spill.map(Spill::arming_report).unwrap_or_default(),
         );
         Ok((traces, decode_commitment, precommits))
     })
@@ -2376,7 +2441,7 @@ pub(crate) fn stream_config(
 mod spill_policy_tests {
     use super::{
         CgroupValue, HostReading, SpillPolicy, cgroup_memory, parse_spill_policy, spill_decision,
-        spill_reserve_bytes, spill_target_from,
+        spill_plausible, spill_reserve_bytes, spill_target_from,
     };
 
     const GIB: u64 = 1 << 30;
@@ -2503,6 +2568,27 @@ mod spill_policy_tests {
         assert_eq!(reading(0, 120 * GIB, 0).bytes(), 120 * GIB);
     }
 
+    /// The queue budgets arm where a spill is plausible: always under
+    /// `always` and a budget (the host unread), never with the spill off, and
+    /// under `auto` once the host and reserve reach 85 % of the target (BIG's
+    /// 110.7 GiB target: 94.1 GiB).
+    #[test]
+    fn the_budgets_arm_where_a_spill_is_plausible() {
+        let never = || panic!("only auto reads the host");
+        let target = 110 * GIB;
+        assert!(!spill_plausible(SpillPolicy::Off, target, never));
+        assert!(spill_plausible(SpillPolicy::Always, target, never));
+        assert!(spill_plausible(
+            SpillPolicy::Budget(40 * GIB),
+            target,
+            never
+        ));
+        assert!(!spill_plausible(SpillPolicy::Auto, target, || 93 * GIB));
+        assert!(spill_plausible(SpillPolicy::Auto, target, || 94 * GIB));
+        // The median's 1× block: ≈ 16 GiB of host, 6.6 GiB of reserve.
+        assert!(!spill_plausible(SpillPolicy::Auto, target, || 23 * GIB));
+    }
+
     /// The target is the smaller of the cgroup limit and `MemTotal`, less
     /// 10 GiB: v1's unlimited sentinel gives `MemTotal`'s, a limit above
     /// `MemTotal` is capped, and with neither nothing spills.
@@ -2618,7 +2704,17 @@ mod memlog_tests {
 
 #[cfg(test)]
 mod queue_tests {
-    use super::QueueRoom;
+    use super::{Arming, QueueRoom};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A test arming: armed while its flag is set.
+    struct Flag(AtomicBool);
+
+    impl Arming for Flag {
+        fn armed(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
 
     /// The queue reports the most bytes and chunks it held at once.
     #[test]
@@ -2636,25 +2732,65 @@ mod queue_tests {
     /// until enough is released, and a chunk alone always fits.
     #[test]
     fn a_budgeted_queue_waits_for_room() {
-        let queue = std::sync::Arc::new(QueueRoom::with_budget(Some(100)));
+        static ARMED: Flag = Flag(AtomicBool::new(true));
+        let queue = QueueRoom::with_budget(Some((100, &ARMED)));
         queue.admit(500);
         let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = {
-            let queue = queue.clone();
-            std::thread::spawn(move || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
                 queue.admit(60);
                 tx.send(()).unwrap();
-            })
-        };
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
-            "admitted beside a full queue"
-        );
-        queue.release(500);
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("admitted once there is room");
-        waiter.join().unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "admitted beside a full queue"
+            );
+            queue.release(500);
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("admitted once there is room");
+        });
         assert_eq!(*queue.held.lock().unwrap(), (60, 1));
+    }
+
+    /// An unarmed budget binds nothing: chunks go in beside a full queue, as
+    /// with no budget, until the arming flips; then an over-budget chunk
+    /// waits for room again.
+    #[test]
+    fn an_unarmed_budget_binds_nothing() {
+        static ARMING: Flag = Flag(AtomicBool::new(false));
+        let queue = QueueRoom::with_budget(Some((100, &ARMING)));
+        queue.admit(500);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                queue.admit(60);
+                tx.send(()).unwrap();
+            });
+            let went_in = rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            if !went_in {
+                // Let the waiter finish before failing.
+                queue.release(500);
+            }
+            assert!(went_in, "an unarmed budget made a chunk wait");
+        });
+        assert_eq!(*queue.held.lock().unwrap(), (560, 2));
+        ARMING.0.store(true, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                queue.admit(40);
+                tx.send(()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "armed: admitted beside a full queue"
+            );
+            queue.release(500);
+            queue.release(60);
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("admitted once there is room");
+        });
     }
 }
