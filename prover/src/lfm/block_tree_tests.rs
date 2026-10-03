@@ -580,24 +580,12 @@ fn the_plan_spreads_chunked_accelerators_by_load() {
     let opts = super::proof::block_base_options();
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
-    let mut shape = honest_fixture_shape(&elf);
     const CHUNKS: usize = 13;
     const CPUS: usize = 40;
-    shape.table_counts.keccak = CHUNKS;
-    shape.table_counts.ecsm = CHUNKS;
-    shape.table_counts.ecdas = CHUNKS;
-    shape.table_counts.cpu += CPUS;
+    let shape = spread_fixture_shape(&elf, CHUNKS, CPUS);
     // In AIR order after the five fixed tables: KECCAK 5–17, ECSM 18–30, ECDAS
     // 31–43, then CPU[0] (32 rows) and the 40 CPU chunks added at 2^21.
     let first_cpu = crate::FIXED_TABLE_COUNT + 3 * CHUNKS;
-    let mut lengths: Vec<usize> = shape.trace_lengths[..crate::FIXED_TABLE_COUNT].to_vec();
-    lengths.extend([crate::BLOCK_KECCAK_MAX_ROWS; CHUNKS]);
-    lengths.extend([crate::BLOCK_ECSM_MAX_ROWS; CHUNKS]);
-    lengths.extend([crate::BLOCK_ECDAS_MAX_ROWS; CHUNKS]);
-    lengths.push(shape.trace_lengths[crate::FIXED_TABLE_COUNT]);
-    lengths.extend([1 << 21; CPUS]);
-    lengths.extend_from_slice(&shape.trace_lengths[crate::FIXED_TABLE_COUNT + 1..]);
-    shape.trace_lengths = lengths;
     let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
     assert!(plan.instance(first_cpu - 1).name.starts_with("ECDAS["));
     assert!(plan.instance(first_cpu).name.starts_with("CPU["));
@@ -638,6 +626,407 @@ fn the_plan_spreads_chunked_accelerators_by_load() {
         one_kind("ECDAS"),
         partition.num_leaves()
     );
+}
+
+/// [`honest_fixture_shape`] at production heights: `chunks` KECCAK, ECSM and
+/// ECDAS instances at their block caps, and `cpus` more CPU chunks at 2^21 rows
+/// after `CPU[0]`.
+fn spread_fixture_shape(elf: &executor::elf::Elf, chunks: usize, cpus: usize) -> BlockShape {
+    let mut shape = honest_fixture_shape(elf);
+    shape.table_counts.keccak = chunks;
+    shape.table_counts.ecsm = chunks;
+    shape.table_counts.ecdas = chunks;
+    shape.table_counts.cpu += cpus;
+    let fixed = crate::FIXED_TABLE_COUNT;
+    let mut lengths: Vec<usize> = shape.trace_lengths[..fixed].to_vec();
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_KECCAK_MAX_ROWS, chunks));
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_ECSM_MAX_ROWS, chunks));
+    lengths.extend(std::iter::repeat_n(crate::BLOCK_ECDAS_MAX_ROWS, chunks));
+    lengths.push(shape.trace_lengths[fixed]);
+    lengths.extend(std::iter::repeat_n(1 << 21, cpus));
+    lengths.extend_from_slice(&shape.trace_lengths[fixed + 1..]);
+    shape.trace_lengths = lengths;
+    shape
+}
+
+// ======================= (S5) the leaf programs' host bytes =================
+
+/// jemalloc's `opt.oversize_threshold` (5.3's default; the instruments read it
+/// back): an allocation of at least this many bytes comes from one arena every
+/// thread shares, a smaller one from its thread's own arena. The pages a freed
+/// buffer leaves behind serve only its arena's later requests.
+const JEMALLOC_OVERSIZE: usize = 8 << 20;
+
+/// A program's host bytes as held (capacities, not lengths), by part, and the
+/// share in allocations at or over [`JEMALLOC_OVERSIZE`]: the part that can
+/// take the pages a freed trace left in the shared arena.
+#[derive(Default, Clone, Copy)]
+struct ProgramBytes {
+    /// The instruction vector itself.
+    instrs: usize,
+    /// `Instr::BitDec`'s bit lists.
+    bitdec_heap: usize,
+    /// `KeccakF`'s and `Blake3`'s boxed operands.
+    boxed: usize,
+    /// The column groups as held: padded rows, at capacity.
+    groups: usize,
+    /// The column groups' padded rows (the committed matrices).
+    groups_padded: usize,
+    /// The column groups' real rows alone.
+    groups_real: usize,
+    /// The arena schema.
+    other: usize,
+    /// Of the total, the bytes in allocations at or over [`JEMALLOC_OVERSIZE`].
+    large: usize,
+    allocs: usize,
+}
+
+impl ProgramBytes {
+    fn of(p: &LfmProgram) -> Self {
+        use super::instr::{Addr, Blake3Operands, Instr, KeccakOperands};
+        let mut b = Self::default();
+        b.instrs = b.note(p.instrs.capacity() * size_of::<Instr>());
+        for instr in &p.instrs {
+            match instr {
+                Instr::BitDec { bits, .. } => {
+                    b.bitdec_heap += b.note(bits.capacity() * size_of::<(Addr, u64)>());
+                }
+                Instr::KeccakF(_) => b.boxed += b.note(size_of::<KeccakOperands>()),
+                Instr::Blake3(_) => b.boxed += b.note(size_of::<Blake3Operands>()),
+                _ => {}
+            }
+        }
+        for g in program_groups(p) {
+            b.groups += b.note(g.data.capacity() * size_of::<FE>());
+            b.groups_padded += g.padded_rows * g.width * size_of::<FE>();
+            b.groups_real += g.real_rows * g.width * size_of::<FE>();
+        }
+        b.other = b.note(p.arena_schema.lens.capacity() * size_of::<u32>());
+        b
+    }
+
+    /// Counts one allocation of `bytes` and returns them.
+    fn note(&mut self, bytes: usize) -> usize {
+        if bytes > 0 {
+            self.allocs += 1;
+            if bytes >= JEMALLOC_OVERSIZE {
+                self.large += bytes;
+            }
+        }
+        bytes
+    }
+
+    fn total(&self) -> usize {
+        self.instrs + self.bitdec_heap + self.boxed + self.groups + self.other
+    }
+
+    fn add(&mut self, o: &Self) {
+        self.instrs += o.instrs;
+        self.bitdec_heap += o.bitdec_heap;
+        self.boxed += o.boxed;
+        self.groups += o.groups;
+        self.groups_padded += o.groups_padded;
+        self.groups_real += o.groups_real;
+        self.other += o.other;
+        self.large += o.large;
+        self.allocs += o.allocs;
+    }
+}
+
+/// A program's column groups with their chip names, in the frozen chip order.
+fn program_groups(p: &LfmProgram) -> [&super::compiler::ColumnGroup; 11] {
+    let g = &p.groups;
+    [
+        &g.const_, &g.balu, &g.xalu, &g.select, &g.bitdec, &g.hash, &g.keccak, &g.blake3, &g.lanes,
+        &g.hint, &g.public,
+    ]
+}
+
+const PROGRAM_GROUP_NAMES: [&str; 11] = [
+    "const", "balu", "xalu", "select", "bitdec", "hash", "keccak", "blake3", "lanes", "hint",
+    "public",
+];
+
+/// The heap's live bytes (jemalloc `stats.allocated`, the epoch turned first).
+fn heap_allocated() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().expect("the jemalloc epoch turns");
+    stats::allocated::read().expect("stats.allocated reads")
+}
+
+/// The pages jemalloc holds: live, freed-and-dirty, and its metadata
+/// (`stats.resident`, an upper bound: a fresh extent counts before it is
+/// touched).
+fn heap_resident() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().expect("the jemalloc epoch turns");
+    stats::resident::read().expect("stats.resident reads")
+}
+
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// The production-height plan the S5 instruments emit from:
+/// [`spread_fixture_shape`] with 13 chunks of each accelerator and 40 CPU
+/// chunks, under the block base's options, every leaf filled toward
+/// [`super::block_plan::LEAF_PERMS_CAP`] as the median block's are.
+fn production_height_plan() -> BlockTreePlan {
+    let opts = super::proof::block_base_options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let shape = spread_fixture_shape(&elf, 13, 40);
+    BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives")
+}
+
+/// ★ D-ANYBLOCK S5 §4.13 instrument (laptop): a block leaf program's host bytes
+/// by part, at production heights ([`production_height_plan`]) — the ≈ 0.34 GiB
+/// a leaf (BIG 480) the whole-block harness holds beside the base. Per leaf:
+/// the instruction vector (`size_of::<Instr>()` a row), `BitDec`'s bit lists
+/// and the boxed operands, the column groups held (padded, at capacity) against
+/// their real rows, and the share in allocations at or over jemalloc's
+/// oversize threshold. The heap's own count of each retained program (jemalloc
+/// `stats.allocated` across its emission, one leaf at a time) checks the sum.
+#[test]
+#[ignore = "laptop instrument: run alone (--exact), so the heap's delta is the program's"]
+fn a_block_leaf_programs_host_bytes_by_part() {
+    use super::instr::{Addr, Instr};
+    let plan = production_height_plan();
+    let costs = plan.costs();
+    let partition = plan.partition().clone();
+    let threshold: usize = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.oversize_threshold\0") }
+        .expect("opt.oversize_threshold reads");
+    println!(
+        "LEAF BYTES: size_of::<Instr>() {} · Addr {} · (Addr, u64) {} · FE {} · jemalloc \
+         oversize threshold {threshold} B (the instruments assume {JEMALLOC_OVERSIZE}) · {} leaves",
+        size_of::<Instr>(),
+        size_of::<Addr>(),
+        size_of::<(Addr, u64)>(),
+        size_of::<FE>(),
+        partition.num_leaves()
+    );
+    assert_eq!(
+        threshold, JEMALLOC_OVERSIZE,
+        "jemalloc's oversize threshold moved"
+    );
+    // The first emission makes the process-wide caches; drop it.
+    drop(plan.leaf_program(0).expect("leaf 0 emits"));
+
+    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    let mut sum = ProgramBytes::default();
+    let (mut perms_sum, mut heap_sum, mut instrs_sum) = (0usize, 0usize, 0usize);
+    let mut variants = std::collections::BTreeMap::<&str, usize>::new();
+    let (mut bitdecs, mut bits, mut contiguous, mut one_mult) = (0usize, 0usize, 0usize, 0usize);
+    let mut groups_held = [0usize; 11];
+    let mut groups_real = [0usize; 11];
+    for (k, leaf) in partition.leaves().iter().enumerate() {
+        let perms: usize = leaf.iter().map(|&i| costs[i]).sum();
+        let before = heap_allocated();
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let heap = heap_allocated().saturating_sub(before);
+        let b = ProgramBytes::of(&program);
+        println!(
+            "LEAF BYTES leaf {k}: {} instances · {perms} perms · {} instrs · held {:.1} MiB (instrs \
+             {:.1} for {:.1} used · bitdec bits {:.1} · boxed {:.1} · groups {:.1}, padded rows {:.1}, \
+             real rows {:.1} · other {:.2}) · ≥ oversize {:.1} % · {} allocations · heap Δ {:.1} MiB \
+             ({:+.1} % on the sum)",
+            leaf.len(),
+            program.instrs.len(),
+            mib(b.total()),
+            mib(b.instrs),
+            mib(program.instrs.len() * size_of::<Instr>()),
+            mib(b.bitdec_heap),
+            mib(b.boxed),
+            mib(b.groups),
+            mib(b.groups_padded),
+            mib(b.groups_real),
+            mib(b.other),
+            100.0 * b.large as f64 / b.total() as f64,
+            b.allocs,
+            mib(heap),
+            100.0 * (heap as f64 / b.total() as f64 - 1.0),
+        );
+        for instr in &program.instrs {
+            let name = match instr {
+                Instr::Const { .. } => "Const",
+                Instr::BaseAlu { .. } => "BaseAlu",
+                Instr::ExtAlu { .. } => "ExtAlu",
+                Instr::Select { .. } => "Select",
+                Instr::BitDec { bits: list, .. } => {
+                    bitdecs += 1;
+                    bits += list.len();
+                    if list.windows(2).all(|w| w[1].0.0 == w[0].0.0 + 1) {
+                        contiguous += 1;
+                    }
+                    if list.windows(2).all(|w| w[1].1 == w[0].1) {
+                        one_mult += 1;
+                    }
+                    "BitDec"
+                }
+                Instr::Hash { .. } => "Hash",
+                Instr::Hint { .. } => "Hint",
+                Instr::Pack { .. } => "Pack",
+                Instr::Unpack { .. } => "Unpack",
+                Instr::KeccakF(_) => "KeccakF",
+                Instr::Blake3(_) => "Blake3",
+                Instr::Public { .. } => "Public",
+            };
+            *variants.entry(name).or_default() += 1;
+        }
+        for (j, g) in program_groups(&program).iter().enumerate() {
+            groups_held[j] += g.data.capacity() * size_of::<FE>();
+            groups_real[j] += g.real_rows * g.width * size_of::<FE>();
+        }
+        sum.add(&b);
+        perms_sum += perms;
+        heap_sum += heap;
+        instrs_sum += program.instrs.len();
+    }
+    let t = sum.total() as f64;
+    let pct = |b: usize| 100.0 * b as f64 / t;
+    println!(
+        "LEAF BYTES Σ: {perms_sum} perms · {instrs_sum} instrs · held {:.1} MiB = instrs {:.1} % · \
+         bitdec bits {:.1} % · boxed {:.1} % · groups {:.1} % (capacity slack {:.1} % and row \
+         padding {:.1} % of the total) · instrs' capacity slack {:.1} % · other {:.2} % · ≥ oversize \
+         {:.1} % · heap Δ {:.1} MiB ({:+.1} %) · {:.0} B a perm, {:.1} B an instr",
+        mib(sum.total()),
+        pct(sum.instrs),
+        pct(sum.bitdec_heap),
+        pct(sum.boxed),
+        pct(sum.groups),
+        pct(sum.groups - sum.groups_padded),
+        pct(sum.groups_padded - sum.groups_real),
+        pct(sum.instrs - instrs_sum * size_of::<Instr>()),
+        pct(sum.other),
+        pct(sum.large),
+        mib(heap_sum),
+        100.0 * (heap_sum as f64 / t - 1.0),
+        t / perms_sum as f64,
+        t / instrs_sum as f64,
+    );
+    let groups: Vec<String> = PROGRAM_GROUP_NAMES
+        .iter()
+        .zip(groups_held.iter().zip(&groups_real))
+        .filter(|(_, (held, _))| **held > 0)
+        .map(|(name, (held, real))| format!("{name} {:.1}/{:.1}", mib(*held), mib(*real)))
+        .collect();
+    println!(
+        "LEAF BYTES groups (MiB held/real rows, Σ leaves): {}",
+        groups.join(" · ")
+    );
+    let mix: Vec<String> = variants
+        .iter()
+        .map(|(name, n)| format!("{name} {:.1} %", 100.0 * *n as f64 / instrs_sum as f64))
+        .collect();
+    println!(
+        "LEAF BYTES instrs: {} · BitDec {bitdecs}: {:.1} bits each, contiguous addresses {:.1} %, \
+         one multiplicity {:.1} %",
+        mix.join(" · "),
+        bits as f64 / bitdecs.max(1) as f64,
+        100.0 * contiguous as f64 / bitdecs.max(1) as f64,
+        100.0 * one_mult as f64 / bitdecs.max(1) as f64,
+    );
+}
+
+/// The S5 late-emission instruments' probe: under the posture's never-purge
+/// jemalloc, `gen` threads allocate and touch trace-like buffers of
+/// `buffer_sizes` (cycled) to ≈ 2 GiB and free them, as phase B retires the
+/// base's traces; then 4 threads of their own emit leaf programs to ≈ 1.75 GiB and
+/// hold them, as the harness's ELF-beside pool does. Reports how much of the
+/// programs' heap took pages the allocator did not already hold
+/// (`stats.resident`'s rise): the bytes a late emission still adds to the
+/// base's high-water.
+fn late_emission_reuse_probe(arm: &str, buffer_sizes: &[usize]) {
+    let dirty: isize = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0") }
+        .expect("opt.dirty_decay_ms reads");
+    assert_eq!(
+        dirty, -1,
+        "run under the posture's allocator: _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"
+    );
+    let plan = production_height_plan();
+    let first = plan.leaf_program(0).expect("leaf 0 emits");
+    let per_leaf = ProgramBytes::of(&first);
+    drop(first);
+    let leaves = (((7usize << 28) / per_leaf.total()).max(1)).min(plan.partition().num_leaves());
+    let pool = |name: &'static str, threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(move |i| format!("{name}-{i}"))
+            .build()
+            .expect("the pool builds")
+    };
+    let (gen_pool, emit_pool) = (pool("probe-gen", 6), pool("probe-emit", 4));
+    let target = 2usize << 30;
+    let mut sizes = Vec::new();
+    let mut at = 0usize;
+    while sizes.iter().sum::<usize>() < target {
+        sizes.push(buffer_sizes[at % buffer_sizes.len()]);
+        at += 1;
+    }
+    let buffers: Vec<Vec<u8>> = gen_pool.install(|| {
+        use rayon::prelude::*;
+        sizes.par_iter().map(|&n| vec![1u8; n]).collect()
+    });
+    let (resident0, live0) = (heap_resident(), heap_allocated());
+    gen_pool.install(|| {
+        use rayon::prelude::*;
+        buffers.into_par_iter().for_each(drop);
+    });
+    let (resident1, live1) = (heap_resident(), heap_allocated());
+    let programs: Vec<LfmProgram> = emit_pool.install(|| {
+        use rayon::prelude::*;
+        (0..leaves)
+            .into_par_iter()
+            .map(|k| plan.leaf_program(k).expect("the leaf emits"))
+            .collect()
+    });
+    let (resident2, live2) = (heap_resident(), heap_allocated());
+    let mut held = ProgramBytes::default();
+    for p in &programs {
+        held.add(&ProgramBytes::of(p));
+    }
+    let heap = live2.saturating_sub(live1);
+    let fresh = resident2.saturating_sub(resident1);
+    println!(
+        "LATE PROBE {arm}: {} buffers ({:.2} GiB, sizes {:?} MiB) freed: live {:.2} → {:.2} GiB, \
+         resident {:.2} → {:.2} · {leaves} leaf programs emitted on 4 threads: heap {:.2} GiB \
+         (held by count {:.2}, ≥ oversize {:.1} %) · resident {:.2} → {:.2} (+{:.2} GiB) · \
+         fresh pages {:.1} % of the programs' heap, reused {:.1} %",
+        sizes.len(),
+        gib(sizes.iter().sum()),
+        buffer_sizes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
+        gib(live0),
+        gib(live1),
+        gib(resident0),
+        gib(resident1),
+        gib(heap),
+        gib(held.total()),
+        100.0 * held.large as f64 / held.total() as f64,
+        gib(resident1),
+        gib(resident2),
+        gib(fresh),
+        100.0 * fresh as f64 / heap as f64,
+        100.0 * (1.0 - fresh as f64 / heap as f64),
+    );
+    drop(programs);
+}
+
+/// ★ S5 late emission's mechanism, the trace arm: the base's packed traces are
+/// tens to hundreds of MiB an instance (median: 56.5 GiB over 941), so phase B
+/// frees them into the shared oversize arena. Laptop, the posture's allocator:
+/// `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`, run alone.
+#[test]
+#[ignore = "laptop instrument: run alone under _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"]
+fn late_emission_probe_over_freed_trace_sized_buffers() {
+    late_emission_reuse_probe("trace-sized", &[16 << 20, 48 << 20, 128 << 20, 24 << 20]);
+}
+
+/// ★ The contrast arm: 1 MiB buffers, under the oversize threshold, so their
+/// pages stay in the freeing threads' own arenas.
+#[test]
+#[ignore = "laptop instrument: run alone under _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"]
+fn late_emission_probe_over_freed_small_buffers() {
+    late_emission_reuse_probe("small", &[1 << 20]);
 }
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
