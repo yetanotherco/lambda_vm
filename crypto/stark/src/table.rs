@@ -393,13 +393,18 @@ impl<F: IsField> Table<F> {
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
-        (0..self.width)
-            .map(|col_idx| {
-                (0..self.height)
-                    .map(|row_idx| self.get(row_idx, col_idx).clone())
-                    .collect()
-            })
-            .collect()
+        // One column per worker: the table is row-major, so this is a strided
+        // read of the whole trace and the widest thing between the executor and
+        // the commitment.
+        let column = |col_idx: usize| -> Vec<FieldElement<F>> {
+            (0..self.height)
+                .map(|row_idx| self.get(row_idx, col_idx).clone())
+                .collect()
+        };
+        #[cfg(feature = "parallel")]
+        return (0..self.width).into_par_iter().map(column).collect();
+        #[cfg(not(feature = "parallel"))]
+        return (0..self.width).map(column).collect();
     }
 
     /// Extract columns as owned vectors, with each allocated at `capacity`.

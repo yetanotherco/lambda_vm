@@ -1,0 +1,946 @@
+//! One sub-proof's query verification: DEEP reconstruction over the SAME arena
+//! cells the Merkle authentication authenticates.
+//!
+//! The [constraint](super::constraints) and [DEEP](super::deep) legs consume
+//! opened values; the [Merkle walk](super::edsl::wrap_merkle_walk)
+//! authenticates them. Built separately the two are each correct and neither
+//! says anything about the other — a program could fold one set of values and
+//! authenticate a different set, and every test that fed both halves the same
+//! data would pass. This module is the join, and it is a join by CONSTRUCTION
+//! rather than by convention: [`emit_group_authentication`] takes cells and
+//! cannot hint, so the only values it can authenticate are the caller's, and
+//! [`emit_query`] hands those same cells to the DEEP fold.
+//!
+//! # The two consumers disagree about layout, which is the whole difficulty
+//!
+//! A query opens four committed matrices — precomputed, main, aux, composition
+//! — and each is a SEPARATE Merkle tree with its own root and its own path. The
+//! leaf of one tree is that matrix's own row pair:
+//!
+//! ```text
+//!   leaf(main) = keccak( main[υ] ‖ main[−υ] )
+//! ```
+//!
+//! while DEEP walks one POINT across all matrices:
+//!
+//! ```text
+//!   DEEP(υ) folds  precomputed[υ] ‖ main[υ] ‖ aux[υ]
+//! ```
+//!
+//! So the authentication groups by matrix and the fold groups by point. The
+//! two orders cross, which is exactly the situation that invites two parallel
+//! copies of the same values in two arenas — sound only as long as the host
+//! filling them agrees with itself, which no in-machine constraint requires.
+//! Here `values` is one vector of cells per matrix, in LEAF order, and DEEP
+//! indexes into it: column `c` at the regular point is `values[c]`, at the
+//! symmetric point `values[num_columns + c]`.
+//!
+//! # The query point is derived from the index bits, not hinted
+//!
+//! `DEEP(υ)` is meaningless unless `υ` is the point the authenticated leaf
+//! sits at. Production derives both from one challenge `iota`
+//! (`query_challenge_to_evaluation_point`); a machine that hinted the point
+//! separately would let a prover authenticate a leaf at one index and evaluate
+//! DEEP at another. [`emit_query`] decomposes the hinted index ONCE and uses
+//! the same bits for the walk and for the point, so the two cannot disagree.
+//!
+//! `υ = offset · g^{br(2·iota)}` where `br` is the bit reversal over the LDE
+//! domain. Reversing `2·iota` maps index bit `i` to weight `2^{depth-1-i}`, so
+//! the point is `offset · Π (g^{2^{depth-1-i}})^{b_i}` — one `Select` and one
+//! `Mul` per bit against program constants, via [`super::edsl::pow_bits`]. The
+//! symmetric point is `−υ`: `br(2·iota+1) = br(2·iota) + L/2` and `g^{L/2} =
+//! −1`, so it costs one subtraction rather than a second derivation.
+//!
+//! # One-row leaves (S2)
+//!
+//! Under [`SubProofShape::layout`] = `LeafLayout::Row` every committed matrix
+//! holds ONE row per leaf: a query index `r` has `log2(lde)` bits (uniform over
+//! the whole LDE, not a pair index), every tree is `log2(lde)` deep, a group's
+//! opening is `num_columns` cells (no symmetric row), the point is
+//! `x_r = offset · g^{br(r)}` alone ([`emit_point_from_row_bits`]), and DEEP
+//! is evaluated ONCE. The FRI leg then starts at the committed DEEP codeword
+//! (the input tree) with the input-slot check `group₀[slot] == DEEP(x_r)`
+//! (`super::fri::emit_query_fri`).
+
+use math::field::traits::IsFFTField;
+
+use crate::tables::types::{FE, GoldilocksField};
+
+use stark::leaf_layout::LeafLayout;
+
+use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
+use super::deep::{DeepInvariants, DeepOpening, DeepShape, emit_deep_point};
+use super::edsl::{self, WrapDigest};
+use super::merkle_cap::CapCells;
+
+/// Rows a Merkle leaf covers at today's layout — `crypto/stark`'s
+/// `ROWS_PER_LEAF`, mirrored here because it fixes program shape: a leaf holds
+/// a row PAIR, which is why one path authenticates both of a query's two
+/// points. One-row leaves (S2) are [`SubProofShape::layout`]'s other value.
+pub const ROWS_PER_LEAF: usize = 2;
+
+/// The compile-time shape of one committed matrix of a sub-proof.
+///
+/// `is_ext` is the element kind, and it is not cosmetic: a base element is
+/// rendered into the leaf as 8 big-endian bytes and an extension element as 24
+/// (components 0, 1, 2, each big-endian — `write_bytes_be` for
+/// `FieldElement<Degree3GoldilocksExtensionField>`). Getting it wrong changes
+/// the byte string and therefore the leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupShape {
+    /// Columns at ONE point. A leaf covers `ROWS_PER_LEAF · num_columns`.
+    pub num_columns: usize,
+    pub is_ext: bool,
+}
+
+impl GroupShape {
+    /// Cells one query's opening of this group occupies under row-pair
+    /// leaves — both points. [`Self::values_at`] is the layout-generic form.
+    pub fn num_values(&self) -> usize {
+        self.values_at(ROWS_PER_LEAF)
+    }
+
+    /// Cells one query's opening of this group occupies when a leaf holds
+    /// `rows_per_leaf` rows: `2·num_columns` for row pairs, `num_columns`
+    /// under one-row leaves (S2).
+    pub fn values_at(&self, rows_per_leaf: usize) -> usize {
+        rows_per_leaf * self.num_columns
+    }
+
+    /// Bytes the row-pair leaf hash covers.
+    pub fn leaf_bytes(&self) -> usize {
+        self.leaf_bytes_at(ROWS_PER_LEAF)
+    }
+
+    /// Bytes the leaf hash covers at `rows_per_leaf` rows per leaf.
+    pub fn leaf_bytes_at(&self, rows_per_leaf: usize) -> usize {
+        self.values_at(rows_per_leaf) * if self.is_ext { 24 } else { 8 }
+    }
+}
+
+/// One sub-proof's per-query verification shape.
+///
+/// Every field is program SHAPE. In particular the group list is: a proof that
+/// carried an aux opening where the program expects none would not match the
+/// arena schema, which is the straight-line discipline standing in for
+/// production's `(Some(root), Some(opening)) | (None, None)` presence check.
+#[derive(Clone, Debug)]
+pub struct SubProofShape {
+    /// The DEEP fold's shape — column count, OOD grid, part count.
+    pub deep: DeepShape,
+    /// The TRACE matrices in DEEP column order: precomputed, then main, then
+    /// aux. Absent groups are omitted, exactly as the proof omits them. Their
+    /// widths must sum to `deep.num_total_cols`.
+    pub trace_groups: Vec<GroupShape>,
+    /// Merkle depth — `log2(lde_length) − 1` when a leaf is a row pair,
+    /// `log2(lde_length)` under one-row leaves ([`Self::layout`]). All four
+    /// trees commit over the same LDE domain at the same layout, so one depth
+    /// serves them all and one index addresses them all.
+    pub merkle_depth: usize,
+    /// `log2` of the LDE domain — `log2_trace_length + log2(blowup)`.
+    pub log2_lde_length: u32,
+    /// The LDE coset offset, `ProofOptions::coset_offset`.
+    pub coset_offset: FE,
+    /// The Merkle-cap height of every committed matrix's tree (they share a
+    /// depth and an opening count, so one height): `0` = uncapped, today's
+    /// format. With `c > 0` each tree's `2^c` cap digests are hinted ONCE per
+    /// sub-proof and authenticated against the root ([`CapCells`]), and every
+    /// query's path stops `c` levels short. A verifier
+    /// constant: `CapPolicy::height(num_queries, merkle_depth)` of the inner
+    /// proof's options, never read from the proof.
+    pub trace_cap: usize,
+    /// The trace trees' leaf layout (S2): today's row
+    /// pairs, or one row per leaf. A verifier constant — the table's
+    /// `stark::leaf_layout::table_leaf_layout`, resolved from the AIR's
+    /// widths and the trace length, never read from the proof. Under
+    /// [`LeafLayout::Row`] a query opens ONE row per tree, its index ranges
+    /// over the whole LDE, and DEEP is evaluated at the one point `x_r`.
+    pub layout: LeafLayout,
+}
+
+impl SubProofShape {
+    /// Rows one leaf of every committed matrix holds (2, or 1 under S2).
+    pub fn rows_per_leaf(&self) -> usize {
+        self.layout.rows_per_leaf()
+    }
+
+    /// Cells one query's opening of `g` occupies at this shape's layout.
+    pub fn group_values(&self, g: &GroupShape) -> usize {
+        g.values_at(self.rows_per_leaf())
+    }
+
+    /// The composition-parts group. Its width is the part count and its
+    /// elements are extension, both of which are already DEEP shape.
+    pub fn parts_group(&self) -> GroupShape {
+        GroupShape {
+            num_columns: self.deep.num_composition_parts,
+            is_ext: true,
+        }
+    }
+
+    /// Every group a query authenticates: the trace matrices then the parts.
+    pub fn groups(&self) -> Vec<GroupShape> {
+        let mut all = self.trace_groups.clone();
+        all.push(self.parts_group());
+        all
+    }
+
+    /// Arena words one query's openings occupy — every group's values, plus
+    /// the index and the sibling digests (`digest_words` per level per group).
+    ///
+    /// ★ `digest_words` is the DIGEST's width in arena words, and it is an
+    /// argument rather than a read of the configuration: the machine side
+    /// passes `edsl::digest_words(b)` — the BUILDER's width, the one every
+    /// emitter advances its cursor by — and the host side passes
+    /// `proof_arena::words_per_root()`, the width it serialises roots at. A
+    /// shape that read the configuration here would agree with a builder at
+    /// `WrapHash::production()` and disagree with any other, and the
+    /// disagreement would surface as the emitter's own stride assertion.
+    pub fn query_words(&self, digest_words: usize) -> usize {
+        1 + self.opening_words(digest_words)
+    }
+
+    /// [`Self::query_words`] WITHOUT the index word.
+    ///
+    /// The assembled verifier's stride: its query index is not proof data at
+    /// all but the transcript's own bits, so the arena carries only the opened
+    /// values and the paths. An arena that still carried an index would be
+    /// offering the prover a second one.
+    pub fn opening_words(&self, digest_words: usize) -> usize {
+        let values: usize = self.groups().iter().map(|g| self.group_values(g)).sum();
+        let siblings = digest_words * self.path_len() * self.groups().len();
+        values + siblings
+    }
+
+    /// Siblings one query's path carries per group: the tree's depth less its
+    /// cap height (the owner path's cap is split off into the caps arena).
+    pub fn path_len(&self) -> usize {
+        self.merkle_depth - self.trace_cap
+    }
+
+    /// Arena words the committed matrices' caps occupy, once per sub-proof:
+    /// `2^c` digests per group when capped, nothing otherwise.
+    pub fn cap_words(&self, digest_words: usize) -> usize {
+        if self.trace_cap == 0 {
+            0
+        } else {
+            self.groups().len() * (1usize << self.trace_cap) * digest_words
+        }
+    }
+
+    /// Permutations the committed matrices' cap checks cost, once per
+    /// sub-proof: `2^c − 1` parents per group (nothing uncapped).
+    pub fn cap_permutations(&self) -> usize {
+        self.groups().len() * super::merkle_cap::cap_root_permutations(self.trace_cap)
+    }
+
+    /// Checked invariants of a shape, so a caller cannot assemble one whose
+    /// groups do not cover the fold.
+    fn check(&self) {
+        assert!(
+            self.trace_cap <= self.merkle_depth,
+            "a cap is at most the tree: height {} over depth {}",
+            self.trace_cap,
+            self.merkle_depth
+        );
+        let width: usize = self.trace_groups.iter().map(|g| g.num_columns).sum();
+        assert_eq!(
+            width, self.deep.num_total_cols,
+            "the trace groups must cover exactly the DEEP column set"
+        );
+        assert_eq!(
+            self.merkle_depth,
+            self.layout.tree_depth(self.log2_lde_length as usize),
+            "a row-pair tree is one level shallower than the LDE domain, a \
+             one-row tree is as deep as it: depth {} against log2(lde) {} at {:?}",
+            self.merkle_depth,
+            self.log2_lde_length,
+            self.layout
+        );
+        // ⚠ NO `merkle_depth >= 1`. A ONE-PAIR domain — a one-row trace at blowup
+        // 2 — has a single leaf, so the tree has no levels and the LEAF HASH IS
+        // THE ROOT. That is a legitimate degenerate shape, and both sides already
+        // handle it without a special case:
+        //
+        // · the host's `verify_merkle_path_from_leaf_hash` loops over an empty
+        //   path and returns `root_hash == hashed_value`;
+        // · `emit_group_authentication` hashes the leaf, walks zero levels, and
+        //   asserts the result equals the committed root.
+        //
+        // So the walk at depth 0 is NOT a no-op — it is exactly the binding, and
+        // the old assert refused a shape the code below verifies correctly. It
+        // read "a tree with no levels has no path to walk", which is true and
+        // beside the point: there is no path, none is walked, and the leaf-versus
+        // -root compare still happens.
+        //
+        // Found by the leaf-node gate at a real continuation epoch's sub-proof
+        // #10; gated by
+        // `per_table_aggregator_tests::a_depth_zero_walk_still_binds_leaf_to_root`,
+        // whose REJECTION arm is what proves the compare survives.
+    }
+}
+
+/// A committed matrix's root, unpacked once and shared by every query.
+///
+/// Hoisting the unpack is what `fri_toy_program` already does per query: the
+/// root is a per-sub-proof value and a 219-query proof would otherwise pay
+/// 219 redundant `Unpack`s per group.
+pub struct GroupCommitment {
+    /// The root's two words as lanes.
+    /// ⚠ A `Vec`, ONE ENTRY PER DIGEST CELL, not `[_; 2]`: the array wrote the
+    /// byte digest's cell COUNT into the type, and an algebraic root is one cell
+    /// of four felts. `edsl::assert_digest_eq_lanes` zips a digest against these
+    /// and asserts the widths agree, so it works at either width unchanged.
+    pub root_lanes: Vec<[Felt; 4]>,
+    pub shape: GroupShape,
+    /// The tree's authenticated Merkle cap, when the format caps it: every
+    /// query's opening is then checked against THESE cells
+    /// ([`CapCells::verify_path`]) instead of the root lanes. `None` = today.
+    pub cap: Option<CapCells>,
+}
+
+impl GroupCommitment {
+    /// Reads a root out of the arena and hoists its unpack.
+    pub fn hint(
+        b: &mut LfmBuilder,
+        arena: super::instr::ArenaId,
+        base: u32,
+        shape: GroupShape,
+    ) -> Self {
+        // ⚠ The configuration's word count, not two: an algebraic root is ONE
+        // arena word of four felts. `RootCells::words_per_root` is the single
+        // definition; a second `+ 1` here would be a second definition.
+        let n = super::epoch::RootCells::words_per_root(b);
+        let root_lanes: Vec<[Felt; 4]> = (0..n)
+            .map(|i| {
+                let w = b.hint_word(arena, base + i);
+                b.unpack(w)
+            })
+            .collect();
+        GroupCommitment {
+            root_lanes,
+            shape,
+            cap: None,
+        }
+    }
+
+    /// A commitment over lanes the caller already holds — the assembled
+    /// verifier's route, where a root reaches this leg as the SAME cells the
+    /// transcript absorbed rather than as a second hint.
+    ///
+    /// A root has two consumers (`epoch::RootCells`' doc comment names them):
+    /// the Fiat-Shamir absorb and this comparison. Hinting it twice is the
+    /// two-consumer hazard — a prover would absorb one root and authenticate
+    /// against another, and no differential over honest data could see it,
+    /// because the host packs the same bytes into both. This constructor is the
+    /// join, and it takes lanes rather than words precisely so there is nothing
+    /// left to hint.
+    pub fn from_lanes(root_lanes: Vec<[Felt; 4]>, shape: GroupShape) -> Self {
+        GroupCommitment {
+            root_lanes,
+            shape,
+            cap: None,
+        }
+    }
+
+    /// Hint this tree's height-`c` cap out of `arena` at `base`, authenticate
+    /// it against the root lanes (once per tree), and check every later
+    /// opening against it. Returns the next free word. `c = 0` hints nothing
+    /// and leaves the root check in place.
+    pub fn hint_cap(
+        &mut self,
+        b: &mut LfmBuilder,
+        arena: super::instr::ArenaId,
+        base: u32,
+        c: usize,
+    ) -> u32 {
+        if c == 0 {
+            return base;
+        }
+        let (cap, next) =
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+        self.cap = Some(cap);
+        next
+    }
+
+    /// The cap height openings of this tree are checked at (0 = the root).
+    pub fn cap_height(&self) -> usize {
+        self.cap.as_ref().map_or(0, CapCells::height)
+    }
+}
+
+/// One query's opening of one committed matrix, as CELLS.
+///
+/// There is deliberately no constructor that hints: the values are whatever the
+/// caller already holds, which is what makes the authentication and the fold
+/// share them rather than agree about them.
+pub struct GroupOpening {
+    /// `evaluations ‖ evaluations_sym` in LEAF order — the row pair written
+    /// column by column, the regular point first.
+    pub values: Vec<Cell>,
+    /// Sibling digests, LEAF LEVEL FIRST — the order
+    /// `verify_merkle_path_from_leaf_hash` consumes them in.
+    pub siblings: Vec<WrapDigest>,
+}
+
+/// The leaf hash of one group's row pair, in the production commitment layout.
+///
+/// Base groups go through [`edsl::wrap_leaf_hash`] unchanged. Extension
+/// groups render each element as its three components, each big-endian —
+/// `write_bytes_be` writes components 0, 1, 2 in that order, so the machine
+/// unpacks the word and byteswaps lanes 0, 1, 2.
+///
+/// Lane 3 is NOT hashed, which is correct (production hashes three components)
+/// and worth stating: an extension cell whose lane 3 is nonzero would hash the
+/// same as one whose lane 3 is zero. It cannot arise here because every
+/// extension value a query opens is also consumed as an ext operand by the DEEP
+/// fold, and an ext read of a word with a nonzero lane 3 is unprovable. A
+/// caller that authenticated an extension group WITHOUT folding it would owe
+/// that check itself.
+pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) -> WrapDigest {
+    emit_leaf_hash_rows(b, shape, ROWS_PER_LEAF, values)
+}
+
+/// [`emit_leaf_hash`] for a leaf of `rows_per_leaf` rows: the same stream
+/// (every value's felts in the order given — row-major across the leaf's
+/// rows, `hash_data_from_slices(evaluations, evaluations_sym)` on the host),
+/// sized by the layout. At `rows_per_leaf = 2` it IS [`emit_leaf_hash`],
+/// instruction for instruction.
+pub fn emit_leaf_hash_rows(
+    b: &mut LfmBuilder,
+    shape: GroupShape,
+    rows_per_leaf: usize,
+    values: &[Cell],
+) -> WrapDigest {
+    use super::keccak_host::BYTES_PER_HALF;
+    use super::transcript_replay::felt_be_halves;
+
+    assert_eq!(
+        values.len(),
+        shape.values_at(rows_per_leaf),
+        "a leaf covers the whole row pair (or the one row)"
+    );
+    if !shape.is_ext {
+        let felts: Vec<Felt> = values.iter().map(|c| Felt(c.addr())).collect();
+        return edsl::wrap_leaf_hash(b, &felts);
+    }
+
+    // ★ The ALGEBRAIC path absorbs the felts. The byte stream below exists only
+    // because the incumbent hashes are byte-oriented: what it serialises IS
+    // three field elements per value, so an algebraic leaf deletes the
+    // serialisation rather than reimplementing it. ✓ The host's decomposition
+    // agrees by construction — `write_bytes_be` for an Fp3 element writes
+    // components 0, 1, 2 in order, which is the lane order `unpack` returns.
+    let Some(byte_hash) = b.wrap_hash().byte_hash() else {
+        let mut felts = Vec::with_capacity(3 * values.len());
+        for v in values {
+            let lanes = b.unpack(*v);
+            felts.extend_from_slice(&lanes[..3]);
+        }
+        return edsl::wrap_leaf_hash(b, &felts);
+    };
+
+    let mut stream = Vec::with_capacity(6 * values.len());
+    for v in values {
+        let lanes = b.unpack(*v);
+        for lane in lanes.iter().take(3) {
+            stream.extend(felt_be_halves(b, *lane));
+        }
+    }
+    let len_bytes = BYTES_PER_HALF * stream.len();
+    debug_assert_eq!(len_bytes, shape.leaf_bytes_at(rows_per_leaf));
+    edsl::wrap_hash_bytes(b, byte_hash, &stream, len_bytes)
+}
+
+/// Authenticate one group's opened values against its committed root.
+///
+/// Takes the caller's cells and never hints a value, so what it authenticates
+/// is what the caller folds. The assert is the binding; `bits` are shared with
+/// every other group of the same query, which is what makes the four trees
+/// agree about WHICH leaf they opened.
+pub fn emit_group_authentication(
+    b: &mut LfmBuilder,
+    commitment: &GroupCommitment,
+    opening: &GroupOpening,
+    bits: &[Bit],
+) {
+    emit_group_authentication_at(b, commitment, ROWS_PER_LEAF, opening, bits);
+}
+
+/// [`emit_group_authentication`] for a leaf of `rows_per_leaf` rows (the
+/// sub-proof's [`SubProofShape::rows_per_leaf`]).
+pub fn emit_group_authentication_at(
+    b: &mut LfmBuilder,
+    commitment: &GroupCommitment,
+    rows_per_leaf: usize,
+    opening: &GroupOpening,
+    bits: &[Bit],
+) {
+    assert_eq!(
+        opening.siblings.len() + commitment.cap_height(),
+        bits.len(),
+        "one sibling per level below the cap, and every group walks the same index"
+    );
+    let leaf = emit_leaf_hash_rows(b, commitment.shape, rows_per_leaf, &opening.values);
+    match &commitment.cap {
+        None => {
+            let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
+            edsl::assert_digest_eq_lanes(b, root, &commitment.root_lanes);
+        }
+        // The whole index goes in; the cap splits it (walk low, mux top).
+        Some(cap) => cap.verify_path(b, leaf, bits, &opening.siblings),
+    }
+}
+
+/// The LDE-domain constants the point derivation multiplies together for an
+/// index of `nbits` bits: `factors[i] = g^{2^{nbits-1-i}}`, matching index bit
+/// `i`'s weight after the bit reversal.
+///
+/// Row pairs: the index `ι` has `nbits = log2(lde) − 1` bits and the point is
+/// at bit-reversed position `2ι`, so bit `i` of `ι` is bit `i + 1` of `2ι`,
+/// weight `2^{log2(lde)−2−i} = 2^{nbits−1−i}`. One row: the index `r` has
+/// `nbits = log2(lde)` bits and the point is at position `r` itself, weight
+/// `2^{log2(lde)−1−i} = 2^{nbits−1−i}`. One formula, keyed on the bit count.
+fn point_factors(log2_lde_length: u32, nbits: usize) -> Vec<FE> {
+    let g = <GoldilocksField as IsFFTField>::get_primitive_root_of_unity(log2_lde_length as u64)
+        .expect("a power-of-two LDE length has a root of unity");
+    (0..nbits).map(|i| g.pow(1u64 << (nbits - 1 - i))).collect()
+}
+
+/// `x_r` — the LDE point at bit-reversed position `r` — from the ONE-ROW
+/// query index bits (`log2(lde)` of them, S2; `r` uniform over the whole LDE).
+/// The one-row counterpart of [`emit_points_from_bits`]: no symmetric point,
+/// because a one-row leaf holds one point.
+pub fn emit_point_from_row_bits(
+    b: &mut LfmBuilder,
+    log2_lde_length: u32,
+    coset_offset: FE,
+    bits: &[Bit],
+) -> Felt {
+    assert_eq!(
+        bits.len(),
+        log2_lde_length as usize,
+        "a one-row index ranges over the whole LDE domain"
+    );
+    edsl::pow_bits(
+        b,
+        bits,
+        &point_factors(log2_lde_length, bits.len()),
+        coset_offset,
+    )
+}
+
+/// `(υ, −υ)` from the query index bits, for the LDE domain given by its size and
+/// coset offset. Shape-only inputs: the factors are program constants.
+///
+/// Keyed on the domain rather than on a [`SubProofShape`] because the FRI leg
+/// needs the same derivation and has no trace shape to hand — it holds a
+/// [`super::fri::FriShape`], which carries both of these fields. One derivation
+/// serves both, which is the point: `join_tests::the_join_premises_hold_on_a_real_proof`
+/// checks THIS function against production's
+/// `query_challenge_to_evaluation_point` at every index of a real proof, and a
+/// second copy would not be covered by that check.
+pub fn emit_points_from_bits(
+    b: &mut LfmBuilder,
+    log2_lde_length: u32,
+    coset_offset: FE,
+    bits: &[Bit],
+) -> (Felt, Felt) {
+    assert_eq!(
+        bits.len(),
+        log2_lde_length as usize - 1,
+        "a leaf is a row pair, so the index is one bit narrower than the domain"
+    );
+    let point = edsl::pow_bits(
+        b,
+        bits,
+        &point_factors(log2_lde_length, bits.len()),
+        coset_offset,
+    );
+    let zero = b.felt_const(FE::zero());
+    (point, b.sub(zero, point))
+}
+
+/// `(υ, −υ)` from the query index bits (row-pair shapes).
+pub fn emit_query_points(b: &mut LfmBuilder, shape: &SubProofShape, bits: &[Bit]) -> (Felt, Felt) {
+    assert_eq!(bits.len(), shape.merkle_depth);
+    assert_eq!(
+        shape.layout,
+        LeafLayout::RowPair,
+        "a one-row query has one point (emit_point_from_row_bits)"
+    );
+    emit_points_from_bits(b, shape.log2_lde_length, shape.coset_offset, bits)
+}
+
+/// Everything one query of one sub-proof contributes, emitted.
+///
+/// Order of business: decompose the index, authenticate every group against
+/// its root, derive the two points from the same bits, then fold DEEP at both.
+/// Returns `(DEEP(υ), DEEP(−υ))` for the FRI leg to consume.
+///
+/// `trace_openings` is parallel to [`SubProofShape::trace_groups`]; the parts
+/// opening is separate because DEEP treats it separately.
+pub fn emit_query(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    commitments: &[GroupCommitment],
+    index: Felt,
+    openings: &[GroupOpening],
+) -> (Ext, Ext) {
+    let out = emit_query_with_bits(b, shape, gamma, inv, commitments, index, openings);
+    (
+        out.deep,
+        out.deep_sym
+            .expect("emit_query returns the DEEP pair: a row-pair shape"),
+    )
+}
+
+/// What one query contributes when the caller needs more than the DEEP pair.
+pub struct QueryOutput {
+    /// `DEEP(υ)` — or, under one-row leaves, `DEEP(x_r)`, the ONE point the
+    /// query opens.
+    pub deep: Ext,
+    /// `DEEP(−υ)` for a row-pair shape; `None` under one-row leaves (S2),
+    /// where the query opens no symmetric row and DEEP runs once.
+    pub deep_sym: Option<Ext>,
+    /// The query index decomposed low-to-high — the SAME cells the Merkle walk
+    /// consumed and the query points were derived from.
+    ///
+    /// Handing these out is what lets a later leg join to this one rather than
+    /// run beside it. FRI reuses the index per layer (leaf position `index >> 1`,
+    /// partner `index ^ 1`, halving each layer), and a leg that decomposed its
+    /// own copy would authenticate one index while folding at another — the
+    /// exact gap this module exists to close, reopened one level up. There is
+    /// no way to return a DIFFERENT decomposition from here: `bit_dec` is
+    /// called once and its result feeds the walk, the points and this field.
+    pub bits: Vec<Bit>,
+    /// `υ` — the cell the DEEP fold above evaluated at.
+    ///
+    /// Exposed for the same reason as [`Self::bits`], one step further along.
+    /// FRI needs `υ⁻¹` for its first fold and `υ^(2^total_folds)` for its
+    /// terminal check; both are functions of this cell, and a leg that
+    /// re-derived the point from `bits` would pay `merkle_depth` `Select`s and
+    /// `Mul`s per query for a value it was already holding. Handing the cell
+    /// over is not just cheaper, it removes the question: there is exactly one
+    /// `emit_query_points` call in this function and its outputs go to DEEP and
+    /// to these fields, so no second point EXISTS to disagree.
+    ///
+    /// The structural guard is a count, not a comparison — see
+    /// `fri_tests::the_fri_join_adds_no_second_point_derivation`.
+    pub point: Felt,
+    /// `−υ`, likewise. The zero-fold FRI shape checks the terminal polynomial
+    /// at both points (production's `zetas.is_empty()` branch tests
+    /// `terminal[2·iota]` AND `terminal[2·iota+1]`). `None` under one-row
+    /// leaves: there is no second point.
+    pub point_sym: Option<Felt>,
+}
+
+/// [`emit_query`], additionally returning the index bits — see [`QueryOutput`].
+///
+/// The index arrives as a FELT here, which is the isolation drivers' route: the
+/// differential supplies production's own `iota` and the emitter decomposes it.
+/// The assembled verifier does not have a felt to supply — its index is
+/// `TranscriptReplay::sample_u64_pow2`'s bits — and takes
+/// [`emit_query_from_bits`] instead, which is the same emitter minus this one
+/// `bit_dec`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_query_with_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    commitments: &[GroupCommitment],
+    index: Felt,
+    openings: &[GroupOpening],
+) -> QueryOutput {
+    let bits = b.bit_dec(index, shape.merkle_depth);
+    emit_query_from_bits(b, shape, gamma, inv, commitments, bits, openings)
+}
+
+/// [`emit_query_with_bits`] over an index the caller already holds as BITS.
+///
+/// This is the entry point the assembled epoch verifier uses. Production's query
+/// index is `sample_u64(lde_length >> 1)`, whose output is `index_bits()` bits by
+/// construction (`verifier.rs:138-141`), and the machine's
+/// `TranscriptReplay::sample_u64_pow2` produces exactly those bits. Routing them
+/// straight in — rather than recomposing a felt and decomposing it again — is
+/// what makes the assembled machine's query index in-range by construction and
+/// closes ledger entry 5: with no felt in the program, `ι` and `ι + 2^(n−1)`
+/// cannot be the same query, because neither is ever a number.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_query_from_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    commitments: &[GroupCommitment],
+    bits: Vec<Bit>,
+    openings: &[GroupOpening],
+) -> QueryOutput {
+    shape.check();
+    let groups = shape.groups();
+    assert_eq!(commitments.len(), groups.len(), "one commitment per group");
+    assert_eq!(openings.len(), groups.len(), "one opening per group");
+    for (c, g) in commitments.iter().zip(&groups) {
+        assert_eq!(c.shape, *g, "commitment shapes must match the sub-proof");
+        assert_eq!(
+            c.cap_height(),
+            shape.trace_cap,
+            "every committed matrix is capped at the shape's height"
+        );
+    }
+    assert_eq!(
+        bits.len(),
+        shape.merkle_depth,
+        "a query index is exactly the tree's depth in bits"
+    );
+
+    let rows = shape.rows_per_leaf();
+    for (commitment, opening) in commitments.iter().zip(openings) {
+        emit_group_authentication_at(b, commitment, rows, opening, &bits);
+    }
+
+    if shape.layout.is_one_row() {
+        return emit_one_row_deep(b, shape, gamma, inv, openings, &groups, bits);
+    }
+
+    let (point, point_sym) = emit_query_points(b, shape, &bits);
+
+    // The crossing: the authenticated cells, re-read by POINT instead of by
+    // matrix. Nothing is hinted here, so `trace` cannot hold anything the walk
+    // above did not fold into a leaf.
+    let mut trace = Vec::with_capacity(shape.deep.num_total_cols);
+    let mut trace_sym = Vec::with_capacity(shape.deep.num_total_cols);
+    for (opening, g) in openings.iter().zip(&groups).take(shape.trace_groups.len()) {
+        for c in 0..g.num_columns {
+            trace.push(opening.values[c].as_ext());
+            trace_sym.push(opening.values[g.num_columns + c].as_ext());
+        }
+    }
+
+    let parts_opening = openings.last().expect("the parts group is always present");
+    let num_parts = shape.deep.num_composition_parts;
+    let parts: Vec<Ext> = (0..num_parts)
+        .map(|j| parts_opening.values[j].as_ext())
+        .collect();
+    let parts_sym: Vec<Ext> = (0..num_parts)
+        .map(|j| parts_opening.values[num_parts + j].as_ext())
+        .collect();
+
+    let regular = DeepOpening {
+        point,
+        trace,
+        parts,
+    };
+    let symmetric = DeepOpening {
+        point: point_sym,
+        trace: trace_sym,
+        parts: parts_sym,
+    };
+    QueryOutput {
+        deep: emit_deep_point(b, &shape.deep, gamma, inv, &regular),
+        deep_sym: Some(emit_deep_point(b, &shape.deep, gamma, inv, &symmetric)),
+        bits,
+        point,
+        point_sym: Some(point_sym),
+    }
+}
+
+/// The one-row half of [`emit_query_from_bits`] (S2), after
+/// every group was authenticated at leaf `r`: `x_r` from the SAME bits, then
+/// DEEP ONCE, over the authenticated cells — column `c` is `values[c]` (a
+/// one-row leaf holds no symmetric row, so there is no `values[w + c]`).
+fn emit_one_row_deep(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    openings: &[GroupOpening],
+    groups: &[GroupShape],
+    bits: Vec<Bit>,
+) -> QueryOutput {
+    let point = emit_point_from_row_bits(b, shape.log2_lde_length, shape.coset_offset, &bits);
+    let mut trace = Vec::with_capacity(shape.deep.num_total_cols);
+    for (opening, g) in openings.iter().zip(groups).take(shape.trace_groups.len()) {
+        assert_eq!(opening.values.len(), g.num_columns, "one row per leaf");
+        trace.extend(opening.values.iter().map(|v| v.as_ext()));
+    }
+    let parts_opening = openings.last().expect("the parts group is always present");
+    let parts: Vec<Ext> = parts_opening.values.iter().map(|v| v.as_ext()).collect();
+    assert_eq!(parts.len(), shape.deep.num_composition_parts);
+    let at = DeepOpening {
+        point,
+        trace,
+        parts,
+    };
+    QueryOutput {
+        deep: emit_deep_point(b, &shape.deep, gamma, inv, &at),
+        deep_sym: None,
+        bits,
+        point,
+        point_sym: None,
+    }
+}
+
+// ===================== the whole sub-proof =====================
+
+/// The arenas one sub-proof's verification reads, in declaration order.
+///
+/// Each field is packed into its OWN arena rather than one concatenated
+/// stream — the packing rule [`super::proof_arena`] exists to enforce, applied
+/// one level up: a query whose group widths shifted would otherwise silently
+/// slide every query behind it.
+pub struct SubProofArenas {
+    /// `γ`, then `ζ`.
+    pub uniforms: super::instr::ArenaId,
+    /// The reconstructed OOD grid, row-major, `num_eval_points ×
+    /// num_total_cols` — the same values the constraint leg folds.
+    pub ood: super::instr::ArenaId,
+    /// The composition parts claimed at `z^P`.
+    pub parts: super::instr::ArenaId,
+    /// Two words per group's committed root, in [`SubProofShape::groups`] order.
+    pub roots: super::instr::ArenaId,
+    /// Per query, in order: the index, then per group the row-pair values
+    /// followed by the sibling digests (two words per level).
+    pub queries: super::instr::ArenaId,
+    /// Per group, its `2^c` cap digests — declared only when the shape caps
+    /// the trees ([`SubProofShape::trace_cap`] `> 0`).
+    pub caps: Option<super::instr::ArenaId>,
+}
+
+/// Emit a whole sub-proof's query verification: the invariants once, then every
+/// query authenticated and folded.
+///
+/// Returns `(DEEP(υ), DEEP(−υ))` per query (a row-pair shape). The invariant
+/// hoist is the reason a 219-query proof is affordable, and it is production's
+/// own hoist — the OOD row sums and the block scalars do not depend on the query.
+pub fn emit_sub_proof(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    num_queries: usize,
+) -> (SubProofArenas, Vec<(Ext, Ext)>) {
+    let (arenas, out) = emit_sub_proof_with_bits(b, shape, num_queries);
+    (
+        arenas,
+        out.into_iter()
+            .map(|q| {
+                (
+                    q.deep,
+                    q.deep_sym
+                        .expect("emit_sub_proof returns DEEP pairs: a row-pair shape"),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// [`emit_sub_proof`], additionally returning each query's index bits — see
+/// [`QueryOutput`]. The FRI leg folds from these same cells.
+pub fn emit_sub_proof_with_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    num_queries: usize,
+) -> (SubProofArenas, Vec<QueryOutput>) {
+    use super::deep::emit_deep_invariants;
+
+    shape.check();
+    assert!(num_queries > 0, "a proof carries at least one query");
+    let groups = shape.groups();
+
+    let uniforms = b.declare_arena(2);
+    let ood = b.declare_arena((shape.deep.num_eval_points * shape.deep.num_total_cols) as u32);
+    let parts = b.declare_arena(shape.deep.num_composition_parts as u32);
+    let roots = b.declare_arena(edsl::digest_words(b) * groups.len() as u32);
+    let queries =
+        b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
+    let cap_words = shape.cap_words(edsl::digest_words(b) as usize);
+    let caps = (cap_words > 0).then(|| b.declare_arena(cap_words as u32));
+    let arenas = SubProofArenas {
+        uniforms,
+        ood,
+        parts,
+        roots,
+        queries,
+        caps,
+    };
+
+    let gamma = b.hint_word(uniforms, 0).as_ext();
+    let zeta = b.hint_word(uniforms, 1).as_ext();
+
+    let mut next = 0u32;
+    let ood_steps: Vec<Vec<Ext>> = (0..shape.deep.num_eval_points)
+        .map(|_| {
+            (0..shape.deep.num_total_cols)
+                .map(|_| {
+                    let c = b.hint_word(ood, next).as_ext();
+                    next += 1;
+                    c
+                })
+                .collect()
+        })
+        .collect();
+    let claimed_parts: Vec<Ext> = (0..shape.deep.num_composition_parts as u32)
+        .map(|j| b.hint_word(parts, j).as_ext())
+        .collect();
+
+    let mut commitments: Vec<GroupCommitment> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| GroupCommitment::hint(b, roots, edsl::digest_words(b) * i as u32, *g))
+        .collect();
+    if let Some(caps) = caps {
+        let mut at = 0u32;
+        for c in &mut commitments {
+            at = c.hint_cap(b, caps, at, shape.trace_cap);
+        }
+        assert_eq!(at as usize, cap_words, "the caps arena is filled exactly");
+    }
+
+    let inv = emit_deep_invariants(b, &shape.deep, gamma, zeta, &ood_steps, &claimed_parts);
+
+    let mut cursor = 0u32;
+    let mut out = Vec::with_capacity(num_queries);
+    for _ in 0..num_queries {
+        let index = b.hint_felt(queries, cursor);
+        cursor += 1;
+        let openings: Vec<GroupOpening> = groups
+            .iter()
+            .map(|g| {
+                let values: Vec<Cell> = (0..shape.group_values(g))
+                    .map(|_| {
+                        let c = b.hint_word(queries, cursor);
+                        cursor += 1;
+                        c
+                    })
+                    .collect();
+                let siblings: Vec<WrapDigest> = (0..shape.path_len())
+                    .map(|_| {
+                        // The stride follows the DIGEST's width, not a literal.
+                        let d = edsl::hint_digest(b, queries, cursor);
+                        cursor += edsl::digest_words(b);
+                        d
+                    })
+                    .collect();
+                GroupOpening { values, siblings }
+            })
+            .collect();
+        out.push(emit_query_with_bits(
+            b,
+            shape,
+            gamma,
+            &inv,
+            &commitments,
+            index,
+            &openings,
+        ));
+    }
+    assert_eq!(
+        cursor as usize,
+        num_queries * shape.query_words(edsl::digest_words(b) as usize),
+        "the emitter's cursor must agree with the declared query stride"
+    );
+
+    (arenas, out)
+}

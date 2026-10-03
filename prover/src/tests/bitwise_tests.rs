@@ -4,7 +4,7 @@ use crate::tables::bitwise::{
     NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols, generate_bitwise_row,
     generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
-use crate::tables::types::{BusId, FE};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::test_utils::multi_prove_ram;
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
@@ -415,16 +415,15 @@ fn test_preprocessed_commitment_is_nonzero() {
 #[cfg(test)]
 mod soundness_tests {
     use super::*;
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
     };
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
+    use stark::prover::IsStarkProver;
     use stark::trace::TraceTable;
     use stark::traits::AIR;
-    use stark::verifier::{IsStarkVerifier, Verifier};
+    use stark::verifier::IsStarkVerifier;
 
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -558,8 +557,14 @@ mod soundness_tests {
         let dummy_air = create_receiver_air(proof_options);
 
         // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
-            .expect("Failed to compute commitment")
+        // — the PINNED prover, so the commitment the AIRs declare is built under
+        // the same hash `multi_prove_ram` recomputes it with. The workspace
+        // `Prover` alias is BLAKE3 whatever the pin says, and under an algebraic
+        // pin it makes the honest arm fail with PrecomputedCommitmentMismatch.
+        crate::hash_pin::BlockProver::compute_precomputed_commitment_for_testing(
+            trace, &dummy_air, 3,
+        )
+        .expect("Failed to compute commitment")
     }
 
     fn create_sender_trace(x: u8, y: u8, claimed_result: u8) -> TraceTable<F, E> {
@@ -626,15 +631,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -674,15 +679,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -744,16 +749,16 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &verifier_airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -762,5 +767,112 @@ mod soundness_tests {
             !result,
             "With preprocessed support, malicious bitwise table should be REJECTED"
         );
+    }
+}
+
+// =========================================================================
+// The precomputed columns' closed-form multilinear extension
+// =========================================================================
+//
+// A recursive verifier on the multilinear path cannot afford
+// `check_preprocessed`'s 2^20 fold per column, and BITWISE is eleven of the
+// sixteen preprocessed columns a real epoch carries. `preprocessed_mle_at`
+// replaces that fold with a closed form. These two tests are what makes the
+// closed form trustworthy, and both of them can fail:
+//
+//   * the cube test pins the VARIABLE CONVENTION against the row generator —
+//     it fails if any bit is read at the wrong position, which is the mistake
+//     a random-point test would also catch but would not localise;
+//   * the random-point test is the real gate: it compares the closed form
+//     against the host's own `Mle::evaluate_in` over the actual 2^20-row
+//     column, which is the function the verifier would otherwise run.
+
+/// A fixed-seed xorshift, so a failure names one reproducible point.
+fn sample_point(seed: u64, num_vars: usize) -> Vec<FieldElement<GoldilocksExtension>> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // Goldilocks is 2^64 - 2^32 + 1; the high bits are cheap to shed and
+        // nothing here needs uniformity, only unpredictability to the author.
+        FE::from(state >> 2)
+    };
+    (0..num_vars)
+        .map(|_| FieldElement::<GoldilocksExtension>::new([next(), next(), next()]))
+        .collect()
+}
+
+/// The closed form agrees with the row generator on the hypercube's corners,
+/// which is what pins which coordinate carries which index bit.
+#[test]
+fn the_bitwise_preprocessed_closed_form_agrees_with_the_row_generator_on_the_cube() {
+    let vars = crate::tables::bitwise::NUM_VARS;
+    // Asymmetric indices: a palindrome or a constant would survive a reversed
+    // variable order, so none of these is one.
+    for index in [
+        0usize, 1, 2, 0x0_0001, 0x0_ABCD, 0x1_2345, 0xF_FFFF, 0x8_0000,
+    ] {
+        // `Mle::evaluate_in` binds its first coordinate to the HIGH half, so
+        // coordinate i is index bit `vars - 1 - i`.
+        let point: Vec<FieldElement<GoldilocksExtension>> = (0..vars)
+            .map(|i| {
+                let bit = (index >> (vars - 1 - i)) & 1;
+                FieldElement::<GoldilocksExtension>::new([
+                    FE::from(bit as u64),
+                    FE::zero(),
+                    FE::zero(),
+                ])
+            })
+            .collect();
+        let got = crate::tables::bitwise::preprocessed_mle_at(&point)
+            .expect("the point is NUM_VARS long");
+        let want = generate_bitwise_row(index);
+        for col in 0..NUM_PRECOMPUTED_COLS {
+            let expected = FieldElement::<GoldilocksExtension>::new([
+                FE::from(want[col]),
+                FE::zero(),
+                FE::zero(),
+            ]);
+            assert_eq!(
+                got[col], expected,
+                "column {col} at row index {index:#07x}: the closed form and \
+                 generate_bitwise_row disagree on the cube"
+            );
+        }
+    }
+}
+
+/// ★ F3. The closed form equals the host's own multilinear fold over the real
+/// 2^20-row columns, at points off the hypercube.
+///
+/// This is the test the recursion's preprocessed-check design rests on: if it
+/// passes, a verifier may evaluate these columns in O(20) operations instead of
+/// O(2^20) and bind exactly what `check_preprocessed` binds today.
+#[test]
+fn the_bitwise_preprocessed_closed_form_matches_the_host_fold_at_random_points() {
+    let vars = crate::tables::bitwise::NUM_VARS;
+    let columns = crate::tables::bitwise::preprocessed_columns();
+    assert_eq!(columns.len(), NUM_PRECOMPUTED_COLS);
+    assert_eq!(columns[0].len(), NUM_ROWS);
+    let mles: Vec<multilinear::mle::Mle<GoldilocksField>> = columns
+        .into_iter()
+        .map(|values| multilinear::mle::Mle::new(values).expect("a power-of-two column"))
+        .collect();
+
+    for seed in [0x5eed_0001u64, 0x5eed_0002, 0x5eed_0003] {
+        let point = sample_point(seed, vars);
+        let got = crate::tables::bitwise::preprocessed_mle_at(&point)
+            .expect("the point is NUM_VARS long");
+        for (col, mle) in mles.iter().enumerate() {
+            let want = mle
+                .evaluate_in::<GoldilocksExtension>(&point)
+                .expect("the column has NUM_VARS variables");
+            assert_eq!(
+                got[col], want,
+                "column {col} at seed {seed:#x}: the closed form and the host's \
+                 2^20 fold disagree"
+            );
+        }
     }
 }

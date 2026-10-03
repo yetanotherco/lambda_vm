@@ -1,0 +1,2139 @@
+//! Committing one stacked polynomial of the multilinear path on device.
+//!
+//! Mirrors the host pipeline in `multilinear`: the Möbius transform that turns
+//! hypercube evaluations into monomial coefficients, the lift's bit-reverse,
+//! one NTT onto the blown-up domain, then the strided-coset leaf hash and the
+//! Merkle tree. Parity against that pipeline is checked by `tests/whir_commit.rs`.
+
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex, Once, Weak};
+
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::Result;
+use crate::device::{DeviceReservation, alloc_or_trim, backend};
+
+/// Leaf-hash passes over a codeword — one per tree actually built.
+///
+/// The quantity H4 is about: a commitment that is opened used to cost TWO of
+/// these, one for the root and one for the paths. It counts launches, not
+/// leaves, because "how many times was this codeword's leaf layer hashed" is
+/// the question, and a test can assert an integer.
+static LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn leaf_hash_calls() -> u64 {
+    LEAF_HASH_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn reset_leaf_hash_calls() {
+    LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// Leaf-hash passes over ONE codeword.
+///
+/// ⚠ The global [`LEAF_HASH_CALLS`] is a diagnostic: it is process-wide, so a
+/// test asserting on it is asserting about every other test sharing the binary
+/// too. That is not a hypothetical — the first gate run of this file had a
+/// counting test read 5 instead of 1 purely because its neighbours were
+/// committing at the same time. A per-codeword count is what an assertion can
+/// actually be about, and it localises a failure to the codeword that caused
+/// it rather than to whoever ran alongside.
+type BuildCount = Arc<AtomicU64>;
+
+/// Trees ASSEMBLED, process-wide — the twin of [`LEAF_HASH_CALLS`] and no
+/// longer the same number as it.
+///
+/// ★ Before the leaf layer was retained these two counted the same event, which
+/// is exactly why the retention needs both: a tree is still assembled for every
+/// opening (the inner levels are rebuilt), but its LEAF PASS is skipped when a
+/// matching layer is in hand. `leaf_hash_calls` well below `tree_builds` is the
+/// retention working; the two equal is the retention not taken.
+static TREE_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+pub fn tree_builds() -> u64 {
+    TREE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Leaf layers this process asked to retain, and what happened.
+///
+/// ⛔ REPORTED, ALWAYS. A run that retains nothing must say so on its own line
+/// rather than reading as a lever that quietly did not fire: the refusal path
+/// below is what makes the scheme safe at full size, so how often it fires is
+/// the first thing any reading of the lever has to know.
+static RETAIN_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static RETAIN_REFUSED: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BYTES_ASKED: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BYTES_ADMITTED: AtomicU64 = AtomicU64::new(0);
+/// Bytes the budget still had when it first refused — zero if it never did.
+static RETAIN_FIRST_REFUSAL_HEADROOM: AtomicU64 = AtomicU64::new(0);
+/// Leaf passes SKIPPED because a matching layer was in hand. The saving, counted
+/// where it happens rather than inferred from two other counters.
+static LEAF_PASSES_SAVED: AtomicU64 = AtomicU64::new(0);
+/// ★ The SIMULTANEOUS retained device bytes held RIGHT NOW — `fetch_add` in
+/// [`KeptNodes::promise`], `fetch_sub` in its `Drop`. Unlike
+/// [`RETAIN_BYTES_ADMITTED`], which only ever rises (cumulative over the run),
+/// this rises and falls with the live layers, so it is the TRUE footprint: the
+/// quantity that contends with argue for the shared budget, and the one an
+/// eviction gives back. wt16 reported the cumulative 39,057 MiB and had no name
+/// for the ~2 GiB that actually bound.
+static RETAIN_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
+/// ★ The PEAK of [`RETAIN_BYTES_LIVE`] over the run — the number the print wants.
+/// The instantaneous live count is ~0 by the time the base readback prints (the
+/// codewords, and their layers, have dropped), so the reporting quantity is this
+/// high-water: the largest simultaneous retained footprint the run ever held.
+static RETAIN_BYTES_LIVE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// What the leaf-layer retention did this process: admitted, refused, the bytes
+/// on each side, the headroom at the first refusal, and the leaf passes skipped.
+pub fn retention_report() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        RETAIN_ADMITTED.load(Ordering::Relaxed),
+        RETAIN_REFUSED.load(Ordering::Relaxed),
+        RETAIN_BYTES_ASKED.load(Ordering::Relaxed),
+        RETAIN_BYTES_ADMITTED.load(Ordering::Relaxed),
+        RETAIN_FIRST_REFUSAL_HEADROOM.load(Ordering::Relaxed),
+        LEAF_PASSES_SAVED.load(Ordering::Relaxed),
+    )
+}
+
+/// ★ The retained leaf-layer device bytes held RIGHT NOW — the live footprint,
+/// as opposed to `retention_report`'s cumulative `admitted` bytes. This is the
+/// quantity that contends with argue for the budget; a reading well below the
+/// cumulative total is the layers being freed as their codewords drop (or an
+/// eviction giving them back).
+pub fn retained_bytes_live() -> u64 {
+    RETAIN_BYTES_LIVE.load(Ordering::Relaxed)
+}
+
+/// ★ The PEAK simultaneous retained device footprint over the run — the largest
+/// [`retained_bytes_live`] ever reached. This is the number that bound argue in
+/// wt16 (~2 GiB); the instantaneous count is ~0 once the codewords drop, so this
+/// is what a report prints. Process-wide and monotone (a high-water), so a fresh
+/// process — which is how the launcher runs each prove — starts it at 0.
+pub fn retained_bytes_peak() -> u64 {
+    RETAIN_BYTES_LIVE_PEAK.load(Ordering::Relaxed)
+}
+
+/// What a codeword keeps of its tree past the call that built it: the whole
+/// tree (the default, [`whole_trees`]) or its leaf layer alone — and in either
+/// case NOTHING outside a promise.
+///
+/// ⛔ THE INVARIANT: every byte kept here is promised — grown into the room of
+/// the codeword that captured it, given back when it drops — and the evictor
+/// hands it to any request it can cover. H4 kept whole node arrays OUTSIDE any
+/// promise, so a full card pushed commits to the host at ~1.5 GiB a chain, and
+/// it lost ~15 s. The leaf layer came first — half the bytes, most of the
+/// saving: a round-0 leaf absorbs a whole `2^k` coset, an inner node two
+/// digests — and the whole tree came back once both were promised and
+/// evictable (job 248, −1.00 s): what separates it from H4 is where the bytes
+/// sit, not how many there are.
+///
+/// ⛔ THE KEY IS PART OF THE OBJECT. A leaf is the `2^log_folding` coset that
+/// folds onto one position, so a layer is valid ONLY for the width it was built
+/// at, and only for the hash that built it. `paths()` takes `log_folding` as a
+/// PARAMETER, and `whir_tree_cache.rs`'s blocking test opens the same codeword
+/// at two widths on purpose: served across widths, this would hand back paths
+/// that are internally consistent and WRONG, which is the outcome that file
+/// exists to forbid. An exact match or a rebuild; there is no near miss.
+struct RetainedLeaves {
+    /// The leaf layer, or the whole node array when `whole`, with the promise
+    /// it holds. Shared so an opening served a whole tree can read it after the
+    /// slot's lock is let go; the promise goes with the LAST handle, never with
+    /// the slot's alone ([`KeptNodes`]).
+    nodes: Arc<KeptNodes>,
+    log_folding: usize,
+    hash: crate::DeviceHash,
+    num_leaves: usize,
+    /// The whole tree rather than the leaf layer alone.
+    whole: bool,
+}
+
+impl RetainedLeaves {
+    /// The bytes this holds, all of them promised.
+    fn bytes(&self) -> u64 {
+        self.nodes.bytes
+    }
+
+    /// Whether an opening holds this right now: the slot's handle is not the
+    /// only one.
+    ///
+    /// ⛔ READ IT UNDER THE SLOT'S LOCK. An opening takes its handle under that
+    /// lock ([`DeviceCodeword::retained_tree`]) and lets it go without one, so
+    /// under the lock the count can fall but never rise: a `false` read there
+    /// stays right for as long as the lock is held, and a `true` can only go
+    /// stale in the safe direction — a tree kept a moment longer than it had
+    /// to be.
+    fn read_by_an_opening(&self) -> bool {
+        Arc::strong_count(&self.nodes) > 1
+    }
+}
+
+/// A kept device buffer that answers for its own promise: grown into its room
+/// when it is admitted, given back by its own `Drop`.
+///
+/// ⛔ THE PROMISE LEAVES WITH THE BUFFER, NOT WITH THE SLOT. An opening served
+/// a whole tree reads it through its own handle after the slot's lock is let
+/// go, so emptying the slot — an eviction, or the codeword dropping — does not
+/// free the buffer while that opening reads. The bytes are given back when the
+/// LAST handle drops, which is also when the buffer is freed; given back by
+/// whoever emptied the slot, the ledger would count less than the card holds
+/// for as long as the reading lasted.
+///
+/// ⛔ AND THE ROOM LIVES AS LONG AS THIS DOES. The handle is strong, so a room
+/// cannot drop — giving back every byte it counts, these included — while a
+/// buffer it counts is still held (the evictor's walk can hold a slot past its
+/// codeword for as long as it looks at it). A kept buffer outlives its
+/// codeword only there, so the rest of the room stays counted for that long,
+/// on the safe side.
+///
+/// The room is the codeword's, which a fold SHARES with the codeword it came
+/// from. So it is shrunk HERE, not by whoever dropped the layer: a fold drops
+/// at the end of its round while the source lives on to the end of the proof,
+/// and shrunk only by the evictor, a fold's layer stayed promised until the
+/// source dropped — every opened chain leaving its folds' layers in the budget
+/// for the rest of the group, and a commitment held across epochs gaining a set
+/// per epoch.
+struct KeptNodes {
+    /// Freed in `Drop`, before the promise goes back.
+    buffer: ManuallyDrop<CudaSlice<u8>>,
+    bytes: u64,
+    room: Arc<DeviceReservation>,
+}
+
+impl KeptNodes {
+    /// Promise `bytes` for `buffer` in `room`, or hand the buffer back when the
+    /// budget will not take them —
+    /// [`grow`](DeviceReservation::grow) changes nothing when it refuses.
+    fn promise(
+        buffer: CudaSlice<u8>,
+        bytes: u64,
+        room: &Arc<DeviceReservation>,
+    ) -> core::result::Result<Self, CudaSlice<u8>> {
+        if !room.grow(bytes) {
+            return Err(buffer);
+        }
+        // The live footprint rises here and falls in `Drop`, so the two balance
+        // over the buffer's lifetime; the peak is kept for the print, since the
+        // instantaneous count is ~0 by the time it is read.
+        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
+        Ok(Self {
+            buffer: ManuallyDrop::new(buffer),
+            bytes,
+            room: Arc::clone(room),
+        })
+    }
+
+    fn buffer(&self) -> &CudaSlice<u8> {
+        &self.buffer
+    }
+
+    fn buffer_mut(&mut self) -> &mut CudaSlice<u8> {
+        &mut self.buffer
+    }
+}
+
+impl Drop for KeptNodes {
+    /// The other half of both accountings: what [`KeptNodes::promise`] added to
+    /// [`RETAIN_BYTES_LIVE`] and to the room goes back here, once the free is
+    /// enqueued. cudarc's `CudaSlice::drop` frees on the slice's own stream,
+    /// after any work queued there on it.
+    fn drop(&mut self) {
+        // SAFETY: `buffer` is dropped exactly once, here, and nothing reads it
+        // afterwards: `self` is being dropped.
+        unsafe { ManuallyDrop::drop(&mut self.buffer) };
+        RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.room.shrink(self.bytes);
+    }
+}
+
+/// What [`DeviceCodeword::hold_kept_tree`] hands a test: a served opening's
+/// handle on a kept tree. The tree, and its promise, stay while this lives.
+#[doc(hidden)]
+pub struct KeptTreeHold {
+    _tree: Arc<KeptNodes>,
+}
+
+/// Retention evictions this process has done, and the bytes they gave back — the
+/// evictable scheme working under pressure. `evicted > 0` with `device fallbacks
+/// 0` is argue getting its budget FROM the retention instead of from the host.
+static RETAIN_EVICTED: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BYTES_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// Kept trees an eviction passed over because an opening was reading them —
+/// see [`evict_retained_layers`].
+static RETAIN_READ_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Kept trees the evictor passed over this process because an opening was
+/// reading them at that moment.
+pub fn retention_read_passes() -> u64 {
+    RETAIN_READ_PASSES.load(Ordering::Relaxed)
+}
+
+/// (evictions, bytes evicted) this process — see [`RETAIN_EVICTED`].
+pub fn retention_evictions() -> (u64, u64) {
+    (
+        RETAIN_EVICTED.load(Ordering::Relaxed),
+        RETAIN_BYTES_EVICTED.load(Ordering::Relaxed),
+    )
+}
+
+/// Budget misses the retained layers could not have covered, and the bytes the
+/// layers could give back at each — see [`keep_futile`].
+static RETAIN_FUTILE_MISSES: AtomicU64 = AtomicU64::new(0);
+static RETAIN_FUTILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// (futile misses, the layers' reclaimable bytes summed over them, whether they
+/// were kept) this process — see [`keep_futile`]. Evicted, the bytes are what
+/// went for nothing; kept, a layer held through two misses counts twice.
+pub fn retention_futile() -> (u64, u64, bool) {
+    (
+        RETAIN_FUTILE_MISSES.load(Ordering::Relaxed),
+        RETAIN_FUTILE_BYTES.load(Ordering::Relaxed),
+        keep_futile(),
+    )
+}
+
+/// The switch [`keep_futile`] reads.
+const KEEP_FUTILE_ENV: &str = "LFM_WHIR_KEEP_FUTILE";
+/// Keep. Job 246 (A B B A on the block): the whole run −1.25 s and the openings'
+/// tree rebuilds −1.39 s, with no layer evicted. The argue's peak in epochs 3–5
+/// rose by the layers it kept, to 25,034 of the 25,688 MiB budget.
+const KEEP_FUTILE_DEFAULT: bool = true;
+
+/// ★ Whether a budget miss the retained layers CANNOT cover leaves them held.
+///
+/// `Backend::reserve` asks the evictor once for its deficit before it gives up.
+/// When every reclaimable layer together is less than that deficit, dropping
+/// them cannot make the request fit: the reserve fails anyway, and each opening
+/// that needed a dropped layer hashes its leaves again. The GKR input-layer
+/// tree's eager probe is such a request: it asks for the whole carry, and its
+/// `None` only picks the lazy tree.
+///
+/// On the block every eviction was of this kind. Job 243 evicted fifteen layers
+/// (2,432 MiB), and its whole-run ledger peak, 24,342 MiB, is below the 24,855
+/// MiB a request that fit after evicting would have left. Its epochs 3–5
+/// rebuilt 1.42 s more trees than epochs of the same shape, of the openings'
+/// 2.41 s — by the permutation count, those layers hashed again.
+///
+/// A miss the layers CAN cover evicts as before, so every `reserve` gets the
+/// answer it got without this switch; only the layers a failing request would
+/// have taken with it stay.
+///
+/// `LFM_WHIR_KEEP_FUTILE` unset or `1` keeps them (the default); `0` evicts
+/// them as before the switch; any other value aborts. Read once and printed
+/// once; a test forces it with [`force_keep_futile`].
+fn keep_futile() -> bool {
+    match KEEP_FUTILE_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                crate::rpx_paths::read(
+                    KEEP_FUTILE_ENV,
+                    KEEP_FUTILE_DEFAULT,
+                    "WHIR retention: a budget miss the leaf layers cannot cover keeps them",
+                    "WHIR retention: a budget miss evicts leaf layers even when they cannot cover it",
+                )
+            })
+        }
+    }
+}
+
+static KEEP_FUTILE_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LFM_WHIR_KEEP_FUTILE` for the whole process — for a test that
+/// takes a futile miss both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_keep_futile(on: Option<bool>) {
+    KEEP_FUTILE_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Openings served a kept whole tree, which built nothing — see [`whole_trees`].
+static WHOLE_TREE_SERVES: AtomicU64 = AtomicU64::new(0);
+
+/// (whether whole trees are kept, the openings they served) this process.
+pub fn retention_whole() -> (bool, u64) {
+    (whole_trees(), WHOLE_TREE_SERVES.load(Ordering::Relaxed))
+}
+
+/// The switch [`whole_trees`] reads.
+const WHOLE_TREES_ENV: &str = "LFM_WHIR_WHOLE_TREES";
+/// Whole trees. Job 248 (A B B A on the block): the whole run −1.00 s, the base
+/// −0.90 s, the openings' tree rebuilds −0.82 s; 952 openings served a kept
+/// tree, and epoch 4's argue evicted two kept trees. The argue's peaks in
+/// epochs 3–5 were 25,633 / 25,306 / 25,681 of the 25,688 MiB budget — epoch 5
+/// within 7 MiB of it, and safe because everything kept is evictable.
+const WHOLE_TREES_DEFAULT: bool = true;
+
+/// ★ Whether a tree is kept WHOLE past the call that built it, not just its
+/// leaf layer.
+///
+/// With the leaf layer kept, every opening still builds the inner levels, and
+/// on the block (job 246) that was the openings' 1.02 s of tree rebuilds: one
+/// permutation a node, level by level, the top levels in one block. The whole
+/// tree costs one more layer's bytes (`num_leaves − 1` nodes), and it is
+/// promised the same way — grown into the codeword's room, and given back to
+/// the evictor under pressure, whole — so a request it can cover still gets its
+/// bytes, and fallbacks cannot rise. The worst case is the old rebuild.
+///
+/// `LFM_WHIR_WHOLE_TREES` unset or `1` keeps whole trees (the default); `0`
+/// keeps leaf layers, as before the switch; any other value aborts. Read once
+/// and printed once; a test forces it with [`force_whole_trees`].
+fn whole_trees() -> bool {
+    match WHOLE_TREES_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                crate::rpx_paths::read(
+                    WHOLE_TREES_ENV,
+                    WHOLE_TREES_DEFAULT,
+                    "WHIR retention: whole trees, the inner levels kept with the leaves",
+                    "WHIR retention: leaf layers, the inner levels rebuilt at each opening",
+                )
+            })
+        }
+    }
+}
+
+static WHOLE_TREES_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LFM_WHIR_WHOLE_TREES` for the whole process — for a test that
+/// opens the same codeword both ways in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_whole_trees(on: Option<bool>) {
+    WHOLE_TREES_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether evicting `reclaimable` bytes of layers is too little for a miss of
+/// `target`: the reserve fails whatever the evictor does. Zero reclaimable is
+/// not futile — there is nothing to keep.
+fn is_futile(target: u64, reclaimable: u64) -> bool {
+    reclaimable > 0 && reclaimable < target
+}
+
+/// Whether the evictor walks its layers for a miss of `target`: always, as
+/// before the switch, unless the miss is futile and the switch keeps them.
+fn evicts(target: u64, reclaimable: u64, keep_futile: bool) -> bool {
+    !(keep_futile && is_futile(target, reclaimable))
+}
+
+/// Seconds since the Unix epoch, the clock the prover's `t=` stamps read.
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Whether the leaf-layer retention is enabled this process. `LFM_WHIR_RETENTION=0`
+/// turns it OFF (capture becomes a no-op), which is how the ABBA's control arm
+/// runs off the SAME binary as the retention arm — the two differ only by this
+/// flag. Read once and cached; default ON.
+fn retention_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LFM_WHIR_RETENTION")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// A handle the allocator can walk to reclaim a codeword's retained layer under
+/// pressure. `Weak`, so the registry never keeps a codeword alive: `leaves`
+/// points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the MUTEX
+/// outlives any single layer, so this entry SURVIVES an eviction and a later
+/// re-capture refills the same `Option`. The kept buffer knows its own room and
+/// gives the budget back when its last handle drops ([`KeptNodes`]). A dead
+/// `leaves` upgrade means the codeword is gone and the eviction walk prunes the
+/// entry.
+struct RetentionHandle {
+    leaves: Weak<Mutex<Option<RetainedLeaves>>>,
+}
+
+/// Every retaining codeword's handle, registered once at its first capture and
+/// pruned when the codeword drops. Walked only on the rare eviction path.
+static RETENTION_REGISTRY: Mutex<Vec<RetentionHandle>> = Mutex::new(Vec::new());
+
+/// Install [`evict_retained_layers`] as the allocator's evictor, once, and say
+/// which way it treats a miss it cannot cover ([`keep_futile`]) and what it
+/// keeps ([`whole_trees`]).
+fn ensure_evictor_installed() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        keep_futile();
+        whole_trees();
+        crate::device::set_retention_evictor(evict_retained_layers)
+    });
+}
+
+/// Register a codeword's layer slot for eviction. Called OUTSIDE the layer lock
+/// (it takes only the registry lock), so the one lock nesting in the system is
+/// the evictor's registry→layer and there is no cycle.
+fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
+    let handle = RetentionHandle {
+        leaves: Arc::downgrade(leaves),
+    };
+    if let Ok(mut reg) = RETENTION_REGISTRY.lock() {
+        reg.push(handle);
+    }
+}
+
+/// ⛔ THE EVICTOR — installed into `device::reserve`, called on its budget-miss
+/// path on the RESERVING thread. Frees at least `target` bytes of BUDGET by
+/// dropping retained leaf layers and whole trees, FIFO (oldest first), pruning
+/// dead entries as it goes; returns the bytes freed.
+///
+/// ★ When what it can give back cannot cover `target` the miss is FUTILE: the
+/// reserve fails whatever is dropped. It is counted and said either way, and
+/// under [`keep_futile`] nothing is dropped and this returns 0.
+///
+/// ★ A kept tree an opening is reading is PASSED OVER, and not counted as
+/// reclaimable: its promise stays until the opening lets go ([`KeptNodes`]), so
+/// dropping the slot's handle would give nothing back and lose the tree. A
+/// request only that tree could cover fails, counted, rather than being handed
+/// bytes the card still holds.
+///
+/// SAFETY, the load-bearing facts:
+/// - NO REENTRANCY. Dropping the last handle of a [`KeptNodes`] is two counter
+///   subtracts, one of them `room.shrink` (a lock-free `be.reserved` subtract),
+///   and a stream-ordered free. It NEVER calls `reserve`/`grow`, so it cannot
+///   re-enter the allocator that called it.
+/// - NO UAF, AND NO BYTE UNCOUNTED. It takes the layer out UNDER the codeword's
+///   own `leaves` mutex, so a concurrent [`serve_retained_leaves`] either ran
+///   first (its `memcpy_dtod` is already enqueued on the codeword's stream) or
+///   sees `None` and rebuilds. An opening served a whole tree takes its own
+///   handle under the same mutex, so what the walk takes has no other handle
+///   (checked there) and can get none once the slot is empty: the buffer is
+///   freed and its promise given back as the walk drops it. The evicted buffer
+///   was allocated on the codeword's stream, and cudarc 0.19.4
+///   `CudaSlice::drop` (core.rs:776-795) first waits on the slice's own read/write
+///   events, then frees on the slice's OWN stream — `free_async(ptr,
+///   self.stream.cu_stream)` when `has_async_alloc`, else `synchronize()` +
+///   `free_sync`. So the free is ordered after any serve copy on that stream (or
+///   a full device sync). The only unsafe shape — an async free on a DIFFERENT
+///   stream than the copy — cannot arise here: both are the codeword's stream.
+/// - LOCK ORDER. Registry mutex, then ONE layer mutex at a time (released before
+///   the next); `be.reserved` is lock-free. Capture registers OUTSIDE the layer
+///   lock, so nothing ever holds layer→registry — acyclic.
+/// - `shrink` frees the BUDGET, not the bytes: never-purge keeps the raw device
+///   allocation pooled for reuse, and the budget is exactly what argue's
+///   `reserve` is gated on ([[gpu-two-vramgates-overlap]]).
+fn evict_retained_layers(target: u64) -> u64 {
+    let mut freed = 0u64;
+    let mut reg = match RETENTION_REGISTRY.lock() {
+        Ok(reg) => reg,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // What an eviction can give back now: everything kept that no opening is
+    // reading. Same lock order as the walk below.
+    let (mut reclaimable, mut being_read) = (0u64, 0u64);
+    reg.retain(|handle| {
+        let Some(leaves) = handle.leaves.upgrade() else {
+            return false;
+        };
+        let slot = match leaves.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match slot.as_ref() {
+            Some(layer) if layer.read_by_an_opening() => being_read += 1,
+            Some(layer) => reclaimable += layer.bytes(),
+            None => {}
+        }
+        true
+    });
+    let keep = keep_futile();
+    let futile = is_futile(target, reclaimable);
+    if futile {
+        let misses = RETAIN_FUTILE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        RETAIN_FUTILE_BYTES.fetch_add(reclaimable, Ordering::Relaxed);
+        eprintln!(
+            "[whir] retention: a reserve missed the budget by {} MiB; the retention can give back {} MiB — {}; \
+             futile misses {misses} t={:.3}{}",
+            target >> 20,
+            reclaimable >> 20,
+            if keep {
+                "kept"
+            } else {
+                "evicted anyway, and the reserve still misses"
+            },
+            unix_secs(),
+            BeingRead(being_read),
+        );
+    }
+    if !evicts(target, reclaimable, keep) {
+        return 0;
+    }
+    let (mut layers, mut trees, mut passed) = (0u64, 0u64, 0u64);
+    reg.retain(|handle| {
+        let Some(leaves) = handle.leaves.upgrade() else {
+            return false; // the codeword is gone; prune this dead entry
+        };
+        if freed >= target {
+            return true; // enough freed; keep the rest for next time
+        }
+        // Take the layer out under its own mutex — a concurrent serve holds this
+        // same lock across its copy enqueue, so the free cannot race it — unless
+        // an opening is reading it, which keeps it until the opening lets go.
+        let taken = {
+            let mut slot = match leaves.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if slot
+                .as_ref()
+                .is_some_and(RetainedLeaves::read_by_an_opening)
+            {
+                passed += 1;
+                None
+            } else {
+                slot.take()
+            }
+        };
+        if let Some(layer) = taken {
+            let bytes = layer.bytes();
+            if layer.whole {
+                trees += 1;
+            } else {
+                layers += 1;
+            }
+            // The walk holds the only handle: `KeptNodes`'s drop frees the
+            // buffer (stream-ordered) and gives the BUDGET back to its room
+            // (for argue), here.
+            drop(layer);
+            freed += bytes;
+            RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
+            RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
+        }
+        true // keep the entry: the mutex lives with the codeword and may refill
+    });
+    RETAIN_READ_PASSES.fetch_add(passed, Ordering::Relaxed);
+    if !futile && (layers + trees > 0 || passed > 0) {
+        eprintln!(
+            "[whir] retention: a reserve missed the budget by {} MiB; evicted {trees} whole tree(s) and {layers} \
+             leaf layer(s), {} MiB, to cover it t={:.3}{}",
+            target >> 20,
+            freed >> 20,
+            unix_secs(),
+            BeingRead(passed),
+        );
+    }
+    freed
+}
+
+/// The eviction lines' note on kept trees an opening was reading, and so kept:
+/// nothing when there were none.
+struct BeingRead(u64);
+
+impl core::fmt::Display for BeingRead {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 => Ok(()),
+            n => write!(
+                f,
+                " · {n} kept tree(s) passed over: an opening was reading them"
+            ),
+        }
+    }
+}
+
+/// May a layer built under `kept` be served for a tree asked for under `want`?
+///
+/// ⛔ A FREE FUNCTION ON PURPOSE. Everything else on this path needs a device,
+/// so this predicate would otherwise be checkable only on the box — and it is
+/// the one piece of the retention whose failure is not slowness but WRONG
+/// PATHS, internally consistent and verifying against nothing. Lifted out, it
+/// takes unit cases on any machine.
+///
+/// All three parts must agree. `num_leaves` is not redundant with
+/// `log_folding`: the same width over a different codeword length is a
+/// different tree, and a clone of a `DeviceCodeword` shares this layer.
+fn leaf_key_matches(
+    kept: (usize, crate::DeviceHash, usize),
+    want: (usize, crate::DeviceHash, usize),
+) -> bool {
+    kept.0 == want.0 && kept.1 == want.1 && kept.2 == want.2
+}
+
+#[cfg(test)]
+mod leaf_key_tests {
+    use super::leaf_key_matches;
+    use crate::DeviceHash;
+
+    /// The exact match is the only match, and each part is shown to matter on
+    /// its own — a predicate that only ever saw agreement would pass while
+    /// ignoring two of its three arguments.
+    #[test]
+    fn a_retained_leaf_layer_is_served_only_under_its_own_key() {
+        let kept = (4usize, DeviceHash::Rpx256, 1024usize);
+        assert!(leaf_key_matches(kept, kept), "an exact match must serve");
+        assert!(
+            !leaf_key_matches(kept, (2, DeviceHash::Rpx256, 1024)),
+            "a different FOLD WIDTH describes a different tree: serving it would              hand back paths of the wrong depth that verify against themselves"
+        );
+        assert!(
+            !leaf_key_matches(kept, (4, DeviceHash::Keccak256, 1024)),
+            "a different HASH describes a different tree"
+        );
+        assert!(
+            !leaf_key_matches(kept, (4, DeviceHash::Rpx256, 512)),
+            "the same width over a different codeword length is a different tree"
+        );
+        assert!(
+            !leaf_key_matches(kept, (2, DeviceHash::Keccak256, 512)),
+            "and all three wrong is still not a match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod futile_miss_tests {
+    use super::{evicts, is_futile};
+
+    const MIB: u64 = 1 << 20;
+
+    /// A miss is futile exactly when the layers hold something and less than the
+    /// deficit. Both edges are pinned: at equality the eviction covers the miss,
+    /// and with nothing held there is nothing to keep.
+    #[test]
+    fn a_miss_is_futile_only_when_the_layers_hold_less_than_it() {
+        assert!(is_futile(900 * MIB, 832 * MIB), "832 MiB cannot cover 900");
+        assert!(!is_futile(832 * MIB, 832 * MIB), "equality covers the miss");
+        assert!(!is_futile(100 * MIB, 832 * MIB), "a small miss is covered");
+        assert!(!is_futile(900 * MIB, 0), "nothing held is nothing to keep");
+    }
+
+    /// The switch changes one cell of the table and no other: a futile miss
+    /// under `keep`. A covered miss evicts either way, which is what keeps every
+    /// `reserve`'s answer the same; and without the switch every miss walks the
+    /// layers, as before it existed.
+    #[test]
+    fn only_a_futile_miss_under_the_switch_keeps_the_layers() {
+        for (target, reclaimable) in [
+            (900 * MIB, 832 * MIB),
+            (100 * MIB, 832 * MIB),
+            (900 * MIB, 0),
+        ] {
+            assert!(
+                evicts(target, reclaimable, false),
+                "switch off: every miss walks the layers ({target}, {reclaimable})"
+            );
+        }
+        assert!(
+            !evicts(900 * MIB, 832 * MIB, true),
+            "switch on: a futile miss keeps them"
+        );
+        assert!(
+            evicts(100 * MIB, 832 * MIB, true),
+            "switch on: a covered miss still evicts, or a reserve that fit before would fail"
+        );
+        assert!(
+            evicts(900 * MIB, 0, true),
+            "switch on: nothing held, so the walk runs (and only prunes)"
+        );
+    }
+
+    /// ★ The default keeps the layers through a futile miss (job 246). Going
+    /// back is `LFM_WHIR_KEEP_FUTILE=0` at run time; a change here moves the
+    /// default for every run, and must fail this first.
+    #[test]
+    fn the_default_keeps_the_layers_through_a_futile_miss() {
+        assert!(
+            !evicts(900 * MIB, 832 * MIB, super::KEEP_FUTILE_DEFAULT),
+            "the default must keep the layers through a miss they cannot cover"
+        );
+        assert!(
+            evicts(100 * MIB, 832 * MIB, super::KEEP_FUTILE_DEFAULT),
+            "and still evict for a miss they can"
+        );
+    }
+}
+
+#[cfg(test)]
+mod whole_tree_tests {
+    use super::tree_bytes;
+
+    /// ★ The default keeps whole trees (job 248). Going back is
+    /// `LFM_WHIR_WHOLE_TREES=0` at run time; a change here moves every run's
+    /// default, and must fail this first.
+    #[test]
+    fn the_default_keeps_whole_trees() {
+        let default = super::WHOLE_TREES_DEFAULT;
+        assert!(default, "the default must keep whole trees");
+    }
+
+    /// What a whole tree adds to the promise over its leaf layer is its inner
+    /// levels: one node fewer than the leaves. So a kept tree costs one more
+    /// layer, less 32 bytes — the figure the argue's margin was sized with.
+    #[test]
+    fn a_kept_tree_is_its_leaf_layer_and_one_layer_more_less_a_node() {
+        for log_leaves in [1usize, 12, 23] {
+            let layer = 32u64 << log_leaves;
+            assert_eq!(tree_bytes(log_leaves), 2 * layer - 32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fold_transient_tests {
+    use super::fold_transient_bytes;
+
+    /// ★ The round-0 fold's transient, in numbers: level by level the first
+    /// two levels' outputs are live together — 2.25× the committed base
+    /// codeword `C` — while fused it is only the output, `3C/64` at six levels
+    /// (extension values, a 64th as many). At the fat stack's 2^28 variables
+    /// (a 2^30 codeword, `C` = 8 GiB) that is 18 GiB against 384 MiB.
+    #[test]
+    fn a_fused_fold_holds_only_its_output() {
+        for n in [25usize, 27, 28] {
+            let log_elements = n + 2;
+            let codeword = 8u64 << log_elements;
+            let stepped = fold_transient_bytes(log_elements, 6, false);
+            let fused = fold_transient_bytes(log_elements, 6, true);
+            println!(
+                "2^{n}: level by level {:.2} C, fused {:.4} C",
+                stepped as f64 / codeword as f64,
+                fused as f64 / codeword as f64
+            );
+            assert_eq!(stepped * 4, codeword * 9);
+            assert_eq!(fused * 64, codeword * 3);
+            assert!(fused * 48 == stepped);
+        }
+        assert_eq!(
+            fold_transient_bytes(20, 1, false),
+            fold_transient_bytes(20, 1, true)
+        );
+    }
+
+    /// ★ A commit holds its coefficients or its tree, never both — and at the
+    /// production first fold of six the coefficients are the larger, a quarter
+    /// of the codeword `C`. Under a uniform fold of four the tree is (half of
+    /// `C`, less a node), and two of those in flight are, to 64 bytes, the one
+    /// codeword a group's room always promised: that room was a commit turn.
+    #[test]
+    fn a_commit_holds_its_coefficients_or_its_tree_never_both() {
+        use super::commit_transient_bytes;
+        for n in [16usize, 25, 27, 28] {
+            let codeword = 8u64 << (n + 2);
+            assert_eq!(commit_transient_bytes(n, 2, 6) * 4, codeword);
+            let uniform = commit_transient_bytes(n, 2, 4);
+            assert_eq!(uniform, codeword / 2 - 32);
+            assert_eq!(codeword - 2 * uniform, 64);
+        }
+    }
+}
+
+use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
+
+/// A codeword the device holds, base-field or ext3.
+///
+/// The commit leaves one here and the chain folds it here: it is the biggest
+/// array the proof moves, and the host only ever needs the few values a query
+/// opens.
+#[derive(Clone)]
+pub struct DeviceCodeword {
+    buffer: Arc<CudaSlice<u64>>,
+    stream: Arc<CudaStream>,
+    elements: usize,
+    base: bool,
+    /// Trees this codeword has built: the commit's, and one for each opening
+    /// that no kept whole tree served.
+    builds: BuildCount,
+    /// Leaf-hash passes this codeword actually paid for. Diverges from
+    /// [`builds`](Self::tree_builds) exactly when a retained layer was served.
+    leaf_passes: BuildCount,
+    /// ★ What is kept of the tree past the call that built it — the whole
+    /// tree or its leaf layer — with the key it is valid under. `Arc` for the
+    /// same reason `room` is one: `DeviceCodeword` is `Clone` and the folds
+    /// share the original's accounting, so a clone must share what is kept
+    /// rather than silently rebuild beside it.
+    leaves: Arc<Mutex<Option<RetainedLeaves>>>,
+    /// The room the chain promised itself: this codeword and the folds that
+    /// halve it, shared with those folds because they live inside it.
+    ///
+    /// ⛔ Whatever is kept of a tree is IN this number, and nothing of a tree
+    /// outside it: a capture grows the room by exactly what it keeps (the whole
+    /// tree, or its leaf layer), and the bytes leave it when that drops or is
+    /// evicted. A tree an opening builds and does not keep lives only for that
+    /// call — see [`with_tree`](Self::with_tree).
+    room: Arc<crate::device::DeviceReservation>,
+    /// Whether this codeword has been registered with the eviction registry.
+    /// Set once, on the first capture, so a rebuild-after-eviction re-capture
+    /// does not push a duplicate handle. `Arc` so all clones share the one flag,
+    /// as they share `leaves` and `room`.
+    registered: Arc<AtomicBool>,
+}
+
+impl DeviceCodeword {
+    pub fn elements(&self) -> usize {
+        self.elements
+    }
+
+    pub fn is_base(&self) -> bool {
+        self.base
+    }
+
+    /// Every limb, read back — one per value for a base codeword, three for an
+    /// extension one. For the parity tests; a chain only ever gathers cosets.
+    pub fn to_host(&self) -> Result<Vec<u64>> {
+        let values = self.stream.clone_dtoh(self.buffer.as_ref())?;
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+
+    /// The first value, which is what the last fold leaves behind.
+    pub fn first(&self) -> Result<[u64; 3]> {
+        let limbs = if self.base { 1 } else { 3 };
+        let head = self.stream.clone_dtoh(&self.buffer.slice(0..limbs))?;
+        self.stream.synchronize()?;
+        Ok(if self.base {
+            [head[0], 0, 0]
+        } else {
+            [head[0], head[1], head[2]]
+        })
+    }
+
+    /// The Merkle tree over this codeword's fold blocks, built here.
+    ///
+    /// A leaf is the `2^log_folding` coset that folds onto one position, and
+    /// the layout is the host's: `2*num_leaves - 1` nodes of 32 bytes, root
+    /// first.
+    fn build_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<(CudaSlice<u8>, usize)> {
+        let num_leaves = self.elements >> log_folding;
+        assert!(num_leaves >= 2, "tree needs at least two leaves");
+        let be = backend()?;
+        let total_nodes = 2 * num_leaves - 1;
+        // SAFETY: every byte is written before it is read — the leaves by the
+        // kernel below, the inner nodes by the level loop after it.
+        let mut nodes =
+            unsafe { crate::device::alloc_or_trim::<u8>(&self.stream, total_nodes * 32) }?;
+        let leaves_offset = (num_leaves - 1) * 32;
+        // ★ THE ONE BRANCH THIS CHANGE ADDS. A matching layer means the leaf
+        // pass is a device-to-device copy instead of a hash of every element;
+        // the inner levels below are built either way, so `build_tree` still
+        // returns the same tree it always did and `build_inner_tree_levels` is
+        // untouched.
+        let served =
+            self.serve_retained_leaves(&mut nodes, leaves_offset, num_leaves, log_folding, hash)?;
+        if !served {
+            {
+                let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+                let num_leaves_u64 = num_leaves as u64;
+                let block = 1u64 << log_folding;
+                // ★ The hash is chosen HERE, not by the host backend that will
+                // label the result. `hash` is the key the caller's `WhirHash`
+                // supplied, so a tree labelled RPX was hashed by RPX's kernels or
+                // was not built here at all.
+                let kernel = match (hash, self.base) {
+                    (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
+                    (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
+                    (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
+                    (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
+                    (other, _) => {
+                        unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
+                    }
+                };
+                unsafe {
+                    self.stream
+                        .launch_builder(kernel)
+                        .arg(self.buffer.as_ref())
+                        .arg(&num_leaves_u64)
+                        .arg(&block)
+                        .arg(&mut leaves)
+                        .launch(keccak_launch_cfg(num_leaves_u64))?;
+                }
+            }
+            // The borrow of `nodes` ends at the brace above, which is what lets
+            // the capture below read the region it just wrote.
+            // The pass was PAID here, so it is counted here — and the layer is
+            // offered for retention while it is in hand. Under `whole_trees` the
+            // whole tree is offered instead, once it is built (`with_tree`).
+            LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+            self.leaf_passes.fetch_add(1, Ordering::Relaxed);
+            if !whole_trees() {
+                self.capture_leaves(&nodes, leaves_offset, num_leaves, log_folding, hash);
+            }
+        } else {
+            LEAF_PASSES_SAVED.fetch_add(1, Ordering::Relaxed);
+        }
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+        TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        Ok((nodes, num_leaves))
+    }
+
+    /// Copy a retained layer into the node buffer's leaf region, if one matches.
+    ///
+    /// ⛔ THE MATCH IS EXACT ON BOTH KEY PARTS AND ON THE SHAPE. A layer built
+    /// at another fold width describes a different tree, and one built under
+    /// another hash describes a different tree again; either served here would
+    /// produce authentication paths that verify against themselves and against
+    /// nothing else.
+    fn serve_retained_leaves(
+        &self,
+        nodes: &mut CudaSlice<u8>,
+        leaves_offset: usize,
+        num_leaves: usize,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<bool> {
+        let held = match self.leaves.lock() {
+            Ok(held) => held,
+            // A poisoned lock is not a reason to serve a layer nobody can
+            // vouch for: rebuild instead.
+            Err(_) => return Ok(false),
+        };
+        let Some(kept) = held.as_ref() else {
+            return Ok(false);
+        };
+        if !leaf_key_matches(
+            (kept.log_folding, kept.hash, kept.num_leaves),
+            (log_folding, hash, num_leaves),
+        ) {
+            return Ok(false);
+        }
+        let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+        if kept.whole {
+            // A whole tree's leaves sit at the same offset in its own buffer.
+            let leaves = kept
+                .nodes
+                .buffer()
+                .slice(leaves_offset..leaves_offset + num_leaves * 32);
+            self.stream.memcpy_dtod(&leaves, &mut region)?;
+        } else {
+            self.stream.memcpy_dtod(kept.nodes.buffer(), &mut region)?;
+        }
+        Ok(true)
+    }
+
+    /// The whole tree kept under this key, if one is: a handle an opening reads
+    /// after the slot's lock is let go, with its leaf count. Taken under that
+    /// lock, which is what lets the evictor tell a tree being read from one
+    /// that is not ([`RetainedLeaves::read_by_an_opening`]); the tree's promise
+    /// stays until the last handle goes ([`KeptNodes`]).
+    fn retained_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<(Arc<KeptNodes>, usize)> {
+        let num_leaves = self.elements >> log_folding;
+        let held = self.leaves.lock().ok()?;
+        let kept = held.as_ref()?;
+        (kept.whole
+            && leaf_key_matches(
+                (kept.log_folding, kept.hash, kept.num_leaves),
+                (log_folding, hash, num_leaves),
+            ))
+        .then(|| (kept.nodes.clone(), kept.num_leaves))
+    }
+
+    /// Offer the tree just built and used for retention WHOLE, and take the
+    /// answer: `None` when it is kept, the buffer back when the budget will not
+    /// take it — the caller then keeps the leaf layer, as without the switch.
+    ///
+    /// The whole tree replaces a leaf layer held under the same key: the tree
+    /// is promised first, then the layer's bytes go back when it drops, so the
+    /// ledger never counts less than it holds.
+    fn capture_tree(
+        &self,
+        nodes: CudaSlice<u8>,
+        num_leaves: usize,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<CudaSlice<u8>> {
+        if !retention_enabled() {
+            return Some(nodes);
+        }
+        ensure_evictor_installed();
+        let Ok(mut held) = self.leaves.lock() else {
+            return Some(nodes);
+        };
+        if held.as_ref().is_some_and(|kept| kept.whole) {
+            return Some(nodes);
+        }
+        let bytes = tree_bytes(num_leaves.trailing_zeros() as usize);
+        RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
+        let kept = match KeptNodes::promise(nodes, bytes, &self.room) {
+            Ok(kept) => kept,
+            Err(nodes) => {
+                Self::note_refusal();
+                return Some(nodes);
+            }
+        };
+        RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
+        RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
+        let replaced = held.replace(RetainedLeaves {
+            nodes: Arc::new(kept),
+            log_folding,
+            hash,
+            num_leaves,
+            whole: true,
+        });
+        // As in `capture_leaves`: the layer lock goes before the registry is
+        // touched. A leaf layer the tree supersedes gives its bytes back as it
+        // drops, after the tree was promised.
+        drop(held);
+        drop(replaced);
+        if !self.registered.swap(true, Ordering::Relaxed) {
+            register_retained(&self.leaves);
+        }
+        None
+    }
+
+    /// Offer the layer just hashed for retention, and take the answer.
+    ///
+    /// ⛔ ALLOCATE, THEN PROMISE, AND GIVE THE PROMISE BACK IF THE ALLOCATION
+    /// FAILED — in that order. Promising first and then failing to allocate
+    /// would leave the budget permanently short by bytes nothing holds, and
+    /// every later commitment would be refused because of it. `grow` returns
+    /// false and changes nothing when the budget will not take it, and
+    /// `shrink` gives back what an allocation could not use, so neither
+    /// direction can leak.
+    ///
+    /// ⚠ EVERY FAILURE PATH IS "NO RETENTION", NEVER AN ERROR. This is a cache:
+    /// the tree it would have saved is built anyway, the commit cannot fail
+    /// because of it, and `commit_stacked`'s device attempt cannot start
+    /// returning `None` — which is what would send a commitment to the host and
+    /// cost the 1.5 GiB per fallen-back chain that killed H4.
+    fn capture_leaves(
+        &self,
+        nodes: &CudaSlice<u8>,
+        leaves_offset: usize,
+        num_leaves: usize,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) {
+        // ⛔ LFM_WHIR_RETENTION=0 disables the retention entirely (the ABBA's
+        // control arm, off the SAME binary): capture is a no-op, nothing is
+        // retained, and the print reads admitted 0. Default ON.
+        if !retention_enabled() {
+            return;
+        }
+        // Install the evictor before any layer exists, so a later `reserve` that
+        // needs the budget can reclaim one. Idempotent (a `Once`).
+        ensure_evictor_installed();
+        let Ok(mut held) = self.leaves.lock() else {
+            return;
+        };
+        if held.is_some() {
+            return;
+        }
+        let bytes = (num_leaves as u64) * 32;
+        RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
+        // SAFETY: every byte is written by the copy below before anything reads
+        // it, and the slice is dropped on every path that does not copy.
+        let Ok(copy) = (unsafe { alloc_or_trim::<u8>(&self.stream, num_leaves * 32) }) else {
+            Self::note_refusal();
+            return;
+        };
+        let Ok(mut kept) = KeptNodes::promise(copy, bytes, &self.room) else {
+            Self::note_refusal();
+            return;
+        };
+        let region = nodes.slice(leaves_offset..leaves_offset + num_leaves * 32);
+        if self.stream.memcpy_dtod(&region, kept.buffer_mut()).is_err() {
+            // Dropping it gives the promise back.
+            drop(kept);
+            Self::note_refusal();
+            return;
+        }
+        RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
+        RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
+        *held = Some(RetainedLeaves {
+            nodes: Arc::new(kept),
+            log_folding,
+            hash,
+            num_leaves,
+            whole: false,
+        });
+        // Release the layer lock BEFORE touching the registry, so the only lock
+        // nesting anywhere is the evictor's registry→layer — acyclic. Register
+        // ONCE: the handle is a Weak to this mutex, survives an eviction, and a
+        // re-capture refills the same slot, so a second push would only duplicate.
+        drop(held);
+        if !self.registered.swap(true, Ordering::Relaxed) {
+            register_retained(&self.leaves);
+        }
+    }
+
+    /// One refusal, with the headroom the budget had the FIRST time it happened
+    /// — the number that says whether the scheme was short by a little or by a
+    /// lot, and which a later refusal would overwrite with a smaller one.
+    fn note_refusal() {
+        RETAIN_REFUSED.fetch_add(1, Ordering::Relaxed);
+        // `max(1)` so "no headroom at all" is still distinguishable from "never
+        // refused", which is what a zero in this slot means.
+        let headroom = backend()
+            .map(|be| {
+                be.vram_budget_bytes()
+                    .saturating_sub(be.reserved_bytes())
+                    .max(1)
+            })
+            .unwrap_or(1);
+        let _ = RETAIN_FIRST_REFUSAL_HEADROOM.compare_exchange(
+            0,
+            headroom,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Run `f` against this codeword's tree: a kept whole tree when one
+    /// matches, else one built here — kept afterwards, whole or as its leaf
+    /// layer, inside the codeword's promise.
+    ///
+    /// # ⛔ The invariant: nothing of a tree is held outside a promise
+    ///
+    /// A commitment that is opened needs its tree twice — for the root and for
+    /// the paths — and the window between is forced by the protocol, not by
+    /// this file. `StackedCommitment::commit` builds EVERY chain's commitment
+    /// before it returns, because all the roots go into the transcript before
+    /// any query index is drawn; the openings come afterwards, one chain at a
+    /// time. So whatever is kept of the last chain's tree lives from its commit
+    /// to its opening, and all N exist before the first opening.
+    ///
+    /// H4 kept whole trees and lost, ~+15 s in both hashes: its node arrays sat
+    /// OUTSIDE any promise, so ten chains at half a gigabyte put the card at
+    /// 96%, device allocations failed, commits silently fell back to the host,
+    /// and the host grew ~1.5 GiB per fallen-back chain. The objection was
+    /// never the bytes but where they sat. What is kept now is promised and
+    /// evictable:
+    ///
+    /// - **The capture asks first.**
+    ///   [`DeviceReservation::grow`](crate::device::DeviceReservation::grow)
+    ///   declines without changing anything when the budget will not take the
+    ///   bytes, and a refusal costs exactly the pass the retention would have
+    ///   saved. The cliff is unreachable rather than unmeasured.
+    /// - **The evictor gives it back** to any request it can cover
+    ///   ([`evict_retained_layers`]), so a request gets the budget it would get
+    ///   with nothing kept, and fallbacks cannot rise. A miss nothing kept can
+    ///   cover keeps it ([`keep_futile`]): that request fails either way.
+    /// - **The leaf layer, then the whole tree.** The layer came first: half the
+    ///   bytes and most of the saving, since a round-0 leaf absorbs a whole
+    ///   `2^k` coset against two digests for an inner node. The whole tree
+    ///   ([`whole_trees`], the default since job 248: −1.00 s) keeps the inner
+    ///   levels too, and an opening served one builds nothing. Evicted, its
+    ///   worst case is the leaf pass again.
+    ///
+    /// The counters keep both kinds of work visible —
+    /// [`tree_builds`](Self::tree_builds), [`leaf_hash_calls`] and
+    /// [`retention_whole`] — and the group-scale test in
+    /// `tests/whir_tree_cache.rs` fails if anything of a tree is ever held
+    /// outside its promise.
+    fn with_tree<R>(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+        f: impl FnOnce(&CudaSlice<u8>, usize) -> Result<R>,
+    ) -> Result<R> {
+        if let Some((tree, num_leaves)) = self.retained_tree(log_folding, hash) {
+            WHOLE_TREE_SERVES.fetch_add(1, Ordering::Relaxed);
+            return f(tree.buffer(), num_leaves);
+        }
+        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
+        let out = f(&nodes, num_leaves)?;
+        if whole_trees()
+            && let Some(nodes) = self.capture_tree(nodes, num_leaves, log_folding, hash)
+        {
+            // The budget would not take the whole tree: keep its leaf layer, as
+            // without the switch (a no-op when a layer is already held).
+            self.capture_leaves(&nodes, (num_leaves - 1) * 32, num_leaves, log_folding, hash);
+        }
+        Ok(out)
+    }
+
+    /// Bytes this codeword's chain has promised the device budget. For tests
+    /// and diagnostics.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.room.bytes()
+    }
+
+    /// ★ How many trees THIS codeword has built.
+    ///
+    /// One after a commit, and one more for each round that opens it — none
+    /// for an opening served a kept whole tree ([`whole_trees`]). Unlike the
+    /// process-wide counter this number is unaffected by whatever else shares
+    /// the test binary, so an assertion on it is about this codeword.
+    pub fn tree_builds(&self) -> u64 {
+        self.builds.load(Ordering::Relaxed)
+    }
+
+    /// ★ Leaf-hash passes over THIS codeword — the number the retention moves.
+    ///
+    /// Equal to [`tree_builds`](Self::tree_builds) when nothing is retained, and
+    /// 1 however many times the codeword is opened when a leaf layer or a whole
+    /// tree is kept. The two together are what make the retention assertable
+    /// in BOTH directions: a cache that stopped working reads them equal, and
+    /// an opening served a kept whole tree leaves both where they were.
+    pub fn leaf_passes(&self) -> u64 {
+        self.leaf_passes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes this codeword is holding retained — its leaf layer, or its whole
+    /// tree under [`whole_trees`] — or zero.
+    pub fn retained_leaf_bytes(&self) -> u64 {
+        self.leaves
+            .lock()
+            .ok()
+            .and_then(|h| h.as_ref().map(RetainedLeaves::bytes))
+            .unwrap_or(0)
+    }
+
+    /// An opening's handle on the whole tree kept under this key, without the
+    /// opening: what a served opening holds while it reads the tree, for a test
+    /// that must keep one across an eviction. Not for production callers.
+    #[doc(hidden)]
+    pub fn hold_kept_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Option<KeptTreeHold> {
+        self.retained_tree(log_folding, hash)
+            .map(|(tree, _)| KeptTreeHold { _tree: tree })
+    }
+
+    /// The root of that tree, which is the commitment.
+    ///
+    /// ★ The tree is kept past this call, inside the codeword's promise — whole
+    /// by default, or its leaf layer — because the other thing anyone wants
+    /// from it is a path per query, and building it again then would cost a
+    /// second leaf-hash pass over the whole codeword ([`with_tree`](Self::with_tree)).
+    pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
+            self.stream.synchronize()?;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&head);
+            Ok(root)
+        })
+    }
+
+    /// The whole tree in the host node layout — what a caller that walks it
+    /// here needs, and what the parity test compares against.
+    pub fn nodes_to_host(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<Vec<u8>> {
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let out = self.stream.clone_dtoh(nodes)?;
+            self.stream.synchronize()?;
+            Ok(out)
+        })
+    }
+
+    /// The authentication paths of `positions`, against the same tree.
+    ///
+    /// ★ Read from the kept whole tree when one matches; otherwise the tree is
+    /// built here, its leaves served from a kept layer when one matches. The
+    /// tree is never brought home — a pageable copy of half a gigabyte is the
+    /// slowest thing in the commit, and what the host needs of a tree is a
+    /// kilobyte per query.
+    pub fn paths(
+        &self,
+        log_folding: usize,
+        positions: &[u32],
+        hash: crate::DeviceHash,
+    ) -> Result<Vec<u8>> {
+        self.with_tree(log_folding, hash, |nodes, num_leaves| {
+            crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)
+        })
+    }
+
+    /// [`paths`](Self::paths) and the tree's Merkle cap at `cap_height`, from
+    /// ONE rebuild: the cap is the heap slice `[2^c − 1, 2^{c+1} − 1)` of the
+    /// same node buffer the paths are gathered from (root at node 0, the host
+    /// `MerkleTree` layout), so the two cannot come from different trees.
+    ///
+    /// Returns `(paths, cap)`: the paths exactly as [`paths`](Self::paths)
+    /// returns them (full depth — the caller cuts them to the cap), and
+    /// `2^cap_height` 32-byte nodes, left to right. `cap_height = 0` gives the
+    /// root. No kernel: the cap is a device-to-host copy of `2^c` nodes.
+    pub fn paths_and_cap(
+        &self,
+        log_folding: usize,
+        positions: &[u32],
+        cap_height: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.with_tree(log_folding, hash, |nodes, num_leaves| {
+            assert!(
+                num_leaves.is_power_of_two() && cap_height <= num_leaves.trailing_zeros() as usize,
+                "a cap of height {cap_height} does not fit a tree of {num_leaves} leaves"
+            );
+            let paths =
+                crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)?;
+            let start = ((1usize << cap_height) - 1) * 32;
+            let end = ((2usize << cap_height) - 1) * 32;
+            let cap = self.stream.clone_dtoh(&nodes.slice(start..end))?;
+            self.stream.synchronize()?;
+            Ok((paths, cap))
+        })
+    }
+
+    /// The fold blocks `indices` open — `block` values at stride `num_leaves`
+    /// from each — gathered where they lie, one launch and one copy back.
+    ///
+    /// Query `q`'s block is `out[q*block*limbs ..]`, with one limb per value
+    /// for a base codeword and three for an extension one.
+    pub fn cosets(&self, indices: &[u64], num_leaves: usize, block: usize) -> Result<Vec<u64>> {
+        assert!(!indices.is_empty(), "a round opens at least one block");
+        let limbs = if self.base { 1usize } else { 3 };
+        let be = backend()?;
+        let index_dev = self.stream.clone_htod(indices)?;
+        let total = indices.len() * block;
+        // SAFETY: the kernel writes every value it is sized for.
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, total * limbs) }?;
+        let queries = indices.len() as u64;
+        let num_leaves_u64 = num_leaves as u64;
+        let block_u64 = block as u64;
+        let limbs_u64 = limbs as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&be.gather_cosets)
+                .arg(self.buffer.as_ref())
+                .arg(&index_dev)
+                .arg(&queries)
+                .arg(&num_leaves_u64)
+                .arg(&block_u64)
+                .arg(&limbs_u64)
+                .arg(&mut out)
+                .launch(LaunchConfig::for_num_elems(total as u32))?;
+        }
+        let values = self.stream.clone_dtoh(&out)?;
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+}
+
+/// The codeword and the Merkle nodes of one stacked polynomial.
+///
+/// `evals` holds the multilinear's `2^m` hypercube values in canonical
+/// Goldilocks form. The codeword is `2^(m + log_blowup)` values in domain
+/// order — the same array the host prover folds — and the nodes are the tree in
+/// the host layout (`2*num_leaves - 1` nodes of 32 bytes, root first), so they
+/// plug straight into a `MerkleTree`.
+///
+/// `log_folding` is the first fold's width: a leaf is the `2^log_folding` coset
+/// that folds onto one position.
+/// The same, over a stacked polynomial that is never assembled on the host.
+///
+/// A stacked polynomial is its columns written at their offsets and zeros
+/// everywhere else, so the parts go straight into the device buffer: what the
+/// host would have built is a copy of them, and building it costs a pass over
+/// every byte the commit is about to upload anyway.
+///
+/// `parts` is `(column, offset in elements)`; `log_evals` is the stacked
+/// polynomial's variable count.
+pub fn commit_codeword_parts(
+    parts: &[(&[u64], usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_from(
+        Source::Parts { parts, log_evals },
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+    )
+}
+
+/// The same for parts the card already holds: `(column index, offset)` into the
+/// epoch's columns. The scatter is then a copy at device bandwidth rather than
+/// the trace crossing the bus again.
+pub fn commit_codeword_resident(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_from(
+        Source::Resident {
+            store,
+            parts,
+            log_evals,
+        },
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+    )
+}
+
+/// Where a commit's coefficients come from: one slab the host holds, or the
+/// columns a stacked polynomial is made of.
+enum Source<'a> {
+    Whole(&'a [u64]),
+    Parts {
+        parts: &'a [(&'a [u64], usize)],
+        log_evals: usize,
+    },
+    Resident {
+        store: &'a crate::columns::DeviceColumns,
+        parts: &'a [(usize, usize)],
+        log_evals: usize,
+    },
+}
+
+impl Source<'_> {
+    fn log_evals(&self) -> u64 {
+        match self {
+            Self::Whole(evals) => evals.len().trailing_zeros() as u64,
+            Self::Parts { log_evals, .. } | Self::Resident { log_evals, .. } => *log_evals as u64,
+        }
+    }
+
+    /// Fills `coeffs`, which is `2^log_evals` elements long.
+    fn write(&self, stream: &Arc<CudaStream>, coeffs: &mut CudaSlice<u64>) -> Result<()> {
+        match self {
+            Self::Whole(evals) => stream.memcpy_htod(*evals, coeffs),
+            Self::Parts { parts, .. } => {
+                // Everything the parts do not cover is the stacking's padding,
+                // and that is zero by definition.
+                stream.memset_zeros(coeffs)?;
+                for (column, offset) in *parts {
+                    let mut at = coeffs.slice_mut(*offset..*offset + column.len());
+                    stream.memcpy_htod(*column, &mut at)?;
+                }
+                Ok(())
+            }
+            Self::Resident { store, parts, .. } => {
+                stream.memset_zeros(coeffs)?;
+                for (column, offset) in *parts {
+                    store.copy_into(*column, coeffs, *offset, stream)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn commit_codeword(
+    evals: &[u64],
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_from(
+        Source::Whole(evals),
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+    )
+}
+
+fn commit_from(
+    source: Source<'_>,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    let log_evals = source.log_evals();
+    let log_n = log_evals + log_blowup as u64;
+    let n = 1usize << log_n;
+    assert!(
+        log_folding as u64 <= log_n,
+        "a leaf cannot exceed the domain"
+    );
+    let num_leaves = n >> log_folding;
+    assert!(num_leaves >= 2, "tree needs at least two leaves");
+    assert!(
+        n <= u32::MAX as usize,
+        "codeword length {n} exceeds u32 range — kernel grid would silently truncate",
+    );
+
+    let be = backend()?;
+    // The codeword itself stays until this commitment's opening. On top of it
+    // there is a working set — the tree this commit builds, and later the
+    // folds and the trees the chain's rounds build — which is another
+    // codeword's worth and is **transient**: one commit or one opening uses it
+    // at a time. A caller committing a group of polynomials promises that once
+    // for all of them and passes `transient: false`; one committing alone
+    // promises it here.
+    let promise = if transient { 2 } else { 1 };
+    let Some(room) = be.reserve(n as u64 * 8 * promise) else {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+        ));
+    };
+    let stream = be.next_stream();
+
+    // The coefficients get a buffer of their own: the Möbius transform runs
+    // over them, and the spread below reads them while it writes the codeword.
+    // SAFETY: every element is written by the copy below.
+    let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
+    source.write(&stream, &mut coeffs)?;
+
+    mobius(
+        stream.as_ref(),
+        be,
+        &mut coeffs,
+        1usize << log_evals,
+        log_evals,
+    )?;
+
+    // The lift's bit-reverse and the NTT's cancel around the zero padding —
+    // see `lift_spread`. What was two scattered passes over the codeword plus
+    // the memset that zeroed it is one pass that writes all of it.
+    // SAFETY: the spread writes every element, padding included (on the column
+    // engine its first pass does, storing all of its tile).
+    let mut x = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
+    let n_u64 = n as u64;
+    let log_blowup_u32 = log_blowup as u32;
+    if crate::lde_cm::engine_enabled()
+        && crate::lde_cm::spread_supports(log_n as u32, log_blowup_u32)
+    {
+        // The same spread and transform in the column engine's ceil(log_n / 8)
+        // passes, the spread fused into the first one, and no twiddle table
+        // (see `lde_cm`). `LAMBDA_VM_LDE_LEGACY=1` takes the branch below.
+        let src = coeffs.device_ptr(&stream).0;
+        let dst = x.device_ptr(&stream).0;
+        crate::lde_cm::spread_ntt_column(&stream, be, src, dst, log_n as u32, log_blowup_u32)?;
+        // Spent: the first pass has read them, and the free is stream-ordered.
+        drop(coeffs);
+    } else {
+        unsafe {
+            stream
+                .launch_builder(&be.lift_spread)
+                .arg(&coeffs)
+                .arg(&n_u64)
+                .arg(&log_blowup_u32)
+                .arg(&mut x)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
+        // Spent: the spread has read them, and the free is stream-ordered.
+        drop(coeffs);
+        let twiddles = be.fwd_twiddles_for(log_n)?;
+        crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
+    }
+
+    let codeword = DeviceCodeword {
+        buffer: Arc::new(x),
+        stream,
+        elements: n,
+        base: true,
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: Arc::new(room),
+        registered: Arc::new(AtomicBool::new(false)),
+    };
+    let root = codeword.commit(log_folding, hash)?;
+    Ok((codeword, root))
+}
+
+/// Levels a tile fuses at once: 32 rows of 32 columns is a full block, and the
+/// shared tile it needs is a few kilobytes.
+const MOBIUS_TILE_LEVELS: u32 = 5;
+/// Columns a tile spans — one warp, matching the kernel.
+const MOBIUS_TILE_COLS: u32 = 32;
+/// Levels the contiguous kernel takes: a block of 256 holds both sides of
+/// every pair the first eight levels make.
+const MOBIUS_LOW_LEVELS: u32 = 8;
+
+/// The Mobius transform over `coeffs`, a window of levels at a time.
+///
+/// Each level is one pass over the whole array, so run one per launch and the
+/// transform is bound by how many times it reads the array rather than by the
+/// subtractions. The windows below fuse the levels that share a tile, which is
+/// the shape the NTT's levels are already fused in.
+fn mobius(
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    coeffs: &mut CudaSlice<u64>,
+    len: usize,
+    log_evals: u64,
+) -> Result<()> {
+    let mut level: u64 = 0;
+
+    // The contiguous window, when there is a whole block of elements to hold.
+    if log_evals >= MOBIUS_LOW_LEVELS as u64 && len >= 256 {
+        let k = MOBIUS_LOW_LEVELS;
+        unsafe {
+            stream
+                .launch_builder(&be.mobius_low_levels)
+                .arg(&mut *coeffs)
+                .arg(&k)
+                .launch(LaunchConfig {
+                    grid_dim: ((len / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        level = k as u64;
+    }
+
+    while level < log_evals {
+        let low = 1u64 << level;
+        let k = MOBIUS_TILE_LEVELS.min((log_evals - level) as u32);
+        // A tile needs a warp of consecutive low indices to stay coalesced; a
+        // level below that is left to the one-level kernel.
+        if low < MOBIUS_TILE_COLS as u64 {
+            let half = (len / 2) as u64;
+            let stride = low;
+            unsafe {
+                stream
+                    .launch_builder(&be.mobius_level)
+                    .arg(&mut *coeffs)
+                    .arg(&half)
+                    .arg(&stride)
+                    .launch(LaunchConfig::for_num_elems(half as u32))?;
+            }
+            level += 1;
+            continue;
+        }
+        let rows = 1u32 << k;
+        let pitch = MOBIUS_TILE_COLS + 1;
+        // Past 2^15 blocks in y the excess goes to grid.z (`ntt::split_grid_y`):
+        // the first tile needs `len >> 13`, 65,536 at 2^29 evaluations.
+        let (grid_y, grid_z) = crate::ntt::split_grid_y(len as u64 / (low << k));
+        unsafe {
+            stream
+                .launch_builder(&be.mobius_tile)
+                .arg(&mut *coeffs)
+                .arg(&level)
+                .arg(&k)
+                .launch(LaunchConfig {
+                    grid_dim: ((low / MOBIUS_TILE_COLS as u64) as u32, grid_y, grid_z),
+                    block_dim: (MOBIUS_TILE_COLS, rows, 1),
+                    shared_mem_bytes: rows * pitch * 8,
+                })?;
+        }
+        level += k as u64;
+    }
+    Ok(())
+}
+
+/// The same, with the codeword brought back — what a caller that folds on the
+/// host needs.
+pub fn commit_codeword_to_host(
+    evals: &[u64],
+    log_blowup: usize,
+    log_folding: usize,
+    hash: crate::DeviceHash,
+) -> Result<(Vec<u64>, Vec<u8>)> {
+    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding, true, hash)?;
+    let values = codeword.stream.clone_dtoh(codeword.buffer.as_ref())?;
+    codeword.stream.synchronize()?;
+    let nodes = codeword.nodes_to_host(log_folding, hash)?;
+    Ok((values, nodes))
+}
+
+/// Folds a codeword `levels` times in one residency, lifting the base field on
+/// the first fold.
+///
+/// `g_invs` is each level's inverse domain generator (the domain squares as the
+/// codeword halves) and `alphas` the folding challenges, three u64 per level.
+/// Returns the folded codeword as interleaved ext3.
+pub fn fold_codeword_base(
+    codeword: &[u64],
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<Vec<u64>> {
+    let levels = g_invs.len();
+    assert!(levels > 0, "a fold needs a level");
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.len().is_power_of_two(),
+        "a codeword is a power of two"
+    );
+    assert!(
+        codeword.len() >> levels >= 1,
+        "{levels} folds do not fit a codeword of {}",
+        codeword.len()
+    );
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut half = codeword.len() / 2;
+    let input = stream.clone_htod(codeword)?;
+    let alpha = stream.clone_htod(alphas)?;
+
+    // SAFETY: the kernel writes every element of the half it produces.
+    let mut current = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
+    let half_arg = half as u64;
+    let g_inv = g_invs[0];
+    unsafe {
+        stream
+            .launch_builder(&be.whir_fold_base_ext3)
+            .arg(&input)
+            .arg(&half_arg)
+            .arg(&two_inv)
+            .arg(&g_inv)
+            .arg(&alpha.slice(0..3))
+            .arg(&mut current)
+            .launch(LaunchConfig::for_num_elems(half as u32))?;
+    }
+    drop(input);
+
+    for (level, g_inv) in g_invs.iter().enumerate().skip(1) {
+        half /= 2;
+        // SAFETY: as above.
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
+        let half_arg = half as u64;
+        unsafe {
+            stream
+                .launch_builder(&be.whir_fold_ext3)
+                .arg(&current)
+                .arg(&half_arg)
+                .arg(&two_inv)
+                .arg(g_inv)
+                .arg(&alpha.slice(level * 3..level * 3 + 3))
+                .arg(&mut next)
+                .launch(LaunchConfig::for_num_elems(half as u32))?;
+        }
+        current = next;
+    }
+
+    let out = stream.clone_dtoh(&current)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Folds a resident codeword `levels` times, leaving the result resident.
+///
+/// The chain folds the same array level after level and only opens a handful
+/// of its values, so it never has to come back.
+pub fn fold_resident(
+    codeword: &DeviceCodeword,
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<DeviceCodeword> {
+    let levels = g_invs.len();
+    assert!(levels > 0, "a fold needs a level");
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.elements >> levels >= 1,
+        "{levels} folds do not fit"
+    );
+
+    let be = backend()?;
+    let stream = codeword.stream.clone();
+    let alpha = stream.clone_htod(alphas)?;
+    let mut half = codeword.elements / 2;
+
+    // SAFETY: the kernel writes every element of the half it produces.
+    let mut current = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
+    let half_arg = half as u64;
+    let kernel = if codeword.base {
+        &be.whir_fold_base_ext3
+    } else {
+        &be.whir_fold_ext3
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(codeword.buffer.as_ref())
+            .arg(&half_arg)
+            .arg(&two_inv)
+            .arg(&g_invs[0])
+            .arg(&alpha.slice(0..3))
+            .arg(&mut current)
+            .launch(LaunchConfig::for_num_elems(half as u32))?;
+    }
+
+    for (level, g_inv) in g_invs.iter().enumerate().skip(1) {
+        half /= 2;
+        // SAFETY: as above.
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
+        let half_arg = half as u64;
+        unsafe {
+            stream
+                .launch_builder(&be.whir_fold_ext3)
+                .arg(&current)
+                .arg(&half_arg)
+                .arg(&two_inv)
+                .arg(g_inv)
+                .arg(&alpha.slice(level * 3..level * 3 + 3))
+                .arg(&mut next)
+                .launch(LaunchConfig::for_num_elems(half as u32))?;
+        }
+        current = next;
+    }
+
+    Ok(DeviceCodeword {
+        buffer: Arc::new(current),
+        stream,
+        elements: half,
+        base: false,
+        // A fold is its OWN codeword: its own cache slot and its own count. It
+        // is committed and opened in its own right, and sharing the parent's
+        // slot would make one of them evict the other every round.
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        // The fold lives inside the room the codeword it came from promised:
+        // it is half of it, and that one is still alive.
+        room: codeword.room.clone(),
+        // A fold is its own codeword for retention too: its own slot, its own
+        // registry entry once it captures.
+        registered: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// The widest fold [`fold_resident_fused`] takes in one launch
+/// (`WHIR_MAX_FOLD` in `whir_fold.cu`): the chain's `MAX_FOLD`.
+pub const FUSED_MAX_FOLD: usize = 6;
+
+/// The most a `levels`-level fold of a `2^log_elements` codeword holds beside
+/// its input: level by level, the first level's output and the second's live
+/// together (`3·8·(2^(N−1) + 2^(N−2))` bytes; one level holds just its own);
+/// fused, only the output (`3·8·2^(N−levels)`).
+pub const fn fold_transient_bytes(log_elements: usize, levels: usize, fused: bool) -> u64 {
+    if fused || levels == 1 {
+        24u64 << (log_elements - levels)
+    } else {
+        (24u64 << (log_elements - 1)) + (24u64 << (log_elements - 2))
+    }
+}
+
+/// Bytes a Merkle tree over `2^log_leaves` leaves holds while it is built:
+/// `2·2^log_leaves − 1` nodes of 32 bytes, the host's layout.
+pub const fn tree_bytes(log_leaves: usize) -> u64 {
+    32 * ((2u64 << log_leaves) - 1)
+}
+
+/// ★ The most one commit of a `2^log_evals` polynomial holds on the card beside
+/// the codeword it leaves there.
+///
+/// Two buffers, and they take turns rather than stack: the coefficients
+/// (`2^log_evals` base values), which the spread reads into the codeword and
+/// which are freed before the transform runs; and the tree over the codeword's
+/// `2^log_folding`-value blocks, built after it. So the peak is the larger of
+/// the two, not their sum. The transform runs in place, and its twiddles are
+/// cached for the process outside every promise. What the commit then keeps of
+/// the tree — the whole tree by default, or its leaf layer — is not a transient
+/// and is not in this number: the codeword's own room grows by exactly that
+/// when it is kept.
+pub const fn commit_transient_bytes(
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+) -> u64 {
+    let coefficients = 8u64 << log_evals;
+    let tree = tree_bytes(log_evals + log_blowup - log_folding);
+    if coefficients > tree {
+        coefficients
+    } else {
+        tree
+    }
+}
+
+/// [`fold_resident`]'s result in ONE launch, with nothing but the output
+/// allocated.
+///
+/// Level by level, the first fold of a committed codeword writes `2^(n+1)`
+/// extension values — 1.5× the codeword — and holds them beside the second
+/// level's while the codeword is still resident: a 2.25× transient that grows
+/// with the stack. Here each output folds its own strided coset in registers
+/// (`whir_fold_k_*` in `whir_fold.cu`), so the transient is the output alone,
+/// `3·2^(n+2−levels)` limbs.
+///
+/// ★ Raw-identical to [`fold_resident`], not merely equal: every pair runs
+/// that kernel's operation sequence on the same raw inputs, `pow_base`'s
+/// squares and multiplication order included (`tests/whir_fold.rs`).
+pub fn fold_resident_fused(
+    codeword: &DeviceCodeword,
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<DeviceCodeword> {
+    let levels = g_invs.len();
+    assert!(
+        (1..=FUSED_MAX_FOLD).contains(&levels),
+        "a fused fold takes 1..={FUSED_MAX_FOLD} levels, not {levels}"
+    );
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.elements >> levels >= 1,
+        "{levels} folds do not fit"
+    );
+
+    let be = backend()?;
+    let stream = codeword.stream.clone();
+    let g_dev = crate::device::htod_or_trim(&stream, g_invs)?;
+    let alpha = crate::device::htod_or_trim(&stream, alphas)?;
+    let n_out = codeword.elements >> levels;
+    // SAFETY: the kernel writes every output element.
+    let mut out = unsafe { alloc_or_trim::<u64>(&stream, n_out * 3) }?;
+    let n_out_arg = n_out as u64;
+    let levels_arg = levels as u32;
+    let kernel = if codeword.base {
+        &be.whir_fold_k_base_ext3
+    } else {
+        &be.whir_fold_k_ext3
+    };
+    // 256 threads: a thread carries a pending value per level, and a 1024-wide
+    // block would cap its registers below what that needs.
+    let block = 256u32;
+    let grid = (n_out as u64).div_ceil(block as u64) as u32;
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(codeword.buffer.as_ref())
+            .arg(&n_out_arg)
+            .arg(&levels_arg)
+            .arg(&two_inv)
+            .arg(&g_dev)
+            .arg(&alpha)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (grid.max(1), 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+
+    Ok(DeviceCodeword {
+        buffer: Arc::new(out),
+        stream,
+        elements: n_out,
+        base: false,
+        // A fold is its own codeword, as `fold_resident`'s is.
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: codeword.room.clone(),
+        registered: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// The same for a codeword already in the extension.
+pub fn fold_codeword_ext3(
+    codeword: &[u64],
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<Vec<u64>> {
+    let levels = g_invs.len();
+    assert!(levels > 0, "a fold needs a level");
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.len().is_multiple_of(3),
+        "three u64 per ext3 element"
+    );
+    let elements = codeword.len() / 3;
+    assert!(elements.is_power_of_two(), "a codeword is a power of two");
+    assert!(elements >> levels >= 1, "{levels} folds do not fit");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut half = elements / 2;
+    let alpha = stream.clone_htod(alphas)?;
+    let mut current = stream.clone_htod(codeword)?;
+
+    for (level, g_inv) in g_invs.iter().enumerate() {
+        // SAFETY: the kernel writes every element of the half it produces.
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
+        let half_arg = half as u64;
+        unsafe {
+            stream
+                .launch_builder(&be.whir_fold_ext3)
+                .arg(&current)
+                .arg(&half_arg)
+                .arg(&two_inv)
+                .arg(g_inv)
+                .arg(&alpha.slice(level * 3..level * 3 + 3))
+                .arg(&mut next)
+                .launch(LaunchConfig::for_num_elems(half as u32))?;
+        }
+        current = next;
+        half /= 2;
+    }
+
+    let out = stream.clone_dtoh(&current)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Merkle-commits an ext3 codeword's fold blocks on device, returning the tree
+/// in the host node layout.
+///
+/// The codeword itself stays where the caller has it: a folded codeword is the
+/// next round's input on the host side, so only the tree comes back.
+pub fn commit_codeword_ext3(
+    codeword: &[u64],
+    log_folding: usize,
+    hash: crate::DeviceHash,
+) -> Result<Vec<u8>> {
+    assert!(
+        codeword.len().is_multiple_of(3),
+        "three u64 per ext3 element"
+    );
+    let elements = codeword.len() / 3;
+    assert!(elements.is_power_of_two(), "a codeword is a power of two");
+    assert!(
+        log_folding <= elements.trailing_zeros() as usize,
+        "a leaf cannot exceed the codeword"
+    );
+    let num_leaves = elements >> log_folding;
+    assert!(num_leaves >= 2, "tree needs at least two leaves");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let values = stream.clone_htod(codeword)?;
+
+    let total_nodes = 2 * num_leaves - 1;
+    // SAFETY: every byte is written before it is read — the leaves by the
+    // kernel below, the inner nodes by the level loop after it.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    {
+        let leaves_offset = (num_leaves - 1) * 32;
+        let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+        let num_leaves_u64 = num_leaves as u64;
+        let block = 1u64 << log_folding;
+        unsafe {
+            stream
+                .launch_builder(match hash {
+                    crate::DeviceHash::Keccak256 => &be.keccak256_leaves_ext3_coset,
+                    crate::DeviceHash::Rpx256 => &be.rpx_leaves_ext3_coset,
+                    other => {
+                        unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
+                    }
+                })
+                .arg(&values)
+                .arg(&num_leaves_u64)
+                .arg(&block)
+                .arg(&mut leaves)
+                .launch(keccak_launch_cfg(num_leaves_u64))?;
+        }
+    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+
+    let out = stream.clone_dtoh(&nodes)?;
+    stream.synchronize()?;
+    Ok(out)
+}

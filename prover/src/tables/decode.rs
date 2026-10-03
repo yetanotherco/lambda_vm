@@ -35,8 +35,8 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -100,13 +100,38 @@ pub type PcToRow = U64HashMap<usize>;
 pub fn generate_decode_trace(
     instructions: &U64HashMap<Instruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
-    // Build entries and PC-to-row mapping
+    // ★★ ROWS GO IN PC ORDER, and the sort is the whole point of this block.
+    //
+    // The rows used to come out of `instructions.iter()`, so their order was
+    // hashbrown's: a function of the hasher, the capacity the map happened to
+    // grow to, and the insertion sequence. Every one of those is stable for a
+    // given binary, which is why nothing has ever failed — prover and verifier
+    // both reach this through `instructions_from_elf`, so they agree with each
+    // other. What they agree on is a CONSTRUCTION PROCEDURE, not the ELF.
+    //
+    // That distinction is about to start mattering. These five columns are
+    // ELF-derived and their Merkle root is on its way to being a program
+    // constant pinned in a recursion guest (W1-B). A pinned root must be a
+    // function of the ELF ALONE: sorted by pc it is, and a hashbrown version
+    // bump, a capacity change or a reserve added upstream cannot move it.
+    // Unsorted it is not, and the failure mode is the bad kind — a toolchain
+    // update silently invalidates the pin, with no ELF change, no code change
+    // and no test that fails until a verifier rejects a valid proof.
+    //
+    // pc is unique (it is the map's key), so the order is total and the sort is
+    // not merely deterministic but canonical.
+    let mut entries: Vec<(u64, Instruction)> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, instr))
+        .collect();
+    entries.sort_unstable_by_key(|(pc, _)| *pc);
+
     let mut pc_to_row = PcToRow::default();
     pc_to_row.reserve(instructions.len() + 1);
-    let entries: Vec<_> = instructions
-        .iter()
+    let entries: Vec<_> = entries
+        .into_iter()
         .enumerate()
-        .map(|(row_idx, (&pc, &instr))| {
+        .map(|(row_idx, (pc, instr))| {
             pc_to_row.insert(pc, row_idx);
             // instruction_length = 4 (RV64C compressed decode is a separate workstream).
             DecodeEntry::from_instruction(pc, instr, 4)
@@ -229,6 +254,35 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Precomputed commitment
 // =========================================================================
 
+/// The precomputed columns themselves, `0..NUM_PRECOMPUTED_COLS` of the DECODE
+/// trace: the program's instruction table.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+/// This is what binds a proof to the program it claims to run.
+pub fn preprocessed_columns(instructions: &U64HashMap<Instruction>) -> Vec<Vec<FE>> {
+    // MU=0: only the precomputed columns are wanted.
+    let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let num_rows = trace.num_rows();
+    (0..NUM_PRECOMPUTED_COLS)
+        .map(|col_idx| {
+            (0..num_rows)
+                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
+                .collect()
+        })
+        .collect()
+}
+
+/// [`preprocessed_columns`] for a program, straight from its ELF.
+///
+/// ★ The ONE place both sides of the multilinear argument take DECODE's
+/// preprocessed columns from, so a prover and a verifier cannot end up looking
+/// at two different instruction tables — see the out-of-band commitment in
+/// `multilinear_continuation`.
+pub fn preprocessed_columns_from_elf(elf: &Elf) -> Result<Vec<Vec<FE>>, InstructionError> {
+    Ok(preprocessed_columns(&instructions_from_elf(elf)?))
+}
+
 /// Computes the LDE commitment for DECODE precomputed columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
@@ -260,20 +314,21 @@ pub fn compute_precomputed_commitment(
     instructions: &U64HashMap<Instruction>,
     options: &ProofOptions,
 ) -> Commitment {
-    // Step 1: Generate trace (MU=0, we only need precomputed columns)
-    let (trace, _pc_to_row) = generate_decode_trace(instructions);
-    let num_rows = trace.num_rows();
+    compute_precomputed_commitment_with(instructions, options, LeafLayout::RowPair)
+}
 
-    // Step 2: Extract precomputed columns (0..NUM_PRECOMPUTED_COLS)
-    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|col_idx| {
-            (0..num_rows)
-                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
-                .collect()
-        })
-        .collect();
+/// [`compute_precomputed_commitment`] under an explicit trace-tree leaf layout
+/// (S2). DECODE is program-dependent, so a one-row DECODE root is computed at
+/// run time, like the row-pair one.
+pub fn compute_precomputed_commitment_with(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    let columns = preprocessed_columns(instructions);
+    let num_rows = columns[0].len();
 
-    // Step 3: Interpolate each column to a polynomial
+    // Interpolate each column to a polynomial
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -282,7 +337,7 @@ pub fn compute_precomputed_commitment(
         })
         .collect();
 
-    // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    // Evaluate polynomials on LDE domain (N * blowup_factor points)
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
     let lde_columns: Vec<Vec<FE>> = polys
@@ -293,9 +348,40 @@ pub fn compute_precomputed_commitment(
         })
         .collect();
 
-    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
-        .expect("Failed to build Merkle tree for decode LDE");
-    root
+    // ★ Through the LFM commit helper, which commits under the BLOCK PATH's pin
+    // rather than `stark`'s default aliases. This root is a PREPROCESSED
+    // commitment the prover recomputes and compares against, so building it with
+    // a different hash than the path commits under fails at prove time with
+    // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
+    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+}
+
+/// DECODE's commitment source for both leaf layouts: the row-pair root
+/// `supplied` by the caller (the recursion guest's) or computed on first use,
+/// and the one-row root computed on first use (program-dependent: no static
+/// twin; a supplied root never stands in for the other layout).
+pub fn lazy_commitment(
+    instructions: std::sync::Arc<U64HashMap<Instruction>>,
+    options: &ProofOptions,
+    supplied: Option<Commitment>,
+) -> stark::lookup::LazyCommitment {
+    let base = match supplied {
+        Some(c) => stark::lookup::LazyCommitment::ready(c),
+        None => {
+            let (instructions, options) = (instructions.clone(), options.clone());
+            stark::lookup::LazyCommitment::deferred(move || {
+                compute_precomputed_commitment(&instructions, &options)
+            })
+        }
+    };
+    let options = options.clone();
+    base.with_one_row(move || {
+        Some(compute_precomputed_commitment_with(
+            &instructions,
+            &options,
+            LeafLayout::Row,
+        ))
+    })
 }
 
 // =========================================================================

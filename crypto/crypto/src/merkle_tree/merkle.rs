@@ -256,6 +256,39 @@ where
         self.nodes.get(idx)
     }
 
+    /// `log2` of the padded leaf count: the number of siblings on a full
+    /// authentication path. `None` on a root-only tree
+    /// ([`from_root`](Self::from_root)), whose shape is not known here.
+    pub fn depth(&self) -> Option<usize> {
+        if self.is_root_only() {
+            return None;
+        }
+        // `node_count = 2·leaves − 1` with `leaves` a power of two (every
+        // constructor guarantees it), so `leaves = (node_count + 1) / 2`.
+        let leaves = self.node_count().div_ceil(2);
+        Some(leaves.ilog2() as usize)
+    }
+
+    /// The Merkle cap at height `cap_height`: the `2^cap_height` nodes that
+    /// sit `cap_height` levels below the root, left to right (heap indices
+    /// `[2^c − 1, 2^{c+1} − 1)`). Height 0 is `[root]`; height `depth` is the
+    /// leaf-hash layer.
+    ///
+    /// `None` on a root-only tree, and when `cap_height > depth` — a cap taller
+    /// than the tree is not representable, and a caller asking for one has a
+    /// policy bug that must fail closed rather than be clamped here. Reads go
+    /// through the node accessor, so a disk-spilled tree works too.
+    pub fn cap(&self, cap_height: usize) -> Option<Vec<B::Node>> {
+        let depth = self.depth()?;
+        if cap_height > depth {
+            return None;
+        }
+        let start = (1usize << cap_height) - 1;
+        (start..2 * start + 1)
+            .map(|i| self.node_get(i).cloned())
+            .collect()
+    }
+
     /// Read-only access to the full node buffer in standard layout:
     /// `nodes[0..leaves_len - 1]` are inner nodes (root at index 0) and
     /// `nodes[leaves_len - 1..]` are the leaves.

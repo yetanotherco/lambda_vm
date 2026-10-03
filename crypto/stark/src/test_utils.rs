@@ -34,5 +34,6 @@ where
         transcript,
         #[cfg(feature = "disk-spill")]
         crate::storage_mode::StorageMode::Ram,
+        crate::residency_mode::ResidencyMode::Retain,
     )
 }
