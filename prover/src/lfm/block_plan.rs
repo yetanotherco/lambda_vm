@@ -509,7 +509,8 @@ impl BlockTreePlan {
     }
 
     /// The tree level by level; below the top, each level's programs and
-    /// artifacts are kept only when `keep`.
+    /// artifacts are kept only when `keep`, and held until the level is done
+    /// only under [`derive_holds_levels`].
     fn derive_levels(
         &self,
         wrap_opts: &crate::ProofOptions,
@@ -519,6 +520,7 @@ impl BlockTreePlan {
         let words = self.child_layout().total();
         let mut phases = Vec::new();
         let mut kept = Vec::new();
+        let hold = keep || derive_holds_levels();
         let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
         let mut level = derive_level(
             &leaves,
@@ -526,6 +528,7 @@ impl BlockTreePlan {
             build,
             wrap_opts,
             words,
+            hold,
             &mut phases,
         )?;
         let levels = self.levels();
@@ -536,10 +539,10 @@ impl BlockTreePlan {
             let mut rest = level.into_iter();
             for &a in &arities.arities {
                 let mut kids: Vec<DerivedChild> = Vec::with_capacity(a);
-                for (program, artifacts, child) in rest.by_ref().take(a) {
+                for (held, child) in rest.by_ref().take(a) {
                     kids.push(child);
-                    if keep {
-                        done.push((program, artifacts));
+                    if keep && let Some(pair) = held {
+                        done.push(pair);
                     }
                 }
                 if kids.len() != a {
@@ -553,19 +556,25 @@ impl BlockTreePlan {
             if keep {
                 kept.push(done);
             }
+            // The top's program and artifacts are the derivation's result.
             level = derive_level(
                 &groups,
                 |kids| self.node_program(kids, top),
                 build,
                 wrap_opts,
                 words,
+                hold || top,
                 &mut phases,
             )?;
         }
         if level.len() != 1 {
             return Err(format!("the tree closes to {} nodes", level.len()));
         }
-        kept.push(level.into_iter().map(|(p, a, _)| (p, a)).collect());
+        let top = level
+            .into_iter()
+            .map(|(held, _)| held.ok_or("the top level keeps its program"))
+            .collect::<Result<Vec<_>, _>>()?;
+        kept.push(top);
         Ok((kept, phases))
     }
 
@@ -767,9 +776,32 @@ impl Drop for BuildPlace<'_> {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`: [`BlockTreePlan::derive_top`] holds each
+/// level's programs and artifacts until the whole level is derived, as it did
+/// before (the A/B control). Unset, each item's program and artifacts are
+/// dropped as soon as its child's shape is derived, so a level holds only the
+/// items in flight rather than all of them: the median block's leaf level is 56
+/// programs of ≈ 0.42 GiB held each. Scheduling only: the derived shapes, and so
+/// the top program, are the same either way.
+fn derive_holds_levels() -> bool {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(
+        || match std::env::var("LAMBDA_VM_BLOCK_DERIVE_HOLD").ok().as_deref() {
+            None | Some("") => false,
+            Some("level") => true,
+            Some(v) => panic!("LAMBDA_VM_BLOCK_DERIVE_HOLD must be `level`, got `{v}`"),
+        },
+    )
+}
+
+/// One item of a derived level: its program and artifacts when the level keeps
+/// them, and its shape as a child.
+type DerivedItem = (Option<(LfmProgram, LfmArtifacts)>, DerivedChild);
+
 /// One level of a tree's derivation: each item's program emitted, its artifacts
 /// built by `build` and its shape as a child derived, in parallel and in order,
-/// at most [`derive_builds_bound`] builds at once.
+/// at most [`derive_builds_bound`] builds at once. Without `keep`, each item's
+/// program and artifacts are dropped as soon as its child is derived.
 /// Pushes the level's stopwatch onto `phases`.
 fn derive_level<T: Sync>(
     items: &[T],
@@ -777,10 +809,11 @@ fn derive_level<T: Sync>(
     build: &(dyn Fn(&LfmProgram) -> LfmArtifacts + Sync),
     wrap_opts: &crate::ProofOptions,
     words: usize,
+    keep: bool,
     phases: &mut Vec<PhaseTimes>,
-) -> Result<Vec<(LfmProgram, LfmArtifacts, DerivedChild)>, String> {
+) -> Result<Vec<DerivedItem>, String> {
     let t = Instant::now();
-    type Derived = (LfmProgram, LfmArtifacts, DerivedChild, f64, f64);
+    type Derived = (DerivedItem, f64, f64);
     let gate = derive_builds_bound().map(BuildGate::new);
     let one = |item: &T| -> Result<Derived, String> {
         let t = Instant::now();
@@ -791,12 +824,11 @@ fn derive_level<T: Sync>(
         let artifacts = build(&program);
         drop(place);
         let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+        let built = t.elapsed().as_secs_f64();
         Ok((
-            program,
-            artifacts,
-            derived,
+            (keep.then_some((program, artifacts)), derived),
             emitted,
-            t.elapsed().as_secs_f64(),
+            built,
         ))
     };
     #[cfg(feature = "parallel")]
@@ -812,10 +844,10 @@ fn derive_level<T: Sync>(
     };
     let level = done
         .into_iter()
-        .map(|(program, artifacts, derived, emitted, built)| {
+        .map(|(item, emitted, built)| {
             phase.emit += emitted;
             phase.build += built;
-            (program, artifacts, derived)
+            item
         })
         .collect();
     phase.wall = t.elapsed().as_secs_f64();

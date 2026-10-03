@@ -3401,6 +3401,16 @@ fn the_block_tree_composes_to_a_top_node() {
         "NOEPOCH_TREE_AHEAD derived no tree"
     );
     let shape = BlockShape::of_proof(&proof);
+    // `NOEPOCH_SHAPE_OUT=<file>`: the shape a consumer receives, for a verifier
+    // run in a process of its own
+    // (`the_block_verifiers_derivation_from_a_saved_shape`).
+    if let Ok(path) = std::env::var("NOEPOCH_SHAPE_OUT")
+        && !path.is_empty()
+    {
+        std::fs::write(&path, shape_to_text(&shape))
+            .unwrap_or_else(|e| panic!("NOEPOCH_SHAPE_OUT {path}: {e}"));
+        println!("   BLOCK SHAPE written to {path}");
+    }
     let (mut rb, verify, replay, beside) = if inline_verify {
         let (rb, verify, replay) =
             harvest_block_over(&inner, &elf_bytes, &proof, true, consts.as_deref())
@@ -3747,4 +3757,245 @@ fn the_block_tree_composes_to_a_top_node() {
             t.elapsed().as_secs_f64()
         );
     }
+}
+
+// ============ the block verifier's derivation in a process of its own ==========
+
+/// The fields of [`crate::TableCounts`], in declaration order, for
+/// [`shape_to_text`] and [`shape_from_text`].
+fn table_count_fields(c: &mut crate::TableCounts) -> [&mut usize; 21] {
+    [
+        &mut c.cpu,
+        &mut c.lt,
+        &mut c.memw,
+        &mut c.memw_aligned,
+        &mut c.load,
+        &mut c.mul,
+        &mut c.dvrm,
+        &mut c.shift,
+        &mut c.branch,
+        &mut c.memw_register,
+        &mut c.eq,
+        &mut c.bytewise,
+        &mut c.store,
+        &mut c.cpu32,
+        &mut c.keccak,
+        &mut c.keccak_rnd,
+        &mut c.ecsm,
+        &mut c.ecdas,
+        &mut c.hint,
+        &mut c.commit,
+        &mut c.blake3,
+    ]
+}
+
+/// A [`BlockShape`] as five lines of text: the table counts, the runtime page
+/// ranges (`base:count`), the private-input pages, the public output's length
+/// and the trace lengths.
+fn shape_to_text(shape: &BlockShape) -> String {
+    let mut counts = shape.table_counts.clone();
+    let join = |v: Vec<String>| v.join(" ");
+    format!(
+        "counts {}\nranges {}\nprivate {}\noutput {}\nlengths {}\n",
+        join(
+            table_count_fields(&mut counts)
+                .iter()
+                .map(|c| c.to_string())
+                .collect()
+        ),
+        join(
+            shape
+                .runtime_page_ranges
+                .iter()
+                .map(|r| format!("{}:{}", r.base, r.count))
+                .collect()
+        ),
+        shape.num_private_input_pages,
+        shape.public_output_len,
+        join(shape.trace_lengths.iter().map(|l| l.to_string()).collect()),
+    )
+}
+
+/// [`shape_to_text`]'s inverse.
+fn shape_from_text(text: &str) -> BlockShape {
+    let line = |key: &str| -> Vec<&str> {
+        let l = text
+            .lines()
+            .find(|l| l.split(' ').next() == Some(key))
+            .unwrap_or_else(|| panic!("the shape has no `{key}` line"));
+        l.split(' ').skip(1).filter(|w| !w.is_empty()).collect()
+    };
+    let num = |w: &str| -> u64 {
+        w.parse()
+            .unwrap_or_else(|_| panic!("`{w}` is not a number"))
+    };
+    let mut table_counts = crate::TableCounts {
+        cpu: 0,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
+        blake3: 0,
+    };
+    let counts = line("counts");
+    assert_eq!(counts.len(), 21, "the shape's counts line has 21 fields");
+    for (field, w) in table_count_fields(&mut table_counts)
+        .into_iter()
+        .zip(counts)
+    {
+        *field = num(w) as usize;
+    }
+    BlockShape {
+        table_counts,
+        runtime_page_ranges: line("ranges")
+            .into_iter()
+            .map(|w| {
+                let (base, count) = w.split_once(':').expect("a range is base:count");
+                crate::RuntimePageRange {
+                    base: num(base),
+                    count: num(count),
+                }
+            })
+            .collect(),
+        num_private_input_pages: num(line("private")[0]) as usize,
+        public_output_len: num(line("output")[0]) as usize,
+        trace_lengths: line("lengths")
+            .into_iter()
+            .map(|w| num(w) as usize)
+            .collect(),
+    }
+}
+
+/// A shape survives its text form: [`shape_from_text`] of [`shape_to_text`] is
+/// the shape, page ranges included.
+#[test]
+fn a_block_shape_round_trips_through_its_text() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let mut shape = honest_fixture_shape(&elf);
+    shape.table_counts.keccak = 3;
+    shape.table_counts.blake3 = 1;
+    shape.runtime_page_ranges = vec![
+        crate::RuntimePageRange {
+            base: 0x7000_0000,
+            count: 2,
+        },
+        crate::RuntimePageRange {
+            base: 0x8000_0000,
+            count: 1,
+        },
+    ];
+    shape.num_private_input_pages = 5;
+    shape.trace_lengths.extend([1 << 18, 1 << 17]);
+    let back = shape_from_text(&shape_to_text(&shape));
+    assert_eq!(format!("{back:?}"), format!("{shape:?}"));
+}
+
+/// The verifier's streaming derivation (each program and its artifacts dropped
+/// once its child is derived) derives the top of the tree that keeps every
+/// program ([`BlockTreePlan::derive_tree`]): a fixture plan with eight more CPU
+/// instances, cut into six leaves, so a leaf level, an interior level and the
+/// top.
+#[test]
+#[ignore = "box tier: two derivations of a six-leaf tree under the wrap preset, ≈ 2 min on the laptop"]
+fn the_streaming_derivation_derives_the_kept_trees_top() {
+    let opts = fixture_block_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let mut shape = honest_fixture_shape(&elf);
+    // The CPU instances follow `CPU[0]`, right after the fixed tables.
+    shape.table_counts.cpu += 8;
+    let at = crate::FIXED_TABLE_COUNT + 1;
+    shape.trace_lengths.splice(at..at, [32; 8]);
+    let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
+    let names: Vec<&str> = plan.instances().iter().map(|i| i.name.as_str()).collect();
+    let partition = partition_by_rule(&names, &plan.costs(), 6).expect("six leaves fill");
+    let plan = plan.with_partition(partition);
+    assert_eq!(
+        plan.levels().len(),
+        2,
+        "six leaves at fan-in 4: one interior level and the top"
+    );
+    let streamed = plan.derive_top(&wrap_opts).expect("the top derives");
+    let (tree, _) = plan
+        .derive_tree(&wrap_opts, &|p| {
+            super::block_plan::artifacts_of(p, &wrap_opts)
+        })
+        .expect("the tree derives");
+    let kept = &tree.last().expect("a top level")[0].1;
+    assert_eq!(streamed.program_id, kept.program_id);
+}
+
+/// ★ The block verifier's derivation ([`BlockTreePlan::derive_top`] under the
+/// block presets, what [`super::block_plan::verify_block_tree`] runs before its
+/// final check) in a process of its own, over a shape a whole-block run saved
+/// (`NOEPOCH_SHAPE_OUT`): its host peak, where no page the tree freed hides it,
+/// and the top id, which must be the whole run's. `LAMBDA_VM_BLOCK_DERIVE_HOLD`
+/// picks how a level holds its programs.
+#[test]
+#[ignore = "box tier: NOEPOCH_ELF and NOEPOCH_SHAPE (a whole-block run's NOEPOCH_SHAPE_OUT), --features cuda"]
+fn the_block_verifiers_derivation_from_a_saved_shape() {
+    use super::per_table_aggregator_tests::HostSampler;
+    use std::time::Instant;
+    let path = |var: &str| std::env::var(var).unwrap_or_else(|_| panic!("{var} must name a file"));
+    let elf_bytes = std::fs::read(path("NOEPOCH_ELF")).expect("read NOEPOCH_ELF");
+    let shape = shape_from_text(
+        &std::fs::read_to_string(path("NOEPOCH_SHAPE")).expect("read NOEPOCH_SHAPE"),
+    );
+    let hold = std::env::var("LAMBDA_VM_BLOCK_DERIVE_HOLD").unwrap_or_default();
+    let opts = super::proof::block_base_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let sampler = HostSampler::start();
+    let t = Instant::now();
+    let consts =
+        super::block_plan::ElfConstants::compute(&elf_bytes, &opts).expect("the constants compute");
+    let constants = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let plan =
+        BlockTreePlan::derive_with(&elf_bytes, &opts, &shape, &consts).expect("the plan derives");
+    let planned = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let (top, levels) = plan.derive_top_timed(&wrap_opts).expect("the top derives");
+    let derived = t.elapsed().as_secs_f64();
+    let (peak, _) = sampler.stop();
+    let split: Vec<String> = levels
+        .iter()
+        .map(|p| {
+            format!(
+                "{} in {:.2} (emit Σ {:.2}, build Σ {:.2})",
+                p.programs, p.wall, p.emit, p.build
+            )
+        })
+        .collect();
+    println!(
+        "BLOCK VERIFIER ONLY: hold `{}` · {} leaves · constants {constants:.2}s · plan {planned:.2}s · derive \
+         {derived:.2}s ({}) · host peak {peak:.3} GiB · top program id {}",
+        if hold.is_empty() {
+            "stream"
+        } else {
+            hold.as_str()
+        },
+        plan.partition().num_leaves(),
+        split.join(" · "),
+        top.program_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 }
