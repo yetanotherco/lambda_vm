@@ -50,14 +50,18 @@ const L2G_LABELS: u64 = 64;
 const MUTANT_TABLE: &str = "BITWISE";
 
 /// The program the proof-bytes tests prove.
-const BYTES_PROGRAM: &str = "add";
+pub(crate) const BYTES_PROGRAM: &str = "add";
 
 type Program = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
 
 /// Every production program, labelled, under the options it is built with:
 /// the VM tables and, with `extras`, the per-epoch local-to-global table and
 /// the LFM chips. `suffix` is appended to every label.
-fn production_programs(opts: &ProofOptions, extras: bool, suffix: &str) -> Vec<(String, Program)> {
+pub(crate) fn production_programs(
+    opts: &ProofOptions,
+    extras: bool,
+    suffix: &str,
+) -> Vec<(String, Program)> {
     let mut out = Vec::new();
     let mut push = |label: String, air: DynAir<'_>| {
         out.push((format!("{label}{suffix}"), air.constraint_program().clone()));
@@ -116,7 +120,7 @@ fn production_programs(opts: &ProofOptions, extras: bool, suffix: &str) -> Vec<(
 /// to four interactions per column get their own programs; the LFM chips keep
 /// pairs under every policy and the local-to-global tables are too narrow to
 /// move, so neither is rebuilt).
-fn compiled_option_sets() -> Vec<(ProofOptions, bool, &'static str)> {
+pub(crate) fn compiled_option_sets() -> Vec<(ProofOptions, bool, &'static str)> {
     let at = |blowup| GoldilocksCubicProofOptions::with_blowup(blowup).expect("a valid blowup");
     let mut k4 = at(4);
     k4.format = stark::proof::options::ProofFormat {
@@ -307,14 +311,14 @@ fn mutant_key() -> u64 {
 /// traces differ, and so do their proofs. Proving copies of one build takes
 /// that out; at grinding 0 (no nonce search) the proof is then a function of
 /// the traces, the options and the prover.
-struct FixedTraces {
+pub(crate) struct FixedTraces {
     elf_bytes: Vec<u8>,
     program: Elf,
     traces: Traces,
 }
 
 impl FixedTraces {
-    fn build(name: &str) -> Self {
+    pub(crate) fn build(name: &str) -> Self {
         let elf_bytes = asm_elf_bytes(name);
         let program = Elf::load(&elf_bytes).expect("load the ELF");
         let run = Executor::new(&program, vec![])
@@ -367,7 +371,7 @@ impl FixedTraces {
 
     /// `prove_with_options`' prove step on a copy of the traces: the same
     /// AIRs, the same statement in the transcript, the same `multi_prove`.
-    fn prove(&self, opts: &ProofOptions) -> Result<VmProof, ProvingError> {
+    pub(crate) fn prove(&self, opts: &ProofOptions) -> Result<VmProof, ProvingError> {
         let mut traces = self.traces.clone();
         let table_counts = traces.table_counts();
         let airs = self.airs(opts);
@@ -399,7 +403,7 @@ impl FixedTraces {
     }
 
     /// Whether the monolithic verifier accepts the proof.
-    fn verifies(&self, proof: &VmProof, opts: &ProofOptions) -> bool {
+    pub(crate) fn verifies(&self, proof: &VmProof, opts: &ProofOptions) -> bool {
         matches!(
             crate::verify_with_options(proof, &self.elf_bytes, opts, None, None),
             Ok(true)
@@ -407,14 +411,14 @@ impl FixedTraces {
     }
 }
 
-fn proof_bytes(proof: &VmProof) -> Vec<u8> {
+pub(crate) fn proof_bytes(proof: &VmProof) -> Vec<u8> {
     rkyv::to_bytes::<rkyv::rancor::Error>(proof)
         .expect("serialize")
         .to_vec()
 }
 
 /// Blowup 4 (the block's) and no grinding.
-fn bytes_options() -> ProofOptions {
+pub(crate) fn bytes_options() -> ProofOptions {
     let opts = GoldilocksCubicProofOptions::with_params(4, 128, 0).expect("options");
     assert_eq!(opts.grinding_factor, 0, "no nonce search");
     opts

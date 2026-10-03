@@ -9,6 +9,8 @@ pub mod branch_bus_tests;
 #[cfg(test)]
 pub mod branch_constraints_tests;
 #[cfg(test)]
+pub mod budgeted_constraints;
+#[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
 pub mod commit_tests;
