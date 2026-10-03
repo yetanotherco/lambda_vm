@@ -227,6 +227,40 @@ fn a_failed_write_keeps_the_trace_resident() {
     assert_eq!((stats.written, stats.memory_reads), (1, 1), "{stats}");
 }
 
+/// The writers' seconds split into their steps: the digest, the aligned copy
+/// (`O_DIRECT` only) and the write calls add up to no more than the whole,
+/// and every written slot's bytes leave memory.
+#[test]
+fn the_writers_seconds_split_into_their_steps() {
+    let shapes: [(usize, &[u64]); 2] = [
+        (4099, &[u64::MAX, 0xff, 0xffff]),
+        // 38 bytes a row: past the 4 MiB bounce buffer.
+        (150_001, &[u64::MAX, 0, 0xffff_ffff, 0x1_0000, 0xff]),
+    ];
+    for direct in [DirectIo::Auto, DirectIo::Off] {
+        let store = store(direct);
+        let mut spilled = Vec::new();
+        for (rows, caps) in shapes {
+            let (mut trace, _) = packed_trace(rows, caps);
+            assert!(trace.spill_main(&store), "{rows} rows: spilled");
+            spilled.push(trace);
+        }
+        store.flush();
+        let stats = store.stats();
+        assert_eq!(stats.written, shapes.len() as u64, "{stats}");
+        let steps = stats.digest_secs + stats.copy_secs + stats.pwrite_secs;
+        assert!(
+            stats.pwrite_secs > 0.0 && steps <= stats.write_secs,
+            "{stats}"
+        );
+        assert_eq!(stats.copy_secs > 0.0, store.is_direct(), "{stats}");
+        for trace in &spilled {
+            assert!(!trace.spilled_main().unwrap().is_resident(), "{stats}");
+        }
+        eprintln!("{direct:?}: {stats}");
+    }
+}
+
 /// The read-back holds at most its window ahead of the drivers (one read
 /// larger than the window goes alone), hands each read over once, and skips
 /// a read a driver took before it got there.

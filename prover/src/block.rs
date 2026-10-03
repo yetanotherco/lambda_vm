@@ -1955,24 +1955,38 @@ pub fn prove_block_traces(
             .map(|(air, trace, _)| (air.name(), trace.num_rows(), trace.num_main_columns)),
     );
     if memlog() {
-        // The main traces the prove starts from: packed, and at 8 bytes a cell.
+        // The main traces the prove starts from: packed, spilled (their bytes
+        // in the heap only while a slot still holds them), and at 8 bytes a
+        // cell.
         let (mut packed, mut wide, mut n_packed) = (0usize, 0usize, 0usize);
+        let (mut spilled, mut spilled_resident, mut n_spilled) = (0usize, 0usize, 0usize);
         for (_, trace, _) in &pairs {
-            match trace.narrow_main() {
-                Some(narrow) => {
-                    packed += narrow.data().len();
-                    n_packed += 1;
+            if let Some(narrow) = trace.narrow_main() {
+                packed += narrow.data().len();
+                n_packed += 1;
+            } else if let Some(slot) = trace.spilled_main() {
+                spilled += slot.len();
+                if slot.is_resident() {
+                    spilled_resident += slot.len();
                 }
-                None => wide += wide_bytes(trace),
+                n_spilled += 1;
+            } else {
+                wide += wide_bytes(trace);
             }
         }
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         eprintln!(
-            "BLOCK MEM traces: {} instances · {n_packed} packed {:.2} GiB · {} at 8 B/cell {:.2} GiB",
+            "BLOCK MEM traces: {} instances · {n_packed} packed {:.2} GiB · {n_spilled} spilled \
+             {:.2} GiB ({:.2} in memory) · {} at 8 B/cell {:.2} GiB",
             pairs.len(),
-            packed as f64 / (1u64 << 30) as f64,
-            pairs.len() - n_packed,
-            wide as f64 / (1u64 << 30) as f64,
+            gib(packed),
+            gib(spilled),
+            gib(spilled_resident),
+            pairs.len() - n_packed - n_spilled,
+            gib(wide),
         );
+        // The traces' bytes in the heap.
+        let traces_held = packed + spilled_resident + wide;
         // What else the heap holds as the prove starts: the precommits (the
         // streamed and phase-A-committed instances'), the precomputed-tree
         // cache, and what no gauge names (the AIRs just built included).
@@ -1994,11 +2008,11 @@ pub fn prove_block_traces(
         );
         if let Some([live, ..]) = heap_stats() {
             let airs = live_before_airs.map_or(0, |before| live.saturating_sub(before));
-            let named = packed + wide + held.iter().sum::<usize>() + cache + airs;
+            let named = traces_held + held.iter().sum::<usize>() + cache + airs;
             eprintln!(
                 "BLOCK MEM setup: heap live {:.2} = traces {:.2} + precommits {:.2} + precomputed trees {:.2} + the AIRs and their pairing {:.2} + unnamed {:.2} (GiB)",
                 g(live),
-                g(packed + wide),
+                g(traces_held),
                 g(held.iter().sum()),
                 g(cache),
                 g(airs),

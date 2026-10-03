@@ -147,6 +147,11 @@ pub struct SpillStats {
     pub written: u64,
     pub bytes_written: u64,
     pub write_secs: f64,
+    /// The writers' seconds by step: digesting the bytes, copying them into
+    /// the aligned buffer (`O_DIRECT` only), and the write calls.
+    pub digest_secs: f64,
+    pub copy_secs: f64,
+    pub pwrite_secs: f64,
     /// Reads from the file, their bytes, and the readers' seconds.
     pub reads: u64,
     pub bytes_read: u64,
@@ -166,13 +171,17 @@ impl std::fmt::Display for SpillStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} slots {:.2} GiB · written {} {:.2} GiB in {:.2} s · read {} {:.2} GiB in {:.2} s \
-             · from memory {} · queue high-water {:.2} GiB · mismatches {} · {}",
+            "{} slots {:.2} GiB · written {} {:.2} GiB in {:.2} s (digest {:.2} · copy {:.2} · \
+             pwrite {:.2}) · read {} {:.2} GiB in {:.2} s · from memory {} · queue high-water \
+             {:.2} GiB · mismatches {} · {}",
             self.slots,
             self.bytes as f64 / GIB,
             self.written,
             self.bytes_written as f64 / GIB,
             self.write_secs,
+            self.digest_secs,
+            self.copy_secs,
+            self.pwrite_secs,
             self.reads,
             self.bytes_read as f64 / GIB,
             self.read_secs,
@@ -195,6 +204,9 @@ struct Counters {
     written: AtomicU64,
     bytes_written: AtomicU64,
     write_ns: AtomicU64,
+    digest_ns: AtomicU64,
+    copy_ns: AtomicU64,
+    pwrite_ns: AtomicU64,
     reads: AtomicU64,
     bytes_read: AtomicU64,
     read_ns: AtomicU64,
@@ -303,17 +315,25 @@ impl Inner {
                 let mut done = 0;
                 while done < bytes.len() {
                     let n = (bytes.len() - done).min(buf.len());
+                    let t = Instant::now();
                     buf[..n].copy_from_slice(&bytes[done..done + n]);
                     let span = round_up(n);
                     buf[n..span].fill(0);
-                    os::pwrite_all(&self.file, &buf[..span], offset + done as u64)?;
+                    let copied = Instant::now();
+                    Counters::add(&self.counters.copy_ns, (copied - t).as_nanos() as u64);
+                    let wrote = os::pwrite_all(&self.file, &buf[..span], offset + done as u64);
+                    Counters::add(&self.counters.pwrite_ns, copied.elapsed().as_nanos() as u64);
+                    wrote?;
                     done += n;
                 }
                 Ok(())
             }
             None => {
-                os::pwrite_all(&self.file, bytes, offset)?;
-                os::settle(&self.file, offset, bytes.len() as u64, true)
+                let t = Instant::now();
+                let wrote = os::pwrite_all(&self.file, bytes, offset)
+                    .and_then(|()| os::settle(&self.file, offset, bytes.len() as u64, true));
+                Counters::add(&self.counters.pwrite_ns, t.elapsed().as_nanos() as u64);
+                wrote
             }
         }
     }
@@ -425,6 +445,7 @@ impl Slot {
         let _ = self
             .digest
             .set(crate::narrow::digest_parts(self.rows, &self.widths, &bytes));
+        Counters::add(&store.counters.digest_ns, t.elapsed().as_nanos() as u64);
         let result = store.write_at(self.offset, &bytes, bounce);
         let mut state = lock(&self.state);
         match result {
@@ -514,6 +535,12 @@ impl SpilledMain {
     /// Whether the packed trace has no bytes.
     pub fn is_empty(&self) -> bool {
         self.slot.len == 0
+    }
+
+    /// Whether the bytes are in memory: not written yet, or kept after a
+    /// failed write.
+    pub fn is_resident(&self) -> bool {
+        self.slot.in_memory()
     }
 
     /// The digest the writer took before writing the bytes
@@ -632,6 +659,9 @@ impl SpillStore {
             written: get(&c.written),
             bytes_written: get(&c.bytes_written),
             write_secs: get(&c.write_ns) as f64 / 1e9,
+            digest_secs: get(&c.digest_ns) as f64 / 1e9,
+            copy_secs: get(&c.copy_ns) as f64 / 1e9,
+            pwrite_secs: get(&c.pwrite_ns) as f64 / 1e9,
             reads: get(&c.reads),
             bytes_read: get(&c.bytes_read),
             read_secs: get(&c.read_ns) as f64 / 1e9,
