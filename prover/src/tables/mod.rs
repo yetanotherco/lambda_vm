@@ -128,10 +128,22 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// KECCAK rows per table, or [`KECCAK_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). A KECCAK row is one whole
+    /// permutation call, so a cut falls between two calls; each call reaches
+    /// its rounds (KECCAK_RND) and its memory only through buses keyed by its
+    /// timestamp.
+    pub keccak: usize,
     /// KECCAK_RND rows per table, or [`KECCAK_RND_UNCHUNKED`] for one table
     /// (every configuration but the no-epoch block's). A chunk holds whole
     /// permutations: `keccak_rnd / 24` of them, at least one.
     pub keccak_rnd: usize,
+    /// ECSM rows per table, or [`ECSM_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). An ECSM row is one whole
+    /// scalar multiplication call, so a cut falls between two calls; each
+    /// call reaches its double/add steps (ECDAS), its scalar bits and its
+    /// memory only through buses keyed by its timestamp.
+    pub ecsm: usize,
     /// ECDAS rows per table, or [`ECDAS_UNCHUNKED`] for one table (every
     /// configuration but the no-epoch block's). An ECDAS row is one
     /// double/add step, so a chunk holds `ecdas` steps and a scalar
@@ -141,9 +153,17 @@ pub struct MaxRowsConfig {
     pub ecdas: usize,
 }
 
+/// [`MaxRowsConfig::keccak`]'s "one table", the value every constructor here
+/// sets: a chunked KECCAK is accepted only by the block verifier.
+pub const KECCAK_UNCHUNKED: usize = usize::MAX;
+
 /// [`MaxRowsConfig::keccak_rnd`]'s "one table", the value every constructor
 /// here sets: a chunked KECCAK_RND is accepted only by the block verifier.
 pub const KECCAK_RND_UNCHUNKED: usize = usize::MAX;
+
+/// [`MaxRowsConfig::ecsm`]'s "one table", the value every constructor here
+/// sets: a chunked ECSM is accepted only by the block verifier.
+pub const ECSM_UNCHUNKED: usize = usize::MAX;
 
 /// [`MaxRowsConfig::ecdas`]'s "one table", the value every constructor here
 /// sets: a chunked ECDAS is accepted only by the block verifier.
@@ -202,7 +222,9 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            keccak: KECCAK_UNCHUNKED,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
             ecdas: ECDAS_UNCHUNKED,
         }
     }
@@ -226,7 +248,9 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
+            keccak: KECCAK_UNCHUNKED,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
             ecdas: ECDAS_UNCHUNKED,
         }
     }
@@ -249,7 +273,9 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            keccak: KECCAK_UNCHUNKED,
             keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
             ecdas: ECDAS_UNCHUNKED,
         }
     }
