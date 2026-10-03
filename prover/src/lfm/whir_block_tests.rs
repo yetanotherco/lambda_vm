@@ -1381,10 +1381,205 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
     }
 }
 
-/// The tree's node programs and artifacts, each published to its slot
-/// (level, node) as soon as it is built: a node's program is a function of its
-/// children's derived shapes, not of their proofs, so the whole tree can be
-/// built while the leaves prove. Level by level, from the leaves' artifacts.
+/// A tree's nodes built level by level from the leaves' shapes `leaves`, each
+/// published to its slot (level, node) as soon as `build` returns it: `build`
+/// takes the level, the node's index, its children's shapes (in order) and
+/// whether it is the top; `shape_of` gives a built node's shape for the level
+/// above. A node depends on its children's shapes, never on their proofs, so
+/// the whole tree can be built while the leaves prove.
+///
+/// With `pool`, a level's nodes are built together on the pool's threads and
+/// each is published into ITS OWN slot whatever order they finish in; without,
+/// one after another on this thread. A build that fails leaves its error in its
+/// slot, and every slot still empty when this returns or unwinds gets one
+/// ([`FailUnpublished`]).
+fn build_levels<C: Sync, N: Send + Sync>(
+    shape: &[super::per_table_aggregator::Level],
+    leaves: &[&C],
+    slots: &[Vec<Published<N>>],
+    shape_of: impl Fn(&N) -> &C + Sync,
+    build: impl Fn(usize, usize, &[&C], bool) -> Result<N, String> + Sync,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    use rayon::prelude::*;
+    let _fail = FailUnpublished(slots);
+    for (lv, arities) in shape.iter().enumerate() {
+        let top = lv + 1 == shape.len();
+        let below: Vec<&C> = match lv {
+            0 => leaves.to_vec(),
+            _ => match slots[lv - 1]
+                .iter()
+                .map(|s| s.wait().map(&shape_of))
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(below) => below,
+                Err(_) => return,
+            },
+        };
+        let mut at = 0usize;
+        let groups: Vec<std::ops::Range<usize>> = arities
+            .arities
+            .iter()
+            .map(|&a| {
+                at += a;
+                at - a..at
+            })
+            .collect();
+        if groups.last().map_or(0, |g| g.end) != below.len() {
+            let _ = slots[lv][0].0.set(Err(format!(
+                "level {}: arities cover {at} of {} children",
+                lv + 1,
+                below.len()
+            )));
+            return;
+        }
+        let one = |j: usize| {
+            let _ = slots[lv][j]
+                .0
+                .set(build(lv, j, &below[groups[j].clone()], top));
+        };
+        match pool {
+            Some(pool) => pool.install(|| (0..groups.len()).into_par_iter().for_each(one)),
+            None => (0..groups.len()).for_each(one),
+        }
+    }
+}
+
+/// [`build_levels`] over a toy tree whose programs are their texts (`L3` a
+/// leaf, `N(..)` / `T(..)` a node over its children's): each node's build
+/// sleeps longer the earlier it is in its level, so on a pool the level's
+/// nodes finish in reverse. Returns every slot's content and the order the
+/// builds finished in.
+#[allow(clippy::type_complexity)]
+fn toy_tree(
+    leaves: usize,
+    arities: &[Vec<usize>],
+    threads: Option<usize>,
+    fail_at: Option<(usize, usize)>,
+) -> (
+    Vec<Vec<Option<Result<String, String>>>>,
+    Vec<(usize, usize)>,
+) {
+    use super::per_table_aggregator::Level;
+    let shape: Vec<Level> = arities
+        .iter()
+        .map(|a| Level { arities: a.clone() })
+        .collect();
+    let leaf_text: Vec<String> = (0..leaves).map(|k| format!("L{k}")).collect();
+    let leaf_refs: Vec<&String> = leaf_text.iter().collect();
+    let slots: Vec<Vec<Published<String>>> = shape
+        .iter()
+        .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+        .collect();
+    let finished = std::sync::Mutex::new(Vec::new());
+    let pool = threads.map(|n| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("a pool")
+    });
+    build_levels(
+        &shape,
+        &leaf_refs,
+        &slots,
+        |node: &String| node,
+        |lv, j, kids: &[&String], top| {
+            let late = shape[lv].arities.len() - j;
+            std::thread::sleep(std::time::Duration::from_millis(4 * late as u64));
+            finished.lock().expect("the log").push((lv, j));
+            if fail_at == Some((lv, j)) {
+                return Err(format!("node ({lv}, {j}) does not build"));
+            }
+            let kids: Vec<&str> = kids.iter().map(|k| k.as_str()).collect();
+            Ok(format!(
+                "{}({})",
+                if top { "T" } else { "N" },
+                kids.join(",")
+            ))
+        },
+        pool.as_ref(),
+    );
+    let got = slots
+        .iter()
+        .map(|level| level.iter().map(|s| s.0.get().cloned()).collect())
+        .collect();
+    (got, finished.into_inner().expect("the log"))
+}
+
+/// ★ The node pipe builds the serial builder's nodes, each in its own slot,
+/// whatever order a level's builds finish in: the median's shape (23 leaves at
+/// fan-in 3), on pools of 2 to 4 threads, where each level's builds finish out
+/// of order, and serially.
+#[test]
+fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
+    let arities = vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]];
+    let group =
+        |kids: &[String], top: bool| format!("{}({})", if top { "T" } else { "N" }, kids.join(","));
+    let leaves: Vec<String> = (0..23).map(|k| format!("L{k}")).collect();
+    let mut want: Vec<Vec<String>> = Vec::new();
+    let mut below = leaves;
+    for (lv, a) in arities.iter().enumerate() {
+        let top = lv + 1 == arities.len();
+        let mut at = 0;
+        let level: Vec<String> = a
+            .iter()
+            .map(|&n| {
+                at += n;
+                group(&below[at - n..at], top)
+            })
+            .collect();
+        want.push(level.clone());
+        below = level;
+    }
+    let want: Vec<Vec<Option<Result<String, String>>>> = want
+        .into_iter()
+        .map(|l| l.into_iter().map(|p| Some(Ok(p))).collect())
+        .collect();
+    for threads in [None, Some(2), Some(3), Some(4)] {
+        let (got, finished) = toy_tree(23, &arities, threads, None);
+        assert_eq!(got, want, "{threads:?} threads");
+        let level0: Vec<usize> = finished
+            .iter()
+            .filter(|(lv, _)| *lv == 0)
+            .map(|(_, j)| *j)
+            .collect();
+        let in_order = level0.windows(2).all(|w| w[0] < w[1]);
+        assert_eq!(
+            in_order,
+            threads.is_none(),
+            "{threads:?} threads: level 0 finished in {level0:?}"
+        );
+    }
+}
+
+/// A node build that fails leaves its error in its slot and an error in every
+/// slot above it, promptly: no level waits for a node that will never come.
+#[test]
+fn a_failing_node_build_fails_every_node_above_it() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let arities = vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]];
+        let _ = tx.send(toy_tree(23, &arities, Some(3), Some((0, 2))).0);
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the builder hung after a failed build");
+    assert_eq!(
+        got[0][2],
+        Some(Err("node (0, 2) does not build".to_string()))
+    );
+    for (lv, level) in got.iter().enumerate().skip(1) {
+        for (j, slot) in level.iter().enumerate() {
+            assert!(
+                matches!(slot, Some(Err(_))),
+                "slot ({lv}, {j}) above a failed build: {slot:?}"
+            );
+        }
+    }
+}
+
+/// The tree's node programs and artifacts ([`build_levels`] over the leaves'
+/// derived shapes), each published to its slot as soon as it is built.
 ///
 /// With `pool` (`W3_NODE_PIPE`, on by default) a level's nodes are built
 /// together on the pool's threads — the builder's own, not the global pool, on
@@ -1404,36 +1599,19 @@ fn build_nodes(
     t_tree: std::time::Instant,
     pool: Option<&rayon::ThreadPool>,
 ) {
-    use rayon::prelude::*;
-    let _fail = FailUnpublished(slots);
     let Ok(leaf_built) = leaves.wait() else {
+        let _fail = FailUnpublished(slots);
         return;
     };
-    for (lv, arities) in shape.iter().enumerate() {
-        let top = lv + 1 == shape.len();
-        let below: Vec<&DerivedChild> = match lv {
-            0 => leaf_built.iter().map(|(_, d, _)| d).collect(),
-            _ => match slots[lv - 1]
-                .iter()
-                .map(|s| s.wait().map(|n| &n.derived))
-                .collect::<Result<Vec<_>, String>>()
-            {
-                Ok(below) => below,
-                Err(_) => return,
-            },
-        };
-        let mut at = 0usize;
-        let groups: Vec<std::ops::Range<usize>> = arities
-            .arities
-            .iter()
-            .map(|&a| {
-                at += a;
-                at - a..at
-            })
-            .collect();
-        let build = |j: usize| -> Result<TreeNode, String> {
+    let leaf_shapes: Vec<&DerivedChild> = leaf_built.iter().map(|(_, d, _)| d).collect();
+    build_levels(
+        shape,
+        &leaf_shapes,
+        slots,
+        |node: &TreeNode| &node.derived,
+        |_, _, kids: &[&DerivedChild], top| -> Result<TreeNode, String> {
             let t = std::time::Instant::now();
-            let program = plan.node_program(&below[groups[j].clone()], top)?;
+            let program = plan.node_program(kids, top)?;
             let artifacts = artifacts_of(&program, wrap);
             let derived = DerivedChild::from_artifacts(&artifacts, wrap, words)?;
             Ok(TreeNode {
@@ -1443,20 +1621,9 @@ fn build_nodes(
                 built: t.elapsed().as_secs_f64(),
                 built_at: t_tree.elapsed().as_secs_f64(),
             })
-        };
-        match pool {
-            Some(pool) => pool.install(|| {
-                (0..groups.len()).into_par_iter().for_each(|j| {
-                    let _ = slots[lv][j].0.set(build(j));
-                })
-            }),
-            None => {
-                for (j, slot) in slots[lv].iter().enumerate() {
-                    let _ = slot.0.set(build(j));
-                }
-            }
-        }
-    }
+        },
+        pool,
+    );
 }
 
 /// The tree proved the way a prover would run it, with the leaves' programs
