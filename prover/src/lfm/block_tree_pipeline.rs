@@ -176,11 +176,20 @@ impl Pipe {
     /// pool of that many host-only threads of the builder's own, not on the
     /// global pool the provers' host phases use.
     ///
-    /// `leaf_programs` are the first leaves' programs. With an `emit_window` W
-    /// > 0 they may be fewer than the leaves, and the builder emits the rest
-    /// itself, in leaf order, on the same pool, at most `2 × W` ahead of its
-    /// builds (`NOEPOCH_TREE_EMIT_WINDOW`): the same programs, emitted later, so
-    /// they do not all sit in memory beside the base.
+    /// `leaf_programs` are the first leaves' programs. With a nonzero
+    /// `emit_window` W they may be fewer than the leaves, and the builder emits
+    /// the rest itself, in leaf order, on the same pool, at most `2 × W` ahead
+    /// of its builds (`NOEPOCH_TREE_EMIT_WINDOW`): the same programs, emitted
+    /// later, so they do not all sit in memory beside the base.
+    ///
+    /// With `node_emit_early` (`NOEPOCH_TREE_NODE_EMIT=early`) each node's
+    /// program is emitted as soon as its children's artifacts exist, during the
+    /// level below, instead of a level's programs together once the whole level
+    /// below is built. The build order is the same; the programs are the same (a
+    /// node's program is a function of its children's derived shapes); only the
+    /// moment each is emitted moves. At the median block the per-level emission
+    /// leaves the card idle 8.9 s between level 0's last hold and level 1's
+    /// first (BIG 481).
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
@@ -188,9 +197,17 @@ impl Pipe {
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
+        node_emit_early: bool,
     ) -> Result<BuilderTimes, String> {
         let run = std::panic::AssertUnwindSafe(|| {
-            self.build(plan, leaf_programs, wrap_opts, emit_threads, emit_window)
+            self.build(
+                plan,
+                leaf_programs,
+                wrap_opts,
+                emit_threads,
+                emit_window,
+                node_emit_early,
+            )
         });
         let outcome = std::panic::catch_unwind(run);
         if !matches!(outcome, Ok(Ok(_))) {
@@ -209,6 +226,7 @@ impl Pipe {
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
+        node_emit_early: bool,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
         // ⚠ On the global pool, a prover that joins inside its `multi_prove`
@@ -229,10 +247,7 @@ impl Pipe {
             None
         };
         #[cfg(not(feature = "parallel"))]
-        let emit_pool: Option<EmitPool> = {
-            let _ = emit_threads;
-            None
-        };
+        let emit_pool: Option<EmitPool> = None;
         let words = plan.child_layout().total();
         let mut build_secs = 0.0;
         let mut built = |program: &LfmProgram| -> Result<(LfmArtifacts, DerivedChild), String> {
@@ -253,90 +268,219 @@ impl Pipe {
                 "{given} leaf programs for {n} leaves with an emission window of {emit_window}"
             ));
         }
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<Result<LfmProgram, String>>(emit_window.max(1));
+        let levels = plan.levels();
+        let pool = emit_pool.as_ref();
         let emit_leaf = |k: usize| plan.leaf_program(k);
-        let mut children = std::thread::scope(|scope| -> Result<Vec<DerivedChild>, String> {
-            if given < n {
-                let pool = emit_pool.as_ref();
-                let emit_leaf = &emit_leaf;
-                scope.spawn(move || emit_in_order(given..n, emit_window, pool, emit_leaf, &tx));
-            } else {
-                drop(tx);
+        let emit_node = |kids: &[DerivedChild], top: bool| -> Result<LfmProgram, String> {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = pool {
+                return pool.install(|| plan.node_program(kids, top));
             }
+            plan.node_program(kids, top)
+        };
+        let (leaf_tx, leaf_rx) =
+            std::sync::mpsc::sync_channel::<Result<LfmProgram, String>>(emit_window.max(1));
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<(usize, usize, Vec<DerivedChild>)>();
+        let (done_tx, done_rx) =
+            std::sync::mpsc::channel::<(usize, usize, Result<LfmProgram, String>, f64)>();
+        let job_rx = Mutex::new(job_rx);
+        let (leaves_at, level_at, emit) = std::thread::scope(|scope| {
+            if given < n {
+                let emit_leaf = &emit_leaf;
+                scope
+                    .spawn(move || emit_in_order(given..n, emit_window, pool, emit_leaf, &leaf_tx));
+            } else {
+                drop(leaf_tx);
+            }
+            // The early node emitters: each takes the next completed group and
+            // emits its node on the builder's pool.
+            if node_emit_early {
+                for _ in 0..emit_threads.max(1) {
+                    let (job_rx, done_tx, emit_node, levels) =
+                        (&job_rx, done_tx.clone(), &emit_node, &levels);
+                    scope.spawn(move || {
+                        loop {
+                            let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok((lv, j, kids)) = job else {
+                                return;
+                            };
+                            let t = Instant::now();
+                            let program = emit_node(&kids, lv + 1 == levels.len());
+                            let secs = t.elapsed().as_secs_f64();
+                            if done_tx.send((lv, j, program, secs)).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+            drop(done_tx);
+            let mut emit = 0.0;
+            // Early mode: each node level's children in arrival order, cut into
+            // their groups as they complete; the emitted programs as they come
+            // back.
+            let mut groupers: Vec<Grouper> = levels
+                .iter()
+                .map(|l| Grouper::new(l.arities.clone()))
+                .collect();
+            let mut ready: Vec<Vec<Option<Result<LfmProgram, String>>>> = levels
+                .iter()
+                .map(|l| (0..l.arities.len()).map(|_| None).collect())
+                .collect();
+
             let mut given = leaf_programs.into_iter();
             let mut children = Vec::with_capacity(n);
             for k in 0..n {
                 let program = match given.next() {
                     Some(program) => program,
-                    None => rx
+                    None => leaf_rx
                         .recv()
                         .map_err(|_| format!("leaf {k}: the leaf emitter stopped early"))??,
                 };
                 let (artifacts, derived) = built(&program)?;
-                children.push(derived);
                 self.put(&self.leaves[k], program, artifacts);
+                if node_emit_early {
+                    submit(&mut groupers, &job_tx, 0, derived)?;
+                } else {
+                    children.push(derived);
+                }
             }
-            Ok(children)
-        })?;
-        let leaves_at = start.elapsed().as_secs_f64();
-        let mut level_at = Vec::new();
-        let mut emit = 0.0;
-        let levels = plan.levels();
-        for (lv, arities) in levels.iter().enumerate() {
-            let top = lv + 1 == levels.len();
-            let mut rest = children.into_iter();
-            let groups: Vec<Vec<DerivedChild>> = arities
-                .arities
-                .iter()
-                .map(|&a| rest.by_ref().take(a).collect())
-                .collect();
-            if groups
-                .iter()
-                .zip(&arities.arities)
-                .any(|(g, &a)| g.len() != a)
-                || rest.next().is_some()
-            {
-                return Err(format!(
-                    "level {}: arities do not cover the children",
-                    lv + 1
-                ));
-            }
-            let t = Instant::now();
-            #[cfg(feature = "parallel")]
-            let programs: Vec<LfmProgram> = {
-                use rayon::prelude::*;
-                let emit = || {
-                    groups
-                        .par_iter()
+            let leaves_at = start.elapsed().as_secs_f64();
+            let mut level_at = Vec::new();
+            for (lv, arities) in levels.iter().enumerate() {
+                let top = lv + 1 == levels.len();
+                let nodes = arities.arities.len();
+                let mut programs: Vec<Option<LfmProgram>> = (0..nodes).map(|_| None).collect();
+                if node_emit_early {
+                    if !groupers[lv].is_complete() {
+                        return Err(format!(
+                            "level {}: arities do not cover the children",
+                            lv + 1
+                        ));
+                    }
+                } else {
+                    let mut rest = std::mem::take(&mut children).into_iter();
+                    let groups: Vec<Vec<DerivedChild>> = arities
+                        .arities
+                        .iter()
+                        .map(|&a| rest.by_ref().take(a).collect())
+                        .collect();
+                    if groups
+                        .iter()
+                        .zip(&arities.arities)
+                        .any(|(g, &a)| g.len() != a)
+                        || rest.next().is_some()
+                    {
+                        return Err(format!(
+                            "level {}: arities do not cover the children",
+                            lv + 1
+                        ));
+                    }
+                    let t = Instant::now();
+                    #[cfg(feature = "parallel")]
+                    let emitted: Vec<LfmProgram> = {
+                        use rayon::prelude::*;
+                        let emit = || {
+                            groups
+                                .par_iter()
+                                .map(|kids| plan.node_program(kids, top))
+                                .collect::<Result<_, String>>()
+                        };
+                        match pool {
+                            Some(pool) => pool.install(emit),
+                            None => emit(),
+                        }?
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    let emitted: Vec<LfmProgram> = groups
+                        .iter()
                         .map(|kids| plan.node_program(kids, top))
-                        .collect::<Result<_, String>>()
-                };
-                match &emit_pool {
-                    Some(pool) => pool.install(emit),
-                    None => emit(),
-                }?
-            };
-            #[cfg(not(feature = "parallel"))]
-            let programs: Vec<LfmProgram> = groups
-                .iter()
-                .map(|kids| plan.node_program(kids, top))
-                .collect::<Result<_, String>>()?;
-            emit += t.elapsed().as_secs_f64();
-            children = Vec::with_capacity(programs.len());
-            for (j, program) in programs.into_iter().enumerate() {
-                let (artifacts, derived) = built(&program)?;
-                children.push(derived);
-                self.put(&self.levels[lv][j], program, artifacts);
+                        .collect::<Result<_, String>>()?;
+                    emit += t.elapsed().as_secs_f64();
+                    programs = emitted.into_iter().map(Some).collect();
+                }
+                for j in 0..nodes {
+                    let program = match programs[j].take() {
+                        Some(program) => program,
+                        None => {
+                            while ready[lv][j].is_none() {
+                                let (l, jj, program, secs) = done_rx.recv().map_err(|_| {
+                                    format!("level {} node {j}: the node emitters stopped", lv + 1)
+                                })?;
+                                emit += secs;
+                                ready[l][jj] = Some(program);
+                            }
+                            ready[lv][j].take().expect("filled above")?
+                        }
+                    };
+                    let (artifacts, derived) = built(&program)?;
+                    self.put(&self.levels[lv][j], program, artifacts);
+                    if node_emit_early && !top {
+                        submit(&mut groupers, &job_tx, lv + 1, derived)?;
+                    } else {
+                        children.push(derived);
+                    }
+                }
+                level_at.push(start.elapsed().as_secs_f64());
             }
-            level_at.push(start.elapsed().as_secs_f64());
-        }
+            drop(job_tx);
+            Ok::<_, String>((leaves_at, level_at, emit))
+        })?;
         Ok(BuilderTimes {
             leaves: leaves_at,
             levels: level_at,
             emit,
             build: build_secs,
         })
+    }
+}
+
+/// Hands `child` to node level `lv`'s grouper and, once it completes a group,
+/// that group to the early node emitters.
+fn submit(
+    groupers: &mut [Grouper],
+    jobs: &std::sync::mpsc::Sender<(usize, usize, Vec<DerivedChild>)>,
+    lv: usize,
+    child: DerivedChild,
+) -> Result<(), String> {
+    if let Some((j, kids)) = groupers[lv].push(child) {
+        jobs.send((lv, j, kids))
+            .map_err(|_| format!("level {}: the node emitters stopped", lv + 1))?;
+    }
+    Ok(())
+}
+
+/// One node level's children in arrival order, cut into the level's groups as
+/// each group completes: what the early node emission submits.
+struct Grouper<T = DerivedChild> {
+    arities: Vec<usize>,
+    next: usize,
+    pending: Vec<T>,
+}
+
+impl<T> Grouper<T> {
+    fn new(arities: Vec<usize>) -> Self {
+        Self {
+            arities,
+            next: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Adds the next child; returns a group (its index and children) once the
+    /// child completes it.
+    fn push(&mut self, child: T) -> Option<(usize, Vec<T>)> {
+        self.pending.push(child);
+        let want = *self.arities.get(self.next)?;
+        (self.pending.len() == want).then(|| {
+            self.next += 1;
+            (self.next - 1, std::mem::take(&mut self.pending))
+        })
+    }
+
+    /// Every group submitted, no child left over.
+    fn is_complete(&self) -> bool {
+        self.next == self.arities.len() && self.pending.is_empty()
     }
 }
 
@@ -395,5 +539,30 @@ mod tests {
             assert_eq!(rx.recv().unwrap(), Err("leaf 7 does not emit".to_string()));
             assert!(rx.recv().is_err(), "nothing after the error");
         });
+    }
+
+    /// The early emission's grouper cuts a level's children into its groups in
+    /// order, a group as soon as its last child arrives, and is complete only
+    /// when every group is out and no child is left over.
+    #[test]
+    fn the_grouper_cuts_complete_groups_in_order() {
+        let mut g = Grouper::<usize>::new(vec![4, 4, 1]);
+        let mut cut = Vec::new();
+        for k in 0..9 {
+            assert!(!g.is_complete(), "child {k}: not complete yet");
+            if let Some((j, kids)) = g.push(k) {
+                cut.push((j, kids));
+            }
+        }
+        assert!(g.is_complete());
+        assert_eq!(
+            cut,
+            vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7]), (2, vec![8])]
+        );
+        let mut over = Grouper::<usize>::new(vec![2]);
+        assert_eq!(over.push(0), None);
+        assert_eq!(over.push(1), Some((0, vec![0, 1])));
+        assert_eq!(over.push(2), None, "a child past the last group");
+        assert!(!over.is_complete(), "a leftover child is not complete");
     }
 }

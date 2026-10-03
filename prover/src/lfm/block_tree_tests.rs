@@ -1280,6 +1280,19 @@ fn emit_pool_knob() -> usize {
     }
 }
 
+/// `NOEPOCH_TREE_NODE_EMIT=early`: in the pipeline mode, the builder emits each
+/// node's program as soon as its children's artifacts exist, during the level
+/// below; `level` or unset (the default) emits a level's programs together once
+/// the whole level below is built, which at the median block leaves the card
+/// idle 8.9 s between level 0's last hold and level 1's first (BIG 481).
+fn node_emit_early_knob() -> bool {
+    match std::env::var("NOEPOCH_TREE_NODE_EMIT").ok().as_deref() {
+        None | Some("" | "level") => false,
+        Some("early") => true,
+        Some(v) => panic!("NOEPOCH_TREE_NODE_EMIT must be early or level, got `{v}`"),
+    }
+}
+
 /// `NOEPOCH_TREE_EMIT_WINDOW=<W>`: in the pipeline mode, only the first W leaf
 /// programs are emitted beside the base; the builder emits the rest in leaf
 /// order, at most `2 × W` ahead of its artifact builds, on its own pool. Unset
@@ -2211,6 +2224,7 @@ fn the_block_tree_composes_to_a_top_node() {
     let tree_ahead = elf_beside.and(tree_ahead_mode());
     let emit_threads = emit_pool_knob();
     let emit_window = emit_window_knob();
+    let node_emit_early = node_emit_early_knob();
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
     // stays on as the tree's builder once `go` says the base is done.
@@ -2279,7 +2293,14 @@ fn the_block_tree_composes_to_a_top_node() {
             let _ = ready_tx.send((consts, secs, ahead));
             let (pipe, plan, leaves) = job?;
             go_rx.recv().ok()?;
-            Some(pipe.run_builder(&plan, leaves, &wrap, emit_threads, emit_window.unwrap_or(0)))
+            Some(pipe.run_builder(
+                &plan,
+                leaves,
+                &wrap,
+                emit_threads,
+                emit_window.unwrap_or(0),
+                node_emit_early,
+            ))
         })
     });
 
@@ -2533,6 +2554,14 @@ fn the_block_tree_composes_to_a_top_node() {
                     Some(w) =>
                         format!("emitted in a window of {w} (the first {w} beside the base)"),
                     None => "all emitted beside the base".to_string(),
+                }
+            );
+            println!(
+                "   TREE PIPE node emission: {}",
+                if node_emit_early {
+                    "early (each node once its children's artifacts exist)"
+                } else {
+                    "per level (each level once the level below is built)"
                 }
             );
         }
