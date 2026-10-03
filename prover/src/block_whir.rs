@@ -278,6 +278,11 @@ pub struct BlockOptions {
     /// ([`BlockCommitted::commit_groups`]); the commits and the proof's bytes
     /// are the same. Production: on.
     pub upload_ahead: bool,
+    /// With windows: the first group's tables go to the card as the packer
+    /// places them, into the store an upload of the closed group would make, so
+    /// its commit does not wait for the upload; the store, the commits and the
+    /// proof's bytes are the same. Production: on.
+    pub early_first_upload: bool,
     /// With windows: print where the host memory is, term by term, every half
     /// second and at each mark ([`memlog`]'s `BLOCK MEM` lines). A
     /// measurement; it moves no proof byte. Production reads
@@ -327,6 +332,7 @@ impl BlockOptions {
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
+            early_first_upload: true,
             memlog: memlog::from_env(),
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
@@ -387,6 +393,21 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
         Ok("card") => Some(Narrowing::CARD),
         Ok("host") => Some(Narrowing::Host),
         Ok(other) => panic!("BLOCK_WHIR_NARROW={other}: wide, card or host"),
+        Err(_) => None,
+    }
+}
+
+/// `BLOCK_WHIR_EARLY_FIRST=0|1`: the real-block tests' choice of
+/// [`BlockOptions::early_first_upload`]; `None` leaves the production one.
+#[cfg(test)]
+pub(crate) fn early_first_upload_from_env() -> Option<bool> {
+    match std::env::var("BLOCK_WHIR_EARLY_FIRST")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        Ok(other) => panic!("BLOCK_WHIR_EARLY_FIRST={other}: 0 or 1"),
         Err(_) => None,
     }
 }
@@ -563,13 +584,14 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3}{} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
                 s.wait_a,
                 s.upload_a,
                 s.upload_paid,
+                if s.early_store { " (early)" } else { "" },
                 s.commit,
                 s.retire,
                 s.committed_at - s.commit - s.retire,
@@ -1934,7 +1956,10 @@ struct Packer<'a> {
     open_shapes: Vec<(usize, usize)>,
     open_keys: Vec<Key>,
     group_keys: Vec<Vec<Key>>,
-    out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
+    out: std::sync::mpsc::SyncSender<multilinear_block::GroupIn<'a, F, E>>,
+    /// [`BlockOptions::early_first_upload`]: the first group's tables go to
+    /// the uploader as they are placed, and come back with its store at close.
+    early: Option<EarlyFirst<'a>>,
     cap: multilinear::whir_chain::StackVars,
     max_polys: usize,
     /// The prove's clock, when each group closed, and the seconds spent
@@ -1945,6 +1970,59 @@ struct Packer<'a> {
     /// A memory log, and the open group's bytes in it.
     ledger: Option<&'a memlog::Ledger>,
     open_bytes: usize,
+}
+
+/// The packer's end of the first group's uploader ([`early_first_uploader`]).
+struct EarlyFirst<'a> {
+    tables: std::sync::mpsc::Sender<CommittedTable<'a, F, E>>,
+    done: std::sync::mpsc::Receiver<EarlyDone<'a>>,
+}
+
+/// What the uploader hands back once the first group closes: its tables, in
+/// order, and their store when every one of them went up.
+type EarlyDone<'a> = (
+    Vec<CommittedTable<'a, F, E>>,
+    Option<(std::sync::Arc<multilinear::gpu::ResidentColumns>, f64)>,
+);
+
+/// The first group's uploader: each table the packer places in the first group
+/// is copied to the card as it arrives, into a store promised for the group's
+/// most cells (`capacity`), in placement order — the order, and so the
+/// offsets, an upload of the closed group would give. A narrow table, a
+/// refused promise or a failed copy leaves the group to be uploaded at close as
+/// before. Hands back the tables and the store with the seconds its copies
+/// took.
+fn early_first_uploader<'a>(
+    tables: std::sync::mpsc::Receiver<CommittedTable<'a, F, E>>,
+    done: std::sync::mpsc::SyncSender<EarlyDone<'a>>,
+    capacity: usize,
+) {
+    let mut builder: Option<multilinear::gpu::ResidentBuilder> = None;
+    let mut refused = false;
+    let mut held = Vec::new();
+    let mut secs = 0.0;
+    for table in tables {
+        if !refused {
+            let t = Instant::now();
+            if builder.is_none() {
+                builder = multilinear::gpu::ResidentBuilder::start(capacity);
+            }
+            let pushed = table.narrow().is_none()
+                && builder.as_mut().is_some_and(|b| b.push(table.columns()));
+            if !pushed {
+                refused = true;
+                builder = None;
+            }
+            secs += t.elapsed().as_secs_f64();
+        }
+        held.push(table);
+    }
+    let t = Instant::now();
+    let store = builder
+        .and_then(multilinear::gpu::ResidentBuilder::finish)
+        .map(std::sync::Arc::new);
+    secs += t.elapsed().as_secs_f64();
+    let _ = done.send((held, store.map(|store| (store, secs))));
 }
 
 impl<'a> Packer<'a> {
@@ -1960,7 +2038,7 @@ impl<'a> Packer<'a> {
         let polys = stark::multilinear_table::global_layout(&self.open_shapes, self.cap)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
             .num_polys();
-        if polys > self.max_polys && !self.open.is_empty() {
+        if polys > self.max_polys && !self.open_keys.is_empty() {
             self.open_shapes.clear();
             self.open_shapes.push(shape);
             self.close()?;
@@ -1978,7 +2056,16 @@ impl<'a> Packer<'a> {
                 .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             self.open_bytes += bytes;
         }
-        self.open.push(table);
+        match &self.early {
+            // The first group's tables go up as they are placed.
+            Some(early) if self.closed_at.is_empty() => {
+                early
+                    .tables
+                    .send(table)
+                    .map_err(|_| Error::Prover("the first group's uploader stopped".into()))?;
+            }
+            _ => self.open.push(table),
+        }
         self.open_keys.push(key);
         Ok(())
     }
@@ -1992,10 +2079,31 @@ impl<'a> Packer<'a> {
         }
         self.group_keys.push(std::mem::take(&mut self.open_keys));
         self.closed_at.push(self.start.elapsed().as_secs_f64());
+        let group = match self.early.take() {
+            // The first group: its tables, and their store once the last copy
+            // has landed (what the commit would otherwise wait for in full).
+            Some(EarlyFirst { tables, done }) => {
+                drop(tables);
+                let t = Instant::now();
+                let (tables, store) = done
+                    .recv()
+                    .map_err(|_| Error::Prover("the first group's uploader stopped".into()))?;
+                let paid = t.elapsed().as_secs_f64();
+                multilinear_block::GroupIn {
+                    tables,
+                    early: store.map(|(store, secs)| multilinear_block::EarlyStore {
+                        store,
+                        upload_secs: secs,
+                        paid_secs: paid,
+                    }),
+                }
+            }
+            None => std::mem::take(&mut self.open).into(),
+        };
         let t = Instant::now();
         let sent = self
             .out
-            .send(std::mem::take(&mut self.open))
+            .send(group)
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
         sent
@@ -2004,7 +2112,7 @@ impl<'a> Packer<'a> {
     /// Sends the last group; hands back every group's tables, when each
     /// closed and the seconds spent waiting on phase A.
     fn finish(mut self) -> Result<Packed, Error> {
-        if !self.open.is_empty() {
+        if !self.open_keys.is_empty() {
             self.close()?;
         }
         Ok((self.group_keys, self.closed_at, self.blocked))
@@ -2848,7 +2956,19 @@ fn prove_streamed(
                 ))
             });
 
-            let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
+            let (gtx, grx) =
+                std::sync::mpsc::sync_channel::<multilinear_block::GroupIn<'_, F, E>>(1);
+            // The first group's uploader, beside the packer.
+            let early = options.early_first_upload.then(|| {
+                let (etx, erx) = std::sync::mpsc::channel();
+                let (dtx, drx) = std::sync::mpsc::sync_channel(1);
+                let capacity = format.group_polys << cap.get();
+                scope.spawn(move || early_first_uploader(erx, dtx, capacity));
+                EarlyFirst {
+                    tables: etx,
+                    done: drx,
+                }
+            });
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
@@ -2861,6 +2981,7 @@ fn prove_streamed(
                     open_keys: Vec::new(),
                     group_keys: Vec::new(),
                     out: gtx,
+                    early,
                     cap,
                     max_polys: format.group_polys,
                     start,
@@ -3038,7 +3159,9 @@ fn prove_streamed(
             let block = BlockCommitted::commit_groups_logged::<H>(
                 grx.iter().inspect(|group| {
                     if let Some(ledger) = ledger {
-                        ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
+                        ledger
+                            .sent
+                            .fetch_sub(memlog::group_bytes(&group.tables), Relaxed);
                     }
                 }),
                 &commit_config,

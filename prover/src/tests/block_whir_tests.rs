@@ -58,6 +58,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         upload_ahead: true,
+        early_first_upload: true,
         memlog: false,
         // The rest laid out in waves of 1 MiB: several at a test's size.
         finish_keccak_rnd_chunks: true,
@@ -362,6 +363,59 @@ fn a_streamed_block_uploading_ahead_proves_and_verifies() {
         let proof = prove(&elf, &format, &o);
         assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
         assert!(verify(&proof, &elf, &format), "ahead {upload_ahead}");
+    }
+}
+
+/// The first group's tables put on the card as they are placed
+/// (`BlockOptions::early_first_upload`) move no byte of the proof: the early
+/// store holds the same words at the same places as the upload at close.
+/// Under both argue formats; byte-equal when the grind is deterministic. On a
+/// card the first group's commit reads the early store (its stamp says so);
+/// without one it falls back to the upload at close, and the bytes are those.
+#[test]
+fn the_first_group_uploaded_early_moves_no_byte_of_the_proof() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
+        let format = BlockFormat {
+            argue,
+            ..many_groups()
+        };
+        let proved = |early: bool| {
+            let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+            o.early_first_upload = early;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+            )
+            .expect("prove");
+            assert!(verify(&proof, &elf, &format), "early {early} {argue:?}");
+            assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+            // Only the first group can come with its store, and only early.
+            for (g, s) in stamps.groups.iter().enumerate() {
+                assert!(
+                    !s.early_store || (early && g == 0),
+                    "group {g}: early store"
+                );
+            }
+            if early && cfg!(feature = "cuda") && multilinear::gpu::reserve_budget() > 0 {
+                assert!(
+                    stamps.groups[0].early_store,
+                    "{argue:?}: no early store on a card"
+                );
+            }
+            rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .expect("serialize")
+                .to_vec()
+        };
+        let at_close = proved(false);
+        let early = proved(true);
+        if crypto::grinding::deterministic() {
+            assert_eq!(at_close, early, "{argue:?}");
+        }
     }
 }
 
@@ -2158,6 +2212,17 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
+    // `BLOCK_WHIR_EARLY_FIRST=0|1` (production 1): the first group's tables go
+    // to the card as they are placed. `LAMBDA_VM_FINISH_EARLY=0|1` (production
+    // 1): the windows' BITWISE sources are counted on a thread of their own.
+    if let Some(early) = crate::block_whir::early_first_upload_from_env() {
+        options.early_first_upload = early;
+    }
+    println!(
+        "BLOCK EARLY FIRST: {} · finish counted early: {}",
+        options.early_first_upload,
+        std::env::var("LAMBDA_VM_FINISH_EARLY").map_or(true, |v| v.trim() != "0")
+    );
     // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048),
     // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
     // (production 1): the rest's layout in waves, KECCAK_RND built as its
