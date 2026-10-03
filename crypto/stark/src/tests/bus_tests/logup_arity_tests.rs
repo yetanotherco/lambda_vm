@@ -56,6 +56,11 @@ fn interactions(pairs: usize, idle: usize) -> Vec<BusInteraction> {
 
 /// Random values, small random multiplicities, all-zero idle multiplicities.
 fn trace(pairs: usize, idle: usize, seed: u64) -> TraceTable<F, E> {
+    trace_rows(pairs, idle, seed, ROWS)
+}
+
+/// [`trace`] at `rows` rows.
+fn trace_rows(pairs: usize, idle: usize, seed: u64, rows: usize) -> TraceTable<F, E> {
     let mut state = seed;
     let mut next = || {
         state = state
@@ -65,12 +70,12 @@ fn trace(pairs: usize, idle: usize, seed: u64) -> TraceTable<F, E> {
     };
     let mut columns = Vec::new();
     for _ in 0..pairs {
-        columns.push((0..ROWS).map(|_| FE::from(next() % 7)).collect());
-        columns.push((0..ROWS).map(|_| FE::from(next())).collect());
+        columns.push((0..rows).map(|_| FE::from(next() % 7)).collect());
+        columns.push((0..rows).map(|_| FE::from(next())).collect());
     }
     for _ in 0..idle {
-        columns.push(vec![FE::zero(); ROWS]);
-        columns.push((0..ROWS).map(|_| FE::from(next())).collect());
+        columns.push(vec![FE::zero(); rows]);
+        columns.push((0..rows).map(|_| FE::from(next())).collect());
     }
     TraceTable::from_columns_main(columns, 1)
 }
@@ -221,12 +226,18 @@ fn where_the_rule_keeps_pairs_the_bytes_are_todays() {
 /// `L/N`, from `acc[0] = 0` around the cycle; `L` is the table's total.
 #[test]
 fn the_host_aux_build_sums_every_interaction_k4() {
+    check_aux_build_k4(ROWS);
+}
+
+/// The T0e check at `rows` rows (at 2^10 and above a `cuda` build takes the
+/// device term-column build).
+fn check_aux_build_k4(rows: usize) {
     let (pairs, idle) = (6, 1);
     let opts = options(4, LogUpPolicy::K4);
     let air = air(pairs, idle, &opts);
-    let mut t = trace(pairs, idle, 99);
+    let mut t = trace_rows(pairs, idle, 99, rows);
     // Give the idle sender multiplicities, so L ≠ 0.
-    for row in 0..ROWS {
+    for row in 0..rows {
         t.set_main(row, 2 * pairs, FE::from(row as u64 % 3));
     }
     let main: Vec<Vec<FE>> = t.columns_main();
@@ -249,14 +260,14 @@ fn the_host_aux_build_sums_every_interaction_k4() {
     };
     let groups = 3; // N = 13 at k = 4: 3 groups, 1 absorbed
     assert_eq!(air.trace_layout().1, groups + 1);
-    let row_totals: Vec<FE3> = (0..ROWS)
+    let row_totals: Vec<FE3> = (0..rows)
         .map(|row| {
             its.iter()
                 .map(|it| frac(it, row))
                 .fold(FE3::zero(), |a, b| a + b)
         })
         .collect();
-    for row in 0..ROWS {
+    for row in 0..rows {
         for g in 0..groups {
             let want = its[4 * g..4 * g + 4]
                 .iter()
@@ -268,10 +279,10 @@ fn the_host_aux_build_sums_every_interaction_k4() {
     let total = row_totals.iter().fold(FE3::zero(), |a, b| a + *b);
     assert_eq!(bus.table_contribution, total, "L is the table's total");
     assert_ne!(total, FE3::zero(), "the idle sender makes L non-zero");
-    let offset = total * FE3::from(ROWS as u64).inv().unwrap();
+    let offset = total * FE3::from(rows as u64).inv().unwrap();
     assert_eq!(*t.get_aux(0, groups), FE3::zero(), "acc[0] = 0");
     for (row, row_total) in row_totals.iter().enumerate() {
-        let step = *t.get_aux((row + 1) % ROWS, groups) - *t.get_aux(row, groups);
+        let step = *t.get_aux((row + 1) % rows, groups) - *t.get_aux(row, groups);
         assert_eq!(step, *row_total - offset, "accumulator step at row {row}");
     }
 }
@@ -396,4 +407,154 @@ fn the_verifier_refuses_more_parts_than_the_blowup() {
         !verifies(&over, &proof),
         "3 composition parts at blowup 2 must be refused"
     );
+}
+
+/// The four-part split on the card, against the host mirror. Every test here
+/// needs a GPU and fails loudly when the device path does not run:
+///
+/// ```text
+/// cargo test -p stark --release --features cuda --lib \
+///     tests::bus_tests::logup_arity_tests::device::d4_parts_ -- --ignored --test-threads=1
+/// LAMBDA_VM_GPU_LDE_THRESHOLD=1024 LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD=4096 \
+/// LAMBDA_VM_GPU_BARY_THRESHOLD=1024 cargo test -p stark --release --features cuda --lib \
+///     tests::bus_tests::logup_arity_tests::device::k4_device_only_ -- --ignored --test-threads=1
+/// ```
+#[cfg(feature = "cuda")]
+mod device {
+    use super::*;
+    use crate::domain::Domain;
+    use crate::examples::quadratic_air::QuadraticAIR;
+    use crate::prover::{IsStarkProver, LdeTwiddles, Prover};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn ext3_to_u64(v: &[FE3]) -> Vec<u64> {
+        v.iter()
+            .flat_map(|e| {
+                let [a, b, c] = e.value();
+                [*a.value(), *b.value(), *c.value()]
+            })
+            .collect()
+    }
+
+    /// ★ For trace lengths 2^8 … 2^21 at blowup 4: on random `H` (any
+    /// values: the split is pointwise and the extension takes any `q` points),
+    /// the device split and ×4 extension equal the host mirror limb for limb,
+    /// both drained to host and read back from the resident handle.
+    #[test]
+    #[ignore = "requires a GPU; run with --features cuda -- --ignored"]
+    fn d4_parts_equal_the_host_split() {
+        let opts = options(4, LogUpPolicy::K4);
+        let air = QuadraticAIR::<F>::new(&opts);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for log_n in 8..=21 {
+            let n = 1usize << log_n;
+            let domain = Domain::new(&air, n);
+            let twiddles = LdeTwiddles::new(&domain);
+            let lde = 4 * n;
+            let h: Vec<FE3> = (0..lde)
+                .map(|_| {
+                    let mut limb = || {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        FE::from(state)
+                    };
+                    FE3::new([limb(), limb(), limb()])
+                })
+                .collect();
+            let host = <Prover<F, E, ()> as IsStarkProver<
+                F,
+                E,
+                (),
+                crate::config::Blake3StarkHash,
+            >>::decompose_and_extend_d4(&h, &domain, &twiddles);
+            let raw = ext3_to_u64(&h);
+            for want_host in [true, false] {
+                let h_dev = math_cuda::constraint_interp::upload_comp_h(&raw).expect("upload H");
+                let before = crate::gpu_lde::GPU_DECOMPOSE_D4_CALLS.load(Relaxed);
+                let (parts, handle) = crate::gpu_lde::try_decompose_extend_d4_dev::<F, E>(
+                    &h_dev,
+                    twiddles.inv_2x(&domain),
+                    twiddles.inv_2y(&domain),
+                    twiddles.d4_weights(&domain),
+                    want_host,
+                )
+                .unwrap_or_else(|| panic!("n=2^{log_n}: the device split declined"));
+                assert_eq!(
+                    crate::gpu_lde::GPU_DECOMPOSE_D4_CALLS.load(Relaxed),
+                    before + 1
+                );
+                assert_eq!((handle.m, handle.lde_size), (4, lde));
+                let resident = crate::gpu_lde::download_ext3_columns::<E>(&handle)
+                    .expect("download the resident parts");
+                assert!(resident == host, "n=2^{log_n}: resident parts differ");
+                if want_host {
+                    assert!(parts == host, "n=2^{log_n}: drained parts differ");
+                } else {
+                    assert!(parts.iter().all(Vec::is_empty), "device-only placeholders");
+                }
+            }
+            println!("D4PARITY n=2^{log_n} lde={lde}: device == host (drained and resident)");
+        }
+    }
+
+    /// The k = 4 aux build through the device term-column kernels (groups of
+    /// four in the descriptor) equals the per-interaction host reference.
+    #[test]
+    #[ignore = "requires a GPU; run with --features cuda -- --ignored"]
+    fn d4_parts_gpu_aux_build_groups_by_four() {
+        for rows in [1usize << 10, 1 << 13] {
+            let before = crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed);
+            check_aux_build_k4(rows);
+            assert!(
+                crate::gpu_lde::GPU_LOGUP_CALLS.load(Relaxed) > before,
+                "rows {rows}: the device aux build did not run"
+            );
+            println!("D4AUX rows={rows}: device k4 aux build == host reference");
+        }
+    }
+
+    /// ★ A k = 4 table proved device-only (device composition, device four-part
+    /// split, resident parts) is the host-composition proof byte for byte, and
+    /// verifies. Needs the device-only envelope lowered to the test's sizes.
+    #[test]
+    #[ignore = "requires a GPU and lowered GPU thresholds; see the module doc"]
+    fn k4_device_only_proof_equals_the_host_composition_proof() {
+        for (pairs, idle, rows) in [
+            (6usize, 1usize, 1usize << 10),
+            (7, 1, 1 << 12),
+            (10, 0, 1 << 11),
+        ] {
+            let air = air(pairs, idle, &options(4, LogUpPolicy::K4));
+            assert_eq!(num_parts(&air), 4);
+            let t = || trace_rows(pairs, idle, rows as u64, rows);
+            crate::gpu_lde::set_gpu_composition_disabled(true);
+            crate::gpu_lde::set_device_only_disabled(true);
+            let host = prove(&air, t());
+            crate::gpu_lde::set_gpu_composition_disabled(false);
+            crate::gpu_lde::set_device_only_disabled(false);
+            let d4 = crate::gpu_lde::GPU_DECOMPOSE_D4_CALLS.load(Relaxed);
+            let dev_only = crate::gpu_lde::gpu_device_only_calls();
+            let device = prove(&air, t());
+            assert!(
+                crate::gpu_lde::GPU_DECOMPOSE_D4_CALLS.load(Relaxed) > d4,
+                "rows {rows}: the device four-part split did not run"
+            );
+            assert!(
+                crate::gpu_lde::gpu_device_only_calls() > dev_only,
+                "rows {rows}: the table was not device-only"
+            );
+            assert!(verifies(&air, &host), "rows {rows}: host proof");
+            assert!(verifies(&air, &device), "rows {rows}: device proof");
+            assert!(
+                proof_bytes(&device) == proof_bytes(&host),
+                "rows {rows}: the device proof differs from the host-composition proof"
+            );
+            println!(
+                "D4PROOF N={} rows={rows}: device-only proof == host proof ({} bytes), verifies",
+                2 * pairs + idle,
+                proof_bytes(&device).len()
+            );
+        }
+    }
 }

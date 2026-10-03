@@ -1425,10 +1425,17 @@ mod tests {
                 .unimplemented_levers()
                 .is_empty()
         );
-        // Until the card splits four composition parts, `k4` must abort.
-        const { assert!(!stark::proof::options::LOGUP_K4_IMPLEMENTED) };
+        // The card splits four composition parts: `k4` is selectable. Three
+        // parts have no device split yet: `k3` and `best` must abort.
+        const { assert!(stark::proof::options::LOGUP_K4_IMPLEMENTED) };
         const { assert!(!stark::proof::options::LOGUP_K3_IMPLEMENTED) };
-        for v in ["k3", "k4", "best"] {
+        assert!(
+            parse(&[(ENV_LOGUP, "k4")])
+                .unwrap()
+                .unimplemented_levers()
+                .is_empty()
+        );
+        for v in ["k3", "best"] {
             assert_eq!(
                 parse(&[(ENV_LOGUP, v)]).unwrap().unimplemented_levers(),
                 vec![ENV_LOGUP],

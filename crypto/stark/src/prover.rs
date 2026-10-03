@@ -787,6 +787,13 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     composition: OnceLock<CompositionLdeTwiddles<F>>,
     /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition — see [`Self::inv_2x`].
     inv_2x: OnceLock<Arc<Vec<FieldElement<F>>>>,
+    /// Four-part decomposition caches (a degree-5 AIR), each built on first
+    /// use: the part-extension weights ([`Self::d4_weights`]), `1/(2·g²·ω²ⁱ)`
+    /// ([`Self::inv_2y`]) and the host extension twiddles
+    /// ([`Self::d4_layer_twiddles`]).
+    d4_weights: OnceLock<Vec<FieldElement<F>>>,
+    inv_2y: OnceLock<Arc<Vec<FieldElement<F>>>>,
+    d4_layer_twiddles: OnceLock<(LayerTwiddles<F>, LayerTwiddles<F>)>,
 }
 
 pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
@@ -880,6 +887,9 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             coset_weights,
             composition: OnceLock::new(),
             inv_2x: OnceLock::new(),
+            d4_weights: OnceLock::new(),
+            inv_2y: OnceLock::new(),
+            d4_layer_twiddles: OnceLock::new(),
         }
     }
 
@@ -908,7 +918,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
     /// domain (an LDE/2-size batch inversion per table per epoch otherwise).
     /// `Arc`'d so the device-resident copy can pin it (see
     /// `gpu_interp::base_vec_device_handle`).
-    fn inv_2x(&self, domain: &Domain<F>) -> &Arc<Vec<FieldElement<F>>> {
+    pub(crate) fn inv_2x(&self, domain: &Domain<F>) -> &Arc<Vec<FieldElement<F>>> {
         self.inv_2x.get_or_init(|| {
             let n = domain.lde_roots_of_unity_coset.len() / 2;
             let mut inv: Vec<FieldElement<F>> = (0..n)
@@ -920,6 +930,57 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             FieldElement::inplace_batch_inverse_sequential(&mut inv)
                 .expect("Coset points are non-zero");
             Arc::new(inv)
+        })
+    }
+
+    /// Weights `(g⁻³)ʲ/q`, `q = lde_size/4`, for the four-part extension: a part
+    /// lives on the g⁴-coset of `q` points, the unnormalized iFFT yields
+    /// `q·cⱼ·(g⁴)ʲ`, and these weights turn that into `cⱼ·gʲ` for the forward
+    /// FFT onto the g-coset (the degree-2 analogue is `g⁻ʲ/(lde_size/2)`).
+    pub(crate) fn d4_weights(&self, domain: &Domain<F>) -> &Vec<FieldElement<F>> {
+        self.d4_weights.get_or_init(|| {
+            let q = domain.interpolation_domain_size * domain.blowup_factor / 4;
+            let g = &domain.coset_offset;
+            let ratio = (g * g * g).inv().expect("the coset offset is non-zero");
+            let mut cur = FieldElement::<F>::from(q as u64)
+                .inv()
+                .expect("q is a power of two");
+            let mut w = Vec::with_capacity(q);
+            for _ in 0..q {
+                w.push(cur.clone());
+                cur = &cur * &ratio;
+            }
+            w
+        })
+    }
+
+    /// `1/(2·g²·ω²ⁱ)` for `i < lde_size/4`: the second radix-2 split of the
+    /// four-part decomposition runs on the g²-coset `yᵢ = (g·ωⁱ)²`, where
+    /// `−yᵢ = yᵢ₊q`.
+    pub(crate) fn inv_2y(&self, domain: &Domain<F>) -> &Arc<Vec<FieldElement<F>>> {
+        self.inv_2y.get_or_init(|| {
+            let q = domain.lde_roots_of_unity_coset.len() / 4;
+            let mut inv: Vec<FieldElement<F>> = (0..q)
+                .map(|i| domain.lde_roots_of_unity_coset[i].square().double())
+                .collect();
+            // Sequential, as in `inv_2x`.
+            FieldElement::inplace_batch_inverse_sequential(&mut inv)
+                .expect("Coset points are non-zero");
+            Arc::new(inv)
+        })
+    }
+
+    /// The host four-part extension's inverse (size `lde_size/4`) and forward
+    /// (size `lde_size`) twiddles.
+    fn d4_layer_twiddles(&self, domain: &Domain<F>) -> &(LayerTwiddles<F>, LayerTwiddles<F>) {
+        self.d4_layer_twiddles.get_or_init(|| {
+            let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+            (
+                LayerTwiddles::<F>::new_inverse((lde_size / 4).trailing_zeros() as u64)
+                    .expect("valid four-part inverse twiddles"),
+                LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
+                    .expect("valid four-part forward twiddles"),
+            )
         })
     }
 }
@@ -2484,22 +2545,24 @@ pub trait IsStarkProver<
         //  - The composition path needs a uniform zerofier with ≥1 group. An
         //    empty constraint set makes `all(end_exemptions == 0)` vacuously
         //    true here but `is_uniform()` false downstream (0 groups).
-        //  - Device-only is entered only for the d=2 quotient decomposition,
-        //    checked below once `n` is in hand. A d=1 table also has a device R2
-        //    path, but the gate below excludes it, so it stays device-additive.
+        //  - Device-only is entered only for the d=2 and d=4 quotient
+        //    decompositions, checked below once `n` is in hand. A d=1 table also
+        //    has a device R2 path, but the gate below excludes it, so it stays
+        //    device-additive.
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
             return false;
         }
         let n = domain.interpolation_domain_size;
-        // Only the d=2 quotient decomposition has a device-resident R2 path that
-        // can serve every downstream consumer from the handle alone. A d=1 table
-        // does have a device R2 path, but it always drains its single part to host
-        // (the query-0 composition canary reads it), so it gains nothing from
-        // dropping the host trace and this gate keeps it device-additive. Any other
-        // part count has no device R2 path at all and needs the host evaluator,
-        // which device-only would leave without data until the R2 downgrade
-        // recovered it.
-        if air.composition_poly_degree_bound(n) / n != 2 {
+        // Only the d=2 and d=4 quotient decompositions have a device-resident R2
+        // path that can serve every downstream consumer from the handle alone
+        // (d=4: the radix-2 split applied twice, a LogUp-k4 table's degree 5). A
+        // d=1 table does have a device R2 path, but it always drains its single
+        // part to host (the query-0 composition canary reads it), so it gains
+        // nothing from dropping the host trace and this gate keeps it
+        // device-additive. Any other part count has no device R2 path at all and
+        // needs the host evaluator, which device-only would leave without data
+        // until the R2 downgrade recovered it.
+        if !matches!(air.composition_poly_degree_bound(n) / n, 2 | 4) {
             return false;
         }
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
@@ -3308,7 +3371,8 @@ pub trait IsStarkProver<
 
     /// Decompose the resident composition `H` into device-resident parts per the
     /// AIR's part count: the trivial d=1 de-interleave (`H` is the single part on
-    /// the LDE coset) or the d=2 quotient split H₀/H₁. Both keep the parts
+    /// the LDE coset), the d=2 quotient split H₀/H₁ or the d=4 split H₀..H₃. All
+    /// keep the parts
     /// device-resident — the commit tree and the R4 openings read `handle.m`, while
     /// R3 and R4 DEEP read the host part Vec's length (see
     /// [`crate::gpu_lde::try_comp_h_to_slabs_dev`] for the invariant that ties the
@@ -3329,7 +3393,7 @@ pub trait IsStarkProver<
     )> {
         if number_of_parts == 1 {
             // d=1 is never device-only (`device_only_for`'s degree gate admits only
-            // d=2), so the single part is always kept on host — `want_host` must
+            // d=2 and d=4), so the single part is always kept on host — `want_host` must
             // hold, and the d=1 helper ignores it by design.
             debug_assert!(
                 want_host,
@@ -3344,6 +3408,14 @@ pub trait IsStarkProver<
                 "d=1 H row count must equal the LDE domain size"
             );
             crate::gpu_lde::try_comp_h_to_slabs_dev::<Field, FieldExtension>(h_dev)
+        } else if number_of_parts == 4 {
+            crate::gpu_lde::try_decompose_extend_d4_dev::<Field, FieldExtension>(
+                h_dev,
+                twiddles.inv_2x(domain),
+                twiddles.inv_2y(domain),
+                twiddles.d4_weights(domain),
+                want_host,
+            )
         } else {
             crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
                 h_dev,
@@ -3442,6 +3514,60 @@ pub trait IsStarkProver<
         .expect("coset extension")
     }
 
+    /// Algebraically decompose `H(x) = H₀(x⁴) + x·H₁(x⁴) + x²·H₂(x⁴) + x³·H₃(x⁴)`
+    /// on the LDE coset — the four parts of a degree-5 AIR, exactly
+    /// `break_in_parts(4)` — and extend each part to the full LDE domain. The
+    /// radix-2 split of [`Self::decompose_and_extend_d2`] applied twice: with
+    /// `q = lde_size/4`, `xᵢ = g·ωⁱ` (`−xᵢ = xᵢ₊₂q`) and `yᵢ = xᵢ²` (`−yᵢ = yᵢ₊q`),
+    ///   A(y) = (H(x) + H(−x)) / 2   = H₀(y²) + y·H₂(y²)
+    ///   B(y) = (H(x) − H(−x)) / (2x) = H₁(y²) + y·H₃(y²)
+    ///   H₀(y²) = (A(y) + A(−y)) / 2,  H₂(y²) = (A(y) − A(−y)) / (2y), and B alike.
+    /// Each part is then `q` evaluations on the g⁴-coset of a polynomial of degree
+    /// `< q`, extended ×4. The host mirror of
+    /// [`crate::gpu_lde::try_decompose_extend_d4_dev`], limb for limb.
+    fn decompose_and_extend_d4(
+        constraint_evaluations: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> Vec<Vec<FieldElement<FieldExtension>>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let lde_size = constraint_evaluations.len();
+        let q = lde_size / 4;
+        debug_assert_eq!(lde_size, q * 4);
+        let h = constraint_evaluations;
+        let inv_2x = twiddles.inv_2x(domain);
+        let inv_2y = twiddles.inv_2y(domain);
+        debug_assert!(inv_2x.len() >= 2 * q && inv_2y.len() >= q);
+        let two_inv = FieldElement::<Field>::from(2u64)
+            .inv()
+            .expect("2 is non-zero in the field");
+
+        let rows = crate::par::par_map_collect(0..q, |i| {
+            let (r1, r2, r3) = (i + q, i + 2 * q, i + 3 * q);
+            let a0 = &two_inv * &(&h[i] + &h[r2]);
+            let b0 = &inv_2x[i] * &(&h[i] - &h[r2]);
+            let a1 = &two_inv * &(&h[r1] + &h[r3]);
+            let b1 = &inv_2x[r1] * &(&h[r1] - &h[r3]);
+            [
+                &two_inv * &(&a0 + &a1),
+                &two_inv * &(&b0 + &b1),
+                &inv_2y[i] * &(&a0 - &a1),
+                &inv_2y[i] * &(&b0 - &b1),
+            ]
+        });
+        let weights = twiddles.d4_weights(domain);
+        let (inv, fwd) = twiddles.d4_layer_twiddles(domain);
+        crate::par::par_map_collect(0..4, |j| {
+            let part: Vec<FieldElement<FieldExtension>> =
+                rows.iter().map(|r| r[j].clone()).collect();
+            Polynomial::coset_lde_full::<Field>(&part, 4, weights, inv, fwd)
+                .expect("four-part coset extension")
+        })
+    }
+
     /// The evaluations of the composition-polynomial parts over the LDE domain,
     /// and nothing else — no commitment.
     ///
@@ -3500,8 +3626,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let mut downloaded_h: Option<Vec<FieldElement<FieldExtension>>> = None;
         #[cfg(feature = "cuda")]
-        if (number_of_parts == 1 || number_of_parts == 2) && !crate::gpu_lde::gpu_force_downgrade()
-        {
+        if matches!(number_of_parts, 1 | 2 | 4) && !crate::gpu_lde::gpu_force_downgrade() {
             // Serializing this window across tables (device constraint eval +
             // decompose, where H is born) empirically eliminates a transient
             // whole-buffer H corruption seen under concurrent R2 windows on
@@ -3522,7 +3647,7 @@ pub trait IsStarkProver<
             ) {
                 let want_host = !lde_trace.host_trace_empty();
                 // num_parts==1 de-interleaves `H` (the single part); num_parts==2
-                // runs the degree-2 quotient split. Both keep the parts resident.
+                // and 4 run the quotient splits. All keep the parts resident.
                 match Self::decompose_comp_h_dev(
                     number_of_parts,
                     &h_dev,
@@ -3544,11 +3669,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         if let Some(h) = downloaded_h.take() {
             // num_parts==1: the downloaded `H` IS the single part (no host
-            // decompose); num_parts==2: run the host degree-2 split + extend.
-            precomputed_parts = Some(if number_of_parts == 1 {
-                vec![h]
-            } else {
-                Self::decompose_and_extend_d2(&h, domain, twiddles)
+            // decompose); num_parts==2 / 4: run the host split + extend.
+            precomputed_parts = Some(match number_of_parts {
+                1 => vec![h],
+                4 => Self::decompose_and_extend_d4(&h, domain, twiddles),
+                _ => Self::decompose_and_extend_d2(&h, domain, twiddles),
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -3619,6 +3744,17 @@ pub trait IsStarkProver<
                 rap_challenges,
             );
             Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+        } else if number_of_parts == 4 {
+            // The four-part split (a degree-5 AIR), the radix-2 split twice.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                rap_challenges,
+            );
+            Self::decompose_and_extend_d4(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![evaluator.evaluate(
@@ -3630,7 +3766,7 @@ pub trait IsStarkProver<
                 rap_challenges,
             )]
         } else {
-            // Fallback for any future AIR with d > 2.
+            // Fallback for any other part count (3, or past 4).
             let constraint_evaluations = evaluator.evaluate(
                 air,
                 lde_trace,
@@ -7096,13 +7232,14 @@ pub trait IsStarkProver<
             boundary_coefficients,
             &round_1_result.rap_challenges,
         );
-        // num_parts==1: `H` IS the single part (no host decompose); num_parts==2:
-        // the degree-2 split. Mirrors the R2 producer so the compare is apples-to-apples.
+        // num_parts==1: `H` IS the single part (no host decompose); num_parts==2 /
+        // 4: the quotient splits. Mirrors the R2 producer so the compare is
+        // apples-to-apples.
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
-        let host_parts = if number_of_parts == 1 {
-            vec![host_h]
-        } else {
-            Self::decompose_and_extend_d2(&host_h, domain, twiddles)
+        let host_parts = match number_of_parts {
+            1 => vec![host_h],
+            4 => Self::decompose_and_extend_d4(&host_h, domain, twiddles),
+            _ => Self::decompose_and_extend_d2(&host_h, domain, twiddles),
         };
         let device_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = if round_2_result
             .lde_composition_poly_evaluations

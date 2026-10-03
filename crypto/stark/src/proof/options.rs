@@ -388,19 +388,22 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 pub const ONE_ROW_IMPLEMENTED: bool = true;
 
 /// [`LogUpPolicy::K4`] (four interactions per column, degree-5 groups, four
-/// composition parts) is implemented on the host: the layout, the group
-/// constraints (one body for the prover folder, the verifier folder and the
-/// IR capture, so the in-guest verifier follows), the host and device aux
-/// builds, and the host composition arm for any part count.
-///
-/// NOT implemented: the device composition decomposition into four parts. A
-/// four-part table has no device R2 path, so it is never device-only and its
-/// composition runs on the host. Flipped when the card splits four parts.
-pub const LOGUP_K4_IMPLEMENTED: bool = false;
+/// composition parts) is implemented:
+/// - the layout and the group constraints: one body for the prover folder,
+///   the verifier folder and the IR capture, so the in-guest (LFM) verifier
+///   and the device interpreter follow;
+/// - the host and device aux builds (the descriptor groups by arity);
+/// - the composition's four-part split on the host
+///   (`decompose_and_extend_d4`) and on the card
+///   (`gpu_lde::try_decompose_extend_d4_dev`, the radix-2 split twice), so a
+///   four-part table may be device-only like a two-part one;
+/// - the host verifier, which refuses an AIR whose parts exceed the blowup.
+pub const LOGUP_K4_IMPLEMENTED: bool = true;
 
 /// [`LogUpPolicy::K3`] and [`LogUpPolicy::Best`]: as for `K4`, plus the three
 /// composition parts a degree-4 group needs. NOT implemented on the device
-/// (three parts have no radix-2 split).
+/// (three parts have no radix-2 split): a three-part table is never
+/// device-only and composes on the host.
 pub const LOGUP_K3_IMPLEMENTED: bool = false;
 
 impl ProofOptions {
