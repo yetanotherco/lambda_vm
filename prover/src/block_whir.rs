@@ -1418,6 +1418,7 @@ pub(crate) fn prove_block_whir_with(
         options,
         deviations,
         &|_, _| {},
+        &|_| {},
     )
 }
 
@@ -1429,6 +1430,11 @@ pub type StatementObserver<'a> = &'a (dyn Fn(BlockStatement<'_>, &[PreparedRoots
 /// A group with a prepared stack, and its stack's roots.
 pub type PreparedRoots = (usize, Vec<multilinear::whir_commit::Commitment>);
 
+/// What a caller is handed as each group's opening ends in phase B: that
+/// group's share of the proof ([`multilinear_block::GroupOpened`]), so the
+/// recursion's leaves over finished groups can start before phase B ends.
+pub type GroupObserver<'a> = &'a (dyn Fn(multilinear_block::GroupOpened<'_, F, E>) + Sync);
+
 /// [`prove_block_whir`], calling `on_statement` as soon as the statement is
 /// final, so a caller can derive the recursion's programs while phase B runs.
 pub fn prove_block_whir_observed(
@@ -1439,6 +1445,28 @@ pub fn prove_block_whir_observed(
     options: &BlockOptions,
     on_statement: StatementObserver<'_>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_observed_groups(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        on_statement,
+        &|_| {},
+    )
+}
+
+/// [`prove_block_whir_observed`], also calling `on_group` as each group's
+/// opening ends ([`GroupObserver`]). The observers read; the proof is the same.
+pub fn prove_block_whir_observed_groups(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
     prove_block_whir_inner(
         elf_bytes,
         private_inputs,
@@ -1447,6 +1475,7 @@ pub fn prove_block_whir_observed(
         options,
         &Deviations::default(),
         on_statement,
+        on_group,
     )
 }
 
@@ -1469,9 +1498,11 @@ pub(crate) fn prove_block_whir_observed_with(
         options,
         deviations,
         on_statement,
+        &|_| {},
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prove_block_whir_inner(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -1480,6 +1511,7 @@ fn prove_block_whir_inner(
     options: &BlockOptions,
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
@@ -1495,6 +1527,7 @@ fn prove_block_whir_inner(
             options,
             deviations,
             on_statement,
+            on_group,
             &mut stamps,
         )?;
         return Ok((proof, stamps));
@@ -2575,6 +2608,7 @@ fn prove_streamed(
     options: &BlockOptions,
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
     let stream_airs = StreamAirs::new(opts);
@@ -3063,7 +3097,7 @@ fn prove_streamed(
             None => &identity,
         };
         let (proof, argues, prepared_openings, groups) =
-            multilinear_block::block_prove_on_forks::<_, _, _, H>(
+            multilinear_block::block_prove_on_forks_observed::<_, _, _, H>(
                 block,
                 &config,
                 &mut transcript,
@@ -3071,6 +3105,7 @@ fn prove_streamed(
                 &tampered,
                 fork_of,
                 &deviations.argue,
+                on_group,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();

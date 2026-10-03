@@ -1284,76 +1284,122 @@ pub fn block_leaf_arena(
     proof: &BlockWhirProof,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
-    let frame = &plan.frame;
-    let refs = frame.airs.air_refs();
-    let mut words: Vec<LfmWord> = proof
-        .proof
-        .roots
-        .iter()
-        .map(super::algebraic_commit::commitment_to_digest)
-        .collect();
+    let mut groups = Vec::with_capacity(plan.partition.leaf(k).len());
     for &g in plan.partition.leaf(k) {
-        let tables = &plan.groups[g];
-        let owned = Shapes::build(&refs, &frame.shapes, tables)?;
         let start = plan.group_start(g);
-        match batched_cap(&frame.config) {
-            None => {
-                for (slot, shape) in owned.table_shapes().iter().enumerate() {
-                    let table = proof
-                        .proof
-                        .tables
-                        .get(start + slot)
-                        .ok_or("the proof is short of tables")?;
-                    let before = words.len();
-                    push_table_words(&mut words, table);
-                    if words.len() - before != table_words(shape) {
-                        return Err(format!(
-                            "table {} carries {} words, its shape {}",
-                            tables[slot],
-                            words.len() - before,
-                            table_words(shape)
-                        ));
-                    }
-                }
-            }
-            Some(cap) => {
-                let argue = proof
-                    .argues
-                    .get(g)
-                    .ok_or("the proof is short of batched argues")?;
-                let shapes = owned.table_shapes();
-                let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(cap));
-                let before = words.len();
-                super::whir_batch::push_batched_words(&mut words, argue);
-                if words.len() - before != expected {
-                    return Err(format!(
-                        "group {g}'s batched argue carries {} words, its shapes {expected}",
-                        words.len() - before
-                    ));
-                }
-            }
-        }
-        let layout = &frame.stack_layouts[g];
-        let chain = ChainShape::new(&frame.config, layout.n_stack());
+        let tables = match batched_cap(&plan.frame.config) {
+            None => proof
+                .proof
+                .tables
+                .get(start..start + plan.groups[g].len())
+                .ok_or("the proof is short of tables")?,
+            Some(_) => &[],
+        };
+        let prepared = match plan.prepared.iter().position(|p| p.group == g) {
+            Some(index) => Some(
+                proof
+                    .prepared
+                    .get(index)
+                    .ok_or("the proof is short of prepared openings")?,
+            ),
+            None => None,
+        };
         let opening = proof
             .proof
             .columns
             .get(g)
             .ok_or("the proof is short of openings")?;
-        push_chains(&mut words, opening, layout.num_polys(), &chain)?;
-        for (index, p) in plan.prepared.iter().enumerate() {
-            if p.group != g {
-                continue;
+        groups.push(group_arena_words(
+            plan,
+            g,
+            tables,
+            proof.argues.get(g),
+            opening,
+            prepared,
+        )?);
+    }
+    Ok(leaf_arena(&proof.proof.roots, groups))
+}
+
+/// A leaf's arena from the block's roots and its groups' words
+/// ([`group_arena_words`]), in the leaf's group order.
+pub fn leaf_arena(roots: &[Commitment], groups: Vec<Vec<LfmWord>>) -> Vec<Vec<LfmWord>> {
+    let mut words: Vec<LfmWord> = roots
+        .iter()
+        .map(super::algebraic_commit::commitment_to_digest)
+        .collect();
+    for group in groups {
+        words.extend(group);
+    }
+    vec![words]
+}
+
+/// Group `g`'s words of a leaf's arena, from its share of the proof alone: its
+/// tables' proofs (the per-table format) or its batched argue, its opening and
+/// its prepared opening. A group's words depend on nothing else, so a leaf can
+/// be fed each group as phase B finishes it. Refuses the shapes the plan does
+/// not derive, as [`block_leaf_arena`] does.
+pub fn group_arena_words(
+    plan: &WhirBlockPlan,
+    g: usize,
+    tables: &[stark::multilinear_table::TableProof<GoldilocksExtension>],
+    argue: Option<&stark::multilinear_table::BatchedArgue<GoldilocksExtension>>,
+    opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    prepared: Option<
+        &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    >,
+) -> Result<Vec<LfmWord>, String> {
+    let frame = &plan.frame;
+    let refs = frame.airs.air_refs();
+    let group_tables = plan.groups.get(g).ok_or("a group the plan does not hold")?;
+    let owned = Shapes::build(&refs, &frame.shapes, group_tables)?;
+    let mut words = Vec::new();
+    match batched_cap(&frame.config) {
+        None => {
+            for (slot, shape) in owned.table_shapes().iter().enumerate() {
+                let table = tables.get(slot).ok_or("the proof is short of tables")?;
+                let before = words.len();
+                push_table_words(&mut words, table);
+                if words.len() - before != table_words(shape) {
+                    return Err(format!(
+                        "table {} carries {} words, its shape {}",
+                        group_tables[slot],
+                        words.len() - before,
+                        table_words(shape)
+                    ));
+                }
             }
-            let shape = ChainShape::new(&frame.config, p.layout.n_stack());
-            let opening = proof
-                .prepared
-                .get(index)
-                .ok_or("the proof is short of prepared openings")?;
-            push_chains(&mut words, opening, p.layout.num_polys(), &shape)?;
+        }
+        Some(cap) => {
+            let argue = argue.ok_or("the proof is short of batched argues")?;
+            let shapes = owned.table_shapes();
+            let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(cap));
+            super::whir_batch::push_batched_words(&mut words, argue);
+            if words.len() != expected {
+                return Err(format!(
+                    "group {g}'s batched argue carries {} words, its shapes {expected}",
+                    words.len()
+                ));
+            }
         }
     }
-    Ok(vec![words])
+    let layout = &frame.stack_layouts[g];
+    let chain = ChainShape::new(&frame.config, layout.n_stack());
+    push_chains(&mut words, opening, layout.num_polys(), &chain)?;
+    let mut planned = plan.prepared.iter().filter(|p| p.group == g);
+    match (planned.next(), prepared) {
+        (Some(p), Some(opening)) => {
+            let shape = ChainShape::new(&frame.config, p.layout.n_stack());
+            push_chains(&mut words, opening, p.layout.num_polys(), &shape)?;
+        }
+        (Some(_), None) => return Err("the proof is short of prepared openings".to_string()),
+        (None, Some(_)) => return Err(format!("a prepared opening for group {g}, which has none")),
+        (None, None) => {}
+    }
+    if planned.next().is_some() {
+        return Err(format!("group {g} plans more than one prepared stack"));
+    }
+    Ok(words)
 }
 
 /// One opening's chains: per polynomial its final value, then its rounds.
