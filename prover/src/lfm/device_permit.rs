@@ -46,8 +46,9 @@
 //!
 //! # Under one shared gate, no exclusion
 //!
-//! With `LAMBDA_VM_SHARED_VRAM_GATE=1` (`stark::prover::shared_vram_gate_on`)
-//! both device paths above take their bytes from ONE process-wide
+//! By default (`stark::prover::shared_vram_gate_on`; `LAMBDA_VM_SHARED_VRAM_GATE=0`
+//! restores the exclusive card) both device paths above take their bytes from
+//! ONE process-wide
 //! `VramGate`: every `multi_prove` admits its tables through it, and the
 //! artifact commit admits its device set through it
 //! (`commit_group_device_or_host_with`). That is the cross-proof running total
@@ -541,6 +542,8 @@ mod tests {
         const HOLD: std::time::Duration = std::time::Duration::from_millis(200);
         let g = ARM.lock().expect("the arm guard is never poisoned");
         disarm(&g);
+        // The exclusive card, which the shared gate (on by default) replaces.
+        stark::prover::pin_shared_vram_gate(Some(false));
         arm(2);
 
         let first_is_in = std::sync::Barrier::new(2);
@@ -599,6 +602,7 @@ mod tests {
             "both workers must have taken it: {stats:?}"
         );
         assert!(stats.held_nanos > 0, "and the held time was accumulated");
+        stark::prover::pin_shared_vram_gate(None);
         disarm(&g);
     }
 
@@ -608,6 +612,7 @@ mod tests {
     fn armed_a_second_hold_on_one_thread_panics_rather_than_parking() {
         let g = ARM.lock().expect("the arm guard is never poisoned");
         disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(false));
         arm(2);
         let panicked = std::thread::spawn(|| {
             let _a = hold();
@@ -615,6 +620,7 @@ mod tests {
         })
         .join();
         assert!(panicked.is_err(), "a reentrant hold must panic");
+        stark::prover::pin_shared_vram_gate(None);
         disarm(&g);
     }
 
