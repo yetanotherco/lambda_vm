@@ -446,6 +446,12 @@ type Committed = (FinishedTable, String, Precommit);
 /// precommits by AIR name.
 type Produced = (Traces, Commitment, Vec<(String, Precommit)>);
 
+#[cfg(test)]
+thread_local! {
+    /// The chunks the extra generators took in this thread's last stream.
+    static LAST_EXTRA_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `LAMBDA_VM_BLOCK_STREAM=0` builds phase A serially (the A arm of the stream
 /// A/B); unset or anything else streams it.
 fn stream_phase_a() -> bool {
@@ -574,6 +580,36 @@ fn stream_generators() -> usize {
         .filter(|&n| n <= 16)
         .unwrap_or(STREAM_GENERATORS)
 }
+
+/// `LAMBDA_VM_BLOCK_GENERATORS_EXTRA=n` (0..=16): `n` generators beside
+/// [`stream_generators`] that take a chunk only while at least
+/// [`stream_extra_generators_at`] chunks wait for a generator, so a producer
+/// that outruns the generators gets help and one they keep up with does not
+/// pay for idle threads beside its walk. Unset or `0`: none (the A arm). At the
+/// median block on BIG ten generators instead of six cut phase A by 5.37 s
+/// behind a producer they could not keep up with (levers 1-6) and cost 1.35 s
+/// behind one they could (levers 1+2), whose walk slowed beside them (BIG 467).
+fn stream_extra_generators() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_GENERATORS_EXTRA")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= 16)
+        .unwrap_or(0)
+}
+
+/// The chunks waiting for a generator at which the extra generators
+/// ([`stream_extra_generators`]) take work: `LAMBDA_VM_BLOCK_GENERATORS_AT=n`
+/// (n ≥ 1), unset [`STREAM_EXTRA_GENERATORS_AT`].
+fn stream_extra_generators_at() -> usize {
+    std::env::var("LAMBDA_VM_BLOCK_GENERATORS_AT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(STREAM_EXTRA_GENERATORS_AT)
+}
+
+/// The default queue depth for [`stream_extra_generators_at`].
+const STREAM_EXTRA_GENERATORS_AT: usize = 16;
 
 /// When the tables the finish builds get their Round-1 commits
 /// (`LAMBDA_VM_BLOCK_FINISH_COMMIT`).
@@ -723,6 +759,15 @@ fn commit_pool_threads() -> usize {
 pub(crate) struct StreamConfig {
     committers: usize,
     generators: usize,
+    /// Generators that work only while the queue is long
+    /// ([`stream_extra_generators`]), and that length.
+    extra_generators: usize,
+    extra_generators_at: usize,
+    /// Tests only: the base generators take nothing until the producer has
+    /// returned and the queue is empty, so the extra generators take every
+    /// chunk.
+    #[cfg(test)]
+    hold_base: bool,
     finish: FinishCommit,
     card_budget: Option<usize>,
     commit_pool: usize,
@@ -730,11 +775,16 @@ pub(crate) struct StreamConfig {
 
 impl StreamConfig {
     /// The block's: [`stream_committers`], [`stream_generators`],
+    /// [`stream_extra_generators`], [`stream_extra_generators_at`],
     /// [`finish_commit`], [`card_gate_budget`], [`commit_pool_threads`].
     fn from_env() -> Self {
         Self {
             committers: stream_committers(),
             generators: stream_generators(),
+            extra_generators: stream_extra_generators(),
+            extra_generators_at: stream_extra_generators_at(),
+            #[cfg(test)]
+            hold_base: false,
             finish: finish_commit(),
             card_budget: card_gate_budget(),
             commit_pool: commit_pool_threads(),
@@ -1342,6 +1392,8 @@ struct ToCommit {
 struct BlockFinishSink<'a> {
     tx: std::sync::mpsc::Sender<Streamed>,
     ledger: Option<&'a MemLedger>,
+    /// The stream's count of jobs sent and not yet taken.
+    waiting: &'a std::sync::atomic::AtomicUsize,
 }
 
 impl FinishSink for BlockFinishSink<'_> {
@@ -1350,12 +1402,16 @@ impl FinishSink for BlockFinishSink<'_> {
         if let Some(ledger) = self.ledger {
             ledger.queue(bytes);
         }
+        self.waiting
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.tx.send(Streamed::Finished(table)) {
             Ok(()) => None,
             Err(refused) => {
                 if let Some(ledger) = self.ledger {
                     ledger.unqueue(bytes);
                 }
+                self.waiting
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 match refused.0 {
                     Streamed::Finished(table) => Some(table),
                     Streamed::Job(_) | Streamed::Chunk(_) => None,
@@ -1396,6 +1452,11 @@ fn build_streamed(
     let t = Instant::now();
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);
+    // Jobs sent and not yet taken (the extra generators' signal), whether the
+    // producer still sends, and the jobs the extra generators took.
+    let waiting = std::sync::atomic::AtomicUsize::new(0);
+    let producing = std::sync::atomic::AtomicBool::new(true);
+    let extra_taken = std::sync::atomic::AtomicUsize::new(0);
     let committer_count = stream.committers;
     // While spilling, both queues have a byte budget: a slow disk throttles
     // the walk ([`SPILL_QUEUE_BYTES`]).
@@ -1433,6 +1494,48 @@ fn build_streamed(
     // host, instances the device packed).
     let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
     let narrow = narrow_streamed();
+    // One streamed chunk generated (or a finished table taken as it is),
+    // packed under narrow storage and handed to the committers.
+    let generate_one = |job: Streamed, ready_tx: &mpsc::Sender<ToCommit>| {
+        let job_bytes = streamed_bytes(&job);
+        if let Some(ledger) = ledger {
+            ledger.take(job_bytes);
+        }
+        let t = Instant::now();
+        // A table the finish handed off is built already, and it
+        // never took room in the ops queue.
+        let (mut table, finished) = match job {
+            Streamed::Job(job) => (FinishedTable::from(job.generate()), false),
+            Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
+            Streamed::Finished(table) => (table, true),
+        };
+        if !finished {
+            queue.release(job_bytes);
+        }
+        let wide = wide_bytes(&table.trace);
+        if let Some(ledger) = ledger {
+            ledger.generated(job_bytes, wide);
+        }
+        if !finished {
+            *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) += t.elapsed().as_secs_f64();
+        }
+        let tp = Instant::now();
+        if narrow && table.trace.narrow_main().is_none() && table.trace.pack_main_narrow() {
+            narrowed.lock().unwrap_or_else(|e| e.into_inner()).2 += tp.elapsed().as_secs_f64();
+        }
+        let held = held_bytes(&table.trace);
+        if let Some(ledger) = ledger {
+            ledger.ready(wide, held);
+        }
+        ready.admit(held);
+        if let Err(refused) = ready_tx.send(ToCommit {
+            table,
+            held,
+            finished,
+        }) {
+            ready.release(refused.0.held);
+        }
+    };
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -1474,60 +1577,64 @@ fn build_streamed(
         // Generators ([`stream_generators`]): each streamed chunk generated,
         // and packed under narrow storage, ahead of the committers.
         for g in 0..generators {
-            let (job_rx, queue, ready, narrowed, generate_secs) =
-                (&job_rx, &queue, &ready, &narrowed, &generate_secs);
+            let (job_rx, waiting, generate_one) = (&job_rx, &waiting, &generate_one);
+            #[cfg(test)]
+            let (producing, hold) = (&producing, stream.hold_base);
             let ready_tx = ready_tx.clone();
             spawn_named(s, format!("gen-{g}"), move || {
+                // Bounded, so extra generators that never take turn the test
+                // into a failure rather than a hang.
+                #[cfg(test)]
+                let held_since = Instant::now();
+                #[cfg(test)]
+                while hold
+                    && (producing.load(Relaxed) || waiting.load(Relaxed) > 0)
+                    && held_since.elapsed().as_secs() < 30
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(job) = job else {
                         return;
                     };
-                    let job_bytes = streamed_bytes(&job);
-                    if let Some(ledger) = ledger {
-                        ledger.take(job_bytes);
-                    }
-                    let t = Instant::now();
-                    // A table the finish handed off is built already, and it
-                    // never took room in the ops queue.
-                    let (mut table, finished) = match job {
-                        Streamed::Job(job) => (FinishedTable::from(job.generate()), false),
-                        Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
-                        Streamed::Finished(table) => (table, true),
-                    };
-                    if !finished {
-                        queue.release(job_bytes);
-                    }
-                    let wide = wide_bytes(&table.trace);
-                    if let Some(ledger) = ledger {
-                        ledger.generated(job_bytes, wide);
-                    }
-                    if !finished {
-                        *generate_secs.lock().unwrap_or_else(|e| e.into_inner()) +=
-                            t.elapsed().as_secs_f64();
-                    }
-                    let tp = Instant::now();
-                    if narrow
-                        && table.trace.narrow_main().is_none()
-                        && table.trace.pack_main_narrow()
-                    {
-                        narrowed.lock().unwrap_or_else(|e| e.into_inner()).2 +=
-                            tp.elapsed().as_secs_f64();
-                    }
-                    let held = held_bytes(&table.trace);
-                    if let Some(ledger) = ledger {
-                        ledger.ready(wide, held);
-                    }
-                    ready.admit(held);
-                    if let Err(refused) = ready_tx.send(ToCommit {
-                        table,
-                        held,
-                        finished,
-                    }) {
-                        ready.release(refused.0.held);
-                    }
+                    waiting.fetch_sub(1, Relaxed);
+                    generate_one(job, &ready_tx);
                 }
             });
+        }
+        // The extra generators ([`stream_extra_generators`]): a chunk only
+        // while the queue is at least `extra_generators_at` long; done once
+        // the producer has stopped and the queue is short, or the queue is
+        // closed and empty.
+        if generators > 0 {
+            for g in 0..stream.extra_generators {
+                let (job_rx, waiting, producing, extra_taken, generate_one) =
+                    (&job_rx, &waiting, &producing, &extra_taken, &generate_one);
+                let ready_tx = ready_tx.clone();
+                let at = stream.extra_generators_at;
+                spawn_named(s, format!("gen-x{g}"), move || {
+                    loop {
+                        if waiting.load(Relaxed) < at {
+                            if !producing.load(Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
+                        match job {
+                            Ok(job) => {
+                                waiting.fetch_sub(1, Relaxed);
+                                extra_taken.fetch_add(1, Relaxed);
+                                generate_one(job, &ready_tx);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                });
+            }
         }
         drop(ready_tx);
 
@@ -1566,6 +1673,7 @@ fn build_streamed(
                                 let Ok(job) = job else {
                                     return Ok(());
                                 };
+                                waiting.fetch_sub(1, Relaxed);
                                 let t = Instant::now();
                                 let job_bytes = streamed_bytes(&job);
                                 if let Some(ledger) = ledger {
@@ -1710,7 +1818,10 @@ fn build_streamed(
                             if let Some(ledger) = ledger {
                                 ledger.queue(bytes);
                             }
-                            let _ = job_tx.send(chunk);
+                            waiting.fetch_add(1, Relaxed);
+                            if job_tx.send(chunk).is_err() {
+                                waiting.fetch_sub(1, Relaxed);
+                            }
                         }
                         collect_secs += t.elapsed().as_secs_f64();
                     }
@@ -1758,7 +1869,10 @@ fn build_streamed(
                             if let Some(ledger) = ledger {
                                 ledger.queue(bytes);
                             }
-                            let _ = job_tx.send(job);
+                            waiting.fetch_add(1, Relaxed);
+                            if job_tx.send(job).is_err() {
+                                waiting.fetch_sub(1, Relaxed);
+                            }
                         }
                         if let Some(ledger) = ledger {
                             ledger
@@ -1775,6 +1889,7 @@ fn build_streamed(
             let sink = (stream.finish != FinishCommit::PhaseB).then(|| BlockFinishSink {
                 tx: job_tx.clone(),
                 ledger,
+                waiting: &waiting,
             });
             drop(job_tx);
             if let Some(ledger) = ledger {
@@ -1803,6 +1918,9 @@ fn build_streamed(
             Ok((traces, collect_secs))
         };
         let produced = produce();
+        // Every sender is gone with `produce` (its own and the finish's sink),
+        // so the extra generators may stop once the queue is short.
+        producing.store(false, Relaxed);
         let mut errors = Vec::new();
         for c in committers {
             if let Err(e) = join(c) {
@@ -1881,12 +1999,24 @@ fn build_streamed(
         eprintln!(
             "BLOCK QUEUE: {committer_count} committers · {generators} generators · at most {:.2} GiB in \
              {most_chunks} chunks waiting as ops · at most {:.2} GiB in {ready_chunks} chunks waiting \
-             generated · waited for room {:.2} s (ops) {:.2} s (generated)",
+             generated · waited for room {:.2} s (ops) {:.2} s (generated){}",
             most_bytes as f64 / (1u64 << 30) as f64,
             ready_bytes as f64 / (1u64 << 30) as f64,
             *queue.waited.lock().unwrap_or_else(|e| e.into_inner()),
             *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
+            if generators > 0 && stream.extra_generators > 0 {
+                format!(
+                    " · {} extra generators at ≥ {} waiting took {} chunks",
+                    stream.extra_generators,
+                    stream.extra_generators_at,
+                    extra_taken.load(Relaxed)
+                )
+            } else {
+                String::new()
+            },
         );
+        #[cfg(test)]
+        LAST_EXTRA_TAKEN.with(|n| n.set(extra_taken.load(Relaxed)));
         Ok((traces, decode_commitment, precommits))
     })
 }
@@ -2094,6 +2224,9 @@ pub(crate) fn stream_for_test(
         StreamConfig {
             committers,
             generators,
+            extra_generators: 0,
+            extra_generators_at: STREAM_EXTRA_GENERATORS_AT,
+            hold_base: false,
             finish: FinishCommit::PhaseB,
             card_budget: None,
             commit_pool: 0,
@@ -2123,6 +2256,9 @@ pub(crate) fn stream_finish_commit_for_test(
         StreamConfig {
             committers,
             generators,
+            extra_generators: 0,
+            extra_generators_at: STREAM_EXTRA_GENERATORS_AT,
+            hold_base: false,
             finish: FinishCommit::Handed,
             card_budget,
             commit_pool,
@@ -2138,6 +2274,34 @@ fn stream_config_for_test(
     stream: StreamConfig,
 ) -> Result<(Traces, Vec<String>), Error> {
     stream_spill_for_test(program, opts, max_rows, stream, None).map(|(t, n, _)| (t, n))
+}
+
+/// [`stream_for_test`] at two committers and one base generator, with `extra`
+/// extra generators that take a chunk while at least `at` chunks wait
+/// ([`stream_extra_generators`]), the base one held back until the producer is
+/// done if `hold_base`: the traces, the instances precommitted, and the chunks
+/// the extra generators took.
+#[cfg(test)]
+pub(crate) fn stream_extra_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    extra: usize,
+    at: usize,
+    hold_base: bool,
+) -> Result<(Traces, Vec<String>, usize), Error> {
+    let (traces, names) = stream_config_for_test(
+        program,
+        opts,
+        max_rows,
+        StreamConfig {
+            extra_generators: extra,
+            extra_generators_at: at,
+            hold_base,
+            ..stream_config(2, 1, true)
+        },
+    )?;
+    Ok((traces, names, LAST_EXTRA_TAKEN.with(|n| n.get())))
 }
 
 /// Phase A's stream with the spill policy `policy` (`None`: no spill):
@@ -2204,6 +2368,9 @@ pub(crate) fn stream_config(
     StreamConfig {
         committers,
         generators,
+        extra_generators: 0,
+        extra_generators_at: STREAM_EXTRA_GENERATORS_AT,
+        hold_base: false,
         finish: if finish_in_a {
             FinishCommit::Handed
         } else {

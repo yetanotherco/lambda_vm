@@ -1272,6 +1272,49 @@ fn the_stream_spills_and_reads_back_the_same_traces() {
     }
 }
 
+/// ★ Extra generators that work only while the queue is long build the same
+/// traces and precommit the same instances. With the base generators held back
+/// until the producer is done, the extra ones (bar 1) take every chunk, so they
+/// are load-bearing here; at a bar no queue reaches they take none; the stream
+/// ends either way.
+#[test]
+fn the_stream_builds_the_same_traces_with_extra_generators() {
+    let opts = crate::lfm::proof::block_base_options();
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("load the ELF");
+        let (mut base, mut names, none) =
+            crate::block::stream_extra_for_test(&program, &opts, &max_rows, 0, 1, false)
+                .expect("no extra generators");
+        assert_eq!(none, 0, "{name}: no extra generator ran");
+        assert!(!names.is_empty(), "{name}: nothing was streamed");
+        names.sort();
+        widen_all(&mut base);
+        let (mut extra, mut extra_names, taken) =
+            crate::block::stream_extra_for_test(&program, &opts, &max_rows, 4, 1, true)
+                .expect("extra generators at a bar of 1, the base held");
+        assert_eq!(
+            taken,
+            names.len(),
+            "{name}: the extra generators took every chunk"
+        );
+        extra_names.sort();
+        assert_eq!(names, extra_names, "{name}: the instances precommitted");
+        widen_all(&mut extra);
+        same_traces(&base, &extra);
+        let (_, _, idle) =
+            crate::block::stream_extra_for_test(&program, &opts, &max_rows, 4, usize::MAX, false)
+                .expect("extra generators that never work");
+        assert_eq!(idle, 0, "{name}: an extra generator worked below its bar");
+    }
+}
+
 /// ★ Phase A's stream builds the same traces and precommits the same instances
 /// however its chunks reach the device: the committers generating them, or
 /// generator threads ahead of them, more of them than committers or as few.
