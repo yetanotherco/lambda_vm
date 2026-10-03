@@ -40,6 +40,7 @@ use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
+use super::blake3::{self, Blake3Operation};
 use super::branch::{self, BranchOperation};
 use super::bytewise;
 use super::commit::{self, CommitOperation};
@@ -66,9 +67,17 @@ use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::types::{GoldilocksExtension, GoldilocksField};
+use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
+
+#[cfg(test)]
+mod lean_walk_tests;
+mod windowed;
+pub use windowed::{
+    Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
+    WindowedTraceBuilder,
+};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -88,12 +97,26 @@ struct MemoryState {
     /// page-map lookup + dense indexing, no per-cell hashing or rehash-on-grow)
     /// is both lighter and faster than a per-cell `HashMap`.
     cells: PagedMem<MemoryCell>,
+    /// Lean accesses ([`WalkLean::memory`]): a multi-byte access inside one
+    /// page finds the page once, and the last page found is remembered (`hot`).
+    /// The cells read and written are the same.
+    lean: bool,
+    /// `(page base, page index)` of the last page a lean access found, or
+    /// [`NO_PAGE`]. While `lean`, every page allocation goes through
+    /// [`Self::page_or_insert`], which leaves the page it allocated here, so an
+    /// index here is never one an allocation moved.
+    hot: (u64, usize),
 }
+
+/// No page: page bases are multiples of the page size, so never odd.
+const NO_PAGE: (u64, usize) = (1, 0);
 
 impl MemoryState {
     fn new() -> Self {
         Self {
             cells: PagedMem::new((0, 0)),
+            lean: false,
+            hot: NO_PAGE,
         }
     }
 
@@ -107,7 +130,16 @@ impl MemoryState {
         for (addr, value) in image.image_iter() {
             cells.set(addr, (value, 0));
         }
-        Self { cells }
+        Self {
+            cells,
+            lean: false,
+            hot: NO_PAGE,
+        }
+    }
+
+    /// The bytes its pages take on the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.cells.heap_bytes()
     }
 
     /// Number of distinct pages that contain at least one cell.
@@ -129,13 +161,62 @@ impl MemoryState {
 
     /// Write a byte to memory with the given timestamp.
     fn write_byte(&mut self, address: u64, value: u8, timestamp: u64) {
-        self.cells.set(address, (value, timestamp));
+        if self.lean {
+            let (base, off) = PagedMem::<MemoryCell>::page_of(address);
+            let index = self.page_or_insert(base);
+            self.cells.page_set(index, off, (value, timestamp));
+        } else {
+            self.cells.set(address, (value, timestamp));
+        }
+    }
+
+    /// The index of the allocated page at `base`, through `hot` (lean only).
+    #[inline]
+    fn page(&mut self, base: u64) -> Option<usize> {
+        if self.hot.0 == base {
+            return Some(self.hot.1);
+        }
+        let index = self.cells.page_index(base)?;
+        self.hot = (base, index);
+        Some(index)
+    }
+
+    /// The index of the page at `base`, allocated on first touch, through `hot`
+    /// (lean only).
+    #[inline]
+    fn page_or_insert(&mut self, base: u64) -> usize {
+        if self.hot.0 == base {
+            return self.hot.1;
+        }
+        let index = self.cells.page_index_or_insert(base);
+        self.hot = (base, index);
+        index
+    }
+
+    /// `count` (≤ 8) bytes from `base_address` within one page: the access a
+    /// lean walk makes in one page lookup. `None` when it is not lean or the
+    /// bytes cross a page (or wrap past `u64::MAX`).
+    #[inline]
+    fn one_page(&self, base_address: u64, count: usize) -> Option<(u64, usize)> {
+        let (base, off) = PagedMem::<MemoryCell>::page_of(base_address);
+        (self.lean && count > 0 && off + count <= page::DEFAULT_PAGE_SIZE).then_some((base, off))
     }
 
     /// Read multiple bytes. Returns arrays of values and timestamps.
-    fn read_bytes(&self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
+    fn read_bytes(&mut self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
         let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
+        if let Some((base, off)) = self.one_page(base_address, count) {
+            // A page never allocated reads (0, 0) throughout, as `read_byte`.
+            if let Some(index) = self.page(base) {
+                for i in 0..count {
+                    let (val, ts) = self.cells.page_get(index, off + i);
+                    values[i] = val as u32;
+                    timestamps[i] = ts;
+                }
+            }
+            return (values, timestamps);
+        }
         for i in 0..count {
             let (val, ts) = self.read_byte(base_address.wrapping_add(i as u64));
             values[i] = val as u32;
@@ -146,6 +227,14 @@ impl MemoryState {
 
     /// Write multiple bytes from a value.
     fn write_bytes(&mut self, base_address: u64, value: u64, count: usize, timestamp: u64) {
+        if let Some((base, off)) = self.one_page(base_address, count) {
+            let index = self.page_or_insert(base);
+            for i in 0..count {
+                let byte = ((value >> (i * 8)) & 0xFF) as u8;
+                self.cells.page_set(index, off + i, (byte, timestamp));
+            }
+            return;
+        }
         for i in 0..count {
             let byte = ((value >> (i * 8)) & 0xFF) as u8;
             self.write_byte(base_address.wrapping_add(i as u64), byte, timestamp);
@@ -337,15 +426,36 @@ fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Result<Vec<CpuOperation>, Error> {
-    let mut cpu_ops = Vec::with_capacity(logs.len());
+    collect_cpu_ops_from(logs, instructions, 0)
+}
 
+/// [`collect_cpu_ops`] for logs that start at cycle `first` of the run: the
+/// timestamps are the run's, so a run collected window by window gets the ops a
+/// whole-run collect would.
+fn collect_cpu_ops_from(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    first: usize,
+) -> Result<Vec<CpuOperation>, Error> {
+    let mut cpu_ops = Vec::with_capacity(logs.len());
+    collect_cpu_ops_into(logs, instructions, first, &mut cpu_ops)?;
+    Ok(cpu_ops)
+}
+
+/// [`collect_cpu_ops_from`], appending to `cpu_ops`.
+fn collect_cpu_ops_into(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    first: usize,
+    cpu_ops: &mut Vec<CpuOperation>,
+) -> Result<(), Error> {
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location. The +4 stride reserves
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = ((first + i) as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -353,6 +463,134 @@ fn collect_cpu_ops(
 
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
+    }
+    Ok(())
+}
+
+/// The parts of the lean walk a windowed build uses (D-EXEC E1). The tables are
+/// the same with any of them; the whole-run build uses none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalkLean {
+    /// Each cycle's decode read from a [`DecodeTable`].
+    pub(crate) decode: bool,
+    /// Memory accesses through [`MemoryState`]'s page-found paths.
+    pub(crate) memory: bool,
+    /// The in-walk BITWISE lookups counted by the accumulator from the CPU and
+    /// LOAD ops instead of listed by the walk.
+    pub(crate) lookups: bool,
+    /// The routing in one pass over a window's CPU ops ([`route_ops_one_pass`]).
+    pub(crate) route: bool,
+}
+
+impl WalkLean {
+    pub(crate) const ALL: Self = Self {
+        decode: true,
+        memory: true,
+        lookups: true,
+        route: true,
+    };
+    pub(crate) const NONE: Self = Self {
+        decode: false,
+        memory: false,
+        lookups: false,
+        route: false,
+    };
+
+    /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
+    /// of `decode`, `memory`, `lookups`, `route`. Read once; any other value is
+    /// refused.
+    pub(crate) fn from_env() -> Result<Self, Error> {
+        static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
+        LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
+            Err(_) => Ok(Self::ALL),
+            Ok(v) => Self::parse(&v).ok_or_else(|| {
+                format!(
+                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, route"
+                )
+            }),
+        })
+        .clone()
+        .map_err(Error::Prover)
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        match v.trim() {
+            "1" => return Some(Self::ALL),
+            "0" => return Some(Self::NONE),
+            _ => {}
+        }
+        let mut lean = Self::NONE;
+        for part in v.split(',').map(str::trim) {
+            match part {
+                "decode" => lean.decode = true,
+                "memory" => lean.memory = true,
+                "lookups" => lean.lookups = true,
+                "route" => lean.route = true,
+                _ => return None,
+            }
+        }
+        Some(lean)
+    }
+}
+
+/// Every pc of the instruction map decoded once, in dense runs of consecutive
+/// pcs (4 bytes apart): a cycle's [`DecodeEntry`] is one indexed read instead of
+/// a hash lookup and a decode of its instruction. Built from the map, so it holds
+/// exactly the pcs the map holds, each decoded as
+/// [`CpuOperation::from_log_and_instruction`] decodes it.
+pub(crate) struct DecodeTable {
+    /// `(first pc, the entries of pc, pc + 4, …)`, ascending.
+    runs: Vec<(u64, Vec<DecodeEntry>)>,
+}
+
+impl DecodeTable {
+    pub(crate) fn from_instructions(instructions: &U64HashMap<Instruction>) -> Self {
+        let mut pcs: Vec<u64> = instructions.keys().copied().collect();
+        pcs.sort_unstable();
+        let mut runs: Vec<(u64, Vec<DecodeEntry>)> = Vec::new();
+        for pc in pcs {
+            let entry = DecodeEntry::from_instruction(pc, instructions[&pc], 4);
+            match runs.last_mut() {
+                Some((first, entries))
+                    if first.checked_add(4 * entries.len() as u64) == Some(pc) =>
+                {
+                    entries.push(entry)
+                }
+                _ => runs.push((pc, vec![entry])),
+            }
+        }
+        Self { runs }
+    }
+
+    /// The decode of the instruction at `pc`, if the map holds one.
+    #[inline]
+    fn get(&self, pc: u64) -> Option<&DecodeEntry> {
+        self.runs.iter().find_map(|(first, entries)| {
+            let offset = pc.wrapping_sub(*first);
+            if offset % 4 != 0 {
+                return None;
+            }
+            entries.get(usize::try_from(offset / 4).ok()?)
+        })
+    }
+}
+
+/// [`collect_cpu_ops_from`] with each cycle's decode read from `table`: the same
+/// ops.
+fn collect_cpu_ops_from_table(
+    logs: &[Log],
+    table: &DecodeTable,
+    first: usize,
+) -> Result<Vec<CpuOperation>, Error> {
+    let mut cpu_ops = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        // As `collect_cpu_ops_into`.
+        let timestamp = ((first + i) as u64) * 4 + 4;
+        let decode = table
+            .get(log.current_pc)
+            .ok_or(Error::MissingInstruction(log.current_pc))?
+            .clone();
+        cpu_ops.push(CpuOperation::from_log(log, timestamp, decode));
     }
     Ok(cpu_ops)
 }
@@ -404,7 +642,7 @@ fn classify_memw(op: &MemwOperation) -> MemwRoute {
 struct MemwBuckets {
     /// Compact register rows (filled directly into the MEMW_R columns).
     register_rows: Vec<RegRow>,
-    aligned: Vec<MemwOperation>,
+    aligned: Vec<memw_aligned::AlignedRow>,
     general: Vec<MemwOperation>,
 }
 
@@ -417,11 +655,17 @@ impl MemwBuckets {
         }
     }
 
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.register_rows)
+            + vec_heap_bytes(&self.aligned)
+            + vec_heap_bytes(&self.general)
+    }
+
     #[inline]
     fn push(&mut self, op: MemwOperation) {
         match classify_memw(&op) {
             MemwRoute::Register => self.register_rows.push(RegRow::from_memw(&op)),
-            MemwRoute::Aligned => self.aligned.push(op),
+            MemwRoute::Aligned => self.aligned.push(memw_aligned::AlignedRow::from_memw(&op)),
             MemwRoute::General => self.general.push(op),
         }
     }
@@ -547,22 +791,170 @@ fn collect_ops_from_cpu(
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
+    Vec<Blake3Operation>,
+    Vec<blake3::Blake3AbsorbOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
     Vec<hint::HintOperation>,
 ) {
-    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
-    let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
-    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
-    let mut commit_ops = Vec::new();
-    let mut keccak_ops = Vec::new();
-    let mut cpu32_ops = Vec::new();
-    let mut ecsm_ops = Vec::new();
-    let mut ecdas_ops = Vec::new();
-    let mut hint_ops = Vec::new();
+    let mut out = WalkOutputs::with_capacity(cpu_ops.len());
+    collect_ops_from_cpu_into(cpu_ops, memory_state, register_state, &mut out, true);
+    let WalkOutputs {
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    } = out;
+    (
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    )
+}
+
+/// Everything the walk emits. [`collect_ops_from_cpu_into`] APPENDS to one of
+/// these, so a run walked a window at a time into the same accumulator gets the
+/// lists a single walk over the run gets: the walk is a left fold over the CPU
+/// ops that reads and advances only the state its caller carries.
+pub(crate) struct WalkOutputs {
+    memw: MemwBuckets,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    commit_ops: Vec<CommitOperation>,
+    keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
+    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    ecsm_ops: Vec<ecsm::EcsmOperation>,
+    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    hint_ops: Vec<hint::HintOperation>,
+}
+
+impl WalkOutputs {
+    /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it.
+    fn with_capacity(cpu_ops: usize) -> Self {
+        Self::for_walk(cpu_ops, true)
+    }
+
+    /// [`Self::with_capacity`], with no room for the in-walk lookups when the
+    /// walk leaves them out (`lookups` false, see [`collect_ops_from_cpu_into`]).
+    fn for_walk(cpu_ops: usize, lookups: bool) -> Self {
+        Self {
+            memw: MemwBuckets::with_register_capacity(cpu_ops * 3),
+            load_ops: Vec::with_capacity(cpu_ops / 8 + 1),
+            lt_ops: Vec::with_capacity(cpu_ops / 10 + 1),
+            shift_ops: Vec::with_capacity(cpu_ops / 10 + 1),
+            bitwise_ops: Vec::with_capacity(if lookups { cpu_ops * 4 } else { 0 }),
+            commit_ops: Vec::new(),
+            keccak_ops: Vec::new(),
+            blake3_ops: Vec::new(),
+            blake3_absorb_ops: Vec::new(),
+            cpu32_ops: Vec::new(),
+            ecsm_ops: Vec::new(),
+            ecdas_ops: Vec::new(),
+            hint_ops: Vec::new(),
+        }
+    }
+
+    /// The bytes its lists take on the heap (capacities, not lengths).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.memw.heap_bytes()
+            + vec_heap_bytes(&self.load_ops)
+            + vec_heap_bytes(&self.lt_ops)
+            + vec_heap_bytes(&self.shift_ops)
+            + vec_heap_bytes(&self.bitwise_ops)
+            + vec_heap_bytes(&self.commit_ops)
+            + vec_heap_bytes(&self.keccak_ops)
+            + vec_heap_bytes(&self.blake3_ops)
+            + vec_heap_bytes(&self.blake3_absorb_ops)
+            + vec_heap_bytes(&self.cpu32_ops)
+            + vec_heap_bytes(&self.ecsm_ops)
+            + vec_heap_bytes(&self.ecdas_ops)
+            + vec_heap_bytes(&self.hint_ops)
+    }
+
+    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
+    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
+        [
+            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
+            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
+            ("memw", vec_heap_bytes(&self.memw.general)),
+            ("load", vec_heap_bytes(&self.load_ops)),
+            ("lt", vec_heap_bytes(&self.lt_ops)),
+            ("shift", vec_heap_bytes(&self.shift_ops)),
+            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
+            ("commit", vec_heap_bytes(&self.commit_ops)),
+            ("keccak", vec_heap_bytes(&self.keccak_ops)),
+            ("blake3", vec_heap_bytes(&self.blake3_ops)),
+            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
+            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
+            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
+            ("hint", vec_heap_bytes(&self.hint_ops)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
+        .collect()
+    }
+}
+
+/// The bytes `list`'s buffer takes on the heap: its capacity, not its length.
+/// Elements that own heap memory of their own are counted at their inline size.
+pub(crate) fn vec_heap_bytes<T>(list: &Vec<T>) -> usize {
+    list.capacity() * std::mem::size_of::<T>()
+}
+
+/// The walk over `cpu_ops`, appended to `out` (see [`WalkOutputs`]). Without
+/// `lookups` the walk leaves out the in-walk BITWISE lookups (each CPU op's and
+/// each LOAD op's), which are a function of the CPU and LOAD ops it emits: the
+/// caller counts them from those ([`CpuOperation::count_bitwise_into`],
+/// [`LoadOperation::count_bitwise_into`]).
+fn collect_ops_from_cpu_into(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    out: &mut WalkOutputs,
+    lookups: bool,
+) {
+    let WalkOutputs {
+        memw,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+        keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        cpu32_ops,
+        ecsm_ops,
+        ecdas_ops,
+        hint_ops,
+    } = out;
+    // This call's commit rows start here; earlier calls' are already in the list.
+    let commit_ops_before = commit_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -583,20 +975,23 @@ fn collect_ops_from_cpu(
 
         // Collect memory operations for Load/Store instructions
         if op.decode.fields.is_load() {
-            let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
+            let (memw_op, load_op) = collect_load_op_from_cpu(op, memory_state);
             memw.push(memw_op);
+            if lookups {
+                // MSB8 lookups for the sign bit extraction.
+                bitwise_ops.extend(load_op.collect_bitwise_ops());
+            }
             load_ops.push(load_op);
-            bitwise_ops.extend(lookups);
         } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw.push(memw_op);
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, &mut memw);
+        collect_register_ops_from_cpu(op, register_state, memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
-        if op.ecall_commit {
+        if op.ecall_commit() {
             commit_ops.extend(expand_commit_operations_for_ecall(
                 op,
                 memory_state,
@@ -604,7 +999,7 @@ fn collect_ops_from_cpu(
             ));
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw.extend_ops(reg_commit_ops);
-            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            let count = u32::try_from(op.commit_count()).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .expect("commit index exceeds u32 range");
@@ -617,8 +1012,8 @@ fn collect_ops_from_cpu(
         }
 
         // Collect KeccakPermute ECALL operations
-        if op.ecall_keccak {
-            let state_addr = op.keccak_state_addr;
+        if op.ecall_keccak() {
+            let state_addr = op.keccak_state_addr();
             let mut input = [0u64; 25];
             for (i, lane) in input.iter_mut().enumerate() {
                 let addr = state_addr
@@ -648,8 +1043,80 @@ fn collect_ops_from_cpu(
             });
         }
 
+        // Collect Blake3Compress ECALL operations
+        if op.ecall_blake3() {
+            let state_addr = op.blake3_state_addr();
+            // 14 input dwords: h | m | t | (block_len, flags), LE words.
+            let mut words = [0u32; 28];
+            for k in 0..14usize {
+                let dword_addr = state_addr
+                    .checked_add(k as u64 * 8)
+                    .expect("blake3 state address range must be validated by the executor");
+                let mut dw = 0u64;
+                for b in 0..8 {
+                    let byte_addr = dword_addr
+                        .checked_add(b as u64)
+                        .expect("blake3 state address range must be validated by the executor");
+                    let (byte_val, _ts) = memory_state.read_byte(byte_addr);
+                    dw |= (byte_val as u64) << (b * 8);
+                }
+                words[2 * k] = dw as u32;
+                words[2 * k + 1] = (dw >> 32) as u32;
+            }
+            let h: [u32; 8] = words[0..8].try_into().unwrap();
+            let m: [u32; 16] = words[8..24].try_into().unwrap();
+            let t = (words[24] as u64) | ((words[25] as u64) << 32);
+            let block_len = words[26];
+            let flags = words[27];
+            let out = executor::vm::instruction::execution::blake3_compress_6round(
+                &h, &m, t, block_len, flags,
+            );
+            // Previous content of the out region, read BEFORE the write ops
+            // below advance memory_state.
+            let mut old_out = [0u8; 64];
+            for (b, byte) in old_out.iter_mut().enumerate() {
+                let byte_addr = state_addr
+                    .checked_add(112 + b as u64)
+                    .expect("blake3 state address range must be validated by the executor");
+                let (v, _ts) = memory_state.read_byte(byte_addr);
+                *byte = v;
+            }
+            let blake3_memw_ops =
+                collect_blake3_memw_ops(op, &words, &out, memory_state, register_state);
+            if !strip_blake3_side_effects() {
+                memw.extend_ops(blake3_memw_ops);
+            }
+            blake3_ops.push(Blake3Operation {
+                timestamp: op.timestamp,
+                state_addr,
+                h,
+                m,
+                t,
+                block_len,
+                flags,
+                old_out,
+                out,
+            });
+        }
+
+        // Collect Blake3Absorb ECALL operations. One ecall becomes a whole GROUP
+        // of `num_blocks + 1` BLAKE3 rows, so unlike every other accelerator the
+        // chip op collected here is a group rather than a row.
+        if op.ecall_blake3_absorb() {
+            let (absorb_memw, absorb_op) =
+                collect_blake3_absorb_ops(op, memory_state, register_state);
+            // Same strip gate as the single-compression MEMW above: the switch
+            // promises "MEMW and BITWISE left out" for BOTH modes, and an
+            // ungated arm here would silently reintroduce a MEMW imbalance the
+            // moment the omission forgery is retargeted at an absorb workload.
+            if !strip_blake3_side_effects() {
+                memw.extend_ops(absorb_memw);
+            }
+            blake3_absorb_ops.push(absorb_op);
+        }
+
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
-        if op.ecall_ecsm {
+        if op.ecall_ecsm() {
             let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
             memw.extend_ops(ecsm_memw);
@@ -658,7 +1125,7 @@ fn collect_ops_from_cpu(
         }
 
         // Collect Hint ecall operations (the 32-byte output write).
-        if op.ecall_hint {
+        if op.ecall_hint() {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
             memw.extend_ops(hint_memw);
             hint_ops.push(hint_op);
@@ -675,7 +1142,7 @@ fn collect_ops_from_cpu(
             if f.is_lt() {
                 lt_ops.push(LtOperation::new_with_invert(
                     op.rv1,
-                    op.arg2,
+                    op.arg2(),
                     f.alu_signed(),
                     f.alu_signed2_or_invert(),
                 ));
@@ -686,7 +1153,7 @@ fn collect_ops_from_cpu(
             if f.is_shift() {
                 shift_ops.push(ShiftOperation::new(
                     op.rv1,
-                    op.arg2,
+                    op.arg2(),
                     f.alu_signed2_or_invert(),
                     f.alu_signed(),
                     f.word_instr,
@@ -697,39 +1164,28 @@ fn collect_ops_from_cpu(
         // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
         // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
         // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
-        bitwise_ops.extend(op.collect_bitwise_ops());
+        if lookups {
+            bitwise_ops.extend(op.collect_bitwise_ops());
+        }
     }
 
     // Each ecall generates count+1 operations (count real rows + 1 end row).
-    // Count only this epoch's rows, so subtract the carried start index.
+    // Count only this call's rows, so subtract the carried start index.
     debug_assert_eq!(
-        commit_ops.len(),
+        commit_ops.len() - commit_ops_before,
         (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
-
-    (
-        memw,
-        load_ops,
-        lt_ops,
-        shift_ops,
-        bitwise_ops,
-        commit_ops,
-        keccak_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ecdas_ops,
-        hint_ops,
-    )
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
 ///
-/// Returns: (memw_op, load_op, bitwise_ops)
+/// Returns: (memw_op, load_op); the LOAD op's BITWISE lookups are
+/// [`LoadOperation::collect_bitwise_ops`].
 fn collect_load_op_from_cpu(
     op: &CpuOperation,
     memory_state: &mut MemoryState,
-) -> (MemwOperation, LoadOperation, Vec<BitwiseOperation>) {
+) -> (MemwOperation, LoadOperation) {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
@@ -776,13 +1232,10 @@ fn collect_load_op_from_cpu(
         res_bytes.map(u64::from),
     );
 
-    // Collect MSB8 lookups for sign bit extraction
-    let bitwise_ops = load_op.collect_bitwise_ops();
-
     // Update memory state
     memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
 
-    (memw_op, load_op, bitwise_ops)
+    (memw_op, load_op)
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
@@ -1288,8 +1741,8 @@ fn collect_commit_memw_ops(
     memory_state: &mut MemoryState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
-    let buf_addr = op.commit_buf_addr;
-    let count = op.commit_count;
+    let buf_addr = op.commit_buf_addr();
+    let count = op.commit_count();
 
     let mut memw_ops = Vec::with_capacity(5 + count as usize);
 
@@ -1448,7 +1901,7 @@ fn collect_keccak_memw_ops(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
-    let state_addr = op.keccak_state_addr;
+    let state_addr = op.keccak_state_addr();
     let mut memw_ops = Vec::with_capacity(26); // 1 register read + 25 lane ops
 
     // Per spec (keccak:c:read_addr): read register x10 to get state_addr
@@ -1496,6 +1949,240 @@ fn collect_keccak_memw_ops(
             let byte_addr = lane_addr
                 .checked_add(b as u64)
                 .expect("keccak state address range must be validated by the executor");
+            memory_state.write_byte(byte_addr, val as u8, ts);
+        }
+    }
+
+    memw_ops
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★ TEST-ONLY — suppresses BLAKE3's *side* contributions to the shared tables.
+    ///
+    /// A BLAKE3 syscall touches four things: the BLAKE3 table itself, the Ecall bus
+    /// (CPU sends, BLAKE3 receives), MEMW (it reads and writes the state region),
+    /// and BITWISE (its XORs and byte checks). Omitting the BLAKE3 table from a
+    /// proof therefore unbalances FOUR buses at once, and the resulting rejection
+    /// says nothing about which one did the work — the omission forgery would be
+    /// rejected identically if the Ecall receiver did not exist at all.
+    ///
+    /// Setting this builds the trace with the MEMW and BITWISE contributions left
+    /// out, so those two balance without the table and **Ecall is the only
+    /// unmatched interaction left**. That is what makes the forgery test in
+    /// `prove_elfs_tests` a test of the Ecall argument rather than of arithmetic
+    /// that would hold anyway.
+    ///
+    /// It exists behind `cfg(test)` because it builds a trace that does not
+    /// describe the execution: nothing may prove under it except a deliberate
+    /// forgery.
+    pub(crate) static STRIP_BLAKE3_SIDE_EFFECTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn strip_blake3_side_effects() -> bool {
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+pub(crate) fn strip_blake3_side_effects() -> bool {
+    false
+}
+
+/// Collect the MEMW operations and the chip group for one Blake3Absorb ECALL.
+///
+/// The four operands come from the register state the way ECSM's and HINT's do
+/// — the CPU row carries nothing useful for an ecall that expands to a group.
+/// Every access happens at the ecall's single timestamp, which is why the ABI
+/// requires the control and message regions to be disjoint — an overlap would
+/// touch one address twice at one timestamp, and no trace can do that:
+///
+///   Per address, MEMW's genesis and finalization tokens have cardinality one,
+///   so that address's accesses form a perfect matching between produced and
+///   consumed tokens — a disjoint union of paths and cycles. Every edge carries
+///   `old_ts < ts` strictly, so no cycle closes, leaving a single strictly
+///   increasing path. Its timestamps are pairwise distinct, for ANY pair of
+///   accesses rather than only adjacent ones.
+///
+/// (The shorter form — "the pair would need `LT(T, T) → 1`" — is not enough on
+/// its own: the second access could consume an OLDER token instead of the one
+/// the first produced. The matching argument is what rules that out.)
+///
+/// The message is read but never written, so `memory_state` is untouched by the
+/// block reads; only `cv_out` advances it.
+fn collect_blake3_absorb_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, blake3::Blake3AbsorbOperation) {
+    use executor::vm::instruction::execution::{BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_BLOCK_BYTES};
+
+    let ts = op.timestamp;
+    let ctrl_addr = register_state.read(10).0;
+    let msg_addr = register_state.read(11).0;
+    let num_blocks = register_state.read(12).0;
+    let first_flags = register_state.read(13).0;
+    let num_blocks_usize =
+        usize::try_from(num_blocks).expect("absorb block count must be validated by the executor");
+
+    // 4 register reads + 4 cv_in dwords + 8 dwords per block + 4 cv_out dwords.
+    let mut memw_ops = Vec::with_capacity(12 + num_blocks_usize * 8);
+
+    // Bind x10..x13 at ts through the memory argument (reads: old == value).
+    for (reg, value) in [
+        (10u8, ctrl_addr),
+        (11, msg_addr),
+        (12, num_blocks),
+        (13, first_flags),
+    ] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, ts, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, ts);
+    }
+
+    // A pure 8-byte read: `old == value`, the content unchanged. It still
+    // advances the address's timestamp, because MEMW models every access as
+    // consuming the (addr, old_ts, old_value) token and producing (addr, ts,
+    // value) — a read that left the token alone would leave the next access
+    // claiming an `old_timestamp` no longer in flight.
+    let mut read_dword = |addr: u64, memw_ops: &mut Vec<MemwOperation>| -> u64 {
+        let (vals, old_ts) = memory_state.read_bytes(addr, 8);
+        let mut dw = 0u64;
+        for (b, &v) in vals.iter().enumerate() {
+            dw |= (v as u64) << (8 * b);
+        }
+        memw_ops.push(MemwOperation::new(false, addr, vals, ts, 8, true).with_old(vals, old_ts));
+        memory_state.write_bytes(addr, dw, 8, ts);
+        dw
+    };
+
+    // cv_in: control dwords 0..4, read into the same `h` columns single mode uses.
+    let mut cv_in = [0u32; 8];
+    for k in 0..4u64 {
+        let dw = read_dword(ctrl_addr + k * 8, &mut memw_ops);
+        cv_in[2 * k as usize] = dw as u32;
+        cv_in[2 * k as usize + 1] = (dw >> 32) as u32;
+    }
+
+    // The message blocks, read in place.
+    let mut blocks = Vec::with_capacity(num_blocks_usize);
+    for i in 0..num_blocks {
+        let block_addr = msg_addr + i * BLAKE3_BLOCK_BYTES;
+        let mut m = [0u32; 16];
+        for k in 0..8u64 {
+            let dw = read_dword(block_addr + k * 8, &mut memw_ops);
+            m[2 * k as usize] = dw as u32;
+            m[2 * k as usize + 1] = (dw >> 32) as u32;
+        }
+        blocks.push(m);
+    }
+
+    let mut absorb_op = blake3::Blake3AbsorbOperation {
+        timestamp: ts,
+        ctrl_addr,
+        msg_addr,
+        first_flags: first_flags as u32,
+        cv_in,
+        blocks,
+        old_cv_out: [0; 32],
+    };
+
+    // cv_out: control dwords 4..8, written on the group's END row with the
+    // chaining value the chain bus delivers there. `expand_absorb` is the same
+    // function the trace filler runs, so this cannot disagree with the row it
+    // is the write for.
+    let rows = blake3::expand_absorb(&absorb_op);
+    let final_cv = rows.last().expect("an absorb group has at least 2 rows").h;
+    for k in 0..4u64 {
+        let addr = ctrl_addr + (BLAKE3_ABSORB_CV_OUT_DWORD + k) * 8;
+        let dw = (final_cv[2 * k as usize] as u64) | ((final_cv[2 * k as usize + 1] as u64) << 32);
+        let mut value = [0u32; 8];
+        for (j, slot) in value.iter_mut().enumerate() {
+            *slot = ((dw >> (8 * j)) & 0xFF) as u32;
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        for (j, &v) in old_vals.iter().enumerate() {
+            absorb_op.old_cv_out[k as usize * 8 + j] = v as u8;
+        }
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, ts, 8, true).with_old(old_vals, old_ts));
+        memory_state.write_bytes(addr, dw, 8, ts);
+    }
+
+    (memw_ops, absorb_op)
+}
+
+/// Collect MEMW operations for a Blake3Compress ECALL.
+///
+/// One register read of x10 plus 22 dword ops at the call's timestamp: the 14
+/// input dwords are pure reads (old = value = the input bytes, re-written at
+/// `ts` like a LOAD), the 8 output dwords write the compression output over
+/// the previous content.
+fn collect_blake3_memw_ops(
+    op: &CpuOperation,
+    words: &[u32; 28],
+    out: &[u32; 16],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> Vec<MemwOperation> {
+    let ts = op.timestamp;
+    let state_addr = op.blake3_state_addr();
+    let mut memw_ops = Vec::with_capacity(23); // 1 register read + 22 dword ops
+
+    // Read register x10 to bind state_addr (same as keccak:c:read_addr).
+    {
+        let reg_value = pack_register_value(state_addr);
+        let reg_addr = 2 * 10u64; // x10 -> address 20
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, state_addr, ts);
+    }
+
+    for k in 0..22usize {
+        let dword_addr = state_addr
+            .checked_add(k as u64 * 8)
+            .expect("blake3 state address range must be validated by the executor");
+
+        // The dword's new value: input dwords re-write their own bytes, output
+        // dwords write the compression output.
+        let dw = if k < 14 {
+            (words[2 * k] as u64) | ((words[2 * k + 1] as u64) << 32)
+        } else {
+            let o = k - 14;
+            (out[2 * o] as u64) | ((out[2 * o + 1] as u64) << 32)
+        };
+        let mut value_bytes = [0u32; 8];
+        for (b, byte) in value_bytes.iter_mut().enumerate() {
+            *byte = ((dw >> (b * 8)) & 0xFF) as u32;
+        }
+
+        let mut old_bytes = [0u32; 8];
+        let mut old_timestamps = [0u64; 8];
+        for b in 0..8 {
+            let byte_addr = dword_addr
+                .checked_add(b as u64)
+                .expect("blake3 state address range must be validated by the executor");
+            let (old_val, old_ts) = memory_state.read_byte(byte_addr);
+            old_bytes[b] = old_val as u32;
+            old_timestamps[b] = old_ts;
+        }
+
+        let memw_op = MemwOperation::new(false, dword_addr, value_bytes, ts, 8, true)
+            .with_old(old_bytes, old_timestamps);
+        memw_ops.push(memw_op);
+
+        for (b, &val) in value_bytes.iter().enumerate() {
+            let byte_addr = dword_addr
+                .checked_add(b as u64)
+                .expect("blake3 state address range must be validated by the executor");
             memory_state.write_byte(byte_addr, val as u8, ts);
         }
     }
@@ -1560,13 +2247,13 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
 /// Collects LT operations from MEMW_A for timestamp ordering.
 ///
 /// Each aligned operation has a single old_timestamp < timestamp check.
-fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
+fn collect_lt_from_memw_aligned(memw_aligned_ops: &[memw_aligned::AlignedRow]) -> Vec<LtOperation> {
     // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
     // Alignment guarantees addr + (width-1) never wraps: the largest width-N
     // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
     memw_aligned_ops
         .iter()
-        .map(|op| LtOperation::new(op.old_timestamp[0], op.timestamp, false))
+        .map(|op| LtOperation::new(op.old_timestamp(), op.timestamp(), false))
         .collect()
 }
 
@@ -1601,12 +2288,12 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 ///
 /// IS_HALF[base_address[i]] for i ∈ [0, 1] and IS_WORD[base_address[2]] are
 /// assumptions — the caller's (CPU's) responsibility.
-fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_memw_aligned(ops: &[memw_aligned::AlignedRow]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
-        let low_half = (op.base_address & 0xFFFF) as u32;
-        let mask: u32 = match op.width {
+        let low_half = (op.base_address() & 0xFFFF) as u32;
+        let mask: u32 = match op.width() {
             2 => 1,
             4 => 3,
             8 => 7,
@@ -2255,8 +2942,8 @@ fn expand_commit_operations_for_ecall(
     let mut ops = Vec::new();
 
     let timestamp = ecall.timestamp;
-    let buf_addr = ecall.commit_buf_addr;
-    let count = ecall.commit_count;
+    let buf_addr = ecall.commit_buf_addr();
+    let count = ecall.commit_count();
 
     for i in 0..=count {
         let remaining = count - i;
@@ -2435,6 +3122,244 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
         }
     }
     out
+}
+
+/// Collect BITWISE lookups generated by the BLAKE3 chip.
+///
+/// Mirrors `blake3::bus_interactions` send-for-send: the alignment AND, the
+/// addr AreBytes pairs, the pointer IS_HALFs, the mixing-core / feed-forward
+/// ByteAlu XORs and shift-halfword AreBytes (both via `blake3::ValueFlow`,
+/// the same canonical enumeration the senders are built from), the message
+/// AreBytes and the OLD_OUT AreBytes.
+///
+/// The absorb mode's rows are mirrored the same way, off the same
+/// `blake3::expand_absorb` the trace filler uses, so a row and the
+/// multiplicities it consumes cannot come from two different enumerations.
+pub(crate) fn collect_bitwise_from_blake3(
+    blake3_ops: &[Blake3Operation],
+    absorb_ops: &[blake3::Blake3AbsorbOperation],
+) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::new();
+
+    /// The four halfword range checks of one DWordHL pointer.
+    fn is_half_dword(ops: &mut Vec<BitwiseOperation>, ptr: u64) {
+        for shift in [0, 16, 32, 48] {
+            let half = ((ptr >> shift) & 0xFFFF) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                ((half >> 8) & 0xFF) as u8,
+            ));
+        }
+    }
+
+    for bop in blake3_ops {
+        let state_addr = bop.state_addr;
+
+        // Alignment: addr[0] & 7 = 0.
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            (state_addr & 0xFF) as u8,
+            7,
+        ));
+
+        // Addr byte range checks: (addr[2i], addr[2i+1]) pairs.
+        for i in 0..4 {
+            let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
+            let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                lo,
+                hi,
+            ));
+        }
+
+        // IS_HALF for the 22 pointers' halfwords.
+        for k in 0..blake3::STATE_DWORDS {
+            let ptr = state_addr
+                .checked_add(k as u64 * 8)
+                .expect("blake3 state address range must be validated by the executor");
+            for shift in [0, 16, 32, 48] {
+                let half = ((ptr >> shift) & 0xFFFF) as u16;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    ((half >> 8) & 0xFF) as u8,
+                ));
+            }
+        }
+
+        // Mixing core + feed-forward, in the senders' canonical order.
+        let flow = blake3::ValueFlow::compute(&bop.h, &bop.m, bop.t, bop.block_len, bop.flags);
+        for &(a, b, _out) in &flow.xors {
+            for byte in 0..4 {
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::ByteAluXor,
+                    ((a >> (8 * byte)) & 0xFF) as u8,
+                    ((b >> (8 * byte)) & 0xFF) as u8,
+                ));
+            }
+        }
+        for &(sll_lo, sllc_lo, sll_hi, sllc_hi, _y) in &flow.rots {
+            for hw in [sll_lo, sllc_lo, sll_hi, sllc_hi] {
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    (hw & 0xFF) as u8,
+                    (hw >> 8) as u8,
+                ));
+            }
+        }
+
+        // Message AreBytes: (byte 2p, byte 2p+1) of each m word.
+        for m in bop.m {
+            for p in 0..2 {
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    ((m >> (16 * p)) & 0xFF) as u8,
+                    ((m >> (16 * p + 8)) & 0xFF) as u8,
+                ));
+            }
+        }
+
+        // OLD_OUT AreBytes pairs.
+        for p in 0..32 {
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                bop.old_out[2 * p],
+                bop.old_out[2 * p + 1],
+            ));
+        }
+    }
+
+    // ---- absorb mode ----
+    for aop in absorb_ops {
+        let rows = blake3::expand_absorb(aop);
+        let n_rows = rows.len();
+        for (i, r) in rows.iter().enumerate() {
+            let compressing = !r.end;
+            // Gated on μ: every row of the group.
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                (aop.ctrl_addr & 0xFF) as u8,
+                7,
+            ));
+            for p in 0..4 {
+                let lo = ((aop.ctrl_addr >> (2 * p * 8)) & 0xFF) as u8;
+                let hi = ((aop.ctrl_addr >> ((2 * p + 1) * 8)) & 0xFF) as u8;
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    lo,
+                    hi,
+                ));
+            }
+            // Only the control region's pointers: ptr[8..22] are MU_S-gated.
+            for k in 0..blake3::CTRL_DWORDS {
+                is_half_dword(
+                    &mut ops,
+                    aop.ctrl_addr
+                        .checked_add(k as u64 * 8)
+                        .expect("absorb control region range must be validated by the executor"),
+                );
+            }
+            // OLD_OUT is all-zero except on the END row, where it carries the
+            // previous content of cv_out; the check itself is μ-gated either way.
+            for p in 0..32 {
+                let (lo, hi) = if r.end {
+                    (aop.old_cv_out.get(2 * p), aop.old_cv_out.get(2 * p + 1))
+                } else {
+                    (None, None)
+                };
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    lo.copied().unwrap_or(0),
+                    hi.copied().unwrap_or(0),
+                ));
+            }
+            // ZERO[REMAINING] -> END, on every absorb row.
+            ops.push(BitwiseOperation::zero(r.remaining));
+            // M_BASE halfwords, on every absorb row (it rides the chain to END).
+            is_half_dword(&mut ops, r.m_base);
+            if r.first {
+                // IS_HALF[Q]: the x11 8-alignment witness, `M_BASE[0] / 8`.
+                let q = (r.m_base & 0xFFFF) / 8;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (q & 0xFF) as u8,
+                    ((q >> 8) & 0xFF) as u8,
+                ));
+            }
+
+            if compressing {
+                // ZERO[REM_DECR] -> NEXT_IS_END, on compressing rows only.
+                ops.push(BitwiseOperation::zero(r.remaining - 1));
+                // The mixing core, in the senders' canonical order.
+                let flow = blake3::ValueFlow::compute(&r.h, &r.m, 0, 64, r.flags);
+                for &(a, b, _out) in &flow.xors {
+                    for byte in 0..4 {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::ByteAluXor,
+                            ((a >> (8 * byte)) & 0xFF) as u8,
+                            ((b >> (8 * byte)) & 0xFF) as u8,
+                        ));
+                    }
+                }
+                for &(sll_lo, sllc_lo, sll_hi, sllc_hi, _y) in &flow.rots {
+                    for hw in [sll_lo, sllc_lo, sll_hi, sllc_hi] {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            (hw & 0xFF) as u8,
+                            (hw >> 8) as u8,
+                        ));
+                    }
+                }
+                for m in r.m {
+                    for p in 0..2 {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            ((m >> (16 * p)) & 0xFF) as u8,
+                            ((m >> (16 * p + 8)) & 0xFF) as u8,
+                        ));
+                    }
+                }
+                // M_BASE_INCR and the 8 message dword pointers.
+                is_half_dword(&mut ops, r.m_base.wrapping_add(64));
+                for j in 0..blake3::MSG_DWORDS {
+                    is_half_dword(
+                        &mut ops,
+                        r.m_base
+                            .checked_add(j as u64 * 8)
+                            .expect("absorb message range must be validated by the executor"),
+                    );
+                }
+            } else {
+                // END row: `h`'s bytes are range-checked here instead of by the
+                // mixing core, which is gated off (soundness ledger 14).
+                for p in 0..16 {
+                    let w = r.h[p / 2];
+                    let shift = 16 * (p % 2);
+                    ops.push(BitwiseOperation::byte_op(
+                        BitwiseOperationType::AreBytes,
+                        ((w >> shift) & 0xFF) as u8,
+                        ((w >> (shift + 8)) & 0xFF) as u8,
+                    ));
+                }
+            }
+
+            if r.first {
+                // The in-circuit block cap: IsB20[REM_DECR · 2^10].
+                let value = (r.remaining as u64 - 1) * blake3::ABSORB_CAP_SCALE;
+                ops.push(BitwiseOperation::b20(
+                    (value & 0xFF) as u8,
+                    ((value >> 8) & 0xFF) as u8,
+                    ((value >> 16) & 0xF) as u8,
+                ));
+            }
+            debug_assert_eq!(r.first, i == 0, "FIRST is the group's first row");
+            debug_assert_eq!(r.end, i + 1 == n_rows, "END is the group's last row");
+        }
+    }
+
+    ops
 }
 
 /// Collect BITWISE lookups generated by the keccak chips.
@@ -2874,6 +3799,21 @@ pub struct Traces {
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// BLAKE3 6-round compression table (one row per compression call)
+    pub blake3: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// BLAKE3 compressions the workload actually performed.
+    ///
+    /// Not derivable from `blake3` above: that trace pads to a 4-row minimum,
+    /// so an unused table and a table with four compressions are the same
+    /// height. This is what decides whether the proof carries the table at all
+    /// (`crate::TableCounts::blake3`).
+    ///
+    /// ⚠ The six accelerator tables beside it are `Vec`s and say the same thing
+    /// with their length, so they need no companion count. BLAKE3 keeps one
+    /// because its trace is still a single padded table rather than a vector.
+    pub num_blake3_ops: usize,
+
     /// ECSM core table (one row per scalar-multiplication ecall). Empty when the
     /// run makes no ECSM call.
     pub ecsms: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -2904,10 +3844,11 @@ pub struct Traces {
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
 /// Phases 3-5 (LT extension, bitwise, trace generation).
+#[derive(Default)]
 struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
-    memw_aligned_ops: Vec<MemwOperation>,
+    memw_aligned_ops: Vec<memw_aligned::AlignedRow>,
     /// Direct-fill MEMW_R rows (register fast path).
     memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
@@ -2919,6 +3860,8 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
@@ -2929,6 +3872,242 @@ struct CollectedOps {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
+}
+
+/// How many leading chunks of each streamed table a windowed build already
+/// generated and handed out (`WindowedTraceBuilder`). Those chunks are the
+/// same op slices a whole-run build would chunk; the final build leaves an
+/// empty placeholder in their slots ([`Traces::insert_streamed`] puts them
+/// back). All zero — every build but the windowed one — changes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamSkip {
+    pub cpu: usize,
+    pub memw_register: usize,
+    pub memw_aligned: usize,
+    pub memw: usize,
+    pub load: usize,
+    pub lt: usize,
+    pub shift: usize,
+    pub store: usize,
+    /// Rows per KECCAK_RND chunk, when the build cuts KECCAK_RND into chunks of
+    /// that many rows (the split a block proof makes); zero builds it whole, as
+    /// every build but the block's.
+    pub keccak_rnd_rows: usize,
+    /// KECCAK_RND chunks already handed out (with `keccak_rnd_rows`).
+    pub keccak_rnd: usize,
+    /// MEMW (general) and MEMW_A ops whose phase-3 LT ops a windowed build has
+    /// already put into the windows' LT lists (block path only, which may chunk
+    /// LT differently from the whole-run build): the table phase derives LT
+    /// only from the ops past these. Zero everywhere else.
+    pub memw_lt_done: usize,
+    pub memw_aligned_lt_done: usize,
+    /// Pack each table the build generates at the bytes its columns need as
+    /// soon as it is generated (`TraceTable::pack_main_narrow`), so the build
+    /// never holds its tables at eight bytes a cell; the words are the same.
+    /// KECCAK, ECSM, ECDAS and a whole KECCAK_RND stay wide: the block cuts
+    /// them after the build. `false` everywhere but the WHIR block's windowed
+    /// finish.
+    pub pack: bool,
+    /// The streamed tables' op lists hold only the ops past their streamed
+    /// chunks (a windowed build that drops each chunk's ops as it hands the
+    /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and
+    /// `memw_lt_done` / `memw_aligned_lt_done` count within those. `false`
+    /// everywhere else: the lists are the whole run's.
+    ///
+    /// [`WindowedTraceBuilder::drop_streamed_ops`]: windowed::WindowedTraceBuilder::drop_streamed_ops
+    pub tails: bool,
+}
+
+/// BITWISE lookups a windowed build counted while the run was still being
+/// walked: the histogram of the first `bitwise_ops` in-walk lookups and of the
+/// first `memw_register_rows` MEMW_R rows (the table phase's two dominant
+/// sources). The table phase counts the rest of those two lists and every other
+/// source as always; the histogram is a commutative monoid, so the
+/// multiplicities are the same.
+pub(crate) struct PreCounted {
+    pub(crate) histogram: bitwise::BitwiseHistogram,
+    pub(crate) bitwise_ops: usize,
+    pub(crate) memw_register_rows: usize,
+    /// The (timestamp, next pc) of the last ECALL among CPU ops that are no
+    /// longer in the CPU list ([`StreamSkip::tails`]): the HALT search's answer
+    /// when the list left holds none.
+    pub(crate) last_ecall: Option<(u64, u64)>,
+    /// The phase-3 LT ops of the MEMW (general) and MEMW_A ops that are no
+    /// longer in their lists ([`StreamSkip::tails`] without the MEMW-derived LT
+    /// ops streamed), in list order: phase 3 puts each before the LT ops of the
+    /// list it derives from the ops left.
+    pub(crate) memw_lt: Vec<LtOperation>,
+    pub(crate) memw_aligned_lt: Vec<LtOperation>,
+}
+
+impl PreCounted {
+    /// The bytes it takes on the heap: the histogram and the derived LT ops.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.histogram.heap_bytes()
+            + vec_heap_bytes(&self.memw_lt)
+            + vec_heap_bytes(&self.memw_aligned_lt)
+    }
+
+    /// [`Self::heap_bytes`] part by part.
+    pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            (
+                "counted memw_a_lt".to_string(),
+                vec_heap_bytes(&self.memw_aligned_lt),
+            ),
+        ]
+    }
+}
+
+/// KECCAK_RND cut into tables of `rows` rows, the first `streamed` of them left
+/// as placeholders: the tables `split_rows` makes of the whole table
+/// ([`keccak_rnd::generate_keccak_rnd_trace`]), each built from the ops that
+/// reach it. A table no taller than `rows` stays one table, as the split leaves
+/// it.
+pub(crate) fn keccak_rnd_chunks(
+    ops: &[KeccakRoundOperation],
+    rows: usize,
+    streamed: usize,
+    pack: bool,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total = (ops.len() * 24).next_power_of_two().max(4);
+    if total <= rows {
+        if streamed > 0 {
+            return Err(Error::Prover(format!(
+                "{streamed} KECCAK_RND chunks were streamed but the table is one of {total} rows"
+            )));
+        }
+        return Ok(vec![packed_if(
+            pack,
+            keccak_rnd::generate_keccak_rnd_trace(ops),
+        )]);
+    }
+    let chunks = total / rows;
+    if streamed > chunks {
+        return Err(Error::Prover(format!(
+            "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"
+        )));
+    }
+    let chunk = |c: usize| {
+        if c < streamed {
+            return streamed_placeholder();
+        }
+        let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
+        packed_if(
+            pack,
+            keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows),
+        )
+    };
+    // Packed, a few chunks at a time in parallel: each chunk's pack is serial,
+    // and one task building them all one after another would be the finish's
+    // last; at most `KECCAK_RND_PACK_WAVE` chunks are wide at once.
+    #[cfg(feature = "parallel")]
+    if pack {
+        let mut tables = Vec::with_capacity(chunks);
+        let all: Vec<usize> = (0..chunks).collect();
+        for wave in all.chunks(KECCAK_RND_PACK_WAVE) {
+            tables.par_extend(wave.par_iter().map(|&c| chunk(c)));
+        }
+        return Ok(tables);
+    }
+    Ok((0..chunks).map(chunk).collect())
+}
+
+/// KECCAK_RND chunks built and packed at once ([`keccak_rnd_chunks`]): each is
+/// ≈ 0.8 GiB at eight bytes a cell (1,480 columns of 2^16 rows) before its pack.
+#[cfg(feature = "parallel")]
+const KECCAK_RND_PACK_WAVE: usize = 4;
+
+/// The ops whose rows reach KECCAK_RND chunk `chunk` of `rows` rows (24 rows an
+/// op), clamped to the `len` ops there are.
+pub(crate) fn keccak_rnd_op_range(chunk: usize, rows: usize, len: usize) -> (usize, usize) {
+    let first = (chunk * rows / 24).min(len);
+    let end = ((chunk + 1) * rows).div_ceil(24).min(len);
+    (first, end)
+}
+
+/// The slot a streamed chunk leaves in the final build: no rows, no columns.
+pub(crate) fn streamed_placeholder() -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    TraceTable::from_columns_main(Vec::new(), 1)
+}
+
+/// `generate`, each table it makes packed at the bytes its columns need as it
+/// is made when `pack` ([`StreamSkip::pack`]); `generate` itself otherwise.
+fn packed_by<T>(
+    pack: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+) -> impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync {
+    move |ops| packed_if(pack, generate(ops))
+}
+
+/// `table`, packed ([`TraceTable::pack_main_narrow`]) when `pack`.
+fn packed_if(
+    pack: bool,
+    mut table: TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    if pack {
+        table.pack_main_narrow();
+    }
+    table
+}
+
+/// [`chunk_and_generate`] / [`chunk_and_generate_optional`] (`optional`) with
+/// the first `skip` chunks already handed out: those slots get placeholders
+/// and are not generated again. `skip == 0` is the plain call. With `tails`,
+/// `ops` holds only the ops past those chunks ([`StreamSkip::tails`]).
+fn chunk_and_generate_skipping<T: Sync>(
+    ops: &[T],
+    max_rows: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    if skip == 0 {
+        return if optional {
+            chunk_and_generate_optional(
+                ops,
+                max_rows,
+                generate,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            chunk_and_generate(
+                ops,
+                max_rows,
+                generate,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        };
+    }
+    let chunks: Vec<&[T]> = ops.chunks(max_rows).collect();
+    let rest = if tails {
+        chunks
+    } else {
+        if skip > chunks.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                chunks.len()
+            )));
+        }
+        chunks[skip..].to_vec()
+    };
+    let mut tables: Vec<_> = (0..skip).map(|_| streamed_placeholder()).collect();
+    tables.extend(generate_chunks(
+        rest,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?);
+    Ok(tables)
 }
 
 /// Chunk raw ops and generate one trace table per chunk, padding an empty `ops`
@@ -3034,6 +4213,305 @@ fn generate_chunks<T: Sync>(
     Ok(tables)
 }
 
+/// What [`collect_all_ops`] derives from the CPU ops, kept as the SEGMENTS its
+/// lists are concatenations of: a filter over every CPU op, then what CPU32
+/// dispatches, then what the DVRM ops imply (over the filter's DVRM ops, then
+/// CPU32's). A run routed window by window appends each segment per window and
+/// concatenates the segments at the end, which gives exactly the lists a
+/// whole-run routing gives (the windowed builder).
+#[derive(Default)]
+struct RoutedSegments {
+    branch_ops: Vec<BranchOperation>,
+    mul_filter: Vec<(MulOperation, bool)>,
+    dvrm_filter: Vec<(DvrmOperation, bool)>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    shift_cpu32: Vec<ShiftOperation>,
+    mul_cpu32: Vec<(MulOperation, bool)>,
+    dvrm_cpu32: Vec<(DvrmOperation, bool)>,
+    bitwise_cpu32: Vec<BitwiseOperation>,
+    lt_dvrm_filter: Vec<LtOperation>,
+    lt_dvrm_cpu32: Vec<LtOperation>,
+    mul_dvrm_filter: Vec<(MulOperation, bool)>,
+    mul_dvrm_cpu32: Vec<(MulOperation, bool)>,
+}
+
+impl RoutedSegments {
+    /// The bytes its segments take on the heap.
+    fn heap_bytes(&self) -> usize {
+        vec_heap_bytes(&self.branch_ops)
+            + vec_heap_bytes(&self.mul_filter)
+            + vec_heap_bytes(&self.dvrm_filter)
+            + vec_heap_bytes(&self.eq_ops)
+            + vec_heap_bytes(&self.bytewise_ops)
+            + vec_heap_bytes(&self.store_ops)
+            + vec_heap_bytes(&self.shift_cpu32)
+            + vec_heap_bytes(&self.mul_cpu32)
+            + vec_heap_bytes(&self.dvrm_cpu32)
+            + vec_heap_bytes(&self.bitwise_cpu32)
+            + vec_heap_bytes(&self.lt_dvrm_filter)
+            + vec_heap_bytes(&self.lt_dvrm_cpu32)
+            + vec_heap_bytes(&self.mul_dvrm_filter)
+            + vec_heap_bytes(&self.mul_dvrm_cpu32)
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        [
+            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
+            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
+            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("store", vec_heap_bytes(&self.store_ops)),
+            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
+            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
+            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
+            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
+            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
+            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
+            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
+            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| (format!("segments {name}"), bytes))
+        .collect()
+    }
+
+    /// Appends a later window's segments, segment by segment.
+    fn append(&mut self, other: Self) {
+        self.branch_ops.extend(other.branch_ops);
+        self.mul_filter.extend(other.mul_filter);
+        self.dvrm_filter.extend(other.dvrm_filter);
+        self.eq_ops.extend(other.eq_ops);
+        self.bytewise_ops.extend(other.bytewise_ops);
+        self.store_ops.extend(other.store_ops);
+        self.shift_cpu32.extend(other.shift_cpu32);
+        self.mul_cpu32.extend(other.mul_cpu32);
+        self.dvrm_cpu32.extend(other.dvrm_cpu32);
+        self.bitwise_cpu32.extend(other.bitwise_cpu32);
+        self.lt_dvrm_filter.extend(other.lt_dvrm_filter);
+        self.lt_dvrm_cpu32.extend(other.lt_dvrm_cpu32);
+        self.mul_dvrm_filter.extend(other.mul_dvrm_filter);
+        self.mul_dvrm_cpu32.extend(other.mul_dvrm_cpu32);
+    }
+}
+
+/// The routing of [`collect_all_ops`], segment by segment ([`RoutedSegments`]).
+fn route_ops(cpu_ops: &[CpuOperation], cpu32_ops: &[cpu32::Cpu32Operation]) -> RoutedSegments {
+    // Collect BRANCH operations from CPU ops where branch_cond = true
+    let branch_ops: Vec<BranchOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.branch_cond())
+        .map(route_branch)
+        .collect();
+
+    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
+    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
+    let mul_filter: Vec<(MulOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
+        .map(route_mul)
+        .collect();
+
+    // Collect DVRM operations from non-word DIV/REM instructions.
+    let dvrm_filter: Vec<(DvrmOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
+        .map(route_dvrm)
+        .collect();
+
+    // Collect the ALU/MEMORY chip ops (non-word rows).
+    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
+    let eq_ops: Vec<eq::EqOperation> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .map(route_eq)
+        .collect();
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .map(route_bytewise)
+        .collect();
+    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
+    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
+    // table row).
+    let store_ops: Vec<store::StoreOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.fields.is_store())
+        .map(route_store)
+        .collect();
+
+    route_from_cpu_segments(
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
+    )
+}
+
+/// [`route_ops`] in one pass over the CPU ops instead of one per segment: each
+/// op goes to every segment whose filter it passes, in CPU order, which is each
+/// filter's order — the same segments.
+fn route_ops_one_pass(
+    cpu_ops: &[CpuOperation],
+    cpu32_ops: &[cpu32::Cpu32Operation],
+) -> RoutedSegments {
+    let mut branch_ops = Vec::new();
+    let mut mul_filter = Vec::new();
+    let mut dvrm_filter = Vec::new();
+    let mut eq_ops = Vec::new();
+    let mut bytewise_ops = Vec::new();
+    let mut store_ops = Vec::new();
+    for op in cpu_ops {
+        let f = &op.decode.fields;
+        if op.branch_cond() {
+            branch_ops.push(route_branch(op));
+        }
+        if !f.word_instr {
+            if f.is_mul() {
+                mul_filter.push(route_mul(op));
+            }
+            if f.is_divrem() {
+                dvrm_filter.push(route_dvrm(op));
+            }
+            if f.is_eq() {
+                eq_ops.push(route_eq(op));
+            }
+            if f.is_and() || f.is_or() || f.is_xor() {
+                bytewise_ops.push(route_bytewise(op));
+            }
+        }
+        if f.is_store() {
+            store_ops.push(route_store(op));
+        }
+    }
+    route_from_cpu_segments(
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
+    )
+}
+
+// [`route_ops`]'s op for each segment it filters out of the CPU ops.
+fn route_branch(op: &CpuOperation) -> BranchOperation {
+    BranchOperation::new(
+        op.decode.pc,
+        op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+        op.rv1,        // register value must match the CPU's BRANCH bus signature
+        op.decode.fields.jalr(),
+    )
+}
+fn route_mul(op: &CpuOperation) -> (MulOperation, bool) {
+    let f = op.decode.fields;
+    (
+        MulOperation::new(op.rv1, f.alu_signed(), op.arg2(), f.alu_signed2_or_invert()),
+        f.alu_muldiv(),
+    )
+}
+fn route_dvrm(op: &CpuOperation) -> (DvrmOperation, bool) {
+    let f = op.decode.fields;
+    (
+        DvrmOperation::new(op.rv1, op.arg2(), f.alu_signed()),
+        f.alu_muldiv(),
+    )
+}
+fn route_eq(op: &CpuOperation) -> eq::EqOperation {
+    eq::EqOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_signed2_or_invert())
+}
+fn route_bytewise(op: &CpuOperation) -> bytewise::BytewiseOperation {
+    bytewise::BytewiseOperation::new(op.rv1, op.arg2(), op.decode.fields.alu_op())
+}
+fn route_store(op: &CpuOperation) -> store::StoreOperation {
+    // The MEMORY bus and the STORE chip's MEMW write share the base
+    // timestamp (spec store.toml uses one `timestamp` for both).
+    store::StoreOperation::new(
+        op.res,
+        op.timestamp,
+        op.rv2,
+        op.decode.fields.mem_bytes() as u8,
+    )
+}
+
+/// The rest of [`route_ops`] once the CPU ops' segments are filtered: CPU32's
+/// dispatch and what the DVRM ops imply.
+fn route_from_cpu_segments(
+    branch_ops: Vec<BranchOperation>,
+    mul_filter: Vec<(MulOperation, bool)>,
+    dvrm_filter: Vec<(DvrmOperation, bool)>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    cpu32_ops: &[cpu32::Cpu32Operation],
+) -> RoutedSegments {
+    // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
+    // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
+    // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
+    // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
+    let mut shift_cpu32 = Vec::new();
+    let mut mul_cpu32 = Vec::new();
+    let mut dvrm_cpu32 = Vec::new();
+    let mut bitwise_cpu32 = Vec::new();
+    for c in cpu32_ops {
+        cpu32_chip_op(c, &mut shift_cpu32, &mut mul_cpu32, &mut dvrm_cpu32);
+        bitwise_cpu32.extend(collect_cpu32_bitwise(c));
+    }
+
+    // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
+    let lt_of = |dvrm: &[(DvrmOperation, bool)]| -> Vec<LtOperation> {
+        dvrm.iter()
+            .map(|(op, _wants_remainder)| LtOperation::new(op.abs_r(), op.abs_d(), false))
+            .collect()
+    };
+    let lt_dvrm_filter = lt_of(&dvrm_filter);
+    let lt_dvrm_cpu32 = lt_of(&dvrm_cpu32);
+
+    // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
+    let mul_of = |dvrm: &[(DvrmOperation, bool)]| -> Vec<(MulOperation, bool)> {
+        let mut out = Vec::with_capacity(2 * dvrm.len());
+        for (op, _wants_remainder) in dvrm {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            out.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            out.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+        out
+    };
+    let mul_dvrm_filter = mul_of(&dvrm_filter);
+    let mul_dvrm_cpu32 = mul_of(&dvrm_cpu32);
+
+    RoutedSegments {
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        shift_cpu32,
+        mul_cpu32,
+        dvrm_cpu32,
+        bitwise_cpu32,
+        lt_dvrm_filter,
+        lt_dvrm_cpu32,
+        mul_dvrm_filter,
+        mul_dvrm_cpu32,
+    }
+}
+
 /// Phase 2: Collect and route all operations from CPU ops.
 ///
 /// Takes the raw output of `collect_ops_from_cpu` plus `register_state`
@@ -3048,6 +4526,8 @@ fn collect_all_ops(
     mut bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -3075,104 +4555,34 @@ fn collect_all_ops(
         general: memw_ops,
     } = memw;
 
-    // Collect BRANCH operations from CPU ops where branch_cond = true
-    let branch_ops: Vec<BranchOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.branch_cond)
-        .map(|op| {
-            BranchOperation::new(
-                op.decode.pc,
-                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
-            )
-        })
-        .collect();
-
-    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
-    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
-    let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
-
-    // Collect DVRM operations from non-word DIV/REM instructions.
-    let mut dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
-
-    // Collect the ALU/MEMORY chip ops (non-word rows).
-    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
-        .collect();
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
-        .filter(|op| {
-            let f = &op.decode.fields;
-            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
-        })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
-        .collect();
-    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
-    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
-    // table row).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            // The MEMORY bus and the STORE chip's MEMW write share the base
-            // timestamp (spec store.toml uses one `timestamp` for both).
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
-            )
-        })
-        .collect();
-
-    // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
-    // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
-    // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
-    // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
-    for c in &cpu32_ops {
-        cpu32_chip_op(c, &mut shift_ops, &mut mul_ops, &mut dvrm_ops);
-        bitwise_ops.extend(collect_cpu32_bitwise(c));
-    }
-
-    // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
-    for (op, _wants_remainder) in &dvrm_ops {
-        lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
-    }
-
-    // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
-    for (op, _wants_remainder) in &dvrm_ops {
-        let d = op.d;
-        let d_signed = op.signed;
-        let q = op.compute_quotient();
-        let q_signed = op.sign_q();
-        let mul_op = MulOperation::new(d, d_signed, q, q_signed);
-        mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
-        mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
-    }
+    let RoutedSegments {
+        branch_ops,
+        mul_filter,
+        dvrm_filter,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        shift_cpu32,
+        mul_cpu32,
+        dvrm_cpu32,
+        bitwise_cpu32,
+        lt_dvrm_filter,
+        lt_dvrm_cpu32,
+        mul_dvrm_filter,
+        mul_dvrm_cpu32,
+    } = route_ops(&cpu_ops, &cpu32_ops);
+    // The lists are the segments in the order the routing always produced them:
+    // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies.
+    shift_ops.extend(shift_cpu32);
+    bitwise_ops.extend(bitwise_cpu32);
+    let mut mul_ops = mul_filter;
+    mul_ops.extend(mul_cpu32);
+    mul_ops.extend(mul_dvrm_filter);
+    mul_ops.extend(mul_dvrm_cpu32);
+    let mut dvrm_ops = dvrm_filter;
+    dvrm_ops.extend(dvrm_cpu32);
+    lt_ops.extend(lt_dvrm_filter);
+    lt_ops.extend(lt_dvrm_cpu32);
 
     CollectedOps {
         cpu_ops,
@@ -3188,6 +4598,8 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3195,6 +4607,71 @@ fn collect_all_ops(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+    }
+}
+
+/// When each phase of a trace build ended, and when each table type's phase-5
+/// generator finished — seconds since [`build_stamps::start`]. Off (one atomic
+/// load a mark) unless the block prover turns it on for its readout; the
+/// epoch pipeline never does.
+pub(crate) mod build_stamps {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// A build's start and its marks, `(label, seconds since the start)`.
+    type Marks = (Instant, Vec<(String, f64)>);
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static LOG: Mutex<Option<Marks>> = Mutex::new(None);
+    /// Called with each mark's label while a build records: a memory log's
+    /// line at each phase end (`LAMBDA_VM_BLOCK_MEMLOG`).
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) type Hook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+    /// Sets (or, `None`, clears) the hook every mark calls.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn set_hook(hook: Option<Hook>) {
+        if let Ok(mut slot) = HOOK.lock() {
+            *slot = hook;
+        }
+    }
+
+    /// Starts recording, clearing what an earlier build left.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn start() {
+        if let Ok(mut log) = LOG.lock() {
+            *log = Some((Instant::now(), Vec::new()));
+        }
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark(label: &str) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut log) = LOG.lock()
+            && let Some((t0, marks)) = log.as_mut()
+        {
+            let at = t0.elapsed().as_secs_f64();
+            marks.push((label.to_string(), at));
+        }
+        let hook = HOOK.lock().ok().and_then(|slot| slot.clone());
+        if let Some(hook) = hook {
+            hook(label);
+        }
+    }
+
+    /// Stops recording and hands back the marks.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn take() -> Vec<(String, f64)> {
+        ON.store(false, Ordering::Relaxed);
+        LOG.lock()
+            .ok()
+            .and_then(|mut log| log.take())
+            .map(|(_, marks)| marks)
+            .unwrap_or_default()
     }
 }
 
@@ -3217,6 +4694,8 @@ fn build_traces<I: ImageSource + Sync>(
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
+    skip: &StreamSkip,
+    mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
@@ -3232,6 +4711,8 @@ fn build_traces<I: ImageSource + Sync>(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        blake3_ops,
+        blake3_absorb_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3244,8 +4725,20 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    lt_ops.extend(collect_lt_from_memw(&memw_ops));
-    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    if let Some(pre) = pre.as_mut() {
+        lt_ops.extend(std::mem::take(&mut pre.memw_lt));
+    }
+    lt_ops.extend(collect_lt_from_memw(
+        &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
+    ));
+    build_stamps::mark("p3a lt from memw");
+    if let Some(pre) = pre.as_mut() {
+        lt_ops.extend(std::mem::take(&mut pre.memw_aligned_lt));
+    }
+    lt_ops.extend(collect_lt_from_memw_aligned(
+        &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
+    ));
+    build_stamps::mark("p3b lt from memw_a");
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
@@ -3256,6 +4749,8 @@ fn build_traces<I: ImageSource + Sync>(
             LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
+
+    build_stamps::mark("p3 lt");
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3271,10 +4766,17 @@ fn build_traces<I: ImageSource + Sync>(
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
+    // Without the streamed chunks' ops (`skip.tails`), their full chunks pad too.
+    let padding = |len: usize| len.next_power_of_two().max(4) - len;
     let num_padding_rows: usize = cpu_ops
         .chunks(max_rows.cpu)
-        .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-        .sum();
+        .map(|chunk| padding(chunk.len()))
+        .sum::<usize>()
+        + if skip.tails {
+            skip.cpu * padding(max_rows.cpu)
+        } else {
+            0
+        };
 
     // The per-source bitwise collectors are all pure functions of their inputs, and the
     // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
@@ -3323,6 +4825,14 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| {
+            if !strip_blake3_side_effects() {
+                h.add_ops(&collect_bitwise_from_blake3(
+                    &blake3_ops,
+                    &blake3_absorb_ops,
+                ));
+            }
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3336,7 +4846,13 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
-    let mut base = bitwise::BitwiseHistogram::new();
+    let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
+    let (mut base, counted_iw, counted_reg) = match pre {
+        Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
+        None => (bitwise::BitwiseHistogram::new(), 0, 0),
+    };
+    let uncounted_iw = &bitwise_ops[counted_iw..];
+    let uncounted_reg = &memw_register_rows[counted_reg..];
 
     #[cfg(feature = "parallel")]
     {
@@ -3351,12 +4867,12 @@ fn build_traces<I: ImageSource + Sync>(
         // byte-identical multiplicities (same as the serial fallback below).
         let cap = rayon::current_num_threads().clamp(1, 8);
         let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
-        let iw_chunk = bitwise_ops.len().div_ceil(cap).max(1);
-        for slice in bitwise_ops.chunks(iw_chunk) {
+        let iw_chunk = uncounted_iw.len().div_ceil(cap).max(1);
+        for slice in uncounted_iw.chunks(iw_chunk) {
             units.push(Box::new(move |h| h.add_ops(slice)));
         }
-        let reg_chunk = memw_register_rows.len().div_ceil(cap).max(1);
-        for slice in memw_register_rows.chunks(reg_chunk) {
+        let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
+        for slice in uncounted_reg.chunks(reg_chunk) {
             units.push(Box::new(move |h| {
                 memw_register::collect_bitwise_from_memw_register(slice, h)
             }));
@@ -3386,8 +4902,8 @@ fn build_traces<I: ImageSource + Sync>(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        base.add_ops(&bitwise_ops);
-        memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
+        base.add_ops(uncounted_iw);
+        memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
         for f in &collectors {
             f(&mut base);
         }
@@ -3400,6 +4916,7 @@ fn build_traces<I: ImageSource + Sync>(
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
+    build_stamps::mark("p4 bitwise");
     // =====================================================================
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p5_generate_tables");
@@ -3410,10 +4927,12 @@ fn build_traces<I: ImageSource + Sync>(
     // to the next epoch via the register snapshot, and HALT is excluded from the
     // proof (`include_halt = false`) so `halt_trace` is unused there.
     let (halt_timestamp, halt_next_pc) = if is_final {
-        let halt_op = cpu_ops
+        let (halt_timestamp, halt_next_pc) = cpu_ops
             .iter()
             .rev()
             .find(|op| op.decode.fields.ecall)
+            .map(|op| (op.timestamp, op.next_pc))
+            .or(streamed_last_ecall)
             .ok_or(Error::MissingHaltEcall)?;
         // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
         // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
@@ -3421,8 +4940,8 @@ fn build_traces<I: ImageSource + Sync>(
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
         // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
         // must match that last write to balance the memory argument.
-        register_state.write_pc(1, halt_op.timestamp + 4 * num_padding_rows as u64 + 1);
-        (halt_op.timestamp, halt_op.next_pc)
+        register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
+        (halt_timestamp, halt_next_pc)
     } else {
         (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
     };
@@ -3433,29 +4952,39 @@ fn build_traces<I: ImageSource + Sync>(
     // they all run in one rayon scope. Disk-spill stays sequential: its
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
+    let pack = skip.pack;
     let gen_cpus = || {
-        chunk_and_generate(
+        chunk_and_generate_skipping(
             cpu_ops_ref,
             max_rows.cpu,
-            cpu::generate_cpu_trace,
+            skip.cpu,
+            skip.tails,
+            false,
+            packed_by(pack, cpu::generate_cpu_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_memws = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &memw_ops,
             max_rows.memw,
-            memw::generate_memw_trace,
+            skip.memw,
+            skip.tails,
+            true,
+            packed_by(pack, memw::generate_memw_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_memw_aligneds = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &memw_aligned_ops,
             max_rows.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace,
+            skip.memw_aligned,
+            skip.tails,
+            true,
+            packed_by(pack, memw_aligned::generate_memw_aligned_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3463,37 +4992,49 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_memw_registers = || {
         // Direct-to-column fill from compact RegRows — the register fast path never
         // materializes a `Vec<MemwOperation>`.
-        chunk_and_generate(
+        chunk_and_generate_skipping(
             &memw_register_rows,
             max_rows.memw_register,
-            memw_register::generate_memw_register_trace_from_rows,
+            skip.memw_register,
+            skip.tails,
+            false,
+            packed_by(pack, memw_register::generate_memw_register_trace_from_rows),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_loads = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &load_ops,
             max_rows.load,
-            load::generate_load_trace,
+            skip.load,
+            skip.tails,
+            true,
+            packed_by(pack, load::generate_load_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_lts = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &lt_ops,
             max_rows.lt,
-            lt::generate_lt_trace,
+            skip.lt,
+            skip.tails,
+            true,
+            packed_by(pack, lt::generate_lt_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_shifts = || {
-        chunk_and_generate_optional(
+        chunk_and_generate_skipping(
             &shift_ops,
             max_rows.shift,
-            shift::generate_shift_trace,
+            skip.shift,
+            skip.tails,
+            true,
+            packed_by(pack, shift::generate_shift_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3502,7 +5043,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
-            mul::generate_mul_trace,
+            packed_by(pack, mul::generate_mul_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3511,7 +5052,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
-            dvrm::generate_dvrm_trace,
+            packed_by(pack, dvrm::generate_dvrm_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3520,7 +5061,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &branch_ops,
             max_rows.branch,
-            branch::generate_branch_trace,
+            packed_by(pack, branch::generate_branch_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3531,7 +5072,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
-            eq::generate_eq_trace,
+            packed_by(pack, eq::generate_eq_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3540,16 +5081,19 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
-            bytewise::generate_bytewise_trace,
+            packed_by(pack, bytewise::generate_bytewise_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_stores = || {
-        chunk_and_generate_optional::<store::StoreOperation>(
+        chunk_and_generate_skipping(
             &store_ops,
             max_rows.store,
-            store::generate_store_trace,
+            skip.store,
+            skip.tails,
+            true,
+            packed_by(pack, store::generate_store_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3558,7 +5102,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
-            cpu32::generate_cpu32_trace,
+            packed_by(pack, cpu32::generate_cpu32_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3567,7 +5111,7 @@ fn build_traces<I: ImageSource + Sync>(
         let mut bitwise = bitwise::generate_bitwise_trace();
         // Fill the MU columns (11..=20) from the accumulated histogram.
         bitwise_histogram.fill_multiplicities(&mut bitwise);
-        bitwise
+        packed_if(pack, bitwise)
     };
     // Each CPU operation looks up the DECODE table once; padding rows look up
     // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
@@ -3577,12 +5121,12 @@ fn build_traces<I: ImageSource + Sync>(
         let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
-        decode
+        packed_if(pack, decode)
     };
     let gen_commits = || {
         generate_optional(
             &commit_ops,
-            commit::generate_commit_trace,
+            packed_by(pack, commit::generate_commit_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3604,29 +5148,58 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
-        generate_optional(
-            &keccak_rnd_ops,
-            keccak_rnd::generate_keccak_rnd_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
+        if skip.keccak_rnd_rows == 0 {
+            // Whole, it may be cut after the build: it stays wide.
+            return generate_optional(
+                &keccak_rnd_ops,
+                keccak_rnd::generate_keccak_rnd_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            );
+        }
+        keccak_rnd_chunks(&keccak_rnd_ops, skip.keccak_rnd_rows, skip.keccak_rnd, pack)
+    };
+    let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
+    let gen_blake3 = || {
+        packed_if(
+            pack,
+            blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops),
         )
     };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
-        keccak_rc_trace
+        packed_if(pack, keccak_rc_trace)
     };
     let gen_pages = || match initial_image {
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
         // every touched cell's Memory init/fini, and every untouched PAGE row
         // self-cancels (init==fini, ts=0), so PAGE contributes nothing here.
         Some(image) if !l2g_memory_bookend => {
-            generate_page_tables(image, memory_state, private_input, l2g_memory_bookend)
+            let (pages, configs) =
+                generate_page_tables(image, memory_state, private_input, l2g_memory_bookend);
+            (
+                pages
+                    .into_iter()
+                    .map(|page| packed_if(pack, page))
+                    .collect(),
+                configs,
+            )
         }
         _ => (Vec::new(), Vec::new()),
     };
-    let gen_register = || register::generate_register_trace(&register_final_state, register_init);
-    let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+    let gen_register = || {
+        packed_if(
+            pack,
+            register::generate_register_trace(&register_final_state, register_init),
+        )
+    };
+    let gen_halt = || {
+        packed_if(
+            pack,
+            halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+        )
+    };
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
@@ -3649,7 +5222,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_hints = || {
         generate_optional(
             &hint_ops,
-            hint::generate_hint_trace,
+            packed_by(pack, hint::generate_hint_trace),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3662,6 +5235,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut commits_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
         (None, None, None, None);
+    let mut blake3_slot = None;
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
@@ -3679,7 +5253,10 @@ fn build_traces<I: ImageSource + Sync>(
             macro_rules! spawn_into {
                 ($slot:ident, $gen:ident) => {{
                     let slot = &mut $slot;
-                    s.spawn(move |_| *slot = Some($gen()));
+                    s.spawn(move |_| {
+                        *slot = Some($gen());
+                        build_stamps::mark(concat!("p5 ", stringify!($gen)));
+                    });
                 }};
             }
             // Heaviest builds first so the scheduler overlaps them with the rest.
@@ -3699,6 +5276,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(keccaks_slot, gen_keccaks);
             spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
+            spawn_into!(blake3_slot, gen_blake3);
             spawn_into!(commits_slot, gen_commits);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
@@ -3727,6 +5305,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccaks_slot = Some(gen_keccaks());
         keccak_rnds_slot = Some(gen_keccak_rnds());
         keccak_rc_slot = Some(gen_keccak_rc());
+        blake3_slot = Some(gen_blake3());
         pages_slot = Some(gen_pages());
         register_slot = Some(gen_register());
         halt_slot = Some(gen_halt());
@@ -3739,6 +5318,7 @@ fn build_traces<I: ImageSource + Sync>(
         hints_slot = Some(gen_hints());
     }
 
+    build_stamps::mark("p5 end");
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
     let cpus = cpus_slot.expect(PHASE5_RAN)?;
     let memws = memws_slot.expect(PHASE5_RAN)?;
@@ -3762,6 +5342,7 @@ fn build_traces<I: ImageSource + Sync>(
     let keccaks = keccaks_slot.expect(PHASE5_RAN)?;
     let keccak_rnds = keccak_rnds_slot.expect(PHASE5_RAN)?;
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
+    let blake3_trace = blake3_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
@@ -3831,6 +5412,8 @@ fn build_traces<I: ImageSource + Sync>(
         commits,
         keccaks,
         keccak_rnds,
+        blake3: blake3_trace,
+        num_blake3_ops,
         keccak_rc: keccak_rc_trace,
         ecsms,
         ecdases,
@@ -3958,8 +5541,7 @@ pub fn count_table_lengths(
 
         // Memory ops from load/store
         if cpu_op.decode.fields.is_load() {
-            let (memw_op, _load_op, _bitwise) =
-                collect_load_op_from_cpu(&cpu_op, &mut memory_state);
+            let (memw_op, _load_op) = collect_load_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
                 &mut memw_by_width,
@@ -3990,10 +5572,10 @@ pub fn count_table_lengths(
         }
 
         // ECALL Commit
-        if cpu_op.ecall_commit {
+        if cpu_op.ecall_commit() {
             // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
             // without building the op vector.
-            commit_count += (cpu_op.commit_count as usize)
+            commit_count += (cpu_op.commit_count() as usize)
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
@@ -4006,14 +5588,14 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
-            let count = u32::try_from(cpu_op.commit_count)
+            let count = u32::try_from(cpu_op.commit_count())
                 .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        if cpu_op.ecall_hint {
+        if cpu_op.ecall_hint() {
             // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
             // 8-byte output writes go through the memory argument, plus the three LT
             // range-checks (selector < 3, in_addr and out_addr low limbs). Replaying it
@@ -4046,7 +5628,7 @@ pub fn count_table_lengths(
         if !f.word_instr && f.is_divrem() {
             dvrm_count += 1;
         }
-        if cpu_op.branch_cond {
+        if cpu_op.branch_cond() {
             branch_count += 1;
         }
     }
@@ -4106,6 +5688,95 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
+    /// The bytes the main tables take: eight a cell, or their packed bytes
+    /// (the page configs and the touched cells left out). A measurement (`LAMBDA_VM_BLOCK_MEMLOG`):
+    /// every table field is named, so a new one does not compile until it is
+    /// counted here.
+    pub fn main_bytes(&self) -> usize {
+        type T = TraceTable<GoldilocksField, GoldilocksExtension>;
+        fn one(t: &T) -> usize {
+            t.narrow_main().map_or_else(
+                || t.main_table.width * t.main_table.height * std::mem::size_of::<u64>(),
+                |packed| packed.data().len(),
+            )
+        }
+        fn all(ts: &[T]) -> usize {
+            ts.iter().map(one).sum()
+        }
+        let Traces {
+            cpus,
+            bitwise,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            page_configs: _,
+            register,
+            public_output_bytes: _,
+            branches,
+            halt,
+            commits,
+            keccaks,
+            keccak_rnds,
+            keccak_rc,
+            blake3,
+            num_blake3_ops: _,
+            ecsms,
+            ecdases,
+            hints,
+            memw_registers,
+            local_to_global,
+            touched_memory_cells: _,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
+        } = self;
+        [
+            cpus,
+            lts,
+            shifts,
+            memws,
+            memw_aligneds,
+            loads,
+            muls,
+            dvrms,
+            pages,
+            branches,
+            commits,
+            keccaks,
+            keccak_rnds,
+            ecsms,
+            ecdases,
+            hints,
+            memw_registers,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
+        ]
+        .into_iter()
+        .map(|ts| all(ts))
+        .sum::<usize>()
+            + [
+                bitwise,
+                decode,
+                register,
+                halt,
+                keccak_rc,
+                blake3,
+                local_to_global,
+            ]
+            .into_iter()
+            .map(one)
+            .sum::<usize>()
+    }
+
     /// Pre-upload the epoch's biggest main traces to device, called from the
     /// epoch pipeline's builder thread (idle slack ahead of the prover) so the
     /// R1 main commits D2D-copy instead of paying the H2D inside their chains.
@@ -4193,6 +5864,7 @@ impl Traces {
     pub fn total_field_elements(&self) -> u64 {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::blake3::cols::NUM_COLUMNS as BLAKE3_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
         use super::bytewise::cols::NUM_COLUMNS as BYTEWISE_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
@@ -4225,6 +5897,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4242,6 +5915,7 @@ impl Traces {
             keccaks,
             keccak_rnds,
             keccak_rc,
+            blake3,
             ecsms,
             ecdases,
             hints,
@@ -4304,6 +5978,11 @@ impl Traces {
             total += (t.num_rows() * KECCAK_RND_COLS) as u64;
         }
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
+        // Counted only when the proof carries the table (`table_counts().blake3`);
+        // an unused BLAKE3 trace is padding the prover never commits.
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * BLAKE3_COLS) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
         }
@@ -4360,6 +6039,7 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
+        let n_blake3 = aux_cols(super::blake3::bus_interactions().len());
         let n_eq = aux_cols(super::eq::bus_interactions().len());
         let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
         let n_store = aux_cols(super::store::bus_interactions().len());
@@ -4370,6 +6050,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4387,6 +6068,7 @@ impl Traces {
             keccaks,
             keccak_rnds,
             keccak_rc,
+            blake3,
             ecsms,
             ecdases,
             hints,
@@ -4449,6 +6131,9 @@ impl Traces {
             total += (t.num_rows() * n_keccak_rnd) as u64;
         }
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * n_blake3) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
         }
@@ -4496,6 +6181,10 @@ impl Traces {
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
             commit: self.commits.len(),
+            // 0 or 1: the table is carried only when the workload used it. The
+            // six above read their own `Vec` length; this one cannot, because a
+            // BLAKE3 trace pads to four rows whether or not it was used.
+            blake3: usize::from(self.num_blake3_ops > 0),
         }
     }
 
@@ -4812,6 +6501,7 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p1 cpu ops");
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
@@ -4826,6 +6516,8 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4833,6 +6525,7 @@ impl Traces {
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p2a collect");
 
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p2b_collect_all");
@@ -4845,6 +6538,8 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4854,6 +6549,7 @@ impl Traces {
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
+        build_stamps::mark("p2b route");
 
         Ok(CollectedEpoch {
             ops,
@@ -4906,6 +6602,8 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
+            &StreamSkip::default(),
+            None,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4939,6 +6637,8 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4954,6 +6654,8 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4980,6 +6682,8 @@ impl Traces {
             &[],
             true,
             false,
+            &StreamSkip::default(),
+            None,
         )
     }
 }

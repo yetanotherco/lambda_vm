@@ -6,8 +6,15 @@ license.workspace = true
 
 [features]
 default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "ecsm/parallel", "dep:rayon"]
-cuda = ["stark/cuda"]
+parallel = [
+    "stark/parallel",
+    "math/parallel",
+    "crypto/parallel",
+    "multilinear/parallel",
+    "ecsm/parallel",
+    "dep:rayon",
+]
+cuda = ["stark/cuda", "multilinear/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
@@ -15,11 +22,38 @@ instruments = ["stark/instruments"]
 nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
-# Host-only verify-hash counter for `test_count_recursion_hashes` (see `hash_metrics`).
+# The BLAKE3 round count, for the `LFM_HASH` arm and — since the P-a flip — for
+# the commitment backends the whole prover commits under. Off = 7 rounds
+# (standard BLAKE3, externally anchored); on = the 6-round A6R variant, which is
+# the shipping arm and is ON BY DEFAULT via `crypto`'s default feature set.
+# It is a compile-time knob rather than a parameter because the chip's column
+# layout is `8 · rounds` G-blocks wide and `hash::num_columns` is a `const fn`.
+#
+# Naming this feature explicitly is therefore redundant on a default build. It
+# stays because it is the knob `make lint`'s matrix and any `--no-default-features`
+# consumer need in order to name the round count at all.
+#
+# It FORWARDS to `crypto`, where the primitive now lives, rather than declaring a
+# second knob: the chip and the commitment backends must be at the same round
+# count or a build commits under one hash and prices another. `crypto`'s is the
+# only definition. The remaining way to desync them is enabling `crypto`'s alone,
+# which the `SOCKET_ROUNDS == BLAKE3_ROUNDS` assertion in `lfm::blake3_socket`
+# catches at compile time.
+blake3-6round = ["crypto/blake3-6round"]
+# Forwards `crypto`'s guest-side chained-absorb switch. See that feature's note
+# for why it stays separate from `blake3-6round`: a guest emitting the absorb
+# ecall needs the prover's absorb mode present to receive it.
+blake3-absorb = ["crypto/blake3-absorb"]
+# Trace-shape profile emission (segment-profile JSONL). Host-only: pulls
+# in serde_json, which the RISC-V recursion guest must not carry.
+shape-profile = ["dep:serde", "dep:serde_json"]
+# Host-only verify-hash counter for `test_count_recursion_hashes` (see `crypto::hash_metrics`).
 hash-metrics = ["crypto/hash-metrics"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
+# The multilinear argument: the WHIR proving path (`multilinear_prove`).
+multilinear = { path = "../crypto/multilinear" }
 crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
@@ -31,13 +65,34 @@ digest = "0.10.7"
 # pointer_width_64: 32-bit rel-ptrs cap an archive at ~2 GiB, which large
 # continuation proofs exceed. Keep in sync across all proof-format crates.
 rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [dev-dependencies]
 env_logger = "*"
+# Test-only: the transcript-count pin in `multilinear_bench_tests` guards on the
+# guest ELF's sha256, because two builds of the same guest from the same sources
+# share a name and differ in bytes — which is how a 0.23% count difference was
+# once read as a model error.
+sha2 = { version = "0.10", default-features = false }
+# Test-only: `serde_json` is behind `shape-profile` for the guest's sake, and a
+# proof round-trip test should not have to turn that on.
+serde_json = "1.0"
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "bytecheck",
+    "aligned",
+    "pointer_width_64",
+] }
 criterion = { version = "0.5", default-features = false }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+# The external anchor for `lfm::blake3` at 7 rounds and for the `LFM_HASH`
+# BLAKE3 socket (`blake3::hash(a ‖ b ‖ "LFMC")`). Test-only on purpose: the
+# machine never calls it, so it can never become a second implementation that
+# the chip is silently checked against instead of the vectors.
+blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
 # Enable stark's test-utils so cross-crate tests can reach
 # `compute_precomputed_commitment_for_testing`. Only active under cargo test/bench.
 stark = { path = "../crypto/stark", features = ["test-utils"] }

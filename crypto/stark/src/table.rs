@@ -393,13 +393,81 @@ impl<F: IsField> Table<F> {
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
-        (0..self.width)
-            .map(|col_idx| {
-                (0..self.height)
-                    .map(|row_idx| self.get(row_idx, col_idx).clone())
-                    .collect()
-            })
-            .collect()
+        // One column per worker: the table is row-major, so this is a strided
+        // read of the whole trace and the widest thing between the executor and
+        // the commitment.
+        let column = |col_idx: usize| -> Vec<FieldElement<F>> {
+            (0..self.height)
+                .map(|row_idx| self.get(row_idx, col_idx).clone())
+                .collect()
+        };
+        #[cfg(feature = "parallel")]
+        return (0..self.width).into_par_iter().map(column).collect();
+        #[cfg(not(feature = "parallel"))]
+        return (0..self.width).map(column).collect();
+    }
+
+    /// [`Self::columns`] by tiles: row blocks in parallel, and within a block
+    /// a band of columns at a time, so each row's cache lines are read once
+    /// rather than once per column. The same columns, in the same order.
+    ///
+    /// `columns` reads the row-major table at a stride of one row per element
+    /// on every column's worker, which pulls a whole cache line for each value:
+    /// on a block's traces that is most of the transposition's time, and its
+    /// memory traffic is what the columns' upload then competes with. A spilled
+    /// table takes `columns`.
+    pub fn columns_blocked(&self) -> Vec<Vec<FieldElement<F>>> {
+        #[cfg(feature = "disk-spill")]
+        if self.mmap_backing.is_some() {
+            return self.columns();
+        }
+        let (width, height) = (self.width, self.height);
+        if width == 0 || height == 0 || self.data.len() != width * height {
+            return self.columns();
+        }
+        const ROWS: usize = 1024;
+        const BAND: usize = 64;
+        let mut columns: Vec<Vec<FieldElement<F>>> =
+            (0..width).map(|_| Vec::with_capacity(height)).collect();
+        // Addresses, not pointers, so the closure is `Sync`; each block writes
+        // rows `r0..r1` of every column, disjoint from every other block.
+        let starts: Vec<usize> = columns
+            .iter_mut()
+            .map(|column| column.as_mut_ptr() as usize)
+            .collect();
+        let data = &self.data;
+        let block = |b: usize| {
+            let r0 = b * ROWS;
+            let r1 = (r0 + ROWS).min(height);
+            let mut c0 = 0;
+            while c0 < width {
+                let c1 = (c0 + BAND).min(width);
+                for row in r0..r1 {
+                    let values = &data[row * width + c0..row * width + c1];
+                    for (offset, value) in values.iter().enumerate() {
+                        // SAFETY: `starts[c]` is column `c`'s buffer, `height`
+                        // elements of capacity; `row < height`, and no other
+                        // block writes this row.
+                        unsafe {
+                            (starts[c0 + offset] as *mut FieldElement<F>)
+                                .add(row)
+                                .write(value.clone());
+                        }
+                    }
+                }
+                c0 = c1;
+            }
+        };
+        let blocks = height.div_ceil(ROWS);
+        #[cfg(feature = "parallel")]
+        (0..blocks).into_par_iter().for_each(block);
+        #[cfg(not(feature = "parallel"))]
+        (0..blocks).for_each(block);
+        for column in &mut columns {
+            // SAFETY: every row of every column was written above.
+            unsafe { column.set_len(height) };
+        }
+        columns
     }
 
     /// Extract columns as owned vectors, with each allocated at `capacity`.

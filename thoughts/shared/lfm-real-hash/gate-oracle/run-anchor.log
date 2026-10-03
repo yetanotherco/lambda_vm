@@ -1,0 +1,8 @@
+==========================================================================
+LAYER 1 ANCHOR CHECK -- blake3_oracle.py
+==========================================================================
+[PASS] A1 official vectors: A1 PASS: 35 hash + 35 keyed + 35 derive_key cases, 115 random cases, 2 known digests
+[PASS] A3 differential: A3 PASS: 200 random compressions x rounds in (6,7) agree with ../../../../../lambda_vm-blake3-impl/thoughts/blake3/blake3-oracle/blake3_ref.py
+[PASS] NC anchor sensitivity: NC PASS: all 4 single-convention perturbations break the anchor
+--------------------------------------------------------------------------
+LAYER 1: ANCHORED

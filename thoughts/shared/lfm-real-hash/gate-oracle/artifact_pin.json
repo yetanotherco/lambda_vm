@@ -1,0 +1,41 @@
+{
+ "path": "/Users/maurofab/workspace/lambda_vm-blake3-impl/prover/src/lfm/blake3_socket.rs",
+ "file_sha256": "9d358f7bb3e2457065a473d478542aa7d218826e6ce81d96c2652d846f7a4cf6",
+ "regions": {
+  "eval": {
+   "sha256": "240619f1580493b3998ac9fbc86aec61352132219ce5ca87c642e6ec2099a6be",
+   "normalized_len": 4200
+  },
+  "bitwise_interactions": {
+   "sha256": "c880036158518796d36e097f3a676a197c5a707aec94ea1284d196dca3a46fa4",
+   "normalized_len": 958
+  },
+  "cols": {
+   "sha256": "f370814ae32795fe6366dbba7956f4e38bfb33681d810c0000bd3e5c799edf44",
+   "normalized_len": 1350
+  },
+  "framing_consts": {
+   "sha256": "21ab1892612cfd3b815c3d3c983a4baedd842de9f4d1b9268bdbc78843a26c24",
+   "normalized_len": 1435
+  }
+ },
+ "framing": {
+  "tag_ascii": "LFMC",
+  "tag_word": 1129137740,
+  "flags": 11,
+  "block_len": 36,
+  "counter": 0,
+  "out_window_expr": "HASH_DIGEST_FELTS",
+  "num_g_expr": "SOCKET_ROUNDS * 8",
+  "g_size": 60,
+  "num_lanes": 8,
+  "tag_t_ascii": "LFMT",
+  "tag_t_word": 1414350412,
+  "tag_l_ascii": "LFML",
+  "tag_l_word": 1280132684,
+  "socket_rounds_expr": "BLAKE3_ROUNDS",
+  "full_output": "false",
+  "rounds_default": 7,
+  "rounds_under_blake3_6round": 6
+ }
+}

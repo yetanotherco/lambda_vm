@@ -15,7 +15,13 @@ use math::field::goldilocks::GoldilocksField;
 use math::polynomial::Polynomial;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use stark::prover::{IsStarkProver, Prover};
+use stark::config::KeccakStarkHash;
+use stark::prover::{GenericProver, IsStarkProver};
+
+/// The keccak prover, named: these tests compare against the CUDA keccak
+/// kernels, so the CPU side must say keccak rather than follow the default
+/// alias (BLAKE3 since the P-a flip).
+type Prover<F, E, PI> = GenericProver<F, E, PI, KeccakStarkHash>;
 
 type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
 
@@ -302,6 +308,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                 let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
                     &row_major,
                     None,
+                    math_cuda::DeviceHash::Keccak256,
                     n,
                     num_cols,
                     blowup,
@@ -366,6 +373,7 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
                 let (handle, _lde) =
                     math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
                         &row_major,
+                        math_cuda::DeviceHash::Keccak256,
                         n,
                         num_cols,
                         blowup,

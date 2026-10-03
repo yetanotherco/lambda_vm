@@ -19,6 +19,11 @@
 
 use stark::grinding::{inner_hash_lanes, is_valid_nonce};
 
+/// The kernel's outer hash is keccak, so the lanes and the validity pin are
+/// keccak's grinding digest — the same type the dispatch in
+/// `generate_nonce_maybe_gpu` keys the device search on.
+type Keccak = stark::config::GrindingDigest<stark::config::KeccakStarkHash>;
+
 /// At a moderate factor the kernel returns a valid nonce, and it is the
 /// smallest one (the exhaustive CPU scan below it is cheap at factor 14).
 ///
@@ -33,14 +38,15 @@ use stark::grinding::{inner_hash_lanes, is_valid_nonce};
 fn gpu_grind_returns_smallest_valid_nonce() {
     let seed = [14u8; 32];
     let factor = 14u8;
-    let nonce = math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, factor), factor)
-        .expect("GPU grind (needs a GPU)");
+    let nonce =
+        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes::<Keccak>(&seed, factor), factor)
+            .expect("GPU grind (needs a GPU)");
     assert!(
-        is_valid_nonce(&seed, nonce, factor),
+        is_valid_nonce::<Keccak>(&seed, nonce, factor),
         "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
     );
     assert!(
-        (0..nonce).all(|n| !is_valid_nonce(&seed, n, factor)),
+        (0..nonce).all(|n| !is_valid_nonce::<Keccak>(&seed, n, factor)),
         "GPU nonce {nonce} is not the smallest valid nonce (factor {factor})"
     );
 }
@@ -51,10 +57,11 @@ fn gpu_grind_returns_smallest_valid_nonce() {
 fn gpu_grind_valid_at_production_factor() {
     let seed = [20u8; 32];
     let factor = 20u8;
-    let nonce = math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, factor), factor)
-        .expect("GPU grind (needs a GPU)");
+    let nonce =
+        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes::<Keccak>(&seed, factor), factor)
+            .expect("GPU grind (needs a GPU)");
     assert!(
-        is_valid_nonce(&seed, nonce, factor),
+        is_valid_nonce::<Keccak>(&seed, nonce, factor),
         "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
     );
 }
@@ -65,7 +72,94 @@ fn gpu_grind_valid_at_production_factor() {
 fn gpu_grind_declines_below_min_factor() {
     let seed = [1u8; 32];
     assert!(
-        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, 1), 1).is_none(),
+        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes::<Keccak>(&seed, 1), 1).is_none(),
         "GPU grind should decline factor 1"
     );
+}
+
+/// ★ THE BLOCK SIZE AND THE GRID CANNOT MOVE THE ANSWER, EXECUTED.
+///
+/// `search` scans contiguous blocks from zero and returns the first hitting
+/// block's minimum, so the nonce is a function of the inner hash and the
+/// grinding factor alone. That is what makes a sweep of either knob move no
+/// proof byte — and it is a property that can fail: a stride or bounds defect
+/// would return a different valid nonce at a different stride, and only an
+/// equality across settings can see it.
+///
+/// Through `generate_nonce_gpu_at` rather than the environment because the
+/// knobs cache in a `OnceLock`: one process cannot read two settings through
+/// `LAMBDA_VM_GRIND_*`, and two processes would be two device contexts.
+#[test]
+fn the_nonce_is_the_same_at_every_scan_factor_and_grid() {
+    let seed = [20u8; 32];
+    let factor = 20u8;
+    let lanes = inner_hash_lanes::<Keccak>(&seed, factor);
+
+    let record = math_cuda::grinding::Knobs::DEFAULT;
+    let expected = math_cuda::grinding::generate_nonce_gpu_at(&lanes, factor, record)
+        .expect("GPU grind at the record posture (needs a GPU)");
+    assert!(
+        is_valid_nonce::<Keccak>(&seed, expected, factor),
+        "the record posture's nonce {expected} fails is_valid_nonce"
+    );
+
+    // Both knobs, both directions, including the pair the ruling names.
+    for knobs in [
+        math_cuda::grinding::Knobs {
+            scan: 1,
+            grid: 1024,
+        },
+        math_cuda::grinding::Knobs {
+            scan: 2,
+            grid: 1024,
+        },
+        math_cuda::grinding::Knobs {
+            scan: 8,
+            grid: 4096,
+        },
+        math_cuda::grinding::Knobs { scan: 8, grid: 256 },
+        math_cuda::grinding::Knobs {
+            scan: 1,
+            grid: 4096,
+        },
+    ] {
+        let nonce = math_cuda::grinding::generate_nonce_gpu_at(&lanes, factor, knobs)
+            .expect("GPU grind (needs a GPU)");
+        assert!(
+            is_valid_nonce::<Keccak>(&seed, nonce, factor),
+            "nonce {nonce} from {knobs:?} fails is_valid_nonce"
+        );
+        assert_eq!(
+            nonce, expected,
+            "{knobs:?} returned {nonce}, the record posture returned {expected} — \
+             the launch geometry moved the answer, so the search is not scanning \
+             contiguously from zero"
+        );
+    }
+}
+
+/// And it is still the SMALLEST at every setting, not merely the same one.
+///
+/// Factor 14 so the exhaustive host scan below the answer stays cheap. Equality
+/// across settings (the test above) would be satisfied by a search that
+/// consistently skipped the same range; minimality is what rules that out.
+#[test]
+fn the_nonce_is_still_the_smallest_at_a_narrow_grid() {
+    let seed = [14u8; 32];
+    let factor = 14u8;
+    let lanes = inner_hash_lanes::<Keccak>(&seed, factor);
+    for knobs in [
+        math_cuda::grinding::Knobs { scan: 1, grid: 256 },
+        math_cuda::grinding::Knobs {
+            scan: 8,
+            grid: 4096,
+        },
+    ] {
+        let nonce = math_cuda::grinding::generate_nonce_gpu_at(&lanes, factor, knobs)
+            .expect("GPU grind (needs a GPU)");
+        assert!(
+            (0..nonce).all(|n| !is_valid_nonce::<Keccak>(&seed, n, factor)),
+            "nonce {nonce} from {knobs:?} is not the smallest valid nonce"
+        );
+    }
 }
