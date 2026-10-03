@@ -356,10 +356,10 @@ fn parse_spill_policy(value: Option<&str>) -> BlockSpillPolicy {
 }
 
 /// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
-/// cgroup's `memory.max` less 10 GiB, else `MemTotal` less 10 GiB (#1013's
-/// `spill_target_bytes`).
+/// smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`]) and
+/// `MemTotal`, less 10 GiB ([`spill_target_from`]) (#1013's
+/// `spill_target_bytes` @ 278e6a8c6).
 fn spill_target_bytes() -> u64 {
-    const MARGIN: u64 = 10 << 30;
     if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
@@ -367,28 +367,79 @@ fn spill_target_bytes() -> u64 {
     {
         return (gib * (1u64 << 30) as f64) as u64;
     }
-    let cgroup_max = cgroup_file("memory.max").and_then(|v| v.trim().parse::<u64>().ok());
+    let limit = cgroup_memory(
+        &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+        std::path::Path::new(CGROUP_ROOT),
+        "memory.max",
+        "memory.limit_in_bytes",
+    );
     let mem_total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
         m.lines()
             .find_map(|l| l.strip_prefix("MemTotal:"))
             .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .map(|kib| kib << 10)
     });
-    cgroup_max
-        .or(mem_total)
-        .map_or(u64::MAX, |b| b.saturating_sub(MARGIN))
+    spill_target_from(limit, mem_total)
 }
 
-/// A file of this process's cgroup (v2), read whole (#1013's `cgroup_file`).
-fn cgroup_file(name: &str) -> Option<String> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    std::fs::read_to_string(format!("/sys/fs/cgroup{}/{name}", path.trim())).ok()
+/// The smaller of a cgroup limit and `MemTotal`, less 10 GiB; no spill
+/// (`u64::MAX`) when neither is known. A v1 cgroup without a limit reads a
+/// sentinel far above `MemTotal`, which the minimum discards (#1013's
+/// `spill_target_from`).
+fn spill_target_from(limit: Option<u64>, mem_total: Option<u64>) -> u64 {
+    const MARGIN: u64 = 10 << 30;
+    match (limit, mem_total) {
+        (Some(limit), Some(total)) => limit.min(total),
+        (Some(bytes), None) | (None, Some(bytes)) => bytes,
+        (None, None) => return u64::MAX,
+    }
+    .saturating_sub(MARGIN)
+}
+
+/// Where the cgroup filesystem is mounted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// A number from this process's cgroup memory files: the v2 file `v2` under
+/// the unified hierarchy (`memory.max`, `memory.current`), else the v1 file
+/// `v1` under the memory controller (`memory.limit_in_bytes`,
+/// `memory.usage_in_bytes`). `proc_cgroup` is `/proc/self/cgroup`, `root` the
+/// cgroup mount. Each is read at the process's cgroup path, then at its
+/// hierarchy's root, which a container without a cgroup namespace sees as its
+/// own cgroup. `None` where neither reads as a number (v2's `max` included)
+/// (#1013's `cgroup_memory`).
+fn cgroup_memory(proc_cgroup: &str, root: &std::path::Path, v2: &str, v1: &str) -> Option<u64> {
+    let read = |dir: &std::path::Path, file: &str| {
+        std::fs::read_to_string(dir.join(file))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let at = |base: &std::path::Path, path: &str, file: &str| {
+        read(&base.join(path.trim().trim_start_matches('/')), file).or_else(|| read(base, file))
+    };
+    let (mut unified, mut memory) = (None, None);
+    for line in proc_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            unified = Some(path);
+        } else if controllers.split(',').any(|c| c == "memory") {
+            memory = Some(path);
+        }
+    }
+    unified
+        .and_then(|path| at(root, path, v2))
+        .or_else(|| memory.and_then(|path| at(&root.join("memory"), path, v1)))
 }
 
 /// What `auto` reads as the host's bytes: the larger of the process's peak
-/// resident set (`VmHWM`) and its cgroup's charge (`memory.current`, which
-/// also counts the page cache) (#1013's `host_bytes_now`).
+/// resident set (`VmHWM`; the resident set itself is not monotone under the
+/// allocator's posture, which drops and re-faults recycled extents) and its
+/// cgroup's charge (`memory.current`, or v1's `memory.usage_in_bytes`; both
+/// count the page cache) (#1013's `host_bytes_now`).
 fn host_bytes_now() -> u64 {
     let hwm = std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -398,7 +449,12 @@ fn host_bytes_now() -> u64 {
                 .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
                 .map(|kib| kib << 10)
         });
-    let charged = cgroup_file("memory.current").and_then(|v| v.trim().parse::<u64>().ok());
+    let charged = cgroup_memory(
+        &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+        std::path::Path::new(CGROUP_ROOT),
+        "memory.current",
+        "memory.usage_in_bytes",
+    );
     hwm.unwrap_or(0).max(charged.unwrap_or(0))
 }
 
@@ -3771,7 +3827,10 @@ pub(crate) fn verify_block_whir_with(
 
 #[cfg(test)]
 mod spill_policy_tests {
-    use super::{BlockSpillPolicy, parse_spill_policy, spill_reserve_bytes, spill_wanted};
+    use super::{
+        BlockSpillPolicy, cgroup_memory, parse_spill_policy, spill_reserve_bytes,
+        spill_target_from, spill_wanted,
+    };
 
     const GIB: u64 = 1 << 30;
 
@@ -3793,6 +3852,90 @@ mod spill_policy_tests {
         assert_eq!(parse_spill_policy(Some("-1")), BlockSpillPolicy::Off);
         assert_eq!(parse_spill_policy(Some("nan")), BlockSpillPolicy::Off);
         assert_eq!(BlockSpillPolicy::default(), BlockSpillPolicy::Auto);
+    }
+
+    /// The cgroup memory files, v2 and v1, from fake `/proc/self/cgroup` texts
+    /// and cgroup trees: v2 at the process's path, v2's `max` falling through
+    /// to v1, v1 at its path or (a container without a cgroup namespace) at
+    /// the controller's root, a v1 controller sharing its hierarchy, and none
+    /// (#1013's test @ 278e6a8c6, in a directory of its own).
+    #[test]
+    fn the_cgroup_memory_files_read_v2_then_v1() {
+        let root = std::env::temp_dir().join(format!("im4b-whir-cgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, file: &str, value: &str| {
+            let dir = root.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), value).unwrap();
+        };
+        let limit = |proc_cgroup: &str| {
+            cgroup_memory(proc_cgroup, &root, "memory.max", "memory.limit_in_bytes")
+        };
+        // v2 at the process's path.
+        put("a/b", "memory.max", "129584070656\n");
+        put("a/b", "memory.current", "4096\n");
+        assert_eq!(limit("0::/a/b\n"), Some(129_584_070_656));
+        assert_eq!(
+            cgroup_memory(
+                "0::/a/b\n",
+                &root,
+                "memory.current",
+                "memory.usage_in_bytes"
+            ),
+            Some(4096)
+        );
+        // v2 unlimited and no v1: no limit.
+        put("c", "memory.max", "max\n");
+        assert_eq!(limit("0::/c\n"), None);
+        // A hybrid host, as FAST: the unified line names a path with no
+        // memory files, and the memory controller's own cgroup is its root.
+        put("memory", "memory.limit_in_bytes", "61774757888\n");
+        put("memory", "memory.usage_in_bytes", "17855025152\n");
+        let fast = "12:memory:/docker/d005\n9:cpu,cpuacct:/docker/d005\n0::/docker/d005\n";
+        assert_eq!(limit(fast), Some(61_774_757_888));
+        assert_eq!(
+            cgroup_memory(fast, &root, "memory.current", "memory.usage_in_bytes"),
+            Some(17_855_025_152)
+        );
+        // v1 at the process's path wins over the controller's root, and a
+        // controller sharing its hierarchy is found.
+        put("memory/docker/d005", "memory.limit_in_bytes", "777\n");
+        assert_eq!(limit(fast), Some(777));
+        put("memory/p", "memory.limit_in_bytes", "888\n");
+        assert_eq!(limit("4:cpu,memory:/p\n"), Some(888));
+        // v2's `max` falls through to v1.
+        assert_eq!(limit("4:memory:/p\n0::/c\n"), Some(888));
+        // Nothing readable.
+        assert_eq!(limit(""), None);
+        assert_eq!(limit("5:pids:/x\n"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The target is the smaller of the cgroup limit and `MemTotal`, less
+    /// 10 GiB: v1's unlimited sentinel gives `MemTotal`'s, a limit above
+    /// `MemTotal` is capped, and with neither nothing spills.
+    #[test]
+    fn the_spill_target_is_the_smaller_limit_less_ten_gib() {
+        let total = 62_840_956u64 << 10;
+        assert_eq!(
+            spill_target_from(Some(61_774_757_888), Some(total)),
+            61_774_757_888 - 10 * GIB
+        );
+        assert_eq!(
+            spill_target_from(Some(9_223_372_036_854_771_712), Some(total)),
+            total - 10 * GIB
+        );
+        assert_eq!(
+            spill_target_from(Some(200 * GIB), Some(125 * GIB)),
+            115 * GIB
+        );
+        assert_eq!(spill_target_from(None, Some(64 * GIB)), 54 * GIB);
+        assert_eq!(
+            spill_target_from(Some(129_584_070_656), None),
+            129_584_070_656 - 10 * GIB
+        );
+        assert_eq!(spill_target_from(Some(8 * GIB), Some(16 * GIB)), 0);
+        assert_eq!(spill_target_from(None, None), u64::MAX);
     }
 
     /// `auto` spills a table only once the host, its reserve and the table
