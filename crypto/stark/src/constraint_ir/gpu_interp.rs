@@ -245,6 +245,20 @@ impl LoweredProgram {
         cache.push(((budget, fast), lowered.clone()));
         lowered
     }
+
+    /// The automatic shape ([`auto_shape`]) and its specialized lowering.
+    fn si_auto(
+        &self,
+        prog: &GoldilocksProgram,
+    ) -> Option<(
+        math_cuda::constraint_interp::SiConfig,
+        std::sync::Arc<SiLowered>,
+    )> {
+        let l16 = self.si(prog, 16, true)?;
+        let l128 = self.si(prog, 128, true)?;
+        let (cfg, budget) = auto_shape(l16.bp.stats.compute_steps, l128.bp.stats.compute_steps);
+        Some((cfg, if budget == 16 { l16 } else { l128 }))
+    }
 }
 
 /// `LAMBDA_VM_GPU_INTERP_SI`: which compositions run the bounded-slot
@@ -280,8 +294,8 @@ pub fn interp_si_setting(raw: Option<&str>) -> SiMode {
 /// the bounded-slot interpreter's launch shape and word budget; flags joined
 /// by `+`: `fast` (specialized opcodes, the default) or `generic`, and
 /// `staged` (steps staged through shared memory), `prefetch` (staged, and the
-/// trace cells of the steps ahead prefetched into L1). Default
-/// `shared:1:128:48:fast`.
+/// trace cells of the steps ahead prefetched into L1). Unset or `auto` (the
+/// default): each program's shape by [`auto_shape`].
 pub const SI_SHAPE_ENV: &str = "LAMBDA_VM_GPU_SI_SHAPE";
 
 /// The bounded-slot interpreter's launch shape and word budget.
@@ -291,21 +305,66 @@ pub struct SiTuning {
     pub budget: u32,
     /// The specialized opcodes ([`super::budgeted::specialize`]).
     pub fast: bool,
+    /// Each program's shape chosen by [`auto_shape`] instead (`cfg` and
+    /// `budget` unused).
+    pub auto: bool,
 }
 
 impl Default for SiTuning {
+    /// The automatic per-program shape.
     fn default() -> Self {
         Self {
-            cfg: math_cuda::constraint_interp::SiConfig {
-                store: math_cuda::constraint_interp::SiStore::Shared,
-                rows_per_thread: 1,
-                block: 128,
-                staged: false,
-                prefetch: false,
-            },
-            budget: 48,
-            fast: true,
+            auto: true,
+            ..SiTuning::fixed(
+                math_cuda::constraint_interp::SiConfig {
+                    store: math_cuda::constraint_interp::SiStore::Shared,
+                    rows_per_thread: 1,
+                    block: 64,
+                    staged: false,
+                    prefetch: false,
+                },
+                16,
+            )
         }
+    }
+}
+
+impl SiTuning {
+    /// One shape and budget for every program, specialized opcodes.
+    pub fn fixed(cfg: math_cuda::constraint_interp::SiConfig, budget: u32) -> Self {
+        Self {
+            cfg,
+            budget,
+            fast: true,
+            auto: false,
+        }
+    }
+}
+
+/// The automatic shape for a program, from its interior steps at 16 and at 128
+/// words a row (`n16`, `n128`), as S1 measured the shapes (FAST 782, I-INTERP
+/// §4.5): the shared-memory slots at 16 words are occupancy-bound and win
+/// unless 16 words make the program recompute a lot; then a 128-word local
+/// array (ECDAS 1.76×, ECSM 1.26× at ≥ 10 k steps; LFM_HASH 3.5×). Programs of
+/// ≥ 2 k steps read their steps from shared memory (staged: KECCAK_RND −9 %,
+/// KECCAK −6 %); smaller ones in 64-thread blocks (CPU, MEMW_*, HALT …).
+/// Returns the shape and its budget.
+pub fn auto_shape(n16: usize, n128: usize) -> (math_cuda::constraint_interp::SiConfig, u32) {
+    use math_cuda::constraint_interp::{SiConfig, SiStore};
+    let x = n16 as f64 / n128.max(1) as f64;
+    let cfg = |store, block, staged| SiConfig {
+        store,
+        rows_per_thread: 1,
+        block,
+        staged,
+        prefetch: false,
+    };
+    if (x >= 1.25 && n128 >= 10_000) || x >= 2.5 {
+        (cfg(SiStore::Local, 128, false), 128)
+    } else if n128 >= 2_000 {
+        (cfg(SiStore::Shared, 128, true), 16)
+    } else {
+        (cfg(SiStore::Shared, 64, false), 16)
     }
 }
 
@@ -315,9 +374,12 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return SiTuning::default();
     };
+    if raw == "auto" {
+        return SiTuning::default();
+    }
     let bad = || -> ! {
         panic!(
-            "{SI_SHAPE_ENV} must be <shared|local>:<rows>:<block>:<budget>[:fast|:generic], got {raw:?}"
+            "{SI_SHAPE_ENV} must be auto or <shared|local>:<rows>:<block>:<budget>[:<flags>], got {raw:?}"
         )
     };
     let parts: Vec<&str> = raw.split(':').collect();
@@ -364,6 +426,7 @@ pub fn si_shape_setting(raw: Option<&str>) -> SiTuning {
         },
         budget,
         fast,
+        auto: false,
     }
 }
 
@@ -714,7 +777,16 @@ where
         SiMode::Uncompiled => compiled.is_none(),
         SiMode::All => true,
     };
-    if si_takes && let Some(si) = lowered.si(gprog, tuning.budget, tuning.fast) {
+    let chosen = if !si_takes {
+        None
+    } else if tuning.auto {
+        lowered.si_auto(gprog)
+    } else {
+        lowered
+            .si(gprog, tuning.budget, tuning.fast)
+            .map(|si| (tuning.cfg, si))
+    };
+    if let Some((si_cfg, si)) = chosen {
         let triples = |v: &[u64]| -> Vec<[u64; 3]> {
             v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
         };
@@ -752,7 +824,7 @@ where
                 ext_uniforms: &uni,
             };
             let out = math_cuda::constraint_interp::eval_composition_si_keep(
-                tuning.cfg, &sp, main, aux, next_step, num_rows, &accum,
+                si_cfg, &sp, main, aux, next_step, num_rows, &accum,
             )
             .and_then(|h| {
                 if keep {
@@ -928,6 +1000,7 @@ mod tests {
         use super::{SiTuning, si_shape_setting};
         use math_cuda::constraint_interp::{SiConfig, SiStore};
         assert_eq!(si_shape_setting(None), SiTuning::default());
+        assert!(si_shape_setting(Some("auto")).auto && SiTuning::default().auto);
         assert_eq!(
             si_shape_setting(Some("local:1:256:64")),
             SiTuning {
@@ -940,6 +1013,7 @@ mod tests {
                 },
                 budget: 64,
                 fast: true,
+                auto: false,
             }
         );
         assert!(!si_shape_setting(Some("shared:1:128:48:generic")).fast);
@@ -953,8 +1027,28 @@ mod tests {
         );
     }
 
+    /// The automatic shape picks S1's best for the three interpreted programs
+    /// (FAST 782: KECCAK_RND and KECCAK staged shared memory at 16 words, ECDAS
+    /// the 128-word local array) and 64-thread shared memory for small ones.
     #[test]
-    #[should_panic(expected = "must be <shared|local>")]
+    fn the_automatic_shape_matches_s1() {
+        use super::auto_shape;
+        use math_cuda::constraint_interp::SiStore;
+        // KECCAK_RND, KECCAK, ECDAS, ECSM, HALT, CPU interior steps (16 / 128).
+        let (k, b) = auto_shape(16_941, 14_177);
+        assert!(k.store == SiStore::Shared && k.staged && k.block == 128 && b == 16);
+        let (k, b) = auto_shape(3_667, 3_294);
+        assert!(k.store == SiStore::Shared && k.staged && b == 16);
+        let (e, b) = auto_shape(46_431, 26_646);
+        assert!(e.store == SiStore::Local && b == 128);
+        assert_eq!(auto_shape(27_400, 21_758).0.store, SiStore::Local);
+        let (h, b) = auto_shape(1_490, 738);
+        assert!(h.store == SiStore::Shared && !h.staged && h.block == 64 && b == 16);
+        assert_eq!(auto_shape(651, 542).0.block, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be auto or <shared|local>")]
     fn the_bounded_slot_shape_refuses_two_local_rows() {
         super::si_shape_setting(Some("local:2:128:48"));
     }

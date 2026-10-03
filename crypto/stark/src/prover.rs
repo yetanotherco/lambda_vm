@@ -1754,7 +1754,8 @@ fn run_admitted<T: Send>(
     let packing = gate_packing();
     let timeline = table_timeline();
     // The timeline also carries each table's composition device time
-    // (` comp_dev=`, CUDA events around the composition kernel).
+    // (` comp_dev=`, CUDA events around the composition kernel) and the
+    // slot-file scratch its composition allocated (` comp_scratch=`).
     #[cfg(feature = "cuda")]
     if timeline {
         math_cuda::constraint_interp::set_composition_timing(true);
@@ -1837,13 +1838,23 @@ fn run_admitted<T: Send>(
                         // This driver's stages from here on are this table's.
                         crate::prove_split::table_begin();
                         #[cfg(feature = "cuda")]
-                        let _ = math_cuda::constraint_interp::take_composition_device_ms();
+                        {
+                            let _ = math_cuda::constraint_interp::take_composition_device_ms();
+                            let _ = math_cuda::constraint_interp::take_composition_scratch_bytes();
+                        }
                     }
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
                     if let (Some(t_claim), Some(t_start)) = (t_claim, t_start) {
                         #[cfg(feature = "cuda")]
                         let comp_dev = math_cuda::constraint_interp::take_composition_device_ms()
-                            .map(|ms| format!(" comp_dev={ms:.3}ms"))
+                            .map(|ms| {
+                                let scratch =
+                                    math_cuda::constraint_interp::take_composition_scratch_bytes();
+                                format!(
+                                    " comp_dev={ms:.3}ms comp_scratch={:.3}GiB",
+                                    scratch as f64 / (1u64 << 30) as f64
+                                )
+                            })
                             .unwrap_or_default();
                         #[cfg(not(feature = "cuda"))]
                         let comp_dev = String::new();

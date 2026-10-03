@@ -218,7 +218,7 @@ fn budgeted_census() {
             unbounded.stats.distinct_nodes,
             unbounded.num_words,
         );
-        for budget in [24u32, 32, 48, 64, 96, 128] {
+        for budget in [16u32, 24, 32, 48, 64, 96, 128] {
             match lower_budgeted(&p, budget) {
                 Ok(bp) => {
                     line.push_str(&format!(
@@ -338,6 +338,7 @@ mod device {
             },
             budget,
             fast: true,
+            auto: false,
         }
     }
 
@@ -352,6 +353,7 @@ mod device {
             },
             budget,
             fast: true,
+            auto: false,
         }
     }
 
@@ -381,6 +383,9 @@ mod device {
     }
 
     fn name(t: &SiTuning) -> String {
+        if t.auto {
+            return "auto".into();
+        }
         let s = match t.cfg.store {
             SiStore::Shared => "smem",
             SiStore::Local => "local",
@@ -503,6 +508,7 @@ mod device {
             staged(shared(1, 64, 48)),
             prefetched(local(128, 48)),
             prefetched(shared(1, 64, 24)),
+            SiTuning::default(),
         ]
     }
 

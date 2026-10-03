@@ -355,6 +355,10 @@ fn eval_composition_launch(
     // Per-thread slot scratch, uninitialized (the walk writes before reading).
     let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
     let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    if COMPOSITION_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+        let bytes = 8 * (num_base_slots + 3 * num_ext_slots) * num_threads;
+        COMPOSITION_SCRATCH.with(|c| c.set(c.get() + bytes as u64));
+    }
     // Output: every row is written by the grid-stride loop.
     let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
 
@@ -482,6 +486,16 @@ static COMPOSITION_TIMING: std::sync::atomic::AtomicBool =
 thread_local! {
     static COMPOSITION_EVENTS: std::cell::RefCell<Vec<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Bytes of slot-file scratch the slot-file interpreter allocated on this
+    /// thread since the last [`take_composition_scratch_bytes`] (timer on).
+    static COMPOSITION_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The slot-file scratch bytes (the slot-file interpreter's per-thread value
+/// files, outside the VRAM gate's estimate) this thread's compositions
+/// allocated since the last call, while the timer is on.
+pub fn take_composition_scratch_bytes() -> u64 {
+    COMPOSITION_SCRATCH.with(|c| c.replace(0))
 }
 
 /// Turn the composition timer on or off, process-wide.
