@@ -63,32 +63,40 @@ fn small_block_at(
     format: &BlockFormat,
     ecdas_rows_log2: usize,
 ) -> (Vec<u8>, BlockWhirProof) {
+    small_block_cut(name, format, |o| o.ecdas_rows_log2 = ecdas_rows_log2)
+}
+
+/// [`small_block`] with its options changed by `cut` (the chunked tables'
+/// heights).
+fn small_block_cut(
+    name: &str,
+    format: &BlockFormat,
+    cut: impl FnOnce(&mut BlockOptions),
+) -> (Vec<u8>, BlockWhirProof) {
     let elf = asm_elf_bytes(name);
     let opts = ProofOptions::default_test_options();
-    let proof = prove_block_whir(
-        &elf,
-        &[],
-        &opts,
-        format,
-        &BlockOptions {
-            max_rows: MaxRowsConfig::small(),
-            keccak_rnd_rows_log2: 3,
-            ecdas_rows_log2,
-            drop_levels: 3,
-            window_log2: None,
-            stream_keccak_rnd: false,
-            stream_memw_lt: false,
-            drop_streamed_ops: false,
-            layout_workers: 0,
-            layout_ahead: Some(2),
-            pack_rest_as_laid_out: false,
-            // Every table packed on a card, so a box run walks the narrow path at a
-            // test's size.
-            narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
-        },
-    )
-    .expect("the block proves")
-    .0;
+    let mut options = BlockOptions {
+        max_rows: MaxRowsConfig::small(),
+        keccak_rnd_rows_log2: 3,
+        ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
+        keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
+        ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+        drop_levels: 3,
+        window_log2: None,
+        stream_keccak_rnd: false,
+        stream_memw_lt: false,
+        drop_streamed_ops: false,
+        layout_workers: 0,
+        layout_ahead: Some(2),
+        pack_rest_as_laid_out: false,
+        // Every table packed on a card, so a box run walks the narrow path at a
+        // test's size.
+        narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+    };
+    cut(&mut options);
+    let proof = prove_block_whir(&elf, &[], &opts, format, &options)
+        .expect("the block proves")
+        .0;
     assert!(
         verify_block_whir(&proof, &elf, &opts, format).expect("verify runs"),
         "the host verifier accepts the block"
@@ -417,6 +425,8 @@ fn dense_block_with(
             max_rows: MaxRowsConfig::default(),
             keccak_rnd_rows_log2: 16,
             ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
+            keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
+            ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
             drop_levels: 3,
             window_log2: None,
             stream_keccak_rnd: false,
@@ -853,7 +863,10 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
     verify(proof.statement()).expect("the block's verifier accepts the split ECDAS");
 
     let mut tall = proof.statement().to_owned();
-    let (_, range, cap) = block_whir::chunked_table_ranges(&tall.table_counts)[1].clone();
+    let (_, range, cap) = block_whir::chunked_table_ranges(&tall.table_counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "ECDAS")
+        .expect("the ECDAS range");
     tall.table_num_vars[range.start] = (cap + 1) as u8;
     let refused = verify(tall.view());
     assert!(
@@ -866,6 +879,64 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
         plan.num_groups(),
         refused.err().unwrap_or_default()
     );
+}
+
+/// ★ KECCAK and ECSM cut through the block's recursion: test_keccak_multi's
+/// three permutations and test_ecsm_multi's three scalar multiplications, one
+/// row a table (four tables each: three calls and the padding row), prove as
+/// blocks whose trees the verifier derives and accepts. Each statement with
+/// its first table stated over its cap ([`block_whir::BLOCK_KECCAK_MAX_VARS`],
+/// [`block_whir::BLOCK_ECSM_MAX_VARS`]) is refused before any program is
+/// derived.
+#[test]
+#[ignore = "proves two small blocks and their trees; box tier"]
+fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
+    super::device_permit::arm(1);
+    let format = small_format();
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    for (guest, name) in [("test_keccak_multi", "KECCAK"), ("test_ecsm_multi", "ECSM")] {
+        let (elf, proof) = small_block_cut(guest, &format, |o| match name {
+            "KECCAK" => o.keccak_rows_log2 = 0,
+            _ => o.ecsm_rows_log2 = 0,
+        });
+        let (_, range, cap) = block_whir::chunked_table_ranges(&proof.table_counts)
+            .into_iter()
+            .find(|(n, ..)| *n == name)
+            .expect("the table's range");
+        assert_eq!(range.len(), 4, "{name}: one row a table");
+        let plan = plan_of(&elf, &proof, &format, None);
+        let (top, _) =
+            compose(&plan, &proof, &format!("{name} TREE")).expect("the honest tree proves");
+        let verify = |statement: block_whir::BlockStatement<'_>| {
+            verify_block_tree_under(
+                &elf,
+                &opts,
+                &format,
+                statement,
+                None,
+                BLOCK_FAN_IN,
+                &wrap,
+                &top,
+            )
+        };
+        verify(proof.statement())
+            .unwrap_or_else(|e| panic!("the block's verifier accepts the split {name}: {e}"));
+
+        let mut tall = proof.statement().to_owned();
+        tall.table_num_vars[range.start] = (cap + 1) as u8;
+        let refused = verify(tall.view());
+        assert!(
+            refused.is_err(),
+            "a {name} table stated over its cap must be refused"
+        );
+        println!(
+            "WHIR BLOCK TREE {name} SPLIT: {} groups, 4 {name} tables, accepted; a {name} over its \
+             cap refused ({})",
+            plan.num_groups(),
+            refused.err().unwrap_or_default()
+        );
+    }
 }
 
 /// ★ The tree over a small block proves to a top, and the block's verifier —
@@ -1305,6 +1376,9 @@ fn the_whir_block_tree_on_a_real_block() {
     if let Some(narrow) = crate::block_whir::narrow_from_env() {
         options.narrow = narrow;
     }
+    // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
+    // ECSM split (production 2^18 / 2^17).
+    crate::block_whir::chunk_cuts_from_env(&mut options);
     let opts = super::proof::block_base_options();
     let wrap = aggregation_wrap_options();
     super::device_permit::arm(siblings);
@@ -1399,6 +1473,12 @@ fn the_whir_block_tree_on_a_real_block() {
             .map(|(_, &n)| n)
             .collect();
         println!("W3 LT HEIGHTS: {lt:?}");
+        println!(
+            "W3 CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{})",
+            block_whir::chunked_census(&proof.table_counts, &proof.table_num_vars),
+            options.keccak_rows_log2,
+            options.ecsm_rows_log2,
+        );
     }
     println!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",

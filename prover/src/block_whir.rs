@@ -81,6 +81,29 @@ pub const BLOCK_MAX_ECDAS: usize = 1 << 12;
 /// step's `(round, op)`.
 pub const BLOCK_ECDAS_ROWS_LOG2: usize = 17;
 
+/// The most KECCAK tables a block statement may declare: a bound on what the
+/// verifier builds before anything is checked, far above any block (a
+/// keccak-heavy block at the gas limit makes ≈ 8 at 2^18 rows).
+pub const BLOCK_MAX_KECCAK: usize = 1 << 12;
+
+/// The rows each KECCAK table holds at most — a prover's choice, under the
+/// format's cap [`BLOCK_KECCAK_MAX_VARS`]. KECCAK is one row per permutation
+/// call, so a cut falls between calls. A keccak-heavy block at the gas limit
+/// makes ≈ 2^21 calls, whose one table would stack into eight polynomials of a
+/// 2^27 stack; at 2^18 rows its 511 columns fit one.
+pub const BLOCK_KECCAK_ROWS_LOG2: usize = 18;
+
+/// The most ECSM tables a block statement may declare: a bound on what the
+/// verifier builds before anything is checked, far above any block.
+pub const BLOCK_MAX_ECSM: usize = 1 << 12;
+
+/// The rows each ECSM table holds at most — a prover's choice, under the
+/// format's cap [`BLOCK_ECSM_MAX_VARS`]. ECSM is one row per scalar
+/// multiplication, so a cut falls between calls (a call's double/add steps are
+/// ECDAS rows, reached through the Ecdas bus keyed by the call's timestamp). At
+/// 2^17 rows its 667 columns fit one polynomial of a 2^27 stack.
+pub const BLOCK_ECSM_ROWS_LOG2: usize = 17;
+
 /// The tallest KECCAK_RND table a block statement may state, in variables: a
 /// verifier constant ([`check_chunked_heights`]), so no statement makes the
 /// argument's tree taller than a 2^16-row table's.
@@ -91,6 +114,16 @@ pub const BLOCK_KECCAK_RND_MAX_VARS: usize = 16;
 /// tree is ≈ 3 GiB and its columns fit one polynomial of a 2^27 stack.
 pub const BLOCK_ECDAS_MAX_VARS: usize = 17;
 
+/// The tallest KECCAK table a block statement may state, in variables: a
+/// verifier constant ([`check_chunked_heights`]), so no statement makes one
+/// KECCAK table stack into more than one polynomial of a 2^27 stack.
+pub const BLOCK_KECCAK_MAX_VARS: usize = 18;
+
+/// The tallest ECSM table a block statement may state, in variables: a
+/// verifier constant ([`check_chunked_heights`]), so no statement makes one
+/// ECSM table stack into more than one polynomial of a 2^27 stack.
+pub const BLOCK_ECSM_MAX_VARS: usize = 17;
+
 /// The tallest table a block statement may state, in variables: a verifier
 /// constant ([`check_table_heights`]). A group stacks at `want.min(cap).max(tallest)`
 /// variables, so one taller table would make its chain taller than the 2^27
@@ -100,6 +133,8 @@ pub const BLOCK_MAX_TABLE_VARS: usize = 27;
 
 const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
 const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
+const _: () = assert!(BLOCK_KECCAK_ROWS_LOG2 <= BLOCK_KECCAK_MAX_VARS);
+const _: () = assert!(BLOCK_ECSM_ROWS_LOG2 <= BLOCK_ECSM_MAX_VARS);
 
 /// Tree levels a group keeps OFF the host between its commit and its opening:
 /// a query re-hashes `2^4` of its codeword's cosets to rebuild them. A
@@ -168,6 +203,12 @@ pub struct BlockOptions {
     /// ECDAS's tables are cut at 2^`ecdas_rows_log2` rows
     /// ([`BLOCK_ECDAS_ROWS_LOG2`] in production).
     pub ecdas_rows_log2: usize,
+    /// KECCAK's tables are cut at 2^`keccak_rows_log2` rows
+    /// ([`BLOCK_KECCAK_ROWS_LOG2`] in production).
+    pub keccak_rows_log2: usize,
+    /// ECSM's tables are cut at 2^`ecsm_rows_log2` rows
+    /// ([`BLOCK_ECSM_ROWS_LOG2`] in production).
+    pub ecsm_rows_log2: usize,
     pub drop_levels: usize,
     /// `Some(k)`: build the traces in windows of 2^k cycles and commit each
     /// table as its chunk completes ([`WindowedTraceBuilder`]); `None`: build
@@ -214,12 +255,14 @@ pub struct BlockOptions {
 
 impl BlockOptions {
     /// Every chunked table at 2^21 rows, KECCAK_RND at 2^16, ECDAS at 2^17,
-    /// windows of 2^20 cycles.
+    /// KECCAK at 2^18, ECSM at 2^17, windows of 2^20 cycles.
     pub fn production() -> Self {
         Self {
             max_rows: MaxRowsConfig::uniform(1 << 21),
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             ecdas_rows_log2: BLOCK_ECDAS_ROWS_LOG2,
+            keccak_rows_log2: BLOCK_KECCAK_ROWS_LOG2,
+            ecsm_rows_log2: BLOCK_ECSM_ROWS_LOG2,
             drop_levels: BLOCK_TREE_DROP_LEVELS,
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
@@ -245,6 +288,47 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
         Ok(other) => panic!("BLOCK_WHIR_NARROW={other}: wide, card or host"),
         Err(_) => None,
     }
+}
+
+/// `BLOCK_WHIR_KECCAK_LOG2=k` (0..=[`BLOCK_KECCAK_MAX_VARS`]) and
+/// `BLOCK_WHIR_ECSM_LOG2=k` (0..=[`BLOCK_ECSM_MAX_VARS`]): the real-block
+/// tests' KECCAK and ECSM cuts, to force a split on a block whose tables fit
+/// one; unset leaves the production ones.
+#[cfg(test)]
+pub(crate) fn chunk_cuts_from_env(options: &mut BlockOptions) {
+    for (name, cap, rows_log2) in [
+        (
+            "BLOCK_WHIR_KECCAK_LOG2",
+            BLOCK_KECCAK_MAX_VARS,
+            &mut options.keccak_rows_log2,
+        ),
+        (
+            "BLOCK_WHIR_ECSM_LOG2",
+            BLOCK_ECSM_MAX_VARS,
+            &mut options.ecsm_rows_log2,
+        ),
+    ] {
+        if let Ok(v) = std::env::var(name) {
+            match v.trim().parse() {
+                Ok(k) if k <= cap => *rows_log2 = k,
+                _ => panic!("{name}={v}: 0..={cap}"),
+            }
+        }
+    }
+}
+
+/// The chunked tables' heights a statement states, for the real-block
+/// readouts: `KECCAK 1 × [14] · KECCAK_RND 4 × [16, 16, 16, 16] · …`.
+#[cfg(test)]
+pub(crate) fn chunked_census(counts: &TableCounts, table_num_vars: &[u8]) -> String {
+    chunked_table_ranges(counts)
+        .into_iter()
+        .map(|(name, range, _)| {
+            let heights = &table_num_vars[range];
+            format!("{name} {} × {heights:?}", heights.len())
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Cycles a streamed prove collects at a time: half a CPU instance at 2^21, so
@@ -485,23 +569,26 @@ impl BlockStamps {
 }
 
 /// The counts a block statement may declare: [`TableCounts::validate`], with
-/// KECCAK_RND and ECDAS chunked (at most [`BLOCK_MAX_KECCAK_RND`] and
-/// [`BLOCK_MAX_ECDAS`] tables).
+/// KECCAK, KECCAK_RND, ECSM and ECDAS chunked (at most [`BLOCK_MAX_KECCAK`],
+/// [`BLOCK_MAX_KECCAK_RND`], [`BLOCK_MAX_ECSM`] and [`BLOCK_MAX_ECDAS`]
+/// tables).
 pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
-    if counts.keccak_rnd > BLOCK_MAX_KECCAK_RND {
-        return Err(Error::InvalidTableCounts(format!(
-            "keccak_rnd count is {} — a block takes at most {BLOCK_MAX_KECCAK_RND}",
-            counts.keccak_rnd,
-        )));
-    }
-    if counts.ecdas > BLOCK_MAX_ECDAS {
-        return Err(Error::InvalidTableCounts(format!(
-            "ecdas count is {} — a block takes at most {BLOCK_MAX_ECDAS}",
-            counts.ecdas,
-        )));
+    for (name, count, max) in [
+        ("keccak", counts.keccak, BLOCK_MAX_KECCAK),
+        ("keccak_rnd", counts.keccak_rnd, BLOCK_MAX_KECCAK_RND),
+        ("ecsm", counts.ecsm, BLOCK_MAX_ECSM),
+        ("ecdas", counts.ecdas, BLOCK_MAX_ECDAS),
+    ] {
+        if count > max {
+            return Err(Error::InvalidTableCounts(format!(
+                "{name} count is {count} — a block takes at most {max}"
+            )));
+        }
     }
     let mut rest = counts.clone();
+    rest.keccak = rest.keccak.min(1);
     rest.keccak_rnd = rest.keccak_rnd.min(1);
+    rest.ecsm = rest.ecsm.min(1);
     rest.ecdas = rest.ecdas.min(1);
     rest.validate()
 }
@@ -513,15 +600,15 @@ pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
 /// Counts whose total passed [`TableCounts::total`] cannot overflow these sums.
 pub(crate) fn chunked_table_ranges(
     counts: &TableCounts,
-) -> [(&'static str, std::ops::Range<usize>, usize); 2] {
-    let keccak_rnd = FIXED_TABLE_COUNT + counts.commit + counts.keccak;
-    let ecdas = keccak_rnd + counts.keccak_rnd + counts.ecsm;
+) -> [(&'static str, std::ops::Range<usize>, usize); 4] {
+    let keccak = FIXED_TABLE_COUNT + counts.commit;
+    let keccak_rnd = keccak + counts.keccak;
+    let ecsm = keccak_rnd + counts.keccak_rnd;
+    let ecdas = ecsm + counts.ecsm;
     [
-        (
-            "KECCAK_RND",
-            keccak_rnd..keccak_rnd + counts.keccak_rnd,
-            BLOCK_KECCAK_RND_MAX_VARS,
-        ),
+        ("KECCAK", keccak..keccak_rnd, BLOCK_KECCAK_MAX_VARS),
+        ("KECCAK_RND", keccak_rnd..ecsm, BLOCK_KECCAK_RND_MAX_VARS),
+        ("ECSM", ecsm..ecdas, BLOCK_ECSM_MAX_VARS),
         ("ECDAS", ecdas..ecdas + counts.ecdas, BLOCK_ECDAS_MAX_VARS),
     ]
 }
@@ -542,9 +629,11 @@ pub(crate) fn check_table_heights(table_num_vars: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Every KECCAK_RND table at most [`BLOCK_KECCAK_RND_MAX_VARS`] variables and
-/// every ECDAS table at most [`BLOCK_ECDAS_MAX_VARS`], against the statement's
-/// heights. Run once the heights are known to be one per table.
+/// Every chunked table under its cap, against the statement's heights: KECCAK
+/// at most [`BLOCK_KECCAK_MAX_VARS`] variables, KECCAK_RND
+/// [`BLOCK_KECCAK_RND_MAX_VARS`], ECSM [`BLOCK_ECSM_MAX_VARS`] and ECDAS
+/// [`BLOCK_ECDAS_MAX_VARS`]. Run once the heights are known to be one per
+/// table.
 pub(crate) fn check_chunked_heights(
     counts: &TableCounts,
     table_num_vars: &[u8],
@@ -1189,6 +1278,8 @@ fn prove_block_whir_inner(
     let t = Instant::now();
     split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2);
     split_ecdas(&mut traces, options.ecdas_rows_log2);
+    split_keccak(&mut traces, options.keccak_rows_log2);
+    split_ecsm(&mut traces, options.ecsm_rows_log2);
     if deviations.omit_first_keccak_rnd && !traces.keccak_rnds.is_empty() {
         traces.keccak_rnds.remove(0);
     }
@@ -1228,7 +1319,29 @@ pub(crate) fn split_ecdas(traces: &mut Traces, rows_log2: usize) {
         .collect();
 }
 
-/// The block's proof over traces already built (and KECCAK_RND already
+/// Cuts every KECCAK table into tables of at most `2^rows_log2` rows: a row is
+/// one whole permutation call, so a cut falls between calls
+/// ([`BLOCK_KECCAK_ROWS_LOG2`]).
+pub(crate) fn split_keccak(traces: &mut Traces, rows_log2: usize) {
+    let rows = 1usize << rows_log2;
+    traces.keccaks = std::mem::take(&mut traces.keccaks)
+        .into_iter()
+        .flat_map(|table| split_rows(table, rows))
+        .collect();
+}
+
+/// Cuts every ECSM table into tables of at most `2^rows_log2` rows: a row is
+/// one whole scalar multiplication, so a cut falls between calls
+/// ([`BLOCK_ECSM_ROWS_LOG2`]).
+pub(crate) fn split_ecsm(traces: &mut Traces, rows_log2: usize) {
+    let rows = 1usize << rows_log2;
+    traces.ecsms = std::mem::take(&mut traces.ecsms)
+        .into_iter()
+        .flat_map(|table| split_rows(table, rows))
+        .collect();
+}
+
+/// The block's proof over traces already built (and the chunked tables already
 /// split). `release_rows` lets each table's row-major copy go as its columns
 /// are taken — what a prove does; a test proving the same traces twice keeps
 /// them. Adds `prep`, `phase_a`, `phase_b` and the groups to `stamps`.
@@ -2153,6 +2266,8 @@ fn prove_streamed(
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
                 split_ecdas(&mut rest, options.ecdas_rows_log2);
+                split_keccak(&mut rest, options.keccak_rows_log2);
+                split_ecsm(&mut rest, options.ecsm_rows_log2);
                 if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
                     return Err(Error::Prover(
                         "omit_first_keccak_rnd is a non-streamed deviation: a streamed chunk \
