@@ -54,6 +54,7 @@
 //! it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use math::{
@@ -174,6 +175,72 @@ impl Narrowing {
 /// Production's smallest table packed narrow: under it a table's eight bytes
 /// a cell are little, and packing it costs the card two round trips.
 pub const NARROW_MIN_CELLS: usize = 1 << 16;
+
+/// Where a block's committed columns are on the host as they move, in bytes:
+/// a memory log's terms (the block prover's `LAMBDA_VM_BLOCK_MEMLOG`), read
+/// by its sampler while the block proves. It counts and changes nothing.
+pub struct BlockMem {
+    /// The group phase A is uploading and committing, eight bytes a cell.
+    pub committing: AtomicUsize,
+    /// Committed groups still held wide while their packers run, until their
+    /// packed tables are installed.
+    pub packing_wide: AtomicUsize,
+    /// What finished packers hold and nothing installed yet.
+    pub packed_ready: AtomicUsize,
+    /// Committed tables as held: packed, and eight bytes a cell.
+    pub held_narrow: AtomicUsize,
+    pub held_wide: AtomicUsize,
+    /// The groups' kept tree tops.
+    pub tree_tops: AtomicUsize,
+    mark: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl BlockMem {
+    /// Every term at zero; `mark` is called at each event: a group committed,
+    /// a group's packed tables installed, a phase-B group's end.
+    pub fn new(mark: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            committing: AtomicUsize::new(0),
+            packing_wide: AtomicUsize::new(0),
+            packed_ready: AtomicUsize::new(0),
+            held_narrow: AtomicUsize::new(0),
+            held_wide: AtomicUsize::new(0),
+            tree_tops: AtomicUsize::new(0),
+            mark: Box::new(mark),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        (self.mark)(label);
+    }
+
+    /// Counts `tables` as held from here on, packed or wide.
+    fn hold<F, E>(&self, tables: &[CommittedTable<'_, F, E>])
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        for table in tables {
+            match table.narrow() {
+                Some(packed) => self.held_narrow.fetch_add(packed.data().len(), Relaxed),
+                None => self.held_wide.fetch_add(wide_bytes(table), Relaxed),
+            };
+        }
+    }
+}
+
+/// A table's committed columns at eight bytes a cell.
+fn wide_bytes<F, E>(table: &CommittedTable<'_, F, E>) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    (table.num_committed_columns() << table.num_vars()) * core::mem::size_of::<FieldElement<F>>()
+}
 
 /// A group's PREPARED opening in a block: one commitment, which both sides
 /// derive from the program, over the leading preprocessed columns of the
@@ -360,6 +427,8 @@ where
     groups: Vec<RetiredStack<F>>,
     roots: Vec<Commitment>,
     stamps: Vec<GroupStamps>,
+    /// A memory log's terms, counted through phase B as well.
+    mem: Option<Arc<BlockMem>>,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -432,6 +501,18 @@ where
         drop_levels: usize,
         narrow: Narrowing,
     ) -> Result<Self, MlError> {
+        Self::commit_groups_logged::<H>(groups, config, drop_levels, narrow, None)
+    }
+
+    /// [`Self::commit_groups`], counting where the columns are in `mem` (a
+    /// memory log, through phase B too) as they move. The commits are the same.
+    pub fn commit_groups_logged<H: WhirHash>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: usize,
+        narrow: Narrowing,
+        mem: Option<Arc<BlockMem>>,
+    ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
         let mut sizes = Vec::new();
         let mut retired_groups = Vec::new();
@@ -460,6 +541,11 @@ where
                 wait_a: waited.elapsed().as_secs_f64(),
                 ..Default::default()
             };
+            let wide = mem.as_ref().map_or(0, |mem| {
+                let wide = group.iter().map(wide_bytes).sum();
+                mem.committing.fetch_add(wide, Relaxed);
+                wide
+            });
             let t = Instant::now();
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
             // Held in an `Arc` like phase B's: once the tree tops are home it
@@ -467,7 +553,7 @@ where
             let store = multilinear::gpu::upload_columns(&columns).map(Arc::new);
             stamp.upload_a = t.elapsed().as_secs_f64();
             if let Some(packed) = packing.take() {
-                packed.install(&mut tables, &mut stamps);
+                packed.install(&mut tables, &mut stamps, mem.as_deref());
             }
             let shapes: Vec<(usize, usize)> = group
                 .iter()
@@ -491,17 +577,31 @@ where
             stamp.retire = t.elapsed().as_secs_f64();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
-            packing = narrow_group(&mut group, store, narrow, &mut stamp).map(|handle| Packing {
-                first_table: tables.len(),
-                group: stamps.len(),
-                handle,
-            });
+            packing =
+                narrow_group(&mut group, store, narrow, &mut stamp, mem.clone()).map(|handle| {
+                    Packing {
+                        first_table: tables.len(),
+                        group: stamps.len(),
+                        wide,
+                        handle,
+                    }
+                });
+            if let Some(mem) = &mem {
+                mem.committing.fetch_sub(wide, Relaxed);
+                mem.tree_tops.fetch_add(stamp.tree_bytes, Relaxed);
+                if packing.is_some() {
+                    mem.packing_wide.fetch_add(wide, Relaxed);
+                } else {
+                    mem.hold(&group);
+                }
+                mem.mark(&format!("group {} committed", stamps.len()));
+            }
             retired_groups.push(retired);
             stamps.push(stamp);
             tables.extend(group);
         }
         if let Some(packed) = packing.take() {
-            packed.install(&mut tables, &mut stamps);
+            packed.install(&mut tables, &mut stamps, mem.as_deref());
         }
         Ok(Self {
             tables,
@@ -509,6 +609,7 @@ where
             groups: retired_groups,
             roots,
             stamps,
+            mem,
         })
     }
 
@@ -552,14 +653,21 @@ type Packed = (Vec<Option<multilinear::narrow::NarrowColumns>>, f64);
 struct Packing {
     first_table: usize,
     group: usize,
+    /// The group's committed columns at eight bytes a cell (counted only for
+    /// a memory log).
+    wide: usize,
     handle: std::thread::JoinHandle<Packed>,
 }
 
 impl Packing {
     /// Waits for the packer and holds each table it packed narrow from here
     /// on. A packer that failed leaves its tables wide.
-    fn install<F, E>(self, tables: &mut [CommittedTable<'_, F, E>], stamps: &mut [GroupStamps])
-    where
+    fn install<F, E>(
+        self,
+        tables: &mut [CommittedTable<'_, F, E>],
+        stamps: &mut [GroupStamps],
+        mem: Option<&BlockMem>,
+    ) where
         F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
         E: IsField + Send + Sync + 'static,
         FieldElement<F>: AsBytes + Sync + Send,
@@ -569,20 +677,30 @@ impl Packing {
         let joined = self.handle.join();
         let stamp = &mut stamps[self.group];
         stamp.pack += t.elapsed().as_secs_f64();
-        let Ok((packed, busy)) = joined else {
-            return;
-        };
-        stamp.pack_busy = busy;
-        for (table, packed) in tables[self.first_table..].iter_mut().zip(packed) {
-            let Some(packed) = packed else {
-                continue;
-            };
-            let bytes = packed.data().len();
-            if table.install_narrow(packed) {
-                stamp.packed_tables += 1;
-                stamp.packed_cells += table.num_committed_columns() << table.num_vars();
-                stamp.packed_bytes += bytes;
+        let installed = match joined {
+            Ok((packed, busy)) => {
+                stamp.pack_busy = busy;
+                let ready: usize = packed.iter().flatten().map(|p| p.data().len()).sum();
+                for (table, packed) in tables[self.first_table..].iter_mut().zip(packed) {
+                    let Some(packed) = packed else {
+                        continue;
+                    };
+                    let bytes = packed.data().len();
+                    if table.install_narrow(packed) {
+                        stamp.packed_tables += 1;
+                        stamp.packed_cells += table.num_committed_columns() << table.num_vars();
+                        stamp.packed_bytes += bytes;
+                    }
+                }
+                ready
             }
+            Err(_) => 0,
+        };
+        if let Some(mem) = mem {
+            mem.packed_ready.fetch_sub(installed, Relaxed);
+            mem.packing_wide.fetch_sub(self.wide, Relaxed);
+            mem.hold(&tables[self.first_table..]);
+            mem.mark(&format!("group {} installed", self.group));
         }
     }
 }
@@ -598,6 +716,7 @@ fn narrow_group<F, E>(
     store: Store,
     narrow: Narrowing,
     stamp: &mut GroupStamps,
+    mem: Option<Arc<BlockMem>>,
 ) -> Option<std::thread::JoinHandle<Packed>>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -621,7 +740,7 @@ where
                 .collect();
             Some(std::thread::spawn(move || {
                 let t = Instant::now();
-                let packed = runs
+                let packed: Vec<Option<multilinear::narrow::NarrowColumns>> = runs
                     .into_iter()
                     .map(|run| {
                         run.and_then(|(first, width)| {
@@ -629,6 +748,10 @@ where
                         })
                     })
                     .collect();
+                if let Some(mem) = mem {
+                    let ready = packed.iter().flatten().map(|p| p.data().len()).sum();
+                    mem.packed_ready.fetch_add(ready, Relaxed);
+                }
                 (packed, t.elapsed().as_secs_f64())
             }))
         }
@@ -774,6 +897,7 @@ where
         groups,
         roots,
         mut stamps,
+        mem,
     } = committed;
     let starts: Vec<usize> = sizes
         .iter()
@@ -888,6 +1012,7 @@ where
 
         let handles = group_columns(group);
         let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
+        let tree_tops = retired.tree_bytes();
         let t = Instant::now();
         let stacked = retired.revive::<H, _>(
             &columns,
@@ -964,6 +1089,10 @@ where
             table.drop_widened();
         }
         drop(store);
+        if let Some(mem) = &mem {
+            mem.tree_tops.fetch_sub(tree_tops, Relaxed);
+            mem.mark(&format!("phase B group {g} end"));
+        }
         at += size;
     }
     Ok((

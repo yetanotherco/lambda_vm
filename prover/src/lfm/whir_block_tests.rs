@@ -85,6 +85,7 @@ fn small_block_at(
             // Every table packed on a card, so a box run walks the narrow path at a
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+            memlog: false,
         },
     )
     .expect("the block proves")
@@ -428,6 +429,7 @@ fn dense_block_with(
             // Every table packed on a card, so a box run walks the narrow path at a
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+            memlog: false,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),

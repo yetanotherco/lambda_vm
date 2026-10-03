@@ -55,6 +55,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         // Every table packed on a card, so a box run walks the narrow path at a
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+        memlog: false,
     }
 }
 
@@ -284,6 +285,79 @@ fn a_streamed_block_held_narrow_proves_and_verifies() {
     );
     assert!(stamps.report().contains("BLOCK NARROW: Host"));
     assert!(verify(&proof, &elf, &format));
+}
+
+/// The memory log (`BlockOptions::memlog`) moves no byte of the proof — the
+/// bytes are compared when the grind is deterministic
+/// (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once per process), the verdicts
+/// always — and its accounting closes: when the proof is done every term in
+/// flight is back at zero, and what is left is the committed tables as held and
+/// the prepared columns.
+#[test]
+fn a_memory_log_moves_no_byte_and_its_terms_close() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let proved = |memlog: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.memlog = memlog;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "memlog {memlog}");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .expect("serialize")
+            .to_vec();
+        (bytes, stamps)
+    };
+    let (off, off_stamps) = proved(false);
+    let (on, on_stamps) = proved(true);
+    assert!(off_stamps.mem_terms.is_empty());
+    let term = |name: &str| -> usize {
+        on_stamps
+            .mem_terms
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no term {name}"))
+            .1
+    };
+    for name in [
+        "exec",
+        "logs",
+        "walk",
+        "walked",
+        "builder",
+        "image",
+        "jobs",
+        "laying",
+        "open",
+        "sent",
+        "rest",
+        "rest_laid",
+        "committing",
+        "pack_wide",
+        "pack_ready",
+        "tops",
+    ] {
+        assert_eq!(
+            term(name),
+            0,
+            "{name} is still counted when the proof is done"
+        );
+    }
+    assert!(term("prepared") > 0, "the prepared columns are held");
+    // Every table's columns, as held: eight bytes a cell when wide, its packed
+    // bytes when narrow — at most eight a cell either way.
+    let held = term("held_narrow") + term("held_wide");
+    assert!(held > 0 && held <= on_stamps.cells * 8, "held {held}");
+    if crypto::grinding::deterministic() {
+        assert_eq!(off, on, "the memory log moved a proof byte");
+    }
 }
 
 /// A narrow table whose width map is wrong widens to other words than were
