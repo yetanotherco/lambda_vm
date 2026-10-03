@@ -1842,7 +1842,7 @@ fn block_whir_on_a_real_block() {
         ..BlockFormat::production()
     };
     let mut options = BlockOptions::production();
-    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 0, the inline layout) and
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 3; 0 is the inline layout) and
     // `BLOCK_WHIR_PACK_REST=1`, as the tree's harness takes them;
     // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
     // (production drops them).
