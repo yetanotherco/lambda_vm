@@ -27,6 +27,7 @@ pub mod merkle;
 pub mod narrow;
 pub mod ntt;
 pub mod nvtx;
+pub mod p1_stark;
 pub mod p1w16;
 pub mod rpx;
 pub mod rpx_paths;
@@ -102,6 +103,30 @@ impl DeviceHash {
             Self::Poseidon1 => "poseidon1-w16",
         }
     }
+
+    /// Children per Merkle node: 4 under ZisK's Poseidon1 (its trees are
+    /// 4-ary, [`p1_stark`]), 2 under every other key.
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Poseidon1 => p1_stark::ARITY,
+            Self::Keccak256 | Self::Blake3 | Self::Rpo256 | Self::Rpx256 | Self::Poseidon => 2,
+        }
+    }
+}
+
+/// Stored nodes of a device tree over `leaves` leaves under `hash`: the binary
+/// heap's `2·leaves − 1`, or the arity-4 layout's count ([`p1_stark::tree_nodes`]).
+pub fn tree_nodes(hash: DeviceHash, leaves: usize) -> usize {
+    match hash.arity() {
+        2 => 2 * leaves - 1,
+        _ => p1_stark::tree_nodes(leaves),
+    }
+}
+
+/// Where the leaves start in that node buffer, in nodes: both layouts store
+/// the leaves last.
+pub fn leaves_offset(hash: DeviceHash, leaves: usize) -> usize {
+    tree_nodes(hash, leaves) - leaves
 }
 
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.

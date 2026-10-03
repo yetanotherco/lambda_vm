@@ -21,6 +21,7 @@
 #include "p1w16.cu"
 #include "p1w16_kat_vectors.h"
 #include "p1_zisk_kat_vectors.h"
+#include "p1_stark_kat_vectors.h"
 
 static int g_fail = 0;
 
@@ -242,7 +243,239 @@ static void run_zisk_leaves() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The PRODUCTION kernels (`p1s_*`, `src/p1_stark.rs`). Nodes are big-endian
+// bytes, so every check decodes them the host's way. The tree and path kernels
+// are checked against ZisK's own trees (`p1_stark_kat_vectors.h`); the leaf
+// kernels against the ZisK leaf above (`p1w16_zleaves_*`, itself pinned to
+// ZisK's vectors) over the same felts.
+// ---------------------------------------------------------------------------
+
+static uint64_t bswap(uint64_t x) { return p1s::bswap64(x); }
+
+// A node's four felts, decoded as `commitment_to_digest` decodes them.
+static void node_felts(const uint8_t *node, uint64_t out[4]) {
+    uint64_t w[4];
+    std::memcpy(w, node, 32);
+    for (int i = 0; i < 4; ++i) out[i] = bswap(w[i]);
+}
+
+static void put_node(uint8_t *node, const uint64_t d[4]) {
+    uint64_t w[4];
+    for (int i = 0; i < 4; ++i) w[i] = bswap(d[i]);
+    std::memcpy(node, w, 32);
+}
+
+static uint64_t tree_nodes4(uint64_t n) {
+    uint64_t total = n;
+    while (n > 1) {
+        n = (n + 3) / 4;
+        total += n;
+    }
+    return total;
+}
+
+// The host driver's walk (`p1_stark::build_inner_tree_levels`) with the tail
+// threshold `tail_max`: per-level launches while a level has more parents,
+// then the one-block tail.
+static void build_tree4(uint8_t *nodes, uint64_t leaves, uint64_t tail_max) {
+    uint64_t child_off = tree_nodes4(leaves) - leaves, n_children = leaves;
+    while (n_children > 1) {
+        const uint64_t n_parents = (n_children + 3) / 4;
+        if (n_parents <= tail_max) {
+            CUDA_HOST_SINGLE_THREAD();
+            p1s_merkle_tail4(nodes, child_off, n_children);
+            return;
+        }
+        const uint64_t parent_off = child_off - n_parents;
+        CUDA_HOST_FOR_EACH_THREAD(t, n_parents)
+        p1s_merkle_level4(nodes, child_off, n_children, parent_off, n_parents);
+        child_off = parent_off;
+        n_children = n_parents;
+    }
+}
+
+static void run_stark_kernels() {
+    const int V = 2;
+    // Trees: ZisK's roots at 1 … 64 leaves (padded levels included), through
+    // the per-level kernel alone, the tail alone, and the two together.
+    for (int k = 0; k < (int)(sizeof(ZK_TREE_N) / sizeof(ZK_TREE_N[0])); ++k) {
+        const uint64_t n = ZK_TREE_N[k];
+        uint64_t felts[4 * 64];
+        zk_felts(ZK_SEED_TREE, 4 * n, felts);
+        const uint64_t tails[4] = {0, 1, 4, 256};
+        for (uint64_t tail_max : tails) {
+            const uint64_t total = tree_nodes4(n);
+            uint8_t nodes[128 * 32];
+            std::memset(nodes, 0xab, sizeof(nodes));
+            for (uint64_t i = 0; i < n; ++i) put_node(nodes + (total - n + i) * 32, felts + 4 * i);
+            build_tree4(nodes, n, tail_max);
+            uint64_t root[4];
+            node_felts(nodes, root);
+            char what[96];
+            std::snprintf(what, sizeof(what), "p1s tree root of %llu leaves (tail at %llu)",
+                          (unsigned long long)n, (unsigned long long)tail_max);
+            check(std::memcmp(root, ZK_TREE_ROOT[k], 32) == 0, what, V);
+        }
+    }
+
+    // Paths: ZisK's 21-row tree (leaf = ZisK's linear hash of a 7-felt row);
+    // the gather returns its siblings per level in child order.
+    {
+        const uint64_t n = ZK_PATH_ROWS, w = ZK_PATH_WIDTH;
+        uint64_t rows[21 * 7];
+        zk_felts(ZK_SEED_ROWS, n * w, rows);
+        const uint64_t total = tree_nodes4(n);
+        uint8_t nodes[32 * 32];
+        std::memset(nodes, 0xab, sizeof(nodes));
+        for (uint64_t r = 0; r < n; ++r) {
+            uint64_t d[4];
+            CUDA_HOST_FOR_EACH_THREAD(t, 1) p1w16_zleaves_base_coset_v2(rows + r * w, 1, w, d);
+            put_node(nodes + (total - n + r) * 32, d);
+        }
+        build_tree4(nodes, n, 256);
+        uint64_t root[4];
+        node_felts(nodes, root);
+        check(std::memcmp(root, ZK_PATH_ROOT, 32) == 0, "p1s tree root over ZisK's path rows", V);
+        const int nq = (int)(sizeof(ZK_PATH_INDEX) / sizeof(ZK_PATH_INDEX[0]));
+        uint32_t pos[8];
+        for (int q = 0; q < nq; ++q) pos[q] = (uint32_t)ZK_PATH_INDEX[q];
+        uint8_t paths[8 * 3 * 3 * 32];
+        CUDA_HOST_FOR_EACH_THREAD(t, nq) p1s_gather_paths4(nodes, pos, nq, n, total, 3, paths);
+        bool ok = true;
+        for (int q = 0; q < nq; ++q)
+            for (int level = 0; level < 3; ++level)
+                for (int sib = 0; sib < 3; ++sib) {
+                    uint64_t got[4];
+                    node_felts(paths + ((q * 3 + level) * 3 + sib) * 32, got);
+                    ok &= std::memcmp(got, ZK_PATH_SIBLINGS[q][level] + 4 * sib, 32) == 0;
+                }
+        check(ok, "p1s gathered paths are ZisK's", V);
+        // Mutation: a node count one too high moves every level's offset, so
+        // the gather must stop matching.
+        CUDA_HOST_FOR_EACH_THREAD(t, nq) p1s_gather_paths4(nodes, pos, nq, n, total + 1, 3, paths);
+        uint64_t got[4];
+        node_felts(paths, got);
+        check(std::memcmp(got, ZK_PATH_SIBLINGS[0][0], 32) != 0,
+              "p1s gather with a wrong shape misses", V);
+    }
+
+    // Leaves: each geometry equals the ZisK leaf of the felts it reads.
+    {
+        const uint64_t num_cols = 7, num_rows = 8, log_rows = 3, stride = 11;
+        uint64_t m[7 * 11];
+        zk_felts(0x7015, 7 * 11, m);
+        uint8_t got[8 * 32];
+        uint64_t want[8 * 4];
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_cols_row(m, stride, num_cols, num_rows, log_rows, got);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1w16_zleaves_rows_v2(m, stride, num_cols, num_rows, log_rows, want);
+        bool ok = true;
+        for (uint64_t r = 0; r < num_rows; ++r) {
+            uint64_t d[4];
+            node_felts(got + 32 * r, d);
+            ok &= std::memcmp(d, want + 4 * r, 32) == 0;
+        }
+        check(ok, "p1s column-major row leaves", V);
+
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1s_leaves_cols_pair(m, stride, num_cols, num_rows, log_rows, got);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1w16_zleaves_row_pair_v2(m, stride, num_cols, num_rows, log_rows, want);
+        ok = true;
+        for (uint64_t j = 0; j < num_rows / 2; ++j) {
+            uint64_t d[4];
+            node_felts(got + 32 * j, d);
+            ok &= std::memcmp(d, want + 4 * j, 32) == 0;
+        }
+        check(ok, "p1s column-major row-pair leaves", V);
+
+        // The same matrix row-major (stride `num_cols`): the row-pair and
+        // one-row kernels over the whole row equal the column-major ones,
+        // and over a column range equal the column-major kernels on that range.
+        uint64_t rm[8 * 7];
+        for (uint64_t r = 0; r < num_rows; ++r)
+            for (uint64_t c = 0; c < num_cols; ++c) rm[r * num_cols + c] = m[c * stride + r];
+        uint8_t got2[8 * 32];
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1s_leaves_rm_pair(rm, num_cols, 0, num_cols, num_rows, log_rows, got2);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1s_leaves_cols_pair(m, stride, num_cols, num_rows, log_rows, got);
+        check(std::memcmp(got, got2, 4 * 32) == 0, "p1s row-major row pairs = column-major", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_rm_row(rm, num_cols, 0, num_cols, num_rows, log_rows, got2);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_cols_row(m, stride, num_cols, num_rows, log_rows, got);
+        check(std::memcmp(got, got2, 8 * 32) == 0, "p1s row-major rows = column-major", V);
+        const uint64_t cs = 2, ce = 5;
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1s_leaves_rm_pair(rm, num_cols, cs, ce, num_rows, log_rows, got2);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
+        p1s_leaves_cols_pair(m + cs * stride, stride, ce - cs, num_rows, log_rows, got);
+        check(std::memcmp(got, got2, 4 * 32) == 0, "p1s row-major row-pair range", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_rm_row(rm, num_cols, cs, ce, num_rows, log_rows, got2);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_cols_row(m + cs * stride, stride, ce - cs, num_rows, log_rows, got);
+        check(std::memcmp(got, got2, 8 * 32) == 0, "p1s row-major one-row range", V);
+        // Mutation: the range must matter.
+        CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
+        p1s_leaves_rm_row(rm, num_cols, cs, ce + 1, num_rows, log_rows, got2);
+        check(std::memcmp(got, got2, 8 * 32) != 0, "p1s row-major range end moves the leaf", V);
+    }
+
+    // FRI group leaves: leaf `j` is the ZisK leaf of its `3·group` contiguous felts.
+    {
+        uint64_t ev[4 * 8 * 3];
+        zk_felts(0xf41, 4 * 8 * 3, ev);
+        const uint64_t groups[3] = {2, 4, 8};
+        for (uint64_t group : groups) {
+            const uint64_t num_leaves = 4 * 8 / group;
+            uint8_t got[16 * 32];
+            CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_fri_group_leaves(ev, num_leaves, group, got);
+            bool ok = true;
+            for (uint64_t j = 0; j < num_leaves; ++j) {
+                uint64_t want[4], d[4];
+                CUDA_HOST_FOR_EACH_THREAD(t, 1)
+                p1w16_zleaves_base_coset_v2(ev + j * group * 3, 1, 3 * group, want);
+                node_felts(got + 32 * j, d);
+                ok &= std::memcmp(d, want, 32) == 0;
+            }
+            char what[64];
+            std::snprintf(what, sizeof(what), "p1s FRI group leaves (group %llu)",
+                          (unsigned long long)group);
+            check(ok, what, V);
+        }
+    }
+
+    // The STARK grind: the smallest nonce whose width-8 permutation of
+    // [inner0..3, nonce, 0, 0, 0] has lane 0 below the limit — checked against
+    // a scan through the permutation probe.
+    {
+        const uint64_t inner[4] = {0x0123456789abcdefull, 0x1111222233334444ull,
+                                   0x5555666677778888ull, 0x00000000deadbeefull};
+        const uint64_t bits = 8, limit = 1ull << (64 - bits);
+        uint64_t want = ~0ull;
+        for (uint64_t nonce = 0; nonce < 4096 && want == ~0ull; ++nonce) {
+            uint64_t s[8] = {inner[0], inner[1], inner[2], inner[3], nonce, 0, 0, 0}, o[8];
+            CUDA_HOST_FOR_EACH_THREAD(t, 1) p1w8_probe<2>(s, 1, o);
+            if (o[0] < limit) want = nonce;
+        }
+        check(want != ~0ull, "p1s grind reference finds a nonce in 4096", V);
+        unsigned long long result = ~0ull;
+        CUDA_HOST_SINGLE_THREAD();
+        p1s_grind_w8(inner, limit, 0, 4096, &result);
+        check(result == want, "p1s grind smallest nonce", V);
+        result = ~0ull;
+        CUDA_HOST_SINGLE_THREAD();
+        p1s_grind_w8(inner, 0, 0, 64, &result);
+        check(result == ~0ull, "p1s grind: limit 0 finds nothing", V);
+    }
+}
+
 int main() {
+    run_stark_kernels();
     run_w8<1>();
     run_w8<2>();
     run_zisk_leaves();
@@ -252,7 +485,7 @@ int main() {
     run<3>(CAUCHY);
     if (g_fail == 0) {
         std::printf("p1w16 host KAT: all checks pass (circulant v0, v1, v2; Cauchy c1; ZisK leaf, "
-                    "rows, row pairs; W8 v1, v2 and its grind)\n");
+                    "rows, row pairs; W8 v1, v2 and its grind; the p1s production kernels)\n");
         return 0;
     }
     std::printf("p1w16 host KAT: %d FAILED\n", g_fail);

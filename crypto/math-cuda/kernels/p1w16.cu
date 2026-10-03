@@ -850,3 +850,236 @@ extern "C" __global__ void p1w16_fill(uint64_t *out, uint64_t n) {
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     out[tid] = goldilocks::canonical(z ^ (z >> 31));
 }
+
+// ===========================================================================
+// PRODUCTION (`p1/*` P2): ZisK's instance on the STARK's device commit paths,
+// launched by `src/p1_stark.rs` for `DeviceHash::Poseidon1`.
+//
+// NODE BYTES are the host's commitment bytes, as `rpx.cu`'s: four canonical
+// felts, each eight BIG-endian bytes (`algebraic_commit::digest_to_commitment`),
+// so a device node buffer is the host's byte for byte and a parent reads its
+// children back with `commitment_to_digest`'s decoding.
+//
+// TREES are 4-ary in the host's arity-4 layout (`crypto::merkle_tree::utils::
+// level_offsets4`): the levels top-down, root at node 0, leaves last; a level
+// holds ⌈below / 4⌉ nodes, so the level above the one at `off` with `n` nodes
+// starts at `off − ⌈n / 4⌉`. A short group's missing children are the zero
+// digest (ZisK's rule; `P1BatchBackend::padding_node`) and are never stored.
+// A parent is `compress4`: the four child digests fill the sixteen lanes,
+// one permutation, lanes 0..4.
+//
+// LEAVES are `zisk_leaf` over the felt sequence the host leaf hashes: the read
+// patterns of `rpx.cu`'s leaf kernels (bit-reversed rows, column by column; a
+// row pair is the first row then the second; an ext3 element as its three
+// components), which is what `element_felts` / `felts_from_bytes` give on the
+// host.
+// ===========================================================================
+
+namespace p1s {
+
+// Byte-swap a u64 (`rpx::bswap64`).
+__device__ __forceinline__ uint64_t bswap64(uint64_t x) {
+    x = ((x & 0x00FF00FF00FF00FFull) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFull);
+    x = ((x & 0x0000FFFF0000FFFFull) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFull);
+    return (x << 32) | (x >> 32);
+}
+
+__device__ __forceinline__ void store_be(const uint64_t d[p1w16::DIGEST], uint8_t *node) {
+    uint64_t *dst = reinterpret_cast<uint64_t *>(node);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) dst[i] = bswap64(d[i]);
+}
+
+__device__ __forceinline__ void load_be(const uint8_t *node, uint64_t *d) {
+    const uint64_t *src = reinterpret_cast<const uint64_t *>(node);
+#pragma unroll
+    for (int i = 0; i < p1w16::DIGEST; ++i) d[i] = bswap64(src[i]);
+}
+
+// Parent `p` of the level at `child_off` (`n_children` nodes), written at
+// `parent_off + p`.
+__device__ __forceinline__ void parent4(uint8_t *nodes, uint64_t child_off, uint64_t n_children,
+                                        uint64_t parent_off, uint64_t p) {
+    uint64_t s[p1w16::WIDTH];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const uint64_t idx = 4 * p + (uint64_t)c;
+        if (idx < n_children) {
+            load_be(nodes + (child_off + idx) * 32, s + 4 * c);
+        } else {
+#pragma unroll
+            for (int i = 0; i < p1w16::DIGEST; ++i) s[4 * c + i] = 0;
+        }
+    }
+    p1w16::permute<2>(s);
+    store_be(s, nodes + (parent_off + p) * 32);
+}
+
+}  // namespace p1s
+
+// One leaf per bit-reversed row of a column-major matrix: column `c` of row
+// `br` at `cols[c * col_stride + br]` (`rpx_leaves_base_batched`'s geometry).
+// An ext3 matrix stored as three base slabs per column
+// (`rpx_leaves_ext3_batched`) is this kernel over `num_cols = 3 · columns`.
+extern "C" __global__ void p1s_leaves_cols_row(const uint64_t *__restrict__ cols, uint64_t col_stride,
+                                               uint64_t num_cols, uint64_t num_rows,
+                                               uint64_t log_num_rows, uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        num_cols, [&](uint64_t c) { return cols[c * col_stride + br]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+// Row-pair leaves of a column-major matrix: leaf `tid` hashes bit-reversed rows
+// `2·tid` then `2·tid + 1`, each column by column
+// (`rpx_leaves_base_row_pair_batched`). Over `num_cols = 3 · parts` slabs it is
+// the composition tree's ext3 row-pair leaf (`rpx_comp_poly_leaves_ext3`).
+extern "C" __global__ void p1s_leaves_cols_pair(const uint64_t *__restrict__ cols, uint64_t col_stride,
+                                                uint64_t num_cols, uint64_t num_rows,
+                                                uint64_t log_num_rows, uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows / 2) return;
+    const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        2 * num_cols,
+        [&](uint64_t i) {
+            return i < num_cols ? cols[i * col_stride + br0] : cols[(i - num_cols) * col_stride + br1];
+        },
+        d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+// Row-major row-pair leaves over columns `[col_start, col_end)` of rows of
+// stride `m` (`rpx_leaves_base_row_major_row_pair[_range]`; the full row is
+// the range `[0, m)`).
+extern "C" __global__ void p1s_leaves_rm_pair(const uint64_t *__restrict__ data, uint64_t m,
+                                              uint64_t col_start, uint64_t col_end,
+                                              uint64_t num_rows, uint64_t log_num_rows,
+                                              uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows / 2) return;
+    const uint64_t *row0 = data + (__brevll(2 * tid) >> (64 - log_num_rows)) * m + col_start;
+    const uint64_t *row1 = data + (__brevll(2 * tid + 1) >> (64 - log_num_rows)) * m + col_start;
+    const uint64_t w = col_end - col_start;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        2 * w, [&](uint64_t i) { return i < w ? row0[i] : row1[i - w]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+// Row-major one-row leaves over columns `[col_start, col_end)`
+// (`rpx_leaves_base_row_major_row_range`).
+extern "C" __global__ void p1s_leaves_rm_row(const uint64_t *__restrict__ data, uint64_t m,
+                                             uint64_t col_start, uint64_t col_end,
+                                             uint64_t num_rows, uint64_t log_num_rows,
+                                             uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    const uint64_t *row = data + (__brevll(tid) >> (64 - log_num_rows)) * m + col_start;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        col_end - col_start, [&](uint64_t i) { return row[i]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+// FRI leaves: leaf `tid` hashes the `3 · group` contiguous felts of the `group`
+// consecutive ext3 values from `tid · group` of an interleaved eval vector
+// (`rpx_fri_group_leaves_ext3`; the pair leaf is `group = 2`, six felts, as
+// `P1PairBackend::hash_data`).
+extern "C" __global__ void p1s_fri_group_leaves(const uint64_t *__restrict__ evals, uint64_t num_leaves,
+                                                uint64_t group, uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t *g = evals + tid * group * 3;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2>(
+        3 * group, [&](uint64_t i) { return g[i]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+// One 4-ary level in place: parent `tid` of the level at `child_off`
+// (`n_children` nodes) into the level at `parent_off` (`n_parents` nodes).
+extern "C" __global__ void p1s_merkle_level4(uint8_t *nodes, uint64_t child_off, uint64_t n_children,
+                                             uint64_t parent_off, uint64_t n_parents) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_parents) return;
+    p1s::parent4(nodes, child_off, n_children, parent_off, tid);
+}
+
+// Every level from the one at `child_off` (`n_children` nodes) up to the root,
+// in one block, a barrier between levels.
+extern "C" __global__ void p1s_merkle_tail4(uint8_t *nodes, uint64_t child_off, uint64_t n_children) {
+    while (n_children > 1) {
+        const uint64_t n_parents = (n_children + 3) / 4;
+        const uint64_t parent_off = child_off - n_parents;
+        for (uint64_t p = threadIdx.x; p < n_parents; p += blockDim.x) {
+            p1s::parent4(nodes, child_off, n_children, parent_off, p);
+        }
+        __syncthreads();
+        child_off = parent_off;
+        n_children = n_parents;
+    }
+}
+
+// Authentication paths: query `tid`'s path is `depth4` levels from the leaves
+// up, each the three other children of its group in child order, the zero
+// digest where the group is short — `MerkleTree::get_proof_by_pos` at arity 4.
+// `total_nodes` is the tree's node count (the leaves start at
+// `total_nodes − leaves_len`).
+extern "C" __global__ void p1s_gather_paths4(const uint8_t *__restrict__ nodes,
+                                             const uint32_t *__restrict__ positions, uint32_t nq,
+                                             uint64_t leaves_len, uint64_t total_nodes,
+                                             uint32_t depth4, uint8_t *__restrict__ out) {
+    uint64_t q = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nq) return;
+    uint64_t i = positions[q];
+    uint64_t n = leaves_len;
+    uint64_t off = total_nodes - leaves_len;
+    uint64_t *dst = reinterpret_cast<uint64_t *>(out + q * (uint64_t)depth4 * 3 * 32);
+    for (uint32_t level = 0; level < depth4; ++level) {
+        const uint64_t first = i & ~3ull;
+        for (uint64_t c = first; c < first + 4; ++c) {
+            if (c == i) continue;
+            if (c < n) {
+                const uint64_t *src = reinterpret_cast<const uint64_t *>(nodes + (off + c) * 32);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) dst[k] = src[k];
+            } else {
+#pragma unroll
+                for (int k = 0; k < 4; ++k) dst[k] = 0;
+            }
+            dst += 4;
+        }
+        const uint64_t parents = (n + 3) / 4;
+        off -= parents;
+        n = parents;
+        i >>= 2;
+    }
+}
+
+// The STARK grind (`P1GrindDigest`, `crypto::grinding`'s two-level form): the
+// smallest nonce in `[base, base + count)` whose width-8 permutation of
+// `[inner0, inner1, inner2, inner3, nonce, 0, 0, 0]` has lane 0 below `limit`.
+// `inner` is the inner hash's four big-endian felts (`inner_hash_felts`). The
+// grid-stride loop, first-hit `atomicMin` and poll of `p1w8_grind`.
+extern "C" __global__ void p1s_grind_w8(const uint64_t *inner, uint64_t limit, uint64_t base,
+                                        uint64_t count, volatile unsigned long long *result) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t i0 = inner[0], i1 = inner[1], i2 = inner[2], i3 = inner[3];
+    for (uint64_t i = tid; i < count; i += stride) {
+        uint64_t nonce = base + i;
+        if (nonce < base) break;
+        if (nonce >= (uint64_t)*result) break;
+        uint64_t s[p1w8::WIDTH] = {i0, i1, i2, i3, goldilocks::canonical(nonce), 0, 0, 0};
+        p1w8::permute<2>(s);
+        if (s[0] < limit) {
+            atomicMin((unsigned long long *)result, (unsigned long long)nonce);
+        }
+    }
+}

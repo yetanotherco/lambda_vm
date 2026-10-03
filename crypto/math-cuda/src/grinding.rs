@@ -286,6 +286,7 @@ pub fn device_fill() -> Option<DeviceFill> {
 enum Arm {
     Keccak256,
     Rpx256,
+    Poseidon1,
 }
 
 /// Smallest nonce whose keccak grind head is `< limit`, or `None` when the CUDA
@@ -297,6 +298,25 @@ pub fn generate_nonce_gpu(inner_lanes: &[u64; 4], grinding_factor: u8) -> Option
     search(
         Arm::Keccak256,
         inner_lanes,
+        grinding_factor,
+        knobs_in_effect(),
+    )
+}
+
+/// Smallest nonce whose Poseidon1 grind head is `< limit` (`p1/*`
+/// exploration branch: `prover::lfm::p1_commit::P1GrindDigest`), or `None` when
+/// the CUDA path is unavailable or errors.
+///
+/// The host predicate hashes `inner_hash ‖ nonce.to_be_bytes()`, 40 bytes =
+/// five big-endian felts, zero-padded to the eight lanes of ONE width-8
+/// permutation, and compares lane 0 with `limit`; `p1s_grind_w8` permutes
+/// `[f0, f1, f2, f3, canonical(nonce), 0, 0, 0]` and compares the same lane.
+/// `inner_felts` are the four big-endian `u64`s of the 32-byte inner hash
+/// (`crypto::grinding::inner_hash_felts`), canonical as a digest's output.
+pub fn generate_nonce_p1_gpu(inner_felts: &[u64; 4], grinding_factor: u8) -> Option<u64> {
+    search(
+        Arm::Poseidon1,
+        inner_felts,
         grinding_factor,
         knobs_in_effect(),
     )
@@ -560,6 +580,7 @@ fn search(arm: Arm, inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Opti
     let (kernel, block_dim) = match arm {
         Arm::Keccak256 => (&be.grind_search, BLOCK_DIM),
         Arm::Rpx256 => (&be.rpx_grind_search, RPX_BLOCK_DIM),
+        Arm::Poseidon1 => crate::p1_stark::grind_kernel().ok()?,
     };
     let stream = be.next_stream();
     let inner_dev = stream.clone_htod(inner.as_slice()).ok()?;
