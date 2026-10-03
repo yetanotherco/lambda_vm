@@ -143,13 +143,20 @@ impl DirtyLog {
             .name("alloc-dirty-log".into())
             .spawn(move || {
                 let period = std::time::Duration::from_secs_f64(secs);
+                if let Some(conf) = conf_line() {
+                    eprintln!("{conf}");
+                }
                 while !flag.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Some(r) = arena_report() {
                         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                        let list = |v: &[u64]| v.iter().map(|b| format!("{:.2}", gib(*b))).collect::<Vec<_>>().join("/");
+                        let counts = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join("/");
                         eprintln!(
                             "ALLOC DIRTY t={:.1} · dirty shared {:.2} · thread {:.2} GiB over {} arenas · \
                              thread large allocations (cumulative) < 1 MiB {:.2} · 1–8 MiB {:.2} · ≥ 8 MiB \
-                             {:.2} GiB",
+                             {:.2} GiB · shared dirty extents by size (< 256 MiB / 0.25–1 / 1–4 / 4–16 / ≥ 16 \
+                             GiB) {} GiB, largest {:.2} GiB · shared requests (cumulative, < 16 MiB / 16–32 / \
+                             32–64 / 64–128 / 128–256 / 256–512 / 512 MiB–1 GiB / ≥ 1 GiB) count {} bytes {} GiB",
                             t0.elapsed().as_secs_f64(),
                             gib(r.shared_dirty),
                             gib(r.thread_dirty),
@@ -157,6 +164,10 @@ impl DirtyLog {
                             gib(r.thread_large[0]),
                             gib(r.thread_large[1]),
                             gib(r.thread_large[2]),
+                            list(&r.shared_extents),
+                            gib(r.shared_largest),
+                            counts(&r.shared_requests),
+                            list(&r.shared_request_bytes),
                         );
                     }
                     std::thread::sleep(period);
@@ -193,6 +204,70 @@ struct ArenaReport {
     thread_arenas: usize,
     /// The thread arenas' cumulative large allocations, bytes by size.
     thread_large: [u64; 3],
+    /// The shared arena's dirty bytes by the size of the (coalesced) extent
+    /// holding them: < 256 MiB, 0.25–1, 1–4, 4–16, ≥ 16 GiB.
+    shared_extents: [u64; 5],
+    /// The shared arena's largest dirty extent, in bytes (its class's average).
+    shared_largest: u64,
+    /// The shared arena's cumulative large allocations by request size (< 16
+    /// MiB, 16–32, 32–64, 64–128, 128–256, 256–512 MiB, 0.5–1, ≥ 1 GiB): count
+    /// and bytes. jemalloc carves a request out of a free extent at most
+    /// `2^lg_extent_max_active_fit` times its size.
+    shared_requests: [u64; 8],
+    shared_request_bytes: [u64; 8],
+}
+
+/// The bucket of a shared-arena request of `size` bytes in
+/// [`ArenaReport::shared_requests`].
+#[cfg_attr(not(test), allow(dead_code))]
+fn request_bucket(size: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    match size {
+        s if s < 16 * MIB => 0,
+        s if s < 32 * MIB => 1,
+        s if s < 64 * MIB => 2,
+        s if s < 128 * MIB => 3,
+        s if s < 256 * MIB => 4,
+        s if s < 512 * MIB => 5,
+        s if s < 1024 * MIB => 6,
+        _ => 7,
+    }
+}
+
+/// The bucket of a shared-arena dirty extent of `size` bytes in
+/// [`ArenaReport::shared_extents`].
+#[cfg_attr(not(test), allow(dead_code))]
+fn extent_bucket(size: u64) -> usize {
+    const GIB: u64 = 1 << 30;
+    match size {
+        s if s < GIB / 4 => 0,
+        s if s < GIB => 1,
+        s if s < 4 * GIB => 2,
+        s if s < 16 * GIB => 3,
+        _ => 4,
+    }
+}
+
+/// The running allocator's options, read back (not the environment's text):
+/// `ALLOC CONF: dirty_decay_ms … · muzzy_decay_ms … · oversize_threshold … ·
+/// lg_extent_max_active_fit … · narenas …`.
+#[cfg(test)]
+fn conf_line() -> Option<String> {
+    use tikv_jemalloc_ctl::raw;
+    let dirty: isize = unsafe { raw::read(b"opt.dirty_decay_ms\0") }.ok()?;
+    let muzzy: isize = unsafe { raw::read(b"opt.muzzy_decay_ms\0") }.ok()?;
+    let oversize: usize = unsafe { raw::read(b"opt.oversize_threshold\0") }.ok()?;
+    let fit: usize = unsafe { raw::read(b"opt.lg_extent_max_active_fit\0") }.ok()?;
+    let narenas: u32 = unsafe { raw::read(b"opt.narenas\0") }.ok()?;
+    Some(format!(
+        "ALLOC CONF: dirty_decay_ms {dirty} · muzzy_decay_ms {muzzy} · oversize_threshold {oversize} · \
+         lg_extent_max_active_fit {fit} · narenas {narenas}"
+    ))
+}
+
+#[cfg(not(test))]
+fn conf_line() -> Option<String> {
+    None
 }
 
 /// Reads every arena's dirty pages (`stats.arenas.<i>.pdirty` × `arenas.page`)
@@ -220,11 +295,19 @@ fn arena_report() -> Option<ArenaReport> {
     raw::name_to_mib(b"stats.arenas.0.pdirty\0", &mut pdirty_mib).ok()?;
     let mut nmalloc_mib = [0usize; 6];
     raw::name_to_mib(b"stats.arenas.0.lextents.0.nmalloc\0", &mut nmalloc_mib).ok()?;
+    let mut ndirty_mib = [0usize; 6];
+    let mut bytes_mib = [0usize; 6];
+    raw::name_to_mib(b"stats.arenas.0.extents.0.ndirty\0", &mut ndirty_mib).ok()?;
+    raw::name_to_mib(b"stats.arenas.0.extents.0.dirty_bytes\0", &mut bytes_mib).ok()?;
     let mut r = ArenaReport {
         shared_dirty: 0,
         thread_dirty: 0,
         thread_arenas: 0,
         thread_large: [0; 3],
+        shared_extents: [0; 5],
+        shared_largest: 0,
+        shared_requests: [0; 8],
+        shared_request_bytes: [0; 8],
     };
     for i in 0..total as usize {
         pdirty_mib[2] = i;
@@ -235,6 +318,34 @@ fn arena_report() -> Option<ArenaReport> {
         let dirty = (pdirty * page) as u64;
         if i == auto as usize {
             r.shared_dirty += dirty;
+            // Its dirty extents by size (an extent's size is its class's bytes
+            // over its count; past the last page-size class the read fails).
+            ndirty_mib[2] = i;
+            bytes_mib[2] = i;
+            for j in 0.. {
+                ndirty_mib[4] = j;
+                bytes_mib[4] = j;
+                let Ok(n) = (unsafe { raw::read_mib::<usize>(&ndirty_mib) }) else {
+                    break;
+                };
+                if n == 0 {
+                    continue;
+                }
+                let bytes = unsafe { raw::read_mib::<usize>(&bytes_mib) }.unwrap_or(0) as u64;
+                let each = bytes / n as u64;
+                r.shared_extents[extent_bucket(each)] += bytes;
+                r.shared_largest = r.shared_largest.max(each);
+            }
+            // Its requests by size.
+            nmalloc_mib[2] = i;
+            for (j, &size) in sizes.iter().enumerate() {
+                nmalloc_mib[4] = j;
+                let n: u64 = unsafe { raw::read_mib(&nmalloc_mib) }.unwrap_or(0);
+                if n > 0 {
+                    r.shared_requests[request_bucket(size)] += n;
+                    r.shared_request_bytes[request_bucket(size)] += n * size as u64;
+                }
+            }
             continue;
         }
         r.thread_dirty += dirty;
@@ -295,6 +406,67 @@ mod tests {
             dirty >= 512 << 20,
             "their freed pages not counted as thread-arena dirty bytes"
         );
+    }
+
+    /// The shared arena's readings: 64 allocations of 16 MiB (over the oversize
+    /// threshold, so the shared arena serves them) count as 16–32 MiB requests
+    /// there, and their freed pages, under the posture, as its dirty bytes. The
+    /// conf line reads the running options back.
+    #[test]
+    #[ignore = "run under the posture: _RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1"]
+    fn the_arena_reader_sees_the_shared_arena() {
+        let conf = conf_line().expect("the options read back");
+        println!("{conf}");
+        assert!(conf.contains("dirty_decay_ms -1") && conf.contains("lg_extent_max_active_fit"));
+        let before = arena_report().expect("the stats read");
+        let buffers: Vec<Vec<u8>> = (0..64).map(|_| vec![1u8; 16 << 20]).collect();
+        drop(buffers);
+        let after = arena_report().expect("the stats read");
+        let requests = after.shared_requests[1] - before.shared_requests[1];
+        let dirty = after.shared_dirty.saturating_sub(before.shared_dirty);
+        println!(
+            "SHARED UNIT: 16–32 MiB requests +{requests} · shared dirty +{} MiB · extents {:?} MiB · largest {} MiB",
+            dirty >> 20,
+            after.shared_extents.map(|b| b >> 20),
+            after.shared_largest >> 20
+        );
+        assert!(
+            requests >= 64,
+            "64 allocations of 16 MiB not counted as shared 16–32 MiB requests"
+        );
+        assert!(
+            dirty >= 512 << 20,
+            "their freed pages not counted as shared-arena dirty bytes"
+        );
+    }
+
+    /// The fit limit's probe: freed 32 MiB buffers coalesce into a ≈ 1 GiB dirty
+    /// extent in the shared arena; 64 requests of 8 MiB (128× smaller) then
+    /// take fresh pages under jemalloc's default `lg_extent_max_active_fit` (6:
+    /// at most 64×) and reuse the extent under `lg_extent_max_active_fit:16`.
+    /// Prints the shared arena's resident growth; asserts nothing.
+    #[test]
+    #[ignore = "laptop instrument: run alone under the posture, with and without lg_extent_max_active_fit:16"]
+    fn the_fit_limit_probe() {
+        let resident = || {
+            tikv_jemalloc_ctl::epoch::advance().expect("the epoch turns");
+            tikv_jemalloc_ctl::stats::resident::read().expect("stats.resident reads")
+        };
+        println!("{}", conf_line().unwrap_or_default());
+        let big: Vec<Vec<u8>> = (0..32).map(|_| vec![1u8; 32 << 20]).collect();
+        drop(big);
+        let freed = arena_report().expect("the stats read");
+        let r0 = resident();
+        let small: Vec<Vec<u8>> = (0..64).map(|_| vec![1u8; 8 << 20]).collect();
+        let r1 = resident();
+        println!(
+            "FIT PROBE: shared dirty extents after the free {:?} MiB (largest {} MiB) · 64 × 8 MiB then take \
+             {} MiB of fresh pages",
+            freed.shared_extents.map(|b| b >> 20),
+            freed.shared_largest >> 20,
+            r1.saturating_sub(r0) >> 20
+        );
+        drop(small);
     }
 
     /// The knob names its boundaries: `all`, or a list split on commas or dots,
