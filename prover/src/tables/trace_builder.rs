@@ -4688,8 +4688,11 @@ fn p4_split() -> bool {
 /// histogram a bucket, on the pool), each unit timed, then merged into `base`
 /// one after another, timed apart; prints one `BLOCK P4 SPLIT` line.
 #[cfg(feature = "parallel")]
+type BitwiseUnit<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
+
+#[cfg(feature = "parallel")]
 fn p4_split_count(
-    buckets: &[Vec<Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + '_>>],
+    buckets: &[Vec<BitwiseUnit<'_>>],
     names: &[Vec<String>],
     base: &mut bitwise::BitwiseHistogram,
 ) {
