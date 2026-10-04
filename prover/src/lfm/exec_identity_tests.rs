@@ -424,3 +424,144 @@ fn merging_adjacent_levels_fails_at_one_address_every_run() {
         "no case had a hash to mis-schedule, so the mutation proved nothing"
     );
 }
+
+// ==================== the streamed execution ====================
+
+/// A node-shaped program: three "children", each a BLAKE3 sponge over an arena
+/// of its own (independent, as a node's verification of each child is), then a
+/// little work over all three (as a node's cross-child checks are).
+fn three_children_program(len_bytes: usize) -> super::compiler::LfmProgram {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
+    let mut firsts = Vec::new();
+    for _ in 0..3 {
+        let arena = b.declare_arena(halves);
+        let stream: Vec<_> = (0..halves).map(|i| b.hint_felt(arena, i)).collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len_bytes);
+        b.public(digest[0]);
+        b.public(digest[1]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[2]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    super::compiler::compile(b.finish())
+}
+
+/// `case` streamed: each arena its own group, landing in `order`.
+fn streamed(case: &Case, order: &[usize]) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let groups: Vec<usize> = (0..case.arenas.len()).collect();
+    let mut ex = StreamedExecution::new(&case.program, groups, &case.hasher)
+        .unwrap_or_else(|e| panic!("{}: a streamed execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &g in order {
+        ex.land(g, std::slice::from_ref(&case.arenas[g]))
+            .unwrap_or_else(|e| panic!("{}: group {g} lands: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the streamed execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+fn three_children_case() -> Case {
+    let len = 202;
+    let arena = |seed: u8| -> Vec<super::word::LfmWord> {
+        let msg: Vec<u8> = (0..len)
+            .map(|i| (37 * i as u32 + 11 + 13 * u32::from(seed)) as u8)
+            .collect();
+        super::keccak_host::pack_stream(&msg)
+            .into_iter()
+            .map(super::word::base_word)
+            .collect()
+    };
+    Case {
+        name: "ThreeChildren(202)",
+        program: three_children_program(len),
+        arenas: vec![arena(0), arena(1), arena(2)],
+        hasher: super::hash::HasherKind::Test,
+    }
+}
+
+/// ★ The streamed execution's gate: whatever order the arena groups land in,
+/// the witness is the serial reference's, word for word — on the node-shaped
+/// case in all six orders and on every identity case in two — and on the
+/// node-shaped case most of the program has run before the last group lands.
+#[test]
+fn a_streamed_execution_is_byte_identical_in_any_landing_order() {
+    let node = three_children_case();
+    let reference_node = reference(&node);
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = streamed(&node, &order);
+        assert_executions_identical(node.name, node.program.num_addrs, &reference_node, &got);
+        let n = node.program.instrs.len();
+        assert_eq!(
+            *ran.last().expect("waves"),
+            n,
+            "{order:?}: every instruction ran once"
+        );
+        assert!(
+            ran[2] * 3 >= n * 2,
+            "{order:?}: only {} of {n} instructions ran before the last group landed",
+            ran[2]
+        );
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let k = case.arenas.len();
+        let forward: Vec<usize> = (0..k).collect();
+        let backward: Vec<usize> = (0..k).rev().collect();
+        for order in [forward, backward] {
+            let (b, ran) = streamed(&case, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            assert_eq!(*ran.last().expect("waves"), case.program.instrs.len());
+        }
+    }
+}
+
+/// A streamed execution refuses what it cannot run: finishing before every
+/// group has landed, a group landing twice, a group with the wrong number of
+/// arenas or an arena of the wrong length — each an error, not a witness.
+#[test]
+fn a_streamed_execution_refuses_an_incomplete_or_malformed_landing() {
+    use super::executor::StreamedExecution;
+    let node = three_children_case();
+    let start =
+        || StreamedExecution::new(&node.program, vec![0, 1, 2], &node.hasher).expect("starts");
+
+    let mut ex = start();
+    ex.land(0, std::slice::from_ref(&node.arenas[0]))
+        .expect("lands");
+    assert!(matches!(ex.finish(), Err(LfmExecError::Internal(_))));
+
+    let mut ex = start();
+    ex.land(1, std::slice::from_ref(&node.arenas[1]))
+        .expect("lands");
+    assert!(matches!(
+        ex.land(1, std::slice::from_ref(&node.arenas[1])),
+        Err(LfmExecError::Internal(_))
+    ));
+
+    let mut ex = start();
+    assert!(matches!(
+        ex.land(2, &node.arenas[1..3]),
+        Err(LfmExecError::ArenaCountMismatch { .. })
+    ));
+    let short = vec![node.arenas[2][..node.arenas[2].len() - 1].to_vec()];
+    assert!(matches!(
+        ex.land(2, &short),
+        Err(LfmExecError::ArenaLenMismatch { .. })
+    ));
+}
