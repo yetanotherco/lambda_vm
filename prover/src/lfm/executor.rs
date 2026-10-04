@@ -381,7 +381,10 @@ pub struct LfmExecution {
 
 struct Machine<'a> {
     memory: WriteOnceMemory,
-    arenas: &'a [Vec<LfmWord>],
+    /// The arenas by id. A streamed execution ([`StreamedExecution`]) leaves an
+    /// arena empty until its group lands, so a read of it before then is
+    /// `ArenaOutOfBounds` — an error, never a value.
+    arenas: Vec<&'a [LfmWord]>,
 }
 
 impl Machine<'_> {
@@ -1118,7 +1121,7 @@ fn execute_inner(
     let t = Instant::now();
     let mut m = Machine {
         memory: WriteOnceMemory::new(program.num_addrs as usize),
-        arenas,
+        arenas: arenas.iter().map(Vec::as_slice).collect(),
     };
     let mut records = LfmRecords::with_capacity(&program.groups);
     let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
@@ -1154,6 +1157,7 @@ fn execute_inner(
                 &mut records,
                 &mut public_words,
                 &mut split,
+                None,
             )?;
             // SAFETY: `run_levels` returned `Ok`, so every instruction ran and
             // every row the schedule handed out was written — see
@@ -1218,6 +1222,211 @@ fn execute_inner(
     })
 }
 
+/// An execution that runs as its arenas arrive, a group at a time: the
+/// instructions that read only landed groups run as soon as the last of those
+/// groups lands, the rest wait. A tree node's children land at different times,
+/// and most of a node is the verification of one child, so most of it can run
+/// before its last child is proved.
+///
+/// The witness is [`execute`]'s, word for word (the gate:
+/// `exec_identity_tests`): each instruction runs exactly once, in the level
+/// schedule's order restricted to a wave, writes the record slot the schedule
+/// gives it, and reads memory that write-once [`WriteOnceMemory`] guards — so a
+/// wrong `need` (an instruction run before an input exists) is
+/// `ReadBeforeWrite` or `ArenaOutOfBounds`, never a different value.
+///
+/// `need[i]` is the set of groups instruction `i` reads, through any chain of
+/// memory: a [`Instr::Hint`] reads its arena's group, every instruction the
+/// union of its inputs' sets (one forward pass: every operand address is below
+/// its destination). Instruction `i` runs in the wave in which its last group
+/// lands; the ones that read no arena run before any lands.
+pub struct StreamedExecution<'p, 'a, H: LfmHasher + Sync> {
+    program: &'p LfmProgram,
+    hasher: &'p H,
+    levels: LevelSchedule,
+    need: Vec<u64>,
+    /// Each arena's group.
+    group_of: Vec<usize>,
+    landed: u64,
+    ran: usize,
+    m: Machine<'a>,
+    records: LfmRecords,
+    public_words: Vec<(u32, LfmWord)>,
+    split: ExecSplit,
+}
+
+impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
+    /// A streamed execution of `program`, its arenas in groups (`group_of[a]` is
+    /// arena `a`'s group, at most 64 groups); runs everything that reads no
+    /// arena now.
+    pub fn new(
+        program: &'p LfmProgram,
+        group_of: Vec<usize>,
+        hasher: &'p H,
+    ) -> Result<Self, LfmExecError> {
+        let schema = &program.arena_schema.lens;
+        if group_of.len() != schema.len() {
+            return Err(LfmExecError::ArenaCountMismatch {
+                expected: schema.len(),
+                found: group_of.len(),
+            });
+        }
+        if group_of.iter().any(|&g| g >= 64) {
+            return Err(LfmExecError::Internal(
+                "a streamed execution takes at most 64 groups",
+            ));
+        }
+        let t = Instant::now();
+        let levels = exec_schedule::build_with_merge(program, 1);
+        // The forward pass: each address's group set, then each instruction's.
+        let mut addr_need = vec![0u64; program.num_addrs as usize];
+        let mut need = vec![0u64; program.instrs.len()];
+        let mut scratch: Vec<Addr> = Vec::with_capacity(32);
+        for (i, instr) in program.instrs.iter().enumerate() {
+            scratch.clear();
+            instr.reads_into(&mut scratch);
+            let mut n = scratch
+                .iter()
+                .map(|r| addr_need.get(r.0 as usize).copied().unwrap_or(0))
+                .fold(0u64, |a, b| a | b);
+            if let Instr::Hint { arena, .. } = instr {
+                // An arena past the schema reads as no group: the executor
+                // rejects the read itself, as it does unstreamed.
+                n |= group_of.get(*arena as usize).map_or(0, |&g| 1u64 << g);
+            }
+            need[i] = n;
+            scratch.clear();
+            instr.writes_into(&mut scratch);
+            for w in &scratch {
+                if let Some(slot) = addr_need.get_mut(w.0 as usize) {
+                    *slot = n;
+                }
+            }
+        }
+        drop(addr_need);
+        let mut split = ExecSplit {
+            depth_pass: t.elapsed().as_secs_f64(),
+            levels: levels.levels(),
+            ..ExecSplit::default()
+        };
+        let t = Instant::now();
+        let m = Machine {
+            memory: WriteOnceMemory::new(program.num_addrs as usize),
+            arenas: vec![&[]; schema.len()],
+        };
+        let records = LfmRecords::with_capacity(&program.groups);
+        let public_words = Vec::with_capacity(program.groups.public.real_rows);
+        split.setup = t.elapsed().as_secs_f64();
+        split.record_bytes = LfmRecords::bytes(&program.groups);
+        let mut streamed = Self {
+            program,
+            hasher,
+            levels,
+            need,
+            group_of,
+            landed: 0,
+            ran: 0,
+            m,
+            records,
+            public_words,
+            split,
+        };
+        streamed.wave(None)?;
+        Ok(streamed)
+    }
+
+    /// Group `group` has landed with `arenas` (its arenas, in arena order): runs
+    /// every instruction whose last group it is.
+    pub fn land(&mut self, group: usize, arenas: &'a [Vec<LfmWord>]) -> Result<(), LfmExecError> {
+        if group >= 64 || self.landed & (1u64 << group) != 0 {
+            return Err(LfmExecError::Internal(
+                "a group landed twice, or is out of range",
+            ));
+        }
+        let ids: Vec<usize> = (0..self.group_of.len())
+            .filter(|&a| self.group_of[a] == group)
+            .collect();
+        if ids.len() != arenas.len() {
+            return Err(LfmExecError::ArenaCountMismatch {
+                expected: ids.len(),
+                found: arenas.len(),
+            });
+        }
+        let schema = &self.program.arena_schema.lens;
+        for (&a, words) in ids.iter().zip(arenas) {
+            if words.len() != schema[a] as usize {
+                return Err(LfmExecError::ArenaLenMismatch {
+                    arena: a as u32,
+                    expected: schema[a],
+                    found: words.len(),
+                });
+            }
+            self.m.arenas[a] = words;
+        }
+        let before = self.landed;
+        self.landed |= 1u64 << group;
+        self.wave(Some(before))
+    }
+
+    /// Runs the instructions whose groups have all landed and had not all
+    /// landed `before` (every instruction that reads no arena, at `None`).
+    fn wave(&mut self, before: Option<u64>) -> Result<(), LfmExecError> {
+        let (need, landed) = (&self.need, self.landed);
+        let keep = |i: usize| {
+            let n = need[i];
+            n & !landed == 0 && before.is_none_or(|b| n & !b != 0)
+        };
+        self.ran += run_levels(
+            self.program,
+            &self.levels,
+            self.hasher,
+            PRODUCTION_COALESCE_BELOW,
+            &mut self.m,
+            &mut self.records,
+            &mut self.public_words,
+            &mut self.split,
+            Some(&keep),
+        )?;
+        Ok(())
+    }
+
+    /// Instructions run so far.
+    pub fn ran(&self) -> usize {
+        self.ran
+    }
+
+    /// The execution, once every group has landed: [`execute`]'s, word for word.
+    pub fn finish(mut self) -> Result<LfmExecution, LfmExecError> {
+        let groups = self.group_of.iter().fold(0u64, |a, &g| a | (1u64 << g));
+        if self.landed != groups {
+            return Err(LfmExecError::Internal(
+                "a streamed execution finished before every group landed",
+            ));
+        }
+        if self.ran != self.program.instrs.len() {
+            return Err(LfmExecError::Internal(
+                "a streamed execution ran a different number of instructions than the program has",
+            ));
+        }
+        // SAFETY: every instruction ran exactly once (each in the one wave in
+        // which its last group landed; `ran` counts them) and every wave
+        // returned `Ok`, so every record slot the schedule hands out was
+        // written — `LfmRecords::commit_slots`'s condition, as in `execute`.
+        unsafe {
+            self.records.commit_slots(&self.program.groups);
+            assert!(self.public_words.capacity() >= self.program.groups.public.real_rows);
+            self.public_words
+                .set_len(self.program.groups.public.real_rows);
+        }
+        Ok(LfmExecution {
+            records: self.records,
+            public_words: self.public_words,
+            memory: self.m.memory,
+            split: self.split,
+        })
+    }
+}
+
 /// The level schedule: for each depth level, its hashes, then its non-hash work.
 ///
 /// # The protocol, and why it needs no lock, no atomic and no `unsafe`
@@ -1243,6 +1452,10 @@ fn execute_inner(
 /// order, so `records.hash` ends up exactly the vector the serial loop would
 /// have pushed. The row numbers come from the schedule, so a row is written once
 /// and read once and the vector is never searched.
+///
+/// `keep`, when given, runs only the instructions it keeps — a streamed
+/// execution's wave ([`StreamedExecution`]) — in the same order; returns how many
+/// instructions ran.
 #[allow(clippy::too_many_arguments)]
 fn run_levels(
     program: &LfmProgram,
@@ -1253,14 +1466,31 @@ fn run_levels(
     records: &mut LfmRecords,
     public_words: &mut Vec<(u32, LfmWord)>,
     split: &mut ExecSplit,
-) -> Result<(), LfmExecError> {
+    keep: Option<&dyn Fn(usize) -> bool>,
+) -> Result<usize, LfmExecError> {
     // One buffer, reused by every level, so a 2,237-level program allocates once
     // rather than 2,237 times. It grows to the widest level and stays there:
     // ~3.4 MiB on a wrap, ~4.8 MiB on a node.
     let mut computed: Vec<Result<HashRow, LfmExecError>> = Vec::new();
+    // A wave's share of a level, when `keep` filters: the same order, a subset.
+    let (mut kept_rows, mut kept_others): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut ran = 0usize;
 
     for d in 0..levels.levels() {
-        let rows = levels.hashes_at(d);
+        let rows = match keep {
+            None => levels.hashes_at(d),
+            Some(keep) => {
+                kept_rows.clear();
+                kept_rows.extend(
+                    levels
+                        .hashes_at(d)
+                        .iter()
+                        .filter(|&&row| keep(levels.instr_of_row(row))),
+                );
+                &kept_rows
+            }
+        };
+        ran += rows.len();
 
         let t = Instant::now();
         if rows.len() < coalesce_below {
@@ -1314,7 +1544,16 @@ fn run_levels(
         // other, so it stays serial and in program order — which is a
         // topological order, so that is enough.
         let t = Instant::now();
-        for &i in levels.others_at(d) {
+        let others = match keep {
+            None => levels.others_at(d),
+            Some(keep) => {
+                kept_others.clear();
+                kept_others.extend(levels.others_at(d).iter().filter(|&&i| keep(i as usize)));
+                &kept_others
+            }
+        };
+        ran += others.len();
+        for &i in others {
             let i = i as usize;
             step(
                 m,
@@ -1327,7 +1566,7 @@ fn run_levels(
         }
         split.residue += t.elapsed().as_secs_f64();
     }
-    Ok(())
+    Ok(ran)
 }
 
 /// One hash instruction's read-only half, dispatched from a program index.

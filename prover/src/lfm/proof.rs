@@ -208,20 +208,38 @@ pub(crate) fn lfm_execute_and_fill(
     // proof — and the cell would then hand it to the NEXT stage on this thread
     // as if it were that stage's own.
     //
-    // ⚠ The two `drop`s below are the other half of that reasoning: this
+    // ⚠ The two `drop`s in [`lfm_fill_executed`] are the other half of that reasoning: this
     // function's PEAK, not its clock, is what fences a third concurrent sibling
     // on a 57.5 GiB host. Both are placed AFTER the elapsed-time read, so
     // `execute` and `fill` keep measuring exactly what they measured before and
     // stay comparable across the change; only the wall absorbs the free, which
     // is a handful of `munmap`s.
     let t = Instant::now();
+    let execution = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    Ok(lfm_fill_executed(
+        program,
+        execution,
+        hasher,
+        t.elapsed().as_secs_f64(),
+    ))
+}
+
+/// The fill half of [`lfm_execute_and_fill`], over an execution already run —
+/// a streamed one ([`super::executor::StreamedExecution`]), whose witness is
+/// [`execute`]'s word for word. `execute_secs` is what the split reports as
+/// the execute.
+pub(crate) fn lfm_fill_executed(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+) -> LfmFilled {
     let LfmExecution {
         records,
         public_words,
         memory,
         split: exec_split,
-    } = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
-    let execute_secs = t.elapsed().as_secs_f64();
+    } = execution;
     // The final write-once array: 32 bytes per address, a few hundred MB for a
     // wrap. It is a diagnostic surface for tests — nothing on the proving path
     // reads it — so held to the end of this scope it would stay live through the
@@ -236,14 +254,14 @@ pub(crate) fn lfm_execute_and_fill(
     // here on; holding the records as well doubles the values through the card
     // phase.
     drop(records);
-    Ok(LfmFilled {
+    LfmFilled {
         traces,
         public_words,
         hasher,
         execute_secs,
         fill_secs,
         exec_split,
-    })
+    }
 }
 
 impl LfmFilled {
