@@ -415,6 +415,22 @@ where
         self.trace.install_narrow(packed)
     }
 
+    /// Hands the packed columns to a spill store (see
+    /// [`TraceData::take_narrow_for_spill`]).
+    pub(crate) fn take_narrow_for_spill(&mut self) -> Option<multilinear::narrow::NarrowColumns> {
+        self.trace.take_narrow_for_spill()
+    }
+
+    /// Brings spilled columns back (see [`TraceData::restore_narrow`]).
+    pub(crate) fn restore_narrow(&mut self, packed: multilinear::narrow::NarrowColumns) -> bool {
+        self.trace.restore_narrow(packed)
+    }
+
+    /// Whether the packed columns are out in a spill store's slot.
+    pub fn is_spilled(&self) -> bool {
+        self.trace.is_spilled()
+    }
+
     /// Packs the columns narrow on the host (see [`TraceData::pack_on_host`]).
     pub(crate) fn pack_on_host(&mut self) -> bool {
         self.trace.pack_on_host()

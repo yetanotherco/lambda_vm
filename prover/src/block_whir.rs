@@ -305,6 +305,257 @@ pub struct BlockOptions {
     /// the host. KECCAK, ECSM, ECDAS and an unchunked KECCAK_RND stay wide.
     /// The proof's bytes are the same. Production: on.
     pub pack_finished: bool,
+    /// Whether phase A hands the committed groups' packed tables to a spill
+    /// store, which phase B reads back in group order
+    /// ([`multilinear_block::BlockSpill`]). The proof's bytes are the same.
+    /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), `auto` unless
+    /// set.
+    pub spill: BlockSpillPolicy,
+}
+
+/// When a block spills its held tables ([`BlockOptions::spill`]): the policy
+/// and the rule of #1013's block pipeline (`prover/src/block.rs`,
+/// `SpillPolicy` … `spill_decision`, @ edddc6873), with #1014's reserve
+/// ([`spill_reserve_bytes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockSpillPolicy {
+    /// Every table stays in memory.
+    Off,
+    /// Every committed group past the first two spills, as far as the store's
+    /// writer queue has room (a measurement arm).
+    Always,
+    /// Keep at most this many bytes of committed packed tables; spill the
+    /// rest.
+    Budget(u64),
+    /// Spill once the host would pass the target ([`spill_target_bytes`]):
+    /// see [`spill_wanted`]. The default: a block that fits spills nothing.
+    #[default]
+    Auto,
+}
+
+/// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
+/// resident budget for committed packed tables). Anything else is `off`. As
+/// #1013's `parse_spill_policy`.
+pub fn spill_from_env() -> BlockSpillPolicy {
+    parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
+}
+
+fn parse_spill_policy(value: Option<&str>) -> BlockSpillPolicy {
+    match value.map(str::trim) {
+        Some("always") => BlockSpillPolicy::Always,
+        Some("auto") => BlockSpillPolicy::Auto,
+        Some(gib) => gib
+            .parse::<f64>()
+            .ok()
+            .filter(|g| g.is_finite() && *g >= 0.0)
+            .map_or(BlockSpillPolicy::Off, |g| {
+                BlockSpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
+            }),
+        None => BlockSpillPolicy::Auto,
+    }
+}
+
+/// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
+/// smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`]) and
+/// `MemTotal`, less 10 GiB ([`spill_target_from`]) (#1013's
+/// `spill_target_bytes` @ 035aef5d6).
+fn spill_target_bytes() -> u64 {
+    if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+    {
+        return (gib * (1u64 << 30) as f64) as u64;
+    }
+    let limit = cgroup_memory(
+        &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+        std::path::Path::new(CGROUP_ROOT),
+        CgroupValue::File("memory.max"),
+        CgroupValue::File("memory.limit_in_bytes"),
+    );
+    let mem_total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kib| kib << 10)
+    });
+    spill_target_from(limit, mem_total)
+}
+
+/// The smaller of a cgroup limit and `MemTotal`, less 10 GiB; no spill
+/// (`u64::MAX`) when neither is known. A v1 cgroup without a limit reads a
+/// sentinel far above `MemTotal`, which the minimum discards (#1013's
+/// `spill_target_from`).
+fn spill_target_from(limit: Option<u64>, mem_total: Option<u64>) -> u64 {
+    const MARGIN: u64 = 10 << 30;
+    match (limit, mem_total) {
+        (Some(limit), Some(total)) => limit.min(total),
+        (Some(bytes), None) | (None, Some(bytes)) => bytes,
+        (None, None) => return u64::MAX,
+    }
+    .saturating_sub(MARGIN)
+}
+
+/// Where the cgroup filesystem is mounted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// One number of a cgroup's memory files: a file that holds just the number,
+/// or one `key value` line of `memory.stat` (#1013's `CgroupValue`).
+#[derive(Clone, Copy)]
+enum CgroupValue<'a> {
+    File(&'a str),
+    Stat(&'a str),
+}
+
+impl CgroupValue<'_> {
+    fn read(self, dir: &std::path::Path) -> Option<u64> {
+        let (file, key) = match self {
+            CgroupValue::File(file) => (file, None),
+            CgroupValue::Stat(key) => ("memory.stat", Some(key)),
+        };
+        let text = std::fs::read_to_string(dir.join(file)).ok()?;
+        match key {
+            None => text.trim().parse::<u64>().ok(),
+            Some(key) => text.lines().find_map(|l| {
+                let (k, v) = l.split_once(' ')?;
+                (k == key).then(|| v.trim().parse::<u64>().ok()).flatten()
+            }),
+        }
+    }
+}
+
+/// A number from this process's cgroup memory files: `v2` under the unified
+/// hierarchy (`memory.max`, `memory.current`, `memory.stat`'s `inactive_file`),
+/// else `v1` under the memory controller (`memory.limit_in_bytes`,
+/// `memory.usage_in_bytes`, `memory.stat`'s `total_inactive_file`).
+/// `proc_cgroup` is `/proc/self/cgroup`, `root` the cgroup mount. Each is read
+/// at the process's cgroup path, then at its hierarchy's root, which a
+/// container without a cgroup namespace sees as its own cgroup. `None` where
+/// neither reads as a number (v2's `max` included) (#1013's
+/// `cgroup_memory`).
+fn cgroup_memory(
+    proc_cgroup: &str,
+    root: &std::path::Path,
+    v2: CgroupValue,
+    v1: CgroupValue,
+) -> Option<u64> {
+    let at = |base: &std::path::Path, path: &str, value: CgroupValue| {
+        value
+            .read(&base.join(path.trim().trim_start_matches('/')))
+            .or_else(|| value.read(base))
+    };
+    let (mut unified, mut memory) = (None, None);
+    for line in proc_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            unified = Some(path);
+        } else if controllers.split(',').any(|c| c == "memory") {
+            memory = Some(path);
+        }
+    }
+    unified
+        .and_then(|path| at(root, path, v2))
+        .or_else(|| memory.and_then(|path| at(&root.join("memory"), path, v1)))
+}
+
+/// What `auto` reads of the host ([`HostReading::bytes`]) (#1013's
+/// `HostReading` @ 035aef5d6, from cf253d235).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HostReading {
+    /// The process's peak resident set (`VmHWM`).
+    hwm: u64,
+    /// The cgroup's charge (`memory.current`, or v1's `memory.usage_in_bytes`),
+    /// page cache included.
+    charged: u64,
+    /// Its inactive file pages (`memory.stat`'s `inactive_file`, or v1's
+    /// `total_inactive_file`): the page cache the kernel reclaims first.
+    inactive_file: u64,
+}
+
+impl HostReading {
+    fn now() -> Self {
+        let hwm = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                    .map(|kib| kib << 10)
+            });
+        let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let root = std::path::Path::new(CGROUP_ROOT);
+        let charged = cgroup_memory(
+            &proc_cgroup,
+            root,
+            CgroupValue::File("memory.current"),
+            CgroupValue::File("memory.usage_in_bytes"),
+        );
+        let inactive_file = cgroup_memory(
+            &proc_cgroup,
+            root,
+            CgroupValue::Stat("inactive_file"),
+            CgroupValue::Stat("total_inactive_file"),
+        );
+        Self {
+            hwm: hwm.unwrap_or(0),
+            charged: charged.unwrap_or(0),
+            inactive_file: inactive_file.unwrap_or(0),
+        }
+    }
+
+    /// The host's bytes: the larger of the peak resident set (the resident set
+    /// itself is not monotone under the allocator's posture, which drops and
+    /// re-faults recycled extents) and the cgroup's working set, its charge
+    /// less its inactive file pages (the kubelet's measure). Page cache the
+    /// kernel would give back first is not counted; active file pages are,
+    /// and the target's 10 GiB margin covers them.
+    fn bytes(&self) -> u64 {
+        self.hwm
+            .max(self.charged.saturating_sub(self.inactive_file))
+    }
+}
+
+/// `auto`'s reserve beside the host's bytes: what the block still needs once
+/// the tables committed so far (`cells` main cells) are on the host. #1014's
+/// own, inferred from the median block (BIG 565, 33.5 G cells): the finish's
+/// p5 transient (25.5 GiB at its peak) and the tree's leaf programs, which
+/// live through phase B (16.3 GiB at its end), ≈ 1.25 GiB per total G cells,
+/// or ≈ 1.65 per G cells committed so far (the streamed share ≈ 0.76); plus
+/// 6 GiB for phase B's bump and the read-back window.
+fn spill_reserve_bytes(cells: u64) -> u64 {
+    const PER_G: f64 = 1.65 * (1u64 << 30) as f64;
+    (cells as f64 / 1e9 * PER_G) as u64 + (6 << 30)
+}
+
+/// The policy's choice for one committed table of `bytes` packed bytes:
+/// `kept` the committed packed bytes kept so far, `cells` the main cells
+/// committed so far (this table's included), `host` the host's bytes
+/// ([`HostReading::bytes`]), read only by `auto` (#1013's `spill_decision`, with
+/// #1014's reserve).
+fn spill_wanted(
+    policy: BlockSpillPolicy,
+    target: u64,
+    kept: u64,
+    cells: u64,
+    bytes: u64,
+    host: impl FnOnce() -> u64,
+) -> bool {
+    match policy {
+        BlockSpillPolicy::Off => false,
+        BlockSpillPolicy::Always => true,
+        BlockSpillPolicy::Budget(budget) => kept + bytes > budget,
+        BlockSpillPolicy::Auto => {
+            host()
+                .saturating_add(spill_reserve_bytes(cells))
+                .saturating_add(bytes)
+                > target
+        }
+    }
 }
 
 impl BlockOptions {
@@ -331,6 +582,7 @@ impl BlockOptions {
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
+            spill: spill_from_env(),
         }
     }
 }
@@ -524,6 +776,11 @@ pub struct BlockStamps {
     /// With [`BlockOptions::memlog`]: every memory term when the proof is
     /// done, bytes; empty without.
     pub mem_terms: Vec<(&'static str, usize)>,
+    /// With [`BlockOptions::spill`]: the store's counters and the read-back's
+    /// report, or why no store opened.
+    pub spill: Option<String>,
+    /// With [`BlockOptions::spill`]: the store's counters after phase B.
+    pub spill_stats: Option<stark::spill::SpillStats>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -775,6 +1032,9 @@ impl BlockStamps {
             sum(|g| g.upload_b),
             sum(|g| g.encode),
         ));
+        if let Some(spill) = &self.spill {
+            out.push_str(&format!("BLOCK SPILL: {spill}\n"));
+        }
         out
     }
 }
@@ -1404,6 +1664,14 @@ pub(crate) struct Deviations {
     /// phase B widens other words than were committed
     /// ([`BlockCommitted::fault_narrow_width_map`]).
     pub narrow_width_map: bool,
+    /// Between the phases, one byte of the first spilled table flipped on
+    /// disk ([`BlockCommitted::fault_spilled_byte`]), so phase B reads back
+    /// other bytes than were written.
+    pub spilled_byte: bool,
+    /// Between the phases, the first spilled table's slot lost
+    /// ([`BlockCommitted::fault_lose_spilled_slot`]), so its columns never
+    /// come back.
+    pub spilled_slot_lost: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2648,6 +2916,52 @@ fn prove_streamed(
         ledger.pool();
         ledger.line("start");
     }
+    // The spill (`BlockOptions::spill`): a store for this prove, unless the
+    // policy is off. A store that does not open leaves every table in memory.
+    let policy = options.spill;
+    let target = spill_target_bytes();
+    let policy_name = match policy {
+        BlockSpillPolicy::Off => "off".to_string(),
+        BlockSpillPolicy::Always => "always".to_string(),
+        BlockSpillPolicy::Budget(b) => format!("budget {:.1} GiB", b as f64 / (1u64 << 30) as f64),
+        BlockSpillPolicy::Auto => format!(
+            "auto (target {:.1} GiB)",
+            target as f64 / (1u64 << 30) as f64
+        ),
+    };
+    // The largest host reading `auto` decided on, for the BLOCK SPILL line
+    // (#1013's `Spill::host_most`).
+    let host_most: std::sync::Arc<std::sync::Mutex<Option<HostReading>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let spill = match policy {
+        BlockSpillPolicy::Off => None,
+        _ => {
+            let store_options = stark::spill::SpillOptions::default();
+            let queue = store_options.queue_bytes;
+            match stark::spill::SpillStore::open(store_options) {
+                Ok(store) => {
+                    let host_most = std::sync::Arc::clone(&host_most);
+                    let wanted: std::sync::Arc<multilinear_block::SpillWanted> =
+                        std::sync::Arc::new(move |kept, cells, bytes| {
+                            spill_wanted(policy, target, kept, cells, bytes, || {
+                                let reading = HostReading::now();
+                                let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
+                                if most.is_none_or(|m| reading.bytes() > m.bytes()) {
+                                    *most = Some(reading);
+                                }
+                                reading.bytes()
+                            })
+                        });
+                    Some(multilinear_block::BlockSpill::new(store, queue, wanted))
+                }
+                Err(e) => {
+                    stamps.spill =
+                        Some(format!("{policy_name} · no store ({e}); every table held"));
+                    None
+                }
+            }
+        }
+    };
 
     crate::with_whir_hash!(|H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
@@ -3024,6 +3338,7 @@ fn prove_streamed(
                 options.narrow,
                 options.upload_ahead,
                 ledger.map(|ledger| ledger.block.clone()),
+                spill.clone(),
             );
             (block, builder.join(), layout.join(), executor.join())
         });
@@ -3040,6 +3355,12 @@ fn prove_streamed(
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
+        }
+        if deviations.spilled_byte && !block.fault_spilled_byte() {
+            return Err(Error::Prover("no spilled table to break".into()));
+        }
+        if deviations.spilled_slot_lost && !block.fault_lose_spilled_slot() {
+            return Err(Error::Prover("no spilled table to lose".into()));
         }
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);
@@ -3129,6 +3450,30 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        if let Some(spill) = &spill {
+            let read_back = spill
+                .prefetch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| "nothing to read back".to_string());
+            let stats = spill.store.stats();
+            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
+                Some(h) => format!(
+                    " · host at most {:.2} GiB (VmHWM {:.2} · charge {:.2} − inactive file {:.2})",
+                    g(h.bytes()),
+                    g(h.hwm),
+                    g(h.charged),
+                    g(h.inactive_file),
+                ),
+                None => String::new(),
+            };
+            stamps.spill = Some(format!(
+                "{policy_name} · {stats} · read-back {read_back}{host}"
+            ));
+            stamps.spill_stats = Some(stats);
+        }
         if multilinear::whir_split::enabled() {
             let chain = multilinear::whir_split::take_chain();
             let top_secs = multilinear::whir_commit::top_path_secs();
@@ -3565,4 +3910,205 @@ pub(crate) fn verify_block_whir_with(
         )
         .is_ok()
     }))
+}
+
+#[cfg(test)]
+mod spill_policy_tests {
+    use super::{
+        BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, parse_spill_policy,
+        spill_reserve_bytes, spill_target_from, spill_wanted,
+    };
+
+    const GIB: u64 = 1 << 30;
+
+    /// `LAMBDA_VM_BLOCK_SPILL`'s values, as #1013 reads them: `auto` (and
+    /// unset), `off`, `always`, a budget in GiB; anything else is off.
+    #[test]
+    fn the_spill_knob_reads_as_on_1013() {
+        assert_eq!(parse_spill_policy(None), BlockSpillPolicy::Auto);
+        assert_eq!(parse_spill_policy(Some("auto")), BlockSpillPolicy::Auto);
+        assert_eq!(
+            parse_spill_policy(Some(" always ")),
+            BlockSpillPolicy::Always
+        );
+        assert_eq!(parse_spill_policy(Some("off")), BlockSpillPolicy::Off);
+        assert_eq!(
+            parse_spill_policy(Some("2.5")),
+            BlockSpillPolicy::Budget(5 * GIB / 2)
+        );
+        assert_eq!(parse_spill_policy(Some("-1")), BlockSpillPolicy::Off);
+        assert_eq!(parse_spill_policy(Some("nan")), BlockSpillPolicy::Off);
+        assert_eq!(BlockSpillPolicy::default(), BlockSpillPolicy::Auto);
+    }
+
+    /// The cgroup memory files, v2 and v1, from fake `/proc/self/cgroup` texts
+    /// and cgroup trees: v2 at the process's path, v2's `max` falling through
+    /// to v1, v1 at its path or (a container without a cgroup namespace) at
+    /// the controller's root, a v1 controller sharing its hierarchy, and none
+    /// (#1013's test @ 035aef5d6, in a directory of its own).
+    #[test]
+    fn the_cgroup_memory_files_read_v2_then_v1() {
+        let root = std::env::temp_dir().join(format!("im4b-whir-cgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, file: &str, value: &str| {
+            let dir = root.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), value).unwrap();
+        };
+        let read = |proc_cgroup: &str, v2, v1| cgroup_memory(proc_cgroup, &root, v2, v1);
+        let limit = |proc_cgroup: &str| {
+            read(
+                proc_cgroup,
+                CgroupValue::File("memory.max"),
+                CgroupValue::File("memory.limit_in_bytes"),
+            )
+        };
+        let charge = |proc_cgroup: &str| {
+            read(
+                proc_cgroup,
+                CgroupValue::File("memory.current"),
+                CgroupValue::File("memory.usage_in_bytes"),
+            )
+        };
+        let inactive = |proc_cgroup: &str| {
+            read(
+                proc_cgroup,
+                CgroupValue::Stat("inactive_file"),
+                CgroupValue::Stat("total_inactive_file"),
+            )
+        };
+        // v2 at the process's path, its charge and its inactive file pages,
+        // read by their exact key (a decoy ending in the same name comes
+        // first).
+        put("a/b", "memory.max", "129584070656\n");
+        put("a/b", "memory.current", "4096\n");
+        put(
+            "a/b",
+            "memory.stat",
+            "anon 100\nfile 9000\nx_inactive_file 1\nactive_file 10\ninactive_file 8192\n",
+        );
+        assert_eq!(limit("0::/a/b\n"), Some(129_584_070_656));
+        assert_eq!(charge("0::/a/b\n"), Some(4096));
+        assert_eq!(inactive("0::/a/b\n"), Some(8192));
+        // v2 unlimited and no v1: no limit.
+        put("c", "memory.max", "max\n");
+        assert_eq!(limit("0::/c\n"), None);
+        // A hybrid host, as FAST: the unified line names a path with no
+        // memory files, and the memory controller's own cgroup is its root.
+        // v1's inactive file pages are its hierarchical key, not the local
+        // one that ends in the same name.
+        put("memory", "memory.limit_in_bytes", "61774757888\n");
+        put("memory", "memory.usage_in_bytes", "17855025152\n");
+        put(
+            "memory",
+            "memory.stat",
+            "cache 16000\ninactive_file 5\ntotal_cache 16000\ntotal_inactive_file 15180000000\n",
+        );
+        let fast = "12:memory:/docker/d005\n9:cpu,cpuacct:/docker/d005\n0::/docker/d005\n";
+        assert_eq!(limit(fast), Some(61_774_757_888));
+        assert_eq!(charge(fast), Some(17_855_025_152));
+        assert_eq!(inactive(fast), Some(15_180_000_000));
+        // v1 at the process's path wins over the controller's root, and a
+        // controller sharing its hierarchy is found.
+        put("memory/docker/d005", "memory.limit_in_bytes", "777\n");
+        assert_eq!(limit(fast), Some(777));
+        put("memory/p", "memory.limit_in_bytes", "888\n");
+        assert_eq!(limit("4:cpu,memory:/p\n"), Some(888));
+        // v2's `max` falls through to v1.
+        assert_eq!(limit("4:memory:/p\n0::/c\n"), Some(888));
+        // Nothing readable.
+        assert_eq!(limit(""), None);
+        assert_eq!(limit("5:pids:/x\n"), None);
+        assert_eq!(inactive("0::/c\n"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `auto`'s host bytes: the larger of the peak resident set and the
+    /// cgroup's working set (its charge less its inactive file pages). FAST at
+    /// 17:28Z: 40.58 GB charged with 15.18 GB inactive file reads 25.40 GB, not
+    /// 40.58; inactive pages past the charge read zero; the peak resident set
+    /// wins when it is larger (#1013's test @ 035aef5d6).
+    #[test]
+    fn auto_reads_the_hosts_working_set() {
+        let reading = |hwm, charged, inactive_file| HostReading {
+            hwm,
+            charged,
+            inactive_file,
+        };
+        assert_eq!(
+            reading(24_680_000_000, 40_580_000_000, 15_180_000_000).bytes(),
+            25_400_000_000
+        );
+        assert_eq!(reading(0, 4 * GIB, 6 * GIB).bytes(), 0);
+        assert_eq!(reading(30 * GIB, 40 * GIB, 15 * GIB).bytes(), 30 * GIB);
+        assert_eq!(reading(0, 120 * GIB, 0).bytes(), 120 * GIB);
+    }
+
+    /// The target is the smaller of the cgroup limit and `MemTotal`, less
+    /// 10 GiB: v1's unlimited sentinel gives `MemTotal`'s, a limit above
+    /// `MemTotal` is capped, and with neither nothing spills.
+    #[test]
+    fn the_spill_target_is_the_smaller_limit_less_ten_gib() {
+        let total = 62_840_956u64 << 10;
+        assert_eq!(
+            spill_target_from(Some(61_774_757_888), Some(total)),
+            61_774_757_888 - 10 * GIB
+        );
+        assert_eq!(
+            spill_target_from(Some(9_223_372_036_854_771_712), Some(total)),
+            total - 10 * GIB
+        );
+        assert_eq!(
+            spill_target_from(Some(200 * GIB), Some(125 * GIB)),
+            115 * GIB
+        );
+        assert_eq!(spill_target_from(None, Some(64 * GIB)), 54 * GIB);
+        assert_eq!(
+            spill_target_from(Some(129_584_070_656), None),
+            129_584_070_656 - 10 * GIB
+        );
+        assert_eq!(spill_target_from(Some(8 * GIB), Some(16 * GIB)), 0);
+        assert_eq!(spill_target_from(None, None), u64::MAX);
+    }
+
+    /// `auto` spills a table only once the host, its reserve and the table
+    /// would pass the target; it reads the host only then. `off` never
+    /// spills, `always` always, a budget once the kept bytes would pass it.
+    #[test]
+    fn auto_spills_only_past_the_target() {
+        let target = 110 * GIB;
+        let cells = 10_000_000_000; // 10 G cells: a reserve of 6 + 16.5 GiB
+        assert_eq!(spill_reserve_bytes(cells), (22.5 * GIB as f64) as u64);
+        let unread = || -> u64 { panic!("only auto reads the host") };
+        assert!(!spill_wanted(
+            BlockSpillPolicy::Off,
+            target,
+            0,
+            cells,
+            GIB,
+            unread
+        ));
+        assert!(spill_wanted(
+            BlockSpillPolicy::Always,
+            target,
+            0,
+            cells,
+            GIB,
+            unread
+        ));
+        let budget = BlockSpillPolicy::Budget(4 * GIB);
+        assert!(!spill_wanted(budget, target, 3 * GIB, cells, GIB, unread));
+        assert!(spill_wanted(
+            budget,
+            target,
+            3 * GIB + 1,
+            cells,
+            GIB,
+            unread
+        ));
+        let auto = BlockSpillPolicy::Auto;
+        assert!(!spill_wanted(auto, target, 0, cells, GIB, || 86 * GIB));
+        assert!(spill_wanted(auto, target, 0, cells, GIB, || 87 * GIB));
+        assert!(!spill_wanted(auto, u64::MAX, 0, cells, GIB, || u64::MAX));
+    }
 }

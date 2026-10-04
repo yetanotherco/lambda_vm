@@ -63,6 +63,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         finish_keccak_rnd_chunks: true,
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
+        spill: crate::block_whir::BlockSpillPolicy::Off,
     }
 }
 
@@ -575,6 +576,151 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
             }
         }
     }
+}
+
+/// ★ Spilling the held tables moves no byte: with the spill on, phase A hands
+/// every group past the first two to the store, phase B reads each back once
+/// in group order, and the proof
+/// verifies with the same partition and statement as with every table held,
+/// its bytes equal under the deterministic grind.
+#[test]
+fn a_block_spilled_to_disk_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let proved = |spill: BlockSpillPolicy| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "spill {spill:?}");
+        (proof, stamps)
+    };
+    let (held, held_stamps) = proved(BlockSpillPolicy::Off);
+    assert!(held_stamps.spill.is_none() && held_stamps.spill_stats.is_none());
+    assert!(
+        held.groups.len() > 2,
+        "{} groups: none past the first two",
+        held.groups.len()
+    );
+    let (spilled, stamps) = proved(BlockSpillPolicy::Always);
+    let stats = stamps.spill_stats.expect("the store's counters");
+    assert!(stats.slots > 0, "nothing spilled: {stats}");
+    assert_eq!(stats.mismatches, 0, "{stats}");
+    assert_eq!(stats.failure, None, "{stats}");
+    assert_eq!(
+        stats.reads + stats.memory_reads,
+        stats.slots,
+        "each slot read back once: {stats}"
+    );
+    assert_eq!(held.groups, spilled.groups, "the partition");
+    assert_eq!(held.table_num_vars, spilled.table_num_vars);
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&held), bytes(&spilled), "the proof");
+    }
+}
+
+/// The policy decides per table: a resident budget the block fits in spills
+/// nothing, one of zero spills every table past the first two groups, and
+/// both verify.
+#[test]
+fn a_spill_budget_decides_what_goes() {
+    use crate::block_whir::BlockSpillPolicy;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let spilled = |policy: BlockSpillPolicy| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = policy;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "{policy:?}");
+        stamps.spill_stats.expect("the store's counters").slots
+    };
+    assert_eq!(
+        spilled(BlockSpillPolicy::Budget(1 << 40)),
+        0,
+        "a budget it fits in"
+    );
+    assert!(spilled(BlockSpillPolicy::Budget(0)) > 0, "a budget of zero");
+}
+
+/// A byte flipped in a spilled table on disk is caught by the store's digest
+/// when phase B reads it back: the prover refuses, naming the table, instead
+/// of proving over other columns.
+#[test]
+fn a_byte_flipped_in_a_spilled_table_is_refused() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.spill = crate::block_whir::BlockSpillPolicy::Always;
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            spilled_byte: true,
+            ..Deviations::default()
+        },
+    );
+    let Err(crate::Error::Prover(why)) = refused else {
+        panic!("a flipped spilled byte was proved over");
+    };
+    assert!(
+        why.contains("SpillFailed") && why.contains("not the ones written"),
+        "{why}"
+    );
+}
+
+/// A spilled table whose columns never come back is refused when phase B
+/// reaches its group, before any reader meets it: a prover error naming the
+/// table, not a proof over empty columns.
+#[test]
+fn a_spilled_table_that_does_not_come_back_is_refused() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.spill = crate::block_whir::BlockSpillPolicy::Always;
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            spilled_slot_lost: true,
+            ..Deviations::default()
+        },
+    );
+    let Err(crate::Error::Prover(why)) = refused else {
+        panic!("a table that never came back was proved over");
+    };
+    assert!(
+        why.contains("SpillFailed") && why.contains("still spilled"),
+        "{why}"
+    );
 }
 
 /// A table the finish packed is laid out narrow only if its preprocessed
