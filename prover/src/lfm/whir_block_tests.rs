@@ -1800,6 +1800,41 @@ fn prove_streamed(
         .map_err(|e| format!("{e:?}"))
 }
 
+/// Whether the top streams: only if a child is still unproved when the top's
+/// program and artifacts are ready. With every child already proved there is
+/// nothing to stream behind, and the streamed path (its forward pass, then a
+/// wave per child) costs more than one whole execution: at 1× the top's slot
+/// fills after its last child, and streaming it anyway cost 0.19 s (BIG 617 /
+/// 618). A failed child counts as done: the whole path reports its error.
+fn top_streams<R>(kids: &[&Published<R>]) -> bool {
+    kids.iter().any(|k| k.0.get().is_none())
+}
+
+/// The top streams when its program is ready before its last child is proved
+/// (as at the median), and executes whole when it is ready after (as at 1×).
+#[test]
+fn the_top_streams_only_while_a_child_is_unproved() {
+    let kids: Vec<Published<u32>> = (0..3).map(|_| Published::new()).collect();
+    let refs: Vec<&Published<u32>> = kids.iter().collect();
+    assert!(top_streams(&refs), "ready before any child: streamed");
+    let _ = kids[2].0.set(Ok(20));
+    let _ = kids[0].0.set(Ok(0));
+    assert!(top_streams(&refs), "ready before the last child: streamed");
+    let _ = kids[1].0.set(Ok(10));
+    assert!(!top_streams(&refs), "ready after the last child: whole");
+
+    let kids: Vec<Published<u32>> = (0..2).map(|_| Published::new()).collect();
+    let _ = kids[0].0.set(Ok(0));
+    let _ = kids[1].0.set(Err("child 1 failed".to_string()));
+    let refs: Vec<&Published<u32>> = kids.iter().collect();
+    assert!(!top_streams(&refs), "a failed child is done: whole");
+    assert_eq!(
+        wait_all(&refs).map(|_| ()),
+        Err("child 1 failed".to_string()),
+        "and the whole path reports the failure"
+    );
+}
+
 /// Calls `land` on each child's result as it is published, in the order they
 /// arrive, each exactly once; a child that failed fails this with its error.
 fn in_arrival_order<R>(
@@ -2090,7 +2125,7 @@ fn prove_tree_pipelined(
     early: Option<EarlyLeaf>,
     node_pipe: Option<&rayon::ThreadPool>,
     dataflow: bool,
-    stream_top: bool,
+    stream_top: Option<&std::sync::OnceLock<bool>>,
 ) -> Result<
     (
         Vec<LevelTiming>,
@@ -2229,7 +2264,18 @@ fn prove_tree_pipelined(
                     }
                     let node = slots[at.lv - 1][at.j].wait()?;
                     let t = std::time::Instant::now();
-                    let lfm = if stream_top && at.lv == shape.len() {
+                    // The top streams only if a child is still unproved now
+                    // that its program and artifacts are here; the choice is
+                    // kept for the readout.
+                    let streamed = match stream_top {
+                        Some(chose) if at.lv == shape.len() => {
+                            let streams = top_streams(kids);
+                            let _ = chose.set(streams);
+                            streams
+                        }
+                        _ => false,
+                    };
+                    let lfm = if streamed {
                         prove_streamed(node, kids, &wrap)
                             .map_err(|e| format!("the top, streamed: {e}"))?
                     } else {
@@ -2705,9 +2751,12 @@ fn the_whir_block_tree_on_a_real_block() {
     // `W3_DATAFLOW=0|1` (default 1): each node proves as soon as its own
     // children are proved, or (0, the control) once its whole level below is.
     let dataflow = knob("W3_DATAFLOW").is_none_or(|v| v != 0);
-    // `W3_STREAM_TOP=0|1` (default 1): the top node executes each child's share
-    // as that child is proved, or (0, the control) all of it after the last.
+    // `W3_STREAM_TOP=0|1` (default 1): when a child is still unproved as the
+    // top node's program and artifacts arrive, the top executes each child's
+    // share as that child is proved; otherwise, and at 0 (the control), all of
+    // it after the last. `W3 TOP EXECUTE` says which the top did.
     let stream_top = knob("W3_STREAM_TOP").is_none_or(|v| v != 0);
+    let top_streamed = std::sync::OnceLock::new();
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2721,7 +2770,7 @@ fn the_whir_block_tree_on_a_real_block() {
         early,
         node_pipe.as_ref(),
         dataflow,
-        stream_top,
+        stream_top.then_some(&top_streamed),
     )
     .expect("the tree proves");
     let top = &proofs.last().expect("a top").1;
@@ -2802,9 +2851,20 @@ fn the_whir_block_tree_on_a_real_block() {
     println!(
         "W3 STREAM TOP: {}",
         if stream_top {
-            "on (the top executes each child's share as that child is proved)"
+            "on (while a child is unproved as its program arrives, the top executes each child's share as that child is proved)"
         } else {
             "off (the top executes after its last child)"
+        }
+    );
+    println!(
+        "W3 TOP EXECUTE: {}",
+        match (stream_top, top_streamed.get()) {
+            (false, _) => "whole (streaming off)",
+            (true, Some(true)) =>
+                "streamed (a child was still unproved when the top's program and artifacts arrived)",
+            (true, Some(false)) =>
+                "whole (every child was proved before the top's program and artifacts arrived)",
+            (true, None) => "unknown (the top never chose)",
         }
     );
     println!(
