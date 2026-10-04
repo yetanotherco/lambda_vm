@@ -1703,9 +1703,10 @@ fn tree_children(
 
 /// Proves every program of a tree on `workers` threads, taking them in `order`
 /// ([`tree_order`]) and publishing each result into its slot (`results[lv][j]`,
-/// level 0 the leaves): `prove` gets the program and its children's results in
-/// order (none for a leaf), each waited for as it lands, so a node whose
-/// children are done proves while the rest of the level below still does. With
+/// level 0 the leaves): `prove` gets the program and its children's slots in
+/// order (none for a leaf), to wait for as it needs them ([`wait_all`]), so a
+/// node whose children are done proves while the rest of the level below still
+/// does — and one that streams can start on its first child. With
 /// `barrier` (the control, `W3_DATAFLOW=0`), a node first waits for the whole
 /// level below, as level-by-level proving did. A failed or panicking prove
 /// leaves an error in its slot and so in every slot above it; every slot still
@@ -1716,7 +1717,7 @@ fn prove_dataflow<R: Send + Sync>(
     results: &[Vec<Published<R>>],
     workers: usize,
     barrier: bool,
-    prove: impl Fn(TreeAt, Vec<&R>) -> Result<R, String> + Sync,
+    prove: impl Fn(TreeAt, &[&Published<R>]) -> Result<R, String> + Sync,
 ) {
     use super::per_table_aggregator_tests::in_index_order;
     let _fail = FailUnpublished(results);
@@ -1730,15 +1731,15 @@ fn prove_dataflow<R: Send + Sync>(
                     true => below.iter().try_for_each(|s| s.wait().map(drop)),
                     false => Ok(()),
                 };
-                all.and_then(|()| {
+                all.map(|()| {
                     tree_children(shape, at)
-                        .map(|c| below[c].wait())
-                        .collect::<Result<Vec<&R>, String>>()
+                        .map(|c| &below[c])
+                        .collect::<Vec<_>>()
                 })
             }
         };
         let result = kids.and_then(|kids| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove(at, kids)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove(at, &kids)))
                 .unwrap_or_else(|payload| {
                     let why = payload
                         .downcast_ref::<String>()
@@ -1750,6 +1751,122 @@ fn prove_dataflow<R: Send + Sync>(
         });
         let _ = results[at.lv][at.j].0.set(result);
     });
+}
+
+/// The top node streamed: its execution starts on the first of its children to
+/// be proved and runs each child's share as that child lands
+/// ([`super::executor::StreamedExecution`]: the witness is the unstreamed
+/// one's, word for word), so only the last child's share, the fill and the
+/// prove remain after the last child. A node's arenas are its children's, in
+/// order and the same number each, so child `c` is group `c`. The execute the
+/// split reports is the part after the last child landed.
+fn prove_streamed(
+    node: &TreeNode,
+    kids: &[&Published<ProvedProgram>],
+    wrap: &crate::ProofOptions,
+) -> Result<LfmProof, String> {
+    use super::executor::StreamedExecution;
+    let k = kids.len();
+    let arenas = node.program.arena_schema.lens.len();
+    if k == 0 || !arenas.is_multiple_of(k) {
+        return Err(format!("{arenas} arenas over {k} children"));
+    }
+    let per = arenas / k;
+    let hasher = node.artifacts.hasher;
+    let held: Vec<std::cell::OnceCell<Vec<Vec<LfmWord>>>> =
+        (0..k).map(|_| std::cell::OnceCell::new()).collect();
+    let mut ex = StreamedExecution::new(
+        &node.program,
+        (0..arenas).map(|a| a / per).collect(),
+        &hasher,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mut last = std::time::Instant::now();
+    in_arrival_order(kids, |c, kid| {
+        let words = held[c].get_or_init(|| child_arena_words(&kid.child));
+        last = std::time::Instant::now();
+        ex.land(c, words)
+            .map_err(|e| format!("child {c} lands: {e:?}"))
+    })?;
+    let execution = ex.finish().map_err(|e| format!("{e:?}"))?;
+    let filled = super::proof::lfm_fill_executed(
+        &node.program,
+        execution,
+        hasher,
+        last.elapsed().as_secs_f64(),
+    );
+    filled
+        .prove(&node.artifacts, wrap, decide_lfm_residency())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Calls `land` on each child's result as it is published, in the order they
+/// arrive, each exactly once; a child that failed fails this with its error.
+fn in_arrival_order<R>(
+    kids: &[&Published<R>],
+    mut land: impl FnMut(usize, &R) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut landed = vec![false; kids.len()];
+    while landed.contains(&false) {
+        let mut moved = false;
+        for (c, kid) in kids.iter().enumerate() {
+            if landed[c] {
+                continue;
+            }
+            match kid.0.get() {
+                None => {}
+                Some(Err(e)) => return Err(e.clone()),
+                Some(Ok(r)) => {
+                    land(c, r)?;
+                    landed[c] = true;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    Ok(())
+}
+
+/// The streamed top's children land in the order they are proved, each once,
+/// and a failed child fails the top with its error, without a hang.
+#[test]
+fn a_streamed_top_takes_its_children_as_they_are_proved() {
+    let kids: Vec<Published<u32>> = (0..3).map(|_| Published::new()).collect();
+    let order = std::thread::scope(|scope| {
+        let kids = &kids;
+        scope.spawn(move || {
+            for c in [2usize, 0, 1] {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let _ = kids[c].0.set(Ok(10 * c as u32));
+            }
+        });
+        let refs: Vec<&Published<u32>> = kids.iter().collect();
+        let mut order = Vec::new();
+        in_arrival_order(&refs, |c, v| {
+            assert_eq!(*v, 10 * c as u32);
+            order.push(c);
+            Ok(())
+        })
+        .expect("every child lands");
+        order
+    });
+    assert_eq!(order, vec![2, 0, 1]);
+
+    let kids: Vec<Published<u32>> = (0..3).map(|_| Published::new()).collect();
+    let _ = kids[1].0.set(Ok(10));
+    let _ = kids[0].0.set(Err("child 0 failed".to_string()));
+    let refs: Vec<&Published<u32>> = kids.iter().collect();
+    // Child 0's error is already published, so this returns at once.
+    let got = in_arrival_order(&refs, |_, _| Ok(()));
+    assert_eq!(got, Err("child 0 failed".to_string()));
+}
+
+/// Every child's result, each waited for in order.
+fn wait_all<'r, R>(kids: &[&'r Published<R>]) -> Result<Vec<&'r R>, String> {
+    kids.iter().map(|k| k.wait()).collect()
 }
 
 /// [`prove_dataflow`] over a toy tree at the median's shape (23 leaves, fan-in
@@ -1789,7 +1906,8 @@ fn toy_flow(
         &results,
         workers,
         barrier,
-        |at, kids: Vec<&(String, u128, u128)>| {
+        |at, kids: &[&Published<(String, u128, u128)>]| {
+            let kids = wait_all(kids)?;
             let start = t0.elapsed().as_millis();
             let late = width(at.lv) - at.j;
             std::thread::sleep(std::time::Duration::from_millis(3 * late as u64));
@@ -1972,6 +2090,7 @@ fn prove_tree_pipelined(
     early: Option<EarlyLeaf>,
     node_pipe: Option<&rayon::ThreadPool>,
     dataflow: bool,
+    stream_top: bool,
 ) -> Result<
     (
         Vec<LevelTiming>,
@@ -2042,7 +2161,7 @@ fn prove_tree_pipelined(
                 &results,
                 siblings,
                 !dataflow,
-                |at, kids: Vec<&ProvedProgram>| -> Result<ProvedProgram, String> {
+                |at, kids: &[&Published<ProvedProgram>]| -> Result<ProvedProgram, String> {
                     let start = t_tree.elapsed().as_secs_f64();
                     if at.lv == 0 {
                         let k = at.j;
@@ -2109,13 +2228,19 @@ fn prove_tree_pipelined(
                         }
                     }
                     let node = slots[at.lv - 1][at.j].wait()?;
-                    let arenas: Vec<Vec<LfmWord>> = kids
-                        .iter()
-                        .flat_map(|k| child_arena_words(&k.child))
-                        .collect();
                     let t = std::time::Instant::now();
-                    let lfm = lfm_prove(&node.program, &node.artifacts, &arenas, &wrap)
-                        .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?;
+                    let lfm = if stream_top && at.lv == shape.len() {
+                        prove_streamed(node, kids, &wrap)
+                            .map_err(|e| format!("the top, streamed: {e}"))?
+                    } else {
+                        let kids = wait_all(kids)?;
+                        let arenas: Vec<Vec<LfmWord>> = kids
+                            .iter()
+                            .flat_map(|k| child_arena_words(&k.child))
+                            .collect();
+                        lfm_prove(&node.program, &node.artifacts, &arenas, &wrap)
+                            .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?
+                    };
                     let prove = t.elapsed().as_secs_f64();
                     let times = ProgramTimes {
                         built_at: node.built_at,
@@ -2580,6 +2705,9 @@ fn the_whir_block_tree_on_a_real_block() {
     // `W3_DATAFLOW=0|1` (default 1): each node proves as soon as its own
     // children are proved, or (0, the control) once its whole level below is.
     let dataflow = knob("W3_DATAFLOW").is_none_or(|v| v != 0);
+    // `W3_STREAM_TOP=0|1` (default 1): the top node executes each child's share
+    // as that child is proved, or (0, the control) all of it after the last.
+    let stream_top = knob("W3_STREAM_TOP").is_none_or(|v| v != 0);
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2593,6 +2721,7 @@ fn the_whir_block_tree_on_a_real_block() {
         early,
         node_pipe.as_ref(),
         dataflow,
+        stream_top,
     )
     .expect("the tree proves");
     let top = &proofs.last().expect("a top").1;
@@ -2670,6 +2799,14 @@ fn the_whir_block_tree_on_a_real_block() {
             }
         }
     }
+    println!(
+        "W3 STREAM TOP: {}",
+        if stream_top {
+            "on (the top executes each child's share as that child is proved)"
+        } else {
+            "off (the top executes after its last child)"
+        }
+    );
     println!(
         "W3 DATAFLOW: {}",
         if dataflow {
