@@ -2370,6 +2370,8 @@ fn the_whir_block_tree_on_a_real_block() {
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
         .expect("read the input");
+    let memlog = std::env::var("LAMBDA_VM_BLOCK_MEMLOG").is_ok_and(|v| v.trim() == "1");
+    let _heap = memlog.then(HeapTicker::start);
     let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
     let run =
         prove_whir_block_tree(&elf, &input, &cfg, &StdoutSink).unwrap_or_else(|e| panic!("{e}"));
@@ -2460,6 +2462,25 @@ fn the_whir_block_tree_on_a_real_block() {
         proof.groups.len(),
         proof.table_num_vars.len()
     );
+    // Off the clock, with the memory log: what one leaf's program holds, the
+    // first and the last emitted again with nothing else running (the tree
+    // emits every leaf's beside phase B and holds them to level 0).
+    if memlog {
+        let leaves = plan.partition().num_leaves();
+        for k in [0, leaves - 1] {
+            let before = heap_allocated();
+            let t = std::time::Instant::now();
+            let program = plan.leaf_program(k).expect("the leaf's program");
+            let held = heap_allocated().saturating_sub(before);
+            println!(
+                "W3 LEAF PROGRAM BYTES: leaf {k} of {leaves} · {} groups · {:.3} GiB held · {} instrs · emitted in {:.2}s",
+                plan.partition().leaf(k).len(),
+                held as f64 / (1u64 << 30) as f64,
+                program.instrs.len(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
 
     // The tree's freed pages back to the OS before the verifiers, as
     // `LAMBDA_VM_ALLOC_PURGE` names it (`tree` is not an `auto` point).
@@ -2513,6 +2534,86 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     verdict.expect("the block's verifier accepts the top");
+}
+
+/// jemalloc's allocated bytes now, the statistics refreshed first (they are
+/// cached until the epoch turns); 0 when they cannot be read.
+fn heap_allocated() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance()
+        .ok()
+        .and_then(|_| stats::allocated::read().ok())
+        .unwrap_or(0)
+}
+
+/// With the memory log on the real block: a `W3 HEAP` line every second from
+/// the test's start to its end — the process's resident set and jemalloc's
+/// allocated / active / resident / retained bytes. The block's own ledger
+/// samples only the base proof; this covers the tree and the verifiers too.
+struct HeapTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeapTicker {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        use tikv_jemalloc_ctl::{epoch, stats};
+        const GIB: f64 = (1u64 << 30) as f64;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let t0 = std::time::Instant::now();
+        let handle = std::thread::Builder::new()
+            .name("w3-heap".to_string())
+            .spawn(move || {
+                while !flag.load(Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                    let rss = std::fs::read_to_string("/proc/self/status")
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .find_map(|l| l.strip_prefix("VmRSS:"))
+                                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+                        })
+                        .map_or("n/a".to_string(), |kib: u64| {
+                            format!("{:.2}", (kib << 10) as f64 / GIB)
+                        });
+                    let heap = epoch::advance().ok().and_then(|_| {
+                        Some([
+                            stats::allocated::read().ok()?,
+                            stats::active::read().ok()?,
+                            stats::resident::read().ok()?,
+                            stats::retained::read().ok()?,
+                        ])
+                    });
+                    let heap = heap.map_or("heap n/a".to_string(), |[al, ac, re, rt]| {
+                        format!(
+                            "alloc {:.2} active {:.2} resident {:.2} retained {:.2}",
+                            al as f64 / GIB,
+                            ac as f64 / GIB,
+                            re as f64 / GIB,
+                            rt as f64 / GIB
+                        )
+                    });
+                    eprintln!(
+                        "W3 HEAP t={:.1} · rss {rss} · {heap} (GiB)",
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for HeapTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 // ========================= the batched argue (N-4) ========================
