@@ -662,6 +662,15 @@ where
         self.narrow.take()
     }
 
+    /// Whether the fused task commits this trace again on the device (its LDE
+    /// recomputed there and checked against the kept top levels, or the root
+    /// recommitted). Only such a trace has a check behind a regenerated
+    /// trace's digest (`crate::regen`), so only such a trace should be
+    /// dropped (R-REGEN A1).
+    pub fn recommits_on_device(&self) -> bool {
+        self.recommit_on_device
+    }
+
     /// The host bytes this precommit holds, as (Merkle tree nodes, kept top
     /// levels, cached main trace, packed copy not yet taken). A measurement for
     /// the caller's memory ledger; it changes nothing.
@@ -2431,14 +2440,14 @@ mod regen_ready_tests {
     }
 
     /// ★ A task that panics before taking its trace: the window is full (it
-    /// holds that trace), so the regenerator waits to deposit the next one
-    /// and that table's driver waits for it. `run_admitted` closes the
-    /// readiness when it keeps the panic, which closes the window: the
+    /// holds that trace), so the regenerator waits to deposit rank 2, and the
+    /// driver of rank 1 (never deposited) waits for it. `run_admitted` closes
+    /// the readiness when it keeps the panic, which closes the window: the
     /// depositor and the driver return, and the panic is the one reported.
     #[test]
     fn a_panicking_task_closes_the_regeneration_window() {
         let (message, deposit) = within(60, "a panicked task's regeneration", || {
-            let (slots, traces, producer) = dropped(2, 1);
+            let (slots, traces, producer) = dropped(3, 1);
             let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
             let fused = FusedReady {
                 spill: None,
@@ -2450,15 +2459,15 @@ mod regen_ready_tests {
                 std::thread::spawn(move || {
                     let _producer = producer;
                     slots[0].deposit(traces[0].clone()).unwrap();
-                    slots[1].deposit(traces[1].clone())
+                    slots[2].deposit(traces[2].clone())
                 })
             };
             let gate = VramGate::new(u64::MAX);
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_admitted(
                     "panic",
-                    &[0, 1],
-                    &[1, 1],
+                    &[0, 1, 2],
+                    &[1, 1, 1],
                     &gate,
                     2,
                     Some(&fused),
@@ -2477,16 +2486,116 @@ mod regen_ready_tests {
         assert!(matches!(deposit, Err(RegenError::Closed(_))), "{deposit:?}");
     }
 
+    /// ★ Out-of-order generators never deadlock the drivers (R-REGEN R1): the
+    /// review's model on the real slots and the real driver loop. `G`
+    /// generators take the ranks in order and finish out of order (the first
+    /// `slow` ranks take 300 ms); `k` drivers walk the ranks; a window of one
+    /// or two traces. Under the prefetch's byte rule ("wait while parked +
+    /// len > ahead") later ranks filled the window while the rank a driver
+    /// waited on could not deposit — a hang whenever G ≥ k + 1. The window
+    /// reserved by rank from the frontier admits the frontier always, and
+    /// every table is taken.
+    #[test]
+    fn out_of_order_generators_never_deadlock_the_drivers() {
+        for (n, ahead_traces, generators, drivers, slow) in [
+            (8, 2, 3, 1, 1),
+            (8, 1, 3, 2, 2),
+            (32, 1, 8, 1, 4),
+            (16, 2, 3, 3, 1),
+        ] {
+            let ok = within(30, "the paced regenerator", move || {
+                paced_run(n, ahead_traces, generators, drivers, slow)
+            });
+            assert!(
+                ok,
+                "n {n} ahead {ahead_traces} G {generators} k {drivers} slow {slow}"
+            );
+        }
+    }
+
+    /// The model of [`out_of_order_generators_never_deadlock_the_drivers`]: true when every
+    /// table's task took its trace.
+    fn paced_run(
+        n: usize,
+        ahead_traces: u64,
+        generators: usize,
+        drivers: usize,
+        slow: usize,
+    ) -> bool {
+        let traces: Vec<NarrowMain> = (0..n as u64).map(narrow).collect();
+        let len = traces[0].data().len() as u64;
+        let (window, producer) = RegenWindow::new(ahead_traces * len);
+        let slots: Vec<RegenSlot> = traces
+            .iter()
+            .enumerate()
+            .map(|(i, t)| window.slot(t, i as u64))
+            .collect();
+        let (job_tx, job_rx) = mpsc::sync_channel::<(RegenSlot, NarrowMain, usize)>(2 * generators);
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let mut gens = Vec::new();
+        for _ in 0..generators {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let producer = window.producer().expect("a producer");
+            gens.push(std::thread::spawn(move || {
+                let _producer = producer;
+                loop {
+                    let next = job_rx.lock().unwrap().recv();
+                    let Ok((slot, trace, rank)) = next else {
+                        return;
+                    };
+                    if rank < slow {
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                    let _ = slot.deposit(trace);
+                }
+            }));
+        }
+        drop(producer);
+        let feeder = {
+            let slots = slots.clone();
+            std::thread::spawn(move || {
+                for (rank, (slot, trace)) in slots.into_iter().zip(traces).enumerate() {
+                    if job_tx.send((slot, trace, rank)).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
+        let fused = FusedReady {
+            spill: None,
+            regen: Some(&ready),
+        };
+        let gate = VramGate::new(u64::MAX);
+        let order: Vec<usize> = (0..n).collect();
+        let out = run_admitted(
+            "paced",
+            &order,
+            &vec![1u64; n],
+            &gate,
+            drivers,
+            Some(&fused),
+            |i| format!("t{i}"),
+            |i| slots[i].take().is_ok(),
+        );
+        feeder.join().unwrap();
+        for g in gens {
+            g.join().unwrap();
+        }
+        out.iter().all(|o| *o == Some(true))
+    }
+
     /// When the prove ends — dropped readiness — a regenerator still waiting
     /// to deposit returns `Closed` instead of waiting for takers that are gone.
     #[test]
     fn the_proves_end_releases_a_waiting_regenerator() {
         let deposit = within(30, "a regenerator after the prove ended", || {
-            let (slots, traces, producer) = dropped(2, 1);
+            let (slots, traces, producer) = dropped(3, 1);
             let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
             slots[0].deposit(traces[0].clone()).unwrap();
+            // Rank 2 waits for room: rank 1, the lowest, is never deposited.
             let regenerator = {
-                let (slot, trace) = (slots[1].clone(), traces[1].clone());
+                let (slot, trace) = (slots[2].clone(), traces[2].clone());
                 std::thread::spawn(move || {
                     let _producer = producer;
                     slot.deposit(trace)
