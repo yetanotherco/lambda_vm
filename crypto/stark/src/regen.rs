@@ -242,6 +242,9 @@ impl RegenWindow {
     /// window's slots (the regenerator deposits in rank order, and phase B
     /// takes them in it).
     pub fn slot(self: &Arc<Self>, narrow: &NarrowMain, rank: u64) -> RegenSlot {
+        // The digest first: concurrent drops must not queue on the window's
+        // lock behind it (R-REGEN N1).
+        let want = Want::of(narrow);
         let settled = Arc::new(AtomicBool::new(false));
         let mut shared = lock(&self.shared);
         let id = shared.slots.len();
@@ -255,7 +258,7 @@ impl RegenWindow {
             window: Arc::clone(self),
             id,
             rank,
-            want: Want::of(narrow),
+            want,
             settled,
         }
     }
