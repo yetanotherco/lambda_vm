@@ -2525,7 +2525,15 @@ impl<'a> Packer<'a> {
     }
 
     fn close(&mut self) -> Result<(), Error> {
-        check_group_count(self.group_keys.len() + 1, self.max_groups)?;
+        // As its groups close the prover knows only how far the block got, not
+        // its total: the refusal says so, so the index is not read as a count.
+        let reached = self.group_keys.len() + 1;
+        if reached > self.max_groups {
+            return Err(Error::InvalidTableCounts(format!(
+                "a block takes at most {} groups; this one reached {reached} as its groups close",
+                self.max_groups
+            )));
+        }
         if let Some(ledger) = self.ledger {
             use std::sync::atomic::Ordering::Relaxed;
             let bytes = std::mem::take(&mut self.open_bytes);
