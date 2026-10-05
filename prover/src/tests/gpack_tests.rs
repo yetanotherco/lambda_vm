@@ -355,3 +355,155 @@ fn the_stream_builds_the_same_packed_traces_with_gpack_on_or_off() {
         }
     }
 }
+
+/// A windowed build of `logs` in the block's configuration (the streamed ops
+/// dropped, the finish's tables packed as they are generated) over windows of
+/// `window` cycles, each streamed chunk packed: with G-pack, written packed by
+/// its job and the finish's tables written packed; without, built at 8 bytes
+/// a cell and packed, as before.
+fn block_build(
+    program: &Elf,
+    input: &[u8],
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    gpack: bool,
+) -> Traces {
+    use rayon::prelude::*;
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .expect("the builder")
+        .drop_streamed_ops()
+        .expect("before any window")
+        .pack_finished_tables();
+    if gpack {
+        builder = builder.generate_packed();
+    }
+    let form = if gpack {
+        TraceForm::Narrow
+    } else {
+        TraceForm::Wide
+    };
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        let jobs = builder.push_jobs(w).expect("a window");
+        chunks.par_extend(jobs.into_par_iter().map(|job| {
+            let mut chunk = job.generate_as(form);
+            chunk.trace.pack_main_narrow();
+            chunk
+        }));
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    traces
+}
+
+/// Each table's name and digest: its packed bytes' (`NarrowMain::digest`),
+/// or, for a table not packed, its words'.
+fn table_digests(t: &Traces) -> Vec<(String, String)> {
+    use rayon::prelude::*;
+    tables(t)
+        .into_par_iter()
+        .map(|(name, table)| {
+            let digest = match table.narrow_main() {
+                Some(narrow) => {
+                    let [a, b] = narrow.digest();
+                    format!("packed {a:016x}{b:016x}")
+                }
+                None => {
+                    let mut h = blake3::Hasher::new();
+                    h.update(&(table.main_table.width as u64).to_le_bytes());
+                    for w in fe_words(table.main_table.row_major_data()) {
+                        h.update(&w.to_le_bytes());
+                    }
+                    format!("words {}", &h.finalize().to_hex()[..32])
+                }
+            };
+            (name, digest)
+        })
+        .collect()
+}
+
+/// ★ Box only (`--ignored`): on a real block (`NOEPOCH_ELF`, `NOEPOCH_INPUT`) at
+/// the block's caps and windows, every table of the windowed build under
+/// G-pack has the packed bytes of the build without it (each table built at 8
+/// bytes a cell, then packed) — twice in one process, the second build writing
+/// every kind at the widths the first learned. Prints `GPACK` lines.
+#[test]
+#[ignore = "a real block: box only (NOEPOCH_ELF, NOEPOCH_INPUT)"]
+fn every_table_of_a_real_block_written_packed_is_the_wide_table_packed() {
+    use crate::tables::gpack::{counts, reset_counts};
+    let elf = std::fs::read(std::env::var("NOEPOCH_ELF").expect("NOEPOCH_ELF")).unwrap();
+    let input = std::fs::read(std::env::var("NOEPOCH_INPUT").expect("NOEPOCH_INPUT")).unwrap();
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let max_rows = crate::block::block_max_rows();
+    let window = max_rows.cpu;
+    let logs = Executor::new(&program, input.clone())
+        .expect("the executor starts")
+        .run()
+        .expect("the block runs")
+        .logs;
+    let t = std::time::Instant::now();
+    let want = table_digests(&block_build(
+        &program, &input, &logs, &max_rows, window, false,
+    ));
+    let packed = want.iter().filter(|(_, d)| d.starts_with("packed")).count();
+    println!(
+        "GPACK off: {} tables ({packed} packed) in {:.2} s",
+        want.len(),
+        t.elapsed().as_secs_f64()
+    );
+    let mut equal = 0;
+    for pass in 0..2 {
+        reset_counts();
+        let t = std::time::Instant::now();
+        let got = table_digests(&block_build(
+            &program, &input, &logs, &max_rows, window, true,
+        ));
+        let secs = t.elapsed().as_secs_f64();
+        let [direct, narrowed, again, wide] = counts();
+        let differ: Vec<&String> = want
+            .iter()
+            .zip(&got)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| &a.0)
+            .collect();
+        println!(
+            "GPACK on, build {pass}: {} tables in {secs:.2} s · {direct} written packed, {narrowed} \
+             narrowed after, {again} written again, {wide} built wide then packed · {} differ {differ:?}",
+            got.len(),
+            differ.len()
+        );
+        if got.len() == want.len() && differ.is_empty() {
+            equal += 1;
+        }
+    }
+    println!("GPACK RESULT: {equal}/2 G-pack builds have every table's packed bytes");
+    assert_eq!(equal, 2);
+}
+
+/// The box test's builds and digests on small programs: the build with G-pack
+/// and the build without give every table the same digest, and both pack the
+/// plain tables.
+#[test]
+fn the_real_block_comparison_holds_on_small_programs() {
+    let chunked_keccak = MaxRowsConfig {
+        keccak_rnd: 48,
+        ..MaxRowsConfig::small()
+    };
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", chunked_keccak),
+    ] {
+        let (program, logs) = run(name);
+        let want = table_digests(&block_build(&program, &[], &logs, &max_rows, 33, false));
+        assert!(want.iter().any(|(_, d)| d.starts_with("packed")));
+        for _ in 0..2 {
+            let got = table_digests(&block_build(&program, &[], &logs, &max_rows, 33, true));
+            assert_eq!(got, want, "{name}");
+        }
+    }
+}
