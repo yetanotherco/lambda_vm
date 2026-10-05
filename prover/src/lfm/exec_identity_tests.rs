@@ -565,3 +565,16 @@ fn a_streamed_execution_refuses_an_incomplete_or_malformed_landing() {
         Err(LfmExecError::ArenaLenMismatch { .. })
     ));
 }
+
+/// An execution refuses to set its public words past their buffer's
+/// capacity, rather than asserting it.
+#[test]
+fn public_words_short_of_the_programs_rows_are_refused() {
+    use super::executor::public_rows_fit;
+    let words: Vec<u64> = Vec::with_capacity(4);
+    assert!(public_rows_fit(&words, words.capacity()).is_ok());
+    assert!(matches!(
+        public_rows_fit(&words, words.capacity() + 1),
+        Err(LfmExecError::Internal(_))
+    ));
+}

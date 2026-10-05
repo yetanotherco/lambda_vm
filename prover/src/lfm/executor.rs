@@ -1159,13 +1159,14 @@ fn execute_inner(
                 &mut split,
                 None,
             )?;
+            public_rows_fit(&public_words, program.groups.public.real_rows)?;
             // SAFETY: `run_levels` returned `Ok`, so every instruction ran and
             // every row the schedule handed out was written — see
             // `LfmRecords::commit_slots`. This is the one call site, and it is
-            // after the `?` so a failed walk never reaches it.
+            // after the `?` so a failed walk never reaches it; the public
+            // words' capacity covers the rows set (checked above).
             unsafe {
                 records.commit_slots(&program.groups);
-                assert!(public_words.capacity() >= program.groups.public.real_rows);
                 public_words.set_len(program.groups.public.real_rows);
             }
         }
@@ -1220,6 +1221,18 @@ fn execute_inner(
         memory: m.memory,
         split,
     })
+}
+
+/// Whether the public words' buffer can hold the program's `rows` before an
+/// execution sets its length to them: a shortfall is refused rather than
+/// asserted (it would be a sizing bug, never a property of the input).
+pub(super) fn public_rows_fit<T>(words: &Vec<T>, rows: usize) -> Result<(), LfmExecError> {
+    match words.capacity() >= rows {
+        true => Ok(()),
+        false => Err(LfmExecError::Internal(
+            "the public words hold fewer rows than the program's",
+        )),
+    }
 }
 
 /// An execution that runs as its arenas arrive, a group at a time: the
@@ -1408,11 +1421,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 "a streamed execution ran a different number of instructions than the program has",
             ));
         }
-        if self.public_words.capacity() < self.program.groups.public.real_rows {
-            return Err(LfmExecError::Internal(
-                "a streamed execution's public words hold fewer rows than the program's",
-            ));
-        }
+        public_rows_fit(&self.public_words, self.program.groups.public.real_rows)?;
         // SAFETY: every instruction ran exactly once (each in the one wave in
         // which its last group landed; `ran` counts them) and every wave
         // returned `Ok`, so every record slot the schedule hands out was

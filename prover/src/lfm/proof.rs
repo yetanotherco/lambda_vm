@@ -136,14 +136,15 @@ pub fn lfm_prove(
 /// together, passing one `hasher` to the executor, the trace filler and the AIR
 /// set. Verification needs the same value ([`verify_against`]).
 ///
-/// # Panics
+/// # Errors
 ///
-/// If `hasher` is not the one `artifacts` was built for. The two are not
-/// independent: `artifacts.program_id` binds the hasher, so a mismatch would
-/// produce a proof whose statement names a permutation the trace does not use —
-/// unverifiable everywhere, and confusing at exactly the point (registry
-/// regeneration) where it would be introduced. The agreement is a caller bug,
-/// not a proof outcome, so it is asserted rather than returned.
+/// [`LfmProveError::HasherMismatch`] if `hasher` is not the one `artifacts` was
+/// built for, before anything runs. The two are not independent:
+/// `artifacts.program_id` binds the hasher, so a mismatch would produce a proof
+/// whose statement names a permutation the trace does not use — unverifiable
+/// everywhere, and confusing at exactly the point (registry regeneration) where
+/// it would be introduced. The agreement is a caller bug, refused rather than
+/// a panic in the prover.
 pub fn lfm_prove_with_hasher(
     program: &LfmProgram,
     artifacts: &LfmArtifacts,
@@ -151,12 +152,7 @@ pub fn lfm_prove_with_hasher(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> Result<LfmProof, LfmProveError> {
-    assert_eq!(
-        artifacts.hasher, hasher,
-        "artifacts were built for {:?} but proving was asked for {hasher:?}; \
-         program_id binds the hasher, so the two must agree",
-        artifacts.hasher
-    );
+    same_hasher(artifacts.hasher, hasher)?;
     lfm_prove_with_residency(
         program,
         artifacts,
@@ -751,6 +747,47 @@ mod tests {
                 assert_eq!((artifacts, filled), (HasherKind::Rpx, HasherKind::Poseidon))
             }
             other => panic!("a mismatch must be refused, got {other:?}"),
+        }
+    }
+
+    /// Proving under a hasher other than the artifacts' is refused before
+    /// anything runs, naming both, not a panic.
+    #[test]
+    fn proving_under_another_hasher_than_the_artifacts_is_refused() {
+        let artifacts = LfmArtifacts {
+            roots: [[0u8; 32]; NUM_LFM_CHIPS],
+            log_heights: [0; NUM_LFM_CHIPS],
+            keccak_rnd_chunks: 0,
+            blake3_chunk_roots: Vec::new(),
+            blake3_chunk_log_heights: Vec::new(),
+            hash_chunk_roots: Vec::new(),
+            hash_chunk_log_heights: Vec::new(),
+            hasher: HasherKind::Rpx,
+            chip_set: ChipSet {
+                keccak: false,
+                blake3: false,
+                bitwise: false,
+            },
+            program_id: [0u8; 32],
+            one_row_roots: None,
+        };
+        // One arena too many: an execution would refuse it, so the refusal
+        // below can only come from the check that runs first.
+        let program = super::super::programs::trivial_program();
+        let arenas = vec![Vec::new(); program.arena_schema.lens.len() + 1];
+        let got = lfm_prove_with_hasher(
+            &program,
+            &artifacts,
+            &arenas,
+            &ProofOptions::default_test_options(),
+            HasherKind::Poseidon,
+        );
+        match got {
+            Err(LfmProveError::HasherMismatch { artifacts, filled }) => {
+                assert_eq!((artifacts, filled), (HasherKind::Rpx, HasherKind::Poseidon))
+            }
+            Err(other) => panic!("proving under another hasher must be refused, got {other:?}"),
+            Ok(_) => panic!("proving under another hasher must be refused, but it proved"),
         }
     }
 }
