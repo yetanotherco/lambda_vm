@@ -1827,6 +1827,119 @@ pub fn prove_block_tree(
     })
 }
 
+// ============================== the proof file ============================
+
+/// The proof file's first bytes.
+const PROOF_MAGIC: [u8; 8] = *b"LVMBLKTR";
+
+/// The proof file's layout version.
+const PROOF_VERSION: u32 = 1;
+
+/// Which tree a proof file holds: the STARK block tree (this one) or the WHIR
+/// block tree. A verifier refuses the other's file by its tag, before reading
+/// it as its own.
+pub const PIPELINE_STARK: u8 = 0;
+
+/// A whole block's proof as a consumer receives it: the shape and the public
+/// output the block claims, and the top node's proof. The block verifier
+/// ([`verify_block_tree_proof`]) takes the shape and the output as claims —
+/// the plan and the top program are derived from the trusted ELF and the
+/// shape, under the block presets — so nothing here is a format parameter:
+/// the file only carries what [`super::block_plan::verify_block_tree`]
+/// already takes from its caller.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct BlockTreeProof {
+    magic: [u8; 8],
+    version: u32,
+    pipeline: u8,
+    pub table_counts: crate::TableCounts,
+    pub runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    pub num_private_input_pages: usize,
+    pub public_output_len: usize,
+    pub trace_lengths: Vec<usize>,
+    pub public_output: Vec<u8>,
+    pub top_proof: stark::proof::stark::MultiProof<Gl, Ext3, ()>,
+    pub top_public_words: Vec<(u32, LfmWord)>,
+}
+
+impl BlockTreeProof {
+    /// The file for a STARK block tree's top proof.
+    pub fn stark(shape: BlockShape, public_output: Vec<u8>, top: LfmProof) -> Self {
+        Self {
+            magic: PROOF_MAGIC,
+            version: PROOF_VERSION,
+            pipeline: PIPELINE_STARK,
+            table_counts: shape.table_counts,
+            runtime_page_ranges: shape.runtime_page_ranges,
+            num_private_input_pages: shape.num_private_input_pages,
+            public_output_len: shape.public_output_len,
+            trace_lengths: shape.trace_lengths,
+            public_output,
+            top_proof: top.proof,
+            top_public_words: top.public_words,
+        }
+    }
+
+    /// The claimed shape.
+    pub fn shape(&self) -> BlockShape {
+        BlockShape {
+            table_counts: self.table_counts.clone(),
+            runtime_page_ranges: self.runtime_page_ranges.clone(),
+            num_private_input_pages: self.num_private_input_pages,
+            public_output_len: self.public_output_len,
+            trace_lengths: self.trace_lengths.clone(),
+        }
+    }
+
+    /// The file's bytes.
+    pub fn to_bytes(&self) -> Result<rkyv::util::AlignedVec, String> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| format!("serialize: {e}"))
+    }
+
+    /// A file read back: refused unless it is this layout's STARK block tree.
+    /// `bytes` must be aligned for rkyv (an `AlignedVec`).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let proof = rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+            .map_err(|e| format!("not a block proof file: {e}"))?;
+        if proof.magic != PROOF_MAGIC {
+            return Err("not a block proof file (magic)".to_string());
+        }
+        if proof.version != PROOF_VERSION {
+            return Err(format!(
+                "block proof file version {}, this build reads {PROOF_VERSION}",
+                proof.version
+            ));
+        }
+        if proof.pipeline != PIPELINE_STARK {
+            return Err(format!(
+                "the file holds pipeline {} ({}), not the STARK block tree",
+                proof.pipeline,
+                if proof.pipeline == 1 {
+                    "the WHIR block tree"
+                } else {
+                    "unknown"
+                }
+            ));
+        }
+        Ok(proof)
+    }
+}
+
+/// ★ A block proof file verified: [`super::block_plan::verify_block_tree`]
+/// over its claimed shape and output and its top proof, under the block
+/// presets, against the trusted `elf_bytes`. Returns the id of the top program
+/// the proof verified against.
+pub fn verify_block_tree_proof(
+    elf_bytes: &[u8],
+    proof: &BlockTreeProof,
+) -> Result<Commitment, String> {
+    let top = LfmProof {
+        proof: proof.top_proof.clone(),
+        public_words: proof.top_public_words.clone(),
+    };
+    super::block_plan::verify_block_tree(elf_bytes, &proof.shape(), &proof.public_output, &top)
+}
+
 /// What the ELF-constants thread hands back on `ready`: the constants and
 /// their seconds; the tree derived ahead (the shape it was derived from, the
 /// pipe or the filled tree with its phases, its seconds, and when it was done
@@ -1932,6 +2045,90 @@ mod tests {
         assert_eq!(parse_leaves(None), Ok(None));
         assert_eq!(parse_leaves(Some("8")), Ok(Some(8)));
         assert!(parse_leaves(Some("0")).is_err());
+    }
+
+    /// A synthetic shape and an empty top proof.
+    fn synthetic_proof() -> BlockTreeProof {
+        let counts = crate::TableCounts {
+            cpu: 3,
+            lt: 1,
+            memw: 2,
+            memw_aligned: 1,
+            load: 1,
+            mul: 1,
+            dvrm: 1,
+            shift: 1,
+            branch: 1,
+            memw_register: 1,
+            eq: 1,
+            bytewise: 1,
+            store: 1,
+            cpu32: 1,
+            keccak: 2,
+            keccak_rnd: 4,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 0,
+            commit: 1,
+            blake3: 0,
+        };
+        let shape = BlockShape {
+            table_counts: counts,
+            runtime_page_ranges: vec![crate::RuntimePageRange {
+                base: 0x7000_0000,
+                count: 3,
+            }],
+            num_private_input_pages: 2,
+            public_output_len: 5,
+            trace_lengths: vec![1 << 21, 1 << 16, 64],
+        };
+        let words: Vec<(u32, LfmWord)> = (0..3u32)
+            .map(|i| (i, [FE::from(u64::from(i) + 7); 4]))
+            .collect();
+        let top = LfmProof {
+            proof: stark::proof::stark::MultiProof { proofs: vec![] },
+            public_words: words,
+        };
+        BlockTreeProof::stark(shape, vec![1, 2, 3, 4, 5], top)
+    }
+
+    /// The proof file reads back what was written; another tag, version or
+    /// magic, or bytes that are not a file, are refused.
+    #[test]
+    fn the_proof_file_round_trips_and_refuses_another_file() {
+        let proof = synthetic_proof();
+        let bytes = proof.to_bytes().expect("serializes");
+        let back = BlockTreeProof::from_bytes(&bytes).expect("reads back");
+        assert_eq!(
+            format!("{:?}", back.shape()),
+            format!("{:?}", proof.shape())
+        );
+        assert_eq!(back.public_output, proof.public_output);
+        assert_eq!(back.top_public_words, proof.top_public_words);
+        assert_eq!(back.top_proof.proofs.len(), 0);
+
+        for (what, tamper) in [
+            (
+                "pipeline",
+                (|p: &mut BlockTreeProof| p.pipeline = 1) as fn(&mut BlockTreeProof),
+            ),
+            ("version", |p| p.version = PROOF_VERSION + 1),
+            ("magic", |p| p.magic[0] ^= 1),
+        ] {
+            let mut other = synthetic_proof();
+            tamper(&mut other);
+            let bytes = other.to_bytes().expect("serializes");
+            assert!(
+                BlockTreeProof::from_bytes(&bytes).is_err(),
+                "a file with another {what} is refused"
+            );
+        }
+        let mut junk = rkyv::util::AlignedVec::<16>::new();
+        junk.extend_from_slice(&[0u8; 7]);
+        assert!(
+            BlockTreeProof::from_bytes(&junk).is_err(),
+            "seven zero bytes"
+        );
     }
 
     /// The posture line names every posture knob, in the table's order.
