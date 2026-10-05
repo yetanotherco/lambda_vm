@@ -321,8 +321,8 @@ fn classify<'a>(
 /// (`LAMBDA_VM_BLOCK_REGEN`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RegenMode {
-    /// `off` (and unset beside a set `LAMBDA_VM_BLOCK_SPILL`): nothing is
-    /// recorded or regenerated.
+    /// `off` (and unset unless the default is no disk,
+    /// [`crate::block::MemoryDefault`]): nothing is recorded or regenerated.
     Off,
     /// `shadow`: phase A records every streamed instance's recipe, and phase
     /// B regenerates each beside the prove, checks it and throws it away.
@@ -336,7 +336,8 @@ pub(crate) enum RegenMode {
     /// policy `off` (`LAMBDA_VM_BLOCK_SPILL=off`) `auto` still decides, with
     /// no store (no disk, I-REGEN §14 P1): once armed every regenerable
     /// instance is dropped and the rest stays on the host. No disk is the
-    /// default: both knobs unset ([`regen_mode`]).
+    /// default where live regeneration can drop: both knobs unset
+    /// ([`crate::block::MemoryDefault::NoDisk`]).
     Auto,
     /// `always`: every regenerable instance is dropped and rebuilt — the
     /// byte-identity test mode, not a policy.
@@ -344,20 +345,22 @@ pub(crate) enum RegenMode {
 }
 
 /// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN`; any other value is refused.
-/// Unset is `auto` while `LAMBDA_VM_BLOCK_SPILL` is unset too — the default is
-/// no disk (I-REGEN §14.9) — and `off` beside a set one, as before no disk
-/// was the default.
-pub(crate) fn regen_mode() -> Result<RegenMode, Error> {
+/// Unset is `auto` under [`crate::block::MemoryDefault::NoDisk`] — both knobs
+/// unset where live regeneration can drop: no disk (I-REGEN §14.9) — and
+/// `off` otherwise, as before no disk was the default.
+pub(crate) fn regen_mode(default: crate::block::MemoryDefault) -> Result<RegenMode, Error> {
     parse_regen_mode(
         std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
-        std::env::var_os("LAMBDA_VM_BLOCK_SPILL").is_some(),
+        default.no_disk(),
     )
 }
 
-fn parse_regen_mode(value: Option<&str>, spill_set: bool) -> Result<RegenMode, Error> {
+/// [`regen_mode`] from the knob's `value`; unset is `auto` when the default
+/// is `no_disk` ([`crate::block::MemoryDefault::no_disk`]), else `off`.
+pub(crate) fn parse_regen_mode(value: Option<&str>, no_disk: bool) -> Result<RegenMode, Error> {
     match value.map(str::trim) {
-        None if spill_set => Ok(RegenMode::Off),
-        None => Ok(RegenMode::Auto),
+        None if no_disk => Ok(RegenMode::Auto),
+        None => Ok(RegenMode::Off),
         Some("off") => Ok(RegenMode::Off),
         Some("shadow") => Ok(RegenMode::Shadow),
         Some("auto") => Ok(RegenMode::Auto),
@@ -1358,15 +1361,15 @@ mod shadow_tests {
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN`: `off`, `shadow`, `auto`, `always`; anything
-    /// else is refused (an error, not a panic). Unset is `auto` with
-    /// `LAMBDA_VM_BLOCK_SPILL` unset too (the default, no disk) and `off`
-    /// beside a set one; a set value means the same either way.
+    /// else is refused (an error, not a panic). Unset is `auto` under the no
+    /// disk default (both knobs unset where live regeneration can drop) and
+    /// `off` otherwise; a set value means the same either way.
     #[test]
     fn the_regen_mode_reads_its_knob() {
-        assert_eq!(parse_regen_mode(None, false).unwrap(), RegenMode::Auto);
-        assert_eq!(parse_regen_mode(None, true).unwrap(), RegenMode::Off);
-        for spill_set in [false, true] {
-            let parse = |v| parse_regen_mode(Some(v), spill_set);
+        assert_eq!(parse_regen_mode(None, true).unwrap(), RegenMode::Auto);
+        assert_eq!(parse_regen_mode(None, false).unwrap(), RegenMode::Off);
+        for no_disk in [false, true] {
+            let parse = |v| parse_regen_mode(Some(v), no_disk);
             assert_eq!(parse(" off ").unwrap(), RegenMode::Off);
             assert_eq!(parse("shadow").unwrap(), RegenMode::Shadow);
             assert_eq!(parse("auto").unwrap(), RegenMode::Auto);

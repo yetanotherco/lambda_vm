@@ -280,24 +280,7 @@ fn prove_block_with_observed(
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
-    // With the table timeline on, the global rayon pool's workers are named
-    // `rayon-<n>` for a per-thread sampler; only a pool nothing built yet can
-    // be named, so a process that used rayon before says so.
-    #[cfg(feature = "parallel")]
-    if std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1") {
-        let named = rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("rayon-{i}"))
-            .build_global()
-            .is_ok();
-        eprintln!(
-            "[block] the global rayon pool's workers {}",
-            if named {
-                "are named rayon-<n>"
-            } else {
-                "keep their names (the pool was built before the block)"
-            }
-        );
-    }
+    name_rayon_workers();
     #[cfg(feature = "cuda")]
     stark::prover::set_default_recommit_top_levels(BLOCK_RECOMMIT_TOP_LEVELS);
     #[cfg(feature = "cuda")]
@@ -314,12 +297,21 @@ fn prove_block_with_observed(
             ledger.line(&format!("finish {label}"))
         })));
     }
+    // What the memory knobs come to when both are unset: no disk where live
+    // regeneration can drop, else the spill tier (its line says why).
+    let memory = MemoryDefault::of(residency);
+    if let MemoryDefault::Spill(why) = memory {
+        eprintln!(
+            "BLOCK MEMORY: LAMBDA_VM_BLOCK_SPILL and LAMBDA_VM_BLOCK_REGEN unset, and live \
+             regeneration could drop nothing ({why}): the spill tier (spill auto, regen off)"
+        );
+    }
     // Regeneration (`LAMBDA_VM_BLOCK_REGEN`): phase A records each streamed
     // instance's recipe, for phase B to rebuild beside the prove (the shadow)
     // or in place of the dropped ones (`auto`, `always`).
     let regen = crate::block_regen::PhaseARegen::new(
-        crate::block_regen::regen_mode()?,
-        stream_phase_a() && !stream_by_push() && narrow_streamed(),
+        crate::block_regen::regen_mode(memory)?,
+        regen_streamed(),
     );
     let live = regen
         .as_ref()
@@ -330,7 +322,7 @@ fn prove_block_with_observed(
     // Live regeneration keeps the policy's decisions without a spill store,
     // and with the spill off it decides with none at all (no disk).
     let spill = stream_phase_a()
-        .then(|| Spill::for_block(spill_policy(), live))
+        .then(|| Spill::for_block(spill_policy(memory), live))
         .flatten();
     let (mut traces, decode_commitment, precommits, streamed) = if stream_phase_a() {
         build_streamed(
@@ -624,6 +616,42 @@ fn narrow_finished() -> bool {
     narrow_level() == 2
 }
 
+/// Phase A can feed regeneration: it streams its windows on the walker's
+/// thread and packs every streamed instance ([`stream_phase_a`], not
+/// [`stream_by_push`], [`narrow_streamed`]).
+fn regen_streamed() -> bool {
+    stream_phase_a() && !stream_by_push() && narrow_streamed()
+}
+
+/// With the table timeline on, the global rayon pool's workers are named
+/// `rayon-<n>` for a per-thread sampler; only a pool nothing built yet can be
+/// named, so a process that used rayon before says so. Once a process, before
+/// the first block and before the device's backend comes up (it sizes its
+/// slots by the global pool, which builds it): [`live_regen_unavailable`]
+/// may bring it up first, for the `BLOCK POSTURE` line.
+fn name_rayon_workers() {
+    #[cfg(feature = "parallel")]
+    {
+        static NAMED: std::sync::Once = std::sync::Once::new();
+        NAMED.call_once(|| {
+            if std::env::var("LAMBDA_VM_TABLE_TIMELINE").is_ok_and(|v| v == "1") {
+                let named = rayon::ThreadPoolBuilder::new()
+                    .thread_name(|i| format!("rayon-{i}"))
+                    .build_global()
+                    .is_ok();
+                eprintln!(
+                    "[block] the global rayon pool's workers {}",
+                    if named {
+                        "are named rayon-<n>"
+                    } else {
+                        "keep their names (the pool was built before the block)"
+                    }
+                );
+            }
+        });
+    }
+}
+
 /// Committer threads for the streamed instances.
 const STREAM_COMMITTERS: usize = 3;
 
@@ -896,7 +924,8 @@ pub(crate) enum SpillPolicy {
     /// regeneration (`LAMBDA_VM_BLOCK_REGEN=auto`) `auto` still decides, with
     /// no store, and once armed drops every regenerable instance (no disk,
     /// [`Spill::for_block`]). The default, with regeneration `auto`, when
-    /// both knobs are unset ([`spill_policy`]).
+    /// both knobs are unset and live regeneration can drop
+    /// ([`MemoryDefault::NoDisk`]).
     Off,
     /// Spill every committed instance that is packed (a measurement arm).
     Always,
@@ -908,39 +937,131 @@ pub(crate) enum SpillPolicy {
     Auto,
 }
 
+/// What an unset `LAMBDA_VM_BLOCK_SPILL` and `LAMBDA_VM_BLOCK_REGEN` come to
+/// (I-REGEN §14.9). No disk relieves the host only by dropping instances for
+/// live regeneration to rebuild, so where it could drop none (no device: CI)
+/// it would keep every trace resident; there both unset are the spill tier,
+/// as before no disk was the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemoryDefault {
+    /// Either knob is set: an unset one means what it did before no disk was
+    /// the default (spill `auto`, regeneration `off`).
+    Set,
+    /// Both unset, and live regeneration can drop: no disk (spill `off`,
+    /// regeneration `auto`).
+    NoDisk,
+    /// Both unset, and live regeneration could drop nothing (why): the spill
+    /// tier (spill `auto`, regeneration `off`).
+    Spill(&'static str),
+}
+
+impl MemoryDefault {
+    /// The default for a block proved under `residency`, from the knobs as
+    /// the process has them. Both unset, it asks for the device
+    /// ([`live_regen_unavailable`]).
+    pub(crate) fn of(residency: ResidencyMode) -> Self {
+        Self::resolve(
+            std::env::var_os("LAMBDA_VM_BLOCK_SPILL").is_some()
+                || std::env::var_os("LAMBDA_VM_BLOCK_REGEN").is_some(),
+            || live_regen_unavailable(residency),
+        )
+    }
+
+    /// [`Self::of`] with either knob `set`, and why live regeneration could
+    /// drop nothing (`unavailable`, asked only with both unset).
+    fn resolve(set: bool, unavailable: impl FnOnce() -> Option<&'static str>) -> Self {
+        if set {
+            return Self::Set;
+        }
+        unavailable().map_or(Self::NoDisk, Self::Spill)
+    }
+
+    /// Whether an unset knob reads no disk's value (spill `off`, regeneration
+    /// `auto`) rather than the spill tier's.
+    pub(crate) fn no_disk(self) -> bool {
+        self == Self::NoDisk
+    }
+}
+
+/// Why live regeneration could drop no instance of a block proved under
+/// `residency` in this process, or `None` when it can. It drops only a
+/// streamed instance whose fused task recommits on the device (R-REGEN A1):
+/// phase A must stream and pack its instances ([`regen_streamed`]), the
+/// residency must recommit on the device, and a device must come up — which
+/// brings the backend up, as the block's first commit would.
+fn live_regen_unavailable(residency: ResidencyMode) -> Option<&'static str> {
+    if !regen_streamed() {
+        return Some("phase A does not stream and pack its instances");
+    }
+    if !residency.recommits_on_device() {
+        return Some("the residency does not recommit on the device");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        name_rayon_workers();
+        stark::gpu_lde::device_vram_budget_bytes()
+            .is_none()
+            .then_some("no device")
+    }
+    #[cfg(not(feature = "cuda"))]
+    Some("no device: a build without cuda")
+}
+
 /// `LAMBDA_VM_BLOCK_SPILL`: `auto` | `off` | `always` | `<GiB>` (a resident
 /// budget for committed packed traces). Anything else is `off`, so with
 /// `LAMBDA_VM_BLOCK_REGEN=auto` a typo is no disk too (its line says so).
-/// Unset is `off` while `LAMBDA_VM_BLOCK_REGEN` is unset too — the default is
-/// no disk, regeneration `auto` (I-REGEN §14.9) — and `auto` beside a set
-/// one, as before no disk was the default.
-fn spill_policy() -> SpillPolicy {
+/// Unset is `off` under [`MemoryDefault::NoDisk`] — both knobs unset where
+/// live regeneration can drop: no disk, regeneration `auto` (I-REGEN §14.9) —
+/// and `auto` otherwise, as before no disk was the default.
+fn spill_policy(default: MemoryDefault) -> SpillPolicy {
     parse_spill_policy(
         std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
-        std::env::var_os("LAMBDA_VM_BLOCK_REGEN").is_some(),
+        default.no_disk(),
     )
 }
 
-/// The `BLOCK POSTURE` line's memory words: the spill policy and the
-/// regeneration mode the knobs come to, and the knobs as the process has them.
+/// The `BLOCK POSTURE` line's memory words for a block ([`prove_block`]'s
+/// residency): the spill policy and the regeneration mode the knobs come to,
+/// which default chose them and why, and the knobs as the process has them.
 pub(crate) fn memory_posture() -> String {
-    let knob = |name: &str| {
-        std::env::var(name).map_or_else(|_| format!("{name} unset"), |v| format!("{name}={v}"))
-    };
-    let spill = spill_policy();
-    let regen = crate::block_regen::regen_mode();
-    let no_disk =
-        spill == SpillPolicy::Off && matches!(regen, Ok(crate::block_regen::RegenMode::Auto));
-    format!(
-        "memory: spill {spill:?} · regen {}{} ({} · {})",
-        regen.map_or_else(|e| format!("refused ({e})"), |m| format!("{m:?}")),
-        if no_disk { " = no disk" } else { "" },
-        knob("LAMBDA_VM_BLOCK_SPILL"),
-        knob("LAMBDA_VM_BLOCK_REGEN"),
+    let spill = std::env::var("LAMBDA_VM_BLOCK_SPILL").ok();
+    let regen = std::env::var("LAMBDA_VM_BLOCK_REGEN").ok();
+    memory_words(
+        spill.as_deref(),
+        regen.as_deref(),
+        MemoryDefault::of(ResidencyMode::RecomputeLdeDevice),
     )
 }
 
-fn parse_spill_policy(value: Option<&str>, regen_set: bool) -> SpillPolicy {
+/// [`memory_posture`]'s words for the knob values `spill` and `regen` under
+/// `default`.
+fn memory_words(spill: Option<&str>, regen: Option<&str>, default: MemoryDefault) -> String {
+    use crate::block_regen::RegenMode;
+    let knob = |name: &str, value: Option<&str>| {
+        value.map_or_else(|| format!("{name} unset"), |v| format!("{name}={v}"))
+    };
+    let policy = parse_spill_policy(spill, default.no_disk());
+    let mode = crate::block_regen::parse_regen_mode(regen, default.no_disk());
+    let no_disk = policy == SpillPolicy::Off && matches!(mode, Ok(RegenMode::Auto));
+    let chosen = match default {
+        MemoryDefault::NoDisk => " = no disk, the default: live regeneration can drop".to_string(),
+        MemoryDefault::Spill(why) => {
+            format!(" = the spill tier, the default: live regeneration could drop nothing ({why})")
+        }
+        MemoryDefault::Set if no_disk => " = no disk".to_string(),
+        MemoryDefault::Set => String::new(),
+    };
+    format!(
+        "memory: spill {policy:?} · regen {}{chosen} ({} · {})",
+        mode.map_or_else(|e| format!("refused ({e})"), |m| format!("{m:?}")),
+        knob("LAMBDA_VM_BLOCK_SPILL", spill),
+        knob("LAMBDA_VM_BLOCK_REGEN", regen),
+    )
+}
+
+/// [`spill_policy`] from the knob's `value`; unset is `off` when the default
+/// is `no_disk` ([`MemoryDefault::no_disk`]), else `auto`.
+fn parse_spill_policy(value: Option<&str>, no_disk: bool) -> SpillPolicy {
     match value.map(str::trim) {
         Some("always") => SpillPolicy::Always,
         Some("auto") => SpillPolicy::Auto,
@@ -951,8 +1072,8 @@ fn parse_spill_policy(value: Option<&str>, regen_set: bool) -> SpillPolicy {
             .map_or(SpillPolicy::Off, |g| {
                 SpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
             }),
-        None if regen_set => SpillPolicy::Auto,
-        None => SpillPolicy::Off,
+        None if no_disk => SpillPolicy::Off,
+        None => SpillPolicy::Auto,
     }
 }
 
@@ -3111,22 +3232,25 @@ mod spill_policy_tests {
 
     use super::finish_sink::Trace;
     use super::{
-        CgroupValue, Fate, HostReading, Spill, SpillPolicy, cgroup_memory, parse_spill_policy,
-        spill_decision, spill_plausible, spill_reserve_bytes, spill_target_from,
+        CgroupValue, Fate, HostReading, MemoryDefault, Spill, SpillPolicy, cgroup_memory,
+        live_regen_unavailable, memory_words, parse_spill_policy, spill_decision, spill_plausible,
+        spill_reserve_bytes, spill_target_from,
     };
+    use crate::block_regen::{RegenMode, parse_regen_mode};
+    use stark::residency_mode::ResidencyMode;
 
     const GIB: u64 = 1 << 30;
 
     /// `LAMBDA_VM_BLOCK_SPILL`'s values: auto, off, always, a budget in GiB;
-    /// anything else is off. Unset is off with `LAMBDA_VM_BLOCK_REGEN` unset
-    /// too (the default, no disk) and auto beside a set one; a set value
-    /// means the same either way.
+    /// anything else is off. Unset is off under the no disk default (both
+    /// knobs unset where live regeneration can drop) and auto otherwise; a
+    /// set value means the same either way.
     #[test]
     fn the_spill_policy_reads_its_knob() {
-        assert_eq!(parse_spill_policy(None, false), SpillPolicy::Off);
-        assert_eq!(parse_spill_policy(None, true), SpillPolicy::Auto);
-        for regen_set in [false, true] {
-            let parse = |v| parse_spill_policy(Some(v), regen_set);
+        assert_eq!(parse_spill_policy(None, true), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(None, false), SpillPolicy::Auto);
+        for no_disk in [false, true] {
+            let parse = |v| parse_spill_policy(Some(v), no_disk);
             assert_eq!(parse("off"), SpillPolicy::Off);
             assert_eq!(parse("always"), SpillPolicy::Always);
             assert_eq!(parse(" auto "), SpillPolicy::Auto);
@@ -3135,6 +3259,81 @@ mod spill_policy_tests {
             assert_eq!(parse("-1"), SpillPolicy::Off);
             assert_eq!(parse("lots"), SpillPolicy::Off);
         }
+    }
+
+    /// Both knobs unset: no disk (spill off, regeneration auto) where live
+    /// regeneration can drop (a device), and the spill tier (spill auto,
+    /// regeneration off) where it could drop nothing (no device). A set knob
+    /// asks for no device and leaves the other its meaning from before.
+    #[test]
+    fn both_knobs_unset_are_no_disk_only_where_live_regeneration_can_drop() {
+        let device = MemoryDefault::resolve(false, || None);
+        assert_eq!(device, MemoryDefault::NoDisk);
+        assert_eq!(parse_spill_policy(None, device.no_disk()), SpillPolicy::Off);
+        assert_eq!(
+            parse_regen_mode(None, device.no_disk()).unwrap(),
+            RegenMode::Auto
+        );
+
+        let no_device = MemoryDefault::resolve(false, || Some("no device"));
+        assert_eq!(no_device, MemoryDefault::Spill("no device"));
+        assert_eq!(
+            parse_spill_policy(None, no_device.no_disk()),
+            SpillPolicy::Auto
+        );
+        assert_eq!(
+            parse_regen_mode(None, no_device.no_disk()).unwrap(),
+            RegenMode::Off
+        );
+
+        let set = MemoryDefault::resolve(true, || panic!("a set knob asks for no device"));
+        assert_eq!(set, MemoryDefault::Set);
+        assert_eq!(parse_spill_policy(None, set.no_disk()), SpillPolicy::Auto);
+        assert_eq!(
+            parse_regen_mode(None, set.no_disk()).unwrap(),
+            RegenMode::Off
+        );
+    }
+
+    /// Live regeneration drops only what recommits on the device: never under
+    /// a residency that recommits on the host, and never in a build without
+    /// the device.
+    #[test]
+    fn live_regeneration_needs_a_device_recommit() {
+        assert!(live_regen_unavailable(ResidencyMode::RecomputeLde).is_some());
+        assert!(live_regen_unavailable(ResidencyMode::Retain).is_some());
+        #[cfg(not(feature = "cuda"))]
+        assert!(live_regen_unavailable(ResidencyMode::RecomputeLdeDevice).is_some());
+    }
+
+    /// The `BLOCK POSTURE` line's memory words say which default chose the
+    /// policy and the mode, and why; a set knob says what it came to.
+    #[test]
+    fn the_memory_words_say_which_default_and_why() {
+        assert_eq!(
+            memory_words(None, None, MemoryDefault::NoDisk),
+            "memory: spill Off · regen Auto = no disk, the default: live regeneration can drop \
+             (LAMBDA_VM_BLOCK_SPILL unset · LAMBDA_VM_BLOCK_REGEN unset)"
+        );
+        assert_eq!(
+            memory_words(None, None, MemoryDefault::Spill("no device")),
+            "memory: spill Auto · regen Off = the spill tier, the default: live regeneration \
+             could drop nothing (no device) (LAMBDA_VM_BLOCK_SPILL unset · \
+             LAMBDA_VM_BLOCK_REGEN unset)"
+        );
+        assert_eq!(
+            memory_words(Some("off"), Some("auto"), MemoryDefault::Set),
+            "memory: spill Off · regen Auto = no disk \
+             (LAMBDA_VM_BLOCK_SPILL=off · LAMBDA_VM_BLOCK_REGEN=auto)"
+        );
+        assert_eq!(
+            memory_words(Some("auto"), None, MemoryDefault::Set),
+            "memory: spill Auto · regen Off (LAMBDA_VM_BLOCK_SPILL=auto · LAMBDA_VM_BLOCK_REGEN unset)"
+        );
+        assert_eq!(
+            memory_words(None, Some("off"), MemoryDefault::Set),
+            "memory: spill Auto · regen Off (LAMBDA_VM_BLOCK_SPILL unset · LAMBDA_VM_BLOCK_REGEN=off)"
+        );
     }
 
     /// The cgroup memory files, v2 and v1, from fake `/proc/self/cgroup` texts

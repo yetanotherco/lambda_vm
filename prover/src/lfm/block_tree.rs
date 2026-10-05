@@ -90,9 +90,10 @@ impl BlockTreeSink for StderrSink {
 /// (`LFM_PROVE_SPLIT`, `LAMBDA_VM_BASE_SPLIT`) are not posture, nor is a knob
 /// whose library default is the posture's value (`LAMBDA_VM_ALLOC_PURGE`,
 /// `auto`; `LAMBDA_VM_BLOCK_SPILL` and `LAMBDA_VM_BLOCK_REGEN`, both unset: no
-/// disk): the harness's env leaves it unset, and [`posture_line`] names what
-/// the memory knobs come to. The allocator's never-purge posture is compiled
-/// into the binary.
+/// disk where live regeneration can drop, else the spill tier): the harness's
+/// env leaves it unset, and [`posture_line`] names what the memory knobs come
+/// to and why. The allocator's never-purge posture is compiled into the
+/// binary.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "8"),
     (POSTURE_VRAM_KNOB, "24000"),
@@ -113,7 +114,9 @@ pub const POSTURE_VRAM_MIN_GIB: f64 = 31.0;
 
 /// The `BLOCK POSTURE:` line: each posture knob as the process has it — equal
 /// to the posture, unset, or another value — and the spill policy and
-/// regeneration mode the block runs under.
+/// regeneration mode the block runs under, with the default that chose them
+/// and why ([`crate::block::MemoryDefault`]). With both memory knobs unset it
+/// asks for the device, which brings the backend up.
 pub fn posture_line() -> String {
     let words: Vec<String> = POSTURE
         .iter()
@@ -1211,7 +1214,6 @@ pub fn prove_block_tree(
         Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * g / c),
         Err(_) => String::new(),
     };
-    sink.line(&posture_line());
     sink.line(&format!(
         "★★★ NO-EPOCH BLOCK TREE (base + leaves + interior + top)\n   \
          {} input bytes · inner blowup {} / {} q · wrap blowup {} / {} q · cgroup {}",
@@ -1412,6 +1414,10 @@ pub fn prove_block_tree(
     // ---- the base.
     let base_sampler = HostSampler::start();
     let t = Instant::now();
+    // The posture line asks for the device (the memory default), which brings
+    // the backend up: here, inside the base's wall and the whole run, where
+    // the base itself brought it up before.
+    sink.line(&posture_line());
     let mut shape_at = None;
     let (proof, times) = crate::block::prove_block_observed(&elf_bytes, input, &inner, &mut |s| {
         shape_at = Some(t.elapsed().as_secs_f64());
@@ -2146,6 +2152,21 @@ mod tests {
         let line = posture_line();
         assert!(line.starts_with("BLOCK POSTURE: "));
         assert!(line.contains(" · memory: spill "), "{line}");
+        // Both memory knobs unset: the line says which default chose them;
+        // without the device, the spill tier.
+        if std::env::var_os("LAMBDA_VM_BLOCK_SPILL").is_none()
+            && std::env::var_os("LAMBDA_VM_BLOCK_REGEN").is_none()
+        {
+            assert!(line.contains(", the default: "), "{line}");
+            #[cfg(not(feature = "cuda"))]
+            assert!(
+                line.contains(
+                    "memory: spill Auto · regen Off = the spill tier, the default: live \
+                     regeneration could drop nothing ("
+                ),
+                "{line}"
+            );
+        }
         let mut at = 0;
         for (name, _) in POSTURE {
             let found = line[at..]
