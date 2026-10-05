@@ -374,6 +374,13 @@ impl RegenSlot {
         self.rank
     }
 
+    /// Its key in the window's order: (rank, then the order slots were made
+    /// in). Phase B's walk takes the dropped tables in this order, the order
+    /// the window reserves in, so equal ranks cannot cross.
+    pub fn order_key(&self) -> (u64, usize) {
+        (self.rank, self.id)
+    }
+
     /// Rows of the dropped trace.
     pub fn rows(&self) -> usize {
         self.want.rows
