@@ -24,6 +24,7 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
@@ -543,121 +544,125 @@ impl CpuOperation {
 pub fn generate_cpu_trace(
     operations: &[CpuOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_cpu_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths CPU traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_cpu_trace`] in `form` (`tables::gpack`).
+pub fn generate_cpu_trace_as(
+    operations: &[CpuOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in operations.iter().enumerate() {
+            let f = &op.decode.fields;
+            let word = f.word_instr;
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        let f = &op.decode.fields;
-        let word = f.word_instr;
+            // For a word_instr delegate row the operational flags/register I/O are
+            // suppressed (CPU32 owns them); only the PC-advancing columns are set.
+            let effective = |flag: bool| !word && flag;
 
-        // For a word_instr delegate row the operational flags/register I/O are
-        // suppressed (CPU32 owns them); only the PC-advancing columns are set.
-        let effective = |flag: bool| !word && flag;
+            table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
+            table.set_dword_wl(row_idx, cols::PC_0, op.decode.pc);
 
-        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
-        table.set_dword_wl(row_idx, cols::PC_0, op.decode.pc);
+            // rs1/rs2/rd and read/write flags are only present on non-word rows.
+            let (rs1, rs2, rd) = if word {
+                (0, 0, 0)
+            } else {
+                (f.rs1, f.rs2, f.rd)
+            };
+            table.set_byte(row_idx, cols::RS1, rs1);
+            table.set_byte(row_idx, cols::RS2, rs2);
+            table.set_byte(row_idx, cols::RD, rd);
 
-        // rs1/rs2/rd and read/write flags are only present on non-word rows.
-        let (rs1, rs2, rd) = if word {
-            (0, 0, 0)
-        } else {
-            (f.rs1, f.rs2, f.rd)
-        };
-        table.set_byte(row_idx, cols::RS1, rs1);
-        table.set_byte(row_idx, cols::RS2, rs2);
-        table.set_byte(row_idx, cols::RD, rd);
+            // x0 is hardwired zero (never read/written); x255 is the PC register and
+            // must be read (read_register1=1) so its MEMW interaction fires.
+            table.set_bool(
+                row_idx,
+                cols::READ_REGISTER1,
+                effective(f.read_register1 && f.rs1 != 0),
+            );
+            table.set_bool(
+                row_idx,
+                cols::READ_REGISTER2,
+                effective(f.read_register2 && f.rs2 != 0),
+            );
+            table.set_bool(
+                row_idx,
+                cols::WRITE_REGISTER,
+                effective(f.write_register && f.rd != 0),
+            );
 
-        // x0 is hardwired zero (never read/written); x255 is the PC register and
-        // must be read (read_register1=1) so its MEMW interaction fires.
-        table.set_bool(
-            row_idx,
-            cols::READ_REGISTER1,
-            effective(f.read_register1 && f.rs1 != 0),
-        );
-        table.set_bool(
-            row_idx,
-            cols::READ_REGISTER2,
-            effective(f.read_register2 && f.rs2 != 0),
-        );
-        table.set_bool(
-            row_idx,
-            cols::WRITE_REGISTER,
-            effective(f.write_register && f.rd != 0),
-        );
+            // On word delegate rows, all operational data columns are 0 (CPU32 owns
+            // the real values); the register-zero / arg2 / rvd=res constraints all
+            // hold with read flags = 0. `op` still carries the real rv1/rv2/rvd for
+            // the CPU32 op-generation, so we mask the columns here.
+            let (imm, rvd, rv1, rv2, arg2, res) = if word {
+                (0, 0, 0, 0, 0, 0)
+            } else {
+                (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2(), op.res)
+            };
 
-        // On word delegate rows, all operational data columns are 0 (CPU32 owns
-        // the real values); the register-zero / arg2 / rvd=res constraints all
-        // hold with read flags = 0. `op` still carries the real rv1/rv2/rvd for
-        // the CPU32 op-generation, so we mask the columns here.
-        let (imm, rvd, rv1, rv2, arg2, res) = if word {
-            (0, 0, 0, 0, 0, 0)
-        } else {
-            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2(), op.res)
-        };
+            table.set_dword_wl(row_idx, cols::IMM_0, imm);
 
-        table.set_dword_wl(row_idx, cols::IMM_0, imm);
+            table.set_byte(
+                row_idx,
+                cols::HALF_INSTRUCTION_LENGTH,
+                f.half_instruction_length,
+            );
+            table.set_bool(row_idx, cols::WORD_INSTR, word);
 
-        table.set_byte(
-            row_idx,
-            cols::HALF_INSTRUCTION_LENGTH,
-            f.half_instruction_length,
-        );
-        table.set_bool(row_idx, cols::WORD_INSTR, word);
+            table.set_bool(row_idx, cols::ALU, effective(f.alu));
+            table.set_byte(row_idx, cols::ALU_FLAGS, if word { 0 } else { f.alu_flags });
+            table.set_bool(row_idx, cols::ADD, effective(f.add));
+            table.set_bool(row_idx, cols::SUB, effective(f.sub));
+            table.set_bool(row_idx, cols::MEMORY, effective(f.memory));
+            table.set_byte(row_idx, cols::MEM_FLAGS, if word { 0 } else { f.mem_flags });
+            table.set_bool(row_idx, cols::BRANCH, effective(f.branch));
+            table.set_bool(row_idx, cols::ECALL, effective(f.ecall));
 
-        table.set_bool(row_idx, cols::ALU, effective(f.alu));
-        table.set_byte(row_idx, cols::ALU_FLAGS, if word { 0 } else { f.alu_flags });
-        table.set_bool(row_idx, cols::ADD, effective(f.add));
-        table.set_bool(row_idx, cols::SUB, effective(f.sub));
-        table.set_bool(row_idx, cols::MEMORY, effective(f.memory));
-        table.set_byte(row_idx, cols::MEM_FLAGS, if word { 0 } else { f.mem_flags });
-        table.set_bool(row_idx, cols::BRANCH, effective(f.branch));
-        table.set_bool(row_idx, cols::ECALL, effective(f.ecall));
+            table.set_dword_wl(row_idx, cols::NEXT_PC_0, op.next_pc);
 
-        table.set_dword_wl(row_idx, cols::NEXT_PC_0, op.next_pc);
+            table.set_dword_wl(row_idx, cols::RVD_0, rvd);
 
-        table.set_dword_wl(row_idx, cols::RVD_0, rvd);
+            // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
+            table.set_dword_wl(row_idx, cols::RV1_0, rv1);
+            table.set_dword_wl(row_idx, cols::RV2_0, rv2);
+            table.set_dword_wl(row_idx, cols::ARG2_0, arg2);
 
-        // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
-        table.set_dword_wl(row_idx, cols::RV1_0, rv1);
-        table.set_dword_wl(row_idx, cols::RV2_0, rv2);
-        table.set_dword_wl(row_idx, cols::ARG2_0, arg2);
+            // res as DWordHL (4 × 16-bit halves).
+            table.set_dword_hl(row_idx, cols::RES_0, res);
 
-        // res as DWordHL (4 × 16-bit halves).
-        table.set_dword_hl(row_idx, cols::RES_0, res);
+            table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond());
 
-        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond());
+            // Inline-PC coordination columns.
+            let pc_double_read = !word && f.read_register1 && f.rs1 == 255;
+            let ts_lo = op.timestamp & 0xFFFF_FFFF;
+            let prev_pc_ts_borrow = !pc_double_read && ts_lo < 3;
+            table.set_bool(row_idx, cols::PC_DOUBLE_READ, pc_double_read);
+            table.set_bool(row_idx, cols::PREV_PC_TIMESTAMP_BORROW, prev_pc_ts_borrow);
+        }
 
-        // Inline-PC coordination columns.
-        let pc_double_read = !word && f.read_register1 && f.rs1 == 255;
-        let ts_lo = op.timestamp & 0xFFFF_FFFF;
-        let prev_pc_ts_borrow = !pc_double_read && ts_lo < 3;
-        table.set_bool(row_idx, cols::PC_DOUBLE_READ, pc_double_read);
-        table.set_bool(row_idx, cols::PREV_PC_TIMESTAMP_BORROW, prev_pc_ts_borrow);
-    }
-
-    // Padding rows: pc = next_pc = 1 (odd, unreachable), half_instruction_length = 0 so
-    // next_pc = pc + 0 = pc, all flags 0. The DECODE table has the matching padding
-    // entry at pc = 1. Per spec, padding rows participate in the inline-PC `memory`
-    // chain: each reads pc=1 at `timestamp - 3` and writes pc=1 at `timestamp + 1`,
-    // so their timestamps must continue the +4 cadence from the last real row (the
-    // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
-    // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
-    // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
-    let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
-    for row_idx in n..num_rows {
-        let j = (row_idx - n + 1) as u64;
-        table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
-        table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
-        table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
-    }
-
-    trace
+        // Padding rows: pc = next_pc = 1 (odd, unreachable), half_instruction_length = 0 so
+        // next_pc = pc + 0 = pc, all flags 0. The DECODE table has the matching padding
+        // entry at pc = 1. Per spec, padding rows participate in the inline-PC `memory`
+        // chain: each reads pc=1 at `timestamp - 3` and writes pc=1 at `timestamp + 1`,
+        // so their timestamps must continue the +4 cadence from the last real row (the
+        // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
+        // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
+        // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
+        let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
+        for row_idx in n..num_rows {
+            let j = (row_idx - n + 1) as u64;
+            table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
+            table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
+            table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
+        }
+    })
 }
 
 /// Generates the CPU trace table directly from executor logs.

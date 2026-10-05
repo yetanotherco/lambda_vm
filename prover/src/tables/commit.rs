@@ -50,6 +50,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
@@ -160,65 +161,69 @@ pub struct CommitOperation {
 pub fn generate_commit_trace(
     ops: &[CommitOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_commit_trace_as(ops, TraceForm::Wide)
+}
+
+/// The widths COMMIT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_commit_trace`] in `form` (`tables::gpack`).
+pub fn generate_commit_trace_as(
+    ops: &[CommitOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in ops.iter().enumerate() {
+            // Timestamp (DWordWL)
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
-    for (row_idx, op) in ops.iter().enumerate() {
-        // Timestamp (DWordWL)
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            // Index (BaseField)
+            table.set_u64(row_idx, cols::INDEX, op.index);
 
-        // Index (BaseField)
-        table.set_u64(row_idx, cols::INDEX, op.index);
+            // Address (DWordWL)
+            table.set_dword_wl(row_idx, cols::ADDRESS_0, op.address);
 
-        // Address (DWordWL)
-        table.set_dword_wl(row_idx, cols::ADDRESS_0, op.address);
+            // address_incr = address + 1 (DWordHL: 4 halfwords)
+            let address_incr = op.address.wrapping_add(1);
+            table.set_dword_hl(row_idx, cols::ADDRESS_INCR_0, address_incr);
 
-        // address_incr = address + 1 (DWordHL: 4 halfwords)
-        let address_incr = op.address.wrapping_add(1);
-        table.set_dword_hl(row_idx, cols::ADDRESS_INCR_0, address_incr);
+            // Count (DWordWL)
+            table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
 
-        // Count (DWordWL)
-        table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
+            // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
+            let count_decr = if op.count == 0 {
+                u64::MAX
+            } else {
+                op.count - 1
+            };
+            table.set_dword_hl(row_idx, cols::COUNT_DECR_0, count_decr);
 
-        // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
-        let count_decr = if op.count == 0 {
-            u64::MAX
-        } else {
-            op.count - 1
-        };
-        table.set_dword_hl(row_idx, cols::COUNT_DECR_0, count_decr);
+            // Control bits
+            table.set_bool(row_idx, cols::FIRST, op.first);
+            table.set_bool(row_idx, cols::END, op.end);
 
-        // Control bits
-        table.set_bool(row_idx, cols::FIRST, op.first);
-        table.set_bool(row_idx, cols::END, op.end);
+            // Value
+            table.set_byte(row_idx, cols::VALUE, op.value);
 
-        // Value
-        table.set_byte(row_idx, cols::VALUE, op.value);
+            // mu = 1 for all real rows (first, middle, and end rows)
+            table.set_fe(row_idx, cols::MU, FE::one());
+        }
 
-        // mu = 1 for all real rows (first, middle, and end rows)
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    // Padding rows: spec requires count=1 and address_incr=[1,0,0,0] so
-    // the unconditional ADD/SUB templates have valid carry values.
-    // count=1 → count_decr=0 (all halfwords zero), address=0 → address_incr=1.
-    for row_idx in n..num_rows {
-        // count = 1 (low word)
-        table.set_fe(row_idx, cols::COUNT_0, FE::one());
-        // address_incr halfword 0 = 1 (address=0, so address+1 = 1)
-        table.set_fe(row_idx, cols::ADDRESS_INCR_0, FE::one());
-        // All other fields remain zero: timestamp=0, address=0, count_1=0,
-        // count_decr=[0,0,0,0], first=0, end=0, value=0, mu=0,
-        // address_incr_1..3=0
-    }
-
-    trace
+        // Padding rows: spec requires count=1 and address_incr=[1,0,0,0] so
+        // the unconditional ADD/SUB templates have valid carry values.
+        // count=1 → count_decr=0 (all halfwords zero), address=0 → address_incr=1.
+        for row_idx in n..num_rows {
+            // count = 1 (low word)
+            table.set_fe(row_idx, cols::COUNT_0, FE::one());
+            // address_incr halfword 0 = 1 (address=0, so address+1 = 1)
+            table.set_fe(row_idx, cols::ADDRESS_INCR_0, FE::one());
+            // All other fields remain zero: timestamp=0, address=0, count_1=0,
+            // count_decr=[0,0,0,0], first=0, end=0, value=0, mu=0,
+            // address_incr_1..3=0
+        }
+    })
 }
 
 // =========================================================================

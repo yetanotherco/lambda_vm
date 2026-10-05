@@ -51,6 +51,7 @@ use super::dvrm::{self, DvrmOperation};
 use super::ecdas;
 use super::ecsm;
 use super::eq;
+use super::gpack::TraceForm;
 use super::halt;
 use super::hint;
 use super::keccak::{self, KeccakOperation};
@@ -3952,6 +3953,10 @@ pub struct StreamSkip {
     /// them after the build. `false` everywhere but the WHIR block's windowed
     /// finish.
     pub pack: bool,
+    /// With [`Self::pack`]: each generator that can writes its table packed as
+    /// it generates it, with no 64-bit copy (G-pack, [`super::gpack`]), instead
+    /// of building it at 8 bytes a cell and packing it. The bytes are the same.
+    pub gpack: bool,
     /// The streamed tables' op lists hold only the ops past their streamed
     /// chunks (a windowed build that drops each chunk's ops as it hands the
     /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and
@@ -4015,6 +4020,7 @@ pub(crate) fn keccak_rnd_chunks(
     rows: usize,
     streamed: usize,
     pack: bool,
+    form: TraceForm,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if ops.is_empty() {
         return Ok(Vec::new());
@@ -4028,7 +4034,7 @@ pub(crate) fn keccak_rnd_chunks(
         }
         return Ok(vec![packed_if(
             pack,
-            keccak_rnd::generate_keccak_rnd_trace(ops),
+            keccak_rnd::generate_keccak_rnd_rows_as(ops, 0, total, form),
         )]);
     }
     let chunks = total / rows;
@@ -4044,7 +4050,12 @@ pub(crate) fn keccak_rnd_chunks(
         let (first, end) = keccak_rnd_op_range(c, rows, ops.len());
         packed_if(
             pack,
-            keccak_rnd::generate_keccak_rnd_rows(&ops[first..end], c * rows - first * 24, rows),
+            keccak_rnd::generate_keccak_rnd_rows_as(
+                &ops[first..end],
+                c * rows - first * 24,
+                rows,
+                form,
+            ),
         )
     };
     // Packed, a few chunks at a time in parallel: each chunk's pack is serial,
@@ -5075,6 +5086,18 @@ fn build_traces<I: ImageSource + Sync>(
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
     let pack = skip.pack;
+    // A packing build writes each table packed as it generates it where the
+    // generator can (G-pack, `StreamSkip::gpack`); `packed_by` then finds it
+    // packed.
+    #[cfg(feature = "disk-spill")]
+    let gpack = pack && skip.gpack && storage_mode != StorageMode::Disk;
+    #[cfg(not(feature = "disk-spill"))]
+    let gpack = pack && skip.gpack;
+    let form = if gpack {
+        TraceForm::Narrow
+    } else {
+        TraceForm::Wide
+    };
     let gen_cpus = || {
         chunk_and_generate_skipping(
             cpu_ops_ref,
@@ -5082,7 +5105,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.cpu,
             skip.tails,
             false,
-            packed_by(pack, cpu::generate_cpu_trace),
+            packed_by(pack, |ops| cpu::generate_cpu_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5094,7 +5117,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw,
             skip.tails,
             true,
-            packed_by(pack, memw::generate_memw_trace),
+            packed_by(pack, |ops| memw::generate_memw_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5106,7 +5129,9 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw_aligned,
             skip.tails,
             true,
-            packed_by(pack, memw_aligned::generate_memw_aligned_trace),
+            packed_by(pack, |ops| {
+                memw_aligned::generate_memw_aligned_trace_as(ops, form)
+            }),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5120,7 +5145,9 @@ fn build_traces<I: ImageSource + Sync>(
             skip.memw_register,
             skip.tails,
             false,
-            packed_by(pack, memw_register::generate_memw_register_trace_from_rows),
+            packed_by(pack, |ops| {
+                memw_register::generate_memw_register_trace_from_rows_as(ops, form)
+            }),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5132,7 +5159,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.load,
             skip.tails,
             true,
-            packed_by(pack, load::generate_load_trace),
+            packed_by(pack, |ops| load::generate_load_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5144,7 +5171,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.lt,
             skip.tails,
             true,
-            packed_by(pack, lt::generate_lt_trace),
+            packed_by(pack, |ops| lt::generate_lt_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5156,7 +5183,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.shift,
             skip.tails,
             true,
-            packed_by(pack, shift::generate_shift_trace),
+            packed_by(pack, |ops| shift::generate_shift_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5165,7 +5192,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
-            packed_by(pack, mul::generate_mul_trace),
+            packed_by(pack, |ops| mul::generate_mul_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5174,7 +5201,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
-            packed_by(pack, dvrm::generate_dvrm_trace),
+            packed_by(pack, |ops| dvrm::generate_dvrm_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5183,7 +5210,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional(
             &branch_ops,
             max_rows.branch,
-            packed_by(pack, branch::generate_branch_trace),
+            packed_by(pack, |ops| branch::generate_branch_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5194,7 +5221,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
-            packed_by(pack, eq::generate_eq_trace),
+            packed_by(pack, |ops| eq::generate_eq_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5203,7 +5230,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
-            packed_by(pack, bytewise::generate_bytewise_trace),
+            packed_by(pack, |ops| bytewise::generate_bytewise_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5215,7 +5242,7 @@ fn build_traces<I: ImageSource + Sync>(
             skip.store,
             skip.tails,
             true,
-            packed_by(pack, store::generate_store_trace),
+            packed_by(pack, |ops| store::generate_store_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5224,7 +5251,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
-            packed_by(pack, cpu32::generate_cpu32_trace),
+            packed_by(pack, |ops| cpu32::generate_cpu32_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5248,7 +5275,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_commits = || {
         generate_optional(
             &commit_ops,
-            packed_by(pack, commit::generate_commit_trace),
+            packed_by(pack, |ops| commit::generate_commit_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -5279,7 +5306,13 @@ fn build_traces<I: ImageSource + Sync>(
                 storage_mode,
             );
         }
-        keccak_rnd_chunks(&keccak_rnd_ops, skip.keccak_rnd_rows, skip.keccak_rnd, pack)
+        keccak_rnd_chunks(
+            &keccak_rnd_ops,
+            skip.keccak_rnd_rows,
+            skip.keccak_rnd,
+            pack,
+            form,
+        )
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
     let gen_blake3 = || {
@@ -5344,7 +5377,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_hints = || {
         generate_optional(
             &hint_ops,
-            packed_by(pack, hint::generate_hint_trace),
+            packed_by(pack, |ops| hint::generate_hint_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
