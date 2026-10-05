@@ -7,6 +7,9 @@
 //! (`stark::regen`) — and the resident regenerable instances are dropped back,
 //! in rank order, until the host is under the target (R-REGEN R6: counted in
 //! dropped bytes, since the host's reading cannot fall before the purge).
+//! With no disk (the spill policy `off`, I-REGEN §14 P1) the policy decides
+//! with no store: once armed, drop-back takes every resident regenerable
+//! instance, every later one is dropped, and the rest stays on the host.
 //! The drops are made on a thread of their own, never under the committers'
 //! lock (R7). Phase B's regenerator ([`run_live`]) rebuilds the dropped
 //! instances in rank order and deposits each into its slot, which paces it

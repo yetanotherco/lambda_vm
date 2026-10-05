@@ -892,7 +892,10 @@ impl StreamConfig {
 /// no proof byte depends on the policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SpillPolicy {
-    /// Keep every trace.
+    /// Keep every trace, and write none to disk. With live `auto`
+    /// regeneration (`LAMBDA_VM_BLOCK_REGEN=auto`) `auto` still decides, with
+    /// no store, and once armed drops every regenerable instance (no disk,
+    /// [`Spill::for_block`]).
     Off,
     /// Spill every committed instance that is packed (a measurement arm).
     Always,
@@ -905,7 +908,8 @@ pub(crate) enum SpillPolicy {
 }
 
 /// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
-/// resident budget for committed packed traces). Anything else is `off`.
+/// resident budget for committed packed traces). Anything else is `off`, so
+/// with `LAMBDA_VM_BLOCK_REGEN=auto` a typo is no disk too (its line says so).
 fn spill_policy() -> SpillPolicy {
     parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
 }
@@ -1277,7 +1281,8 @@ impl Spill {
     /// `droppable` — dropped. The first decision to move an instance off the
     /// host arms live regeneration (`auto`): its reserve counts from then on,
     /// and the resident regenerable instances are dropped back until the
-    /// bytes they free reach `host + reserve − (target − 2 GiB)` (R-REGEN R6).
+    /// bytes they free reach `host + reserve − (target − 2 GiB)` (R-REGEN R6)
+    /// — all of them with no disk, which drops every later one too.
     fn consider(
         &self,
         trace: &mut finish_sink::Trace,
