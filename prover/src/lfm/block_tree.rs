@@ -2146,10 +2146,12 @@ mod tests {
     }
 
     /// The posture line names every posture knob, in the table's order, then
-    /// the memory knobs.
+    /// the memory knobs and the default that chose them. It prints the line,
+    /// for a box to read what the device probe chose.
     #[test]
     fn the_posture_line_names_every_knob() {
         let line = posture_line();
+        println!("{line}");
         assert!(line.starts_with("BLOCK POSTURE: "));
         assert!(line.contains(" · memory: spill "), "{line}");
         // Both memory knobs unset: the line says which default chose them;
