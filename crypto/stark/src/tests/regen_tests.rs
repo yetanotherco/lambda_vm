@@ -280,7 +280,7 @@ fn a_wrong_regenerated_trace_without_the_digest_is_never_accepted() {
 }
 
 /// ★ On the card, the digest off: a regenerated trace one bit off is refused
-/// by the kept-top check (or rejected by the verifier), never accepted.
+/// by the kept-top check — the layer behind the digest — never proved.
 #[cfg(feature = "cuda")]
 #[test_log::test]
 #[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
@@ -292,8 +292,16 @@ fn a_wrong_regenerated_trace_without_the_digest_is_refused_on_the_card() {
             all,
             Regenerator::BentNoDigest(table),
         ) {
-            Err(ProvingError::RecomputedCommitmentMismatch(_)) => {}
-            Ok(proof) => assert!(!verifies(&proof), "table {table}: accepted"),
+            Err(ProvingError::RecomputedCommitmentMismatch(msg)) => {
+                assert!(
+                    msg.contains("does not match the kept tree"),
+                    "table {table}: {msg}"
+                )
+            }
+            Ok(proof) => panic!(
+                "table {table}: a bent trace was proved (verifies: {})",
+                verifies(&proof)
+            ),
             Err(e) => panic!("table {table}: unexpected refusal {e:?}"),
         }
     }

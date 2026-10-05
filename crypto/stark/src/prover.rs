@@ -2479,7 +2479,7 @@ mod regen_ready_tests {
     #[test]
     fn the_dropped_tables_go_last_in_their_regenerators_order() {
         let order = vec![4, 0, 3, 1, 2];
-        assert_eq!(regenerated_last(order.clone(), |_| None), order);
+        assert_eq!(regenerated_last(order.clone(), |_| None::<u64>), order);
         let rank = |i: usize| match i {
             0 => Some(9),
             3 => Some(2),
@@ -2487,6 +2487,13 @@ mod regen_ready_tests {
             _ => None,
         };
         assert_eq!(regenerated_last(order, rank), vec![4, 2, 3, 1, 0]);
+        // Equal ranks go in the window's (rank, id) order, not the walk's.
+        let key = |i: usize| match i {
+            0 => Some((1u64, 7usize)),
+            3 => Some((1, 2)),
+            _ => None,
+        };
+        assert_eq!(regenerated_last(vec![0, 3, 1], key), vec![1, 3, 0]);
     }
 
     /// No dropped trace: no regeneration readiness, so the fused phase is
@@ -3766,10 +3773,11 @@ fn heaviest_first(weights: &[u64]) -> Vec<usize> {
 }
 
 /// `order` with the tables whose traces are dropped ([`crate::regen`]) moved
-/// to its end, by `rank`: phase B proves them in the order their regenerator
-/// deposits them (D-REGEN §2.3), after every other table, which keeps its
-/// place. No dropped table: `order` itself.
-fn regenerated_last(order: Vec<usize>, rank: impl Fn(usize) -> Option<u64>) -> Vec<usize> {
+/// to its end, by `rank` (their slots' (rank, id), the window's own order):
+/// phase B proves them in the order their regenerator deposits them and
+/// their window reserves in (D-REGEN §2.3), after every other table, which
+/// keeps its place. No dropped table: `order` itself.
+fn regenerated_last<K: Ord>(order: Vec<usize>, rank: impl Fn(usize) -> Option<K>) -> Vec<usize> {
     let (mut dropped, rest): (Vec<usize>, Vec<usize>) =
         order.into_iter().partition(|&i| rank(i).is_some());
     if dropped.is_empty() {
@@ -7798,7 +7806,10 @@ pub trait IsStarkProver<
             .collect();
         // A dropped trace's table goes last, in its regenerator's order.
         let peak_order = regenerated_last(heaviest_first(&peak_walk_weights), |idx| {
-            air_trace_pairs[idx].1.regen_main().map(|slot| slot.rank())
+            air_trace_pairs[idx]
+                .1
+                .regen_main()
+                .map(|slot| slot.order_key())
         });
 
         // Spilled traces (`TraceTable::spill_main`) come back from the disk
