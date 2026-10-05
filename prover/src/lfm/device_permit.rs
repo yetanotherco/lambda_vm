@@ -428,6 +428,9 @@ pub struct CardPermit {
     guard: Option<std::sync::MutexGuard<'static, ()>>,
     /// Under the shared gate, a `multi_prove`'s place among [`shared_proves`].
     _slot: Option<ProveSlot>,
+    /// Under the armed shared gate, an exclusive hold's whole gate: its device
+    /// work keeps no account there, so nothing admitted may run beside it.
+    _whole: Option<stark::prover::SharedVramPermit>,
     since: Instant,
     /// ⛔ ROUND-3 TREE PROBE ONLY, `None` unless `LAMBDA_VM_TREE_BUSY_PROBE` is
     /// set: which device phase this hold is, and the nanoseconds its holder
@@ -493,18 +496,21 @@ pub fn hold() -> CardPermit {
     hold_labeled("card")
 }
 
-/// [`hold`] with the device phase named, for the trace line. The name is the
-/// only thing that tells an artifact commit's window from a `multi_prove`'s in
-/// a log where both are just holds.
-pub fn hold_labeled(phase: &'static str) -> CardPermit {
+/// [`hold_labeled`] for a device phase whose device work admits its bytes
+/// through the shared VRAM gate when it is armed: a STARK `multi_prove`
+/// (`proof.rs`) and a STARK artifact build (`program_census.rs`). Under the
+/// armed gate it takes no card (a `multi_prove` takes one of the
+/// [`shared_proves`] places); otherwise it is [`hold_labeled`]. Every other
+/// device phase (a W-LFM build or prove, on the device's own reservation
+/// ledger) keeps [`hold_labeled`], which under the armed gate also takes the
+/// whole gate (i-sched2's review).
+pub fn hold_gated(phase: &'static str) -> CardPermit {
     let traced = trace_enabled();
-    // One `OnceLock` read per hold — tens of them in a whole block run, never in
-    // a loop. Off, this is the only thing the probe costs anywhere.
     let probed = super::tree_probe::enabled();
     // Under the armed shared gate the bytes are the exclusion (see the module
     // doc): no card to take, a `multi_prove` takes a proof place, and the window
-    // is still traced. The place is a blocking wait, so never on a rayon worker
-    // (the rule below), and a deferred prove waits for its latch first.
+    // is still traced. The place is a blocking wait, so never on a rayon worker,
+    // and a deferred prove waits for its latch first.
     if stark::prover::shared_vram_gate_on() {
         #[cfg(feature = "parallel")]
         assert!(
@@ -519,6 +525,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         return CardPermit {
             guard: None,
             _slot: slot,
+            _whole: None,
             since: Instant::now(),
             probe: probed.then_some((phase, waited.as_nanos() as u64)),
             trace: traced.then(|| {
@@ -536,10 +543,22 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
             },
         };
     }
+    hold_labeled(phase)
+}
+
+/// [`hold`] with the device phase named, for the trace line. The name is the
+/// only thing that tells an artifact commit's window from a `multi_prove`'s in
+/// a log where both are just holds.
+pub fn hold_labeled(phase: &'static str) -> CardPermit {
+    let traced = trace_enabled();
+    // One `OnceLock` read per hold — tens of them in a whole block run, never in
+    // a loop. Off, this is the only thing the probe costs anywhere.
+    let probed = super::tree_probe::enabled();
     if workers() <= 1 && !traced && !probed {
         return CardPermit {
             guard: None,
             _slot: None,
+            _whole: None,
             since: Instant::now(),
             probe: None,
             trace: None,
@@ -555,6 +574,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         return CardPermit {
             guard: None,
             _slot: None,
+            _whole: None,
             since: Instant::now(),
             probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
@@ -606,9 +626,14 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
          artifact commit's admission is a per-dispatch bound with no running \
          total, and each `multi_prove` builds its own full-budget VramGate"
     );
+    // Under the armed shared gate this hold's device work keeps no account in
+    // it, so it takes the whole gate as well: it waits for every admitted byte
+    // to leave, and nothing is admitted beside it.
+    let whole = stark::prover::shared_vram_admit_whole();
     CardPermit {
         guard: Some(guard),
         _slot: None,
+        _whole: whole,
         since: Instant::now(),
         // ⚠ The SAME `waited` the trace line and `WAITED_NANOS` carry, not a
         // second reading of the clock — three accountings of one wait that
@@ -649,11 +674,11 @@ mod tests {
         stark::prover::pin_shared_vram_gate(Some(true));
         arm(4);
         {
-            let _a = hold_labeled("multi_prove");
-            let _b = hold_labeled("build_artifacts");
+            let _a = hold_gated("multi_prove");
+            let _b = hold_gated("build_artifacts");
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    let _c = hold_labeled("multi_prove");
+                    let _c = hold_gated("multi_prove");
                 });
             });
         }
@@ -680,7 +705,7 @@ mod tests {
             .map(|_| {
                 let (rx, taken) = (release_rx.clone(), taken_tx.clone());
                 std::thread::spawn(move || {
-                    let _p = hold_labeled("multi_prove");
+                    let _p = hold_gated("multi_prove");
                     taken.send(()).expect("the test is listening");
                     let _ = rx.lock().expect("never poisoned").recv();
                 })
@@ -691,10 +716,10 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("a place is free");
         }
-        let _artifacts = hold_labeled("build_artifacts");
+        let _artifacts = hold_gated("build_artifacts");
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let _p = hold_labeled("multi_prove");
+            let _p = hold_gated("multi_prove");
             tx.send(()).expect("the test is listening");
         });
         assert!(
@@ -710,6 +735,36 @@ mod tests {
         for h in holders {
             h.join().expect("a holder finishes");
         }
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+    }
+
+    /// ★ UNDER THE ARMED SHARED GATE A HOLD THAT KEEPS NO ACCOUNT IN IT (a
+    /// W-LFM phase, through `hold_labeled`) IS EXCLUSIVE AGAINST EVERY ADMITTED
+    /// BYTE: it waits until a gated prove's bytes leave the gate, and holds the
+    /// gate whole until it drops.
+    #[test]
+    fn under_the_shared_gate_an_ungated_hold_takes_the_whole_gate() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        arm(4);
+        // A gated prove's tables hold bytes in the gate.
+        let prove_bytes = stark::prover::shared_vram_admit(5).expect("the gate is on");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wlfm = std::thread::spawn(move || {
+            let _card = hold_labeled("multi_prove");
+            tx.send(()).expect("the test is listening");
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an ungated hold entered beside admitted bytes"
+        );
+        drop(prove_bytes);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("it enters once the bytes leave");
+        wlfm.join().expect("the ungated holder finishes");
         stark::prover::pin_shared_vram_gate(None);
         disarm(&g);
     }

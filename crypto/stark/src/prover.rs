@@ -1074,6 +1074,11 @@ impl VramGate {
     /// Claim (`held`, `headroom`) for a prove that will carry resident bytes,
     /// waiting until it fits beside the claims in force ([`ClaimBook::fits`]).
     fn claim(&self, held: u64, headroom: u64) -> ResidentClaim<'_> {
+        #[cfg(feature = "parallel")]
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "a VRAM claim blocks on a rayon worker: claim from a plain thread"
+        );
         let mut claims = self.claims.lock().unwrap();
         while !claims.fits(held, headroom, self.budget.load(Ordering::Relaxed)) {
             claims = self.claim_room.wait(claims).unwrap();
@@ -1101,6 +1106,14 @@ impl VramGate {
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
+        // ⛔ Never on a rayon worker: a worker parked here could be the one a
+        // table's own parallel work (beneath it on this stack, or queued
+        // behind it) needs to finish and free the very bytes it waits for.
+        #[cfg(feature = "parallel")]
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "a VRAM admission blocks on a rayon worker: admit from a plain thread"
+        );
         let mut used = self.used.lock().unwrap();
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
@@ -1109,6 +1122,26 @@ impl VramGate {
                 return VramPermit { gate: self, bytes };
             }
             used = self.freed.wait(used).unwrap();
+        }
+    }
+
+    /// The whole gate: wait until nothing is admitted, then hold every byte of
+    /// it (whatever the budget, even an unbounded one) until the permit drops.
+    fn acquire_whole(&self) -> VramPermit<'_> {
+        #[cfg(feature = "parallel")]
+        assert!(
+            rayon::current_thread_index().is_none(),
+            "a VRAM admission blocks on a rayon worker: admit from a plain thread"
+        );
+        let mut used = self.used.lock().unwrap();
+        while *used != 0 {
+            used = self.freed.wait(used).unwrap();
+        }
+        *used = u64::MAX;
+        self.trace_used(*used);
+        VramPermit {
+            gate: self,
+            bytes: u64::MAX,
         }
     }
 
@@ -1393,14 +1426,33 @@ pub struct SharedVramPermit {
 }
 
 /// Take `bytes` from the shared gate for device work done outside
-/// [`IsStarkProver::multi_prove`] (an artifact commit), waiting until they fit
-/// beside what the proofs in flight hold. `None` when the shared gate is off or
-/// unarmed: the caller then keeps its own exclusion.
+/// [`IsStarkProver::multi_prove`] (an artifact build's window of commits),
+/// waiting until they fit beside what the proofs in flight hold. `None` when
+/// the shared gate is off or unarmed: the caller then keeps its own exclusion.
+///
+/// From a plain thread only (the build's, before its parallel walk): the
+/// admission blocks, and it refuses a rayon worker.
 pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
     shared_vram_gate_on().then(|| SharedVramPermit {
         _permit: shared_vram_gate(device_vram_budget()).acquire(bytes),
     })
 }
+
+/// The WHOLE shared gate, for device work that keeps no account in it (a
+/// W-LFM build or prove, on the device's own reservation ledger): admitted only
+/// once nothing else holds bytes, and nothing else is admitted until it drops.
+/// `None` when the shared gate is off or unarmed.
+pub fn shared_vram_admit_whole() -> Option<SharedVramPermit> {
+    shared_vram_gate_on().then(|| SharedVramPermit {
+        _permit: shared_vram_gate(device_vram_budget()).acquire_whole(),
+    })
+}
+
+/// Test-only: serialises the tests that pin the shared gate
+/// ([`pin_shared_vram_gate`]); the pin is process-wide, so under `cargo
+/// test`'s threads one test's pin would otherwise reach another's prove.
+#[cfg(test)]
+pub(crate) static SHARED_GATE_PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for VramPermit<'_> {
     fn drop(&mut self) {
@@ -6514,6 +6566,9 @@ mod shared_vram_gate_tests {
     /// dropped.
     #[test]
     fn the_shared_admission_holds_bytes_only_when_the_gate_is_on() {
+        let _serial = super::SHARED_GATE_PIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pin_shared_vram_gate(Some(false));
         assert!(shared_vram_admit(7).is_none(), "off: no admission");
         pin_shared_vram_gate(Some(true));
@@ -6524,6 +6579,54 @@ mod shared_vram_gate_tests {
             assert_eq!(*gate.used.lock().unwrap(), before + 7, "the bytes are held");
         }
         assert_eq!(*gate.used.lock().unwrap(), before, "and released on drop");
+        pin_shared_vram_gate(None);
+    }
+
+    /// ★ The admission refuses a rayon worker: a blocking wait there can starve
+    /// the parallel work that would free the bytes it waits for.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn the_shared_admission_refuses_a_rayon_worker() {
+        let _serial = super::SHARED_GATE_PIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pin_shared_vram_gate(Some(true));
+        let on_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool")
+            .install(|| std::panic::catch_unwind(|| shared_vram_admit(1).is_some()));
+        pin_shared_vram_gate(None);
+        assert!(
+            on_worker.is_err(),
+            "an admission on a rayon worker must panic"
+        );
+    }
+
+    /// The whole gate waits for every admitted byte to leave, and holds every
+    /// other admission off until it drops.
+    #[test]
+    fn the_whole_gate_excludes_every_admission() {
+        let _serial = super::SHARED_GATE_PIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pin_shared_vram_gate(Some(true));
+        let held = shared_vram_admit(3).expect("on: an admission");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let whole = std::thread::spawn(move || {
+            let w = super::shared_vram_admit_whole().expect("on");
+            tx.send(()).expect("the test listens");
+            drop(w);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the whole gate entered beside admitted bytes"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the whole gate enters once they leave");
+        whole.join().expect("the whole holder finishes");
         pin_shared_vram_gate(None);
     }
 
