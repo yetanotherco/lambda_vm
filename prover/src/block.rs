@@ -30,8 +30,8 @@ use crate::tables::MaxRowsConfig;
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    ChunkJob, DecodeArtifacts, StreamSkip, StreamedChunk, Traces, WindowedTraceBuilder,
-    build_initial_image,
+    ChunkJob, DecodeArtifacts, StreamSkip, StreamTable, StreamedChunk, Traces,
+    WindowedTraceBuilder, build_initial_image,
 };
 use crate::{AcceleratorShape, Commitment, Error, ProofOptions, VmAirs, VmProof};
 
@@ -314,6 +314,12 @@ fn prove_block_with_observed(
             ledger.line(&format!("finish {label}"))
         })));
     }
+    // Regeneration's shadow (`LAMBDA_VM_BLOCK_REGEN`): phase A records each
+    // streamed instance's recipe for phase B to rebuild beside the prove.
+    let recorder = crate::block_regen::shadow_recorder(
+        crate::block_regen::regen_mode()?,
+        stream_phase_a() && !stream_by_push() && narrow_streamed(),
+    );
     // A new block: no memory pressure seen yet (`alloc_purge`'s `auto`).
     crate::alloc_purge::clear_memory_pressure();
     // The spill outlives the prove: phase B reads the spilled traces back.
@@ -331,6 +337,7 @@ fn prove_block_with_observed(
             &StreamConfig::from_env(),
             ledger.as_deref(),
             spill.as_ref(),
+            recorder.as_ref(),
         )?
     } else {
         let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
@@ -343,28 +350,65 @@ fn prove_block_with_observed(
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
-    if crate::block_regen::probe() {
-        eprintln!(
-            "{}",
-            crate::block_regen::TraceClasses::of(&traces, &streamed).line()
-        );
+    let classes = (crate::block_regen::probe() || recorder.is_some())
+        .then(|| crate::block_regen::TraceClasses::of(&traces, &streamed));
+    if let Some(classes) = classes.filter(|_| crate::block_regen::probe()) {
+        eprintln!("{}", classes.line());
     }
     // Phase A's freed pages (the finish's lists, spilled traces) back to the OS
     // before phase B allocates: under memory pressure by default, or as
     // `LAMBDA_VM_ALLOC_PURGE` names it.
     crate::alloc_purge::purge_point("phase-a");
 
-    let proof = prove_block_traces(
-        elf_bytes,
-        &program,
-        &mut traces,
-        opts,
-        Some(decode_commitment),
-        residency,
-        precommits,
-        &mut times,
-        on_shape,
-    )?;
+    let recipes = recorder.map(crate::block_regen::Recorder::finish);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let prove_called = Instant::now();
+    let (proof, shadow) = std::thread::scope(|s| {
+        let shadow = recipes.as_ref().map(|(recipes, _)| {
+            crate::block_regen::spawn_shadow(s, &program, private_input, max_rows, recipes, &stop)
+        });
+        let proof = prove_block_traces(
+            elf_bytes,
+            &program,
+            &mut traces,
+            opts,
+            Some(decode_commitment),
+            residency,
+            precommits,
+            &mut times,
+            on_shape,
+        );
+        if proof.is_err() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let waited = Instant::now();
+        let report = shadow.map(crate::block_regen::ShadowHandle::join);
+        if report.is_some() {
+            eprintln!(
+                "BLOCK REGEN shadow joined {:.2} s after the prove",
+                waited.elapsed().as_secs_f64()
+            );
+        }
+        (proof, report)
+    });
+    if let (Some(report), Some((recipes, stray)), Some(classes)) = (&shadow, &recipes, &classes) {
+        // When the prove started, on the regenerator's clock.
+        let called = if prove_called >= report.started {
+            prove_called.duration_since(report.started).as_secs_f64()
+        } else {
+            -report.started.duration_since(prove_called).as_secs_f64()
+        };
+        crate::block_regen::report_shadow(
+            report,
+            recipes,
+            *stray,
+            classes.streamed.cells,
+            classes.total().cells,
+            times.prove,
+            called + times.setup,
+        );
+    }
+    let proof = proof?;
     if let Some(ledger) = &ledger {
         ledger.line("prove end");
     }
@@ -1525,6 +1569,16 @@ fn streamed_bytes(streamed: &Streamed) -> usize {
     }
 }
 
+/// Which streamed chunk `streamed` is, if it is one (regeneration's
+/// recorder keys its recipes by it).
+fn streamed_key(streamed: &Streamed) -> Option<(StreamTable, usize)> {
+    match streamed {
+        Streamed::Job(job) => Some((job.table, job.index)),
+        Streamed::Chunk(chunk) => Some((chunk.table, chunk.index)),
+        Streamed::Finished(_) => None,
+    }
+}
+
 /// A main trace's bytes as held: packed, or 64-bit.
 fn held_bytes(trace: &finish_sink::Trace) -> usize {
     trace
@@ -1612,6 +1666,7 @@ fn build_streamed(
     stream: &StreamConfig,
     ledger: Option<&MemLedger>,
     spill: Option<&Spill>,
+    recorder: Option<&crate::block_regen::Recorder>,
 ) -> Result<Produced, Error> {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering::Relaxed;
@@ -1720,6 +1775,7 @@ fn build_streamed(
                     if let Some(ledger) = ledger {
                         ledger.take(job_bytes);
                     }
+                    let key = recorder.and(streamed_key(&job));
                     let t = Instant::now();
                     // A table the finish handed off is built already, and it
                     // never took room in the ops queue.
@@ -1747,6 +1803,13 @@ fn build_streamed(
                     {
                         narrowed.lock().unwrap_or_else(|e| e.into_inner()).2 +=
                             tp.elapsed().as_secs_f64();
+                    }
+                    // Regeneration's shadow: the packed trace's digest, taken
+                    // where it was packed.
+                    if let (Some(recorder), Some((stream, index)), Some(packed)) =
+                        (recorder, key, table.trace.narrow_main())
+                    {
+                        recorder.packed(stream, index, packed);
                     }
                     let held = held_bytes(&table.trace);
                     if let Some(ledger) = ledger {
@@ -1777,7 +1840,9 @@ fn build_streamed(
                         loop {
                             // `t`: from the chunk's arrival (its generation
                             // included when this committer generates it).
-                            let (mut chunk, wide, held, finished, t) = if generators > 0 {
+                            // `key`: a streamed chunk this committer packs
+                            // itself, for regeneration's recorder.
+                            let (mut chunk, wide, held, finished, t, key) = if generators > 0 {
                                 let next =
                                     ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                                 let Ok(ToCommit {
@@ -1794,7 +1859,7 @@ fn build_streamed(
                                     ledger.take_ready(held);
                                 }
                                 let wide = wide_bytes(&table.trace);
-                                (table, wide, held, finished, t)
+                                (table, wide, held, finished, t, None)
                             } else {
                                 let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                                 let Ok(job) = job else {
@@ -1805,6 +1870,7 @@ fn build_streamed(
                                 if let Some(ledger) = ledger {
                                     ledger.take(job_bytes);
                                 }
+                                let key = recorder.and(streamed_key(&job));
                                 let (table, finished) = match job {
                                     Streamed::Job(job) => {
                                         (FinishedTable::from(job.generate()), false)
@@ -1824,7 +1890,7 @@ fn build_streamed(
                                         t.elapsed().as_secs_f64();
                                     wide
                                 };
-                                (table, wide, held, finished, t)
+                                (table, wide, held, finished, t, key)
                             };
                             let air = finish_sink::air_for(chunk.kind, chunk.index, opts);
                             let name = air.name().to_string();
@@ -1883,6 +1949,11 @@ fn build_streamed(
                                         n.2 += tp.elapsed().as_secs_f64();
                                     }
                                 }
+                            }
+                            if let (Some(recorder), Some((stream, index)), Some(packed)) =
+                                (recorder, key, chunk.trace.narrow_main())
+                            {
+                                recorder.packed(stream, index, packed);
                             }
                             let packed = chunk.trace.narrow_main().map(|t| t.data().len());
                             let spilled = spill.map_or(0, |spill| spill.consider(&mut chunk.trace));
@@ -1996,7 +2067,15 @@ fn build_streamed(
                         if let Some(ledger) = ledger {
                             ledger.walked_bytes.fetch_sub(walked.heap_bytes(), Relaxed);
                         }
-                        for job in accumulator.absorb(walked) {
+                        let jobs = match recorder {
+                            Some(recorder) => {
+                                let (jobs, added) = accumulator.absorb_counted(walked);
+                                recorder.window(added, &jobs);
+                                jobs
+                            }
+                            None => accumulator.absorb(walked),
+                        };
+                        for job in jobs {
                             let job = Streamed::Job(job);
                             let bytes = streamed_bytes(&job);
                             queue.admit(bytes);
@@ -2439,6 +2518,7 @@ pub(crate) fn stream_spill_for_test(
         &stream,
         ledger.as_ref(),
         spill.as_ref(),
+        None,
     )?;
     let report = spill.as_ref().map(Spill::report).unwrap_or_default();
     if let Some(ledger) = &ledger {
@@ -2488,8 +2568,37 @@ pub(crate) fn stream_skip_for_test(
         &stream_config(2, 3, true),
         None,
         None,
+        None,
     )?;
     Ok((traces, streamed))
+}
+
+/// Phase A's stream of `program` (no input) under `stream` with
+/// regeneration's recorder on: the traces, how many chunks of each streamed
+/// table the stream handed out, the recipes in hand-out order and the stray
+/// digests.
+#[cfg(test)]
+pub(crate) fn stream_recorded_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    stream: StreamConfig,
+) -> Result<(Traces, StreamSkip, Vec<crate::block_regen::Recipe>, usize), Error> {
+    let recorder = crate::block_regen::Recorder::new();
+    let (traces, _, _, streamed) = build_streamed(
+        program,
+        &[],
+        opts,
+        max_rows,
+        ResidencyMode::RecomputeLdeDevice,
+        &mut BlockTimes::default(),
+        &stream,
+        None,
+        None,
+        Some(&recorder),
+    )?;
+    let (recipes, stray) = recorder.finish();
+    Ok((traces, streamed, recipes, stray))
 }
 
 /// The stream's configuration for a test: `committers` / `generators`, the
