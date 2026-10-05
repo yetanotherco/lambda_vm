@@ -51,13 +51,31 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked.
 // `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc, but
 // it carries its own copy of this block and reads its own process — it pins the
-// pattern, not this export. Deleting the lines below turns nothing red.
+// pattern. This binary's own unit tests read this export back
+// (`the_binary_runs_its_never_purge_posture`): deleting the lines below turns
+// that test red.
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: Option<&'static core::ffi::c_char> =
     Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
+/// This binary's jemalloc: the never-purge posture it runs, read back for the
+/// `BLOCK POSTURE SET` line and its test.
+mod allocator {
+    /// The running `opt.dirty_decay_ms` and `opt.muzzy_decay_ms`: `-1` is the
+    /// never-purge posture this binary compiles in.
+    pub fn decay_ms() -> Option<(isize, isize)> {
+        // SAFETY: both names are NUL-terminated `ssize_t` options.
+        unsafe {
+            Some((
+                tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0").ok()?,
+                tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0").ok()?,
+            ))
+        }
+    }
+}
 
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
@@ -279,6 +297,51 @@ enum Commands {
         whir: bool,
     },
 
+    /// Prove a whole block as a recursion tree, base to top node
+    ///
+    /// The block's no-epoch WHIR base proof, the leaves that verify its
+    /// groups, the nodes and the top: one proof a consumer verifies with
+    /// `verify-block` against the ELF. Needs a `--features cuda` build. The
+    /// production posture (table parallelism, the WHIR hash, retention, the
+    /// grind's search, ...) is set for every knob the environment leaves unset;
+    /// the `BLOCK POSTURE` lines on stderr say which.
+    ProveBlock {
+        /// Path to the guest ELF
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// The block's private input (the guest reads it with `get_private_input()`)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        input: Option<PathBuf>,
+
+        /// Output path for the block proof
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        output: PathBuf,
+
+        /// Print the whole run's wall (base to top node)
+        #[arg(long)]
+        time: bool,
+
+        /// Print the blake3 digest of the top proof's bytes
+        #[arg(long)]
+        digest: bool,
+    },
+
+    /// Verify a block proof produced by `prove-block`
+    VerifyBlock {
+        /// Path to the block proof
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        proof: PathBuf,
+
+        /// Path to the guest ELF the block ran (trusted)
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Print verification time
+        #[arg(long)]
+        time: bool,
+    },
+
     /// Count main-trace and aux-trace field elements without proving
     CountElements {
         /// Path to the ELF file
@@ -294,6 +357,16 @@ enum Commands {
 fn main() -> ExitCode {
     env_logger::init();
     let cli = Cli::parse();
+    // Still single-threaded here: clap and env_logger spawn nothing.
+    if matches!(
+        cli.command,
+        Commands::ProveBlock { .. } | Commands::VerifyBlock { .. }
+    ) {
+        // SAFETY: no thread but this one exists yet.
+        for line in unsafe { apply_posture() } {
+            eprintln!("{line}");
+        }
+    }
 
     match cli.command {
         Commands::Execute {
@@ -359,7 +432,207 @@ fn main() -> ExitCode {
                 cmd_verify(proof, elf, blowup, time)
             }
         }
+        Commands::ProveBlock {
+            elf,
+            input,
+            output,
+            time,
+            digest,
+        } => cmd_prove_block(elf, input, output, time, digest),
+        Commands::VerifyBlock { proof, elf, time } => cmd_verify_block(proof, elf, time),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+    }
+}
+
+/// What the posture does in an environment: the knobs it sets (each posture
+/// knob the environment leaves unset) and the ones the environment already
+/// sets.
+struct PosturePlan {
+    set: Vec<(&'static str, &'static str)>,
+    env: Vec<String>,
+}
+
+fn posture_plan(env: impl Fn(&str) -> Option<String>) -> PosturePlan {
+    let mut plan = PosturePlan {
+        set: Vec::new(),
+        env: Vec::new(),
+    };
+    for &(name, value) in prover::lfm::whir_block_tree::POSTURE {
+        match env(name) {
+            Some(v) => plan.env.push(format!("{name}={v}")),
+            None => plan.set.push((name, value)),
+        }
+    }
+    plan
+}
+
+/// The block's production posture ([`prover::lfm::whir_block_tree::POSTURE`]),
+/// set for every knob the environment leaves unset ([`posture_plan`]). The
+/// WHIR hash among them is a format knob, so `verify-block` sets it too.
+/// Returns the lines that say what it set and what it left.
+///
+/// # Safety
+///
+/// Sets environment variables: no other thread may exist.
+unsafe fn apply_posture() -> Vec<String> {
+    let plan = posture_plan(|name| std::env::var(name).ok());
+    for (name, value) in &plan.set {
+        // SAFETY: the caller's: no other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+    let decay = match allocator::decay_ms() {
+        Some((-1, -1)) => "never purge (dirty -1, muzzy -1)".to_string(),
+        Some((d, m)) => format!("dirty_decay_ms {d}, muzzy_decay_ms {m} (_RJEM_MALLOC_CONF)"),
+        None => "unread".to_string(),
+    };
+    let words = |w: Vec<String>| {
+        if w.is_empty() {
+            "none".to_string()
+        } else {
+            w.join(" ")
+        }
+    };
+    vec![format!(
+        "BLOCK POSTURE SET: {} · from the environment: {} · jemalloc: {decay}",
+        words(plan.set.iter().map(|(n, v)| format!("{n}={v}")).collect()),
+        words(plan.env),
+    )]
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn cmd_prove_block(
+    elf_path: PathBuf,
+    input_path: Option<PathBuf>,
+    output_path: PathBuf,
+    time: bool,
+    digest: bool,
+) -> ExitCode {
+    use prover::lfm::whir_block_tree::{
+        StderrSink, WhirBlockTreeProof, WhirTreeConfig, prove_whir_block_tree,
+    };
+
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match read_private_input(input_path.as_ref()) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = match WhirTreeConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A forced leaf count, another fan-in or another argue is another tree than
+    // the one `verify-block` derives: harness arms, not a production proof.
+    if !cfg.at_presets() {
+        eprintln!(
+            "W3_LEAVES, W3_FAN_IN and BLOCK_WHIR_ARGUE make another tree than the block \
+             verifier derives: unset them to prove a block the CLI can verify"
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut run = match prove_whir_block_tree(&elf_data, &input, &cfg, &StderrSink) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("Block proof failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let whole = run.times.whole;
+    let Some((_, top)) = run.proofs.pop() else {
+        eprintln!("Block proof failed: the tree has no top");
+        return ExitCode::FAILURE;
+    };
+    let top_digest = digest.then(|| match rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof) {
+        Ok(bytes) => format!(
+            "BLOCK TOP DIGEST: {} (blake3 of the top proof's {} bytes)",
+            &blake3::hash(&bytes).to_hex()[..32],
+            bytes.len()
+        ),
+        Err(e) => format!("BLOCK TOP DIGEST: none ({e})"),
+    });
+    let output_hex = hex(&run.statement.public_output);
+    let file = WhirBlockTreeProof::new(run.statement, top);
+    let bytes = match file.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to serialize the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(&output_path, &bytes) {
+        eprintln!("Failed to write {output_path:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "Block proof written to {output_path:?} ({} bytes)",
+        bytes.len()
+    );
+    println!("Output: {output_hex}");
+    if let Some(line) = top_digest {
+        println!("{line}");
+    }
+    if time {
+        println!("Proving time: {whole:.3}s");
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
+    use prover::lfm::whir_block_tree::{WhirBlockTreeProof, verify_whir_block_tree_proof};
+
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let proof = match WhirBlockTreeProof::from_bytes(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to read the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(bytes);
+    eprintln!("Verifying block proof...");
+    let start = Instant::now();
+    let result = verify_whir_block_tree_proof(&elf_data, &proof);
+    let verify_elapsed = start.elapsed();
+    match result {
+        Ok(()) => {
+            eprintln!("Verification succeeded!");
+            println!("Output: {}", hex(&proof.public_output));
+            if time {
+                println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Verification failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -1313,6 +1586,71 @@ mod tests {
         assert!(help.contains("--epoch-size-log2 <N>"));
         assert!(!help.contains("--num-epochs"));
         assert!(!help.contains("--epoch-size <"));
+    }
+
+    /// `prove-block` takes the ELF, an optional input and a required output;
+    /// `verify-block` the proof and the ELF.
+    #[test]
+    fn the_block_commands_take_their_arguments() {
+        let ok = |args: &[&str]| Cli::command().try_get_matches_from(args).is_ok();
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "-o",
+            "block.proof"
+        ]));
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "--input",
+            "block.bin",
+            "-o",
+            "block.proof",
+            "--time",
+            "--digest"
+        ]));
+        assert!(
+            !ok(&["cli", "prove-block", "guest.elf"]),
+            "an output is required"
+        );
+        assert!(ok(&[
+            "cli",
+            "verify-block",
+            "block.proof",
+            "guest.elf",
+            "--time"
+        ]));
+        assert!(
+            !ok(&["cli", "verify-block", "block.proof"]),
+            "the ELF is required"
+        );
+    }
+
+    /// The posture sets exactly the knobs the environment leaves unset.
+    #[test]
+    fn the_posture_sets_only_unset_knobs() {
+        use prover::lfm::whir_block_tree::POSTURE;
+        let all = posture_plan(|_| None);
+        assert_eq!(all.set, POSTURE.to_vec());
+        assert!(all.env.is_empty());
+        let mine = posture_plan(|n| (n == "TABLE_PARALLELISM").then(|| "8".to_string()));
+        assert!(mine.set.iter().all(|(n, _)| *n != "TABLE_PARALLELISM"));
+        assert_eq!(mine.env, vec!["TABLE_PARALLELISM=8".to_string()]);
+    }
+
+    /// The binary runs the allocator posture it compiles in: jemalloc never
+    /// purges (`opt.dirty_decay_ms` and `opt.muzzy_decay_ms` are -1), unless
+    /// `_RJEM_MALLOC_CONF` says otherwise. Deleting the `malloc_conf` export
+    /// turns this red.
+    #[test]
+    fn the_binary_runs_its_never_purge_posture() {
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_some() {
+            println!("_RJEM_MALLOC_CONF is set: the compiled posture is overridden, not read");
+            return;
+        }
+        assert_eq!(allocator::decay_ms(), Some((-1, -1)));
     }
 
     #[test]
