@@ -1061,16 +1061,24 @@ pub(crate) fn spawn_shadow<'scope>(
     let handle = std::thread::Builder::new()
         .name("regen-walk".to_string())
         .spawn_scoped(scope, move || {
+            // The walker's CPU includes building its start state (the image,
+            // the decode table).
+            let cpu0 = thread_cpu_secs();
             match RegenBuilder::new(program, private_input, max_rows) {
-                Ok(builder) => run_shadow(
-                    program,
-                    private_input,
-                    builder,
-                    max_rows.cpu,
-                    recipes,
-                    regen_generators(),
-                    stop,
-                ),
+                Ok(builder) => {
+                    let setup = cpu_since(cpu0);
+                    let mut report = run_shadow(
+                        program,
+                        private_input,
+                        builder,
+                        max_rows.cpu,
+                        recipes,
+                        regen_generators(),
+                        stop,
+                    );
+                    report.cpu[1] = report.cpu[1].zip(setup).map(|(walk, setup)| walk + setup);
+                    report
+                }
                 Err(e) => {
                     let mut report = ShadowReport::new(started, recipes.len(), 0, 0);
                     report.error = Some(format!("the regenerator: {e}"));
