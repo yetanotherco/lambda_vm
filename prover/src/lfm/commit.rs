@@ -286,7 +286,8 @@ pub fn commit_group_device_or_host_with(
 /// admission blocks and a rayon worker inside the walk must not (i-sched2's
 /// review). `shapes` are the window's groups as (padded rows, width); each one
 /// the device path could take counts its whole commit set, so the bound holds
-/// whichever of them the device admits. `None` off the gate, or unarmed.
+/// whichever of them the device admits. `None` off the gate, or unarmed, or
+/// when no shape reaches the device.
 pub fn admit_window(
     shapes: impl IntoIterator<Item = (usize, usize)>,
     options: &ProofOptions,
@@ -319,6 +320,11 @@ pub fn admit_window(
         let _ = (shapes.into_iter().count(), options, layout);
         0
     };
+    // A window that reaches no device (host commits, empty shapes) asks the
+    // gate for nothing, and so never waits on it.
+    if bytes == 0 {
+        return None;
+    }
     stark::prover::shared_vram_admit(bytes)
 }
 

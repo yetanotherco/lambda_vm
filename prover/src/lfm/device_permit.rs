@@ -510,12 +510,13 @@ pub fn hold_gated(phase: &'static str) -> CardPermit {
     let probed = super::tree_probe::enabled();
     // Under the armed shared gate the bytes are the exclusion (see the module
     // doc): no card to take, a `multi_prove` takes a proof place, and the window
-    // is still traced. The place is a blocking wait, so never on a rayon worker,
-    // and a deferred prove waits for its latch first.
+    // is still traced. Only a `multi_prove` waits here (for its latch, then a
+    // place), so only it is refused on a rayon worker; an artifact build's hold
+    // never waits.
     if stark::prover::shared_vram_gate_on() {
         #[cfg(feature = "parallel")]
         debug_assert!(
-            rayon::current_thread_index().is_none(),
+            phase != "multi_prove" || rayon::current_thread_index().is_none(),
             "a proof place is taken on a rayon worker ({phase}): take it from a plain thread"
         );
         wait_deferral(phase);
@@ -555,11 +556,24 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // One `OnceLock` read per hold — tens of them in a whole block run, never in
     // a loop. Off, this is the only thing the probe costs anywhere.
     let probed = super::tree_probe::enabled();
+    // Under the armed shared gate this hold's device work keeps no account in
+    // it, so it takes the whole gate as well: it waits for every admitted byte
+    // to leave, and nothing is admitted beside it. With one worker there is no
+    // card to take, so the whole gate is the only exclusion and is taken here,
+    // before the early returns; with more, after the card (below), so a holder
+    // of the whole gate never waits for the card.
+    let whole_now = || {
+        if workers() <= 1 {
+            stark::prover::shared_vram_admit_whole()
+        } else {
+            None
+        }
+    };
     if workers() <= 1 && !traced && !probed {
         return CardPermit {
             guard: None,
             _slot: None,
-            _whole: None,
+            _whole: whole_now(),
             since: Instant::now(),
             probe: None,
             trace: None,
@@ -571,11 +585,12 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // device phase — which is the window the sampler has to be sliced by in the
     // K=1 control too, or the two arms are compared on different definitions.
     if workers() <= 1 {
+        let whole = whole_now();
         let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
         return CardPermit {
             guard: None,
             _slot: None,
-            _whole: None,
+            _whole: whole,
             since: Instant::now(),
             probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
@@ -631,9 +646,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
          artifact commit's admission is a per-dispatch bound with no running \
          total, and each `multi_prove` builds its own full-budget VramGate"
     );
-    // Under the armed shared gate this hold's device work keeps no account in
-    // it, so it takes the whole gate as well: it waits for every admitted byte
-    // to leave, and nothing is admitted beside it.
+    // The whole gate, after the card (see above).
     let whole = stark::prover::shared_vram_admit_whole();
     CardPermit {
         guard: Some(guard),
@@ -772,6 +785,92 @@ mod tests {
         wlfm.join().expect("the ungated holder finishes");
         stark::prover::pin_shared_vram_gate(None);
         disarm(&g);
+    }
+
+    /// ★ WITH ONE WORKER THERE IS NO CARD, so under the armed shared gate an
+    /// ungated hold takes the whole gate before its early return: it still
+    /// waits for a gated prove's bytes to leave, and holds the gate whole.
+    #[test]
+    fn under_the_shared_gate_an_ungated_hold_with_one_worker_takes_the_whole_gate() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        assert_eq!(workers(), 1, "one worker: the early return");
+        let prove_bytes = stark::prover::shared_vram_admit(5).expect("the gate is on");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wlfm = std::thread::spawn(move || {
+            let _card = hold_labeled("multi_prove");
+            tx.send(()).expect("the test is listening");
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an ungated hold with one worker entered beside admitted bytes"
+        );
+        drop(prove_bytes);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("it enters once the bytes leave");
+        wlfm.join().expect("the ungated holder finishes");
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+    }
+
+    /// Under the armed shared gate only a `multi_prove` waits in `hold_gated`
+    /// (for its latch, then a place), so only it is refused on a rayon worker;
+    /// an artifact build's hold, which never waits, is not. (Debug assertions.)
+    #[cfg(all(feature = "parallel", debug_assertions))]
+    #[test]
+    fn under_the_shared_gate_only_a_prove_is_refused_on_a_rayon_worker() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool");
+        let build =
+            pool.install(|| std::panic::catch_unwind(|| drop(hold_gated("build_artifacts"))));
+        let prove = pool.install(|| std::panic::catch_unwind(|| drop(hold_gated("multi_prove"))));
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+        assert!(
+            build.is_ok(),
+            "an artifact build's hold was refused on a rayon worker"
+        );
+        assert!(prove.is_err(), "a prove took a place on a rayon worker");
+    }
+
+    /// An artifact window that reaches no device (host commits, empty shapes)
+    /// asks the armed gate for nothing, so it never waits on it, not even on a
+    /// rayon worker (i-sched2's review).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn under_the_shared_gate_a_window_with_no_device_bytes_asks_nothing() {
+        let g = ARM.lock().expect("the arm guard is never poisoned");
+        disarm(&g);
+        stark::prover::pin_shared_vram_gate(Some(true));
+        let options =
+            stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        let on_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool")
+            .install(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::super::commit::admit_window(
+                        [(0, 20), (4_096, 0)],
+                        &options,
+                        stark::leaf_layout::LeafLayout::RowPair,
+                    )
+                    .is_none()
+                }))
+            });
+        stark::prover::pin_shared_vram_gate(None);
+        disarm(&g);
+        assert!(
+            matches!(on_worker, Ok(true)),
+            "a window with no device bytes asked the gate (or panicked on the worker)"
+        );
     }
 
     /// The shared gate's margin grows by half a GiB per proof place, over a
