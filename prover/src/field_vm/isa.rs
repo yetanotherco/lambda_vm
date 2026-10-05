@@ -154,7 +154,7 @@ impl Instr {
 /// A program: the halt loop at `PC = 0`, the start `nop` at `PC = 1`, then the body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
-    pub instrs: Vec<Instr>,
+    pub(crate) instrs: Vec<Instr>,
 }
 
 impl Program {

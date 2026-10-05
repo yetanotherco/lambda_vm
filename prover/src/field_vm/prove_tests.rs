@@ -334,6 +334,13 @@ fn non_canonical_public_address_is_rejected() {
 }
 
 #[test]
+fn programs_start_with_the_halt_loop_and_start_nop() {
+    let program = power_program(3);
+    assert_eq!(program.instrs[0], super::isa::Instr::halt());
+    assert_eq!(program.instrs[1], super::isa::Instr::nop());
+}
+
+#[test]
 fn flagging_an_unclaimed_cell_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| {
