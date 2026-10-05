@@ -2344,6 +2344,25 @@ fn a_failed_program_fails_every_program_above_it_without_a_hang() {
     }
 }
 
+/// The shared VRAM gate armed for the tree's sibling proofs while this lives
+/// (`device_permit::arm_shared_gate`; inert with the knob off or at one
+/// sibling), disarmed on drop, the error and unwind paths included.
+struct SharedGateArmed(bool);
+
+impl SharedGateArmed {
+    fn arm(on: bool) -> Self {
+        Self(on && super::device_permit::arm_shared_gate(true).is_some())
+    }
+}
+
+impl Drop for SharedGateArmed {
+    fn drop(&mut self) {
+        if self.0 {
+            super::device_permit::arm_shared_gate(false);
+        }
+    }
+}
+
 /// The tree proved the way a prover would run it, with the leaves' programs
 /// emitted beforehand (`leaves`, while phase B ran):
 /// 1. the leaves' artifacts, one after another on a thread of their own (each
@@ -2389,6 +2408,10 @@ fn prove_tree_pipelined(
     String,
 > {
     use super::per_table_aggregator_tests::harvest_child;
+    // The shared VRAM gate (`LAMBDA_VM_SHARED_VRAM_GATE=1`) is armed here, for
+    // the tree's sibling proofs only, after the base; disarmed when the tree
+    // returns or unwinds (the same wiring as #1014's moved driver).
+    let _shared_gate = SharedGateArmed::arm(siblings > 1);
     let early = std::sync::Mutex::new(early);
     let early_out: std::sync::Mutex<Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>> =
         std::sync::Mutex::new(None);
