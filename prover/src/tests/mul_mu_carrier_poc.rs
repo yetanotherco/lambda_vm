@@ -177,10 +177,8 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
             if tuple[0] < HALF {
                 range.push((tuple.clone(), *m));
             }
-        } else if *bus == b20 {
-            if tuple[0] < B20 {
-                range20.push((tuple.clone(), *m));
-            }
+        } else if *bus == b20 && tuple[0] < B20 {
+            range20.push((tuple.clone(), *m));
         }
     }
     let mut carrier = Vec::new();

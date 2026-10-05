@@ -701,7 +701,7 @@ mod mu_bound {
     use crate::tables::branch::{
         MU_MAX, bus_interactions, cols, dedup_branch_rows, generate_branch_trace,
     };
-    use crate::tables::types::{BusId, FE};
+    use crate::tables::types::BusId;
 
     /// Presence: μ is IS_HALF-checked weighted by itself.
     #[test]
