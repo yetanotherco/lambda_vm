@@ -683,6 +683,37 @@ impl Accumulator<'_> {
             + self.counted.heap_bytes()
     }
 
+    /// [`Self::absorb`], and the ops `window` added to each streamed table's
+    /// list, in [`StreamTable::ALL`] order (the MEMW-derived LT ops of
+    /// [`WindowedTraceBuilder::stream_memw_lt`] aside).
+    pub fn absorb_counted(&mut self, window: WalkedWindow) -> (Vec<ChunkJob>, [usize; 8]) {
+        let walk = &window.walk;
+        let mut added = [
+            window.cpu_ops.len(),
+            walk.memw.register_rows.len(),
+            walk.memw.aligned.len(),
+            walk.memw.general.len(),
+            walk.load_ops.len(),
+            walk.lt_ops.len(),
+            walk.shift_ops.len(),
+            0,
+        ];
+        let stores_before = self.segments.store_ops.len();
+        let jobs = self.absorb(window);
+        // STORE's segment loses the ops of the chunks cut from it when the
+        // builder drops its streamed ops.
+        let cut: usize = if self.kept.is_some() {
+            jobs.iter()
+                .filter(|job| job.table == StreamTable::Store)
+                .map(ChunkJob::op_count)
+                .sum()
+        } else {
+            0
+        };
+        added[7] = self.segments.store_ops.len() + cut - stores_before;
+        (jobs, added)
+    }
+
     /// Routes a walked window, keeps it, and hands out the chunks the run's
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
@@ -964,6 +995,11 @@ impl<T> Segments<T> {
         self.parts
             .iter()
             .flat_map(|(part, range)| part[range.clone()].iter())
+    }
+
+    /// Its ops.
+    fn len(&self) -> usize {
+        self.parts.iter().map(|(_, range)| range.len()).sum()
     }
 
     /// The bytes its ops take (the ranges, not the parts they lie in).
@@ -1524,6 +1560,20 @@ impl ChunkJob {
         }
     }
 
+    /// Its ops: the table's rows before padding.
+    pub fn op_count(&self) -> usize {
+        match &self.ops {
+            ChunkOps::Cpu(ops, _) => ops.len(),
+            ChunkOps::MemwRegister(ops) => ops.len(),
+            ChunkOps::MemwAligned(ops) => ops.len(),
+            ChunkOps::Memw(ops) => ops.len(),
+            ChunkOps::Load(ops) => ops.len(),
+            ChunkOps::Lt(ops) => ops.len(),
+            ChunkOps::Shift(ops) => ops.len(),
+            ChunkOps::Store(ops) => ops.len(),
+        }
+    }
+
     pub fn generate(self) -> StreamedChunk {
         let trace = match &self.ops {
             ChunkOps::Cpu(ops, decode) => cpu::generate_cpu_trace_segments(&ops.slices(), decode),
@@ -1634,6 +1684,218 @@ fn assemble(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+    }
+}
+
+/// A run's streamed chunks built again from its logs (D-REGEN §2.3, the
+/// sequential regenerator's walker and slicer): the run is walked from the
+/// start with the regeneration walk ([`super::collect_streamed_ops_from_cpu_into`]),
+/// which carries the state the windowed build's walk carries but lists only the
+/// streamed tables' ops, and each table's list is cut as the hand-out cuts it.
+/// Chunk `k` of a table is ops `[k·max, (k+1)·max)` of its list, the slice
+/// [`Accumulator::absorb`] hands out as that chunk, so its job generates the
+/// same table. Nothing it does reads or writes the windowed build.
+///
+/// Unlike the windowed build it takes the run's last window too (the chunks
+/// that window completes were the finish's, which a caller rebuilding the
+/// streamed chunks skips), and the windows may be any length.
+pub struct RegenBuilder {
+    decode: Arc<DecodeTable>,
+    memory_state: MemoryState,
+    register_state: RegisterState,
+    /// Cycles walked so far: the next window's first cycle.
+    cycles: usize,
+    /// The cycles walked at a time within a window ([`walk_batch`]).
+    batch: usize,
+    max_rows: crate::tables::MaxRowsConfig,
+    cpu: Tail<super::CpuOperation>,
+    register_rows: Tail<super::RegRow>,
+    aligned: Tail<memw_aligned::AlignedRow>,
+    general: Tail<super::MemwOperation>,
+    load: Tail<super::LoadOperation>,
+    lt: Tail<super::LtOperation>,
+    shift: Tail<super::ShiftOperation>,
+    store: Vec<store::StoreOperation>,
+    /// Chunks of each streamed table cut so far.
+    cut: StreamSkip,
+    /// A test's slicer bug: the first op of this table's list is dropped.
+    #[cfg(test)]
+    drop_one: Option<StreamTable>,
+}
+
+impl RegenBuilder {
+    /// A regenerator for a run of `elf` on `private_input`, chunked at
+    /// `max_rows`: the state [`WindowedTraceBuilder::new`] starts from.
+    pub fn new(
+        elf: &Elf,
+        private_input: &[u8],
+        max_rows: &crate::tables::MaxRowsConfig,
+    ) -> Result<Self, Error> {
+        let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input));
+        memory_state.lean = WalkLean::from_env()?.memory;
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        Ok(Self {
+            decode: Arc::new(DecodeTable::from_instructions(&instructions)),
+            memory_state,
+            register_state: RegisterState::from_init(&register_init),
+            cycles: 0,
+            batch: walk_batch(),
+            max_rows: max_rows.clone(),
+            cpu: Tail::new(),
+            register_rows: Tail::new(),
+            aligned: Tail::new(),
+            general: Tail::new(),
+            load: Tail::new(),
+            lt: Tail::new(),
+            shift: Tail::new(),
+            store: Vec::new(),
+            cut: StreamSkip::default(),
+            #[cfg(test)]
+            drop_one: None,
+        })
+    }
+
+    /// The slicer drops the first op of `table`'s list: a regeneration bug, for
+    /// the tests that check it is caught.
+    #[cfg(test)]
+    pub(crate) fn drop_one_op(mut self, table: StreamTable) -> Self {
+        self.drop_one = Some(table);
+        self
+    }
+
+    /// Cycles walked so far.
+    pub fn cycles(&self) -> usize {
+        self.cycles
+    }
+
+    /// The bytes the walk's carried memory state takes on the heap.
+    pub fn state_bytes(&self) -> usize {
+        self.memory_state.heap_bytes()
+    }
+
+    /// Walks the run's next window (its last one included) and returns every
+    /// chunk of the streamed tables it completes, in the hand-out's order
+    /// ([`StreamTable::ALL`], then by index).
+    pub fn push(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
+        let mut cpu_ops = Vec::with_capacity(logs.len());
+        let mut walk = WalkOutputs::for_walk(logs.len(), false);
+        let batch = match self.batch {
+            0 => logs.len().max(1),
+            n => n,
+        };
+        for part in logs.chunks(batch) {
+            let from = cpu_ops.len();
+            super::collect_cpu_ops_into(part, &self.decode, self.cycles + from, &mut cpu_ops)?;
+            super::collect_streamed_ops_from_cpu_into(
+                &cpu_ops[from..],
+                &self.decode,
+                &mut self.memory_state,
+                &mut self.register_state,
+                &mut walk,
+            );
+        }
+        self.cycles += logs.len();
+        // STORE's segment, as the routing filters it out of the CPU ops.
+        self.store.extend(
+            cpu_ops
+                .iter()
+                .map(|op| self.decode.op(op))
+                .filter(|op| op.decode.fields.is_store())
+                .map(super::route_store),
+        );
+        // Mutable for the tests' slicer bug (`drop_one_op`).
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let MemwBuckets {
+            mut register_rows,
+            mut aligned,
+            mut general,
+        } = walk.memw;
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let (mut load, mut lt, mut shift) = (walk.load_ops, walk.lt_ops, walk.shift_ops);
+        #[cfg(test)]
+        if let Some(table) = self.drop_one {
+            fn drop_first<T>(list: &mut Vec<T>) -> bool {
+                (!list.is_empty()).then(|| list.remove(0)).is_some()
+            }
+            let dropped = match table {
+                StreamTable::Cpu => drop_first(&mut cpu_ops),
+                StreamTable::MemwRegister => drop_first(&mut register_rows),
+                StreamTable::MemwAligned => drop_first(&mut aligned),
+                StreamTable::Memw => drop_first(&mut general),
+                StreamTable::Load => drop_first(&mut load),
+                StreamTable::Lt => drop_first(&mut lt),
+                StreamTable::Shift => drop_first(&mut shift),
+                StreamTable::Store => drop_first(&mut self.store),
+            };
+            if dropped {
+                self.drop_one = None;
+            }
+        }
+        self.cpu.push(cpu_ops);
+        self.register_rows.push(register_rows);
+        self.aligned.push(aligned);
+        self.general.push(general);
+        self.load.push(load);
+        self.lt.push(lt);
+        self.shift.push(shift);
+        Ok(self.cut_chunks())
+    }
+
+    /// Every full chunk the tails now hold, cut out of them.
+    fn cut_chunks(&mut self) -> Vec<ChunkJob> {
+        let m = &self.max_rows;
+        let e = &mut self.cut;
+        let mut jobs = Vec::new();
+        macro_rules! cut {
+            ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr) => {{
+                let max = $max;
+                while max > 0 && $tail.len >= max {
+                    jobs.push(ChunkJob {
+                        table: $table,
+                        index: $done,
+                        ops: ChunkOps::$variant($tail.take(max)),
+                    });
+                    $done += 1;
+                }
+            }};
+        }
+        while m.cpu > 0 && self.cpu.len >= m.cpu {
+            jobs.push(ChunkJob {
+                table: StreamTable::Cpu,
+                index: e.cpu,
+                ops: ChunkOps::Cpu(self.cpu.take(m.cpu), Arc::clone(&self.decode)),
+            });
+            e.cpu += 1;
+        }
+        cut!(
+            StreamTable::MemwRegister,
+            MemwRegister,
+            self.register_rows,
+            m.memw_register,
+            e.memw_register
+        );
+        cut!(
+            StreamTable::MemwAligned,
+            MemwAligned,
+            self.aligned,
+            m.memw_aligned,
+            e.memw_aligned
+        );
+        cut!(StreamTable::Memw, Memw, self.general, m.memw, e.memw);
+        cut!(StreamTable::Load, Load, self.load, m.load, e.load);
+        cut!(StreamTable::Lt, Lt, self.lt, m.lt, e.lt);
+        cut!(StreamTable::Shift, Shift, self.shift, m.shift, e.shift);
+        while m.store > 0 && self.store.len() >= m.store {
+            jobs.push(ChunkJob {
+                table: StreamTable::Store,
+                index: e.store,
+                ops: ChunkOps::Store(self.store.drain(..m.store).collect()),
+            });
+            e.store += 1;
+        }
+        jobs
     }
 }
 
