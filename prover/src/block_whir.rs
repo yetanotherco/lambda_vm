@@ -216,9 +216,9 @@ pub struct BlockFormat {
 
 /// The most groups a block statement may declare: a verifier constant. The 1×
 /// block has 9 and the median 90. The bound caps what a statement can make the
-/// verifier build and the block-wide LogUp support, which reads 128.51 bits at
-/// 256 groups (127.51 at 512).
-pub const BLOCK_MAX_GROUPS: usize = 256;
+/// verifier build and the block-wide LogUp support, which reads 126.51 bits at
+/// 1024 groups; a block of at most 256 groups keeps 128.51.
+pub const BLOCK_MAX_GROUPS: usize = 1024;
 
 /// Refuses `groups` over `max_groups` ([`BlockFormat::max_groups`]). The
 /// verifier refuses a statement with more ([`block_frame`]), and the prover
