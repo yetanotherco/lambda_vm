@@ -33,10 +33,12 @@ type Ext3 = GoldilocksExtension;
 /// production derived from it.
 #[derive(Clone)]
 pub(crate) struct HostTable {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) shape: TableChallengeShape,
     /// The verifier's HARDCODED precomputed commitment, when the AIR is
     /// preprocessed. A program constant, not arena data: the verifier does not
     /// take this from the proof (`verifier.rs:1187`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) precomputed_root: Option<Commitment>,
     pub(crate) main_root: Commitment,
     pub(crate) aux_root: Option<Commitment>,
@@ -535,7 +537,9 @@ impl TableLegs {
 /// and a VM epoch proof alike. That is what makes one node emitter serve every
 /// level.
 pub(crate) struct HarvestedChild {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) artifacts: super::registry::LfmArtifacts,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) opts: crate::ProofOptions,
     pub(crate) public_words: Vec<(u32, LfmWord)>,
     pub(crate) tables: Vec<HostTable>,

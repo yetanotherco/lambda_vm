@@ -596,7 +596,6 @@ pub const BLOCK_REST_LAYOUT_BYTES: usize = 2 << 30;
 /// `BLOCK_WHIR_PACK_FINISHED=0|1`: the real-block tests' choice of
 /// [`BlockOptions::rest_layout_bytes`], [`BlockOptions::finish_keccak_rnd_chunks`]
 /// and [`BlockOptions::pack_finished`]; unset leaves the production ones.
-#[cfg(test)]
 pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
     match std::env::var("BLOCK_WHIR_REST_LAYOUT")
         .as_deref()
@@ -631,7 +630,6 @@ pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
 
 /// `BLOCK_WHIR_NARROW=wide|card|host`: the real-block tests' choice of
 /// [`BlockOptions::narrow`]; `None` leaves the production one.
-#[cfg(test)]
 pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
     use multilinear_block::Narrowing;
     match std::env::var("BLOCK_WHIR_NARROW").as_deref().map(str::trim) {
@@ -645,7 +643,6 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
 
 /// `BLOCK_WHIR_UPLOAD_AHEAD=0|1`: the real-block tests' choice of
 /// [`BlockOptions::upload_ahead`]; `None` leaves the production one.
-#[cfg(test)]
 pub(crate) fn upload_ahead_from_env() -> Option<bool> {
     match std::env::var("BLOCK_WHIR_UPLOAD_AHEAD")
         .as_deref()
@@ -662,7 +659,6 @@ pub(crate) fn upload_ahead_from_env() -> Option<bool> {
 /// `BLOCK_WHIR_ECSM_LOG2=k` (0..=[`BLOCK_ECSM_MAX_VARS`]): the real-block
 /// tests' KECCAK and ECSM cuts, to force a split on a block whose tables fit
 /// one; unset leaves the production ones.
-#[cfg(test)]
 pub(crate) fn chunk_cuts_from_env(options: &mut BlockOptions) {
     for (name, cap, rows_log2) in [
         (
@@ -687,7 +683,6 @@ pub(crate) fn chunk_cuts_from_env(options: &mut BlockOptions) {
 
 /// The chunked tables' heights a statement states, for the real-block
 /// readouts: `KECCAK 1 × [14] · KECCAK_RND 4 × [16, 16, 16, 16] · …`.
-#[cfg(test)]
 pub(crate) fn chunked_census(counts: &TableCounts, table_num_vars: &[u8]) -> String {
     chunked_table_ranges(counts)
         .into_iter()

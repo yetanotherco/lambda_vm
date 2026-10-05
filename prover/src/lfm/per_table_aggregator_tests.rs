@@ -1060,16 +1060,6 @@ pub(super) fn real_child_timed(
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// [`real_child`] without its verify ([`super::harvest::harvest_child`]), for a
-/// caller that verifies the same proof elsewhere or off the clock.
-pub(super) fn harvest_child(
-    artifacts: super::registry::LfmArtifacts,
-    opts: crate::ProofOptions,
-    proved: &super::proof::LfmProof,
-) -> RealChild {
-    super::harvest::harvest_child(artifacts, opts, proved).unwrap_or_else(|e| panic!("{e}"))
-}
-
 /// The child's shape, as the node's emitter reads it.
 pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildShape<'_> {
     super::per_table_aggregator::ChildShape {
@@ -3622,94 +3612,7 @@ fn cgroup_limit_gib() -> Result<f64, String> {
     Err(tried.join("; "))
 }
 
-/// Print the census and the chip padding panel for one node program.
-///
-/// The panel is a FORWARD instrument, not a diagnostic: printed from the working
-/// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
-/// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
-/// usable. Print it at EVERY level.
-/// Run `task` over `0..n` on `workers` threads, and return the results **in
-/// index order** whatever order they finished in.
-///
-/// ★★★ THE ORDER IS THE SOUNDNESS PROPERTY, not a convenience. A level's
-/// children, layouts and label runs are three parallel vectors, and a node at
-/// the level above takes a contiguous SUBSLICE of each — which is exactly what
-/// makes contiguity across sibling subtrees a consequence of the label pins
-/// rather than a check of its own. Drain them in completion order and the pins
-/// still verify, one subtree at a time, while the tree they describe is not the
-/// tree that was built. ⇒ results land in per-index slots and are drained by
-/// index, so nothing downstream can observe that a scheduler ran at all.
-///
-/// `workers <= 1` runs `task` inline, on this thread, in order: the control arm
-/// is the original path and not this function with one worker.
-///
-/// # Panics
-///
-/// Re-raises the FIRST worker panic on the caller's thread, payload intact.
-/// ⚠ `std::thread::scope` otherwise propagates with the fixed string "a scoped
-/// thread panicked", which names neither the cause nor its location, and
-/// libtest's global hook files a spawned thread's own message against no test
-/// and drops it on the floor. The prover's `run_admitted` learned that the
-/// expensive way — eleven anonymous failures in one suite run.
-pub(super) fn in_index_order<T: Send>(
-    n: usize,
-    workers: usize,
-    task: impl Fn(usize) -> T + Sync,
-) -> Vec<T> {
-    let slots: Vec<std::sync::Mutex<Option<T>>> =
-        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    if workers <= 1 {
-        for (j, slot) in slots.iter().enumerate() {
-            *slot.lock().expect("a slot is never poisoned") = Some(task(j));
-        }
-    } else {
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let first_panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
-            std::sync::Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let (cursor, slots, first_panic, task) = (&cursor, &slots, &first_panic, &task);
-                scope.spawn(move || {
-                    // ⛔ THIS THREAD IS PART OF THIS LEVEL. Without the enrolment
-                    // its artifact builds are not counted and the level reports
-                    // fewer proofs than it made.
-                    let _enrolled = super::program_census::enrol();
-                    loop {
-                        let j = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if j >= slots.len() {
-                            break;
-                        }
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(j))) {
-                            Ok(out) => {
-                                *slots[j].lock().expect("a slot is never poisoned") = Some(out);
-                            }
-                            Err(payload) => {
-                                let mut first =
-                                    first_panic.lock().unwrap_or_else(|e| e.into_inner());
-                                if first.is_none() {
-                                    *first = Some(payload);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            std::panic::resume_unwind(payload);
-        }
-    }
-    slots
-        .into_iter()
-        .enumerate()
-        .map(|(j, slot)| {
-            slot.into_inner()
-                .expect("a slot is never poisoned")
-                .unwrap_or_else(|| panic!("index {j} produced no result"))
-        })
-        .collect()
-}
+pub(super) use super::tree_run::in_index_order;
 
 /// ★★★ THE ORDERING GATE, with the completion order FORCED to the reverse of
 /// the index order.
@@ -4294,6 +4197,12 @@ fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
     );
 }
 
+/// Print the census and the chip padding panel for one node program.
+///
+/// The panel is a FORWARD instrument, not a diagnostic: printed from the working
+/// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
+/// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
+/// usable. Print it at EVERY level.
 fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
     let (main, aux) =
         super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);

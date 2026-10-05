@@ -40,8 +40,8 @@ pub mod fixture;
 pub mod fri;
 pub mod global_parent;
 pub mod global_split;
-pub mod hash;
 pub(crate) mod harvest;
+pub mod hash;
 pub mod instr;
 pub mod keccak_adapter;
 pub mod keccak_host;
@@ -67,12 +67,15 @@ pub mod trace;
 pub mod transcript_replay;
 /// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — a diagnostic, OFF by default.
 pub mod tree_probe;
+pub(crate) mod tree_run;
 pub mod validator;
 pub mod whir_air;
 /// The batched argue as a machine leg (D-BATCH B-4a).
 pub mod whir_batch;
 #[cfg(feature = "parallel")]
 pub mod whir_block;
+#[cfg(feature = "parallel")]
+pub mod whir_block_tree;
 pub mod whir_bus;
 pub mod whir_chain;
 pub mod whir_epoch;
