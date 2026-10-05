@@ -101,7 +101,7 @@ stderr.
 
 The command runs the production posture: every knob in `POSTURE` (`prover/src/lfm/block_tree.rs`) that the
 environment leaves unset is set to its posture value. These are the table parallelism, the VRAM budget, gate
-packing, the row cap, the tree cache cap, the executor schedule, the tree's sibling counts and the allocator purge.
+packing, the row cap, the tree cache cap, the executor schedule and the tree's sibling counts.
 The VRAM budget (24000 MB, a 32 GiB card's) is set only when `nvidia-smi` reports a card of at least 31 GiB; on
 any other card, set `LAMBDA_VM_VRAM_BUDGET_MB` yourself. The `BLOCK POSTURE` lines on stderr say what was set and
 what came from the environment. The binary compiles in jemalloc's never-purge posture and returns freed pages to

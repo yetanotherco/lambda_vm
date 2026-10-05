@@ -87,8 +87,10 @@ impl BlockTreeSink for StderrSink {
 /// environment leaves unset — `LAMBDA_VM_VRAM_BUDGET_MB` only on a card of at
 /// least [`POSTURE_VRAM_MIN_GIB`] — and the harness never does: its arms rely
 /// on unset meaning the library default. Measurement-only knobs
-/// (`LFM_PROVE_SPLIT`, `LAMBDA_VM_BASE_SPLIT`) are not posture. The allocator's
-/// never-purge posture is compiled into the binary.
+/// (`LFM_PROVE_SPLIT`, `LAMBDA_VM_BASE_SPLIT`) are not posture, nor is a knob
+/// whose library default is the posture's value (`LAMBDA_VM_ALLOC_PURGE`,
+/// `auto`): the harness's env leaves it unset. The allocator's never-purge
+/// posture is compiled into the binary.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "8"),
     (POSTURE_VRAM_KNOB, "24000"),
@@ -98,7 +100,6 @@ pub const POSTURE: &[(&str, &str)] = &[
     ("LFM_EXEC_PARALLEL", "1"),
     ("LFM_TREE_SIBLINGS_L0", "8"),
     ("LFM_TREE_SIBLINGS", "4"),
-    (crate::alloc_purge::ALLOC_PURGE_ENV, "auto"),
 ];
 
 /// The posture's VRAM budget: 24000 MB is the 32 GiB card's.
