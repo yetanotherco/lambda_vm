@@ -2465,9 +2465,25 @@ const D12_LEAVES: [&[usize]; 8] = [
 /// the plan's on the `BLOCK PARTITION SOURCE` line.
 struct HarnessSink;
 
+/// The precomputed-tree download counters when the base proved, so the run's
+/// `TREE DOWNLOAD` line splits the base's downloads from the recursion's.
+#[cfg(feature = "cuda")]
+static TREE_DOWNLOADS_AT_BASE: std::sync::Mutex<Option<math_cuda::device::TreeDownloadTotals>> =
+    std::sync::Mutex::new(None);
+
 impl BlockTreeSink for HarnessSink {
     fn write(&self, text: &str) {
         print!("{text}");
+    }
+
+    fn base_proved(&self, _proof: &crate::VmProof) {
+        #[cfg(feature = "cuda")]
+        {
+            *TREE_DOWNLOADS_AT_BASE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                Some(math_cuda::device::tree_download_totals());
+        }
     }
 
     fn partition_note(&self, names: &[&str], partition: &BlockPartition) -> Option<String> {
@@ -2518,6 +2534,8 @@ fn the_block_tree_composes_to_a_top_node() {
     let input = read("NOEPOCH_INPUT");
     let wrap_opts = super::proof::aggregation_wrap_options();
     let cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(feature = "cuda")]
+    let tree_downloads_at_start = math_cuda::device::tree_download_totals();
     let run = super::block_tree::prove_block_tree(
         &elf_bytes,
         &input,
@@ -2525,6 +2543,27 @@ fn the_block_tree_composes_to_a_top_node() {
         std::sync::Arc::new(HarnessSink),
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    // The precomputed trees the run downloaded on cache misses, by path, the
+    // base's apart from the recursion's (I-COPIES L1).
+    #[cfg(feature = "cuda")]
+    {
+        let end = math_cuda::device::tree_download_totals();
+        let at_base = TREE_DOWNLOADS_AT_BASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(tree_downloads_at_start);
+        println!(
+            "   TREE DOWNLOAD ({}): base {} · recursion {} · staging pair waits {}",
+            if math_cuda::device::tree_download_staged() {
+                "staged"
+            } else {
+                "pageable"
+            },
+            at_base.since(&tree_downloads_at_start).line(),
+            end.since(&at_base).line(),
+            math_cuda::device::staging_totals().pair_waits
+        );
+    }
     let super::block_tree::BlockTreeRun {
         shape,
         top_proof,

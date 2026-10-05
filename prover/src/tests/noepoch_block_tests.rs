@@ -307,6 +307,18 @@ fn noepoch_block_prove_and_verify() {
         prove_peak.map_or("unknown".to_string(), |g| format!("{g:.2} GiB")),
         DEVICE_RECOMMITS.load(Ordering::SeqCst),
     );
+    // The precomputed trees the base downloaded on cache misses, by path
+    // (I-COPIES L1): the digest above is over proofs that opened them.
+    #[cfg(feature = "cuda")]
+    println!(
+        "TREE DOWNLOAD ({}): base {}",
+        if math_cuda::device::tree_download_staged() {
+            "staged"
+        } else {
+            "pageable"
+        },
+        math_cuda::device::tree_download_totals().line()
+    );
     assert!(verified, "the block proof does not verify");
 }
 
