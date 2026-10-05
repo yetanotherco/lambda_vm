@@ -392,7 +392,13 @@ fn prove_block_with_observed(
             .as_ref()
             .map(|plan| std::sync::Arc::clone(&plan.window));
         let regenerator = live_plan.map(|plan| {
-            crate::block_regen::live::spawn_live(s, &program, private_input, max_rows, plan)
+            // Phase A's form: packed as generated under G-pack.
+            let form = if gpack() {
+                TraceForm::Narrow
+            } else {
+                TraceForm::Wide
+            };
+            crate::block_regen::live::spawn_live(s, &program, private_input, max_rows, plan, form)
         });
         let proof = prove_block_traces(
             elf_bytes,

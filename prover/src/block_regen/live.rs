@@ -36,6 +36,7 @@ use stark::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 use super::{
     GIB, Recorder, RegenMode, cpu_since, regen_generators, slot as table_slot, thread_cpu_secs,
 };
+use crate::tables::gpack::TraceForm;
 use crate::tables::trace_builder::{ChunkJob, RegenBuilder, StreamTable};
 
 /// Which streamed chunk an instance is.
@@ -48,12 +49,14 @@ pub(crate) fn regen_ahead_bytes() -> u64 {
     gib_knob("LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB", 4.0)
 }
 
-/// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 6): the host bytes auto
+/// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10): the host bytes auto
 /// reserves for the regenerator in phase B once regeneration is armed — its
-/// walk state, windows, jobs and generators' outputs (R-REGEN A3: sized from
-/// BIG 636's VmRSS P − S plus the ahead window). Never added unarmed.
+/// walk state, windows, jobs and generators' outputs, and the traces
+/// deposited ahead of their fused tasks (R-REGEN A3: BIG 636's phase-B peak
+/// VmRSS with the shadow less without it, +5.90 GiB at p90, plus the 4 GiB
+/// window). Never added unarmed.
 pub(crate) fn regen_reserve_bytes() -> u64 {
-    gib_knob("LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB", 6.0)
+    gib_knob("LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB", 10.0)
 }
 
 fn gib_knob(var: &str, default: f64) -> u64 {
@@ -518,7 +521,8 @@ pub(crate) struct LiveFaults {
 /// The live regenerator (D-REGEN §2.3, sequential form): `builder` walks the
 /// run of `program` on `private_input`, executed `window_cycles` cycles at a
 /// time on a thread of its own; every chunk it cuts that was dropped is
-/// generated, packed and deposited into its slot on one of `generators`
+/// generated in `form` (packed as it is written under G-pack, else 64-bit),
+/// packed if it is not, and deposited into its slot on one of `generators`
 /// threads, in rank order of dispatch. Never panics; every exit leaves no
 /// slot waiting.
 ///
@@ -526,6 +530,7 @@ pub(crate) struct LiveFaults {
 /// must be phase A's (`max_rows.cpu` cycles): on others the slicer cuts some
 /// rank after a higher one, and that rank is failed — its table refused, never
 /// waited on (R10).
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub(crate) fn run_live(
     program: &Elf,
     private_input: &[u8],
@@ -533,6 +538,7 @@ pub(crate) fn run_live(
     window_cycles: usize,
     plan: LivePlan,
     generators: usize,
+    form: TraceForm,
     #[cfg(test)] faults: LiveFaults,
 ) -> LiveReport {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -654,13 +660,15 @@ pub(crate) fn run_live(
                             }
                             let (table, index) = (job.table, job.index);
                             let built = catch_unwind(AssertUnwindSafe(|| {
-                                let mut trace = job.generate().trace;
-                                trace
-                                    .pack_main_narrow()
-                                    .then(|| trace.narrow_main().cloned())
+                                let mut trace = job.generate_as(form).trace;
+                                if !trace.is_main_narrow() {
+                                    trace.pack_main_narrow();
+                                }
+                                // Moved out, not copied.
+                                trace.take_main_for_regen()
                             }));
                             let narrow = match built {
-                                Ok(Some(Some(narrow))) => narrow,
+                                Ok(Some(narrow)) => narrow,
                                 Ok(_) => {
                                     let why = format!("{table:?}[{index}]: the trace did not pack");
                                     guard.slot.fail(&why);
@@ -911,14 +919,15 @@ impl LiveHandle<'_> {
 
 /// [`run_live`] over the block's run on a thread of `scope`: windows of
 /// `max_rows.cpu` cycles, phase A's (which the ranks need), [`regen_generators`]
-/// generators. A regenerator that cannot start drops `plan` — its producer —
-/// so every slot fails at once.
+/// generators writing each chunk in `form` (phase A's). A regenerator that
+/// cannot start drops `plan` — its producer — so every slot fails at once.
 pub(crate) fn spawn_live<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     program: &'scope Elf,
     private_input: &'scope [u8],
     max_rows: &'scope crate::tables::MaxRowsConfig,
     plan: LivePlan,
+    form: TraceForm,
 ) -> LiveHandle<'scope> {
     let dropped = plan.dropped.len();
     let handle = std::thread::Builder::new()
@@ -935,6 +944,7 @@ pub(crate) fn spawn_live<'scope>(
                         max_rows.cpu,
                         plan,
                         regen_generators(),
+                        form,
                         #[cfg(test)]
                         LiveFaults::default(),
                     );
