@@ -935,6 +935,11 @@ pub fn storage_estimate_parallelism() -> usize {
 /// blocked worker would starve.
 struct VramGate {
     used: std::sync::Mutex<u64>,
+    /// Whether the whole gate is held ([`VramGate::acquire_whole`]): while it
+    /// is, nothing is admitted, whatever the budget (a byte count alone cannot
+    /// exclude anything from an unbounded gate). Read and written only under
+    /// `used`'s lock.
+    whole: std::sync::atomic::AtomicBool,
     freed: std::sync::Condvar,
     /// The byte budget. Atomic only so the shared gate
     /// ([`arm_shared_vram_gate`]) can be calibrated in place between levels.
@@ -1035,6 +1040,21 @@ struct VramPermit<'a> {
     bytes: u64,
 }
 
+/// The whole gate, held ([`VramGate::acquire_whole`]); given back on drop.
+struct WholeGatePermit<'a> {
+    gate: &'a VramGate,
+}
+
+impl Drop for WholeGatePermit<'_> {
+    fn drop(&mut self) {
+        let used = self.gate.used.lock().unwrap_or_else(|e| e.into_inner());
+        self.gate.whole.store(false, Ordering::Relaxed);
+        self.gate.trace_whole(false);
+        drop(used);
+        self.gate.freed.notify_all();
+    }
+}
+
 /// ⛔ A gate's waits never run on a rayon worker: a worker waiting in a
 /// prove's join runs other queued jobs on its own stack, and one parked here
 /// on bytes held by the prove whose frame sits beneath it can never get them.
@@ -1057,6 +1077,7 @@ impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
             used: std::sync::Mutex::new(0),
+            whole: std::sync::atomic::AtomicBool::new(false),
             freed: std::sync::Condvar::new(),
             budget: AtomicU64::new(budget),
             claims: std::sync::Mutex::new(ClaimBook::default()),
@@ -1123,7 +1144,9 @@ impl VramGate {
         refuse_rayon_wait("an admission");
         let mut used = self.used.lock().unwrap();
         loop {
-            if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
+            if !self.whole.load(Ordering::Relaxed)
+                && (*used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed))
+            {
                 *used = used.saturating_add(bytes);
                 self.trace_used(*used);
                 return VramPermit { gate: self, bytes };
@@ -1132,19 +1155,29 @@ impl VramGate {
         }
     }
 
-    /// The whole gate: wait until nothing is admitted, then hold every byte of
-    /// it (whatever the budget, even an unbounded one) until the permit drops.
-    fn acquire_whole(&self) -> VramPermit<'_> {
+    /// The whole gate: wait until nothing is admitted and no one else holds
+    /// it, then admit nothing beside it (whatever the budget, even an
+    /// unbounded one) until the permit drops.
+    fn acquire_whole(&self) -> WholeGatePermit<'_> {
         refuse_rayon_wait("the whole gate");
         let mut used = self.used.lock().unwrap();
-        while *used != 0 {
+        while *used != 0 || self.whole.load(Ordering::Relaxed) {
             used = self.freed.wait(used).unwrap();
         }
-        *used = u64::MAX;
-        self.trace_used(*used);
-        VramPermit {
-            gate: self,
-            bytes: u64::MAX,
+        self.whole.store(true, Ordering::Relaxed);
+        self.trace_whole(true);
+        drop(used);
+        WholeGatePermit { gate: self }
+    }
+
+    /// One `SGATE` line: the whole gate taken (1) or given back (0).
+    fn trace_whole(&self, held: bool) {
+        if self.trace {
+            eprintln!(
+                "SGATE t={:.3} whole={}",
+                crate::prove_split::epoch_secs(),
+                u8::from(held)
+            );
         }
     }
 
@@ -1299,8 +1332,12 @@ pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
     let budget = {
         let used = gate.used.lock().unwrap();
         // Never under a claim: a budget calibrated lower than the claims in
-        // force would void their guarantee.
-        if *used == 0 && gate.claims.lock().unwrap().len() == 0 {
+        // force would void their guarantee. Nor under the whole gate, whose
+        // holder's device memory the card's free bytes would leave out.
+        if *used == 0
+            && !gate.whole.load(Ordering::Relaxed)
+            && gate.claims.lock().unwrap().len() == 0
+        {
             let free = device_free_after_trim();
             let b = calibrated_budget(configured, free, margin_bytes);
             gate.budget.store(b, Ordering::Relaxed);
@@ -1425,7 +1462,8 @@ fn device_vram_budget() -> u64 {
 /// Bytes of the shared gate ([`shared_vram_gate_on`]) held by device work
 /// outside a prove; released on drop.
 pub struct SharedVramPermit {
-    _permit: VramPermit<'static>,
+    _bytes: Option<VramPermit<'static>>,
+    _whole: Option<WholeGatePermit<'static>>,
 }
 
 /// Take `bytes` from the shared gate for device work done outside
@@ -1437,7 +1475,8 @@ pub struct SharedVramPermit {
 /// admission blocks, and it refuses a rayon worker.
 pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
     shared_vram_gate_on().then(|| SharedVramPermit {
-        _permit: shared_vram_gate(device_vram_budget()).acquire(bytes),
+        _bytes: Some(shared_vram_gate(device_vram_budget()).acquire(bytes)),
+        _whole: None,
     })
 }
 
@@ -1447,7 +1486,8 @@ pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
 /// `None` when the shared gate is off or unarmed.
 pub fn shared_vram_admit_whole() -> Option<SharedVramPermit> {
     shared_vram_gate_on().then(|| SharedVramPermit {
-        _permit: shared_vram_gate(device_vram_budget()).acquire_whole(),
+        _bytes: None,
+        _whole: Some(shared_vram_gate(device_vram_budget()).acquire_whole()),
     })
 }
 
@@ -6632,6 +6672,45 @@ mod shared_vram_gate_tests {
             .expect("the whole gate enters once they leave");
         whole.join().expect("the whole holder finishes");
         pin_shared_vram_gate(None);
+    }
+
+    /// ★ While the whole gate is held nothing is admitted, whatever the
+    /// budget: on a finite gate, and on an unbounded one, where no byte count
+    /// could keep an admission out (i-sched2's review: a whole gate made of
+    /// bytes alone admitted beside its holder there). A second whole waits too.
+    #[test]
+    fn an_admission_waits_while_the_whole_gate_is_held() {
+        for budget in [10, u64::MAX] {
+            let gate = &super::VramGate::new(budget);
+            let whole = gate.acquire_whole();
+            std::thread::scope(|s| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let second = tx.clone();
+                s.spawn(move || {
+                    let _p = gate.acquire(1);
+                    tx.send("admission").expect("the test listens");
+                });
+                s.spawn(move || {
+                    let _w = gate.acquire_whole();
+                    second.send("whole").expect("the test listens");
+                });
+                assert!(
+                    rx.recv_timeout(std::time::Duration::from_millis(200))
+                        .is_err(),
+                    "budget {budget}: entered beside the whole gate"
+                );
+                drop(whole);
+                for _ in 0..2 {
+                    rx.recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("each enters once the whole gate is given back");
+                }
+            });
+            assert_eq!(
+                *gate.used.lock().unwrap(),
+                0,
+                "budget {budget}: the account is empty"
+            );
+        }
     }
 
     /// The knob is on only at `1`: the gate is off by default on #1014 until
