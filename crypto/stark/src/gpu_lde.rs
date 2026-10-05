@@ -3061,6 +3061,40 @@ where
     Some(cols)
 }
 
+/// The device memory pool and the card, read at one instant: what callers
+/// outside this crate print to split a card reading (nvidia-smi) into what a
+/// prove held and what the pool kept ([`pool_readout`]). Every field is `None`
+/// when it could not be read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolReadout {
+    /// The pool's live bytes (allocated, not yet freed): `(now, high-water)`.
+    pub used: Option<(u64, u64)>,
+    /// The bytes the pool holds from the card, freed blocks it kept included.
+    pub reserved_now: Option<u64>,
+    /// The most it held at any instant since the last reset.
+    pub reserved_high: Option<u64>,
+    /// The card's `(used, total)` bytes.
+    pub card: Option<(u64, u64)>,
+}
+
+/// Read the device pool's live and reserved bytes and high-waters and the
+/// card's used memory; with `reset`, restart both high-waters afterwards.
+pub fn pool_readout(reset: bool) -> PoolReadout {
+    let out = PoolReadout {
+        used: math_cuda::device::pool_used_bytes().ok(),
+        reserved_now: math_cuda::device::pool_reserved_bytes().ok(),
+        reserved_high: math_cuda::device::pool_reserved_high_bytes().ok(),
+        card: math_cuda::device::backend()
+            .ok()
+            .and_then(|b| b.device_mem_info())
+            .map(|(free, total)| (total.saturating_sub(free), total)),
+    };
+    if reset {
+        let _ = math_cuda::device::reset_pool_high_water();
+    }
+    out
+}
+
 /// The device's VRAM admission budget in bytes, if a CUDA backend is up.
 /// Lets callers outside this crate (the epoch builder's trace pre-upload)
 /// size their riding-ahead allocations relative to the same budget the

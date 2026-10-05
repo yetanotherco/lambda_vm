@@ -720,25 +720,55 @@ pub fn pool_reserved_bytes() -> Result<u64> {
     Ok(value)
 }
 
-/// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
-/// to zero, and the next allocation raises it to what is then in use — so a
-/// reader takes the larger of it and the `now` it read before the reset.
+/// The most the default memory pool has held from the device at any instant
+/// since the last [`reset_pool_high_water`] (`CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH`):
+/// the pool's side of the card's peak, freed blocks the pool kept included.
+/// Read against [`pool_used_bytes`]' high-water it splits a card reading into
+/// what the process held and what the pool retained.
+pub fn pool_reserved_high_bytes() -> Result<u64> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let mut value = 0u64;
+    // SAFETY: as in `pool_used_bytes`.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            &mut value as *mut u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(value)
+}
+
+/// Restarts the pool's two high-water marks, [`pool_used_bytes`]' and
+/// [`pool_reserved_high_bytes`]'. The driver only resets them to zero, and the
+/// next allocation raises them to what is then in use or held — so a reader
+/// takes the larger of each and the current value it read before the reset.
 pub fn reset_pool_high_water() -> Result<()> {
     use cudarc::driver::sys;
     let be = backend()?;
     let zero = 0u64;
     // SAFETY: as in `pool_used_bytes`; zero is the one value the driver takes
-    // for this attribute.
+    // for these attributes.
     unsafe {
         let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
             sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
         ))?;
-        sys::cuMemPoolSetAttribute(
-            pool,
+        for attribute in [
             sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-            &zero as *const u64 as *mut core::ffi::c_void,
-        )
-        .result()?;
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+        ] {
+            sys::cuMemPoolSetAttribute(
+                pool,
+                attribute,
+                &zero as *const u64 as *mut core::ffi::c_void,
+            )
+            .result()?;
+        }
     }
     Ok(())
 }

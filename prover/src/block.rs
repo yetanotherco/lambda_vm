@@ -338,6 +338,7 @@ fn prove_block_with_observed(
         crate::tables::trace_builder::set_finish_marks(None);
         ledger.line("phase A end");
     }
+    pool_readout_point("phase A");
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
@@ -360,6 +361,7 @@ fn prove_block_with_observed(
     if let Some(ledger) = &ledger {
         ledger.line("prove end");
     }
+    pool_readout_point("phase B");
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL end: {}", spill.report());
     }
@@ -1240,6 +1242,59 @@ impl<'a> QueueRoom<'a> {
 fn memlog() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_MEMLOG").is_ok_and(|v| v.trim() == "1")
 }
+
+/// `LAMBDA_VM_BLOCK_POOL_READOUT=1`: one `BLOCK POOL` line at phase A's end and
+/// one at phase B's end — the device pool's live high-water (bytes allocated
+/// and not yet freed) against its reserved high-water (bytes held from the
+/// card, freed blocks the pool kept included) and the card's used memory — so
+/// a card reading (nvidia-smi) splits into what the prove held and what the
+/// pool retained. Each line restarts both high-waters, so the second is phase
+/// B's own. Frees still queued on a stream count as live. A measurement knob,
+/// off by default; reading the pool changes nothing the prover computes.
+fn pool_readout() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_POOL_READOUT").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Under [`pool_readout`], the `BLOCK POOL` line for the phase that just ended.
+fn pool_readout_point(phase: &str) {
+    if !pool_readout() {
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let r = stark::gpu_lde::pool_readout(true);
+        eprintln!(
+            "{}",
+            pool_readout_line(phase, r.used, r.reserved_high, r.reserved_now, r.card)
+        );
+    }
+    // Without cuda there is no pool: every value prints as `?`.
+    #[cfg(not(feature = "cuda"))]
+    eprintln!("{}", pool_readout_line(phase, None, None, None, None));
+}
+
+/// The `BLOCK POOL` line: `used` is the pool's live `(now, high-water)`,
+/// `card` the card's `(used, total)`; an unreadable value prints as `?`.
+fn pool_readout_line(
+    phase: &str,
+    used: Option<(u64, u64)>,
+    reserved_high: Option<u64>,
+    reserved_now: Option<u64>,
+    card: Option<(u64, u64)>,
+) -> String {
+    let gib = |v: Option<u64>| v.map_or("?".to_string(), |b| format!("{:.2}", b as f64 / GIB_F));
+    format!(
+        "BLOCK POOL {phase}: live peak {} GiB (now {}) · reserved peak {} GiB (now {}) · card used {} of {} GiB",
+        gib(used.map(|(now, high)| high.max(now))),
+        gib(used.map(|(now, _)| now)),
+        gib(reserved_high.map(|high| high.max(reserved_now.unwrap_or(0)))),
+        gib(reserved_now),
+        gib(card.map(|(u, _)| u)),
+        gib(card.map(|(_, t)| t)),
+    )
+}
+
+const GIB_F: f64 = (1u64 << 30) as f64;
 
 /// Where the block's host memory is: what phase A holds in the places it knows
 /// of, printed ([`MemLedger::line`]) beside the process's resident set and, in
@@ -2671,6 +2726,46 @@ mod spill_policy_tests {
         }
         assert!(spilling);
         assert!(spill_reserve_bytes(0) == 6 * GIB && spill_reserve_bytes(10_000_000_000) > 7 * GIB);
+    }
+}
+
+#[cfg(test)]
+mod pool_readout_tests {
+    use super::pool_readout_line;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The line names the phase, takes each high-water as at least its current
+    /// value (the driver resets a mark to zero), and prints `?` for what it
+    /// could not read.
+    #[test]
+    fn the_pool_line_reads_peaks_against_their_current_values() {
+        assert_eq!(
+            pool_readout_line(
+                "phase B",
+                Some((2 * GIB, 21 * GIB)),
+                Some(28 * GIB),
+                Some(27 * GIB),
+                Some((29 * GIB, 32 * GIB)),
+            ),
+            "BLOCK POOL phase B: live peak 21.00 GiB (now 2.00) · reserved peak 28.00 GiB (now 27.00) · card used \
+             29.00 of 32.00 GiB"
+        );
+        assert_eq!(
+            pool_readout_line("phase A", Some((3 * GIB, 0)), Some(0), Some(5 * GIB), None),
+            "BLOCK POOL phase A: live peak 3.00 GiB (now 3.00) · reserved peak 5.00 GiB (now 5.00) · card used ? of ? GiB"
+        );
+        assert!(
+            pool_readout_line("phase B", None, None, None, None).ends_with(
+                "live peak ? GiB (now ?) · reserved peak ? GiB (now ?) · card used ? of ? GiB"
+            )
+        );
+    }
+
+    /// Off by default: the test process sets no knob.
+    #[test]
+    fn the_pool_readout_is_off_by_default() {
+        assert!(!super::pool_readout());
     }
 }
 
