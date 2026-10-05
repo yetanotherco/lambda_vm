@@ -1956,17 +1956,103 @@ pub fn coset_lde_narrow_with_merkle_tree_keep_rpl(
     Ok((handle, lde_out))
 }
 
+/// A precomputed tree's nodes on their way to the host: still bytes (the
+/// pageable download, converted to nodes at the end of the commit, where the
+/// conversion has always run) or already nodes (the staged download).
+enum PrecomputedHost {
+    Bytes {
+        bytes: Vec<u8>,
+        took: std::time::Duration,
+    },
+    Nodes(Vec<[u8; 32]>),
+}
+
+impl PrecomputedHost {
+    fn into_nodes(self) -> Vec<[u8; 32]> {
+        match self {
+            PrecomputedHost::Nodes(nodes) => nodes,
+            PrecomputedHost::Bytes { bytes, took } => {
+                let started = std::time::Instant::now();
+                let nodes: Vec<[u8; 32]> = bytes
+                    .chunks_exact(32)
+                    .map(|c| {
+                        let mut node = [0u8; 32];
+                        node.copy_from_slice(c);
+                        node
+                    })
+                    .collect();
+                crate::device::note_tree_download(false, bytes.len(), took + started.elapsed());
+                nodes
+            }
+        }
+    }
+}
+
+/// Bring a built precomputed tree (`nodes_dev`, a full node buffer) to the
+/// host, then run `then` — the multiplicity tree's build — on the same stream.
+/// [`crate::device::tree_download_staged`] picks the transfer:
+///
+/// - pageable (the default): one pageable copy into a zeroed byte vector, the
+///   buffer freed, then `then`;
+/// - staged: through a staging pair straight into the node vector, the buffer
+///   freed and `then` queued as soon as the last chunk's DMA is, so the
+///   multiplicity tree hashes while the host copies the last chunks. Both
+///   frees are stream-ordered behind the reads, so one tree is the device peak
+///   either way (as `stark::device_set::CommitDeviceSet::tree_bytes` counts).
+///
+/// The timer starts once the tree is built (an event waited on first), so the
+/// counters time the transfer, not the hashing before it.
+fn download_precomputed_then<X>(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    nodes_dev: CudaSlice<u8>,
+    then: impl FnOnce() -> Result<X>,
+) -> Result<(PrecomputedHost, X)> {
+    let n_bytes = nodes_dev.len();
+    let built = be.take_event()?;
+    built.event().record(stream)?;
+    built.event().synchronize()?;
+    let started = std::time::Instant::now();
+    if !crate::device::tree_download_staged() {
+        let mut bytes = vec![0u8; n_bytes];
+        stream.memcpy_dtoh(&nodes_dev, &mut bytes)?;
+        drop(nodes_dev);
+        let took = started.elapsed();
+        let x = then()?;
+        return Ok((PrecomputedHost::Bytes { bytes, took }, x));
+    }
+    assert_eq!(n_bytes % 32, 0, "a node buffer holds whole nodes");
+    let src = {
+        let (ptr, _record) = nodes_dev.device_ptr(stream);
+        ptr
+    };
+    let mut nodes: Vec<[u8; 32]> = Vec::new();
+    // SAFETY: `src` is `nodes_dev`, `n_bytes / 32` nodes, whose writers (the
+    // tree build) are queued on `stream` before this call; nothing writes it
+    // again, and the closure frees it stream-ordered on `stream`, behind the
+    // last chunk's read. Every 32-byte pattern is a valid node.
+    let x = unsafe {
+        crate::device::dtoh_staged_uncounted(stream, src, n_bytes / 32, &mut nodes, move || {
+            drop(nodes_dev);
+            then()
+        })
+    }?;
+    crate::device::note_tree_download(true, n_bytes, started.elapsed());
+    Ok((PrecomputedHost::Nodes(nodes), x))
+}
+
 /// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
 /// precomputed columns `[0, split_col)` and the multiplicity columns
 /// `[split_col, m)` commit to separate trees over the same row-major LDE,
 /// mirroring the CPU `commit_rows_bit_reversed_subset` pair.
 ///
 /// The precomputed tree's complete node buffer is downloaded to host
-/// (`(2*num_leaves - 1) * 32` bytes, inner nodes first, root at offset 0,
-/// leaves at the tail — the exact `MerkleTree::from_precomputed_nodes`
-/// layout) because it feeds the process-wide host tree cache; it is only
-/// built when `build_precomputed` is true (the caller skips it on a cache
-/// hit). The multiplicity tree stays resident in `handle.tree` — openings
+/// (`2*num_leaves - 1` nodes, inner nodes first, root at index 0, leaves at
+/// the tail — the exact `MerkleTree::from_precomputed_nodes` layout) because
+/// it feeds the process-wide host tree cache; it is only built when
+/// `build_precomputed` is true (the caller skips it on a cache hit). How it
+/// travels is [`crate::device::TREE_DOWNLOAD_ENV`]'s choice; the nodes are the
+/// same bytes either way. The multiplicity tree stays resident in `handle.tree` — openings
 /// gather its paths on device.
 ///
 /// Returns `(precomputed_nodes, handle, row_major_lde)`. The handle also
@@ -1984,7 +2070,7 @@ pub fn coset_lde_row_major_split_trees(
     split_col: usize,
     build_precomputed: bool,
     retain_host_lde: bool,
-) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+) -> Result<(Option<Vec<[u8; 32]>>, GpuLdeBase, Vec<u64>)> {
     coset_lde_row_major_split_trees_rpl(
         row_major,
         predev,
@@ -2017,7 +2103,7 @@ pub fn coset_lde_row_major_split_trees_rpl(
     build_precomputed: bool,
     retain_host_lde: bool,
     rows_per_leaf: usize,
-) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+) -> Result<(Option<Vec<[u8; 32]>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -2088,19 +2174,19 @@ pub fn coset_lde_row_major_split_trees_rpl(
 
     // Precomputed subset tree: full nodes to host (feeds the process-wide
     // host tree cache keyed by root; built once per prove on cache miss).
-    let precomputed_nodes = if build_precomputed {
-        let nodes_dev = build_subset_tree_dev(0, split_col as u64)?;
-        let mut nodes_host = vec![0u8; nodes_bytes];
-        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
-        Some(nodes_host)
-    } else {
-        None
-    };
     // Multiplicity subset tree: resident (per-epoch; the ~2x-leaves node
     // download and host rebuild it used to pay are dropped — R4 openings
-    // gather paths on device).
+    // gather paths on device). Built behind the precomputed tree's download.
+    let build_mult = || build_subset_tree_dev(split_col as u64, cols_u64);
+    let (precomputed_host, mult_nodes_dev) = if build_precomputed {
+        let nodes_dev = build_subset_tree_dev(0, split_col as u64)?;
+        let (host, mult) = download_precomputed_then(&stream, be, nodes_dev, build_mult)?;
+        (Some(host), mult)
+    } else {
+        (None, build_mult()?)
+    };
     let mult_tree = {
-        let nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
+        let nodes_dev = mult_nodes_dev;
         let mut root = [0u8; 32];
         stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
         GpuMerkleTree {
@@ -2164,6 +2250,7 @@ pub fn coset_lde_row_major_split_trees_rpl(
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
+    let precomputed_nodes = precomputed_host.map(PrecomputedHost::into_nodes);
     Ok((precomputed_nodes, handle, lde_out))
 }
 
@@ -2185,7 +2272,7 @@ fn coset_lde_row_major_split_trees_col_major(
     split_col: usize,
     build_precomputed: bool,
     rows_per_leaf: usize,
-) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+) -> Result<(Option<Vec<[u8; 32]>>, GpuLdeBase, Vec<u64>)> {
     let lde_size = n * blowup_factor;
     let num_leaves = lde_size / rows_per_leaf;
     let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
@@ -2214,16 +2301,16 @@ fn coset_lde_row_major_split_trees_col_major(
 
     // As the legacy path: the precomputed tree's nodes go to host (the
     // process-wide tree cache), the multiplicity tree stays resident.
-    let precomputed_nodes = if build_precomputed {
+    let build_mult = || build_subset_tree_dev(split_col, m);
+    let (precomputed_host, mult_nodes_dev) = if build_precomputed {
         let nodes_dev = build_subset_tree_dev(0, split_col)?;
-        let mut nodes_host = vec![0u8; nodes_bytes];
-        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
-        Some(nodes_host)
+        let (host, mult) = download_precomputed_then(stream, be, nodes_dev, build_mult)?;
+        (Some(host), mult)
     } else {
-        None
+        (None, build_mult()?)
     };
     let mult_tree = {
-        let nodes_dev = build_subset_tree_dev(split_col, m)?;
+        let nodes_dev = mult_nodes_dev;
         let mut root = [0u8; 32];
         stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
         GpuMerkleTree {
@@ -2244,6 +2331,7 @@ fn coset_lde_row_major_split_trees_col_major(
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
+    let precomputed_nodes = precomputed_host.map(PrecomputedHost::into_nodes);
     Ok((precomputed_nodes, handle, Vec::new()))
 }
 

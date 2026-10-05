@@ -1966,6 +1966,165 @@ pub fn staging_totals() -> StagingTotals {
     }
 }
 
+/// How a preprocessed commit brings its precomputed tree's node buffer to the
+/// host on a tree-cache miss. `staged`: through a staging pair
+/// ([`dtoh_staged_uncounted`]) straight into the host tree's node vector, with
+/// the multiplicity tree queued behind the last chunk. Unset, `legacy` or
+/// `pageable`: one pageable copy into a zeroed byte vector, converted to nodes
+/// at the end of the commit — the path before the knob existed. The nodes are
+/// the same bytes either way; only the transfer differs.
+pub const TREE_DOWNLOAD_ENV: &str = "LAMBDA_VM_TREE_DOWNLOAD";
+
+thread_local! {
+    /// The calling thread's override of [`tree_download_staged`], so one test
+    /// process can run both paths. `None` reads the environment.
+    static TREE_DOWNLOAD_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the calling thread downloads precomputed trees staged: its override
+/// if set, else [`TREE_DOWNLOAD_ENV`], read once per process and named once on
+/// stderr, so every log states which download it ran.
+pub fn tree_download_staged() -> bool {
+    if let Some(on) = TREE_DOWNLOAD_OVERRIDE.with(|o| o.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (staged, why) = tree_download_setting(std::env::var(TREE_DOWNLOAD_ENV).ok().as_deref());
+        eprintln!(
+            "[gpu] precomputed-tree download: {} ({why})",
+            if staged { "staged" } else { "pageable" }
+        );
+        staged
+    })
+}
+
+/// [`TREE_DOWNLOAD_ENV`]'s value read: whether it selects the staged download,
+/// and how the value was taken. An unknown value keeps the pageable path and
+/// says so, rather than failing a prove over a typo.
+fn tree_download_setting(value: Option<&str>) -> (bool, String) {
+    match value.map(str::trim) {
+        None => (false, format!("{TREE_DOWNLOAD_ENV} unset")),
+        Some("staged") => (true, format!("{TREE_DOWNLOAD_ENV}=staged")),
+        Some(v @ ("legacy" | "pageable")) => (false, format!("{TREE_DOWNLOAD_ENV}={v}")),
+        Some(v) => (
+            false,
+            format!("{TREE_DOWNLOAD_ENV}={v:?} is not staged, legacy or pageable"),
+        ),
+    }
+}
+
+/// Force [`tree_download_staged`] on the calling thread; `None` restores the
+/// environment's answer.
+pub fn set_tree_download_override(on: Option<bool>) {
+    TREE_DOWNLOAD_OVERRIDE.with(|o| o.set(on));
+}
+
+/// Precomputed-tree downloads by path (`[pageable, staged]`): trees, bytes, and
+/// the time from the tree being built to the host holding every node — the
+/// pageable path's zero-fill, copy and conversion to nodes included.
+static TREE_DOWNLOADS: [[AtomicU64; 3]; 2] = [
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+];
+
+/// Record one precomputed-tree download of `bytes` that took `took`.
+pub fn note_tree_download(staged: bool, bytes: usize, took: std::time::Duration) {
+    let c = &TREE_DOWNLOADS[usize::from(staged)];
+    c[0].fetch_add(1, Ordering::Relaxed);
+    c[1].fetch_add(bytes as u64, Ordering::Relaxed);
+    c[2].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The precomputed-tree download counters, `[pageable, staged]` each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeDownloadTotals {
+    pub trees: [u64; 2],
+    pub bytes: [u64; 2],
+    pub nanos: [u64; 2],
+}
+
+impl TreeDownloadTotals {
+    /// What moved between `earlier` and `self`.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let d = |a: [u64; 2], b: [u64; 2]| [a[0] - b[0], a[1] - b[1]];
+        Self {
+            trees: d(self.trees, earlier.trees),
+            bytes: d(self.bytes, earlier.bytes),
+            nanos: d(self.nanos, earlier.nanos),
+        }
+    }
+
+    /// One line: `pageable <n> trees <GB> in <s> (<GB/s>) | staged …`.
+    pub fn line(&self) -> String {
+        let one = |i: usize| {
+            let gb = self.bytes[i] as f64 / 1e9;
+            let s = self.nanos[i] as f64 / 1e9;
+            format!(
+                "{} {} trees {gb:.2} GB in {s:.2} s ({:.2} GB/s)",
+                ["pageable", "staged"][i],
+                self.trees[i],
+                if s > 0.0 { gb / s } else { 0.0 }
+            )
+        };
+        format!("{} | {}", one(0), one(1))
+    }
+}
+
+/// The precomputed-tree download counters since the process started.
+pub fn tree_download_totals() -> TreeDownloadTotals {
+    let load = |k: usize| {
+        [
+            TREE_DOWNLOADS[0][k].load(Ordering::Relaxed),
+            TREE_DOWNLOADS[1][k].load(Ordering::Relaxed),
+        ]
+    };
+    TreeDownloadTotals {
+        trees: load(0),
+        bytes: load(1),
+        nanos: load(2),
+    }
+}
+
+#[cfg(test)]
+mod tree_download_tests {
+    use super::{TreeDownloadTotals, tree_download_setting};
+
+    /// Only `staged` selects the staged download; unset, `legacy`, `pageable`
+    /// and anything else keep the pageable path, and the reason names the value.
+    #[test]
+    fn only_staged_selects_the_staged_download() {
+        assert!(!tree_download_setting(None).0);
+        assert!(tree_download_setting(Some("staged")).0);
+        assert!(tree_download_setting(Some(" staged ")).0);
+        assert!(!tree_download_setting(Some("legacy")).0);
+        assert!(!tree_download_setting(Some("pageable")).0);
+        let (on, why) = tree_download_setting(Some("stagde"));
+        assert!(!on);
+        assert!(why.contains("\"stagde\""), "{why}");
+    }
+
+    #[test]
+    fn totals_subtract_and_print_per_path() {
+        let earlier = TreeDownloadTotals {
+            trees: [1, 2],
+            bytes: [1_000_000_000, 0],
+            nanos: [500_000_000, 0],
+        };
+        let now = TreeDownloadTotals {
+            trees: [3, 2],
+            bytes: [5_000_000_000, 0],
+            nanos: [2_500_000_000, 0],
+        };
+        let d = now.since(&earlier);
+        assert_eq!(d.trees, [2, 0]);
+        assert_eq!(
+            d.line(),
+            "pageable 2 trees 4.00 GB in 2.00 s (2.00 GB/s) | staged 0 trees 0.00 GB in 0.00 s (0.00 GB/s)"
+        );
+    }
+}
+
 /// Make up to `n` staging pairs now (never more than [`MAX_STAGING_PAIRS`]
 /// exist), so a prove's first transfers find them made instead of paying
 /// their `cuMemHostAlloc` between two kernels. Returns how many pairs exist.
@@ -2179,13 +2338,43 @@ pub unsafe fn dtoh_staged_into<R>(
     dst: &mut Vec<u64>,
     after_last_enqueue: impl FnOnce() -> Result<R>,
 ) -> Result<R> {
-    assert!(dst.is_empty(), "dtoh_staged_into: dst must start empty");
     if n == 0 {
+        assert!(dst.is_empty(), "dtoh_staged_into: dst must start empty");
         return after_last_enqueue();
     }
     let started = std::time::Instant::now();
+    // SAFETY: the caller's contract is `dtoh_staged_uncounted`'s, for `u64`s.
+    let result = unsafe { dtoh_staged_uncounted(stream, src, n, dst, after_last_enqueue) }?;
+    STAGING_STATS.note_out(true, n * 8, started.elapsed());
+    Ok(result)
+}
+
+/// [`dtoh_staged_into`] for any plain element type, and counted by its caller
+/// instead of in the retained-LDE download's counters: the same pair, chunks and
+/// ordering, with `n` counting `T`s. `T`'s size must divide
+/// [`STAGED_CHUNK_BYTES`], so no element straddles two chunks.
+///
+/// # Safety
+/// As [`dtoh_staged_into`], with `src` addressing at least `n` `T`s, and every
+/// bit pattern the device wrote there a valid `T` (plain data).
+pub unsafe fn dtoh_staged_uncounted<T: Copy, R>(
+    stream: &Arc<CudaStream>,
+    src: cudarc::driver::sys::CUdeviceptr,
+    n: usize,
+    dst: &mut Vec<T>,
+    after_last_enqueue: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    assert!(dst.is_empty(), "dtoh_staged_into: dst must start empty");
+    let size = std::mem::size_of::<T>();
+    assert!(
+        size > 0 && STAGED_CHUNK_BYTES.is_multiple_of(size),
+        "dtoh_staged_into: the element size must divide the chunk"
+    );
+    if n == 0 {
+        return after_last_enqueue();
+    }
     dst.reserve_exact(n);
-    let chunk = STAGED_CHUNK_BYTES / 8;
+    let chunk = STAGED_CHUNK_BYTES / size;
     let n_chunks = n.div_ceil(chunk);
     let chunk_len = |k: usize| (n - k * chunk).min(chunk);
 
@@ -2211,13 +2400,13 @@ pub unsafe fn dtoh_staged_into<R>(
             // already copied out, or the previous borrower's DMA — is done.
             buf.sync_event()?;
             // SAFETY: the buffer holds `STAGED_CHUNK_BYTES >= chunk_len(next) *
-            // 8`, nothing reads or writes it (above), and the source range lies
-            // inside the caller's `n` values.
+            // size`, nothing reads or writes it (above), and the source range
+            // lies inside the caller's `n` values.
             unsafe {
                 let r = cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
                     buf.ptr as *mut core::ffi::c_void,
-                    src + (next * chunk * 8) as u64,
-                    chunk_len(next) * 8,
+                    src + (next * chunk * size) as u64,
+                    chunk_len(next) * size,
                     stream.cu_stream(),
                 )
                 .result();
@@ -2238,7 +2427,7 @@ pub unsafe fn dtoh_staged_into<R>(
         // `[k * chunk, k * chunk + chunk_len(k))`.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                buf.ptr as *const u64,
+                buf.ptr as *const T,
                 dst.as_mut_ptr().add(k * chunk),
                 chunk_len(k),
             );
@@ -2248,7 +2437,6 @@ pub unsafe fn dtoh_staged_into<R>(
     drain.armed = false;
     // SAFETY: the loop wrote all `n` values.
     unsafe { dst.set_len(n) };
-    STAGING_STATS.note_out(true, n * 8, started.elapsed());
     Ok(result.expect("the closure ran at the last enqueue"))
 }
 
