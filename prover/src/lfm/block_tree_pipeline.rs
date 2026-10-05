@@ -429,7 +429,9 @@ impl Pipe {
                                 emit += secs;
                                 ready[l][jj] = Some(program);
                             }
-                            ready[lv][j].take().expect("filled above")?
+                            ready[lv][j].take().ok_or_else(|| {
+                                format!("level {} node {j}: its program never arrived", lv + 1)
+                            })??
                         }
                     };
                     let (artifacts, derived) = built(&program)?;

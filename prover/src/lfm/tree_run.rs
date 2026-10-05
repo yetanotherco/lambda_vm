@@ -389,11 +389,11 @@ impl HostSampler {
     /// `(peak GiB, argmax UNIX seconds)` over this sampler's window.
     pub(crate) fn stop(mut self) -> (f64, f64) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A sampler that could not run reports no peak, at the time it stopped.
         self.handle
             .take()
-            .expect("a sampler is stopped once")
-            .join()
-            .expect("the sampler thread must not panic")
+            .and_then(|h| h.join().ok())
+            .unwrap_or_else(|| (0.0, unix_now()))
     }
 }
 
