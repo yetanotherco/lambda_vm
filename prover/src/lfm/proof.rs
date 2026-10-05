@@ -361,14 +361,6 @@ pub(crate) fn prove_traces_with_hasher(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
-    // a driver has armed it, and then exclusive: `multi_prove` builds its own
-    // full-budget `VramGate`, so two of them in flight would budget the card
-    // twice over. Held here rather than around the whole of `lfm_prove`
-    // deliberately — the executor and the trace fill run BEFORE this call and
-    // must be free to overlap another proof's device phase, which is the entire
-    // point of the lever.
-    let _card = super::device_permit::hold_labeled("multi_prove");
     let mut airs = LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
@@ -390,6 +382,16 @@ pub(crate) fn prove_traces_with_hasher(
         public_words,
         options.fri_final_poly_log_degree,
     );
+    // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
+    // a driver has armed it, and then exclusive (or, under the armed shared
+    // VRAM gate, one of its proof places): `multi_prove` builds its own
+    // full-budget `VramGate` unless the gate is shared, so two of them in flight
+    // would budget the card twice over. Held around `multi_prove` alone
+    // deliberately — the executor and the trace fill run BEFORE this call, and
+    // the AIR set and the statement's absorb above touch no device, so all of
+    // them are free to overlap another proof's device phase, which is the
+    // entire point of the lever.
+    let _card = super::device_permit::hold_labeled("multi_prove");
     crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
