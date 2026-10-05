@@ -1242,8 +1242,8 @@ fn memlog() -> bool {
 }
 
 /// Where the block's host memory is: what phase A holds in the places it knows
-/// of, printed ([`MemLedger::line`]) beside the process's resident set and, in
-/// the lib's tests (which run jemalloc), the allocator's live, active and
+/// of, printed ([`MemLedger::line`]) beside the process's resident set and,
+/// where the allocator can be read ([`heap_stats`]), its live, active and
 /// resident bytes. Lists count at their capacities. It changes no trace.
 struct MemLedger {
     start: Instant,
@@ -1481,26 +1481,12 @@ fn proc_rss_bytes() -> Option<usize> {
     Some(kib * 1024)
 }
 
-/// jemalloc's allocated, active, resident, mapped and retained bytes: in the
-/// lib's tests, which install jemalloc as the allocator (`lib.rs`).
-#[cfg(test)]
+/// The allocator's allocated, active, resident, mapped and retained bytes,
+/// when it can be read ([`crate::alloc_purge::stats`]: the binary's hooks, or
+/// the jemalloc the lib's tests install).
 fn heap_stats() -> Option<[usize; 5]> {
-    use tikv_jemalloc_ctl::{epoch, stats};
-    // The statistics are cached until the epoch turns.
-    epoch::advance().ok()?;
-    Some([
-        stats::allocated::read().ok()?,
-        stats::active::read().ok()?,
-        stats::resident::read().ok()?,
-        stats::mapped::read().ok()?,
-        stats::retained::read().ok()?,
-    ])
-}
-
-/// Outside the lib's tests the allocator's statistics are not read.
-#[cfg(not(test))]
-fn heap_stats() -> Option<[usize; 5]> {
-    None
+    crate::alloc_purge::stats()
+        .map(|s| [s.allocated, s.active, s.resident, s.mapped, s.retained])
 }
 
 /// The bytes a streamed chunk on its way to a committer holds.

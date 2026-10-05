@@ -11,10 +11,13 @@
 //! the next phase starts near its live set. Decay 0 does the same continuously
 //! at +54 s of base.
 //!
-//! [`purge_point`] is the call a pipeline makes at a named boundary. It purges
-//! only in the lib's own test builds, whose global allocator is jemalloc
-//! (`lib.rs`); anywhere else the binary owns the allocator, and the call does
-//! nothing.
+//! [`purge_point`] is the call a pipeline makes at a named boundary. The lib
+//! does not own the allocator, the binary does: it purges through the
+//! [`AllocatorHooks`] the binary [`install`]s (the CLI installs jemalloc's), or,
+//! in the lib's own test builds, through the jemalloc their `lib.rs` installs.
+//! Anywhere else the call does nothing. The same hooks give the allocator's
+//! statistics ([`stats`]) to the readers that need them: the block's memory
+//! ledger and the tree's late leaf emission.
 //!
 //! By default (`auto`) a purge runs only once the block's memory is short: at
 //! phase A's end and the base's end, after the spill's queue budgets armed
@@ -22,6 +25,58 @@
 //! purges took the base's phase-B peak 119.79 → 116.60 GiB and level 0's start
 //! ≈ 115 → 55.6 GiB, where without them level 0 was OOM-killed (BIG 120, 1215);
 //! a block that fits never arms, so it pays nothing.
+
+/// The allocator's statistics, in bytes (jemalloc's `stats.*`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocStats {
+    /// Live: what the program asked for and has not freed.
+    pub allocated: usize,
+    /// In active pages.
+    pub active: usize,
+    /// Held in pages: live, freed-and-dirty, and metadata (an upper bound: a
+    /// fresh extent counts before it is touched).
+    pub resident: usize,
+    pub mapped: usize,
+    pub retained: usize,
+}
+
+/// The binary's allocator, as the lib may ask it: its statistics, and a purge
+/// of every arena's dirty pages (`true` when it ran).
+#[derive(Clone, Copy, Debug)]
+pub struct AllocatorHooks {
+    pub stats: fn() -> Option<AllocStats>,
+    pub purge_all: fn() -> bool,
+}
+
+static HOOKS: std::sync::OnceLock<AllocatorHooks> = std::sync::OnceLock::new();
+
+/// The binary installs its allocator's hooks, once, at startup. Returns `false`
+/// when hooks were already installed (the first stay).
+pub fn install(hooks: AllocatorHooks) -> bool {
+    HOOKS.set(hooks).is_ok()
+}
+
+/// The installed hooks, else the lib's own test build's jemalloc.
+fn hooks() -> Option<AllocatorHooks> {
+    HOOKS.get().copied().or(BUILT_IN)
+}
+
+/// The lib's test build installs jemalloc as its global allocator (`lib.rs`).
+#[cfg(test)]
+const BUILT_IN: Option<AllocatorHooks> = Some(AllocatorHooks {
+    stats: jemalloc_stats,
+    purge_all: jemalloc_purge_all,
+});
+
+/// Outside the lib's tests the binary owns the allocator: nothing built in.
+#[cfg(not(test))]
+const BUILT_IN: Option<AllocatorHooks> = None;
+
+/// The allocator's statistics, when the binary's hooks (or the lib's test
+/// build) can read them.
+pub fn stats() -> Option<AllocStats> {
+    hooks().and_then(|h| (h.stats)())
+}
 
 /// What one purge did.
 #[derive(Clone, Copy, Debug)]
@@ -121,17 +176,46 @@ pub fn purge_point(point: &str) -> Option<Purge> {
     Some(purge)
 }
 
+/// Purge every arena through the hooks, timed, with the resident bytes
+/// before and after.
+fn purge_all_arenas() -> Option<Purge> {
+    purge_with(hooks()?)
+}
+
+fn purge_with(hooks: AllocatorHooks) -> Option<Purge> {
+    let resident = || (hooks.stats)().map(|s| s.resident);
+    let resident_before = resident()?;
+    let t = std::time::Instant::now();
+    if !(hooks.purge_all)() {
+        return None;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    Some(Purge {
+        secs,
+        resident_before,
+        resident_after: resident()?,
+    })
+}
+
+/// jemalloc's statistics, the epoch turned first (they are cached until it
+/// turns).
+#[cfg(test)]
+fn jemalloc_stats() -> Option<AllocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    Some(AllocStats {
+        allocated: stats::allocated::read().ok()?,
+        active: stats::active::read().ok()?,
+        resident: stats::resident::read().ok()?,
+        mapped: stats::mapped::read().ok()?,
+        retained: stats::retained::read().ok()?,
+    })
+}
+
 /// `arena.<MALLCTL_ARENAS_ALL>.purge` (4096, jemalloc's "every arena" index): a
 /// control that neither reads nor writes, so every pointer is null.
 #[cfg(test)]
-fn purge_all_arenas() -> Option<Purge> {
-    use tikv_jemalloc_ctl::{epoch, stats};
-    let resident = || -> Option<usize> {
-        epoch::advance().ok()?;
-        stats::resident::read().ok()
-    };
-    let resident_before = resident()?;
-    let t = std::time::Instant::now();
+fn jemalloc_purge_all() -> bool {
     // SAFETY: the name is NUL-terminated, and a control that takes no value is
     // called with null old and new pointers and zero lengths, as jemalloc's
     // `NEITHER_READ_NOR_WRITE` requires.
@@ -144,22 +228,10 @@ fn purge_all_arenas() -> Option<Purge> {
             0,
         )
     };
-    let secs = t.elapsed().as_secs_f64();
     if rc != 0 {
         eprintln!("ALLOC PURGE: arena.4096.purge returned {rc}");
-        return None;
     }
-    Some(Purge {
-        secs,
-        resident_before,
-        resident_after: resident()?,
-    })
-}
-
-/// Outside the lib's tests the binary owns the allocator: nothing to purge.
-#[cfg(not(test))]
-fn purge_all_arenas() -> Option<Purge> {
-    None
+    rc == 0
 }
 
 #[cfg(test)]
@@ -205,6 +277,52 @@ mod tests {
         }
         assert_eq!(decide(Some("base.tree"), "tree", false), Decision::Purge);
         assert_eq!(decide(Some("base.tree"), "phase-a", true), Decision::No);
+    }
+
+    /// A purge goes through the hooks it is given: it reads the resident bytes
+    /// before and after, and a purge that did not run is no purge.
+    #[test]
+    fn a_purge_runs_through_its_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RESIDENT: AtomicUsize = AtomicUsize::new(900);
+        fn stats() -> Option<AllocStats> {
+            Some(AllocStats {
+                resident: RESIDENT.load(Ordering::SeqCst),
+                ..AllocStats::default()
+            })
+        }
+        fn purged() -> bool {
+            RESIDENT.store(100, Ordering::SeqCst);
+            true
+        }
+        fn refused() -> bool {
+            false
+        }
+        fn blind() -> Option<AllocStats> {
+            None
+        }
+        let purge = purge_with(AllocatorHooks {
+            stats,
+            purge_all: purged,
+        })
+        .expect("the hooks purge");
+        assert_eq!((purge.resident_before, purge.resident_after), (900, 100));
+        let refused = AllocatorHooks {
+            stats,
+            purge_all: refused,
+        };
+        assert!(purge_with(refused).is_none());
+        let blind = AllocatorHooks {
+            stats: blind,
+            purge_all: purged,
+        };
+        assert!(purge_with(blind).is_none(), "no reading, no purge line");
+    }
+
+    /// The lib's test build reads its own jemalloc with no hook installed.
+    #[test]
+    fn the_test_build_reads_its_jemalloc() {
+        assert!(stats().is_some_and(|s| s.allocated > 0 && s.resident >= s.allocated));
     }
 
     /// A purge hands back the pages freed buffers left: 512 buffers of 1 MiB,
