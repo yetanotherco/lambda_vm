@@ -1032,8 +1032,6 @@ fn the_node_cost_model_is_measured() {
 /// reader lives in [`super::harvest`], where the block tree's driver uses it
 /// too).
 pub(super) use super::harvest::HarvestedChild as RealChild;
-/// The child's shape, as the node's emitter reads it.
-pub(super) use super::harvest::child_shape;
 
 /// Harvest a child from a proof PRODUCTION ACCEPTS. Panics loudly otherwise —
 /// nothing downstream may read a proof the verifier would reject.
@@ -1062,15 +1060,24 @@ pub(super) fn real_child_timed(
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// [`real_child_timed`] without its verify, for a caller that verifies the same
-/// proof elsewhere and fails the run on a refusal before it reports anything
-/// (the block tree's children, verified beside the timed path).
-pub(super) fn real_child_unverified(
-    artifacts: super::registry::LfmArtifacts,
-    opts: crate::ProofOptions,
-    proved: &super::proof::LfmProof,
-) -> RealChild {
-    super::harvest::harvest_child(artifacts, opts, proved).unwrap_or_else(|e| panic!("{e}"))
+/// The child's shape, as the node's emitter reads it.
+pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildShape<'_> {
+    super::per_table_aggregator::ChildShape {
+        program_id: &c.artifacts.program_id,
+        num_public_words: c.public_words.len(),
+        fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
+        tables: c
+            .tables
+            .iter()
+            .zip(&c.legs)
+            .map(|(h, leg)| super::per_table_aggregator::ChildTable {
+                challenge: &h.shape,
+                verify: &leg.verify,
+                analysis: &leg.analysis,
+                precomputed_root: leg.precomputed_commitment.as_ref(),
+            })
+            .collect(),
+    }
 }
 
 /// The child's arenas, in `declare_leg_arenas`' declaration order.
@@ -1619,70 +1626,10 @@ impl CacheMode {
     }
 }
 
-/// ★ THE `prove` FIELD, SPLIT — `execute · fill · multi_prove`.
-///
-/// The per-node TIMING line prints the whole of `lfm_prove` as one number, and
-/// the three phases inside it are three different machines: a single-threaded
-/// interpreter, a parallel trace fill, and the only one that reaches the card.
-/// A lever aimed at the wrong one reads zero.
-///
-/// ⓘ Printed HERE rather than beside the timers, for the stage's label — a
-/// bare line is unattributable the moment two proofs are in flight. Silent on a
-/// LOADED stage, because nothing proved: `take_prove_split` returns `None` and
-/// there is nothing to attribute.
+/// [`super::tree_run::prove_split_text`], printed.
 pub(super) fn print_prove_split(label: &str) {
-    if let Some(split) = super::proof::take_prove_split() {
-        println!(
-            "   {label} LFM PROVE: execute {:.2}s · fill {:.2}s · multi_prove {:.2}s{}",
-            split.execute,
-            split.fill,
-            split.multi_prove,
-            // ⓘ Absent when there was no wait, so a serial line is byte-identical
-            // to every one already in the campaign's logs and the two arms diff
-            // on their numbers rather than on their shape.
-            if split.permit_wait > 0.0 {
-                format!(" · permit wait {:.2}s", split.permit_wait)
-            } else {
-                String::new()
-            },
-        );
-        // ⛔ A SECOND LINE, never extra fields on the first. Every log the
-        // campaign has compared greps `LFM PROVE:` and reads its three numbers
-        // positionally; widening that line would re-baseline every one of them.
-        //
-        // ⓘ `parallel 0 levels` beside a large `levels` is the reading this line
-        // exists to make visible: it means every level was coalesced onto the
-        // calling thread and the parallel path never ran, which a wall alone
-        // would show only as a lever that did nothing.
-        let e = split.exec;
-        println!(
-            "   {label} LFM EXEC: levels {} · parallel {} levels / {} hashes · \
-             depth pass {:.2}s · setup {:.2}s · hash phase {:.2}s · apply {:.2}s · \
-             residue {:.2}s · sum {:.2}s",
-            e.levels,
-            e.parallel_levels,
-            e.parallel_hashes,
-            e.depth_pass,
-            e.setup,
-            e.hash_phase,
-            e.apply,
-            e.residue,
-            e.depth_pass + e.setup + e.hash_phase + e.apply + e.residue,
-        );
-        // ⓘ A THIRD line, for the two questions a wall cannot answer: how big
-        // the thing `setup` touches is, and what width the pool actually gave.
-        // `ns/perm` is measured on the coalesced levels of THIS proof — same
-        // box, same load, no rayon — so `width` is a reading, not an argument.
-        if e.serial_hashes > 0 {
-            println!(
-                "   {label} LFM EXEC WIDTH: records {:.0} MiB · {} serial hashes at \
-                 {:.0} ns/perm · effective width {:.1}",
-                e.record_bytes as f64 / (1u64 << 20) as f64,
-                e.serial_hashes,
-                e.secs_per_perm() * 1e9,
-                e.effective_width(),
-            );
-        }
+    if let Some(text) = super::tree_run::prove_split_text(label) {
+        print!("{text}");
     }
 }
 
@@ -2477,28 +2424,7 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
     );
 }
 
-/// Both memory numbers at once — `(VmRSS, VmHWM)` in GiB, live and high-water.
-///
-/// ⚠ `VmHWM` alone cannot see a TROUGH, and the trough is half the model. A
-/// high-water mark only rises, so a mark taken after a phase reports the largest
-/// the process has EVER been, not what that phase left resident. That difference
-/// decides whether the next phase's peak is `live + its own working set` or is
-/// hidden under an earlier phase's mark entirely — and on this workload the two
-/// diverge hard: box A measured `VmHWM` static at 72.50 GiB while `VmRSS`
-/// oscillated between 19.98 and 58.13.
-///
-/// A `ps` sample of the LIVE figure once reached this lane as if it were a
-/// high-water mark, and every derivation built on it was wrong by the gap
-/// between them. Both are printed so that cannot recur.
-fn rss_marks() -> (Option<f64>, Option<f64>) {
-    let read = |key: &str| -> Option<f64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let line = status.lines().find(|l| l.starts_with(key))?;
-        let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kb / (1024.0 * 1024.0))
-    };
-    (read("VmRSS:"), read("VmHWM:"))
-}
+use super::tree_run::rss_marks;
 
 /// ★★★ LIVE BYTES vs RESIDENT BYTES, straight from the allocator.
 ///
@@ -3103,180 +3029,9 @@ fn assert_the_rpx_grind_reached_the_device(stage: &str) {
 
 // ======================= the production tree driver =======================
 
-/// A 100 Hz `VmRSS` sampler with an ARGMAX TIMESTAMP.
-///
-/// ⛔ WHY NOT `VmHWM`. A high-water only rises, so it cannot see a peak BELOW
-/// itself and cannot say WHEN its own peak happened. That is what struck the
-/// 37.169 GiB "the tree does not grow per level": three reads of one monotone
-/// counter, in a process that had already proved a base and four wraps, with no
-/// mark before the first level — a whole-process bound that priced no level in
-/// it, level 1 included, and being a within-run comparison did not rescue it.
-///
-/// ⇒ A sampled max carries an argmax `t`, which buys two things a high-water
-/// cannot: a level's peak is the max inside ITS OWN window rather than the
-/// process's, and the host peak can be checked for SIMULTANEITY against an
-/// external device trace. Non-simultaneous maxima must not be summed.
-pub(super) struct HostSampler {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<(f64, f64)>>,
-}
+pub(super) use super::tree_run::{HostSampler, cgroup_limit_gib};
 
-impl HostSampler {
-    pub(super) fn start() -> Self {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
-            let (mut peak, mut at) = (0.0f64, unix_now());
-            while !flag.load(Ordering::Relaxed) {
-                if let (Some(rss), _) = rss_marks()
-                    && rss > peak
-                {
-                    peak = rss;
-                    at = unix_now();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            (peak, at)
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    /// `(peak GiB, argmax UNIX seconds)` over this sampler's window.
-    pub(super) fn stop(mut self) -> (f64, f64) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.handle
-            .take()
-            .expect("a sampler is stopped once")
-            .join()
-            .expect("the sampler thread must not panic")
-    }
-}
-
-fn unix_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-/// The cgroup memory ceiling, trying **v2 then v1**, or `None` with the reason.
-///
-/// ⚠ A sampler hard-coded to one layout reads NOTHING on the other box and
-/// reports no error, so a percentage-of-ceiling silently becomes a percentage of
-/// zero — or of a default nobody chose. Both paths are tried and a miss is
-/// LOUD; the caller must not print a percentage without a ceiling.
-pub(super) fn cgroup_limit_gib() -> Result<f64, String> {
-    const PATHS: [&str; 2] = [
-        "/sys/fs/cgroup/memory.max",                   // v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1
-    ];
-    let mut tried = Vec::new();
-    for p in PATHS {
-        match std::fs::read_to_string(p) {
-            Ok(s) if s.trim() == "max" => tried.push(format!("{p}=max (unlimited)")),
-            Ok(s) => match s.trim().parse::<u64>() {
-                Ok(b) => return Ok(b as f64 / (1024.0 * 1024.0 * 1024.0)),
-                Err(e) => tried.push(format!("{p} unparsable: {e}")),
-            },
-            Err(e) => tried.push(format!("{p}: {e}")),
-        }
-    }
-    Err(tried.join("; "))
-}
-
-/// Print the census and the chip padding panel for one node program.
-///
-/// The panel is a FORWARD instrument, not a diagnostic: printed from the working
-/// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
-/// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
-/// usable. Print it at EVERY level.
-/// Run `task` over `0..n` on `workers` threads, and return the results **in
-/// index order** whatever order they finished in.
-///
-/// ★★★ THE ORDER IS THE SOUNDNESS PROPERTY, not a convenience. A level's
-/// children, layouts and label runs are three parallel vectors, and a node at
-/// the level above takes a contiguous SUBSLICE of each — which is exactly what
-/// makes contiguity across sibling subtrees a consequence of the label pins
-/// rather than a check of its own. Drain them in completion order and the pins
-/// still verify, one subtree at a time, while the tree they describe is not the
-/// tree that was built. ⇒ results land in per-index slots and are drained by
-/// index, so nothing downstream can observe that a scheduler ran at all.
-///
-/// `workers <= 1` runs `task` inline, on this thread, in order: the control arm
-/// is the original path and not this function with one worker.
-///
-/// # Panics
-///
-/// Re-raises the FIRST worker panic on the caller's thread, payload intact.
-/// ⚠ `std::thread::scope` otherwise propagates with the fixed string "a scoped
-/// thread panicked", which names neither the cause nor its location, and
-/// libtest's global hook files a spawned thread's own message against no test
-/// and drops it on the floor. The prover's `run_admitted` learned that the
-/// expensive way — eleven anonymous failures in one suite run.
-pub(super) fn in_index_order<T: Send>(
-    n: usize,
-    workers: usize,
-    task: impl Fn(usize) -> T + Sync,
-) -> Vec<T> {
-    let slots: Vec<std::sync::Mutex<Option<T>>> =
-        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    if workers <= 1 {
-        for (j, slot) in slots.iter().enumerate() {
-            *slot.lock().expect("a slot is never poisoned") = Some(task(j));
-        }
-    } else {
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let first_panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
-            std::sync::Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let (cursor, slots, first_panic, task) = (&cursor, &slots, &first_panic, &task);
-                scope.spawn(move || {
-                    // ⛔ THIS THREAD IS PART OF THIS LEVEL. Without the enrolment
-                    // its artifact builds are not counted and the level reports
-                    // fewer proofs than it made.
-                    let _enrolled = super::program_census::enrol();
-                    loop {
-                        let j = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if j >= slots.len() {
-                            break;
-                        }
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(j))) {
-                            Ok(out) => {
-                                *slots[j].lock().expect("a slot is never poisoned") = Some(out);
-                            }
-                            Err(payload) => {
-                                let mut first =
-                                    first_panic.lock().unwrap_or_else(|e| e.into_inner());
-                                if first.is_none() {
-                                    *first = Some(payload);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            std::panic::resume_unwind(payload);
-        }
-    }
-    slots
-        .into_iter()
-        .enumerate()
-        .map(|(j, slot)| {
-            slot.into_inner()
-                .expect("a slot is never poisoned")
-                .unwrap_or_else(|| panic!("index {j} produced no result"))
-        })
-        .collect()
-}
+pub(super) use super::tree_run::in_index_order;
 
 /// ★★★ THE ORDERING GATE, with the completion order FORCED to the reverse of
 /// the index order.
@@ -3468,9 +3223,7 @@ fn in_index_order_re_raises_a_worker_panic_with_its_message() {
 /// two multiply: at `TABLE_PARALLELISM=4` and two siblings the card still sees
 /// one proof's four tables, because the permit admits one proof at a time.
 pub(super) fn tree_siblings() -> usize {
-    let k = std::env::var("LFM_TREE_K").ok();
-    let s = std::env::var("LFM_TREE_SIBLINGS").ok();
-    resolve_siblings(k.as_deref(), s.as_deref())
+    super::tree_run::tree_siblings().unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// How many EPOCH WRAPS prove at once — `LFM_TREE_SIBLINGS_L0`, or
@@ -3635,85 +3388,56 @@ fn l0_takes_base_decode() -> bool {
 }
 
 pub(super) fn tree_siblings_l0() -> usize {
-    let k = std::env::var("LFM_TREE_K_L0").ok();
-    let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
-    resolve_siblings(k.as_deref(), s.as_deref())
+    super::tree_run::tree_siblings_l0().unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// [`tree_siblings`] with the environment supplied, so the resolution is
-/// testable without mutating process state.
-///
-/// An empty value reads as unset — `FOO= cmd` is the shell clearing a variable,
-/// and failing a run for that spelling of "default" helps nobody.
-fn resolve_siblings(k: Option<&str>, siblings: Option<&str>) -> usize {
-    fn clean(v: Option<&str>) -> Option<&str> {
-        v.filter(|v| !v.is_empty())
-    }
-    let (k, siblings) = (clean(k), clean(siblings));
-    let named = match (k, siblings) {
-        (None, None) => return 1,
-        (Some(a), Some(b)) => {
-            assert_eq!(
-                a, b,
-                "LFM_TREE_K=`{a}` and LFM_TREE_SIBLINGS=`{b}` are the same knob \
-                 set to two values, so the launch line does not name one \
-                 experiment. Set one of them"
-            );
-            a
-        }
-        (Some(v), None) | (None, Some(v)) => v,
-    };
-    let n: usize = named
-        .parse()
-        .unwrap_or_else(|_| panic!("the sibling count must be a positive integer, got `{named}`"));
-    assert!(n >= 1, "the sibling count must be at least 1, got {n}");
-    n
-}
+use super::tree_run::resolve_siblings;
 
 /// Either spelling is read, and neither is required.
 #[test]
 fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
-    assert_eq!(resolve_siblings(None, None), 1, "unset is the control");
-    assert_eq!(resolve_siblings(Some(""), Some("")), 1, "empty is unset");
-    assert_eq!(resolve_siblings(Some("2"), None), 2, "LFM_TREE_K alone");
+    assert_eq!(resolve_siblings(None, None), Ok(1), "unset is the control");
+    assert_eq!(
+        resolve_siblings(Some(""), Some("")),
+        Ok(1),
+        "empty is unset"
+    );
+    assert_eq!(resolve_siblings(Some("2"), None), Ok(2), "LFM_TREE_K alone");
     assert_eq!(
         resolve_siblings(None, Some("3")),
-        3,
+        Ok(3),
         "LFM_TREE_SIBLINGS alone"
     );
     assert_eq!(
         resolve_siblings(Some("2"), Some("2")),
-        2,
+        Ok(2),
         "agreeing is fine"
     );
     // ★ The one that matters: a launch line setting both to different values
     // names two experiments, and a run that silently picked one would be
     // reported under the other's name.
     assert!(
-        std::panic::catch_unwind(|| resolve_siblings(Some("2"), Some("4"))).is_err(),
+        resolve_siblings(Some("2"), Some("4")).is_err(),
         "two values for one knob must refuse"
     );
     assert!(
-        std::panic::catch_unwind(|| resolve_siblings(Some("lots"), None)).is_err(),
+        resolve_siblings(Some("lots"), None).is_err(),
         "a non-integer must refuse"
     );
     assert!(
-        std::panic::catch_unwind(|| resolve_siblings(Some("0"), None)).is_err(),
+        resolve_siblings(Some("0"), None).is_err(),
         "zero workers is not an experiment"
     );
 }
 
+/// Print the census and the chip padding panel for one node program
+/// ([`super::tree_run::census_panel`]), and Lane E's reach profile under
+/// `LFM_REACH_PROFILE`.
 pub(super) fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
-    let (main, aux) =
-        super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
-    let cells = main + 3 * aux;
-    let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
+    let (cells, _, text) = super::tree_run::census_panel(program, label, fan_in);
     // ONE `print!` for the whole panel, never a `println!` per line: see
     // `census_panel_text`.
-    print!(
-        "{}",
-        census_panel_text(label, cells, program.instrs.len(), &panel, fan_in)
-    );
+    print!("{text}");
     // ★ Lane E's dependency measurement, on the SAME production programs the
     // panel above describes — folded in here rather than given its own fixture
     // because this is the one call site every shape already passes through
@@ -3732,84 +3456,7 @@ pub(super) fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize)
     (cells, program.instrs.len())
 }
 
-/// A program's census line, its chip panel and its step line, as the ONE string
-/// [`census_and_panel`] prints.
-///
-/// One `print!` holds the stdout lock for the whole panel. Printed a line at a
-/// time, the panels of proofs census'd at once (level 0's wraps in flight,
-/// sibling nodes, the level pool) interleaved LINE BY LINE with each other and
-/// with any other thread's output, and a chip line carries no label: a reader
-/// of the log could only tell whose line it was from the numbers on it. The
-/// bytes are exactly what the per-line `println!`s wrote
-/// ([`the_census_panel_is_the_per_line_bytes`]), so every reader of the panel
-/// parses it unchanged.
-fn census_panel_text(
-    label: &str,
-    cells: u64,
-    instrs: usize,
-    panel: &[super::airs::LfmChipCells],
-    fan_in: usize,
-) -> String {
-    use std::fmt::Write as _;
-    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
-        instrs,
-        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
-    );
-    let step = (fan_in + 1) as f64 / fan_in as f64;
-    // A split `LFM_HASH` is two census entries, printed as ONE panel line —
-    // real and committed rows summed, the chunk heights in a trailing
-    // `[split a+b]` — so a panel never repeats a chip name (the box reader treats a
-    // repeat as two interleaved panels) and `LFM_HASH` real rows stay the
-    // permutation count. Unsplit programs print exactly as before.
-    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
-    let hash_chunks: Vec<&super::airs::LfmChipCells> =
-        panel.iter().filter(|c| c.name == hash).collect();
-    for c in panel {
-        if c.name == hash && hash_chunks.len() > 1 {
-            if !std::ptr::eq(c, hash_chunks[0]) {
-                continue;
-            }
-            let real: u64 = hash_chunks.iter().map(|h| h.real_rows).sum();
-            let rows: u64 = hash_chunks.iter().map(|h| h.rows).sum();
-            let heights: Vec<String> = hash_chunks.iter().map(|h| h.rows.to_string()).collect();
-            let _ = writeln!(
-                out,
-                "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  AT RISK  cliff +{} cells  [split {}]",
-                c.name,
-                real,
-                rows,
-                100.0 * (rows - real) as f64 / rows as f64,
-                hash_chunks.iter().map(|h| h.cliff_cost()).sum::<u64>(),
-                heights.join("+"),
-            );
-            continue;
-        }
-        let _ = writeln!(
-            out,
-            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
-            c.name,
-            c.real_rows,
-            c.rows,
-            100.0 * c.headroom(),
-            if c.at_risk() { "AT RISK" } else { "fixed  " },
-            c.cliff_cost(),
-        );
-    }
-    let stepping: Vec<&str> = panel
-        .iter()
-        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
-        .map(|c| c.name)
-        .collect();
-    let _ = writeln!(
-        out,
-        "     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}"
-    );
-    out
-}
+use super::tree_run::census_panel_text;
 
 /// ★ [`census_panel_text`] is byte for byte what the per-line `println!`s of the
 /// census panel wrote: one `print!` changes when the panel reaches the log, and

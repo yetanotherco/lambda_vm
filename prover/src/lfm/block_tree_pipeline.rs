@@ -14,7 +14,8 @@
 //!   artifacts, level by level, while the leaves prove.
 //!
 //! A prover takes its program from its slot, waiting for it if the builder is
-//! behind; a builder failure fails every waiter.
+//! behind; a builder failure fails every waiter. The whole-block driver
+//! ([`super::block_tree`]) runs it, in the harness and in the CLI alike.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -136,25 +137,43 @@ impl Pipe {
     }
 
     /// Leaf `k`'s program and artifacts, waiting for them.
-    pub(super) fn take_leaf(&self, k: usize, label: &str) -> (LfmProgram, LfmArtifacts) {
-        self.take(&self.leaves[k], label)
+    pub(super) fn take_leaf(
+        &self,
+        k: usize,
+        label: &str,
+    ) -> Result<(LfmProgram, LfmArtifacts), String> {
+        let slot = self
+            .leaves
+            .get(k)
+            .ok_or_else(|| format!("{label}: no leaf slot {k}"))?;
+        self.take(slot, label)
     }
 
     /// Node `j` of node level `lv` (0 = the first above the leaves), waiting.
-    pub(super) fn take_node(&self, lv: usize, j: usize, label: &str) -> (LfmProgram, LfmArtifacts) {
-        self.take(&self.levels[lv][j], label)
+    pub(super) fn take_node(
+        &self,
+        lv: usize,
+        j: usize,
+        label: &str,
+    ) -> Result<(LfmProgram, LfmArtifacts), String> {
+        let slot = self
+            .levels
+            .get(lv)
+            .and_then(|level| level.get(j))
+            .ok_or_else(|| format!("{label}: no node slot {lv}/{j}"))?;
+        self.take(slot, label)
     }
 
-    fn take(&self, slot: &Slot, label: &str) -> (LfmProgram, LfmArtifacts) {
+    /// A slot's value, waiting for it; an error once the builder has failed.
+    fn take(&self, slot: &Slot, label: &str) -> Result<(LfmProgram, LfmArtifacts), String> {
         let mut value = slot.value.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = value.take() {
-                return v;
+                return Ok(v);
             }
-            assert!(
-                !self.failed.load(Ordering::SeqCst),
-                "{label}: the tree's builder failed"
-            );
+            if self.failed.load(Ordering::SeqCst) {
+                return Err(format!("{label}: the tree's builder failed"));
+            }
             value = slot
                 .ready
                 .wait_timeout(value, Duration::from_millis(200))

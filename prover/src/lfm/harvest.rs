@@ -5,7 +5,10 @@
 //! leaves from the base proof and its nodes from their children with these.
 //!
 //! Every shape is the AIR's at the proof's trace length; the proof is checked
-//! against it, never read into it, and a proof that disagrees is an error.
+//! against it, never read into it, and a proof that disagrees is an error. The
+//! oracle fields the suites compare against (the challenges production derived,
+//! the child's LogUp pair) are read the same way in every build, and read only
+//! by the suites.
 //!
 //! The suites that grew these readers (`epoch_tests`, `epoch_verify_tests`,
 //! `per_table_aggregator_tests`) keep their names and their panicking forms
@@ -46,13 +49,19 @@ pub(crate) struct HostTable {
     pub(crate) fri_roots: Vec<Commitment>,
     pub(crate) fri_coeffs: Vec<FEE>,
     pub(crate) nonce: Option<u64>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) needs_lookup_challenges: bool,
 
     // ---- the oracle ----
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) beta: FEE,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) z: FEE,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) gamma: FEE,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) zetas: Vec<FEE>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) iotas: Vec<usize>,
 }
 
@@ -154,6 +163,7 @@ pub(crate) fn host_table_forked(
 /// the reader as well as in the emitted program.
 pub(crate) struct TableLegs {
     pub(crate) verify: TableVerifyShape,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) analysis: Analysis,
     /// `[query][group]` — the row pair in leaf order, then the path.
     pub(crate) openings: Vec<Vec<(Vec<LfmWord>, Vec<Commitment>)>>,
@@ -167,15 +177,19 @@ pub(crate) struct TableLegs {
     /// Production's OWN boundary-constraint list for this AIR, kept so
     /// `the_boundary_terms_are_program_shape` can compare the program-shape
     /// rule against the call rather than against a belief about it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) production_boundary: Vec<BoundaryTerm>,
     /// `AIR::has_aux_trace`, the rule's input.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) has_aux_trace: bool,
     /// Preprocessed-column count, zero when the AIR is not preprocessed. Which
     /// sub-proofs are preprocessed is what assembly ledger entry 7 is about.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) num_precomputed_cols: usize,
     /// The commitment production absorbs for this table, when preprocessed —
     /// `air.precomputed_commitment()`, taken from the AIR and never from the
     /// proof.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) precomputed_commitment: Option<Commitment>,
 }
 
@@ -255,7 +269,11 @@ pub(crate) fn build_table_legs(
                      c: usize|
      -> Result<Vec<Commitment>, String> {
         if c == 0 || q != 0 {
-            check_eq(path.len(), depth - c, &format!("query {q}: a path to the cap"))?;
+            check_eq(
+                path.len(),
+                depth - c,
+                &format!("query {q}: a path to the cap"),
+            )?;
             return Ok(path.to_vec());
         }
         let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
@@ -464,7 +482,11 @@ impl TableLegs {
             return Ok(None);
         }
         let out = super::proof_arena::commitments_to_arena(&self.caps);
-        check_eq(out.len(), words, "the caps arena is what the shape declares")?;
+        check_eq(
+            out.len(),
+            words,
+            "the caps arena is what the shape declares",
+        )?;
         Ok(Some(out))
     }
 
@@ -523,6 +545,7 @@ pub(crate) struct HarvestedChild {
     /// must reproduce in-machine. Consumed by
     /// `the_leaf_node_verifies_and_binds_two_wraps` through
     /// `NodePublishSet::Diagnostic`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) z_alpha: (FEE, FEE),
 }
 
@@ -625,26 +648,6 @@ pub(crate) fn harvest_child(
         legs,
         z_alpha: (lookup[0], lookup[1]),
     })
-}
-
-/// The child's shape, as the node's emitter reads it.
-pub(crate) fn child_shape(c: &HarvestedChild) -> super::per_table_aggregator::ChildShape<'_> {
-    super::per_table_aggregator::ChildShape {
-        program_id: &c.artifacts.program_id,
-        num_public_words: c.public_words.len(),
-        fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
-        tables: c
-            .tables
-            .iter()
-            .zip(&c.legs)
-            .map(|(h, leg)| super::per_table_aggregator::ChildTable {
-                challenge: &h.shape,
-                verify: &leg.verify,
-                analysis: &leg.analysis,
-                precomputed_root: leg.precomputed_commitment.as_ref(),
-            })
-            .collect(),
-    }
 }
 
 /// The child's arenas, in `declare_leg_arenas`' declaration order.

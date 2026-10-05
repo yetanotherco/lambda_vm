@@ -1485,8 +1485,7 @@ fn proc_rss_bytes() -> Option<usize> {
 /// when it can be read ([`crate::alloc_purge::stats`]: the binary's hooks, or
 /// the jemalloc the lib's tests install).
 fn heap_stats() -> Option<[usize; 5]> {
-    crate::alloc_purge::stats()
-        .map(|s| [s.allocated, s.active, s.resident, s.mapped, s.retained])
+    crate::alloc_purge::stats().map(|s| [s.allocated, s.active, s.resident, s.mapped, s.retained])
 }
 
 /// The bytes a streamed chunk on its way to a committer holds.

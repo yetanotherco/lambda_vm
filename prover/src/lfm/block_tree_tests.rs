@@ -12,9 +12,8 @@
 //! - box, production scale: the whole block, base to top node, timed.
 
 use stark::config::Commitment;
-use stark::proof::view::MultiProofView;
 
-use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{FE, FEE};
 
 use super::LfmArtifacts;
 use super::block_leaf::{BlockPartition, emit_block_leaf_over, partition_by_rule};
@@ -23,50 +22,21 @@ use super::block_node::{
 };
 use super::block_plan::{BlockShape, BlockTreePlan, le_halves, top_claims};
 use super::block_replay::{BlockStatementShape, replay_block_front};
-use super::block_tree_pipeline::Pipe;
+use super::block_tree::{BlockTreeSink, StdoutSink};
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::edsl::WrapHash;
-use super::epoch_tests::HostTable;
-use super::epoch_verify_tests::TableLegs;
 use super::executor::execute;
 use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, publics_arena};
-use super::per_table_aggregator_tests::{RealChild, child_arena_words, child_shape};
+use super::per_table_aggregator_tests::{RealChild, child_shape};
 use super::statement_replay::{NUM_TABLE_COUNTS, PhaseAPreprocessed, PhaseATable};
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
-
-type Gl = GoldilocksField;
-type Ext3 = GoldilocksExtension;
 
 fn production_builder() -> LfmBuilder {
     LfmBuilder::new().with_wrap_hash(WrapHash::production())
 }
 
-/// Bytes as the arena's `u32` halves: four bytes each, little-endian, the last
-/// zero-padded.
-/// The host transcript every block prover and verifier starts from:
-/// `StatementKind::Monolithic` over the block's statement fields.
-fn block_seed(
-    elf_digest: &[u8; 32],
-    public_output: &[u8],
-    table_counts: &crate::TableCounts,
-    num_private_input_pages: usize,
-    runtime_page_ranges: &[crate::RuntimePageRange],
-    fri_final_poly_log_degree: u8,
-) -> crate::hash_pin::BlockTranscript {
-    let mut t = crate::hash_pin::block_transcript(&[]);
-    crate::statement::absorb_statement_with_digest(
-        &mut t,
-        crate::statement::StatementKind::Monolithic,
-        elf_digest,
-        public_output,
-        table_counts,
-        num_private_input_pages,
-        runtime_page_ranges,
-        fri_final_poly_log_degree,
-    );
-    t
-}
+use super::block_tree::block_seed;
 
 // ================================ (a) the front ===========================
 
@@ -651,97 +621,9 @@ fn spread_fixture_shape(elf: &executor::elf::Elf, chunks: usize, cpus: usize) ->
 
 // ======================= (S5) the leaf programs' host bytes =================
 
-/// jemalloc's `opt.oversize_threshold` (5.3's default; the instruments read it
-/// back): an allocation of at least this many bytes comes from one arena every
-/// thread shares, a smaller one from its thread's own arena. The pages a freed
-/// buffer leaves behind serve only its arena's later requests.
-const JEMALLOC_OVERSIZE: usize = 8 << 20;
+use super::block_tree::{JEMALLOC_OVERSIZE, ProgramBytes, program_groups};
 
-/// A program's host bytes as held (capacities, not lengths), by part, and the
-/// share in allocations at or over [`JEMALLOC_OVERSIZE`]: the part that can
-/// take the pages a freed trace left in the shared arena.
-#[derive(Default, Clone, Copy)]
-struct ProgramBytes {
-    /// The instruction vector itself.
-    instrs: usize,
-    /// `Instr::BitDec`'s bit lists.
-    bitdec_heap: usize,
-    /// `KeccakF`'s and `Blake3`'s boxed operands.
-    boxed: usize,
-    /// The column groups as held: padded rows, at capacity.
-    groups: usize,
-    /// The column groups' padded rows (the committed matrices).
-    groups_padded: usize,
-    /// The column groups' real rows alone.
-    groups_real: usize,
-    /// The arena schema.
-    other: usize,
-    /// Of the total, the bytes in allocations at or over [`JEMALLOC_OVERSIZE`].
-    large: usize,
-    allocs: usize,
-}
-
-impl ProgramBytes {
-    fn of(p: &LfmProgram) -> Self {
-        use super::instr::{Addr, Blake3Operands, Instr, KeccakOperands};
-        let mut b = Self::default();
-        b.instrs = b.note(p.instrs.capacity() * size_of::<Instr>());
-        for instr in &p.instrs {
-            match instr {
-                Instr::BitDec { bits, .. } => {
-                    b.bitdec_heap += b.note(bits.capacity() * size_of::<(Addr, u64)>());
-                }
-                Instr::KeccakF(_) => b.boxed += b.note(size_of::<KeccakOperands>()),
-                Instr::Blake3(_) => b.boxed += b.note(size_of::<Blake3Operands>()),
-                _ => {}
-            }
-        }
-        for g in program_groups(p) {
-            b.groups += b.note(g.data.capacity() * size_of::<FE>());
-            b.groups_padded += g.padded_rows * g.width * size_of::<FE>();
-            b.groups_real += g.real_rows * g.width * size_of::<FE>();
-        }
-        b.other = b.note(p.arena_schema.lens.capacity() * size_of::<u32>());
-        b
-    }
-
-    /// Counts one allocation of `bytes` and returns them.
-    fn note(&mut self, bytes: usize) -> usize {
-        if bytes > 0 {
-            self.allocs += 1;
-            if bytes >= JEMALLOC_OVERSIZE {
-                self.large += bytes;
-            }
-        }
-        bytes
-    }
-
-    fn total(&self) -> usize {
-        self.instrs + self.bitdec_heap + self.boxed + self.groups + self.other
-    }
-
-    fn add(&mut self, o: &Self) {
-        self.instrs += o.instrs;
-        self.bitdec_heap += o.bitdec_heap;
-        self.boxed += o.boxed;
-        self.groups += o.groups;
-        self.groups_padded += o.groups_padded;
-        self.groups_real += o.groups_real;
-        self.other += o.other;
-        self.large += o.large;
-        self.allocs += o.allocs;
-    }
-}
-
-/// A program's column groups with their chip names, in the frozen chip order.
-fn program_groups(p: &LfmProgram) -> [&super::compiler::ColumnGroup; 11] {
-    let g = &p.groups;
-    [
-        &g.const_, &g.balu, &g.xalu, &g.select, &g.bitdec, &g.hash, &g.keccak, &g.blake3, &g.lanes,
-        &g.hint, &g.public,
-    ]
-}
-
+/// [`program_groups`]' chip names, in its order.
 const PROGRAM_GROUP_NAMES: [&str; 11] = [
     "const", "balu", "xalu", "select", "bitdec", "hash", "keccak", "blake3", "lanes", "hint",
     "public",
@@ -1480,72 +1362,9 @@ fn every_block_binding_refuses_its_tamper_and_is_load_bearing() {
 
 // =============================== the block harvest ========================
 
-/// One block proof, production-accepted, read for leaf emission.
-///
-/// `plan` is the verifier's: every shape and constant a leaf is emitted from,
-/// derived from the ELF, the options and the shape the proof claims — never
-/// from its data. The other fields are the proof's DATA, which the leaves'
-/// arenas carry: every instance's main root, the shared state, and per instance
-/// the fork's data ([`HostTable`]) and the legs' openings ([`TableLegs`]), each
-/// checked against the AIR's shape as it is read.
-pub(super) struct RealBlock {
-    pub(super) plan: BlockTreePlan,
-    pub(super) public_output: Vec<u8>,
-    pub(super) main_roots: Vec<Commitment>,
-    pub(super) tables: Vec<HostTable>,
-    pub(super) legs: Vec<TableLegs>,
-    /// The host transcript's state after `z, α`.
-    pub(super) state: LfmWord,
-    /// The COMMIT-bus target production computed.
-    pub(super) expected_bus_balance: FEE,
-}
-
-impl RealBlock {
-    pub(super) fn num_instances(&self) -> usize {
-        self.plan.num_instances()
-    }
-
-    /// AIR names, in AIR order.
-    pub(super) fn names(&self) -> Vec<&str> {
-        self.plan
-            .instances()
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect()
-    }
-
-    /// The rule over `num_leaves` leaves: a TEST partition, another tree than
-    /// the plan's unless the count is the plan's own.
-    pub(super) fn partition_over(&self, num_leaves: usize) -> BlockPartition {
-        partition_by_rule(&self.names(), &self.plan.costs(), num_leaves)
-            .expect("the rule fills every leaf")
-    }
-
-    /// What leaf `k` of `partition` must publish, from the host's own values:
-    /// the id, the state, the output halves, and its share of the bus — less
-    /// the target when it `carries` it.
-    pub(super) fn expected_leaf_publics(
-        &self,
-        partition: &BlockPartition,
-        k: usize,
-        carries: bool,
-    ) -> Vec<LfmWord> {
-        let mut words =
-            super::programs::program_id_words(&self.plan.attested().program_id()).to_vec();
-        words.push(self.state);
-        words.extend(le_halves(&self.public_output).into_iter().map(base_word));
-        let mut share = partition
-            .leaf(k)
-            .iter()
-            .filter_map(|&i| self.tables[i].contribution)
-            .fold(FEE::zero(), |acc, l| acc + l);
-        if carries {
-            share = share - self.expected_bus_balance;
-        }
-        words.push(ext_word(&share));
-        words
-    }
-}
+/// One block proof, production-accepted, read for leaf emission
+/// ([`super::block_tree::BlockWitness`]).
+pub(super) use super::block_tree::BlockWitness as RealBlock;
 
 /// Harvest a block proof that production's block verifier accepts.
 ///
@@ -1576,8 +1395,9 @@ pub(super) fn harvest_block_with(
 }
 
 /// [`harvest_block_with`] over ELF constants computed ahead (beside the base),
-/// or computed here when `None`. Prints the split of its first half: the plan,
-/// the COMMIT-bus target, the host verify.
+/// or computed here when `None` ([`super::block_tree::harvest_block_over`]).
+/// Prints the split of its first half: the plan, the COMMIT-bus target, the
+/// host verify.
 pub(super) fn harvest_block_over(
     opts: &crate::ProofOptions,
     elf_bytes: &[u8],
@@ -1585,142 +1405,12 @@ pub(super) fn harvest_block_over(
     verify: bool,
     consts: Option<&super::block_plan::ElfConstants>,
 ) -> Result<(RealBlock, f64, f64), String> {
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
-    use rayon::prelude::*;
-    use stark::verifier::IsStarkVerifier;
-
-    let t_verify = std::time::Instant::now();
-    let shape = BlockShape::of_proof(proof);
-    let plan = match consts {
-        Some(c) => BlockTreePlan::derive_with(elf_bytes, opts, &shape, c)?,
-        None => BlockTreePlan::derive(elf_bytes, opts, &shape)?,
-    };
-    let plan_secs = t_verify.elapsed().as_secs_f64();
-    let view = MultiProofView::Owned(&proof.proof);
-    let refs = plan.airs().air_refs();
-    let seed = || {
-        block_seed(
-            plan.elf_digest(),
-            &proof.public_output,
-            &proof.table_counts,
-            proof.num_private_input_pages,
-            &proof.runtime_page_ranges,
-            opts.fri_final_poly_log_degree,
-        )
-    };
-    let expected = crate::compute_expected_commit_bus_balance_view(
-        &refs,
-        view,
-        &proof.public_output,
-        0,
-        &mut seed(),
-    )
-    .ok_or("the COMMIT bus target must compute")?;
-    let target_secs = t_verify.elapsed().as_secs_f64() - plan_secs;
-    if verify
-        && !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
-            &refs,
-            view,
-            &mut seed(),
-            &expected,
-        )
-    {
-        return Err("production's verifier rejects the block".to_string());
-    }
-    let verify_secs = t_verify.elapsed().as_secs_f64();
-    println!(
-        "   harvest split ({}): plan {plan_secs:.2}s ({}) · bus target {target_secs:.2}s · \
-         host verify {:.2}s",
-        if verify { "verifying" } else { "reading" },
-        if consts.is_some() {
-            "ELF constants ahead"
-        } else {
-            "ELF constants inline"
-        },
-        verify_secs - plan_secs - target_secs
-    );
-
-    // ---- Phase A, as `multi_verify_views` absorbs it: the plan's preprocessed
-    // roots (the AIR's, never the proof's), then the proof's main roots.
-    let t_replay = std::time::Instant::now();
-    let n = refs.len();
-    let mut transcript = seed();
-    let mut main_roots = Vec::with_capacity(n);
-    for idx in 0..n {
-        let v = view.get(idx);
-        if let Some(p) = &plan.instance(idx).precomputed_root {
-            transcript.append_bytes(p);
-        }
-        transcript.append_bytes(v.lde_trace_main_merkle_root());
-        main_roots.push(*v.lde_trace_main_merkle_root());
-    }
-    let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
-        .map(|_| transcript.sample_field_element())
-        .collect();
-    let state = transcript.state_word();
-
-    // ---- one fork per instance, and the legs' reading of the same sub-proof.
-    let per_instance: Vec<(HostTable, TableLegs)> = (0..n)
-        .into_par_iter()
-        .map(|idx| {
-            let air = refs[idx];
-            let v = view.get(idx);
-            let mut fork = transcript.clone();
-            if n > 1 {
-                fork.append_bytes(&(idx as u64).to_le_bytes());
-            }
-            if let Some(root) = v.lde_trace_aux_merkle_root() {
-                fork.append_bytes(root);
-            }
-            if let Some(c) = v.bus_table_contribution() {
-                fork.append_field_element(&c);
-            }
-            let table = super::epoch_tests::host_table_forked(air, v, idx, n, &mut fork, &lookup);
-            let legs = super::epoch_verify_tests::build_table_legs(air, v, &lookup);
-            (table, legs)
-        })
-        .collect();
-    let (tables, legs): (Vec<_>, Vec<_>) = per_instance.into_iter().unzip();
-    // The proof-reading path and the plan derive one shape per instance.
-    for (i, (t, l)) in tables.iter().zip(&legs).enumerate() {
-        let planned = plan.instance(i);
-        assert_eq!(
-            t.precomputed_root, planned.precomputed_root,
-            "instance {i}: the fork's and the plan's preprocessed roots are one value"
-        );
-        assert_eq!(
-            format!("{:?}", t.shape),
-            format!("{:?}", planned.challenge),
-            "instance {i}: the plan's challenge shape is the one the proof is read against"
-        );
-        assert_eq!(
-            format!("{:?}", l.verify),
-            format!("{:?}", planned.verify),
-            "instance {i}: the plan's legs shape is the one the proof is read against"
-        );
-    }
-    let replay_secs = t_replay.elapsed().as_secs_f64();
-
-    Ok((
-        RealBlock {
-            plan,
-            public_output: proof.public_output.clone(),
-            main_roots,
-            tables,
-            legs,
-            state,
-            expected_bus_balance: expected,
-        },
-        verify_secs,
-        replay_secs,
-    ))
+    super::block_tree::harvest_block_over(opts, elf_bytes, proof, verify, consts, &StdoutSink)
 }
 
 /// Leaf `k` of the plan — the program the verifier derives.
 pub(super) fn block_leaf_program(rb: &RealBlock, k: usize) -> LfmProgram {
-    rb.plan
-        .leaf_program(k)
-        .unwrap_or_else(|e| panic!("leaf {k} must emit: {e}"))
+    super::block_tree::block_leaf_program(rb, k).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Leaf `k` of another partition, carrying the COMMIT-bus target when
@@ -1744,37 +1434,7 @@ pub(super) fn block_leaf_arenas(
     partition: &BlockPartition,
     k: usize,
 ) -> Vec<Vec<LfmWord>> {
-    let mut arenas: Vec<Vec<LfmWord>> = vec![
-        le_halves(&rb.public_output)
-            .into_iter()
-            .map(base_word)
-            .collect(),
-        super::proof_arena::commitments_to_arena(&rb.main_roots),
-    ];
-    for &i in partition.leaf(k) {
-        let (h, leg) = (&rb.tables[i], &rb.legs[i]);
-        if let Some(root) = &h.aux_root {
-            arenas.push(super::proof_arena::commitments_to_arena(&[*root]));
-        }
-        if let Some(l) = &h.contribution {
-            arenas.push(vec![ext_word(l)]);
-        }
-        arenas.push(super::proof_arena::commitments_to_arena(&[
-            h.composition_root
-        ]));
-        arenas.push(h.ood_current.iter().map(ext_word).collect());
-        arenas.push(h.ood_next.iter().map(ext_word).collect());
-        arenas.push(h.parts.iter().map(ext_word).collect());
-        arenas.push(super::proof_arena::commitments_to_arena(&h.fri_roots));
-        arenas.push(h.fri_coeffs.iter().map(ext_word).collect());
-        if let Some(nonce) = h.nonce {
-            arenas.push(vec![base_word(FE::from(nonce))]);
-        }
-        arenas.push(leg.opening_arena());
-        arenas.push(leg.fri_arena());
-        arenas.extend(leg.caps_arena());
-    }
-    arenas
+    super::block_tree::block_leaf_arenas(rb, partition, k).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A block node over `children` from their PROOF-read shapes, under a
@@ -1802,35 +1462,9 @@ pub(super) fn block_node_program_with(
     program
 }
 
-/// The plan's node over `children`, from the shapes their ARTIFACTS give — no
-/// child proof — checked against the heights their proofs carry.
-pub(super) fn block_node_program(
-    plan: &BlockTreePlan,
-    children: &[&RealChild],
-    top: bool,
-) -> LfmProgram {
-    let words = plan.child_layout().total();
-    let derived: Vec<DerivedChild> = children
-        .iter()
-        .map(|c| {
-            let d = DerivedChild::from_artifacts(&c.artifacts, &c.opts, words)
-                .unwrap_or_else(|e| panic!("a child's shapes derive from its artifacts: {e}"));
-            let proved: Vec<u32> = c.tables.iter().map(|t| t.shape.log2_trace_length).collect();
-            assert_eq!(
-                d.log2_trace_lengths(),
-                proved,
-                "the artifacts' heights are the child proof's trace lengths"
-            );
-            d
-        })
-        .collect();
-    plan.node_program(&derived, top)
-        .unwrap_or_else(|e| panic!("a block node must emit: {e}"))
-}
-
 /// A block node's arenas: its children's, in child order.
 pub(super) fn block_node_arenas(children: &[&RealChild]) -> Vec<Vec<LfmWord>> {
-    children.iter().flat_map(|c| child_arena_words(c)).collect()
+    super::block_tree::block_node_arenas(children).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Prove `program` over `arenas` and read the proof back as a child — production
@@ -1854,9 +1488,10 @@ pub(super) fn prove_program(
     prove_program_with(label, program, None, arenas, opts, true)
 }
 
-/// [`prove_program`] over the artifacts built ahead, when given. Without
-/// `verify_inline` the proof is read back unverified: the caller verifies it
-/// elsewhere ([`BesideVerifies`]) before anything is reported.
+/// [`prove_program`] over the artifacts built ahead, when given
+/// ([`super::block_tree::prove_program_with`]). Without `verify_inline` the
+/// proof is read back unverified: the caller verifies it elsewhere before
+/// anything is reported.
 pub(super) fn prove_program_with(
     label: &str,
     program: &LfmProgram,
@@ -1865,90 +1500,16 @@ pub(super) fn prove_program_with(
     opts: &crate::ProofOptions,
     verify_inline: bool,
 ) -> (RealChild, super::proof::LfmProof) {
-    let t = std::time::Instant::now();
-    let artifacts = built.unwrap_or_else(|| {
-        super::program_census::build_artifacts_counted(program, opts, crate::hash_pin::BLOCK_HASHER)
-    });
-    let t_artifacts = t.elapsed().as_secs_f64();
-    let t = std::time::Instant::now();
-    let proved = super::proof::lfm_prove(program, &artifacts, arenas, opts)
-        .unwrap_or_else(|e| panic!("{label} must prove: {e:?}"));
-    let t_prove = t.elapsed().as_secs_f64();
-    super::per_table_aggregator_tests::print_prove_split(label);
-    let t = std::time::Instant::now();
-    let (child, verified) = if verify_inline {
-        let (child, t_verify) =
-            super::per_table_aggregator_tests::real_child_timed(artifacts, opts.clone(), &proved);
-        (child, format!("verify {t_verify:.2}"))
-    } else {
-        let child = super::per_table_aggregator_tests::real_child_unverified(
-            artifacts,
-            opts.clone(),
-            &proved,
-        );
-        (child, "verified beside".to_string())
-    };
-    println!(
-        "   {label} TIMING: {} instructions · build_artifacts {t_artifacts:.2}s · prove \
-         {t_prove:.2}s · harvest {:.2}s ({verified})",
-        program.instrs.len(),
-        t.elapsed().as_secs_f64()
-    );
-    (child, proved)
-}
-
-/// Child proofs verified on helper threads beside the timed path (the default;
-/// `NOEPOCH_CHILD_VERIFY=inline` is the old order): production's verify of each, every one
-/// joined, a refusal failing the run, before anything is reported.
-#[derive(Default)]
-pub(super) struct BesideVerifies(std::sync::Mutex<Vec<(String, std::thread::JoinHandle<bool>)>>);
-
-impl BesideVerifies {
-    fn spawn(
-        &self,
-        label: &str,
-        artifacts: LfmArtifacts,
-        proof: super::proof::LfmProof,
-        opts: crate::ProofOptions,
-    ) {
-        let handle = std::thread::spawn(move || {
-            super::proof::verify_against_artifacts(
-                &artifacts,
-                &proof.proof,
-                &proof.public_words,
-                &opts,
-            )
-        });
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((label.to_string(), handle));
-    }
-
-    /// Joins every verify, panicking on a refusal; returns how many and the
-    /// seconds the join waited.
-    fn join_all(&self) -> (usize, f64) {
-        let t = std::time::Instant::now();
-        let jobs = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
-        let n = jobs.len();
-        for (label, handle) in jobs {
-            let accepted = handle
-                .join()
-                .unwrap_or_else(|_| panic!("{label}: the verify beside panicked"));
-            assert!(
-                accepted,
-                "{label}: production refuses the child (verified beside)"
-            );
-        }
-        (n, t.elapsed().as_secs_f64())
-    }
-}
-
-/// The tree's child proofs verified beside the timed path, by default (FAST
-/// 398: −0.62 s on level 0 + interior, the join waiting 0.00 s);
-/// `NOEPOCH_CHILD_VERIFY=inline` verifies each before its parent, as before.
-fn child_verify_beside_knob() -> bool {
-    std::env::var("NOEPOCH_CHILD_VERIFY").map_or(true, |v| v != "inline")
+    super::block_tree::prove_program_with(
+        label,
+        program,
+        built,
+        arenas,
+        opts,
+        verify_inline,
+        &StdoutSink,
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// ★ The block tree's FINAL check over the plan the harness holds: the top
@@ -1978,381 +1539,16 @@ pub(super) fn compose_block_tree(
     opts: &crate::ProofOptions,
     siblings: usize,
 ) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
-    compose_block_tree_with(plan, leaves, opts, siblings, None, None)
-}
-
-/// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`). Unset or `pipe`,
-/// the default (FAST 451: recursion −2.56 s): the leaf programs are emitted
-/// beside the base on the host and the artifacts built on the card during level
-/// 0, each node program emitted as its children's artifacts exist
-/// ([`super::block_tree_pipeline`]). `1` derives every program and its
-/// artifacts beside the base on the host; `0` derives each inline, before it
-/// proves.
-#[derive(Clone, Copy)]
-enum AheadMode {
-    Host,
-    Pipe,
-}
-
-fn tree_ahead_mode() -> Option<AheadMode> {
-    match std::env::var("NOEPOCH_TREE_AHEAD").ok().as_deref() {
-        Some("0") => None,
-        Some("1") => Some(AheadMode::Host),
-        None | Some("" | "pipe") => Some(AheadMode::Pipe),
-        Some(v) => panic!("NOEPOCH_TREE_AHEAD must be 0, 1 or pipe, got `{v}`"),
-    }
-}
-
-/// Threads of the pipeline builder's own pool for the node emission, by
-/// default: one per level-1 node of the block's 8 leaves at fan-in 2, where it
-/// was measured (FAST 455: level 0 −0.40 s, recursion −0.29 s; on the global
-/// pool a leaf proof's join could steal an emission and hold the card idle). At
-/// fan-in 4 level 1 has two nodes to emit.
-const EMIT_POOL_THREADS: usize = 4;
-
-/// `NOEPOCH_EMIT_POOL=<threads>`: the pipeline's builder emits the node
-/// programs on a host-only pool of its own with that many threads, unset
-/// meaning [`EMIT_POOL_THREADS`]; `0` emits them on the global pool the provers
-/// use.
-fn emit_pool_knob() -> usize {
-    match std::env::var("NOEPOCH_EMIT_POOL") {
-        Ok(v) if !v.is_empty() => v
-            .parse::<usize>()
-            .unwrap_or_else(|_| panic!("NOEPOCH_EMIT_POOL must be a thread count, got `{v}`")),
-        _ => EMIT_POOL_THREADS,
-    }
-}
-
-/// `NOEPOCH_TREE_NODE_EMIT`: in the pipeline mode, `early` or unset (the
-/// default) emits each node's program as soon as its children's artifacts
-/// exist, during the level below; `level` emits a level's programs together
-/// once the whole level below is built. Per level, the median block's card sat
-/// idle 8.9 s between level 0's last hold and level 1's first (BIG 481); early
-/// takes the median's recursion −7.32 s (BIG 483, 2 + 2) and 1× −0.15 s (FAST
-/// 668, 4 + 4), the programs and the top unchanged.
-fn node_emit_early_knob() -> bool {
-    match std::env::var("NOEPOCH_TREE_NODE_EMIT").ok().as_deref() {
-        None | Some("" | "early") => true,
-        Some("level") => false,
-        Some(v) => panic!("NOEPOCH_TREE_NODE_EMIT must be early or level, got `{v}`"),
-    }
-}
-
-/// `NOEPOCH_TREE_EMIT_WINDOW=<W>`: in the pipeline mode, only the first W leaf
-/// programs are emitted beside the base; the builder emits the rest in leaf
-/// order, at most `2 × W` ahead of its artifact builds, on its own pool. Unset
-/// (the default) emits every leaf program beside the base, which holds them all
-/// through the base's prove (≈ 338 MiB a leaf at the median block, BIG 480).
-fn emit_window_knob() -> Option<usize> {
-    std::env::var("NOEPOCH_TREE_EMIT_WINDOW")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            v.parse()
-                .ok()
-                .filter(|w: &usize| *w >= 1)
-                .unwrap_or_else(|| {
-                    panic!("NOEPOCH_TREE_EMIT_WINDOW must be a positive integer, got `{v}`")
-                })
-        })
-}
-
-/// How the pipeline emits the leaf programs beside the base
-/// (`NOEPOCH_TREE_EMIT_LATE`).
-///
-/// Late: leaf 0 at the shape, the rest once the heap's live bytes have fallen
-/// `margin` × their estimated bytes below the shape's (phase B frees each trace
-/// as its table proves), or have stopped falling, or the base has returned
-/// ([`late_trigger`]). Freed trace buffers sit in jemalloc's shared oversize
-/// arena and 99.5 % of a program's bytes are allocations that size, so the
-/// programs take the freed pages instead of raising the base's high-water. At
-/// the median, spill off, that is base-phase VmRSS −10.37 GiB, recursion −0.31
-/// s, whole −2.15 s, 98 % of the programs' bytes on reused pages (BIG 585, 2 +
-/// 2); with spill on it is inert (−1.28 GiB, +0.55 s), the room phase A leaves
-/// being elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum LateMode {
-    /// `0` or `off`: every leaf program at the shape.
-    Off,
-    /// Unset, empty or `auto` (the default): late at [`LATE_MARGIN`] when the
-    /// programs' estimate reaches [`LATE_MIN_ESTIMATE`], at the shape otherwise.
-    Auto,
-    /// `<margin>`: late at that margin, whatever the estimate.
-    Margin(f64),
-}
-
-fn emit_late_knob() -> LateMode {
-    match std::env::var("NOEPOCH_TREE_EMIT_LATE").ok().as_deref() {
-        None | Some("" | "auto") => LateMode::Auto,
-        Some("0" | "off") => LateMode::Off,
-        Some(v) => LateMode::Margin(
-            v.parse()
-                .ok()
-                .filter(|m: &f64| m.is_finite() && *m > 0.0)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "NOEPOCH_TREE_EMIT_LATE must be auto, off or a positive margin, got `{v}`"
-                    )
-                }),
-        ),
-    }
-}
-
-/// The default late emission's margin over the programs' estimated bytes: the
-/// pages they need plus phase B's own transients (BIG 585).
-const LATE_MARGIN: f64 = 1.25;
-
-/// The default late emission's floor: below this estimate the programs are
-/// emitted at the shape. A small tree's programs barely move the peak, and its
-/// short phase B may not free `margin` × their bytes before the base returns,
-/// which would leave the harvest waiting on them (the record block's 7 more
-/// leaves are ≈ 3.8 GiB [I]; the median's 55 are 30.6 GiB).
-const LATE_MIN_ESTIMATE: usize = 8 << 30;
-
-/// The margin a late emission waits at, or `None` to emit at the shape.
-fn late_margin(mode: LateMode, estimate: usize) -> Option<f64> {
-    match mode {
-        LateMode::Off => None,
-        LateMode::Margin(m) => Some(m),
-        LateMode::Auto => (estimate >= LATE_MIN_ESTIMATE).then_some(LATE_MARGIN),
-    }
-}
-
-/// The other `beside - 1` leaves' programs' bytes, from leaf 0's (`first`)
-/// bytes a permutation of in-guest verification.
-fn late_estimate(plan: &BlockTreePlan, first: &LfmProgram, beside: usize) -> usize {
-    let costs = plan.costs();
-    let perms =
-        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
-    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
-    (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize
-}
-
-/// The default emits late only above its floor, a margin forces it, `off` never.
-#[test]
-fn the_default_late_emission_needs_its_floor() {
-    const G: usize = 1 << 30;
-    assert_eq!(late_margin(LateMode::Auto, 30 * G), Some(LATE_MARGIN));
-    assert_eq!(
-        late_margin(LateMode::Auto, LATE_MIN_ESTIMATE),
-        Some(LATE_MARGIN)
-    );
-    assert_eq!(late_margin(LateMode::Auto, 4 * G), None);
-    assert_eq!(late_margin(LateMode::Margin(2.0), G), Some(2.0));
-    assert_eq!(late_margin(LateMode::Off, 30 * G), None);
-}
-
-/// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
-/// by [`LATE_LOW_STEP`] for this long (spill on: phase B holds only its
-/// read-back window, so the live bytes stop falling long before the programs'
-/// bytes are freed).
-const LATE_SETTLE_SECS: f64 = 30.0;
-
-/// The step a new low of the heap's live bytes must beat the last one by.
-const LATE_LOW_STEP: usize = 1 << 30;
-
-/// When the late emission (`NOEPOCH_TREE_EMIT_LATE`) starts: once the heap's
-/// live bytes are `need` below their value at the shape (`fell`), or have made
-/// no new low for [`LATE_SETTLE_SECS`] (`settled`), or the base has returned
-/// (`base returned`); `None` keeps waiting.
-fn late_trigger(
-    live_at_shape: usize,
-    live: usize,
-    need: usize,
-    since_low_secs: f64,
-    base_done: bool,
-) -> Option<&'static str> {
-    if live_at_shape.saturating_sub(live) >= need {
-        Some("fell")
-    } else if base_done {
-        Some("base returned")
-    } else if since_low_secs >= LATE_SETTLE_SECS {
-        Some("settled")
-    } else {
-        None
-    }
-}
-
-/// The late emission's wait and what the heap did around it.
-struct LateWait {
-    margin: f64,
-    trigger: &'static str,
-    waited: f64,
-    /// Seconds since the base started, when the wait ended.
-    at: f64,
-    estimate: usize,
-    need: usize,
-    live_at_shape: usize,
-    live_at_start: usize,
-    resident_at_start: usize,
-}
-
-/// Waits for [`late_trigger`], polling the heap every 200 ms, for a fall of
-/// `margin` × `estimate` ([`late_estimate`]).
-fn wait_for_late_emission(
-    estimate: usize,
-    margin: f64,
-    live_at_shape: usize,
-    base_done: &std::sync::atomic::AtomicBool,
-    t_base0: std::time::Instant,
-) -> LateWait {
-    use std::time::Instant;
-    let need = (margin * estimate as f64) as usize;
-    let t = Instant::now();
-    let (mut low, mut low_at) = (live_at_shape, Instant::now());
-    let trigger = loop {
-        let live = heap_allocated();
-        if live + LATE_LOW_STEP <= low {
-            (low, low_at) = (live, Instant::now());
-        }
-        let done = base_done.load(std::sync::atomic::Ordering::SeqCst);
-        if let Some(why) = late_trigger(
-            live_at_shape,
-            live,
-            need,
-            low_at.elapsed().as_secs_f64(),
-            done,
-        ) {
-            break why;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    };
-    LateWait {
-        margin,
-        trigger,
-        waited: t.elapsed().as_secs_f64(),
-        at: t_base0.elapsed().as_secs_f64(),
-        estimate,
-        need,
-        live_at_shape,
-        live_at_start: heap_allocated(),
-        resident_at_start: heap_resident(),
-    }
-}
-
-/// `NOEPOCH_TREE_EMIT_LATE`'s trigger: a fall of `need` below the shape's live
-/// bytes starts the emission; otherwise the base's return or a heap that has
-/// settled does; nothing else does.
-#[test]
-fn the_late_emission_waits_for_its_room() {
-    const G: usize = 1 << 30;
-    // The median, spill off: 68 GiB live at the shape, a fall of 30 GiB needed.
-    assert_eq!(late_trigger(68 * G, 60 * G, 30 * G, 0.5, false), None);
-    assert_eq!(
-        late_trigger(68 * G, 38 * G, 30 * G, 0.5, false),
-        Some("fell")
-    );
-    // Phase B's transients lifting the live bytes over the shape's are no fall.
-    assert_eq!(late_trigger(68 * G, 70 * G, 30 * G, 0.5, false), None);
-    let settled = LATE_SETTLE_SECS;
-    assert_eq!(
-        late_trigger(68 * G, 60 * G, 30 * G, settled - 0.1, false),
-        None
-    );
-    assert_eq!(
-        late_trigger(68 * G, 60 * G, 30 * G, settled, false),
-        Some("settled")
-    );
-    assert_eq!(
-        late_trigger(68 * G, 60 * G, 30 * G, 0.5, true),
-        Some("base returned")
-    );
-    // The fall is reported over the other two.
-    assert_eq!(
-        late_trigger(68 * G, 38 * G, 30 * G, settled, true),
-        Some("fell")
-    );
-}
-
-/// [`compose_block_tree`], each node proved from the program and artifacts
-/// derived ahead when `ahead` holds the node levels, and each node below the top
-/// verified on `beside` when given (the top is verified inline).
-pub(super) fn compose_block_tree_with(
-    plan: &BlockTreePlan,
-    leaves: Vec<RealChild>,
-    opts: &crate::ProofOptions,
-    siblings: usize,
-    ahead: Option<&Pipe>,
-    beside: Option<&BesideVerifies>,
-) -> (RealChild, super::proof::LfmProof, Vec<f64>) {
-    let fan_in = super::block_plan::block_fan_in();
-    let shape = plan.levels();
-    let mut level = leaves;
-    let mut top_proof = None;
-    let mut walls = Vec::with_capacity(shape.len());
-    for (lv, arities) in shape.iter().enumerate() {
-        let top = lv + 1 == shape.len();
-        let t = std::time::Instant::now();
-        let mut starts = Vec::with_capacity(arities.arities.len());
-        let mut at = 0usize;
-        for a in &arities.arities {
-            starts.push(at..at + a);
-            at += a;
-        }
-        assert_eq!(at, level.len(), "the level's arities cover its children");
-        let next = super::per_table_aggregator_tests::in_index_order(starts.len(), siblings, |j| {
-            let kids: Vec<&RealChild> = level[starts[j].clone()].iter().collect();
-            let label = format!(
-                "BLOCK L{}N{j} ({} child{}){}",
-                lv + 1,
-                kids.len(),
-                if kids.len() == 1 { "" } else { "ren" },
-                if top { " TOP" } else { "" }
-            );
-            let te = std::time::Instant::now();
-            let (program, built) = match ahead {
-                Some(p) => {
-                    let (program, artifacts) = p.take_node(lv, j, &label);
-                    (program, Some(artifacts))
-                }
-                None => (block_node_program(plan, &kids, top), None),
-            };
-            println!(
-                "   {label}: {} in {:.2}s",
-                if built.is_some() {
-                    "program ahead"
-                } else {
-                    "emitted"
-                },
-                te.elapsed().as_secs_f64()
-            );
-            super::per_table_aggregator_tests::census_and_panel(&program, &label, fan_in);
-            let inline = top || beside.is_none();
-            let (child, proof) = prove_program_with(
-                &label,
-                &program,
-                built,
-                &block_node_arenas(&kids),
-                opts,
-                inline,
-            );
-            if let (false, Some(b)) = (inline, beside) {
-                b.spawn(&label, child.artifacts.clone(), proof, opts.clone());
-                return (child, None);
-            }
-            (child, top.then_some(proof))
-        });
-        let (next, mut proofs): (Vec<RealChild>, Vec<Option<super::proof::LfmProof>>) =
-            next.into_iter().unzip();
-        if top {
-            top_proof = proofs.pop().flatten();
-        }
-        let wall = t.elapsed().as_secs_f64();
-        println!(
-            "   BLOCK LEVEL {}: {} node(s) in {wall:.2}s{}",
-            lv + 1,
-            next.len(),
-            if top { " (the top)" } else { "" }
-        );
-        walls.push(wall);
-        level = next;
-    }
-    assert_eq!(level.len(), 1, "the tree closes to one node");
-    (
-        level.pop().expect("one"),
-        top_proof.expect("the top level keeps its proof"),
-        walls,
+    super::block_tree::compose_block_tree_with(
+        plan,
+        leaves,
+        opts,
+        siblings,
+        None,
+        None,
+        &StdoutSink,
     )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The top node's published words, against the host's: the id, the state, the
@@ -3265,325 +2461,79 @@ const D12_LEAVES: [&[usize]; 8] = [
     ],
 ];
 
-/// Threads for the ELF constants beside the base by default: FAST 393 measured
-/// the harvest −1.87 s and the whole −1.80 s at four, the base +0.02 s.
-const ELF_BESIDE_THREADS: usize = 4;
+/// The harness's sink: stdout, and D-NOEPOCH §12.2's partition compared with
+/// the plan's on the `BLOCK PARTITION SOURCE` line.
+struct HarnessSink;
 
-/// `NOEPOCH_ELF_BESIDE`: threads for the ELF constants beside the base, unset
-/// meaning [`ELF_BESIDE_THREADS`]; `0` computes them inline in the harvest.
-fn elf_beside_knob() -> Option<usize> {
-    match std::env::var("NOEPOCH_ELF_BESIDE") {
-        Ok(v) if !v.is_empty() => Some(
-            v.parse::<usize>()
-                .unwrap_or_else(|_| panic!("NOEPOCH_ELF_BESIDE must be a thread count, got `{v}`")),
-        ),
-        _ => Some(ELF_BESIDE_THREADS),
+impl BlockTreeSink for HarnessSink {
+    fn write(&self, text: &str) {
+        print!("{text}");
     }
-    .filter(|&t| t > 0)
+
+    fn partition_note(&self, names: &[&str], partition: &BlockPartition) -> Option<String> {
+        let d12_block = names.len() == 137 && names[42] == "MEMW[0]" && names[100] == "MEMW_R[0]";
+        Some(
+            if !d12_block {
+                "n/a (not the 137-instance block)"
+            } else if partition
+                .leaves()
+                .iter()
+                .map(Vec::as_slice)
+                .eq(D12_LEAVES.iter().copied())
+            {
+                "equal"
+            } else {
+                "differ (reported, not used)"
+            }
+            .to_string(),
+        )
+    }
 }
 
-/// `NOEPOCH_LEAVES`: the leaf count; unset is the rule's `⌈Σ cost / 279 000⌉`.
-fn leaves_knob() -> Option<usize> {
-    std::env::var("NOEPOCH_LEAVES")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            v.parse()
-                .ok()
-                .filter(|k: &usize| *k >= 1)
-                .unwrap_or_else(|| panic!("NOEPOCH_LEAVES must be a positive integer, got `{v}`"))
-        })
-}
-
-/// ★★★ THE WHOLE NO-EPOCH BLOCK, base to top node: `block::prove_block`, the
-/// harvest, the leaves (level 0), the interior and the top — the block's
-/// recursion, and the number the epoch/no-epoch decision is taken on.
+/// ★★★ THE WHOLE NO-EPOCH BLOCK, base to top node, through the one driver the
+/// CLI's `prove-block` runs too ([`super::block_tree::prove_block_tree`]):
+/// `block::prove_block`, the harvest, the leaves (level 0), the interior and
+/// the top — the block's recursion, and the number the epoch/no-epoch decision
+/// is taken on.
 ///
 /// Its `★★★ WHOLE RUN` line is measured as the epoch tree's
 /// ([`super::per_table_aggregator_tests::the_production_tree_composes_to_a_root`]):
-/// from before the base to the last proof, the harness's verifies inside. That
+/// from before the base to the last proof, the in-run verifies inside. That
 /// tree's number stops at its interior (its block-artifact root is a separate
 /// arm); this one's top node is its last proof, and it closes the block's bus.
+/// After the run, off its clock: the block verifier, cold and warm.
 #[test]
 #[ignore = "box tier, production scale: the whole no-epoch block and its recursion (NOEPOCH_ELF, NOEPOCH_INPUT, --features cuda)"]
 fn the_block_tree_composes_to_a_top_node() {
-    use super::per_table_aggregator_tests::{
-        HostSampler, cgroup_limit_gib, in_index_order, tree_siblings, tree_siblings_l0,
-    };
     use std::time::Instant;
 
     // A refused harvest names its table and its check: the verifier's `error!` lines.
     let _ = env_logger::builder().is_test(true).try_init();
 
-    if !cfg!(feature = "cuda") {
-        panic!("the production block tree requires `--features cuda`");
-    }
     let read = |var: &str| -> Vec<u8> {
         let p = std::env::var(var).unwrap_or_else(|_| panic!("{var} must name a file"));
         std::fs::read(&p).unwrap_or_else(|e| panic!("{var} {p}: {e}"))
     };
     let elf_bytes = read("NOEPOCH_ELF");
     let input = read("NOEPOCH_INPUT");
-    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
-    let ceiling = cgroup_limit_gib();
-    let pct = |g: f64| match &ceiling {
-        Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * g / c),
-        Err(_) => String::new(),
-    };
-    println!(
-        "★★★ NO-EPOCH BLOCK TREE (base + leaves + interior + top)\n   \
-         {} input bytes · inner blowup {} / {} q · wrap blowup {} / {} q · cgroup {}",
-        input.len(),
-        inner.blowup_factor,
-        inner.fri_number_of_queries,
-        wrap_opts.blowup_factor,
-        wrap_opts.fri_number_of_queries,
-        match &ceiling {
-            Ok(g) => format!("{g:.2} GiB"),
-            Err(why) => format!("UNKNOWN — {why}"),
-        },
-    );
-
-    let whole = HostSampler::start();
-    let t_all = Instant::now();
-
-    // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`, four
-    // by default): the plan's ELF-only input (DECODE's root, recomputed on the
-    // host) computed on a pool of its own while the base proves, joined by the
-    // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline.
-    let elf_beside = elf_beside_knob();
-    // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
-    // leaf programs (with `1`, every tree program and its artifacts, on the host)
-    // from the shape the base hands out before its prove, and the levels prove
-    // from them.
-    let tree_ahead = elf_beside.and(tree_ahead_mode());
-    let emit_threads = emit_pool_knob();
-    let emit_window = emit_window_knob();
-    let node_emit_early = node_emit_early_knob();
-    let emit_late = emit_late_knob();
-    let base_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
-    // The thread hands its results back on `ready` and, in the pipeline mode,
-    // stays on as the tree's builder once `go` says the base is done.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let t_base0 = Instant::now();
-    let consts_beside = elf_beside.map(|threads| {
-        let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
-        let base_done = base_done.clone();
-        std::thread::spawn(move || {
-            let t = Instant::now();
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|i| format!("elf-beside-{i}"))
-                .start_handler(|_| super::commit::mark_thread_host_only())
-                .build()
-                .expect("the ELF constants pool builds");
-            let consts = pool.install(|| super::block_plan::ElfConstants::compute(&elf, &opts));
-            let secs = t.elapsed().as_secs_f64();
-            let mut job = None;
-            let mut late_line = None;
-            let ahead = match (&consts, tree_ahead) {
-                (Ok(c), Some(mode)) => shape_rx.recv().ok().map(|shape| {
-                    let live_at_shape = (emit_late != LateMode::Off).then(heap_allocated);
-                    let t = Instant::now();
-                    let derived = pool.install(|| -> Result<_, String> {
-                        let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
-                        Ok(match mode {
-                            AheadMode::Host => {
-                                let (tree, phases) = plan.derive_tree(&wrap, &|program| {
-                                    super::registry::build_artifacts_with_hasher(
-                                        program,
-                                        &wrap,
-                                        crate::hash_pin::BLOCK_HASHER,
-                                    )
-                                })?;
-                                (std::sync::Arc::new(Pipe::filled(tree)), phases)
-                            }
-                            AheadMode::Pipe => {
-                                use rayon::prelude::*;
-                                let n = plan.partition().num_leaves();
-                                let beside = emit_window.map_or(n, |w| w.min(n));
-                                // `NOEPOCH_TREE_EMIT_LATE`: leaf 0 now, sizing the
-                                // wait; the rest once phase B has freed their room.
-                                let mut leaves = Vec::with_capacity(beside);
-                                let late = match live_at_shape {
-                                    Some(live) if beside > 1 => {
-                                        leaves.push(plan.leaf_program(0)?);
-                                        let estimate = late_estimate(&plan, &leaves[0], beside);
-                                        match late_margin(emit_late, estimate) {
-                                            Some(margin) => Some(wait_for_late_emission(
-                                                estimate, margin, live, &base_done, t_base0,
-                                            )),
-                                            None => {
-                                                late_line = Some(format!(
-                                                    "   TREE LATE: auto, the other {} leaves' programs \
-                                                     estimated {:.2} GiB, under the {:.0} GiB floor: \
-                                                     emitted at the shape",
-                                                    beside - 1,
-                                                    gib(estimate),
-                                                    gib(LATE_MIN_ESTIMATE)
-                                                ));
-                                                None
-                                            }
-                                        }
-                                    }
-                                    _ => None,
-                                };
-                                let te = Instant::now();
-                                let first = leaves.len();
-                                leaves.extend(
-                                    (first..beside)
-                                        .into_par_iter()
-                                        .map(|k| plan.leaf_program(k))
-                                        .collect::<Result<Vec<_>, String>>()?,
-                                );
-                                if let Some(w) = late {
-                                    let mut held = ProgramBytes::default();
-                                    for p in &leaves {
-                                        held.add(&ProgramBytes::of(p));
-                                    }
-                                    let resident = heap_resident();
-                                    late_line = Some(format!(
-                                        "   TREE LATE: leaf 0 at the shape, {} more after {:.2}s ({}) \
-                                         at {:.2}s of the base, emitted in {:.2}s, done at {:.2}s · heap \
-                                         live {:.2} GiB at the shape → {:.2} at the start (need a fall of \
-                                         {:.2} = {} × {:.2} estimated) → {:.2} at the end · resident \
-                                         {:.2} → {:.2} GiB over the emission (+{:.2}) · programs held \
-                                         {:.2} GiB, ≥ oversize {:.1} %",
-                                        beside - 1,
-                                        w.waited,
-                                        w.trigger,
-                                        w.at,
-                                        te.elapsed().as_secs_f64(),
-                                        t_base0.elapsed().as_secs_f64(),
-                                        gib(w.live_at_shape),
-                                        gib(w.live_at_start),
-                                        gib(w.need),
-                                        w.margin,
-                                        gib(w.estimate),
-                                        gib(heap_allocated()),
-                                        gib(w.resident_at_start),
-                                        gib(resident),
-                                        gib(resident.saturating_sub(w.resident_at_start)),
-                                        gib(held.total()),
-                                        100.0 * held.large as f64 / held.total().max(1) as f64,
-                                    ));
-                                }
-                                let pipe = std::sync::Arc::new(Pipe::new(n, &plan.levels()));
-                                let emitted = super::block_plan::PhaseTimes {
-                                    programs: leaves.len(),
-                                    wall: te.elapsed().as_secs_f64(),
-                                    emit: te.elapsed().as_secs_f64(),
-                                    build: 0.0,
-                                };
-                                job = Some((pipe.clone(), plan, leaves));
-                                (pipe, vec![emitted])
-                            }
-                        })
-                    });
-                    (
-                        shape,
-                        derived,
-                        t.elapsed().as_secs_f64(),
-                        t_base0.elapsed().as_secs_f64(),
-                    )
-                }),
-                _ => None,
-            };
-            let _ = ready_tx.send((consts, secs, ahead, late_line));
-            let (pipe, plan, leaves) = job?;
-            go_rx.recv().ok()?;
-            Some(pipe.run_builder(
-                &plan,
-                leaves,
-                &wrap,
-                emit_threads,
-                emit_window.unwrap_or(0),
-                node_emit_early,
-            ))
-        })
-    });
-
-    // ---- the base.
-    let base_sampler = HostSampler::start();
-    let t = Instant::now();
-    let mut shape_at = None;
-    let (proof, times) = crate::block::prove_block_observed(&elf_bytes, &input, &inner, &mut |s| {
-        shape_at = Some(t.elapsed().as_secs_f64());
-        let _ = shape_tx.send(s.clone());
-    })
-    .expect("the block must prove");
-    base_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    drop(shape_tx);
-    let base = t.elapsed().as_secs_f64();
-    let (base_peak, _) = base_sampler.stop();
-    println!(
-        "   base: {} sub-proofs in {base:.2}s (execute {:.2} · build {:.2} · setup {:.2} · \
-         prove {:.2}) · host peak {base_peak:.3} GiB{}",
-        proof.proof.proofs.len(),
-        times.execute,
-        times.build,
-        times.setup,
-        times.prove,
-        pct(base_peak)
-    );
-
-    // The base's freed pages back to the OS before the tree allocates: under
-    // memory pressure by default, or as `LAMBDA_VM_ALLOC_PURGE` names it
-    // (counted in the whole run, in no phase's wall).
-    crate::alloc_purge::purge_point("base");
-
-    // ---- the harvest. Production's verify of the base is a harness assert, not
-    // work a driver does, so by default it runs on a helper thread beside level 0
-    // and is joined before anything is reported: a refused block still fails the
-    // run, it only stops delaying the leaves (the epoch tree's per-epoch verifies
-    // likewise run beside its other wraps). `NOEPOCH_HARVEST_VERIFY=inline`
-    // verifies first, as before.
-    let inline_verify = std::env::var("NOEPOCH_HARVEST_VERIFY").is_ok_and(|v| v == "inline");
-    let t = Instant::now();
-    let mut pipe = None;
-    let consts = consts_beside.as_ref().map(|_| {
-        let tj = Instant::now();
-        let (consts, secs, ahead, late_line) =
-            ready_rx.recv().expect("the ELF constants thread stopped");
-        println!(
-            "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
-             waited {:.2}s (counted in the harvest)",
-            elf_beside.unwrap_or(0),
-            tj.elapsed().as_secs_f64()
-        );
-        if let Some((shape, derived, secs, done_at)) = ahead {
-            let (filled, phases) = derived.expect("the tree derives ahead");
-            assert_eq!(
-                format!("{shape:?}"),
-                format!("{:?}", BlockShape::of_proof(&proof)),
-                "the shape handed out before the prove is the proof's"
-            );
-            let split: Vec<String> = phases
-                .iter()
-                .map(|p| format!("{} in {:.2} (emit Σ {:.2}, build Σ {:.2})", p.programs, p.wall, p.emit, p.build))
-                .collect();
-            println!(
-                "   TREE AHEAD: {} programs derived beside the base in {secs:.2}s on the host (shape at \
-                 {:.2}s, done at {done_at:.2}s of a {base:.2}s base) · {}",
-                phases.iter().map(|p| p.programs).sum::<usize>(),
-                shape_at.unwrap_or(f64::NAN),
-                split.join(" · ")
-            );
-            pipe = Some(filled);
-        }
-        if let Some(line) = late_line {
-            println!("{line}");
-        }
-        std::sync::Arc::new(consts.expect("the ELF constants compute"))
-    });
-    assert!(
-        tree_ahead.is_none() || pipe.is_some(),
-        "NOEPOCH_TREE_AHEAD derived no tree"
-    );
-    let shape = BlockShape::of_proof(&proof);
+    let cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let run = super::block_tree::prove_block_tree(
+        &elf_bytes,
+        &input,
+        &cfg,
+        std::sync::Arc::new(HarnessSink),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let super::block_tree::BlockTreeRun {
+        shape,
+        top_proof,
+        top,
+        witness: rb,
+        consts,
+        forced,
+        ..
+    } = run;
     // `NOEPOCH_SHAPE_OUT=<file>`: the shape a consumer receives, for a verifier
     // run in a process of its own
     // (`the_block_verifiers_derivation_from_a_saved_shape`).
@@ -3594,281 +2544,6 @@ fn the_block_tree_composes_to_a_top_node() {
             .unwrap_or_else(|e| panic!("NOEPOCH_SHAPE_OUT {path}: {e}"));
         println!("   BLOCK SHAPE written to {path}");
     }
-    let (mut rb, verify, replay, beside) = if inline_verify {
-        let (rb, verify, replay) =
-            harvest_block_over(&inner, &elf_bytes, &proof, true, consts.as_deref())
-                .expect("harvest");
-        drop(proof);
-        (rb, Some(verify), replay, None)
-    } else {
-        let proof = std::sync::Arc::new(proof);
-        let beside = {
-            let (proof, opts, elf) = (proof.clone(), inner.clone(), elf_bytes.clone());
-            let consts = consts.clone();
-            std::thread::spawn(move || {
-                harvest_block_over(&opts, &elf, &proof, true, consts.as_deref())
-                    .map(|(rb, verify, _)| (rb.state, verify))
-            })
-        };
-        let (rb, _, replay) =
-            harvest_block_over(&inner, &elf_bytes, &proof, false, consts.as_deref())
-                .expect("harvest");
-        drop(proof);
-        (rb, None, replay, Some(beside))
-    };
-    let mut harvest = t.elapsed().as_secs_f64();
-    println!(
-        "   harvest: {harvest:.2}s (production verify {}, harness-only · replay {replay:.2}s) · \
-         {} instances · public output {} bytes",
-        match verify {
-            Some(v) => format!("{v:.2}s inline"),
-            None => "beside level 0".to_string(),
-        },
-        rb.num_instances(),
-        rb.public_output.len()
-    );
-
-    // ---- the partition: the plan's — the rule over the closed-form costs, a
-    // pure function of the block's shape. `NOEPOCH_LEAVES` forces another leaf
-    // count: another tree, which the final check then derives over.
-    let forced = leaves_knob();
-    if let Some(k) = forced {
-        let p = rb.partition_over(k);
-        rb.plan = rb.plan.with_partition(p);
-    }
-    let partition = rb.plan.partition().clone();
-    let names = rb.names();
-    let d12_block = names.len() == 137 && names[42] == "MEMW[0]" && names[100] == "MEMW_R[0]";
-    println!(
-        "   BLOCK PARTITION SOURCE: {} · D-NOEPOCH §12.2's lists (legmodel.py costs): {}",
-        if forced.is_some() {
-            "NOEPOCH_LEAVES (forced: NOT the plan's tree)"
-        } else {
-            "the plan (the rule)"
-        },
-        if !d12_block {
-            "n/a (not the 137-instance block)"
-        } else if partition
-            .leaves()
-            .iter()
-            .map(Vec::as_slice)
-            .eq(D12_LEAVES.iter().copied())
-        {
-            "equal"
-        } else {
-            "differ (reported, not used)"
-        }
-    );
-    let costs = rb.plan.costs();
-    let k = partition.num_leaves();
-    for (j, leaf) in partition.leaves().iter().enumerate() {
-        let perms: usize = leaf.iter().map(|&i| costs[i]).sum();
-        println!(
-            "   BLOCK LEAF {j}: {} instances · {perms} perms (closed form) · idx {leaf:?}",
-            leaf.len()
-        );
-    }
-    println!(
-        "   BLOCK PARTITION: {k} leaves, Σ {} perms, heaviest {} (cap {}, cost model v{})",
-        costs.iter().sum::<usize>(),
-        partition
-            .leaves()
-            .iter()
-            .map(|l| l.iter().map(|&i| costs[i]).sum::<usize>())
-            .max()
-            .unwrap_or(0),
-        super::block_plan::LEAF_PERMS_CAP,
-        rb.plan.cost_model()
-    );
-    // Which leaves verify the chunked accelerators' instances (the rule seeds
-    // each table's first instance and fills its later chunks by load).
-    let leaves_of = |kind: &str| -> Vec<usize> {
-        let prefix = format!("{kind}[");
-        (0..k)
-            .filter(|&j| {
-                partition
-                    .leaf(j)
-                    .iter()
-                    .any(|&i| names[i].starts_with(&prefix))
-            })
-            .collect()
-    };
-    println!(
-        "   BLOCK PARTITION CHUNKED: KECCAK on leaves {:?} · ECSM {:?} · ECDAS {:?} · KECCAK_RND {:?}",
-        leaves_of("KECCAK"),
-        leaves_of("ECSM"),
-        leaves_of("ECDAS"),
-        leaves_of("KECCAK_RND")
-    );
-
-    // ---- level 0: the leaves.
-    let beside_verifies = child_verify_beside_knob().then(BesideVerifies::default);
-    let l0 = tree_siblings_l0().min(k);
-    println!("   ★ LEVEL-0 CONCURRENCY: {l0} leaf proof(s) at once (LFM_TREE_SIBLINGS_L0)");
-    super::device_permit::arm(l0);
-    // The pipeline's builder starts on the card now that the base is done.
-    let _ = go_tx.send(());
-    let l0_sampler = HostSampler::start();
-    let t = Instant::now();
-    let leaves = in_index_order(k, l0, |j| {
-        let label = format!("BLOCK L0 leaf {j}");
-        let te = Instant::now();
-        let (program, built) = match &pipe {
-            Some(p) => {
-                let (program, artifacts) = p.take_leaf(j, &label);
-                (program, Some(artifacts))
-            }
-            None => (block_leaf_program(&rb, j), None),
-        };
-        let arenas = block_leaf_arenas(&rb, &partition, j);
-        println!(
-            "   {label}: {} + arenas in {:.2}s",
-            if built.is_some() {
-                "program ahead"
-            } else {
-                "emitted"
-            },
-            te.elapsed().as_secs_f64()
-        );
-        super::per_table_aggregator_tests::census_and_panel(
-            &program,
-            &label,
-            super::block_plan::block_fan_in(),
-        );
-        let (child, proof) = prove_program_with(
-            &label,
-            &program,
-            built,
-            &arenas,
-            &wrap_opts,
-            beside_verifies.is_none(),
-        );
-        if let Some(b) = &beside_verifies {
-            b.spawn(&label, child.artifacts.clone(), proof, wrap_opts.clone());
-        }
-        let words: Vec<LfmWord> = child.public_words.iter().map(|(_, w)| *w).collect();
-        assert_eq!(
-            words,
-            rb.expected_leaf_publics(&partition, j, j == rb.plan.carrier()),
-            "{label} publishes the host's id, state, output and share"
-        );
-        child
-    });
-    let level0 = t.elapsed().as_secs_f64();
-    let (l0_peak, _) = l0_sampler.stop();
-    println!(
-        "   BLOCK LEVEL 0: {k} leaves in {level0:.2}s · host peak {l0_peak:.3} GiB{}",
-        pct(l0_peak)
-    );
-
-    // ---- the interior and the top.
-    let siblings = tree_siblings();
-    println!("   ★ SIBLING CONCURRENCY: {siblings} node proof(s) at once (LFM_TREE_SIBLINGS)");
-    super::device_permit::arm(siblings);
-    let t = Instant::now();
-    let (top, top_proof, walls) = compose_block_tree_with(
-        &rb.plan,
-        leaves,
-        &wrap_opts,
-        siblings,
-        pipe.as_deref(),
-        beside_verifies.as_ref(),
-    );
-    // The pipeline's builder is done by now (every node took its program).
-    if let Some(handle) = consts_beside {
-        let built = handle.join().expect("the ELF constants thread panicked");
-        if let Some(times) = built {
-            let times = times.expect("the tree's builder");
-            println!(
-                "   TREE PIPE: leaf artifacts built by {:.2}s of level 0, node levels by {:?} s · node \
-                 emission Σ {:.2}s ({}) · artifact builds Σ {:.2}s (holding the card permit) · leaf \
-                 programs {}",
-                times.leaves,
-                times.levels,
-                times.emit,
-                if emit_threads > 0 {
-                    format!("own pool of {emit_threads}")
-                } else {
-                    "global pool".to_string()
-                },
-                times.build,
-                match emit_window {
-                    Some(w) =>
-                        format!("emitted in a window of {w} (the first {w} beside the base)"),
-                    None => "all emitted beside the base".to_string(),
-                }
-            );
-            println!(
-                "   TREE PIPE node emission: {}",
-                if node_emit_early {
-                    "early (each node once its children's artifacts exist)"
-                } else {
-                    "per level (each level once the level below is built)"
-                }
-            );
-        }
-    }
-    super::device_permit::arm(1);
-    // Every child verified beside is joined here, inside the interior's time: a
-    // refusal fails the run before anything is reported.
-    if let Some(b) = &beside_verifies {
-        let (n, waited) = b.join_all();
-        println!(
-            "   CHILD VERIFIES beside the timed path: {n} accepted (production's verify), the join \
-             waited {waited:.2}s (counted in the interior)"
-        );
-    }
-    let interior = t.elapsed().as_secs_f64();
-    // The verify beside level 0 must have accepted the block, over the same
-    // reconstruction the leaves read (one state word), before anything counts.
-    // What the join waits is on the critical path, so it is the harvest's.
-    if let Some(beside) = beside {
-        let t = Instant::now();
-        let (state, verify) = beside
-            .join()
-            .expect("the harvest verify beside level 0 panicked")
-            .expect("harvest (verified beside level 0)");
-        assert_eq!(
-            state, rb.state,
-            "the verified harvest and the leaves' harvest read one transcript"
-        );
-        let waited = t.elapsed().as_secs_f64();
-        harvest += waited;
-        println!(
-            "   harvest verify beside level 0: production verify {verify:.2}s, harness-only · \
-             joined after the top, waited {waited:.2}s (counted in the harvest)"
-        );
-    }
-    assert_top_claims_the_block(&top, &rb);
-    let t = Instant::now();
-    assert!(
-        verify_block_top(&top.artifacts, &top_proof, &wrap_opts),
-        "the top proof must verify against the top program the harness emitted"
-    );
-    println!(
-        "   BLOCK FINAL CHECK (harness): the top verifies against its emitted program \
-         ({:.2}s, program id {})",
-        t.elapsed().as_secs_f64(),
-        top.artifacts
-            .program_id
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-
-    let total = t_all.elapsed().as_secs_f64();
-    let (peak, at) = whole.stop();
-    println!(
-        "★★★ NO-EPOCH BLOCK: base {base:.2}s · harvest {harvest:.2}s · level 0 {level0:.2}s \
-         ({k} leaves) · interior {interior:.2}s (levels {}) · recursion {:.2}s · whole {total:.2}s",
-        walls
-            .iter()
-            .map(|w| format!("{w:.2}"))
-            .collect::<Vec<_>>()
-            .join(" + "),
-        harvest + level0 + interior
-    );
-    println!("★★★ WHOLE RUN: host peak {peak:.3} GiB at t={at:.1}, {total:.1}s total");
     // `LAMBDA_VM_ALLOC_PURGE=tree` (or `all`): the tree's freed pages back to
     // the OS before the verifier derives its programs (after the whole run's
     // stopwatch).

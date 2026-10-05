@@ -27,6 +27,10 @@ pub mod block_node;
 pub mod block_plan;
 pub mod block_replay;
 pub mod block_root;
+#[cfg(feature = "parallel")]
+pub mod block_tree;
+#[cfg(feature = "parallel")]
+mod block_tree_pipeline;
 pub mod builder;
 pub mod card_schedule;
 pub mod chips;
@@ -46,8 +50,8 @@ pub mod fixture;
 pub mod fri;
 pub mod global_parent;
 pub mod global_split;
-pub mod hash;
 pub(crate) mod harvest;
+pub mod hash;
 pub mod instr;
 pub mod keccak_adapter;
 pub mod keccak_host;
@@ -73,6 +77,7 @@ pub mod trace;
 pub mod transcript_replay;
 /// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — a diagnostic, OFF by default.
 pub mod tree_probe;
+pub(crate) mod tree_run;
 pub mod validator;
 pub mod whir_air;
 pub mod whir_bus;
@@ -143,8 +148,6 @@ mod blake3_probe;
 mod blake3_socket_kats;
 #[cfg(test)]
 mod blake3_socket_tests;
-#[cfg(test)]
-mod block_tree_pipeline;
 #[cfg(test)]
 mod block_tree_tests;
 #[cfg(all(test, feature = "cuda"))]

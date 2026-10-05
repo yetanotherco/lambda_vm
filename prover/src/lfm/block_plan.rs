@@ -369,7 +369,6 @@ impl BlockTreePlan {
     }
 
     /// The AIR set the plan derived its shapes from — the host verifier's.
-    #[cfg(test)]
     pub(crate) fn airs(&self) -> &crate::VmAirs {
         &self.airs
     }
