@@ -21,7 +21,9 @@
 //! # What the plan fixes
 //!
 //! - The partition: [`partition_by_rule`] over the instances' closed-form costs
-//!   (D-NOEPOCH §12.2's rule) — a pure function of the shape, no env read.
+//!   (D-NOEPOCH §12.2's rule), or under `NOEPOCH_PARTITION_MODEL=3` the padded
+//!   partition ([`super::leaf_pack`]) — a pure function of the shape and the
+//!   model version ([`partition_model`]), never of a proof.
 //! - The carrier: leaf 0 subtracts the COMMIT-bus target, and no other leaf can
 //!   (the leaf emitter computes `carries = leaf == plan.carrier()`).
 //! - The attestation id a leaf publishes: computed from the very preprocessed
@@ -75,7 +77,30 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 /// - v1: every ECDAS, ECSM and KECCAK instance seeded on leaf 1, 2 and 3.
 /// - v2: only `ECDAS[0]`, `ECSM[0]` and `KECCAK[0]` seeded there; their later
 ///   chunks fill by load, so no count of them overfills one leaf.
+/// - v3 ([`PARTITION_MODEL_PADDED`], opt-in): v2's seeds, the rest packed by
+///   the leaves' padded LFM chip heights ([`super::leaf_pack`]).
 pub const PARTITION_COST_MODEL: u32 = 2;
+
+/// The padded partition's version ([`super::leaf_pack`]), selected by
+/// `NOEPOCH_PARTITION_MODEL=3`.
+pub const PARTITION_MODEL_PADDED: u32 = 3;
+
+/// The partition the plan derives: [`PARTITION_COST_MODEL`] (v2, the default)
+/// or `NOEPOCH_PARTITION_MODEL=3` ([`PARTITION_MODEL_PADDED`]). Read once per
+/// process. Like [`block_fan_in`] it is a tree-format parameter: every leaf's
+/// instance list, and so the top, depends on it, and a verifier configured
+/// otherwise than the prover derives another top and refuses (completeness,
+/// never soundness). It is never read from a proof.
+pub fn partition_model() -> u32 {
+    static MODEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODEL.get_or_init(
+        || match std::env::var("NOEPOCH_PARTITION_MODEL").as_deref() {
+            Err(_) | Ok("2") => PARTITION_COST_MODEL,
+            Ok("3") => PARTITION_MODEL_PADDED,
+            Ok(v) => panic!("NOEPOCH_PARTITION_MODEL must be 2 or 3, got `{v}`"),
+        },
+    )
+}
 
 /// The leaf that subtracts the COMMIT-bus target.
 const CARRIER: usize = 0;
@@ -176,6 +201,9 @@ pub struct BlockTreePlan {
     data_pages: Vec<(u64, usize)>,
     instances: Vec<PlannedInstance>,
     partition: BlockPartition,
+    /// The partition's version: [`PARTITION_COST_MODEL`] or
+    /// [`PARTITION_MODEL_PADDED`] ([`partition_model`]).
+    cost_model: u32,
     /// The AIR set the shapes came from — the host verifier's. Kept for a
     /// caller that verifies the base over the very set (the harness's harvest).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -326,7 +354,7 @@ impl BlockTreePlan {
         let names: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
         let partition = partition_for(&names, &costs)?;
 
-        Ok(Self {
+        let mut plan = Self {
             statement: super::block_replay::BlockStatementShape {
                 public_output_len: shape.public_output_len,
                 table_counts: crate::statement::table_count_values(&shape.table_counts),
@@ -344,8 +372,14 @@ impl BlockTreePlan {
             data_pages,
             instances,
             partition,
+            cost_model: PARTITION_COST_MODEL,
             airs,
-        })
+        };
+        if partition_model() == PARTITION_MODEL_PADDED {
+            plan.partition = super::leaf_pack::padded_partition(&plan)?;
+            plan.cost_model = PARTITION_MODEL_PADDED;
+        }
+        Ok(plan)
     }
 
     pub fn statement(&self) -> &super::block_replay::BlockStatementShape {
@@ -397,9 +431,10 @@ impl BlockTreePlan {
         &self.partition
     }
 
-    /// The partition's cost-model version ([`PARTITION_COST_MODEL`]).
+    /// The partition's cost-model version ([`PARTITION_COST_MODEL`], or
+    /// [`PARTITION_MODEL_PADDED`] under `NOEPOCH_PARTITION_MODEL=3`).
     pub fn cost_model(&self) -> u32 {
-        PARTITION_COST_MODEL
+        self.cost_model
     }
 
     /// The one leaf that subtracts the COMMIT-bus target.
@@ -683,7 +718,7 @@ fn instance_cost(verify: &TableVerifyShape) -> usize {
 /// D-NOEPOCH §12.2's partition: the rule over `⌈Σ cost / cap⌉` leaves, one more
 /// leaf while the heaviest leaf is over the cap and another leaf can help (a
 /// block whose instances are all at or under the cap). Pure in the shape.
-fn partition_for(names: &[&str], costs: &[usize]) -> Result<BlockPartition, String> {
+pub(crate) fn partition_for(names: &[&str], costs: &[usize]) -> Result<BlockPartition, String> {
     let total: usize = costs.iter().sum();
     let widest = costs.iter().copied().max().unwrap_or(0);
     let mut k = total.div_ceil(LEAF_PERMS_CAP).clamp(1, names.len().max(1));
@@ -704,6 +739,12 @@ fn partition_for(names: &[&str], costs: &[usize]) -> Result<BlockPartition, Stri
 
 fn builder() -> LfmBuilder {
     LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
+}
+
+/// The builder every tree program is emitted into, for the partition's probes
+/// ([`super::block_leaf::probe_leaf`]).
+pub(crate) fn leaf_builder() -> LfmBuilder {
+    builder()
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {

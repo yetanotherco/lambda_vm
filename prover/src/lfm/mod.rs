@@ -57,6 +57,7 @@ pub mod keccak_adapter;
 pub mod keccak_host;
 pub mod layout;
 pub mod lde;
+pub mod leaf_pack;
 pub mod logup;
 pub mod merkle_cap;
 pub mod per_table_aggregator;
@@ -174,6 +175,8 @@ mod join_tests;
 mod keccak_probe;
 #[cfg(test)]
 mod leaf_kats;
+#[cfg(test)]
+mod leaf_pack_tests;
 #[cfg(test)]
 mod leaf_tests;
 #[cfg(test)]

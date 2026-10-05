@@ -112,27 +112,11 @@ impl BlockPartition {
     }
 }
 
-/// D-NOEPOCH §12.2's rule over the block's AIR-order instance list:
-///
-/// 1. the KECCAK_RND instances seed leaves `0, 1, 2, …` (mod `num_leaves`);
-/// 2. `ECDAS[0]` goes to leaf 1, `ECSM[0]` to leaf 2 and `KECCAK[0]` to leaf 3
-///    (mod `num_leaves`);
-/// 3. the fixed and tiny tables (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT,
-///    COMMIT, HINT) go to leaf 0;
-/// 4. every other instance — ECDAS, ECSM and KECCAK chunks past the first
-///    included, so no count of them can overfill one leaf — in AIR order but PAGE last,
-///    goes to the leaf whose cost so far is smallest (ties: the lowest leaf).
-///
-/// `names` are the AIRs' names (`CPU[3]`, `PAGE:0x1000` …; the instance suffix
-/// after `[` or `:` is ignored) and `costs` any additive per-instance cost.
-/// Pure: every emitter that needs the partition derives the same one from the
-/// same instance list. Refuses a leaf count that leaves a leaf empty.
-pub fn partition_by_rule(
-    names: &[&str],
-    costs: &[usize],
-    num_leaves: usize,
-) -> Result<BlockPartition, String> {
-    assert_eq!(names.len(), costs.len(), "one cost per instance");
+/// Steps 1–3 of [`partition_by_rule`]: the KECCAK_RND round-robin, the first
+/// ECDAS, ECSM and KECCAK instances, and the fixed and tiny tables, over
+/// `num_leaves` leaves; and which instances they placed. The padded partition
+/// ([`super::leaf_pack`]) keeps these where the rule puts them.
+pub(crate) fn seed_leaves(names: &[&str], num_leaves: usize) -> (Vec<Vec<usize>>, Vec<bool>) {
     assert!(num_leaves >= 1, "a block has at least one leaf");
     let kind = |name: &str| -> String { name.split(['[', ':']).next().unwrap_or(name).to_string() };
     let mut leaves: Vec<Vec<usize>> = vec![Vec::new(); num_leaves];
@@ -172,6 +156,32 @@ pub fn partition_by_rule(
             _ => {}
         }
     }
+    (leaves, placed)
+}
+
+/// D-NOEPOCH §12.2's rule over the block's AIR-order instance list:
+///
+/// 1. the KECCAK_RND instances seed leaves `0, 1, 2, …` (mod `num_leaves`);
+/// 2. `ECDAS[0]` goes to leaf 1, `ECSM[0]` to leaf 2 and `KECCAK[0]` to leaf 3
+///    (mod `num_leaves`);
+/// 3. the fixed and tiny tables (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT,
+///    COMMIT, HINT) go to leaf 0;
+/// 4. every other instance — ECDAS, ECSM and KECCAK chunks past the first
+///    included, so no count of them can overfill one leaf — in AIR order but PAGE last,
+///    goes to the leaf whose cost so far is smallest (ties: the lowest leaf).
+///
+/// `names` are the AIRs' names (`CPU[3]`, `PAGE:0x1000` …; the instance suffix
+/// after `[` or `:` is ignored) and `costs` any additive per-instance cost.
+/// Pure: every emitter that needs the partition derives the same one from the
+/// same instance list. Refuses a leaf count that leaves a leaf empty.
+pub fn partition_by_rule(
+    names: &[&str],
+    costs: &[usize],
+    num_leaves: usize,
+) -> Result<BlockPartition, String> {
+    assert_eq!(names.len(), costs.len(), "one cost per instance");
+    let kind = |name: &str| -> String { name.split(['[', ':']).next().unwrap_or(name).to_string() };
+    let (mut leaves, placed) = seed_leaves(names, num_leaves);
     let rest: Vec<usize> = (0..names.len())
         .filter(|&i| !placed[i] && kind(names[i]) != "PAGE")
         .chain((0..names.len()).filter(|&i| !placed[i] && kind(names[i]) == "PAGE"))
@@ -233,6 +243,20 @@ pub(crate) fn emit_block_leaf_over(
     carries: bool,
 ) {
     emit_leaf(b, plan, partition, leaf, carries);
+}
+
+/// Leaf 0 over `partition`, compiled but not validated: the probe the padded
+/// partition ([`super::leaf_pack`]) measures an instance list's LFM rows with.
+/// It is the production emitter, so a probe's rows are a real leaf's rows; it
+/// never becomes a tree program.
+pub(crate) fn probe_leaf(
+    plan: &BlockTreePlan,
+    partition: &BlockPartition,
+    carries: bool,
+) -> super::compiler::LfmProgram {
+    let mut b = super::block_plan::leaf_builder();
+    emit_leaf(&mut b, plan, partition, 0, carries);
+    super::compiler::compile(b.finish())
 }
 
 fn emit_leaf(
