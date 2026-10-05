@@ -895,7 +895,8 @@ pub(crate) enum SpillPolicy {
     /// Keep every trace, and write none to disk. With live `auto`
     /// regeneration (`LAMBDA_VM_BLOCK_REGEN=auto`) `auto` still decides, with
     /// no store, and once armed drops every regenerable instance (no disk,
-    /// [`Spill::for_block`]).
+    /// [`Spill::for_block`]). The default, with regeneration `auto`, when
+    /// both knobs are unset ([`spill_policy`]).
     Off,
     /// Spill every committed instance that is packed (a measurement arm).
     Always,
@@ -903,18 +904,43 @@ pub(crate) enum SpillPolicy {
     /// spill the rest.
     Budget(u64),
     /// Spill once the host would pass the target ([`spill_target_bytes`]):
-    /// see [`spill_decision`]. The default: a block that fits spills nothing.
+    /// see [`spill_decision`]. A block that fits spills nothing.
     Auto,
 }
 
-/// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
-/// resident budget for committed packed traces). Anything else is `off`, so
-/// with `LAMBDA_VM_BLOCK_REGEN=auto` a typo is no disk too (its line says so).
+/// `LAMBDA_VM_BLOCK_SPILL`: `auto` | `off` | `always` | `<GiB>` (a resident
+/// budget for committed packed traces). Anything else is `off`, so with
+/// `LAMBDA_VM_BLOCK_REGEN=auto` a typo is no disk too (its line says so).
+/// Unset is `off` while `LAMBDA_VM_BLOCK_REGEN` is unset too — the default is
+/// no disk, regeneration `auto` (I-REGEN §14.9) — and `auto` beside a set
+/// one, as before no disk was the default.
 fn spill_policy() -> SpillPolicy {
-    parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
+    parse_spill_policy(
+        std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
+        std::env::var_os("LAMBDA_VM_BLOCK_REGEN").is_some(),
+    )
 }
 
-fn parse_spill_policy(value: Option<&str>) -> SpillPolicy {
+/// The `BLOCK POSTURE` line's memory words: the spill policy and the
+/// regeneration mode the knobs come to, and the knobs as the process has them.
+pub(crate) fn memory_posture() -> String {
+    let knob = |name: &str| {
+        std::env::var(name).map_or_else(|_| format!("{name} unset"), |v| format!("{name}={v}"))
+    };
+    let spill = spill_policy();
+    let regen = crate::block_regen::regen_mode();
+    let no_disk =
+        spill == SpillPolicy::Off && matches!(regen, Ok(crate::block_regen::RegenMode::Auto));
+    format!(
+        "memory: spill {spill:?} · regen {}{} ({} · {})",
+        regen.map_or_else(|e| format!("refused ({e})"), |m| format!("{m:?}")),
+        if no_disk { " = no disk" } else { "" },
+        knob("LAMBDA_VM_BLOCK_SPILL"),
+        knob("LAMBDA_VM_BLOCK_REGEN"),
+    )
+}
+
+fn parse_spill_policy(value: Option<&str>, regen_set: bool) -> SpillPolicy {
     match value.map(str::trim) {
         Some("always") => SpillPolicy::Always,
         Some("auto") => SpillPolicy::Auto,
@@ -925,7 +951,8 @@ fn parse_spill_policy(value: Option<&str>) -> SpillPolicy {
             .map_or(SpillPolicy::Off, |g| {
                 SpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
             }),
-        None => SpillPolicy::Auto,
+        None if regen_set => SpillPolicy::Auto,
+        None => SpillPolicy::Off,
     }
 }
 
@@ -3090,24 +3117,24 @@ mod spill_policy_tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// `LAMBDA_VM_BLOCK_SPILL`'s values: auto (and unset), off, always, a
-    /// budget in GiB; anything else is off.
+    /// `LAMBDA_VM_BLOCK_SPILL`'s values: auto, off, always, a budget in GiB;
+    /// anything else is off. Unset is off with `LAMBDA_VM_BLOCK_REGEN` unset
+    /// too (the default, no disk) and auto beside a set one; a set value
+    /// means the same either way.
     #[test]
     fn the_spill_policy_reads_its_knob() {
-        assert_eq!(parse_spill_policy(None), SpillPolicy::Auto);
-        assert_eq!(parse_spill_policy(Some("off")), SpillPolicy::Off);
-        assert_eq!(parse_spill_policy(Some("always")), SpillPolicy::Always);
-        assert_eq!(parse_spill_policy(Some(" auto ")), SpillPolicy::Auto);
-        assert_eq!(
-            parse_spill_policy(Some("40")),
-            SpillPolicy::Budget(40 * GIB)
-        );
-        assert_eq!(
-            parse_spill_policy(Some("0.5")),
-            SpillPolicy::Budget(GIB / 2)
-        );
-        assert_eq!(parse_spill_policy(Some("-1")), SpillPolicy::Off);
-        assert_eq!(parse_spill_policy(Some("lots")), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(None, false), SpillPolicy::Off);
+        assert_eq!(parse_spill_policy(None, true), SpillPolicy::Auto);
+        for regen_set in [false, true] {
+            let parse = |v| parse_spill_policy(Some(v), regen_set);
+            assert_eq!(parse("off"), SpillPolicy::Off);
+            assert_eq!(parse("always"), SpillPolicy::Always);
+            assert_eq!(parse(" auto "), SpillPolicy::Auto);
+            assert_eq!(parse("40"), SpillPolicy::Budget(40 * GIB));
+            assert_eq!(parse("0.5"), SpillPolicy::Budget(GIB / 2));
+            assert_eq!(parse("-1"), SpillPolicy::Off);
+            assert_eq!(parse("lots"), SpillPolicy::Off);
+        }
     }
 
     /// The cgroup memory files, v2 and v1, from fake `/proc/self/cgroup` texts

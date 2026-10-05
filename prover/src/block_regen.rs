@@ -321,7 +321,8 @@ fn classify<'a>(
 /// (`LAMBDA_VM_BLOCK_REGEN`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RegenMode {
-    /// Unset or `off`: nothing is recorded or regenerated.
+    /// `off` (and unset beside a set `LAMBDA_VM_BLOCK_SPILL`): nothing is
+    /// recorded or regenerated.
     Off,
     /// `shadow`: phase A records every streamed instance's recipe, and phase
     /// B regenerates each beside the prove, checks it and throws it away.
@@ -334,7 +335,8 @@ pub(crate) enum RegenMode {
     /// block that fits drops nothing and runs no regenerator. With the spill
     /// policy `off` (`LAMBDA_VM_BLOCK_SPILL=off`) `auto` still decides, with
     /// no store (no disk, I-REGEN §14 P1): once armed every regenerable
-    /// instance is dropped and the rest stays on the host.
+    /// instance is dropped and the rest stays on the host. No disk is the
+    /// default: both knobs unset ([`regen_mode`]).
     Auto,
     /// `always`: every regenerable instance is dropped and rebuilt — the
     /// byte-identity test mode, not a policy.
@@ -342,13 +344,21 @@ pub(crate) enum RegenMode {
 }
 
 /// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN`; any other value is refused.
+/// Unset is `auto` while `LAMBDA_VM_BLOCK_SPILL` is unset too — the default is
+/// no disk (I-REGEN §14.9) — and `off` beside a set one, as before no disk
+/// was the default.
 pub(crate) fn regen_mode() -> Result<RegenMode, Error> {
-    parse_regen_mode(std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref())
+    parse_regen_mode(
+        std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
+        std::env::var_os("LAMBDA_VM_BLOCK_SPILL").is_some(),
+    )
 }
 
-fn parse_regen_mode(value: Option<&str>) -> Result<RegenMode, Error> {
+fn parse_regen_mode(value: Option<&str>, spill_set: bool) -> Result<RegenMode, Error> {
     match value.map(str::trim) {
-        None | Some("off") => Ok(RegenMode::Off),
+        None if spill_set => Ok(RegenMode::Off),
+        None => Ok(RegenMode::Auto),
+        Some("off") => Ok(RegenMode::Off),
         Some("shadow") => Ok(RegenMode::Shadow),
         Some("auto") => Ok(RegenMode::Auto),
         Some("always") => Ok(RegenMode::Always),
@@ -1347,17 +1357,23 @@ mod shadow_tests {
         )
     }
 
-    /// `LAMBDA_VM_BLOCK_REGEN`: unset and `off` are off, `shadow` is the shadow,
-    /// anything else is refused (an error, not a panic).
+    /// `LAMBDA_VM_BLOCK_REGEN`: `off`, `shadow`, `auto`, `always`; anything
+    /// else is refused (an error, not a panic). Unset is `auto` with
+    /// `LAMBDA_VM_BLOCK_SPILL` unset too (the default, no disk) and `off`
+    /// beside a set one; a set value means the same either way.
     #[test]
     fn the_regen_mode_reads_its_knob() {
-        assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
-        assert_eq!(parse_regen_mode(Some(" off ")).unwrap(), RegenMode::Off);
-        assert_eq!(parse_regen_mode(Some("shadow")).unwrap(), RegenMode::Shadow);
-        assert_eq!(parse_regen_mode(Some("auto")).unwrap(), RegenMode::Auto);
-        assert_eq!(parse_regen_mode(Some("always")).unwrap(), RegenMode::Always);
-        for bad in ["", "on", "Always", "Shadow", "1"] {
-            assert!(parse_regen_mode(Some(bad)).is_err(), "{bad:?}");
+        assert_eq!(parse_regen_mode(None, false).unwrap(), RegenMode::Auto);
+        assert_eq!(parse_regen_mode(None, true).unwrap(), RegenMode::Off);
+        for spill_set in [false, true] {
+            let parse = |v| parse_regen_mode(Some(v), spill_set);
+            assert_eq!(parse(" off ").unwrap(), RegenMode::Off);
+            assert_eq!(parse("shadow").unwrap(), RegenMode::Shadow);
+            assert_eq!(parse("auto").unwrap(), RegenMode::Auto);
+            assert_eq!(parse("always").unwrap(), RegenMode::Always);
+            for bad in ["", "on", "Always", "Shadow", "1"] {
+                assert!(parse(bad).is_err(), "{bad:?}");
+            }
         }
     }
 

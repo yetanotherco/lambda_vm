@@ -89,8 +89,10 @@ impl BlockTreeSink for StderrSink {
 /// on unset meaning the library default. Measurement-only knobs
 /// (`LFM_PROVE_SPLIT`, `LAMBDA_VM_BASE_SPLIT`) are not posture, nor is a knob
 /// whose library default is the posture's value (`LAMBDA_VM_ALLOC_PURGE`,
-/// `auto`): the harness's env leaves it unset. The allocator's never-purge
-/// posture is compiled into the binary.
+/// `auto`; `LAMBDA_VM_BLOCK_SPILL` and `LAMBDA_VM_BLOCK_REGEN`, both unset: no
+/// disk): the harness's env leaves it unset, and [`posture_line`] names what
+/// the memory knobs come to. The allocator's never-purge posture is compiled
+/// into the binary.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "8"),
     (POSTURE_VRAM_KNOB, "24000"),
@@ -110,7 +112,8 @@ pub const POSTURE_VRAM_KNOB: &str = "LAMBDA_VM_VRAM_BUDGET_MB";
 pub const POSTURE_VRAM_MIN_GIB: f64 = 31.0;
 
 /// The `BLOCK POSTURE:` line: each posture knob as the process has it — equal
-/// to the posture, unset, or another value.
+/// to the posture, unset, or another value — and the spill policy and
+/// regeneration mode the block runs under.
 pub fn posture_line() -> String {
     let words: Vec<String> = POSTURE
         .iter()
@@ -120,7 +123,11 @@ pub fn posture_line() -> String {
             Err(_) => format!("{name} unset (≠ posture {want})"),
         })
         .collect();
-    format!("BLOCK POSTURE: {}", words.join(" · "))
+    format!(
+        "BLOCK POSTURE: {} · {}",
+        words.join(" · "),
+        crate::block::memory_posture()
+    )
 }
 
 // ================================ the knobs ===============================
@@ -2132,11 +2139,13 @@ mod tests {
         );
     }
 
-    /// The posture line names every posture knob, in the table's order.
+    /// The posture line names every posture knob, in the table's order, then
+    /// the memory knobs.
     #[test]
     fn the_posture_line_names_every_knob() {
         let line = posture_line();
         assert!(line.starts_with("BLOCK POSTURE: "));
+        assert!(line.contains(" · memory: spill "), "{line}");
         let mut at = 0;
         for (name, _) in POSTURE {
             let found = line[at..]
