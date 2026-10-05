@@ -26,6 +26,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
@@ -199,47 +200,59 @@ pub fn generate_load_trace(
     generate_load_trace_segments(&[operations])
 }
 
+/// [`generate_load_trace`] in `form` (`tables::gpack`).
+pub fn generate_load_trace_as(
+    operations: &[LoadOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_load_trace_segments_as(&[operations], form)
+}
+
 /// [`generate_load_trace`] over `segments`, the operations one after another: a chunk handed
 /// out as the window parts it lies in.
 pub(crate) fn generate_load_trace_segments(
     segments: &[&[LoadOperation]],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_load_trace_segments_as(segments, TraceForm::Wide)
+}
+
+/// The widths LOAD traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_load_trace_segments`] in `form` (`tables::gpack`).
+pub(crate) fn generate_load_trace_segments_as(
+    segments: &[&[LoadOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            // Input columns
+            table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
-    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
-        // Input columns
-        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            // read flags
+            let (r2, r4, r8) = op.read_flags();
+            table.set_bool(row_idx, cols::READ2, r2);
+            table.set_bool(row_idx, cols::READ4, r4);
+            table.set_bool(row_idx, cols::READ8, r8);
 
-        // read flags
-        let (r2, r4, r8) = op.read_flags();
-        table.set_bool(row_idx, cols::READ2, r2);
-        table.set_bool(row_idx, cols::READ4, r4);
-        table.set_bool(row_idx, cols::READ8, r8);
+            // signed
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
 
-        // signed
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
+            // Output: res[8]
+            for i in 0..8 {
+                table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
+            }
 
-        // Output: res[8]
-        for i in 0..8 {
-            table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
+            // Auxiliary: sign_bit
+            table.set_bool(row_idx, cols::SIGN_BIT, op.compute_sign_bit());
+
+            // Multiplicity: active row
+            table.set_fe(row_idx, cols::MU, FE::one());
         }
-
-        // Auxiliary: sign_bit
-        table.set_bool(row_idx, cols::SIGN_BIT, op.compute_sign_bit());
-
-        // Multiplicity: active row
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    trace
+    })
 }
 
 // =========================================================================

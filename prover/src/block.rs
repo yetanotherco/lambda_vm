@@ -27,6 +27,7 @@ use stark::residency_mode::ResidencyMode;
 use crate::finish_sink::{self, FinishSink, FinishedTable};
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
+use crate::tables::gpack::{self, TraceForm};
 use crate::tables::register;
 use crate::tables::trace_builder::{
     ChunkJob, DecodeArtifacts, StreamedChunk, Traces, WindowedTraceBuilder, build_initial_image,
@@ -542,6 +543,15 @@ fn packed_builds() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_PACKED_BUILD").is_ok_and(|v| v.trim() == "0")
 }
 
+/// G-pack (`tables::gpack`), `LAMBDA_VM_BLOCK_GPACK`: under narrow storage the
+/// generators write each streamed chunk packed as they generate it, and the
+/// finish each table it builds ([`WindowedTraceBuilder::generate_packed`]),
+/// with no 64-bit copy; `0` builds each at 8 bytes a cell and packs it
+/// afterwards (the A arm). The bytes are the same either way.
+fn gpack() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_GPACK").is_ok_and(|v| v.trim() == "0")
+}
+
 /// `LAMBDA_VM_BLOCK_KR_WIDE_CAP=n` (1..=64): with KECCAK_RND built wide, then
 /// packed (`LAMBDA_VM_BLOCK_PACKED_BUILD=0`), the finish builds at most `n` of its chunks at
 /// 8 bytes a cell at once ([`WindowedTraceBuilder::cap_kr_wide`]); unset,
@@ -729,7 +739,8 @@ fn commit_pool_threads() -> usize {
 
 /// How phase A's stream hands its chunks to the device: committer and
 /// generator threads, when the finish's tables are committed, the card's byte
-/// budget for the commits, and the committers' own pool.
+/// budget for the commits, the committers' own pool, and whether the tables
+/// are written packed as they are generated ([`gpack`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StreamConfig {
     committers: usize,
@@ -737,11 +748,13 @@ pub(crate) struct StreamConfig {
     finish: FinishCommit,
     card_budget: Option<usize>,
     commit_pool: usize,
+    gpack: bool,
 }
 
 impl StreamConfig {
     /// The block's: [`stream_committers`], [`stream_generators`],
-    /// [`finish_commit`], [`card_gate_budget`], [`commit_pool_threads`].
+    /// [`finish_commit`], [`card_gate_budget`], [`commit_pool_threads`],
+    /// [`gpack`].
     fn from_env() -> Self {
         Self {
             committers: stream_committers(),
@@ -749,7 +762,14 @@ impl StreamConfig {
             finish: finish_commit(),
             card_budget: card_gate_budget(),
             commit_pool: commit_pool_threads(),
+            gpack: gpack(),
         }
+    }
+
+    /// This config with G-pack on or off ([`gpack`]).
+    #[cfg(test)]
+    pub(crate) fn with_gpack(self, gpack: bool) -> Self {
+        Self { gpack, ..self }
     }
 }
 
@@ -1630,6 +1650,14 @@ fn build_streamed(
     // host, instances the device packed).
     let narrowed = Mutex::new((0usize, 0usize, 0.0f64, 0usize));
     let narrow = narrow_streamed();
+    // The form the generators write each streamed chunk in: packed as it is
+    // generated under G-pack, else at 8 bytes a cell (packed below).
+    let form = if narrow && stream.gpack {
+        TraceForm::Narrow
+    } else {
+        TraceForm::Wide
+    };
+    gpack::reset_counts();
     std::thread::scope(|s| {
         // The executor, window by window, a bounded two windows ahead.
         let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
@@ -1688,14 +1716,15 @@ fn build_streamed(
                     // A table the finish handed off is built already, and it
                     // never took room in the ops queue.
                     let (mut table, finished) = match job {
-                        Streamed::Job(job) => (FinishedTable::from(job.generate()), false),
+                        Streamed::Job(job) => (FinishedTable::from(job.generate_as(form)), false),
                         Streamed::Chunk(chunk) => (FinishedTable::from(chunk), false),
                         Streamed::Finished(table) => (table, true),
                     };
                     if !finished {
                         queue.release(job_bytes);
                     }
-                    let wide = wide_bytes(&table.trace);
+                    // As generated: packed under G-pack, else 64-bit.
+                    let wide = held_bytes(&table.trace);
                     if let Some(ledger) = ledger {
                         ledger.generated(job_bytes, wide);
                     }
@@ -1877,6 +1906,9 @@ fn build_streamed(
             }
             if narrow_finished() {
                 builder = builder.pack_finished_tables();
+                if stream.gpack {
+                    builder = builder.generate_packed();
+                }
                 if !packed_builds() {
                     builder = builder.build_wide_then_pack().cap_kr_wide(kr_wide_cap());
                 }
@@ -2049,15 +2081,23 @@ fn build_streamed(
             } else {
                 "committers"
             };
+            let [direct, narrowed_after, rewritten, wide_then_packed] = gpack::counts();
             eprintln!(
                 "BLOCK NARROW: streamed main traces {:.2} GiB packed to {:.2} GiB ({:.3} B/cell) · \
-                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the {packers}",
+                 {by_device} of {n} packed by the device · host packing {secs:.2} s on the {packers} · \
+                 G-pack {}: {direct} written packed, {narrowed_after} narrowed after, {rewritten} \
+                 written again, {wide_then_packed} built wide then packed",
                 wide as f64 / (1u64 << 30) as f64,
                 packed as f64 / (1u64 << 30) as f64,
                 if wide > 0 {
                     packed as f64 * 8.0 / wide as f64
                 } else {
                     0.0
+                },
+                if form == TraceForm::Narrow {
+                    "on"
+                } else {
+                    "off"
                 },
             );
         }
@@ -2314,6 +2354,7 @@ pub(crate) fn stream_for_test(
             finish: FinishCommit::PhaseB,
             card_budget: None,
             commit_pool: 0,
+            gpack: true,
         },
     )
 }
@@ -2343,6 +2384,7 @@ pub(crate) fn stream_finish_commit_for_test(
             finish: FinishCommit::Handed,
             card_budget,
             commit_pool,
+            gpack: true,
         },
     )
 }
@@ -2428,6 +2470,7 @@ pub(crate) fn stream_config(
         },
         card_budget: None,
         commit_pool: 0,
+        gpack: true,
     }
 }
 

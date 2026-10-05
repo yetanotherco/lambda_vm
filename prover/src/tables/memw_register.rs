@@ -44,6 +44,7 @@ use stark::trace::TraceTable;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::memw::MemwOperation;
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
@@ -89,7 +90,7 @@ pub mod cols {
 /// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
 ///
 /// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
-/// column fill ([`generate_memw_register_trace_from_rows`]) and its IS_HALFWORD
+/// column fill ([`generate_memw_register_trace_from_rows_as`]) and its IS_HALFWORD
 /// bitwise collector ([`collect_bitwise_from_memw_register`]) need, and nothing
 /// else. It replaces the full `MemwOperation` (~152 B after the `[u32; 8]`
 /// value/old shrink, but still 8-element arrays) for register accesses — the
@@ -204,48 +205,55 @@ pub(crate) fn generate_memw_register_trace(
     generate_memw_register_trace_from_rows(&rows)
 }
 
-/// The MEMW_R column fill from compact [`RegRow`]s. This is the single source of
-/// truth for the MEMW_R trace layout; both the walk's direct fast path and the
-/// `MemwOperation`-based `generate_memw_register_trace` test wrapper land here.
+/// [`generate_memw_register_trace_from_rows_as`] at 8 bytes a cell.
+#[cfg(test)]
 pub(crate) fn generate_memw_register_trace_from_rows(
     rows: &[RegRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    generate_memw_register_trace_from_rows_segments(&[rows])
+    generate_memw_register_trace_from_rows_as(rows, TraceForm::Wide)
 }
 
-/// [`generate_memw_register_trace_from_rows`] over `segments`, the rows one after another: a chunk handed
-/// out as the window parts it lies in.
-pub(crate) fn generate_memw_register_trace_from_rows_segments(
+/// The MEMW_R column fill from compact [`RegRow`]s, in `form`
+/// (`tables::gpack`). This is the single source of truth for the MEMW_R trace
+/// layout; both the walk's direct fast path and the `MemwOperation`-based
+/// `generate_memw_register_trace` test wrapper land here.
+pub(crate) fn generate_memw_register_trace_from_rows_as(
+    rows: &[RegRow],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_register_trace_from_rows_segments_as(&[rows], form)
+}
+
+/// The widths MEMW_R traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_memw_register_trace_from_rows_as`] over `segments`, the rows one
+/// after another: a chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
     segments: &[&[RegRow]],
+    form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-
-    for (row_idx, r) in segments.iter().flat_map(|s| s.iter()).enumerate() {
-        // ADDRESS = base_address / 2 (already divided in RegRow).
-        table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
-        // Timestamp split into lo/hi 32-bit words.
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
-        // Value: registers are DWordWL = 2 words.
-        table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
-        table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
-        // Old value.
-        table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
-        table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
-        // Old timestamp low (upper limb shared with TIMESTAMP_1).
-        table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
-        // Multiplicity.
-        table.set_bool(row_idx, cols::MU_READ, r.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
-    }
-
-    trace
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, r) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            // ADDRESS = base_address / 2 (already divided in RegRow).
+            table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
+            // Timestamp split into lo/hi 32-bit words.
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
+            // Value: registers are DWordWL = 2 words.
+            table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
+            table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
+            // Old value.
+            table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
+            table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
+            // Old timestamp low (upper limb shared with TIMESTAMP_1).
+            table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
+            // Multiplicity.
+            table.set_bool(row_idx, cols::MU_READ, r.is_read);
+            table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
+        }
+    })
 }
 
 /// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta

@@ -31,6 +31,7 @@ use stark::trace::TraceTable;
 
 use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -162,20 +163,35 @@ pub fn generate_lt_trace(
     generate_lt_trace_segments(&[operations])
 }
 
+/// [`generate_lt_trace`] in `form` (`tables::gpack`).
+pub fn generate_lt_trace_as(
+    operations: &[LtOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(&[operations], form)
+}
+
 /// [`generate_lt_trace`] over `segments`, the operations one after another: a
 /// chunk handed out as the window parts it lies in.
 pub(crate) fn generate_lt_trace_segments(
     segments: &[&[LtOperation]],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(segments, TraceForm::Wide)
+}
+
+/// The widths LT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_lt_trace_segments`] in `form` (`tables::gpack`).
+pub(crate) fn generate_lt_trace_segments_as(
+    segments: &[&[LtOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let unique_ops = deduplicate(segments.iter().flat_map(|s| s.iter()));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    fill_lt_rows(&mut trace.main_table, &unique_ops);
-    trace
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |t| {
+        fill_lt_rows(t, &unique_ops)
+    })
 }
 
 /// [`generate_lt_trace`], packed (`stark::narrow`) as it is built, a block of
@@ -196,7 +212,15 @@ pub fn generate_lt_trace_packed(
         fill_lt_rows(&mut block, part);
         builder.push_rows(crate::tables::types::fe_words(block.row_major_data()));
     }
-    TraceTable::from_narrow_main(builder.finish(), 1)
+    let narrow = builder.finish();
+    WIDTHS.learn(narrow.widths());
+    TraceTable::from_narrow_main(narrow, 1)
+}
+
+/// Whether LT traces were built packed in this process, so G-pack can write
+/// the next one packed directly (`tables::gpack`).
+pub(crate) fn widths_known() -> bool {
+    WIDTHS.known(cols::NUM_COLUMNS)
 }
 
 /// Rows per block of [`generate_lt_trace_packed`].
@@ -217,10 +241,7 @@ fn deduplicate<'a>(
 }
 
 /// Rows `0..unique_ops.len()` of a zeroed LT table.
-fn fill_lt_rows(
-    table: &mut stark::table::Table<GoldilocksField>,
-    unique_ops: &[(LtOperation, u64)],
-) {
+fn fill_lt_rows<T: VmTable>(table: &mut T, unique_ops: &[(LtOperation, u64)]) {
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         // Store input columns
         table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);

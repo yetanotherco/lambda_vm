@@ -37,6 +37,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -246,15 +247,28 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
 pub fn generate_keccak_rnd_trace(
     ops: &[KeccakRoundOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_keccak_rnd_trace_as(ops, TraceForm::Wide)
+}
+
+/// The widths KECCAK_RND traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_keccak_rnd_trace`] in `form` (`tables::gpack`).
+pub fn generate_keccak_rnd_trace_as(
+    ops: &[KeccakRoundOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n_rows = (ops.len() * 24).next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(n_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    fill_keccak_rnd_rows(&mut trace.main_table, ops);
     // Padding rows have mu=0 and all zeros (default)
-    trace
+    generate_main!(form, &WIDTHS, n_rows, cols::NUM_COLUMNS, |t| {
+        fill_keccak_rnd_rows(t, ops)
+    })
+}
+
+/// Whether KECCAK_RND traces were built packed in this process, so G-pack can
+/// write the next one packed directly (`tables::gpack`).
+pub(crate) fn widths_known() -> bool {
+    WIDTHS.known(cols::NUM_COLUMNS)
 }
 
 /// [`generate_keccak_rnd_trace`], packed (`stark::narrow`) as it is built, a
@@ -275,7 +289,9 @@ pub fn generate_keccak_rnd_trace_packed(
         fill_keccak_rnd_rows(&mut block, part);
         builder.push_rows(crate::tables::types::fe_words(block.row_major_data()));
     }
-    TraceTable::from_narrow_main(builder.finish(), 1)
+    let narrow = builder.finish();
+    WIDTHS.learn(narrow.widths());
+    TraceTable::from_narrow_main(narrow, 1)
 }
 
 /// Permutations per block of [`generate_keccak_rnd_trace_packed`].
@@ -284,10 +300,7 @@ const PACKED_BLOCK_OPS: usize = 128;
 /// Rows `0..24 * ops.len()` of a zeroed KECCAK_RND table: each permutation's
 /// 24 rounds.
 #[allow(clippy::needless_range_loop)]
-fn fill_keccak_rnd_rows(
-    table: &mut stark::table::Table<GoldilocksField>,
-    ops: &[KeccakRoundOperation],
-) {
+fn fill_keccak_rnd_rows<T: VmTable>(table: &mut T, ops: &[KeccakRoundOperation]) {
     for (op_idx, op) in ops.iter().enumerate() {
         // Execute round-by-round, tracking the state
         let mut state = op.input;

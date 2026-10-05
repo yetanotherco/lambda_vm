@@ -25,6 +25,7 @@
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
 use super::decode::DecodeTable;
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
@@ -572,24 +573,44 @@ pub fn generate_cpu_trace(
     operations: &[CpuOperation],
     decode: &DecodeTable,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    generate_cpu_trace_segments(&[operations], decode)
+    generate_cpu_trace_as(operations, decode, TraceForm::Wide)
 }
 
-/// [`generate_cpu_trace`] over `segments`, the operations one after another: a
-/// chunk handed out as the window parts it lies in.
-pub(crate) fn generate_cpu_trace_segments(
+/// [`generate_cpu_trace`] in `form` (`tables::gpack`).
+pub fn generate_cpu_trace_as(
+    operations: &[CpuOperation],
+    decode: &DecodeTable,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_cpu_trace_segments_as(&[operations], decode, form)
+}
+
+/// The widths CPU traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_cpu_trace_as`] over `segments`, the operations one after
+/// another: a chunk handed out as the window parts it lies in.
+pub(crate) fn generate_cpu_trace_segments_as(
     segments: &[&[CpuOperation]],
     decode: &DecodeTable,
+    form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |t| {
+        fill_cpu_rows(t, segments, decode, num_rows)
+    })
+}
 
+/// Every row of a zeroed CPU table of `num_rows` rows: `segments`' operations,
+/// then the padding.
+fn fill_cpu_rows<T: VmTable>(
+    table: &mut T,
+    segments: &[&[CpuOperation]],
+    decode: &DecodeTable,
+    num_rows: usize,
+) {
+    let n: usize = segments.iter().map(|s| s.len()).sum();
     for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
         let op = decode.op(op);
         let f = &op.decode.fields;
@@ -700,8 +721,6 @@ pub(crate) fn generate_cpu_trace_segments(
         table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
         table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
     }
-
-    trace
 }
 
 /// The CPU ops of `logs` (timestamps from 4, the run's cadence) read against

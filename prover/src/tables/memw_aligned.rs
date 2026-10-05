@@ -41,6 +41,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::memw::MemwOperation;
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::emit_is_bit;
@@ -209,54 +210,60 @@ impl AlignedRow {
 
 const _: () = assert!(std::mem::size_of::<AlignedRow>() == 48);
 
+#[cfg(test)]
 pub(crate) fn generate_memw_aligned_trace(
     operations: &[AlignedRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    generate_memw_aligned_trace_segments(&[operations])
+    generate_memw_aligned_trace_as(operations, TraceForm::Wide)
 }
 
-/// [`generate_memw_aligned_trace`] over `segments`, the operations one after another: a chunk handed
-/// out as the window parts it lies in.
-pub(crate) fn generate_memw_aligned_trace_segments(
+/// The MEMW_A trace of `operations` in `form` (`tables::gpack`).
+pub(crate) fn generate_memw_aligned_trace_as(
+    operations: &[AlignedRow],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_aligned_trace_segments_as(&[operations], form)
+}
+
+/// The widths MEMW_A traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_memw_aligned_trace_as`] over `segments`, the operations one after
+/// another: a chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_aligned_trace_segments_as(
     segments: &[&[AlignedRow]],
+    form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            table.set_bool(row_idx, cols::IS_REGISTER, op.is_register());
 
-    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
-        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register());
+            table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address());
 
-        table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address());
+            for (column, element) in cols::VALUE.into_iter().zip(op.value()) {
+                table.set_u64(row_idx, column, element as u64);
+            }
 
-        for (column, element) in cols::VALUE.into_iter().zip(op.value()) {
-            table.set_u64(row_idx, column, element as u64);
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp());
+
+            let (w2, w4, w8) = op.write_flags();
+            table.set_bool(row_idx, cols::WRITE2, w2);
+            table.set_bool(row_idx, cols::WRITE4, w4);
+            table.set_bool(row_idx, cols::WRITE8, w8);
+
+            for (column, element) in cols::OLD.into_iter().zip(op.old()) {
+                table.set_u64(row_idx, column, element as u64);
+            }
+
+            // Single old_timestamp (verified equal for all bytes when routed here)
+            table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp());
+
+            table.set_bool(row_idx, cols::MU_READ, op.is_read());
+            table.set_bool(row_idx, cols::MU_WRITE, !op.is_read());
         }
-
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp());
-
-        let (w2, w4, w8) = op.write_flags();
-        table.set_bool(row_idx, cols::WRITE2, w2);
-        table.set_bool(row_idx, cols::WRITE4, w4);
-        table.set_bool(row_idx, cols::WRITE8, w8);
-
-        for (column, element) in cols::OLD.into_iter().zip(op.old()) {
-            table.set_u64(row_idx, column, element as u64);
-        }
-
-        // Single old_timestamp (verified equal for all bytes when routed here)
-        table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp());
-
-        table.set_bool(row_idx, cols::MU_READ, op.is_read());
-        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read());
-    }
-
-    trace
+    })
 }
 
 // =========================================================================

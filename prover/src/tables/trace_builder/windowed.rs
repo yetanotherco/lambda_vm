@@ -66,6 +66,7 @@ use executor::vm::logs::Log;
 use rayon::prelude::*;
 use stark::trace::TraceTable;
 
+use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted, RegisterState,
@@ -274,6 +275,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// chunks are the caller's to pack. The words are the same.
     pub fn pack_finished_tables(mut self) -> Self {
         self.emitted.pack = true;
+        self
+    }
+
+    /// With [`Self::pack_finished_tables`], each table `finish` builds is
+    /// written packed as it is generated where its generator can (G-pack,
+    /// [`StreamSkip::gpack`]), instead of built at 8 bytes a cell and packed.
+    /// The bytes are the same.
+    pub fn generate_packed(mut self) -> Self {
+        self.emitted.gpack = true;
         self
     }
 
@@ -1487,19 +1497,31 @@ impl ChunkJob {
     }
 
     pub fn generate(self) -> StreamedChunk {
+        self.generate_as(TraceForm::Wide)
+    }
+
+    /// [`Self::generate`] in `form`: with [`TraceForm::Narrow`], the table
+    /// packed as it is written (G-pack, `tables::gpack`), the bytes
+    /// `TraceTable::pack_main_narrow` gives the 64-bit one.
+    pub fn generate_as(self, form: TraceForm) -> StreamedChunk {
         let trace = match &self.ops {
-            ChunkOps::Cpu(ops, decode) => cpu::generate_cpu_trace_segments(&ops.slices(), decode),
+            ChunkOps::Cpu(ops, decode) => {
+                cpu::generate_cpu_trace_segments_as(&ops.slices(), decode, form)
+            }
             ChunkOps::MemwRegister(ops) => {
-                memw_register::generate_memw_register_trace_from_rows_segments(&ops.slices())
+                memw_register::generate_memw_register_trace_from_rows_segments_as(
+                    &ops.slices(),
+                    form,
+                )
             }
             ChunkOps::MemwAligned(ops) => {
-                memw_aligned::generate_memw_aligned_trace_segments(&ops.slices())
+                memw_aligned::generate_memw_aligned_trace_segments_as(&ops.slices(), form)
             }
-            ChunkOps::Memw(ops) => memw::generate_memw_trace_segments(&ops.slices()),
-            ChunkOps::Load(ops) => load::generate_load_trace_segments(&ops.slices()),
-            ChunkOps::Lt(ops) => lt::generate_lt_trace_segments(&ops.slices()),
-            ChunkOps::Shift(ops) => shift::generate_shift_trace_segments(&ops.slices()),
-            ChunkOps::Store(ops) => store::generate_store_trace(ops),
+            ChunkOps::Memw(ops) => memw::generate_memw_trace_segments_as(&ops.slices(), form),
+            ChunkOps::Load(ops) => load::generate_load_trace_segments_as(&ops.slices(), form),
+            ChunkOps::Lt(ops) => lt::generate_lt_trace_segments_as(&ops.slices(), form),
+            ChunkOps::Shift(ops) => shift::generate_shift_trace_segments_as(&ops.slices(), form),
+            ChunkOps::Store(ops) => store::generate_store_trace_as(ops, form),
         };
         StreamedChunk {
             table: self.table,
