@@ -2046,7 +2046,10 @@ pub(crate) fn collect_bitwise_from_dvrm(
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_branch(
+    branch_ops: &[BranchOperation],
+    max_rows_branch: usize,
+) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(branch_ops.len() * 5);
 
     for op in branch_ops {
@@ -2095,6 +2098,19 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
             (next_pc_high_2 & 0xFF) as u8,
             (next_pc_high_2 >> 8) as u8,
         ));
+    }
+
+    // IS_HALF[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
+    // over exactly the rows `generate_branch_trace` builds for each chunk.
+    for chunk in branch_ops.chunks(max_rows_branch) {
+        for (_, mu) in branch::dedup_branch_rows(chunk) {
+            let op = BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (mu & 0xFF) as u8,
+                ((mu >> 8) & 0xFF) as u8,
+            );
+            bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
+        }
     }
 
     bitwise_ops
@@ -3336,6 +3352,7 @@ fn build_traces<I: ImageSource + Sync>(
     // independent of accumulation order.
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let lt_chunk = max_rows.lt;
+    let branch_chunk = max_rows.branch;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
@@ -3344,7 +3361,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops, lt_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops, branch_chunk))),
         Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
         Box::new(|h| {
             for op in &bytewise_ops {

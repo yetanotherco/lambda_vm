@@ -9,6 +9,8 @@ pub mod branch_bus_tests;
 #[cfg(test)]
 pub mod branch_constraints_tests;
 #[cfg(test)]
+pub mod branch_multiplicity_poc;
+#[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
 pub mod commit_tests;
@@ -68,6 +70,8 @@ pub mod memw_aligned_tests;
 pub mod memw_register_tests;
 #[cfg(test)]
 pub mod memw_tests;
+#[cfg(test)]
+pub mod mul_mu_carrier_poc;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]

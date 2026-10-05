@@ -690,3 +690,115 @@ fn test_soundness_wrong_offset() {
 
     assert!(!prove_and_verify_custom(&ops, &receiver_rows));
 }
+
+// Soundness regression: μ is a bounded, non-negative multiplicity. Every BRANCH
+// lookup fires with μ, so a free μ = −1 twin of an honest row received range
+// lookups instead of sending them and absorbed another row's out-of-range limb
+// (`branch_multiplicity_poc`). μ is now IS_HALF-checked weighted by itself, and
+// trace generation splits a row whose count would exceed `MU_MAX`.
+mod mu_bound {
+    use crate::tables::branch::BranchOperation;
+    use crate::tables::branch::{
+        MU_MAX, bus_interactions, cols, dedup_branch_rows, generate_branch_trace,
+    };
+    use crate::tables::types::{BusId, FE};
+
+    /// Presence: μ is IS_HALF-checked weighted by itself.
+    #[test]
+    fn branch_bounds_its_multiplicity() {
+        use stark::lookup::{BusValue, Multiplicity, Packing};
+        assert!(
+            bus_interactions().iter().any(|i| i.is_sender
+                && i.bus_id == BusId::IsHalfword as u64
+                && matches!(i.multiplicity, Multiplicity::Column(m) if m == cols::MU)
+                && matches!(i.values.as_slice(),
+                    [BusValue::Packed { start_column, packing: Packing::Direct }] if *start_column == cols::MU)),
+            "BRANCH must IS_HALF-check μ weighted by itself"
+        );
+    }
+
+    /// Splitting: a count above `MU_MAX` spreads over rows within the bound that
+    /// preserve the total; exactly `MU_MAX` still fits one row.
+    #[test]
+    fn dedup_branch_rows_splits_counts_above_mu_max() {
+        let op = BranchOperation::new(1 << 48, 0, 0, false);
+        let ops: Vec<_> = std::iter::repeat_n(op.clone(), 2 * MU_MAX as usize + 7).collect();
+        let mut rows: Vec<u64> = dedup_branch_rows(&ops).iter().map(|(_, mu)| *mu).collect();
+        rows.sort();
+        assert_eq!(rows, vec![7, MU_MAX, MU_MAX]);
+
+        let ops: Vec<_> = std::iter::repeat_n(op, MU_MAX as usize).collect();
+        assert_eq!(dedup_branch_rows(&ops).len(), 1);
+        assert!(dedup_branch_rows(&[]).is_empty());
+
+        // The generated trace never holds a μ above the bound.
+        let ops: Vec<_> = std::iter::repeat_n(
+            BranchOperation::new(1 << 48, 0, 0, false),
+            MU_MAX as usize + 1,
+        )
+        .collect();
+        let trace = generate_branch_trace(&ops);
+        let mut total = 0u64;
+        for r in 0..trace.num_rows() {
+            let mu = trace.get_main(r, cols::MU).to_raw();
+            assert!(mu <= MU_MAX);
+            total += mu;
+        }
+        assert_eq!(total, ops.len() as u64);
+    }
+
+    /// Consistency: the BITWISE collector tallies exactly the IS_HALF[μ] lookups
+    /// the generated BRANCH instances send (each row's μ, weighted by μ; padding
+    /// nothing), across small instances and for a row split by `MU_MAX`.
+    #[test]
+    fn branch_mu_bound_lookups_match_collector() {
+        use crate::tables::bitwise::BitwiseOperationType;
+        use crate::tables::trace_builder::collect_bitwise_from_branch;
+        use std::collections::HashMap;
+
+        let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);
+        let distinct = [
+            BranchOperation::new(1 << 48, 0, 0, false),
+            BranchOperation::new(0x1234_5678, 0x100, 0, false),
+            BranchOperation::new(0, 0, 0x20, true),
+        ];
+        let small: Vec<_> = distinct.iter().cycle().take(11).cloned().collect();
+        let split: Vec<_> = std::iter::repeat_n(distinct[0].clone(), MU_MAX as usize + 2)
+            .chain(distinct.iter().cloned())
+            .collect();
+
+        for (ops, chunk) in [(small, 4usize), (split, 1 << 20)] {
+            let collected = collect_bitwise_from_branch(&ops, chunk);
+
+            // IS_HALF minus the per-raw-op next_pc_high range checks leaves the μ bound.
+            let mut is_half: HashMap<(u8, u8), i64> = HashMap::new();
+            for b in collected
+                .iter()
+                .filter(|b| b.lookup_type == BitwiseOperationType::IsHalf)
+            {
+                *is_half.entry((b.x, b.y)).or_default() += 1;
+            }
+            for op in &ops {
+                let next_pc = op.compute_next_pc();
+                for shift in [16, 32, 48] {
+                    *is_half.entry(half(next_pc >> shift & 0xFFFF)).or_default() -= 1;
+                }
+            }
+
+            let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
+            for c in ops.chunks(chunk) {
+                let t = generate_branch_trace(c);
+                for r in 0..t.num_rows() {
+                    let mu = t.get_main(r, cols::MU).to_raw();
+                    *expected.entry(half(mu)).or_default() += mu as i64;
+                }
+            }
+            is_half.retain(|_, n| *n != 0);
+            expected.retain(|_, n| *n != 0);
+            assert_eq!(
+                is_half, expected,
+                "IS_HALF[μ] tally must match the trace rows"
+            );
+        }
+    }
+}

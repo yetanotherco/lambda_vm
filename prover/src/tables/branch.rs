@@ -150,20 +150,43 @@ impl BranchOperation {
     }
 }
 
-/// Generates the BRANCH trace table from a list of operations.
-///
-/// Duplicate operations (same pc, offset, register, jalr) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
-pub fn generate_branch_trace(
-    operations: &[BranchOperation],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
+/// Largest per-row multiplicity: `μ` is range-checked to a halfword
+/// (`IS_HALF[μ]`, weighted by μ), so a row holds at most this many lookups. The
+/// bound keeps μ non-negative: without it a `μ = −1` twin of an honest row
+/// cancels it on the BRANCH bus while *receiving* its range lookups, absorbing
+/// another row's out-of-range limb (same bug as LT).
+pub const MU_MAX: u64 = (1 << 16) - 1;
+
+/// Deduplicates BRANCH operations into trace rows: `(pc, offset, register,
+/// jalr) -> μ`, splitting an op over several rows when its count exceeds
+/// [`MU_MAX`]. Shared by trace generation and the BITWISE collector so the
+/// per-row lookups they count cannot drift apart.
+pub fn dedup_branch_rows(operations: &[BranchOperation]) -> Vec<(BranchOperation, u64)> {
     let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
+
+/// Generates the BRANCH trace table from a list of operations.
+///
+/// Duplicate operations (same pc, offset, register, jalr) are merged into a
+/// single row with their multiplicities summed (see [`dedup_branch_rows`]). The
+/// table is then padded to the next power of 2.
+pub fn generate_branch_trace(
+    operations: &[BranchOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = dedup_branch_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -222,7 +245,8 @@ pub fn generate_branch_trace(
 /// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
 /// - **Sends** BYTE_ALU[AND] lookup for LSB masking
 ///   (next_pc_low[0] = unmasked_low_byte & 254)
-/// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks
+/// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks and for
+///   the μ multiplicity bound
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
@@ -280,6 +304,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::NEXT_PC_HIGH_2,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALF[μ] | μ. Every lookup here fires with μ, so μ itself must be
+        // bounded and non-negative. Otherwise a μ = −1 twin of an honest row
+        // cancels it on the BRANCH bus while *receiving* its range lookups and
+        // absorbs an out-of-range IS_HALFWORD sent by any row (same as LT). Sent
+        // with itself as multiplicity: `k` rows holding an out-of-range `v` put
+        // weight `k·v ≠ 0` on a tuple IS_HALF has no row for, while padding
+        // (μ = 0) contributes nothing. See `MU_MAX`.
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::MU,
                 packing: Packing::Direct,
             }],
         ),
