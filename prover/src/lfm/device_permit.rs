@@ -178,7 +178,15 @@ static PROVE_ROOM: std::sync::Condvar = std::sync::Condvar::new();
 struct ProveSlot;
 
 impl ProveSlot {
+    /// ⛔ On a plain thread only, like every wait of the shared gate
+    /// (`stark::prover::shared_vram_admit`): a rayon worker that waits here
+    /// may be running the job on top of a holder's frame.
     fn take() -> Self {
+        #[cfg(feature = "parallel")]
+        debug_assert!(
+            rayon::current_thread_index().is_none(),
+            "a rayon worker waits for a proof place under the shared VRAM gate"
+        );
         let cap = shared_proves();
         let mut n = PROVES_IN.lock().unwrap_or_else(|e| e.into_inner());
         while *n >= cap {

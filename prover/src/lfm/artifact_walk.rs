@@ -11,7 +11,7 @@ use crate::tables::{bitwise, keccak_rc};
 
 use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS, blake3_chunk_rows};
 use super::commit::{
-    commit_group_device_or_host_with, commit_group_host_with, commit_reaches_device,
+    SharedAdmission, commit_group_device_or_host_in, commit_group_host_with, commit_reaches_device,
 };
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
@@ -44,6 +44,32 @@ impl Pass {
         }
     }
 
+    /// The device bytes this pass's commit of a `rows × width` group takes:
+    /// the fused commit's device set when the commit reaches the card, none
+    /// when it stays on the host or is left to the other pass.
+    fn device_bytes(
+        self,
+        rows: usize,
+        width: usize,
+        options: &ProofOptions,
+        layout: LeafLayout,
+    ) -> u64 {
+        if self == Pass::Host
+            || !self.takes(rows, width, options, layout)
+            || !commit_reaches_device(rows, width, options, layout)
+        {
+            return 0;
+        }
+        stark::device_set::commit_device_set_rpl(
+            rows,
+            width,
+            options.blowup_factor as usize,
+            true,
+            layout.rows_per_leaf(),
+        )
+        .total()
+    }
+
     /// Commit `group` if this pass takes it.
     fn commit(
         self,
@@ -51,9 +77,10 @@ impl Pass {
         group: &ColumnGroup,
         options: &ProofOptions,
         layout: LeafLayout,
+        shared: SharedAdmission,
     ) -> Option<Commitment> {
         self.takes(group.padded_rows, group.width, options, layout)
-            .then(|| self.commit_taken(label, group, options, layout))
+            .then(|| self.commit_taken(label, group, options, layout, shared))
     }
 
     /// Commit `LFM_BLAKE3` chunk `chunk` if this pass takes it, deciding on the
@@ -66,11 +93,12 @@ impl Pass {
         rows: usize,
         options: &ProofOptions,
         layout: LeafLayout,
+        shared: SharedAdmission,
     ) -> Option<Commitment> {
         self.takes(rows, program.groups.blake3.width, options, layout)
             .then(|| {
                 let group = program.blake3_chunk_group(chunk);
-                self.commit_taken(BLAKE3_CHUNK_LABEL, &group, options, layout)
+                self.commit_taken(BLAKE3_CHUNK_LABEL, &group, options, layout, shared)
             })
     }
 
@@ -80,14 +108,47 @@ impl Pass {
         group: &ColumnGroup,
         options: &ProofOptions,
         layout: LeafLayout,
+        shared: SharedAdmission,
     ) -> Commitment {
         match self {
             Pass::Host => commit_group_host_with(group, options, layout),
             Pass::All | Pass::Device => {
-                commit_group_device_or_host_with(label, group, options, layout)
+                commit_group_device_or_host_in(label, group, options, layout, shared)
             }
         }
     }
+}
+
+/// One window of a walk's commits through the build's fork
+/// ([`map_maybe_parallel`]), the window's device bytes taken from the shared
+/// VRAM gate FIRST, on this thread (`admit`: `stark::prover::shared_vram_admit`
+/// in a build), and held until every commit of the window is made.
+///
+/// ⛔ A commit in the fork runs on a rayon worker, which must never wait on the
+/// gate. Each commit used to ask for its own bytes there, and a worker waiting
+/// in a prove's `join` could run one on top of the prove's frame and park on
+/// bytes that prove keeps. The window is the unit the walk already bounds
+/// residency by, so the bytes held are those the window's commits could hold
+/// at once.
+fn commit_window<T: Sync, R: Send, P>(
+    items: &[T],
+    device_bytes: impl Fn(&T) -> u64,
+    admit: impl FnOnce(u64) -> Option<P>,
+    commit: impl Fn(&T, SharedAdmission) -> R + Sync + Send,
+) -> Vec<R> {
+    let bytes = items
+        .iter()
+        .map(device_bytes)
+        .fold(0u64, u64::saturating_add);
+    // No commit of the window reaches the card: no gate to ask (and a build
+    // without a card never touches it).
+    let held = if bytes > 0 { admit(bytes) } else { None };
+    let shared = SharedAdmission::Window {
+        held: held.is_some(),
+    };
+    let roots = map_maybe_parallel(items, |item| commit(item, shared));
+    drop(held);
+    roots
 }
 
 /// One leaf layout's commits: slots 0..=10, the `LFM_BLAKE3` chunks, the
@@ -272,16 +333,31 @@ impl<'p> BuildPlan<'p> {
         // statement about the fixture, not about the change. Lane P's production
         // split is the number to plan against.
         //
-        // ⓘ ON A CUDA BUILD THE WINDOW IS A HOST-FALLBACK BOUND, not the live one.
-        // `commit_group_device_or_host` sends each group to the card, where the
-        // residency that matters is `stark::device_set`'s and admission enforces it
-        // per call. The window still bounds the host path exactly as before, which
-        // is the path a machine with no card takes.
+        // ⓘ ON A CUDA BUILD THE WINDOW ALSO BOUNDS THE CARD. Each group goes to
+        // the card, where the residency that matters is `stark::device_set`'s:
+        // under the shared VRAM gate the window's sets are admitted together, on
+        // this thread before the fork ([`commit_window`]); under the derivation's
+        // gate each dispatch is. The window still bounds the host path exactly as
+        // before, which is the path a machine with no card takes.
         let in_flight = groups_in_flight();
+        let admit = stark::prover::shared_vram_admit;
+        let group_bytes = |layout: LeafLayout| {
+            move |g: &&ColumnGroup| pass.device_bytes(g.padded_rows, g.width, options, layout)
+        };
+        let chunk_bytes = |layout: LeafLayout| {
+            move |c: &usize| {
+                pass.device_bytes(
+                    self.blake3_rows[*c],
+                    self.program.groups.blake3.width,
+                    options,
+                    layout,
+                )
+            }
+        };
         let mut slots = vec![None; groups.len()];
         for (base, window) in groups.chunks(in_flight).enumerate() {
-            let commits = map_maybe_parallel(window, |g| {
-                pass.commit(PREP_GROUP_LABEL, g, options, RowPair)
+            let commits = commit_window(window, group_bytes(RowPair), admit, |g, shared| {
+                pass.commit(PREP_GROUP_LABEL, g, options, RowPair, shared)
             });
             for (k, root) in commits.into_iter().enumerate() {
                 slots[base * in_flight + k] = root;
@@ -293,16 +369,25 @@ impl<'p> BuildPlan<'p> {
         // bound that names itself.
         let mut blake3 = Vec::with_capacity(chunks.len());
         for window in chunks.chunks(in_flight) {
-            blake3.extend(map_maybe_parallel(window, |c| {
-                pass.commit_blake3_chunk(self.program, *c, self.blake3_rows[*c], options, RowPair)
-            }));
+            blake3.extend(commit_window(
+                window,
+                chunk_bytes(RowPair),
+                admit,
+                |c, shared| {
+                    let rows = self.blake3_rows[*c];
+                    pass.commit_blake3_chunk(self.program, *c, rows, options, RowPair, shared)
+                },
+            ));
         }
         // The hash tail, committed like the BLAKE3 chunks.
         let mut tail_roots = Vec::with_capacity(tail.len());
         for window in tail.chunks(in_flight) {
-            tail_roots.extend(map_maybe_parallel(window, |g| {
-                pass.commit(HASH_CHUNK_LABEL, g, options, RowPair)
-            }));
+            tail_roots.extend(commit_window(
+                window,
+                group_bytes(RowPair),
+                admit,
+                |g, shared| pass.commit(HASH_CHUNK_LABEL, g, options, RowPair, shared),
+            ));
         }
         let row_pair = LayoutRoots {
             slots,
@@ -310,13 +395,18 @@ impl<'p> BuildPlan<'p> {
             tail: tail_roots,
         };
         // The one-row (S2) roots of the same groups: each list is dispatched
-        // whole, as it always has been.
+        // whole, as it always has been, so each list is one window.
         let one_row = self.one_row.then(|| LayoutRoots {
-            slots: map_maybe_parallel(&groups, |g| pass.commit(PREP_GROUP_LABEL, g, options, Row)),
-            blake3: map_maybe_parallel(&chunks, |c| {
-                pass.commit_blake3_chunk(self.program, *c, self.blake3_rows[*c], options, Row)
+            slots: commit_window(&groups, group_bytes(Row), admit, |g, shared| {
+                pass.commit(PREP_GROUP_LABEL, g, options, Row, shared)
             }),
-            tail: map_maybe_parallel(&tail, |g| pass.commit(HASH_CHUNK_LABEL, g, options, Row)),
+            blake3: commit_window(&chunks, chunk_bytes(Row), admit, |c, shared| {
+                let rows = self.blake3_rows[*c];
+                pass.commit_blake3_chunk(self.program, *c, rows, options, Row, shared)
+            }),
+            tail: commit_window(&tail, group_bytes(Row), admit, |g, shared| {
+                pass.commit(HASH_CHUNK_LABEL, g, options, Row, shared)
+            }),
         });
         Walked { row_pair, one_row }
     }
@@ -470,5 +560,67 @@ mod tests {
     #[should_panic(expected = "made on neither side")]
     fn a_slot_made_on_neither_side_is_refused() {
         let _ = roots(&[Some(1), None]).merge(None);
+    }
+
+    /// ★ A window's device bytes are asked for ONCE, on the thread that forks
+    /// it and before the fork, and held until its last commit is made; every
+    /// commit in the fork is told they are held and asks for nothing itself.
+    #[test]
+    fn a_window_asks_for_its_bytes_once_on_the_forking_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Held<'a>(&'a AtomicBool);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let here = std::thread::current().id();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let held = AtomicBool::new(false);
+        let made = commit_window(
+            &[3u64, 0, 5, 2],
+            |&bytes| bytes,
+            |bytes| {
+                asked
+                    .lock()
+                    .unwrap()
+                    .push((bytes, std::thread::current().id()));
+                held.store(true, Ordering::SeqCst);
+                Some(Held(&held))
+            },
+            |&bytes, shared| {
+                assert!(
+                    held.load(Ordering::SeqCst),
+                    "a commit runs with the window's bytes held"
+                );
+                (bytes, shared)
+            },
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![(10, here)]);
+        assert!(!held.load(Ordering::SeqCst), "given back after the window");
+        assert_eq!(
+            made,
+            [3, 0, 5, 2].map(|b| (b, SharedAdmission::Window { held: true })),
+            "every commit, in order, told its bytes are held"
+        );
+    }
+
+    /// A window none of whose commits reaches the card asks for nothing, and
+    /// a gate that is off (`None`) leaves each commit to the derivation's gate.
+    #[test]
+    fn a_window_with_no_device_bytes_or_no_gate_holds_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        let ask = |_: u64| -> Option<()> {
+            asked.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        let host = commit_window(&[1u8, 2], |_| 0, ask, |_, shared| shared);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no device bytes: no ask");
+        let off = commit_window(&[1u8, 2], |_| 7, ask, |_, shared| shared);
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "one ask for the window");
+        for shared in host.into_iter().chain(off) {
+            assert_eq!(shared, SharedAdmission::Window { held: false });
+        }
     }
 }

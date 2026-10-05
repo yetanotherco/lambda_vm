@@ -239,6 +239,33 @@ pub fn commit_group_device_or_host_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
+    commit_group_device_or_host_in(label, group, options, layout, SharedAdmission::Here)
+}
+
+/// Who takes a device commit's bytes from the shared VRAM gate
+/// (`stark::prover::shared_vram_admit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SharedAdmission {
+    /// The commit, around its own dispatch: a caller on a plain thread.
+    Here,
+    /// The caller, for the whole window the commit runs in, on the thread
+    /// that forked it and before the fork (`held` when the gate was on and the
+    /// bytes are held). A commit inside a parallel map runs on a rayon worker,
+    /// which must never wait on the gate (`stark::prover::refuse_rayon_wait`).
+    Window { held: bool },
+}
+
+/// [`commit_group_device_or_host_with`], with the shared gate's admission
+/// placed by `shared`.
+pub(super) fn commit_group_device_or_host_in(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+    shared: SharedAdmission,
+) -> Commitment {
+    #[cfg(not(feature = "cuda"))]
+    let _ = shared;
     #[cfg(feature = "cuda")]
     if device_artifacts()
         && !HOST_ONLY.with(|h| h.get())
@@ -267,14 +294,23 @@ pub fn commit_group_device_or_host_with(
         // measures.
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
         // Under the shared gate (`LAMBDA_VM_SHARED_VRAM_GATE`) the commit's
-        // device set is admitted beside the proofs in flight; otherwise the
-        // caller's card permit is the exclusion. Outside it, the block tree's
-        // derivation keeps its own running total (`derive_gate`), held around
-        // this dispatch alone: nothing below forks rayon.
-        let _bytes = stark::prover::shared_vram_admit(set.total());
-        let _derive = match _bytes {
-            None => super::derive_gate::admit(set.total()),
-            Some(_) => None,
+        // device set is admitted beside the proofs in flight, here or by the
+        // caller for its window (`shared`); otherwise the caller's card permit
+        // is the exclusion. Outside it, the block tree's derivation keeps its
+        // own running total (`derive_gate`), held around this dispatch alone:
+        // nothing below forks rayon.
+        let _bytes = match shared {
+            SharedAdmission::Here => stark::prover::shared_vram_admit(set.total()),
+            SharedAdmission::Window { .. } => None,
+        };
+        let gated = match shared {
+            SharedAdmission::Here => _bytes.is_some(),
+            SharedAdmission::Window { held } => held,
+        };
+        let _derive = if gated {
+            None
+        } else {
+            super::derive_gate::admit(set.total())
         };
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
