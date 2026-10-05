@@ -1679,8 +1679,15 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
+/// MSB16 and the operand/difference IS_HALFWORD lookups are emitted once per raw
+/// op. The IS_HALF[μ] multiplicity bound is counted over the rows of each
+/// `max_rows_lt` chunk, mirroring `chunk_and_generate_optional`.
+///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_lt(
+    lt_ops: &[LtOperation],
+    max_rows_lt: usize,
+) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
 
     for op in lt_ops {
@@ -1723,6 +1730,19 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
             (rhs_1 & 0xFF) as u8,
             (rhs_1 >> 8) as u8,
         ));
+    }
+
+    // IS_HALF[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
+    // over exactly the rows `generate_lt_trace` builds for each chunk.
+    for chunk in lt_ops.chunks(max_rows_lt) {
+        for (_, mu) in lt::dedup_lt_rows(chunk) {
+            let op = BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (mu & 0xFF) as u8,
+                ((mu >> 8) & 0xFF) as u8,
+            );
+            bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
+        }
     }
 
     bitwise_ops
@@ -3315,12 +3335,13 @@ fn build_traces<I: ImageSource + Sync>(
     // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
     // independent of accumulation order.
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
+    let lt_chunk = max_rows.lt;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
     let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops, lt_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),

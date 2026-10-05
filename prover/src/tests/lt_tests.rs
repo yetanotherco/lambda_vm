@@ -169,8 +169,8 @@ fn test_bus_interactions_count() {
     // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1])
     // + ALU receiver x1 (every LT lookup goes through the unified ALU bus
     // — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
-    // timestamp / |r|<|d| checks) = 9.
-    assert_eq!(interactions.len(), 9);
+    // timestamp / |r|<|d| checks) + IS_HALFWORD x1 bounding μ = 10.
+    assert_eq!(interactions.len(), 10);
 }
 
 // Soundness regression: `lt` must equal `(lhs < rhs)`. The in-chip constraints were
@@ -231,4 +231,113 @@ fn test_lt_rejects_forged_out() {
         !validate_busless(&air, &trace),
         "forged out=1 (lt=invert=0) must be rejected by OutXorInvert"
     );
+}
+
+// Soundness regression: μ is a bounded, non-negative multiplicity. Every LT
+// lookup fires with μ, so a free μ = −1 twin of an honest row received range
+// lookups instead of sending them and absorbed another row's out-of-range limb
+// (`lt_multiplicity_poc`, `multiplicity_forgery_poc`). μ is now IS_HALF-checked
+// weighted by itself, and trace generation splits a row whose count would
+// exceed `MU_MAX`.
+
+/// Presence: μ is IS_HALF-checked weighted by itself, so an out-of-range value
+/// `v` always lands on the bus with weight `v ≠ 0`.
+#[test]
+fn test_lt_bounds_its_multiplicity() {
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusValue, Multiplicity, Packing};
+    assert!(
+        bus_interactions().iter().any(|i| i.is_sender
+            && i.bus_id == BusId::IsHalfword as u64
+            && matches!(i.multiplicity, Multiplicity::Column(m) if m == cols::MU)
+            && matches!(i.values.as_slice(),
+                [BusValue::Packed { start_column, packing: Packing::Direct }] if *start_column == cols::MU)),
+        "LT must IS_HALF-check μ weighted by itself"
+    );
+}
+
+/// Splitting: a count above `MU_MAX` spreads over rows within the bound that
+/// preserve the total; exactly `MU_MAX` still fits one row.
+#[test]
+fn test_dedup_lt_rows_splits_counts_above_mu_max() {
+    use crate::tables::lt::{MU_MAX, dedup_lt_rows};
+    let op = LtOperation::new(5, 3, SIGNED);
+    let ops: Vec<_> = std::iter::repeat_n(op.clone(), 2 * MU_MAX as usize + 7).collect();
+    let mut rows: Vec<u64> = dedup_lt_rows(&ops).iter().map(|(_, mu)| *mu).collect();
+    rows.sort();
+    assert_eq!(rows, vec![7, MU_MAX, MU_MAX]);
+
+    let ops: Vec<_> = std::iter::repeat_n(op, MU_MAX as usize).collect();
+    assert_eq!(dedup_lt_rows(&ops).len(), 1);
+    assert!(dedup_lt_rows(&[]).is_empty());
+
+    // The generated trace never holds a μ above the bound.
+    let ops: Vec<_> =
+        std::iter::repeat_n(LtOperation::new(1, 2, UNSIGNED), MU_MAX as usize + 1).collect();
+    let trace = generate_lt_trace(&ops);
+    let mut total = 0u64;
+    for r in 0..trace.num_rows() {
+        let mu = trace.get_main(r, cols::MU).to_raw();
+        assert!(mu <= MU_MAX);
+        total += mu;
+    }
+    assert_eq!(total, ops.len() as u64);
+}
+
+/// Consistency: the BITWISE collector tallies exactly the IS_HALF[μ] lookups the
+/// generated LT instances send (each row's μ, weighted by μ; padding nothing),
+/// across several small instances and for a row split by `MU_MAX`.
+#[test]
+fn test_lt_mu_bound_lookups_match_collector() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::lt::MU_MAX;
+    use crate::tables::trace_builder::collect_bitwise_from_lt;
+    use std::collections::HashMap;
+
+    let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);
+    let distinct = [
+        LtOperation::new(5, 3, SIGNED),
+        LtOperation::new(u64::MAX, 1, UNSIGNED),
+        LtOperation::new(0x1234_5678_9abc_def0, 0x1234_5678_0000_0000, SIGNED),
+    ];
+    let small: Vec<_> = distinct.iter().cycle().take(11).cloned().collect();
+    let split: Vec<_> = std::iter::repeat_n(distinct[0].clone(), MU_MAX as usize + 2)
+        .chain(distinct.iter().cloned())
+        .collect();
+
+    for (ops, chunk) in [(small, 4usize), (split, 1 << 20)] {
+        let collected = collect_bitwise_from_lt(&ops, chunk);
+
+        // IS_HALF minus the per-raw-op range checks leaves the μ bound.
+        let mut is_half: HashMap<(u8, u8), i64> = HashMap::new();
+        for b in collected
+            .iter()
+            .filter(|b| b.lookup_type == BitwiseOperationType::IsHalf)
+        {
+            *is_half.entry((b.x, b.y)).or_default() += 1;
+        }
+        for op in &ops {
+            let sub = op.lhs.wrapping_sub(op.rhs);
+            for shift in [0, 16, 32, 48] {
+                *is_half.entry(half(sub >> shift & 0xFFFF)).or_default() -= 1;
+            }
+            *is_half.entry(half(op.lhs >> 32 & 0xFFFF)).or_default() -= 1;
+            *is_half.entry(half(op.rhs >> 32 & 0xFFFF)).or_default() -= 1;
+        }
+
+        let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
+        for c in ops.chunks(chunk) {
+            let t = generate_lt_trace(c);
+            for r in 0..t.num_rows() {
+                let mu = t.get_main(r, cols::MU).to_raw();
+                *expected.entry(half(mu)).or_default() += mu as i64;
+            }
+        }
+        is_half.retain(|_, n| *n != 0);
+        expected.retain(|_, n| *n != 0);
+        assert_eq!(
+            is_half, expected,
+            "IS_HALF[μ] tally must match the trace rows"
+        );
+    }
 }

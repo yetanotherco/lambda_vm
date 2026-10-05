@@ -1,6 +1,7 @@
 //! End-to-end regression tests for unconstrained multiplicities: MUL's
 //! `μ_lo`/`μ_hi` and DVRM's `μ_q`/`μ_r` must be bounded and non-negative, and
-//! SHIFT's `zbs` and LOAD's `μ` must be bits.
+//! SHIFT's `zbs` and LOAD's `μ` must be bits, and LT's `μ` must be bounded and
+//! non-negative.
 //!
 //! **MUL / DVRM.** Both chips send every range check (and DVRM its MUL/LT/ZERO checks) with
 //! multiplicity `μ_a + μ_b`, the row's total lookup count. Before the fix neither
@@ -22,6 +23,13 @@
 //! carries `sign_bit`) while netting `MSB8[res[0]] → 0` minus `→ 1`, which
 //! cancels a real LB row's forged sign bit (`lb 0x05 = 0xFF..05` verified
 //! against `main`). The fix bit-constrains μ.
+//!
+//! **LT.** LT weights its ALU receive and all its range lookups by one free μ. A
+//! `μ = −1` twin of an honest row cancels it on the ALU bus while *receiving*
+//! its range lookups, with `sub_0` set to any `X < 2^32` — so it absorbs an
+//! out-of-range IS_HALFWORD send. The victim can be another LT row: `5 < 3`
+//! answered 1 with a `sub_3 = 2^16` limb verified against the branch before the
+//! LT fix. See also `lt_multiplicity_poc` (chip level).
 //!
 //! Each guest computes a value with one real instruction and commits it; the
 //! malicious prover claims a different value and reshapes the chip's rows. It
@@ -105,6 +113,16 @@ const SLL: Scenario = Scenario {
     forged: 0,
     is_target: arith_log,
     forge_rows: forge_shift_rows,
+};
+
+const SLT: Scenario = Scenario {
+    guest: "poc_slt_commit",
+    lhs: 5,
+    rhs: 3,
+    honest: 0,
+    forged: 1,
+    is_target: arith_log,
+    forge_rows: forge_lt_rows,
 };
 
 const LB: Scenario = Scenario {
@@ -458,6 +476,87 @@ fn forge_load_rows(traces: &mut Traces, s: &Scenario) {
     }
 }
 
+/// LT: `5 < 3` forged to 1.
+///
+/// * Row A (the real SLT, `μ = 1`) gets `lt = out = 1` and `carry_1 = 1`: its
+///   high `lhs − rhs` word becomes `2^32`, split as `sub_2 = 0, sub_3 = 2^16`.
+///   Every LT constraint holds; only `IS_HALFWORD[2^16]` is out of range.
+/// * Padding row C becomes a `μ = −1` twin of the op `2^16 − 0` with
+///   `sub_0 = 2^16, sub_1 = 0`: it *receives* `IS_HALFWORD[2^16]`.
+/// * Padding row D is the honest `2^16 − 0` row, cancelling C on the ALU bus.
+///
+/// The BITWISE IS_HALF/MSB16 multiplicities are moved by the net change in LT's
+/// own sends, evaluated from the real interactions (so a lookup added by the
+/// fix is accounted for); a value with no BITWISE row is left for the bus.
+fn forge_lt_rows(traces: &mut Traces, s: &Scenario) {
+    use super::lt_multiplicity_poc::{Row, honest_row, lt_net, twin_row};
+    use crate::tables::lt::{LtOperation, cols};
+    const HALF: u64 = 1 << 16;
+
+    let t = &mut traces.lts[0];
+    let rows = |t: &TraceTable<Base, Ext>| -> Vec<Row> {
+        (0..t.num_rows())
+            .map(|r| (0..cols::NUM_COLUMNS).map(|c| *t.get_main(r, c)).collect())
+            .collect()
+    };
+    let before = rows(t);
+
+    let a = (0..t.num_rows())
+        .find(|&r| {
+            *t.get_main(r, cols::LHS_0) == FE::from(s.lhs)
+                && *t.get_main(r, cols::RHS_0) == FE::from(s.rhs)
+                && *t.get_main(r, cols::MU) == FE::one()
+        })
+        .expect("honest SLT row not found");
+    assert_eq!(*t.get_main(a, cols::OUT), FE::from(s.honest));
+    // Equal high words and no low borrow: the honest high diff word is 0.
+    assert_eq!(*t.get_main(a, cols::LHS_SUB_RHS_2), FE::zero());
+    assert_eq!(*t.get_main(a, cols::LHS_SUB_RHS_3), FE::zero());
+    let padding: Vec<usize> = (0..t.num_rows())
+        .filter(|&r| (0..cols::NUM_COLUMNS).all(|c| *t.get_main(r, c) == FE::zero()))
+        .take(2)
+        .collect();
+    let [c, d] = padding[..] else {
+        panic!("two all-zero padding rows are needed for the twin and its honest copy");
+    };
+
+    t.set_main(a, cols::LT, FE::one());
+    t.set_main(a, cols::OUT, FE::from(s.forged));
+    t.set_main(a, cols::LHS_SUB_RHS_3, FE::from(HALF));
+    let carrier = LtOperation::new(HALF, 0, false);
+    for (r, row) in [(c, twin_row(&carrier, HALF)), (d, honest_row(&carrier))] {
+        for (col, v) in row.into_iter().enumerate() {
+            t.set_main(r, col, v);
+        }
+    }
+    let after = rows(t);
+
+    let (old, new) = (lt_net(&before), lt_net(&after));
+    let half_id: u64 = BusId::IsHalfword.into();
+    let msb_id: u64 = BusId::Msb16.into();
+    let keys: std::collections::HashSet<_> = old.keys().chain(new.keys()).cloned().collect();
+    for (bus, tuple) in keys {
+        let delta = new
+            .get(&(bus, tuple.clone()))
+            .copied()
+            .unwrap_or(FE::zero())
+            - old
+                .get(&(bus, tuple.clone()))
+                .copied()
+                .unwrap_or(FE::zero());
+        let v = tuple[0];
+        if delta == FE::zero() || v >= HALF {
+            continue;
+        }
+        if bus == half_id {
+            bump_bitwise(traces, bw_cols::MU_IS_HALF, v, delta);
+        } else if bus == msb_id {
+            assert_eq!(tuple[1], v >> 15, "MSB16 sends stay honest");
+            bump_bitwise(traces, bw_cols::MU_MSB16, v, delta);
+        }
+    }
+}
+
 fn verifier_accepts(s: &Scenario, proof: &VmProof) -> bool {
     crate::verify_with_options(proof, &asm_elf_bytes(s.guest), &opts(), None, None)
         .expect("verify must not error")
@@ -623,5 +722,38 @@ fn load_negative_mu_sign_extension_forgery_is_rejected() {
             }
         ),
         "FORGERY: lb 0x05 = 0xFFFFFFFFFFFFFF05 was accepted — LOAD's μ is not bit-constrained"
+    );
+}
+
+#[test]
+fn lt_honest_control_verifies() {
+    assert_honest_verifies(&SLT);
+}
+
+/// Negative control: the CPU claims `5 < 3` but the LT rows are left honest.
+#[test]
+fn lt_unanswered_forged_claim_is_rejected() {
+    assert!(!crafted_accepted(
+        &SLT,
+        Forge {
+            claim: true,
+            rows: false
+        }
+    ));
+}
+
+/// Regression: `5 < 3` answered 1 via a `μ = −1` twin absorbing the forged row's
+/// out-of-range `sub_3 = 2^16` limb.
+#[test]
+fn lt_negative_mu_twin_forgery_is_rejected() {
+    assert!(
+        !crafted_accepted(
+            &SLT,
+            Forge {
+                claim: true,
+                rows: true
+            }
+        ),
+        "FORGERY: 5 < 3 = 1 was accepted — LT's μ is not bounded"
     );
 }

@@ -59,6 +59,8 @@ pub mod local_to_global_bus_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
+pub mod lt_multiplicity_poc;
+#[cfg(test)]
 pub mod lt_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
