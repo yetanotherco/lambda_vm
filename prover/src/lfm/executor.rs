@@ -1408,13 +1408,18 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 "a streamed execution ran a different number of instructions than the program has",
             ));
         }
+        if self.public_words.capacity() < self.program.groups.public.real_rows {
+            return Err(LfmExecError::Internal(
+                "a streamed execution's public words hold fewer rows than the program's",
+            ));
+        }
         // SAFETY: every instruction ran exactly once (each in the one wave in
         // which its last group landed; `ran` counts them) and every wave
         // returned `Ok`, so every record slot the schedule hands out was
-        // written — `LfmRecords::commit_slots`'s condition, as in `execute`.
+        // written — `LfmRecords::commit_slots`'s condition, as in `execute`;
+        // and the public words' capacity covers the rows set (checked above).
         unsafe {
             self.records.commit_slots(&self.program.groups);
-            assert!(self.public_words.capacity() >= self.program.groups.public.real_rows);
             self.public_words
                 .set_len(self.program.groups.public.real_rows);
         }
