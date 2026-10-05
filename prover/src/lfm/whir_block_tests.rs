@@ -1728,11 +1728,58 @@ fn within_20s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         .expect("the tree's scheduler deadlocked (no result in 20 s)")
 }
 
+/// [`prove_dataflow`] over the toy's shape where the last leaf, once taken,
+/// holds its worker until some node starts (or 1 s passes): whether a node
+/// started while that leaf was still proving. No clock decides it, only who
+/// signalled whom.
+fn a_node_starts_while_the_last_leaf_proves(workers: usize, barrier: bool) -> bool {
+    use super::per_table_aggregator::Level;
+    let shape: Vec<Level> = [vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]]
+        .into_iter()
+        .map(|arities| Level { arities })
+        .collect();
+    let results: Vec<Vec<Published<()>>> = std::iter::once(23)
+        .chain(shape.iter().map(|l| l.arities.len()))
+        .map(|n| (0..n).map(|_| Published::new()).collect())
+        .collect();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started_rx) = (
+        std::sync::Mutex::new(started_tx),
+        std::sync::Mutex::new(started_rx),
+    );
+    let overlapped = std::sync::atomic::AtomicBool::new(false);
+    prove_dataflow(
+        &shape,
+        &tree_order(23, &shape),
+        &results,
+        workers,
+        barrier,
+        |at, kids: &[&Published<()>]| {
+            wait_all(kids)?;
+            match (at.lv, at.j) {
+                (0, 22) => {
+                    let rx = started_rx.lock().expect("one receiver");
+                    if rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok() {
+                        overlapped.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                (0, _) => {}
+                _ => {
+                    let _ = started_tx.lock().expect("never poisoned").send(());
+                }
+            }
+            Ok(())
+        },
+    );
+    overlapped.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// ★ Dataflow over the median's shape proves every program of the serial
 /// level-by-level order, each in its own slot, whatever order they finish in
 /// (each level in reverse), at 1 to 4 workers: and with two or more workers a
 /// node proves while the level below is still proving, which the barrier
-/// (the control) never lets it.
+/// (the control) and a single worker never let it. The overlap is decided by
+/// signals, not by timestamps: the last leaf waits for a node to start.
 #[test]
 fn dataflow_proves_the_level_by_level_programs_in_any_completion_order() {
     let leaves: Vec<String> = (0..23).map(|k| format!("L{k}")).collect();
@@ -1766,17 +1813,9 @@ fn dataflow_proves_the_level_by_level_programs_in_any_completion_order() {
                 })
                 .collect();
             assert_eq!(texts, want, "{workers} workers, barrier {barrier}");
-            // Does any node start before its level below has finished?
-            let early = (1..got.len()).any(|lv| {
-                let below_end = got[lv - 1]
-                    .iter()
-                    .map(|r| r.as_ref().expect("proved").2)
-                    .max()
-                    .unwrap_or(0);
-                got[lv]
-                    .iter()
-                    .any(|r| r.as_ref().expect("proved").1 < below_end)
-            });
+            // Does a node start while the level below is still proving?
+            let early =
+                within_20s(move || a_node_starts_while_the_last_leaf_proves(workers, barrier));
             assert_eq!(
                 early,
                 workers >= 2 && !barrier,
