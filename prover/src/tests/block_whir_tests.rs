@@ -1849,8 +1849,9 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
     }
 }
 
-/// ★ W-7: block-wide LogUp at the group maximum reads 128.51 bits, at least
-/// 128 (CRYPTO-REVIEW W-7; the LogUp row of D-BATCH §3.2, argue_bits.py). Its
+/// ★ W-7: block-wide LogUp at the group maximum reads 126.51 bits, and a block
+/// of at most 256 groups keeps 128.51 (CRYPTO-REVIEW W-7; the LogUp row of
+/// D-BATCH §3.2, argue_bits.py). Its
 /// error is (len + 1)(|supp| − 1)L/|F|, with len the longest bus message (204,
 /// KECCAK_RND's), L the list size at rate 1/4 (300) and |F| = p³. |supp| is at
 /// most 2^11 fractions a row over 3 · 2^27 rows a group: a group of several
@@ -1866,18 +1867,22 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     let stack = ZfFormat::DEFAULT.whir_stack.get();
     assert_eq!(stack, 27);
     assert!(block_whir::BLOCK_MAX_TABLE_VARS <= stack);
-    let rows = (block_whir::BLOCK_MAX_GROUPS * block_whir::BLOCK_GROUP_POLYS) as f64
-        * 2f64.powi(stack as i32);
-    let support = rows * 2f64.powi(FRACTIONS_A_ROW_LOG2);
-    let field_log2 = 3.0 * (0xFFFF_FFFF_0000_0001u64 as f64).log2();
-    let bits = field_log2 - ((LEN_MAX + 1.0) * (support - 1.0) * LIST_SIZE).log2();
-    assert_eq!(format!("{bits:.2}"), "128.51");
-    assert!(bits >= 128.0);
+    let bits = |groups: usize| {
+        let rows = (groups * block_whir::BLOCK_GROUP_POLYS) as f64 * 2f64.powi(stack as i32);
+        let support = rows * 2f64.powi(FRACTIONS_A_ROW_LOG2);
+        let field_log2 = 3.0 * (0xFFFF_FFFF_0000_0001u64 as f64).log2();
+        field_log2 - ((LEN_MAX + 1.0) * (support - 1.0) * LIST_SIZE).log2()
+    };
+    assert_eq!(
+        format!("{:.2}", bits(block_whir::BLOCK_MAX_GROUPS)),
+        "126.51"
+    );
+    assert!(bits(256) >= 128.5);
 }
 
 /// ★ W-7's edge on the prover's plan: tables that fill a group each, at the
-/// production stack and polynomial budget, plan into 256 groups, which are
-/// taken, and into 257, which are refused with the verifier's error.
+/// production stack and polynomial budget, plan into 1024 groups, which are
+/// taken, and into 1025, which are refused with the verifier's error.
 #[test]
 fn the_plan_takes_the_group_maximum_and_refuses_one_more() {
     let stack = ZfFormat::DEFAULT.whir_stack;
@@ -1895,15 +1900,15 @@ fn the_plan_takes_the_group_maximum_and_refuses_one_more() {
             let Err(crate::Error::InvalidTableCounts(why)) = planned else {
                 panic!("the plan took {groups} groups");
             };
-            assert_eq!(why, "257 groups — a block takes at most 256");
+            assert_eq!(why, "1025 groups — a block takes at most 1024");
         } else {
             assert!(planned.is_ok(), "the plan refused {groups} groups");
         }
     }
 }
 
-/// ★ W-7's edge at the verifier: a statement of 257 groups is refused by the
-/// group maximum, before its partition is read; at 256 the maximum lets the
+/// ★ W-7's edge at the verifier: a statement of 1025 groups is refused by the
+/// group maximum, before its partition is read; at 1024 the maximum lets the
 /// statement through, and the partition check refuses the forged groups.
 #[test]
 fn the_verifier_refuses_one_group_over_the_maximum() {
@@ -1922,7 +1927,7 @@ fn the_verifier_refuses_one_group_over_the_maximum() {
             panic!("the verifier did not refuse {groups} groups");
         };
         if groups > block_whir::BLOCK_MAX_GROUPS {
-            assert_eq!(why, "257 groups — a block takes at most 256");
+            assert_eq!(why, "1025 groups — a block takes at most 1024");
         } else {
             assert_eq!(why, "table 0 is in two groups");
         }
