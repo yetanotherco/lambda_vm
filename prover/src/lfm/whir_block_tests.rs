@@ -1408,8 +1408,9 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
 /// one after another here. `finish` always runs on this thread, never on a
 /// rayon worker: a worker that waits inside rayon while it holds the card runs
 /// queued jobs meanwhile, and a sibling that takes the card is a second hold on
-/// one thread (BIG 569). A node's program is published before its finish
-/// starts. A build that fails leaves its error in its slots, and every slot
+/// one thread (BIG 569). A node's program is published as its emission ends
+/// (on the pool, with `pool`), before its finish starts and whatever the other
+/// nodes' finishes are waiting for. A build that fails leaves its error in its slots, and every slot
 /// still empty when this returns or unwinds gets one ([`FailUnpublished`]).
 #[allow(clippy::too_many_arguments)]
 fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
@@ -1467,19 +1468,23 @@ fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
         }
         match pool {
             Some(pool) => {
-                let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<(E, P), String>)>();
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<P, String>)>();
                 pool.in_place_scope(|scope| {
                     for (j, kids) in groups.iter().enumerate() {
-                        let (tx, emit, kids) = (tx.clone(), &emit, &below[kids.clone()]);
+                        let (tx, emit, publish) = (tx.clone(), &emit, &publish);
+                        let kids = &below[kids.clone()];
+                        // Each program is published here, as its emission
+                        // ends: never behind another node's finish, which
+                        // may wait for the card (BIG 622: a program queued
+                        // 2.1 s behind a sibling's artifacts).
                         scope.spawn(move |_| {
-                            let _ = tx.send((j, emit(lv, j, kids, top)));
+                            let _ = tx.send((j, publish(lv, j, emit(lv, j, kids, top))));
                         });
                     }
                     drop(tx);
                     // This thread, not a pool worker, finishes each node as
                     // its program arrives.
-                    for (j, emitted) in rx {
-                        let rest = publish(lv, j, emitted);
+                    for (j, rest) in rx {
                         let _ = slots[lv][j].0.set(rest.and_then(|p| finish(lv, j, p)));
                     }
                 });
@@ -1874,11 +1879,15 @@ fn node_flow<E, N, F, R>(
     prove(filled, node.wait()?)
 }
 
-/// One node's stamps in [`split_slot_flow`]: when it executed and proved
-/// (ms since the tree started), whose artifacts it proved with, and when those
-/// were built.
+/// One node's stamps in [`split_slot_flow`], in ms since the tree started:
+/// when a worker took it, when its program was emitted, when the worker got
+/// the program, when it executed and proved; and whose artifacts it proved
+/// with, and when those were built.
 #[derive(Clone, Debug)]
 struct FlowStamps {
+    taken: u128,
+    emitted: u128,
+    got: u128,
     exec: u128,
     prove: u128,
     artifacts: String,
@@ -1886,9 +1895,10 @@ struct FlowStamps {
 }
 
 /// The tree's split slots over a toy at the median's shape (23 leaves, fan-in
-/// 3): [`build_levels`] publishes each node's program at once and its
-/// artifacts after a finish that holds "the card" longer the later the node is
-/// in its level; [`prove_dataflow`] proves the leaves and runs each node
+/// 3): [`build_levels`] emits each level's programs on a pool in reverse (the
+/// last node first), publishes each program and then each node's artifacts
+/// after a finish that holds "the card" — 120 ms for the first node to arrive,
+/// 5 ms for the rest; [`prove_dataflow`] proves the leaves and runs each node
 /// through [`node_flow`]. Returns every node's stamps, by level then index.
 fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
     use super::per_table_aggregator::Level;
@@ -1904,15 +1914,17 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
             .map(|l| l.arities.iter().map(|_| Published::new()).collect())
             .collect()
     };
-    // A program is its text; a node is (its artifacts' name, when built).
+    // A program is (its text, when emitted); a node is (its artifacts' name,
+    // when built).
     let (programs, slots) = (node_slots(), node_slots());
     let results: Vec<Vec<Published<FlowStamps>>> = std::iter::once(23)
         .chain(shape.iter().map(|l| l.arities.len()))
         .map(|n| (0..n).map(|_| Published::new()).collect())
         .collect();
     let t0 = std::time::Instant::now();
+    let ms = || t0.elapsed().as_millis();
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
+        .num_threads(4)
         .build()
         .expect("a pool");
     std::thread::scope(|scope| {
@@ -1923,7 +1935,9 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
                 &programs,
                 &slots,
                 |node: &(String, u128)| &node.0,
-                |_, _, kids: &[&String], _| {
+                |lv, j, kids: &[&String], _| {
+                    let late = shape[lv].arities.len() - j;
+                    std::thread::sleep(std::time::Duration::from_millis(3 * late as u64));
                     let text = format!(
                         "N({})",
                         kids.iter()
@@ -1931,11 +1945,13 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
                             .collect::<Vec<_>>()
                             .join(",")
                     );
-                    Ok(((text.clone(), t0.elapsed().as_millis()), text))
+                    Ok(((text.clone(), ms()), text))
                 },
                 |lv, j, _: String| {
-                    std::thread::sleep(std::time::Duration::from_millis(5 + 5 * j as u64));
-                    Ok((format!("A{lv}.{j}"), t0.elapsed().as_millis()))
+                    let first = j + 1 == shape[lv].arities.len();
+                    let hold = if first { 120 } else { 5 };
+                    std::thread::sleep(std::time::Duration::from_millis(hold));
+                    Ok((format!("A{lv}.{j}"), ms()))
                 },
                 Some(&pool),
             )
@@ -1947,10 +1963,14 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
             workers,
             false,
             |at, kids: &[&Published<FlowStamps>]| {
+                let taken = ms();
                 if at.lv == 0 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    let now = t0.elapsed().as_millis();
+                    let now = ms();
                     return Ok(FlowStamps {
+                        taken,
+                        emitted: 0,
+                        got: taken,
                         exec: now,
                         prove: now,
                         artifacts: String::new(),
@@ -1962,16 +1982,20 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
                     &slots,
                     at,
                     true,
-                    |_program| {
+                    |program: &(String, u128)| {
+                        let got = ms();
                         wait_all(kids)?;
-                        let exec = t0.elapsed().as_millis();
+                        let exec = ms();
                         std::thread::sleep(std::time::Duration::from_millis(1));
-                        Ok(exec)
+                        Ok((program.1, got, exec))
                     },
-                    |exec, node: &(String, u128)| {
+                    |(emitted, got, exec), node: &(String, u128)| {
                         Ok(FlowStamps {
+                            taken,
+                            emitted,
+                            got,
                             exec,
-                            prove: t0.elapsed().as_millis(),
+                            prove: ms(),
                             artifacts: node.0.clone(),
                             ready: node.1,
                         })
@@ -1992,11 +2016,12 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
         .collect()
 }
 
-/// ★ A node executes from its program before its artifacts are built, but
-/// proves only with its OWN artifacts, after they are built — at 1 to 6
-/// workers, without a hang. (Waiting on another node's artifact slot proves
-/// early with the wrong artifacts and fails this; so does waiting for the
-/// artifacts before the execute, which never executes early.)
+/// ★ A node gets its program as soon as it is emitted — not behind another
+/// node's finish holding the card — and executes from it before its artifacts
+/// are built, but proves only with its OWN artifacts, after they are built: at
+/// 1 to 6 workers, without a hang. (Publishing a program after a sibling's
+/// finish, waiting on another node's artifact slot, or waiting for the
+/// artifacts before the execute each fails this.)
 #[test]
 fn a_node_proves_only_after_its_own_artifacts_and_executes_before_them() {
     for workers in 1..=6 {
@@ -2004,18 +2029,20 @@ fn a_node_proves_only_after_its_own_artifacts_and_executes_before_them() {
         let mut early = 0usize;
         for (l, level) in got.iter().enumerate() {
             for (j, node) in level.iter().enumerate() {
-                assert_eq!(
-                    node.artifacts,
-                    format!("A{l}.{j}"),
-                    "{workers} workers: node ({}, {j})",
-                    l + 1
-                );
+                let at = format!("{workers} workers: node ({}, {j})", l + 1);
+                assert_eq!(node.artifacts, format!("A{l}.{j}"), "{at}");
                 assert!(
                     node.prove >= node.ready,
-                    "{workers} workers: node ({}, {j}) proved at {} ms, before its artifacts at {} ms",
-                    l + 1,
+                    "{at} proved at {} ms, before its artifacts at {} ms",
                     node.prove,
                     node.ready
+                );
+                assert!(
+                    node.got <= node.taken.max(node.emitted) + 40,
+                    "{at} got its program at {} ms: emitted at {} ms, taken at {} ms",
+                    node.got,
+                    node.emitted,
+                    node.taken
                 );
                 early += usize::from(node.exec < node.ready);
             }
@@ -2032,7 +2059,8 @@ fn a_node_proves_only_after_its_own_artifacts_and_executes_before_them() {
 /// too). With every child already proved there is nothing to stream behind,
 /// and the streamed path (its forward pass, then a wave per child) costs more
 /// than one whole execution: at 1× the top's artifacts come after its last
-/// child, and streaming it anyway cost 0.19 s (BIG 617 / 618). A failed child counts as done: the whole path reports its error.
+/// child, and streaming it anyway cost 0.19 s (BIG 617 / 618). A failed child
+/// counts as done: the whole path reports its error.
 fn top_streams<R>(kids: &[&Published<R>]) -> bool {
     kids.iter().any(|k| k.0.get().is_none())
 }
