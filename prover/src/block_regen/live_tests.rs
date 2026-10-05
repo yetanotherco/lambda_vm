@@ -553,13 +553,15 @@ fn no_disk_auto_drops_every_regenerable_and_spills_nothing() {
         let program = program(name);
         let config = stream_config(*committers, *generators, finish_in_a);
         let mut reference_traces = resident(&program, config);
+        // The host read as 0 against a 64 GiB target, never the real host's
+        // reading: a host of ≲ 16 GiB would arm at the first decision.
         let mut unarmed = phase_a(
             &program,
             config,
             RegenMode::Auto,
             4 * GIB,
             Some(SpillPolicy::Off),
-            None,
+            Some(u64::MAX),
         );
         assert!(unarmed.plan.is_none(), "{name}: {}", unarmed.line);
         assert!(
