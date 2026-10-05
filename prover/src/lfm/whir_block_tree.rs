@@ -1616,6 +1616,121 @@ pub fn prove_whir_block_tree(
     })
 }
 
+// ============================== the proof file ============================
+
+/// The proof file's first bytes (the STARK block tree's file shares them).
+const PROOF_MAGIC: [u8; 8] = *b"LVMBLKTR";
+
+/// The proof file's layout version.
+const PROOF_VERSION: u32 = 1;
+
+/// Which tree a proof file holds: the STARK block tree (0) or this one. A
+/// verifier refuses the other's file by its tag, before reading it as its own.
+pub const PIPELINE_WHIR: u8 = 1;
+
+/// A whole W3 block's proof as a consumer receives it: the block's statement
+/// and the top node's proof. The block verifier ([`verify_whir_block_tree_proof`])
+/// takes the statement as a claim — the plan and the top program are derived
+/// from the trusted ELF and the statement, under the block presets — so
+/// nothing here is a format parameter: the file only carries what
+/// [`super::whir_block::verify_block_tree`] already takes from its caller.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct WhirBlockTreeProof {
+    magic: [u8; 8],
+    version: u32,
+    pipeline: u8,
+    pub table_num_vars: Vec<u8>,
+    pub runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    pub table_counts: crate::TableCounts,
+    pub public_output: Vec<u8>,
+    pub num_private_input_pages: usize,
+    pub groups: Vec<Vec<u32>>,
+    pub top_proof: stark::proof::stark::MultiProof<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >,
+    pub top_public_words: Vec<(u32, LfmWord)>,
+}
+
+impl WhirBlockTreeProof {
+    /// The file for a W3 block's statement and its top proof.
+    pub fn new(statement: block_whir::OwnedBlockStatement, top: LfmProof) -> Self {
+        Self {
+            magic: PROOF_MAGIC,
+            version: PROOF_VERSION,
+            pipeline: PIPELINE_WHIR,
+            table_num_vars: statement.table_num_vars,
+            runtime_page_ranges: statement.runtime_page_ranges,
+            table_counts: statement.table_counts,
+            public_output: statement.public_output,
+            num_private_input_pages: statement.num_private_input_pages,
+            groups: statement.groups,
+            top_proof: top.proof,
+            top_public_words: top.public_words,
+        }
+    }
+
+    /// The claimed statement.
+    pub fn statement(&self) -> block_whir::BlockStatement<'_> {
+        block_whir::BlockStatement {
+            table_num_vars: &self.table_num_vars,
+            runtime_page_ranges: &self.runtime_page_ranges,
+            table_counts: &self.table_counts,
+            public_output: &self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: &self.groups,
+        }
+    }
+
+    /// The file's bytes.
+    pub fn to_bytes(&self) -> Result<rkyv::util::AlignedVec, String> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| format!("serialize: {e}"))
+    }
+
+    /// A file read back: refused unless it is this layout's W3 block tree.
+    /// `bytes` must be aligned for rkyv (an `AlignedVec`).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let proof = rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+            .map_err(|e| format!("not a W3 block proof file: {e}"))?;
+        if proof.magic != PROOF_MAGIC {
+            return Err("not a block proof file (magic)".to_string());
+        }
+        if proof.version != PROOF_VERSION {
+            return Err(format!(
+                "block proof file version {}, this build reads {PROOF_VERSION}",
+                proof.version
+            ));
+        }
+        if proof.pipeline != PIPELINE_WHIR {
+            return Err(format!(
+                "the file holds pipeline {} ({}), not the WHIR block tree",
+                proof.pipeline,
+                if proof.pipeline == 0 {
+                    "the STARK block tree"
+                } else {
+                    "unknown"
+                }
+            ));
+        }
+        Ok(proof)
+    }
+}
+
+/// ★ A W3 block proof file verified: [`super::whir_block::verify_block_tree`]
+/// over its claimed statement and its top proof, under the block presets,
+/// against the trusted `elf_bytes`.
+pub fn verify_whir_block_tree_proof(
+    elf_bytes: &[u8],
+    proof: &WhirBlockTreeProof,
+) -> Result<(), String> {
+    let top = LfmProof {
+        proof: proof.top_proof.clone(),
+        public_words: proof.top_public_words.clone(),
+    };
+    super::whir_block::verify_block_tree(elf_bytes, proof.statement(), &top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,6 +1749,90 @@ mod tests {
             at += found + name.len();
         }
         assert!(POSTURE.contains(&("LAMBDA_VM_WHIR_HASH", "rpx")));
+    }
+
+    /// A synthetic statement and an empty top proof.
+    fn synthetic_proof() -> WhirBlockTreeProof {
+        let counts = crate::TableCounts {
+            cpu: 3,
+            lt: 1,
+            memw: 2,
+            memw_aligned: 1,
+            load: 1,
+            mul: 1,
+            dvrm: 1,
+            shift: 1,
+            branch: 1,
+            memw_register: 1,
+            eq: 1,
+            bytewise: 1,
+            store: 1,
+            cpu32: 1,
+            keccak: 2,
+            keccak_rnd: 4,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 0,
+            commit: 1,
+            blake3: 0,
+        };
+        let statement = block_whir::OwnedBlockStatement {
+            table_num_vars: vec![21, 16, 6],
+            runtime_page_ranges: vec![crate::RuntimePageRange {
+                base: 0x7000_0000,
+                count: 3,
+            }],
+            table_counts: counts,
+            public_output: vec![1, 2, 3, 4, 5],
+            num_private_input_pages: 2,
+            groups: vec![vec![0, 2], vec![1]],
+        };
+        let words: Vec<(u32, LfmWord)> = (0..3u32)
+            .map(|i| (i, [crate::tables::types::FE::from(u64::from(i) + 7); 4]))
+            .collect();
+        let top = LfmProof {
+            proof: stark::proof::stark::MultiProof { proofs: vec![] },
+            public_words: words,
+        };
+        WhirBlockTreeProof::new(statement, top)
+    }
+
+    /// The proof file reads back what was written; another tag, version or
+    /// magic, or bytes that are not a file, are refused.
+    #[test]
+    fn the_proof_file_round_trips_and_refuses_another_file() {
+        let proof = synthetic_proof();
+        let bytes = proof.to_bytes().expect("serializes");
+        let back = WhirBlockTreeProof::from_bytes(&bytes).expect("reads back");
+        assert_eq!(
+            format!("{:?}", back.statement()),
+            format!("{:?}", proof.statement())
+        );
+        assert_eq!(back.top_public_words, proof.top_public_words);
+        assert_eq!(back.top_proof.proofs.len(), 0);
+
+        for (what, tamper) in [
+            (
+                "pipeline",
+                (|p: &mut WhirBlockTreeProof| p.pipeline = 0) as fn(&mut WhirBlockTreeProof),
+            ),
+            ("version", |p| p.version = PROOF_VERSION + 1),
+            ("magic", |p| p.magic[0] ^= 1),
+        ] {
+            let mut other = synthetic_proof();
+            tamper(&mut other);
+            let bytes = other.to_bytes().expect("serializes");
+            assert!(
+                WhirBlockTreeProof::from_bytes(&bytes).is_err(),
+                "a file with another {what} is refused"
+            );
+        }
+        let mut junk = rkyv::util::AlignedVec::<16>::new();
+        junk.extend_from_slice(&[0u8; 7]);
+        assert!(
+            WhirBlockTreeProof::from_bytes(&junk).is_err(),
+            "seven zero bytes"
+        );
     }
 
     /// Only the production tree is at the presets: the plan's leaf count, the
