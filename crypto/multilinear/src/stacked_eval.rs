@@ -126,6 +126,49 @@ impl ColumnsAt<'_> {
     }
 }
 
+std::thread_local! {
+    /// Whether this thread's commits run each pair on threads of their own
+    /// ([`with_pairs_off_pool`]).
+    static PAIRS_OFF_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with this thread's [`StackedCommitment`] commits taking each pair
+/// on this thread and one of its own (`on`), or on the global rayon pool, as
+/// they always have (`off`). The commits, and so the roots, are the same.
+///
+/// A caller outside the pool hands its pair to the pool's injector, which a
+/// worker reads only once its own deque and every other worker's are empty:
+/// beside a long parallel phase (the block's finish) the card waits for that.
+/// A pair on its own threads waits for nothing but the card.
+pub fn with_pairs_off_pool<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRS_OFF_POOL.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(PAIRS_OFF_POOL.with(|c| c.replace(on)));
+    f()
+}
+
+/// Commits `pair` (one or two polynomials) with `commit`, the second on a
+/// thread of its own; in order, as the pool's `collect` would.
+#[cfg(feature = "parallel")]
+fn commit_pair_off_pool<P: Sync, T: Send>(
+    pair: &[P],
+    commit: &(dyn Fn(&P) -> Result<T, Error> + Sync),
+) -> Result<Vec<T>, Error> {
+    std::thread::scope(|scope| {
+        let second = pair.get(1).map(|p| scope.spawn(move || commit(p)));
+        let first = pair.first().map(commit);
+        let second = second.map(|h| {
+            h.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        first.into_iter().chain(second).collect()
+    })
+}
+
 impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> StackedCommitment<F, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
@@ -259,12 +302,17 @@ where
         };
         let mut domain = None;
         let mut commitments = Vec::with_capacity(sources.len());
+        #[cfg(feature = "parallel")]
+        let off_pool = PAIRS_OFF_POOL.with(std::cell::Cell::get);
         for pair in sources.chunks(2) {
             #[cfg(feature = "parallel")]
-            let built = pair
-                .par_iter()
-                .map(commit)
-                .collect::<Result<Vec<_>, Error>>()?;
+            let built = if off_pool {
+                commit_pair_off_pool(pair, &commit)?
+            } else {
+                pair.par_iter()
+                    .map(commit)
+                    .collect::<Result<Vec<_>, Error>>()?
+            };
             #[cfg(not(feature = "parallel"))]
             let built = pair.iter().map(commit).collect::<Result<Vec<_>, Error>>()?;
             for (commitment, d) in built {
@@ -1150,6 +1198,72 @@ mod tests {
                 "drop {drop_levels}: {got:?}"
             );
         }
+    }
+
+    /// A pair committed off the pool is the pair the pool commits: the same roots,
+    /// polynomial by polynomial. The flag is this thread's, and is back as it was after
+    /// each call.
+    #[test]
+    fn pairs_off_the_pool_commit_the_same_roots() {
+        let off_pool = || PAIRS_OFF_POOL.with(std::cell::Cell::get);
+        // Six columns, two slots per stacked polynomial: three polynomials, a pair and
+        // one alone.
+        let roots = |off| {
+            with_pairs_off_pool(off, || {
+                let (layout, columns) = stack_of(6, 3, 4);
+                StackedCommitment::<F, KeccakWhir>::commit(
+                    layout,
+                    &crate::stacking::borrow(&columns),
+                    None,
+                    &config(),
+                )
+                .unwrap()
+                .roots()
+            })
+        };
+        let pool = roots(false);
+        assert_eq!(pool.len(), 3);
+        assert_eq!(roots(true), pool);
+        assert!(!off_pool());
+        with_pairs_off_pool(true, || {
+            with_pairs_off_pool(false, || assert!(!off_pool()));
+            assert!(off_pool());
+        });
+        assert!(!off_pool());
+    }
+
+    /// Off the pool, a pair runs on its caller's thread and one of its own, never a
+    /// pool thread, in order; an error in either is the pair's.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_pair_off_the_pool_runs_on_threads_of_its_own() {
+        let caller = std::thread::current().id();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let commit = |p: &u32| -> Result<u32, Error> {
+            seen.lock().unwrap().push((
+                *p,
+                std::thread::current().id(),
+                rayon::current_thread_index(),
+            ));
+            if *p == 9 {
+                Err(Error::EmptyPolynomial)
+            } else {
+                Ok(p * 10)
+            }
+        };
+        assert_eq!(
+            commit_pair_off_pool(&[1, 2], &commit).unwrap(),
+            vec![10, 20]
+        );
+        assert_eq!(commit_pair_off_pool(&[3], &commit).unwrap(), vec![30]);
+        assert!(commit_pair_off_pool(&[1, 9], &commit).is_err());
+        assert!(commit_pair_off_pool(&[9, 1], &commit).is_err());
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.iter().all(|&(_, _, pool)| pool.is_none()), "{seen:?}");
+        let thread_of = |p| seen.iter().find(|s| s.0 == p).unwrap().1;
+        assert_eq!(thread_of(1), caller);
+        assert_ne!(thread_of(2), caller);
+        assert_eq!(thread_of(3), caller);
     }
 
     /// The point of the module: many columns, one commitment, one opening.

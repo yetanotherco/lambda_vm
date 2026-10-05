@@ -1170,18 +1170,43 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let t = Instant::now();
-    let stacked = StackedCommitment::<F, H>::commit_signalled(
-        layout,
-        columns,
-        resident.map(|(store, first)| (store, ColumnsAt::From(first))),
-        config,
-        on_room,
-    )?;
+    let stacked = multilinear::stacked_eval::with_pairs_off_pool(commit_pairs_off_pool(), || {
+        StackedCommitment::<F, H>::commit_signalled(
+            layout,
+            columns,
+            resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+            config,
+            on_room,
+        )
+    })?;
     let roots = stacked.roots();
     let commit = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let retired = stacked.retire(drop_levels, config)?;
     Ok((roots, retired, commit, t.elapsed().as_secs_f64()))
+}
+
+/// `LAMBDA_VM_BLOCK_COMMIT_OFF_POOL`: phase A commits each group's pairs of
+/// polynomials on the committer's own threads (`1`), or on the global rayon
+/// pool (unset or `0`, the default). The roots are the same either way. The
+/// committer is not a pool thread, so on the pool its pair waits in the
+/// injector behind every job the finish's generators queue (rayon-core's
+/// `find_work`: own deque, then stealing, then injected jobs), and the card
+/// waits with it. Read once; anything else is off.
+pub fn commit_pairs_off_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        commit_pairs_off_pool_from(
+            std::env::var("LAMBDA_VM_BLOCK_COMMIT_OFF_POOL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`commit_pairs_off_pool`]'s reading of its variable.
+fn commit_pairs_off_pool_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 /// What a packer hands back: one packed table or none per table of its group,
@@ -2103,11 +2128,20 @@ where
 
 #[cfg(test)]
 mod spill_tests {
-    use super::{from_store, to_store};
+    use super::{commit_pairs_off_pool_from, from_store, to_store};
     use multilinear::narrow::NarrowColumns;
 
     /// The packed columns move to the store's payload and back without a
     /// copy: the same bytes at the same address.
+    #[test]
+    fn the_commit_pairs_go_off_the_pool_only_at_one() {
+        assert!(!commit_pairs_off_pool_from(None));
+        assert!(!commit_pairs_off_pool_from(Some("0")));
+        assert!(commit_pairs_off_pool_from(Some("1")));
+        assert!(commit_pairs_off_pool_from(Some(" 1 ")));
+        assert!(!commit_pairs_off_pool_from(Some("yes")));
+    }
+
     #[test]
     fn the_columns_move_to_the_store_and_back_without_a_copy() {
         let words: Vec<u64> = (0..3 * 4096u64).map(|i| i * 0x9e37_79b9 % 70_000).collect();
