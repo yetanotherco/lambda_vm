@@ -1990,6 +1990,50 @@ pub(crate) fn strip_blake3_side_effects() -> bool {
     false
 }
 
+/// `LAMBDA_VM_P4_SLICED`: phase 4 cuts its per-op BITWISE sources into slices of whole ops
+/// (unset or anything but `0`, #1013's c36984343), or counts each source as one collector
+/// (`0`, the path before, kept for the A/B). The multiplicities are the same either way.
+fn p4_sliced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_P4_SLICED").as_deref() != Ok("0"))
+}
+
+/// Phase 4's per-op BITWISE sources, cut into slices of whole ops ([`p4_slice_len`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum P4Source {
+    Lt,
+    Mul,
+    Dvrm,
+    Branch,
+    Shift,
+    Bytewise,
+    Eq,
+    Store,
+    MemwAligned,
+    Keccak,
+    Ecdas,
+}
+
+/// Ops per slice of a phase-4 source. MUL and DVRM deduplicate their bit-gated lookups per
+/// instance, so each of their slices is one instance (`mul_chunk` / `dvrm_chunk` rows, from the
+/// first op); the others are sums over their ops, so any cut counts the same and the length
+/// only bounds a slice's list of lookups (KECCAK sends about 5,000 per permutation).
+fn p4_slice_len(source: P4Source, mul_chunk: usize, dvrm_chunk: usize) -> usize {
+    match source {
+        P4Source::Mul => mul_chunk.max(1),
+        P4Source::Dvrm => dvrm_chunk.max(1),
+        P4Source::MemwAligned => 1 << 22,
+        P4Source::Keccak => 1 << 11,
+        P4Source::Ecdas => 1 << 16,
+        P4Source::Lt
+        | P4Source::Branch
+        | P4Source::Shift
+        | P4Source::Bytewise
+        | P4Source::Eq
+        | P4Source::Store => 1 << 20,
+    }
+}
+
 /// Collect the MEMW operations and the chip group for one Blake3Absorb ECALL.
 ///
 /// The four operands come from the register state the way ECSM's and HINT's do
@@ -4799,32 +4843,111 @@ fn build_traces<I: ImageSource + Sync>(
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
-    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
-    // split into row-ranges in the parallel path below) stays a single whole-source collector.
-    let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
-        Box::new(|h| {
-            for op in &bytewise_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| {
-            for op in &eq_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| {
-            for op in &store_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+    // The sources that are a sum over their ops are cut into slices of whole ops, so phase 4's
+    // buckets share them (a whole source was one bucket's long pole) and no slice's list of
+    // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
+    // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
+    // below; the rest stay one collector each.
+    let mut collectors: Vec<Collector> = Vec::new();
+    if p4_sliced() {
+        for slice in lt_ops.chunks(p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_lt(slice))
+            }));
+        }
+        for slice in mul_ops.chunks(p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_mul(slice, mul_chunk))
+            }));
+        }
+        for slice in dvrm_ops.chunks(p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_dvrm(slice, dvrm_chunk))
+            }));
+        }
+        for slice in branch_ops.chunks(p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_branch(slice))
+            }));
+        }
+        for slice in shift_ops.chunks(p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&shift::collect_bitwise_from_shift(slice))
+            }));
+        }
+        for slice in bytewise_ops.chunks(p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                for op in slice {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        for slice in eq_ops.chunks(p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                for op in slice {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        for slice in store_ops.chunks(p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                for op in slice {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        for slice in
+            memw_aligned_ops.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
+        {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_memw_aligned(slice))
+            }));
+        }
+        for slice in keccak_ops.chunks(p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_keccak(slice))
+            }));
+        }
+        for slice in ecdas_ops.chunks(p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_ecdas(slice))
+            }));
+        }
+    } else {
+        // `LAMBDA_VM_P4_SLICED=0`: every source one collector, as before the slices (the A/B's
+        // control). The same multiplicities: the histogram is a commutative sum.
+        collectors.extend([
+            Box::new(|h: &mut bitwise::BitwiseHistogram| {
+                h.add_ops(&collect_bitwise_from_lt(&lt_ops))
+            }) as Collector,
+            Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
+            Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
+            Box::new(|h| {
+                for op in &bytewise_ops {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| {
+                for op in &eq_ops {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| {
+                for op in &store_ops {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        ]);
+    }
+    collectors.extend([
+        Box::new(|h: &mut bitwise::BitwiseHistogram| {
+            h.add_ops(&collect_bitwise_from_commit(&commit_ops))
+        }) as Collector,
         Box::new(|h| {
             if !strip_blake3_side_effects() {
                 h.add_ops(&collect_bitwise_from_blake3(
@@ -4834,10 +4957,9 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
-    ];
+    ]);
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
@@ -6685,5 +6807,109 @@ impl Traces {
             &StreamSkip::default(),
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod p4_slice_tests {
+    use super::{
+        BitwiseOperation, DvrmOperation, LtOperation, MulOperation, P4Source,
+        collect_bitwise_from_dvrm, collect_bitwise_from_lt, collect_bitwise_from_mul, p4_slice_len,
+    };
+    use std::collections::HashMap;
+
+    fn counts(ops: &[BitwiseOperation], into: &mut HashMap<BitwiseOperation, u64>) {
+        for op in ops {
+            *into.entry(*op).or_default() += 1;
+        }
+    }
+
+    /// Counts `ops` whole, and slice by slice at phase 4's length for `source`.
+    fn whole_and_sliced<T>(
+        ops: &[T],
+        source: P4Source,
+        mul_chunk: usize,
+        dvrm_chunk: usize,
+        collect: impl Fn(&[T]) -> Vec<BitwiseOperation>,
+    ) -> (
+        HashMap<BitwiseOperation, u64>,
+        HashMap<BitwiseOperation, u64>,
+        usize,
+    ) {
+        let mut whole = HashMap::new();
+        counts(&collect(ops), &mut whole);
+        let mut sliced = HashMap::new();
+        let mut slices = 0;
+        for slice in ops.chunks(p4_slice_len(source, mul_chunk, dvrm_chunk)) {
+            counts(&collect(slice), &mut sliced);
+            slices += 1;
+        }
+        (whole, sliced, slices)
+    }
+
+    /// Phase 4's slices count every lookup the whole sources count. MUL and DVRM deduplicate
+    /// their signed lookups per instance, so their slices must be whole instances: the ops
+    /// below repeat inside and across instances, so a cut one row off (checked here) changes
+    /// the counts, and a `p4_slice_len` that misaligns them fails the equality. LT is a sum
+    /// over its ops, cut across its 2^20-op slices.
+    #[test]
+    fn phase_4_slices_count_what_the_whole_sources_count() {
+        const CHUNK: usize = 8;
+        let mul: Vec<(MulOperation, bool)> = (0..203u64)
+            .map(|i| {
+                // Three distinct signed ops, repeating: each instance deduplicates its own.
+                let op = MulOperation {
+                    lhs: (i % 3 + 1) << 61 | 5,
+                    lhs_signed: true,
+                    rhs: 3 << 61 | 7,
+                    rhs_signed: true,
+                };
+                (op, i % 3 == 0)
+            })
+            .collect();
+        let (whole, sliced, slices) = whole_and_sliced(&mul, P4Source::Mul, CHUNK, CHUNK, |s| {
+            collect_bitwise_from_mul(s, CHUNK)
+        });
+        assert!(slices > 1);
+        assert_eq!(whole, sliced, "MUL");
+        let mut off = HashMap::new();
+        for slice in mul.chunks(CHUNK + 1) {
+            counts(&collect_bitwise_from_mul(slice, CHUNK), &mut off);
+        }
+        assert_ne!(whole, off, "MUL's ops do not tell a misaligned cut apart");
+
+        let dvrm: Vec<(DvrmOperation, bool)> = (0..197u64)
+            .map(|i| {
+                let op = DvrmOperation {
+                    n: (i % 3 + 1) << 61 | 9,
+                    d: 5 << 60 | 3,
+                    signed: true,
+                };
+                (op, i % 2 == 0)
+            })
+            .collect();
+        let (whole, sliced, slices) = whole_and_sliced(&dvrm, P4Source::Dvrm, CHUNK, CHUNK, |s| {
+            collect_bitwise_from_dvrm(s, CHUNK)
+        });
+        assert!(slices > 1);
+        assert_eq!(whole, sliced, "DVRM");
+        let mut off = HashMap::new();
+        for slice in dvrm.chunks(CHUNK + 1) {
+            counts(&collect_bitwise_from_dvrm(slice, CHUNK), &mut off);
+        }
+        assert_ne!(whole, off, "DVRM's ops do not tell a misaligned cut apart");
+
+        let lt: Vec<LtOperation> = (0..(1u64 << 20) + 37)
+            .map(|i| LtOperation {
+                lhs: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                rhs: i.rotate_left(17),
+                signed: i % 2 == 0,
+                invert: i % 3 == 0,
+            })
+            .collect();
+        let (whole, sliced, slices) =
+            whole_and_sliced(&lt, P4Source::Lt, CHUNK, CHUNK, collect_bitwise_from_lt);
+        assert_eq!(slices, 2);
+        assert_eq!(whole, sliced, "LT");
     }
 }
