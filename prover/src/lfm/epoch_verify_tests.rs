@@ -42,220 +42,26 @@ use stark::traits::AIR;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-use super::constraints::{Analysis, BoundaryTerm};
 use super::epoch_verify::{TableVerifyShape, boundary_terms};
 use super::executor::execute;
 use super::fri::FriShape;
-use super::word::{LfmWord, base_word, ext_word, word_as_ext};
+use super::word::word_as_ext;
 
 type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
 
-/// Everything the verification legs read about one real sub-proof.
-///
-/// The split against `epoch_tests::HostTable` is by CONSUMER, not by
-/// convenience: that struct holds what the transcript absorbs, this one holds
-/// what the legs open. Nothing appears in both — which is the arena-join
-/// obligation showing up in the test fixture as well as in the emitted program.
-pub(super) struct TableLegs {
-    pub(super) verify: TableVerifyShape,
-    pub(super) analysis: Analysis,
-    /// `[query][group]` — the row pair in leaf order, then the path.
-    openings: Vec<Vec<(Vec<LfmWord>, Vec<Commitment>)>>,
-    /// `[query][layer]` — `(opened values, path)`: the sibling `pᵢ(−υ^(2ⁱ))`
-    /// under `pair`, the whole `2^{d_j}` group under a fold schedule.
-    fri_openings: Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>,
-    /// Every capped tree's cap, split off query 0's (owner) path, in the caps
-    /// arena's order: the committed matrices in group order, then the capped
-    /// FRI layers. Empty at the default format.
-    caps: Vec<Commitment>,
-    /// Production's OWN boundary-constraint list for this AIR, kept so
-    /// [`the_boundary_terms_are_program_shape`] can compare the program-shape
-    /// rule against the call rather than against a belief about it.
-    production_boundary: Vec<BoundaryTerm>,
-    /// `AIR::has_aux_trace`, the rule's input.
-    has_aux_trace: bool,
-    /// Preprocessed-column count, zero when the AIR is not preprocessed. Which
-    /// sub-proofs are preprocessed is what assembly ledger entry 7 is about.
-    pub(super) num_precomputed_cols: usize,
-    /// The commitment production absorbs for this table, when preprocessed —
-    /// `air.precomputed_commitment()`, taken from the AIR and never from the
-    /// proof.
-    pub(super) precomputed_commitment: Option<Commitment>,
-}
+/// Everything the verification legs read about one real sub-proof (the reader
+/// lives in [`super::harvest`], where the block tree's driver uses it too).
+pub(super) use super::harvest::TableLegs;
 
-/// Read one real sub-proof into the shapes and openings the legs consume.
-///
-/// Every shape here is derived from the AIR and the proof OPTIONS. The one
-/// parameter that is neither is `log2_trace_length` — a table's chunk length is
-/// chosen by the prover's row counts — and it is program shape in the assembled
-/// verifier for the reason the arena schema makes it one: the program is emitted
-/// for a specific epoch shape, and a proof whose trace length disagreed would
-/// not match the arenas it declares.
+/// [`super::harvest::build_table_legs`], panicking on a proof that disagrees
+/// with its AIR.
 pub(super) fn build_table_legs(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
 ) -> TableLegs {
-    // The shapes, from the AIR and the trace length alone; the proof's blocks
-    // are then checked against them, never read into them.
-    let trace_length = view.trace_length();
-    let (verify, analysis) = TableVerifyShape::derive(air, trace_length)
-        .unwrap_or_else(|e| panic!("the legs' shape derives: {e}"));
-    let (main_width, aux_width) = air.trace_layout();
-    let num_precomputed = if air.is_preprocessed() {
-        air.num_precomputed_columns()
-    } else {
-        0
-    };
-    let log2_trace_length = trace_length.trailing_zeros();
-    assert_eq!(
-        view.composition_poly_parts_ood_evaluation().len(),
-        verify.quotient.num_composition_parts,
-        "the proof's part count is the AIR's degree bound"
-    );
-    // The grid the machine rebuilds and the blocks the proof carries must
-    // describe one table. Asserted rather than assumed because the machine's
-    // reconstruction is indexed by the SHAPE and filled from the BLOCKS: a width
-    // disagreement would silently scatter the next-row values into wrong columns.
-    let deep = &verify.sub.deep;
-    let ood_c = view.trace_ood_evaluations();
-    let ood_n = view.trace_ood_next_evaluations();
-    assert_eq!(
-        ood_c.width(),
-        deep.num_total_cols,
-        "the current-row OOD block is the full trace width"
-    );
-    assert_eq!(
-        ood_c.height(),
-        deep.step_size,
-        "the current-row block's height IS step_size (ood.rs:110-114)"
-    );
-    assert_eq!(
-        ood_n.width(),
-        deep.next_row_cols.len(),
-        "the next-row block is as wide as the transition window"
-    );
-    assert_eq!(
-        ood_n.height(),
-        deep.num_eval_points - deep.step_size,
-        "the next-row block covers every evaluation point past the first step"
-    );
-
-    // ---- the owner split: query 0 of a capped tree carries the cap at the end
-    // of its path; the arenas take the `D − c` siblings, the caps arena the cap.
-    let mut trace_caps: Vec<Vec<Commitment>> = Vec::new();
-    let mut split = |q: usize, path: &[Commitment], depth: usize, c: usize| -> Vec<Commitment> {
-        if c == 0 || q != 0 {
-            assert_eq!(path.len(), depth - c, "query {q}: a path to the cap");
-            return path.to_vec();
-        }
-        let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-            .expect("the owner path is D − c + 2^c long");
-        trace_caps.push(cap.to_vec());
-        siblings.to_vec()
-    };
-    let (depth, c_trace) = (verify.sub.merkle_depth, verify.sub.trace_cap);
-
-    // ---- the openings, per query, in the emitter's group order.
-    let openings = (0..view.deep_poly_openings_len())
-        .map(|q| {
-            let o = view.deep_poly_opening(q);
-            let mut groups: Vec<(Vec<LfmWord>, Vec<Commitment>)> = Vec::new();
-            if num_precomputed > 0 {
-                let p = o
-                    .precomputed_trace_polys()
-                    .expect("a preprocessed air opens its precomputed columns");
-                groups.push((
-                    p.evaluations()
-                        .iter()
-                        .chain(p.evaluations_sym())
-                        .map(|v| base_word(*v))
-                        .collect(),
-                    split(q, p.merkle_path(), depth, c_trace),
-                ));
-            }
-            let m = o.main_trace_polys();
-            groups.push((
-                m.evaluations()
-                    .iter()
-                    .chain(m.evaluations_sym())
-                    .map(|v| base_word(*v))
-                    .collect(),
-                split(q, m.merkle_path(), depth, c_trace),
-            ));
-            if aux_width > 0 {
-                let a = o.aux_trace_polys().expect("an aux opening");
-                groups.push((
-                    a.evaluations()
-                        .iter()
-                        .chain(a.evaluations_sym())
-                        .map(ext_word)
-                        .collect(),
-                    split(q, a.merkle_path(), depth, c_trace),
-                ));
-            }
-            let c = o.composition_poly();
-            groups.push((
-                c.evaluations()
-                    .iter()
-                    .chain(c.evaluations_sym())
-                    .map(ext_word)
-                    .collect(),
-                split(q, c.merkle_path(), depth, c_trace),
-            ));
-            groups
-        })
-        .collect();
-
-    let (fri_openings, fri_caps) = fri_layer_openings(view, verify.fri);
-
-    // Production's own boundary list, for the premise check only. It takes the
-    // bus public inputs, which are PROOF data — which is exactly why the emitted
-    // program must not be built from this call.
-    let bus_public_inputs = view
-        .bus_table_contribution()
-        .map(stark::lookup::BusPublicInputs::from_contribution);
-    let generator = <Gl as math::field::traits::IsFFTField>::get_primitive_root_of_unity(
-        log2_trace_length as u64,
-    )
-    .expect("a power-of-two trace length has a root of unity");
-    let production_boundary = air
-        .boundary_constraints(
-            &(),
-            rap_challenges,
-            bus_public_inputs.as_ref(),
-            trace_length,
-        )
-        .constraints
-        .iter()
-        .map(|c| BoundaryTerm {
-            col: if c.is_aux { main_width + c.col } else { c.col },
-            point: generator.pow(c.step as u64),
-            value: c.value,
-        })
-        .collect();
-
-    let caps: Vec<Commitment> = trace_caps.into_iter().flatten().chain(fri_caps).collect();
-    assert_eq!(
-        caps.len() * super::proof_arena::words_per_root(),
-        verify.cap_words(super::proof_arena::words_per_root()),
-        "every capped tree's cap, and nothing else"
-    );
-
-    TableLegs {
-        verify,
-        analysis,
-        openings,
-        fri_openings,
-        caps,
-        production_boundary,
-        has_aux_trace: air.has_aux_trace(),
-        num_precomputed_cols: num_precomputed,
-        precomputed_commitment: air
-            .is_preprocessed()
-            .then(|| layout_precomputed_commitment(air, trace_length)),
-    }
+    super::harvest::build_table_legs(air, view, rap_challenges).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// [`super::epoch_verify::layout_precomputed_commitment`], where a layout
@@ -265,18 +71,12 @@ pub(super) fn layout_precomputed_commitment<PI>(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
     trace_length: usize,
 ) -> Commitment {
-    super::epoch_verify::layout_precomputed_commitment(air, trace_length)
-        .unwrap_or_else(|| panic!("no precomputed commitment at {trace_length} rows"))
+    super::harvest::layout_precomputed_commitment(air, trace_length)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// Every query's FRI layer openings, per layer `(opened values, path)`, and
-/// the capped layers' caps (layer order) split off query 0's owner paths.
-///
-/// The proof's flat `layers_evaluations_sym` is one sibling per layer under
-/// `pair` and every layer's full group (`2^{d_j}` values, position order)
-/// under a fold schedule; `FriShape::layer_values` says which.
-/// Each path is cut at its layer's cap: query 0 of a capped layer carries
-/// `D − c + 2^c` nodes, every other query `D − c`.
+/// [`super::harvest::fri_layer_openings`], panicking on a proof that disagrees
+/// with its FRI shape.
 #[allow(clippy::type_complexity)]
 pub(super) fn fri_layer_openings<PI>(
     view: StarkProofView<'_, Gl, Ext3, PI>,
@@ -286,98 +86,7 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
 {
-    let mut caps: Vec<Commitment> = Vec::new();
-    let openings = (0..view.query_list_len())
-        .map(|q| {
-            let d = view.query(q);
-            let flat = d.layers_evaluations_sym();
-            let per_query: usize = (0..fri.num_committed()).map(|j| fri.layer_values(j)).sum();
-            assert_eq!(
-                flat.len(),
-                per_query,
-                "query {q}: the opened values per query"
-            );
-            let mut offset = 0usize;
-            (0..fri.num_committed())
-                .map(|i| {
-                    let values = flat[offset..offset + fri.layer_values(i)].to_vec();
-                    offset += fri.layer_values(i);
-                    let path = d.layer_auth_path(i);
-                    let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
-                    if c == 0 || q != 0 {
-                        assert_eq!(path.len(), depth - c, "query {q} FRI layer {i}");
-                        return (values, path.to_vec());
-                    }
-                    let (siblings, cap) =
-                        crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-                            .expect("the owner path is D − c + 2^c long");
-                    caps.extend_from_slice(cap);
-                    (values, siblings.to_vec())
-                })
-                .collect()
-        })
-        .collect();
-    (openings, caps)
-}
-
-impl TableLegs {
-    /// Per query, per group: the row-pair values then the sibling digests.
-    ///
-    /// NO index word, which is the whole difference from
-    /// `join_tests::HostSubProof::query_arena`: the assembled verifier's index is
-    /// the transcript's own bits, so an arena that carried one would be offering
-    /// the prover a second index.
-    pub(super) fn opening_arena(&self) -> Vec<LfmWord> {
-        let mut out = Vec::new();
-        for query in &self.openings {
-            for (values, siblings) in query {
-                out.extend(values.iter().copied());
-                out.extend(super::proof_arena::commitments_to_arena(siblings));
-            }
-        }
-        assert_eq!(
-            out.len(),
-            self.verify
-                .opening_words(super::proof_arena::words_per_root()),
-            "the opening arena must fill exactly what the shape declares"
-        );
-        out
-    }
-
-    /// The sub-proof's Merkle caps, once — `None` at the default format, where
-    /// the emitter declares no caps arena
-    /// (`epoch_verify::declare_table_arenas`).
-    pub(super) fn caps_arena(&self) -> Option<Vec<LfmWord>> {
-        let words = self.verify.cap_words(super::proof_arena::words_per_root());
-        if words == 0 {
-            assert!(self.caps.is_empty());
-            return None;
-        }
-        let out = super::proof_arena::commitments_to_arena(&self.caps);
-        assert_eq!(
-            out.len(),
-            words,
-            "the caps arena is what the shape declares"
-        );
-        Some(out)
-    }
-
-    /// Per query, per committed layer: the symmetric evaluation then its path.
-    pub(super) fn fri_arena(&self) -> Vec<LfmWord> {
-        let mut out = Vec::new();
-        for query in &self.fri_openings {
-            for (values, path) in query {
-                out.extend(values.iter().map(ext_word));
-                out.extend(super::proof_arena::commitments_to_arena(path));
-            }
-        }
-        assert_eq!(
-            out.len(),
-            self.verify.fri_words(super::proof_arena::words_per_root()),
-            "the FRI arena must fill exactly what the shape declares"
-        );
-        out
-    }
+    super::harvest::fri_layer_openings(view, fri).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// ★ THE RUN: the whole epoch verifier — spine AND legs — on a real

@@ -49,35 +49,9 @@ use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
 
-/// Everything one real sub-proof supplies to the replay, plus the challenges
-/// production derived from it.
-#[derive(Clone)]
-pub(super) struct HostTable {
-    pub(super) shape: TableChallengeShape,
-    /// The verifier's HARDCODED precomputed commitment, when the AIR is
-    /// preprocessed. A program constant, not arena data: the verifier does not
-    /// take this from the proof (`verifier.rs:1187`).
-    pub(super) precomputed_root: Option<Commitment>,
-    pub(super) main_root: Commitment,
-    pub(super) aux_root: Option<Commitment>,
-    pub(super) contribution: Option<FEE>,
-    pub(super) composition_root: Commitment,
-    /// Row-major, as `row_major_data` carries it.
-    pub(super) ood_current: Vec<FEE>,
-    pub(super) ood_next: Vec<FEE>,
-    pub(super) parts: Vec<FEE>,
-    pub(super) fri_roots: Vec<Commitment>,
-    pub(super) fri_coeffs: Vec<FEE>,
-    pub(super) nonce: Option<u64>,
-    needs_lookup_challenges: bool,
-
-    // ---- the oracle ----
-    pub(super) beta: FEE,
-    pub(super) z: FEE,
-    pub(super) gamma: FEE,
-    pub(super) zetas: Vec<FEE>,
-    pub(super) iotas: Vec<usize>,
-}
+/// Everything one real sub-proof supplies to the replay (the reader lives in
+/// [`super::harvest`], where the block tree's driver uses it too).
+pub(super) use super::harvest::HostTable;
 
 /// Read a real single-table proof into [`HostTable`], taking the challenges
 /// from the production verifier rather than recomputing them.
@@ -1709,9 +1683,9 @@ fn the_from_proof_constructor_rejects_a_tampered_bundle() {
     );
 }
 
-/// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
-/// already positioned (separator, aux root and `L` absorbed), so the oracle
-/// comes from `replay_rounds_after_round_1` on THAT transcript.
+/// [`host_table`] for a sub-proof inside a multi-table epoch
+/// ([`super::harvest::host_table_forked`]), panicking on a proof that
+/// disagrees with its AIR.
 pub(super) fn host_table_forked(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
@@ -1720,78 +1694,8 @@ pub(super) fn host_table_forked(
     fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> HostTable {
-    use crate::hash_pin::BlockVerifier as Verifier;
-    use stark::domain::new_verifier_domain;
-    use stark::verifier::IsStarkVerifier;
-
-    let trace_length = view.trace_length();
-    let domain = new_verifier_domain(air, trace_length);
-    let layout = Verifier::<Gl, Ext3, ()>::ood_layout(air);
-    let challenges = Verifier::<Gl, Ext3, ()>::replay_rounds_after_round_1(
-        air,
-        view,
-        &(),
-        &domain,
-        fork,
-        lookup_challenges.to_vec(),
-        &layout,
-    );
-
-    let nt = challenges.transition_coeffs.len();
-    let beta = if nt > 1 {
-        challenges.transition_coeffs[1]
-    } else {
-        challenges.boundary_coeffs[0]
-    };
-    // `γ` is the second term of the DEEP coefficient run, which starts at one —
-    // the same recovery `constraint_tests::deep_shape` makes.
-    let gamma = challenges.trace_term_coeffs[1][0];
-
-    let ood_c = view.trace_ood_evaluations();
-    let ood_n = view.trace_ood_next_evaluations();
-    // The shape is the AIR's at this trace length; the proof is checked against
-    // it, never read into it.
-    let shape = TableChallengeShape::derive(air, index, num_tables, trace_length);
-    assert_eq!(
-        (
-            view.lde_trace_aux_merkle_root().is_some(),
-            view.bus_table_contribution().is_some(),
-            (ood_c.width(), ood_c.height()),
-            (ood_n.width(), ood_n.height()),
-            view.composition_poly_parts_ood_evaluation().len(),
-        ),
-        (
-            shape.has_aux_root,
-            shape.has_contribution,
-            shape.ood_current_dims,
-            shape.ood_next_dims,
-            shape.num_parts,
-        ),
-        "table {index}: the proof's aux root, L, OOD blocks and part count are the AIR's"
-    );
-
-    HostTable {
-        shape,
-        precomputed_root: air.is_preprocessed().then(|| {
-            super::epoch_verify_tests::layout_precomputed_commitment(air, view.trace_length())
-        }),
-        main_root: *view.lde_trace_main_merkle_root(),
-        aux_root: view.lde_trace_aux_merkle_root().copied(),
-        contribution: view.bus_table_contribution(),
-        composition_root: *view.composition_poly_root(),
-        ood_current: ood_c.row_major_data().to_vec(),
-        ood_next: ood_n.row_major_data().to_vec(),
-        parts: view.composition_poly_parts_ood_evaluation().to_vec(),
-        fri_roots: view.fri_layers_merkle_roots().to_vec(),
-        fri_coeffs: view.fri_final_poly_coeffs().to_vec(),
-        nonce: view.nonce(),
-        needs_lookup_challenges: true,
-        beta,
-        z: challenges.z,
-        gamma,
-        zetas: challenges.zetas.clone(),
-        iotas: challenges.iotas.clone(),
-    }
+    super::harvest::host_table_forked(air, view, index, num_tables, fork, lookup_challenges)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The whole epoch's Fiat-Shamir spine, as one program.

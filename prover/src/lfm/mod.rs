@@ -41,6 +41,7 @@ pub mod fri;
 pub mod global_parent;
 pub mod global_split;
 pub mod hash;
+pub(crate) mod harvest;
 pub mod instr;
 pub mod keccak_adapter;
 pub mod keccak_host;
