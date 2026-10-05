@@ -936,7 +936,11 @@ pub fn storage_estimate_parallelism() -> usize {
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
-    budget: u64,
+    /// The byte budget. Atomic only so the shared gate
+    /// ([`arm_shared_vram_gate`]) can be calibrated in place between levels.
+    budget: AtomicU64,
+    /// `SGATE` lines on every change of the account ([`shared_gate_trace`]).
+    trace: bool,
 }
 
 struct VramPermit<'a> {
@@ -949,26 +953,262 @@ impl VramGate {
         Self {
             used: std::sync::Mutex::new(0),
             freed: std::sync::Condvar::new(),
-            budget,
+            budget: AtomicU64::new(budget),
+            trace: false,
         }
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
         let mut used = self.used.lock().unwrap();
         loop {
-            if *used == 0 || used.saturating_add(bytes) <= self.budget {
+            if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
                 *used = used.saturating_add(bytes);
+                self.trace_used(*used);
                 return VramPermit { gate: self, bytes };
             }
             used = self.freed.wait(used).unwrap();
         }
     }
+
+    /// One `SGATE` line: the bytes admitted now, and the device pool's live
+    /// bytes (allocated and not yet freed) to read them against.
+    fn trace_used(&self, used: u64) {
+        if self.trace {
+            #[cfg(feature = "cuda")]
+            let pool = math_cuda::device::pool_used_bytes()
+                .map(|(now, _)| format!(" pool={:.3}GiB", now as f64 / (1u64 << 30) as f64))
+                .unwrap_or_default();
+            #[cfg(not(feature = "cuda"))]
+            let pool = String::new();
+            eprintln!(
+                "SGATE t={:.3} used={:.3}GiB{pool}",
+                crate::prove_split::epoch_secs(),
+                used as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+}
+
+/// `LAMBDA_VM_SHARED_GATE_TRACE=1`: the shared gate prints one `SGATE` line
+/// (unix seconds, the bytes admitted) on every change of its account, so a box
+/// run can lay it beside the card's `memory.used`. Off by default.
+fn shared_gate_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_SHARED_GATE_TRACE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `LAMBDA_VM_SHARED_VRAM_GATE=1` (default off), while a caller has armed it
+/// ([`arm_shared_vram_gate`]): every [`IsStarkProver::multi_prove`] admits its
+/// tables through ONE [`VramGate`] instead of a fresh full-budget gate per
+/// call, and device work outside a prove takes its bytes from the same gate
+/// ([`shared_vram_admit`]). Proofs in flight at once then share one running
+/// total, so a caller may run several of them in their device phases together
+/// (the block tree's sibling proofs) without two gates each budgeting the whole
+/// card. Off, or unarmed: a gate per call, and callers that run proofs
+/// concurrently serialise them (the LFM card permit).
+///
+/// Ported from #1013 (a87d9aa06, a29b6e4e4, 73e3d644d), where it is on by
+/// default. Every device user that can run beside an armed prove takes its
+/// bytes from this gate. The block's base keeps its own accounts: the gate is
+/// armed only for the tree's sibling proofs, after the base. While armed the
+/// device's memory pool releases at each sync
+/// ([`math_cuda::device::armed_release_threshold_bytes`]), so what the base
+/// freed is not left reserved outside the gate's account.
+pub fn shared_vram_gate_on() -> bool {
+    #[cfg(any(test, feature = "test-utils"))]
+    match SHARED_VRAM_GATE_PIN.load(Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    shared_vram_gate_knob() && SHARED_VRAM_GATE_ARMED.load(Ordering::SeqCst)
+}
+
+/// The knob alone: on only at `LAMBDA_VM_SHARED_VRAM_GATE=1`.
+fn shared_vram_gate_knob() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        shared_vram_gate_setting(std::env::var("LAMBDA_VM_SHARED_VRAM_GATE").ok().as_deref())
+    })
+}
+
+/// [`shared_vram_gate_knob`] for a raw value: on only at `1`.
+fn shared_vram_gate_setting(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// Whether a caller armed the shared gate ([`arm_shared_vram_gate`]).
+static SHARED_VRAM_GATE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the shared gate (under its knob) for proofs a caller is about to run
+/// concurrently, or disarm it (`on = false`). Arming CALIBRATES the gate while
+/// it holds nothing: the device's streams are drained, the pool's unused
+/// memory is handed back, and the budget becomes the card's free memory then,
+/// less `margin_bytes`, capped at the configured budget
+/// ([`calibrated_budget`]). What the gate cannot see (device caches, compiled
+/// modules, frees not yet released, each prove's bytes beyond its tables'
+/// estimates) is then outside the budget rather than on top of it. While
+/// armed, the device pool releases freed blocks at each sync; disarming
+/// restores the posture the pool was created with. Returns the budget, or
+/// `None` with the knob off or on disarming.
+pub fn arm_shared_vram_gate(on: bool, margin_bytes: u64) -> Option<u64> {
+    if !shared_vram_gate_knob() {
+        return None;
+    }
+    if !on {
+        SHARED_VRAM_GATE_ARMED.store(false, Ordering::SeqCst);
+        pool_releases_while_armed(false);
+        return None;
+    }
+    let releasing = pool_releases_while_armed(true);
+    let configured = device_vram_budget();
+    let gate = shared_vram_gate(configured);
+    let budget = {
+        let used = gate.used.lock().unwrap();
+        if *used == 0 {
+            let free = device_free_after_trim();
+            let b = calibrated_budget(configured, free, margin_bytes);
+            gate.budget.store(b, Ordering::Relaxed);
+            let gib = |v: u64| v as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "[prover] shared VRAM gate armed: budget {:.2} GiB (card free {} after a drain and a pool trim, margin {:.2} GiB, configured {:.2} GiB){}",
+                gib(b),
+                free.map_or("unknown".to_string(), |f| format!("{:.2} GiB", gib(f))),
+                gib(margin_bytes),
+                gib(configured),
+                if releasing {
+                    "; the pool releases at each sync while armed"
+                } else {
+                    ""
+                },
+            );
+            b
+        } else {
+            gate.budget.load(Ordering::Relaxed)
+        }
+    };
+    SHARED_VRAM_GATE_ARMED.store(true, Ordering::SeqCst);
+    Some(budget)
+}
+
+/// Lower the device pool's release threshold for the armed stretch, or put
+/// the pool's own back. Whether the armed threshold is in place.
+fn pool_releases_while_armed(on: bool) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        let Some(armed) = math_cuda::device::armed_release_threshold_bytes() else {
+            return false;
+        };
+        let Ok(b) = math_cuda::device::backend() else {
+            return false;
+        };
+        let threshold = if on {
+            armed
+        } else {
+            math_cuda::device::mempool_release_threshold_bytes()
+        };
+        b.set_mempool_release_threshold(threshold) && on
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = on;
+        false
+    }
+}
+
+/// The shared gate's budget: the card's `free` bytes less `margin`, never above
+/// `configured`; `configured` when the card cannot be queried.
+fn calibrated_budget(configured: u64, free: Option<u64>, margin: u64) -> u64 {
+    match free {
+        Some(f) => f.saturating_sub(margin).min(configured),
+        None => configured,
+    }
+}
+
+/// The card's free bytes after draining every stream and handing the device
+/// pool's unused memory back. The drain comes first: a free still queued on a
+/// stream holds its block until the stream reaches it, and the trim cannot
+/// hand back what the pool has not been given (#1013's FAST 479: 11.6–12.8 GiB
+/// used at the arming after a trim alone, 1.3–1.5 GiB after a drain).
+fn device_free_after_trim() -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    {
+        let b = math_cuda::device::backend().ok()?;
+        b.synchronize();
+        b.trim_mempool_to(0);
+        b.device_mem_info().map(|(free, _)| free)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// Test-only pin of [`shared_vram_gate_on`]: 0 reads the environment, 1 off,
+/// 2 on. Process-wide.
+#[cfg(any(test, feature = "test-utils"))]
+static SHARED_VRAM_GATE_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: pin [`shared_vram_gate_on`] for this process (`None` returns it to
+/// the environment).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn pin_shared_vram_gate(on: Option<bool>) {
+    SHARED_VRAM_GATE_PIN.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The process-wide gate behind [`shared_vram_gate_on`], at `budget` bytes the
+/// first time it is asked for (calibrated in place at each arming).
+fn shared_vram_gate(budget: u64) -> &'static VramGate {
+    static GATE: OnceLock<VramGate> = OnceLock::new();
+    GATE.get_or_init(|| VramGate {
+        trace: shared_gate_trace(),
+        ..VramGate::new(budget)
+    })
+}
+
+/// The card's admission budget, or `u64::MAX` without a device.
+fn device_vram_budget() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::backend()
+            .map(|b| b.vram_budget_bytes())
+            .unwrap_or(u64::MAX)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        u64::MAX
+    }
+}
+
+/// Bytes of the shared gate ([`shared_vram_gate_on`]) held by device work
+/// outside a prove; released on drop.
+pub struct SharedVramPermit {
+    _permit: VramPermit<'static>,
+}
+
+/// Take `bytes` from the shared gate for device work done outside
+/// [`IsStarkProver::multi_prove`] (an artifact commit), waiting until they fit
+/// beside what the proofs in flight hold. `None` when the shared gate is off or
+/// unarmed: the caller then keeps its own exclusion.
+pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
+    shared_vram_gate_on().then(|| SharedVramPermit {
+        _permit: shared_vram_gate(device_vram_budget()).acquire(bytes),
+    })
 }
 
 impl Drop for VramPermit<'_> {
     fn drop(&mut self) {
-        let mut used = self.gate.used.lock().unwrap();
+        let mut used = self.gate.used.lock().unwrap_or_else(|e| e.into_inner());
         *used = used.saturating_sub(self.bytes);
+        self.gate.trace_used(*used);
         drop(used);
         self.gate.freed.notify_all();
     }
@@ -4440,7 +4680,17 @@ pub trait IsStarkProver<
         // don't re-add pre-sizing without a shared-slab design that bounds the
         // number of allocations.
 
-        let vram_gate = VramGate::new(vram_budget);
+        // One gate for every prove in the process while a caller runs proofs
+        // concurrently under the shared gate (`LAMBDA_VM_SHARED_VRAM_GATE`,
+        // armed); otherwise a gate of this prove's own.
+        let gate_shared = shared_vram_gate_on();
+        let local_gate;
+        let vram_gate: &VramGate = if gate_shared {
+            shared_vram_gate(vram_budget)
+        } else {
+            local_gate = VramGate::new(vram_budget);
+            &local_gate
+        };
 
         // The shapes the AIR and the domain fix, read once: the device-set
         // estimates the gate admits against derive from them
@@ -4556,7 +4806,7 @@ pub trait IsStarkProver<
         let main_results = run_admitted(
             &main_walk_order,
             &main_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             |idx| table_names[idx].clone(),
             |idx| {
@@ -5150,7 +5400,7 @@ pub trait IsStarkProver<
         let table_results = run_admitted(
             &peak_order,
             &peak_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             |idx| table_names[idx].clone(),
             |idx| {
@@ -5167,7 +5417,7 @@ pub trait IsStarkProver<
             let aux_outs = run_admitted(
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 |idx| table_names[idx].clone(),
                 aux_stage,
@@ -5196,7 +5446,7 @@ pub trait IsStarkProver<
             run_admitted(
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 |idx| table_names[idx].clone(),
                 |idx| {
@@ -5949,6 +6199,61 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_vram_gate_tests {
+    use super::{
+        calibrated_budget, pin_shared_vram_gate, shared_vram_admit, shared_vram_gate,
+        shared_vram_gate_setting,
+    };
+
+    /// Off (or unarmed), the admission is inert and the caller keeps its own
+    /// exclusion; on, it holds its bytes in the one process-wide gate until
+    /// dropped.
+    #[test]
+    fn the_shared_admission_holds_bytes_only_when_the_gate_is_on() {
+        pin_shared_vram_gate(Some(false));
+        assert!(shared_vram_admit(7).is_none(), "off: no admission");
+        pin_shared_vram_gate(Some(true));
+        let gate = shared_vram_gate(u64::MAX);
+        let before = *gate.used.lock().unwrap();
+        {
+            let _held = shared_vram_admit(7).expect("on: an admission");
+            assert_eq!(*gate.used.lock().unwrap(), before + 7, "the bytes are held");
+        }
+        assert_eq!(*gate.used.lock().unwrap(), before, "and released on drop");
+        pin_shared_vram_gate(None);
+    }
+
+    /// The knob is on only at `1`: the gate is off by default on #1014 until
+    /// its A/B.
+    #[test]
+    fn the_shared_gate_is_on_only_at_one() {
+        assert!(!shared_vram_gate_setting(None));
+        assert!(!shared_vram_gate_setting(Some("0")));
+        assert!(!shared_vram_gate_setting(Some("")));
+        assert!(shared_vram_gate_setting(Some("1")));
+        assert!(shared_vram_gate_setting(Some(" 1 ")));
+    }
+
+    /// The calibrated budget is the card's free bytes less the margin, never
+    /// above the configured budget, and the configured budget when the card
+    /// cannot be read.
+    #[test]
+    fn the_calibrated_budget_is_free_less_the_margin_capped() {
+        let gib = 1u64 << 30;
+        assert_eq!(
+            calibrated_budget(24 * gib, Some(30 * gib), 3 * gib),
+            24 * gib
+        );
+        assert_eq!(
+            calibrated_budget(24 * gib, Some(20 * gib), 3 * gib),
+            17 * gib
+        );
+        assert_eq!(calibrated_budget(24 * gib, Some(2 * gib), 3 * gib), 0);
+        assert_eq!(calibrated_budget(24 * gib, None, 3 * gib), 24 * gib);
     }
 }
 

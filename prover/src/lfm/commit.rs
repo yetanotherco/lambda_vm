@@ -250,6 +250,10 @@ pub fn commit_group_device_or_host_with(
         // would otherwise not have. The measurement cannot perturb what it
         // measures.
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
+        // Under the armed shared gate (`LAMBDA_VM_SHARED_VRAM_GATE`) the
+        // commit's device set is admitted beside the proofs in flight;
+        // otherwise the caller's card permit is the exclusion.
+        let _bytes = stark::prover::shared_vram_admit(set.total());
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
