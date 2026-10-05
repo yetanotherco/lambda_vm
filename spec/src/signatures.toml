@@ -183,13 +183,6 @@ tag = "IS_WH"
 kind = "interaction"
 input = ["Word", "Half"]
 
-# IS_WHH[X, Y]
-[[signatures]]
-tag = "IS_WHH"
-kind = "template"
-input = ["DWordWHH"]
-cond = "BaseField"
-
 # HWSL[res; X, shift]
 [[signatures]]
 tag = "HWSL"

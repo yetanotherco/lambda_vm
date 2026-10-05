@@ -149,7 +149,7 @@ name = "ecall"
 [[constraints.ecall]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["+", 64, ["*", ["-", ["^", 2, 32], 94], ["-", 1, "is_write"]]], "is_set"], ["*", ["*", ["-", ["^", 2, 32], 1], ["-", 1, "is_write"]]]]]
+input = ["timestamp", ["arr", ["-", ["+", 64, ["*", ["-", ["^", 2, 32], 94], ["-", 1, "is_write"]]], "is_set"], ["*", ["-", ["^", 2, 32], 1], ["-", 1, "is_write"]]]]
 multiplicity = ["-", "first"]
 ref = "copy:c:receive_ecall"
 
