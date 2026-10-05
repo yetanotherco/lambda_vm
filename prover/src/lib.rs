@@ -14,6 +14,7 @@ pub mod alloc_purge;
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod block;
+mod block_regen;
 pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
