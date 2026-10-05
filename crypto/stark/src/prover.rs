@@ -1178,9 +1178,9 @@ pub fn storage_estimate_parallelism() -> usize {
 /// permit drop. An oversized request is admitted alone (when nothing else
 /// holds bytes), so tables larger than the whole budget still prove.
 ///
-/// Only OS driver threads block here (see `run_admitted`) — never rayon
-/// workers, whose pool the admitted tables use internally and which a
-/// blocked worker would starve.
+/// Only OS threads wait here — `run_admitted`'s drivers, a prove's calling
+/// thread for its claim, an artifact build's thread for its window
+/// ([`shared_vram_admit`]) — never rayon workers ([`refuse_rayon_wait`]).
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
@@ -1285,6 +1285,26 @@ impl<'a> VramPermit<'a> {
     }
 }
 
+/// ⛔ A rayon worker never waits on a gate.
+///
+/// A worker waiting inside a `join` runs other queued jobs on its own stack,
+/// injected ones included. If one of them waits here for bytes a prove holds,
+/// and that prove's task is the frame beneath it on the same stack, the prove
+/// can never drop its bytes: a deadlock. Before the artifact build took its
+/// window's bytes on its own thread, its commits waited here from inside its
+/// parallel map. A debug check, not a release panic: a wait in the wrong place
+/// is a scheduling bug, and the test builds name it where it happens.
+fn refuse_rayon_wait(wait: &str) {
+    #[cfg(feature = "parallel")]
+    debug_assert!(
+        rayon::current_thread_index().is_none(),
+        "a rayon worker waits on a VRAM gate ({wait}): a job it runs while a holder's \
+         frame waits beneath it can park it on bytes that holder keeps"
+    );
+    #[cfg(not(feature = "parallel"))]
+    let _ = wait;
+}
+
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
@@ -1298,6 +1318,7 @@ impl VramGate {
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
+        refuse_rayon_wait("acquire");
         let mut used = self.used.lock().unwrap();
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
@@ -1334,6 +1355,7 @@ impl VramGate {
     /// Claim (`held`, `headroom`) for a prove that will carry resident bytes,
     /// waiting until it fits beside the claims in force ([`ClaimBook::fits`]).
     fn claim(&self, held: u64, headroom: u64) -> ResidentClaim<'_> {
+        refuse_rayon_wait("claim");
         let mut claims = self.claims.lock().unwrap();
         while !claims.fits(held, headroom, self.budget.load(Ordering::Relaxed)) {
             claims = self.claim_room.wait(claims).unwrap();
@@ -1514,6 +1536,7 @@ impl VramGate {
         claimed: &std::sync::Mutex<Vec<bool>>,
         ready: &dyn Fn(usize) -> bool,
     ) -> Option<(usize, VramPermit<'g>)> {
+        refuse_rayon_wait("acquire_first_fitting");
         let mut used = self.used.lock().unwrap();
         loop {
             let mut unready = false;
@@ -1627,6 +1650,126 @@ mod shared_vram_gate_tests {
         }
         assert_eq!(*gate.used.lock().unwrap(), before, "and released on drop");
         pin_shared_vram_gate(None);
+    }
+}
+
+/// ⛔ Where an artifact build waits for its bytes.
+///
+/// One schedule, made deterministic on a one-worker pool: a holder takes 8 of
+/// a 10-byte gate on its own thread, then hands its work to the worker (its
+/// `install`, a prove's parallel work), which yields once inside it: what a
+/// worker waiting in a `join` does. A build needs 4 more.
+#[cfg(all(test, feature = "parallel"))]
+mod rayon_wait_tests {
+    use super::VramGate;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn one_worker() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool")
+    }
+
+    /// ⛔ THE OLD SHAPE: the build's commit asks the gate from INSIDE its
+    /// fork. The worker runs that job on top of the holder's frame, so its
+    /// wait could only end when the holder drops its bytes, which it can only
+    /// do once the worker returns: parked for good. Refused now, by name.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_commit_that_asks_the_gate_inside_its_fork_is_refused() {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(10)));
+        let pool: &'static rayon::ThreadPool = Box::leak(Box::new(one_worker()));
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let (injected_tx, injected_rx) = mpsc::channel::<()>();
+        let (out_tx, out_rx) = mpsc::channel::<Result<(), String>>();
+        let holder = std::thread::spawn(move || {
+            let _held = gate.acquire(8);
+            pool.install(move || {
+                inside_tx.send(()).expect("the test is listening");
+                injected_rx.recv().expect("the build injects its commit");
+                rayon::yield_now()
+            })
+        });
+        // The worker is busy inside the holder's work; then the build's fork:
+        // one commit job, injected into the pool.
+        inside_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the holder's work is on the worker");
+        pool.spawn(move || {
+            let asked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(gate.acquire(4))));
+            let _ = out_tx.send(asked.map_err(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            }));
+        });
+        injected_tx.send(()).expect("the holder is waiting");
+        let asked = out_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("parked: the commit waits under the holder's frame (the deadlock)");
+        let why = asked.expect_err("a rayon worker's wait on the gate is refused");
+        assert!(
+            why.contains("a rayon worker waits on a VRAM gate (acquire)"),
+            "{why}"
+        );
+        assert_eq!(
+            holder.join().expect("the holder finishes"),
+            Some(rayon::Yield::Executed),
+            "the worker ran the commit inside the holder's work"
+        );
+    }
+
+    /// ★ THE NEW SHAPE: the build takes its window's bytes on its own thread
+    /// before it forks. It waits there, the worker inside the holder finds no
+    /// job to run, the holder finishes and drops its bytes, and the build
+    /// forks with its bytes held: nothing in the fork asks the gate.
+    #[test]
+    fn a_window_admitted_before_its_fork_waits_on_its_own_thread_and_completes() {
+        let gate: &'static VramGate = Box::leak(Box::new(VramGate::new(10)));
+        let pool: &'static rayon::ThreadPool = Box::leak(Box::new(one_worker()));
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = gate.acquire(8);
+            held_tx.send(()).expect("the test is listening");
+            pool.install(move || {
+                go_rx.recv().expect("the build is on its way to the gate");
+                // Room for the build to reach its wait; the outcome is the
+                // same whether it has or not, since nothing is forked yet.
+                std::thread::sleep(Duration::from_millis(50));
+                rayon::yield_now()
+            })
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the holder holds");
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        let build = std::thread::spawn(move || {
+            let _window = gate.acquire(4);
+            let commits: usize = pool.install(|| {
+                use rayon::prelude::*;
+                (0..4usize).into_par_iter().map(|_| 1).sum()
+            });
+            let _ = done_tx.send(commits);
+        });
+        go_tx.send(()).expect("the holder is waiting");
+        assert_eq!(
+            holder.join().expect("the holder finishes"),
+            Some(rayon::Yield::Idle),
+            "the worker found no commit to run inside the holder's work"
+        );
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the build completes once the holder is done"),
+            4
+        );
+        build.join().expect("the build finishes");
+        assert_eq!(*gate.used.lock().unwrap(), 0, "every byte given back");
     }
 }
 
@@ -2850,6 +2993,9 @@ pub struct SharedVramPermit {
 /// [`IsStarkProver::multi_prove`] (an artifact commit), waiting until they fit
 /// beside what the proofs in flight hold. `None` when the shared gate is off:
 /// the caller then keeps its own exclusion.
+///
+/// ⛔ Call it on the thread that forks the work, before the fork, never from
+/// inside a parallel iterator ([`refuse_rayon_wait`]).
 pub fn shared_vram_admit(bytes: u64) -> Option<SharedVramPermit> {
     shared_vram_gate_on().then(|| SharedVramPermit {
         _permit: shared_vram_gate(device_vram_budget()).acquire(bytes),
