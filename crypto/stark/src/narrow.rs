@@ -131,10 +131,10 @@ impl NarrowMain {
         })
     }
 
-    /// The rows, the column widths and the packed bytes, for a store that
-    /// keeps the bytes elsewhere ([`crate::spill`]); [`Self::from_parts`] puts
-    /// them back together.
-    pub(crate) fn into_parts(self) -> (usize, Vec<u8>, Vec<u8>) {
+    /// The rows, the column widths and the packed bytes, for a holder of
+    /// another type with this layout (`multilinear::narrow::NarrowColumns`);
+    /// [`Self::from_parts`] puts them back together.
+    pub fn into_parts(self) -> (usize, Vec<u8>, Vec<u8>) {
         (self.rows, self.widths, self.data)
     }
 
@@ -354,6 +354,246 @@ fn rewiden(bytes: &[u8], from: u8, to: u8, rows: usize) -> Vec<u8> {
     out
 }
 
+/// A [`NarrowMain`] written a cell at a time straight into its packed columns,
+/// so a generator never holds a 64-bit trace, not even a block of one.
+///
+/// The caller picks each column's width up front: a guess, such as the widths
+/// the table's earlier traces needed. The writer stores each word's low bytes
+/// at its column's width and keeps the OR of every word written to each
+/// column, which has the bit length of the column's largest word. When every
+/// word fit, [`Self::finish`] gives the [`NarrowMain::pack`] of the same words,
+/// byte for byte: a column given more bytes than it needed is narrowed in
+/// place. When a word did not fit, the bytes written are not the trace, and
+/// `finish` returns the widths the trace needs instead, for the caller to write
+/// it again at those (which cannot miss: they hold every word written).
+///
+/// Cells never written are zero. A cell written twice keeps its last word, but
+/// both words count toward its column's width: writers set each cell once.
+pub struct NarrowWriter {
+    rows: usize,
+    columns: Vec<WriterColumn>,
+    data: Vec<u8>,
+}
+
+/// A [`NarrowWriter`] column: where it starts in the data, its width, and the
+/// OR of every word written to it.
+#[derive(Clone, Copy)]
+struct WriterColumn {
+    offset: usize,
+    width: usize,
+    seen: u64,
+}
+
+/// The fewest bytes of 1, 2, 4 and 8 that hold `w` bytes.
+fn valid_width(w: u8) -> usize {
+    match w {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        _ => 8,
+    }
+}
+
+impl NarrowWriter {
+    /// A writer for a trace of `rows` rows and `widths.len()` columns, column
+    /// `c` at `widths[c]` bytes (rounded up to 1, 2, 4 or 8).
+    pub fn new(rows: usize, widths: &[u8]) -> Self {
+        let mut columns = Vec::with_capacity(widths.len());
+        let mut total = 0usize;
+        for &w in widths {
+            let width = valid_width(w);
+            columns.push(WriterColumn {
+                offset: total,
+                width,
+                seen: 0,
+            });
+            total += rows * width;
+        }
+        Self {
+            rows,
+            columns,
+            data: vec![0u8; total],
+        }
+    }
+
+    /// Rows of the trace.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Columns of the trace.
+    pub fn cols(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Write `word` into row `row` of column `col`: its low bytes, at the
+    /// column's width (see [`NarrowWriter`] for a word that does not fit).
+    #[inline]
+    pub fn set(&mut self, row: usize, col: usize, word: u64) {
+        debug_assert!(row < self.rows, "NarrowWriter: row {row} of {}", self.rows);
+        let column = &mut self.columns[col];
+        column.seen |= word;
+        let (width, at) = (column.width, column.offset + row * column.width);
+        match width {
+            1 => self.data[at] = word as u8,
+            2 => self.data[at..at + 2].copy_from_slice(&(word as u16).to_le_bytes()),
+            4 => self.data[at..at + 4].copy_from_slice(&(word as u32).to_le_bytes()),
+            _ => self.data[at..at + 8].copy_from_slice(&word.to_le_bytes()),
+        }
+    }
+
+    /// The widths the words written so far need: what [`Self::finish`] gives
+    /// the trace when they all fit.
+    pub fn needed_widths(&self) -> Vec<u8> {
+        self.columns.iter().map(|c| width_of(c.seen)).collect()
+    }
+
+    /// The widths the columns are written at.
+    pub fn widths(&self) -> Vec<u8> {
+        self.columns.iter().map(|c| c.width as u8).collect()
+    }
+
+    /// The packed trace, every column narrowed to the bytes its words need; or,
+    /// when a word did not fit its column, `Err` with the widths the trace
+    /// needs (each at least the width given, for a column that missed).
+    pub fn finish(self) -> Result<NarrowMain, Vec<u8>> {
+        let need = self.needed_widths();
+        if need
+            .iter()
+            .zip(&self.columns)
+            .any(|(&n, c)| n as usize > c.width)
+        {
+            return Err(need);
+        }
+        let Self {
+            rows,
+            columns,
+            mut data,
+        } = self;
+        // Columns move only toward the front and only narrow, so moving them
+        // in order never overwrites a byte not yet moved.
+        let mut offsets = Vec::with_capacity(columns.len());
+        let mut at = 0usize;
+        for (&n, c) in need.iter().zip(&columns) {
+            let n = n as usize;
+            offsets.push(at);
+            if at != c.offset || n != c.width {
+                move_column(&mut data, rows, c.offset, c.width, at, n);
+            }
+            at += rows * n;
+        }
+        if at != data.len() {
+            data.truncate(at);
+            data.shrink_to_fit();
+        }
+        let narrow = NarrowMain {
+            rows,
+            widths: need,
+            offsets,
+            data,
+        };
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            narrow.widths,
+            (0..narrow.cols())
+                .map(|c| width_of(narrow.column(c).into_iter().fold(0, |m, v| m | v)))
+                .collect::<Vec<_>>(),
+            "NarrowWriter: a column's width is not its largest word's (a cell written twice?)"
+        );
+        #[cfg(any(test, feature = "test-utils"))]
+        let narrow = mutation::apply(narrow);
+        Ok(narrow)
+    }
+}
+
+/// Move a column of `rows` cells at `from` (`w` bytes each) to `to` (`n` bytes
+/// each, `n <= w`), keeping each cell's low `n` bytes. `to <= from`, so the
+/// cells are moved front to back.
+fn move_column(data: &mut [u8], rows: usize, from: usize, w: usize, to: usize, n: usize) {
+    debug_assert!(to <= from && n <= w);
+    if n == w {
+        data.copy_within(from..from + rows * w, to);
+        return;
+    }
+    fn narrow<const W: usize, const N: usize>(
+        data: &mut [u8],
+        rows: usize,
+        from: usize,
+        to: usize,
+    ) {
+        for r in 0..rows {
+            let mut cell = [0u8; W];
+            cell.copy_from_slice(&data[from + r * W..from + (r + 1) * W]);
+            data[to + r * N..to + (r + 1) * N].copy_from_slice(&cell[..N]);
+        }
+    }
+    match (w, n) {
+        (2, 1) => narrow::<2, 1>(data, rows, from, to),
+        (4, 1) => narrow::<4, 1>(data, rows, from, to),
+        (4, 2) => narrow::<4, 2>(data, rows, from, to),
+        (8, 1) => narrow::<8, 1>(data, rows, from, to),
+        (8, 2) => narrow::<8, 2>(data, rows, from, to),
+        _ => narrow::<8, 4>(data, rows, from, to),
+    }
+}
+
+/// Test-only faults in [`NarrowWriter::finish`]'s output, per thread: one
+/// column given a byte more than it needs, or one column's bytes shifted by a
+/// byte. The gates that compare a written trace with the packed 64-bit one
+/// must catch both.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mutation {
+    use super::NarrowMain;
+    use std::cell::Cell;
+
+    /// A fault [`set`] arms.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Mutation {
+        /// Column `c` at the next width up (a 1-byte column at 2 bytes): the
+        /// words are the same, the bytes are not.
+        WidenColumn(usize),
+        /// Column `c`'s bytes rotated by one: a column read one byte off.
+        ShiftColumn(usize),
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<Mutation>> = const { Cell::new(None) };
+    }
+
+    /// Arm (or with `None`, disarm) a fault for every trace this thread's
+    /// writers finish.
+    pub fn set(m: Option<Mutation>) {
+        ARMED.with(|a| a.set(m));
+    }
+
+    pub(super) fn apply(narrow: NarrowMain) -> NarrowMain {
+        let Some(m) = ARMED.with(Cell::get) else {
+            return narrow;
+        };
+        let cols = narrow.cols();
+        match m {
+            Mutation::WidenColumn(c) if c < cols && narrow.widths[c] < 8 => {
+                let mut widths = narrow.widths.clone();
+                widths[c] *= 2;
+                let mut data = Vec::new();
+                for (k, &w) in widths.iter().enumerate() {
+                    for v in narrow.column(k) {
+                        data.extend_from_slice(&v.to_le_bytes()[..w as usize]);
+                    }
+                }
+                NarrowMain::from_parts(narrow.rows, widths, data).unwrap_or(narrow)
+            }
+            Mutation::ShiftColumn(c) if c < cols && narrow.rows > 1 => {
+                let mut narrow = narrow;
+                let (off, len) = (narrow.offsets[c], narrow.rows * narrow.widths[c] as usize);
+                narrow.data[off..off + len].rotate_left(1);
+                narrow
+            }
+            _ => narrow,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +704,145 @@ mod tests {
         }
         let fewer = NarrowMain::pack(&words[..999 * cols], cols);
         assert_ne!(fewer.digest(), narrow.digest());
+    }
+
+    /// Words with every column width, some cells never written (rows past
+    /// `written`): column c tops out at a different byte boundary, in a row
+    /// that is not the first.
+    fn words_for_the_writer(rows: usize, written: usize) -> (Vec<u64>, usize) {
+        let tops = [
+            0u64,
+            1,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u64::MAX,
+        ];
+        let cols = tops.len();
+        let words = (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                if r >= written {
+                    0
+                } else if r == written / 2 {
+                    tops[c]
+                } else {
+                    (r as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % (tops[c] / 2 + 1)
+                }
+            })
+            .collect();
+        (words, cols)
+    }
+
+    /// Write `words` (row-major, `cols` wide) into a writer at `widths`, in
+    /// row order or column by column from the last row.
+    fn write(words: &[u64], cols: usize, widths: &[u8], scrambled: bool) -> NarrowWriter {
+        let rows = words.len() / cols;
+        let mut w = NarrowWriter::new(rows, widths);
+        let mut cell = |r: usize, c: usize| {
+            if words[r * cols + c] != 0 {
+                w.set(r, c, words[r * cols + c]);
+            }
+        };
+        if scrambled {
+            for c in 0..cols {
+                for r in (0..rows).rev() {
+                    cell(r, c);
+                }
+            }
+        } else {
+            for r in 0..rows {
+                for c in 0..cols {
+                    cell(r, c);
+                }
+            }
+        }
+        w
+    }
+
+    /// ★ Written a cell at a time — at the widths the columns need, at more
+    /// bytes than they need (each column narrowed in place, every width pair),
+    /// at a mix, in any order, with cells never written — the trace finishes
+    /// to the bytes [`NarrowMain::pack`] gives it. At fewer bytes than a column
+    /// needs it does not finish: it names the widths, and written again at
+    /// those it finishes to the same bytes.
+    #[test]
+    fn a_trace_written_cell_by_cell_packs_as_a_whole() {
+        let rows = 3 * PACK_BLOCK_ROWS + 5;
+        let (words, cols) = words_for_the_writer(rows, rows - 7);
+        let whole = NarrowMain::pack(&words, cols);
+        assert_eq!(whole.widths(), &[1, 1, 1, 2, 2, 4, 4, 8, 8]);
+        let exact = whole.widths().to_vec();
+        let mixed: Vec<u8> = exact
+            .iter()
+            .enumerate()
+            .map(|(c, &w)| if c % 2 == 0 { 8 } else { w })
+            .collect();
+        let at_least = |floor: u8| exact.iter().map(|&w| w.max(floor)).collect::<Vec<u8>>();
+        for widths in [at_least(1), at_least(2), at_least(4), at_least(8), mixed] {
+            for scrambled in [false, true] {
+                let written = write(&words, cols, &widths, scrambled);
+                assert_eq!(written.needed_widths(), exact);
+                assert_eq!(
+                    written.finish().ok(),
+                    Some(whole.clone()),
+                    "{widths:?}, scrambled {scrambled}"
+                );
+            }
+        }
+        // Too narrow for every column past the first three: refused with the
+        // widths, then written at those.
+        let missed = write(&words, cols, &[1; 9], false).finish();
+        assert_eq!(missed.as_ref().err(), Some(&exact));
+        let again = write(&words, cols, &missed.unwrap_err(), true);
+        assert_eq!(again.finish().ok(), Some(whole));
+    }
+
+    /// A widths list that is not 1, 2, 4 or 8 is rounded up; a trace never
+    /// written, of no rows or of no columns, finishes empty.
+    #[test]
+    fn the_writer_rounds_widths_up_and_finishes_empty_traces() {
+        let w = NarrowWriter::new(10, &[0, 3, 5, 9]);
+        assert_eq!(w.widths(), [1, 4, 8, 8]);
+        assert_eq!(w.finish().ok(), Some(NarrowMain::pack(&[0; 40], 4)));
+        assert_eq!(
+            NarrowWriter::new(0, &[2, 4]).finish().ok(),
+            Some(NarrowMain::pack(&[], 2))
+        );
+        assert_eq!(
+            NarrowWriter::new(5, &[]).finish().ok(),
+            NarrowMain::from_parts(5, Vec::new(), Vec::new())
+        );
+    }
+
+    /// The test faults change the bytes: a column one width up widens to the
+    /// same words, a shifted column does not.
+    #[test]
+    fn the_writer_faults_change_the_bytes() {
+        let rows = 100;
+        let (words, cols) = words_for_the_writer(rows, rows);
+        let whole = NarrowMain::pack(&words, cols);
+        for (m, same_words) in [
+            (mutation::Mutation::WidenColumn(3), true),
+            (mutation::Mutation::ShiftColumn(5), false),
+        ] {
+            mutation::set(Some(m));
+            let bent = write(&words, cols, whole.widths(), false).finish();
+            mutation::set(None);
+            let bent = bent.expect("the words fit");
+            assert_ne!(bent, whole, "{m:?}");
+            assert_ne!(bent.digest(), whole.digest(), "{m:?}");
+            let mut back = vec![0u64; words.len()];
+            bent.widen_into(&mut back);
+            assert_eq!(back == words, same_words, "{m:?}");
+        }
+        assert_eq!(
+            write(&words, cols, whole.widths(), false).finish().ok(),
+            Some(whole)
+        );
     }
 
     /// An empty trace packs to nothing and widens to nothing.
