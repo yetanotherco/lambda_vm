@@ -97,6 +97,15 @@ impl CommitDeviceSet {
             .saturating_add(self.tree_bytes)
             .saturating_add(self.scratch_bytes)
     }
+
+    /// What the commit leaves on the device once it returns with its LDE kept
+    /// (`Retain`): the LDE, plus the snapshot and the tree when it kept them.
+    /// The scratch is gone by then.
+    pub const fn resident(&self, snapshot: bool, tree: bool) -> u64 {
+        self.lde_bytes
+            .saturating_add(if snapshot { self.snapshot_bytes } else { 0 })
+            .saturating_add(if tree { self.tree_bytes } else { 0 })
+    }
 }
 
 /// Size one fused commit's device set. `base_cols` counts BASE-FIELD columns:
