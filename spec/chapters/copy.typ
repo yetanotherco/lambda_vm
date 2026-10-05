@@ -1,4 +1,4 @@
-#import "/meta.typ": aside, et
+#import "/meta.typ": aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -16,7 +16,7 @@
 
 The #copy chip copies a range of bytes from one location to another.
 This single chip serves the standard `C` memory functions `memcpy`, `memmove` and 
-(a variation to#footnote[See @reading-parameters]) `memset`, as well as the `write` sycall.
+(a variation to#footnote[See @reading-parameters]) `memset`, as well as the `write` syscall.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -64,7 +64,7 @@ as enforced by @copy:c:one_hot.
 Each of the three chip states corresponds to a syscall number: $-30$ for `memmove`/`memcpy`, $-31$ for `memset`, and $64$ to `write`.#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
 The chip is to accept `ECALL`s with all three of these numbers.
 Rather than having a separate interactions for each, this chip leverages the 
-prover-hinted `is_commit` and `is_set` flags to extract the correct syscall number from the bus:
+prover-hinted `is_write` and `is_set` flags to extract the correct syscall number from the bus:
 
 #render_constraint_table(chip, config, groups: "ecall")
 
@@ -74,13 +74,13 @@ ensuring this flag is only set on the first row of a copy sequence.
 == Reading parameters <reading-parameters>
 
 Each of the four operations accepts three input parameters, and produces one return value.
-The `mem*` operations, have the following interfaces:
+The `mem*` operations have the following interfaces:
 ```cpp
 void* memcpy(  void* dest, const void* src, std::size_t count );
 void* memmove( void* dest, const void* src, std::size_t count );		
 void* memset(  void* dest,          int ch, std::size_t count );
 ```
-To deal with only a single interface, it was decided to have this accelerator only provide support for repeating a selection of eight bytes over a desired length `count`, rather than supporting `memset` proper. 
+To deal with only a single interface, this accelerator only provides support for repeating a selection of eight bytes over a desired length `count`, rather than supporting `memset` proper. 
 The implementation of `memset(dest, ch, count)` can then consist of writing `ch`
 for the first $min(8, #`count`)$ bytes, and invoking this ECALL if needed.
 
@@ -89,15 +89,15 @@ Having settled on the interface for the `mem*` operations, we turn our attention
 ssize_t write(size_t count; int fd, const void buf[count], size_t count);
 ```
 To invoke the `write` syscall, one should call `ECALL` with the appropriate syscall number after writing the file descriptor `fd` to `A0` (= `x10`), filling `A1` (= `x11`) with the address of `buf`'s first byte, and making `A2` (= `x12`) contain `count`.
-Once the syscall returns, `A0` stores the number of bytes that was _actually_ written to the `fd` during the syscall.
+Once the syscall returns, `A0` stores the number of bytes that were written to the `fd` during the syscall.
 
 Given that this syscall already exists, its interface is fixed and should not be modified: the other operations have to be mapped onto it.
 To this end, we require the parameters of the function to be stored in order in `A0`-`A2` before requesting the `ECALL`; this chip ensures the return value is stored in `A0` before handing control back to the `CPU`.
 
 With all four operations now supplying a `src` and `count` in the same parameter position, reading them from `x11` and `x12` is easily achieved by means of @copy:c:read_src and @copy:c:read_count.
 The destination address is found in `x10` for the `mem*` operations; for `write` it is not provided. 
-To ensure `write` does not overwrite previously written values, register `x254` (initialized at 0),
-it used to keep track of the number of bytes previously written.
+To ensure `write` does not overwrite previously written values, register `x254` (initialized to 0),
+is used to keep track of the number of bytes previously written.
 The value in this register can thus act as the starting point for the `write`-sequence, 
 as long as it is appropriately updated with each `write` syscall.
 Hence, @copy:c:read_dst reads `dst` from either `x10` or `x254` depending on `is_write`,
@@ -112,7 +112,7 @@ Since this chip will always perfectly execute a `write`, this constraint moreove
 
 #render_constraint_table(chip, config, groups: "read_input")
 
-Note: constraints @copy:c:range_dst_res is included to satisfy assumptions made 
+Note: @copy:c:range_dst_res is included to satisfy assumptions made 
 by the `ADD` template.
 
 
@@ -122,7 +122,7 @@ Rather than performing the full copy in a single row, this chip splits each oper
 in "chunks", with each row in the table representing one such chunk.
 Each row copies `step` bytes (which is either $1$ or $8$) from the source to
 the destination.
-Note that by this model, a copy operation on $x$ bytes can represented using 
+Note that by this model, a copy operation on $x$ bytes can be represented using 
 $floor.l x / 8 floor.r + x mod 8$ rows.
 #footnote[
   The prover is free to select the `step` of each row; an $x$-byte copy could
@@ -141,7 +141,7 @@ instead of reading this information from the registers as is done on `first`-row
 
 #render_constraint_table(chip, config, groups: "forward")
 
-Note: constraints @copy:c:range_src_incr and @copy:c:range_dst_incr are included to satisfy assumptions made by the `ADD` template;  @copy:c:range_count_decr satisfies the assumption made by the `SUB` template in (which is inlined through @copy:c:count_borrows).
+Note: constraints @copy:c:range_src_incr and @copy:c:range_dst_incr are included to satisfy assumptions made by the `ADD` template; @copy:c:range_count_decr satisfies the assumption made by the `SUB` template (which is inlined through @copy:c:count_borrows).
 
 == Terminating the recursion
 
@@ -160,18 +160,18 @@ The statement $#`end` arrow.double.l.r #`count`=#`step` or (#`count` = 0 and #`f
 where the first implication is captured by constraints
 @copy:c:end_implies_count_is_step_or_zc_lower and
 @copy:c:end_implies_count_is_step_or_zc_upper, and
-the second by @copy:c:borrow_implies_end.
-Note that the third implication is already captured indirectly by @copy:c:borrow_implies_first: not setting the flag in this case will lead to a new row with $#`first` = 0$ being introduced (by @copy:c:send_next_chunk) which is guaranteed to have $#`count_borrows[1]` = 1$, thus violating this constraint.
+the third by @copy:c:borrow_implies_end.
+Note that the second implication is already captured indirectly by @copy:c:borrow_implies_first: not setting the flag in this case will lead to a new row with $#`first` = 0$ being introduced (by @copy:c:send_next_chunk) which is guaranteed to have $#`count_borrows[1]` = 1$, thus violating this constraint.
 
 #render_constraint_table(chip, config, groups: "restrict_end")
 
 == Performing the move
 Constraints @copy:c:read_value and @copy:c:write_value respectively read and write
 `value` from/to memory.
-Whether eight or just 8 byte is copied, is determined by the prover-hinted `single` flag.
+Whether eight or just one byte is copied, is determined by the prover-hinted `single` flag.
 When set, the top seven bytes in `value` are fixed at zero (@copy:c:single_lanes).
 
-For most copy operations, the value is read at $#`timestamp` + 1$ and written at $#`timestamp` + 2$.
+For most copy operations, the value is read at $#`timestamp`$ and written at $#`timestamp` + 1$.
 The exception to this rule, are `memset` operations, performing the write before the read instead.
 While this behaviour may seem counterintuitive, this inverse timing technique
 ensures the same eight bytes are repeated across the requested memory domain.
@@ -183,10 +183,11 @@ which is enforced by @copy:c:set_gap.
 
 
 == Bits
-Lastly, both `first` and `end` must be bits, and both must imply $#`μ` = 1$ to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
-Note that $#`μ` - #`count_borrows[i]`$ is always binary, since $#`count_borrows[1]` => #`μ` = 1$ indirectly holds
+Lastly, `Bit` variables must be bits, and both `first` and `end` must imply $#`μ` = 1$ to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
+Note that $#`μ` - #`count_borrows[1]`$ is always binary, since $#`count_borrows[1]` => #`μ` = 1$ indirectly holds
 via @copy:c:borrow_implies_first.
-#render_constraint_table(chip, config, groups: "bits")
+Additionally, we should make sure that `is_set` and `is_write` do not occur on padding rows, and that `first_write` is correctly defined.
+#render_constraint_table(chip, config, groups: ("bits", "functionality"))
 
 = Padding
 To pad this chip, use the below data.

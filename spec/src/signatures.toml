@@ -118,7 +118,7 @@ tag = "ECALL"
 kind = "interaction"
 input = ["Word", "DWordWL"]
 
-# COPY_NEXT[timestamp, src, dst, count, is_set, is_commit]
+# COPY_NEXT[timestamp, src, dst, count, is_set, is_write]
 [[signatures]]
 tag = "COPY_NEXT"
 kind = "interaction"
