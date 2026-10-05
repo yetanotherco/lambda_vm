@@ -1035,6 +1035,24 @@ struct VramPermit<'a> {
     bytes: u64,
 }
 
+/// ⛔ A gate's waits never run on a rayon worker: a worker waiting in a
+/// prove's join runs other queued jobs on its own stack, and one parked here
+/// on bytes held by the prove whose frame sits beneath it can never get them.
+/// The callers make this unreachable (every wait is on a plain thread: the
+/// admission driver's, an artifact build's before its fork, a tree node's), so
+/// the check is for tests, as on #1013 (60bbf532f): a debug assertion, never a
+/// production panic.
+fn refuse_rayon_wait(wait: &str) {
+    #[cfg(feature = "parallel")]
+    debug_assert!(
+        rayon::current_thread_index().is_none(),
+        "a rayon worker waits on a VRAM gate ({wait}): a job it runs while a holder's \
+         frame waits beneath it can park it on bytes that holder keeps"
+    );
+    #[cfg(not(feature = "parallel"))]
+    let _ = wait;
+}
+
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
@@ -1074,11 +1092,7 @@ impl VramGate {
     /// Claim (`held`, `headroom`) for a prove that will carry resident bytes,
     /// waiting until it fits beside the claims in force ([`ClaimBook::fits`]).
     fn claim(&self, held: u64, headroom: u64) -> ResidentClaim<'_> {
-        #[cfg(feature = "parallel")]
-        assert!(
-            rayon::current_thread_index().is_none(),
-            "a VRAM claim blocks on a rayon worker: claim from a plain thread"
-        );
+        refuse_rayon_wait("a claim");
         let mut claims = self.claims.lock().unwrap();
         while !claims.fits(held, headroom, self.budget.load(Ordering::Relaxed)) {
             claims = self.claim_room.wait(claims).unwrap();
@@ -1106,14 +1120,7 @@ impl VramGate {
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
-        // ⛔ Never on a rayon worker: a worker parked here could be the one a
-        // table's own parallel work (beneath it on this stack, or queued
-        // behind it) needs to finish and free the very bytes it waits for.
-        #[cfg(feature = "parallel")]
-        assert!(
-            rayon::current_thread_index().is_none(),
-            "a VRAM admission blocks on a rayon worker: admit from a plain thread"
-        );
+        refuse_rayon_wait("an admission");
         let mut used = self.used.lock().unwrap();
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget.load(Ordering::Relaxed) {
@@ -1128,11 +1135,7 @@ impl VramGate {
     /// The whole gate: wait until nothing is admitted, then hold every byte of
     /// it (whatever the budget, even an unbounded one) until the permit drops.
     fn acquire_whole(&self) -> VramPermit<'_> {
-        #[cfg(feature = "parallel")]
-        assert!(
-            rayon::current_thread_index().is_none(),
-            "a VRAM admission blocks on a rayon worker: admit from a plain thread"
-        );
+        refuse_rayon_wait("the whole gate");
         let mut used = self.used.lock().unwrap();
         while *used != 0 {
             used = self.freed.wait(used).unwrap();
@@ -6583,8 +6586,9 @@ mod shared_vram_gate_tests {
     }
 
     /// ★ The admission refuses a rayon worker: a blocking wait there can starve
-    /// the parallel work that would free the bytes it waits for.
-    #[cfg(feature = "parallel")]
+    /// the parallel work that would free the bytes it waits for. (A debug
+    /// assertion: the test runs where it is compiled in.)
+    #[cfg(all(feature = "parallel", debug_assertions))]
     #[test]
     fn the_shared_admission_refuses_a_rayon_worker() {
         let _serial = super::SHARED_GATE_PIN_LOCK
