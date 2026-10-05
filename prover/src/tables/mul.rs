@@ -35,6 +35,7 @@ use stark::trace::TraceTable;
 
 use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{
     BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
@@ -291,6 +292,17 @@ impl MulOperation {
 pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_mul_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths MUL traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_mul_trace`] in `form` (`tables::gpack`).
+pub fn generate_mul_trace_as(
+    operations: &[(MulOperation, bool)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
     let mut op_map: OpMap<MulOperation, MulMultiplicities> = OpMap::with_hasher(trace_hash_state());
 
@@ -305,48 +317,41 @@ pub fn generate_mul_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
+            // Compute product
+            let (lo, hi) = op.compute_product();
 
-    for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        // Compute product
-        let (lo, hi) = op.compute_product();
+            // Fill lhs as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::LHS_0, op.lhs);
+            table.set_bool(row_idx, cols::LHS_SIGNED, op.lhs_signed);
 
-        // Fill lhs as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::LHS_0, op.lhs);
-        table.set_bool(row_idx, cols::LHS_SIGNED, op.lhs_signed);
+            // Fill rhs as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::RHS_0, op.rhs);
+            table.set_bool(row_idx, cols::RHS_SIGNED, op.rhs_signed);
 
-        // Fill rhs as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::RHS_0, op.rhs);
-        table.set_bool(row_idx, cols::RHS_SIGNED, op.rhs_signed);
+            // Fill lo as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::LO_0, lo);
 
-        // Fill lo as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::LO_0, lo);
+            // Fill hi as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::HI_0, hi);
 
-        // Fill hi as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::HI_0, hi);
+            // Fill auxiliary columns
+            table.set_bool(row_idx, cols::LHS_IS_NEGATIVE, op.lhs_is_negative());
+            table.set_bool(row_idx, cols::RHS_IS_NEGATIVE, op.rhs_is_negative());
 
-        // Fill auxiliary columns
-        table.set_bool(row_idx, cols::LHS_IS_NEGATIVE, op.lhs_is_negative());
-        table.set_bool(row_idx, cols::RHS_IS_NEGATIVE, op.rhs_is_negative());
+            // Fill raw_product columns
+            let raw = op.compute_raw_products();
+            table.set_u64(row_idx, cols::RAW_PRODUCT_0, raw[0]);
+            table.set_u64(row_idx, cols::RAW_PRODUCT_1, raw[1]);
+            table.set_u64(row_idx, cols::RAW_PRODUCT_2, raw[2]);
+            table.set_u64(row_idx, cols::RAW_PRODUCT_3, raw[3]);
 
-        // Fill raw_product columns
-        let raw = op.compute_raw_products();
-        table.set_u64(row_idx, cols::RAW_PRODUCT_0, raw[0]);
-        table.set_u64(row_idx, cols::RAW_PRODUCT_1, raw[1]);
-        table.set_u64(row_idx, cols::RAW_PRODUCT_2, raw[2]);
-        table.set_u64(row_idx, cols::RAW_PRODUCT_3, raw[3]);
-
-        // Fill multiplicities (ALU bus, lo/hi)
-        table.set_u64(row_idx, cols::MU_LO, multiplicities.mu_lo);
-        table.set_u64(row_idx, cols::MU_HI, multiplicities.mu_hi);
-    }
-
-    trace
+            // Fill multiplicities (ALU bus, lo/hi)
+            table.set_u64(row_idx, cols::MU_LO, multiplicities.mu_lo);
+            table.set_u64(row_idx, cols::MU_HI, multiplicities.mu_hi);
+        }
+    })
 }
 
 // =========================================================================

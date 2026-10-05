@@ -63,6 +63,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         finish_keccak_rnd_chunks: true,
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
+        gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
     }
 }
@@ -616,6 +617,63 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
                 };
                 assert_eq!(bytes(&before), bytes(&after), "{what}: the proof");
             }
+        }
+    }
+}
+
+/// ★ G-pack (BlockOptions::gpack: the streamed chunks written packed and laid
+/// out narrow, the finish's tables written packed) moves no byte: the same
+/// partition, tables and statement as without it, inline and on the worker
+/// layout, every streamed kind past its first chunk written packed, and the
+/// proof bytes equal under the deterministic grind.
+#[test]
+fn gpack_moves_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    for workers in [0usize, 3] {
+        let proved = |gpack: bool| {
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = workers;
+            o.gpack = gpack;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+            )
+            .expect("prove");
+            assert!(
+                verify(&proof, &elf, &format),
+                "gpack {gpack}, {workers} workers"
+            );
+            (proof, stamps)
+        };
+        let (before, before_stamps) = proved(false);
+        let (after, stamps) = proved(true);
+        let what = format!("{workers} workers");
+        assert!(!before_stamps.layout.gpack.0, "{what}");
+        let [direct, narrowed, again, _] = stamps.layout.gpack.1;
+        assert!(
+            stamps.layout.gpack.0 && direct + narrowed + again > 0,
+            "{what}: {:?}",
+            stamps.layout.gpack
+        );
+        assert_eq!(before.groups, after.groups, "{what}: the partition");
+        assert_eq!(before.table_num_vars, after.table_num_vars, "{what}");
+        assert_eq!(
+            format!("{:?}", before.table_counts),
+            format!("{:?}", after.table_counts),
+            "{what}"
+        );
+        if crypto::grinding::deterministic() {
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(bytes(&before), bytes(&after), "{what}: the proof");
         }
     }
 }

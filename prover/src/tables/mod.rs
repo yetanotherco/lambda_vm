@@ -21,6 +21,8 @@
 
 pub mod types;
 
+pub mod gpack;
+
 pub mod bitwise;
 pub mod blake3;
 pub mod branch;

@@ -102,6 +102,7 @@ fn small_block_cut(
         finish_keccak_rnd_chunks: true,
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
+        gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
     };
     cut(&mut options);
@@ -556,6 +557,7 @@ fn dense_block_with(
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(1 << 20),
             pack_finished: true,
+            gpack: true,
             spill: crate::block_whir::BlockSpillPolicy::Off,
         },
         deviations,

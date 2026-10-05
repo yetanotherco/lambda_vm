@@ -37,6 +37,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -260,49 +261,53 @@ pub fn generate_keccak_rnd_rows(
     skip: usize,
     rows: usize,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-    for (op_idx, op) in ops.iter().enumerate() {
-        let first = op_idx * 24;
-        if first + 24 <= skip || first >= skip + rows {
-            continue;
-        }
-        if first >= skip && first + 24 <= skip + rows {
-            fill_op(table, op, first - skip);
-        } else {
-            // An op the slice cuts: its 24 rows on the side, the part in range
-            // copied over.
-            let mut scratch = TraceTable::<GoldilocksField, GoldilocksExtension>::new_main(
-                crate::tables::types::zeroed_fe_vec(24 * cols::NUM_COLUMNS),
-                cols::NUM_COLUMNS,
-                1,
-            );
-            fill_op(&mut scratch.main_table, op, 0);
-            for round in 0..24 {
-                let row = first + round;
-                if row >= skip && row < skip + rows {
-                    for col in 0..cols::NUM_COLUMNS {
-                        table.set(row - skip, col, *scratch.main_table.get(round, col));
+    generate_keccak_rnd_rows_as(ops, skip, rows, TraceForm::Wide)
+}
+
+/// The widths KECCAK_RND traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_keccak_rnd_rows`] in `form` (`tables::gpack`).
+pub fn generate_keccak_rnd_rows_as(
+    ops: &[KeccakRoundOperation],
+    skip: usize,
+    rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Padding rows have mu=0 and all zeros (default)
+    generate_main!(form, &WIDTHS, rows, cols::NUM_COLUMNS, |table| {
+        for (op_idx, op) in ops.iter().enumerate() {
+            let first = op_idx * 24;
+            if first + 24 <= skip || first >= skip + rows {
+                continue;
+            }
+            if first >= skip && first + 24 <= skip + rows {
+                fill_op(table, op, first - skip);
+            } else {
+                // An op the slice cuts: its 24 rows on the side, the part in
+                // range copied over.
+                let mut scratch = TraceTable::<GoldilocksField, GoldilocksExtension>::new_main(
+                    crate::tables::types::zeroed_fe_vec(24 * cols::NUM_COLUMNS),
+                    cols::NUM_COLUMNS,
+                    1,
+                );
+                fill_op(&mut scratch.main_table, op, 0);
+                for round in 0..24 {
+                    let row = first + round;
+                    if row >= skip && row < skip + rows {
+                        for col in 0..cols::NUM_COLUMNS {
+                            table.set_fe(row - skip, col, *scratch.main_table.get(round, col));
+                        }
                     }
                 }
             }
         }
-    }
-    // Padding rows have mu=0 and all zeros (default)
-    trace
+    })
 }
 
 /// One op's 24 rows, from row `first_row` on.
 #[allow(clippy::needless_range_loop)]
-fn fill_op(
-    table: &mut stark::table::Table<GoldilocksField>,
-    op: &KeccakRoundOperation,
-    first_row: usize,
-) {
+fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usize) {
     // Execute round-by-round, tracking the state
     let mut state = op.input;
 

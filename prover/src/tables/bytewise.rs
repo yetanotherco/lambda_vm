@@ -19,6 +19,7 @@
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -97,6 +98,17 @@ impl BytewiseOperation {
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_bytewise_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths BYTEWISE traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_bytewise_trace`] in `form` (`tables::gpack`).
+pub fn generate_bytewise_trace_as(
+    operations: &[BytewiseOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use super::trace_hash::{OpMap, trace_hash_state};
 
     let mut op_map: OpMap<BytewiseOperation, u64> = OpMap::with_hasher(trace_hash_state());
@@ -106,24 +118,17 @@ pub fn generate_bytewise_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+            let res = op.compute_res();
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let res = op.compute_res();
-
-        table.set_dword_bl(row_idx, cols::A[0], op.a);
-        table.set_dword_bl(row_idx, cols::B[0], op.b);
-        table.set_dword_bl(row_idx, cols::RES[0], res);
-        table.set_byte(row_idx, cols::OP, op.op);
-        table.set_u64(row_idx, cols::MU, *multiplicity);
-    }
-
-    trace
+            table.set_dword_bl(row_idx, cols::A[0], op.a);
+            table.set_dword_bl(row_idx, cols::B[0], op.b);
+            table.set_dword_bl(row_idx, cols::RES[0], res);
+            table.set_byte(row_idx, cols::OP, op.op);
+            table.set_u64(row_idx, cols::MU, *multiplicity);
+        }
+    })
 }
 
 // =========================================================================

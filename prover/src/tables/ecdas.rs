@@ -14,6 +14,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::tables::ecsm::ecdas_tuple;
 use ecsm::{EcdasStep, P_BYTES};
@@ -92,50 +93,54 @@ fn fe_from_i64(c: i64) -> FE {
 pub fn generate_ecdas_trace(
     ops: &[EcdasOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_ecdas_trace_as(ops, TraceForm::Wide)
+}
+
+/// The widths ECDAS traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_ecdas_trace`] in `form` (`tables::gpack`).
+pub fn generate_ecdas_trace_as(
+    ops: &[EcdasOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in ops.iter().enumerate() {
+            let s = &op.step;
 
-    for (row_idx, op) in ops.iter().enumerate() {
-        let s = &op.step;
-
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-        table.set_bytes(row_idx, cols::XG, &s.x_g);
-        table.set_bytes(row_idx, cols::YG, &s.y_g);
-        table.set_bytes(row_idx, cols::XA, &s.x_a);
-        table.set_bytes(row_idx, cols::YA, &s.y_a);
-        table.set_byte(row_idx, cols::ROUND, s.round);
-        table.set_byte(row_idx, cols::OP, s.op);
-        table.set_bytes(row_idx, cols::XR, &s.x_r);
-        table.set_bytes(row_idx, cols::YR, &s.y_r);
-        table.set_bytes(row_idx, cols::LAMBDA, &s.lambda);
-        table.set_bytes(row_idx, cols::Q0, &s.q0);
-        table.set_bytes(row_idx, cols::Q1, &s.q1);
-        table.set_bytes(row_idx, cols::Q2, &s.q2);
-        for i in 0..64 {
-            debug_assert!((0..1 << 16).contains(&(s.c0[i] + CARRY_OFFSET_LAMBDA)));
-            debug_assert!((0..1 << 16).contains(&(s.c1[i] + CARRY_OFFSET_XR)));
-            debug_assert!((0..1 << 16).contains(&(s.c2[i] + CARRY_OFFSET_YR)));
-            table.set_fe(row_idx, cols::c0(i), fe_from_i64(s.c0[i]));
-            table.set_fe(row_idx, cols::c1(i), fe_from_i64(s.c1[i]));
-            table.set_fe(row_idx, cols::c2(i), fe_from_i64(s.c2[i]));
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_bytes(row_idx, cols::XG, &s.x_g);
+            table.set_bytes(row_idx, cols::YG, &s.y_g);
+            table.set_bytes(row_idx, cols::XA, &s.x_a);
+            table.set_bytes(row_idx, cols::YA, &s.y_a);
+            table.set_byte(row_idx, cols::ROUND, s.round);
+            table.set_byte(row_idx, cols::OP, s.op);
+            table.set_bytes(row_idx, cols::XR, &s.x_r);
+            table.set_bytes(row_idx, cols::YR, &s.y_r);
+            table.set_bytes(row_idx, cols::LAMBDA, &s.lambda);
+            table.set_bytes(row_idx, cols::Q0, &s.q0);
+            table.set_bytes(row_idx, cols::Q1, &s.q1);
+            table.set_bytes(row_idx, cols::Q2, &s.q2);
+            for i in 0..64 {
+                debug_assert!((0..1 << 16).contains(&(s.c0[i] + CARRY_OFFSET_LAMBDA)));
+                debug_assert!((0..1 << 16).contains(&(s.c1[i] + CARRY_OFFSET_XR)));
+                debug_assert!((0..1 << 16).contains(&(s.c2[i] + CARRY_OFFSET_YR)));
+                table.set_fe(row_idx, cols::c0(i), fe_from_i64(s.c0[i]));
+                table.set_fe(row_idx, cols::c1(i), fe_from_i64(s.c1[i]));
+                table.set_fe(row_idx, cols::c2(i), fe_from_i64(s.c2[i]));
+            }
+            table.set_byte(row_idx, cols::NEXT_OP, s.next_op);
+            table.set_fe(row_idx, cols::MU, FE::one());
         }
-        table.set_byte(row_idx, cols::NEXT_OP, s.next_op);
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
 
-    // Padding rows: q0 = q1 = q2 = 0, op = 1 (add), everything else 0. The μ-gated R·P
-    // term vanishes (μ=0), so all convolution relations hold with zero carries.
-    for row_idx in n..num_rows {
-        table.set_byte(row_idx, cols::OP, 1);
-    }
-
-    trace
+        // Padding rows: q0 = q1 = q2 = 0, op = 1 (add), everything else 0. The μ-gated R·P
+        // term vanishes (μ=0), so all convolution relations hold with zero carries.
+        for row_idx in n..num_rows {
+            table.set_byte(row_idx, cols::OP, 1);
+        }
+    })
 }
 
 // =========================================================================

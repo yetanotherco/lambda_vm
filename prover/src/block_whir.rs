@@ -43,6 +43,7 @@ use crate::multilinear_prove::{
     absorb_tagged, chain_config_under, layout_of, preprocessed_mles, shapes_of, stacks,
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
+use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
     ChunkJob, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
 };
@@ -305,6 +306,13 @@ pub struct BlockOptions {
     /// the host. KECCAK, ECSM, ECDAS and an unchunked KECCAK_RND stay wide.
     /// The proof's bytes are the same. Production: on.
     pub pack_finished: bool,
+    /// G-pack (`tables::gpack`): the generators write each table packed as
+    /// they generate it, with no 64-bit copy — every streamed chunk (laid out
+    /// narrow from that, when the groups are held narrow) and, with
+    /// [`Self::pack_finished`], every table the finish packs. The proof's bytes
+    /// are the same. Production: on unless `LAMBDA_VM_BLOCK_GPACK=0` (the A
+    /// arm: built at 8 bytes a cell, then laid out or packed as before).
+    pub gpack: bool,
     /// Whether phase A hands the committed groups' packed tables to a spill
     /// store, which phase B reads back in group order
     /// ([`multilinear_block::BlockSpill`]). The proof's bytes are the same.
@@ -582,9 +590,16 @@ impl BlockOptions {
             finish_keccak_rnd_chunks: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
+            gpack: gpack_from_env(),
             spill: spill_from_env(),
         }
     }
+}
+
+/// `LAMBDA_VM_BLOCK_GPACK`: [`BlockOptions::gpack`]'s production value, on
+/// unless `0`.
+pub(crate) fn gpack_from_env() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_GPACK").is_ok_and(|v| v.trim() == "0")
 }
 
 /// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
@@ -797,6 +812,9 @@ pub struct LayoutStamps {
     /// Each table of the rest in AIR order: its name, when its layout ended
     /// (seconds since the prove started) and its group.
     pub rest_tables: Vec<(String, f64, usize)>,
+    /// G-pack ([`BlockOptions::gpack`]): whether it was on, and its counts
+    /// (`tables::gpack::counts`) at phase A's end.
+    pub gpack: (bool, [usize; 4]),
 }
 
 impl BlockStamps {
@@ -886,6 +904,12 @@ impl BlockStamps {
                 "BLOCK REST PACKED: {} tables laid out narrow from the finish, {:.2} GiB\n",
                 l.packed_rest.0,
                 l.packed_rest.1 as f64 / (1u64 << 30) as f64,
+            ));
+            let (on, [direct, narrowed, again, wide]) = l.gpack;
+            out.push_str(&format!(
+                "BLOCK GPACK: G-pack {}: {direct} written packed, {narrowed} narrowed after, {again} \
+                 written again, {wide} built wide then packed\n",
+                if on { "on" } else { "off" },
             ));
             let tables: Vec<String> = l
                 .rest_tables
@@ -2108,6 +2132,8 @@ pub(crate) fn prove_traces(
 /// set builds them all with the same constructor — and the verifier checks the
 /// result against its own set.
 struct StreamAirs {
+    /// The form the streamed chunks are written in (G-pack, `tables::gpack`).
+    form: TraceForm,
     cpu: crate::VmAir,
     memw_register: crate::VmAir,
     memw_aligned: crate::VmAir,
@@ -2122,9 +2148,10 @@ struct StreamAirs {
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 
 impl StreamAirs {
-    fn new(opts: &ProofOptions) -> Self {
+    fn new(opts: &ProofOptions, form: TraceForm) -> Self {
         use crate::test_utils::*;
         Self {
+            form,
             cpu: Box::new(create_cpu_air(opts)),
             memw_register: Box::new(create_memw_register_air(opts)),
             memw_aligned: Box::new(create_memw_aligned_air(opts)),
@@ -2299,7 +2326,7 @@ fn lay_out_chunk<'a>(
         ledger.laying.fetch_add(ops, Relaxed);
         ops
     });
-    let mut chunk = job.generate();
+    let mut chunk = job.generate_as(airs.form);
     let rows = ledger.map_or(0, |ledger| {
         let rows = memlog::rows_bytes(&chunk.trace);
         ledger.laying.fetch_add(rows, Relaxed);
@@ -2311,7 +2338,13 @@ fn lay_out_chunk<'a>(
         chunk.trace.main_table.width,
         height.trailing_zeros() as usize,
     );
-    let table = table_of(airs.of(chunk.table), &mut chunk.trace, shape, true);
+    // Written packed (G-pack): laid out narrow from its packed columns, with
+    // no transposition.
+    let table = if chunk.trace.narrow_main().is_some() {
+        table_of_narrow(airs.of(chunk.table), &mut chunk.trace, shape)
+    } else {
+        table_of(airs.of(chunk.table), &mut chunk.trace, shape, true)
+    };
     if let Some(ledger) = ledger {
         ledger.laying.fetch_sub(rows, Relaxed);
     }
@@ -2893,7 +2926,15 @@ fn prove_streamed(
     on_group: GroupObserver<'_>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
-    let stream_airs = StreamAirs::new(opts);
+    // G-pack writes the streamed chunks packed when the groups are held
+    // narrow; they are then laid out narrow, as the finish's packed tables.
+    let stream_form = if options.gpack && options.narrow != multilinear_block::Narrowing::Wide {
+        TraceForm::Narrow
+    } else {
+        TraceForm::Wide
+    };
+    gpack::reset_counts();
+    let stream_airs = StreamAirs::new(opts, stream_form);
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
@@ -3010,6 +3051,9 @@ fn prove_streamed(
                 }
                 if options.pack_finished {
                     builder = builder.pack_finished_tables();
+                    if options.gpack {
+                        builder = builder.generate_packed();
+                    }
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
@@ -3316,6 +3360,7 @@ fn prove_streamed(
                         ahead_most,
                         packed_rest,
                         rest_tables,
+                        gpack: (false, [0; 4]),
                     },
                 })
             });
@@ -3361,6 +3406,7 @@ fn prove_streamed(
         stamps.streamed = (windows_done, streamed);
         stamps.prep = laid.busy;
         stamps.layout = laid.layout.clone();
+        stamps.layout.gpack = (options.gpack, gpack::counts());
         stamps.phase_a = start.elapsed().as_secs_f64();
         if let Some(ledger) = ledger {
             ledger.line("phase A end");

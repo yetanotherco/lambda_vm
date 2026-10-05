@@ -65,6 +65,7 @@ use executor::vm::logs::Log;
 use rayon::prelude::*;
 use stark::trace::TraceTable;
 
+use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     CollectedOps, DecodeArtifacts, DecodeTable, MemoryState, MemwBuckets, PreCounted,
@@ -154,6 +155,8 @@ pub struct WindowedTraceBuilder<'a> {
     finish_keccak_rnd_rows: usize,
     /// [`Self::pack_finished_tables`].
     pack_finished: bool,
+    /// [`Self::generate_packed`].
+    gpack: bool,
 }
 
 /// Where a windowed build spent its time, seconds summed over the windows:
@@ -212,6 +215,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             decode,
             finish_keccak_rnd_rows: 0,
             pack_finished: false,
+            gpack: false,
         })
     }
 
@@ -289,6 +293,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// the caller's.
     pub fn pack_finished_tables(mut self) -> Self {
         self.pack_finished = true;
+        self
+    }
+
+    /// With [`Self::pack_finished_tables`], each table `finish` packs is
+    /// written packed as it is generated where its generator can (G-pack,
+    /// [`StreamSkip::gpack`]), instead of built at 8 bytes a cell and packed.
+    /// The bytes are the same.
+    pub fn generate_packed(mut self) -> Self {
+        self.gpack = true;
         self
     }
 
@@ -420,6 +433,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             stream_memw_lt,
             finish_keccak_rnd_rows,
             pack_finished,
+            gpack,
             ..
         } = self;
         // Chunks at the finish alone: none were handed out.
@@ -434,6 +448,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         };
         let emitted = StreamSkip {
             pack: pack_finished,
+            gpack: pack_finished && gpack,
             ..emitted
         };
         let (ops, decode_trace, skip, pre) = match kept {
@@ -1333,17 +1348,24 @@ impl ChunkJob {
     }
 
     pub fn generate(self) -> StreamedChunk {
+        self.generate_as(TraceForm::Wide)
+    }
+
+    /// [`Self::generate`] in `form`: with [`TraceForm::Narrow`], the table
+    /// packed as it is written (G-pack, `tables::gpack`), the bytes
+    /// `TraceTable::pack_main_narrow` gives the 64-bit one.
+    pub fn generate_as(self, form: TraceForm) -> StreamedChunk {
         let trace = match &self.ops {
-            ChunkOps::Cpu(ops) => cpu::generate_cpu_trace(ops),
+            ChunkOps::Cpu(ops) => cpu::generate_cpu_trace_as(ops, form),
             ChunkOps::MemwRegister(ops) => {
-                memw_register::generate_memw_register_trace_from_rows(ops)
+                memw_register::generate_memw_register_trace_from_rows_as(ops, form)
             }
-            ChunkOps::MemwAligned(ops) => memw_aligned::generate_memw_aligned_trace(ops),
-            ChunkOps::Memw(ops) => memw::generate_memw_trace(ops),
-            ChunkOps::Load(ops) => load::generate_load_trace(ops),
-            ChunkOps::Lt(ops) => lt::generate_lt_trace(ops),
-            ChunkOps::Shift(ops) => shift::generate_shift_trace(ops),
-            ChunkOps::Store(ops) => store::generate_store_trace(ops),
+            ChunkOps::MemwAligned(ops) => memw_aligned::generate_memw_aligned_trace_as(ops, form),
+            ChunkOps::Memw(ops) => memw::generate_memw_trace_as(ops, form),
+            ChunkOps::Load(ops) => load::generate_load_trace_as(ops, form),
+            ChunkOps::Lt(ops) => lt::generate_lt_trace_as(ops, form),
+            ChunkOps::Shift(ops) => shift::generate_shift_trace_as(ops, form),
+            ChunkOps::Store(ops) => store::generate_store_trace_as(ops, form),
             ChunkOps::KeccakRnd { ops, skip, rows } => {
                 let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
                     .iter()
@@ -1353,7 +1375,7 @@ impl ChunkJob {
                         output: op.output,
                     })
                     .collect();
-                keccak_rnd::generate_keccak_rnd_rows(&ops, *skip, *rows)
+                keccak_rnd::generate_keccak_rnd_rows_as(&ops, *skip, *rows, form)
             }
         };
         StreamedChunk {

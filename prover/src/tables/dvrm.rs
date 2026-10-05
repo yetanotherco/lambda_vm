@@ -34,6 +34,7 @@ use stark::trace::TraceTable;
 
 use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{
     BusId, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
@@ -283,6 +284,17 @@ impl DvrmOperation {
 pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_dvrm_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths DVRM traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_dvrm_trace`] in `form` (`tables::gpack`).
+pub fn generate_dvrm_trace_as(
+    operations: &[(DvrmOperation, bool)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
     let mut op_map: OpMap<DvrmOperation, DvrmMultiplicities> =
         OpMap::with_hasher(trace_hash_state());
@@ -298,56 +310,49 @@ pub fn generate_dvrm_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
+            let q = op.compute_quotient();
+            let r = op.compute_remainder();
+            let n_sub_r = op.n_sub_r();
+            let abs_r = op.abs_r();
+            let abs_d = op.abs_d();
 
-    for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        let q = op.compute_quotient();
-        let r = op.compute_remainder();
-        let n_sub_r = op.n_sub_r();
-        let abs_r = op.abs_r();
-        let abs_d = op.abs_d();
+            // Fill n as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::N_0, op.n);
 
-        // Fill n as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::N_0, op.n);
+            // Fill d as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::D_0, op.d);
 
-        // Fill d as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::D_0, op.d);
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
 
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
+            // Fill q as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::Q_0, q);
 
-        // Fill q as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::Q_0, q);
+            // Fill r as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::R_0, r);
 
-        // Fill r as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::R_0, r);
+            // Fill auxiliary columns
+            table.set_bool(row_idx, cols::DIV_BY_ZERO, op.is_div_by_zero());
+            table.set_bool(row_idx, cols::OVERFLOW, op.is_overflow());
 
-        // Fill auxiliary columns
-        table.set_bool(row_idx, cols::DIV_BY_ZERO, op.is_div_by_zero());
-        table.set_bool(row_idx, cols::OVERFLOW, op.is_overflow());
+            table.set_dword_wl(row_idx, cols::ABS_R_0, abs_r);
+            table.set_dword_wl(row_idx, cols::ABS_D_0, abs_d);
 
-        table.set_dword_wl(row_idx, cols::ABS_R_0, abs_r);
-        table.set_dword_wl(row_idx, cols::ABS_D_0, abs_d);
+            // Fill n_sub_r as DWordHL (4 halfwords)
+            table.set_dword_hl(row_idx, cols::N_SUB_R_0, n_sub_r);
 
-        // Fill n_sub_r as DWordHL (4 halfwords)
-        table.set_dword_hl(row_idx, cols::N_SUB_R_0, n_sub_r);
+            table.set_bool(row_idx, cols::SIGN_N_SUB_R, op.sign_n_sub_r());
+            table.set_bool(row_idx, cols::SIGN_N, op.sign_n());
+            table.set_bool(row_idx, cols::SIGN_D, op.sign_d());
+            table.set_bool(row_idx, cols::SIGN_Q, op.sign_q());
+            table.set_bool(row_idx, cols::SIGN_R, op.sign_r());
 
-        table.set_bool(row_idx, cols::SIGN_N_SUB_R, op.sign_n_sub_r());
-        table.set_bool(row_idx, cols::SIGN_N, op.sign_n());
-        table.set_bool(row_idx, cols::SIGN_D, op.sign_d());
-        table.set_bool(row_idx, cols::SIGN_Q, op.sign_q());
-        table.set_bool(row_idx, cols::SIGN_R, op.sign_r());
-
-        // Multiplicities
-        table.set_u64(row_idx, cols::MU_Q, multiplicities.mu_q);
-        table.set_u64(row_idx, cols::MU_R, multiplicities.mu_r);
-    }
-
-    trace
+            // Multiplicities
+            table.set_u64(row_idx, cols::MU_Q, multiplicities.mu_q);
+            table.set_u64(row_idx, cols::MU_R, multiplicities.mu_r);
+        }
+    })
 }
 
 // =========================================================================
