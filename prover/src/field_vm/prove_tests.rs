@@ -321,6 +321,19 @@ fn unsorted_or_repeated_public_claims_are_rejected() {
 }
 
 #[test]
+fn non_canonical_public_address_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let p = math::field::goldilocks::GOLDILOCKS_PRIME;
+    let aliased = [cells[0], (cells[1].0 + p, cells[1].1)];
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let mut traces = generate_traces(&program, &exec, &POWER_PUBLIC);
+    let proof = prove_traces(&id, &aliased, &mut traces, &options).unwrap();
+    assert!(!verify(&id, &aliased, &proof, &options));
+}
+
+#[test]
 fn flagging_an_unclaimed_cell_is_rejected() {
     let (program, exec) = power_exec();
     assert!(!verifies_after(&program, &exec, |t| {

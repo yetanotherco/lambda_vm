@@ -206,14 +206,17 @@ pub fn prove(
 }
 
 /// Verifies that `program_id` halts with memory holding `public`, whose
-/// addresses must be strictly increasing.
+/// addresses must be canonical field elements and strictly increasing.
 pub fn verify(
     program_id: &Commitment,
     public: &[PublicCell],
     proof: &FvmProof,
     options: &ProofOptions,
 ) -> bool {
-    if !public.windows(2).all(|w| w[0].0 < w[1].0) {
+    let canonical = public
+        .iter()
+        .all(|(addr, _)| *addr < math::field::goldilocks::GOLDILOCKS_PRIME);
+    if !canonical || !public.windows(2).all(|w| w[0].0 < w[1].0) {
         return false;
     }
     let [fvm, dec, mem] = match proof.proofs.as_slice() {
