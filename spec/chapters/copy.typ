@@ -81,7 +81,8 @@ void* memmove( void* dest, const void* src, std::size_t count );
 void* memset(  void* dest,          int ch, std::size_t count );
 ```
 To deal with only a single interface, it was decided to have this accelerator only provide support for repeating a selection of eight bytes over a desired length `count`, rather than supporting `memset` proper. 
-The implementation of `memset(dest, ch, count)` can then be reduced to a small stub that asserts that $#`count` > 8$, writes `ch` to the first eight addresses of `dest`, and lastly invokes this accelerator with an syscall to repeat the character for the remaining $#`count` - 8$ bytes; the stub should execute a `STORE` operation for `memset` calls with $#`count` <= 8$, which is more efficient anyway.
+The implementation of `memset(dest, ch, count)` can then consist of writing `ch`
+for the first $min(8, #`count`)$ bytes, and invoking this ECALL if needed.
 
 Having settled on the interface for the `mem*` operations, we turn our attention the `write` syscall, which has the following interface#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]]):
 ```c
@@ -183,9 +184,8 @@ which is enforced by @copy:c:set_gap.
 
 == Bits
 Lastly, both `first` and `end` must be bits, and both must imply $#`μ` = 1$ to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
-Note that $#`μ` - #`zc`$ is always binary, since $#`zc` => #`μ` = 1$ indirectly holds
+Note that $#`μ` - #`count_borrows[i]`$ is always binary, since $#`count_borrows[1]` => #`μ` = 1$ indirectly holds
 via @copy:c:borrow_implies_first.
-// TODO
 #render_constraint_table(chip, config, groups: "bits")
 
 = Padding
@@ -201,7 +201,9 @@ As requested by the standard, this chip accepts arbitrary operand alignment.
 
 Note that this chip is only an accelerator; in practice, a library with functions
 has to be made to resolve the differences in calling ABI between the
-`memset`/`memcpy`/`memmove` functions and the syscalls this chip accelerates; only `write` does not need an extra stub.
+`memset`/`memcpy`/`memmove` functions and the syscalls this chip accelerates.
+The `write` interface of this chip corresponds exactly to the syscall ABI,
+making it compatible with any normal usage thereof (e.g. by a libc function).
 
 Moreover, the standard's fourth operation, `memcmp`, is not covered by this chip, as it does not involve copying.
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
