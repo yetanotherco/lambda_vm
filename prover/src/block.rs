@@ -3075,9 +3075,12 @@ pub(crate) fn stream_config(
 
 #[cfg(test)]
 mod spill_policy_tests {
+    use stark::narrow::NarrowMain;
+
+    use super::finish_sink::Trace;
     use super::{
-        CgroupValue, HostReading, SpillPolicy, cgroup_memory, parse_spill_policy, spill_decision,
-        spill_plausible, spill_reserve_bytes, spill_target_from,
+        CgroupValue, Fate, HostReading, Spill, SpillPolicy, cgroup_memory, parse_spill_policy,
+        spill_decision, spill_plausible, spill_reserve_bytes, spill_target_from,
     };
 
     const GIB: u64 = 1 << 30;
@@ -3298,6 +3301,44 @@ mod spill_policy_tests {
         }
         assert!(spilling);
         assert!(spill_reserve_bytes(0) == 6 * GIB && spill_reserve_bytes(10_000_000_000) > 7 * GIB);
+    }
+
+    /// No disk, armed (I-REGEN §14 P1): a later regenerable instance is
+    /// dropped even once the host reads back under the target, and one that
+    /// cannot be regenerated stays on the host, counted. Without no disk the
+    /// same reading keeps the regenerable one.
+    #[test]
+    fn no_disk_drops_every_later_regenerable_once_armed() {
+        use crate::block_regen::RegenMode;
+        use crate::block_regen::live::LiveRegen;
+        use std::sync::atomic::Ordering::Relaxed;
+        let trace = || {
+            let words: Vec<u64> = (0..16).collect();
+            Trace::from_narrow_main(NarrowMain::pack(&words, 2), 1).expect("it packs")
+        };
+        for no_disk in [true, false] {
+            let live = LiveRegen::for_test(RegenMode::Auto, 4 * GIB);
+            if no_disk {
+                live.set_no_disk();
+            }
+            let mut spill = Spill::with_store(SpillPolicy::Auto, None);
+            spill.target = 64 * GIB;
+            // The host read as the target: the first decision arms.
+            spill.fake_host_after = Some(0);
+            assert_eq!(spill.consider(&mut trace(), Some(&live), true), Fate::Drop);
+            assert!(live.is_armed());
+            // The host read as 0, under the target from now on.
+            spill.fake_host_after = Some(u64::MAX);
+            let later = if no_disk { Fate::Drop } else { Fate::Kept };
+            assert_eq!(
+                spill.consider(&mut trace(), Some(&live), true),
+                later,
+                "no disk {no_disk}"
+            );
+            let resident = spill.resident.load(Relaxed);
+            assert_eq!(spill.consider(&mut trace(), Some(&live), false), Fate::Kept);
+            assert!(spill.resident.load(Relaxed) > resident, "counted resident");
+        }
     }
 }
 
