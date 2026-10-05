@@ -685,6 +685,7 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
         Err(LfmProveError::Prover(err)) => {
             panic!("a tampered main root must fail in EXECUTION, not in the prover: {err:?}")
         }
+        Err(err @ LfmProveError::HasherMismatch { .. }) => panic!("{err:?}"),
         Ok(_) => panic!("a tampered main root must not produce a wrap proof"),
     }
 
@@ -1010,6 +1011,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
         Err(LfmProveError::Prover(err)) => {
             panic!("a tampered inner proof must fail in execution, not in the prover: {err:?}")
         }
+        Err(err @ LfmProveError::HasherMismatch { .. }) => panic!("{err:?}"),
         Ok(_) => panic!("a tampered opened value must not produce a wrap proof"),
     }
 

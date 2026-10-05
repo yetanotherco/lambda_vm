@@ -105,6 +105,13 @@ pub(crate) fn record_prove_split(split: ProveSplit) {
 pub enum LfmProveError {
     Exec(LfmExecError),
     Prover(ProvingError),
+    /// Traces filled for one permutation proved against artifacts built for
+    /// another: a caller's mismatch, refused before the card
+    /// ([`LfmFilled::prove`]).
+    HasherMismatch {
+        artifacts: HasherKind,
+        filled: HasherKind,
+    },
 }
 
 /// Proves under the permutation `artifacts` was built for.
@@ -267,7 +274,11 @@ pub(crate) fn lfm_fill_executed(
 impl LfmFilled {
     /// The card half of [`lfm_prove_with_residency`]: prove the filled traces
     /// against `artifacts`, which must be built for the hasher they were
-    /// filled with (the same agreement [`lfm_prove_with_hasher`] asserts).
+    /// filled with — a mismatch is refused ([`LfmProveError::HasherMismatch`])
+    /// before anything reaches the card. A caller that fills before its
+    /// artifacts exist (the W3 tree's leaves and nodes) can name the wrong
+    /// hasher; the proof it would get names a permutation its traces do not
+    /// use.
     pub(crate) fn prove(
         self,
         artifacts: &LfmArtifacts,
@@ -282,11 +293,7 @@ impl LfmFilled {
             fill_secs,
             exec_split,
         } = self;
-        assert_eq!(
-            artifacts.hasher, hasher,
-            "artifacts were built for {:?} but the traces were filled for {hasher:?}",
-            artifacts.hasher
-        );
+        same_hasher(artifacts.hasher, hasher)?;
         let t = Instant::now();
         let waited_before = super::device_permit::waited_secs();
         let proof = prove_traces_with_hasher(
@@ -317,6 +324,14 @@ impl LfmFilled {
             proof,
             public_words,
         })
+    }
+}
+
+/// The traces' hasher against the artifacts': [`LfmFilled::prove`]'s refusal.
+fn same_hasher(artifacts: HasherKind, filled: HasherKind) -> Result<(), LfmProveError> {
+    match artifacts == filled {
+        true => Ok(()),
+        false => Err(LfmProveError::HasherMismatch { artifacts, filled }),
     }
 }
 
@@ -720,4 +735,22 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 /// (its presets name it).
 pub fn block_base_options() -> ProofOptions {
     crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filled traces prove only against artifacts built for their hasher; any
+    /// other pair is refused with both hashers named, not a panic.
+    #[test]
+    fn a_fill_and_artifacts_for_different_hashers_are_refused() {
+        assert!(same_hasher(HasherKind::Rpx, HasherKind::Rpx).is_ok());
+        match same_hasher(HasherKind::Rpx, HasherKind::Poseidon) {
+            Err(LfmProveError::HasherMismatch { artifacts, filled }) => {
+                assert_eq!((artifacts, filled), (HasherKind::Rpx, HasherKind::Poseidon))
+            }
+            other => panic!("a mismatch must be refused, got {other:?}"),
+        }
+    }
 }
