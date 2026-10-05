@@ -509,6 +509,13 @@ impl RegenSlot {
         }
     }
 
+    /// Test only: [`Self::take`], for a fused task stood in for by a test
+    /// outside this crate.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn take_for_test(&self) -> Result<NarrowMain, RegenError> {
+        self.take()
+    }
+
     /// The regenerated trace, for its one reader, without blocking: its
     /// fused task holds its VRAM permit here, after its driver waited for the
     /// slot. A slot not deposited yet is an error (and settles failed, so a
@@ -886,6 +893,30 @@ mod tests {
         trace.unregen_main().unwrap();
         assert!(!trace.is_main_regenerable());
         assert_eq!(trace.narrow_main().unwrap(), &packed);
+        assert_eq!(trace.columns_main(), columns);
+    }
+
+    /// The drop in two halves (the bytes out, then the slot in): the same
+    /// state as one drop, and the second half refuses a trace that still
+    /// holds words or a slot of another height.
+    #[test]
+    fn a_drop_in_two_halves_is_a_drop() {
+        let (mut trace, columns) = packed_trace(64);
+        let (window, _producer) = RegenWindow::new(1 << 30);
+        let narrow = trace.take_main_for_regen().expect("a packed trace");
+        assert!(trace.narrow_main().is_none() && !trace.is_main_regenerable());
+        let slot = window.slot(&narrow, 0);
+        let (mut other, _) = packed_trace(32);
+        assert!(
+            !other.install_regen_main(slot.clone()),
+            "a trace with words"
+        );
+        assert!(other.take_main_for_regen().is_some());
+        assert!(!other.install_regen_main(slot.clone()), "another height");
+        assert!(trace.install_regen_main(slot.clone()));
+        assert!(!trace.install_regen_main(slot.clone()), "twice");
+        slot.deposit(narrow).unwrap();
+        trace.unregen_main().unwrap();
         assert_eq!(trace.columns_main(), columns);
     }
 

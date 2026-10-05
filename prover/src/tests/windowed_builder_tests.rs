@@ -143,7 +143,7 @@ fn same_list(what: &str, a: &[Table], b: &[Table]) {
     }
 }
 
-fn same_traces(a: &Traces, b: &Traces) {
+pub(crate) fn same_traces(a: &Traces, b: &Traces) {
     same_list("CPU", &a.cpus, &b.cpus);
     same_list("MEMW_R", &a.memw_registers, &b.memw_registers);
     same_list("MEMW_A", &a.memw_aligneds, &b.memw_aligneds);
@@ -683,7 +683,7 @@ fn dropping_the_streamed_ops_keeps_ecdas_chunked_the_same() {
 }
 
 /// Every packed table of `t` widened back on the host; how many were packed.
-fn widen_all(t: &mut Traces) -> usize {
+pub(crate) fn widen_all(t: &mut Traces) -> usize {
     let mut packed = 0;
     for list in [
         &mut t.cpus,
@@ -710,9 +710,10 @@ fn widen_all(t: &mut Traces) -> usize {
     ] {
         for table in list
             .iter_mut()
-            .filter(|t| t.is_main_narrow() || t.is_main_spilled())
+            .filter(|t| t.is_main_narrow() || t.is_main_spilled() || t.is_main_regenerable())
         {
-            // A spilled trace is read back first.
+            // A spilled trace is read back first, a dropped one taken from its
+            // slot once regenerated.
             table.widen_main_on_host();
             packed += 1;
         }
