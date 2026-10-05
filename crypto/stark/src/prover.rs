@@ -136,9 +136,28 @@ pub enum ProvingError {
     /// A spilled main trace could not be read back. Carries the AIR's name
     /// and the I/O error.
     SpilledTraceRead(String),
+    /// A dropped main trace ([`crate::regen`]) came back as another trace
+    /// than the one dropped (its shape or digest): a bug in its regenerator.
+    /// Refused before any of the table's device work. Carries the AIR's name.
+    RegeneratedTraceMismatch(String),
+    /// A dropped main trace did not come back: its regenerator failed or
+    /// stopped, the window closed, or the trace was dropped before its
+    /// Round-1 commit. Carries the AIR's name and why.
+    RegeneratedTraceFailed(String),
 }
 
 impl ProvingError {
+    /// The refusal for table `table`'s dropped trace that did not come back
+    /// as the trace dropped.
+    fn regenerated(table: &str, e: crate::regen::RegenError) -> Self {
+        match e {
+            crate::regen::RegenError::Mismatch => {
+                ProvingError::RegeneratedTraceMismatch(table.to_string())
+            }
+            other => ProvingError::RegeneratedTraceFailed(format!("table {table}: {other}")),
+        }
+    }
+
     /// The refusal for table `table`'s spilled trace that did not come back.
     fn spilled(table: &str, e: crate::spill::SpillError) -> Self {
         match e {
@@ -2402,6 +2421,228 @@ mod admit_ready_tests {
     }
 }
 
+#[cfg(test)]
+mod regen_ready_tests {
+    use super::{AdmitReady, FusedReady, RegenReady, VramGate, regenerated_last, run_admitted};
+    use crate::narrow::NarrowMain;
+    use crate::regen::{RegenError, RegenSlot, RegenWindow};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn narrow(seed: u64) -> NarrowMain {
+        let words: Vec<u64> = (0..96u64).map(|i| (i ^ seed) % 9_000).collect();
+        NarrowMain::pack(&words, 3)
+    }
+
+    /// `n` dropped traces' slots in one window (rank = index), their packed
+    /// traces, and the window's producer.
+    fn dropped(
+        n: usize,
+        ahead: u64,
+    ) -> (Vec<RegenSlot>, Vec<NarrowMain>, crate::regen::RegenProducer) {
+        let (window, producer) = RegenWindow::new(ahead);
+        let traces: Vec<NarrowMain> = (0..n as u64).map(narrow).collect();
+        let slots = traces
+            .iter()
+            .enumerate()
+            .map(|(i, t)| window.slot(t, i as u64))
+            .collect();
+        (slots, traces, producer)
+    }
+
+    fn within<T: Send + 'static>(
+        secs: u64,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .unwrap_or_else(|_| panic!("{what}: hung"))
+    }
+
+    /// The fused walk takes the dropped tables last, by their regenerator's
+    /// rank; every other table keeps its place. With nothing dropped the walk
+    /// is the heaviest-first walk itself, which is what keeps every prove
+    /// that drops nothing — resident or spilled — on its old schedule.
+    #[test]
+    fn the_dropped_tables_go_last_in_their_regenerators_order() {
+        let order = vec![4, 0, 3, 1, 2];
+        assert_eq!(regenerated_last(order.clone(), |_| None), order);
+        let rank = |i: usize| match i {
+            0 => Some(9),
+            3 => Some(2),
+            1 => Some(5),
+            _ => None,
+        };
+        assert_eq!(regenerated_last(order, rank), vec![4, 2, 3, 1, 0]);
+    }
+
+    /// No dropped trace: no regeneration readiness, so the fused phase is
+    /// the spill-only (or resident) phase it was.
+    #[test]
+    fn nothing_dropped_builds_no_regeneration_readiness() {
+        assert!(RegenReady::of(vec![None, None, None]).is_none());
+        let (slots, _, _p) = dropped(1, 1 << 20);
+        let ready = RegenReady::of(vec![None, Some(slots[0].clone())]).unwrap();
+        assert!(ready.slot(0).is_none() && ready.slot(1).is_some());
+        let fused = FusedReady {
+            spill: None,
+            regen: Some(&ready),
+        };
+        assert!(fused.is_ready(0), "a table not dropped waits on nothing");
+        assert!(!fused.is_ready(1));
+    }
+
+    /// ★ A driver waits for its table's regenerated trace BEFORE the gate:
+    /// with one permit, table 0's trace is deposited only once table 1 runs,
+    /// which it can because table 0's driver holds no bytes while it waits.
+    #[test]
+    fn a_driver_waits_for_its_regenerated_trace_holding_no_permit() {
+        let (slots, traces, _producer) = dropped(1, 1 << 20);
+        let ready = RegenReady::of(vec![Some(slots[0].clone()), None]).unwrap();
+        let fused = FusedReady {
+            spill: None,
+            regen: Some(&ready),
+        };
+        let gate = VramGate::new(1);
+        let out = run_admitted(
+            "regen",
+            &[0, 1],
+            &[1, 1],
+            &gate,
+            2,
+            Some(&fused),
+            |idx| format!("t{idx}"),
+            |idx| {
+                if idx == 1 {
+                    assert_eq!(
+                        *gate.used.lock().unwrap(),
+                        1,
+                        "table 0 waits holding no bytes"
+                    );
+                    slots[0].deposit(traces[0].clone()).unwrap();
+                    return true;
+                }
+                slots[0].take() == Ok(traces[0].clone())
+            },
+        );
+        assert_eq!(out, vec![Some(true), Some(true)]);
+    }
+
+    /// ★ A dead regenerator cannot hang a driver: it deposits one trace and
+    /// dies (its producer dropped mid-run); the drivers of the two tables it
+    /// never deposited return with `Failed`, and the run ends.
+    #[test]
+    fn a_dead_regenerator_cannot_hang_a_driver() {
+        let results = within(60, "drivers of a dead regenerator's tables", || {
+            let (slots, traces, producer) = dropped(3, 1 << 20);
+            let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
+            let fused = FusedReady {
+                spill: None,
+                regen: Some(&ready),
+            };
+            let regenerator = {
+                let (slot, trace) = (slots[0].clone(), traces[0].clone());
+                std::thread::spawn(move || {
+                    let _producer = producer;
+                    slot.deposit(trace).unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                    panic!("the regenerator dies");
+                })
+            };
+            let gate = VramGate::new(u64::MAX);
+            let out = run_admitted(
+                "dead",
+                &[0, 1, 2],
+                &[1, 1, 1],
+                &gate,
+                3,
+                Some(&fused),
+                |idx| format!("t{idx}"),
+                |idx| slots[idx].take(),
+            );
+            assert!(regenerator.join().is_err());
+            out
+        });
+        assert!(matches!(results[0], Some(Ok(_))));
+        for r in &results[1..] {
+            assert!(matches!(r, Some(Err(RegenError::Failed(_)))), "{r:?}");
+        }
+    }
+
+    /// ★ A task that panics before taking its trace: the window is full (it
+    /// holds that trace), so the regenerator waits to deposit the next one
+    /// and that table's driver waits for it. `run_admitted` closes the
+    /// readiness when it keeps the panic, which closes the window: the
+    /// depositor and the driver return, and the panic is the one reported.
+    #[test]
+    fn a_panicking_task_closes_the_regeneration_window() {
+        let (message, deposit) = within(60, "a panicked task's regeneration", || {
+            let (slots, traces, producer) = dropped(2, 1);
+            let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
+            let fused = FusedReady {
+                spill: None,
+                regen: Some(&ready),
+            };
+            let regenerator = {
+                let slots = slots.clone();
+                let traces = traces.clone();
+                std::thread::spawn(move || {
+                    let _producer = producer;
+                    slots[0].deposit(traces[0].clone()).unwrap();
+                    slots[1].deposit(traces[1].clone())
+                })
+            };
+            let gate = VramGate::new(u64::MAX);
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_admitted(
+                    "panic",
+                    &[0, 1],
+                    &[1, 1],
+                    &gate,
+                    2,
+                    Some(&fused),
+                    |idx| format!("t{idx}"),
+                    |idx| {
+                        assert!(idx != 0, "table 0 fails before it takes its trace");
+                        slots[idx].take().is_ok()
+                    },
+                )
+            }));
+            let message = out.err().and_then(|p| p.downcast_ref::<String>().cloned());
+            (message, regenerator.join().unwrap())
+        });
+        let message = message.expect("the task's panic is re-raised");
+        assert!(message.contains("table 0 fails"), "{message}");
+        assert!(matches!(deposit, Err(RegenError::Closed(_))), "{deposit:?}");
+    }
+
+    /// When the prove ends — dropped readiness — a regenerator still waiting
+    /// to deposit returns `Closed` instead of waiting for takers that are gone.
+    #[test]
+    fn the_proves_end_releases_a_waiting_regenerator() {
+        let deposit = within(30, "a regenerator after the prove ended", || {
+            let (slots, traces, producer) = dropped(2, 1);
+            let ready = RegenReady::of(slots.iter().cloned().map(Some).collect()).unwrap();
+            slots[0].deposit(traces[0].clone()).unwrap();
+            let regenerator = {
+                let (slot, trace) = (slots[1].clone(), traces[1].clone());
+                std::thread::spawn(move || {
+                    let _producer = producer;
+                    slot.deposit(trace)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(100));
+            drop(ready);
+            regenerator.join().unwrap()
+        });
+        assert!(matches!(deposit, Err(RegenError::Closed(_))), "{deposit:?}");
+    }
+}
+
 /// `LAMBDA_VM_RECOMMIT_TOP_LEVELS=k` (k ≥ 1): under `RecomputeLdeDevice` a
 /// plain table's Round 1 keeps its tree's top levels (all but the bottom `k`)
 /// on the host, and its fused task recomputes the LDE alone on the device —
@@ -3040,6 +3281,97 @@ impl AdmitReady for SpillReady<'_> {
     }
 }
 
+/// The dropped traces of a prove ([`crate::regen`]): each table's slot, if
+/// its trace is dropped, and their windows. Dropping it closes the windows,
+/// so a regenerator still depositing when the prove ends (an error, a
+/// refusal) returns instead of waiting for takers that are gone.
+struct RegenReady {
+    slots: Vec<Option<crate::regen::RegenSlot>>,
+    windows: Vec<Arc<crate::regen::RegenWindow>>,
+}
+
+impl RegenReady {
+    /// `None` when no trace is dropped: the prove then waits on nothing new.
+    fn of(slots: Vec<Option<crate::regen::RegenSlot>>) -> Option<Self> {
+        let mut windows: Vec<Arc<crate::regen::RegenWindow>> = Vec::new();
+        for slot in slots.iter().flatten() {
+            if !windows.iter().any(|w| Arc::ptr_eq(w, slot.window())) {
+                windows.push(Arc::clone(slot.window()));
+            }
+        }
+        (!windows.is_empty()).then_some(Self { slots, windows })
+    }
+
+    fn slot(&self, idx: usize) -> Option<&crate::regen::RegenSlot> {
+        self.slots.get(idx).and_then(Option::as_ref)
+    }
+
+    /// Close every window: the slots not deposited fail with `why`.
+    fn close_all(&self, why: &str) {
+        for window in &self.windows {
+            window.close(why);
+        }
+    }
+
+    /// One line for the prove's log.
+    fn report(&self) -> String {
+        self.windows
+            .iter()
+            .map(|w| w.report())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+impl Drop for RegenReady {
+    fn drop(&mut self) {
+        self.close_all("the prove ended");
+    }
+}
+
+/// The fused phase's host inputs: a spilled trace read back, or a dropped
+/// trace regenerated. A table is one or the other or neither; a driver waits
+/// for its own BEFORE the gate, so no VRAM permit is held across either.
+struct FusedReady<'a> {
+    spill: Option<SpillReady<'a>>,
+    regen: Option<&'a RegenReady>,
+}
+
+impl AdmitReady for FusedReady<'_> {
+    fn wait(&self, idx: usize) {
+        match self.regen.and_then(|r| r.slot(idx)) {
+            Some(slot) => {
+                #[cfg(any(test, feature = "test-utils"))]
+                assert_eq!(
+                    PERMITS_HELD.with(|p| p.get()),
+                    0,
+                    "a driver waits for table {idx}'s regenerated trace holding a VRAM permit"
+                );
+                slot.wait()
+            }
+            None => {
+                if let Some(spill) = &self.spill {
+                    spill.wait(idx)
+                }
+            }
+        }
+    }
+    fn is_ready(&self, idx: usize) -> bool {
+        match self.regen.and_then(|r| r.slot(idx)) {
+            Some(slot) => slot.is_ready(),
+            None => self.spill.as_ref().is_none_or(|s| s.is_ready(idx)),
+        }
+    }
+    fn close(&self) {
+        if let Some(spill) = &self.spill {
+            spill.close();
+        }
+        if let Some(regen) = self.regen {
+            regen.close_all("a fused task stopped");
+        }
+    }
+}
+
 /// Run `task` once per table index on `workers` OS driver threads, admitting
 /// each index through `gate` with its estimated bytes. The two array arguments
 /// are deliberately independent: `estimates` is what the gate spends (the
@@ -3319,6 +3651,20 @@ fn heaviest_first(weights: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..weights.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(weights[i]));
     order
+}
+
+/// `order` with the tables whose traces are dropped ([`crate::regen`]) moved
+/// to its end, by `rank`: phase B proves them in the order their regenerator
+/// deposits them (D-REGEN §2.3), after every other table, which keeps its
+/// place. No dropped table: `order` itself.
+fn regenerated_last(order: Vec<usize>, rank: impl Fn(usize) -> Option<u64>) -> Vec<usize> {
+    let (mut dropped, rest): (Vec<usize>, Vec<usize>) =
+        order.into_iter().partition(|&i| rank(i).is_some());
+    if dropped.is_empty() {
+        return rest;
+    }
+    dropped.sort_by_key(|&i| rank(i));
+    rest.into_iter().chain(dropped).collect()
 }
 
 /// One line naming the walk a phase took, heaviest first. Printed once per
@@ -7338,7 +7684,10 @@ pub trait IsStarkProver<
             .iter()
             .map(|s| table_walk_weight(s.main_cols, s.aux_cols, s.n * s.blowup))
             .collect();
-        let peak_order = heaviest_first(&peak_walk_weights);
+        // A dropped trace's table goes last, in its regenerator's order.
+        let peak_order = regenerated_last(heaviest_first(&peak_walk_weights), |idx| {
+            air_trace_pairs[idx].1.regen_main().map(|slot| slot.rank())
+        });
 
         // Spilled traces (`TraceTable::spill_main`) come back from the disk
         // in the order their readers take them: the Round-1 commits of those
@@ -7380,7 +7729,19 @@ pub trait IsStarkProver<
                 .map(|prefetch| SpillReady { prefetch, phase })
         };
         let r1_ready = spill_ready(crate::spill::ReadPhase::Round1);
-        let fused_ready = spill_ready(crate::spill::ReadPhase::Fused);
+        // Dropped traces (`TraceTable::drop_main_for_regen`) come back from
+        // their regenerator; each driver waits for its slot as for a spilled
+        // trace. None dropped: the fused phase waits as before.
+        let regen_ready = RegenReady::of(
+            air_trace_pairs
+                .iter()
+                .map(|(_, trace, _)| trace.regen_main().cloned())
+                .collect(),
+        );
+        let fused_ready = (spill_prefetch.is_some() || regen_ready.is_some()).then(|| FusedReady {
+            spill: spill_ready(crate::spill::ReadPhase::Fused),
+            regen: regen_ready.as_ref(),
+        });
 
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
@@ -7536,6 +7897,14 @@ pub trait IsStarkProver<
                 return Ok(pre);
             }
             let (air, trace, _) = &air_trace_pairs[idx];
+            // A dropped trace has no words to commit: only a precommitted
+            // trace may be dropped.
+            if trace.is_main_regenerable() {
+                return Err(ProvingError::RegeneratedTraceFailed(format!(
+                    "table {}: dropped before its Round-1 commit",
+                    air.name()
+                )));
+            }
             // A spilled trace commits from a copy holding its packed
             // words; the trace stays spilled for its fused task.
             let loaded;
@@ -7834,6 +8203,14 @@ pub trait IsStarkProver<
                 trace
                     .unspill_main_with(read)
                     .map_err(|e| ProvingError::spilled(air.name(), e))?;
+            }
+            // A dropped trace takes its regenerated bytes, checked against
+            // the digest taken when it was dropped, or the table is refused
+            // before any of its device work.
+            if trace.is_main_regenerable() {
+                trace
+                    .unregen_main()
+                    .map_err(|e| ProvingError::regenerated(air.name(), e))?;
             }
 
             // A packed main trace (`TraceTable::pack_main_narrow`) is widened
@@ -8433,6 +8810,9 @@ pub trait IsStarkProver<
         crate::prove_split::add(&crate::prove_split::FUSED, __ps_fused);
         if let Some(prefetch) = &spill_prefetch {
             eprintln!("[prover] SPILL read-back: {}", prefetch.report());
+        }
+        if let Some(regen) = &regen_ready {
+            eprintln!("[prover] REGEN: {}", regen.report());
         }
         let mut proofs = Vec::with_capacity(num_airs);
         for result in table_results {
