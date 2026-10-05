@@ -1659,7 +1659,7 @@ pub fn prove_with_options_and_inputs(
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
     // The block prover (`block::prove_block`) is the one with a Poseidon1 arm.
-    crate::hash_pin::require_rpx_base("prove_with_options_and_inputs");
+    crate::hash_pin::require_rpx_base("prove_with_options_and_inputs").map_err(Error::Prover)?;
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]

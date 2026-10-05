@@ -380,7 +380,7 @@ pub(crate) fn prove_traces_with_hasher(
         public_words,
         options.fri_final_poly_log_degree,
     );
-    crate::hash_pin::require_rpx_base("the LFM prover");
+    crate::hash_pin::require_rpx_base("the LFM prover").map_err(ProvingError::WrongParameter)?;
     crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,

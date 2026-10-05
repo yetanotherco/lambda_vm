@@ -243,12 +243,14 @@ pub fn base_hash() -> BaseHash {
 
 /// Refuse a path that has no P1 arm (the epoch pipeline, the LFM recursion)
 /// under [`BaseHash::P1`], rather than letting it mix RPX proofs with P1
-/// preprocessed roots.
-pub fn require_rpx_base(path: &str) {
-    assert!(
-        base_hash() == BaseHash::Rpx,
-        "{path} has no Poseidon1 arm: unset {BASE_HASH_ENV} (it is p1)"
-    );
+/// preprocessed roots. The error names the path; the caller types it.
+pub fn require_rpx_base(path: &str) -> Result<(), String> {
+    match base_hash() {
+        BaseHash::Rpx => Ok(()),
+        BaseHash::P1 => Err(format!(
+            "{path} has no Poseidon1 arm: unset {BASE_HASH_ENV} (it is p1)"
+        )),
+    }
 }
 
 /// Under [`BaseHash::P1`], the root of a STATIC preprocessed table (BITWISE,
