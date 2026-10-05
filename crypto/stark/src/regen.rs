@@ -8,9 +8,14 @@
 //! ([`crate::trace::TraceTable::drop_main_for_regen`]) and a caller's
 //! regenerator deposits it again in phase B.
 //!
-//! - A [`RegenWindow`] holds the dropped instances' [`RegenSlot`]s and bounds
-//!   the bytes deposited and not yet taken (`ahead`): a deposit past it waits,
-//!   so the regenerator never runs more than a window ahead of the fused tasks.
+//! - A [`RegenWindow`] holds the dropped instances' [`RegenSlot`]s and paces
+//!   the regenerator by rank: a deposit of rank `r` goes once the slots from
+//!   the frontier (the lowest rank not yet taken or failed) up to `r` hold at
+//!   most `ahead` bytes, deposited or not; the frontier itself always goes.
+//!   So the regenerator runs at most a window ahead of the fused tasks, which
+//!   take in rank order, and its generators may finish out of order inside
+//!   it: the window is reserved from the frontier, so later ranks can never
+//!   fill it while the rank a driver waits on cannot deposit (R-REGEN R1).
 //! - A deposit is checked against the shape and the digest taken when the
 //!   trace was dropped ([`NarrowMain::digest`]); another trace fails its slot,
 //!   and the prove refuses that table before any of its device work. The
@@ -20,10 +25,13 @@
 //!   [`RegenProducer`]; once every producer is dropped (the regenerator ended,
 //!   panicked, or never started), every slot not deposited fails. Closing the
 //!   window ([`RegenWindow::close`], the prove's end or a panicked task) wakes
-//!   every waiter and every depositor.
+//!   every waiter and every depositor. A fused task's take never blocks: it
+//!   runs holding its VRAM permit, after its driver waited for the slot.
 //!
 //! Nothing is dropped unless a caller opens a window and drops traces into it.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -76,6 +84,14 @@ impl Want {
             digest: narrow.digest(),
         }
     }
+
+    /// The shape alone: rows, column widths and bytes. Always checked, so a
+    /// deposit can never be widened into a buffer of another size.
+    fn same_shape(&self, narrow: &NarrowMain) -> bool {
+        self.rows == narrow.rows()
+            && self.widths == narrow.widths()
+            && self.len == narrow.data().len()
+    }
 }
 
 enum SlotState {
@@ -85,9 +101,20 @@ enum SlotState {
     Taken,
 }
 
+struct Slot {
+    rank: u64,
+    state: SlotState,
+    /// Set once the state leaves `Waiting`: the lock-free half of
+    /// [`RegenSlot::is_ready`], which the gate's packing scan polls.
+    settled: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 struct Shared {
-    slots: Vec<SlotState>,
+    slots: Vec<Slot>,
+    /// The slots not yet taken or failed, by (rank, id), with their bytes:
+    /// the first is the frontier, and the window is reserved from it.
+    live: BTreeMap<(u64, usize), u64>,
     /// Bytes deposited and not taken, and the most at once.
     parked: u64,
     high_water: u64,
@@ -98,16 +125,16 @@ struct Shared {
     deposits: u64,
     mismatches: u64,
     taken: u64,
-    /// Seconds depositors waited for room, and takers for their trace.
+    /// Seconds depositors waited for room, and drivers for their trace.
     deposit_wait_ns: u64,
     take_wait_ns: u64,
 }
 
 impl Shared {
-    /// The state a taker of slot `id` sees now: its trace, its failure, or
+    /// What a reader of slot `id` sees now: its trace, its failure, or
     /// nothing yet (`None`).
     fn settled(&self, id: usize) -> Option<Result<(), RegenError>> {
-        match &self.slots[id] {
+        match &self.slots[id].state {
             SlotState::Ready(_) => Some(Ok(())),
             SlotState::Failed(e) => Some(Err(e.clone())),
             SlotState::Taken => Some(Err(RegenError::Failed(
@@ -126,6 +153,36 @@ impl Shared {
             }
         }
     }
+
+    /// Slot `id` leaves `Waiting` for `state` (a failed slot is consumed:
+    /// it leaves the window's reservation).
+    fn settle(&mut self, id: usize, state: SlotState) {
+        let slot = &mut self.slots[id];
+        if matches!(state, SlotState::Failed(_)) {
+            self.live.remove(&(slot.rank, id));
+        }
+        slot.state = state;
+        slot.settled.store(true, Ordering::Release);
+    }
+
+    /// Whether slot `key` may deposit now: it is the frontier, or the slots
+    /// from the frontier up to it reserve at most `ahead` bytes.
+    fn admits(&self, key: (u64, usize), ahead: u64) -> bool {
+        if self.live.keys().next() == Some(&key) {
+            return true;
+        }
+        let mut reserved = 0u64;
+        for (&k, &len) in &self.live {
+            if k > key {
+                break;
+            }
+            reserved = reserved.saturating_add(len);
+            if reserved > ahead {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// The dropped traces of one prove and the bytes deposited ahead of their
@@ -134,12 +191,20 @@ pub struct RegenWindow {
     shared: Mutex<Shared>,
     changed: Condvar,
     ahead: u64,
+    /// The lock-free halves of a waiting slot's readiness: the window closed,
+    /// and every producer gone.
+    closed: AtomicBool,
+    gone: AtomicBool,
+    /// Test only: deposits checked on their shape alone, so the checks behind
+    /// the digest can be tested.
+    #[cfg(any(test, feature = "test-utils"))]
+    verify: AtomicBool,
 }
 
 impl RegenWindow {
-    /// A window that holds at most `ahead` bytes deposited and not taken (one
-    /// trace larger than that is deposited alone), and its first producer:
-    /// the caller hands it to the regenerator, so a regenerator that never
+    /// A window that reserves at most `ahead` bytes from its frontier (the
+    /// frontier, however large, always goes), and its first producer: the
+    /// caller hands it to the regenerator, so a regenerator that never
     /// starts, ends early or panics fails every slot it did not deposit.
     pub fn new(ahead: u64) -> (Arc<Self>, RegenProducer) {
         let window = Arc::new(Self {
@@ -149,6 +214,10 @@ impl RegenWindow {
             }),
             changed: Condvar::new(),
             ahead,
+            closed: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            verify: AtomicBool::new(true),
         });
         let producer = RegenProducer {
             window: Arc::clone(&window),
@@ -156,26 +225,38 @@ impl RegenWindow {
         (window, producer)
     }
 
-    /// Another producer, alive as long as it is held.
-    pub fn producer(self: &Arc<Self>) -> RegenProducer {
-        lock(&self.shared).producers += 1;
-        RegenProducer {
-            window: Arc::clone(self),
+    /// Another producer, alive as long as it is held. None once every
+    /// producer is gone (the slots not deposited have failed already).
+    pub fn producer(self: &Arc<Self>) -> Option<RegenProducer> {
+        let mut shared = lock(&self.shared);
+        if shared.producers == 0 {
+            return None;
         }
+        shared.producers += 1;
+        Some(RegenProducer {
+            window: Arc::clone(self),
+        })
     }
 
     /// A slot for `narrow`, about to be dropped: `rank` orders it among the
     /// window's slots (the regenerator deposits in rank order, and phase B
     /// takes them in it).
     pub fn slot(self: &Arc<Self>, narrow: &NarrowMain, rank: u64) -> RegenSlot {
+        let settled = Arc::new(AtomicBool::new(false));
         let mut shared = lock(&self.shared);
         let id = shared.slots.len();
-        shared.slots.push(SlotState::Waiting);
+        shared.slots.push(Slot {
+            rank,
+            state: SlotState::Waiting,
+            settled: Arc::clone(&settled),
+        });
+        shared.live.insert((rank, id), narrow.data().len() as u64);
         RegenSlot {
             window: Arc::clone(self),
             id,
             rank,
             want: Want::of(narrow),
+            settled,
         }
     }
 
@@ -186,30 +267,45 @@ impl RegenWindow {
         if shared.closed.is_none() {
             shared.closed = Some(why.to_string());
         }
+        self.closed.store(true, Ordering::Release);
         drop(shared);
         self.changed.notify_all();
     }
 
     /// Whether it is closed.
     pub fn is_closed(&self) -> bool {
-        lock(&self.shared).closed.is_some()
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Test only: check deposits on their shape alone (`false`), so a wrong
+    /// trace of the right shape reaches the checks behind the digest.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_verify(&self, on: bool) {
+        self.verify.store(on, Ordering::SeqCst);
+    }
+
+    fn verifies(&self) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        return self.verify.load(Ordering::SeqCst);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        true
     }
 
     /// One line for the prove's log.
     pub fn report(&self) -> String {
         let shared = lock(&self.shared);
-        let waiting = shared
-            .slots
-            .iter()
-            .filter(|s| matches!(s, SlotState::Waiting))
-            .count();
         format!(
-            "{} slots · {} deposited · {} taken · {} mismatches · {waiting} never deposited · window \
-             {:.2} GiB, high-water {:.2} GiB · depositors waited {:.2} s · takers waited {:.2} s",
+            "{} slots · {} deposited · {} taken · {} mismatches · {} never deposited · window \
+             {:.2} GiB, high-water {:.2} GiB · depositors waited {:.2} s · drivers waited {:.2} s",
             shared.slots.len(),
             shared.deposits,
             shared.taken,
             shared.mismatches,
+            shared
+                .slots
+                .iter()
+                .filter(|s| matches!(s.state, SlotState::Waiting))
+                .count(),
             self.ahead as f64 / GIB,
             shared.high_water as f64 / GIB,
             shared.deposit_wait_ns as f64 / 1e9,
@@ -228,6 +324,9 @@ impl Drop for RegenProducer {
     fn drop(&mut self) {
         let mut shared = lock(&self.window.shared);
         shared.producers = shared.producers.saturating_sub(1);
+        if shared.producers == 0 {
+            self.window.gone.store(true, Ordering::Release);
+        }
         drop(shared);
         self.window.changed.notify_all();
     }
@@ -241,6 +340,7 @@ pub struct RegenSlot {
     id: usize,
     rank: u64,
     want: Want,
+    settled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RegenSlot {
@@ -297,45 +397,51 @@ impl RegenSlot {
     }
 
     /// Put the regenerated trace in the slot: checked against the dropped
-    /// one's shape and digest, then held until its fused task takes it,
-    /// waiting first while the window holds `ahead` bytes. A trace that is not
-    /// the dropped one fails the slot (its table is refused) and returns
-    /// [`RegenError::Mismatch`]; a closed window returns
+    /// one's shape and digest, then held until its fused task takes it. It
+    /// waits first until the window admits its rank (see the module docs). A
+    /// trace that is not the dropped one fails the slot (its table is
+    /// refused) and returns [`RegenError::Mismatch`]; a closed window returns
     /// [`RegenError::Closed`]; a slot already settled refuses a second trace.
     pub fn deposit(&self, narrow: NarrowMain) -> Result<(), RegenError> {
-        let matches = Want::of(&narrow) == self.want;
         let window = &self.window;
+        let matches = if window.verifies() {
+            Want::of(&narrow) == self.want
+        } else {
+            self.want.same_shape(&narrow)
+        };
         let t = Instant::now();
         let mut shared = lock(&window.shared);
-        if !matches!(shared.slots[self.id], SlotState::Waiting) {
+        if !matches!(shared.slots[self.id].state, SlotState::Waiting) {
             return Err(RegenError::Failed("deposited twice".to_string()));
         }
         if !matches {
-            shared.slots[self.id] = SlotState::Failed(RegenError::Mismatch);
+            shared.settle(self.id, SlotState::Failed(RegenError::Mismatch));
             shared.mismatches += 1;
             drop(shared);
             window.changed.notify_all();
             return Err(RegenError::Mismatch);
         }
         let len = self.want.len as u64;
-        while shared.closed.is_none()
-            && shared.parked > 0
-            && shared.parked + len > window.ahead
-            && matches!(shared.slots[self.id], SlotState::Waiting)
-        {
+        let key = (self.rank, self.id);
+        loop {
+            if let Some(why) = &shared.closed {
+                let why = why.clone();
+                shared.deposit_wait_ns += t.elapsed().as_nanos() as u64;
+                return Err(RegenError::Closed(why));
+            }
+            if !matches!(shared.slots[self.id].state, SlotState::Waiting) {
+                return Err(RegenError::Failed("settled while it waited".to_string()));
+            }
+            if shared.admits(key, window.ahead) {
+                break;
+            }
             shared = window
                 .changed
                 .wait(shared)
                 .unwrap_or_else(|e| e.into_inner());
         }
         shared.deposit_wait_ns += t.elapsed().as_nanos() as u64;
-        if let Some(why) = &shared.closed {
-            return Err(RegenError::Closed(why.clone()));
-        }
-        if !matches!(shared.slots[self.id], SlotState::Waiting) {
-            return Err(RegenError::Failed("deposited twice".to_string()));
-        }
-        shared.slots[self.id] = SlotState::Ready(narrow);
+        shared.settle(self.id, SlotState::Ready(narrow));
         shared.parked += len;
         shared.high_water = shared.high_water.max(shared.parked);
         shared.deposits += 1;
@@ -347,17 +453,22 @@ impl RegenSlot {
     /// The regenerator gives this slot up: its table is refused with `why`.
     pub fn fail(&self, why: &str) {
         let mut shared = lock(&self.window.shared);
-        if matches!(shared.slots[self.id], SlotState::Waiting) {
-            shared.slots[self.id] = SlotState::Failed(RegenError::Failed(why.to_string()));
+        if matches!(shared.slots[self.id].state, SlotState::Waiting) {
+            shared.settle(
+                self.id,
+                SlotState::Failed(RegenError::Failed(why.to_string())),
+            );
         }
         drop(shared);
         self.window.changed.notify_all();
     }
 
     /// Whether [`Self::wait`] would return at once: the trace is in, or it
-    /// will never be.
+    /// will never be. Lock-free (the gate's packing scan polls it).
     pub fn is_ready(&self) -> bool {
-        lock(&self.window.shared).settled(self.id).is_some()
+        self.settled.load(Ordering::Acquire)
+            || self.window.closed.load(Ordering::Acquire)
+            || self.window.gone.load(Ordering::Acquire)
     }
 
     /// Block until the trace is in, or it will never be.
@@ -379,7 +490,7 @@ impl RegenSlot {
     pub fn load(&self) -> Result<NarrowMain, RegenError> {
         self.wait();
         let shared = lock(&self.window.shared);
-        match &shared.slots[self.id] {
+        match &shared.slots[self.id].state {
             SlotState::Ready(narrow) => Ok(narrow.clone()),
             _ => match shared.settled(self.id) {
                 Some(Err(e)) => Err(e),
@@ -388,36 +499,43 @@ impl RegenSlot {
         }
     }
 
-    /// The regenerated trace, for its one reader (blocking until it is in or
-    /// will never be): its bytes leave the window, which makes room for the
-    /// next deposit.
+    /// The regenerated trace, for its one reader, without blocking: its
+    /// fused task holds its VRAM permit here, after its driver waited for the
+    /// slot. A slot not deposited yet is an error (and settles failed, so a
+    /// late deposit is refused rather than parked for nobody); its bytes
+    /// leave the window, which makes room for the next deposit.
     pub(crate) fn take(&self) -> Result<NarrowMain, RegenError> {
-        self.wait();
         let mut shared = lock(&self.window.shared);
-        let settled = shared.settled(self.id);
-        match settled {
-            Some(Ok(())) => {
-                let state = std::mem::replace(&mut shared.slots[self.id], SlotState::Taken);
-                let SlotState::Ready(narrow) = state else {
-                    return Err(RegenError::Failed(
-                        "its trace was already taken".to_string(),
-                    ));
-                };
+        let state = std::mem::replace(&mut shared.slots[self.id].state, SlotState::Taken);
+        match state {
+            SlotState::Ready(narrow) => {
                 shared.parked = shared.parked.saturating_sub(self.want.len as u64);
+                shared.live.remove(&(self.rank, self.id));
                 shared.taken += 1;
                 drop(shared);
                 self.window.changed.notify_all();
                 Ok(narrow)
             }
-            Some(Err(e)) => {
-                // A slot that will never be deposited settles as failed, so
-                // a second look says the same.
-                if matches!(shared.slots[self.id], SlotState::Waiting) {
-                    shared.slots[self.id] = SlotState::Failed(e.clone());
-                }
+            SlotState::Failed(e) => {
+                shared.slots[self.id].state = SlotState::Failed(e.clone());
                 Err(e)
             }
-            None => Err(RegenError::Failed("not settled after its wait".to_string())),
+            SlotState::Taken => Err(RegenError::Failed(
+                "its trace was already taken".to_string(),
+            )),
+            SlotState::Waiting => {
+                shared.slots[self.id].state = SlotState::Waiting;
+                let e = match shared.settled(self.id) {
+                    Some(Err(e)) => e,
+                    _ => {
+                        RegenError::Failed("not deposited when its fused task took it".to_string())
+                    }
+                };
+                shared.settle(self.id, SlotState::Failed(e.clone()));
+                drop(shared);
+                self.window.changed.notify_all();
+                Err(e)
+            }
         }
     }
 }
@@ -515,7 +633,10 @@ mod tests {
         let slot_b = window.slot(&b, 1);
         let waiter = {
             let slot_b = slot_b.clone();
-            std::thread::spawn(move || slot_b.take())
+            std::thread::spawn(move || {
+                slot_b.wait();
+                slot_b.take()
+            })
         };
         std::thread::sleep(Duration::from_millis(50));
         let regenerator = std::thread::spawn(move || {
@@ -531,43 +652,80 @@ mod tests {
         assert!(window.report().contains("1 deposited"));
     }
 
-    /// ★ A window holds at most `ahead` bytes deposited and not taken: the
-    /// next deposit waits for a take; one trace larger than the window goes
+    /// ★ The window paces by rank from its frontier: with room for one trace,
+    /// ranks 1 and 2 wait while rank 0 is parked, rank 1 goes once rank 0 is
+    /// taken, rank 2 once rank 1 is; a frontier larger than the window goes
     /// alone.
     #[test]
     fn a_deposit_waits_for_room_in_the_window() {
-        let a = narrow(64, 1);
-        let b = narrow(64, 2);
-        let (window, _producer) = RegenWindow::new(a.data().len() as u64);
-        let slot_a = window.slot(&a, 0);
-        let slot_b = window.slot(&b, 1);
-        slot_a.deposit(a.clone()).unwrap();
+        let t: Vec<NarrowMain> = (1..=3).map(|seed| narrow(64, seed)).collect();
+        let (window, _producer) = RegenWindow::new(t[0].data().len() as u64);
+        let slots: Vec<RegenSlot> = (0..3).map(|r| window.slot(&t[r], r as u64)).collect();
+        slots[0].deposit(t[0].clone()).unwrap();
         let (tx, rx) = mpsc::channel();
-        let depositor = {
-            let slot_b = slot_b.clone();
-            std::thread::spawn(move || {
-                let out = slot_b.deposit(b);
-                tx.send(()).unwrap();
+        let mut depositors = Vec::new();
+        for r in [2, 1] {
+            let (slot, trace, tx) = (slots[r].clone(), t[r].clone(), tx.clone());
+            depositors.push(std::thread::spawn(move || {
+                let out = slot.deposit(trace);
+                tx.send(r).unwrap();
                 out
-            })
-        };
-        assert!(
-            rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "deposited past the window"
+            }));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let quiet = Duration::from_millis(200);
+        assert!(rx.recv_timeout(quiet).is_err(), "deposited past the window");
+        assert_eq!(slots[0].take().unwrap(), t[0]);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(1),
+            "rank 1, the frontier"
         );
-        assert_eq!(slot_a.take().unwrap(), a);
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("deposited once there is room");
-        depositor.join().unwrap().unwrap();
-        assert!(slot_b.take().is_ok());
-        // A trace larger than the window, into an empty window, goes alone.
+        assert!(rx.recv_timeout(quiet).is_err(), "rank 2 past the window");
+        assert_eq!(slots[1].take().unwrap(), t[1]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(2));
+        for d in depositors {
+            d.join().unwrap().unwrap();
+        }
+        assert_eq!(slots[2].take().unwrap(), t[2]);
         let (small, _p) = RegenWindow::new(1);
         let big = narrow(1000, 3);
-        let slot = small.slot(&big, 0);
-        slot.deposit(big).unwrap();
+        small.slot(&big, 0).deposit(big).unwrap();
     }
 
-    /// ★ Closing the window wakes a depositor waiting for room and a taker
+    /// The window stays a bound for a regenerator that deposits in rank order
+    /// with no taker: it deposits what the window reserves, then waits.
+    #[test]
+    fn an_in_order_regenerator_stays_inside_the_window() {
+        let t: Vec<NarrowMain> = (0..6).map(|seed| narrow(64, seed)).collect();
+        let len = t[0].data().len() as u64;
+        let (window, _producer) = RegenWindow::new(2 * len);
+        let slots: Vec<RegenSlot> = (0..6).map(|r| window.slot(&t[r], r as u64)).collect();
+        let (tx, rx) = mpsc::channel();
+        let regenerator = {
+            let (slots, t) = (slots.clone(), t.clone());
+            std::thread::spawn(move || {
+                for (slot, trace) in slots.iter().zip(t) {
+                    if slot.deposit(trace).is_err() {
+                        return;
+                    }
+                    tx.send(()).unwrap();
+                }
+            })
+        };
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("inside the window");
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "past the window"
+        );
+        window.close("done");
+        regenerator.join().unwrap();
+    }
+
+    /// ★ Closing the window wakes a depositor waiting for room and a driver
     /// waiting for its trace: both return `Closed`, and nothing hangs.
     #[test]
     fn closing_the_window_wakes_every_waiter() {
@@ -579,16 +737,80 @@ mod tests {
         let slot_b = window.slot(&b, 1);
         let slot_c = window.slot(&c, 2);
         slot_a.deposit(a).unwrap();
-        let depositor = std::thread::spawn(move || slot_b.deposit(b));
-        let taker = std::thread::spawn(move || slot_c.take());
+        // Rank 2 waits for room (rank 1 is the lowest, never deposited); the
+        // driver of rank 1 waits for it.
+        let depositor = std::thread::spawn(move || slot_c.deposit(c));
+        let driver = std::thread::spawn(move || {
+            slot_b.wait();
+            slot_b.take()
+        });
         std::thread::sleep(Duration::from_millis(100));
         window.close("the prove ended");
         let (dep, take) = within(10, "a closed window's waiters", move || {
-            (depositor.join().unwrap(), taker.join().unwrap())
+            (depositor.join().unwrap(), driver.join().unwrap())
         });
         assert!(matches!(dep, Err(RegenError::Closed(_))), "{dep:?}");
         assert!(matches!(take, Err(RegenError::Closed(_))), "{take:?}");
         assert!(window.is_closed());
+        drop(b);
+    }
+
+    /// ★ A take never blocks: before its deposit it is an error, the slot
+    /// settles failed, and the late deposit is refused instead of parked for
+    /// a reader that is gone.
+    #[test]
+    fn a_take_before_the_deposit_is_an_error_not_a_wait() {
+        let (window, _producer) = RegenWindow::new(1 << 30);
+        let a = narrow(16, 1);
+        let slot = window.slot(&a, 0);
+        let got = within(5, "a take before the deposit", {
+            let slot = slot.clone();
+            move || slot.take()
+        });
+        assert!(matches!(got, Err(RegenError::Failed(_))), "{got:?}");
+        assert!(slot.is_ready());
+        assert!(slot.deposit(a).is_err());
+        assert!(window.report().contains("0 deposited"));
+    }
+
+    /// Readiness without the lock: settled by a deposit, by a failure, by the
+    /// window closing, or by its last producer leaving.
+    #[test]
+    fn readiness_is_read_without_the_lock() {
+        let a = narrow(16, 1);
+        let (window, producer) = RegenWindow::new(1 << 30);
+        let (s0, s1, s2) = (window.slot(&a, 0), window.slot(&a, 1), window.slot(&a, 2));
+        assert!(!s0.is_ready() && !s1.is_ready() && !s2.is_ready());
+        s0.deposit(a.clone()).unwrap();
+        s1.fail("no");
+        assert!(s0.is_ready() && s1.is_ready() && !s2.is_ready());
+        drop(producer);
+        assert!(s2.is_ready(), "its last producer left");
+        assert!(
+            window.producer().is_none(),
+            "no producer after the last one left"
+        );
+        let (closed, _p) = RegenWindow::new(1 << 30);
+        let s = closed.slot(&a, 0);
+        closed.close("done");
+        assert!(s.is_ready() && closed.is_closed());
+    }
+
+    /// Test hook: with the digest off a wrong trace of the right shape is
+    /// deposited (the checks behind the digest then have to catch it); a
+    /// wrong shape is refused all the same.
+    #[test]
+    fn the_shape_is_checked_with_the_digest_off() {
+        let (window, _producer) = RegenWindow::new(1 << 30);
+        window.set_verify(false);
+        let a = narrow(16, 1);
+        let mut bent = a.clone();
+        bent.flip_first_bit();
+        window.slot(&a, 0).deposit(bent).unwrap();
+        assert_eq!(
+            window.slot(&a, 1).deposit(narrow(15, 1)),
+            Err(RegenError::Mismatch)
+        );
     }
 
     /// A slot given up fails with the regenerator's reason.
@@ -598,6 +820,7 @@ mod tests {
         let a = narrow(10, 1);
         let slot = window.slot(&a, 0);
         slot.fail("the walk refused window 3");
+        slot.wait();
         assert_eq!(
             slot.take(),
             Err(RegenError::Failed("the walk refused window 3".to_string()))

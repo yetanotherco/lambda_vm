@@ -55,6 +55,9 @@ enum Regenerator {
     Bent(usize),
     /// Deposits every trace with one bit flipped.
     BentAll,
+    /// Deposits table `t`'s trace with one bit flipped, the window's digest
+    /// check off (test hook): only the checks behind the digest are left.
+    BentNoDigest(usize),
     /// Dies before depositing anything.
     Dead,
 }
@@ -138,13 +141,19 @@ fn prove_held_here(
     }
     store.flush();
     dropped.sort_by_key(|d| d.0);
+    if let Regenerator::BentNoDigest(_) = regenerator {
+        window.set_verify(false);
+    }
     let regen = std::thread::spawn(move || {
         let _producer = producer;
         if regenerator == Regenerator::Dead {
             return;
         }
         for (_, t, slot, mut packed) in dropped {
-            if regenerator == Regenerator::Bent(t) || regenerator == Regenerator::BentAll {
+            if regenerator == Regenerator::Bent(t)
+                || regenerator == Regenerator::BentAll
+                || regenerator == Regenerator::BentNoDigest(t)
+            {
                 packed.flip_first_bit();
             }
             // A refused deposit fails its slot; the prove refuses the table.
@@ -175,6 +184,22 @@ fn prove_held_here(
 
 fn bytes(proof: &MultiProof<F, E, ()>) -> Vec<u8> {
     bincode::serialize(proof).unwrap()
+}
+
+fn verifies(proof: &MultiProof<F, E, ()>) -> bool {
+    use crate::verifier::{IsStarkVerifier, Verifier};
+    let proof_options = test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+    Verifier::multi_verify(
+        &airs,
+        proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &math::field::element::FieldElement::zero(),
+    )
 }
 
 fn air_names() -> [String; 3] {
@@ -222,6 +247,54 @@ fn a_wrong_regenerated_trace_refuses_the_proof() {
                 Err(e) => panic!("{residency:?} table {table}: wrong refusal {e:?}"),
                 Ok(_) => panic!("{residency:?} table {table}: a wrong trace was proved"),
             }
+        }
+    }
+}
+
+/// ★ Negative, the digest off: a regenerated trace one bit off the dropped
+/// one is never a proof the verifier accepts unless it is the resident proof
+/// itself (a word no stage of phase B reads). Where phase B recomputes the
+/// main LDE from the deposited words (`RecomputeLde`), every perturbation is
+/// caught; on the card the kept-top check refuses it (the cuda twin below).
+#[test]
+fn a_wrong_regenerated_trace_without_the_digest_is_never_accepted() {
+    let all = [Held::Dropped(0), Held::Dropped(1), Held::Dropped(2)];
+    for residency in RESIDENCIES {
+        let want = bytes(&prove_held(residency, RESIDENT, Regenerator::Faithful).unwrap());
+        let (mut refused, mut rejected) = (0, 0);
+        for table in 0..3 {
+            match prove_held(residency, all, Regenerator::BentNoDigest(table)) {
+                Err(_) => refused += 1,
+                Ok(proof) if !verifies(&proof) => rejected += 1,
+                Ok(proof) => assert!(
+                    bytes(&proof) == want,
+                    "{residency:?} table {table}: a wrong trace proved and verified"
+                ),
+            }
+        }
+        eprintln!("{residency:?}: refused {refused}, rejected {rejected} of 3");
+        if residency == ResidencyMode::RecomputeLde {
+            assert_eq!(refused + rejected, 3, "{residency:?}");
+        }
+    }
+}
+
+/// ★ On the card, the digest off: a regenerated trace one bit off is refused
+/// by the kept-top check (or rejected by the verifier), never accepted.
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn a_wrong_regenerated_trace_without_the_digest_is_refused_on_the_card() {
+    let all = [Held::Dropped(0), Held::Dropped(1), Held::Dropped(2)];
+    for table in 0..3 {
+        match prove_held(
+            ResidencyMode::RecomputeLdeDevice,
+            all,
+            Regenerator::BentNoDigest(table),
+        ) {
+            Err(ProvingError::RecomputedCommitmentMismatch(_)) => {}
+            Ok(proof) => assert!(!verifies(&proof), "table {table}: accepted"),
+            Err(e) => panic!("table {table}: unexpected refusal {e:?}"),
         }
     }
 }

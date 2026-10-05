@@ -521,6 +521,9 @@ where
         if let Err(e) = self.unspill_main() {
             panic!("reading a spilled main trace back: {e}");
         }
+        if let Some(slot) = &self.regen_main {
+            slot.wait();
+        }
         if let Err(e) = self.unregen_main() {
             panic!("reading a dropped main trace back: {e}");
         }
@@ -638,9 +641,10 @@ where
         self.regen_main.as_ref()
     }
 
-    /// Hold the regenerated packed trace again, taken from its slot (waiting
-    /// for it): checked against the dropped one's digest when it was
-    /// deposited. A no-op on a trace that is not dropped. On an error the
+    /// Hold the regenerated packed trace again, taken from its slot without
+    /// waiting (the prover's driver waited for it before the task's VRAM
+    /// permit): checked against the dropped one's shape and digest when it
+    /// was deposited. A no-op on a trace that is not dropped. On an error the
     /// trace has no main words: its table is refused.
     pub(crate) fn unregen_main(&mut self) -> Result<(), crate::regen::RegenError> {
         let Some(slot) = self.regen_main.take() else {
