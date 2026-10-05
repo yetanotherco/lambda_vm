@@ -265,3 +265,24 @@ fn recompute_lde_releases_aux_columns_and_retain_keeps_them() {
         }
     }
 }
+
+/// ★ The shared VRAM gate (`LAMBDA_VM_SHARED_VRAM_GATE`, ported from #1013)
+/// changes which tables are admitted when, never a byte of the proof: the
+/// same instance proved under a gate of its own and under the process-wide
+/// shared gate — with a `Retain` prove's claim taken and its fused tasks
+/// admitted for their sets less what they carry — is byte-identical and
+/// verifies.
+#[test_log::test]
+fn the_shared_vram_gate_produces_byte_identical_proofs() {
+    crate::prover::pin_shared_vram_gate(Some(false));
+    let own = prove_under(ResidencyMode::Retain);
+    crate::prover::pin_shared_vram_gate(Some(true));
+    let shared = prove_under(ResidencyMode::Retain);
+    crate::prover::pin_shared_vram_gate(None);
+    assert!(verifies(&shared), "the shared-gate proof does not verify");
+    assert_eq!(
+        bincode::serialize(&own).unwrap(),
+        bincode::serialize(&shared).unwrap(),
+        "the shared gate moved a proof byte"
+    );
+}
