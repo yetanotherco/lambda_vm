@@ -331,9 +331,10 @@ pub(crate) enum RegenMode {
     /// the host, a regenerable one is dropped instead of spilled (and the
     /// resident regenerable ones are dropped back until the host is under
     /// the target), and phase B rebuilds the dropped ones ([`live`]). A
-    /// block that fits drops nothing and runs no regenerator, and with the
-    /// spill policy `off` (`LAMBDA_VM_BLOCK_SPILL=off`) nothing ever leaves
-    /// the host, so it never arms.
+    /// block that fits drops nothing and runs no regenerator. With the spill
+    /// policy `off` (`LAMBDA_VM_BLOCK_SPILL=off`) `auto` still decides, with
+    /// no store (no disk, I-REGEN §14 P1): once armed every regenerable
+    /// instance is dropped and the rest stays on the host.
     Auto,
     /// `always`: every regenerable instance is dropped and rebuilt — the
     /// byte-identity test mode, not a policy.

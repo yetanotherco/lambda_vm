@@ -327,9 +327,10 @@ fn prove_block_with_observed(
     // A new block: no memory pressure seen yet (`alloc_purge`'s `auto`).
     crate::alloc_purge::clear_memory_pressure();
     // The spill outlives the prove: phase B reads the spilled traces back.
-    // Live regeneration keeps the policy's decisions without a spill store.
+    // Live regeneration keeps the policy's decisions without a spill store,
+    // and with the spill off it decides with none at all (no disk).
     let spill = stream_phase_a()
-        .then(|| Spill::open(spill_policy(), live.is_some()))
+        .then(|| Spill::for_block(spill_policy(), live))
         .flatten();
     let (mut traces, decode_commitment, precommits, streamed) = if stream_phase_a() {
         build_streamed(
@@ -1227,7 +1228,33 @@ impl Spill {
                 return None;
             }
         };
-        Some(Self {
+        Some(Self::with_store(policy, store))
+    }
+
+    /// The block's spill under `policy` with live regeneration `live`:
+    /// [`Self::open`], except with the policy `off` and live `auto`
+    /// regeneration (step 4's no-disk mode, I-REGEN §14 P1). Then `auto`
+    /// still decides, with no store: once it arms, every regenerable instance
+    /// is dropped and the rest stays on the host, and nothing is written to
+    /// disk.
+    fn for_block(
+        policy: SpillPolicy,
+        live: Option<&crate::block_regen::live::LiveRegen>,
+    ) -> Option<Self> {
+        match live {
+            Some(live) if policy == SpillPolicy::Off && live.auto() => {
+                live.set_no_disk();
+                eprintln!(
+                    "BLOCK SPILL: off with live regeneration: auto decides with no store (no disk)"
+                );
+                Some(Self::with_store(SpillPolicy::Auto, None))
+            }
+            _ => Self::open(policy, live.is_some()),
+        }
+    }
+
+    fn with_store(policy: SpillPolicy, store: Option<stark::spill::SpillStore>) -> Self {
+        Self {
             policy,
             target: spill_target_bytes(),
             store,
@@ -1242,7 +1269,7 @@ impl Spill {
             fake_host_after: None,
             #[cfg(test)]
             seen: std::sync::atomic::AtomicU64::new(0),
-        })
+        }
     }
 
     /// A committed instance's packed trace: spilled when the policy says so
@@ -1266,6 +1293,10 @@ impl Spill {
         #[cfg(test)]
         let seen = self.seen.fetch_add(bytes as u64, Relaxed) + bytes as u64;
         if droppable && live.is_some_and(|l| l.always()) {
+            return Fate::Drop;
+        }
+        // No disk, armed: every regenerable instance leaves (I-REGEN §14 P1).
+        if droppable && live.is_some_and(|l| l.no_disk() && l.is_armed()) {
             return Fate::Drop;
         }
         let resident = self.resident.load(Relaxed);
@@ -2951,7 +2982,7 @@ pub(crate) fn stream_live_for_test(
     fake_host_after: Option<u64>,
 ) -> Result<LiveRun, Error> {
     let spill = policy.map(|p| {
-        let mut spill = Spill::open(p, true).expect("the spill decides");
+        let mut spill = Spill::for_block(p, Some(&live)).expect("the spill decides");
         if fake_host_after.is_some() {
             spill.fake_host_after = fake_host_after;
             spill.target = 64 << 30;

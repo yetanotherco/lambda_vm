@@ -125,6 +125,10 @@ pub(crate) struct LiveRegen {
     reserve: u64,
     started: Instant,
     state: Mutex<LiveState>,
+    /// No disk (the spill policy `off`, I-REGEN §14 P1): once armed, every
+    /// resident regenerable instance is dropped back and every later one is
+    /// dropped; what cannot be regenerated stays on the host.
+    no_disk: std::sync::atomic::AtomicBool,
     /// Test only: drop traces whose fused task recommits on the host (the
     /// laptop has no device), which production never does (A1).
     #[cfg(test)]
@@ -159,6 +163,7 @@ impl LiveRegen {
             reserve,
             started: Instant::now(),
             state: Mutex::new(LiveState::default()),
+            no_disk: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             host_recommit_ok: std::sync::atomic::AtomicBool::new(false),
         }
@@ -195,6 +200,21 @@ impl LiveRegen {
     /// Whether every regenerable instance is dropped (the test mode).
     pub(crate) fn always(&self) -> bool {
         self.mode == RegenMode::Always
+    }
+
+    /// Whether this is `auto` (the policy's tier).
+    pub(crate) fn auto(&self) -> bool {
+        self.mode == RegenMode::Auto
+    }
+
+    /// No disk: the spill policy is `off`, so the policy decides with no
+    /// store (I-REGEN §14 P1). Set before phase A starts.
+    pub(crate) fn set_no_disk(&self) {
+        self.no_disk.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn no_disk(&self) -> bool {
+        self.no_disk.load(Ordering::Relaxed)
     }
 
     pub(crate) fn is_armed(&self) -> bool {
@@ -246,18 +266,19 @@ impl LiveRegen {
 
     /// Arm on the first decision to move an instance off the host: from now
     /// on the reserve counts, and the resident regenerable instances are
-    /// dropped back in rank order until their bytes reach `need` (R6).
-    /// Returns whether this call armed.
+    /// dropped back in rank order until their bytes reach `need` (R6) — all
+    /// of them with no disk (§14 P1). Returns whether this call armed.
     pub(crate) fn arm(&self, need: u64) -> bool {
         let mut state = self.lock();
         if state.armed.is_some() {
             return false;
         }
+        let all = self.no_disk();
         let mut candidates = std::mem::take(&mut state.candidates);
         candidates.sort_by_key(|c| c.rank);
         let mut planned = 0u64;
         for c in candidates {
-            if planned >= need {
+            if planned >= need && !all {
                 break;
             }
             // Counted only once queued (R-REGEN S4).
@@ -280,8 +301,9 @@ impl LiveRegen {
 
     /// A droppable instance kept resident: a drop-back candidate, or — kept
     /// by a decision made before another committer armed, while drop-back is
-    /// short of its need — dropped back now.
+    /// short of its need (always, with no disk) — dropped back now.
     pub(crate) fn kept(&self, index: usize, key: StreamKey, rank: u64, bytes: u64) {
+        let all = self.no_disk();
         let mut state = self.lock();
         let state = &mut *state;
         match &mut state.armed {
@@ -291,7 +313,7 @@ impl LiveRegen {
                 key,
                 bytes,
             }),
-            Some((_, need, planned)) if *planned < *need => {
+            Some((_, need, planned)) if all || *planned < *need => {
                 if let Some(tx) = &state.drop_tx
                     && tx
                         .send(DropJob {
@@ -357,10 +379,11 @@ impl LiveRegen {
             None => "never armed".to_string(),
         };
         format!(
-            "BLOCK REGEN dropped: {:?} · {n} instances {:.2} GiB (drop-back {} instances {:.2} GiB) \
-             · {armed} · {} recipes · refused {} (host recommit) {} (no longer droppable) · \
+            "BLOCK REGEN dropped: {:?}{} · {n} instances {:.2} GiB (drop-back {} instances {:.2} \
+             GiB) · {armed} · {} recipes · refused {} (host recommit) {} (no longer droppable) · \
              reserve {:.1} GiB once armed · {} errors",
             self.mode,
+            if self.no_disk() { " (no disk)" } else { "" },
             bytes as f64 / GIB,
             back.len(),
             back.iter().map(|d| d.bytes).sum::<u64>() as f64 / GIB,

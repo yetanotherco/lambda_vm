@@ -538,6 +538,134 @@ fn drop_back_stops_on_the_bytes_it_was_given() {
     );
 }
 
+/// ★ No disk (I-REGEN §14 P1): with the spill policy `off`, `auto` still decides
+/// with no store. Unarmed it drops nothing and builds the resident run's
+/// traces. Under pressure (the host read as the target once half the streamed
+/// bytes were considered) it arms once, drops back **every** streamed chunk
+/// kept before arming and drops every later one, spills nothing (no store),
+/// keeps what cannot be regenerated on the host (counted resident), and the
+/// regenerator brings every dropped trace back.
+#[test]
+fn no_disk_auto_drops_every_regenerable_and_spills_nothing() {
+    let _one = one_at_a_time();
+    for (name, (committers, generators, finish_in_a)) in &CASES[..2] {
+        let (name, finish_in_a) = (*name, *finish_in_a);
+        let program = program(name);
+        let config = stream_config(*committers, *generators, finish_in_a);
+        let mut reference_traces = resident(&program, config);
+        let mut unarmed = phase_a(
+            &program,
+            config,
+            RegenMode::Auto,
+            4 * GIB,
+            Some(SpillPolicy::Off),
+            None,
+        );
+        assert!(unarmed.plan.is_none(), "{name}: {}", unarmed.line);
+        assert!(
+            unarmed.line.contains("Auto (no disk) · 0 instances")
+                && unarmed.line.contains("never armed"),
+            "{}",
+            unarmed.line
+        );
+        assert!(unarmed.spill.contains("no store"), "{}", unarmed.spill);
+        widen_all(&mut unarmed.traces);
+        let streamed_bytes: u64 = streamed_chunks(&unarmed.streamed)
+            .iter()
+            .map(|&k| reference(&reference_traces, k).data().len() as u64)
+            .sum();
+        let mut run = phase_a(
+            &program,
+            config,
+            RegenMode::Auto,
+            4 * GIB,
+            Some(SpillPolicy::Off),
+            Some(streamed_bytes / 2),
+        );
+        assert!(run.armed.is_some(), "{name}: {}", run.line);
+        assert!(run.line.contains("Auto (no disk) · "), "{}", run.line);
+        assert!(
+            run.spill.contains("no store") && run.spill.contains("spilled 0 instances"),
+            "{name}: {}",
+            run.spill
+        );
+        let chunks = streamed_chunks(&run.streamed);
+        for &(table, index) in &chunks {
+            let trace = &list(&run.traces, table)[index];
+            assert!(
+                trace.is_main_regenerable(),
+                "{name}: {table:?}[{index}] kept: {}",
+                run.line
+            );
+        }
+        assert!(
+            all_tables(&run.traces).all(|t| !t.is_main_spilled()),
+            "{name}: something spilled"
+        );
+        let plan = run.plan.take().expect("something was dropped");
+        assert_eq!(plan.dropped.len(), chunks.len(), "{}", run.line);
+        let back: u64 = plan
+            .dropped
+            .iter()
+            .filter(|d| d.back)
+            .map(|d| d.bytes)
+            .sum();
+        assert!(back > 0, "{name}: no drop-back: {}", run.line);
+        assert_eq!(
+            run.armed.map(|(_, given)| given),
+            Some(back),
+            "{name}: drop-back took it all"
+        );
+        let narrow: u64 = all_tables(&run.traces)
+            .filter_map(|t| t.narrow_main())
+            .map(|n| n.data().len() as u64)
+            .sum();
+        if finish_in_a {
+            assert!(
+                run.resident > 0 && run.resident <= narrow,
+                "{name}: {} of {narrow}",
+                run.resident
+            );
+        } else {
+            assert_eq!(run.resident, 0, "{name}: {}", run.spill);
+        }
+        let keys = keys_of(&plan);
+        let traces = &mut run.traces;
+        let (report, taken) = regenerate(&program, plan, 2, LiveFaults::default(), move || {
+            widen_in_rank_order(traces, &keys)
+        });
+        let report = report.expect("the regenerator ended");
+        assert!(taken.is_some(), "{name}: phase B's taker hung");
+        assert_eq!(report.deposited, chunks.len(), "{}", report.line());
+        widen_all(&mut run.traces);
+        widen_all(&mut reference_traces);
+        same_traces(&reference_traces, &run.traces);
+        same_traces(&reference_traces, &unarmed.traces);
+    }
+}
+
+/// No disk's drop-back takes every candidate whatever the need, and every
+/// candidate kept after arming is dropped back too.
+#[test]
+fn no_disk_drop_back_takes_every_candidate() {
+    let live = LiveRegen::for_test(RegenMode::Auto, 4 * GIB);
+    live.set_no_disk();
+    let (tx, rx) = mpsc::channel();
+    live.set_drop_tx(tx);
+    for (i, &(rank, bytes)) in [(3u64, 10u64), (1, 20), (2, 30)].iter().enumerate() {
+        live.kept(i, (StreamTable::Cpu, i), rank, bytes);
+    }
+    assert!(live.arm(1));
+    let sent: Vec<u64> = rx.try_iter().map(|j| j.rank).collect();
+    assert_eq!(sent, [1, 2, 3]);
+    assert_eq!(live.armed_for_test(), Some((1, 60)));
+    live.kept(9, (StreamTable::Cpu, 9), 9, 5);
+    let late: Vec<(u64, bool)> = rx.try_iter().map(|j| (j.rank, j.back)).collect();
+    assert_eq!(late, [(9, true)]);
+    assert_eq!(live.armed_for_test(), Some((1, 65)));
+    assert!(live.line().contains("Auto (no disk)"), "{}", live.line());
+}
+
 /// Phase A of `all_instructions_64` under `always` for the fault tests, its
 /// window one byte (only the frontier deposits): the program and the plan.
 fn dropped_run() -> (Elf, LivePlan) {
