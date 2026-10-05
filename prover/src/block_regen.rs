@@ -1326,6 +1326,17 @@ mod shadow_tests {
                     assert!(report.regenerated.iter().all(|r| r.matched));
                     let plan = plan(&recipes, &report, 0.0, 10.0, classes.total().cells);
                     assert_eq!((plan.planned, plan.missing), (recipes.len(), 0));
+                    if window == 7 {
+                        report_shadow(
+                            &report,
+                            &recipes,
+                            stray,
+                            classes.streamed.cells,
+                            classes.total().cells,
+                            10.0,
+                            0.0,
+                        );
+                    }
                     regenerated += report.regenerated.len();
                 }
             }
