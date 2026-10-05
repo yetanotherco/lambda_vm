@@ -616,21 +616,47 @@ where
         window: &std::sync::Arc<crate::regen::RegenWindow>,
         rank: u64,
     ) -> Option<crate::regen::RegenSlot> {
-        if self.spilled_main.is_some() || self.regen_main.is_some() {
-            return None;
-        }
-        let narrow = self.narrow_main.take()?;
-        let narrow = match std::sync::Arc::try_unwrap(narrow) {
-            Ok(narrow) => narrow,
-            Err(shared) => {
-                self.narrow_main = Some(shared);
-                return None;
-            }
-        };
+        let narrow = self.take_main_for_regen()?;
         let slot = window.slot(&narrow, rank);
         drop(narrow);
         self.regen_main = Some(slot.clone());
         Some(slot)
+    }
+
+    /// The first half of [`Self::drop_main_for_regen`], for a caller that
+    /// digests elsewhere (outside a lock it holds the trace under): the
+    /// packed trace moved out, the table keeping its width and height and no
+    /// main words until [`Self::install_regen_main`]. `None`, and the trace
+    /// untouched, when it is not packed, its packed copy is shared, or it is
+    /// spilled or dropped already.
+    pub fn take_main_for_regen(&mut self) -> Option<crate::narrow::NarrowMain> {
+        if self.spilled_main.is_some() || self.regen_main.is_some() {
+            return None;
+        }
+        let narrow = self.narrow_main.take()?;
+        match std::sync::Arc::try_unwrap(narrow) {
+            Ok(narrow) => Some(narrow),
+            Err(shared) => {
+                self.narrow_main = Some(shared);
+                None
+            }
+        }
+    }
+
+    /// The second half: the dropped trace's slot, made from the bytes
+    /// [`Self::take_main_for_regen`] moved out. `false`, and the trace
+    /// untouched, unless the trace holds no main words of any kind (packed,
+    /// spilled or dropped) and the slot has the trace's shape.
+    pub fn install_regen_main(&mut self, slot: crate::regen::RegenSlot) -> bool {
+        if self.narrow_main.is_some()
+            || self.spilled_main.is_some()
+            || self.regen_main.is_some()
+            || slot.rows() != self.main_table.height
+        {
+            return false;
+        }
+        self.regen_main = Some(slot);
+        true
     }
 
     /// Whether the packed main trace is dropped for a regenerator

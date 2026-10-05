@@ -314,17 +314,22 @@ fn prove_block_with_observed(
             ledger.line(&format!("finish {label}"))
         })));
     }
-    // Regeneration's shadow (`LAMBDA_VM_BLOCK_REGEN`): phase A records each
-    // streamed instance's recipe for phase B to rebuild beside the prove.
-    let recorder = crate::block_regen::shadow_recorder(
+    // Regeneration (`LAMBDA_VM_BLOCK_REGEN`): phase A records each streamed
+    // instance's recipe, for phase B to rebuild beside the prove (the shadow)
+    // or in place of the dropped ones (`auto`, `always`).
+    let regen = crate::block_regen::PhaseARegen::new(
         crate::block_regen::regen_mode()?,
         stream_phase_a() && !stream_by_push() && narrow_streamed(),
     );
+    let live = regen
+        .as_ref()
+        .and_then(crate::block_regen::PhaseARegen::live);
     // A new block: no memory pressure seen yet (`alloc_purge`'s `auto`).
     crate::alloc_purge::clear_memory_pressure();
     // The spill outlives the prove: phase B reads the spilled traces back.
+    // Live regeneration keeps the policy's decisions without a spill store.
     let spill = stream_phase_a()
-        .then(|| Spill::open(spill_policy()))
+        .then(|| Spill::open(spill_policy(), live.is_some()))
         .flatten();
     let (mut traces, decode_commitment, precommits, streamed) = if stream_phase_a() {
         build_streamed(
@@ -337,7 +342,7 @@ fn prove_block_with_observed(
             &StreamConfig::from_env(),
             ledger.as_deref(),
             spill.as_ref(),
-            recorder.as_ref(),
+            regen.as_ref(),
         )?
     } else {
         let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
@@ -350,7 +355,10 @@ fn prove_block_with_observed(
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
     }
-    let classes = (crate::block_regen::probe() || recorder.is_some())
+    if let Some(live) = live {
+        eprintln!("{}", live.line());
+    }
+    let classes = (crate::block_regen::probe() || regen.is_some())
         .then(|| crate::block_regen::TraceClasses::of(&traces, &streamed));
     if let Some(classes) = classes.filter(|_| crate::block_regen::probe()) {
         eprintln!("{}", classes.line());
@@ -360,12 +368,31 @@ fn prove_block_with_observed(
     // `LAMBDA_VM_ALLOC_PURGE` names it.
     crate::alloc_purge::purge_point("phase-a");
 
-    let recipes = recorder.map(crate::block_regen::Recorder::finish);
+    // The shadow's recipes, or live regeneration's plan: none when nothing
+    // was dropped, and then no regenerator, no builder and no thread (R8).
+    let (recipes, live_plan) = match regen {
+        Some(crate::block_regen::PhaseARegen::Shadow(recorder)) => {
+            (Some((*recorder).finish()), None)
+        }
+        Some(crate::block_regen::PhaseARegen::Live(live)) => (None, (*live).into_plan()),
+        None => (None, None),
+    };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let prove_called = Instant::now();
-    let (proof, shadow) = std::thread::scope(|s| {
+    let (proof, shadow, live_report) = std::thread::scope(|s| {
         let shadow = recipes.as_ref().map(|(recipes, _)| {
             crate::block_regen::spawn_shadow(s, &program, private_input, max_rows, recipes, &stop)
+        });
+        // Closes the regeneration window on every exit of the prove, an
+        // unwind included, before this scope joins the regenerator (R4).
+        let guard = live_plan
+            .as_ref()
+            .map(|plan| crate::block_regen::live::WindowGuard::new(&plan.window));
+        let window = live_plan
+            .as_ref()
+            .map(|plan| std::sync::Arc::clone(&plan.window));
+        let regenerator = live_plan.map(|plan| {
+            crate::block_regen::live::spawn_live(s, &program, private_input, max_rows, plan)
         });
         let proof = prove_block_traces(
             elf_bytes,
@@ -381,6 +408,22 @@ fn prove_block_with_observed(
         if proof.is_err() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Returned or refused: every dropped table that will ever take its
+        // trace has taken it, so the window closes and the regenerator ends.
+        if let Some(guard) = &guard {
+            guard.close("the block's prove returned");
+        }
+        let waited = Instant::now();
+        let live_report = regenerator.map(crate::block_regen::live::LiveHandle::join);
+        if let (Some(report), Some(window)) = (&live_report, &window) {
+            eprintln!("{}", report.line());
+            eprintln!(
+                "BLOCK REGEN window: {} · joined {:.2} s after the prove",
+                window.report(),
+                waited.elapsed().as_secs_f64()
+            );
+        }
+        drop(guard);
         let waited = Instant::now();
         let report = shadow.map(crate::block_regen::ShadowHandle::join);
         if report.is_some() {
@@ -389,8 +432,18 @@ fn prove_block_with_observed(
                 waited.elapsed().as_secs_f64()
             );
         }
-        (proof, report)
+        (proof, report, live_report)
     });
+    if let Some(report) = &live_report
+        && let Some(cpu) = report.cpu_total()
+        && times.prove > 0.0
+    {
+        eprintln!(
+            "BLOCK REGEN live CPU: {cpu:.1} s = {:.2} cores over the prove ({:.2} s)",
+            cpu / times.prove,
+            times.prove
+        );
+    }
     if let (Some(report), Some((recipes, stray)), Some(classes)) = (&shadow, &recipes, &classes) {
         // When the prove started, on the regenerator's clock.
         let called = if prove_called >= report.started {
@@ -1097,11 +1150,27 @@ trait Arming: Sync {
     fn armed(&self) -> bool;
 }
 
+/// What phase A does with a committed instance's packed trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Kept on the host.
+    Kept,
+    /// Written to the spill file: its bytes.
+    Spilled(usize),
+    /// Dropped for phase B to regenerate (live regeneration).
+    Drop,
+}
+
 /// Phase A's spill: the policy, its store, and what it decided.
 struct Spill {
     policy: SpillPolicy,
     target: u64,
-    store: stark::spill::SpillStore,
+    /// `None` when the store did not open but live regeneration still needs
+    /// the policy's decisions (R-REGEN A9): what cannot be dropped stays.
+    store: Option<stark::spill::SpillStore>,
+    /// Host bytes reserved beside `spill_reserve_bytes` once live
+    /// regeneration is armed (its phase-B footprint); 0 until then.
+    extra_reserve: std::sync::atomic::AtomicU64,
     /// Committed packed bytes kept on the host, and committed main cells.
     resident: std::sync::atomic::AtomicU64,
     cells: std::sync::atomic::AtomicU64,
@@ -1113,56 +1182,89 @@ struct Spill {
     /// budgets armed ([`Arming`]).
     opened: Instant,
     armed_at: std::sync::Mutex<Option<f64>>,
+    /// Test only: `auto` reads the host as 0 until this many packed bytes
+    /// were considered, and as the target after (the laptop's host never
+    /// reaches a target), with the bytes considered so far.
+    #[cfg(test)]
+    fake_host_after: Option<u64>,
+    #[cfg(test)]
+    seen: std::sync::atomic::AtomicU64,
 }
 
 impl Spill {
     /// The policy's store, opened; `None` when the policy is `off`, or when
     /// the store will not open (the block then runs resident, as without a
-    /// policy, and says why).
-    fn open(policy: SpillPolicy) -> Option<Self> {
+    /// policy, and says why) — unless `decide_without_store` (live
+    /// regeneration): then the policy decides with no store, and what it
+    /// moves off the host is dropped if it can be, else kept.
+    fn open(policy: SpillPolicy, decide_without_store: bool) -> Option<Self> {
         if policy == SpillPolicy::Off {
             return None;
         }
-        // `disk-spill`'s storage keeps a trace's words in an mmap of its own;
-        // a spilled trace keeps none in its table. The two are not combined
-        // (I-SPILL R13): with that feature the block runs resident.
-        if cfg!(feature = "disk-spill") {
-            eprintln!(
-                "BLOCK SPILL: {policy:?} wanted, but not with the disk-spill feature: resident"
-            );
-            return None;
-        }
-        match stark::spill::SpillStore::open(stark::spill::SpillOptions::default()) {
-            Ok(store) => Some(Self {
-                policy,
-                target: spill_target_bytes(),
-                store,
-                resident: std::sync::atomic::AtomicU64::new(0),
-                cells: std::sync::atomic::AtomicU64::new(0),
-                spilled: std::sync::Mutex::new((0, 0, 0)),
-                host_most: std::sync::Mutex::new(None),
-                opened: Instant::now(),
-                armed_at: std::sync::Mutex::new(None),
-            }),
-            Err(e) => {
-                eprintln!(
-                    "BLOCK SPILL: {policy:?} wanted, but the store did not open ({e}): resident"
-                );
+        let store = if cfg!(feature = "disk-spill") {
+            // `disk-spill`'s storage keeps a trace's words in an mmap of its
+            // own; a spilled trace keeps none in its table. The two are not
+            // combined (I-SPILL R13): with that feature nothing spills.
+            Err("not with the disk-spill feature".to_string())
+        } else {
+            stark::spill::SpillStore::open(stark::spill::SpillOptions::default())
+                .map_err(|e| format!("the store did not open ({e})"))
+        };
+        let store = match store {
+            Ok(store) => Some(store),
+            Err(why) if decide_without_store => {
+                eprintln!("BLOCK SPILL: {policy:?} wanted, but {why}: decisions only, no spill");
                 None
             }
-        }
+            Err(why) => {
+                eprintln!("BLOCK SPILL: {policy:?} wanted, but {why}: resident");
+                return None;
+            }
+        };
+        Some(Self {
+            policy,
+            target: spill_target_bytes(),
+            store,
+            extra_reserve: std::sync::atomic::AtomicU64::new(0),
+            resident: std::sync::atomic::AtomicU64::new(0),
+            cells: std::sync::atomic::AtomicU64::new(0),
+            spilled: std::sync::Mutex::new((0, 0, 0)),
+            host_most: std::sync::Mutex::new(None),
+            opened: Instant::now(),
+            armed_at: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fake_host_after: None,
+            #[cfg(test)]
+            seen: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// A committed instance's packed trace: spilled when the policy says so
-    /// and the store takes it. Returns the bytes spilled (0: kept).
-    fn consider(&self, trace: &mut finish_sink::Trace) -> usize {
+    /// and the store takes it, or — under live regeneration, when it is
+    /// `droppable` — dropped. The first decision to move an instance off the
+    /// host arms live regeneration (`auto`): its reserve counts from then on,
+    /// and the resident regenerable instances are dropped back until the
+    /// bytes they free reach `host + reserve − (target − 2 GiB)` (R-REGEN R6).
+    fn consider(
+        &self,
+        trace: &mut finish_sink::Trace,
+        live: Option<&crate::block_regen::live::LiveRegen>,
+        droppable: bool,
+    ) -> Fate {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(bytes) = trace.narrow_main().map(|t| t.data().len()) else {
-            return 0;
+            return Fate::Kept;
         };
         let cells = (trace.num_rows() * trace.num_main_columns) as u64;
         let cells = self.cells.fetch_add(cells, Relaxed) + cells;
+        #[cfg(test)]
+        let seen = self.seen.fetch_add(bytes as u64, Relaxed) + bytes as u64;
+        if droppable && live.is_some_and(|l| l.always()) {
+            return Fate::Drop;
+        }
         let resident = self.resident.load(Relaxed);
+        let extra = self.extra_reserve.load(Relaxed);
+        let mut host = None;
         let wanted = spill_decision(
             self.policy,
             self.target,
@@ -1170,24 +1272,66 @@ impl Spill {
             cells,
             bytes as u64,
             || {
+                #[cfg(test)]
+                if let Some(after) = self.fake_host_after {
+                    let reading = if seen > after { self.target } else { 0 };
+                    host = Some(reading);
+                    return reading.saturating_add(extra);
+                }
                 let reading = HostReading::now();
                 let mut most = self.host_most.lock().unwrap_or_else(|e| e.into_inner());
                 if most.is_none_or(|m| reading.bytes() > m.bytes()) {
                     *most = Some(reading);
                 }
-                reading.bytes()
+                host = Some(reading.bytes());
+                reading.bytes().saturating_add(extra)
             },
         );
+        // The first move off the host arms. Under `auto` (the host read) the
+        // reserve counts from now on, and drop-back is given what takes the
+        // host under the target; a policy that does not read the host drops
+        // what it would spill, and nothing back.
+        if wanted
+            && let Some(live) = live
+            && !live.is_armed()
+        {
+            let need = match host {
+                Some(host) => {
+                    let reserve = live.reserve();
+                    self.extra_reserve.store(reserve, Relaxed);
+                    host.saturating_add(spill_reserve_bytes(cells))
+                        .saturating_add(reserve)
+                        .saturating_sub(self.target.saturating_sub(2 << 30))
+                }
+                None => 0,
+            };
+            live.arm(need);
+        }
         let mut s = self.spilled.lock().unwrap_or_else(|e| e.into_inner());
-        if wanted && trace.spill_main(&self.store) {
+        if wanted && droppable && live.is_some() {
+            return Fate::Drop;
+        }
+        if wanted
+            && let Some(store) = &self.store
+            && trace.spill_main(store)
+        {
             s.0 += 1;
             s.1 += bytes as u64;
-            bytes
+            Fate::Spilled(bytes)
         } else {
             s.2 += 1;
             self.resident.fetch_add(bytes as u64, Relaxed);
-            0
+            Fate::Kept
         }
+    }
+
+    /// Kept bytes that drop-back dropped since: they leave the host.
+    fn forget_resident(&self, bytes: u64) {
+        let _ = self.resident.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |r| Some(r.saturating_sub(bytes)),
+        );
     }
 
     /// The `BLOCK SPILL` line: the policy, its decisions and the store.
@@ -1210,7 +1354,9 @@ impl Spill {
             g(self.target),
             g(bytes),
             g(self.resident.load(std::sync::atomic::Ordering::Relaxed)),
-            self.store.stats(),
+            self.store
+                .as_ref()
+                .map_or("no store".to_string(), |store| store.stats().to_string()),
         )
     }
 }
@@ -1226,6 +1372,10 @@ impl Arming for Spill {
             HostReading::now()
                 .bytes()
                 .saturating_add(spill_reserve_bytes(cells))
+                .saturating_add(
+                    self.extra_reserve
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
         });
         if plausible {
             *armed_at = Some(self.opened.elapsed().as_secs_f64());
@@ -1436,6 +1586,15 @@ impl MemLedger {
         self.committed_spilled.fetch_add(bytes, Relaxed);
     }
 
+    /// A committed instance's packed trace was dropped for regeneration:
+    /// `bytes` leave the committed packed.
+    fn dropped(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .committed_packed
+            .fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(bytes)));
+    }
+
     /// One line of `what`'s parts, largest first, those of at least 0.01 GiB.
     fn parts(&self, what: &str, mut parts: Vec<(String, usize)>) {
         const GIB: f64 = (1u64 << 30) as f64;
@@ -1579,6 +1738,68 @@ fn streamed_key(streamed: &Streamed) -> Option<(StreamTable, usize)> {
     }
 }
 
+/// Closes live regeneration's drop queue when dropped, so the drop thread
+/// ends with phase A whatever way phase A ends.
+struct DropsGuard<'a>(&'a crate::block_regen::live::LiveRegen);
+
+impl Drop for DropsGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close_drops();
+    }
+}
+
+/// The drop thread (R-REGEN R7): each queued drop takes the entry's packed
+/// bytes out under `committed`'s lock, makes their slot (the digest) outside
+/// it, and installs the slot under it again. An entry no longer droppable
+/// (spilled, shared, dropped) stays as it is; a slot that cannot go in after
+/// its bytes went out is an error (the trace would have no words).
+fn run_drops(
+    live: &crate::block_regen::live::LiveRegen,
+    jobs: std::sync::mpsc::Receiver<crate::block_regen::live::DropJob>,
+    committed: &std::sync::Mutex<Vec<Committed>>,
+    spill: Option<&Spill>,
+    ledger: Option<&MemLedger>,
+) {
+    let lock = || committed.lock().unwrap_or_else(|e| e.into_inner());
+    for job in jobs {
+        let narrow = lock()
+            .get_mut(job.index)
+            .and_then(|entry| entry.0.trace.take_main_for_regen());
+        let Some(narrow) = narrow else {
+            live.refused_late();
+            continue;
+        };
+        let bytes = narrow.data().len() as u64;
+        let slot = live.window().slot(&narrow, job.rank);
+        drop(narrow);
+        let installed = lock()
+            .get_mut(job.index)
+            .is_some_and(|entry| entry.0.trace.install_regen_main(slot.clone()));
+        if !installed {
+            slot.fail("its slot could not be installed");
+            live.drop_error(format!(
+                "{:?}[{}]: its bytes went out but its slot did not go in",
+                job.key.0, job.key.1
+            ));
+            continue;
+        }
+        if job.back
+            && let Some(spill) = spill
+        {
+            spill.forget_resident(bytes);
+        }
+        if let Some(ledger) = ledger {
+            ledger.dropped(bytes as usize);
+        }
+        live.dropped_one(crate::block_regen::live::Dropped {
+            key: job.key,
+            slot,
+            bytes,
+            back: job.back,
+        });
+    }
+}
+
 /// A main trace's bytes as held: packed, or 64-bit.
 fn held_bytes(trace: &finish_sink::Trace) -> usize {
     trace
@@ -1611,6 +1832,8 @@ struct ToCommit {
     table: FinishedTable,
     held: usize,
     finished: bool,
+    /// The streamed chunk it is, under regeneration (its recipe's key).
+    key: Option<(StreamTable, usize)>,
 }
 
 /// The finish's sink in phase A: each table it is handed goes into the
@@ -1666,7 +1889,7 @@ fn build_streamed(
     stream: &StreamConfig,
     ledger: Option<&MemLedger>,
     spill: Option<&Spill>,
-    recorder: Option<&crate::block_regen::Recorder>,
+    regen: Option<&crate::block_regen::PhaseARegen>,
 ) -> Result<Produced, Error> {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering::Relaxed;
@@ -1775,7 +1998,7 @@ fn build_streamed(
                     if let Some(ledger) = ledger {
                         ledger.take(job_bytes);
                     }
-                    let key = recorder.and(streamed_key(&job));
+                    let key = regen.and(streamed_key(&job));
                     let t = Instant::now();
                     // A table the finish handed off is built already, and it
                     // never took room in the ops queue.
@@ -1806,10 +2029,11 @@ fn build_streamed(
                     }
                     // Regeneration's shadow: the packed trace's digest, taken
                     // where it was packed.
-                    if let (Some(recorder), Some((stream, index)), Some(packed)) =
-                        (recorder, key, table.trace.narrow_main())
+                    if let (Some(regen), Some((stream, index)), Some(packed)) =
+                        (regen, key, table.trace.narrow_main())
+                        && regen.digests_at_pack()
                     {
-                        recorder.packed(stream, index, packed);
+                        regen.recorder().packed(stream, index, packed);
                     }
                     let held = held_bytes(&table.trace);
                     if let Some(ledger) = ledger {
@@ -1820,6 +2044,7 @@ fn build_streamed(
                         table,
                         held,
                         finished,
+                        key,
                     }) {
                         ready.release(refused.0.held);
                     }
@@ -1827,6 +2052,37 @@ fn build_streamed(
             });
         }
         drop(ready_tx);
+
+        // Live regeneration's drops, on a thread of their own (R-REGEN R7):
+        // a committed entry's packed bytes move out under the lock, their
+        // digest is taken outside it, and the slot goes in under it again.
+        // Joined before phase A collects `committed`; the guard closes its
+        // queue on every exit, an unwind included, so it never outlives them.
+        let live = regen.and_then(crate::block_regen::PhaseARegen::live);
+        let _drops_open = live.map(DropsGuard);
+        let dropper = match live {
+            Some(live) => {
+                let (drop_tx, drop_rx) = mpsc::channel::<crate::block_regen::live::DropJob>();
+                let committed = &committed;
+                let spawned = std::thread::Builder::new()
+                    .name("regen-drop".to_string())
+                    .spawn_scoped(s, move || {
+                        run_drops(live, drop_rx, committed, spill, ledger)
+                    });
+                match spawned {
+                    Ok(handle) => {
+                        live.set_drop_tx(drop_tx);
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        return Err(Error::Prover(format!(
+                            "regeneration's drop thread did not start: {e}"
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
 
         // Committers: each streamed chunk generated (unless a generator did)
         // and Round-1 committed, as the chunks complete.
@@ -1840,8 +2096,8 @@ fn build_streamed(
                         loop {
                             // `t`: from the chunk's arrival (its generation
                             // included when this committer generates it).
-                            // `key`: a streamed chunk this committer packs
-                            // itself, for regeneration's recorder.
+                            // `key`: the streamed chunk it is, under
+                            // regeneration.
                             let (mut chunk, wide, held, finished, t, key) = if generators > 0 {
                                 let next =
                                     ready_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
@@ -1849,6 +2105,7 @@ fn build_streamed(
                                     table,
                                     held,
                                     finished,
+                                    key,
                                 }) = next
                                 else {
                                     return Ok(());
@@ -1859,7 +2116,7 @@ fn build_streamed(
                                     ledger.take_ready(held);
                                 }
                                 let wide = wide_bytes(&table.trace);
-                                (table, wide, held, finished, t, None)
+                                (table, wide, held, finished, t, key)
                             } else {
                                 let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                                 let Ok(job) = job else {
@@ -1870,7 +2127,7 @@ fn build_streamed(
                                 if let Some(ledger) = ledger {
                                     ledger.take(job_bytes);
                                 }
-                                let key = recorder.and(streamed_key(&job));
+                                let key = regen.and(streamed_key(&job));
                                 let (table, finished) = match job {
                                     Streamed::Job(job) => {
                                         (FinishedTable::from(job.generate()), false)
@@ -1950,23 +2207,54 @@ fn build_streamed(
                                     }
                                 }
                             }
-                            if let (Some(recorder), Some((stream, index)), Some(packed)) =
-                                (recorder, key, chunk.trace.narrow_main())
+                            // The shadow's digest, where the committer packed it
+                            // (no generators).
+                            if let (Some(regen), Some((stream, index)), Some(packed)) =
+                                (regen, key, chunk.trace.narrow_main())
+                                && generators == 0
+                                && regen.digests_at_pack()
                             {
-                                recorder.packed(stream, index, packed);
+                                regen.recorder().packed(stream, index, packed);
                             }
+                            // Live regeneration: a streamed chunk whose fused task
+                            // recommits on the device may be dropped (A1).
+                            let live = regen.and_then(crate::block_regen::PhaseARegen::live);
+                            let rank = if finished {
+                                None
+                            } else {
+                                live.and_then(|l| l.droppable(key, pre.recommits_on_device()))
+                            };
                             let packed = chunk.trace.narrow_main().map(|t| t.data().len());
-                            let spilled = spill.map_or(0, |spill| spill.consider(&mut chunk.trace));
+                            let fate = match spill {
+                                Some(spill) => {
+                                    spill.consider(&mut chunk.trace, live, rank.is_some())
+                                }
+                                None if rank.is_some() && live.is_some_and(|l| l.always()) => {
+                                    Fate::Drop
+                                }
+                                None => Fate::Kept,
+                            };
                             if let Some(ledger) = ledger {
                                 ledger.keep(held, packed);
-                                if spilled > 0 {
+                                if let Fate::Spilled(spilled) = fate {
                                     ledger.spilled(spilled);
                                 }
                             }
-                            committed
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push((chunk, name, pre));
+                            let index = {
+                                let mut committed =
+                                    committed.lock().unwrap_or_else(|e| e.into_inner());
+                                committed.push((chunk, name, pre));
+                                committed.len() - 1
+                            };
+                            if let (Some(live), Some(rank), Some(key)) = (live, rank, key) {
+                                match fate {
+                                    Fate::Drop => live.drop_later(index, key, rank),
+                                    Fate::Kept => {
+                                        live.kept(index, key, rank, packed.unwrap_or(0) as u64)
+                                    }
+                                    Fate::Spilled(_) => {}
+                                }
+                            }
                         }
                     };
                     let result = commit_all();
@@ -1979,6 +2267,8 @@ fn build_streamed(
         }
 
         let produce = || -> Result<(Traces, f64, StreamSkip), Error> {
+            // Never `stream_memw_lt` here: regeneration's walk does not
+            // replicate it, and its recipes hold only without it (R-REGEN A10).
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
@@ -2067,7 +2357,7 @@ fn build_streamed(
                         if let Some(ledger) = ledger {
                             ledger.walked_bytes.fetch_sub(walked.heap_bytes(), Relaxed);
                         }
-                        let jobs = match recorder {
+                        let jobs = match regen.map(crate::block_regen::PhaseARegen::recorder) {
                             Some(recorder) => {
                                 let (jobs, added) = accumulator.absorb_counted(walked);
                                 recorder.window(added, &jobs);
@@ -2132,6 +2422,19 @@ fn build_streamed(
         for c in committers {
             if let Err(e) = join(c) {
                 errors.push(e);
+            }
+        }
+        // Every drop is queued: the drop thread finishes them before phase A
+        // collects `committed`.
+        if let (Some(live), Some(dropper)) = (live, dropper) {
+            live.close_drops();
+            if dropper.join().is_err() {
+                errors.push(Error::Prover(
+                    "regeneration's drop thread panicked".to_string(),
+                ));
+            }
+            if let Some(e) = live.errors().into_iter().next() {
+                errors.push(Error::Prover(format!("a regeneration drop: {e}")));
             }
         }
         let (mut traces, collect_secs, streamed) = produced?;
@@ -2277,7 +2580,10 @@ pub fn prove_block_traces(
         opts.fri_final_poly_log_degree,
     );
     let public_output = traces.public_output_bytes.clone();
-    let pairs = airs.air_trace_pairs(traces);
+    // A mismatch between the AIR set and the traces is refused here rather
+    // than asserted (R-REGEN R4): the regenerator may be waiting on this
+    // prove, and the block's window guard closes it on the refusal.
+    let pairs = airs.try_air_trace_pairs(traces)?;
     print_census(
         pairs
             .iter()
@@ -2289,6 +2595,7 @@ pub fn prove_block_traces(
         // cell.
         let (mut packed, mut wide, mut n_packed) = (0usize, 0usize, 0usize);
         let (mut spilled, mut spilled_resident, mut n_spilled) = (0usize, 0usize, 0usize);
+        let (mut dropped, mut n_dropped) = (0usize, 0usize);
         for (_, trace, _) in &pairs {
             if let Some(narrow) = trace.narrow_main() {
                 packed += narrow.data().len();
@@ -2299,6 +2606,9 @@ pub fn prove_block_traces(
                     spilled_resident += slot.len();
                 }
                 n_spilled += 1;
+            } else if let Some(slot) = trace.regen_main() {
+                dropped += slot.len();
+                n_dropped += 1;
             } else {
                 wide += wide_bytes(trace);
             }
@@ -2306,13 +2616,21 @@ pub fn prove_block_traces(
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         eprintln!(
             "BLOCK MEM traces: {} instances · {n_packed} packed {:.2} GiB · {n_spilled} spilled \
-             {:.2} GiB ({:.2} in memory) · {} at 8 B/cell {:.2} GiB",
+             {:.2} GiB ({:.2} in memory) · {} at 8 B/cell {:.2} GiB{}",
             pairs.len(),
             gib(packed),
             gib(spilled),
             gib(spilled_resident),
-            pairs.len() - n_packed - n_spilled,
+            pairs.len() - n_packed - n_spilled - n_dropped,
             gib(wide),
+            if n_dropped > 0 {
+                format!(
+                    " · {n_dropped} dropped {:.2} GiB (regenerated in phase B)",
+                    gib(dropped)
+                )
+            } else {
+                String::new()
+            },
         );
         // The traces' bytes in the heap.
         let traces_held = packed + spilled_resident + wide;
@@ -2506,7 +2824,7 @@ pub(crate) fn stream_spill_for_test(
     stream: StreamConfig,
     policy: Option<SpillPolicy>,
 ) -> Result<(Traces, Vec<String>, String), Error> {
-    let spill = policy.map(|p| Spill::open(p).expect("the spill store opens"));
+    let spill = policy.map(|p| Spill::open(p, false).expect("the spill store opens"));
     let ledger = (stream.finish != FinishCommit::PhaseB || spill.is_some()).then(MemLedger::new);
     let (traces, _, precommits, _) = build_streamed(
         program,
@@ -2573,6 +2891,75 @@ pub(crate) fn stream_skip_for_test(
     Ok((traces, streamed))
 }
 
+/// What [`stream_live_for_test`] built and decided.
+#[cfg(test)]
+pub(crate) struct LiveRun {
+    pub(crate) traces: Traces,
+    /// Chunks of each streamed table the stream handed out.
+    pub(crate) streamed: StreamSkip,
+    /// The `BLOCK REGEN dropped` and `BLOCK SPILL` lines.
+    pub(crate) line: String,
+    pub(crate) spill: String,
+    /// Committed packed bytes the spill counts on the host.
+    pub(crate) resident: u64,
+    /// Drop-back's need and the bytes it was given, once armed.
+    pub(crate) armed: Option<(u64, u64)>,
+    /// Phase B's regeneration: none when nothing was dropped.
+    pub(crate) plan: Option<crate::block_regen::live::LivePlan>,
+}
+
+/// Phase A's stream of `program` (no input) under `stream` with live
+/// regeneration `live` and the spill `policy` (none: no spill), `auto`
+/// reading the host as 0 until `fake_host_after` packed bytes were
+/// considered and as the target after.
+#[cfg(test)]
+pub(crate) fn stream_live_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    stream: StreamConfig,
+    live: crate::block_regen::live::LiveRegen,
+    policy: Option<SpillPolicy>,
+    fake_host_after: Option<u64>,
+) -> Result<LiveRun, Error> {
+    let spill = policy.map(|p| {
+        let mut spill = Spill::open(p, true).expect("the spill decides");
+        if fake_host_after.is_some() {
+            spill.fake_host_after = fake_host_after;
+            spill.target = 64 << 30;
+        }
+        spill
+    });
+    let ledger = MemLedger::new();
+    let regen = crate::block_regen::PhaseARegen::Live(Box::new(live));
+    let (traces, _, _, streamed) = build_streamed(
+        program,
+        &[],
+        opts,
+        max_rows,
+        ResidencyMode::RecomputeLdeDevice,
+        &mut BlockTimes::default(),
+        &stream,
+        Some(&ledger),
+        spill.as_ref(),
+        Some(&regen),
+    )?;
+    let crate::block_regen::PhaseARegen::Live(live) = regen else {
+        return Err(Error::Prover("live regeneration".to_string()));
+    };
+    Ok(LiveRun {
+        traces,
+        streamed,
+        line: live.line(),
+        spill: spill.as_ref().map(Spill::report).unwrap_or_default(),
+        resident: spill
+            .as_ref()
+            .map_or(0, |s| s.resident.load(std::sync::atomic::Ordering::Relaxed)),
+        armed: live.armed_for_test(),
+        plan: (*live).into_plan(),
+    })
+}
+
 /// Phase A's stream of `program` (no input) under `stream` with
 /// regeneration's recorder on: the traces, how many chunks of each streamed
 /// table the stream handed out, the recipes in hand-out order and the stray
@@ -2584,7 +2971,8 @@ pub(crate) fn stream_recorded_for_test(
     max_rows: &MaxRowsConfig,
     stream: StreamConfig,
 ) -> Result<(Traces, StreamSkip, Vec<crate::block_regen::Recipe>, usize), Error> {
-    let recorder = crate::block_regen::Recorder::new();
+    let regen =
+        crate::block_regen::PhaseARegen::Shadow(Box::new(crate::block_regen::Recorder::new()));
     let (traces, _, _, streamed) = build_streamed(
         program,
         &[],
@@ -2595,9 +2983,12 @@ pub(crate) fn stream_recorded_for_test(
         &stream,
         None,
         None,
-        Some(&recorder),
+        Some(&regen),
     )?;
-    let (recipes, stray) = recorder.finish();
+    let crate::block_regen::PhaseARegen::Shadow(recorder) = regen else {
+        return Err(Error::Prover("the shadow's recorder".to_string()));
+    };
+    let (recipes, stray) = (*recorder).finish();
     Ok((traces, streamed, recipes, stray))
 }
 

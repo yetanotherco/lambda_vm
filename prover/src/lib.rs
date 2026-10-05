@@ -874,12 +874,25 @@ pub struct RegisterPreprocessed<'a> {
 
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
+    /// A disagreement between the AIR set and the traces is a bug here; this
+    /// form asserts it (see [`Self::try_air_trace_pairs`]).
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
+        self.try_air_trace_pairs(traces)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::air_trace_pairs`], refusing an AIR set and traces that disagree
+    /// on a table's count with an [`Error`] instead of asserting it — for a
+    /// caller with work waiting on the prove (the block's regenerator).
+    pub fn try_air_trace_pairs<'a>(
+        &'a self,
+        traces: &'a mut Traces,
+    ) -> Result<Vec<AirTracePair<'a>>, Error> {
         // Every chunked table is paired by `zip` below, which stops at the shorter
         // side: an AIR set and a trace set that disagreed would silently prove fewer
         // tables than the statement declares. They are built from the same
         // `TableCounts`, so a mismatch is a bug here, not a shape a proof can carry.
-        assert_eq!(
+        let (airs, trace_counts) = (
             [
                 self.cpus.len(),
                 self.lts.len(),
@@ -901,7 +914,7 @@ impl VmAirs {
                 self.eqs.len(),
                 self.bytewises.len(),
                 self.stores.len(),
-                self.cpu32s.len()
+                self.cpu32s.len(),
             ],
             [
                 traces.cpus.len(),
@@ -924,10 +937,14 @@ impl VmAirs {
                 traces.eqs.len(),
                 traces.bytewises.len(),
                 traces.stores.len(),
-                traces.cpu32s.len()
+                traces.cpu32s.len(),
             ],
-            "AIR set and traces disagree on table counts",
         );
+        if airs != trace_counts {
+            return Err(Error::Prover(format!(
+                "AIR set and traces disagree on table counts: {airs:?} against {trace_counts:?}"
+            )));
+        }
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
@@ -1020,7 +1037,7 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
 
-        pairs
+        Ok(pairs)
     }
 
     /// Collect AIR references for [`Verifier::multi_verify`].

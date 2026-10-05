@@ -37,6 +37,10 @@ use crate::Error;
 use crate::tables::trace_builder::{ChunkJob, RegenBuilder, StreamSkip, StreamTable, Traces};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
+pub(crate) mod live;
+#[cfg(test)]
+mod live_tests;
+
 type Table = stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>;
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -129,6 +133,8 @@ pub(crate) struct ClassBytes {
     pub(crate) packed: u64,
     pub(crate) spilled: u64,
     pub(crate) wide: u64,
+    /// Dropped for regeneration: not held anywhere until phase B rebuilds it.
+    pub(crate) dropped: u64,
 }
 
 impl ClassBytes {
@@ -140,14 +146,16 @@ impl ClassBytes {
             self.packed += narrow.data().len() as u64;
         } else if let Some(slot) = trace.spilled_main() {
             self.spilled += slot.len() as u64;
+        } else if let Some(slot) = trace.regen_main() {
+            self.dropped += slot.len() as u64;
         } else {
             self.wide += cells * std::mem::size_of::<u64>() as u64;
         }
     }
 
-    /// Its bytes, wherever they are.
+    /// Its bytes, wherever they are (dropped ones included).
     pub(crate) fn bytes(&self) -> u64 {
-        self.packed + self.spilled + self.wide
+        self.packed + self.spilled + self.wide + self.dropped
     }
 }
 
@@ -186,6 +194,7 @@ impl TraceClasses {
             packed: a.packed + b.packed + c.packed,
             spilled: a.spilled + b.spilled + c.spilled,
             wide: a.wide + b.wide + c.wide,
+            dropped: a.dropped + b.dropped + c.dropped,
         }
     }
 
@@ -317,6 +326,16 @@ pub(crate) enum RegenMode {
     /// `shadow`: phase A records every streamed instance's recipe, and phase
     /// B regenerates each beside the prove, checks it and throws it away.
     Shadow,
+    /// `auto`: a tier of the spill policy's `auto`. Phase A records every
+    /// streamed instance's recipe; once the policy would move an instance off
+    /// the host, a regenerable one is dropped instead of spilled (and the
+    /// resident regenerable ones are dropped back until the host is under
+    /// the target), and phase B rebuilds the dropped ones ([`live`]). A
+    /// block that fits drops nothing and runs no regenerator.
+    Auto,
+    /// `always`: every regenerable instance is dropped and rebuilt — the
+    /// byte-identity test mode, not a policy.
+    Always,
 }
 
 /// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN`; any other value is refused.
@@ -328,8 +347,10 @@ fn parse_regen_mode(value: Option<&str>) -> Result<RegenMode, Error> {
     match value.map(str::trim) {
         None | Some("off") => Ok(RegenMode::Off),
         Some("shadow") => Ok(RegenMode::Shadow),
+        Some("auto") => Ok(RegenMode::Auto),
+        Some("always") => Ok(RegenMode::Always),
         Some(other) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_REGEN must be `off` or `shadow`, got `{other}`"
+            "LAMBDA_VM_BLOCK_REGEN must be `off`, `shadow`, `auto` or `always`, got `{other}`"
         ))),
     }
 }
@@ -529,6 +550,19 @@ impl Recorder {
             Some(recipe) => recipe.packed = Some(packed),
             None => r.stray += 1,
         }
+    }
+
+    /// The rank of chunk `index` of `table`: its place in the hand-out.
+    pub(crate) fn rank_of(&self, table: StreamTable, index: usize) -> Option<u64> {
+        self.lock()
+            .recipes
+            .get(&(slot(table), index))
+            .map(|r| r.order as u64)
+    }
+
+    /// The recipes recorded so far.
+    pub(crate) fn len(&self) -> usize {
+        self.lock().recipes.len()
     }
 
     /// The recipes in hand-out order, and the digests that found no recipe.
@@ -1009,7 +1043,7 @@ impl Plan {
 /// own thread and packs each streamed instance), else none, saying why.
 pub(crate) fn shadow_recorder(mode: RegenMode, streamed: bool) -> Option<Recorder> {
     match (mode, streamed) {
-        (RegenMode::Off, _) => None,
+        (RegenMode::Off | RegenMode::Auto | RegenMode::Always, _) => None,
         (RegenMode::Shadow, true) => Some(Recorder::new()),
         (RegenMode::Shadow, false) => {
             eprintln!(
@@ -1018,6 +1052,48 @@ pub(crate) fn shadow_recorder(mode: RegenMode, streamed: bool) -> Option<Recorde
             );
             None
         }
+    }
+}
+
+/// Phase A's regeneration: the shadow's recorder (digests at pack), or live
+/// regeneration (recipes, drops under the policy).
+pub(crate) enum PhaseARegen {
+    Shadow(Box<Recorder>),
+    Live(Box<live::LiveRegen>),
+}
+
+impl PhaseARegen {
+    /// The regeneration `mode` asks for, when phase A can feed it
+    /// (`streamed`); none otherwise (saying why).
+    pub(crate) fn new(mode: RegenMode, streamed: bool) -> Option<Self> {
+        match mode {
+            RegenMode::Off => None,
+            RegenMode::Shadow => shadow_recorder(mode, streamed).map(|r| Self::Shadow(Box::new(r))),
+            RegenMode::Auto | RegenMode::Always => {
+                live::LiveRegen::new(mode, streamed).map(|live| Self::Live(Box::new(live)))
+            }
+        }
+    }
+
+    pub(crate) fn recorder(&self) -> &Recorder {
+        match self {
+            Self::Shadow(recorder) => recorder,
+            Self::Live(live) => live.recorder(),
+        }
+    }
+
+    /// Live regeneration, when it is.
+    pub(crate) fn live(&self) -> Option<&live::LiveRegen> {
+        match self {
+            Self::Shadow(_) => None,
+            Self::Live(live) => Some(live),
+        }
+    }
+
+    /// Whether the thread that packs a streamed instance digests it (the
+    /// shadow compares against it; live regeneration digests at drop).
+    pub(crate) fn digests_at_pack(&self) -> bool {
+        matches!(self, Self::Shadow(_))
     }
 }
 
@@ -1275,7 +1351,9 @@ mod shadow_tests {
         assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
         assert_eq!(parse_regen_mode(Some(" off ")).unwrap(), RegenMode::Off);
         assert_eq!(parse_regen_mode(Some("shadow")).unwrap(), RegenMode::Shadow);
-        for bad in ["", "on", "always", "Shadow", "1"] {
+        assert_eq!(parse_regen_mode(Some("auto")).unwrap(), RegenMode::Auto);
+        assert_eq!(parse_regen_mode(Some("always")).unwrap(), RegenMode::Always);
+        for bad in ["", "on", "Always", "Shadow", "1"] {
             assert!(parse_regen_mode(Some(bad)).is_err(), "{bad:?}");
         }
     }
