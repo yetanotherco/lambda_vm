@@ -2498,10 +2498,13 @@ mod regen_ready_tests {
     #[test]
     fn out_of_order_generators_never_deadlock_the_drivers() {
         for (n, ahead_traces, generators, drivers, slow) in [
+            // r-regen's hang cases (k = 1 and 2 drivers, G = 3 generators).
             (8, 2, 3, 1, 1),
             (8, 1, 3, 2, 2),
-            (32, 1, 8, 1, 4),
+            // Its live cases (k ≥ G), and many generators behind one driver.
             (16, 2, 3, 3, 1),
+            (16, 1, 3, 8, 2),
+            (32, 1, 8, 1, 4),
         ] {
             let ok = within(30, "the paced regenerator", move || {
                 paced_run(n, ahead_traces, generators, drivers, slow)
