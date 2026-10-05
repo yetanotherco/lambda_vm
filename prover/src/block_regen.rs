@@ -331,7 +331,9 @@ pub(crate) enum RegenMode {
     /// the host, a regenerable one is dropped instead of spilled (and the
     /// resident regenerable ones are dropped back until the host is under
     /// the target), and phase B rebuilds the dropped ones ([`live`]). A
-    /// block that fits drops nothing and runs no regenerator.
+    /// block that fits drops nothing and runs no regenerator, and with the
+    /// spill policy `off` (`LAMBDA_VM_BLOCK_SPILL=off`) nothing ever leaves
+    /// the host, so it never arms.
     Auto,
     /// `always`: every regenerable instance is dropped and rebuilt — the
     /// byte-identity test mode, not a policy.
@@ -1365,6 +1367,7 @@ mod shadow_tests {
     /// and 33 cycles, with no mismatch.
     #[test]
     fn the_shadow_regenerates_every_streamed_instance() {
+        let _one = super::live_tests::one_at_a_time();
         let opts = crate::lfm::proof::block_base_options();
         let max_rows = max_rows();
         let mut regenerated = 0;
@@ -1436,6 +1439,7 @@ mod shadow_tests {
     /// as missing.
     #[test]
     fn a_wrong_regeneration_is_a_mismatch() {
+        let _one = super::live_tests::one_at_a_time();
         let opts = crate::lfm::proof::block_base_options();
         let max_rows = max_rows();
         let program = program("all_instructions_64");
@@ -1486,6 +1490,7 @@ mod shadow_tests {
     /// Stopped before it starts, the shadow regenerates nothing and says why.
     #[test]
     fn a_stopped_shadow_says_so() {
+        let _one = super::live_tests::one_at_a_time();
         let opts = crate::lfm::proof::block_base_options();
         let max_rows = max_rows();
         let program = program("test_keccak_multi");

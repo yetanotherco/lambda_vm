@@ -108,6 +108,9 @@ struct LiveState {
     refused_host: usize,
     refused_late: usize,
     errors: Vec<String>,
+    /// The cycles phase A's executor ran at a time: the windows the ranks
+    /// were handed out in.
+    phase_a_window: Option<usize>,
 }
 
 /// Phase A's side of live regeneration (`auto` or `always`): the recipes,
@@ -225,6 +228,12 @@ impl LiveRegen {
         Some(rank)
     }
 
+    /// The cycles phase A's executor runs at a time (its windows, which the
+    /// ranks follow): the regenerator must walk the same (R-REGEN S3).
+    pub(crate) fn set_phase_a_window(&self, cycles: usize) {
+        self.lock().phase_a_window = Some(cycles);
+    }
+
     /// The drop thread's queue.
     pub(crate) fn set_drop_tx(&self, tx: mpsc::Sender<DropJob>) {
         self.lock().drop_tx = Some(tx);
@@ -251,14 +260,18 @@ impl LiveRegen {
             if planned >= need {
                 break;
             }
-            planned += c.bytes;
-            if let Some(tx) = &state.drop_tx {
-                let _ = tx.send(DropJob {
-                    index: c.index,
-                    key: c.key,
-                    rank: c.rank,
-                    back: true,
-                });
+            // Counted only once queued (R-REGEN S4).
+            if let Some(tx) = &state.drop_tx
+                && tx
+                    .send(DropJob {
+                        index: c.index,
+                        key: c.key,
+                        rank: c.rank,
+                        back: true,
+                    })
+                    .is_ok()
+            {
+                planned += c.bytes;
             }
         }
         state.armed = Some((self.started.elapsed().as_secs_f64(), need, planned));
@@ -279,14 +292,17 @@ impl LiveRegen {
                 bytes,
             }),
             Some((_, need, planned)) if *planned < *need => {
-                *planned += bytes;
-                if let Some(tx) = &state.drop_tx {
-                    let _ = tx.send(DropJob {
-                        index,
-                        key,
-                        rank,
-                        back: true,
-                    });
+                if let Some(tx) = &state.drop_tx
+                    && tx
+                        .send(DropJob {
+                            index,
+                            key,
+                            rank,
+                            back: true,
+                        })
+                        .is_ok()
+                {
+                    *planned += bytes;
                 }
             }
             Some(_) => {}
@@ -375,16 +391,18 @@ impl LiveRegen {
             window: self.window,
             producer,
             dropped,
+            phase_a_window: state.phase_a_window,
         })
     }
 }
 
-/// Phase B's regeneration: the window, its first producer, and the dropped
-/// instances in rank order.
+/// Phase B's regeneration: the window, its first producer, the dropped
+/// instances in rank order, and the windows phase A handed them out in.
 pub(crate) struct LivePlan {
     pub(crate) window: Arc<RegenWindow>,
     pub(crate) producer: RegenProducer,
     pub(crate) dropped: Vec<Dropped>,
+    pub(crate) phase_a_window: Option<usize>,
 }
 
 /// Closes the window when dropped, and on demand (R4): the block's prove
@@ -527,9 +545,11 @@ pub(crate) struct LiveFaults {
 /// slot waiting.
 ///
 /// The ranks are phase A's hand-out order, window by window, so the windows
-/// must be phase A's (`max_rows.cpu` cycles): on others the slicer cuts some
-/// rank after a higher one, and that rank is failed — its table refused, never
-/// waited on (R10).
+/// must be phase A's (`max_rows.cpu` cycles): a plan whose phase A walked
+/// other windows than `window_cycles` (or did not say) is refused whole, every
+/// slot failed before anything runs (R-REGEN S3). Within the same windows, a
+/// rank the slicer cuts after a higher one is failed — its table refused,
+/// never waited on (R10).
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub(crate) fn run_live(
     program: &Elf,
@@ -547,7 +567,27 @@ pub(crate) fn run_live(
         window,
         producer,
         dropped,
+        phase_a_window,
     } = plan;
+    if phase_a_window != Some(window_cycles) {
+        let why = format!(
+            "the regenerator walks windows of {window_cycles} cycles, phase A walked {}: its \
+             ranks do not hold",
+            phase_a_window.map_or("unknown windows".to_string(), |w| format!("{w}"))
+        );
+        for d in &dropped {
+            d.slot.fail(&why);
+        }
+        drop(producer);
+        return LiveReport {
+            dropped: dropped.len(),
+            skipped: dropped.len(),
+            generators,
+            error: Some(why),
+            wall: started.elapsed().as_secs_f64(),
+            ..LiveReport::default()
+        };
+    }
     let mut builder = builder;
     let mut report = LiveReport {
         dropped: dropped.len(),
