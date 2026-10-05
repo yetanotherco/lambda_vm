@@ -385,7 +385,10 @@ where
             }
             // A dropped trace, read once its regenerator deposited it (a copy:
             // its fused task still takes it). The prover takes it before its
-            // readers, so here too only a caller outside it lands here.
+            // readers, so here too only a caller outside it lands here — and
+            // only beside the fused phase: the regenerator is paced by the
+            // fused tasks' takes, so a reader that blocks one of them here
+            // before the fused phase would wait forever (R-REGEN C4).
             (None, Some(slot)) => {
                 loaded = slot
                     .load()

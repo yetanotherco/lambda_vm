@@ -299,6 +299,42 @@ fn a_wrong_regenerated_trace_without_the_digest_is_refused_on_the_card() {
     }
 }
 
+/// ★ On the card, the second layer behind a regenerated trace: every deposit
+/// faithful (the digest passes), then one packed bit flipped right before the
+/// device widens it, and the kept-top check refuses the proof with
+/// `RecomputedCommitmentMismatch` — `a_bad_device_widen_is_refused` with the
+/// regenerator as the source (R-REGEN N4).
+#[cfg(feature = "cuda")]
+#[test_log::test]
+#[ignore = "requires a GPU, LAMBDA_VM_GPU_LDE_THRESHOLD=2 and LAMBDA_VM_RECOMMIT_TOP_LEVELS=2; run alone"]
+fn a_regenerated_trace_bent_before_the_widen_is_refused_on_the_card() {
+    let all = [Held::Dropped(0), Held::Dropped(1), Held::Dropped(2)];
+    for table in 0..3 {
+        crate::residency_mode::test_hooks::perturb_narrow_before_recommit(table);
+        let out = prove_held(
+            ResidencyMode::RecomputeLdeDevice,
+            all,
+            Regenerator::Faithful,
+        );
+        assert_eq!(
+            crate::residency_mode::test_hooks::PERTURB_NARROW_BEFORE_RECOMMIT
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "table {table}: the perturbation never fired"
+        );
+        match out {
+            Err(ProvingError::RecomputedCommitmentMismatch(msg)) => {
+                assert!(
+                    msg.contains("does not match the kept tree"),
+                    "table {table}: {msg}"
+                )
+            }
+            Err(e) => panic!("table {table}: wrong refusal {e:?}"),
+            Ok(_) => panic!("table {table}: a bent regenerated trace was proved"),
+        }
+    }
+}
+
 /// ★ A regenerator that dies before depositing refuses the proof with
 /// `RegeneratedTraceFailed`, and the prove returns (no driver hangs).
 #[test]
