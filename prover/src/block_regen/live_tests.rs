@@ -21,6 +21,7 @@ use crate::block::{
     LiveRun, SpillPolicy, StreamConfig, stream_config, stream_live_for_test, stream_spill_for_test,
 };
 use crate::tables::MaxRowsConfig;
+use crate::tables::gpack::TraceForm;
 use crate::tables::trace_builder::{RegenBuilder, StreamSkip, StreamTable, Traces};
 use crate::tests::windowed_builder_tests::{same_traces, widen_all};
 
@@ -143,7 +144,8 @@ fn reference(traces: &Traces, (table, index): (StreamTable, usize)) -> &NarrowMa
 }
 
 /// The regenerator over `plan` beside `taker` (phase B's stand-in), each on a
-/// thread of its own, walking phase A's windows. Returns the regenerator's
+/// thread of its own, walking phase A's windows and writing packed (G-pack,
+/// as phase A here). Returns the regenerator's
 /// report and the taker's result, or `None` for either that did not end
 /// within [`DEADLINE`] — the window is then closed, which must release both.
 fn regenerate<R: Send>(
@@ -153,13 +155,23 @@ fn regenerate<R: Send>(
     faults: LiveFaults,
     taker: impl FnOnce() -> R + Send,
 ) -> (Option<LiveReport>, Option<R>) {
-    regenerate_on(program, max_rows().cpu, plan, generators, faults, taker)
+    let window = max_rows().cpu;
+    regenerate_on(
+        program,
+        window,
+        TraceForm::Narrow,
+        plan,
+        generators,
+        faults,
+        taker,
+    )
 }
 
-/// [`regenerate`] on windows of `window` cycles.
+/// [`regenerate`] on windows of `window` cycles, writing in `form`.
 fn regenerate_on<R: Send>(
     program: &Elf,
     window: usize,
+    form: TraceForm,
     plan: LivePlan,
     generators: usize,
     faults: LiveFaults,
@@ -171,7 +183,16 @@ fn regenerate_on<R: Send>(
         let (report_tx, report_rx) = mpsc::channel();
         let (taken_tx, taken_rx) = mpsc::channel();
         s.spawn(move || {
-            let report = run_live(program, &[], builder, window, plan, generators, faults);
+            let report = run_live(
+                program,
+                &[],
+                builder,
+                window,
+                plan,
+                generators,
+                form,
+                faults,
+            );
             let _ = report_tx.send(report);
         });
         s.spawn(move || {
@@ -223,15 +244,20 @@ fn slots_of(plan: &LivePlan) -> Vec<RegenSlot> {
 /// resident run's digest, no words), the plan lists them in rank order, and
 /// the regenerator brings every one back while phase B takes them in rank
 /// order — with the window at 4 GiB, and at one byte (only the frontier may
-/// deposit, the reviewer's hang case) — so the traces are the resident run's,
-/// table for table.
+/// deposit, the reviewer's hang case), written packed (G-pack) or at 8 bytes
+/// a cell then packed — so the traces are the resident run's, table for
+/// table.
 #[test]
 fn always_drops_every_streamed_chunk_and_the_regenerator_brings_each_back() {
     for name in PROGRAMS {
         let program = program(name);
         for (committers, generators, finish_in_a) in CONFIGS {
             let config = stream_config(committers, generators, finish_in_a);
-            for (ahead, generators) in [(4 * GIB, 3), (1, 1), (1, 3)] {
+            for (ahead, generators, form) in [
+                (4 * GIB, 3, TraceForm::Narrow),
+                (1, 1, TraceForm::Wide),
+                (1, 3, TraceForm::Narrow),
+            ] {
                 // Widened at the end of each case.
                 let mut reference_traces = resident(&program, config);
                 let mut run = phase_a(&program, config, RegenMode::Always, ahead, None, None);
@@ -269,8 +295,10 @@ fn always_drops_every_streamed_chunk_and_the_regenerator_brings_each_back() {
                 let keys = keys_of(&plan);
                 let n = keys.len();
                 let traces = &mut run.traces;
-                let (report, taken) = regenerate(
+                let (report, taken) = regenerate_on(
                     &program,
+                    max_rows().cpu,
+                    form,
                     plan,
                     generators,
                     LiveFaults::default(),
@@ -753,6 +781,7 @@ fn a_regenerator_on_other_windows_refuses_never_waits() {
         let (report, taken) = regenerate_on(
             &program,
             window,
+            TraceForm::Narrow,
             plan,
             2,
             LiveFaults::default(),
