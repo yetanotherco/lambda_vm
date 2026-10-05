@@ -3013,6 +3013,17 @@ fn the_whir_block_tree_on_a_real_block() {
         plan.partition().leaves(),
         plan.prepared().len()
     );
+    // Each leaf's chips, real / padded rows: how far each sits from its next
+    // doubling, and which one doubled when the in-guest work moves.
+    for (k, program) in programs.iter().enumerate() {
+        let chips: Vec<String> =
+            super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER)
+                .iter()
+                .filter(|c| c.real_rows > 0)
+                .map(|c| format!("{}={}/{}", c.name, c.real_rows, c.rows))
+                .collect();
+        println!("W3 LEAF CENSUS {k}: {}", chips.join(" "));
+    }
 
     // The readouts above run on the clock, between the base and the tree: a
     // prover prints none of them, so the whole block is also given without.
@@ -3433,4 +3444,92 @@ fn the_batched_whir_block_tree_proves_to_the_derived_top() {
         under(&small_format()).is_err(),
         "the per-table verifier refuses the batched top"
     );
+}
+
+/// ★ The grind bits (`LAMBDA_VM_ZF_WHIR_GRIND_BITS`) are a verifier constant
+/// on the block's recursion too: the statement, Q and the grind are the leaf
+/// program's constants. Over a block ground at 18 bits the plan at 18 emits a
+/// leaf that executes; the plan at 20 emits one that refuses the same proof.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn a_block_leaf_at_20_bits_refuses_a_block_ground_at_18() {
+    let at = |bits: u8| BlockFormat {
+        zf: ZfFormat {
+            whir_grind_bits: bits,
+            ..small_format().zf
+        },
+        ..small_format()
+    };
+    let (elf, proof) = small_block("test_commit_4", &at(18));
+    let plan = plan_of(&elf, &proof, &at(18), Some(1));
+    run_leaf(&plan, &proof, 0, LeafChecks::ALL).expect("the leaf at 18 bits executes");
+
+    let strict = plan_of(&elf, &proof, &at(20), Some(1));
+    assert_ne!(
+        strict.id(),
+        plan.id(),
+        "the statement at 20 bits is another statement"
+    );
+    let program = leaf_program_with(&strict, 0, LeafChecks::ALL).expect("the leaf at 20 emits");
+    let refusal = match block_leaf_arena(&strict, &proof, 0) {
+        Err(e) => format!("the arena: {e}"),
+        Ok(arenas) if program.arena_schema.lens != vec![arenas[0].len() as u32] => format!(
+            "the arena's length: {} words for a leaf hinting {:?}",
+            arenas[0].len(),
+            program.arena_schema.lens
+        ),
+        Ok(arenas) => match execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER) {
+            Err(e) => format!("the execution: {e:?}"),
+            Ok(_) => panic!("a leaf at 20 bits executed over a block ground at 18"),
+        },
+    };
+    println!("GRIND LEAF REFUSAL: {refusal}");
+}
+
+/// I-GRIND2 instrument (not a gate): a block group's in-guest opening cost
+/// ([`super::whir_stacked::stacked_verify_cost`], what the plan charges a
+/// group for its stacked opening and each prepared one) at 20 grind bits
+/// (Q 112) and at `LAMBDA_VM_ZF_WHIR_GRIND_BITS=18` (Q 114), per stack height
+/// and polynomial count. The per-group deltas predict the W3 plan's costs and
+/// leaf count under the arm; the argue's cost does not read Q.
+///
+/// cargo test -p lambda-vm-prover --lib grind_bits_group_cost_census -- --ignored --nocapture
+#[test]
+#[ignore = "instrument: prints the group opening cost per setting, asserts nothing"]
+fn grind_bits_group_cost_census() {
+    for bits in crate::zf_format::WHIR_GRIND_BITS {
+        let format = ZfFormat {
+            whir_grind_bits: bits,
+            ..ZfFormat::DEFAULT
+        };
+        for (polys, n) in [1usize, 2, 3]
+            .into_iter()
+            .map(|p| (p, 27usize))
+            .chain((15..=26).map(|n| (1, n)))
+        {
+            // Tables of 2^n cells, one per polynomial: at 27 the stack cap
+            // keeps them apart, below it one table is one polynomial.
+            let height = n.min(21);
+            let shapes = vec![(1usize << (n - height), height); polys];
+            let config = crate::multilinear_prove::chain_config_under(&format, &shapes);
+            let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
+                .expect("a layout");
+            let (_, group_of) = super::whir_epoch::group_columns(&shapes);
+            let chain = super::whir_chain::ChainShape::new(&config, layout.n_stack());
+            let cost = super::whir_stacked::stacked_verify_cost(
+                &layout,
+                &group_of,
+                &chain,
+                super::whir_epoch::fresh_schedule().entry(),
+            );
+            println!(
+                "GRINDGROUP bits={bits} Q={} n_stack={} polys={} perms={} instrs={}",
+                config.num_queries,
+                layout.n_stack(),
+                layout.num_polys(),
+                cost.perms(),
+                cost.operations(),
+            );
+        }
+    }
 }

@@ -8,14 +8,15 @@
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! LAMBDA_VM_ZF_WHIR_STACK  25 | 26 | 27                   WHIR stack cap, in variables (S2)
 //! LAMBDA_VM_ZF_WHIR_GRIND  query | all                    WHIR proof of work: before the queries only, or all three (P2)
+//! LAMBDA_VM_ZF_WHIR_GRIND_BITS  20 | 18               WHIR proof-of-work bits; Q buys back what the grind gives up
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query`.
-//! Each lever was measured net positive on block runs before it became the
+//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
+//! whir_grind_bits=18`. Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
-//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`), so setting
-//! all seven to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
+//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`,
+//! `whir_grind_bits=20`), so setting all eight to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
 //! byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
@@ -47,8 +48,8 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query`.
-//! Its absence in a log is then a fact about the run, not an ambiguity.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
+//! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
 
@@ -65,16 +66,32 @@ pub const ENV_ONE_ROW: &str = "LAMBDA_VM_ZF_ONE_ROW";
 pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
+pub const ENV_WHIR_GRIND_BITS: &str = "LAMBDA_VM_ZF_WHIR_GRIND_BITS";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
 /// `uniform4` after it.
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
 
-/// The WHIR base chains' proof-of-work bits, wherever [`WhirGrind`] places
-/// them. The query count subtracts the query grind's bits from what the
-/// queries must buy (`multilinear::query_count::num_queries`).
-pub const PRODUCTION_WHIR_GRIND_BITS: u8 = 20;
+/// The WHIR chains' proof-of-work bits at the default, wherever [`WhirGrind`]
+/// places them. The query count subtracts the query grind's bits from what the
+/// queries must buy (`multilinear::query_count::num_queries`), so 18 bits run
+/// Q 114 where 20 ran 112 (FAST 320: base −0.90 s at block 25368371).
+pub const PRODUCTION_WHIR_GRIND_BITS: u8 = 18;
+
+/// The bits the WHIR chains ground before the default moved to 18: the legacy
+/// format's, and `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`'s (the opt-out).
+pub const LEGACY_WHIR_GRIND_BITS: u8 = 20;
+
+/// The grind bits `LAMBDA_VM_ZF_WHIR_GRIND_BITS` accepts. 18 trades two grind
+/// bits for two queries (Q 112 → 114 at every production height from 15 to 27
+/// variables), and every phase keeps at least the proven minimum it has at 20:
+/// the binding phase is the unground fold at 27 variables (130.393), which
+/// neither the query grind nor Q reaches; the query phases move 130.926 →
+/// 130.907. Not below 18: each bit given up costs every chain the recursion
+/// verifies a query (on the block, every block leaf's in-guest openings).
+/// Widening this list is a format decision, not a parser one.
+pub const WHIR_GRIND_BITS: [u8; 2] = [20, 18];
 
 /// One process's proof format. [`ZfFormat::default`] is [`ZfFormat::DEFAULT`],
 /// the measured configuration; [`ZfFormat::LEGACY`] is every lever off.
@@ -94,6 +111,8 @@ pub struct ZfFormat {
     pub whir_stack: StackVars,
     /// P2: where the WHIR base chains grind.
     pub whir_grind: WhirGrind,
+    /// How many bits each of those grinds spends.
+    pub whir_grind_bits: u8,
 }
 
 /// Where the WHIR base chains grind (P2), and so which nonces their rounds
@@ -119,11 +138,11 @@ pub enum WhirGrind {
 }
 
 impl WhirGrind {
-    /// The grind bits this placement puts in a chain config.
-    pub const fn bits(self) -> GrindBits {
+    /// The grind bits this placement puts in a chain config, `bits` a grind.
+    pub const fn bits(self, bits: u8) -> GrindBits {
         match self {
-            Self::Query => GrindBits::query_only(PRODUCTION_WHIR_GRIND_BITS),
-            Self::All => GrindBits::uniform(PRODUCTION_WHIR_GRIND_BITS),
+            Self::Query => GrindBits::query_only(bits),
+            Self::All => GrindBits::uniform(bits),
         }
     }
 
@@ -192,7 +211,10 @@ impl ZfFormat {
     /// one raises the proven minimum ([`WhirGrind`]), and the query counts, the
     /// query grinds and the blowups are the legacy ones. It changes no STARK
     /// proof. `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
-    /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's.
+    /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's. `whir_grind_bits=18` grinds
+    /// two bits fewer and buys them back with two queries (Q 112 → 114): the
+    /// proven minimum stays 130.393 bits, at the unground fold (WHIR block base
+    /// −0.90 s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -201,9 +223,10 @@ impl ZfFormat {
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
+        whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
     };
 
-    /// The legacy format: every lever off. What all seven knobs at their
+    /// The legacy format: every lever off. What all eight knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -214,6 +237,7 @@ impl ZfFormat {
         whir_folds: WhirFolds::Uniform,
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
+        whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -226,9 +250,16 @@ impl ZfFormat {
             && self.whir_folds == WhirFolds::Uniform
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
+            && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
     }
 
-    /// Parse the seven knobs through `lookup` (the process environment in
+    /// The grind bits the WHIR chains run at: [`WhirGrind`]'s placement with
+    /// `whir_grind_bits` bits in each placed grind.
+    pub const fn whir_grind_bits(&self) -> GrindBits {
+        self.whir_grind.bits(self.whir_grind_bits)
+    }
+
+    /// Parse the eight knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
@@ -261,6 +292,9 @@ impl ZfFormat {
             format.whir_grind = v
                 .parse()
                 .map_err(|()| format!("{ENV_WHIR_GRIND}={v:?}: expected `query` or `all`"))?;
+        }
+        if let Some(v) = get(ENV_WHIR_GRIND_BITS) {
+            format.whir_grind_bits = parse_whir_grind_bits(&v)?;
         }
         Ok(format)
     }
@@ -342,18 +376,19 @@ impl ZfFormat {
     }
 
     /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…
-    /// whir_grind=…`, each value in the spelling its knob accepts.
+    /// whir_grind=… whir_grind_bits=…`, each value in the spelling its knob accepts.
     pub fn banner(&self) -> String {
         format!(
             "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={} whir_stack={} \
-             whir_grind={}",
+             whir_grind={} whir_grind_bits={}",
             self.cap,
             self.whir_cap,
             self.fri,
             self.one_row,
             whir_folds_name(&self.whir_folds),
             self.whir_stack.get(),
-            self.whir_grind
+            self.whir_grind,
+            self.whir_grind_bits
         )
     }
 
@@ -387,8 +422,9 @@ impl ZfFormat {
     }
 
     /// The WHIR part: what `multilinear::ChainConfig` carries. `whir_grind`'s
-    /// other half, its bits, is a security parameter and goes in where the
-    /// config is built ([`crate::multilinear_prove::chain_config_under`]).
+    /// other half, its bits ([`Self::whir_grind_bits`]), is a security
+    /// parameter and goes in where the config is built
+    /// ([`crate::multilinear_prove::chain_config_under`]).
     pub fn chain_format(&self) -> ChainFormat {
         ChainFormat {
             cap: self.whir_cap,
@@ -466,6 +502,24 @@ fn whir_folds_name(folds: &WhirFolds) -> String {
     }
 }
 
+/// `20` | `18`.
+fn parse_whir_grind_bits(v: &str) -> Result<u8, String> {
+    WHIR_GRIND_BITS
+        .iter()
+        .copied()
+        .find(|&b| v == b.to_string())
+        .ok_or_else(|| {
+            format!(
+                "{ENV_WHIR_GRIND_BITS}={v:?}: expected {}",
+                WHIR_GRIND_BITS
+                    .iter()
+                    .map(|b| format!("`{b}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )
+        })
+}
+
 /// The stack caps the knob accepts: the three proved, verified and measured
 /// to fit on the 32 GiB card (block 25368371, E2c). Not 28: its argument's
 /// reservations would not fit the device ledger. Not below 25: nothing asks
@@ -521,12 +575,13 @@ mod tests {
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
+                whir_grind_bits: 18,
             }
         );
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 \
-             whir_grind=query"
+             whir_grind=query whir_grind_bits=18"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
@@ -544,6 +599,7 @@ mod tests {
             (ENV_WHIR_FOLDS, "uniform4"),
             (ENV_WHIR_STACK, "25"),
             (ENV_WHIR_GRIND, "all"),
+            (ENV_WHIR_GRIND_BITS, "20"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
@@ -551,7 +607,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
-             whir_grind=all"
+             whir_grind=all whir_grind_bits=20"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -609,6 +665,14 @@ mod tests {
                 "all",
                 ZfFormat {
                     whir_grind: WhirGrind::All,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_WHIR_GRIND_BITS,
+                "20",
+                ZfFormat {
+                    whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
                     ..ZfFormat::DEFAULT
                 },
             ),
@@ -676,6 +740,13 @@ mod tests {
                 "{v:?}"
             );
         }
+        for (v, want) in [("20", 20u8), ("18", 18), (" 18 ", 18)] {
+            assert_eq!(
+                parse(&[(ENV_WHIR_GRIND_BITS, v)]).unwrap().whir_grind_bits,
+                want,
+                "{v:?}"
+            );
+        }
     }
 
     #[test]
@@ -719,6 +790,14 @@ mod tests {
             (ENV_WHIR_GRIND, "off"),
             (ENV_WHIR_GRIND, "query-only"),
             (ENV_WHIR_GRIND, "20"),
+            (ENV_WHIR_GRIND_BITS, ""),
+            (ENV_WHIR_GRIND_BITS, "19"),
+            (ENV_WHIR_GRIND_BITS, "16"),
+            (ENV_WHIR_GRIND_BITS, "0"),
+            (ENV_WHIR_GRIND_BITS, "018"),
+            (ENV_WHIR_GRIND_BITS, "18.0"),
+            (ENV_WHIR_GRIND_BITS, "off"),
+            (ENV_WHIR_GRIND_BITS, "query"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
@@ -735,11 +814,12 @@ mod tests {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
+            whir_grind_bits: 18,
         };
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all"
+             whir_grind=all whir_grind_bits=18"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -757,6 +837,7 @@ mod tests {
             (ENV_WHIR_FOLDS, fields["whir_folds"]),
             (ENV_WHIR_STACK, fields["whir_stack"]),
             (ENV_WHIR_GRIND, fields["whir_grind"]),
+            (ENV_WHIR_GRIND_BITS, fields["whir_grind_bits"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -802,7 +883,7 @@ mod tests {
                 .unwrap()
                 .banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query"
+             whir_grind=query whir_grind_bits=18"
         );
     }
 
@@ -892,7 +973,7 @@ mod tests {
         );
         assert_eq!(
             (c.rounds(16), c.num_queries),
-            (4, 112),
+            (4, 114),
             "charged at 16 variables"
         );
         // What the widest table alone would charge: three rounds, one query fewer.
@@ -902,12 +983,12 @@ mod tests {
             ZfFormat::DEFAULT.whir_folds,
             14,
             128,
-            multilinear::whir_chain::GrindBits::uniform(20),
+            ZfFormat::DEFAULT.whir_grind_bits(),
         );
-        assert_eq!(widest_alone.num_queries, 111);
+        assert_eq!(widest_alone.num_queries, 113);
         // At the production shapes the charge moves nothing, at every accepted
-        // stack: the widest table stands at or above the cap, and Q is 112
-        // anywhere from 15 to 30 variables.
+        // stack: the widest table stands at or above the cap, and Q is 114 at
+        // every production height.
         for n in WHIR_STACKS {
             let f = ZfFormat {
                 whir_stack: StackVars::new(n).unwrap(),
@@ -919,7 +1000,7 @@ mod tests {
             ] {
                 assert_eq!(
                     chain_config_under(&f, shapes).num_queries,
-                    112,
+                    114,
                     "stack {n}, shapes {shapes:?}"
                 );
             }
@@ -1007,11 +1088,13 @@ mod tests {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             ..ZfFormat::LEGACY
         };
-        // The production default runs the first6 schedules, to its stack.
+        // The production default runs the first6 schedules, to its stack, at
+        // its grind bits' Q.
         assert_eq!(
             ZfFormat::DEFAULT.whir_schedule_line(),
             ZfFormat {
                 whir_stack: ZfFormat::DEFAULT.whir_stack,
+                whir_grind_bits: ZfFormat::DEFAULT.whir_grind_bits,
                 ..first6
             }
             .whir_schedule_line()
@@ -1038,7 +1121,8 @@ mod tests {
 
     /// The production WHIR config under each accepted knob value: the format
     /// is carried, Q is charged the schedule's rounds, and at the block's
-    /// tallest stack (25) every arm keeps today's Q = 112.
+    /// tallest stack (25) every fold arm keeps the legacy Q = 112 at 20 grind
+    /// bits, and the default's Q = 114 at its 18.
     #[test]
     fn the_production_chain_config_under_each_arm() {
         use crate::multilinear_prove::chain_config_under;
@@ -1046,36 +1130,32 @@ mod tests {
         assert_eq!(today.format, ChainFormat::DEFAULT);
         assert_eq!((today.rounds(25), today.num_queries), (7, 112));
         // The production config (no knob set) is the measured default's:
-        // cap auto, first6 — six rounds at 25, Q unchanged at 112.
+        // cap auto, first6 — six rounds at 25; Q 114 at 18 grind bits.
         let production = crate::multilinear_prove::chain_config(&[(1, 25)]);
         assert_eq!(
             production,
             chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)])
         );
         assert_eq!(production.format, ZfFormat::DEFAULT.chain_format());
-        assert_eq!((production.rounds(25), production.num_queries), (6, 112));
+        assert_eq!((production.rounds(25), production.num_queries), (6, 114));
         assert_eq!(production.schedule(25), vec![6, 4, 4, 4, 4, 3]);
         assert_eq!(
-            (
-                production.log_blowup,
-                production.log_folding,
-                production.grind.query
-            ),
-            (today.log_blowup, today.log_folding, today.grind.query),
-            "the blowup and the query grind do not move with the format"
+            (production.log_blowup, production.log_folding),
+            (today.log_blowup, today.log_folding),
+            "the blowup does not move with the format"
         );
         // P2: the default grinds before the queries alone, the legacy format
-        // before all three challenges.
-        assert_eq!(production.grind, GrindBits::query_only(20));
+        // before all three challenges; the default at 18 bits, the legacy at 20.
+        assert_eq!(production.grind, GrindBits::query_only(18));
         assert_eq!(today.grind, GrindBits::uniform(20));
         for (name, rounds25) in [("first5", 6), ("first6", 6)] {
             let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
             let c = chain_config_under(&f, &[(1, 25)]);
             assert_eq!(c.format.folds, f.whir_folds);
-            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 112), "{name}");
+            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 114), "{name}");
             assert_eq!(
                 (c.log_blowup, c.log_folding, c.grind),
-                (today.log_blowup, today.log_folding, f.whir_grind.bits())
+                (today.log_blowup, today.log_folding, f.whir_grind_bits())
             );
             assert_ne!(c.fold_word(), today.fold_word());
         }
@@ -1228,13 +1308,14 @@ mod tests {
     #[test]
     fn the_whir_grind_lever_is_selectable_and_carried() {
         for (v, bits, nonces) in [
-            ("query", GrindBits::query_only(20), NonceLayout::Spent),
-            ("all", GrindBits::uniform(20), NonceLayout::Three),
+            ("query", GrindBits::query_only(18), NonceLayout::Spent),
+            ("all", GrindBits::uniform(18), NonceLayout::Three),
         ] {
             let f = parse(&[(ENV_WHIR_GRIND, v)]).unwrap();
             assert!(f.unimplemented_levers().is_empty(), "{v}");
             assert!(
-                f.banner().ends_with(&format!(" whir_grind={v}")),
+                f.banner()
+                    .ends_with(&format!(" whir_grind={v} whir_grind_bits=18")),
                 "{}",
                 f.banner()
             );
@@ -1246,7 +1327,7 @@ mod tests {
                 let c = crate::multilinear_prove::chain_config_under(&at, &[(1, n)]);
                 assert_eq!((c.grind, c.format.nonces), (bits, nonces), "{v} at {n}");
                 assert_eq!(
-                    c.num_queries, 112,
+                    c.num_queries, 114,
                     "{v} at {n}: Q reads the query grind alone"
                 );
             }
@@ -1263,12 +1344,14 @@ mod tests {
         assert_eq!(ChainFormat::DEFAULT.nonces, NonceLayout::Three);
     }
 
-    /// ★ THE OPT-OUT IS TODAY'S CONFIG. `LAMBDA_VM_ZF_WHIR_GRIND=all`, alone,
-    /// builds the production WHIR config exactly as it was before P2, spelled
-    /// out here as a literal rather than derived through the code under test:
-    /// blowup 2^2, fold 4 under first6, Q 112, 20-bit grinds before all three
-    /// challenges, the auto cap, stack 27, three nonces a round. The default
-    /// differs from it in the grind and the nonce layout, and in nothing else.
+    /// ★ THE OPT-OUT IS TODAY'S CONFIG. `LAMBDA_VM_ZF_WHIR_GRIND=all` with
+    /// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` builds the production WHIR config
+    /// exactly as it was before P2, spelled out here as a literal rather than
+    /// derived through the code under test: blowup 2^2, fold 4 under first6,
+    /// Q 112, 20-bit grinds before all three challenges, the auto cap, stack 27,
+    /// three nonces a round. The default differs from it in the grind (placed
+    /// before the queries alone, at 18 bits), its Q (114) and the nonce layout,
+    /// and in nothing else.
     #[test]
     fn the_grind_opt_out_is_the_production_config_before_p2() {
         let before_p2 = ChainConfig {
@@ -1288,7 +1371,7 @@ mod tests {
                 argue: multilinear::whir_chain::ArgueFormat::PerTable,
             },
         };
-        let opt_out = parse(&[(ENV_WHIR_GRIND, "all")]).unwrap();
+        let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();
         for shapes in [
             &[(1usize, 25usize)][..],
             &[(1, 27)][..],
@@ -1302,10 +1385,11 @@ mod tests {
             assert_eq!(
                 crate::multilinear_prove::chain_config_under(&ZfFormat::DEFAULT, shapes),
                 ChainConfig {
+                    num_queries: 114,
                     grind: GrindBits {
                         folding: 0,
                         ood: 0,
-                        query: 20,
+                        query: 18,
                     },
                     format: ChainFormat {
                         nonces: NonceLayout::Spent,
@@ -1336,6 +1420,133 @@ mod tests {
                 "{}",
                 preset.name()
             );
+        }
+    }
+
+    /// The default's 18 grind bits trade two grind bits for two queries against
+    /// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` (the opt-out, the legacy bits) and
+    /// move nothing else: Q 112 → 114 at every production height (15 to 27
+    /// variables, every accepted stack, the block's shapes), 111 → 113 below a
+    /// fourth round, under either placement.
+    #[test]
+    fn the_grind_bits_knob_trades_two_bits_for_two_queries() {
+        use crate::multilinear_prove::chain_config_under;
+        assert_eq!(PRODUCTION_WHIR_GRIND_BITS, 18);
+        assert_eq!(LEGACY_WHIR_GRIND_BITS, 20);
+        assert_eq!(
+            ZfFormat::DEFAULT.whir_grind_bits,
+            PRODUCTION_WHIR_GRIND_BITS
+        );
+        assert_eq!(ZfFormat::LEGACY.whir_grind_bits, LEGACY_WHIR_GRIND_BITS);
+        assert_eq!(
+            parse(&[(ENV_WHIR_GRIND_BITS, "18")]).unwrap(),
+            ZfFormat::DEFAULT
+        );
+        assert!(ZfFormat::DEFAULT.whir_schedule_line().contains(" q=114 "));
+
+        // The opt-out: 20 bits, Q 112, nothing else moved.
+        let f = parse(&[(ENV_WHIR_GRIND_BITS, "20")]).unwrap();
+        assert!(f.unimplemented_levers().is_empty());
+        assert!(!f.is_legacy());
+        assert!(
+            f.banner().ends_with(" whir_grind=query whir_grind_bits=20"),
+            "{}",
+            f.banner()
+        );
+        assert_eq!(
+            ZfFormat {
+                whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
+                ..f
+            },
+            ZfFormat::DEFAULT,
+            "the knob moves the bits and nothing else"
+        );
+        assert_eq!(f.chain_format(), ZfFormat::DEFAULT.chain_format());
+        assert_eq!(f.proof_format(), ZfFormat::DEFAULT.proof_format());
+        assert!(f.whir_schedule_line().contains(" q=112 "));
+
+        for (placement, bits18, bits20) in [
+            (
+                WhirGrind::Query,
+                GrindBits::query_only(18),
+                GrindBits::query_only(20),
+            ),
+            (
+                WhirGrind::All,
+                GrindBits::uniform(18),
+                GrindBits::uniform(20),
+            ),
+        ] {
+            let at18 = ZfFormat {
+                whir_grind: placement,
+                ..ZfFormat::DEFAULT
+            };
+            let at20 = ZfFormat {
+                whir_grind: placement,
+                ..f
+            };
+            for n in WHIR_STACKS {
+                let stack = StackVars::new(n).unwrap();
+                for shapes in [
+                    &[(1usize, n)][..],
+                    &[(1, 27)][..],
+                    &[(64, 21), (1480, 16), (8, 20)][..],
+                ] {
+                    let c18 = chain_config_under(
+                        &ZfFormat {
+                            whir_stack: stack,
+                            ..at18
+                        },
+                        shapes,
+                    );
+                    let c20 = chain_config_under(
+                        &ZfFormat {
+                            whir_stack: stack,
+                            ..at20
+                        },
+                        shapes,
+                    );
+                    assert_eq!(
+                        (c18.num_queries, c18.grind, c20.num_queries, c20.grind),
+                        (114, bits18, 112, bits20),
+                        "{placement} at stack {n}, shapes {shapes:?}"
+                    );
+                    assert_eq!(
+                        ChainConfig {
+                            num_queries: c20.num_queries,
+                            grind: c20.grind,
+                            ..c18
+                        },
+                        c20,
+                        "{placement} at stack {n}, shapes {shapes:?}: only Q and the grind move"
+                    );
+                }
+            }
+            // Below a fourth round (14 variables and narrower) both sides buy
+            // one query less.
+            assert_eq!(
+                (
+                    chain_config_under(&at18, &[(1, 14)]).num_queries,
+                    chain_config_under(&at20, &[(1, 14)]).num_queries
+                ),
+                (113, 111),
+                "{placement}"
+            );
+        }
+        // Every height a production chain reaches, from the rule itself.
+        for n in 15..=27 {
+            let q = |bits| {
+                ChainConfig::with_security_folds(
+                    2,
+                    PRODUCTION_WHIR_LOG_FOLDING,
+                    ZfFormat::DEFAULT.whir_folds,
+                    n,
+                    128,
+                    GrindBits::query_only(bits),
+                )
+                .num_queries
+            };
+            assert_eq!((q(18), q(20)), (114, 112), "{n} variables");
         }
     }
 }

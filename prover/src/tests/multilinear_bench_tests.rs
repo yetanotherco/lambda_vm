@@ -1170,19 +1170,27 @@ fn check_transcript_pins(
     // transcript this is, and it reaches the posture through this function.
     let max_rows_log2 = crate::tables::max_rows_log2_override();
     // ★ The bases were MEASURED at the legacy WHIR format (uniform
-    // folds, no cap, stack 25, three grinds a round). A run at any other WHIR format — the
-    // production default included — is a different measurement: it SKIPS and
-    // says so, like a run at another table cap. Re-pinning at the default needs
-    // a box measurement.
+    // folds, no cap, stack 25, three grinds a round of 20 bits, Q 112). A run at
+    // any other WHIR format — the production default included — is a different
+    // measurement: it SKIPS and says so, like a run at another table cap.
+    // Re-pinning at the default needs a box measurement. The grind bits are
+    // not in the chain format, but they set Q, which every chain's query
+    // squeezes read.
     let whir_format = crate::zf_format::ZfFormat::global().chain_format();
-    if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT {
+    let grind_bits = crate::zf_format::ZfFormat::global().whir_grind_bits;
+    if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT
+        || grind_bits != crate::zf_format::LEGACY_WHIR_GRIND_BITS
+    {
         println!(
-            "{:<12} transcript pin SKIPPED - WHIR format {:?} (the bases were measured at the \
-             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4 \
-             LAMBDA_VM_ZF_WHIR_STACK=25 LAMBDA_VM_ZF_WHIR_GRIND=all)",
+            "{:<12} transcript pin SKIPPED - WHIR format {:?} at {grind_bits} grind bits (the \
+             bases were measured at the legacy format {:?} at {} bits; set \
+             LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4 \
+             LAMBDA_VM_ZF_WHIR_STACK=25 LAMBDA_VM_ZF_WHIR_GRIND=all \
+             LAMBDA_VM_ZF_WHIR_GRIND_BITS=20)",
             "WHIR",
             whir_format,
             multilinear::whir_chain::ChainFormat::DEFAULT,
+            crate::zf_format::LEGACY_WHIR_GRIND_BITS,
         );
         return;
     }
@@ -1438,15 +1446,24 @@ fn the_pinned_pair_is_the_measurement() {
     // ★ AND THE PREPARED OPENING'S TERM, re-spelled the same way. The pin
     // derives it by calling `schedule()`; this writes the arithmetic out at the
     // shape that schedule implies — six rounds over twenty-three variables at
-    // fold width four, 112 queries, four candidates a squeeze — so the two
-    // spellings disagree if either the round structure or the shape moves.
+    // fold width four, the process's queries (112 at 20 grind bits, 114 at the
+    // default's 18), four candidates a squeeze — so the two spellings disagree
+    // if either the round structure or the shape moves.
     // `the_prepared_opening_is_the_schedule_the_shape_implies` is what ties
-    // those four numbers to the shape rather than to this comment.
+    // those four numbers to the shape rather than to this comment. The runtime
+    // pin applies only at 20 bits, where the bases were measured.
+    let opening_queries = if crate::zf_format::ZfFormat::global().whir_grind_bits
+        == crate::zf_format::LEGACY_WHIR_GRIND_BITS
+    {
+        112u64
+    } else {
+        114u64
+    };
     let (rounds, folded, queries) = (6u64, 23u64, 112u64);
     let grinds = 3 * rounds - 1;
     let opening = (
         5 + grinds + 2 * folded + 2 * (rounds - 1) + 1,
-        1 + folded + 2 * (rounds - 1) + rounds * queries.div_ceil(4),
+        1 + folded + 2 * (rounds - 1) + rounds * opening_queries.div_ceil(4),
         grinds,
     );
 
@@ -1737,15 +1754,25 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
         want,
         "the fold schedule the chain runs"
     );
+    // The query count follows the process's grind bits: 114 at the default's
+    // 18, 112 at `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`. Two more queries a round
+    // cost one more squeeze each of the six rounds (four candidates a squeeze).
+    let (queries, squeezes) = if crate::zf_format::ZfFormat::global().whir_grind_bits
+        == crate::zf_format::LEGACY_WHIR_GRIND_BITS
+    {
+        (112, 202)
+    } else {
+        (114, 208)
+    };
     assert_eq!(
-        config.num_queries, 112,
+        config.num_queries, queries,
         "the shipped query count at this shape"
     );
 
     // …and the terms those four numbers produce.
     assert_eq!(
         transcript_pin::prepared_opening_per_epoch(shape),
-        (79, 202, 17),
+        (79, squeezes, 17),
         "the opening's per-epoch transcript cost"
     );
     assert_eq!(
