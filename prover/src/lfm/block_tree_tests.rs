@@ -777,11 +777,30 @@ fn production_height_plan() -> BlockTreePlan {
 
 /// [`spread_fixture_shape`]'s plan under the block base's options.
 fn spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
-    let opts = super::proof::block_base_options();
+    spread_plan_under(chunks, cpus, &super::proof::block_base_options())
+}
+
+/// [`spread_plan`] at the default format with the LogUp pair layout — the
+/// format the pinned tree ids were recorded under, before k4 became the
+/// default. The pins guard the program form, which no format choice changes,
+/// so they keep holding at the rollback format.
+fn pinned_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
+    let pair = crate::zf_format::ZfFormat {
+        logup: stark::proof::options::LogUpPolicy::Pair,
+        ..crate::zf_format::ZfFormat::DEFAULT
+    };
+    spread_plan_under(
+        chunks,
+        cpus,
+        &pair.base_options(crate::recursion::Preset::Blowup4.options()),
+    )
+}
+
+fn spread_plan_under(chunks: usize, cpus: usize, opts: &crate::ProofOptions) -> BlockTreePlan {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
     let shape = spread_fixture_shape(&elf, chunks, cpus);
-    BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives")
+    BlockTreePlan::derive(&elf_bytes, opts, &shape).expect("the plan derives")
 }
 
 /// ★ D-ANYBLOCK S5 §4.13 instrument (laptop): a block leaf program's host bytes
@@ -1123,7 +1142,7 @@ fn check_pinned_tree_ids(label: &str, plan: &BlockTreePlan, pins: &[(&str, &[&st
 #[test]
 #[should_panic(expected = "no pinned ids for the fixture ELF's digest")]
 fn pinned_tree_ids_refuse_an_elf_they_do_not_know() {
-    check_pinned_tree_ids("NONE", &spread_plan(2, 4), &[("00", &[])]);
+    check_pinned_tree_ids("NONE", &pinned_spread_plan(2, 4), &[("00", &[])]);
 }
 
 /// The fixture ELF's digest on the laptop (macOS clang) and on FAST.
@@ -1137,7 +1156,7 @@ const FAST_ELF_DIGEST: &str = "f5e120d0eaa369d7ebdec2767b8d0c0559ceeac138edf0970
 #[test]
 #[ignore = "laptop or box: run with --exact"]
 fn the_compact_program_form_keeps_a_small_trees_ids() {
-    check_pinned_tree_ids("SMALL TREE IDS", &spread_plan(2, 4), &SMALL_TREE_IDS);
+    check_pinned_tree_ids("SMALL TREE IDS", &pinned_spread_plan(2, 4), &SMALL_TREE_IDS);
 }
 
 /// The same at production heights ([`production_height_plan`]: 7 leaves, 2
@@ -1148,7 +1167,7 @@ fn the_compact_program_form_keeps_a_small_trees_ids() {
 fn the_compact_program_form_keeps_every_production_height_tree_id() {
     check_pinned_tree_ids(
         "TREE IDS",
-        &production_height_plan(),
+        &pinned_spread_plan(13, 40),
         &PRODUCTION_HEIGHT_TREE_IDS,
     );
 }

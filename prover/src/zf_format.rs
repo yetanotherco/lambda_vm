@@ -13,7 +13,7 @@
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
 //! `cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query
-//! logup=pair`.
+//! logup=k4`.
 //! Each lever was measured net positive on block runs before it became the
 //! default (`one_row=auto` on the STARK pipeline: see [`ZfFormat::DEFAULT`]).
 //! Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
@@ -52,7 +52,7 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query logup=pair`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 whir_grind=query logup=k4`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -210,6 +210,12 @@ impl ZfFormat {
     /// query grinds and the blowups are the legacy ones. It changes no STARK
     /// proof. `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
     /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's.
+    /// `logup=k4` commits up to four LogUp interactions per aux column on the
+    /// STARK base tables where the rule admits it (degree ≤ blowup + 1): the
+    /// median block's phase B −9.56 s (BIG 600, t −27) and the 1× base −0.97 s
+    /// (FAST 861), most of it from smaller per-table device sets packing under
+    /// the VRAM gate. It reaches the base tables only ([`Self::base_proof_format`]);
+    /// the LFM chips keep pairs. `LAMBDA_VM_ZF_LOGUP=pair` is its rollback.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -218,7 +224,7 @@ impl ZfFormat {
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
-        logup: LogUpPolicy::Pair,
+        logup: LogUpPolicy::K4,
     };
 
     /// The legacy format: every lever off. What all eight knobs at their
@@ -565,13 +571,13 @@ mod tests {
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
-                logup: LogUpPolicy::Pair,
+                logup: LogUpPolicy::K4,
             }
         );
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query logup=pair"
+             whir_grind=query logup=k4"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
@@ -865,7 +871,7 @@ mod tests {
                 .unwrap()
                 .banner(),
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query logup=pair"
+             whir_grind=query logup=k4"
         );
     }
 
@@ -1150,15 +1156,17 @@ mod tests {
         // No test sets a ZF knob, so the process format is the default and the
         // production constructors must stamp the MEASURED configuration.
         assert_eq!(*ZfFormat::global(), ZfFormat::DEFAULT);
-        let want = ZfFormat::DEFAULT.proof_format();
-        for (site, o) in [
+        // The LFM proofs carry the chips' pair layout; the base, the default arity.
+        for (site, o, want) in [
             (
                 "aggregation_wrap_options",
                 crate::lfm::proof::aggregation_wrap_options(),
+                ZfFormat::DEFAULT.proof_format(),
             ),
             (
                 "block_base_options",
                 crate::lfm::proof::block_base_options(),
+                ZfFormat::DEFAULT.base_proof_format(),
             ),
         ] {
             assert_eq!(o.format, want, "{site}");
@@ -1384,12 +1392,12 @@ mod tests {
     }
 
     /// `LAMBDA_VM_ZF_LOGUP`: every spelling parses to its policy and moves no
-    /// other field; `pair` is the default and the legacy value. A policy whose
+    /// other field; `k4` is the default, `pair` the legacy value and the rollback. A policy whose
     /// device path this build lacks is reported (and so aborts at
     /// [`ZfFormat::global`]), never proved as another format.
     #[test]
     fn the_logup_knob_parses_and_unbuilt_policies_are_refused() {
-        assert_eq!(ZfFormat::DEFAULT.logup, LogUpPolicy::Pair);
+        assert_eq!(ZfFormat::DEFAULT.logup, LogUpPolicy::K4);
         assert_eq!(ZfFormat::LEGACY.logup, LogUpPolicy::Pair);
         for (v, want) in [
             ("pair", LogUpPolicy::Pair),
@@ -1474,10 +1482,10 @@ mod tests {
             );
             assert_eq!(f.proof_format(), ZfFormat::DEFAULT.proof_format());
         }
-        // No knob set: the production base options are the pair layout.
+        // No knob set: the production base options carry k4; the chips, pairs.
         assert_eq!(
             crate::lfm::proof::block_base_options().format.logup,
-            LogUpPolicy::Pair
+            LogUpPolicy::K4
         );
         assert_eq!(
             crate::lfm::proof::aggregation_wrap_options().format.logup,

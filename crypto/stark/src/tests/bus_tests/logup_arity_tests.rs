@@ -352,6 +352,19 @@ fn a_k4_proof_is_refused_under_the_pair_layout() {
     assert!(!verifies(&pair, &proof));
 }
 
+/// N3 reversed, now that k4 is the production default: a pair-layout proof
+/// (the rollback) checked against the k4 AIR is refused on shape too, so a
+/// verifier at the default never accepts a proof made at the rollback.
+#[test]
+fn a_pair_proof_is_refused_under_the_k4_layout() {
+    let pair = air(6, 1, &options(4, LogUpPolicy::Pair));
+    let proof = prove(&pair, trace(6, 1, 13));
+    assert!(verifies(&pair, &proof), "the pair control proof verifies");
+    let k4 = air(6, 1, &options(4, LogUpPolicy::K4));
+    assert_eq!(k4.trace_layout().1, 4);
+    assert!(!verifies(&k4, &proof));
+}
+
 /// N4: a proof carrying 3 or 5 part OODs for a 4-part AIR.
 #[test]
 fn a_wrong_composition_part_count_is_refused() {

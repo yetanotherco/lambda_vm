@@ -140,13 +140,9 @@ fn options(blowup: u8, logup: LogUpPolicy) -> ProofOptions {
     opts
 }
 
-/// ★ T0a: under the pair policy, every production VM table and every LFM chip
-/// has today's widths, part count and constraint program, byte for byte —
-/// the default format moves no compiled-kernel key and no proof. The same
-/// holds for a wide policy at a blowup that cannot hold wider groups.
-#[test]
-fn the_pair_policy_keeps_every_production_program() {
-    let golden: Vec<Program> = PAIR_GOLDEN
+/// [`PAIR_GOLDEN`] as programs.
+fn pair_golden() -> Vec<Program> {
+    PAIR_GOLDEN
         .iter()
         .map(|&(label, main, aux, parts, digest)| Program {
             label: label.to_string(),
@@ -155,7 +151,17 @@ fn the_pair_policy_keeps_every_production_program() {
             parts,
             digest,
         })
-        .collect();
+        .collect()
+}
+
+/// ★ T0a: under the pair policy, every production VM table and every LFM chip
+/// has the widths, part count and constraint program it had before arities
+/// existed, byte for byte — the rollback (`LAMBDA_VM_ZF_LOGUP=pair`) moves no
+/// compiled-kernel key and no proof. The same holds for a wide policy at a
+/// blowup that cannot hold wider groups.
+#[test]
+fn the_pair_policy_keeps_every_production_program() {
+    let golden = pair_golden();
     assert!(!golden.is_empty(), "the golden list is pinned");
     assert_eq!(programs(&options(4, LogUpPolicy::Pair)), golden);
     let legacy = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4");
@@ -169,6 +175,27 @@ fn the_pair_policy_keeps_every_production_program() {
             "{policy} at blowup 2"
         );
     }
+}
+
+/// ★ k4 is the production default: the block's base options with no knob set
+/// ([`crate::zf_format::ZfFormat::DEFAULT`]) build exactly the k4 programs, and
+/// the rollback spelling `LAMBDA_VM_ZF_LOGUP=pair` builds the golden pair list,
+/// byte for byte.
+#[test]
+fn the_default_base_format_is_k4_and_pair_rolls_back() {
+    use crate::zf_format::{ENV_LOGUP, ZfFormat};
+    let base = GoldilocksCubicProofOptions::with_blowup(4).expect("blowup 4");
+    let default = ZfFormat::DEFAULT.base_options(base.clone());
+    assert_eq!(default.format.logup, LogUpPolicy::K4);
+    assert_eq!(programs(&default), programs(&options(4, LogUpPolicy::K4)));
+    assert_ne!(
+        programs(&default),
+        pair_golden(),
+        "k4 moves the switched tables"
+    );
+    let rollback = ZfFormat::from_lookup(|name| (name == ENV_LOGUP).then(|| "pair".to_string()))
+        .expect("the rollback spelling parses");
+    assert_eq!(programs(&rollback.base_options(base)), pair_golden());
 }
 
 /// ★ T0f on the production tables: under `k4` at blowup 4 each table commits

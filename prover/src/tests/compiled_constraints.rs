@@ -116,7 +116,7 @@ pub(crate) fn production_programs(
 
 /// The option sets the compiled kernels cover: the legacy format at blowup 2
 /// and 4 (every program the pair layout builds), and the VM tables under
-/// `LAMBDA_VM_ZF_LOGUP=k4` at the block's blowup 4 (the tables the rule moves
+/// k4, the block's default, at its blowup 4 (the tables the rule moves
 /// to four interactions per column get their own programs; the LFM chips keep
 /// pairs under every policy and the local-to-global tables are too narrow to
 /// move, so neither is rebuilt).
