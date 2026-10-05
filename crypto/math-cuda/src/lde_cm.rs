@@ -167,12 +167,18 @@ pub(crate) fn plan(l: u32) -> Vec<u32> {
     ks
 }
 
-/// log2 of the lanes a block spans: 256 threads at 16 elements each hold
-/// `4096 >> k` sub-transforms' worth, capped by what the level window allows
+/// log2 of the lanes a block spans: 128 threads at 16 elements each hold
+/// `2048 >> k` sub-transforms' worth, capped by what the level window allows
 /// (`2^s` lanes of `lo` for a strided pass, `2^(l-k)` sub-transforms for the
 /// contiguous one). Mirrored by the host KAT's `pass_log_t`.
+///
+/// 128 rather than 256 threads: a pass is held to two resident blocks an SM by
+/// its registers and its shared-memory tile alike, and the smaller blocks fit
+/// five, which lifts occupancy from 33 to 42 % and takes ≈ 9 % off the passes
+/// at the prover's shapes (S0 bench, FAST 866). The values are unchanged: a
+/// block's size only decides which thread transforms which elements.
 fn pass_log_t(l: u32, s: u32, k: u32) -> u32 {
-    let cap = 12 - k;
+    let cap = 11 - k;
     let lim = if s > 0 { s } else { l - k };
     cap.min(lim)
 }

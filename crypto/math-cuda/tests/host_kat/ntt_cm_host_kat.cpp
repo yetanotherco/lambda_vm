@@ -173,12 +173,12 @@ std::vector<u64> naive_dft(const std::vector<u64> &in, unsigned L, bool inverse)
 
 // ---------------------------------------------------------------------------
 // Launch replay: one pass over `cols` columns, exactly the geometry the Rust
-// driver uses (see `lde_cm.rs`): T = min(4096 >> k, 2^s) for strided passes,
-// T = min(4096 >> k, 2^(L - k)) for contiguous ones.
+// driver uses (see `lde_cm.rs`): T = min(2048 >> k, 2^s) for strided passes,
+// T = min(2048 >> k, 2^(L - k)) for contiguous ones.
 // ---------------------------------------------------------------------------
 
 unsigned pass_log_t(unsigned L, unsigned s, unsigned k) {
-    const unsigned cap = 12 - k;  // log2(4096 >> k)
+    const unsigned cap = 11 - k;  // log2(2048 >> k)
     const unsigned lim = s > 0 ? s : L - k;
     return cap < lim ? cap : lim;
 }
