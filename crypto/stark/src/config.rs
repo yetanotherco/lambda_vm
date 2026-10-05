@@ -157,6 +157,10 @@ pub enum CommitmentHash {
     /// eprint 2026/306 and 2026/1692). Present so the comparison has its priced
     /// reference and its control, never as a candidate.
     Poseidon,
+    /// ZisK's Poseidon1 instance (Goldilocks, width 16, rate 12; `crypto::hash::
+    /// poseidon1_stark`): ZisK's leaf hash and ARITY-4 trees. ⚠ An exploration
+    /// configuration (branch `p1/*`), not a candidate for landing.
+    Poseidon1,
 }
 
 /// The hash behind [`Commitment`], [`BatchedMerkleTree`] and
@@ -270,6 +274,25 @@ pub trait StarkHash: Send + Sync + 'static {
     /// What both Merkle families hash with. The name a proof's roots may be
     /// called by.
     const COMMITMENT_HASH: CommitmentHash;
+
+    /// Children per Merkle node in both families (`IsMerkleTreeBackend::ARITY`;
+    /// a configuration states it once, and its backends must agree). At 4,
+    /// Merkle caps are not defined: prover and verifier both commit and check
+    /// uncapped whatever the format's cap policy says.
+    const ARITY: usize = 2;
+}
+
+/// The cap policy a configuration actually runs: the format's, or `Off` at
+/// arity 4, where caps are not defined ([`StarkHash::ARITY`]). A verifier
+/// constant, derived from the configuration and never from the proof.
+pub fn effective_cap_policy<H: StarkHash>(
+    policy: crypto::merkle_tree::cap::CapPolicy,
+) -> crypto::merkle_tree::cap::CapPolicy {
+    if H::ARITY == 2 {
+        policy
+    } else {
+        crypto::merkle_tree::cap::CapPolicy::Off
+    }
 }
 
 /// The digest a configuration grinds over: its transcript's hash, because the

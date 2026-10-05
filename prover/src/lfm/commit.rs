@@ -101,11 +101,27 @@ pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> C
     // the production tables whose roots `lfm_program_id` names, so the hash that
     // BUILDS them and the hash the program identity CLAIMS have to be the same
     // one — `registry.rs` records that as the condition under which this read
-    // moves, and the pin is what moved it.
-    let (_, root) = commit_bit_reversed_with::<
-        GoldilocksField,
-        <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-    >(lde_columns, layout.rows_per_leaf())
+    // moves, and the pin is what moved it. Under the P1 base hash
+    // (`hash_pin::base_hash`) they are the base proof's preprocessed roots under
+    // ZisK's Poseidon1 instead.
+    match crate::hash_pin::base_hash() {
+        crate::hash_pin::BaseHash::Rpx => {
+            commit_lde_columns_under::<crate::hash_pin::BlockStarkHash>(lde_columns, layout)
+        }
+        crate::hash_pin::BaseHash::P1 => {
+            commit_lde_columns_under::<crate::lfm::p1_commit::P1StarkHash>(lde_columns, layout)
+        }
+    }
+}
+
+fn commit_lde_columns_under<H: stark::config::StarkHash>(
+    lde_columns: &[Vec<FE>],
+    layout: LeafLayout,
+) -> Commitment {
+    let (_, root) = commit_bit_reversed_with::<GoldilocksField, H::Batched<GoldilocksField>>(
+        lde_columns,
+        layout.rows_per_leaf(),
+    )
     .expect("Merkle build failed for LFM column group");
     root
 }
@@ -312,18 +328,14 @@ pub(super) fn commit_group_device_or_host_in(
         } else {
             super::derive_gate::admit(set.total())
         };
-        let committed = stark::gpu_lde::try_commit_row_major_with::<
-            GoldilocksField,
-            <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-        >(
-            label,
-            &group.data,
-            group.padded_rows,
-            group.width,
-            options.blowup_factor as usize,
-            &FE::from(options.coset_offset),
-            layout.rows_per_leaf(),
-        );
+        let committed = match crate::hash_pin::base_hash() {
+            crate::hash_pin::BaseHash::Rpx => commit_group_device_under::<
+                crate::hash_pin::BlockStarkHash,
+            >(label, group, options, layout),
+            crate::hash_pin::BaseHash::P1 => commit_group_device_under::<
+                crate::lfm::p1_commit::P1StarkHash,
+            >(label, group, options, layout),
+        };
         if let Some(t) = probe_t {
             super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
         }
@@ -334,6 +346,25 @@ pub(super) fn commit_group_device_or_host_in(
     }
     let _ = label;
     commit_group_host_with(group, options, layout)
+}
+
+/// The device commit of [`commit_group_device_or_host_with`] under `H`.
+#[cfg(feature = "cuda")]
+fn commit_group_device_under<H: stark::config::StarkHash>(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Option<Commitment> {
+    stark::gpu_lde::try_commit_row_major_with::<GoldilocksField, H::Batched<GoldilocksField>>(
+        label,
+        &group.data,
+        group.padded_rows,
+        group.width,
+        options.blowup_factor as usize,
+        &FE::from(options.coset_offset),
+        layout.rows_per_leaf(),
+    )
 }
 
 /// The host arm of [`commit_group_device_or_host_with`], and nothing else: it

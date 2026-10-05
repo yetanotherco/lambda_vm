@@ -160,6 +160,16 @@ pub fn verify_merkle_path_to_cap_from_leaf_hash<B: IsMerkleTreeBackend>(
     index: usize,
     leaf_hash: B::Node,
 ) -> bool {
+    if B::ARITY == 4 {
+        // `depth` stays the binary depth `log2(leaves)` the shapes speak; the
+        // walk has `⌈depth / 2⌉` levels of three siblings. Caps are binary-only:
+        // an arity-4 tree verifies against its root.
+        return cap.len() == 1
+            && depth < usize::BITS as usize
+            && index >> depth == 0
+            && siblings.len() == 3 * depth.div_ceil(2)
+            && verify_merkle_path_from_leaf_hash::<B>(siblings, &cap[0], index, leaf_hash);
+    }
     let Some(c) = cap_height_of(cap) else {
         return false;
     };
@@ -185,6 +195,32 @@ pub fn split_owner_path<N>(path: &[N], depth: usize, cap_height: usize) -> Optio
         siblings + (1usize << cap_height)
     };
     (path.len() == expected).then(|| path.split_at(siblings))
+}
+
+/// [`embed_cap`] for a tree of `arity` children per node. At arity 4 only the
+/// uncapped form exists (`cap == [root]`): every path must be its full
+/// `3·⌈depth / 2⌉` siblings, `depth` being the binary depth `log2(leaves)`, and
+/// nothing moves.
+pub fn embed_cap_arity<N: Clone>(
+    paths: &mut [&mut Vec<N>],
+    depth: usize,
+    cap: &[N],
+    arity: usize,
+) -> Result<(), CapError> {
+    if arity != 4 {
+        return embed_cap(paths, depth, cap);
+    }
+    if cap.len() != 1 {
+        return Err(CapError::CapLength(cap.len()));
+    }
+    let expected = 3 * depth.div_ceil(2);
+    match paths.iter().find(|p| p.len() != expected) {
+        Some(p) => Err(CapError::PathLength {
+            expected,
+            got: p.len(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Prover side of the owner-path encoding: cut every path of one tree to
@@ -264,6 +300,10 @@ impl<'a, N: PartialEq + Eq + Clone> CappedRoot<'a, N> {
         depth: usize,
         cap_height: usize,
     ) -> Option<(Self, &'a [N])> {
+        if B::ARITY == 4 {
+            // Uncapped only; the path's length is checked by `verify`.
+            return (cap_height == 0).then(|| (Self::uncapped(root, depth), owner_path));
+        }
         let (siblings, cap) = split_owner_path(owner_path, depth, cap_height)?;
         if cap_height == 0 {
             return Some((Self::uncapped(root, depth), siblings));

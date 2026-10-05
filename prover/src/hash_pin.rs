@@ -170,9 +170,272 @@ pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherK
 pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
     <BlockStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
+// =========================================================================
+// The base-hash knob (`p1/*` exploration branch)
+// =========================================================================
+
+/// Which hash the block path's BASE proof commits under in this process: the
+/// pin above ([`BaseHash::Rpx`], the default), or ZisK's Poseidon1
+/// ([`BaseHash::P1`]: `lfm::p1_commit`, 4-ary trees, ZisK's transcript and
+/// width-8 grind). Read once from [`BASE_HASH_ENV`] by the prover AND the host
+/// verifier of one binary — a verifier-side constant, never a field of the
+/// proof — so the two arms of an A/B are one binary.
+///
+/// ⚠ Exploration only. The recursion still verifies RPX proofs, so a P1 base
+/// proof is proved and host-verified, never wrapped; the epoch and LFM paths
+/// refuse to run under P1 ([`require_rpx_base`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseHash {
+    /// [`BlockStarkHash`] under [`BlockTranscript`]: every proof's bytes as
+    /// they are without the knob.
+    Rpx,
+    /// [`crate::lfm::p1_commit::P1StarkHash`] under
+    /// [`crate::lfm::p1_commit::P1Transcript`].
+    P1,
+}
+
+/// `rpx` (or unset) | `p1`. Any other value aborts, naming these: a typo read
+/// as the default would make one arm of an A/B the other.
+pub const BASE_HASH_ENV: &str = "LAMBDA_VM_BASE_HASH";
+
+/// The value of [`BASE_HASH_ENV`] as a [`BaseHash`]; `None` is unset.
+pub fn parse_base_hash(value: Option<&str>) -> Result<BaseHash, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(BaseHash::Rpx),
+        Some(v) if v == "rpx" => Ok(BaseHash::Rpx),
+        Some(v) if v == "p1" => Ok(BaseHash::P1),
+        Some(v) => Err(format!(
+            "{BASE_HASH_ENV}={v:?}: expected `rpx` (the default) or `p1`"
+        )),
+    }
+}
+
+/// ★ This process's base hash, read once. Prints one line on the first read
+/// (the default included), so a log names its arm.
+#[cfg(not(target_os = "zkvm"))]
+pub fn base_hash() -> BaseHash {
+    static BASE: std::sync::OnceLock<BaseHash> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let raw = std::env::var(BASE_HASH_ENV).ok();
+        let base = parse_base_hash(raw.as_deref()).unwrap_or_else(|e| {
+            eprintln!("BASE HASH: {e}");
+            std::process::abort()
+        });
+        eprintln!(
+            "BASE HASH: {} ({})",
+            match base {
+                BaseHash::Rpx => "rpx — RPX256, binary trees",
+                BaseHash::P1 => "p1 — ZisK's Poseidon1, 4-ary trees, width-8 grind",
+            },
+            raw.map_or("the default".to_string(), |v| format!(
+                "{BASE_HASH_ENV}={v}"
+            ))
+        );
+        base
+    })
+}
+
+/// The recursion guest verifies RPX base proofs only.
+#[cfg(target_os = "zkvm")]
+pub fn base_hash() -> BaseHash {
+    BaseHash::Rpx
+}
+
+/// Refuse a path that has no P1 arm (the epoch pipeline, the LFM recursion)
+/// under [`BaseHash::P1`], rather than letting it mix RPX proofs with P1
+/// preprocessed roots.
+pub fn require_rpx_base(path: &str) {
+    assert!(
+        base_hash() == BaseHash::Rpx,
+        "{path} has no Poseidon1 arm: unset {BASE_HASH_ENV} (it is p1)"
+    );
+}
+
+/// Under [`BaseHash::P1`], the root of a STATIC preprocessed table (BITWISE,
+/// KECCAK_RC, the zero-init and private-input pages): computed once per
+/// process by `compute` and kept, keyed by everything it is a function of
+/// (the table, the blowup, the coset offset, the leaf layout). The blessed
+/// constants in those tables are RPX roots, so under P1 they cannot be
+/// returned; a recompute per AIR construction would put a 2^20-row commit in
+/// every prove's setup. [`warm_base_statics`] fills it before a timed prove.
+pub fn p1_static_root(
+    table: &'static str,
+    options: &stark::proof::options::ProofOptions,
+    layout: stark::leaf_layout::LeafLayout,
+    compute: impl FnOnce() -> stark::config::Commitment,
+) -> stark::config::Commitment {
+    type Key = (&'static str, u8, u64, usize);
+    static ROOTS: std::sync::Mutex<std::collections::BTreeMap<Key, stark::config::Commitment>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let key = (
+        table,
+        options.blowup_factor,
+        options.coset_offset,
+        layout.rows_per_leaf(),
+    );
+    if let Some(root) = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return *root;
+    }
+    // Computed outside the lock: deterministic, so a concurrent duplicate
+    // computes the same root.
+    let root = compute();
+    ROOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, root);
+    root
+}
+
+/// Under [`BaseHash::P1`], compute every static preprocessed root
+/// [`p1_static_root`] keeps, both leaf layouts, at `options`, and print them;
+/// under RPX they are constants and this does nothing. A harness calls it
+/// before the clock starts, so the P1 arm's prove pays what the RPX arm's
+/// pays for them: nothing.
+pub fn warm_base_statics(options: &stark::proof::options::ProofOptions) {
+    if base_hash() != BaseHash::P1 {
+        return;
+    }
+    use stark::leaf_layout::LeafLayout;
+    let t = std::time::Instant::now();
+    // The Poseidon1 kernels load on first use: load them here, off the clock.
+    #[cfg(feature = "cuda")]
+    if !stark::gpu_lde::warm_commitment_hash(stark::config::CommitmentHash::Poseidon1) {
+        eprintln!("BASE HASH P1: the Poseidon1 device kernels did not load");
+    }
+    let mut lines = Vec::new();
+    for layout in [LeafLayout::RowPair, LeafLayout::Row] {
+        let roots = [
+            (
+                "bitwise",
+                crate::tables::bitwise::preprocessed_commitment_for(options, layout),
+            ),
+            (
+                "keccak_rc",
+                crate::tables::keccak_rc::preprocessed_commitment_for(options, layout),
+            ),
+            (
+                "zero page",
+                crate::tables::page::zero_init_preprocessed_commitment_for(options, layout),
+            ),
+            (
+                "private page",
+                crate::tables::page::private_page_preprocessed_commitment_for(options, layout),
+            ),
+        ];
+        for (name, root) in roots {
+            lines.push(format!(
+                "{name}/{}: {}",
+                layout.rows_per_leaf(),
+                root.map_or("none".to_string(), |r| r[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>())
+            ));
+        }
+    }
+    eprintln!(
+        "BASE HASH P1 STATICS: {} roots in {:.2}s ({})",
+        lines.len(),
+        t.elapsed().as_secs_f64(),
+        lines.join(" · ")
+    );
+}
+
+/// A base-proof configuration: the commitment configuration and the
+/// Fiat–Shamir transcript object, named together so the two cannot be mixed
+/// (the module header's half-flip). The block prover and the host verifier are
+/// generic over it; [`base_hash`] picks the instance once, at their entries.
+pub trait BlockHash: Send + Sync + 'static {
+    /// The commitment configuration.
+    type H: stark::config::StarkHash;
+    /// The transcript object.
+    type Transcript: crypto::fiat_shamir::is_transcript::IsStarkTranscript<
+            crate::tables::types::GoldilocksExtension,
+            crate::tables::types::GoldilocksField,
+        > + Clone
+        + Send;
+    /// The knob value this configuration answers to.
+    const BASE: BaseHash;
+    /// A fresh transcript over `seed`.
+    fn transcript(seed: &[u8]) -> Self::Transcript;
+}
+
+/// The pin: [`BlockStarkHash`] under [`BlockTranscript`].
+pub struct RpxBlock;
+
+impl BlockHash for RpxBlock {
+    type H = BlockStarkHash;
+    type Transcript = BlockTranscript;
+    const BASE: BaseHash = BaseHash::Rpx;
+    fn transcript(seed: &[u8]) -> BlockTranscript {
+        block_transcript(seed)
+    }
+}
+
+/// ZisK's Poseidon1 (`lfm::p1_commit`).
+pub struct P1Block;
+
+impl BlockHash for P1Block {
+    type H = crate::lfm::p1_commit::P1StarkHash;
+    type Transcript = crate::lfm::p1_commit::P1Transcript;
+    const BASE: BaseHash = BaseHash::P1;
+    fn transcript(seed: &[u8]) -> Self::Transcript {
+        crate::lfm::p1_commit::P1Transcript::with_seed(seed)
+    }
+}
+
+/// The prover at configuration `C`.
+pub type BlockProverOf<C, Field, FieldExtension, PI> =
+    stark::prover::GenericProver<Field, FieldExtension, PI, <C as BlockHash>::H>;
+
+/// The verifier at configuration `C`.
+pub type BlockVerifierOf<C, Field, FieldExtension, PI> =
+    stark::verifier::GenericVerifier<Field, FieldExtension, PI, <C as BlockHash>::H>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The knob's spellings: unset and `rpx` are the pin, `p1` the exploration
+    /// arm, anything else is refused (never read as the default).
+    #[test]
+    fn the_base_hash_knob_accepts_its_two_spellings_only() {
+        assert_eq!(parse_base_hash(None), Ok(BaseHash::Rpx));
+        assert_eq!(parse_base_hash(Some("rpx")), Ok(BaseHash::Rpx));
+        assert_eq!(parse_base_hash(Some(" RPX ")), Ok(BaseHash::Rpx));
+        assert_eq!(parse_base_hash(Some("p1")), Ok(BaseHash::P1));
+        assert_eq!(parse_base_hash(Some("P1")), Ok(BaseHash::P1));
+        for bad in ["", "poseidon", "p2", "1", "rpx256"] {
+            assert!(
+                parse_base_hash(Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// ✓ The RPX configuration IS the pin: same commitment configuration, same
+    /// transcript object and the same state from the same seed, so the knob at
+    /// its default changes no byte.
+    #[test]
+    fn the_rpx_configuration_is_the_pin() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+        assert_eq!(
+            std::any::TypeId::of::<<RpxBlock as BlockHash>::H>(),
+            std::any::TypeId::of::<BlockStarkHash>()
+        );
+        assert_eq!(
+            std::any::TypeId::of::<<RpxBlock as BlockHash>::Transcript>(),
+            std::any::TypeId::of::<BlockTranscript>()
+        );
+        let a = <BlockTranscript as IsTranscript<E>>::state(&RpxBlock::transcript(b"seed"));
+        let b = <BlockTranscript as IsTranscript<E>>::state(&block_transcript(b"seed"));
+        assert_eq!(a, b);
+        // The P1 configuration is a different hash and a different stream.
+        let p = <crate::lfm::p1_commit::P1Transcript as IsTranscript<E>>::state(
+            &P1Block::transcript(b"seed"),
+        );
+        assert_ne!(a, p);
+    }
     // Named here rather than at module scope: the byte arm's `BlockTranscript`
     // mentions the extension field and an algebraic arm's does not, so a
     // module-scope import would be unused on one of the two.

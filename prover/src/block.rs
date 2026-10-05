@@ -138,6 +138,30 @@ pub fn verify_block(
     )
 }
 
+/// [`verify_block`] under the base configuration `base` rather than this
+/// process's ([`crate::hash_pin::base_hash`]): a proof made under one base hash
+/// must be refused by the other's verifier.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn verify_block_under(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    base: crate::hash_pin::BaseHash,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = crate::statement::elf_digest(elf_bytes);
+    crate::verify_prepared_shaped_under(
+        vm_proof,
+        &program,
+        &elf_digest,
+        opts,
+        None,
+        None,
+        AcceleratorShape::BlockChunked,
+        base,
+    )
+}
+
 /// `LAMBDA_VM_BLOCK_WARM_PRECOMPUTED=0` leaves the ELF data pages' preprocessed
 /// commitments to Round 1 (the A arm of the warm A/B); unset or anything else
 /// derives them beside the execution.
@@ -279,6 +303,37 @@ fn prove_block_with_observed(
     residency: ResidencyMode,
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
+    match crate::hash_pin::base_hash() {
+        crate::hash_pin::BaseHash::Rpx => prove_block_under::<crate::hash_pin::RpxBlock>(
+            elf_bytes,
+            private_input,
+            opts,
+            max_rows,
+            residency,
+            on_shape,
+        ),
+        crate::hash_pin::BaseHash::P1 => prove_block_under::<crate::hash_pin::P1Block>(
+            elf_bytes,
+            private_input,
+            opts,
+            max_rows,
+            residency,
+            on_shape,
+        ),
+    }
+}
+
+/// [`prove_block_with_observed`] under the base configuration `C`: phase A
+/// (the streamed or serial build, the streamed instances' commits), the prove
+/// and the regeneration beside it.
+fn prove_block_under<C: crate::hash_pin::BlockHash>(
+    elf_bytes: &[u8],
+    private_input: &[u8],
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+    residency: ResidencyMode,
+    on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
+) -> Result<(VmProof, BlockTimes), Error> {
     let mut times = BlockTimes::default();
     // With the table timeline on, the global rayon pool's workers are named
     // `rayon-<n>` for a per-thread sampler; only a pool nothing built yet can
@@ -333,7 +388,7 @@ fn prove_block_with_observed(
         .then(|| Spill::for_block(spill_policy(), live))
         .flatten();
     let (mut traces, decode_commitment, precommits, streamed) = if stream_phase_a() {
-        build_streamed(
+        build_streamed::<C>(
             &program,
             private_input,
             opts,
@@ -401,7 +456,7 @@ fn prove_block_with_observed(
             };
             crate::block_regen::live::spawn_live(s, &program, private_input, max_rows, plan, form)
         });
-        let proof = prove_block_traces(
+        let proof = prove_block_traces_with::<C>(
             elf_bytes,
             &program,
             &mut traces,
@@ -550,20 +605,21 @@ fn build_serial(
     Ok((traces, decode_commitment))
 }
 
-/// A streamed instance's Round-1 commit, made in phase A's stream.
-type Precommit = stark::prover::PrecommittedMain<
+/// A streamed instance's Round-1 commit, made in phase A's stream under the
+/// base configuration `C` ([`crate::hash_pin::BlockHash`]).
+type Precommit<C> = stark::prover::PrecommittedMain<
     crate::tables::types::GoldilocksField,
-    crate::hash_pin::BlockStarkHash,
+    <C as crate::hash_pin::BlockHash>::H,
 >;
 
 /// An instance back from its committer: the table (for
 /// [`finish_sink::insert_finished`]), its AIR name and its Round-1 commit.
-type Committed = (FinishedTable, String, Precommit);
+type Committed<C> = (FinishedTable, String, Precommit<C>);
 
 /// Phase A's output: the traces, DECODE's root, the streamed instances'
 /// precommits by AIR name, and how many chunks of each streamed table the
 /// stream handed out.
-type Produced = (Traces, Commitment, Vec<(String, Precommit)>, StreamSkip);
+type Produced<C> = (Traces, Commitment, Vec<(String, Precommit<C>)>, StreamSkip);
 
 /// `LAMBDA_VM_BLOCK_STREAM=0` builds phase A serially (the A arm of the stream
 /// A/B); unset or anything else streams it.
@@ -1833,10 +1889,10 @@ impl Drop for DropsGuard<'_> {
 /// the spill refuses as well (`spill_main`), so there is no spill to fall back
 /// on. A slot that cannot go in after its bytes went out is an error (the
 /// trace would have no words).
-fn run_drops(
+fn run_drops<C: crate::hash_pin::BlockHash>(
     live: &crate::block_regen::live::LiveRegen,
     jobs: std::sync::mpsc::Receiver<crate::block_regen::live::DropJob>,
-    committed: &std::sync::Mutex<Vec<Committed>>,
+    committed: &std::sync::Mutex<Vec<Committed<C>>>,
     spill: Option<&Spill>,
     ledger: Option<&MemLedger>,
 ) {
@@ -1966,7 +2022,7 @@ impl FinishSink for BlockFinishSink<'_> {
 /// walked once the next one arrives (the last goes to `finish`). The traces are
 /// a whole-run build's (the builder's own tests).
 #[allow(clippy::too_many_arguments)]
-fn build_streamed(
+fn build_streamed<C: crate::hash_pin::BlockHash>(
     program: &Elf,
     private_input: &[u8],
     opts: &ProofOptions,
@@ -1977,7 +2033,7 @@ fn build_streamed(
     ledger: Option<&MemLedger>,
     spill: Option<&Spill>,
     regen: Option<&crate::block_regen::PhaseARegen>,
-) -> Result<Produced, Error> {
+) -> Result<Produced<C>, Error> {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::mpsc;
@@ -2020,7 +2076,7 @@ fn build_streamed(
     // Tables the finish handed off and the committers committed, and their
     // seconds from arrival to commit.
     let finished_committed = Mutex::new((0usize, 0.0f64));
-    let committed: Mutex<Vec<Committed>> = Mutex::new(Vec::new());
+    let committed: Mutex<Vec<Committed<C>>> = Mutex::new(Vec::new());
     let commit_secs = Mutex::new(0.0f64);
     let generate_secs = Mutex::new(0.0f64);
     // Packed instances: (wide bytes, packed bytes, seconds packing on the
@@ -2158,7 +2214,7 @@ fn build_streamed(
                 let spawned = std::thread::Builder::new()
                     .name("regen-drop".to_string())
                     .spawn_scoped(s, move || {
-                        run_drops(live, drop_rx, committed, spill, ledger)
+                        run_drops::<C>(live, drop_rx, committed, spill, ledger)
                     });
                 match spawned {
                     Ok(handle) => {
@@ -2245,7 +2301,7 @@ fn build_streamed(
                             let on_card = commit_card_bytes(&air, &chunk.trace);
                             card.admit(on_card);
                             let commit = || {
-                                crate::hash_pin::BlockProver::precommit_main(
+                                crate::hash_pin::BlockProverOf::<C, _, _, _>::precommit_main(
                                     air.as_ref(),
                                     &chunk.trace,
                                     #[cfg(feature = "disk-spill")]
@@ -2535,7 +2591,7 @@ fn build_streamed(
         times.execute = join(exec)?;
         let decode_commitment = join(decode)?;
 
-        let committed: Vec<Committed> =
+        let committed: Vec<Committed<C>> =
             std::mem::take(&mut *committed.lock().unwrap_or_else(|e| e.into_inner()));
         let (n_finished, finished_secs) =
             *finished_committed.lock().unwrap_or_else(|e| e.into_inner());
@@ -2624,6 +2680,9 @@ fn build_streamed(
 /// statement in the transcript, and one `multi_prove` under `residency`.
 /// Prints the instance census and hands `on_shape` the proof's shape before
 /// proving.
+///
+/// Under this process's base hash ([`crate::hash_pin::base_hash`]); RPX
+/// precommits only, the only kind a caller outside phase A has.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_block_traces(
     elf_bytes: &[u8],
@@ -2632,7 +2691,53 @@ pub fn prove_block_traces(
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
     residency: ResidencyMode,
-    precommits: Vec<(String, Precommit)>,
+    precommits: Vec<(String, Precommit<crate::hash_pin::RpxBlock>)>,
+    times: &mut BlockTimes,
+    on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
+) -> Result<VmProof, Error> {
+    match crate::hash_pin::base_hash() {
+        crate::hash_pin::BaseHash::Rpx => prove_block_traces_with::<crate::hash_pin::RpxBlock>(
+            elf_bytes,
+            program,
+            traces,
+            opts,
+            decode_commitment,
+            residency,
+            precommits,
+            times,
+            on_shape,
+        ),
+        crate::hash_pin::BaseHash::P1 => {
+            if !precommits.is_empty() {
+                return Err(Error::Prover(
+                    "RPX precommits handed to a Poseidon1 prove".to_string(),
+                ));
+            }
+            prove_block_traces_with::<crate::hash_pin::P1Block>(
+                elf_bytes,
+                program,
+                traces,
+                opts,
+                decode_commitment,
+                residency,
+                Vec::new(),
+                times,
+                on_shape,
+            )
+        }
+    }
+}
+
+/// [`prove_block_traces`] under the base configuration `C`.
+#[allow(clippy::too_many_arguments)]
+fn prove_block_traces_with<C: crate::hash_pin::BlockHash>(
+    elf_bytes: &[u8],
+    program: &Elf,
+    traces: &mut Traces,
+    opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    residency: ResidencyMode,
+    precommits: Vec<(String, Precommit<C>)>,
     times: &mut BlockTimes,
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<VmProof, Error> {
@@ -2659,7 +2764,7 @@ pub fn prove_block_traces(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = C::transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -2774,9 +2879,9 @@ pub fn prove_block_traces(
     // Each streamed instance's precommit goes to its AIR's index (by name); the
     // rest commit in Round 1.
     let n_precommits = precommits.len();
-    let mut by_name: std::collections::BTreeMap<String, Precommit> =
+    let mut by_name: std::collections::BTreeMap<String, Precommit<C>> =
         precommits.into_iter().collect();
-    let precommitted: Vec<Option<Precommit>> = pairs
+    let precommitted: Vec<Option<Precommit<C>>> = pairs
         .iter()
         .map(|(air, _, _)| by_name.remove(air.name()))
         .collect();
@@ -2788,7 +2893,7 @@ pub fn prove_block_traces(
     }
 
     let t = Instant::now();
-    let proof = crate::hash_pin::BlockProver::multi_prove_precommitted(
+    let proof = crate::hash_pin::BlockProverOf::<C, _, _, _>::multi_prove_precommitted(
         pairs,
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -2917,7 +3022,7 @@ pub(crate) fn stream_spill_for_test(
 ) -> Result<(Traces, Vec<String>, String), Error> {
     let spill = policy.map(|p| Spill::open(p, false).expect("the spill store opens"));
     let ledger = (stream.finish != FinishCommit::PhaseB || spill.is_some()).then(MemLedger::new);
-    let (traces, _, precommits, _) = build_streamed(
+    let (traces, _, precommits, _) = build_streamed::<crate::hash_pin::RpxBlock>(
         program,
         &[],
         opts,
@@ -2967,7 +3072,7 @@ pub(crate) fn stream_skip_for_test(
     opts: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<(Traces, StreamSkip), Error> {
-    let (traces, _, _, streamed) = build_streamed(
+    let (traces, _, _, streamed) = build_streamed::<crate::hash_pin::RpxBlock>(
         program,
         &[],
         opts,
@@ -3023,7 +3128,7 @@ pub(crate) fn stream_live_for_test(
     });
     let ledger = MemLedger::new();
     let regen = crate::block_regen::PhaseARegen::Live(Box::new(live));
-    let (traces, _, _, streamed) = build_streamed(
+    let (traces, _, _, streamed) = build_streamed::<crate::hash_pin::RpxBlock>(
         program,
         &[],
         opts,
@@ -3064,7 +3169,7 @@ pub(crate) fn stream_recorded_for_test(
 ) -> Result<(Traces, StreamSkip, Vec<crate::block_regen::Recipe>, usize), Error> {
     let regen =
         crate::block_regen::PhaseARegen::Shadow(Box::new(crate::block_regen::Recorder::new()));
-    let (traces, _, _, streamed) = build_streamed(
+    let (traces, _, _, streamed) = build_streamed::<crate::hash_pin::RpxBlock>(
         program,
         &[],
         opts,

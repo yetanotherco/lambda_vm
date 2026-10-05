@@ -596,6 +596,8 @@ impl WrapHash {
             stark::config::CommitmentHash::Rpo256
             | stark::config::CommitmentHash::Rpx256
             | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
+            // No recursion verifies a Poseidon1 proof yet (`p1/*` stage P3).
+            stark::config::CommitmentHash::Poseidon1 => WrapHash::Algebraic,
         }
     }
 
@@ -696,6 +698,18 @@ impl WrapHash {
             return WrapDigest::from_cell(zero_cell);
         }
 
+        if b.p1w16_census().is_some() {
+            // Census geometry: a rate-12 block is three words, one width-16
+            // permutation (stand-in row; the capacity chaining is not emitted).
+            let mut digest = zero_cell;
+            for block in cells.chunks(3) {
+                let w = |i: usize| block.get(i).copied().unwrap_or(zero_cell);
+                digest = b.permute([w(0), w(1), w(2)])[0];
+            }
+            let _ = cap;
+            return WrapDigest::from_cell(digest);
+        }
+
         let mut digest = zero_cell;
         for block in cells.chunks(2) {
             let rate0 = block[0];
@@ -752,6 +766,9 @@ impl WrapHash {
         siblings: &[WrapDigest],
     ) -> WrapDigest {
         assert_eq!(bits.len(), siblings.len(), "one sibling per level");
+        if let (Some(arena), None) = (b.p1w16_census(), self.byte_hash()) {
+            return p1w16_census_walk(b, arena, leaf, bits, siblings);
+        }
         let mut current = leaf;
         for (bit, sibling) in bits.iter().zip(siblings) {
             // ★ EVERY cell of the digest swaps on the SAME bit — a loop rather
@@ -800,6 +817,24 @@ impl WrapHash {
              pad by repeating the last leaf and no caller here needs that"
         );
         let mut level = leaves.to_vec();
+        if b.p1w16_census().is_some() && self.byte_hash().is_none() {
+            // Census geometry: 4-ary nodes (one stand-in row each); an odd
+            // height leaves one binary level at the top.
+            while level.len() > 1 {
+                level = if level.len().is_multiple_of(4) {
+                    level
+                        .chunks_exact(4)
+                        .map(|q| WrapDigest::from_cell(b.permute([q[0][0], q[1][0], q[2][0]])[0]))
+                        .collect()
+                } else {
+                    level
+                        .chunks_exact(2)
+                        .map(|pair| self.hash_pair(b, pair[0], pair[1]))
+                        .collect()
+                };
+            }
+            return level[0];
+        }
         while level.len() > 1 {
             level = level
                 .chunks_exact(2)
@@ -808,6 +843,39 @@ impl WrapHash {
         }
         level[0]
     }
+}
+
+/// ⚠ CENSUS ONLY ([`LfmBuilder::with_p1w16_census`]): a 4-ary Merkle walk.
+///
+/// Per two index bits `(b0, b1)`: the current node and the level-0 sibling are
+/// placed by one `Select` on `b0`; that pair and the two level-1 siblings are
+/// placed by two `Select`s on `b1`; one width-16 node hashes the four
+/// (stand-in `permute` row over three of the cells). A 4-ary level carries
+/// THREE sibling digests where two binary levels carry two: the given
+/// `siblings[2k]`, `siblings[2k+1]` and one more hinted word. An odd walk
+/// ends with one binary level.
+fn p1w16_census_walk(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    leaf: WrapDigest,
+    bits: &[Bit],
+    siblings: &[WrapDigest],
+) -> WrapDigest {
+    let mut current = leaf[0];
+    let mut k = 0;
+    while k + 1 < bits.len() {
+        let extra = b.hint_word(arena, 0);
+        let (x0, x1) = b.select(bits[k], current, siblings[k][0]);
+        let (y0, _y2) = b.select(bits[k + 1], x0, siblings[k + 1][0]);
+        let (y1, _y3) = b.select(bits[k + 1], x1, extra);
+        current = b.permute([y0, y1, _y2])[0];
+        k += 2;
+    }
+    if k < bits.len() {
+        let (l, r) = b.select(bits[k], current, siblings[k][0]);
+        current = b.compress(l.as_digest(), r.as_digest()).as_cell();
+    }
+    WrapDigest::from_cell(current)
 }
 
 /// Bytes in a commitment / Merkle node.

@@ -873,7 +873,7 @@ pub trait IsStarkVerifier<
         // one row: `log2(lde)`; a group tree per FRI layer under a fold
         // schedule) — at the default exactly `StarkCaps::new`'s.
         let caps = StarkCaps::from_layout(
-            options.format.merkle_cap,
+            crate::config::effective_cap_policy::<H>(options.format.merkle_cap),
             options.fri_number_of_queries,
             lde_log,
             &layout,

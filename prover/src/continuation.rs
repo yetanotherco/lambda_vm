@@ -1965,6 +1965,7 @@ fn prove_prepped_epoch(
 
     #[cfg(feature = "shape-profile")]
     crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
+    crate::hash_pin::require_rpx_base("the epoch pipeline");
     let proof = crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
         &mut seed(),
@@ -2318,6 +2319,7 @@ fn prove_prepped_global(
     #[cfg(feature = "shape-profile")]
     crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
 
+    crate::hash_pin::require_rpx_base("the epoch pipeline");
     crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
         &mut global_transcript(

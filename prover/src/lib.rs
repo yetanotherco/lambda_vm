@@ -1658,6 +1658,8 @@ pub fn prove_with_options_and_inputs(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    // The block prover (`block::prove_block`) is the one with a Poseidon1 arm.
+    crate::hash_pin::require_rpx_base("prove_with_options_and_inputs");
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]
@@ -1910,7 +1912,33 @@ pub(crate) fn verify_prepared_shaped(
     page_commitments: Option<&[(u64, Commitment)]>,
     shape: AcceleratorShape,
 ) -> Result<bool, Error> {
-    verify_proof_parts(
+    verify_prepared_shaped_under(
+        vm_proof,
+        program,
+        elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+        shape,
+        crate::hash_pin::base_hash(),
+    )
+}
+
+/// [`verify_prepared_shaped`] under an explicit base configuration rather
+/// than this process's: what lets a test show that a proof made under one
+/// base hash is refused by the other's verifier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_prepared_shaped_under(
+    vm_proof: &VmProof,
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+    shape: AcceleratorShape,
+    base: crate::hash_pin::BaseHash,
+) -> Result<bool, Error> {
+    verify_proof_parts_under(
         MultiProofView::Owned(&vm_proof.proof),
         &vm_proof.table_counts,
         &vm_proof.runtime_page_ranges,
@@ -1922,6 +1950,7 @@ pub(crate) fn verify_prepared_shaped(
         decode_commitment,
         page_commitments,
         shape,
+        base,
     )
 }
 
@@ -1944,6 +1973,38 @@ fn verify_proof_parts(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
     shape: AcceleratorShape,
+) -> Result<bool, Error> {
+    verify_proof_parts_under(
+        proofs,
+        table_counts,
+        runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        program,
+        elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+        shape,
+        crate::hash_pin::base_hash(),
+    )
+}
+
+/// [`verify_proof_parts`] under the base configuration `base`.
+#[allow(clippy::too_many_arguments)]
+fn verify_proof_parts_under(
+    proofs: MultiProofView<'_, F, E, ()>,
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    num_private_input_pages: usize,
+    public_output: &[u8],
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+    shape: AcceleratorShape,
+    base: crate::hash_pin::BaseHash,
 ) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs. A zero count is legitimate
     // for every chip but CPU and MEMW_R — what keeps it honest is the LogUp bus,
@@ -2017,19 +2078,58 @@ fn verify_proof_parts(
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
 
-    // Bind the statement into the verifier's transcript. A tampered statement
-    // field makes this diverge from the prover's transcript state, so every
-    // derived challenge differs and verification rejects.
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
-    absorb_statement_with_digest(
-        &mut transcript,
-        StatementKind::Monolithic,
+    // The base configuration is the caller's (this process's,
+    // [`hash_pin::base_hash`], on every production path): a verifier-side
+    // constant, never read from the proof.
+    let statement = MonolithicStatement {
         elf_digest,
         public_output,
         table_counts,
         num_private_input_pages,
         runtime_page_ranges,
-        proof_options.fri_final_poly_log_degree,
+        fri_final_poly_log_degree: proof_options.fri_final_poly_log_degree,
+    };
+    Ok(match base {
+        crate::hash_pin::BaseHash::Rpx => {
+            verify_monolithic_under::<crate::hash_pin::RpxBlock>(&air_refs, proofs, &statement)
+        }
+        crate::hash_pin::BaseHash::P1 => {
+            verify_monolithic_under::<crate::hash_pin::P1Block>(&air_refs, proofs, &statement)
+        }
+    })
+}
+
+/// What a monolithic proof's transcript absorbs before its first commitment.
+struct MonolithicStatement<'a> {
+    elf_digest: &'a [u8; 32],
+    public_output: &'a [u8],
+    table_counts: &'a TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &'a [RuntimePageRange],
+    fri_final_poly_log_degree: u8,
+}
+
+/// The monolithic verification under the base configuration `C`: the
+/// statement into `C`'s transcript, the COMMIT bus balance from a replay of
+/// it, then `multi_verify_views`.
+fn verify_monolithic_under<C: crate::hash_pin::BlockHash>(
+    air_refs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: MultiProofView<'_, F, E, ()>,
+    statement: &MonolithicStatement<'_>,
+) -> bool {
+    // Bind the statement into the verifier's transcript. A tampered statement
+    // field makes this diverge from the prover's transcript state, so every
+    // derived challenge differs and verification rejects.
+    let mut transcript = C::transcript(&[]);
+    absorb_statement_with_digest(
+        &mut transcript,
+        StatementKind::Monolithic,
+        statement.elf_digest,
+        statement.public_output,
+        statement.table_counts,
+        statement.num_private_input_pages,
+        statement.runtime_page_ranges,
+        statement.fri_final_poly_log_degree,
     );
 
     // Fork the post-absorb state: the replay helper advances through Phase A
@@ -2037,26 +2137,26 @@ fn verify_proof_parts(
     // the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance_view(
-        &air_refs,
+        air_refs,
         proofs,
-        public_output,
+        statement.public_output,
         // Monolithic proof: commits are indexed from 0.
         0,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,
-        None => return Ok(false),
+        None => return false,
     };
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(crate::hash_pin::BlockVerifier::multi_verify_views(
-        &air_refs,
+    crate::hash_pin::BlockVerifierOf::<C, _, _, _>::multi_verify_views(
+        air_refs,
         proofs,
         &mut transcript,
         &expected_bus_balance,
-    ))
+    )
 }
 
 /// Prove and verify in one call (convenience).

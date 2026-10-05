@@ -65,6 +65,7 @@ const fn device_hash_for(hash: CommitmentHash) -> math_cuda::DeviceHash {
         CommitmentHash::Rpo256 => math_cuda::DeviceHash::Rpo256,
         CommitmentHash::Rpx256 => math_cuda::DeviceHash::Rpx256,
         CommitmentHash::Poseidon => math_cuda::DeviceHash::Poseidon,
+        CommitmentHash::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
     }
 }
 
@@ -77,6 +78,7 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
         math_cuda::DeviceHash::Rpo256 => CommitmentHash::Rpo256,
         math_cuda::DeviceHash::Rpx256 => CommitmentHash::Rpx256,
         math_cuda::DeviceHash::Poseidon => CommitmentHash::Poseidon,
+        math_cuda::DeviceHash::Poseidon1 => CommitmentHash::Poseidon1,
     }
 }
 
@@ -91,12 +93,13 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
 /// and is added to this list with its arm. Discriminants are compared because
 /// `PartialEq` is not `const`.
 const _: () = {
-    const ALL: [CommitmentHash; 5] = [
+    const ALL: [CommitmentHash; 6] = [
         CommitmentHash::Keccak256,
         CommitmentHash::Blake3,
         CommitmentHash::Rpo256,
         CommitmentHash::Rpx256,
         CommitmentHash::Poseidon,
+        CommitmentHash::Poseidon1,
     ];
     let mut i = 0;
     while i < ALL.len() {
@@ -112,6 +115,17 @@ const _: () = {
 /// The `math_cuda` dispatch key for `B`'s hash.
 pub(crate) fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
     device_hash_for(B::COMMITMENT_HASH)
+}
+
+/// Load `hash`'s device kernels now, if they load lazily (ZisK's Poseidon1:
+/// `math_cuda::p1_stark`), so the first commit under it does not pay the
+/// module load. `false` when they do not load (no device); a no-op for every
+/// hash the backend loads at start-up.
+pub fn warm_commitment_hash(hash: CommitmentHash) -> bool {
+    match device_hash_for(hash) {
+        math_cuda::DeviceHash::Poseidon1 => math_cuda::p1_stark::kernels().is_ok(),
+        _ => true,
+    }
 }
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
@@ -2327,6 +2341,12 @@ where
         math_cuda::DeviceHash::Rpx256 => {
             math_cuda::rpx::build_comp_poly_tree_from_evals_ext3_keep_rpl(&raw_parts, rows_per_leaf)
         }
+        math_cuda::DeviceHash::Poseidon1 => {
+            math_cuda::p1_stark::build_comp_poly_tree_from_evals_ext3_keep_rpl(
+                &raw_parts,
+                rows_per_leaf,
+            )
+        }
         math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
             B::COMMITMENT_HASH
@@ -2397,6 +2417,15 @@ where
             handle.lde_size,
             rows_per_leaf,
         ),
+        math_cuda::DeviceHash::Poseidon1 => {
+            math_cuda::p1_stark::build_comp_poly_tree_from_slabs_dev_rpl(
+                &stream,
+                handle.buf.as_ref(),
+                handle.m,
+                handle.lde_size,
+                rows_per_leaf,
+            )
+        }
         math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
             B::COMMITMENT_HASH
@@ -4088,14 +4117,27 @@ pub(crate) fn gather_proofs_dev(
         "gather_proofs_dev: position exceeds u32 range"
     );
     let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
-    let bytes = math_cuda::merkle::gather_merkle_paths_dev(
-        &tree.nodes,
-        tree.leaves_len,
-        &positions_u32,
-        stream,
-    )
-    .ok()?;
-    let depth = tree.leaves_len.trailing_zeros() as usize;
+    // A path is `depth` nodes: one sibling per binary level, or three per
+    // 4-ary level (`MerkleTree::get_proof_by_pos` at arity 4).
+    let (bytes, depth) = if tree.arity == math_cuda::p1_stark::ARITY {
+        let bytes = math_cuda::p1_stark::gather_paths_dev(
+            &tree.nodes,
+            tree.leaves_len,
+            &positions_u32,
+            stream,
+        )
+        .ok()?;
+        (bytes, 3 * math_cuda::p1_stark::depth(tree.leaves_len))
+    } else {
+        let bytes = math_cuda::merkle::gather_merkle_paths_dev(
+            &tree.nodes,
+            tree.leaves_len,
+            &positions_u32,
+            stream,
+        )
+        .ok()?;
+        (bytes, tree.leaves_len.trailing_zeros() as usize)
+    };
     debug_assert_eq!(bytes.len(), positions.len() * depth * 32);
     let mut proofs = Vec::with_capacity(positions.len());
     for q in 0..positions.len() {
@@ -4130,6 +4172,14 @@ pub(crate) fn read_cap_dev(
         return Err(format!(
             "device tree has {} leaves, not a power of two",
             tree.leaves_len
+        ));
+    }
+    // Caps are not defined on a 4-ary tree (`effective_cap_policy`); height 0
+    // is its root either way.
+    if tree.arity != 2 && cap_height > 0 {
+        return Err(format!(
+            "a height-{cap_height} cap of an arity-{} device tree",
+            tree.arity
         ));
     }
     let depth = tree.leaves_len.trailing_zeros() as usize;

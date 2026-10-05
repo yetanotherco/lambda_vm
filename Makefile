@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-ntt-cm-host-kat test-whir-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -674,6 +674,17 @@ test-rpx-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
 	    -o target/host_kat/rpx_simt_host_kat $(HOST_KAT_DIR)/rpx_simt_host_kat.cpp
 	./target/host_kat/rpx_simt_host_kat
+
+# Known-answer tests for the Poseidon1 width-16 MEASUREMENT kernels
+# (`p1w16.cu`, D-HASH stage 1), run on the HOST through the same shim: the
+# permutation, the rate-12 coset leaves (base and ext3), the 4-ary node and the
+# grind, at both multiply variants, against the vectors the host reference and
+# Plonky3 agree on. Nothing on a proving path uses these kernels.
+test-p1w16-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/p1w16_host_kat $(HOST_KAT_DIR)/p1w16_host_kat.cpp
+	./target/host_kat/p1w16_host_kat
 
 # Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`), run
 # on the HOST through the same shim: every pass shape against the

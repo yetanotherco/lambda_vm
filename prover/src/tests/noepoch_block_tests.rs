@@ -239,6 +239,101 @@ fn noepoch_refuses_a_trace_that_moved() {
     }
 }
 
+/// (d) A plain device-committed table (CPU[0] at 2^18 rows): the table the
+/// kept top levels (`LAMBDA_VM_RECOMMIT_TOP_LEVELS`) apply to, so their
+/// rebuilt openings must give the Retain proof's bytes.
+#[test]
+#[ignore = "proves a VM program twice at blowup 4; GPU box gate (cuda)"]
+fn noepoch_same_bytes_fib_160k() {
+    same_bytes_under_both_modes("fib_iterative_160k", &MaxRowsConfig::default());
+}
+
+// =========================================================================
+// ZisK's Poseidon1 as the base hash (`p1/*` exploration, P2): run under
+// `LAMBDA_VM_BASE_HASH=p1`, by the box gate. The tests above also run there
+// unchanged, proving and verifying under P1.
+// =========================================================================
+
+#[cfg(feature = "cuda")]
+fn require_p1_base() {
+    assert_eq!(
+        crate::hash_pin::base_hash(),
+        crate::hash_pin::BaseHash::P1,
+        "run under {}=p1",
+        crate::hash_pin::BASE_HASH_ENV
+    );
+}
+
+/// ★ A P1 block proof (grinding on, so the device grind runs) verifies under
+/// its own configuration and is refused by the RPX one — the base hash is a
+/// verifier constant and the two configurations do not agree by accident —
+/// and a flipped byte in a main-trace path, an FRI path, the main root or the
+/// nonce is refused.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "proves a VM program at blowup 4 under LAMBDA_VM_BASE_HASH=p1; GPU box gate (cuda)"]
+fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
+    use crate::hash_pin::BaseHash;
+    require_p1_base();
+    let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
+    let base = GoldilocksCubicProofOptions::with_params(4, 128, 12).expect("options");
+    let opts = crate::zf_format::ZfFormat::DEFAULT.options(base);
+    crate::hash_pin::warm_base_statics(&opts);
+    crypto::grinding::reset_gpu_grind_calls();
+    let proof = build
+        .prove(&opts, ResidencyMode::RecomputeLdeDevice, true)
+        .expect("P1 prove");
+    assert!(
+        crypto::grinding::gpu_grind_calls_p1() > 0,
+        "no P1 device grind ran"
+    );
+    assert_eq!(
+        crypto::grinding::gpu_grind_calls_rpx(),
+        0,
+        "an RPX grind ran"
+    );
+    let verify = |p: &VmProof, base: BaseHash| {
+        matches!(
+            crate::block::verify_block_under(p, &build.elf_bytes, &opts, base),
+            Ok(true)
+        )
+    };
+    assert!(verify(&proof, BaseHash::P1), "the P1 proof must verify");
+    assert!(
+        !verify(&proof, BaseHash::Rpx),
+        "the RPX verifier accepted a P1 proof"
+    );
+    let idx = build.air_index(&opts, "CPU[0]");
+    type Tamper = fn(&mut VmProof, usize);
+    let tampers: [(&str, Tamper); 4] = [
+        ("main-trace path node", |p, i| {
+            p.proof.proofs[i].deep_poly_openings[0]
+                .main_trace_polys
+                .proof
+                .merkle_path[0][0] ^= 1
+        }),
+        ("FRI path node", |p, i| {
+            p.proof.proofs[i].query_list[0].layers_auth_paths[0].merkle_path[1][5] ^= 1
+        }),
+        ("main root", |p, i| {
+            p.proof.proofs[i].lde_trace_main_merkle_root[31] ^= 1
+        }),
+        ("nonce", |p, i| {
+            p.proof.proofs[i].nonce = p.proof.proofs[i].nonce.map(|n| n ^ 1)
+        }),
+    ];
+    for (what, tamper) in tampers {
+        let mut bad = proof.clone();
+        tamper(&mut bad, idx);
+        assert!(!verify(&bad, BaseHash::P1), "a tampered {what} verified");
+        println!("NOEPOCH P1 NEGATIVE {what} (CPU[0], index {idx}): refused");
+    }
+    println!(
+        "NOEPOCH P1: fib_iterative_160k verifies under P1, refused under RPX; {} P1 device grinds",
+        crypto::grinding::gpu_grind_calls_p1()
+    );
+}
+
 /// Peak resident set of this process, from `/proc/self/status` (Linux).
 fn vm_hwm_gib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -268,15 +363,27 @@ fn noepoch_block_prove_and_verify() {
     let opts = crate::lfm::proof::block_base_options();
     println!(
         "NOEPOCH BLOCK: {elf_path} ({} B), input {input_path} ({} B), blowup {} / {} queries / \
-         grinding {}",
+         grinding {} · base hash {:?}",
         elf_bytes.len(),
         input.len(),
         opts.blowup_factor,
         opts.fri_number_of_queries,
-        opts.grinding_factor
+        opts.grinding_factor,
+        crate::hash_pin::base_hash(),
     );
+    // Before the clock: under the P1 base hash the static preprocessed roots
+    // are computed once here (the RPX arm reads them as constants).
+    crate::hash_pin::warm_base_statics(&opts);
+    #[cfg(feature = "cuda")]
+    crypto::grinding::reset_gpu_grind_calls();
 
     let (proof, times) = prove_block(&elf_bytes, &input, &opts).expect("the block must prove");
+    #[cfg(feature = "cuda")]
+    println!(
+        "NOEPOCH GRINDS: device rpx {} · p1 {}",
+        crypto::grinding::gpu_grind_calls_rpx(),
+        crypto::grinding::gpu_grind_calls_p1()
+    );
     let prove_peak = vm_hwm_gib();
     let sub_proofs = proof.proof.proofs.len();
     let bytes = proof_bytes(&proof);
