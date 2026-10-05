@@ -90,7 +90,7 @@ static WORKERS: AtomicUsize = AtomicUsize::new(1);
 static CARD: Mutex<()> = Mutex::new(());
 
 /// Holders right now. ★ The evidence for the falsifier, not a statistic: the
-/// acquire asserts this is 1, so "two holders at once" fails loudly at the
+/// acquire asserts this is 1 (a debug assertion), so "two holders at once" fails loudly at the
 /// moment it happens rather than being inferred afterwards from a VRAM abort.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// The largest value `IN_FLIGHT` has ever taken. Printed, so a green run says
@@ -489,9 +489,10 @@ impl Drop for CardPermit {
 ///
 /// # Panics
 ///
-/// If this thread already holds it (a self-deadlock, named rather than parked),
-/// or if two holders are ever observed (the falsifier, caught at the instant it
-/// happens rather than inferred later from a VRAM abort).
+/// In a build with debug assertions (the tests): if this thread already holds
+/// it (a self-deadlock, named rather than parked), if two holders are ever
+/// observed (the falsifier, caught at the instant it happens rather than
+/// inferred later from a VRAM abort), or if it is taken on a rayon worker.
 pub fn hold() -> CardPermit {
     hold_labeled("card")
 }
@@ -513,7 +514,7 @@ pub fn hold_gated(phase: &'static str) -> CardPermit {
     // and a deferred prove waits for its latch first.
     if stark::prover::shared_vram_gate_on() {
         #[cfg(feature = "parallel")]
-        assert!(
+        debug_assert!(
             rayon::current_thread_index().is_none(),
             "a proof place is taken on a rayon worker ({phase}): take it from a plain thread"
         );
@@ -592,13 +593,17 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     // arm N parked there; which run trips it is the scheduler's choice). Taken
     // from a plain thread, the card is held while rayon builds under it, and
     // that thread blocks instead of running anyone's jobs.
+    //
+    // These checks (and the two-holders one below) are debug assertions, never
+    // production panics: the callers make each violation unreachable (holds
+    // are taken on plain threads, one per thread), so they are for tests.
     #[cfg(feature = "parallel")]
-    assert!(
+    debug_assert!(
         rayon::current_thread_index().is_none(),
         "the card permit is taken on a rayon worker ({phase}): a job it runs while it \
          waits inside rayon could take it again; take it from a plain thread"
     );
-    assert!(
+    debug_assert!(
         !HELD_HERE.with(|h| h.get()),
         "the card permit is not reentrant and this thread already holds it; \
          taking it twice without releasing parks the thread forever"
@@ -619,7 +624,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
     let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     PEAK_IN_FLIGHT.fetch_max(now, Ordering::Relaxed);
     ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
-    assert_eq!(
+    debug_assert_eq!(
         now, 1,
         "★ TWO HOLDERS ON THE CARD. The permit is not a single gate, and two \
          proofs in their device phases can ask for twice the budget: the \
@@ -892,7 +897,10 @@ mod tests {
     }
 
     /// ⛔ A self-deadlock is NAMED, not parked. Without the re-entry check this
-    /// test would hang rather than fail, which is the whole point of it.
+    /// test would hang rather than fail, which is the whole point of it. (A
+    /// debug assertion: without it a release build would park here, so the
+    /// test runs only where it is compiled in.)
+    #[cfg(debug_assertions)]
     #[test]
     fn armed_a_second_hold_on_one_thread_panics_rather_than_parking() {
         let g = ARM.lock().expect("the arm guard is never poisoned");
@@ -918,8 +926,8 @@ mod tests {
     /// the wait and the sibling the only queued job: before the guard the
     /// sibling's hold re-entered every time (i-m4b's repro, m4b/permit-reentry);
     /// with it, the first hold on the worker is refused, before the card is
-    /// taken, so nothing can re-enter.
-    #[cfg(feature = "parallel")]
+    /// taken, so nothing can re-enter. (Debug assertions only, as above.)
+    #[cfg(all(feature = "parallel", debug_assertions))]
     #[test]
     fn armed_a_hold_on_a_rayon_worker_is_refused_before_a_sibling_can_take_it_again() {
         let g = ARM.lock().expect("the arm guard is never poisoned");
