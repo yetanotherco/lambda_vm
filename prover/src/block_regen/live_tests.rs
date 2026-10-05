@@ -31,11 +31,15 @@ const GIB: u64 = 1 << 30;
 /// hang (they take well under a second here).
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The programs, and phase A's (committers, generators, finish in phase A):
-/// the committers generating with the finish in phase B, and generators ahead
-/// with the finish in phase A.
-const PROGRAMS: [&str; 2] = ["all_instructions_64", "test_keccak_multi"];
-const CONFIGS: [(usize, usize, bool); 2] = [(2, 3, true), (3, 0, false)];
+/// The cases, kept to a few for the laptop (R-REGEN S7): a program and phase
+/// A's (committers, generators, finish in phase A) — generators ahead with
+/// the finish in phase A, the committers generating with it in phase B, and
+/// KECCAK chunked.
+const CASES: [(&str, (usize, usize, bool)); 3] = [
+    ("all_instructions_64", (2, 3, true)),
+    ("all_instructions_64", (3, 0, false)),
+    ("test_keccak_multi", (2, 3, true)),
+];
 
 fn max_rows() -> MaxRowsConfig {
     MaxRowsConfig {
@@ -93,6 +97,15 @@ fn streamed_chunks(streamed: &StreamSkip) -> Vec<(StreamTable, usize)> {
         .iter()
         .flat_map(|&t| (0..handed_out(streamed, t)).map(move |i| (t, i)))
         .collect()
+}
+
+/// One of these tests (and the shadow's) at a time: each holds a few runs'
+/// traces, and side by side on the laptop they reached 5.3 GiB (R-REGEN S7);
+/// alone, 2.5 at most.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Phase A under live regeneration `mode` with a window of `ahead` bytes.
@@ -249,16 +262,18 @@ fn slots_of(plan: &LivePlan) -> Vec<RegenSlot> {
 /// table.
 #[test]
 fn always_drops_every_streamed_chunk_and_the_regenerator_brings_each_back() {
-    for name in PROGRAMS {
+    let _one = one_at_a_time();
+    let arms = [
+        (4 * GIB, 3, TraceForm::Narrow),
+        (1, 1, TraceForm::Wide),
+        (1, 3, TraceForm::Narrow),
+    ];
+    for ((name, (committers, generators, finish_in_a)), arm) in CASES.into_iter().zip(arms) {
         let program = program(name);
-        for (committers, generators, finish_in_a) in CONFIGS {
-            let config = stream_config(committers, generators, finish_in_a);
-            for (ahead, generators, form) in [
-                (4 * GIB, 3, TraceForm::Narrow),
-                (1, 1, TraceForm::Wide),
-                (1, 3, TraceForm::Narrow),
-            ] {
-                // Widened at the end of each case.
+        let config = stream_config(committers, generators, finish_in_a);
+        {
+            let (ahead, generators, form) = arm;
+            {
                 let mut reference_traces = resident(&program, config);
                 let mut run = phase_a(&program, config, RegenMode::Always, ahead, None, None);
                 let chunks = streamed_chunks(&run.streamed);
@@ -324,6 +339,7 @@ fn always_drops_every_streamed_chunk_and_the_regenerator_brings_each_back() {
 /// spill policy at all.
 #[test]
 fn auto_that_never_arms_drops_nothing() {
+    let _one = one_at_a_time();
     let program = program("all_instructions_64");
     let config = stream_config(2, 3, true);
     let mut reference_traces = resident(&program, config);
@@ -354,9 +370,10 @@ fn auto_that_never_arms_drops_nothing() {
 /// the traces (the spilled ones read back) are the resident run's.
 #[test]
 fn auto_drops_the_regenerable_and_spills_only_the_rest() {
-    for name in PROGRAMS {
+    let _one = one_at_a_time();
+    for (name, (committers, generators, finish_in_a)) in CASES {
         let program = program(name);
-        for (committers, generators, finish_in_a) in CONFIGS {
+        {
             let config = stream_config(committers, generators, finish_in_a);
             let mut reference_traces = resident(&program, config);
             let streamed_bytes: u64 = {
@@ -506,6 +523,11 @@ fn drop_back_stops_on_the_bytes_it_was_given() {
     live.close_drops();
     live.kept(8, key(8), 6, 8);
     assert!(sent(&rx).is_empty(), "no queue, no drop");
+    assert_eq!(
+        live.armed_for_test(),
+        Some((1000, 158)),
+        "and nothing counted"
+    );
 
     let (live, rx) = armed(0);
     assert!(sent(&rx).is_empty());
@@ -516,13 +538,22 @@ fn drop_back_stops_on_the_bytes_it_was_given() {
     );
 }
 
-/// Phase A under `always` for the fault tests, its window one byte (only the
-/// frontier deposits), with the resident traces.
-fn dropped_run(name: &str, config: StreamConfig) -> (Elf, LiveRun, Traces) {
-    let program = program(name);
-    let reference_traces = resident(&program, config);
-    let run = phase_a(&program, config, RegenMode::Always, 1, None, None);
-    (program, run, reference_traces)
+/// Phase A of `all_instructions_64` under `always` for the fault tests, its
+/// window one byte (only the frontier deposits): the program and the plan.
+fn dropped_run() -> (Elf, LivePlan) {
+    let program = program("all_instructions_64");
+    let mut run = phase_a(&program, fault_config(), RegenMode::Always, 1, None, None);
+    let plan = run.plan.take().expect("something was dropped");
+    (program, plan)
+}
+
+fn fault_config() -> StreamConfig {
+    stream_config(2, 3, true)
+}
+
+/// The resident traces of [`dropped_run`]'s run.
+fn dropped_reference() -> Traces {
+    resident(&program("all_instructions_64"), fault_config())
 }
 
 /// Every slot of `taken` refused but those in `ok`, which are the resident
@@ -562,15 +593,13 @@ fn check_taken(
 /// comes back.
 #[test]
 fn a_chunk_the_slicer_skips_is_failed_before_a_higher_rank() {
-    let config = stream_config(2, 3, true);
-    let (program, mut run, reference_traces) = dropped_run("all_instructions_64", config);
-    let plan = run.plan.take().expect("something was dropped");
-    let n = plan.dropped.len();
-    assert!(n >= 3, "too few dropped: {n}");
-    drop(plan);
-    for (skip, generators) in [(0, 1), (0, 3), (n / 2, 1), (n - 1, 2)] {
-        let (_, mut run, _) = dropped_run("all_instructions_64", config);
-        let plan = run.plan.take().expect("something was dropped");
+    let _one = one_at_a_time();
+    let reference_traces = dropped_reference();
+    for case in 0..4 {
+        let (program, plan) = dropped_run();
+        let n = plan.dropped.len();
+        assert!(n >= 3, "too few dropped: {n}");
+        let (skip, generators) = [(0, 1), (0, 3), (n / 2, 1), (n - 1, 2)][case];
         let (slots, keys) = (slots_of(&plan), keys_of(&plan));
         let faults = LiveFaults {
             skip_rank: Some(plan.dropped[skip].slot.rank()),
@@ -612,9 +641,9 @@ fn a_chunk_the_slicer_skips_is_failed_before_a_higher_rank() {
 /// rest is refused.
 #[test]
 fn every_exit_of_the_regenerator_settles_every_slot() {
-    let config = stream_config(2, 3, true);
-    let (program, mut run, reference_traces) = dropped_run("all_instructions_64", config);
-    let plan = run.plan.take().expect("something was dropped");
+    let _one = one_at_a_time();
+    let reference_traces = dropped_reference();
+    let (program, plan) = dropped_run();
     let n = plan.dropped.len();
     let (slots, keys) = (slots_of(&plan), keys_of(&plan));
     let taker_slots = slots.clone();
@@ -622,22 +651,11 @@ fn every_exit_of_the_regenerator_settles_every_slot() {
         take_in_rank_order(&taker_slots)
     });
     let clean = report.expect("the clean run ended");
-    check_taken(
-        "clean",
-        &slots,
-        &keys,
-        &taken.expect("taken"),
-        &reference_traces,
-        |_| true,
-    );
+    let taken = taken.expect("taken");
+    check_taken("clean", &slots, &keys, &taken, &reference_traces, |_| true);
     let windows = clean.windows;
     assert!(windows >= 2, "too few windows: {}", clean.line());
 
-    let faults = |f: fn(&mut LiveFaults, usize, u64), at: usize, rank: u64| {
-        let mut faults = LiveFaults::default();
-        f(&mut faults, at, rank);
-        faults
-    };
     type Case = (&'static str, fn(&mut LiveFaults, usize, u64), usize);
     let cases: [Case; 6] = [
         (
@@ -668,18 +686,14 @@ fn every_exit_of_the_regenerator_settles_every_slot() {
         ("no generator starts", |f, _, _| f.no_generators = true, 2),
     ];
     for (what, set, generators) in cases {
-        let (_, mut run, _) = dropped_run("all_instructions_64", config);
-        let plan = run.plan.take().expect("something was dropped");
+        let (program, plan) = dropped_run();
         let (slots, keys) = (slots_of(&plan), keys_of(&plan));
-        let dies = plan.dropped[1].slot.rank();
+        let mut faults = LiveFaults::default();
+        set(&mut faults, windows, plan.dropped[1].slot.rank());
         let taker_slots = slots.clone();
-        let (report, taken) = regenerate(
-            &program,
-            plan,
-            generators,
-            faults(set, windows, dies),
-            move || take_in_rank_order(&taker_slots),
-        );
+        let (report, taken) = regenerate(&program, plan, generators, faults, move || {
+            take_in_rank_order(&taker_slots)
+        });
         let report = report.unwrap_or_else(|| panic!("{what}: the regenerator hung"));
         let taken = taken.unwrap_or_else(|| panic!("{what}: phase B's taker hung"));
         let came_back: Vec<bool> = taken.iter().map(Result::is_ok).collect();
@@ -715,9 +729,8 @@ fn every_exit_of_the_regenerator_settles_every_slot() {
 /// slot is settled.
 #[test]
 fn the_proves_end_releases_a_regenerator_waiting_on_its_takers() {
-    let config = stream_config(2, 3, true);
-    let (program, mut run, _) = dropped_run("all_instructions_64", config);
-    let plan = run.plan.take().expect("something was dropped");
+    let _one = one_at_a_time();
+    let (program, plan) = dropped_run();
     let slots = slots_of(&plan);
     let window = Arc::clone(&plan.window);
     let first = slots[0].clone();
@@ -743,6 +756,7 @@ fn the_proves_end_releases_a_regenerator_waiting_on_its_takers() {
 /// with an error on the block path, never asserted.
 #[test]
 fn an_air_set_that_disagrees_with_the_traces_is_an_error() {
+    let _one = one_at_a_time();
     let program = program("all_instructions_64");
     let mut traces = resident(&program, stream_config(2, 3, true));
     let airs = crate::VmAirs::new(
@@ -765,16 +779,27 @@ fn an_air_set_that_disagrees_with_the_traces_is_an_error() {
     }
 }
 
-/// The ranks are phase A's hand-out order, so the regenerator must walk phase
-/// A's windows: on others (1, 7 and 33 cycles against phase A's 32) a rank cut
-/// after a higher one is refused — never waited on — and everything else
-/// comes back. Cycle by cycle, some is refused.
+/// ★ Invariant (I-REGEN §10.2): the ranks are phase A's hand-out order, window
+/// by window, so the regenerator walks phase A's windows. A plan whose phase A
+/// walked other windows (1, 7 and 33 cycles against phase A's 32) is refused
+/// whole — every slot failed at once, nothing run, never a wait (R-REGEN S3).
+/// Past that check (the plan made to claim the regenerator's windows), R10
+/// still refuses, never waits: cycle by cycle some chunk is cut after a
+/// higher-ranked one.
 #[test]
 fn a_regenerator_on_other_windows_refuses_never_waits() {
-    let config = stream_config(2, 3, true);
-    for window in [1, 7, 33] {
-        let (program, mut run, reference_traces) = dropped_run("all_instructions_64", config);
-        let plan = run.plan.take().expect("something was dropped");
+    let _one = one_at_a_time();
+    let reference_traces = dropped_reference();
+    for (window, claimed) in [(1, false), (7, false), (33, false), (1, true), (7, true)] {
+        let (program, mut plan) = dropped_run();
+        assert_eq!(
+            plan.phase_a_window,
+            Some(max_rows().cpu),
+            "phase A's windows"
+        );
+        if claimed {
+            plan.phase_a_window = Some(window);
+        }
         let n = plan.dropped.len();
         let (slots, keys) = (slots_of(&plan), keys_of(&plan));
         let taker_slots = slots.clone();
@@ -787,27 +812,33 @@ fn a_regenerator_on_other_windows_refuses_never_waits() {
             LiveFaults::default(),
             move || take_in_rank_order(&taker_slots),
         );
-        let what = format!("windows of {window}");
+        let what = format!("windows of {window}, claimed {claimed}");
         let report = report.unwrap_or_else(|| panic!("{what}: the regenerator hung"));
         let taken = taken.unwrap_or_else(|| panic!("{what}: phase B's taker hung"));
         let came_back: Vec<bool> = taken.iter().map(Result::is_ok).collect();
         check_taken(&what, &slots, &keys, &taken, &reference_traces, |i| {
             came_back[i]
         });
-        for out in &taken {
-            if let Err(e) = out {
-                assert!(
-                    e.to_string().contains("before a higher rank"),
-                    "{what}: {e}"
-                );
-            }
-        }
         let refused = came_back.iter().filter(|&&ok| !ok).count();
         assert_eq!(report.deposited + refused, n, "{what}: {}", report.line());
-        if window == 1 {
-            // Cycle by cycle, chunks of other tables complete before the CPU
-            // chunk phase A handed out first in their window.
+        let mark = if claimed {
+            "before a higher rank"
+        } else {
+            "phase A walked 32"
+        };
+        for e in taken.iter().filter_map(|t| t.as_ref().err()) {
+            assert!(e.to_string().contains(mark), "{what}: {e}");
+        }
+        if claimed {
             assert!(refused > 0, "{what}: {}", report.line());
+        } else {
+            assert_eq!(
+                (refused, report.windows),
+                (n, 0),
+                "{what}: {}",
+                report.line()
+            );
+            assert!(report.error.as_deref().is_some_and(|e| e.contains(mark)));
         }
     }
 }

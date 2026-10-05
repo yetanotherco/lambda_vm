@@ -1331,6 +1331,13 @@ impl Spill {
         }
     }
 
+    /// Bytes decided as a drop that stayed on the host (the drop thread found
+    /// them no longer droppable): counted resident after all.
+    fn keep_late(&self, bytes: u64) {
+        self.resident
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Kept bytes that drop-back dropped since: they leave the host.
     fn forget_resident(&self, bytes: u64) {
         let _ = self.resident.fetch_update(
@@ -1757,8 +1764,12 @@ impl Drop for DropsGuard<'_> {
 /// The drop thread (R-REGEN R7): each queued drop takes the entry's packed
 /// bytes out under `committed`'s lock, makes their slot (the digest) outside
 /// it, and installs the slot under it again. An entry no longer droppable
-/// (spilled, shared, dropped) stays as it is; a slot that cannot go in after
-/// its bytes went out is an error (the trace would have no words).
+/// stays as it is, counted resident if it was not (R-REGEN S1). Each instance
+/// has one fate and is queued at most once, so of the reasons only a shared
+/// packed copy could apply, which nothing makes in a block today, and which
+/// the spill refuses as well (`spill_main`), so there is no spill to fall back
+/// on. A slot that cannot go in after its bytes went out is an error (the
+/// trace would have no words).
 fn run_drops(
     live: &crate::block_regen::live::LiveRegen,
     jobs: std::sync::mpsc::Receiver<crate::block_regen::live::DropJob>,
@@ -1768,11 +1779,18 @@ fn run_drops(
 ) {
     let lock = || committed.lock().unwrap_or_else(|e| e.into_inner());
     for job in jobs {
-        let narrow = lock()
-            .get_mut(job.index)
-            .and_then(|entry| entry.0.trace.take_main_for_regen());
+        let (narrow, held) = lock().get_mut(job.index).map_or((None, None), |entry| {
+            let trace = &mut entry.0.trace;
+            let narrow = trace.take_main_for_regen();
+            let held = trace.narrow_main().map(|n| n.data().len() as u64);
+            (narrow, held)
+        });
         let Some(narrow) = narrow else {
             live.refused_late();
+            // A drop decided in place of a keep was never counted resident.
+            if let (Some(bytes), false, Some(spill)) = (held, job.back, spill) {
+                spill.keep_late(bytes);
+            }
             continue;
         };
         let bytes = narrow.data().len() as u64;
@@ -1902,6 +1920,10 @@ fn build_streamed(
     use std::sync::mpsc;
 
     let window = max_rows.cpu;
+    // Regeneration's ranks follow these windows; its regenerator walks the same.
+    if let Some(live) = regen.and_then(crate::block_regen::PhaseARegen::live) {
+        live.set_phase_a_window(window);
+    }
     let t = Instant::now();
     let (job_tx, job_rx) = mpsc::channel::<Streamed>();
     let job_rx = Mutex::new(job_rx);

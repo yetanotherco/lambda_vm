@@ -652,6 +652,7 @@ where
             || self.spilled_main.is_some()
             || self.regen_main.is_some()
             || slot.rows() != self.main_table.height
+            || slot.cols() != self.main_table.width
         {
             return false;
         }

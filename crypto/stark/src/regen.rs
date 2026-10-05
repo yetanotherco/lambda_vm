@@ -386,6 +386,11 @@ impl RegenSlot {
         self.want.rows
     }
 
+    /// Columns of the dropped trace.
+    pub fn cols(&self) -> usize {
+        self.want.widths.len()
+    }
+
     /// Packed bytes of the dropped trace.
     pub fn len(&self) -> usize {
         self.want.len
@@ -913,6 +918,10 @@ mod tests {
         );
         assert!(other.take_main_for_regen().is_some());
         assert!(!other.install_regen_main(slot.clone()), "another height");
+        let (mut narrower, _) = packed_trace(64);
+        narrower.main_table.width -= 1;
+        assert!(narrower.take_main_for_regen().is_some());
+        assert!(!narrower.install_regen_main(slot.clone()), "another width");
         assert!(trace.install_regen_main(slot.clone()));
         assert!(!trace.install_regen_main(slot.clone()), "twice");
         slot.deposit(narrow).unwrap();
