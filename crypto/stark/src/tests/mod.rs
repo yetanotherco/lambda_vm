@@ -22,6 +22,7 @@ pub mod path_length_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
+pub mod regen_tests;
 pub mod residency_mode_tests;
 pub mod resident_carry_tests;
 pub mod row_pair_opening_tests;
