@@ -1028,27 +1028,12 @@ fn the_node_cost_model_is_measured() {
 
 // ======================= the child harvest and the node ===================
 
-/// One child LFM proof, production-accepted, harvested for emission.
-///
-/// The per-table sibling of `epoch_tests::RealEpoch`, over an LFM machine's
-/// proof rather than the VM's. ★ Nothing in the harvest is LFM-specific:
-/// `host_table_forked` and `build_table_legs` take `(&dyn AIR,
-/// StarkProofView)`, so the same two functions read a wrap proof, a node proof
-/// and a VM epoch proof alike. That is what makes one node emitter serve every
-/// level.
-pub(super) struct RealChild {
-    pub(super) artifacts: super::registry::LfmArtifacts,
-    pub(super) opts: crate::ProofOptions,
-    pub(super) public_words: Vec<(u32, LfmWord)>,
-    pub(super) tables: Vec<super::epoch_tests::HostTable>,
-    pub(super) legs: Vec<super::epoch_verify_tests::TableLegs>,
-    /// The child's OWN shared LogUp pair, recovered host-side by
-    /// `verify_against_chunked`'s own Phase A replay — the oracle the node's leg
-    /// must reproduce in-machine. Consumed by
-    /// [`the_leaf_node_verifies_and_binds_two_wraps`] through
-    /// `NodePublishSet::Diagnostic`.
-    pub(super) z_alpha: (FEE, FEE),
-}
+/// One child LFM proof, production-accepted, harvested for emission (the
+/// reader lives in [`super::harvest`], where the block tree's driver uses it
+/// too).
+pub(super) use super::harvest::HarvestedChild as RealChild;
+/// The child's shape, as the node's emitter reads it.
+pub(super) use super::harvest::child_shape;
 
 /// Harvest a child from a proof PRODUCTION ACCEPTS. Panics loudly otherwise —
 /// nothing downstream may read a proof the verifier would reject.
@@ -1065,27 +1050,16 @@ pub(super) fn real_child(
 /// ⛔ THE ASSERT IS TIMED, NOT SKIPPED, AND THERE IS NO KNOB THAT SKIPS IT.
 /// It is a complete host STARK verify of the proof produced moments earlier,
 /// and it is what the harness's trustworthiness rests on — a child read from a
-/// proof production would reject describes nothing. What it is NOT is work a
-/// production driver does at this point, so it belongs on a line of its own
-/// rather than inside a `harvest` figure that then gets quoted as the cost of
-/// harvesting.
+/// proof production would reject describes nothing. It belongs on a line of
+/// its own rather than inside a `harvest` figure that then gets quoted as the
+/// cost of harvesting.
 pub(super) fn real_child_timed(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> (RealChild, f64) {
-    let t_verify = std::time::Instant::now();
-    assert!(
-        super::proof::verify_against_artifacts(
-            &artifacts,
-            &proved.proof,
-            &proved.public_words,
-            &opts
-        ),
-        "the harness only reads children production accepts"
-    );
-    let verify_secs = t_verify.elapsed().as_secs_f64();
-    (real_child_unverified(artifacts, opts, proved), verify_secs)
+    super::harvest::harvest_child_verified(artifacts, opts, proved)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// [`real_child_timed`] without its verify, for a caller that verifies the same
@@ -1096,140 +1070,12 @@ pub(super) fn real_child_unverified(
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> RealChild {
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
-    use stark::proof::view::MultiProofView;
-
-    // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
-    // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
-    // as `verify_against_artifacts` builds it: a one-row chip's Phase A root and
-    // leg compare use them.
-    let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts);
-    let refs = airs.air_refs();
-    let view = MultiProofView::Owned(&proved.proof);
-    assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
-
-    // The seed IS `verify_against_chunked`'s: the LFM statement over the claimed
-    // words, and nothing before it.
-    let seed = || {
-        let mut t = crate::hash_pin::block_transcript(&[]);
-        super::statement::absorb_lfm_statement(
-            &mut t,
-            &artifacts.program_id,
-            &proved.public_words,
-            opts.fri_final_poly_log_degree,
-        );
-        t
-    };
-
-    let mut transcript = seed();
-    for (idx, air) in refs.iter().enumerate() {
-        let v = view.get(idx);
-        if air.is_preprocessed() {
-            transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
-                *air,
-                v.trace_length(),
-            ));
-        }
-        transcript.append_bytes(v.lde_trace_main_merkle_root());
-    }
-    let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
-        .map(|_| transcript.sample_field_element())
-        .collect();
-
-    let num_tables = refs.len();
-    let tables: Vec<super::epoch_tests::HostTable> = refs
-        .iter()
-        .enumerate()
-        .map(|(idx, air)| {
-            let v = view.get(idx);
-            let mut fork = transcript.clone();
-            if num_tables > 1 {
-                fork.append_bytes(&(idx as u64).to_le_bytes());
-            }
-            if let Some(root) = v.lde_trace_aux_merkle_root() {
-                fork.append_bytes(root);
-            }
-            if let Some(c) = v.bus_table_contribution() {
-                fork.append_field_element(&c);
-            }
-            super::epoch_tests::host_table_forked(*air, v, idx, num_tables, &mut fork, &lookup)
-        })
-        .collect();
-    let legs = refs
-        .iter()
-        .enumerate()
-        .map(|(idx, air)| super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup))
-        .collect();
-
-    RealChild {
-        artifacts,
-        opts,
-        public_words: proved.public_words.clone(),
-        tables,
-        legs,
-        z_alpha: (lookup[0], lookup[1]),
-    }
-}
-
-/// The child's shape, as the node's emitter reads it.
-pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildShape<'_> {
-    super::per_table_aggregator::ChildShape {
-        program_id: &c.artifacts.program_id,
-        num_public_words: c.public_words.len(),
-        fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
-        tables: c
-            .tables
-            .iter()
-            .zip(&c.legs)
-            .map(|(h, leg)| super::per_table_aggregator::ChildTable {
-                challenge: &h.shape,
-                verify: &leg.verify,
-                analysis: &leg.analysis,
-                precomputed_root: leg.precomputed_commitment.as_ref(),
-            })
-            .collect(),
-    }
+    super::harvest::harvest_child(artifacts, opts, proved).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The child's arenas, in `declare_leg_arenas`' declaration order.
 pub(super) fn child_arena_words(c: &RealChild) -> Vec<Vec<LfmWord>> {
-    let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
-    // The published words, eight halves each — the statement's own layout.
-    let mut publics = Vec::with_capacity(8 * c.public_words.len());
-    for (_, word) in &c.public_words {
-        for lane in word {
-            let v: u64 = lane.canonical();
-            publics.push(base_word(FE::from(v & 0xFFFF_FFFF)));
-            publics.push(base_word(FE::from(v >> 32)));
-        }
-    }
-    arenas.push(publics);
-    arenas.push(super::proof_arena::commitments_to_arena(
-        &c.tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
-    ));
-    for (h, leg) in c.tables.iter().zip(&c.legs) {
-        if let Some(root) = &h.aux_root {
-            arenas.push(super::proof_arena::commitments_to_arena(&[*root]));
-        }
-        if let Some(l) = &h.contribution {
-            arenas.push(vec![ext_word(l)]);
-        }
-        arenas.push(super::proof_arena::commitments_to_arena(&[
-            h.composition_root
-        ]));
-        arenas.push(h.ood_current.iter().map(ext_word).collect());
-        arenas.push(h.ood_next.iter().map(ext_word).collect());
-        arenas.push(h.parts.iter().map(ext_word).collect());
-        arenas.push(super::proof_arena::commitments_to_arena(&h.fri_roots));
-        arenas.push(h.fri_coeffs.iter().map(ext_word).collect());
-        if let Some(nonce) = h.nonce {
-            arenas.push(vec![base_word(FE::from(nonce))]);
-        }
-        arenas.push(leg.opening_arena());
-        arenas.push(leg.fri_arena());
-        arenas.extend(leg.caps_arena());
-    }
-    arenas
+    super::harvest::try_child_arena_words(c).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The aggregation node over `children`, at any level and any arity.
