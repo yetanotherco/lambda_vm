@@ -214,16 +214,17 @@ pub struct BlockFormat {
     pub argue: ArgueFormat,
 }
 
-/// The most groups a block statement may declare. The block has 9; the bound
-/// leaves room for larger blocks and caps what a statement can make the
-/// verifier build.
-pub const BLOCK_MAX_GROUPS: usize = 64;
+/// The most groups a block statement may declare: a verifier constant. The 1×
+/// block has 9 and the median 90. The bound caps what a statement can make the
+/// verifier build and the block-wide LogUp support, which reads 128.51 bits at
+/// 256 groups (127.51 at 512).
+pub const BLOCK_MAX_GROUPS: usize = 256;
 
 /// Refuses `groups` over `max_groups` ([`BlockFormat::max_groups`]). The
 /// verifier refuses a statement with more ([`block_frame`]), and the prover
 /// refuses as its groups close, so a block the verifier would refuse is not
 /// proved.
-fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
+pub(crate) fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
     if groups > max_groups {
         return Err(Error::InvalidTableCounts(format!(
             "{groups} groups — a block takes at most {max_groups}"
