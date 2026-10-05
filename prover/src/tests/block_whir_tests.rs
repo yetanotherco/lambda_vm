@@ -1365,16 +1365,17 @@ fn a_partition_over_the_group_maximum_is_refused() {
     assert!(verify(&proof, &elf, &exact));
 }
 
-/// ★ The prover refuses a partition over the group maximum as its groups
-/// close, with the verifier's own error, on the streamed path and the
-/// whole-run one, instead of proving a block the verifier refuses.
+/// ★ The prover refuses a partition over the group maximum instead of
+/// proving a block the verifier refuses: the whole-run path with the
+/// verifier's own error, the streamed one as its groups close, saying how far
+/// the block got (the group that went over, not a total).
 #[test]
 fn the_prover_refuses_a_partition_over_the_group_maximum() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    for opts in [
-        streamed(MaxRowsConfig::small(), 16, 3),
-        options(MaxRowsConfig::small(), 16),
+    for (opts, streaming) in [
+        (streamed(MaxRowsConfig::small(), 16, 3), true),
+        (options(MaxRowsConfig::small(), 16), false),
     ] {
         let proof = prove(&elf, &format, &opts);
         let n = proof.groups.len();
@@ -1399,7 +1400,17 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
         else {
             panic!("the verifier did not refuse {n} groups");
         };
-        assert_eq!(prover, verifier);
+        if streaming {
+            assert_eq!(
+                prover,
+                format!(
+                    "a block takes at most {} groups; this one reached {n} as its groups close",
+                    n - 1
+                )
+            );
+        } else {
+            assert_eq!(prover, verifier);
+        }
     }
 }
 
