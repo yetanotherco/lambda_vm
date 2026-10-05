@@ -29,7 +29,8 @@ use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    ChunkJob, DecodeArtifacts, StreamedChunk, Traces, WindowedTraceBuilder, build_initial_image,
+    ChunkJob, DecodeArtifacts, StreamSkip, StreamedChunk, Traces, WindowedTraceBuilder,
+    build_initial_image,
 };
 use crate::{AcceleratorShape, Commitment, Error, ProofOptions, VmAirs, VmProof};
 
@@ -318,7 +319,7 @@ fn prove_block_with_observed(
     let spill = stream_phase_a()
         .then(|| Spill::open(spill_policy()))
         .flatten();
-    let (mut traces, decode_commitment, precommits) = if stream_phase_a() {
+    let (mut traces, decode_commitment, precommits, streamed) = if stream_phase_a() {
         build_streamed(
             &program,
             private_input,
@@ -332,7 +333,7 @@ fn prove_block_with_observed(
         )?
     } else {
         let (traces, decode) = build_serial(&program, private_input, opts, max_rows, &mut times)?;
-        (traces, decode, Vec::new())
+        (traces, decode, Vec::new(), Default::default())
     };
     if let Some(ledger) = &ledger {
         crate::tables::trace_builder::set_finish_marks(None);
@@ -340,6 +341,12 @@ fn prove_block_with_observed(
     }
     if let Some(spill) = &spill {
         eprintln!("BLOCK SPILL phase A: {}", spill.report());
+    }
+    if crate::block_regen::probe() {
+        eprintln!(
+            "{}",
+            crate::block_regen::TraceClasses::of(&traces, &streamed).line()
+        );
     }
     // Phase A's freed pages (the finish's lists, spilled traces) back to the OS
     // before phase B allocates: under memory pressure by default, or as
@@ -448,9 +455,10 @@ type Precommit = stark::prover::PrecommittedMain<
 /// [`finish_sink::insert_finished`]), its AIR name and its Round-1 commit.
 type Committed = (FinishedTable, String, Precommit);
 
-/// Phase A's output: the traces, DECODE's root and the streamed instances'
-/// precommits by AIR name.
-type Produced = (Traces, Commitment, Vec<(String, Precommit)>);
+/// Phase A's output: the traces, DECODE's root, the streamed instances'
+/// precommits by AIR name, and how many chunks of each streamed table the
+/// stream handed out.
+type Produced = (Traces, Commitment, Vec<(String, Precommit)>, StreamSkip);
 
 /// `LAMBDA_VM_BLOCK_STREAM=0` builds phase A serially (the A arm of the stream
 /// A/B); unset or anything else streams it.
@@ -1870,7 +1878,7 @@ fn build_streamed(
             ));
         }
 
-        let produce = || -> Result<(Traces, f64), Error> {
+        let produce = || -> Result<(Traces, f64, StreamSkip), Error> {
             let mut builder = WindowedTraceBuilder::new(program, private_input, max_rows)?;
             if drop_streamed_ops() {
                 builder = builder.drop_streamed_ops()?;
@@ -1923,9 +1931,14 @@ fn build_streamed(
                         move || -> Result<_, Error> {
                             // One window held back: the run's last is `finish`'s.
                             let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                            let mut census = crate::block_regen::probe()
+                                .then(crate::block_regen::TouchCensus::default);
                             for logs in log_rx.iter() {
                                 if let Some(prev) = held.replace(logs) {
                                     let walked = walker.walk(&prev)?;
+                                    if let Some(census) = census.as_mut() {
+                                        census.push(walked.cycles(), walked.first_touch_bytes());
+                                    }
                                     if let Some(ledger) = ledger {
                                         ledger.walk_bytes.store(walker.state_bytes(), Relaxed);
                                         ledger.logs_bytes.fetch_sub(
@@ -1939,6 +1952,9 @@ fn build_streamed(
                                         break;
                                     }
                                 }
+                            }
+                            if let Some(census) = census {
+                                eprintln!("{}", census.line());
                             }
                             Ok(held.unwrap_or_default())
                         },
@@ -1979,6 +1995,7 @@ fn build_streamed(
                 ledger.parts("builder", builder.heap_parts());
             }
             let windows = builder.stamps();
+            let streamed = builder.streamed();
             let t = Instant::now();
             let traces =
                 builder.finish_handing(&last, sink.as_ref().map(|sink| sink as &dyn FinishSink))?;
@@ -1997,7 +2014,7 @@ fn build_streamed(
                 if drop_streamed_ops() { "on" } else { "off" },
             );
             collect_secs += finish_secs;
-            Ok((traces, collect_secs))
+            Ok((traces, collect_secs, streamed))
         };
         let produced = produce();
         let mut errors = Vec::new();
@@ -2006,7 +2023,7 @@ fn build_streamed(
                 errors.push(e);
             }
         }
-        let (mut traces, collect_secs) = produced?;
+        let (mut traces, collect_secs, streamed) = produced?;
         if let Some(e) = errors.into_iter().next() {
             return Err(e);
         }
@@ -2085,7 +2102,7 @@ fn build_streamed(
             *ready.waited.lock().unwrap_or_else(|e| e.into_inner()),
             spill.map(Spill::arming_report).unwrap_or_default(),
         );
-        Ok((traces, decode_commitment, precommits))
+        Ok((traces, decode_commitment, precommits, streamed))
     })
 }
 
@@ -2370,7 +2387,7 @@ pub(crate) fn stream_spill_for_test(
 ) -> Result<(Traces, Vec<String>, String), Error> {
     let spill = policy.map(|p| Spill::open(p).expect("the spill store opens"));
     let ledger = (stream.finish != FinishCommit::PhaseB || spill.is_some()).then(MemLedger::new);
-    let (traces, _, precommits) = build_streamed(
+    let (traces, _, precommits, _) = build_streamed(
         program,
         &[],
         opts,
@@ -2408,6 +2425,29 @@ pub(crate) fn stream_spill_for_test(
         precommits.into_iter().map(|(name, _)| name).collect(),
         report,
     ))
+}
+
+/// Phase A's stream of `program` (no input), two committers behind three
+/// generators, the finish's tables committed in phase A: the traces and how
+/// many chunks of each streamed table the stream handed out.
+#[cfg(test)]
+pub(crate) fn stream_skip_for_test(
+    program: &Elf,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<(Traces, StreamSkip), Error> {
+    let (traces, _, _, streamed) = build_streamed(
+        program,
+        &[],
+        opts,
+        max_rows,
+        ResidencyMode::RecomputeLdeDevice,
+        &mut BlockTimes::default(),
+        &stream_config(2, 3, true),
+        None,
+        None,
+    )?;
+    Ok((traces, streamed))
 }
 
 /// The stream's configuration for a test: `committers` / `generators`, the

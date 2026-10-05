@@ -80,6 +80,8 @@ use crate::tables::{
 };
 
 #[cfg(test)]
+mod regen_tests;
+#[cfg(test)]
 mod tail_tests;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -544,6 +546,42 @@ impl WalkedWindow {
     /// The bytes its lists take on the heap (capacities).
     pub fn heap_bytes(&self) -> usize {
         super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
+    }
+
+    /// The cycles it holds.
+    pub fn cycles(&self) -> usize {
+        self.cpu_ops.len()
+    }
+
+    /// The bytes of memory the window reads carried state for: those whose
+    /// old timestamp precedes the window's first cycle. Each is counted once,
+    /// since its first access in the window gives it a timestamp inside it.
+    /// Registers are not counted. This is the size of a per-window entry
+    /// state (D-REGEN §2.4), the census of i-exec's producer harness.
+    pub fn first_touch_bytes(&self) -> usize {
+        let Some(t0) = self.cpu_ops.first().map(|op| op.timestamp) else {
+            return 0;
+        };
+        let memw = &self.walk.memw;
+        // An aligned row's bytes share one old timestamp.
+        let aligned: usize = memw
+            .aligned
+            .iter()
+            .filter(|row| !row.is_register() && row.old_timestamp() < t0)
+            .map(|row| usize::from(row.width()).min(8))
+            .sum();
+        let general: usize = memw
+            .general
+            .iter()
+            .filter(|op| !op.is_register)
+            .map(|op| {
+                op.old_timestamp[..usize::from(op.width).min(8)]
+                    .iter()
+                    .filter(|&&ts| ts < t0)
+                    .count()
+            })
+            .sum();
+        aligned + general
     }
 }
 
