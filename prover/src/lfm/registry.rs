@@ -559,8 +559,17 @@ pub fn build_artifacts_with_hasher(
     // residency that matters is `stark::device_set`'s and admission enforces it
     // per call. The window still bounds the host path exactly as before, which
     // is the path a machine with no card takes.
+    // Under the armed shared VRAM gate each window's device bytes are
+    // admitted here, on the build's thread, before its parallel walk
+    // (`admit_window`).
+    let row_pair = stark::leaf_layout::LeafLayout::RowPair;
     let in_flight = groups_in_flight();
     for (base, window) in groups.chunks(in_flight).enumerate() {
+        let _admitted = super::commit::admit_window(
+            window.iter().map(|g| (g.padded_rows, g.width)),
+            options,
+            row_pair,
+        );
         let commits = map_maybe_parallel(window, |g| {
             commit_group_device_or_host(PREP_GROUP_LABEL, g, options)
         });
@@ -574,7 +583,15 @@ pub fn build_artifacts_with_hasher(
     // bound that names itself.
     let chunks: Vec<usize> = (0..blake3_chunk_log_heights.len()).collect();
     let mut blake3_chunk_roots: Vec<Commitment> = Vec::with_capacity(chunks.len());
+    let blake3_width = program.groups.blake3.width;
     for window in chunks.chunks(in_flight) {
+        let _admitted = super::commit::admit_window(
+            window
+                .iter()
+                .map(|&c| (1usize << blake3_chunk_log_heights[c], blake3_width)),
+            options,
+            row_pair,
+        );
         blake3_chunk_roots.extend(map_maybe_parallel(window, |c| {
             let group = program.blake3_chunk_group(*c);
             commit_group_device_or_host(BLAKE3_CHUNK_LABEL, &group, options)
@@ -587,6 +604,11 @@ pub fn build_artifacts_with_hasher(
     let mut hash_chunk_log_heights: Vec<u8> = vec![log_heights[HASH_SLOT]];
     let tail: Vec<&ColumnGroup> = hash_chunks.iter().skip(1).collect();
     for window in tail.chunks(in_flight) {
+        let _admitted = super::commit::admit_window(
+            window.iter().map(|g| (g.padded_rows, g.width)),
+            options,
+            row_pair,
+        );
         hash_chunk_roots.extend(map_maybe_parallel(window, |g| {
             commit_group_device_or_host(HASH_CHUNK_LABEL, g, options)
         }));
@@ -655,13 +677,30 @@ fn build_one_row_roots(
 ) -> LfmOneRowRoots {
     use stark::leaf_layout::LeafLayout::Row;
     let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
+    // Under the armed shared VRAM gate each walk's device bytes are admitted
+    // here, on the build's thread (`admit_window`); these walks are not
+    // windowed, so each admits its whole list.
+    let admitted = super::commit::admit_window(
+        groups.iter().map(|g| (g.padded_rows, g.width)),
+        options,
+        Row,
+    );
     let commits = map_maybe_parallel(groups, |g| {
         super::commit::commit_group_device_or_host_with(PREP_GROUP_LABEL, g, options, Row)
     });
     for (slot, root) in commits.into_iter().enumerate() {
         roots[slot] = Some(root);
     }
-    let chunks: Vec<usize> = (0..blake3_chunk_rows(program).len()).collect();
+    drop(admitted);
+    let chunk_rows = blake3_chunk_rows(program);
+    let chunks: Vec<usize> = (0..chunk_rows.len()).collect();
+    let admitted = super::commit::admit_window(
+        chunk_rows
+            .iter()
+            .map(|&rows| (rows, program.groups.blake3.width)),
+        options,
+        Row,
+    );
     let blake3_chunk_roots = map_maybe_parallel(&chunks, |c| {
         let group = program.blake3_chunk_group(*c);
         super::commit::commit_group_device_or_host_with(BLAKE3_CHUNK_LABEL, &group, options, Row)
@@ -671,6 +710,12 @@ fn build_one_row_roots(
     roots[14] = bitwise::preprocessed_commitment_for(options, Row);
     // Chunk 0 is slot 5's one-row root; the hash tail follows.
     let mut hash_chunk_roots: Vec<Commitment> = roots[HASH_SLOT].into_iter().collect();
+    drop(admitted);
+    let _admitted = super::commit::admit_window(
+        hash_tail.iter().map(|g| (g.padded_rows, g.width)),
+        options,
+        Row,
+    );
     hash_chunk_roots.extend(map_maybe_parallel(hash_tail, |g| {
         super::commit::commit_group_device_or_host_with(HASH_CHUNK_LABEL, g, options, Row)
     }));

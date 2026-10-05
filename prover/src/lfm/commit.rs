@@ -251,9 +251,10 @@ pub fn commit_group_device_or_host_with(
         // measures.
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
         // Under the armed shared gate (`LAMBDA_VM_SHARED_VRAM_GATE`) the
-        // commit's device set is admitted beside the proofs in flight;
-        // otherwise the caller's card permit is the exclusion.
-        let _bytes = stark::prover::shared_vram_admit(set.total());
+        // caller admitted this commit's device set with its window's, on its
+        // own thread ([`admit_window`]): this may run on a rayon worker, where
+        // a blocking admission is refused. Otherwise the caller's card permit
+        // is the exclusion.
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
@@ -277,6 +278,48 @@ pub fn commit_group_device_or_host_with(
     let _ = label;
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
+}
+
+/// The device bytes a window of artifact commits can hold at once, admitted on
+/// the armed shared VRAM gate (`stark::prover::shared_vram_gate_on`) on THIS
+/// thread: the build's own, before the window's parallel walk, because the
+/// admission blocks and a rayon worker inside the walk must not (i-sched2's
+/// review). `shapes` are the window's groups as (padded rows, width); each one
+/// the device path could take counts its whole commit set, so the bound holds
+/// whichever of them the device admits. `None` off the gate, or unarmed.
+pub fn admit_window(
+    shapes: impl IntoIterator<Item = (usize, usize)>,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Option<stark::prover::SharedVramPermit> {
+    if !stark::prover::shared_vram_gate_on() {
+        return None;
+    }
+    #[cfg(feature = "cuda")]
+    let bytes = if device_artifacts() {
+        shapes
+            .into_iter()
+            .filter(|&(rows, width)| rows > 0 && width > 0)
+            .map(|(rows, width)| {
+                stark::device_set::commit_device_set_rpl(
+                    rows,
+                    width,
+                    options.blowup_factor as usize,
+                    true,
+                    layout.rows_per_leaf(),
+                )
+                .total()
+            })
+            .fold(0u64, u64::saturating_add)
+    } else {
+        0
+    };
+    #[cfg(not(feature = "cuda"))]
+    let bytes = {
+        let _ = (shapes.into_iter().count(), options, layout);
+        0
+    };
+    stark::prover::shared_vram_admit(bytes)
 }
 
 /// Commits one instruction column group.

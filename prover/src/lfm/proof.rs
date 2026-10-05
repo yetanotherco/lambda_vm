@@ -391,7 +391,7 @@ pub(crate) fn prove_traces_with_hasher(
     // the AIR set and the statement's absorb above touch no device, so all of
     // them are free to overlap another proof's device phase, which is the
     // entire point of the lever.
-    let _card = super::device_permit::hold_labeled("multi_prove");
+    let _card = super::device_permit::hold_gated("multi_prove");
     crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,

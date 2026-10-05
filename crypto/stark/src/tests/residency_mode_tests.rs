@@ -274,6 +274,9 @@ fn recompute_lde_releases_aux_columns_and_retain_keeps_them() {
 /// verifies.
 #[test_log::test]
 fn the_shared_vram_gate_produces_byte_identical_proofs() {
+    let _serial = crate::prover::SHARED_GATE_PIN_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     crate::prover::pin_shared_vram_gate(Some(false));
     let own = prove_under(ResidencyMode::Retain);
     crate::prover::pin_shared_vram_gate(Some(true));
