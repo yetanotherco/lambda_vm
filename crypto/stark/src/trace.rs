@@ -288,6 +288,29 @@ where
         true
     }
 
+    /// A trace held packed from the start: `packed`'s rows and columns, with
+    /// no 64-bit copy ever made (the prover's G-pack). `Err` gives `packed`
+    /// back where a trace cannot be held packed, as [`Self::pack_main_narrow`]
+    /// refuses it: not Goldilocks, or no columns.
+    pub fn try_from_narrow_main(
+        packed: multilinear::narrow::NarrowColumns,
+        step_size: usize,
+    ) -> Result<Self, multilinear::narrow::NarrowColumns>
+    where
+        F: 'static,
+    {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || packed.cols() == 0
+        {
+            return Err(packed);
+        }
+        let mut trace = Self::new_main(Vec::new(), packed.cols(), step_size);
+        trace.main_table.height = packed.rows();
+        trace.narrow_main = Some(packed);
+        Ok(trace)
+    }
+
     /// The packed main trace, when [`Self::pack_main_narrow`] packed it.
     pub fn narrow_main(&self) -> Option<&multilinear::narrow::NarrowColumns> {
         self.narrow_main.as_ref()
