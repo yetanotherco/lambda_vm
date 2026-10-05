@@ -267,6 +267,16 @@ pub fn generate_keccak_rnd_rows(
 /// The widths KECCAK_RND traces needed so far in this process (`tables::gpack`).
 static WIDTHS: WidthHint = WidthHint::new();
 
+/// Whether [`generate_keccak_rnd_rows_as`] in `form` writes its rows packed,
+/// with no 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier
+/// KECCAK_RND trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
 /// [`generate_keccak_rnd_rows`] in `form` (`tables::gpack`).
 pub fn generate_keccak_rnd_rows_as(
     ops: &[KeccakRoundOperation],

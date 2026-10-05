@@ -4022,6 +4022,42 @@ pub(crate) fn keccak_rnd_chunks(
     pack: bool,
     form: TraceForm,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    keccak_rnd_chunks_in_waves(ops, rows, streamed, pack, form, kr_packed_wave())
+}
+
+/// `LAMBDA_VM_KR_PACKED_WAVE`: how many KECCAK_RND chunks [`keccak_rnd_chunks`]
+/// builds at once while it writes them packed (G-pack, once the widths are
+/// known): unset, [`KECCAK_RND_PACK_WAVE`] as every chunk (the default); `n ≥
+/// 1`, `n`; `0`, every chunk left in one parallel pass. A chunk written packed
+/// holds no 64-bit table, so the wave bounds nothing but the parallelism. The
+/// tables and their order are the same. Read once; any other value is the
+/// default.
+pub(crate) fn kr_packed_wave() -> usize {
+    static WAVE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WAVE.get_or_init(|| {
+        kr_packed_wave_from(std::env::var("LAMBDA_VM_KR_PACKED_WAVE").ok().as_deref())
+    })
+}
+
+/// [`kr_packed_wave`]'s reading of its variable.
+fn kr_packed_wave_from(value: Option<&str>) -> usize {
+    match value.map(str::trim).map(str::parse::<usize>) {
+        Some(Ok(0)) => usize::MAX,
+        Some(Ok(n)) => n,
+        _ => KECCAK_RND_PACK_WAVE,
+    }
+}
+
+/// [`keccak_rnd_chunks`], the chunks written packed built `packed_wave` at a
+/// time ([`kr_packed_wave`]).
+fn keccak_rnd_chunks_in_waves(
+    ops: &[KeccakRoundOperation],
+    rows: usize,
+    streamed: usize,
+    pack: bool,
+    form: TraceForm,
+    packed_wave: usize,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -4060,22 +4096,31 @@ pub(crate) fn keccak_rnd_chunks(
     };
     // Packed, a few chunks at a time in parallel: each chunk's pack is serial,
     // and one task building them all one after another would be the finish's
-    // last; at most `KECCAK_RND_PACK_WAVE` chunks are wide at once.
+    // last; at most `KECCAK_RND_PACK_WAVE` chunks are wide at once. Once the
+    // chunks are written packed (the first wave left G-pack their widths) none
+    // is wide, and `packed_wave` go at once.
     #[cfg(feature = "parallel")]
     if pack {
         let mut tables = Vec::with_capacity(chunks);
-        let all: Vec<usize> = (0..chunks).collect();
-        for wave in all.chunks(KECCAK_RND_PACK_WAVE) {
-            tables.par_extend(wave.par_iter().map(|&c| chunk(c)));
+        while tables.len() < chunks {
+            let wave = if keccak_rnd::rows_written_packed(form) {
+                packed_wave
+            } else {
+                KECCAK_RND_PACK_WAVE
+            };
+            let first = tables.len();
+            let end = first.saturating_add(wave.max(1)).min(chunks);
+            tables.par_extend((first..end).into_par_iter().map(chunk));
         }
         return Ok(tables);
     }
+    #[cfg(not(feature = "parallel"))]
+    let _ = packed_wave;
     Ok((0..chunks).map(chunk).collect())
 }
 
 /// KECCAK_RND chunks built and packed at once ([`keccak_rnd_chunks`]): each is
 /// ≈ 0.8 GiB at eight bytes a cell (1,480 columns of 2^16 rows) before its pack.
-#[cfg(feature = "parallel")]
 const KECCAK_RND_PACK_WAVE: usize = 4;
 
 /// The ops whose rows reach KECCAK_RND chunk `chunk` of `rows` rows (24 rows an
@@ -6944,5 +6989,98 @@ mod p4_slice_tests {
             whole_and_sliced(&lt, P4Source::Lt, CHUNK, CHUNK, collect_bitwise_from_lt);
         assert_eq!(slices, 2);
         assert_eq!(whole, sliced, "LT");
+    }
+}
+
+#[cfg(test)]
+mod kr_wave_tests {
+    use super::{
+        KECCAK_RND_PACK_WAVE, KeccakRoundOperation, TraceForm, keccak_rnd,
+        keccak_rnd_chunks_in_waves, kr_packed_wave_from,
+    };
+
+    /// `count` ops with distinct states, each 24 rows.
+    fn ops(count: usize) -> Vec<KeccakRoundOperation> {
+        (0..count as u64)
+            .map(|i| KeccakRoundOperation {
+                timestamp: 4 * i + 1,
+                input: std::array::from_fn(|l| {
+                    (i + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((l as u64) << 7)
+                }),
+                output: std::array::from_fn(|l| {
+                    (i + 3).wrapping_mul(0xc2b2_ae3d_27d4_eb4f) ^ l as u64
+                }),
+            })
+            .collect()
+    }
+
+    /// A table's main trace as words, row-major, whether it is held packed or wide.
+    fn words(
+        table: &stark::trace::TraceTable<super::GoldilocksField, super::GoldilocksExtension>,
+    ) -> Vec<u64> {
+        match table.narrow_main() {
+            Some(packed) => {
+                let columns: Vec<Vec<u64>> = (0..packed.cols()).map(|c| packed.column(c)).collect();
+                (0..packed.rows())
+                    .flat_map(|r| columns.iter().map(move |column| column[r]))
+                    .collect()
+            }
+            None => {
+                let main = &table.main_table;
+                (0..main.height)
+                    .flat_map(|r| (0..main.width).map(move |c| *main.get(r, c).value()))
+                    .collect()
+            }
+        }
+    }
+
+    /// The finish's KECCAK_RND tables are the same tables, in the same order, however many of
+    /// the chunks written packed go at once: the wave moves time, never a word.
+    #[test]
+    fn keccak_rnd_chunks_are_the_same_at_every_packed_wave() {
+        // 21 ops = 504 rows in a 512-row table: eight chunks of 64 rows, the last part padding,
+        // and ops cut across chunk edges.
+        let ops = ops(21);
+        let reference =
+            keccak_rnd_chunks_in_waves(&ops, 64, 0, true, TraceForm::Narrow, KECCAK_RND_PACK_WAVE)
+                .expect("the chunks");
+        assert_eq!(reference.len(), 8);
+        for wave in [1, 3, usize::MAX] {
+            let tables = keccak_rnd_chunks_in_waves(&ops, 64, 0, true, TraceForm::Narrow, wave)
+                .expect("the chunks");
+            assert_eq!(tables.len(), reference.len(), "wave {wave}");
+            for (i, (got, want)) in tables.iter().zip(&reference).enumerate() {
+                assert_eq!(
+                    got.narrow_main().map(|p| p.widths().to_vec()),
+                    want.narrow_main().map(|p| p.widths().to_vec()),
+                    "wave {wave}, chunk {i}: widths"
+                );
+                assert_eq!(words(got), words(want), "wave {wave}, chunk {i}");
+            }
+        }
+        // The wide build is the same words too.
+        let wide = keccak_rnd_chunks_in_waves(&ops, 64, 0, false, TraceForm::Wide, usize::MAX)
+            .expect("the chunks");
+        for (i, (got, want)) in wide.iter().zip(&reference).enumerate() {
+            assert_eq!(words(got), words(want), "wide, chunk {i}");
+        }
+        // Once a KECCAK_RND trace was written in this process, the next is written packed
+        // (the wave's switch), except where every trace is wide.
+        assert_eq!(
+            keccak_rnd::rows_written_packed(TraceForm::Narrow),
+            !cfg!(feature = "debug-checks")
+        );
+        assert!(!keccak_rnd::rows_written_packed(TraceForm::Wide));
+    }
+
+    #[test]
+    fn the_packed_wave_reads_unset_as_four_and_zero_as_all() {
+        assert_eq!(kr_packed_wave_from(None), KECCAK_RND_PACK_WAVE);
+        assert_eq!(KECCAK_RND_PACK_WAVE, 4);
+        assert_eq!(kr_packed_wave_from(Some("4")), 4);
+        assert_eq!(kr_packed_wave_from(Some(" 16 ")), 16);
+        assert_eq!(kr_packed_wave_from(Some("0")), usize::MAX);
+        assert_eq!(kr_packed_wave_from(Some("all")), KECCAK_RND_PACK_WAVE);
+        assert_eq!(kr_packed_wave_from(Some("-1")), KECCAK_RND_PACK_WAVE);
     }
 }

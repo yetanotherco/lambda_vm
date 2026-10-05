@@ -102,6 +102,21 @@ pub fn posture_line() -> String {
     format!("BLOCK POSTURE: {}", words.join(" · "))
 }
 
+/// Phase A's two knobs beside the finish, as the run read them:
+/// `LAMBDA_VM_KR_PACKED_WAVE` (KECCAK_RND chunks written packed at once) and
+/// `LAMBDA_VM_BLOCK_COMMIT_OFF_POOL` (the committer's pairs off the global
+/// pool).
+pub fn finish_idle_line() -> String {
+    let wave = match crate::tables::trace_builder::kr_packed_wave() {
+        usize::MAX => "all".to_string(),
+        n => n.to_string(),
+    };
+    format!(
+        "BLOCK FINISH IDLE: KECCAK_RND packed wave {wave} · commit pairs off the pool {}",
+        stark::multilinear_block::commit_pairs_off_pool()
+    )
+}
+
 // ================================ the knobs ===============================
 
 /// Every knob the W3 block reads, once.
@@ -1197,6 +1212,7 @@ pub fn prove_whir_block_tree(
     sink.line(&posture_line());
     sink.line(&format!("W3 ARGUE: {argue:?}"));
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
+    sink.line(&finish_idle_line());
     sink.line(&format!(
         "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {}",
         options
