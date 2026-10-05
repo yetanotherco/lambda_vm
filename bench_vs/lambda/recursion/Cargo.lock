@@ -801,6 +801,7 @@ dependencies = [
  "crypto",
  "digest",
  "itertools",
+ "libc",
  "log",
  "math",
  "multilinear",
