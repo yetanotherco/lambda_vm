@@ -105,6 +105,48 @@ fn a_program_proves_and_verifies_as_one_block() {
     assert!(verify(&proof, &elf, &one_group()));
 }
 
+/// ★ `LAMBDA_VM_ZF_WHIR_GRIND_BITS` on the block: the grind bits, and the Q
+/// they buy back, are the verifier's constants, never the proof's. A block
+/// ground at 18 bits verifies under 18 and is refused by a verifier at 20; a
+/// block ground at 20 is refused by a verifier at 18.
+#[test]
+fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
+    let at = |bits: u8| BlockFormat {
+        zf: ZfFormat {
+            whir_grind_bits: bits,
+            ..many_groups().zf
+        },
+        ..many_groups()
+    };
+    let (c18, c20) = (
+        at(18).chain_config(&[(1, 27)]),
+        at(20).chain_config(&[(1, 27)]),
+    );
+    assert_eq!(
+        (
+            c18.num_queries,
+            c18.grind.query,
+            c20.num_queries,
+            c20.grind.query
+        ),
+        (114, 18, 112, 20)
+    );
+    let elf = asm_elf_bytes("sub");
+    let options = options(MaxRowsConfig::small(), 3);
+    let ground18 = prove(&elf, &at(18), &options);
+    assert!(verify(&ground18, &elf, &at(18)), "the control at 18 bits");
+    assert!(
+        !verify(&ground18, &elf, &at(20)),
+        "a verifier at 20 bits must refuse a block ground at 18"
+    );
+    let ground20 = prove(&elf, &at(20), &options);
+    assert!(verify(&ground20, &elf, &at(20)), "the control at 20 bits");
+    assert!(
+        !verify(&ground20, &elf, &at(18)),
+        "a verifier at 18 bits must refuse a block ground at 20"
+    );
+}
+
 /// The block's shape: many chunks of every table, spread over several groups,
 /// each argued and opened on its own fork.
 #[test]
