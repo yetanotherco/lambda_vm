@@ -434,16 +434,28 @@ where
     where
         F: 'static,
     {
+        Self::try_from_narrow_main(narrow, step_size).ok()
+    }
+
+    /// [`Self::from_narrow_main`], giving `narrow` back where the trace cannot
+    /// be held packed.
+    pub fn try_from_narrow_main(
+        narrow: crate::narrow::NarrowMain,
+        step_size: usize,
+    ) -> Result<Self, crate::narrow::NarrowMain>
+    where
+        F: 'static,
+    {
         if cfg!(feature = "debug-checks")
             || std::any::TypeId::of::<F>()
                 != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
         {
-            return None;
+            return Err(narrow);
         }
         let mut trace = Self::new_main(Vec::new(), narrow.cols(), step_size);
         trace.main_table.height = narrow.rows();
         trace.narrow_main = Some(std::sync::Arc::new(narrow));
-        Some(trace)
+        Ok(trace)
     }
 
     /// Take `narrow` as this trace's packed main trace (packed elsewhere, e.g.
