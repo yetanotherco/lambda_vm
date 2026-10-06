@@ -104,9 +104,10 @@ impl RootCells {
     /// Read from the emitter's own `WrapDigest` shape rather than restated, so
     /// the machine side and `proof_arena`'s writer cannot disagree about it.
     pub fn words_per_root(b: &LfmBuilder) -> u32 {
-        match b.wrap_hash() {
-            super::edsl::WrapHash::Algebraic => 1,
-            _ => DIGEST_WORDS as u32,
+        if b.wrap_hash().one_cell_digest() {
+            1
+        } else {
+            DIGEST_WORDS as u32
         }
     }
 
@@ -184,7 +185,7 @@ impl RootCells {
     /// and handing them to a byte fold would hash four values as if they were
     /// eight — silently, since the count would still look plausible.
     pub fn byte_halves(&self, b: &mut LfmBuilder) -> Vec<Felt> {
-        if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+        if b.wrap_hash().one_cell_digest() {
             let mut out = Vec::with_capacity(4 * DIGEST_WORDS);
             for lanes in &self.lanes {
                 for lane in lanes {
@@ -231,7 +232,9 @@ impl RootCells {
     /// `proof_arena::commitment_words`' layout, which is how a keccak digest
     /// reaches the chip.
     pub fn constant(b: &mut LfmBuilder, root: &[u8; 4 * 4 * DIGEST_WORDS]) -> Self {
-        if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+        // A Poseidon1 digest serialises the same way (`p1_commit`'s node
+        // encoding is `digest_to_commitment`), so one conversion serves both.
+        if b.wrap_hash().one_cell_digest() {
             // ★ The same 32 bytes read as the FOUR CANONICAL FELTS an algebraic
             // backend serialised them from — one interned cell, not eight
             // interned halves. The conversion is the backend's own, not a
@@ -561,6 +564,10 @@ pub(super) fn emit_grinding_check(
         "a grinding factor is in 1..=64 (grinding.rs:22-25), got {factor}"
     );
 
+    if b.wrap_hash() == super::edsl::WrapHash::Poseidon1 {
+        emit_p1_grinding_check(b, seed, nonce, factor);
+        return;
+    }
     let Some(byte_hash) = b.wrap_hash().byte_hash() else {
         emit_algebraic_grinding_check(b, seed, nonce, factor);
         return;
@@ -684,6 +691,42 @@ pub(crate) fn grinding_check_constants(factor: u8) -> Vec<super::word::LfmWord> 
         }
     }
     words
+}
+
+/// The POSEIDON1 arm of [`emit_grinding_check`]: `p1_commit::P1GrindDigest`'s
+/// two width-8 permutations, emulated ([`super::p1w16_emit::w8_permute`]),
+/// then the top `factor` bits of lane 0's canonical value.
+///
+/// The inner preimage is `PREFIX ‖ state ‖ factor` (41 bytes) read as 8-byte
+/// big-endian felts: the prefix felt, the state's four lanes (a Poseidon1
+/// digest serialises as its canonical lanes, so the 32 bytes ARE them), and
+/// `factor` in the top byte of the sixth. The outer one is the inner digest's
+/// four lanes and the nonce. The digest's first eight bytes are lane 0's
+/// canonical value big-endian, so "below `2^(64 − g)`" is its top `g` bits zero.
+fn emit_p1_grinding_check(
+    b: &mut LfmBuilder,
+    seed: super::edsl::WrapDigest,
+    nonce: Felt,
+    factor: u8,
+) {
+    use super::p1w16_emit::w8_permute;
+
+    assert_eq!(seed.len(), 1, "a Poseidon1 transcript state is ONE cell");
+    let [s0, s1, s2, s3] = b.unpack(seed[0]);
+    let prefix = b.felt_const(FE::from(u64::from_be_bytes(GRINDING_PREFIX)));
+    let fac = b.felt_const(FE::from(u64::from(factor) << 56));
+    let zero = b.felt_const(FE::zero());
+    let inner = w8_permute(b, [prefix, s0, s1, s2, s3, fac, zero, zero]);
+    let outer = w8_permute(
+        b,
+        [
+            inner[0], inner[1], inner[2], inner[3], nonce, zero, zero, zero,
+        ],
+    );
+    let bits = b.bit_dec(outer[0], 64);
+    for bit in &bits[64 - factor as usize..] {
+        b.assert_eq(Felt(bit.addr()), zero);
+    }
 }
 
 fn emit_algebraic_grinding_check(

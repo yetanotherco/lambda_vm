@@ -780,6 +780,8 @@ pub fn blocks_for(felts: usize, hash: WrapHash) -> usize {
         // on an exact multiple. Written as its own arm rather than merged, so
         // the equality stays a checked property instead of an assumption.
         WrapHash::Algebraic => felts.div_ceil(super::rpo::RATE_FELTS).max(1),
+        // ZisK's leaf: twelve felts a permutation, none for an empty leaf.
+        WrapHash::Poseidon1 => felts.div_ceil(super::p1w16_emit::RATE_FELTS),
     }
 }
 
