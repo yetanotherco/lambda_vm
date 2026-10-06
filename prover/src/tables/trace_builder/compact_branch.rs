@@ -1,47 +1,24 @@
-//! BRANCH ops as the builder keeps them until their tables are built: a stream
-//! of zigzag LEB128 deltas instead of 32 bytes an op (S3c-BRANCH).
+//! BRANCH ops as the builder keeps them until their tables are built: a
+//! [`DeltaStream`] instead of 32 bytes an op (S3c-BRANCH).
 //!
 //! An op is a flags byte (`jalr`, and how its register is coded) and three
 //! varints: the pc from the previous op's, the offset itself, and the register
 //! the cheapest of three ways (as it is, from the previous op's register, or
 //! from the op's own pc: a JALR's return address sits near it). Every op takes
 //! at most 31 bytes, so any op, whatever its values, is kept losslessly and
-//! none is held raw. Every [`INDEX_EVERY`] ops a sparse index records where
-//! the stream stands, so any range expands on its own; the stream is stored in
-//! blocks of at most [`super::blocks::BLOCK_BYTES`] that are never
-//! reallocated once full, and an op never straddles two blocks (as
-//! [`super::CompactLt`]). The ops expand exactly as pushed, in order, so the
-//! tables are the same.
+//! none is held raw.
 
-use super::{BranchOperation, Expand, Part, Segmented, blocks};
+use super::BranchOperation;
+use super::delta::{Codec, DeltaStream, cheapest, get, put, unzigzag, zigzag};
 
-/// Where the stream stands at op `k * INDEX_EVERY`: its block, the byte in
-/// it, and the previous op's pc and register.
-#[derive(Clone, Copy)]
-struct Mark {
-    block: u32,
-    at: u32,
+/// BRANCH's [`Codec`]: the previous op's pc and register.
+#[derive(Clone, Copy, Default)]
+pub(super) struct BranchCodec {
     pc: u64,
     register: u64,
 }
 
-#[derive(Default)]
-pub(super) struct CompactBranch {
-    bytes: Vec<Vec<u8>>,
-    index: Vec<Mark>,
-    len: usize,
-    last_pc: u64,
-    last_register: u64,
-    /// Bytes a block of the stream holds; 0 is [`blocks::BLOCK_BYTES`] (tests
-    /// set a small one, to cross blocks).
-    block_bytes: usize,
-}
-
-const INDEX_EVERY: usize = 4096;
-
-/// The most bytes one op takes: the flags byte and three varints of at most
-/// ten.
-const OP_BYTES: usize = 31;
+pub(super) type CompactBranch = DeltaStream<BranchCodec>;
 
 /// `flags`: the op is a JALR.
 const JALR: u8 = 1;
@@ -51,204 +28,50 @@ const REGISTER_ABSOLUTE: u8 = 0;
 const REGISTER_FROM_LAST: u8 = 1;
 const REGISTER_FROM_PC: u8 = 2;
 
-fn zigzag(d: u64) -> u64 {
-    (d << 1) ^ ((d as i64 >> 63) as u64)
-}
+impl Codec for BranchCodec {
+    type Op = BranchOperation;
+    /// The flags byte and three varints of at most ten.
+    const MAX_BYTES: usize = 31;
 
-fn unzigzag(z: u64) -> u64 {
-    (z >> 1) ^ (z & 1).wrapping_neg()
-}
-
-/// The bytes LEB128 takes for `v`.
-fn varint_len(v: u64) -> usize {
-    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
-}
-
-fn put(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push(v as u8 | 0x80);
-        v >>= 7;
+    fn encode(&mut self, op: &BranchOperation, out: &mut Vec<u8>) {
+        let (mode, register) = cheapest([
+            (REGISTER_ABSOLUTE, zigzag(op.register)),
+            (
+                REGISTER_FROM_LAST,
+                zigzag(op.register.wrapping_sub(self.register)),
+            ),
+            (REGISTER_FROM_PC, zigzag(op.register.wrapping_sub(op.pc))),
+        ]);
+        out.push((u8::from(op.jalr) * JALR) | (mode << REGISTER_SHIFT));
+        put(out, zigzag(op.pc.wrapping_sub(self.pc)));
+        put(out, zigzag(op.offset));
+        put(out, register);
+        self.pc = op.pc;
+        self.register = op.register;
     }
-    out.push(v as u8);
-}
 
-fn get(bytes: &[u8], at: &mut usize) -> u64 {
-    let (mut v, mut shift) = (0u64, 0u32);
-    loop {
-        let b = bytes[*at];
+    fn decode(&mut self, bytes: &[u8], at: &mut usize) -> BranchOperation {
+        let flags = bytes[*at];
         *at += 1;
-        v |= u64::from(b & 0x7f) << shift;
-        if b < 0x80 {
-            return v;
-        }
-        shift += 7;
-    }
-}
-
-impl CompactBranch {
-    /// A list whose stream is cut into blocks of `bytes` (at least an op's).
-    #[cfg(test)]
-    pub(super) fn with_block_bytes(bytes: usize) -> Self {
-        Self {
-            block_bytes: bytes.max(OP_BYTES),
-            ..Self::default()
-        }
-    }
-
-    /// `ops`, in order.
-    pub(super) fn from_ops(ops: &[BranchOperation]) -> Self {
-        let mut list = Self::default();
-        list.extend(ops);
-        list
-    }
-
-    fn block_bytes(&self) -> usize {
-        if self.block_bytes == 0 {
-            blocks::BLOCK_BYTES
-        } else {
-            self.block_bytes
-        }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Append `ops`, in order.
-    pub(super) fn extend(&mut self, ops: &[BranchOperation]) {
-        let block_bytes = self.block_bytes();
-        for op in ops {
-            // Room for the op in the last block: grown as a `Vec` grows up to
-            // a block's bytes, else a new block, allocated whole.
-            let room = self
-                .bytes
-                .last()
-                .is_some_and(|last| last.len() + OP_BYTES <= block_bytes);
-            if !room {
-                let capacity = if self.bytes.is_empty() {
-                    4096.min(block_bytes)
-                } else {
-                    block_bytes
-                };
-                self.bytes.push(Vec::with_capacity(capacity));
-            }
-            let block = self.bytes.len() - 1;
-            let Some(last) = self.bytes.last_mut() else {
-                continue;
-            };
-            if last.capacity() - last.len() < OP_BYTES {
-                let want = (last.capacity() * 2)
-                    .min(block_bytes)
-                    .max(last.len() + OP_BYTES);
-                last.reserve_exact(want - last.len());
-            }
-            if self.len.is_multiple_of(INDEX_EVERY) {
-                self.index.push(Mark {
-                    block: block as u32,
-                    at: last.len() as u32,
-                    pc: self.last_pc,
-                    register: self.last_register,
-                });
-            }
-            // The register, the cheapest of its three codings.
-            let codings = [
-                (REGISTER_ABSOLUTE, zigzag(op.register)),
-                (
-                    REGISTER_FROM_LAST,
-                    zigzag(op.register.wrapping_sub(self.last_register)),
-                ),
-                (REGISTER_FROM_PC, zigzag(op.register.wrapping_sub(op.pc))),
-            ];
-            let (mode, register) = codings
-                .into_iter()
-                .min_by_key(|&(_, v)| varint_len(v))
-                .unwrap_or((REGISTER_ABSOLUTE, zigzag(op.register)));
-            last.push((u8::from(op.jalr) * JALR) | (mode << REGISTER_SHIFT));
-            put(last, zigzag(op.pc.wrapping_sub(self.last_pc)));
-            put(last, zigzag(op.offset));
-            put(last, register);
-            self.last_pc = op.pc;
-            self.last_register = op.register;
-            self.len += 1;
-        }
-    }
-
-    /// The bytes it takes on the heap (capacities).
-    pub(super) fn heap_bytes(&self) -> usize {
-        self.bytes.iter().map(Vec::capacity).sum::<usize>()
-            + self.bytes.capacity() * std::mem::size_of::<Vec<u8>>()
-            + self.index.capacity() * std::mem::size_of::<Mark>()
-    }
-
-    /// The bytes its largest single allocation takes.
-    pub(super) fn largest_bytes(&self) -> usize {
-        let blocks = self.bytes.iter().map(Vec::capacity).max().unwrap_or(0);
-        blocks.max(self.index.capacity() * std::mem::size_of::<Mark>())
-    }
-
-    /// The list as one compact segment.
-    pub(super) fn segments(&self) -> Segmented<'_, BranchOperation> {
-        Segmented {
-            parts: vec![Part::Compact(self)],
-        }
-    }
-
-    /// Ops `start..end`, expanded.
-    pub(super) fn range(&self, start: usize, end: usize) -> Vec<BranchOperation> {
-        let mut out = Vec::new();
-        self.expand_into(start, end, &mut out);
-        out
-    }
-}
-
-impl Expand<BranchOperation> for CompactBranch {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn expand_into(&self, start: usize, end: usize, out: &mut Vec<BranchOperation>) {
-        let end = end.min(self.len);
-        if start >= end {
-            return;
-        }
-        let first = start / INDEX_EVERY;
-        let mark = self.index[first];
-        let (mut block, mut at) = (mark.block as usize, mark.at as usize);
-        let (mut pc, mut register) = (mark.pc, mark.register);
-        out.reserve(end - start);
-        for k in first * INDEX_EVERY..end {
-            // An op lies in one block: the next op starts the next block once
-            // this one ends.
-            if at >= self.bytes[block].len() {
-                block += 1;
-                at = 0;
-            }
-            let bytes = &self.bytes[block];
-            let flags = bytes[at];
-            at += 1;
-            pc = pc.wrapping_add(unzigzag(get(bytes, &mut at)));
-            let offset = unzigzag(get(bytes, &mut at));
-            let coded = unzigzag(get(bytes, &mut at));
-            register = match (flags >> REGISTER_SHIFT) & 3 {
-                REGISTER_FROM_LAST => register.wrapping_add(coded),
-                REGISTER_FROM_PC => pc.wrapping_add(coded),
-                _ => coded,
-            };
-            if k >= start {
-                out.push(BranchOperation::new(
-                    pc,
-                    offset,
-                    register,
-                    flags & JALR != 0,
-                ));
-            }
-        }
+        self.pc = self.pc.wrapping_add(unzigzag(get(bytes, at)));
+        let offset = unzigzag(get(bytes, at));
+        let coded = unzigzag(get(bytes, at));
+        self.register = match (flags >> REGISTER_SHIFT) & 3 {
+            REGISTER_FROM_LAST => self.register.wrapping_add(coded),
+            REGISTER_FROM_PC => self.pc.wrapping_add(coded),
+            _ => coded,
+        };
+        BranchOperation::new(self.pc, offset, self.register, flags & JALR != 0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactBranch, INDEX_EVERY, OP_BYTES};
+    use super::super::delta::{Codec, with_index_every};
+    use super::{BranchCodec, CompactBranch};
+
+    const INDEX_EVERY: usize = 4096;
+    const OP_BYTES: usize = <BranchCodec as Codec>::MAX_BYTES;
     use crate::tables::branch::{BranchOperation, generate_branch_trace};
 
     /// Ops whose fields reach both ends of u64 and i64 and sit near each other,
@@ -324,12 +147,42 @@ mod tests {
                     "ops {start}..{end}, blocks of {block_bytes}"
                 );
             }
-            let stream: usize = list.bytes.iter().map(Vec::len).sum();
+            let stream = list.stream_bytes();
             assert!(
                 stream <= OP_BYTES * all.len(),
                 "{stream} bytes for {} ops",
                 all.len()
             );
+        }
+    }
+
+    /// Chunks of every size around the index's spacing, each starting past an
+    /// index mark, expand to their ops; so does a stream marked every three
+    /// ops ([`with_index_every`]), where nearly every range starts past one.
+    #[test]
+    fn chunks_starting_past_an_index_mark_expand_to_their_ops() {
+        let all = ops(3 * INDEX_EVERY + 77);
+        let list = CompactBranch::from_ops(&all);
+        assert_eq!(list.every(), INDEX_EVERY);
+        for chunk in [1000usize, INDEX_EVERY - 1, INDEX_EVERY + 1, 5000] {
+            for (k, want) in all.chunks(chunk).enumerate() {
+                assert_eq!(
+                    list.range(k * chunk, (k + 1) * chunk),
+                    want,
+                    "chunk {k} of {chunk}"
+                );
+            }
+        }
+        let dense = with_index_every(3, || CompactBranch::from_ops(&all));
+        assert_eq!(dense.every(), 3);
+        for chunk in [1usize, 2, 7, 100] {
+            for (k, want) in all.chunks(chunk).enumerate().take(500) {
+                assert_eq!(
+                    dense.range(k * chunk, (k + 1) * chunk),
+                    want,
+                    "dense chunk {k} of {chunk}"
+                );
+            }
         }
     }
 
@@ -346,7 +199,7 @@ mod tests {
         );
         let list = CompactBranch::from_ops(std::slice::from_ref(&worst));
         assert_eq!(list.range(0, 1), vec![worst]);
-        assert!(list.bytes[0].len() <= OP_BYTES);
+        assert!(list.stream_bytes() <= OP_BYTES);
         let common: Vec<BranchOperation> = (0..1000u64)
             .map(|k| {
                 BranchOperation::new(
@@ -359,7 +212,7 @@ mod tests {
             .collect();
         let list = CompactBranch::from_ops(&common);
         assert_eq!(list.range(0, 1000), common);
-        let stream: usize = list.bytes.iter().map(Vec::len).sum();
+        let stream = list.stream_bytes();
         assert!(
             stream <= 6 * common.len(),
             "{stream} bytes for 1000 common ops"

@@ -74,6 +74,7 @@ use crate::paged_mem::{ImageSource, PagedMem};
 
 mod blocks;
 mod compact_branch;
+mod delta;
 mod finish;
 #[cfg(test)]
 mod finish_oracle;

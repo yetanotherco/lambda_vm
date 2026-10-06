@@ -339,6 +339,51 @@ fn the_plan_builds_the_oracles_windowed_tables() {
     }
 }
 
+/// The delta-coded lists ([`super::delta`]) marked every three ops instead of
+/// every 4096, so nearly every chunk and every p4 slice starts past an index
+/// mark: the windowed builds make the same tables word for word.
+#[test]
+fn the_tables_are_the_same_with_an_index_mark_every_three_ops() {
+    type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
+    let configs: Vec<(&str, Configure)> = vec![
+        ("plain", Box::new(|b| b)),
+        (
+            "dropped, KECCAK_RND at the finish, cuts, packed, written packed",
+            Box::new(|b| {
+                b.keccak_rnd_chunks_at_finish(32)
+                    .expect("rows")
+                    .cuts_at_finish(2, 4, 2)
+                    .expect("rows")
+                    .pack_finished_tables()
+                    .generate_packed()
+                    .drop_streamed_ops()
+                    .expect("before any window")
+            }),
+        ),
+    ];
+    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
+        for name in [
+            "all_instructions_64",
+            "misalign_sd",
+            "test_keccak_multi",
+            "test_ecsm_multi",
+        ] {
+            let (program, logs) = run(name);
+            for window in [7, 1000] {
+                for (config, configure) in &configs {
+                    let build = || windowed(&program, &logs, &max_rows, window, configure.as_ref());
+                    let dense = super::delta::with_index_every(3, build);
+                    same(
+                        &format!("{name} window {window} {config}, marks every 3"),
+                        &build(),
+                        &dense,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A plan over a collected run, as `build_from_collected` makes one.
 fn plan_of<'a>(
     ops: CollectedOps,

@@ -1994,7 +1994,7 @@ fn vec_units<'a, T: Send + Sync + 'a>(
 }
 
 /// A list a family's chunks are read from as segments: in blocks, or
-/// delta-coded ([`CompactBranch`]).
+/// delta-coded ([`delta::DeltaStream`]).
 trait SegmentList<T>: Send + Sync {
     fn list_len(&self) -> usize;
     fn list_segments(&self) -> Segmented<'_, T>;
@@ -2010,12 +2010,12 @@ impl<T: Send + Sync> SegmentList<T> for BlockVec<T> {
     }
 }
 
-impl SegmentList<BranchOperation> for CompactBranch {
+impl<C: delta::Codec> SegmentList<C::Op> for delta::DeltaStream<C> {
     fn list_len(&self) -> usize {
         self.len()
     }
 
-    fn list_segments(&self) -> Segmented<'_, BranchOperation> {
+    fn list_segments(&self) -> Segmented<'_, C::Op> {
         self.segments()
     }
 }
