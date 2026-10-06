@@ -2529,7 +2529,7 @@ fn the_block_tree_composes_to_a_top_node() {
         shape,
         top_proof,
         top,
-        witness: rb,
+        witness: mut rb,
         consts,
         forced,
         ..
@@ -2613,6 +2613,39 @@ fn the_block_tree_composes_to_a_top_node() {
     );
     if let Some(split) = split {
         println!("   BLOCK VERIFIER split (cold): {split}");
+    }
+    // ★ I-PADLEAF G1: a tree proved under the padded partition (version 3) is
+    // refused by a verifier at version 2, which derives the rule's partition,
+    // so another top. Opt-in (`NOEPOCH_CROSS_MODEL_CHECK=1`): it derives the
+    // whole v2 tree once more.
+    if forced.is_none()
+        && rb.plan.cost_model() == super::block_plan::PARTITION_MODEL_PADDED
+        && std::env::var("NOEPOCH_CROSS_MODEL_CHECK").as_deref() == Ok("1")
+    {
+        let v2 = super::block_plan::partition_for(&rb.names(), &rb.plan.costs())
+            .expect("the rule partitions");
+        if v2 == *rb.plan.partition() {
+            println!("   BLOCK VERIFIER CROSS-MODEL: v3 kept v2's partition; nothing to refuse");
+        } else {
+            let v3 = rb.plan.replace_partition(v2);
+            let v2_top = rb.plan.derive_top(&wrap_opts);
+            rb.plan.replace_partition(v3);
+            let v2_top = v2_top.expect("the v2 top derives");
+            assert_ne!(
+                v2_top.program_id, top.artifacts.program_id,
+                "a v2 verifier must derive another top than the v3 tree's"
+            );
+            assert!(
+                !verify_block_top(&v2_top, &top_proof, &wrap_opts),
+                "the v3 top proof must not verify against the v2 top program"
+            );
+            println!(
+                "   BLOCK VERIFIER CROSS-MODEL: refused — a v2 verifier derives top {} ≠ the \
+                 proved v3 top {}",
+                super::block_tree::hex_id(&v2_top.program_id),
+                super::block_tree::hex_id(&top.artifacts.program_id)
+            );
+        }
     }
     #[cfg(feature = "cuda")]
     {

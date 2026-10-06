@@ -302,15 +302,15 @@ fn padleaf_mix_instrument() {
     println!("PADLEAF FRONT {}", join(model.front()));
     println!("PADLEAF CARRIER {}", join(model.carrier()));
     let costs = plan.costs();
-    for i in 0..plan.num_instances() {
+    for (i, cost) in costs.iter().enumerate() {
         println!(
-            "PADLEAF INST {i} {} {} {}",
+            "PADLEAF INST {i} {} {cost} {}",
             plan.instance(i).name,
-            costs[i],
             join(model.instance(i))
         );
     }
-    let partition = plan.partition();
+    let names: Vec<&str> = plan.instances().iter().map(|i| i.name.as_str()).collect();
+    let partition = &partition_for(&names, &costs).expect("v2 partitions");
     let mut v2_cells = 0u64;
     for (k, list) in partition.leaves().iter().enumerate() {
         let rows = model.leaf_rows(list, k == plan.carrier());
@@ -329,7 +329,6 @@ fn padleaf_mix_instrument() {
         "PADLEAF V2 STEPS {}",
         steps(&model, partition.leaves(), plan.carrier())
     );
-    let names: Vec<&str> = plan.instances().iter().map(|i| i.name.as_str()).collect();
     let (seeds, seeded) = seed_leaves(&names, partition.num_leaves());
     let start = spread_start(&model, &seeds, &seeded, plan.carrier());
     for (label, lists) in [

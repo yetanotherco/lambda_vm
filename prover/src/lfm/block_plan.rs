@@ -630,6 +630,14 @@ impl BlockTreePlan {
         self.partition = partition;
         self
     }
+
+    /// [`Self::with_partition`] in place, returning the partition it replaces —
+    /// test-only.
+    #[cfg(test)]
+    pub(crate) fn replace_partition(&mut self, partition: BlockPartition) -> BlockPartition {
+        assert_eq!(partition.num_instances(), self.instances.len());
+        std::mem::replace(&mut self.partition, partition)
+    }
 }
 
 /// The block tree's fan-in: children per interior node. Four: the record
