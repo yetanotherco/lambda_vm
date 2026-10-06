@@ -77,6 +77,7 @@ use multilinear::{
 };
 
 use crate::narrow::NarrowMain;
+use crate::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 use crate::spill::{Prefetch, ReadPhase, SpillStore, SpilledMain};
 
 use crate::multilinear_table::{
@@ -306,14 +307,20 @@ pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
 /// ([`Self::hand_off`]) may move parked tables to `store` later in phase A.
 /// Phase B reads them back in group order, ahead of their upload, and lets
 /// each group's go after its opening.
+///
+/// With no store the policy still decides, and what it would move off the
+/// host stays parked. With live regeneration ([`Self::with_regen`]) a table
+/// phase B can rebuild leaves the host as a drop instead ([`BlockRegen`]).
 #[derive(Clone)]
 pub struct BlockSpill {
-    pub store: Arc<SpillStore>,
+    pub store: Option<Arc<SpillStore>>,
     /// The writer queue the store was opened with
     /// ([`crate::spill::SpillOptions::queue_bytes`]).
     pub queue_bytes: u64,
     /// The policy's choice for one table.
     pub wanted: Arc<SpillWanted>,
+    /// Live regeneration, when it is on.
+    pub regen: Option<BlockRegen>,
     /// Packed bytes of the committed tables kept, and main cells committed.
     kept: Arc<std::sync::atomic::AtomicU64>,
     cells: Arc<std::sync::atomic::AtomicU64>,
@@ -334,16 +341,21 @@ pub struct BlockSpill {
 }
 
 /// A committed table's packed columns parked by the spill: held here until a
-/// hand-off ([`BlockSpill::hand_off`]) moves them to the store, and read back
-/// from whichever holds them before the group's upload (`restore_group`).
+/// hand-off ([`BlockSpill::hand_off`]) moves them to the store or live
+/// regeneration drops them, and read back from whichever holds them before the
+/// group's upload (`restore_group`).
 struct Parked {
     len: u64,
+    /// Its rank when phase B can rebuild it ([`BlockRegen`]).
+    rank: Option<u64>,
     state: std::sync::Mutex<ParkedState>,
 }
 
 enum ParkedState {
     Resident(multilinear::narrow::NarrowColumns),
     Spilled(SpilledMain),
+    /// Dropped after its digest: phase B's regenerator deposits it again.
+    Dropped(RegenSlot),
     /// Taken and not put back (a store that refused its bytes' shape): phase B
     /// refuses the table.
     Lost,
@@ -354,6 +366,14 @@ impl Parked {
     fn handle(&self) -> Option<SpilledMain> {
         match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
             ParkedState::Spilled(handle) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// The slot it was dropped into, once dropped.
+    fn dropped(&self) -> Option<RegenSlot> {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            ParkedState::Dropped(slot) => Some(slot.clone()),
             _ => None,
         }
     }
@@ -373,6 +393,14 @@ impl Out {
         match self {
             Self::Spilled(handle) => Some(handle.clone()),
             Self::Parked(parked) => parked.handle(),
+        }
+    }
+
+    /// The regeneration slot, when the columns were dropped.
+    fn dropped(&self) -> Option<RegenSlot> {
+        match self {
+            Self::Spilled(_) => None,
+            Self::Parked(parked) => parked.dropped(),
         }
     }
 }
@@ -396,11 +424,14 @@ pub struct HandOffReport {
 }
 
 impl BlockSpill {
-    pub fn new(store: SpillStore, queue_bytes: u64, wanted: Arc<SpillWanted>) -> Self {
+    /// A spill to `store`, or deciding with none (what the policy would move
+    /// off the host stays parked).
+    pub fn new(store: Option<SpillStore>, queue_bytes: u64, wanted: Arc<SpillWanted>) -> Self {
         Self {
-            store: Arc::new(store),
+            store: store.map(Arc::new),
             queue_bytes,
             wanted,
+            regen: None,
             kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefetch: Arc::new(std::sync::Mutex::new(None)),
@@ -412,6 +443,13 @@ impl BlockSpill {
         }
     }
 
+    /// Live regeneration on: a table `regen` can rebuild leaves the host as a
+    /// drop ([`BlockRegen`]).
+    pub fn with_regen(mut self, regen: BlockRegen) -> Self {
+        self.regen = Some(regen);
+        self
+    }
+
     /// Hands the parked tables to the store, oldest first, until `need` bytes
     /// have gone or phase A ends, through the store's own hand-off
     /// ([`SpillStore::spill`]): the tables parked by then, and those parked
@@ -419,16 +457,25 @@ impl BlockSpill {
     /// have spilled). It runs on a thread of its own, so the caller does not
     /// wait on the writers, and phase A's end joins it. Once only, and never
     /// after phase A's end: `false` then (or when the thread cannot start).
+    ///
+    /// With live regeneration it arms it first ([`BlockRegen::arm`]): every
+    /// parked table phase B can rebuild is dropped, and only the others go to
+    /// the store; with no store, nothing else leaves.
     pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
+        if let Some(regen) = &self.regen {
+            regen.arm();
+        }
+        let Some(store) = self.store.clone() else {
+            return self.regen.is_some();
+        };
         let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
         if hand_off.closed || hand_off.thread.is_some() || hand_off.report.is_some() {
             return false;
         }
-        let (parked, parked_more, closed, store, handing) = (
+        let (parked, parked_more, closed, handing) = (
             Arc::clone(&self.parked),
             Arc::clone(&self.parked_more),
             Arc::clone(&self.closed),
-            Arc::clone(&self.store),
             Arc::clone(&self.handing),
         );
         handing.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -462,6 +509,10 @@ impl BlockSpill {
                         break;
                     };
                     next += 1;
+                    // Regeneration's: dropped, not written.
+                    if slot.rank.is_some() {
+                        continue;
+                    }
                     let taken = std::mem::replace(
                         &mut *slot.state.lock().unwrap_or_else(|e| e.into_inner()),
                         ParkedState::Lost,
@@ -514,7 +565,8 @@ impl BlockSpill {
         }
     }
 
-    /// Phase A's end: joins a running hand-off, and none starts after this.
+    /// Phase A's end: joins a running hand-off and live regeneration's drops,
+    /// and none starts after this.
     fn close_hand_off(&self) {
         let thread = {
             let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
@@ -535,6 +587,9 @@ impl BlockSpill {
                 .unwrap_or_else(|e| e.into_inner())
                 .report = Some(report);
         }
+        if let Some(regen) = &self.regen {
+            regen.close_drops();
+        }
     }
 
     /// What the hand-off did, once phase A's end joined it; `None` when none
@@ -550,10 +605,266 @@ impl BlockSpill {
     /// the store's one producer, so the room it sees stays: the spill that
     /// follows does not wait.
     fn has_room(&self, len: u64) -> bool {
-        let stats = self.store.stats();
+        let Some(store) = &self.store else {
+            return false;
+        };
+        let stats = store.stats();
         let pending = stats.bytes.saturating_sub(stats.bytes_written);
         pending == 0 || pending + len <= self.queue_bytes
     }
+}
+
+/// Live regeneration on a block (D-WHIR-NODISK §2.1). `droppable(t)` is the
+/// rank of the table at block index `t` when phase B can rebuild its columns
+/// (a streamed chunk: its place in the hand-out), `None` otherwise. Phase A
+/// drops such a table instead of keeping or spilling it: its packed columns
+/// leave the host after their digest, on a thread of their own, and a
+/// [`RegenSlot`] in `window` stands for them; phase B waits on the slot before
+/// the table's group needs it (`restore_group`), and a deposit that is not
+/// the dropped columns refuses the table there, before any device work, with
+/// the kept tree top's check behind the digest.
+///
+/// Under `always` every droppable table is dropped (the byte-identity test
+/// mode). Otherwise nothing drops until the policy first moves a table off
+/// the host (or the walk's hand-off): that arms it, every parked droppable
+/// table is dropped back in rank order, and every later one is dropped. A
+/// block that never arms drops nothing.
+#[derive(Clone)]
+pub struct BlockRegen {
+    droppable: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
+    window: Arc<RegenWindow>,
+    always: bool,
+    started: Instant,
+    inner: Arc<std::sync::Mutex<RegenState>>,
+}
+
+#[derive(Default)]
+struct RegenState {
+    /// When it armed, seconds after it was made.
+    armed: Option<f64>,
+    /// The window's first producer, kept for the regenerator.
+    producer: Option<RegenProducer>,
+    /// Parked droppable tables, for drop-back at arming.
+    candidates: Vec<Arc<Parked>>,
+    tx: Option<std::sync::mpsc::Sender<DropJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Every drop, in the order made: its rank, its slot, its bytes and
+    /// whether drop-back made it.
+    dropped: Vec<(u64, RegenSlot, u64, bool)>,
+    /// Drops that found their table gone from the host (handed to the store).
+    refused_late: usize,
+    /// A memory log, which counts each drop out of the held bytes.
+    mem: Option<Arc<BlockMem>>,
+}
+
+/// A table for the drop thread, and whether drop-back sent it.
+struct DropJob {
+    parked: Arc<Parked>,
+    back: bool,
+}
+
+/// What live regeneration dropped ([`BlockRegen::report`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DropReport {
+    pub armed: Option<f64>,
+    pub tables: usize,
+    pub bytes: u64,
+    pub back_tables: usize,
+    pub back_bytes: u64,
+    pub refused_late: usize,
+}
+
+impl BlockRegen {
+    /// Live regeneration over `droppable`, its slots paced by a window of
+    /// `ahead` bytes ([`RegenWindow::new`]). Its drop thread starts here; phase
+    /// A's end joins it.
+    pub fn new(
+        droppable: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
+        ahead: u64,
+        always: bool,
+    ) -> Self {
+        let (window, producer) = RegenWindow::new(ahead);
+        let inner = Arc::new(std::sync::Mutex::new(RegenState {
+            producer: Some(producer),
+            ..RegenState::default()
+        }));
+        let (tx, rx) = std::sync::mpsc::channel::<DropJob>();
+        let (window_in, inner_in) = (Arc::clone(&window), Arc::clone(&inner));
+        let thread = std::thread::Builder::new()
+            .name("block-regen-drop".to_string())
+            .spawn(move || {
+                for job in rx {
+                    let rank = job.parked.rank;
+                    let mem = inner_in.lock().unwrap_or_else(|e| e.into_inner()).mem.clone();
+                    let dropped = rank
+                        .and_then(|rank| drop_parked(&window_in, &job.parked, rank, mem.as_deref()));
+                    let mut state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
+                    match (dropped, rank) {
+                        (Some(slot), Some(rank)) => {
+                            state
+                                .dropped
+                                .push((rank, slot, job.parked.len, job.back))
+                        }
+                        _ => state.refused_late += 1,
+                    }
+                }
+            });
+        {
+            let mut state = inner.lock().unwrap_or_else(|e| e.into_inner());
+            match thread {
+                Ok(thread) => {
+                    state.tx = Some(tx);
+                    state.thread = Some(thread);
+                }
+                // No drop thread: nothing drops, and every table stays as the
+                // policy leaves it.
+                Err(_) => drop(tx),
+            }
+        }
+        Self {
+            droppable,
+            window,
+            always,
+            started: Instant::now(),
+            inner,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegenState> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The rank of the table at block index `index`, when it may be dropped.
+    pub fn rank_of(&self, index: usize) -> Option<u64> {
+        (self.droppable)(index)
+    }
+
+    /// The window the dropped tables' slots are in.
+    pub fn window(&self) -> &Arc<RegenWindow> {
+        &self.window
+    }
+
+    /// Whether it armed.
+    pub fn is_armed(&self) -> bool {
+        self.lock().armed.is_some()
+    }
+
+    /// Whether every droppable table is dropped.
+    pub fn always(&self) -> bool {
+        self.always
+    }
+
+    /// Arm: from now on every droppable table is dropped, and every parked one
+    /// is dropped back, in rank order. Returns whether this call armed.
+    pub fn arm(&self) -> bool {
+        let mut state = self.lock();
+        if state.armed.is_some() {
+            return false;
+        }
+        state.armed = Some(self.started.elapsed().as_secs_f64());
+        let mut candidates = std::mem::take(&mut state.candidates);
+        candidates.sort_by_key(|p| p.rank);
+        for parked in candidates {
+            Self::queue(&state, parked, true);
+        }
+        true
+    }
+
+    /// A memory log for the drops to count in.
+    fn set_mem(&self, mem: Option<Arc<BlockMem>>) {
+        self.lock().mem = mem;
+    }
+
+    /// A parked droppable table: dropped now when armed or `always`, else a
+    /// drop-back candidate.
+    fn parked(&self, parked: Arc<Parked>) {
+        let mut state = self.lock();
+        if self.always || state.armed.is_some() {
+            Self::queue(&state, parked, false);
+        } else {
+            state.candidates.push(parked);
+        }
+    }
+
+    fn queue(state: &RegenState, parked: Arc<Parked>, back: bool) {
+        if let Some(tx) = &state.tx {
+            let _ = tx.send(DropJob { parked, back });
+        }
+    }
+
+    /// No more drops: the drop thread finishes what is queued and ends.
+    fn close_drops(&self) {
+        let thread = {
+            let mut state = self.lock();
+            state.tx = None;
+            state.thread.take()
+        };
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+
+    /// What it dropped.
+    pub fn report(&self) -> DropReport {
+        let state = self.lock();
+        let back = state.dropped.iter().filter(|d| d.3);
+        DropReport {
+            armed: state.armed,
+            tables: state.dropped.len(),
+            bytes: state.dropped.iter().map(|d| d.2).sum(),
+            back_tables: back.clone().count(),
+            back_bytes: back.map(|d| d.2).sum(),
+            refused_late: state.refused_late,
+        }
+    }
+
+    /// Phase B's regeneration: every dropped table's rank and slot, in the
+    /// window's order, and the window's first producer for the regenerator.
+    /// `None` when nothing was dropped (the producer goes with it).
+    pub fn into_plan(self) -> Option<(Vec<(u64, RegenSlot)>, RegenProducer)> {
+        let mut state = self.lock();
+        let producer = state.producer.take();
+        let mut dropped: Vec<(u64, RegenSlot)> = state
+            .dropped
+            .iter()
+            .map(|(rank, slot, _, _)| (*rank, slot.clone()))
+            .collect();
+        if dropped.is_empty() {
+            return None;
+        }
+        dropped.sort_by_key(|(_, slot)| slot.order_key());
+        Some((dropped, producer?))
+    }
+}
+
+/// Drops a parked table's packed columns: they leave `parked` under its lock,
+/// are digested into a slot of `window` outside it, are freed, and the slot
+/// takes their place. `None`, and nothing changed, when the table is no
+/// longer held on the host.
+fn drop_parked(
+    window: &Arc<RegenWindow>,
+    parked: &Parked,
+    rank: u64,
+    mem: Option<&BlockMem>,
+) -> Option<RegenSlot> {
+    let packed = {
+        let mut state = parked.state.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, ParkedState::Lost) {
+            ParkedState::Resident(packed) => packed,
+            other => {
+                *state = other;
+                return None;
+            }
+        }
+    };
+    let slot = window.slot(&packed, rank);
+    let len = packed.data().len();
+    drop(packed);
+    *parked.state.lock().unwrap_or_else(|e| e.into_inner()) = ParkedState::Dropped(slot.clone());
+    if let Some(mem) = mem {
+        mem.held_narrow.fetch_sub(len, Relaxed);
+    }
+    Some(slot)
 }
 
 /// Packed columns as the store's payload ([`NarrowMain`]): the same parts,
@@ -578,6 +889,11 @@ fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
 /// ([`Parked`]): on the host until a hand-off moves it. Every table counts
 /// toward the cells committed, and every one not spilled toward the bytes
 /// kept.
+///
+/// With live regeneration a table phase B can rebuild is parked in any group
+/// and is dropped instead ([`BlockRegen`]): at once under `always`, once the
+/// policy first wants a table out (which arms it), and back at arming while
+/// parked. It counts toward the bytes kept only while it is not dropped.
 fn spill_group<F, E>(
     spill: &BlockSpill,
     g: usize,
@@ -598,7 +914,8 @@ where
         let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
             continue;
         };
-        if g < SPILL_RESIDENT_GROUPS {
+        let rank = spill.regen.as_ref().and_then(|r| r.rank_of(first + k));
+        if g < SPILL_RESIDENT_GROUPS && rank.is_none() {
             spill.kept.fetch_add(len as u64, Relaxed);
             continue;
         }
@@ -607,11 +924,28 @@ where
             reason: "its packed parts did not move to the store and back",
         };
         let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
-        let spill_now = (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
+        if let (Some(regen), Some(_)) = (&spill.regen, rank) {
+            let parked = Arc::new(Parked {
+                len: len as u64,
+                rank,
+                state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+            });
+            *slot = Some(Out::Parked(Arc::clone(&parked)));
+            if !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64) {
+                regen.arm();
+            }
+            if !regen.always() && !regen.is_armed() {
+                spill.kept.fetch_add(len as u64, Relaxed);
+            }
+            regen.parked(parked);
+            continue;
+        }
+        let spill_now = spill.store.is_some()
+            && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
             && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
             && spill.has_room(len as u64);
-        let packed = if spill_now {
-            match spill.store.spill(to_store(packed).ok_or_else(failed)?) {
+        let packed = match (&spill.store, spill_now) {
+            (Some(store), true) => match store.spill(to_store(packed).ok_or_else(failed)?) {
                 Ok(handle) => {
                     if let Some(mem) = mem {
                         mem.held_narrow.fetch_sub(len, Relaxed);
@@ -621,12 +955,12 @@ where
                     continue;
                 }
                 Err(main) => from_store(main).ok_or_else(failed)?,
-            }
-        } else {
-            packed
+            },
+            _ => packed,
         };
         let parked = Arc::new(Parked {
             len: len as u64,
+            rank: None,
             state: std::sync::Mutex::new(ParkedState::Resident(packed)),
         });
         spill
@@ -644,8 +978,9 @@ where
 /// Brings `tables`' columns back before their upload, `first` being the
 /// first's index: a parked table's from the host, or from the store when a
 /// hand-off moved them; a spilled table's from the read-back ahead when it
-/// has them, or read here. Refused when a read fails or does not match what
-/// was written.
+/// has them, or read here; a dropped table's from its regeneration slot,
+/// waiting for its deposit. Refused when a read fails or does not match what
+/// was written, or a deposit is not what was dropped.
 fn restore_group<F, E>(
     first: usize,
     tables: &mut [CommittedTable<'_, F, E>],
@@ -678,6 +1013,34 @@ where
                                 table: index,
                                 reason: "the parked columns do not have the table's shape",
                             });
+                        }
+                        continue;
+                    }
+                    ParkedState::Dropped(regen) => {
+                        regen.wait();
+                        let packed = regen.take().map_err(|e| MlError::SpillFailed {
+                            table: index,
+                            reason: match e {
+                                RegenError::Mismatch => {
+                                    "the regenerated columns are not the ones dropped"
+                                }
+                                RegenError::Failed(_) => {
+                                    "the regenerator did not bring its columns back"
+                                }
+                                RegenError::Closed(_) => {
+                                    "the regeneration window closed before its columns came back"
+                                }
+                            },
+                        })?;
+                        let len = packed.data().len();
+                        if !table.restore_narrow(packed) {
+                            return Err(MlError::SpillFailed {
+                                table: index,
+                                reason: "the regenerated columns do not have the table's shape",
+                            });
+                        }
+                        if let Some(mem) = mem {
+                            mem.held_narrow.fetch_add(len, Relaxed);
                         }
                         continue;
                     }
@@ -1056,6 +1419,9 @@ where
         let mut spilled: Vec<Option<Out>> = Vec::new();
         let mut sizes = Vec::new();
         let mut retired_groups = Vec::new();
+        if let Some(regen) = spill.as_ref().and_then(|spill| spill.regen.as_ref()) {
+            regen.set_mem(mem.clone());
+        }
         let mut roots = Vec::new();
         let mut stamps = Vec::new();
         let mut incoming = groups.into_iter();
@@ -1354,6 +1720,29 @@ where
         &self.stamps
     }
 
+    /// By group, whether it holds a table whose columns were dropped for
+    /// phase B to rebuild ([`BlockRegen`]): the groups [`rebuilt_last`] puts
+    /// last.
+    pub fn rebuilt_groups(&self) -> Vec<bool> {
+        let mut at = 0usize;
+        self.sizes
+            .iter()
+            .map(|&size| {
+                let rebuilt = self.spilled[at..at + size]
+                    .iter()
+                    .flatten()
+                    .any(|out| out.dropped().is_some());
+                at += size;
+                rebuilt
+            })
+            .collect()
+    }
+
+    /// Live regeneration, when phase A ran with it.
+    pub fn regen(&self) -> Option<&BlockRegen> {
+        self.spill.as_ref().and_then(|spill| spill.regen.as_ref())
+    }
+
     /// A test's fault: the first narrow table's width map made wrong
     /// ([`multilinear::narrow::NarrowColumns::fault_width_map`]), so phase B
     /// widens other words than were committed. Returns whether a table was
@@ -1385,10 +1774,10 @@ where
     #[doc(hidden)]
     pub fn fault_spilled_byte(&mut self) -> bool {
         #[cfg(any(test, feature = "test-utils"))]
-        if let Some(spill) = &self.spill {
-            spill.store.flush();
+        if let Some(store) = self.spill.as_ref().and_then(|spill| spill.store.as_ref()) {
+            store.flush();
             if let Some(handle) = self.spilled.iter().flatten().find_map(Out::handle) {
-                return spill.store.corrupt_on_disk(&handle, 0).unwrap_or(false);
+                return store.corrupt_on_disk(&handle, 0).unwrap_or(false);
             }
         }
         false
