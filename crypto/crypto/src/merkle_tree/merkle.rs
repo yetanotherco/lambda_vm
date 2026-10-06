@@ -236,7 +236,7 @@ where
             let inner: usize = level_sizes4(leaves_len)[1..].iter().sum();
             let mut nodes = vec![hashed_leaves[0].clone(); inner];
             nodes.extend(hashed_leaves);
-            build4::<B>(&mut nodes, leaves_len);
+            build4::<B>(&mut nodes, leaves_len)?;
             return Some(MerkleTree {
                 root: nodes[ROOT].clone(),
                 nodes,
@@ -402,7 +402,7 @@ where
                 path.push(if c < sizes[level] {
                     self.node_get(offsets[level] + c)?.clone()
                 } else {
-                    B::padding_node()
+                    B::padding_node()?
                 });
             }
             i /= 4;

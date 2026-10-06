@@ -44,16 +44,15 @@ where
             return false;
         }
         for siblings in merkle_path.chunks_exact(3) {
+            // The node's own slot, then its three siblings around it in order.
             let at = index % 4;
-            let mut s = siblings.iter();
-            let mut child = |c: usize| {
-                if c == at {
-                    hashed_value.clone()
-                } else {
-                    s.next().cloned().expect("three siblings per level")
-                }
+            let [s0, s1, s2] = [&siblings[0], &siblings[1], &siblings[2]].map(Clone::clone);
+            let children = match at {
+                0 => [hashed_value, s0, s1, s2],
+                1 => [s0, hashed_value, s1, s2],
+                2 => [s0, s1, hashed_value, s2],
+                _ => [s0, s1, s2, hashed_value],
             };
-            let children = [child(0), child(1), child(2), child(3)];
             hashed_value = B::hash_four(&children);
             index /= 4;
         }

@@ -303,6 +303,7 @@ fn prove_block_with_observed(
     residency: ResidencyMode,
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
+    crate::hash_pin::check_knobs().map_err(Error::Prover)?;
     match crate::hash_pin::base_hash() {
         crate::hash_pin::BaseHash::Rpx => prove_block_under::<crate::hash_pin::RpxBlock>(
             elf_bytes,

@@ -81,16 +81,19 @@ where
         <Self as IsStreamingLeafBackend<F>>::hash_data_from_slices(input, &[])
     }
 
-    fn hash_new_parent(_: &Commitment, _: &Commitment) -> Commitment {
-        unreachable!("a Poseidon1 tree is 4-ary: no binary parent exists")
+    /// A 4-ary tree has no binary parent; the two-child form is the 4-ary
+    /// node over the pair and two padding digests (the shape of an odd-depth
+    /// tree's top), so the method is defined everywhere.
+    fn hash_new_parent(left: &Commitment, right: &Commitment) -> Commitment {
+        node4(&[*left, *right, [0u8; 32], [0u8; 32]])
     }
 
     fn hash_four(children: &[Commitment; 4]) -> Commitment {
         node4(children)
     }
 
-    fn padding_node() -> Commitment {
-        [0u8; 32]
+    fn padding_node() -> Option<Commitment> {
+        Some([0u8; 32])
     }
 }
 
@@ -140,16 +143,19 @@ where
         leaf(&felts)
     }
 
-    fn hash_new_parent(_: &Commitment, _: &Commitment) -> Commitment {
-        unreachable!("a Poseidon1 tree is 4-ary: no binary parent exists")
+    /// A 4-ary tree has no binary parent; the two-child form is the 4-ary
+    /// node over the pair and two padding digests (the shape of an odd-depth
+    /// tree's top), so the method is defined everywhere.
+    fn hash_new_parent(left: &Commitment, right: &Commitment) -> Commitment {
+        node4(&[*left, *right, [0u8; 32], [0u8; 32]])
     }
 
     fn hash_four(children: &[Commitment; 4]) -> Commitment {
         node4(children)
     }
 
-    fn padding_node() -> Commitment {
-        [0u8; 32]
+    fn padding_node() -> Option<Commitment> {
+        Some([0u8; 32])
     }
 }
 

@@ -297,6 +297,23 @@ pub fn p1_cap() -> stark::proof::options::CapPolicy {
     P1_CAP_DEFAULT
 }
 
+/// The base-hash knobs ([`BASE_HASH_ENV`], [`P1_CAP_ENV`]) as this process
+/// has them, checked without reading them into the process: `Err` names a
+/// value [`base_hash`] or [`p1_cap`] would abort on. The block prover and
+/// verifier entries call it first, so a bad knob is a typed refusal there.
+#[cfg(not(target_os = "zkvm"))]
+pub fn check_knobs() -> Result<(), String> {
+    parse_base_hash(std::env::var(BASE_HASH_ENV).ok().as_deref())?;
+    parse_p1_cap(std::env::var(P1_CAP_ENV).ok().as_deref())?;
+    Ok(())
+}
+
+/// The recursion guest reads no knob.
+#[cfg(target_os = "zkvm")]
+pub fn check_knobs() -> Result<(), String> {
+    Ok(())
+}
+
 /// Refuse a path that has no P1 arm (the epoch pipeline, the LFM recursion)
 /// under [`BaseHash::P1`], rather than letting it mix RPX proofs with P1
 /// preprocessed roots. The error names the path; the caller types it.

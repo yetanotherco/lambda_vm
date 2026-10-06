@@ -137,12 +137,23 @@ pub fn leaves_len4(total: usize) -> Option<usize> {
 
 /// Builds every inner level of an arity-4 tree in place: `nodes` holds the
 /// levels top-down per [`level_offsets4`], the leaf level already filled.
-pub fn build4<B: IsMerkleTreeBackend>(nodes: &mut [B::Node], leaves_len: usize)
+///
+/// `None` (nothing built) when a level needs padding and the backend has no
+/// padding digest ([`IsMerkleTreeBackend::padding_node`]).
+pub fn build4<B: IsMerkleTreeBackend>(nodes: &mut [B::Node], leaves_len: usize) -> Option<()>
 where
     B::Node: Clone,
 {
     let sizes = level_sizes4(leaves_len);
     let offsets = level_offsets4(&sizes);
+    // A level of `n > 1` nodes not a multiple of four ends in a short group,
+    // which takes the padding digest; with no short group the placeholder is
+    // never read.
+    let pad = match B::padding_node() {
+        Some(pad) => pad,
+        None if sizes.iter().any(|&n| n > 1 && !n.is_multiple_of(4)) => return None,
+        None => nodes.first()?.clone(),
+    };
     for j in 0..sizes.len() - 1 {
         let (above, below) = nodes.split_at_mut(offsets[j]);
         let children = &below[..sizes[j]];
@@ -152,7 +163,7 @@ where
                 children
                     .get(4 * p + c)
                     .cloned()
-                    .unwrap_or_else(B::padding_node)
+                    .unwrap_or_else(|| pad.clone())
             };
             B::hash_four(&[child(0), child(1), child(2), child(3)])
         };
@@ -167,4 +178,5 @@ where
             .enumerate()
             .for_each(|(p, out)| *out = parent_of(p));
     }
+    Some(())
 }

@@ -4869,6 +4869,16 @@ pub trait IsStarkProver<
         // padding digest (only the whole-tree subtree of a 2^odd-leaf tree
         // has one), as the committed tree's build does.
         let arity4 = top.arity == 4;
+        // A short 4-ary group takes the backend's padding digest.
+        let pad = match <H::Batched<Field> as IsMerkleTreeBackend>::padding_node() {
+            Some(pad) => pad,
+            None if arity4 => {
+                return Err(ProvingError::WrongParameter(
+                    "an arity-4 kept top over a backend with no padding digest".to_string(),
+                ));
+            }
+            None => [0u8; 32],
+        };
         let rebuild = |bi: usize| -> (Vec<Vec<Commitment>>, Commitment) {
             let mut buf = vec![0u8; rpl * ncols * byte_len];
             let mut level: Vec<Commitment> = (0..per)
@@ -4886,11 +4896,7 @@ pub trait IsStarkProver<
                     level
                         .chunks(4)
                         .map(|g| {
-                            let child = |c: usize| {
-                                g.get(c).copied().unwrap_or_else(
-                                    <H::Batched<Field> as IsMerkleTreeBackend>::padding_node,
-                                )
-                            };
+                            let child = |c: usize| g.get(c).copied().unwrap_or(pad);
                             <H::Batched<Field> as IsMerkleTreeBackend>::hash_four(&[
                                 child(0),
                                 child(1),
@@ -4940,9 +4946,7 @@ pub trait IsStarkProver<
                     if arity4 {
                         let first = i / 4 * 4;
                         for c in (first..first + 4).filter(|&c| c != i) {
-                            path.push(level.get(c).copied().unwrap_or_else(
-                                <H::Batched<Field> as IsMerkleTreeBackend>::padding_node,
-                            ));
+                            path.push(level.get(c).copied().unwrap_or(pad));
                         }
                         i /= 4;
                     } else {

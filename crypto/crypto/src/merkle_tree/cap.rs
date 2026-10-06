@@ -178,13 +178,15 @@ pub fn cap_root<B: IsMerkleTreeBackend>(cap: &[B::Node]) -> Option<B::Node> {
         // Groups of four, a short group padded (`build4`'s rule): a cap of
         // `2·4^(c−1)` nodes folds to two, then to the root with two paddings.
         while level.len() > 1 {
-            level = level
-                .chunks(4)
-                .map(|group| {
-                    let child = |i: usize| group.get(i).cloned().unwrap_or_else(B::padding_node);
-                    B::hash_four(&[child(0), child(1), child(2), child(3)])
-                })
-                .collect();
+            let mut up = Vec::with_capacity(level.len().div_ceil(4));
+            for group in level.chunks(4) {
+                let child = |i: usize| match group.get(i) {
+                    Some(node) => Some(node.clone()),
+                    None => B::padding_node(),
+                };
+                up.push(B::hash_four(&[child(0)?, child(1)?, child(2)?, child(3)?]));
+            }
+            level = up;
         }
         return level.pop();
     }

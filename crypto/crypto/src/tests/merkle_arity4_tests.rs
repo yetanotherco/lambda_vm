@@ -31,8 +31,8 @@ impl IsMerkleTreeBackend for P1Backend {
         canon(&p1::linear_hash(leaf))
     }
 
-    fn hash_new_parent(_: &[u64; 4], _: &[u64; 4]) -> [u64; 4] {
-        unreachable!("an arity-4 backend has no binary parent")
+    fn hash_new_parent(left: &[u64; 4], right: &[u64; 4]) -> [u64; 4] {
+        Self::hash_four(&[*left, *right, [0; 4], [0; 4]])
     }
 
     fn hash_four(children: &[[u64; 4]; 4]) -> [u64; 4] {
@@ -41,8 +41,8 @@ impl IsMerkleTreeBackend for P1Backend {
         ))
     }
 
-    fn padding_node() -> [u64; 4] {
-        [0; 4]
+    fn padding_node() -> Option<[u64; 4]> {
+        Some([0; 4])
     }
 }
 
@@ -407,4 +407,43 @@ fn an_embed_or_split_of_the_wrong_shape_is_refused() {
     assert!(split_owner_path_arity(&full, 4, 1, 4).is_none());
     assert!(split_owner_path_arity(&full, 4, 0, 4).is_some());
     assert!(split_owner_path_arity(&full, 4, 3, 4).is_none());
+}
+
+/// [`P1Backend`] without a padding digest: an arity-4 tree that needs one
+/// (a level not a multiple of four) is refused, not built with a guess.
+struct NoPadBackend;
+
+impl IsMerkleTreeBackend for NoPadBackend {
+    type Node = [u64; 4];
+    type Data = Vec<Fp>;
+    const ARITY: usize = 4;
+
+    fn hash_data(leaf: &Vec<Fp>) -> [u64; 4] {
+        P1Backend::hash_data(leaf)
+    }
+
+    fn hash_new_parent(left: &[u64; 4], right: &[u64; 4]) -> [u64; 4] {
+        P1Backend::hash_new_parent(left, right)
+    }
+
+    fn hash_four(children: &[[u64; 4]; 4]) -> [u64; 4] {
+        P1Backend::hash_four(children)
+    }
+}
+
+#[test]
+fn an_arity_4_backend_without_padding_refuses_what_needs_it() {
+    use crate::merkle_tree::cap::cap_root;
+    // 8 leaves: levels 8, 2, 1 — the two-node level needs padding.
+    assert!(MerkleTree::<NoPadBackend>::build(&rows(8)).is_none());
+    // 16 leaves: levels 16, 4, 1 — no padding, the same tree as P1's.
+    let tree = MerkleTree::<NoPadBackend>::build(&rows(16)).expect("no padding needed");
+    assert_eq!(
+        tree.root,
+        MerkleTree::<P1Backend>::build(&rows(16)).unwrap().root
+    );
+    // A two-node cap (odd depth) needs padding to reach its root.
+    let odd = MerkleTree::<P1Backend>::build(&rows(8)).unwrap();
+    assert!(cap_root::<NoPadBackend>(&odd.cap(1).unwrap()).is_none());
+    assert_eq!(cap_root::<P1Backend>(&odd.cap(1).unwrap()), Some(odd.root));
 }

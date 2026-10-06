@@ -1912,6 +1912,7 @@ pub(crate) fn verify_prepared_shaped(
     page_commitments: Option<&[(u64, Commitment)]>,
     shape: AcceleratorShape,
 ) -> Result<bool, Error> {
+    crate::hash_pin::check_knobs().map_err(Error::Prover)?;
     verify_prepared_shaped_under(
         vm_proof,
         program,
