@@ -6,4 +6,5 @@
 
 pub mod default_transcript;
 pub mod is_transcript;
+pub mod p1_transcript;
 pub mod transcript_hash;
