@@ -73,6 +73,7 @@ use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod blocks;
+mod compact_branch;
 mod finish;
 #[cfg(test)]
 mod finish_oracle;
@@ -83,6 +84,7 @@ pub(crate) mod gate;
 mod lean_walk_tests;
 mod windowed;
 use blocks::{BlockVec, block_len};
+use compact_branch::CompactBranch;
 pub(crate) use finish::{Emitted, RestHeader};
 pub use windowed::{
     Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
@@ -3925,7 +3927,8 @@ struct CollectedOps {
     lt_ops: BlockVec<LtOperation>,
     shift_ops: BlockVec<ShiftOperation>,
     bitwise_ops: BlockVec<BitwiseOperation>,
-    branch_ops: BlockVec<BranchOperation>,
+    /// Delta-coded ([`CompactBranch`]).
+    branch_ops: CompactBranch,
     mul_ops: BlockVec<(MulOperation, bool)>,
     dvrm_ops: BlockVec<(DvrmOperation, bool)>,
     commit_ops: BlockVec<CommitOperation>,
@@ -4777,7 +4780,8 @@ struct RoutedSegments {
 /// a [`BlockVec`] in blocks of its table's chunk (or [`blocks::BLOCK_BYTES`]),
 /// never reallocated as it grows. The same segments, in the same order.
 struct RoutedBlocks {
-    branch_ops: BlockVec<BranchOperation>,
+    /// Delta-coded ([`CompactBranch`]).
+    branch_ops: CompactBranch,
     mul_filter: BlockVec<(MulOperation, bool)>,
     dvrm_filter: BlockVec<(DvrmOperation, bool)>,
     eq_ops: BlockVec<eq::EqOperation>,
@@ -4800,7 +4804,7 @@ impl RoutedBlocks {
             BlockVec::new(block_len::<T>(chunk))
         }
         Self {
-            branch_ops: list(m.branch),
+            branch_ops: CompactBranch::default(),
             mul_filter: list(m.mul),
             dvrm_filter: list(m.dvrm),
             eq_ops: list(m.eq),
@@ -4819,7 +4823,7 @@ impl RoutedBlocks {
 
     /// Appends a later window's segments, segment by segment.
     fn append(&mut self, other: RoutedSegments) {
-        self.branch_ops.extend(other.branch_ops);
+        self.branch_ops.extend(&other.branch_ops);
         self.mul_filter.extend(other.mul_filter);
         self.dvrm_filter.extend(other.dvrm_filter);
         self.eq_ops.extend(other.eq_ops);
@@ -4841,7 +4845,11 @@ impl RoutedBlocks {
             (name, list.heap_bytes(), list.largest_bytes())
         }
         [
-            of("branch", &self.branch_ops),
+            (
+                "branch",
+                self.branch_ops.heap_bytes(),
+                self.branch_ops.largest_bytes(),
+            ),
             of("mul_filter", &self.mul_filter),
             of("dvrm_filter", &self.dvrm_filter),
             of("eq", &self.eq_ops),
@@ -5176,7 +5184,7 @@ fn collect_all_ops(
         lt_ops,
         shift_ops,
         bitwise_ops,
-        branch_ops: BlockVec::from_vec(branch_ops),
+        branch_ops: CompactBranch::from_ops(&branch_ops),
         mul_ops,
         dvrm_ops,
         commit_ops: BlockVec::from_vec(commit_ops),

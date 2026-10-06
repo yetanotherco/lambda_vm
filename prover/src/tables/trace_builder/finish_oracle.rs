@@ -242,12 +242,11 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             }));
         }
         let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
-        for slice in branch_ops
-            .parts()
-            .flat_map(|part| part.chunks(branch_slice))
-        {
+        for k in 0..branch_ops.len().div_ceil(branch_slice.max(1)) {
+            let branch_ops = &branch_ops;
             collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_branch(slice))
+                let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
+                h.add_ops(&collect_bitwise_from_branch(&slice))
             }));
         }
         let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
@@ -337,8 +336,9 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 }
             }),
             Box::new(|h| {
-                for part in branch_ops.parts() {
-                    h.add_ops(&collect_bitwise_from_branch(part))
+                for k in 0..branch_ops.len().div_ceil(1 << 20) {
+                    let slice = branch_ops.range(k << 20, (k + 1) << 20);
+                    h.add_ops(&collect_bitwise_from_branch(&slice))
                 }
             }),
             Box::new(|h| {
