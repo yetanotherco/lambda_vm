@@ -406,6 +406,7 @@ fn the_block_front_draws_the_hosts_challenges() {
         let mut t = T::new(&[]);
         block_whir::absorb_block(
             &mut t,
+            crate::statement::MULTILINEAR_BLOCK_TAG,
             &elf,
             &proof.public_output,
             &proof.table_counts,
