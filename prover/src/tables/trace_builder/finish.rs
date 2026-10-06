@@ -149,7 +149,7 @@ pub(super) struct FinishPlan<'a> {
     keccak_ops: BlockVec<KeccakOperation>,
     blake3_ops: BlockVec<Blake3Operation>,
     blake3_absorb_ops: BlockVec<blake3::Blake3AbsorbOperation>,
-    eq_ops: BlockVec<eq::EqOperation>,
+    eq_ops: CompactEq,
     bytewise_ops: BlockVec<bytewise::BytewiseOperation>,
     store_ops: BlockVec<store::StoreOperation>,
     cpu32_ops: BlockVec<cpu32::Cpu32Operation>,
@@ -395,9 +395,10 @@ impl<'a> FinishPlan<'a> {
                     }));
                 }
                 let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
-                for slice in eq_ops.parts().flat_map(|part| part.chunks(eq_slice)) {
+                for k in 0..eq_ops.len().div_ceil(eq_slice.max(1)) {
+                    let eq_ops = &eq_ops;
                     collectors.push(Box::new(move |h| {
-                        for op in slice {
+                        for op in eq_ops.range(k * eq_slice, (k + 1) * eq_slice) {
                             h.add_ops(&op.collect_bitwise_ops());
                         }
                     }));
@@ -482,8 +483,10 @@ impl<'a> FinishPlan<'a> {
                         }
                     }),
                     Box::new(|h| {
-                        for op in eq_ops.iter() {
-                            h.add_ops(&op.collect_bitwise_ops());
+                        for k in 0..eq_ops.len().div_ceil(1 << 20) {
+                            for op in eq_ops.range(k << 20, (k + 1) << 20) {
+                                h.add_ops(&op.collect_bitwise_ops());
+                            }
                         }
                     }),
                     Box::new(|h| {
