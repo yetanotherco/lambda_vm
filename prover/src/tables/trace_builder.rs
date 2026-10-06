@@ -4027,11 +4027,13 @@ pub(crate) fn keccak_rnd_chunks(
 
 /// `LAMBDA_VM_KR_PACKED_WAVE`: how many KECCAK_RND chunks [`keccak_rnd_chunks`]
 /// builds at once while it writes them packed (G-pack, once the widths are
-/// known): unset, [`KECCAK_RND_PACK_WAVE`] as every chunk (the default); `n ≥
-/// 1`, `n`; `0`, every chunk left in one parallel pass. A chunk written packed
-/// holds no 64-bit table, so the wave bounds nothing but the parallelism. The
-/// tables and their order are the same. Read once; any other value is the
-/// default.
+/// known): unset or `0`, every chunk left in one parallel pass (the default);
+/// `n ≥ 1`, `n` (`4`, [`KECCAK_RND_PACK_WAVE`], is the wave as it was). A chunk
+/// written packed holds no 64-bit table, so the wave bounds nothing but the
+/// parallelism. The tables and their order are the same. Read once; any other
+/// value is the default. At the median block the finish's KECCAK_RND tail and
+/// the card's wait for the rest go with it (ULTRA 096: finish 15.8 → 9.1 s,
+/// phase A −6.7 s with the commit pairs off the pool, −5.7 s alone).
 pub(crate) fn kr_packed_wave() -> usize {
     static WAVE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WAVE.get_or_init(|| {
@@ -4042,9 +4044,8 @@ pub(crate) fn kr_packed_wave() -> usize {
 /// [`kr_packed_wave`]'s reading of its variable.
 fn kr_packed_wave_from(value: Option<&str>) -> usize {
     match value.map(str::trim).map(str::parse::<usize>) {
-        Some(Ok(0)) => usize::MAX,
-        Some(Ok(n)) => n,
-        _ => KECCAK_RND_PACK_WAVE,
+        Some(Ok(n)) if n > 0 => n,
+        _ => usize::MAX,
     }
 }
 
@@ -7073,14 +7074,16 @@ mod kr_wave_tests {
         assert!(!keccak_rnd::rows_written_packed(TraceForm::Wide));
     }
 
+    /// The default builds every chunk written packed in one pass; `4` is the opt-out to the
+    /// wave as it was.
     #[test]
-    fn the_packed_wave_reads_unset_as_four_and_zero_as_all() {
-        assert_eq!(kr_packed_wave_from(None), KECCAK_RND_PACK_WAVE);
-        assert_eq!(KECCAK_RND_PACK_WAVE, 4);
-        assert_eq!(kr_packed_wave_from(Some("4")), 4);
-        assert_eq!(kr_packed_wave_from(Some(" 16 ")), 16);
+    fn the_packed_wave_is_all_by_default_and_four_opts_out() {
+        assert_eq!(kr_packed_wave_from(None), usize::MAX);
         assert_eq!(kr_packed_wave_from(Some("0")), usize::MAX);
-        assert_eq!(kr_packed_wave_from(Some("all")), KECCAK_RND_PACK_WAVE);
-        assert_eq!(kr_packed_wave_from(Some("-1")), KECCAK_RND_PACK_WAVE);
+        assert_eq!(kr_packed_wave_from(Some("all")), usize::MAX);
+        assert_eq!(kr_packed_wave_from(Some("-1")), usize::MAX);
+        assert_eq!(KECCAK_RND_PACK_WAVE, 4);
+        assert_eq!(kr_packed_wave_from(Some("4")), KECCAK_RND_PACK_WAVE);
+        assert_eq!(kr_packed_wave_from(Some(" 16 ")), 16);
     }
 }
