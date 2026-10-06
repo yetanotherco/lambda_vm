@@ -85,7 +85,7 @@ fn small_block_cut(
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
-        drop_levels: 3,
+        drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
@@ -179,7 +179,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
         let mut options = BlockOptions::production();
         options.max_rows = MaxRowsConfig::small();
         options.keccak_rnd_rows_log2 = 3;
-        options.drop_levels = 3;
+        options.drop_levels = multilinear::whir_commit::TreeDrop::uniform(3);
         options.window_log2 = Some(4);
         options.narrow = stark::multilinear_block::Narrowing::Card { min_cells: 0 };
         let seen = std::sync::Mutex::new(Vec::<GroupMsg>::new());
@@ -540,7 +540,7 @@ fn dense_block_with(
             ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
             ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
-            drop_levels: 3,
+            drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
             window_log2: None,
             stream_keccak_rnd: false,
             stream_memw_lt: false,

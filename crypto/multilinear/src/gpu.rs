@@ -5538,6 +5538,25 @@ impl DeviceCodeword {
         Some(values.chunks_exact(block).map(<[_]>::to_vec).collect())
     }
 
+    /// The subtrees of `blocks` (each `2^dropped` consecutive leaves), hashed
+    /// and built where the codeword lies: one tree over the gathered leaves in
+    /// the host node layout, the blocks' roots `dropped` levels above its
+    /// leaves (see `math_cuda::whir::DeviceCodeword::block_subtrees`).
+    pub(crate) fn block_subtrees(
+        &self,
+        log_folding: usize,
+        blocks: &[usize],
+        dropped: usize,
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<Vec<[u8; 32]>> {
+        let blocks: Vec<u64> = blocks.iter().map(|block| *block as u64).collect();
+        let bytes = self
+            .0
+            .block_subtrees(log_folding, &blocks, dropped, hash.into_math_cuda())
+            .ok()?;
+        nodes_in_place(bytes)
+    }
+
     /// Its first value, which is what the last fold leaves behind.
     pub(crate) fn first<F>(&self) -> Option<math::field::element::FieldElement<F>>
     where
@@ -5687,6 +5706,16 @@ impl DeviceCodeword {
     where
         F: math::field::traits::IsField + 'static,
     {
+        match self.0 {}
+    }
+
+    pub(crate) fn block_subtrees(
+        &self,
+        _log_folding: usize,
+        _blocks: &[usize],
+        _dropped: usize,
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<Vec<[u8; 32]>> {
         match self.0 {}
     }
 

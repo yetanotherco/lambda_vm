@@ -84,6 +84,42 @@ pub fn top_path_secs() -> (f64, f64) {
     )
 }
 
+/// The kept-top paths of codewords on the card, by route: re-hashed on the card
+/// (the default), or on the host when the card's re-hash failed or
+/// `LAMBDA_VM_TOP_PATHS_HOST=1` asked for it — the fallback, ≈ 16× today's host
+/// cost at 8 dropped levels, which a block reports as a WARN line.
+static TOP_DEVICE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_DEVICE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_HOST_FALLBACK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOP_HOST_FALLBACK_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `LAMBDA_VM_TOP_PATHS_HOST=1`: a codeword on the card has its kept-top paths
+/// re-hashed on the host, as when the card's re-hash fails (the fallback's
+/// measurement and its gate). Read once.
+fn top_paths_on_host() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LAMBDA_VM_TOP_PATHS_HOST").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// `(calls, seconds)` of the kept-top paths of codewords on the card, re-hashed
+/// on the card and on the host (the fallback): `((card calls, card s), (host
+/// calls, host s))`.
+pub fn top_path_routes() -> ((u64, f64), (u64, f64)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        (
+            TOP_DEVICE_CALLS.load(Relaxed),
+            TOP_DEVICE_NANOS.load(Relaxed) as f64 / 1e9,
+        ),
+        (
+            TOP_HOST_FALLBACK_CALLS.load(Relaxed),
+            TOP_HOST_FALLBACK_NANOS.load(Relaxed) as f64 / 1e9,
+        ),
+    )
+}
+
 /// `(open_many calls served from a kept top, leaves re-hashed for them)`.
 pub fn top_path_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -91,6 +127,43 @@ pub fn top_path_counts() -> (u64, u64) {
         TOP_PATH_CALLS.load(Relaxed),
         TOP_LEAVES_REHASHED.load(Relaxed),
     )
+}
+
+/// How many bottom levels a retired commitment's tree drops
+/// ([`CodewordCommitment::retire`]): `device` for a codeword the card holds,
+/// whose dropped levels are re-hashed on the card when a path needs them, and
+/// `host` for one on the host, re-hashed there. Each level dropped halves the
+/// kept top and doubles the leaves a path re-hashes. Clamped per tree to its
+/// depth less the tallest cap it may be asked for.
+///
+/// ★ A PROVER-SIDE MEMORY CHOICE, NOT A FORMAT ONE (see [`TreeTop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeDrop {
+    pub device: usize,
+    pub host: usize,
+}
+
+impl TreeDrop {
+    /// The same depth wherever the codeword is.
+    pub const fn uniform(levels: usize) -> Self {
+        Self {
+            device: levels,
+            host: levels,
+        }
+    }
+
+    /// The levels to drop from a tree `depth` deep whose tallest cap is
+    /// `tallest_cap`, its codeword on the card or not: never into the cap.
+    pub fn levels(self, on_device: bool, depth: usize, tallest_cap: usize) -> usize {
+        let wanted = if on_device { self.device } else { self.host };
+        wanted.min(depth.saturating_sub(tallest_cap))
+    }
+}
+
+impl std::fmt::Display for TreeDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "card {} · host {}", self.device, self.host)
+    }
 }
 
 /// What a retired commitment keeps of its tree: the heap prefix down to the
@@ -133,6 +206,11 @@ impl RetiredCommitment {
     /// Host bytes this keeps of the tree.
     pub fn tree_bytes(&self) -> usize {
         self.top.bytes()
+    }
+
+    /// The bottom levels its tree dropped.
+    pub fn dropped(&self) -> usize {
+        self.top.dropped
     }
 
     pub fn log_domain_size(&self) -> usize {
@@ -221,6 +299,17 @@ pub struct CosetOpening<F: IsField> {
     /// The `2^k` codeword values, in coset order.
     pub values: Vec<FieldElement<F>>,
     pub proof: Proof<Commitment>,
+}
+
+/// A node's sibling in the host heap layout (root at 0, children `2i + 1` and
+/// `2i + 2`): a right child's is the node before it, a left child's the one
+/// after.
+fn sibling(pos: usize) -> usize {
+    if pos.is_multiple_of(2) {
+        pos - 1
+    } else {
+        pos + 1
+    }
 }
 
 /// The codeword positions that fold onto `index`.
@@ -434,13 +523,13 @@ where
     }
 
     /// Lets the codeword go and keeps the root and the tree's top: every level
-    /// but the bottom `drop_levels` — fewer when the tree is shallower, and
-    /// never into the Merkle cap `cap` may ask this tree for, which is read
-    /// from the kept levels. What the block prover holds between committing a
-    /// group and opening it.
+    /// but the bottom `drop` levels for where the codeword is ([`TreeDrop`]) —
+    /// fewer when the tree is shallower, and never into the Merkle cap `cap`
+    /// may ask this tree for, which is read from the kept levels. What the
+    /// block prover holds between committing a group and opening it.
     pub fn retire(
         self,
-        drop_levels: usize,
+        drop: TreeDrop,
         cap: crypto::merkle_tree::cap::CapPolicy,
     ) -> Result<RetiredCommitment, Error> {
         if let Some(top) = self.top {
@@ -456,7 +545,8 @@ where
         // The tallest cap the policy gives a tree this deep, whatever its
         // opening count (the height is monotone in it).
         let tallest_cap = cap.height(usize::MAX, depth);
-        let dropped = drop_levels.min(depth - tallest_cap);
+        let on_device = matches!(self.codeword, Codeword::Device(_));
+        let dropped = drop.levels(on_device, depth, tallest_cap);
         let keep = (1usize << (depth - dropped + 1)) - 1;
         let nodes =
             match &self.codeword {
@@ -486,11 +576,14 @@ where
         })
     }
 
-    /// The paths of `indices` from the kept top: the leaves of each queried
-    /// block of `2^dropped` are gathered from the codeword and hashed here,
-    /// their subtree's root is checked against the kept node, and the path
-    /// continues through the kept levels.
+    /// The paths of `indices` from the kept top: each queried block of
+    /// `2^dropped` leaves is re-hashed — on the card when the codeword is
+    /// there ([`Self::card_top_paths`]), else, or when the card's re-hash
+    /// fails, on the host ([`Self::host_top_paths`]) — its subtree's root is
+    /// checked against the kept node, and the path continues through the kept
+    /// levels. Either route gives the same paths, byte for byte.
     fn top_paths(&self, top: &TreeTop, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
+        use std::sync::atomic::Ordering::Relaxed;
         let num_leaves = self.num_leaves();
         if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
             return Err(Error::QueryOutOfRange {
@@ -498,6 +591,96 @@ where
                 bound: num_leaves,
             });
         }
+        let on_device = matches!(self.codeword, Codeword::Device(_));
+        if on_device && !top_paths_on_host() {
+            let started = std::time::Instant::now();
+            if let Some(paths) = self.card_top_paths(top, indices) {
+                TOP_DEVICE_CALLS.fetch_add(1, Relaxed);
+                TOP_DEVICE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+                return paths;
+            }
+        }
+        let started = std::time::Instant::now();
+        let paths = self.host_top_paths(top, indices);
+        if on_device {
+            TOP_HOST_FALLBACK_CALLS.fetch_add(1, Relaxed);
+            TOP_HOST_FALLBACK_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        }
+        paths
+    }
+
+    /// [`Self::top_paths`] on the card: the queried blocks' subtrees hashed and
+    /// built where the codeword lies (`DeviceCodeword::block_subtrees`), and
+    /// only their nodes brought home. `None` when the card could not (the
+    /// caller falls back to the host); a block whose rebuilt root is not the
+    /// kept node is refused, as on the host.
+    fn card_top_paths(
+        &self,
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Option<Result<Vec<Proof<Commitment>>, Error>> {
+        let Codeword::Device(device) = &self.codeword else {
+            return None;
+        };
+        let dropped = top.dropped;
+        let span = 1usize << dropped;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> dropped).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let nodes = device.block_subtrees(self.log_folding, &blocks, dropped, H::DEVICE)?;
+        let leaves = (blocks.len() << dropped).next_power_of_two().max(2);
+        if nodes.len() != 2 * leaves - 1 {
+            return None;
+        }
+        TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TOP_LEAVES_REHASHED.fetch_add(
+            (blocks.len() << dropped) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let frontier = (1usize << (self.depth() - dropped)) - 1;
+        // The blocks are `2^dropped`-aligned among the gathered leaves, so
+        // block `k`'s root sits `dropped` levels up, `k`-th on its level.
+        let roots_at = (leaves >> dropped) - 1;
+        for (k, &block) in blocks.iter().enumerate() {
+            if top.nodes.get(frontier + block) != Some(&nodes[roots_at + k]) {
+                return Some(Err(Error::RecomputedCodewordMismatch { block }));
+            }
+        }
+        let paths = indices
+            .iter()
+            .map(|&index| {
+                let block = index >> dropped;
+                let k = blocks
+                    .binary_search(&block)
+                    .map_err(|_| Error::QueryOutOfRange {
+                        index,
+                        bound: self.num_leaves(),
+                    })?;
+                let mut merkle_path = Vec::with_capacity(self.depth());
+                let mut pos = (leaves - 1) + (k << dropped) + (index & (span - 1));
+                for _ in 0..dropped {
+                    merkle_path.push(nodes[sibling(pos)]);
+                    pos = (pos - 1) / 2;
+                }
+                let mut pos = frontier + block;
+                while pos != 0 {
+                    merkle_path.push(top.nodes[sibling(pos)]);
+                    pos = (pos - 1) / 2;
+                }
+                Ok(Proof { merkle_path })
+            })
+            .collect();
+        Some(paths)
+    }
+
+    /// [`Self::top_paths`] on the host: the leaves of each queried block are
+    /// gathered from the codeword and hashed here.
+    fn host_top_paths(
+        &self,
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let num_leaves = self.num_leaves();
         let depth = self.depth();
         let dropped = top.dropped;
         let span = 1usize << dropped;
@@ -567,12 +750,7 @@ where
                     .merkle_path;
                 let mut pos = frontier + block;
                 while pos != 0 {
-                    let sibling = if pos.is_multiple_of(2) {
-                        pos - 1
-                    } else {
-                        pos + 1
-                    };
-                    merkle_path.push(top.nodes[sibling]);
+                    merkle_path.push(top.nodes[sibling(pos)]);
                     pos = (pos - 1) / 2;
                 }
                 Ok(Proof { merkle_path })
@@ -989,6 +1167,134 @@ mod tests {
         let domain = Domain::<F>::new(num_vars + log_blowup).unwrap();
         let cw = encode(&monomial_coefficients(&f), &domain).unwrap();
         (cw, domain)
+    }
+
+    /// A retired tree drops its codeword's own depth of levels — the card's
+    /// or the host's — and never into the tallest cap it may be asked for:
+    /// a shallow tree keeps at least its cap.
+    #[test]
+    fn the_drop_follows_the_codeword_and_stops_at_the_cap() {
+        let drop = TreeDrop { device: 8, host: 4 };
+        assert_eq!(drop.levels(true, 23, 3), 8);
+        assert_eq!(drop.levels(false, 23, 3), 4);
+        assert_eq!(drop.levels(true, 9, 3), 6, "clamped to depth − cap");
+        assert_eq!(drop.levels(false, 5, 3), 2);
+        assert_eq!(drop.levels(true, 2, 3), 0, "a tree no deeper than its cap");
+        assert_eq!(TreeDrop::uniform(5), TreeDrop { device: 5, host: 5 });
+        assert_eq!(drop.to_string(), "card 8 · host 4");
+    }
+
+    /// The clamp on a real retire: a host tree 6 deep under the tallest auto
+    /// cap (3) asked to drop 8 drops 3, and its paths are the whole tree's.
+    #[test]
+    fn a_shallow_tree_drops_down_to_its_cap_and_keeps_its_paths() {
+        let (cw, _) = pseudo_codeword(6, 2, 11);
+        let kept = CodewordCommitment::<F, KeccakWhir>::new(&cw, 2).unwrap();
+        assert_eq!(kept.depth(), 6);
+        let indices = [0usize, 5, 17, 63];
+        let want: Vec<_> = indices.iter().map(|&i| kept.paths(&[i]).unwrap()).collect();
+        let cap = crypto::merkle_tree::cap::CapPolicy::Auto;
+        let retired = CodewordCommitment::<F, KeccakWhir>::new(&cw, 2)
+            .unwrap()
+            .retire(TreeDrop::uniform(8), cap)
+            .unwrap();
+        assert_eq!(retired.dropped(), 6 - cap.height(usize::MAX, 6));
+        assert_eq!(retired.dropped(), 3);
+        let revived = retired.revive::<F, KeccakWhir>(Codeword::Host(cw)).unwrap();
+        let got: Vec<_> = indices
+            .iter()
+            .map(|&i| revived.paths(&[i]).unwrap())
+            .collect();
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
+
+    /// ★ The card's re-hash of a retired tree's queried blocks (box only, a
+    /// codeword big enough for the card): at 4, 6 and 8 dropped levels, under
+    /// both hashes, the card's paths are the host's and the kept tree's, byte
+    /// for byte; a kept node flipped is refused on the card as on the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_card_rehashes_a_retired_trees_blocks_to_the_host_paths() {
+        fn check<H: WhirHash>() {
+            use crate::stacked_eval::StackedCommitment;
+            use crate::stacking::StackedLayout;
+            let config = crate::whir_chain::ChainConfig {
+                log_blowup: 2,
+                log_folding: 2,
+                num_queries: 3,
+                grind: crate::whir_chain::GrindBits::default(),
+                format: crate::whir_chain::ChainFormat::DEFAULT,
+            };
+            let num_vars = 14;
+            let columns: Vec<Mle<F>> = (0..3u64)
+                .map(|c| {
+                    Mle::new(
+                        (0..1u64 << num_vars)
+                            .map(|i| FE::from(i.wrapping_mul(0x9e37_79b9).wrapping_add(c) >> 7))
+                            .collect(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let layout = StackedLayout::build(&[num_vars; 3], num_vars).unwrap();
+            let borrowed = crate::stacking::borrow(&columns);
+            let mut kept =
+                StackedCommitment::<F, H>::commit(layout.clone(), &borrowed, None, &config)
+                    .unwrap();
+            let indices: Vec<usize> = (0..40usize)
+                .map(|q| (q * 2_654_435_761) % (1 << 14))
+                .collect();
+            let want: Vec<Vec<Proof<Commitment>>> = kept
+                .commitments_mut()
+                .iter()
+                .map(|c| c.paths(&indices).unwrap())
+                .collect();
+            for d in [4usize, 6, 8] {
+                let retired =
+                    StackedCommitment::<F, H>::commit(layout.clone(), &borrowed, None, &config)
+                        .unwrap()
+                        .retire(TreeDrop::uniform(d), &config)
+                        .unwrap();
+                let mut revived = retired.revive::<H, _>(&borrowed, None, &config).unwrap();
+                for (c, want) in revived.commitments_mut().iter_mut().zip(&want) {
+                    assert!(
+                        matches!(c.codeword, Codeword::Device(_)),
+                        "the codeword is on the card"
+                    );
+                    let top = c.top.clone().expect("a kept top");
+                    assert_eq!(top.dropped, d);
+                    let card = c
+                        .card_top_paths(&top, &indices)
+                        .expect("the card re-hashes")
+                        .unwrap();
+                    let host = c.host_top_paths(&top, &indices).unwrap();
+                    assert_eq!(
+                        format!("{card:?}"),
+                        format!("{host:?}"),
+                        "d {d}: card vs host"
+                    );
+                    assert_eq!(
+                        format!("{card:?}"),
+                        format!("{want:?}"),
+                        "d {d}: card vs kept"
+                    );
+                    // A kept node under a queried block flipped: refused on both.
+                    let frontier = (1usize << (c.depth() - d)) - 1;
+                    let mut bad = top.clone();
+                    bad.nodes[frontier + (indices[0] >> d)][0] ^= 1;
+                    assert!(matches!(
+                        c.card_top_paths(&bad, &indices),
+                        Some(Err(Error::RecomputedCodewordMismatch { .. }))
+                    ));
+                    assert!(matches!(
+                        c.host_top_paths(&bad, &indices),
+                        Err(Error::RecomputedCodewordMismatch { .. })
+                    ));
+                }
+            }
+        }
+        check::<KeccakWhir>();
+        check::<crate::whir_hash::RpxWhir>();
     }
 
     #[test]

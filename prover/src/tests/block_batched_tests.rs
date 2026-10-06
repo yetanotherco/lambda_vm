@@ -53,7 +53,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
-        drop_levels: 3,
+        drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,

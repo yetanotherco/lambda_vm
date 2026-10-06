@@ -962,7 +962,7 @@ where
         tables: Vec<CommittedTable<'a, F, E>>,
         sizes: &[usize],
         config: &ChainConfig,
-        drop_levels: usize,
+        drop_levels: multilinear::whir_commit::TreeDrop,
         narrow: Narrowing,
         upload_ahead: bool,
     ) -> Result<Self, MlError> {
@@ -989,7 +989,7 @@ where
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         sizes: &[usize],
         config: &ChainConfig,
-        drop_levels: usize,
+        drop_levels: multilinear::whir_commit::TreeDrop,
         narrow: Narrowing,
         upload_ahead: bool,
     ) -> Result<Self, MlError> {
@@ -1022,7 +1022,7 @@ where
     pub fn commit_groups<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         config: &ChainConfig,
-        drop_levels: usize,
+        drop_levels: multilinear::whir_commit::TreeDrop,
         narrow: Narrowing,
         upload_ahead: bool,
     ) -> Result<Self, MlError> {
@@ -1042,7 +1042,7 @@ where
     pub fn commit_groups_logged<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         config: &ChainConfig,
-        drop_levels: usize,
+        drop_levels: multilinear::whir_commit::TreeDrop,
         narrow: Narrowing,
         upload_ahead: bool,
         mem: Option<Arc<BlockMem>>,
@@ -1419,7 +1419,7 @@ fn commit_and_retire<F, H, C>(
     columns: &[&C],
     resident: Option<(&multilinear::gpu::ResidentColumns, usize)>,
     config: &ChainConfig,
-    drop_levels: usize,
+    drop_levels: multilinear::whir_commit::TreeDrop,
     on_room: &dyn Fn(),
 ) -> Result<(Vec<Commitment>, RetiredStack<F>, f64, f64), MlError>
 where

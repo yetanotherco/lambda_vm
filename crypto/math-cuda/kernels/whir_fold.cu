@@ -98,6 +98,27 @@ extern "C" __global__ void gather_cosets(const uint64_t *__restrict__ codeword,
     }
 }
 
+// The same gather into the strided layout the coset leaf kernels read: leaf `i`
+// of the `leaves` gathered (`indices[i]`) at slot `t` goes to
+// `out[(i + t*leaves)*limbs ..]`, so `rpx_leaves_*_coset` / `keccak256_leaves_*_coset`
+// over `out` with `num_leaves = leaves` hash exactly the committed leaves. What a
+// retired tree's queried blocks are re-hashed from, on the card.
+extern "C" __global__ void gather_cosets_strided(const uint64_t *__restrict__ codeword,
+                                                 const uint64_t *__restrict__ indices,
+                                                 uint64_t leaves, uint64_t num_leaves,
+                                                 uint64_t block, uint64_t limbs,
+                                                 uint64_t *__restrict__ out) {
+    uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= leaves * block) return;
+    uint64_t i = task / block;
+    uint64_t t = task - i * block;
+    const uint64_t *from = codeword + (indices[i] + t * num_leaves) * limbs;
+    uint64_t *at = out + (i + t * leaves) * limbs;
+    for (uint64_t k = 0; k < limbs; ++k) {
+        at[k] = from[k];
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EVERY LEVEL OF A ROUND'S FOLD IN ONE PASS.
 //

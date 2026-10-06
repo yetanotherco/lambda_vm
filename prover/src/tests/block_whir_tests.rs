@@ -46,7 +46,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
-        drop_levels: 3,
+        drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
         stream_memw_lt: false,
@@ -208,7 +208,7 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
     block_whir::split_keccak_rnd(&mut traces, 16);
     let mut proved = |drop_levels: usize| {
         let mut o = options(MaxRowsConfig::small(), 16);
-        o.drop_levels = drop_levels;
+        o.drop_levels = multilinear::whir_commit::TreeDrop::uniform(drop_levels);
         let proof = block_whir::prove_traces(
             &program,
             &elf,
@@ -228,9 +228,10 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
             .to_vec()
     };
     let whole = proved(0);
-    let (three, all) = (proved(3), proved(64));
+    let (three, eight, all) = (proved(3), proved(8), proved(64));
     if crypto::grinding::deterministic() {
         assert_eq!(whole, three);
+        assert_eq!(whole, eight);
         assert_eq!(whole, all);
     }
 }

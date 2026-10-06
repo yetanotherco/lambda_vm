@@ -139,10 +139,52 @@ const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
 const _: () = assert!(BLOCK_KECCAK_ROWS_LOG2 <= BLOCK_KECCAK_MAX_VARS);
 const _: () = assert!(BLOCK_ECSM_ROWS_LOG2 <= BLOCK_ECSM_MAX_VARS);
 
-/// Tree levels a group keeps OFF the host between its commit and its opening:
-/// a query re-hashes `2^4` of its codeword's cosets to rebuild them. A
-/// prover's choice; the proof does not depend on it.
+/// Tree levels a group keeps OFF the host between its commit and its opening,
+/// for a codeword on the host: a query re-hashes `2^4` of its codeword's cosets
+/// there to rebuild them. A prover's choice; the proof does not depend on it.
 pub const BLOCK_TREE_DROP_LEVELS: usize = 4;
+
+/// The same for a codeword the card holds, whose queried blocks are re-hashed
+/// on the card (`DeviceCodeword::block_subtrees`): `2^8` cosets a query, which
+/// costs the card ≈ 1 ms a round and takes the kept tops to 1/16 of
+/// [`BLOCK_TREE_DROP_LEVELS`]'s — 0.0059 GiB a group, 1.1 GiB at p90 (I-WFULL
+/// §5). Should the card's re-hash fail, the host re-hashes them instead, ≈ 16×
+/// its cost at 4, and the block reports it as a WARN line.
+pub const BLOCK_TREE_DROP_LEVELS_DEVICE: usize = 8;
+
+/// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: `<device>` or `<device>,<host>`, the
+/// levels a retired tree drops ([`multilinear::whir_commit::TreeDrop`]);
+/// unset or unreadable, [`BLOCK_TREE_DROP_LEVELS_DEVICE`] and
+/// [`BLOCK_TREE_DROP_LEVELS`]. A knob a RAM-adaptive policy can set; the proof
+/// does not depend on it.
+pub fn tree_drop_from_env() -> multilinear::whir_commit::TreeDrop {
+    parse_tree_drop(
+        std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_tree_drop(value: Option<&str>) -> multilinear::whir_commit::TreeDrop {
+    let default = multilinear::whir_commit::TreeDrop {
+        device: BLOCK_TREE_DROP_LEVELS_DEVICE,
+        host: BLOCK_TREE_DROP_LEVELS,
+    };
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let mut parts = value.split(',').map(|p| p.trim().parse::<usize>().ok());
+    match (parts.next().flatten(), parts.next(), parts.next()) {
+        (Some(device), None, None) => multilinear::whir_commit::TreeDrop {
+            device,
+            host: default.host,
+        },
+        (Some(device), Some(Some(host)), None) => {
+            multilinear::whir_commit::TreeDrop { device, host }
+        }
+        _ => default,
+    }
+}
 
 /// The verifier-side constants of a block proof. [`BlockFormat::production`]
 /// is what the block runs at; the tests shrink the stack so a small program
@@ -226,7 +268,9 @@ pub struct BlockOptions {
     /// ECSM's tables are cut at 2^`ecsm_rows_log2` rows
     /// ([`BLOCK_ECSM_ROWS_LOG2`] in production).
     pub ecsm_rows_log2: usize,
-    pub drop_levels: usize,
+    /// The bottom levels each committed tree drops until its opening, on the
+    /// card and on the host. Production: [`tree_drop_from_env`].
+    pub drop_levels: multilinear::whir_commit::TreeDrop,
     /// `Some(k)`: build the traces in windows of 2^k cycles and commit each
     /// table as its chunk completes ([`WindowedTraceBuilder`]); `None`: build
     /// the whole run, then commit.
@@ -636,7 +680,7 @@ impl BlockOptions {
             ecdas_rows_log2: BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: BLOCK_KECCAK_ROWS_LOG2,
             ecsm_rows_log2: BLOCK_ECSM_ROWS_LOG2,
-            drop_levels: BLOCK_TREE_DROP_LEVELS,
+            drop_levels: tree_drop_from_env(),
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
             stream_memw_lt: false,
@@ -840,6 +884,11 @@ pub struct BlockStamps {
     /// tops and the leaves re-hashed for them. A revived commitment never
     /// builds a device tree, so nothing re-commits.
     pub top_paths: (u64, u64),
+    /// Of those, for codewords on the card: `(calls, seconds)` re-hashed on
+    /// the card, and on the host (the fallback).
+    pub top_routes: ((u64, f64), (u64, f64)),
+    /// The levels the retired trees dropped (on the card · on the host).
+    pub drop_levels: Option<multilinear::whir_commit::TreeDrop>,
     /// Phase B's openings, by host stage (`LAMBDA_VM_BASE_SPLIT=1`, else
     /// empty): the WHIR chains' six stages, their query split, and the kept-top
     /// paths' gather and re-hash, seconds on the prover's thread.
@@ -999,10 +1048,19 @@ impl BlockStamps {
                 tables.join(" ")
             ));
         }
+        let ((card_calls, card_secs), (host_calls, host_secs)) = self.top_routes;
         out.push_str(&format!(
-            "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed on the host · phase B on one thread + one upload helper\n",
-            self.top_paths.0, self.top_paths.1,
+            "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed · on the card {card_calls} calls in {card_secs:.3} s · on the host (fallback) {host_calls} calls in {host_secs:.3} s · dropped {} · phase B on one thread + one upload helper\n",
+            self.top_paths.0,
+            self.top_paths.1,
+            self.drop_levels
+                .map_or("-".to_string(), |d| d.to_string()),
         ));
+        if host_calls > 0 {
+            out.push_str(&format!(
+                "BLOCK WARN: {host_calls} first-round path calls of codewords on the card were re-hashed on the host (the fallback; LAMBDA_VM_TOP_PATHS_HOST or a failed card re-hash): {host_secs:.2} s\n"
+            ));
+        }
         let reserved: Vec<String> = self
             .groups
             .iter()
@@ -2161,6 +2219,7 @@ pub(crate) fn prove_traces(
             .collect();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
+        let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
@@ -2184,6 +2243,18 @@ pub(crate) fn prove_traces(
             paths_after.0 - paths_before.0,
             paths_after.1 - paths_before.1,
         );
+        let routes_after = multilinear::whir_commit::top_path_routes();
+        stamps.top_routes = (
+            (
+                routes_after.0.0 - routes_before.0.0,
+                routes_after.0.1 - routes_before.0.1,
+            ),
+            (
+                routes_after.1.0 - routes_before.1.0,
+                routes_after.1.1 - routes_before.1.1,
+            ),
+        );
+        stamps.drop_levels = Some(options.drop_levels);
         let widens_after = multilinear::narrow::host_widens();
         stamps.narrow = options.narrow;
         stamps.host_widens = (
@@ -3607,6 +3678,7 @@ fn prove_streamed(
         let top_secs_before = multilinear::whir_commit::top_path_secs();
         let t = Instant::now();
         let paths_before = multilinear::whir_commit::top_path_counts();
+        let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
@@ -3698,6 +3770,18 @@ fn prove_streamed(
             paths_after.0 - paths_before.0,
             paths_after.1 - paths_before.1,
         );
+        let routes_after = multilinear::whir_commit::top_path_routes();
+        stamps.top_routes = (
+            (
+                routes_after.0.0 - routes_before.0.0,
+                routes_after.0.1 - routes_before.0.1,
+            ),
+            (
+                routes_after.1.0 - routes_before.1.0,
+                routes_after.1.1 - routes_before.1.1,
+            ),
+        );
+        stamps.drop_levels = Some(options.drop_levels);
         let widens_after = multilinear::narrow::host_widens();
         stamps.narrow = options.narrow;
         stamps.host_widens = (
@@ -4106,7 +4190,8 @@ pub(crate) fn verify_block_whir_with(
 mod spill_policy_tests {
     use super::{
         BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, hand_off_need, memory_short,
-        parse_hand_off, parse_spill_policy, spill_reserve_bytes, spill_target_from, spill_wanted,
+        parse_hand_off, parse_spill_policy, parse_tree_drop, spill_reserve_bytes,
+        spill_target_from, spill_wanted,
     };
 
     const GIB: u64 = 1 << 30;
@@ -4357,6 +4442,25 @@ mod spill_policy_tests {
         assert_eq!(hand_off_need(gib(85.19), windows(584), u64::MAX), 0);
         let small = spill_target_from(None, Some(64 * GIB));
         assert!(hand_off_need(gib(40.0), windows(285), small) > 0);
+    }
+
+    /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: unset is 8 on the card and 4 on the
+    /// host; `<card>` or `<card>,<host>` sets them; anything else is the
+    /// default.
+    #[test]
+    fn the_tree_drop_knob_reads_card_then_host() {
+        use multilinear::whir_commit::TreeDrop;
+        let default = TreeDrop { device: 8, host: 4 };
+        assert_eq!(parse_tree_drop(None), default);
+        assert_eq!(parse_tree_drop(Some("")), default);
+        assert_eq!(parse_tree_drop(Some("6")), TreeDrop { device: 6, host: 4 });
+        assert_eq!(
+            parse_tree_drop(Some(" 6 , 5 ")),
+            TreeDrop { device: 6, host: 5 }
+        );
+        assert_eq!(parse_tree_drop(Some("4,4")), TreeDrop::uniform(4));
+        assert_eq!(parse_tree_drop(Some("x")), default);
+        assert_eq!(parse_tree_drop(Some("6,5,1")), default);
     }
 
     /// `LAMBDA_VM_BLOCK_HAND_OFF`: unset, `auto` or anything else decides at

@@ -347,6 +347,13 @@ where
         self.commitments.iter().map(|c| c.root()).collect()
     }
 
+    /// Each stacked polynomial's commitment, for a test that reads its paths
+    /// on the card.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn commitments_mut(&mut self) -> &mut [CodewordCommitment<F, H>] {
+        &mut self.commitments
+    }
+
     pub fn domain(&self) -> &Domain<F> {
         &self.domain
     }
@@ -356,11 +363,12 @@ where
     }
 
     /// Lets every codeword go — and the room the group promised the card —
-    /// keeping the roots and each tree's top (all but its bottom
-    /// `drop_levels` levels) on the host. See [`RetiredStack::revive`].
+    /// keeping the roots and each tree's top (all but its bottom `drop` levels,
+    /// [`crate::whir_commit::TreeDrop`]) on the host. See
+    /// [`RetiredStack::revive`].
     pub fn retire(
         self,
-        drop_levels: usize,
+        drop: crate::whir_commit::TreeDrop,
         config: &ChainConfig,
     ) -> Result<RetiredStack<F>, Error> {
         // The group's room goes back here (`room: _` drops it); each codeword
@@ -374,7 +382,7 @@ where
         } = self;
         let commitments = commitments
             .into_iter()
-            .map(|commitment| commitment.retire(drop_levels, config.format.cap))
+            .map(|commitment| commitment.retire(drop, config.format.cap))
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(RetiredStack {
             layout,
@@ -966,7 +974,7 @@ mod tests {
             None,
             config,
         )?
-        .retire(drop_levels, config)?;
+        .retire(crate::whir_commit::TreeDrop::uniform(drop_levels), config)?;
         let revived = retired.revive::<KeccakWhir, _>(
             &crate::stacking::borrow(revived_over),
             None,
@@ -1034,7 +1042,7 @@ mod tests {
             &config(),
         )
         .unwrap()
-        .retire(3, &config())
+        .retire(crate::whir_commit::TreeDrop::uniform(3), &config())
         .unwrap();
         assert_eq!(retired.roots(), roots);
         assert!(retired.tree_bytes() > 0);

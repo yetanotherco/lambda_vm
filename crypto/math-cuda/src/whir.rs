@@ -1453,6 +1453,95 @@ impl DeviceCodeword {
         self.stream.synchronize()?;
         Ok(values)
     }
+
+    /// The subtrees of `blocks` — each block the `2^dropped` consecutive leaves
+    /// `[b·2^dropped, (b+1)·2^dropped)` of this codeword's tree at
+    /// `log_folding` — hashed and built here, from the codeword where it lies:
+    /// what a retired tree's queried blocks are re-hashed from, rather than
+    /// bringing their cosets home.
+    ///
+    /// Returns the nodes of ONE tree over the gathered leaves, in the host
+    /// layout (`2M − 1` nodes of 32 bytes, root first, `M` = the leaves rounded
+    /// up to a power of two, the last leaf repeated as padding). The blocks are
+    /// `2^dropped`-aligned in it, so the nodes `dropped` levels above the leaves
+    /// are the blocks' subtree roots, in `blocks`' order; the levels above them
+    /// mix blocks and mean nothing. Leaves and levels are hashed by the same
+    /// kernels the commit used, so each subtree is the committed one, byte for
+    /// byte — which the caller checks against the node it kept.
+    pub fn block_subtrees(
+        &self,
+        log_folding: usize,
+        blocks: &[u64],
+        dropped: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<Vec<u8>> {
+        assert!(!blocks.is_empty(), "a round opens at least one block");
+        let num_leaves = self.elements >> log_folding;
+        let span = 1u64 << dropped;
+        let real = blocks.len() << dropped;
+        let leaves = real.next_power_of_two().max(2);
+        let mut indices: Vec<u64> = blocks
+            .iter()
+            .flat_map(|&b| (b * span)..((b + 1) * span))
+            .collect();
+        let last = *indices.last().expect("at least one leaf");
+        assert!(
+            (last as usize) < num_leaves,
+            "block past the tree's {num_leaves} leaves"
+        );
+        indices.resize(leaves, last);
+        let limbs = if self.base { 1u64 } else { 3 };
+        let block = 1u64 << log_folding;
+        let be = backend()?;
+        let index_dev = self.stream.clone_htod(&indices)?;
+        let values = leaves * block as usize * limbs as usize;
+        // SAFETY: the gather writes every value it is sized for.
+        let mut gathered = unsafe { alloc_or_trim::<u64>(&self.stream, values) }?;
+        let leaves_u64 = leaves as u64;
+        let num_leaves_u64 = num_leaves as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&be.gather_cosets_strided)
+                .arg(self.buffer.as_ref())
+                .arg(&index_dev)
+                .arg(&leaves_u64)
+                .arg(&num_leaves_u64)
+                .arg(&block)
+                .arg(&limbs)
+                .arg(&mut gathered)
+                .launch(LaunchConfig::for_num_elems((leaves as u64 * block) as u32))?;
+        }
+        let total_nodes = 2 * leaves - 1;
+        // SAFETY: every byte is written before it is read — the leaves by the
+        // kernel below, the inner nodes by the level loop after it.
+        let mut nodes = unsafe { alloc_or_trim::<u8>(&self.stream, total_nodes * 32) }?;
+        let leaves_offset = (leaves - 1) * 32;
+        {
+            let mut out = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
+            let kernel = match (hash, self.base) {
+                (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
+                (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
+                (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
+                (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
+                (other, _) => {
+                    unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
+                }
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(&gathered)
+                    .arg(&leaves_u64)
+                    .arg(&block)
+                    .arg(&mut out)
+                    .launch(keccak_launch_cfg(leaves_u64))?;
+            }
+        }
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, leaves, hash)?;
+        let out = self.stream.clone_dtoh(&nodes)?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
 }
 
 /// The codeword and the Merkle nodes of one stacked polynomial.
