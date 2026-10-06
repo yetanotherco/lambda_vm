@@ -50,11 +50,28 @@
 //! computed from three lengths is the bug class that is correct on a fixture and
 //! wrong on a block. The statement padding that makes the offset a multiple of
 //! eight is W1's, computed from the accumulated length.
+//!
+//! # The Poseidon1 arm
+//!
+//! A [`WrapHash::Poseidon1`] builder replays ZisK's field sponge instead
+//! ([`WhirTranscript::for_builder`]), the host's `P1Transcript`
+//! (`crypto/crypto/src/fiat_shamir/p1_transcript.rs`), through
+//! [`P1SpongeVar`]. That sponge has no byte buffer: every `append_bytes` is the
+//! LENGTH felt, then the bytes as 8-byte big-endian felts (the last zero-padded
+//! on the low side, `felts_from_bytes`), and every `append_field_element` its
+//! three coordinates. So the call boundaries are part of the stream, and the
+//! callers name what they absorb: [`WhirTranscript::absorb_digest`] and
+//! [`WhirTranscript::absorb_root_lanes`] are a 32-byte `append_bytes`,
+//! [`WhirTranscript::absorb_nonce`] an 8-byte one, and each
+//! [`WhirTranscript::absorb_const_bytes`] call is one `append_bytes` of its
+//! bytes. A candidate is one squeezed lane; `state()` is the sponge's digest
+//! after flushing a copy. The byte arm above is unchanged, call for call.
 
 use crate::tables::types::{FE, FEE};
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::WrapHash;
+use super::p1w16_emit::P1SpongeVar;
 
 /// Felts a squeeze hands out before it must refill — `SQUEEZE_LEN / 8` in the
 /// host's bytes (`default_transcript.rs:19`).
@@ -82,6 +99,28 @@ pub struct WhirTranscript {
     out_pos: usize,
     /// Squeezes emitted, for the cost pins.
     squeezes: usize,
+    /// The Poseidon1 sponge, when the builder verifies a Poseidon1 base: every
+    /// call below goes to it and the byte buffer above stays empty.
+    p1: Option<P1Arm>,
+}
+
+/// The Poseidon1 arm's state: the sponge, and constant lanes absorbed by a
+/// call that has no builder ([`WhirTranscript::absorb_const_bytes`]), put in
+/// order before anything else touches the sponge. Putting a lane later is the
+/// same stream: the sponge is a function of its lanes' order alone.
+#[derive(Clone)]
+struct P1Arm {
+    sponge: P1SpongeVar,
+    consts: Vec<FE>,
+}
+
+impl P1Arm {
+    fn ready(&mut self, b: &mut LfmBuilder) -> &mut P1SpongeVar {
+        for v in self.consts.drain(..) {
+            self.sponge.put_const(b, v);
+        }
+        &mut self.sponge
+    }
 }
 
 impl WhirTranscript {
@@ -94,11 +133,34 @@ impl WhirTranscript {
             out: None,
             out_pos: CANDIDATES_PER_SQUEEZE,
             squeezes: 0,
+            p1: None,
         }
     }
 
+    /// The transcript of a program built by `b`: [`Self::new`], or under a
+    /// [`WrapHash::Poseidon1`] builder the empty `P1Transcript` (`P1Whir`'s
+    /// `WhirHash::sponge()`, which absorbs no seed).
+    pub fn for_builder(b: &mut LfmBuilder) -> Self {
+        let mut t = Self::new();
+        if b.wrap_hash() == WrapHash::Poseidon1 {
+            t.p1 = Some(P1Arm {
+                sponge: P1SpongeVar::new(b),
+                consts: Vec::new(),
+            });
+        }
+        t
+    }
+
     /// `append_bytes` of a PROGRAM CONSTANT: free, and unconstrained in length.
+    ///
+    /// Under Poseidon1 it is ONE `append_bytes` call: the length, then the
+    /// bytes' felts, all program constants.
     pub fn absorb_const_bytes(&mut self, bytes: &[u8]) {
+        if let Some(arm) = &mut self.p1 {
+            arm.consts.push(FE::from(bytes.len() as u64));
+            arm.consts.extend(const_byte_felts(bytes));
+            return;
+        }
         self.pending.extend_from_slice(bytes);
         self.invalidate();
     }
@@ -106,8 +168,16 @@ impl WhirTranscript {
     /// `append_bytes` / `append_field_element` of RUNTIME felts.
     ///
     /// Panics when the constant run before it does not end on a felt boundary:
-    /// see the module header.
+    /// see the module header. Under Poseidon1 these are field-element lanes
+    /// with no length: a byte string goes through the named absorbs below.
     pub fn absorb_felts(&mut self, b: &mut LfmBuilder, felts: &[Felt]) {
+        if let Some(arm) = &mut self.p1 {
+            let sponge = arm.ready(b);
+            for felt in felts {
+                sponge.put_felt(b, *felt);
+            }
+            return;
+        }
         assert_eq!(
             self.pending.len() % BYTES_PER_FELT,
             0,
@@ -134,7 +204,27 @@ impl WhirTranscript {
     /// (`digest_to_commitment`, `rpx/mod.rs:428`).
     pub fn absorb_digest(&mut self, b: &mut LfmBuilder, digest: Cell) {
         let lanes = b.unpack(digest);
-        self.absorb_felts(b, &lanes);
+        self.absorb_root_lanes(b, &lanes);
+    }
+
+    /// `append_bytes(root, 32)` of a root already unpacked into its four lanes.
+    pub fn absorb_root_lanes(&mut self, b: &mut LfmBuilder, lanes: &[Felt; 4]) {
+        self.absorb_byte_felts(b, DIGEST_FELTS * BYTES_PER_FELT, lanes);
+    }
+
+    /// `append_bytes(&nonce.to_be_bytes())`: eight big-endian bytes, one felt.
+    pub fn absorb_nonce(&mut self, b: &mut LfmBuilder, nonce: Felt) {
+        self.absorb_byte_felts(b, BYTES_PER_FELT, &[nonce]);
+    }
+
+    /// One `append_bytes` of `len` RUNTIME bytes that are exactly `felts`, big-
+    /// endian: the felts on the byte arm, the length and then the felts under
+    /// Poseidon1.
+    fn absorb_byte_felts(&mut self, b: &mut LfmBuilder, len: usize, felts: &[Felt]) {
+        if let Some(arm) = &mut self.p1 {
+            arm.consts.push(FE::from(len as u64));
+        }
+        self.absorb_felts(b, felts);
     }
 
     /// `DefaultTranscript::sample()` — hash the accumulated buffer, clear it,
@@ -144,6 +234,11 @@ impl WhirTranscript {
     /// draws differ. Dropping it leaves every draw after the first identical,
     /// which a single pinned value cannot see.
     pub fn squeeze(&mut self, b: &mut LfmBuilder) -> [Felt; CANDIDATES_PER_SQUEEZE] {
+        if let Some(arm) = &mut self.p1 {
+            // Four candidates: the Poseidon1 sponge squeezes lanes, not digests.
+            let sponge = arm.ready(b);
+            return core::array::from_fn(|_| sponge.squeeze(b));
+        }
         let felts = self.felts_now(b);
         let digest = WrapHash::Algebraic.leaf_hash(b, &felts);
         let lanes = b.unpack(digest.cells()[0]);
@@ -160,6 +255,9 @@ impl WhirTranscript {
     /// writes felt `i` as the big-endian bytes `8i..8i+8` and the sampler reads
     /// exactly those with `from_be_bytes`, so the two conversions cancel.
     pub fn next_candidate(&mut self, b: &mut LfmBuilder) -> Felt {
+        if let Some(arm) = &mut self.p1 {
+            return arm.ready(b).squeeze(b);
+        }
         if self.out.is_none() || self.out_pos >= CANDIDATES_PER_SQUEEZE {
             self.squeeze(b);
         }
@@ -202,6 +300,9 @@ impl WhirTranscript {
     /// hashes the same bytes again. The packing is therefore emitted twice,
     /// which is redundant work and never a different value.
     pub fn state(&mut self, b: &mut LfmBuilder) -> Cell {
+        if let Some(arm) = &mut self.p1 {
+            return arm.ready(b).digest(b);
+        }
         let felts = self.felts_now(b);
         WrapHash::Algebraic.leaf_hash(b, &felts).cells()[0]
     }
@@ -250,12 +351,21 @@ impl WhirTranscript {
 /// (`rpx/mod.rs:396-406` writes the available bytes at the FRONT of a zeroed
 /// eight-byte buffer, so the missing ones are the low bytes).
 fn pack_const_bytes(b: &mut LfmBuilder, bytes: &[u8]) -> Vec<Felt> {
+    const_byte_felts(bytes)
+        .into_iter()
+        .map(|felt| b.felt_const(felt))
+        .collect()
+}
+
+/// The values [`pack_const_bytes`] interns: `rpx::felts_from_bytes`, the rule
+/// both sponges read bytes by.
+fn const_byte_felts(bytes: &[u8]) -> Vec<FE> {
     bytes
         .chunks(BYTES_PER_FELT)
         .map(|group| {
             let mut whole = [0u8; BYTES_PER_FELT];
             whole[..group.len()].copy_from_slice(group);
-            b.felt_const(FE::from(u64::from_be_bytes(whole)))
+            FE::from(u64::from_be_bytes(whole))
         })
         .collect()
 }
@@ -320,6 +430,17 @@ pub struct SpongeEntry {
     /// Candidates of the last squeeze already handed out;
     /// `CANDIDATES_PER_SQUEEZE` means "none in hand, the next draw squeezes".
     pub out_pos: usize,
+    /// The Poseidon1 sponge's state instead, when the program verifies a
+    /// Poseidon1 base (the two fields above are then unused).
+    pub p1: Option<P1SpongeEntry>,
+}
+
+/// Where a Poseidon1 sponge stands (`poseidon1_stark::Transcript`): lanes
+/// pending in its rate, and output lanes not yet squeezed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct P1SpongeEntry {
+    pub pending: usize,
+    pub unread: usize,
 }
 
 impl SpongeEntry {
@@ -329,6 +450,22 @@ impl SpongeEntry {
         Self {
             buffered_felts: 0,
             out_pos: CANDIDATES_PER_SQUEEZE,
+            p1: None,
+        }
+    }
+
+    /// The empty transcript of a program built under `hash`: [`Self::fresh`],
+    /// or the empty Poseidon1 sponge (nothing pending, nothing to read).
+    pub const fn fresh_for(hash: WrapHash) -> Self {
+        match hash {
+            WrapHash::Poseidon1 => Self {
+                p1: Some(P1SpongeEntry {
+                    pending: 0,
+                    unread: 0,
+                }),
+                ..Self::fresh()
+            },
+            _ => Self::fresh(),
         }
     }
 }
@@ -374,7 +511,14 @@ pub struct SpongeSchedule {
     buffered: usize,
     out_pos: usize,
     hashes: Vec<SpongeHash>,
+    /// The Poseidon1 sponge instead, and the permutations it has spent.
+    p1: Option<(P1SpongeEntry, usize)>,
 }
+
+/// Lanes of rate in a Poseidon1 sponge block, and lanes one permutation's
+/// output hands out.
+const P1_RATE: usize = super::p1w16_emit::RATE_FELTS;
+const P1_OUT: usize = 16;
 
 impl SpongeSchedule {
     pub fn new(entry: SpongeEntry) -> Self {
@@ -382,14 +526,35 @@ impl SpongeSchedule {
             buffered: entry.buffered_felts,
             out_pos: entry.out_pos,
             hashes: Vec::new(),
+            p1: entry.p1.map(|p| (p, 0)),
         }
     }
 
     /// `append_bytes` / `append_field_element`: the buffer grows and any
-    /// buffered squeeze output is dropped (`:205-210`).
+    /// buffered squeeze output is dropped (`:205-210`). Under Poseidon1, each
+    /// felt is a lane: a full rate permutes (`Transcript::put1`).
     pub fn absorb(&mut self, felts: usize) {
+        if let Some((p, perms)) = &mut self.p1 {
+            for _ in 0..felts {
+                p.pending += 1;
+                p.unread = 0;
+                if p.pending == P1_RATE {
+                    *perms += 1;
+                    p.pending = 0;
+                    p.unread = P1_OUT;
+                }
+            }
+            return;
+        }
         self.buffered += felts;
         self.out_pos = CANDIDATES_PER_SQUEEZE;
+    }
+
+    /// `append_bytes(root, 32)`: four felts, and under Poseidon1 the length
+    /// before them.
+    pub fn absorb_root(&mut self) {
+        let len = usize::from(self.p1.is_some());
+        self.absorb(len + DIGEST_FELTS);
     }
 
     /// `sample()`: the buffer is hashed, and the digest is re-absorbed — which
@@ -402,6 +567,15 @@ impl SpongeSchedule {
 
     /// `next_sample_u64`: refill only when nothing is in hand.
     pub fn candidate(&mut self) {
+        if let Some((p, perms)) = &mut self.p1 {
+            if p.unread == 0 {
+                *perms += 1;
+                p.pending = 0;
+                p.unread = P1_OUT;
+            }
+            p.unread -= 1;
+            return;
+        }
         if self.out_pos >= CANDIDATES_PER_SQUEEZE {
             self.squeeze();
         }
@@ -422,6 +596,15 @@ impl SpongeSchedule {
     /// eight big-endian bytes.
     pub fn grind(&mut self, bits: usize) {
         if bits == 0 {
+            return;
+        }
+        if let Some((p, perms)) = &mut self.p1 {
+            // `state()` flushes a COPY: one permutation when lanes are pending,
+            // none adopted. Then the nonce's `append_bytes`, length and felt.
+            if p.pending > 0 {
+                *perms += 1;
+            }
+            self.absorb(1 + NONCE_FELTS);
             return;
         }
         self.hashes.push(SpongeHash::State(self.buffered));
@@ -445,16 +628,25 @@ impl SpongeSchedule {
         SpongeEntry {
             buffered_felts: self.buffered,
             out_pos: self.out_pos,
+            p1: self.p1.map(|(p, _)| p),
         }
     }
 
-    /// INSTRUCTIONS the hashes cost.
+    /// INSTRUCTIONS the hashes cost. Under Poseidon1 an estimate, four a
+    /// permutation (its rate words and the `Hash16` row): the census reads the
+    /// emitted program for the exact count.
     pub fn rows(&self) -> usize {
+        if let Some((_, perms)) = self.p1 {
+            return 4 * perms;
+        }
         self.hashes.iter().map(|hash| hash.rows()).sum()
     }
 
-    /// PERMUTATIONS the hashes cost.
+    /// PERMUTATIONS the hashes cost: under Poseidon1, `Hash16` rows.
     pub fn perms(&self) -> usize {
+        if let Some((_, perms)) = self.p1 {
+            return perms;
+        }
         self.hashes.iter().map(|hash| hash.perms()).sum()
     }
 }
@@ -501,7 +693,7 @@ pub fn emit_grind_check(
     let seed = transcript.state(b);
     super::epoch::emit_grinding_check(b, super::edsl::WrapDigest::from_cell(seed), nonce, bits);
     // `append_bytes(&nonce.to_be_bytes())`: eight big-endian bytes are one felt.
-    transcript.absorb_felts(b, &[nonce]);
+    transcript.absorb_nonce(b, nonce);
 }
 
 /// INSTRUCTIONS [`emit_grind_check`] emits beyond the transcript state's own

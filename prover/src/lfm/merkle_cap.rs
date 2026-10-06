@@ -175,6 +175,30 @@ impl CapCells {
         index_bits: &[Bit],
         siblings: &[WrapDigest],
     ) {
+        self.verify_path_by(b, leaf, index_bits, siblings, false);
+    }
+
+    /// [`Self::verify_path`] with an arity-4 path's siblings in CHILD order, as
+    /// the proof carries them ([`super::p1w16_emit::walk4_child`]); at arity 2
+    /// it is [`Self::verify_path`].
+    pub fn verify_path_child(
+        &self,
+        b: &mut LfmBuilder,
+        leaf: WrapDigest,
+        index_bits: &[Bit],
+        siblings: &[WrapDigest],
+    ) {
+        self.verify_path_by(b, leaf, index_bits, siblings, true);
+    }
+
+    fn verify_path_by(
+        &self,
+        b: &mut LfmBuilder,
+        leaf: WrapDigest,
+        index_bits: &[Bit],
+        siblings: &[WrapDigest],
+        child_order: bool,
+    ) {
         assert!(
             index_bits.len() >= self.mux_bits,
             "the index covers the cap: {} bits under a {}-bit mux",
@@ -193,7 +217,11 @@ impl CapCells {
             "a path to the cap: its hints for every level below it"
         );
         let (walk_bits, top_bits) = index_bits.split_at(walked);
-        let walked = edsl::wrap_merkle_walk(b, leaf, walk_bits, siblings);
+        let walked = if child_order && hash.arity() == 4 {
+            super::p1w16_emit::walk4_child(b, leaf, walk_bits, siblings)
+        } else {
+            edsl::wrap_merkle_walk(b, leaf, walk_bits, siblings)
+        };
         let node = self.select(b, top_bits);
         for (x, y) in walked.iter().zip(node.iter()) {
             edsl::assert_word_eq(b, *x, *y);
@@ -303,4 +331,43 @@ pub fn path_to_cap(
         .map(|t| [t[0], t[1], t[2]])
         .collect();
     Ok((super::p1w16_emit::hint_order(index, walked, &triples), cap))
+}
+
+/// [`path_to_cap`] with an arity-4 path left in CHILD order (the proof's own,
+/// [`super::p1w16_emit::walk4_child`]'s hints), so it needs no leaf index. An
+/// uncapped odd-depth tree's top triple keeps only its first sibling, the
+/// partner: the other two are the padding the walk supplies as constants.
+pub fn child_path_to_cap(
+    path: &[Commitment],
+    depth: usize,
+    c: usize,
+    arity: usize,
+    owner: bool,
+) -> Result<(Vec<Commitment>, Option<Vec<Commitment>>), String> {
+    if arity != 4 {
+        return path_to_cap(path, depth, c, arity, owner, None);
+    }
+    let levels = crypto::merkle_tree::cap::tree_levels(depth, 4);
+    let (siblings, cap) = if c == 0 || !owner {
+        if path.len() != 3 * (levels - c) {
+            return Err(format!(
+                "a path to the cap: {} nodes, the shape takes {}",
+                path.len(),
+                3 * (levels - c)
+            ));
+        }
+        (path, None)
+    } else {
+        let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path_arity(path, depth, c, 4)
+            .ok_or("the owner path is the path to the cap, then the cap")?;
+        (siblings, Some(cap.to_vec()))
+    };
+    let walked = depth - mux_bits(depth, c, 4);
+    let mut out = siblings.to_vec();
+    if walked % 2 == 1 {
+        // The uncapped odd top: drop its two padding siblings.
+        out.truncate(out.len() - 2);
+    }
+    debug_assert_eq!(out.len(), super::p1w16_emit::path_hints(walked));
+    Ok((out, cap))
 }

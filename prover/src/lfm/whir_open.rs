@@ -62,6 +62,16 @@
 //! later caller can forget: **a base value that is NOT part of a leaf this leg
 //! hashes is not pinned, and must not be lifted.** The bad state is unreachable
 //! only while the values folded and the values hashed are the same slice.
+//!
+//! # Under Poseidon1
+//!
+//! A [`WrapHash::Poseidon1`](super::edsl::WrapHash) builder verifies a
+//! Poseidon1 base's 4-ary trees: the leaf is `poseidon1_stark::linear_hash`
+//! (rate 12, the width tag; [`edsl::wrap_leaf_hash`] dispatches), and the walk
+//! is [`super::p1w16_emit::walk4_child`] over the path in the proof's own child
+//! order, three siblings a 4-ary level and one at an uncapped odd top
+//! ([`super::merkle_cap::child_path_to_cap`] lays the arena out). The `Pack`
+//! pin above holds the same way: the leaf packs every value lane.
 
 use super::builder::{Bit, Ext, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
@@ -241,13 +251,18 @@ pub fn emit_verify_opening(
     siblings: &[WrapDigest],
     root_lanes: &[Felt; 4],
 ) {
+    let hash = b.wrap_hash();
     assert_eq!(
-        index_bits.len(),
+        hash.path_hints(index_bits.len()),
         siblings.len(),
-        "one sibling and one index bit per level of the tree"
+        "the path's siblings for every level of the tree"
     );
     let leaf = emit_block_leaf(b, values);
-    let walked = edsl::wrap_merkle_walk(b, leaf, index_bits, siblings);
+    let walked = if hash.arity() == 4 {
+        super::p1w16_emit::walk4_child(b, leaf, index_bits, siblings)
+    } else {
+        edsl::wrap_merkle_walk(b, leaf, index_bits, siblings)
+    };
     edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(root_lanes));
 }
 
@@ -289,13 +304,10 @@ impl TreeAuth {
         match self {
             TreeAuth::Root(lanes) => emit_verify_opening(b, values, index_bits, siblings, lanes),
             TreeAuth::Cap(cap) => {
-                assert_eq!(
-                    siblings.len() + cap.height(),
-                    index_bits.len(),
-                    "a path to the cap: one sibling per level below it"
-                );
+                // The cap checks the path's length against the index and its
+                // height at the builder's arity.
                 let leaf = emit_block_leaf(b, values);
-                cap.verify_path(b, leaf, index_bits, siblings);
+                cap.verify_path_child(b, leaf, index_bits, siblings);
             }
         }
     }

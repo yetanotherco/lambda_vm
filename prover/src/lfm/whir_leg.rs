@@ -795,6 +795,7 @@ pub fn whir_leg_cost(shape: &WhirLegShape<'_>) -> WhirLegCost {
         SpongeEntry {
             buffered_felts: statement_felts,
             out_pos: CANDIDATES_PER_SQUEEZE,
+            p1: None,
         },
     );
     cost.spine += roots_ops + schedule.rows();

@@ -990,6 +990,7 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
         let entry = SpongeEntry {
             buffered_felts: buffered,
             out_pos,
+            p1: None,
         };
         let entered = chain_hash_schedule(&shape, entry);
         assert_eq!(entered.len(), fresh.len(), "the event count cannot move");
@@ -1021,14 +1022,16 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
                 &shape,
                 SpongeEntry {
                     buffered_felts: 5,
-                    out_pos
+                    out_pos,
+                    p1: None,
                 }
             ),
             chain_hash_schedule(
                 &shape,
                 SpongeEntry {
                     buffered_felts: 5,
-                    out_pos: 0
+                    out_pos: 0,
+                    p1: None,
                 }
             ),
             "a chain never draws before it absorbs, so what is in hand on entry is dropped"

@@ -379,7 +379,7 @@ pub fn roots_block_cost(
 ) -> (usize, SpongeSchedule) {
     let mut schedule = SpongeSchedule::new(entry);
     for _ in 0..carried + derived {
-        schedule.absorb(FELTS_PER_DIGEST);
+        schedule.absorb_root();
     }
     for _ in 0..DRAWS {
         schedule.draw_ext();
@@ -438,10 +438,6 @@ pub fn roots_block_constants(derived: &[LfmWord], schedule: &SpongeSchedule) -> 
 /// here; a block that drew two would leave the sponge in a different state and
 /// every table's first challenge would differ.
 const DRAWS: usize = 3;
-
-/// Felts a 32-byte commitment occupies in the sponge's stream — the transcript's
-/// own constant, not a second spelling of four.
-use super::whir_transcript::DIGEST_FELTS as FELTS_PER_DIGEST;
 
 /// What the epoch's closure leaves for a caller to look at.
 ///
