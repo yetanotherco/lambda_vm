@@ -66,6 +66,7 @@ pub mod p1w16_socket;
 pub mod per_table_aggregator;
 pub mod poseidon;
 pub mod preprocessed;
+pub mod program_budget;
 pub mod program_census;
 pub mod programs;
 pub mod proof;

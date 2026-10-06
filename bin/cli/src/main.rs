@@ -521,8 +521,12 @@ struct PosturePlan {
 fn posture_plan(
     env: impl Fn(&str) -> Option<String>,
     card: impl Fn() -> Option<f64>,
+    target: impl Fn() -> u64,
 ) -> PosturePlan {
-    use prover::lfm::block_tree::{POSTURE, POSTURE_VRAM_KNOB, POSTURE_VRAM_MIN_GIB};
+    use prover::lfm::block_tree::{
+        POSTURE, POSTURE_TREE_CACHE_KNOB, POSTURE_VRAM_KNOB, POSTURE_VRAM_MIN_GIB,
+        posture_tree_cache_cap,
+    };
     let mut plan = PosturePlan {
         set: Vec::new(),
         env: Vec::new(),
@@ -547,6 +551,19 @@ fn posture_plan(
                 }
             }
         }
+        if name == POSTURE_TREE_CACHE_KNOB {
+            let target = target();
+            let cap = posture_tree_cache_cap(target);
+            if cap != value {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {name}={cap}, not {value}: the host target is {:.1} GiB \
+                     (LAMBDA_VM_BLOCK_SPILL_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+            }
+            plan.set.push((name, cap));
+            continue;
+        }
         plan.set.push((name, value));
     }
     plan
@@ -560,7 +577,11 @@ fn posture_plan(
 ///
 /// Sets environment variables: no other thread may exist.
 unsafe fn apply_posture() -> Vec<String> {
-    let plan = posture_plan(|name| std::env::var(name).ok(), card_gib);
+    let plan = posture_plan(
+        |name| std::env::var(name).ok(),
+        card_gib,
+        prover::block::spill_target_bytes,
+    );
     for (name, value) in &plan.set {
         // SAFETY: the caller's: no other thread exists.
         unsafe { std::env::set_var(name, value) };
@@ -1752,12 +1773,13 @@ mod tests {
     fn the_posture_sets_only_unset_knobs_and_the_budget_only_on_a_big_card() {
         use prover::lfm::block_tree::{POSTURE, POSTURE_VRAM_KNOB};
         let none = |_: &str| None;
-        let all = posture_plan(none, || Some(31.84));
+        let roomy = || 110u64 << 30;
+        let all = posture_plan(none, || Some(31.84), roomy);
         assert_eq!(all.set, POSTURE.to_vec(), "every knob, on a 5090");
         assert!(all.env.is_empty() && all.notes.is_empty());
 
         for card in [Some(23.99), None] {
-            let small = posture_plan(none, || card);
+            let small = posture_plan(none, || card, roomy);
             assert!(
                 small.set.iter().all(|(n, _)| *n != POSTURE_VRAM_KNOB),
                 "{card:?}: no budget"
@@ -1769,9 +1791,33 @@ mod tests {
         let mine = posture_plan(
             |n| (n == "TABLE_PARALLELISM").then(|| "4".to_string()),
             || Some(31.84),
+            roomy,
         );
         assert!(mine.set.iter().all(|(n, _)| *n != "TABLE_PARALLELISM"));
         assert_eq!(mine.env, vec!["TABLE_PARALLELISM=4".to_string()]);
+    }
+
+    /// The precomputed-tree cache's posture follows the host target: 64
+    /// entries from a 64 GiB target up, 16 below it (with a note), and a value
+    /// the environment sets is left alone.
+    #[test]
+    fn the_tree_cache_posture_follows_the_host_target() {
+        use prover::lfm::block_tree::POSTURE_TREE_CACHE_KNOB as CAP;
+        let none = |_: &str| None;
+        let cap = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == CAP).map(|(_, v)| *v);
+        let big = posture_plan(none, || Some(31.84), || 64u64 << 30);
+        assert_eq!(cap(&big), Some("64"));
+        assert!(big.notes.is_empty());
+        let small = posture_plan(none, || Some(31.84), || 54u64 << 30);
+        assert_eq!(cap(&small), Some("16"));
+        assert_eq!(small.notes.len(), 1, "the note says why");
+        let set = posture_plan(
+            |n| (n == CAP).then(|| "32".to_string()),
+            || Some(31.84),
+            || 54u64 << 30,
+        );
+        assert_eq!(cap(&set), None, "the environment's value stays");
+        assert_eq!(set.env, vec![format!("{CAP}=32")]);
     }
 
     /// The binary runs the allocator posture it compiles in: jemalloc never

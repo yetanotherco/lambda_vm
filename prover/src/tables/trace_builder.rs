@@ -859,9 +859,19 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.blake3_ops)
             + vec_heap_bytes(&self.blake3_absorb_ops)
             + vec_heap_bytes(&self.cpu32_ops)
-            + vec_heap_bytes(&self.ecsm_ops)
+            + self.ecsm_bytes()
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
+    }
+
+    /// The ECSM list's heap: its buffer and the steps each op's witness owns.
+    fn ecsm_bytes(&self) -> usize {
+        vec_heap_bytes(&self.ecsm_ops)
+            + self
+                .ecsm_ops
+                .iter()
+                .map(ecsm::EcsmOperation::steps_heap_bytes)
+                .sum::<usize>()
     }
 
     /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
@@ -879,7 +889,7 @@ impl WalkOutputs {
             ("blake3", vec_heap_bytes(&self.blake3_ops)),
             ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
             ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
-            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
+            ("ecsm", self.ecsm_bytes()),
             ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
             ("hint", vec_heap_bytes(&self.hint_ops)),
         ]
@@ -1359,7 +1369,7 @@ fn collect_ecsm_ops(
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = ::ecsm::compute_witness(&k, &xg)
+    let mut witness = ::ecsm::compute_witness(&k, &xg)
         .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
     let mut memw_ops = Vec::with_capacity(15);
@@ -1442,10 +1452,10 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    let ecdas_ops = witness
-        .steps
-        .iter()
-        .cloned()
+    // The steps become the ECDAS ops; the ECSM op keeps none (its table and
+    // its lookups read the witness's other fields alone).
+    let ecdas_ops = std::mem::take(&mut witness.steps)
+        .into_iter()
         .map(|step| ecdas::EcdasOperation { timestamp: t, step })
         .collect();
     let ecsm_op = ecsm::EcsmOperation {
@@ -7479,5 +7489,137 @@ mod segmented_tests {
             .unwrap();
             assert_eq!(words(&a), words(&b), "empty, optional {optional}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ecsm_steps_tests {
+    use super::{
+        GoldilocksExtension, GoldilocksField, MemoryState, RegisterState, WalkOutputs,
+        collect_ecsm_ops, ecdas, ecsm,
+    };
+    use crate::tables::cpu::{CpuOp, CpuOperation};
+    use crate::tables::types::DecodeEntry;
+    use stark::trace::TraceTable;
+
+    /// A table's main trace as words, row-major.
+    fn words(table: &TraceTable<GoldilocksField, GoldilocksExtension>) -> Vec<u64> {
+        let main = &table.main_table;
+        (0..main.height)
+            .flat_map(|r| (0..main.width).map(move |c| *main.get(r, c).value()))
+            .collect()
+    }
+
+    /// secp256k1's generator x, little-endian.
+    fn gx() -> [u8; 32] {
+        let mut gx = [
+            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        gx.reverse();
+        gx
+    }
+
+    /// An ECSM call's ops as the walk collects them, for scalar `k` at time `t`.
+    fn call(k: &[u8; 32], t: u64) -> (ecsm::EcsmOperation, Vec<ecdas::EcdasOperation>) {
+        let (addr_xr, addr_xg, addr_k) = (0x1000u64, 0x2000u64, 0x3000u64);
+        let mut memory_state = MemoryState::new();
+        let mut register_state = RegisterState::new(0);
+        register_state.write(10, addr_xr, 1);
+        register_state.write(11, addr_xg, 1);
+        register_state.write(12, addr_k, 1);
+        let gx = gx();
+        for d in 0..4 {
+            let dword = |bytes: &[u8; 32]| {
+                u64::from_le_bytes(bytes[8 * d..8 * d + 8].try_into().expect("8 bytes"))
+            };
+            memory_state.write_bytes(addr_xg + 8 * d as u64, dword(&gx), 8, 1);
+            memory_state.write_bytes(addr_k + 8 * d as u64, dword(k), 8, 1);
+        }
+        let decode = DecodeEntry::default();
+        let op = CpuOperation {
+            timestamp: t,
+            ..Default::default()
+        };
+        let (_, ecsm_op, ecdas_ops) = collect_ecsm_ops(
+            CpuOp::new(&decode, &op),
+            &mut memory_state,
+            &mut register_state,
+        );
+        (ecsm_op, ecdas_ops)
+    }
+
+    /// An ECSM call's ECDAS rows are its witness's steps, moved out of the ECSM
+    /// op: the ECDAS table of the ops the walk collects is the table of the
+    /// steps a fresh witness computes, the ECSM table is the fresh witness's,
+    /// and the ECSM op keeps no steps.
+    #[test]
+    fn an_ecsm_calls_ecdas_rows_are_its_witness_steps() {
+        let mut big = [0xA5u8; 32];
+        big[31] = 0x7F;
+        let scalars: Vec<[u8; 32]> = [1u64, 2, 5, 0xFFFF, 1_000_003]
+            .iter()
+            .map(|v| {
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&v.to_le_bytes());
+                k
+            })
+            .chain([big])
+            .collect();
+        for (i, k) in scalars.iter().enumerate() {
+            let t = 100 + 10 * i as u64;
+            let (ecsm_op, ecdas_ops) = call(k, t);
+            let fresh = ::ecsm::compute_witness(k, &gx()).expect("a valid scalar and point");
+            assert!(ecsm_op.witness.steps.is_empty(), "scalar {i}: steps kept");
+            assert_eq!(ecdas_ops.len(), fresh.steps.len(), "scalar {i}");
+            let want: Vec<ecdas::EcdasOperation> = fresh
+                .steps
+                .iter()
+                .cloned()
+                .map(|step| ecdas::EcdasOperation { timestamp: t, step })
+                .collect();
+            assert_eq!(
+                words(&ecdas::generate_ecdas_trace(&want)),
+                words(&ecdas::generate_ecdas_trace(&ecdas_ops)),
+                "scalar {i}: ECDAS rows"
+            );
+            let whole = ecsm::EcsmOperation {
+                timestamp: t,
+                addr_xg: ecsm_op.addr_xg,
+                addr_k: ecsm_op.addr_k,
+                addr_xr: ecsm_op.addr_xr,
+                witness: fresh,
+            };
+            assert_eq!(
+                words(&ecsm::generate_ecsm_trace(&[whole])),
+                words(&ecsm::generate_ecsm_trace(&[ecsm_op])),
+                "scalar {i}: ECSM row"
+            );
+        }
+    }
+
+    /// The walk's ECSM list counts the steps' buffer each op's witness owns, so
+    /// the memory log names it.
+    #[test]
+    fn the_ecsm_list_counts_the_witness_steps() {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&1_000_003u64.to_le_bytes());
+        let witness = ::ecsm::compute_witness(&k, &gx()).expect("a valid scalar and point");
+        let steps = witness.steps.capacity() * std::mem::size_of::<::ecsm::EcdasStep>();
+        assert!(steps > 0);
+        let mut walk = WalkOutputs::with_capacity(0);
+        let bare = walk.heap_bytes();
+        walk.ecsm_ops.push(ecsm::EcsmOperation {
+            timestamp: 7,
+            addr_xg: 0x2000,
+            addr_k: 0x3000,
+            addr_xr: 0x1000,
+            witness,
+        });
+        let list = super::vec_heap_bytes(&walk.ecsm_ops);
+        assert_eq!(walk.heap_bytes(), bare + list + steps);
+        let parts = walk.heap_parts("kept rest ");
+        assert!(parts.contains(&("kept rest ecsm".to_string(), list + steps)));
     }
 }

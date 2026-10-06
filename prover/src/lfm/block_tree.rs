@@ -93,7 +93,9 @@ impl BlockTreeSink for StderrSink {
 /// disk where live regeneration can drop, else the spill tier): the harness's
 /// env leaves it unset, and [`posture_line`] names what the memory knobs come
 /// to and why. The allocator's never-purge posture is compiled into the
-/// binary.
+/// binary. `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host
+/// target ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target
+/// up, 16 below it.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "8"),
     (POSTURE_VRAM_KNOB, "24000"),
@@ -104,6 +106,27 @@ pub const POSTURE: &[(&str, &str)] = &[
     ("LFM_TREE_SIBLINGS_L0", "8"),
     ("LFM_TREE_SIBLINGS", "4"),
 ];
+
+/// The precomputed-tree cache's knob, whose posture follows the host target.
+pub const POSTURE_TREE_CACHE_KNOB: &str = "LFM_PRECOMPUTED_TREE_CACHE_CAP";
+
+/// The host target (GiB, [`crate::block::spill_target_bytes`]) from which the
+/// posture keeps [`POSTURE`]'s 64 precomputed-tree cache entries.
+pub const POSTURE_TREE_CACHE_FULL_TARGET_GIB: u64 = 64;
+
+/// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture for a host `target` in bytes:
+/// 64 entries (≈ 100 MiB each, ≈ 6.2 GiB once full) from a
+/// [`POSTURE_TREE_CACHE_FULL_TARGET_GIB`] target up, 16 below it, where the
+/// ≈ 4.7 GiB they free count for more than the hits they lose. A miss only
+/// rebuilds the tree: the cache's key is the root, so nothing a proof commits
+/// to moves.
+pub fn posture_tree_cache_cap(target: u64) -> &'static str {
+    if target >= POSTURE_TREE_CACHE_FULL_TARGET_GIB << 30 {
+        "64"
+    } else {
+        "16"
+    }
+}
 
 /// The posture's VRAM budget: 24000 MB is the 32 GiB card's.
 pub const POSTURE_VRAM_KNOB: &str = "LAMBDA_VM_VRAM_BUDGET_MB";
@@ -120,6 +143,16 @@ pub const POSTURE_VRAM_MIN_GIB: f64 = 31.0;
 pub fn posture_line() -> String {
     let words: Vec<String> = POSTURE
         .iter()
+        .map(|&(name, want)| {
+            if name == POSTURE_TREE_CACHE_KNOB {
+                (
+                    name,
+                    posture_tree_cache_cap(crate::block::spill_target_bytes()),
+                )
+            } else {
+                (name, want)
+            }
+        })
         .map(|(name, want)| match std::env::var(name) {
             Ok(v) if v == *want => format!("{name}={v}"),
             Ok(v) => format!("{name}={v} (≠ posture {want})"),
@@ -285,6 +318,11 @@ pub struct BlockTreeConfig {
     /// under it ([`super::edsl::WrapHash::for_base`]) and the block verifier
     /// must be given the same one ([`super::block_plan::verify_block_tree_for`]).
     pub base: stark::proof::options::BaseFormat,
+    /// `LAMBDA_VM_TREE_PROGRAM_BUDGET`: how many bytes of tree programs may
+    /// exist ahead of their provers ([`super::program_budget`]); `auto` (the
+    /// default) against the spill target, in the pipeline mode without an
+    /// emission window.
+    pub program_budget: super::program_budget::BudgetSetting,
 }
 
 impl BlockTreeConfig {
@@ -306,6 +344,7 @@ impl BlockTreeConfig {
             siblings_l0: super::tree_run::tree_siblings_l0()?,
             siblings: super::tree_run::tree_siblings()?,
             base: stark::proof::options::BaseFormat::RPX,
+            program_budget: super::program_budget::setting_from_env()?,
         })
     }
 }
@@ -434,6 +473,19 @@ fn late_estimate(plan: &BlockTreePlan, first: &LfmProgram, beside: usize) -> usi
         |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
     let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
     (per_perm * (1..beside).map(perms).sum::<usize>() as f64) as usize
+}
+
+/// Every leaf program's estimated bytes, from leaf 0's (`first`) bytes a
+/// permutation of in-guest verification, as [`late_estimate`] sizes the late
+/// wait: what the program budget admits each leaf with before it is emitted.
+fn leaf_estimates(plan: &BlockTreePlan, first: &LfmProgram) -> Vec<u64> {
+    let costs = plan.costs();
+    let perms =
+        |k: usize| -> usize { plan.partition().leaves()[k].iter().map(|&i| costs[i]).sum() };
+    let per_perm = ProgramBytes::of(first).total() as f64 / perms(0).max(1) as f64;
+    (0..plan.partition().num_leaves())
+        .map(|k| (per_perm * perms(k) as f64) as u64)
+        .collect()
 }
 
 /// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
@@ -1189,12 +1241,14 @@ pub(super) fn compose_block_tree_with(
                     if top { " TOP" } else { "" }
                 );
                 let te = Instant::now();
-                let (program, built) = match ahead {
+                // The permit (under a program budget) is bound first, so it is
+                // dropped last: after the program it accounts for.
+                let (_permit, program, built) = match ahead {
                     Some(p) => {
-                        let (program, artifacts) = p.take_node(lv, j, &label)?;
-                        (program, Some(artifacts))
+                        let (program, artifacts, permit) = p.take_node(lv, j, &label)?;
+                        (permit, program, Some(artifacts))
                     }
-                    None => (block_node_program(plan, &kids, top)?, None),
+                    None => (None, block_node_program(plan, &kids, top)?, None),
                 };
                 sink.line(&format!(
                     "   {label}: {} in {:.2}s",
@@ -1241,6 +1295,15 @@ pub(super) fn compose_block_tree_with(
             if top { " (the top)" } else { "" }
         ));
         walls.push(wall);
+        // `LAMBDA_VM_TREE_LEVEL_PURGE`: the level's freed pages back to the OS
+        // before the next level, only where the host is short.
+        if !top {
+            crate::alloc_purge::purge_after_level(
+                lv + 1,
+                crate::block::spill_target_bytes(),
+                &|l: &str| sink.line(l),
+            );
+        }
         level = next;
     }
     if level.len() != 1 {
@@ -1373,6 +1436,17 @@ pub fn prove_block_tree(
     let emit_window = cfg.emit_window;
     let node_emit_early = cfg.node_emit_early;
     let emit_late = cfg.emit_late;
+    // The tree programs' budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`, I-MEMFIT §2):
+    // in the pipeline mode without an emission window, against the spill
+    // target; `off` (or a window, or another mode) keeps every program where
+    // it was.
+    let program_budget = match (cfg.program_budget, emit_window, tree_ahead) {
+        (super::program_budget::BudgetSetting::Off, _, _) | (_, Some(_), _) => None,
+        (setting, None, Some(AheadMode::Pipe)) => Some(super::program_budget::ProgramBudget::new(
+            super::program_budget::Room::of(setting, crate::block::spill_target_bytes()),
+        )),
+        (_, None, _) => None,
+    };
     let base_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shape_tx, shape_rx) = std::sync::mpsc::channel::<BlockShape>();
     // The thread hands its results back on `ready` and, in the pipeline mode,
@@ -1383,6 +1457,7 @@ pub fn prove_block_tree(
     let consts_beside = elf_beside.map(|threads| {
         let (elf, opts, wrap) = (elf_bytes.clone(), inner.clone(), wrap_opts.clone());
         let base_done = base_done.clone();
+        let program_budget = program_budget.clone();
         std::thread::spawn(move || -> Option<Result<super::block_tree_pipeline::BuilderTimes, String>> {
             let t = Instant::now();
             let pool = match rayon::ThreadPoolBuilder::new()
@@ -1488,13 +1563,46 @@ pub fn prove_block_tree(
                                     _ => None,
                                 };
                                 let te = Instant::now();
+                                // Under a program budget, leaf 0 (emitted now if the
+                                // late wait did not) is admitted as the lowest pending
+                                // and sizes every leaf's estimate; the others come in
+                                // beside the base, in leaf order, while the budget has
+                                // room (`try_acquire` never waits, so this pool's
+                                // worker never parks); the builder emits the rest as
+                                // the budget admits them.
+                                let mut permits = Vec::new();
+                                let mut budget_plan = None;
+                                let mut upto = beside;
+                                if let Some(b) = &program_budget {
+                                    if leaves.is_empty() {
+                                        leaves.push(plan.leaf_program(0)?);
+                                    }
+                                    let estimates = leaf_estimates(&plan, &leaves[0]);
+                                    let mut p0 = b.try_acquire(0, estimates[0]).ok_or(
+                                        "the program budget refused leaf 0, the lowest pending",
+                                    )?;
+                                    p0.emitted(ProgramBytes::of(&leaves[0]).total() as u64);
+                                    permits.push(p0);
+                                    upto = 1;
+                                    while upto < beside {
+                                        match b.try_acquire(upto, estimates[upto]) {
+                                            Some(p) => permits.push(p),
+                                            None => break,
+                                        }
+                                        upto += 1;
+                                    }
+                                    budget_plan = Some((b.clone(), estimates));
+                                }
                                 let first = leaves.len();
                                 leaves.extend(
-                                    (first..beside)
+                                    (first..upto)
                                         .into_par_iter()
                                         .map(|k| plan.leaf_program(k))
                                         .collect::<Result<Vec<_>, String>>()?,
                                 );
+                                for (p, permit) in leaves.iter().zip(permits.iter_mut()).skip(1) {
+                                    permit.emitted(ProgramBytes::of(p).total() as u64);
+                                }
                                 if let Some(w) = late {
                                     let mut held = ProgramBytes::default();
                                     for p in &leaves {
@@ -1508,7 +1616,7 @@ pub fn prove_block_tree(
                                          {:.2} = {} × {:.2} estimated) → {:.2} at the end · resident \
                                          {:.2} → {:.2} GiB over the emission (+{:.2}) · programs held \
                                          {:.2} GiB, ≥ oversize {:.1} %",
-                                        beside - 1,
+                                        leaves.len() - 1,
                                         w.waited,
                                         w.trigger,
                                         w.at,
@@ -1527,6 +1635,18 @@ pub fn prove_block_tree(
                                         100.0 * held.large as f64 / held.total().max(1) as f64,
                                     ));
                                 }
+                                if let Some((b, _)) = &budget_plan {
+                                    let line = format!(
+                                        "   TREE PROGRAM BUDGET: {} · {upto} of {n} leaf programs \
+                                         beside the base, the rest emitted by the builder as \
+                                         the budget admits them",
+                                        b.describe()
+                                    );
+                                    late_line = Some(match late_line.take() {
+                                        Some(l) => format!("{l}\n{line}"),
+                                        None => line,
+                                    });
+                                }
                                 let pipe = Arc::new(Pipe::new(n, &plan.levels()));
                                 let emitted = super::block_plan::PhaseTimes {
                                     programs: leaves.len(),
@@ -1534,7 +1654,12 @@ pub fn prove_block_tree(
                                     emit: te.elapsed().as_secs_f64(),
                                     build: 0.0,
                                 };
-                                job = Some((pipe.clone(), plan, leaves));
+                                let mut permits = permits.into_iter();
+                                let leaves = leaves
+                                    .into_iter()
+                                    .map(|p| (p, permits.next()))
+                                    .collect::<Vec<_>>();
+                                job = Some((pipe.clone(), plan, leaves, budget_plan));
                                 (pipe, vec![emitted])
                             }
                         })
@@ -1549,7 +1674,7 @@ pub fn prove_block_tree(
                 _ => None,
             };
             let _ = ready_tx.send((consts, secs, ahead, late_line));
-            let (pipe, plan, leaves) = job?;
+            let (pipe, plan, leaves, budget_plan) = job?;
             go_rx.recv().ok()?;
             Some(pipe.run_builder(
                 &plan,
@@ -1558,6 +1683,12 @@ pub fn prove_block_tree(
                 emit_threads,
                 emit_window.unwrap_or(0),
                 node_emit_early,
+                budget_plan.map(|(budget, leaf_estimates)| {
+                    super::block_tree_pipeline::BudgetPlan {
+                        budget,
+                        leaf_estimates,
+                    }
+                }),
             ))
         })
     });
@@ -1783,12 +1914,14 @@ pub fn prove_block_tree(
         let out = (|| -> Result<HarvestedChild, String> {
             let label = format!("BLOCK L0 leaf {j}");
             let te = Instant::now();
-            let (program, built) = match &pipe {
+            // The permit (under a program budget) is bound first, so it is
+            // dropped last: after the program it accounts for.
+            let (_permit, program, built) = match &pipe {
                 Some(p) => {
-                    let (program, artifacts) = p.take_leaf(j, &label)?;
-                    (program, Some(artifacts))
+                    let (program, artifacts, permit) = p.take_leaf(j, &label)?;
+                    (permit, program, Some(artifacts))
                 }
-                None => (block_leaf_program(&rb, j)?, None),
+                None => (None, block_leaf_program(&rb, j)?, None),
             };
             let arenas = block_leaf_arenas(&rb, &partition, j)?;
             sink.line(&format!(
@@ -1836,6 +1969,9 @@ pub fn prove_block_tree(
         "   BLOCK LEVEL 0: {k} leaves in {level0:.2}s · host peak {l0_peak:.3} GiB{}",
         pct(l0_peak)
     ));
+    crate::alloc_purge::purge_after_level(0, crate::block::spill_target_bytes(), &|l: &str| {
+        sink.line(l)
+    });
 
     // ---- the interior and the top.
     let siblings = cfg.siblings;
@@ -1873,12 +2009,16 @@ pub fn prove_block_tree(
                     "global pool".to_string()
                 },
                 times.build,
-                match emit_window {
-                    Some(w) =>
+                match (emit_window, &times.budget) {
+                    (Some(w), _) =>
                         format!("emitted in a window of {w} (the first {w} beside the base)"),
-                    None => "all emitted beside the base".to_string(),
+                    (None, Some(_)) => "under the program budget (below)".to_string(),
+                    (None, None) => "all emitted beside the base".to_string(),
                 }
             ));
+            if let Some(budget) = &times.budget {
+                sink.line(&format!("   TREE PROGRAM BUDGET end: {budget}"));
+            }
             sink.line(&format!(
                 "   TREE PIPE node emission: {}",
                 if node_emit_early {

@@ -17,20 +17,48 @@
 //! behind; a builder failure fails every waiter. The whole-block driver
 //! ([`super::block_tree`]) runs it, in the harness and in the CLI alike.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::LfmArtifacts;
 use super::block_plan::{BlockTreePlan, TreePrograms};
 use super::compiler::LfmProgram;
 use super::per_table_aggregator::{DerivedChild, Level};
+use super::program_budget::{Permit, ProgramBudget};
+
+/// A program, its artifacts, and its admission under the tree's program
+/// budget (none without one): what a slot holds and a prover takes.
+pub(super) type Taken = (LfmProgram, LfmArtifacts, Option<Permit>);
+
+/// A program as it is emitted: with its admission, under a budget.
+pub(super) type Emitted = (LfmProgram, Option<Permit>);
 
 /// One program and its artifacts, once its builder has put them.
 #[derive(Default)]
 struct Slot {
-    value: Mutex<Option<(LfmProgram, LfmArtifacts)>>,
+    value: Mutex<Option<Taken>>,
     ready: Condvar,
+}
+
+/// Threads of the streaming emitter that emits, under a program budget, the
+/// leaf programs not emitted beside the base. Level 0 takes ≈ 1.2 leaves a
+/// second at p90 and a leaf program takes ≈ 1.8–2.5 s to emit; the window's
+/// chunks of 4 kept level 0 waiting (BIG 662: +40 s), four streaming threads
+/// keep ahead [I].
+const DEFERRED_LEAF_EMITTERS: usize = 4;
+
+/// Fails the budget when dropped armed: an error or a panic in the builder
+/// wakes every emitter parked in an admission before the builder's scope
+/// joins them.
+struct FailOnDrop<'a>(Option<&'a ProgramBudget>);
+
+impl Drop for FailOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.0 {
+            budget.fail();
+        }
+    }
 }
 
 /// Every slot of a block tree: the leaves, then each node level.
@@ -97,6 +125,15 @@ pub(super) struct BuilderTimes {
     /// (leaves and nodes, each holding the card permit).
     pub emit: f64,
     pub build: f64,
+    /// The program budget's summary, with one.
+    pub budget: Option<String>,
+}
+
+/// The tree's program budget and every leaf program's estimated bytes (what
+/// a leaf is admitted with before it is emitted).
+pub(super) struct BudgetPlan {
+    pub budget: Arc<ProgramBudget>,
+    pub leaf_estimates: Vec<u64>,
 }
 
 impl Pipe {
@@ -117,8 +154,8 @@ impl Pipe {
         let slots = |level: Vec<(LfmProgram, LfmArtifacts)>| -> Vec<Slot> {
             level
                 .into_iter()
-                .map(|p| Slot {
-                    value: Mutex::new(Some(p)),
+                .map(|(program, artifacts)| Slot {
+                    value: Mutex::new(Some((program, artifacts, None))),
                     ready: Condvar::new(),
                 })
                 .collect()
@@ -136,12 +173,9 @@ impl Pipe {
         }
     }
 
-    /// Leaf `k`'s program and artifacts, waiting for them.
-    pub(super) fn take_leaf(
-        &self,
-        k: usize,
-        label: &str,
-    ) -> Result<(LfmProgram, LfmArtifacts), String> {
+    /// Leaf `k`'s program and artifacts, waiting for them; its permit is
+    /// claimed (the prover drops it with the program).
+    pub(super) fn take_leaf(&self, k: usize, label: &str) -> Result<Taken, String> {
         let slot = self
             .leaves
             .get(k)
@@ -150,12 +184,7 @@ impl Pipe {
     }
 
     /// Node `j` of node level `lv` (0 = the first above the leaves), waiting.
-    pub(super) fn take_node(
-        &self,
-        lv: usize,
-        j: usize,
-        label: &str,
-    ) -> Result<(LfmProgram, LfmArtifacts), String> {
+    pub(super) fn take_node(&self, lv: usize, j: usize, label: &str) -> Result<Taken, String> {
         let slot = self
             .levels
             .get(lv)
@@ -165,10 +194,13 @@ impl Pipe {
     }
 
     /// A slot's value, waiting for it; an error once the builder has failed.
-    fn take(&self, slot: &Slot, label: &str) -> Result<(LfmProgram, LfmArtifacts), String> {
+    fn take(&self, slot: &Slot, label: &str) -> Result<Taken, String> {
         let mut value = slot.value.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = value.take() {
+                if let Some(permit) = &v.2 {
+                    permit.claim();
+                }
                 return Ok(v);
             }
             if self.failed.load(Ordering::SeqCst) {
@@ -182,8 +214,14 @@ impl Pipe {
         }
     }
 
-    fn put(&self, slot: &Slot, program: LfmProgram, artifacts: LfmArtifacts) {
-        *slot.value.lock().unwrap_or_else(|e| e.into_inner()) = Some((program, artifacts));
+    fn put(
+        &self,
+        slot: &Slot,
+        program: LfmProgram,
+        artifacts: LfmArtifacts,
+        permit: Option<Permit>,
+    ) {
+        *slot.value.lock().unwrap_or_else(|e| e.into_inner()) = Some((program, artifacts, permit));
         slot.ready.notify_all();
     }
 
@@ -209,14 +247,24 @@ impl Pipe {
     /// moment each is emitted moves. At the median block the per-level emission
     /// leaves the card idle 8.9 s between level 0's last hold and level 1's
     /// first (BIG 481).
+    ///
+    /// Under a program budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`,
+    /// [`super::program_budget`]) every program is admitted before it is
+    /// emitted, in prove order: `leaf_programs` are the leaves admitted beside
+    /// the base (each with its permit), the builder emits the rest on
+    /// [`DEFERRED_LEAF_EMITTERS`] streaming threads as the budget admits them,
+    /// and each node program is admitted before its emission. A permit travels
+    /// in the slot and is dropped with its program by the prover.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
-        leaf_programs: Vec<LfmProgram>,
+        leaf_programs: Vec<Emitted>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
         node_emit_early: bool,
+        budget: Option<BudgetPlan>,
     ) -> Result<BuilderTimes, String> {
         let run = std::panic::AssertUnwindSafe(|| {
             self.build(
@@ -226,6 +274,7 @@ impl Pipe {
                 emit_threads,
                 emit_window,
                 node_emit_early,
+                budget,
             )
         });
         let outcome = std::panic::catch_unwind(run);
@@ -238,14 +287,16 @@ impl Pipe {
         outcome.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         plan: &BlockTreePlan,
-        leaf_programs: Vec<LfmProgram>,
+        leaf_programs: Vec<Emitted>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
         node_emit_early: bool,
+        budget: Option<BudgetPlan>,
     ) -> Result<BuilderTimes, String> {
         let start = Instant::now();
         // ⚠ On the global pool, a prover that joins inside its `multi_prove`
@@ -282,14 +333,43 @@ impl Pipe {
         };
         let n = self.leaves.len();
         let given = leaf_programs.len();
-        if given > n || (given < n && emit_window == 0) {
+        if given > n || (given < n && emit_window == 0 && budget.is_none()) {
             return Err(format!(
-                "{given} leaf programs for {n} leaves with an emission window of {emit_window}"
+                "{given} leaf programs for {n} leaves with an emission window of {emit_window} \
+                 and {} program budget",
+                if budget.is_some() { "a" } else { "no" }
             ));
         }
         let levels = plan.levels();
         let pool = emit_pool.as_ref();
-        let emit_leaf = |k: usize| plan.leaf_program(k);
+        // A program's place in prove order: the leaves, then each node level.
+        let mut node_orders = Vec::with_capacity(levels.len());
+        let mut next_order = n;
+        for level in &levels {
+            node_orders.push(next_order);
+            next_order += level.arities.len();
+        }
+        let node_order = |lv: usize, j: usize| node_orders[lv] + j;
+        let held_bytes = |p: &LfmProgram| super::block_tree::ProgramBytes::of(p).total() as u64;
+        // A node program's estimate before it is emitted: the largest node seen,
+        // or twice the largest leaf before the first (5.6–5.8 M instructions
+        // against a leaf's 2.6 M at p90, BIG 662).
+        let node_seen = AtomicU64::new(0);
+        let node_estimate = || {
+            let leaf = budget
+                .as_ref()
+                .and_then(|b| b.leaf_estimates.iter().max().copied())
+                .unwrap_or(0);
+            node_seen.load(Ordering::SeqCst).max(2 * leaf)
+        };
+        let emit_leaf = |k: usize| plan.leaf_program(k).map(|p| (p, None));
+        let emit_leaf_on_pool = |k: usize| -> Result<LfmProgram, String> {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = pool {
+                return pool.install(|| plan.leaf_program(k));
+            }
+            plan.leaf_program(k)
+        };
         let emit_node = |kids: &[DerivedChild], top: bool| -> Result<LfmProgram, String> {
             #[cfg(feature = "parallel")]
             if let Some(pool) = pool {
@@ -297,17 +377,61 @@ impl Pipe {
             }
             plan.node_program(kids, top)
         };
+        // A node's program, admitted first under a budget.
+        let admitted_node =
+            |order: usize, kids: &[DerivedChild], top: bool| -> Result<Emitted, String> {
+                match &budget {
+                    Some(b) => {
+                        let mut permit = b.budget.acquire(order, node_estimate())?;
+                        let program = emit_node(kids, top)?;
+                        let bytes = held_bytes(&program);
+                        node_seen.fetch_max(bytes, Ordering::SeqCst);
+                        permit.emitted(bytes);
+                        Ok((program, Some(permit)))
+                    }
+                    None => Ok((emit_node(kids, top)?, None)),
+                }
+            };
+        let leaf_channel = if budget.is_some() { n } else { emit_window };
         let (leaf_tx, leaf_rx) =
-            std::sync::mpsc::sync_channel::<Result<LfmProgram, String>>(emit_window.max(1));
+            std::sync::mpsc::sync_channel::<Result<Emitted, String>>(leaf_channel.max(1));
         let (job_tx, job_rx) = std::sync::mpsc::channel::<(usize, usize, Vec<DerivedChild>)>();
-        let (done_tx, done_rx) =
-            std::sync::mpsc::channel::<(usize, usize, Result<LfmProgram, String>, f64)>();
+        type Done = (usize, usize, Result<Emitted, String>, f64);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
         let job_rx = Mutex::new(job_rx);
         let (leaves_at, level_at, emit) = std::thread::scope(|scope| {
+            // An error or a panic below fails the budget before this scope
+            // joins its threads, so no emitter stays parked in an admission;
+            // disarmed once every slot is put.
+            let mut fail_budget = FailOnDrop(budget.as_ref().map(|b| &*b.budget));
             if given < n {
-                let emit_leaf = &emit_leaf;
-                scope
-                    .spawn(move || emit_in_order(given..n, emit_window, pool, emit_leaf, &leaf_tx));
+                match &budget {
+                    Some(b) => {
+                        let (b, emit_leaf_on_pool, held_bytes) =
+                            (b, &emit_leaf_on_pool, &held_bytes);
+                        scope.spawn(move || {
+                            let emit = |k: usize| -> Result<Emitted, String> {
+                                let estimate = b.leaf_estimates.get(k).copied().unwrap_or(0);
+                                let mut permit = b.budget.acquire(k, estimate)?;
+                                let program = emit_leaf_on_pool(k)?;
+                                permit.emitted(held_bytes(&program));
+                                Ok((program, Some(permit)))
+                            };
+                            super::program_budget::emit_ordered(
+                                given..n,
+                                DEFERRED_LEAF_EMITTERS,
+                                &emit,
+                                &mut |_, program| leaf_tx.send(program).is_ok(),
+                            );
+                        });
+                    }
+                    None => {
+                        let emit_leaf = &emit_leaf;
+                        scope.spawn(move || {
+                            emit_in_order(given..n, emit_window, pool, emit_leaf, &leaf_tx)
+                        });
+                    }
+                }
             } else {
                 drop(leaf_tx);
             }
@@ -315,8 +439,13 @@ impl Pipe {
             // emits its node on the builder's pool.
             if node_emit_early {
                 for _ in 0..emit_threads.max(1) {
-                    let (job_rx, done_tx, emit_node, levels) =
-                        (&job_rx, done_tx.clone(), &emit_node, &levels);
+                    let (job_rx, done_tx, admitted_node, levels, node_order) = (
+                        &job_rx,
+                        done_tx.clone(),
+                        &admitted_node,
+                        &levels,
+                        &node_order,
+                    );
                     scope.spawn(move || {
                         loop {
                             let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
@@ -324,7 +453,8 @@ impl Pipe {
                                 return;
                             };
                             let t = Instant::now();
-                            let program = emit_node(&kids, lv + 1 == levels.len());
+                            let program =
+                                admitted_node(node_order(lv, j), &kids, lv + 1 == levels.len());
                             let secs = t.elapsed().as_secs_f64();
                             if done_tx.send((lv, j, program, secs)).is_err() {
                                 return;
@@ -342,7 +472,7 @@ impl Pipe {
                 .iter()
                 .map(|l| Grouper::new(l.arities.clone()))
                 .collect();
-            let mut ready: Vec<Vec<Option<Result<LfmProgram, String>>>> = levels
+            let mut ready: Vec<Vec<Option<Result<Emitted, String>>>> = levels
                 .iter()
                 .map(|l| (0..l.arities.len()).map(|_| None).collect())
                 .collect();
@@ -350,14 +480,14 @@ impl Pipe {
             let mut given = leaf_programs.into_iter();
             let mut children = Vec::with_capacity(n);
             for k in 0..n {
-                let program = match given.next() {
+                let (program, permit) = match given.next() {
                     Some(program) => program,
                     None => leaf_rx
                         .recv()
                         .map_err(|_| format!("leaf {k}: the leaf emitter stopped early"))??,
                 };
                 let (artifacts, derived) = built(&program)?;
-                self.put(&self.leaves[k], program, artifacts);
+                self.put(&self.leaves[k], program, artifacts, permit);
                 if node_emit_early {
                     submit(&mut groupers, &job_tx, 0, derived)?;
                 } else {
@@ -369,7 +499,7 @@ impl Pipe {
             for (lv, arities) in levels.iter().enumerate() {
                 let top = lv + 1 == levels.len();
                 let nodes = arities.arities.len();
-                let mut programs: Vec<Option<LfmProgram>> = (0..nodes).map(|_| None).collect();
+                let mut programs: Vec<Option<Emitted>> = (0..nodes).map(|_| None).collect();
                 if node_emit_early {
                     if !groupers[lv].is_complete() {
                         return Err(format!(
@@ -395,6 +525,19 @@ impl Pipe {
                             lv + 1
                         ));
                     }
+                    // Under a budget, the level's nodes are admitted in order
+                    // here, on the builder's own thread, before they are
+                    // emitted together (never parked inside the pool).
+                    let mut permits: Vec<Option<Permit>> = match &budget {
+                        Some(b) => (0..nodes)
+                            .map(|j| {
+                                b.budget
+                                    .acquire(node_order(lv, j), node_estimate())
+                                    .map(Some)
+                            })
+                            .collect::<Result<_, String>>()?,
+                        None => (0..nodes).map(|_| None).collect(),
+                    };
                     let t = Instant::now();
                     #[cfg(feature = "parallel")]
                     let emitted: Vec<LfmProgram> = {
@@ -416,7 +559,19 @@ impl Pipe {
                         .map(|kids| plan.node_program(kids, top))
                         .collect::<Result<_, String>>()?;
                     emit += t.elapsed().as_secs_f64();
-                    programs = emitted.into_iter().map(Some).collect();
+                    programs = emitted
+                        .into_iter()
+                        .zip(permits.iter_mut())
+                        .map(|(program, permit)| {
+                            let mut permit = permit.take();
+                            if let Some(p) = permit.as_mut() {
+                                let bytes = held_bytes(&program);
+                                node_seen.fetch_max(bytes, Ordering::SeqCst);
+                                p.emitted(bytes);
+                            }
+                            Some((program, permit))
+                        })
+                        .collect();
                 }
                 for j in 0..nodes {
                     let program = match programs[j].take() {
@@ -434,8 +589,9 @@ impl Pipe {
                             })??
                         }
                     };
+                    let (program, permit) = program;
                     let (artifacts, derived) = built(&program)?;
-                    self.put(&self.levels[lv][j], program, artifacts);
+                    self.put(&self.levels[lv][j], program, artifacts, permit);
                     if node_emit_early && !top {
                         submit(&mut groupers, &job_tx, lv + 1, derived)?;
                     } else {
@@ -445,6 +601,7 @@ impl Pipe {
                 level_at.push(start.elapsed().as_secs_f64());
             }
             drop(job_tx);
+            fail_budget.0 = None;
             Ok::<_, String>((leaves_at, level_at, emit))
         })?;
         Ok(BuilderTimes {
@@ -452,6 +609,7 @@ impl Pipe {
             levels: level_at,
             emit,
             build: build_secs,
+            budget: budget.map(|b| b.budget.summary()),
         })
     }
 }
