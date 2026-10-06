@@ -5441,7 +5441,7 @@ fn build_traces<I: ImageSource + Sync>(
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
         // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
         // must match that last write to balance the memory argument.
-        let final_pc = halt_timestamp + 4 * num_padding_rows as u64 + 1;
+        let final_pc = clock::final_pc_timestamp(halt_timestamp, num_padding_rows);
         clock::check_clock(final_pc, "the CPU's last padding row")?;
         register_state.write_pc(1, final_pc);
         (halt_timestamp, halt_next_pc)
