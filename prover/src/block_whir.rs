@@ -540,6 +540,36 @@ fn spill_reserve_bytes(cells: u64) -> u64 {
     (cells as f64 / 1e9 * PER_G) as u64 + (6 << 30)
 }
 
+/// The share of `auto`'s target ([`spill_target_bytes`]) past which the block's
+/// memory is short for the allocator's purge ([`crate::alloc_purge`]): 85 %, a
+/// share so it follows the host's RAM.
+const PRESSURE_SHARE: (u64, u64) = (17, 20);
+
+/// Notes memory pressure for [`crate::alloc_purge`] once the host's bytes
+/// ([`HostReading::bytes`]) pass [`PRESSURE_SHARE`] of `target`, and says
+/// whether they did.
+///
+/// ★ THE ONE WAY #1014'S PURGE DIFFERS FROM #1013'S. The module, its knob
+/// (`LAMBDA_VM_ALLOC_PURGE`, `auto` by default) and its points are #1013's;
+/// #1013 notes the pressure when its spill's queue budgets arm, and #1014's
+/// spill has no budgets, so it reads the host where the spill decides (each
+/// committed table) and once more at phase A's end. A block whose host stays
+/// under the share (the median: at most 86.6 GiB against 94.1 on BIG) never
+/// purges.
+fn note_pressure_past(host: u64, target: u64) -> bool {
+    let short = memory_short(host, target);
+    if short {
+        crate::alloc_purge::note_memory_pressure();
+    }
+    short
+}
+
+/// Whether `host` bytes are past [`PRESSURE_SHARE`] of `target`.
+fn memory_short(host: u64, target: u64) -> bool {
+    let (num, den) = PRESSURE_SHARE;
+    host > target / den * num
+}
+
 /// The policy's choice for one committed table of `bytes` packed bytes:
 /// `kept` the committed packed bytes kept so far, `cells` the main cells
 /// committed so far (this table's included), `host` the host's bytes
@@ -2952,6 +2982,8 @@ fn prove_streamed(
         TraceForm::Wide
     };
     gpack::reset_counts();
+    // A new block: no memory pressure seen yet (`alloc_purge`).
+    crate::alloc_purge::clear_memory_pressure();
     let stream_airs = StreamAirs::new(opts, stream_form);
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
@@ -2995,16 +3027,20 @@ fn prove_streamed(
             match stark::spill::SpillStore::open(store_options) {
                 Ok(store) => {
                     let host_most = std::sync::Arc::clone(&host_most);
+                    // The host is read at each decision, whatever the policy:
+                    // `auto` decides on it and the purge's pressure is noted
+                    // from it (`note_pressure_past`).
                     let wanted: std::sync::Arc<multilinear_block::SpillWanted> =
                         std::sync::Arc::new(move |kept, cells, bytes| {
-                            spill_wanted(policy, target, kept, cells, bytes, || {
-                                let reading = HostReading::now();
+                            let reading = HostReading::now();
+                            {
                                 let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
                                 if most.is_none_or(|m| reading.bytes() > m.bytes()) {
                                     *most = Some(reading);
                                 }
-                                reading.bytes()
-                            })
+                            }
+                            note_pressure_past(reading.bytes(), target);
+                            spill_wanted(policy, target, kept, cells, bytes, || reading.bytes())
                         });
                     Some(multilinear_block::BlockSpill::new(store, queue, wanted))
                 }
@@ -3435,6 +3471,11 @@ fn prove_streamed(
         if let Some(ledger) = ledger {
             ledger.line("phase A end");
         }
+        // Phase A's freed pages back to the OS before phase B allocates: when
+        // the block's memory is short (`note_pressure_past`, read once more
+        // here), or as `LAMBDA_VM_ALLOC_PURGE` names it.
+        note_pressure_past(HostReading::now().bytes(), target);
+        crate::alloc_purge::purge_point("phase-a");
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
@@ -3980,8 +4021,8 @@ pub(crate) fn verify_block_whir_with(
 #[cfg(test)]
 mod spill_policy_tests {
     use super::{
-        BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, parse_spill_policy,
-        spill_reserve_bytes, spill_target_from, spill_wanted,
+        BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, memory_short,
+        parse_spill_policy, spill_reserve_bytes, spill_target_from, spill_wanted,
     };
 
     const GIB: u64 = 1 << 30;
@@ -4175,5 +4216,26 @@ mod spill_policy_tests {
         assert!(!spill_wanted(auto, target, 0, cells, GIB, || 86 * GIB));
         assert!(spill_wanted(auto, target, 0, cells, GIB, || 87 * GIB));
         assert!(!spill_wanted(auto, u64::MAX, 0, cells, GIB, || u64::MAX));
+    }
+
+    /// The purge's memory pressure on #1014: the host past 85 % of `auto`'s
+    /// target, a share of whatever host it runs on. On BIG (target 110.69 GiB,
+    /// share 94.09) the median's highest reading (BIG 653, 86.64 GiB) is not
+    /// short and p90's and full gas's (BIG 660, 120.05 and 105.55) are; on a
+    /// 64 GiB host (target 54) the share is 45.9; with no limit known, never.
+    #[test]
+    fn memory_is_short_past_85_percent_of_the_target() {
+        let big = 129_584_070_656 - 10 * GIB;
+        let share = big / 20 * 17;
+        assert!(!memory_short(share, big));
+        assert!(memory_short(share + 1, big));
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        assert!(!memory_short(gib(86.64), big), "the median never purges");
+        assert!(memory_short(gib(120.05), big), "p90 purges");
+        assert!(memory_short(gib(105.55), big), "full gas purges");
+        let small = spill_target_from(None, Some(64 * GIB));
+        assert!(!memory_short(gib(45.8), small));
+        assert!(memory_short(gib(46.0), small));
+        assert!(!memory_short(1024 * GIB, u64::MAX));
     }
 }

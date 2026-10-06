@@ -1375,6 +1375,10 @@ pub fn prove_whir_block_tree(
     });
     let (proof, stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     let base = t0.elapsed().as_secs_f64();
+    // The base's freed pages back to the OS before the tree allocates: when
+    // the block found its memory short, or as `LAMBDA_VM_ALLOC_PURGE` names it
+    // (`alloc_purge`).
+    crate::alloc_purge::purge_point("base");
     let (plan, programs, stated_at, ready_at, early) = pre
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;

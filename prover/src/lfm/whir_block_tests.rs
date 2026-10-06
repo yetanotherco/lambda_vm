@@ -1992,6 +1992,10 @@ fn the_whir_block_tree_on_a_real_block() {
         proof.table_num_vars.len()
     );
 
+    // The tree's freed pages back to the OS before the verifiers, as
+    // `LAMBDA_VM_ALLOC_PURGE` names it (`tree` is not an `auto` point).
+    crate::alloc_purge::purge_point("tree");
+
     // Off the clock: the harness's checks, the permit disarmed first. The
     // verifier derives the tree's programs and artifacts as rayon jobs
     // (`WhirBlockPlan::programs`), which must not take an armed card from a
