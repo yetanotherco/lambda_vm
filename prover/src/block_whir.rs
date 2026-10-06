@@ -620,22 +620,29 @@ fn memory_short(host: u64, target: u64) -> bool {
 /// 298.4 M and full gas (660 D) 18.06 over 602.9 M, both under it.
 const FINISH_GROWTH_PER_CYCLE: f64 = 30.08 * (1u64 << 30) as f64 / 612.3e6;
 
-/// What a block hands back to its spill at the walk's end
-/// ([`multilinear_block::BlockSpill::hand_off`]), decided once there: the
-/// forecast of phase A's peak, `hwm` (the resident high-water so far) plus
-/// [`FINISH_GROWTH_PER_CYCLE`] for each of the `cycles` walked, past
-/// [`PRESSURE_SHARE`] of `target`; 0 when the forecast fits under it. The
-/// finish is still ahead, so the parked tables leave before its hump builds,
-/// and the hump reuses their pages.
-fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
-    let (num, den) = PRESSURE_SHARE;
-    let forecast = hwm.saturating_add((FINISH_GROWTH_PER_CYCLE * cycles as f64) as u64);
-    forecast.saturating_sub(target / den * num)
+/// Phase A's peak as forecast at the walk's end: `hwm`, the resident
+/// high-water so far, plus [`FINISH_GROWTH_PER_CYCLE`] for each of the
+/// `cycles` walked.
+fn finish_forecast(hwm: u64, cycles: u64) -> u64 {
+    hwm.saturating_add((FINISH_GROWTH_PER_CYCLE * cycles as f64) as u64)
 }
 
-/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the hand-off at the
-/// walk's end ([`hand_off_need`]); `off` never hands off (the parked tables
-/// stay on the host, as `auto` kept them). Anything else is `auto`.
+/// ★ THE SWITCH, decided once at the walk's end: whether the block goes to the
+/// store for the rest of phase A ([`multilinear_block::BlockSpill::switch_to_store`]:
+/// every parked table, and every table past the first groups from then on).
+/// It is on when the forecast ([`finish_forecast`]) passes [`PRESSURE_SHARE`]
+/// of `target`. A switch, not an amount: handing back only the excess left
+/// p90 at 105.4 GiB (BIG 669), since each GiB handed off lowered phase A's
+/// peak by 0.55 GiB, and the committer had parked what `auto` would have
+/// spilled; spilling everything from the walk's end is 660's S arm, 82 GiB.
+fn switch_to_store_at_walk_end(hwm: u64, cycles: u64, target: u64) -> bool {
+    memory_short(finish_forecast(hwm, cycles), target)
+}
+
+/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the switch at the
+/// walk's end ([`switch_to_store_at_walk_end`]); `off` never switches (the
+/// parked tables stay on the host, as `auto` kept them). Anything else is
+/// `auto`.
 fn hand_off_from_env() -> bool {
     parse_hand_off(std::env::var("LAMBDA_VM_BLOCK_HAND_OFF").ok().as_deref())
 }
@@ -1827,9 +1834,9 @@ pub(crate) struct Deviations {
     /// ([`BlockCommitted::fault_lose_spilled_slot`]), so its columns never
     /// come back.
     pub spilled_slot_lost: bool,
-    /// At the walk's end, every parked table handed to the store, whatever the
-    /// forecast ([`hand_off_need`]).
-    pub hand_off_all: bool,
+    /// At the walk's end, the block switched to the store whatever the
+    /// forecast ([`switch_to_store_at_walk_end`]).
+    pub hand_off_force: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -3293,36 +3300,33 @@ fn prove_streamed(
                     ledger.parts("builder", builder.heap_parts());
                 }
                 // The walk is done and the block's size known: when the
-                // finish's forecast passes the pressure share, the parked
-                // tables go to the store now, before its hump builds.
+                // finish's forecast passes the pressure share, the block
+                // switches to the store now, before the finish's hump builds.
                 if let Some(spill) = walk_spill.as_ref().filter(|_| {
-                    deviations.hand_off_all || hand_off_from_env()
+                    deviations.hand_off_force || hand_off_from_env()
                 }) {
                     let hwm = HostReading::now().hwm;
                     let cycles = (window_stamps.windows as u64).saturating_mul(window as u64);
-                    let need = if deviations.hand_off_all {
-                        u64::MAX
-                    } else {
-                        hand_off_need(hwm, cycles, target)
-                    };
-                    if need > 0 {
+                    if deviations.hand_off_force
+                        || switch_to_store_at_walk_end(hwm, cycles, target)
+                    {
                         crate::alloc_purge::note_memory_pressure();
-                        let started = spill.hand_off(need, ledger.map(|l| l.block.clone()));
+                        let started = spill.switch_to_store(ledger.map(|l| l.block.clone()));
                         let g = |b: u64| b as f64 / (1u64 << 30) as f64;
                         eprintln!(
-                            "BLOCK HAND-OFF: at the walk's end ({windows_done:.2} s), VmHWM {:.2} GiB + \
-                             {:.2} for {:.1} M cycles walked is past {:.2} GiB ({}/{} of the target) by {} · \
-                             parked tables to the store, oldest first: {}",
+                            "BLOCK HAND-OFF: at the walk's end ({windows_done:.2} s), the forecast VmHWM \
+                             {:.2} GiB + {:.2} for {:.1} M cycles walked is past {:.2} GiB ({}/{} of the \
+                             target){} · every parked table, and every one from now on, to the store: {}",
                             g(hwm),
                             FINISH_GROWTH_PER_CYCLE * cycles as f64 / (1u64 << 30) as f64,
                             cycles as f64 / 1e6,
                             g(target / PRESSURE_SHARE.1 * PRESSURE_SHARE.0),
                             PRESSURE_SHARE.0,
                             PRESSURE_SHARE.1,
-                            if need == u64::MAX {
-                                "everything (a test's deviation)".to_string()
+                            if deviations.hand_off_force {
+                                " (forced: a test's deviation)"
                             } else {
-                                format!("{:.2} GiB", g(need))
+                                ""
                             },
                             if started { "started" } else { "not started" },
                         );
@@ -3719,15 +3723,13 @@ fn prove_streamed(
             };
             let hand_off = match spill.hand_off_report() {
                 Some(r) => format!(
-                    " · hand-off at the walk's end: {} tables {:.2} GiB of {} in {:.2} s",
+                    " · hand-off at the walk's end: {} tables {:.2} GiB ({} parked after the switch) in \
+                     {:.2} s, {} left on the host",
                     r.tables,
                     g(r.handed),
-                    if r.asked == u64::MAX {
-                        "every parked one".to_string()
-                    } else {
-                        format!("{:.2} GiB asked", g(r.asked))
-                    },
-                    r.secs
+                    r.after,
+                    r.secs,
+                    r.left
                 ),
                 None => String::new(),
             };
@@ -4189,9 +4191,9 @@ pub(crate) fn verify_block_whir_with(
 #[cfg(test)]
 mod spill_policy_tests {
     use super::{
-        BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, hand_off_need, memory_short,
+        BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, finish_forecast, memory_short,
         parse_hand_off, parse_spill_policy, parse_tree_drop, spill_reserve_bytes,
-        spill_target_from, spill_wanted,
+        spill_target_from, spill_wanted, switch_to_store_at_walk_end,
     };
 
     const GIB: u64 = 1 << 30;
@@ -4408,40 +4410,50 @@ mod spill_policy_tests {
         assert!(!memory_short(1024 * GIB, u64::MAX));
     }
 
-    /// The hand-off at the walk's end, against the rows its coefficient comes
+    /// The switch at the walk's end, against the rows its coefficient comes
     /// from (I-WFULL §4.1; BIG, target 110.69 GiB, line 94.09): p90 (660 D,
-    /// VmHWM 85.19 at the walk's end, 584 windows of 2^20 cycles) hands back
-    /// ≈ 21.2 GiB, which its forecast puts at the line; full gas (86.81, 575)
-    /// ≈ 22.3; the median (653: 66.74, 285), p90 with nothing kept (660 S:
-    /// 48.57) and 1× hand back nothing; with no limit known, never. On a
-    /// 64 GiB host (target 54, line 45.9) a 40 GiB median walk does.
+    /// VmHWM 85.19 at the walk's end, 584 windows of 2^20 cycles; 669, 90.48)
+    /// and full gas (86.81, 575) switch; the median (653: 66.74, 285), p90 with
+    /// nothing kept (660 S: 48.57) and 1× do not; with no limit known, never.
+    /// On a 64 GiB host (target 54, line 45.9) a 40 GiB median walk does.
     #[test]
-    fn the_hand_off_forecast_reads_660s_rows() {
+    fn the_switch_at_the_walk_reads_660s_rows() {
         let big = 129_584_070_656 - 10 * GIB;
         let gib = |g: f64| (g * GIB as f64) as u64;
-        let as_gib = |b: u64| b as f64 / GIB as f64;
         let windows = |n: u64| n << 20;
-        let p90 = as_gib(hand_off_need(gib(85.19), windows(584), big));
-        assert!((20.7..21.7).contains(&p90), "p90 hands back {p90:.2} GiB");
-        let full = as_gib(hand_off_need(gib(86.81), windows(575), big));
+        let p90 = finish_forecast(gib(85.19), windows(584)) as f64 / GIB as f64;
+        assert!((115.0..115.6).contains(&p90), "p90's forecast {p90:.2} GiB");
         assert!(
-            (21.8..22.8).contains(&full),
-            "full gas hands back {full:.2} GiB"
+            switch_to_store_at_walk_end(gib(85.19), windows(584), big),
+            "p90 (660)"
         );
-        assert_eq!(
-            hand_off_need(gib(66.74), windows(285), big),
-            0,
+        assert!(
+            switch_to_store_at_walk_end(gib(90.48), windows(584), big),
+            "p90 (669)"
+        );
+        assert!(
+            switch_to_store_at_walk_end(gib(86.81), windows(575), big),
+            "full gas"
+        );
+        assert!(
+            !switch_to_store_at_walk_end(gib(66.74), windows(285), big),
             "the median"
         );
-        assert_eq!(
-            hand_off_need(gib(48.57), windows(584), big),
-            0,
+        assert!(
+            !switch_to_store_at_walk_end(gib(48.57), windows(584), big),
             "p90, nothing kept"
         );
-        assert_eq!(hand_off_need(gib(30.0), windows(30), big), 0, "1×");
-        assert_eq!(hand_off_need(gib(85.19), windows(584), u64::MAX), 0);
+        assert!(
+            !switch_to_store_at_walk_end(gib(30.0), windows(30), big),
+            "1×"
+        );
+        assert!(!switch_to_store_at_walk_end(
+            gib(85.19),
+            windows(584),
+            u64::MAX
+        ));
         let small = spill_target_from(None, Some(64 * GIB));
-        assert!(hand_off_need(gib(40.0), windows(285), small) > 0);
+        assert!(switch_to_store_at_walk_end(gib(40.0), windows(285), small));
     }
 
     /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: unset is 8 on the card and 4 on the

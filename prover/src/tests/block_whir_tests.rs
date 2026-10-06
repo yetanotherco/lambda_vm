@@ -824,19 +824,19 @@ fn a_spilled_table_that_does_not_come_back_is_refused() {
     );
 }
 
-/// ★ Parked tables handed to the store at the walk's end move no byte: with a
+/// ★ A block switched to the store at the walk's end moves no byte: with a
 /// budget the block fits in, every table past the first two groups is parked
-/// on the host; the hand-off (here every parked one, whatever the forecast)
-/// moves them to the store before the finish, phase B reads each back once,
-/// and the proof verifies with the same partition, its bytes equal to the
-/// held run's under the deterministic grind.
+/// on the host; switched (here whatever the forecast), every parked table and
+/// every one after goes to the store, none stays on the host, phase B reads
+/// each back once, and the proof verifies with the same partition, its bytes
+/// equal to the held run's under the deterministic grind.
 #[test]
 fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
 
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
-    let proved = |spill: BlockSpillPolicy, hand_off_all: bool| {
+    let proved = |spill: BlockSpillPolicy, hand_off_force: bool| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
         o.spill = spill;
         let (proof, stamps) = prove_block_whir_with(
@@ -846,14 +846,14 @@ fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
             &format,
             &o,
             &Deviations {
-                hand_off_all,
+                hand_off_force,
                 ..Deviations::default()
             },
         )
         .expect("prove");
         assert!(
             verify(&proof, &elf, &format),
-            "{spill:?} hand-off {hand_off_all}"
+            "{spill:?} hand-off {hand_off_force}"
         );
         (proof, stamps)
     };
@@ -877,7 +877,23 @@ fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
         "each slot read back once: {stats}"
     );
     let line = stamps.spill.expect("the spill's line");
-    assert!(line.contains("hand-off at the walk's end"), "{line}");
+    // Switched at the walk's end, before any group was installed: every table
+    // past the first groups was parked after the switch and moved, none left.
+    let after = format!("({} parked after the switch)", stats.slots);
+    assert!(
+        line.contains("hand-off at the walk's end") && line.contains(&after),
+        "{line}"
+    );
+    assert!(line.contains(", 0 left on the host"), "{line}");
+    // With `always`, which wants every table out, the committer still leaves
+    // the store to the hand-off once switched: every slot is the hand-off's.
+    let (_, always) = proved(BlockSpillPolicy::Always, true);
+    let slots = always.spill_stats.expect("the store's counters").slots;
+    let line = always.spill.expect("the spill's line");
+    assert!(
+        slots > 0 && line.contains(&format!("({slots} parked after the switch)")),
+        "{line}"
+    );
     assert_eq!(held.groups, parked.groups, "the partition");
     assert_eq!(held.groups, handed.groups, "the partition");
     if crypto::grinding::deterministic() {
@@ -906,7 +922,7 @@ fn a_handed_off_table_that_does_not_come_back_is_refused() {
         &format,
         &o,
         &Deviations {
-            hand_off_all: true,
+            hand_off_force: true,
             spilled_slot_lost: true,
             ..Deviations::default()
         },

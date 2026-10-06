@@ -298,10 +298,10 @@ pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
 /// group's packed tables as the group is installed: past the first
 /// [`SPILL_RESIDENT_GROUPS`] groups, a table the policy wants out and the
 /// store's writer queue has room for goes to `store`, so the committer never
-/// waits on the writers; any other is parked, and one hand-off
-/// ([`Self::hand_off`]) may move parked tables to `store` later in phase A.
-/// Phase B reads them back in group order, ahead of their upload, and lets
-/// each group's go after its opening.
+/// waits on the writers; any other is parked. Once switched to the store
+/// ([`Self::switch_to_store`]), every parked table and every one past them
+/// goes to `store` for the rest of phase A. Phase B reads them back in group
+/// order, ahead of their upload, and lets each group's go after its opening.
 #[derive(Clone)]
 pub struct BlockSpill {
     pub store: Arc<SpillStore>,
@@ -316,22 +316,23 @@ pub struct BlockSpill {
     /// The read-back's report ([`Prefetch::report`]), once phase B has run.
     pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
     /// Every table parked past the first [`SPILL_RESIDENT_GROUPS`] groups, in
-    /// the order it was parked: group order. `parked_more` wakes a hand-off
+    /// the order it was parked: group order. `parked_more` wakes the hand-off
     /// waiting for the next one, or for phase A's end (`closed`).
     parked: Arc<std::sync::Mutex<Vec<Arc<Parked>>>>,
     parked_more: Arc<std::sync::Condvar>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    /// The hand-off ([`Self::hand_off`]): its thread while it runs, then its
-    /// report.
+    /// The hand-off ([`Self::switch_to_store`]): its thread while it runs,
+    /// then its report.
     hand_off: Arc<std::sync::Mutex<HandOff>>,
-    /// Set while a hand-off runs: the committer parks what it would spill, so
-    /// the store keeps one producer and the committer never waits on it.
-    handing: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once switched to the store: from then on the committer parks every
+    /// table past the first groups and the hand-off moves each to the store,
+    /// so the store keeps one producer and the committer never waits on it.
+    switched: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// A committed table's packed columns parked by the spill: held here until a
-/// hand-off ([`BlockSpill::hand_off`]) moves them to the store, and read back
-/// from whichever holds them before the group's upload (`restore_group`).
+/// A committed table's packed columns parked by the spill: held here until the
+/// hand-off ([`BlockSpill::switch_to_store`]) moves them to the store, and read
+/// back from whichever holds them before the group's upload (`restore_group`).
 struct Parked {
     len: u64,
     state: std::sync::Mutex<ParkedState>,
@@ -381,13 +382,16 @@ struct HandOff {
     closed: bool,
 }
 
-/// What a hand-off did: the bytes it was asked for and handed, the tables, its
-/// seconds.
+/// What the hand-off did once the block switched to the store: the bytes and
+/// tables it moved, how many of those were parked after the switch, the
+/// parked tables still on the host at phase A's end (none unless the store
+/// failed), and its seconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct HandOffReport {
-    pub asked: u64,
     pub handed: u64,
     pub tables: usize,
+    pub after: usize,
+    pub left: usize,
     pub secs: f64,
 }
 
@@ -404,48 +408,65 @@ impl BlockSpill {
             parked_more: Arc::new(std::sync::Condvar::new()),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hand_off: Arc::new(std::sync::Mutex::new(HandOff::default())),
-            handing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            switched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Hands the parked tables to the store, oldest first, until `need` bytes
-    /// have gone or phase A ends, through the store's own hand-off
-    /// ([`SpillStore::spill`]): the tables parked by then, and those parked
-    /// after, as they come (while it runs the committer parks what it would
-    /// have spilled). It runs on a thread of its own, so the caller does not
-    /// wait on the writers, and phase A's end joins it. Once only, and never
-    /// after phase A's end: `false` then (or when the thread cannot start).
-    pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
+    /// Parks `packed`, a table's columns, on the host, after every table
+    /// parked before it.
+    fn park(&self, packed: multilinear::narrow::NarrowColumns) -> Arc<Parked> {
+        let len = packed.data().len() as u64;
+        let parked = Arc::new(Parked {
+            len,
+            state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+        });
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&parked));
+        self.parked_more.notify_all();
+        parked
+    }
+
+    /// Switches the block to the store for the rest of phase A: every parked
+    /// table goes to the store, oldest first, and so does every table parked
+    /// after, as the committer parks it, until phase A ends. A switch, not an
+    /// amount: whoever decides it (the forecast at the walk's end) only says
+    /// when. The moves go through the store's own hand-off
+    /// ([`SpillStore::spill`]) on a thread of their own, so neither the caller
+    /// nor the committer waits on the writers, and phase A's end joins it.
+    /// Once only, and never after phase A's end: `false` then (or when the
+    /// thread cannot start).
+    pub fn switch_to_store(&self, mem: Option<Arc<BlockMem>>) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
         let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
         if hand_off.closed || hand_off.thread.is_some() || hand_off.report.is_some() {
             return false;
         }
-        let (parked, parked_more, closed, store, handing) = (
+        let (parked, parked_more, closed, store) = (
             Arc::clone(&self.parked),
             Arc::clone(&self.parked_more),
             Arc::clone(&self.closed),
             Arc::clone(&self.store),
-            Arc::clone(&self.handing),
         );
-        handing.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The tables parked by the switch: the ones past them were parked after.
+        let before = parked.lock().unwrap_or_else(|e| e.into_inner()).len();
+        self.switched.store(true, SeqCst);
         let thread = std::thread::Builder::new()
             .name("block-hand-off".to_string())
             .spawn(move || {
                 let started = Instant::now();
-                let mut report = HandOffReport {
-                    asked: need,
-                    ..HandOffReport::default()
-                };
+                let mut report = HandOffReport::default();
                 let mut next = 0usize;
-                while report.handed < need {
-                    // The next parked table, waiting for one while phase A runs.
+                loop {
+                    // The next parked table, waiting for one until phase A ends.
                     let slot = {
                         let mut list = parked.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(slot) = list.get(next) {
                                 break Some(Arc::clone(slot));
                             }
-                            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                            if closed.load(SeqCst) {
                                 break None;
                             }
                             list = parked_more
@@ -457,6 +478,7 @@ impl BlockSpill {
                     let Some(slot) = slot else {
                         break;
                     };
+                    let index = next;
                     next += 1;
                     let taken = std::mem::replace(
                         &mut *slot.state.lock().unwrap_or_else(|e| e.into_inner()),
@@ -471,7 +493,7 @@ impl BlockSpill {
                     };
                     // A shape the store refuses stays `Lost`: phase B refuses it.
                     let Some(main) = to_store(packed) else {
-                        break;
+                        continue;
                     };
                     let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
                     match store.spill(main) {
@@ -479,12 +501,14 @@ impl BlockSpill {
                             *state = ParkedState::Spilled(handle);
                             report.handed += slot.len;
                             report.tables += 1;
+                            report.after += usize::from(index >= before);
                             if let Some(mem) = &mem {
                                 mem.held_narrow.fetch_sub(slot.len as usize, Relaxed);
                                 mem.spilled.fetch_add(slot.len as usize, Relaxed);
                             }
                         }
-                        // The store failed: what is left stays parked.
+                        // The store failed: this table and the rest stay
+                        // parked, on the host.
                         Err(main) => {
                             if let Some(packed) = from_store(main) {
                                 *state = ParkedState::Resident(packed);
@@ -493,7 +517,17 @@ impl BlockSpill {
                         }
                     }
                 }
-                handing.store(false, std::sync::atomic::Ordering::SeqCst);
+                report.left = parked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|slot| {
+                        matches!(
+                            *slot.state.lock().unwrap_or_else(|e| e.into_inner()),
+                            ParkedState::Resident(_)
+                        )
+                    })
+                    .count();
                 report.secs = started.elapsed().as_secs_f64();
                 report
             });
@@ -503,8 +537,7 @@ impl BlockSpill {
                 true
             }
             Err(_) => {
-                self.handing
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                self.switched.store(false, SeqCst);
                 false
             }
         }
@@ -569,9 +602,10 @@ fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
 /// Considers group `g`'s narrow tables for the spill, `first` being the
 /// first's index; where each table taken out of its group went goes in `out`.
 /// The first [`SPILL_RESIDENT_GROUPS`] groups keep theirs in place. Past them,
-/// a table the policy wants out, while no hand-off runs, and that the store's
-/// writer queue has room for goes to `store`; any other is parked
-/// ([`Parked`]): on the host until a hand-off moves it. Every table counts
+/// before the block switched to the store, a table the policy wants out and
+/// the store's writer queue has room for goes to `store`; any other is parked
+/// ([`Parked`]): on the host, unless the switch comes, which then moves it.
+/// After the switch every one is parked for the hand-off to move. Every table counts
 /// toward the cells committed, and every one not spilled toward the bytes
 /// kept.
 fn spill_group<F, E>(
@@ -603,8 +637,10 @@ where
             reason: "its packed parts did not move to the store and back",
         };
         let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
-        let spill_now = (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
-            && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
+        // Once switched to the store the hand-off moves every parked table:
+        // the committer parks this one for it rather than calling the store.
+        let spill_now = !spill.switched.load(std::sync::atomic::Ordering::SeqCst)
+            && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
             && spill.has_room(len as u64);
         let packed = if spill_now {
             match spill.store.spill(to_store(packed).ok_or_else(failed)?) {
@@ -621,17 +657,7 @@ where
         } else {
             packed
         };
-        let parked = Arc::new(Parked {
-            len: len as u64,
-            state: std::sync::Mutex::new(ParkedState::Resident(packed)),
-        });
-        spill
-            .parked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Arc::clone(&parked));
-        spill.parked_more.notify_all();
-        *slot = Some(Out::Parked(parked));
+        *slot = Some(Out::Parked(spill.park(packed)));
         spill.kept.fetch_add(len as u64, Relaxed);
     }
     Ok(())
@@ -2393,8 +2419,78 @@ where
 
 #[cfg(test)]
 mod spill_tests {
-    use super::{commit_pairs_off_pool_from, from_store, to_store};
+    use super::{BlockSpill, ParkedState, commit_pairs_off_pool_from, from_store, to_store};
     use multilinear::narrow::NarrowColumns;
+    use std::sync::Arc;
+
+    fn columns(seed: u64) -> NarrowColumns {
+        let words: Vec<u64> = (0..3 * 4096u64)
+            .map(|i| (i ^ seed) * 0x9e37_79b9 % 70_000)
+            .collect();
+        NarrowColumns::pack_row_major(&words, 3).expect("packs")
+    }
+
+    fn resident(spill: &BlockSpill) -> Vec<bool> {
+        spill
+            .parked
+            .lock()
+            .expect("the parked list")
+            .iter()
+            .map(|slot| {
+                matches!(
+                    *slot.state.lock().expect("a slot"),
+                    ParkedState::Resident(_)
+                )
+            })
+            .collect()
+    }
+
+    fn spill_for_test() -> BlockSpill {
+        let store = crate::spill::SpillStore::open(crate::spill::SpillOptions::default())
+            .expect("a spill store in the temp dir");
+        BlockSpill::new(store, 2 << 30, Arc::new(|_, _, _| false))
+    }
+
+    /// ★ The switch moves every parked table to the store, oldest first, and
+    /// every table parked after it, as the committer parks it (at p90 the
+    /// groups installed during the hand-off, 120–126 on BIG 669): at phase A's
+    /// end none is left on the host, and each comes back from the store with
+    /// its bytes.
+    #[test]
+    fn the_switch_moves_every_parked_table_and_every_later_one_to_the_store() {
+        let spill = spill_for_test();
+        let first = spill.park(columns(1));
+        let second = spill.park(columns(2));
+        assert!(spill.switch_to_store(None), "the switch starts");
+        assert!(!spill.switch_to_store(None), "once only");
+        let later = spill.park(columns(3));
+        spill.close_hand_off();
+        let report = spill.hand_off_report().expect("the hand-off's report");
+        assert_eq!(
+            (report.tables, report.after, report.left),
+            (3, 1, 0),
+            "{report:?}"
+        );
+        assert_eq!(resident(&spill), vec![false, false, false]);
+        for (slot, seed) in [(first, 1), (second, 2), (later, 3)] {
+            let handle = slot.handle().expect("in the store");
+            let back = from_store(handle.into_narrow().expect("reads back")).expect("converts");
+            assert_eq!(back.data(), columns(seed).data(), "table {seed}");
+        }
+        assert!(!spill.switch_to_store(None), "never after phase A's end");
+    }
+
+    /// Without the switch the parked tables stay on the host and there is no
+    /// hand-off.
+    #[test]
+    fn without_the_switch_the_parked_tables_stay_on_the_host() {
+        let spill = spill_for_test();
+        spill.park(columns(1));
+        spill.park(columns(2));
+        spill.close_hand_off();
+        assert_eq!(spill.hand_off_report(), None);
+        assert_eq!(resident(&spill), vec![true, true]);
+    }
 
     /// The packed columns move to the store's payload and back without a
     /// copy: the same bytes at the same address.
