@@ -1943,12 +1943,14 @@ pub fn staging_totals() -> StagingTotals {
 }
 
 /// How a preprocessed commit brings its precomputed tree's node buffer to the
-/// host on a tree-cache miss. `staged`: through a staging pair
-/// ([`dtoh_staged_uncounted`]) straight into the host tree's node vector, with
-/// the multiplicity tree queued behind the last chunk. Unset, `legacy` or
-/// `pageable`: one pageable copy into a zeroed byte vector, converted to nodes
-/// at the end of the commit — the path before the knob existed. The nodes are
-/// the same bytes either way; only the transfer differs.
+/// host on a tree-cache miss. Unset or `staged` (the default): through a
+/// staging pair ([`dtoh_staged_uncounted`]) straight into the host tree's node
+/// vector, with the multiplicity tree queued behind the last chunk. `legacy`
+/// or `pageable` (the opt-out): one pageable copy into a zeroed byte vector,
+/// converted to nodes at the end of the commit — the path before the knob
+/// existed. The nodes are the same bytes either way; only the transfer
+/// differs. #1013's median 25475471 recursion took 2.9 s (ULTRA) and 6.3 s
+/// (RYZEN) less staged (I-COPIES §6, §8).
 pub const TREE_DOWNLOAD_ENV: &str = "LAMBDA_VM_TREE_DOWNLOAD";
 
 thread_local! {
@@ -1976,16 +1978,16 @@ pub fn tree_download_staged() -> bool {
 }
 
 /// [`TREE_DOWNLOAD_ENV`]'s value read: whether it selects the staged download,
-/// and how the value was taken. An unknown value keeps the pageable path and
-/// says so, rather than failing a prove over a typo.
+/// and how the value was taken. An unknown value keeps the default (staged)
+/// and says so, rather than failing a prove over a typo.
 fn tree_download_setting(value: Option<&str>) -> (bool, String) {
     match value.map(str::trim) {
-        None => (false, format!("{TREE_DOWNLOAD_ENV} unset")),
+        None => (true, format!("{TREE_DOWNLOAD_ENV} unset, the default")),
         Some("staged") => (true, format!("{TREE_DOWNLOAD_ENV}=staged")),
         Some(v @ ("legacy" | "pageable")) => (false, format!("{TREE_DOWNLOAD_ENV}={v}")),
         Some(v) => (
-            false,
-            format!("{TREE_DOWNLOAD_ENV}={v:?} is not staged, legacy or pageable"),
+            true,
+            format!("{TREE_DOWNLOAD_ENV}={v:?} is not staged, legacy or pageable: the default"),
         ),
     }
 }
@@ -2066,18 +2068,22 @@ pub fn tree_download_totals() -> TreeDownloadTotals {
 mod tree_download_tests {
     use super::{TreeDownloadTotals, tree_download_setting};
 
-    /// Only `staged` selects the staged download; unset, `legacy`, `pageable`
-    /// and anything else keep the pageable path, and the reason names the value.
+    /// The staged download is the default: unset, `staged` and anything
+    /// unknown select it; only `legacy` and `pageable` opt out, and the reason
+    /// names the value.
     #[test]
-    fn only_staged_selects_the_staged_download() {
-        assert!(!tree_download_setting(None).0);
+    fn staged_is_the_default_and_only_legacy_or_pageable_opt_out() {
+        let (on, why) = tree_download_setting(None);
+        assert!(on, "unset must select the staged download");
+        assert!(why.contains("the default"), "{why}");
         assert!(tree_download_setting(Some("staged")).0);
         assert!(tree_download_setting(Some(" staged ")).0);
         assert!(!tree_download_setting(Some("legacy")).0);
+        assert!(!tree_download_setting(Some(" legacy ")).0);
         assert!(!tree_download_setting(Some("pageable")).0);
-        let (on, why) = tree_download_setting(Some("stagde"));
-        assert!(!on);
-        assert!(why.contains("\"stagde\""), "{why}");
+        let (on, why) = tree_download_setting(Some("legcay"));
+        assert!(on, "an unknown value keeps the default");
+        assert!(why.contains("\"legcay\""), "{why}");
     }
 
     #[test]

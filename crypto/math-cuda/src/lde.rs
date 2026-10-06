@@ -1808,9 +1808,9 @@ impl PrecomputedHost {
 /// host, then run `then` — the multiplicity tree's build — on the same stream.
 /// [`crate::device::tree_download_staged`] picks the transfer:
 ///
-/// - pageable (the default): one pageable copy into a zeroed byte vector, the
-///   buffer freed, then `then`;
-/// - staged: through a staging pair straight into the node vector, the buffer
+/// - pageable (the `legacy` opt-out): one pageable copy into a zeroed byte
+///   vector, the buffer freed, then `then`;
+/// - staged (the default): through a staging pair straight into the node vector, the buffer
 ///   freed and `then` queued as soon as the last chunk's DMA is, so the
 ///   multiplicity tree hashes while the host copies the last chunks. Both
 ///   frees are stream-ordered behind the reads, so one tree is the device peak
