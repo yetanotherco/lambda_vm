@@ -1287,7 +1287,8 @@ pub(crate) fn run_live(
                             let packed = match built {
                                 Ok(Some(packed)) => packed,
                                 Ok(None) => {
-                                    let why = format!("{table:?}[{index}]: the columns did not pack");
+                                    let why =
+                                        format!("{table:?}[{index}]: the columns did not pack");
                                     guard.slot.fail(&why);
                                     guard.settled = true;
                                     failures.lock().unwrap_or_else(|e| e.into_inner()).push(why);

@@ -2603,10 +2603,9 @@ fn lay_out_chunk<'a>(
         ops
     });
     let mut chunk = job.generate_as(airs.form);
-    if let (Some(recorder), Some(packed)) = (
-        recorder.filter(|r| r.digests()),
-        chunk.trace.narrow_main(),
-    ) {
+    if let (Some(recorder), Some(packed)) =
+        (recorder.filter(|r| r.digests()), chunk.trace.narrow_main())
+    {
         recorder.packed(chunk.table, chunk.index, packed);
     }
     let rows = ledger.map_or(0, |ledger| {
@@ -3473,7 +3472,11 @@ fn prove_streamed(
             let store_options = stark::spill::SpillOptions::default();
             let queue = store_options.queue_bytes;
             match stark::spill::SpillStore::open(store_options) {
-                Ok(store) => Some(multilinear_block::BlockSpill::new(Some(store), queue, wanted)),
+                Ok(store) => Some(multilinear_block::BlockSpill::new(
+                    Some(store),
+                    queue,
+                    wanted,
+                )),
                 Err(e) if live_regen.is_some() => {
                     stamps.spill = Some(format!(
                         "{policy_name} · no store ({e}); live regeneration decides with none"

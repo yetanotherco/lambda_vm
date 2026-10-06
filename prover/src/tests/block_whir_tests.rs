@@ -1402,9 +1402,14 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
             .to_vec()
     };
     let in_order = proved(None, BlockSpillPolicy::Off).expect("prove");
-    assert!(in_order.groups.len() > 3, "{} groups", in_order.groups.len());
+    assert!(
+        in_order.groups.len() > 3,
+        "{} groups",
+        in_order.groups.len()
+    );
     let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
-    let odd_first: fn(usize) -> Vec<usize> = |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
+    let odd_first: fn(usize) -> Vec<usize> =
+        |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
     for (what, order, spill) in [
         ("reversed", reversed, BlockSpillPolicy::Off),
         ("odd first", odd_first, BlockSpillPolicy::Off),
@@ -1469,16 +1474,36 @@ fn live_regeneration_proves_the_same_bytes() {
             .expect("serialize")
             .to_vec()
     };
-    let (plain, plain_stamps) =
-        regenerated(&elf, &format, RegenMode::Off, BlockSpillPolicy::Off, Deviations::default())
-            .expect("prove");
+    let (plain, plain_stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
     assert!(plain_stamps.regen.is_none());
     let streamed = plain_stamps.streamed.1;
     assert!(streamed > 0);
     for (what, mode, policy, target) in [
-        ("always, no disk", RegenMode::Always, BlockSpillPolicy::Off, None),
-        ("always, the rest spilled", RegenMode::Always, BlockSpillPolicy::Always, None),
-        ("auto armed, no disk", RegenMode::Auto, BlockSpillPolicy::Off, Some(0)),
+        (
+            "always, no disk",
+            RegenMode::Always,
+            BlockSpillPolicy::Off,
+            None,
+        ),
+        (
+            "always, the rest spilled",
+            RegenMode::Always,
+            BlockSpillPolicy::Always,
+            None,
+        ),
+        (
+            "auto armed, no disk",
+            RegenMode::Auto,
+            BlockSpillPolicy::Off,
+            Some(0),
+        ),
     ] {
         let (proof, stamps) = regenerated(
             &elf,
@@ -1501,7 +1526,10 @@ fn live_regeneration_proves_the_same_bytes() {
         if policy == BlockSpillPolicy::Off {
             assert!(stamps.spill_stats.is_none(), "{what}: a store opened");
             assert!(
-                stamps.spill.as_deref().is_some_and(|l| l.contains("no store")),
+                stamps
+                    .spill
+                    .as_deref()
+                    .is_some_and(|l| l.contains("no store")),
                 "{what}: {:?}",
                 stamps.spill
             );
@@ -1526,7 +1554,10 @@ fn live_regeneration_proves_the_same_bytes() {
     let r = stamps.regen.expect("live regeneration's readout");
     let lines = r.lines.join("\n");
     assert_eq!(r.dropped, 0, "{lines}");
-    assert!(lines.contains("never armed") && !lines.contains("BLOCK REGEN live:"), "{lines}");
+    assert!(
+        lines.contains("never armed") && !lines.contains("BLOCK REGEN live:"),
+        "{lines}"
+    );
     assert!(lines.contains("0 of"), "{lines}");
     if crypto::grinding::deterministic() {
         assert_eq!(bytes(&proof), bytes(&plain), "auto unarmed: the proof");
@@ -1547,7 +1578,8 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
-    let cases: [(&str, LiveFaults, Option<fn(usize) -> Vec<usize>>, &str); 6] = [
+    type Order = Option<fn(usize) -> Vec<usize>>;
+    let cases: [(&str, LiveFaults, Order, &str); 6] = [
         (
             "a bent deposit",
             LiveFaults {
@@ -1604,7 +1636,6 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
     for (what, faults, order, why) in cases {
         let (tx, rx) = std::sync::mpsc::channel();
         let elf = elf.clone();
-        let format = format.clone();
         std::thread::spawn(move || {
             let out = regenerated(
                 &elf,

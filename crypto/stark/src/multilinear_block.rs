@@ -695,15 +695,18 @@ impl BlockRegen {
             .spawn(move || {
                 for job in rx {
                     let rank = job.parked.rank;
-                    let mem = inner_in.lock().unwrap_or_else(|e| e.into_inner()).mem.clone();
-                    let dropped = rank
-                        .and_then(|rank| drop_parked(&window_in, &job.parked, rank, mem.as_deref()));
+                    let mem = inner_in
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mem
+                        .clone();
+                    let dropped = rank.and_then(|rank| {
+                        drop_parked(&window_in, &job.parked, rank, mem.as_deref())
+                    });
                     let mut state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
                     match (dropped, rank) {
                         (Some(slot), Some(rank)) => {
-                            state
-                                .dropped
-                                .push((rank, slot, job.parked.len, job.back))
+                            state.dropped.push((rank, slot, job.parked.len, job.back))
                         }
                         _ => state.refused_late += 1,
                     }
@@ -2210,15 +2213,7 @@ where
 {
     let order: Vec<usize> = (0..committed.sizes.len()).collect();
     block_prove_in_order::<F, E, T, H>(
-        committed,
-        config,
-        transcript,
-        prepared,
-        deviations,
-        fork_of,
-        argue,
-        on_group,
-        &order,
+        committed, config, transcript, prepared, deviations, fork_of, argue, on_group, &order,
     )
 }
 
@@ -2235,11 +2230,11 @@ pub fn rebuilt_last(rebuilt: &[bool]) -> Vec<usize> {
 
 /// A group's tables, mutably, and another group's (`next`), each a contiguous
 /// run of `tables` that does not meet the other.
-fn group_and_next<'s, X>(
-    tables: &'s mut [X],
+fn group_and_next<X>(
+    tables: &mut [X],
     (at, size): (usize, usize),
     next: Option<(usize, usize)>,
-) -> (&'s mut [X], Option<&'s [X]>) {
+) -> (&mut [X], Option<&[X]>) {
     match next {
         None => (&mut tables[at..at + size], None),
         Some((first, len)) if first >= at + size => {
@@ -2295,7 +2290,11 @@ where
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
-    if order.len() != n || !order.iter().all(|&g| g < n && !std::mem::replace(&mut seen[g], true)) {
+    if order.len() != n
+        || !order
+            .iter()
+            .all(|&g| g < n && !std::mem::replace(&mut seen[g], true))
+    {
         return Err(MlError::QueryCountMismatch {
             expected: n,
             got: order.len(),
@@ -2366,8 +2365,8 @@ where
         if spill.is_some() {
             // This group's columns and the next's, back before their uploads
             // (the next one's goes up beside this group's argue).
-            for (first, len) in std::iter::once((at, size))
-                .chain(next_g.map(|next| (starts[next], sizes[next])))
+            for (first, len) in
+                std::iter::once((at, size)).chain(next_g.map(|next| (starts[next], sizes[next])))
             {
                 restore_group(
                     first,
@@ -2946,7 +2945,10 @@ mod spill_tests {
         let (group, next) = super::group_and_next(&mut tables, (6, 4), Some((0, 2)));
         assert_eq!((&*group, next), (&[6, 7, 8, 9][..], Some(&[0, 1][..])));
         let (group, next) = super::group_and_next(&mut tables, (0, 5), Some((5, 5)));
-        assert_eq!((&*group, next), (&[0, 1, 2, 3, 4][..], Some(&[5, 6, 7, 8, 9][..])));
+        assert_eq!(
+            (&*group, next),
+            (&[0, 1, 2, 3, 4][..], Some(&[5, 6, 7, 8, 9][..]))
+        );
         let (group, next) = super::group_and_next(&mut tables, (3, 1), None);
         assert_eq!((&*group, next), (&[3][..], None));
     }
