@@ -321,8 +321,10 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
     use stark::proof::options::BaseFormat;
     let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
     let base = GoldilocksCubicProofOptions::with_params(4, 128, 12).expect("options");
-    let rpx_opts = crate::zf_format::ZfFormat::DEFAULT.options(base.clone());
-    let opts = crate::zf_format::ZfFormat::P1.options(base);
+    // The base tables' formats (`base_options`: the base hash rides there; the
+    // LFM format, `options`, keeps RPX).
+    let rpx_opts = crate::zf_format::ZfFormat::DEFAULT.base_options(base.clone());
+    let opts = crate::zf_format::ZfFormat::P1.base_options(base);
     assert_eq!(opts.format.base, BaseFormat::P1);
     crate::hash_pin::warm_base_statics(&opts);
     crypto::grinding::reset_gpu_grind_calls();

@@ -577,6 +577,27 @@ mod tests {
 
     /// ★ With no knob set the process proves the MEASURED
     /// configuration.
+    /// The base rides on the base tables' format only: `ZfFormat::P1`'s base
+    /// options name Poseidon1, its LFM options keep RPX, and DEFAULT is RPX.
+    #[test]
+    fn the_base_rides_on_the_base_tables_format_only() {
+        use stark::proof::options::BaseFormat;
+        assert_eq!(ZfFormat::DEFAULT.base, BaseFormat::RPX);
+        assert_eq!(ZfFormat::LEGACY.base, BaseFormat::RPX);
+        assert_eq!(ZfFormat::P1.base_proof_format().base, BaseFormat::P1);
+        assert_eq!(ZfFormat::P1.proof_format().base, BaseFormat::RPX);
+        assert_eq!(ZfFormat::DEFAULT.base_proof_format().base, BaseFormat::RPX);
+        assert_eq!(
+            ZfFormat {
+                base: BaseFormat::RPX,
+                ..ZfFormat::P1
+            },
+            ZfFormat::DEFAULT
+        );
+        assert!(ZfFormat::P1.banner().ends_with(" base=Poseidon1/c4"));
+        assert!(!ZfFormat::DEFAULT.banner().contains("base="));
+    }
+
     #[test]
     fn nothing_set_is_the_measured_default() {
         let f = parse(&[]).unwrap();
