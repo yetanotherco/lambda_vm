@@ -313,6 +313,7 @@ dependencies = [
  "stark",
  "tempfile",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
 ]
 
@@ -865,6 +866,7 @@ dependencies = [
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tiny-keccak",
 ]

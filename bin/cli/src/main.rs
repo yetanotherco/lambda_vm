@@ -61,9 +61,53 @@ const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 pub static malloc_conf: Option<&'static core::ffi::c_char> =
     Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
 
-/// This binary's jemalloc: the never-purge posture it runs, read back for the
-/// `BLOCK POSTURE SET` line and its test.
+/// This binary's jemalloc, as the prover asks it (`prover::alloc_purge`): its
+/// statistics, and a purge of every arena's dirty pages. Installed at the top
+/// of `main`, so the block's purge points (`LAMBDA_VM_ALLOC_PURGE`, `auto` by
+/// default) run here as they do in the prover's own tests. It also reads back
+/// the never-purge posture it runs for the `BLOCK POSTURE SET` line and its
+/// test.
 mod allocator {
+    use prover::alloc_purge::{AllocStats, AllocatorHooks};
+
+    pub const HOOKS: AllocatorHooks = AllocatorHooks { stats, purge_all };
+
+    /// jemalloc's statistics, the epoch turned first (they are cached until
+    /// it turns).
+    fn stats() -> Option<AllocStats> {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::advance().ok()?;
+        Some(AllocStats {
+            allocated: stats::allocated::read().ok()?,
+            active: stats::active::read().ok()?,
+            resident: stats::resident::read().ok()?,
+            mapped: stats::mapped::read().ok()?,
+            retained: stats::retained::read().ok()?,
+        })
+    }
+
+    /// `arena.<MALLCTL_ARENAS_ALL>.purge` (4096, jemalloc's "every arena"
+    /// index): a control that neither reads nor writes, so every pointer is
+    /// null.
+    fn purge_all() -> bool {
+        // SAFETY: the name is NUL-terminated, and a control that takes no
+        // value is called with null old and new pointers and zero lengths, as
+        // jemalloc's `NEITHER_READ_NOR_WRITE` requires.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arena.4096.purge".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            eprintln!("ALLOC PURGE: arena.4096.purge returned {rc}");
+        }
+        rc == 0
+    }
+
     /// The running `opt.dirty_decay_ms` and `opt.muzzy_decay_ms`: `-1` is the
     /// never-purge posture this binary compiles in.
     pub fn decay_ms() -> Option<(isize, isize)> {
@@ -356,6 +400,7 @@ enum Commands {
 
 fn main() -> ExitCode {
     env_logger::init();
+    prover::alloc_purge::install(allocator::HOOKS);
     let cli = Cli::parse();
     // Still single-threaded here: clap and env_logger spawn nothing.
     if matches!(
@@ -1651,6 +1696,31 @@ mod tests {
             return;
         }
         assert_eq!(allocator::decay_ms(), Some((-1, -1)));
+    }
+
+    /// The hooks the binary installs reach its jemalloc: the prover reads the
+    /// statistics through them, and the purge hands back the pages 512 freed
+    /// buffers of 1 MiB left behind (under the never-purge posture they stay
+    /// resident until then).
+    #[test]
+    fn the_installed_hooks_read_and_purge_this_binarys_jemalloc() {
+        prover::alloc_purge::install(allocator::HOOKS);
+        let resident = || {
+            prover::alloc_purge::stats()
+                .expect("the prover reads the installed hooks")
+                .resident
+        };
+        let buffers: Vec<Vec<u8>> = (0..512).map(|_| vec![1u8; 1 << 20]).collect();
+        drop(buffers);
+        let retained = resident();
+        assert!((allocator::HOOKS.purge_all)(), "the purge runs");
+        let purged = resident();
+        assert!(
+            retained >= purged + (256 << 20),
+            "resident {} → {} MiB: the purge returned less than half of 512 MiB freed",
+            retained >> 20,
+            purged >> 20
+        );
     }
 
     #[test]
