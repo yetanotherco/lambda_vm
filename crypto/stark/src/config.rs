@@ -127,7 +127,7 @@ where
 /// compile time, so a variant added here without one is a build error naming
 /// the gap, and the bridge cannot cross-pair two hashes. A twin whose kernels
 /// are not yet ported is legal: its dispatch arms abort loudly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommitmentHash {
     /// Keccak-256 at both the leaf and the parent layer.
     Keccak256,
