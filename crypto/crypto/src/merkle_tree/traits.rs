@@ -29,6 +29,29 @@ pub trait IsMerkleTreeBackend {
     /// This function takes to children nodes and builds a new parent node.
     /// It will be used in the construction of the Merkle tree.
     fn hash_new_parent(child_1: &Self::Node, child_2: &Self::Node) -> Self::Node;
+
+    /// Children per inner node: 2, or 4 for a backend that overrides
+    /// [`Self::hash_four`] and [`Self::padding_node`]. A tree's layout, its
+    /// paths and its caps all follow this constant (`MerkleTree`'s arity-4
+    /// docs), so it is a FORMAT constant of the backend.
+    const ARITY: usize = 2;
+
+    /// An arity-4 parent over its four children in order. Called only when
+    /// [`Self::ARITY`] is 4; a binary backend's default is the two binary
+    /// levels over them, so it is defined everywhere.
+    fn hash_four(children: &[Self::Node; 4]) -> Self::Node {
+        Self::hash_new_parent(
+            &Self::hash_new_parent(&children[0], &children[1]),
+            &Self::hash_new_parent(&children[2], &children[3]),
+        )
+    }
+
+    /// The digest an arity-4 level is padded with up to a multiple of four
+    /// children (ZisK's rule: zero). `None` for a backend with none (every
+    /// binary backend): an arity-4 build, path or cap over it is refused.
+    fn padding_node() -> Option<Self::Node> {
+        None
+    }
 }
 
 /// A leaf backend that can hash a leaf without being handed one.
