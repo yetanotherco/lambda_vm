@@ -1436,3 +1436,124 @@ fn push_openings4(
         }
     }
 }
+
+// =============================================================================
+// A chain's rows by chip — what a Poseidon1 leaf's partition bounds
+// =============================================================================
+
+/// Rows one leaf part spends in the chips whose padded heights a Poseidon1
+/// leaf's partition bounds ([`super::whir_block::leaf_partition_rows`]): the
+/// socket (`Hash16`), `Select`, the base ALU and the hinted words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChipRows {
+    pub hash: usize,
+    pub select: usize,
+    pub balu: usize,
+    pub hint: usize,
+}
+
+impl ChipRows {
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            hash: self.hash + other.hash,
+            select: self.select + other.select,
+            balu: self.balu + other.balu,
+            hint: self.hint + other.hint,
+        }
+    }
+
+    pub fn scale(self, n: usize) -> Self {
+        Self {
+            hash: self.hash * n,
+            select: self.select * n,
+            balu: self.balu * n,
+            hint: self.hint * n,
+        }
+    }
+
+    /// The rows by chip of a compiled program.
+    pub fn of(program: &super::compiler::LfmProgram) -> Self {
+        use super::instr::Instr;
+        let mut rows = Self::default();
+        for instr in &program.instrs {
+            match instr {
+                Instr::Hash { .. } | Instr::Hash16(_) => rows.hash += 1,
+                Instr::Select { .. } => rows.select += 1,
+                Instr::BaseAlu { .. } => rows.balu += 1,
+                Instr::Hint { .. } => rows.hint += 1,
+                _ => {}
+            }
+        }
+        rows
+    }
+}
+
+/// ★ One chain's `Select` and base-ALU rows, measured by emitting it once under
+/// `hash` (cached per shape): exact by construction, whatever the fold's form,
+/// the walk's or the grind's — a closed form here would be a second
+/// derivation to drift. Its socket rows and words are not taken from here:
+/// they depend on the transcript the chain enters with and on the arena the
+/// leaf lays out, which the plan counts itself.
+///
+/// The emission is a chain over a hinted point with the `eq` weight; a stacked
+/// opening's weight (`whir_stacked::emit_weight_at`) is extension arithmetic,
+/// so it spends neither chip (`whir_p1_census_tests` holds a group's rows to
+/// the sum of its chains').
+pub fn chain_select_balu(shape: &ChainShape, hash: super::edsl::WrapHash) -> ChipRows {
+    type Cache = Vec<(ChainShape, super::edsl::WrapHash, ChipRows)>;
+    static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Vec::new());
+    if let Ok(cache) = CACHE.lock()
+        && let Some((_, _, rows)) = cache.iter().find(|(s, h, _)| s == shape && *h == hash)
+    {
+        return *rows;
+    }
+    let program = chain_program_under(shape, hash);
+    let all = ChipRows::of(&program);
+    let rows = ChipRows {
+        hash: 0,
+        select: all.select,
+        balu: all.balu,
+        hint: 0,
+    };
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.push((shape.clone(), hash, rows));
+    }
+    rows
+}
+
+/// One chain's verify as a standalone program under `hash`: `z`, `y`, the root
+/// and the final value hinted, then the rounds' wires, then
+/// [`emit_verify_weighted`] with the `eq` weight.
+pub fn chain_program_under(
+    shape: &ChainShape,
+    hash: super::edsl::WrapHash,
+) -> super::compiler::LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(hash);
+    let prefix = (shape.num_vars + 3) as u32;
+    let arena = b.declare_arena(prefix + RoundStorage::words(shape));
+    let mut transcript = WhirTranscript::for_builder(&mut b);
+    let z: Vec<Ext> = (0..shape.num_vars)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let y = b.hint_word(arena, shape.num_vars as u32).as_ext();
+    let root = b.hint_word(arena, shape.num_vars as u32 + 1);
+    let root_lanes = b.unpack(root);
+    let final_value = b.hint_word(arena, shape.num_vars as u32 + 2).as_ext();
+    let storage = RoundStorage::hint(&mut b, arena, prefix, shape);
+    let (current, next) = storage.openings();
+    let wires = storage.wires(&current, &next);
+    let domain = Domain::<GoldilocksField>::new(shape.domain_log[0])
+        .expect("a chain's first domain is a valid domain");
+    emit_verify_weighted(
+        &mut b,
+        &mut transcript,
+        &wires,
+        &root_lanes,
+        final_value,
+        y,
+        shape,
+        &domain,
+        |b, alphas| emit_eq_eval(b, &z, alphas),
+    );
+    super::compiler::compile(b.finish())
+}
