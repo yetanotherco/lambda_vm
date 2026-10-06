@@ -77,6 +77,54 @@ pub const LEAF_PERMS_CAP: usize = 279_000;
 ///   chunks fill by load, so no count of them overfills one leaf.
 pub const PARTITION_COST_MODEL: u32 = 2;
 
+/// The partition's cost model under a Poseidon1 base (P3a), versioned apart
+/// from [`PARTITION_COST_MODEL`] so the RPX model, its partitions and every
+/// RPX id stay where they are. The same rule and closed form, under the
+/// Poseidon1 wrap hash (rate-12 leaves, 4-ary paths and caps, in width-16
+/// socket rows), with its own fork constant ([`P1_FORK_PERMS`]) and cap
+/// ([`P1_LEAF_PERMS_CAP`]).
+///
+/// - v1: the P3a census.
+pub const P1_PARTITION_COST_MODEL: u32 = 0x5031_0001;
+
+/// [`FORK_PERMS`] under a Poseidon1 base, in socket rows: the fork's
+/// transcript (ZisK's sponge, twelve felts a permutation) per instance on top
+/// of its legs' closed form. The grinding check is two emulated width-8
+/// permutations, ALU rows, so it adds no socket row.
+pub const P1_FORK_PERMS: usize = 230;
+
+/// [`LEAF_PERMS_CAP`] under a Poseidon1 base: the same `LFM_HASH` table
+/// height, filled with socket rows (the socket is as wide as RPX's chip).
+pub const P1_LEAF_PERMS_CAP: usize = LEAF_PERMS_CAP;
+
+/// One partition cost model: its version, the per-instance fork constant and
+/// the leaf-load cap, in the base's hash rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CostModel {
+    pub id: u32,
+    pub fork_perms: usize,
+    pub leaf_cap: usize,
+}
+
+impl CostModel {
+    /// The model a plan over a base proof committed under `base` partitions
+    /// with: today's for RPX, [`P1_PARTITION_COST_MODEL`]'s for Poseidon1.
+    pub fn for_base(base: &stark::proof::options::BaseFormat) -> Self {
+        match crate::hash_pin::base_of_hash(base.hash) {
+            crate::hash_pin::BaseHash::Rpx => Self {
+                id: PARTITION_COST_MODEL,
+                fork_perms: FORK_PERMS,
+                leaf_cap: LEAF_PERMS_CAP,
+            },
+            crate::hash_pin::BaseHash::P1 => Self {
+                id: P1_PARTITION_COST_MODEL,
+                fork_perms: P1_FORK_PERMS,
+                leaf_cap: P1_LEAF_PERMS_CAP,
+            },
+        }
+    }
+}
+
 /// The leaf that subtracts the COMMIT-bus target.
 const CARRIER: usize = 0;
 
@@ -180,6 +228,9 @@ pub struct BlockTreePlan {
     /// caller that verifies the base over the very set (the harness's harvest).
     #[cfg_attr(not(test), allow(dead_code))]
     airs: crate::VmAirs,
+    /// The base proof's format (`opts.format.base`): the leaves' wrap hash
+    /// ([`super::edsl::WrapHash::for_base`]) and the partition's cost model.
+    base: stark::proof::options::BaseFormat,
 }
 
 impl BlockTreePlan {
@@ -214,6 +265,10 @@ impl BlockTreePlan {
         {
             return Err("ELF constants of another ELF or other options".to_string());
         }
+        // The base hash is the caller's format, refused when the block path
+        // has no configuration for it.
+        crate::hash_pin::checked_base(&opts.format)?;
+        let base = opts.format.base;
         let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
         let page_configs = check_shape(&elf, opts, shape)?;
         let n = shape.trace_lengths.len();
@@ -322,12 +377,16 @@ impl BlockTreePlan {
             return Err("DECODE is preprocessed".to_string());
         }
 
-        let costs: Vec<usize> = instances.iter().map(|i| instance_cost(&i.verify)).collect();
+        let costs: Vec<usize> = instances
+            .iter()
+            .map(|i| instance_cost(&i.verify, &base))
+            .collect();
         let names: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
-        let partition = partition_for(&names, &costs)?;
+        let partition = partition_for(&names, &costs, CostModel::for_base(&base).leaf_cap)?;
 
         Ok(Self {
             statement: super::block_replay::BlockStatementShape {
+                domain_tag: crate::hash_pin::statement_tag(&opts.format),
                 public_output_len: shape.public_output_len,
                 table_counts: crate::statement::table_count_values(&shape.table_counts),
                 num_private_input_pages: shape.num_private_input_pages as u64,
@@ -345,6 +404,7 @@ impl BlockTreePlan {
             instances,
             partition,
             airs,
+            base,
         })
     }
 
@@ -397,9 +457,15 @@ impl BlockTreePlan {
         &self.partition
     }
 
-    /// The partition's cost-model version ([`PARTITION_COST_MODEL`]).
+    /// The partition's cost-model version ([`PARTITION_COST_MODEL`], or
+    /// [`P1_PARTITION_COST_MODEL`] over a Poseidon1 base).
     pub fn cost_model(&self) -> u32 {
-        PARTITION_COST_MODEL
+        CostModel::for_base(&self.base).id
+    }
+
+    /// The base proof's format the plan was derived under.
+    pub fn base(&self) -> &stark::proof::options::BaseFormat {
+        &self.base
     }
 
     /// The one leaf that subtracts the COMMIT-bus target.
@@ -412,7 +478,7 @@ impl BlockTreePlan {
     pub fn costs(&self) -> Vec<usize> {
         self.instances
             .iter()
-            .map(|i| instance_cost(&i.verify))
+            .map(|i| instance_cost(&i.verify, &self.base))
             .collect()
     }
 
@@ -437,7 +503,7 @@ impl BlockTreePlan {
         if k >= self.partition.num_leaves() {
             return Err(format!("no leaf {k}"));
         }
-        let mut b = builder();
+        let mut b = leaf_builder(&self.base);
         super::block_leaf::emit_block_leaf(&mut b, self, k);
         finish(b)
     }
@@ -674,19 +740,20 @@ pub fn check_shape(
     Ok(page_configs)
 }
 
-/// One instance's in-guest cost: the legs' closed form plus the fork.
-fn instance_cost(verify: &TableVerifyShape) -> usize {
-    super::epoch_verify::table_permutations_for(verify, super::edsl::WrapHash::production())
-        + FORK_PERMS
+/// One instance's in-guest cost: the legs' closed form under the base's wrap
+/// hash plus the fork, in that hash's rows.
+fn instance_cost(verify: &TableVerifyShape, base: &stark::proof::options::BaseFormat) -> usize {
+    super::epoch_verify::table_permutations_for(verify, super::edsl::WrapHash::for_base(base))
+        + CostModel::for_base(base).fork_perms
 }
 
 /// D-NOEPOCH §12.2's partition: the rule over `⌈Σ cost / cap⌉` leaves, one more
 /// leaf while the heaviest leaf is over the cap and another leaf can help (a
 /// block whose instances are all at or under the cap). Pure in the shape.
-fn partition_for(names: &[&str], costs: &[usize]) -> Result<BlockPartition, String> {
+fn partition_for(names: &[&str], costs: &[usize], cap: usize) -> Result<BlockPartition, String> {
     let total: usize = costs.iter().sum();
     let widest = costs.iter().copied().max().unwrap_or(0);
-    let mut k = total.div_ceil(LEAF_PERMS_CAP).clamp(1, names.len().max(1));
+    let mut k = total.div_ceil(cap).clamp(1, names.len().max(1));
     loop {
         let p = partition_by_rule(names, costs, k)?;
         let heaviest = p
@@ -695,15 +762,21 @@ fn partition_for(names: &[&str], costs: &[usize]) -> Result<BlockPartition, Stri
             .map(|l| l.iter().map(|&i| costs[i]).sum::<usize>())
             .max()
             .unwrap_or(0);
-        if heaviest <= LEAF_PERMS_CAP || widest > LEAF_PERMS_CAP || k == names.len() {
+        if heaviest <= cap || widest > cap || k == names.len() {
             return Ok(p);
         }
         k += 1;
     }
 }
 
+/// A node's builder: nodes verify LFM proofs, which the pin commits.
 fn builder() -> LfmBuilder {
     LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
+}
+
+/// A leaf's builder: a leaf verifies base sub-proofs, committed under `base`.
+fn leaf_builder(base: &stark::proof::options::BaseFormat) -> LfmBuilder {
+    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::for_base(base))
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
@@ -941,7 +1014,14 @@ pub fn verify_block_tree(
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
-    verify_block_tree_timed(elf_bytes, None, shape, public_output, top).map(|(id, _)| id)
+    verify_block_tree_for(
+        stark::proof::options::BaseFormat::RPX,
+        elf_bytes,
+        None,
+        shape,
+        public_output,
+        top,
+    )
 }
 
 /// [`verify_block_tree`] over ELF constants computed ahead
@@ -956,11 +1036,35 @@ pub fn verify_block_tree_with(
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
-    verify_block_tree_timed(elf_bytes, Some(consts), shape, public_output, top).map(|(id, _)| id)
+    verify_block_tree_for(
+        stark::proof::options::BaseFormat::RPX,
+        elf_bytes,
+        Some(consts),
+        shape,
+        public_output,
+        top,
+    )
 }
 
-/// [`verify_block_tree`], over `consts` when given, and its stopwatch.
+/// [`verify_block_tree`] for a block whose base proof is committed under
+/// `base` — the verifier's own format constant, never the proof's: the plan,
+/// every leaf (verifying the base under [`super::edsl::WrapHash::for_base`]),
+/// so the top program and its id, are derived under it. A top proof of a tree
+/// over another base derives another top and is refused.
+pub fn verify_block_tree_for(
+    base: stark::proof::options::BaseFormat,
+    elf_bytes: &[u8],
+    consts: Option<&ElfConstants>,
+    shape: &BlockShape,
+    public_output: &[u8],
+    top: &super::proof::LfmProof,
+) -> Result<Commitment, String> {
+    verify_block_tree_timed(base, elf_bytes, consts, shape, public_output, top).map(|(id, _)| id)
+}
+
+/// [`verify_block_tree_for`], and its stopwatch.
 pub(crate) fn verify_block_tree_timed(
+    base: stark::proof::options::BaseFormat,
     elf_bytes: &[u8],
     consts: Option<&ElfConstants>,
     shape: &BlockShape,
@@ -969,7 +1073,7 @@ pub(crate) fn verify_block_tree_timed(
 ) -> Result<(Commitment, VerifyTimes), String> {
     verify_under(
         elf_bytes,
-        &super::proof::block_base_options(),
+        &super::proof::block_base_options_for(base),
         &super::proof::aggregation_wrap_options(),
         consts,
         shape,

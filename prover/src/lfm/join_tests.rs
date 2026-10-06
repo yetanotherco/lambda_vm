@@ -159,6 +159,7 @@ pub(super) fn build_host_sub_proof(
         log2_lde_length: lde_length.trailing_zeros(),
         coset_offset: FE::from(air.options().coset_offset),
         trace_cap,
+        arity: 2,
         layout: leaf_layout,
     };
     // Query 0 of a capped tree is its owner: its path carries the cap after
@@ -639,6 +640,7 @@ fn shape_for(
         log2_lde_length: log2_trace_length + log2_blowup,
         coset_offset: FE::from(3u64),
         trace_cap: 0,
+        arity: 2,
         layout: stark::leaf_layout::LeafLayout::RowPair,
     }
 }

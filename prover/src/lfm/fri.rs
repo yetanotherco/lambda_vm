@@ -289,21 +289,47 @@ impl FriShape {
         self.index_bits() - consumed
     }
 
-    /// Merkle-cap height of committed layer `i`'s tree under the format's cap
-    /// policy: every layer tree is opened once per query (`0` = uncapped).
-    /// The same function the host prover and verifier use
-    /// (`stark::merkle_caps::StarkCaps`), at the same depth.
-    pub fn layer_cap(self, layer: usize) -> usize {
-        self.format
-            .merkle_cap
-            .height(self.num_queries, self.layer_depth(layer))
+    /// Children per node of the layer trees: 4 under a Poseidon1 base
+    /// (`format.base`, a verifier constant), else 2.
+    pub fn arity(self) -> usize {
+        super::edsl::WrapHash::for_base(&self.format.base).arity()
     }
 
-    /// Merkle path length a query's opening of committed layer `i` carries:
-    /// the tree's depth less its cap height (the owner path's cap is split off
-    /// into the caps arena).
+    /// Merkle-cap height of committed layer `i`'s tree under the format's cap
+    /// policy at the trees' arity, in that arity's levels: every layer tree is
+    /// opened once per query (`0` = uncapped). The same function the host
+    /// prover and verifier use (`stark::merkle_caps::StarkCaps`), at the same
+    /// depth.
+    pub fn layer_cap(self, layer: usize) -> usize {
+        let arity = self.arity();
+        stark::merkle_caps::StarkCaps::tree_cap_height(
+            stark::config::cap_policy_at_arity(&self.format, arity),
+            self.num_queries,
+            self.layer_depth(layer),
+            arity,
+        )
+    }
+
+    /// Sibling digests a query's opening of committed layer `i` carries: the
+    /// tree's depth less its cap height at arity 2, three per walked 4-ary
+    /// level at arity 4 (the owner path's cap is split off into the caps
+    /// arena; [`super::merkle_cap::path_hints`]).
     pub fn layer_path_len(self, layer: usize) -> usize {
-        self.layer_depth(layer) - self.layer_cap(layer)
+        super::merkle_cap::path_hints(self.layer_depth(layer), self.layer_cap(layer), self.arity())
+    }
+
+    /// Node hashes a query's walk of committed layer `i` costs.
+    pub fn layer_path_permutations(self, layer: usize) -> usize {
+        super::merkle_cap::path_permutations(
+            self.layer_depth(layer),
+            self.layer_cap(layer),
+            self.arity(),
+        )
+    }
+
+    /// Digests in committed layer `i`'s cap (1, the root, uncapped).
+    pub fn layer_cap_nodes(self, layer: usize) -> usize {
+        super::merkle_cap::cap_nodes(self.layer_depth(layer), self.layer_cap(layer), self.arity())
     }
 
     /// Arena words the committed layers' caps occupy, once per sub-proof.
@@ -311,32 +337,43 @@ impl FriShape {
         (0..self.num_committed())
             .map(|i| match self.layer_cap(i) {
                 0 => 0,
-                c => (1usize << c) * digest_words,
+                _ => self.layer_cap_nodes(i) * digest_words,
             })
             .sum()
     }
 
     /// Permutations the committed layers' cap checks cost, once per
-    /// sub-proof: `2^c − 1` parents per capped layer.
+    /// sub-proof: each capped layer's cap hashed to its root.
     pub fn cap_permutations(self) -> usize {
         (0..self.num_committed())
-            .map(|i| super::merkle_cap::cap_root_permutations(self.layer_cap(i)))
+            .map(|i| {
+                super::merkle_cap::cap_root_permutations(self.layer_cap_nodes(i), self.arity())
+            })
             .sum()
     }
 
-    /// Merkle path steps one query walks across every committed layer.
+    /// Merkle path steps (node hashes) one query walks across every committed
+    /// layer.
     pub fn path_steps_per_query(self) -> usize {
+        (0..self.num_committed())
+            .map(|i| self.layer_path_permutations(i))
+            .sum()
+    }
+
+    /// Sibling digests one query's paths carry across every committed layer
+    /// ([`Self::path_steps_per_query`] at arity 2).
+    pub fn path_hints_per_query(self) -> usize {
         (0..self.num_committed())
             .map(|i| self.layer_path_len(i))
             .sum()
     }
 
-    /// Permutations one query costs under the production wrap hash: every
+    /// Permutations one query costs under its base's wrap hash: every
     /// committed layer's leaf (a 48-byte pair is one block under every hash;
     /// a `2^d` group is `⌈3·2^d / 8⌉` at the rate-8 algebraic sponge) plus one
     /// per path step (a parent is one compression under every hash).
     pub fn permutations_per_query(self) -> usize {
-        self.leaf_permutations_per_query(super::edsl::WrapHash::production())
+        self.leaf_permutations_per_query(super::edsl::WrapHash::for_base(&self.format.base))
             + self.path_steps_per_query()
     }
 
@@ -370,7 +407,7 @@ impl FriShape {
         let values: usize = (0..self.num_committed())
             .map(|j| self.layer_values(j))
             .sum();
-        values + digest_words * self.path_steps_per_query()
+        values + digest_words * self.path_hints_per_query()
     }
 
     /// Keccak permutations the whole sub-proof's FRI costs.
@@ -539,16 +576,23 @@ impl LayerCommitment {
         }
     }
 
-    /// Hint this layer tree's height-`c` cap out of `arena` at `base` and
-    /// authenticate it against the root lanes, once per tree (see
-    /// [`super::sub_proof::GroupCommitment::hint_cap`]). Returns the next free
-    /// word; `c = 0` hints nothing.
-    pub fn hint_cap(&mut self, b: &mut LfmBuilder, arena: ArenaId, base: u32, c: usize) -> u32 {
+    /// Hint this layer tree's height-`c` cap (a tree over `2^depth` leaves)
+    /// out of `arena` at `base` and authenticate it against the root lanes,
+    /// once per tree (see [`super::sub_proof::GroupCommitment::hint_cap`]).
+    /// Returns the next free word; `c = 0` hints nothing.
+    pub fn hint_cap(
+        &mut self,
+        b: &mut LfmBuilder,
+        arena: ArenaId,
+        base: u32,
+        c: usize,
+        depth: usize,
+    ) -> u32 {
         if c == 0 {
             return base;
         }
         let (cap, next) =
-            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, depth, &self.root_lanes);
         self.cap = Some(cap);
         next
     }
@@ -593,7 +637,7 @@ pub fn hint_layer_caps(
     );
     let mut at = 0u32;
     for (i, layer) in layers.iter_mut().enumerate() {
-        at = layer.hint_cap(b, arena, at, shape.layer_cap(i));
+        at = layer.hint_cap(b, arena, at, shape.layer_cap(i), shape.layer_depth(i));
     }
     assert_eq!(
         at as usize,
@@ -894,6 +938,11 @@ pub fn emit_query_fri(
     openings: &[LayerOpening],
 ) -> Ext {
     let c = shape.num_committed();
+    assert_eq!(
+        b.wrap_hash().arity(),
+        shape.arity(),
+        "the builder hashes the layer trees the shape describes"
+    );
     assert_eq!(
         q.bits.len(),
         shape.index_bits(),

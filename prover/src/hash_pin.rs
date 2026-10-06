@@ -197,7 +197,12 @@ pub enum BaseHash {
 /// base, else the pin. What the preprocessed roots and the statics follow;
 /// the prove and verify entries check the name first ([`checked_base`]).
 pub fn base_of(format: &stark::proof::options::ProofFormat) -> BaseHash {
-    match format.base.hash {
+    base_of_hash(format.base.hash)
+}
+
+/// [`base_of`] for the format's base hash alone.
+pub fn base_of_hash(hash: stark::config::CommitmentHash) -> BaseHash {
+    match hash {
         stark::config::CommitmentHash::Poseidon1 => BaseHash::P1,
         _ => BaseHash::Rpx,
     }
@@ -343,6 +348,9 @@ pub trait BlockHash: Send + Sync + 'static {
     /// The monolithic statement's leading domain tag under `format`: it names
     /// the commitment geometry the statement is about (I-P1C §9.2).
     fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8>;
+    /// The transcript's state digest as a machine word: what the block
+    /// tree's leaves publish (`TranscriptReplay::state`).
+    fn state_word(t: &Self::Transcript) -> crate::lfm::word::LfmWord;
 }
 
 /// The pin: [`BlockStarkHash`] under [`BlockTranscript`].
@@ -358,6 +366,9 @@ impl BlockHash for RpxBlock {
     /// Today's tag, byte for byte: RPX statements do not move.
     fn statement_tag(_: &stark::proof::options::ProofFormat) -> Vec<u8> {
         crate::statement::DOMAIN_TAG.to_vec()
+    }
+    fn state_word(t: &BlockTranscript) -> crate::lfm::word::LfmWord {
+        t.state_word()
     }
 }
 
@@ -375,6 +386,22 @@ impl BlockHash for P1Block {
     /// height (`C0` uncapped).
     fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
         p1_statement_tag(format.base.arity4_cap)
+    }
+    /// `state()`'s four lanes (the node encoding's felts).
+    fn state_word(t: &Self::Transcript) -> crate::lfm::word::LfmWord {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+        let bytes = IsTranscript::<crate::tables::types::GoldilocksExtension>::state(t);
+        crate::lfm::algebraic_commit::commitment_to_digest(&bytes)
+    }
+}
+
+/// [`BlockHash::statement_tag`] of the configuration `format` names
+/// ([`base_of`]): the monolithic statement's leading tag, RPX's byte for byte
+/// at the default.
+pub fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
+    match base_of(format) {
+        BaseHash::Rpx => RpxBlock::statement_tag(format),
+        BaseHash::P1 => P1Block::statement_tag(format),
     }
 }
 

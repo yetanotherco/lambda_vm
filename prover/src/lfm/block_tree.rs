@@ -232,6 +232,13 @@ pub struct BlockTreeConfig {
     pub siblings_l0: usize,
     /// `LFM_TREE_SIBLINGS` (or `LFM_TREE_K`): node proofs at once.
     pub siblings: usize,
+    /// The base proof's format ([`super::proof::block_base_options_for`]):
+    /// RPX, today's, unless the caller names another. No knob sets it — the
+    /// library reads the base from no environment variable; a harness or a
+    /// CLI flag maps its own spelling into it. The leaves verify the base
+    /// under it ([`super::edsl::WrapHash::for_base`]) and the block verifier
+    /// must be given the same one ([`super::block_plan::verify_block_tree_for`]).
+    pub base: stark::proof::options::BaseFormat,
 }
 
 impl BlockTreeConfig {
@@ -251,6 +258,7 @@ impl BlockTreeConfig {
             forced_leaves: parse_leaves(var("NOEPOCH_LEAVES").as_deref())?,
             siblings_l0: super::tree_run::tree_siblings_l0()?,
             siblings: super::tree_run::tree_siblings()?,
+            base: stark::proof::options::BaseFormat::RPX,
         })
     }
 }
@@ -565,8 +573,10 @@ fn gib(bytes: usize) -> f64 {
 
 // =============================== the harvest ==============================
 
-/// The host transcript every block prover and verifier starts from:
-/// `StatementKind::Monolithic` over the block's statement fields.
+/// The host transcript every RPX block prover and verifier starts from:
+/// `StatementKind::Monolithic` over the block's statement fields
+/// ([`block_seed_under`] at the pin).
+#[cfg(test)]
 pub(crate) fn block_seed(
     elf_digest: &[u8; 32],
     public_output: &[u8],
@@ -584,6 +594,31 @@ pub(crate) fn block_seed(
         table_counts,
         num_private_input_pages,
         runtime_page_ranges,
+        fri_final_poly_log_degree,
+    );
+    t
+}
+
+/// [`block_seed`] under the block configuration `C` and the base `format`:
+/// `C`'s transcript, the statement under its tag (`C::statement_tag`, RPX's
+/// is [`block_seed`]'s byte for byte) — the block prover's own seed
+/// (`block.rs`).
+fn block_seed_under<C: crate::hash_pin::BlockHash>(
+    format: &stark::proof::options::ProofFormat,
+    proof: &crate::VmProof,
+    elf_digest: &[u8; 32],
+    fri_final_poly_log_degree: u8,
+) -> C::Transcript {
+    let mut t = C::transcript(&[]);
+    crate::statement::absorb_statement_with_digest_and_tag(
+        &mut t,
+        &C::statement_tag(format),
+        crate::statement::StatementKind::Monolithic,
+        elf_digest,
+        &proof.public_output,
+        &proof.table_counts,
+        proof.num_private_input_pages,
+        &proof.runtime_page_ranges,
         fri_final_poly_log_degree,
     );
     t
@@ -691,6 +726,31 @@ pub(crate) fn harvest_block_over(
     consts: Option<&ElfConstants>,
     sink: &dyn BlockTreeSink,
 ) -> Result<(BlockWitness, f64, f64), String> {
+    // The base configuration is the verifier's format (`opts.format.base`),
+    // never the proof's: a P1 base proof is read with the P1 verifier on ZisK's
+    // transcript, an RPX one as before.
+    match crate::hash_pin::checked_base(&opts.format)? {
+        crate::hash_pin::BaseHash::Rpx => harvest_block_under::<crate::hash_pin::RpxBlock>(
+            opts, elf_bytes, proof, verify, consts, sink,
+        ),
+        crate::hash_pin::BaseHash::P1 => harvest_block_under::<crate::hash_pin::P1Block>(
+            opts, elf_bytes, proof, verify, consts, sink,
+        ),
+    }
+}
+
+/// [`harvest_block_over`] under the block configuration `C`.
+fn harvest_block_under<C: crate::hash_pin::BlockHash>(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    proof: &crate::VmProof,
+    verify: bool,
+    consts: Option<&ElfConstants>,
+    sink: &dyn BlockTreeSink,
+) -> Result<(BlockWitness, f64, f64), String>
+where
+    C::Transcript: Sync,
+{
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use rayon::prelude::*;
     use stark::verifier::IsStarkVerifier;
@@ -705,12 +765,10 @@ pub(crate) fn harvest_block_over(
     let view = MultiProofView::Owned(&proof.proof);
     let refs = plan.airs().air_refs();
     let seed = || {
-        block_seed(
+        block_seed_under::<C>(
+            &opts.format,
+            proof,
             plan.elf_digest(),
-            &proof.public_output,
-            &proof.table_counts,
-            proof.num_private_input_pages,
-            &proof.runtime_page_ranges,
             opts.fri_final_poly_log_degree,
         )
     };
@@ -724,7 +782,7 @@ pub(crate) fn harvest_block_over(
     .ok_or("the COMMIT bus target must compute")?;
     let target_secs = t_verify.elapsed().as_secs_f64() - plan_secs;
     if verify
-        && !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+        && !crate::hash_pin::BlockVerifierOf::<C, Gl, Ext3, ()>::multi_verify_views(
             &refs,
             view,
             &mut seed(),
@@ -763,7 +821,7 @@ pub(crate) fn harvest_block_over(
     let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
         .map(|_| transcript.sample_field_element())
         .collect();
-    let state = transcript.state_word();
+    let state = C::state_word(&transcript);
 
     // ---- one fork per instance, and the legs' reading of the same sub-proof.
     let per_instance: Vec<(HostTable, TableLegs)> = (0..n)
@@ -781,8 +839,9 @@ pub(crate) fn harvest_block_over(
             if let Some(c) = v.bus_table_contribution() {
                 fork.append_field_element(&c);
             }
-            let table = super::harvest::host_table_forked(air, v, idx, n, &mut fork, &lookup)?;
-            let legs = super::harvest::build_table_legs(air, v, &lookup)?;
+            let table =
+                super::harvest::host_table_forked_under::<C>(air, v, idx, n, &mut fork, &lookup)?;
+            let legs = super::harvest::build_table_legs_at(air, v, &lookup, Some(&table.iotas))?;
             Ok((table, legs))
         })
         .collect::<Result<_, String>>()?;
@@ -1208,7 +1267,7 @@ pub fn prove_block_tree(
         ));
     }
     let elf_bytes: Arc<[u8]> = Arc::from(elf_bytes);
-    let inner = super::proof::block_base_options();
+    let inner = super::proof::block_base_options_for(cfg.base);
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     let pct = |g: f64| match &ceiling {

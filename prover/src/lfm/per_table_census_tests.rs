@@ -416,6 +416,7 @@ fn table_shape(
             .format
             .merkle_cap
             .height(opts.fri_number_of_queries, merkle_depth),
+        arity: 2,
         layout: leaf_layout,
     };
     let has_aux_trace = air.has_aux_trace();

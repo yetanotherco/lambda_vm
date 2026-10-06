@@ -135,6 +135,7 @@ fn the_block_front_replays_the_hosts_transcript() {
 
     // MACHINE.
     let shape = BlockStatementShape {
+        domain_tag: crate::statement::DOMAIN_TAG.to_vec(),
         public_output_len: OUTPUT_LEN,
         table_counts: count_array,
         num_private_input_pages: PAGES as u64,
@@ -2518,7 +2519,22 @@ fn the_block_tree_composes_to_a_top_node() {
     let elf_bytes = read("NOEPOCH_ELF");
     let input = read("NOEPOCH_INPUT");
     let wrap_opts = super::proof::aggregation_wrap_options();
-    let cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let mut cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    // The base format the harness's environment names (`NOEPOCH_BASE`,
+    // `NOEPOCH_P1_CAP`; RPX unset): test code, the library reads no such
+    // variable. Under P1 the static preprocessed roots are computed here,
+    // before the run's clock, as the base harness does.
+    let base_opts = crate::tests::noepoch_block_tests::noepoch_harness_options();
+    cfg.base = base_opts.format.base;
+    if crate::hash_pin::base_of(&base_opts.format) == crate::hash_pin::BaseHash::P1 {
+        println!(
+            "BASE HASH: p1 (format {:?}, cap {}) · statement tag {}",
+            cfg.base.hash,
+            cfg.base.arity4_cap,
+            String::from_utf8_lossy(&crate::hash_pin::statement_tag(&base_opts.format))
+        );
+        crate::hash_pin::warm_base_statics(&base_opts);
+    }
     let run = super::block_tree::prove_block_tree(
         &elf_bytes,
         &input,
@@ -2574,6 +2590,7 @@ fn the_block_tree_composes_to_a_top_node() {
     let derived = match forced {
         None => {
             let (id, times) = super::block_plan::verify_block_tree_timed(
+                cfg.base,
                 &elf_bytes,
                 None,
                 &shape,
@@ -2639,6 +2656,7 @@ fn the_block_tree_composes_to_a_top_node() {
     if let (None, Some(consts)) = (forced, consts.as_deref()) {
         let t = Instant::now();
         let (id, warm) = super::block_plan::verify_block_tree_timed(
+            cfg.base,
             &elf_bytes,
             Some(consts),
             &shape,

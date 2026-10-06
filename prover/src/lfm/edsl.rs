@@ -626,8 +626,24 @@ impl WrapHash {
             stark::config::CommitmentHash::Rpo256
             | stark::config::CommitmentHash::Rpx256
             | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
-            // No recursion verifies a Poseidon1 proof yet (`p1/*` stage P3).
+            // The pin is never Poseidon1: a Poseidon1 BASE is a format, and the
+            // programs that verify one take [`WrapHash::for_base`].
             stark::config::CommitmentHash::Poseidon1 => WrapHash::Algebraic,
+        }
+    }
+
+    /// The wrap hash of a program that verifies a base proof committed under
+    /// `base`: [`WrapHash::Poseidon1`] for ZisK's Poseidon1, else the pin's
+    /// ([`Self::production`]) — the block path maps every other hash to the pin
+    /// (`hash_pin::base_of`) and its prove and verify entries refuse one it has
+    /// no configuration for (`hash_pin::checked_base`). A verifier constant
+    /// from the caller's format, never from the environment or the proof, so
+    /// every program emitted under it, and every id above, is a function of
+    /// `base` (I-P1C §9.4).
+    pub fn for_base(base: &stark::proof::options::BaseFormat) -> Self {
+        match crate::hash_pin::base_of_hash(base.hash) {
+            crate::hash_pin::BaseHash::P1 => WrapHash::Poseidon1,
+            crate::hash_pin::BaseHash::Rpx => Self::production(),
         }
     }
 

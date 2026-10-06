@@ -463,7 +463,7 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
 /// `NOEPOCH_P1_CAP` = `off` or a 4-ary height (unset: 4); `NOEPOCH_P1_NO_TAG=1`
 /// proves and verifies P1 under RPX's statement tag (the pre-tag bytes). Test
 /// code: the library reads no such variable.
-fn noepoch_harness_options() -> ProofOptions {
+pub(crate) fn noepoch_harness_options() -> ProofOptions {
     let mut opts = crate::lfm::proof::block_base_options();
     let base = std::env::var("NOEPOCH_BASE").unwrap_or_else(|_| "rpx".to_string());
     match base.as_str() {

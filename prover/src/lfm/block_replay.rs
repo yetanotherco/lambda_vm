@@ -28,8 +28,6 @@
 //! output is the one per-proof value: arena halves, published by the leaf so
 //! the tree carries the block's claim to its top.
 
-use crate::statement::DOMAIN_TAG;
-
 use super::builder::{Ext, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
 use super::keccak_host::BYTES_PER_HALF;
@@ -40,6 +38,10 @@ use super::transcript_replay::TranscriptReplay;
 /// everything but the ELF digest and the public output's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockStatementShape {
+    /// The statement's leading domain tag: `hash_pin::statement_tag` of the
+    /// base format, which names the base proof's commitment geometry
+    /// (`statement::DOMAIN_TAG` under RPX, today's bytes). A verifier constant.
+    pub domain_tag: Vec<u8>,
     /// Length of the public output in bytes; fixes how many arena halves the
     /// leaf reads.
     pub public_output_len: usize,
@@ -55,7 +57,7 @@ pub struct BlockStatementShape {
 impl BlockStatementShape {
     /// Total bytes the statement absorbs.
     pub fn byte_len(&self) -> usize {
-        DOMAIN_TAG.len()
+        self.domain_tag.len()
             + 32
             + 8
             + self.public_output_len
@@ -91,7 +93,7 @@ pub fn absorb_block_statement(
         shape.out_halves(),
         "public_output halves must match the declared length"
     );
-    t.append_const_bytes(DOMAIN_TAG);
+    t.append_const_bytes(&shape.domain_tag);
     t.append_const_bytes(elf_digest);
     t.append_const_bytes(&(shape.public_output_len as u64).to_le_bytes());
     t.append_bytes_misaligned(public_output, shape.public_output_len);

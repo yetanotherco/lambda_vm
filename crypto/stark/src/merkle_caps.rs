@@ -91,6 +91,20 @@ impl StarkCaps {
         lde_log: usize,
         one_row: bool,
     ) -> Result<Self, crate::fri::schedule::FriFormatError> {
+        Self::for_options_arity(options, lde_log, one_row, 2)
+    }
+
+    /// [`Self::for_options`] for a configuration whose trees have `arity`
+    /// children per node: the format's cap policy at that arity
+    /// ([`crate::config::cap_policy_at_arity`]) over that arity's levels, as
+    /// the prover and the host verifier lay them out (`from_layout_arity` over
+    /// `effective_cap_policy`). At arity 2 it is [`Self::for_options`].
+    pub fn for_options_arity(
+        options: &crate::proof::options::ProofOptions,
+        lde_log: usize,
+        one_row: bool,
+        arity: usize,
+    ) -> Result<Self, crate::fri::schedule::FriFormatError> {
         let blowup_log = (options.blowup_factor as u32).trailing_zeros();
         let layout = crate::fri::terminal::FriFoldLayout::for_options(
             lde_log as u32,
@@ -98,11 +112,12 @@ impl StarkCaps {
             options,
             one_row,
         )?;
-        Ok(Self::from_layout(
-            options.format.merkle_cap,
+        Ok(Self::from_layout_arity(
+            crate::config::cap_policy_at_arity(&options.format, arity),
             options.fri_number_of_queries,
             lde_log,
             &layout,
+            arity,
         ))
     }
 
@@ -112,19 +127,9 @@ impl StarkCaps {
     /// 1`; one row: `log2(lde)`) and committed layer `j` is
     /// `layout.layer_depth(lde_log, j)` deep: `log2(lde) − j − 2` under the
     /// all-ones row-pair schedule (so this is [`Self::new`] there), the group
-    /// tree's depth under any other.
-    pub(crate) fn from_layout(
-        policy: CapPolicy,
-        num_queries: usize,
-        lde_log: usize,
-        layout: &crate::fri::terminal::FriFoldLayout,
-    ) -> Self {
-        Self::from_layout_arity(policy, num_queries, lde_log, layout, 2)
-    }
-
-    /// [`Self::from_layout`] for trees of `arity` children per node: the
-    /// depths stay binary (`log2(leaves)`), the heights count that arity's
-    /// levels ([`Self::with_depths_arity`]).
+    /// tree's depth under any other. For trees of `arity` children per node
+    /// the depths stay binary (`log2(leaves)`) and the heights count that
+    /// arity's levels ([`Self::with_depths_arity`]).
     pub(crate) fn from_layout_arity(
         policy: CapPolicy,
         num_queries: usize,

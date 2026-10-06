@@ -711,3 +711,13 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 pub fn block_base_options() -> ProofOptions {
     crate::zf_format::ZfFormat::global().base_options(crate::recursion::Preset::Blowup4.options())
 }
+
+/// [`block_base_options`] with the base proof committed under `base` (the
+/// caller's format, never the environment's): the block tree's base and its
+/// verifier under a Poseidon1 base (P3a). `BaseFormat::RPX` is
+/// [`block_base_options`].
+pub fn block_base_options_for(base: stark::proof::options::BaseFormat) -> ProofOptions {
+    let mut opts = block_base_options();
+    opts.format.base = base;
+    opts
+}

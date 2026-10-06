@@ -289,7 +289,17 @@ pub trait StarkHash: Send + Sync + 'static {
 pub fn effective_cap_policy<H: StarkHash>(
     format: &crate::proof::options::ProofFormat,
 ) -> crypto::merkle_tree::cap::CapPolicy {
-    if H::ARITY == 2 {
+    cap_policy_at_arity(format, H::ARITY)
+}
+
+/// [`effective_cap_policy`] for trees of `arity` children per node, for a
+/// caller that holds the arity rather than the configuration (the in-guest
+/// verifier's shapes).
+pub fn cap_policy_at_arity(
+    format: &crate::proof::options::ProofFormat,
+    arity: usize,
+) -> crypto::merkle_tree::cap::CapPolicy {
+    if arity == 2 {
         format.merkle_cap
     } else {
         format.base.arity4_cap

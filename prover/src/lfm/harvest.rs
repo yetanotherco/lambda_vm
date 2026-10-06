@@ -76,14 +76,34 @@ pub(crate) fn host_table_forked(
     fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> Result<HostTable, String> {
-    use crate::hash_pin::BlockVerifier as Verifier;
+    host_table_forked_under::<crate::hash_pin::RpxBlock>(
+        air,
+        view,
+        index,
+        num_tables,
+        fork,
+        lookup_challenges,
+    )
+}
+
+/// [`host_table_forked`] for a sub-proof committed under the block
+/// configuration `C` (its verifier, on its transcript).
+pub(crate) fn host_table_forked_under<C: crate::hash_pin::BlockHash>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    view: StarkProofView<'_, Gl, Ext3, ()>,
+    index: usize,
+    num_tables: usize,
+    fork: &mut C::Transcript,
+    lookup_challenges: &[FEE],
+) -> Result<HostTable, String> {
     use stark::domain::new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
+    type Verifier<F, E, PI, C> = crate::hash_pin::BlockVerifierOf<C, F, E, PI>;
 
     let trace_length = view.trace_length();
     let domain = new_verifier_domain(air, trace_length);
-    let layout = Verifier::<Gl, Ext3, ()>::ood_layout(air);
-    let challenges = Verifier::<Gl, Ext3, ()>::replay_rounds_after_round_1(
+    let layout = Verifier::<Gl, Ext3, (), C>::ood_layout(air);
+    let challenges = Verifier::<Gl, Ext3, (), C>::replay_rounds_after_round_1(
         air,
         view,
         &(),
@@ -215,6 +235,19 @@ pub(crate) fn build_table_legs(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
 ) -> Result<TableLegs, String> {
+    build_table_legs_at(air, view, rap_challenges, None)
+}
+
+/// [`build_table_legs`] with every query's leaf index (`iotas`, the
+/// transcript's, from [`HostTable::iotas`]): an arity-4 (Poseidon1) proof
+/// needs them to lay each path out in the walk's hint order
+/// ([`super::p1w16_emit::hint_order`]); a binary one ignores them.
+pub(crate) fn build_table_legs_at(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    view: StarkProofView<'_, Gl, Ext3, ()>,
+    rap_challenges: &[FEE],
+    iotas: Option<&[usize]>,
+) -> Result<TableLegs, String> {
     // The shapes, from the AIR and the trace length alone; the proof's blocks
     // are then checked against them, never read into them.
     let trace_length = view.trace_length();
@@ -261,25 +294,19 @@ pub(crate) fn build_table_legs(
     )?;
 
     // ---- the owner split: query 0 of a capped tree carries the cap at the end
-    // of its path; the arenas take the `D − c` siblings, the caps arena the cap.
+    // of its path; the arenas take the path to the cap, the caps arena the cap.
     let mut trace_caps: Vec<Vec<Commitment>> = Vec::new();
+    let arity = verify.sub.arity;
     let mut split = |q: usize,
                      path: &[Commitment],
                      depth: usize,
                      c: usize|
      -> Result<Vec<Commitment>, String> {
-        if c == 0 || q != 0 {
-            check_eq(
-                path.len(),
-                depth - c,
-                &format!("query {q}: a path to the cap"),
-            )?;
-            return Ok(path.to_vec());
-        }
-        let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-            .ok_or("the owner path is D − c + 2^c long")?;
-        trace_caps.push(cap.to_vec());
-        Ok(siblings.to_vec())
+        let index = leaf_index(iotas, q, 0)?;
+        let (siblings, cap) = path_to_cap(path, depth, c, arity, q == 0, index)
+            .map_err(|e| format!("query {q}: {e}"))?;
+        trace_caps.extend(cap);
+        Ok(siblings)
     };
     let (depth, c_trace) = (verify.sub.merkle_depth, verify.sub.trace_cap);
 
@@ -333,7 +360,7 @@ pub(crate) fn build_table_legs(
         openings.push(groups);
     }
 
-    let (fri_openings, fri_caps) = fri_layer_openings(view, verify.fri)?;
+    let (fri_openings, fri_caps) = fri_layer_openings_at(view, verify.fri, iotas)?;
 
     // Production's own boundary list, for the premise check only. It takes the
     // bus public inputs, which are PROOF data — which is exactly why the emitted
@@ -407,6 +434,7 @@ type FriOpenings = Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>;
 /// under a fold schedule; `FriShape::layer_values` says which.
 /// Each path is cut at its layer's cap: query 0 of a capped layer carries
 /// `D − c + 2^c` nodes, every other query `D − c`.
+#[cfg(test)]
 pub(crate) fn fri_layer_openings<PI>(
     view: StarkProofView<'_, Gl, Ext3, PI>,
     fri: FriShape,
@@ -415,6 +443,22 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
 {
+    fri_layer_openings_at(view, fri, None)
+}
+
+/// [`fri_layer_openings`] with every query's index (see
+/// [`build_table_legs_at`]): layer `j`'s tree leaf is the index past the
+/// layer's slot, `iota >> (G_j + d_j)`.
+pub(crate) fn fri_layer_openings_at<PI>(
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    fri: FriShape,
+    iotas: Option<&[usize]>,
+) -> Result<(FriOpenings, Vec<Commitment>), String>
+where
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
+    let arity = fri.arity();
     let mut caps: Vec<Commitment> = Vec::new();
     let mut openings = Vec::with_capacity(view.query_list_len());
     for q in 0..view.query_list_len() {
@@ -433,19 +477,76 @@ where
             offset += fri.layer_values(i);
             let path = d.layer_auth_path(i);
             let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
-            if c == 0 || q != 0 {
-                check_eq(path.len(), depth - c, &format!("query {q} FRI layer {i}"))?;
-                layers.push((values, path.to_vec()));
-                continue;
-            }
-            let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-                .ok_or("the owner path is D − c + 2^c long")?;
-            caps.extend_from_slice(cap);
-            layers.push((values, siblings.to_vec()));
+            let shift = fri.layer_bit_offset(i) + fri.layer_fold(i) as usize;
+            let index = leaf_index(iotas, q, shift)?;
+            let (siblings, cap) = path_to_cap(path, depth, c, arity, q == 0, index)
+                .map_err(|e| format!("query {q} FRI layer {i}: {e}"))?;
+            caps.extend(cap.into_iter().flatten());
+            layers.push((values, siblings));
         }
         openings.push(layers);
     }
     Ok((openings, caps))
+}
+
+/// Query `q`'s leaf index shifted right by `shift` (a FRI layer's tree), when
+/// the caller supplied the indices.
+fn leaf_index(iotas: Option<&[usize]>, q: usize, shift: usize) -> Result<Option<usize>, String> {
+    iotas
+        .map(|all| {
+            all.get(q)
+                .map(|iota| iota >> shift)
+                .ok_or_else(|| format!("no index for query {q}"))
+        })
+        .transpose()
+}
+
+/// One opening's path, cut to the cap, in the arena's order, and the cap
+/// itself when this is the tree's owner path (query 0 of a capped tree).
+///
+/// At arity 2 the path to the cap is the first `D − c` siblings as the proof
+/// carries them. At arity 4 the proof carries three siblings per 4-ary level in
+/// child order (`3(⌈D/2⌉ − c)` of them, the owner path then the cap's nodes);
+/// they are laid out in the walk's hint order for the opening at `index`
+/// ([`super::p1w16_emit::hint_order`], which drops an uncapped odd-depth top's
+/// two padding siblings), so an arity-4 path needs its leaf index.
+fn path_to_cap(
+    path: &[Commitment],
+    depth: usize,
+    c: usize,
+    arity: usize,
+    owner: bool,
+    index: Option<usize>,
+) -> Result<(Vec<Commitment>, Option<Vec<Commitment>>), String> {
+    let (siblings, cap) = if c == 0 || !owner {
+        let kept = if arity == 4 {
+            3 * (crypto::merkle_tree::cap::tree_levels(depth, 4) - c)
+        } else {
+            depth - c
+        };
+        check_eq(path.len(), kept, "a path to the cap")?;
+        (path, None)
+    } else {
+        let (siblings, cap) =
+            crypto::merkle_tree::cap::split_owner_path_arity(path, depth, c, arity)
+                .ok_or("the owner path is the path to the cap, then the cap")?;
+        (siblings, Some(cap.to_vec()))
+    };
+    if arity != 4 {
+        return Ok((siblings.to_vec(), cap));
+    }
+    let index = index.ok_or("an arity-4 path is laid out at its leaf index")?;
+    let walked = depth - super::merkle_cap::mux_bits(depth, c, 4);
+    check_eq(
+        siblings.len(),
+        3 * walked.div_ceil(2),
+        "three siblings per walked 4-ary level",
+    )?;
+    let triples: Vec<[Commitment; 3]> = siblings
+        .chunks_exact(3)
+        .map(|t| [t[0], t[1], t[2]])
+        .collect();
+    Ok((super::p1w16_emit::hint_order(index, walked, &triples), cap))
 }
 
 impl TableLegs {

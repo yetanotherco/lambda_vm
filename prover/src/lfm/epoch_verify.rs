@@ -154,13 +154,20 @@ impl TableVerifyShape {
     }
 
     fn check_caps(&self) {
+        let arity = self.fri.arity();
+        assert_eq!(
+            self.sub.arity, arity,
+            "the trace trees and the FRI layers are one configuration's trees"
+        );
         assert_eq!(
             self.sub.trace_cap,
-            self.fri
-                .format
-                .merkle_cap
-                .height(self.num_queries, self.sub.merkle_depth),
-            "the trace trees' cap is the format's, at their depth and query count"
+            stark::merkle_caps::StarkCaps::tree_cap_height(
+                stark::config::cap_policy_at_arity(&self.fri.format, arity),
+                self.num_queries,
+                self.sub.merkle_depth,
+                arity,
+            ),
+            "the trace trees' cap is the format's, at their depth, arity and query count"
         );
     }
 
@@ -182,6 +189,11 @@ impl TableVerifyShape {
             return Err(format!("trace length {trace_length} is not a power of two"));
         }
         let opts = air.options();
+        // The base hash names the trees' arity (and so the cap's units): the
+        // verifier's format, refused here when the block path has no
+        // configuration for it.
+        crate::hash_pin::checked_base(&opts.format)?;
+        let arity = super::edsl::WrapHash::for_base(&opts.format.base).arity();
         let layout = stark::verifier::Verifier::<
             crate::tables::types::GoldilocksField,
             crate::tables::types::GoldilocksExtension,
@@ -237,10 +249,13 @@ impl TableVerifyShape {
             merkle_depth,
             log2_lde_length,
             coset_offset: FE::from(opts.coset_offset),
-            trace_cap: opts
-                .format
-                .merkle_cap
-                .height(opts.fri_number_of_queries, merkle_depth),
+            trace_cap: stark::merkle_caps::StarkCaps::tree_cap_height(
+                stark::config::cap_policy_at_arity(&opts.format, arity),
+                opts.fri_number_of_queries,
+                merkle_depth,
+                arity,
+            ),
+            arity,
             layout: leaf_layout,
         };
         let has_aux_trace = air.has_aux_trace();
@@ -263,10 +278,11 @@ impl TableVerifyShape {
 
         // The cap heights: these shapes' against the host's own `StarkCaps`, so
         // the two sides derive every tree's height and depth from one function.
-        let host = stark::merkle_caps::StarkCaps::for_options(
+        let host = stark::merkle_caps::StarkCaps::for_options_arity(
             opts,
             log2_lde_length as usize,
             leaf_layout.is_one_row(),
+            arity,
         )
         .map_err(|e| format!("a format the host does not lay out: {e:?}"))?;
         let fri_agrees = host.fri.len() == shape.fri.num_committed()
@@ -498,12 +514,18 @@ pub fn emit_table_verification(
     if let Some(caps) = arenas.caps {
         let mut at = 0u32;
         for c in &mut commitments {
-            at = c.hint_cap(b, caps, at, shape.sub.trace_cap);
+            at = c.hint_cap(b, caps, at, shape.sub.trace_cap, shape.sub.merkle_depth);
         }
         assert_eq!(at as usize, shape.sub.cap_words(digest_words));
         let mut fri_at = at;
         for (i, layer) in fri.layers.iter_mut().enumerate() {
-            fri_at = layer.hint_cap(b, caps, fri_at, shape.fri.layer_cap(i));
+            fri_at = layer.hint_cap(
+                b,
+                caps,
+                fri_at,
+                shape.fri.layer_cap(i),
+                shape.fri.layer_depth(i),
+            );
         }
         assert_eq!(
             fri_at as usize,
@@ -752,7 +774,7 @@ pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations_at_rate(&shape.sub, rate_felts)
         + fri_leaf_permutations_at_rate(&shape.fri, rate_felts)
-        + groups * shape.sub.path_len()
+        + groups * shape.sub.path_permutations()
         + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
@@ -804,8 +826,10 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
         .sum();
     // Per committed layer: a pair leaf (six felts), or a `2^d`-value group.
     let fri_leaves = shape.fri.leaf_permutations_per_query(hash);
-    let per_query =
-        leaves + fri_leaves + groups * shape.sub.path_len() + shape.fri.path_steps_per_query();
+    let per_query = leaves
+        + fri_leaves
+        + groups * shape.sub.path_permutations()
+        + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
 
@@ -837,7 +861,7 @@ pub fn table_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
 pub fn query_permutations(shape: &TableVerifyShape) -> usize {
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations(&shape.sub)
-        + groups * shape.sub.path_len()
+        + groups * shape.sub.path_permutations()
         + shape.fri.permutations_per_query();
     shape.num_queries * per_query
 }
