@@ -242,16 +242,27 @@ fn arity_4_caps_round_trip_at_every_height() {
     }
 }
 
-/// One capped tree (`k = 9`, `h = 5`, `c = 3`: 32 cap nodes, 6 kept siblings)
-/// and one honest opening, for the tampers below.
-fn capped_fixture() -> (
+/// A tree, its rows, the owner path of one opening (cap embedded), the binary
+/// depth, the cap height and the opened position.
+type CappedFixture = (
     MerkleTree<P1Backend>,
     Vec<Vec<Fp>>,
     Vec<[u64; 4]>,
     usize,
     usize,
     usize,
-) {
+);
+
+/// The whole capped check of one owner opening: `(root, owner path, depth, c,
+/// index, leaf hash)`.
+type AcceptOwner = fn(&[u64; 4], &[[u64; 4]], usize, usize, usize, [u64; 4]) -> bool;
+
+/// [`crate::merkle_tree::cap::verify_merkle_path_to_cap_from_leaf_hash`]'s shape.
+type VerifyToCap = fn(&[[u64; 4]], &[[u64; 4]], usize, usize, [u64; 4]) -> bool;
+
+/// One capped tree (`k = 9`, `h = 5`, `c = 3`: 32 cap nodes, 6 kept siblings)
+/// and one honest opening, for the tampers below.
+fn capped_fixture() -> CappedFixture {
     use crate::merkle_tree::cap::embed_cap_arity;
     let (k, c, pos) = (9usize, 3usize, 300usize);
     let data = rows(1 << k);
@@ -308,9 +319,7 @@ fn a_tampered_capped_arity_4_opening_is_rejected() {
 /// root: its cap is consistent with its own siblings, so only the cap-to-root
 /// check stands between it and acceptance. `accept` is the whole capped check
 /// of one owner opening: `(root, owner path, depth, c, index, leaf hash)`.
-fn admits_forged_cap(
-    accept: fn(&[u64; 4], &[[u64; 4]], usize, usize, usize, [u64; 4]) -> bool,
-) -> bool {
+fn admits_forged_cap(accept: AcceptOwner) -> bool {
     use crate::merkle_tree::cap::embed_cap_arity;
     let (honest, _, _, k, c, pos) = capped_fixture();
     let forged_data: Vec<Vec<Fp>> = rows((1 << k) + 1)[1..].to_vec();
@@ -352,9 +361,7 @@ fn mutation_without_the_cap_to_root_check_admits_a_forged_arity_4_cap() {
 /// The real node one 4-ary level above leaf 0 presented as the leaf hash, with
 /// the path from it upward: three siblings short. Index 0 keeps every slot the
 /// fold reads at 0, so only the exact-length check rejects it.
-fn admits_internal_node(
-    verify: fn(&[[u64; 4]], &[[u64; 4]], usize, usize, [u64; 4]) -> bool,
-) -> bool {
+fn admits_internal_node(verify: VerifyToCap) -> bool {
     let (tree, data, owner, k, c, _) = capped_fixture();
     let cap = &owner[owner.len() - tree.cap(c).expect("c ≤ h").len()..];
     let full = tree.get_proof_by_pos(0).expect("in range").merkle_path;
