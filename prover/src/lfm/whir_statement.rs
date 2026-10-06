@@ -200,6 +200,7 @@ impl StatementCost {
         SpongeEntry {
             buffered_felts: self.felts,
             out_pos: CANDIDATES_PER_SQUEEZE,
+            p1: None,
         }
     }
 }

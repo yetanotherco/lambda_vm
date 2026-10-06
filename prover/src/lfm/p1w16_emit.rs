@@ -30,6 +30,11 @@
 //! (`Merkle4`'s padding). There the index's phantom bit is zero, the walk takes
 //! ONE hint (the partner), and the two padding children are constant zero cells,
 //! not hints, so they cannot be anything else.
+//!
+//! [`walk4_child`] takes the siblings in ZisK's child order instead, as the
+//! proof carries them, and spends three more `Select`s a full level placing
+//! them: its arena needs no leaf index (the WHIR leaf's, whose arena is filled
+//! from the proof alone).
 
 use crate::tables::types::FE;
 use crypto::hash::poseidon1_w8 as w8;
@@ -143,6 +148,55 @@ pub fn walk4(
             }
             _ => {
                 // The odd top: two real children and two zero digests.
+                let z = zero_cell(b);
+                node4(b, [l, r, z, z])
+            }
+        };
+    }
+    WrapDigest::from_cell(cur)
+}
+
+/// Walk one 4-ary Merkle path whose hints are in CHILD order: per full level
+/// the three siblings as ZisK's path lists them (the children other than the
+/// current one, in child order), at an odd-depth top only the partner (the
+/// first sibling; the two padding children are constant zeros, never hints).
+///
+/// With the current node at child `p = b0 + 2·b1`, the partner is sibling 0
+/// when `b1 = 0` and sibling 2 when `b1 = 1`, and the other pair is siblings
+/// `(1, 2)` or `(0, 1)`: three `Select`s on `b1` put them in [`hint_order`],
+/// and [`walk4`]'s level follows. Every placement is a `Select` on an index
+/// bit, so the node hashed is the one the index names, whatever the hints.
+pub fn walk4_child(
+    b: &mut LfmBuilder,
+    leaf: WrapDigest,
+    bits: &[Bit],
+    siblings: &[WrapDigest],
+) -> WrapDigest {
+    assert_eq!(
+        siblings.len(),
+        path_hints(bits.len()),
+        "three siblings per 4-ary level, one at an odd top"
+    );
+    let mut cur = leaf.cells()[0];
+    let mut s = siblings.iter().map(|d| d.cells()[0]);
+    for pair in bits.chunks(2) {
+        cur = match pair {
+            [b0, b1] => {
+                let s0 = s.next().expect("counted above");
+                let s1 = s.next().expect("counted above");
+                let s2 = s.next().expect("counted above");
+                let (partner, _) = b.select(*b1, s0, s2);
+                let (u0, _) = b.select(*b1, s1, s0);
+                let (u1, _) = b.select(*b1, s2, s1);
+                let (l, r) = b.select(*b0, cur, partner);
+                let (c0, c2) = b.select(*b1, l, u0);
+                let (c1, c3) = b.select(*b1, r, u1);
+                node4(b, [c0, c1, c2, c3])
+            }
+            _ => {
+                // The odd top: the partner, then two zero digests.
+                let partner = s.next().expect("counted above");
+                let (l, r) = b.select(pair[0], cur, partner);
                 let z = zero_cell(b);
                 node4(b, [l, r, z, z])
             }
