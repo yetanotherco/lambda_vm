@@ -529,7 +529,7 @@ fn a_p1_stacked_opening_round_trips_and_survives_a_retire() {
 
     let num_vars = 6;
     let columns: Vec<Mle<F>> = (0..5u64).map(|i| poly(num_vars, 7 + 13 * i)).collect();
-    let layout = StackedLayout::build(&vec![num_vars; 5], 8).unwrap();
+    let layout = StackedLayout::build(&[num_vars; 5], 8).unwrap();
     assert!(layout.num_polys() >= 2);
     let at: Vec<EE> = (0..num_vars)
         .map(|i| EE::new([FE::from(3 + i as u64), FE::from(5), FE::from(i as u64)]))
