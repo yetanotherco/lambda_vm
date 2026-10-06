@@ -2567,7 +2567,7 @@ fn the_whir_block_tree_on_a_real_block() {
         Ok(other) => panic!("BLOCK_WHIR_BASE={other}: rpx, p1 or p1w"),
     };
     cfg.format.zf = cfg.format.zf.with_base(base);
-    println!("W3 BASE: {:?}", cfg.format.zf.base.hash);
+    println!("W3 BASE HASH: {:?}", cfg.format.zf.base.hash);
     let run =
         prove_whir_block_tree(&elf, &input, &cfg, &StdoutSink).unwrap_or_else(|e| panic!("{e}"));
     let (proof, plan, proofs, early_out, base) = (

@@ -498,18 +498,18 @@ fn rows(hash: usize, select: usize, balu: usize, hint: usize) -> ChipRows {
     }
 }
 
-/// The census's shapes: a full group, a prepared one (ethrex's DECODE), a
-/// small last group.
+/// The census's shapes (median mix, an ethrex ELF): a full group, a prepared
+/// one (DECODE's stack, the ELF pages' genesis).
 const FULL: ChipRows = ChipRows {
     hash: 38_646,
-    select: 167_238,
-    balu: 117_270,
+    select: 139_878,
+    balu: 142_236,
     hint: 140_290,
 };
 const PREPARED: ChipRows = ChipRows {
     hash: 48_656,
-    select: 206_796,
-    balu: 149_310,
+    select: 172_938,
+    balu: 180_090,
     hint: 185_114,
 };
 
@@ -521,12 +521,11 @@ fn under(r: ChipRows, h: ChipRows) -> bool {
     r.hash <= h.hash && r.select <= h.select && r.balu <= h.balu && r.hint <= h.hint
 }
 
-/// ★ The partition admits no leaf past a chip's height. A prepared group and
-/// two full ones fit the socket cap (125.9 k ≤ 2^17) but not `Select`
-/// (541 k > 2^19): a socket-only partition would double that leaf's `Select`
-/// silently; this one never builds it. A small last group never joins three
-/// full ones either. Every group is placed once, over the fewest leaves the
-/// rows allow, and a group no leaf holds is refused.
+/// ★ The partition admits no leaf past a chip's height, whichever chip binds:
+/// groups light in the socket but heavy in `Select` (or hints) are split
+/// where a socket-only partition would double that chip silently. A small last
+/// group never joins three full ones. Every group is placed once, over no more
+/// leaves than the rows need, and a group no leaf holds is refused.
 #[test]
 fn the_p1_partition_keeps_every_chip_under_its_height() {
     let front = rows(300, 0, 0, 240);
@@ -544,24 +543,36 @@ fn the_p1_partition_keeps_every_chip_under_its_height() {
                 loads.len()
             );
         }
-        // Fewest: one leaf fewer cannot hold them (Select binds: three full a leaf).
-        let selects: usize = loads.iter().map(|l| l.select).sum();
-        assert!(partition.num_leaves() >= selects.div_ceil(P1_LEAF_HEIGHTS.select));
+        // No fewer than the socket's sum allows.
+        let hashes: usize = loads.iter().map(|l| l.hash).sum();
+        assert!(partition.num_leaves() >= hashes.div_ceil(P1_LEAF_HEIGHTS.hash - front.hash));
         // Deterministic.
         assert_eq!(
             partition,
             leaf_partition_rows(&loads, front, P1_LEAF_HEIGHTS).expect("again")
         );
     }
-    // Three full groups share a leaf; a prepared one takes one partner at most.
+    // Three full groups share a leaf, and so do a prepared one and two full:
+    // the 1× block's nine groups close in three leaves.
     let p = leaf_partition_rows(&[FULL, FULL, FULL], front, P1_LEAF_HEIGHTS).expect("fits");
     assert_eq!(p.num_leaves(), 1, "three full groups are one leaf");
     let p = leaf_partition_rows(&[PREPARED, FULL, FULL], front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(
-        p.num_leaves(),
-        2,
-        "a prepared group and two full ones are two leaves"
-    );
+    assert_eq!(p.num_leaves(), 1, "a prepared group and two full ones");
+    let nine = [vec![FULL; 7], vec![PREPARED; 2]].concat();
+    let p = leaf_partition_rows(&nine, front, P1_LEAF_HEIGHTS).expect("fits");
+    assert_eq!(p.num_leaves(), 3, "the 1× block's nine groups");
+    // Select binds, or the hints: groups light in the socket are split.
+    for heavy in [
+        rows(10_000, 300_000, 10_000, 10_000),
+        rows(10_000, 10_000, 10_000, 300_000),
+    ] {
+        let p = leaf_partition_rows(&[heavy, heavy], front, P1_LEAF_HEIGHTS).expect("fits");
+        assert_eq!(
+            p.num_leaves(),
+            2,
+            "{heavy:?} twice is past 2^19: split, not doubled"
+        );
+    }
     // Refusals: a group past a height, a front that fills a chip.
     let huge = rows(1_000, 600_000, 0, 0);
     assert!(leaf_partition_rows(&[FULL, huge], front, P1_LEAF_HEIGHTS).is_err());
