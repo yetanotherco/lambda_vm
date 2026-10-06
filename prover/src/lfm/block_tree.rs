@@ -1640,7 +1640,7 @@ pub fn prove_block_tree(
             .map(|l| l.iter().map(|&i| costs[i]).sum::<usize>())
             .max()
             .unwrap_or(0),
-        super::block_plan::LEAF_PERMS_CAP,
+        super::block_plan::CostModel::for_base(rb.plan.base()).leaf_cap,
         rb.plan.cost_model()
     ));
     // Which leaves verify the chunked accelerators' instances (the rule seeds

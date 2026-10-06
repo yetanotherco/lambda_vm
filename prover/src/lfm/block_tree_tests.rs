@@ -1860,6 +1860,10 @@ fn small_block_at(
 #[ignore = "proves a VM block (BITWISE is 2^20 rows); box tier"]
 fn block_leaves_execute_over_a_real_block_proof() {
     let opts = fixture_block_options();
+    println!(
+        "BLOCK FIXTURE BASE: {:?} cap {}",
+        opts.format.base.hash, opts.format.base.arity4_cap
+    );
     let wrap_opts = super::proof::aggregation_wrap_options();
     let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &opts);
     assert!(
@@ -2102,6 +2106,10 @@ fn contribution_arena(
 #[ignore = "proves two VM blocks, their leaves and nodes; box tier"]
 fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
     let opts = fixture_block_options();
+    println!(
+        "BLOCK FIXTURE BASE: {:?} cap {}",
+        opts.format.base.hash, opts.format.base.arity4_cap
+    );
     let wrap_opts = super::proof::aggregation_wrap_options();
     let input_a: Vec<u8> = (0u8..16).collect();
     let mut input_b = input_a.clone();
