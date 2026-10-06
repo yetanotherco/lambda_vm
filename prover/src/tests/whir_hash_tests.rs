@@ -279,3 +279,109 @@ fn the_two_transcript_types_draw_different_challenges() {
     assert_eq!(<KeccakWhir as WhirHash>::Transcript::NAME, "keccak256");
     assert_eq!(<RpxWhir as WhirHash>::Transcript::NAME, "rpx256");
 }
+
+// ===========================================================================
+// ZisK's Poseidon1 (D-WHIR-P1 S1): the same seam at a third hash, whose trees
+// are 4-ary and whose sponge is a field sponge, through each configuration's
+// own `WhirHash::sponge`.
+// ===========================================================================
+
+/// The configuration's own sponge with the fixture's tag absorbed.
+fn sponge<H: WhirHash>() -> H::Sponge {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    let mut t = H::sponge();
+    t.append_bytes(b"whir-hash-seam");
+    t
+}
+
+fn prove_sponged<H: WhirHash>(columns: &Columns) -> Proof {
+    let table = CommittedTable::from_layout(layout(columns), |col| columns[col as usize].clone())
+        .expect("committed table");
+    let committed = CommittedTables::<_, _, H>::commit(vec![table], &config()).expect("commit");
+    multilinear_table::multi_prove(&committed, &config(), &mut sponge::<H>(), None).expect("prove")
+}
+
+fn verify_sponged<H: WhirHash>(proof: &Proof, columns: &Columns) -> Result<(), multilinear::Error> {
+    let table = CommittedTable::from_layout(layout(columns), |col| columns[col as usize].clone())
+        .expect("committed table");
+    let committed = CommittedTables::<_, _, H>::commit(vec![table], &config()).expect("commit");
+    let owed = multilinear_table::contribution(&proof.tables[0].bus_output)
+        .ok_or(multilinear::Error::BusImbalance)?;
+    let verifier_layout = layout(columns);
+    let statement = verifier_layout.statement();
+    multilinear_table::multi_verify::<_, _, _, H>(
+        proof,
+        &[statement],
+        std::slice::from_ref(committed.groups()[0].layout()),
+        std::slice::from_ref(committed.groups()[0].domain()),
+        committed.sizes(),
+        &owed,
+        &config(),
+        &mut sponge::<H>(),
+        None,
+    )
+}
+
+/// The RPX and keccak sponges ARE the transcripts the block always built
+/// (`DefaultTranscript::new(&[])`): equal states and challenges after the same
+/// absorbs, so routing the block through `WhirHash::sponge` moves no byte.
+#[test]
+fn the_rpx_and_keccak_sponges_are_the_default_transcripts() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    fn same<H: WhirHash>() {
+        let mut a = H::sponge();
+        let mut b = DefaultTranscript::<Ext, H::Transcript>::new(&[]);
+        for t in [&mut a as &mut dyn IsTranscript<Ext>, &mut b] {
+            t.append_bytes(b"statement");
+            t.append_field_element(&FieldElement::<Ext>::from(7u64));
+        }
+        assert_eq!(a.state(), b.state(), "{}", H::NAME);
+        assert_eq!(a.sample_field_element(), b.sample_field_element());
+        assert_eq!(a.sample_u64(1 << 20), b.sample_u64(1 << 20));
+    }
+    same::<KeccakWhir>();
+    same::<RpxWhir>();
+}
+
+/// (G2 at P1) The Poseidon1 arm proves and verifies on the real table, and its
+/// roots and bytes differ from RPX's under the same fixture.
+#[test]
+fn the_p1_arm_proves_and_verifies_and_differs_from_rpx() {
+    use multilinear::whir_hash::P1Whir;
+    let columns = fixture_columns();
+    let p1 = prove_sponged::<P1Whir>(&columns);
+    verify_sponged::<P1Whir>(&p1, &columns).expect("a P1 proof must verify under P1");
+    let rpx = prove_sponged::<RpxWhir>(&columns);
+    verify_sponged::<RpxWhir>(&rpx, &columns).expect("an RPX proof must verify under RPX");
+    assert_ne!(p1.roots, rpx.roots, "the P1 seam must hash with P1");
+    assert_ne!(serialized(&p1), serialized(&rpx));
+}
+
+/// (G3 at P1) ★★ Prove under one, verify under the other: rejected, both ways,
+/// and against keccak too.
+#[test]
+fn a_p1_proof_and_an_rpx_proof_do_not_cross_verify() {
+    use multilinear::whir_hash::P1Whir;
+    let columns = fixture_columns();
+    let p1 = prove_sponged::<P1Whir>(&columns);
+    assert!(verify_sponged::<RpxWhir>(&p1, &columns).is_err());
+    assert!(verify_sponged::<KeccakWhir>(&p1, &columns).is_err());
+    let rpx = prove_sponged::<RpxWhir>(&columns);
+    assert!(verify_sponged::<P1Whir>(&rpx, &columns).is_err());
+}
+
+/// The P1 grind is its own: its nonce fails RPX's predicate and the reverse.
+#[test]
+fn the_p1_grind_follows_its_configuration() {
+    use crypto::grinding::{generate_nonce_smallest, is_valid_nonce};
+    use multilinear::whir_hash::{GrindingDigest, P1Whir};
+    let seed = [7u8; 32];
+    let factor = 12u8;
+    let p = generate_nonce_smallest::<GrindingDigest<P1Whir>>(&seed, factor).expect("nonce");
+    let r = generate_nonce_smallest::<GrindingDigest<RpxWhir>>(&seed, factor).expect("nonce");
+    assert!(is_valid_nonce::<GrindingDigest<P1Whir>>(&seed, p, factor));
+    assert_ne!(p, r);
+    assert!(!is_valid_nonce::<GrindingDigest<RpxWhir>>(&seed, p, factor));
+    assert!(!is_valid_nonce::<GrindingDigest<P1Whir>>(&seed, r, factor));
+    assert_eq!(P1Whir::NAME, "poseidon1-w16");
+}

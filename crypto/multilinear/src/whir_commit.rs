@@ -4,10 +4,11 @@
 //! `{ j, j + N/2^k, …, j + (2^k - 1)·N/2^k }`.
 
 use crypto::merkle_tree::{
-    cap::{CappedRoot, embed_cap},
+    cap::{CapPolicy, CappedRoot, MAX_CAP_HEIGHT, embed_cap_arity, tree_levels},
     merkle::MerkleTree,
     proof::Proof,
     traits::IsMerkleTreeBackend,
+    utils::{level_offsets4, level_sizes4},
 };
 use math::{
     field::{
@@ -158,6 +159,53 @@ impl TreeDrop {
         let wanted = if on_device { self.device } else { self.host };
         wanted.min(depth.saturating_sub(tallest_cap))
     }
+
+    /// [`Self::levels`] for a tree of `arity` children per node over
+    /// `2^depth` leaves, `tallest_cap` counting that arity's levels. At arity
+    /// 4 the drop counts 4-ary levels, half the binary count, so a dropped
+    /// block keeps the leaves it has at arity 2 (8 → 4: 256 leaves); and it
+    /// stops where a kept node covers `4^dropped` whole leaves, which an odd
+    /// tree's two-node top does not.
+    pub fn levels_at(
+        self,
+        on_device: bool,
+        depth: usize,
+        tallest_cap: usize,
+        arity: usize,
+    ) -> usize {
+        if arity != 4 {
+            return self.levels(on_device, depth, tallest_cap);
+        }
+        let wanted = if on_device { self.device } else { self.host } / 2;
+        wanted
+            .min(depth / 2)
+            .min(tree_levels(depth, 4).saturating_sub(tallest_cap))
+    }
+}
+
+/// The cap height of one tree over `2^depth` leaves of `arity` children per
+/// node, opened `openings` times under `policy`: `policy.height` over the
+/// tree's levels (4-ary levels at arity 4), and at arity 4 no taller than a cap
+/// of `2^MAX_CAP_HEIGHT` nodes. At arity 2 it is `policy.height(openings,
+/// depth)`, today's. Prover and verifier both derive it from public numbers.
+pub fn tree_cap_height(policy: CapPolicy, openings: usize, depth: usize, arity: usize) -> usize {
+    let c = policy.height(openings, tree_levels(depth, arity));
+    if arity == 4 {
+        c.min(MAX_CAP_HEIGHT / 2)
+    } else {
+        c
+    }
+}
+
+/// Nodes a kept top holds: the levels above the `dropped` bottom ones, root
+/// first — `2^(depth − dropped + 1) − 1` at arity 2, the matching prefix of
+/// the arity-4 layout (`MerkleTree`'s, top-down) at arity 4.
+fn kept_top_nodes(num_leaves: usize, depth: usize, dropped: usize, arity: usize) -> usize {
+    if arity == 4 {
+        level_sizes4(num_leaves)[dropped..].iter().sum()
+    } else {
+        (1usize << (depth - dropped + 1)) - 1
+    }
 }
 
 impl std::fmt::Display for TreeDrop {
@@ -167,7 +215,8 @@ impl std::fmt::Display for TreeDrop {
 }
 
 /// What a retired commitment keeps of its tree: the heap prefix down to the
-/// level whose nodes each cover `2^dropped` leaves.
+/// level whose nodes each cover `2^dropped` leaves (`4^dropped` at arity 4,
+/// whose prefix is the arity-4 layout's top levels).
 ///
 /// ★ A PROVER-SIDE MEMORY CHOICE, NOT A FORMAT ONE. The paths it answers are
 /// the paths of the whole tree, byte for byte: the levels it dropped are
@@ -175,8 +224,10 @@ impl std::fmt::Display for TreeDrop {
 /// against the kept one before any path leaves.
 #[derive(Clone, Debug)]
 pub struct TreeTop {
-    /// `2^(depth − dropped + 1) − 1` nodes, root first (the host layout).
+    /// `2^(depth − dropped + 1) − 1` nodes, root first (the host layout), or
+    /// the arity-4 layout's top levels.
     nodes: Vec<Commitment>,
+    /// Levels dropped, in the tree's own levels (4-ary at arity 4).
     dropped: usize,
 }
 
@@ -500,9 +551,27 @@ where
         1usize << (self.log_domain_size - self.log_folding)
     }
 
-    /// Siblings on a full authentication path: `log2(num_leaves)`.
+    /// `log2(num_leaves)`: the index bits, whatever the arity (siblings on a
+    /// full path at arity 2).
     pub fn depth(&self) -> usize {
         self.log_domain_size - self.log_folding
+    }
+
+    /// Children per node of this commitment's tree.
+    pub fn arity() -> usize {
+        <Backend<F, H> as IsMerkleTreeBackend>::ARITY
+    }
+
+    /// The tree's levels: [`Self::depth`] at arity 2, `⌈depth / 2⌉` at arity
+    /// 4. Cap heights and kept tops count these.
+    pub fn levels(&self) -> usize {
+        tree_levels(self.depth(), Self::arity())
+    }
+
+    /// Siblings on a full authentication path: one per level at arity 2,
+    /// three per level at arity 4.
+    pub fn path_len(&self) -> usize {
+        (Self::arity() - 1) * self.levels()
     }
 
     pub fn log_folding(&self) -> usize {
@@ -526,7 +595,8 @@ where
     /// but the bottom `drop` levels for where the codeword is ([`TreeDrop`]) —
     /// fewer when the tree is shallower, and never into the Merkle cap `cap`
     /// may ask this tree for, which is read from the kept levels. What the
-    /// block prover holds between committing a group and opening it.
+    /// block prover holds between committing a group and opening it. `cap` is
+    /// the policy at this tree's arity (`ChainFormat::cap_policy_at`).
     pub fn retire(
         self,
         drop: TreeDrop,
@@ -542,12 +612,13 @@ where
             });
         }
         let depth = self.depth();
+        let arity = Self::arity();
         // The tallest cap the policy gives a tree this deep, whatever its
         // opening count (the height is monotone in it).
-        let tallest_cap = cap.height(usize::MAX, depth);
+        let tallest_cap = tree_cap_height(cap, usize::MAX, depth, arity);
         let on_device = matches!(self.codeword, Codeword::Device(_));
-        let dropped = drop.levels(on_device, depth, tallest_cap);
-        let keep = (1usize << (depth - dropped + 1)) - 1;
+        let dropped = drop.levels_at(on_device, depth, tallest_cap, arity);
+        let keep = kept_top_nodes(self.num_leaves(), depth, dropped, arity);
         let nodes =
             match &self.codeword {
                 Codeword::Device(device) => device
@@ -622,6 +693,11 @@ where
         let Codeword::Device(device) = &self.codeword else {
             return None;
         };
+        // The card re-hashes binary subtrees only; an arity-4 tree's kept-top
+        // paths are served by the host (`host_top_paths`).
+        if Self::arity() != 2 {
+            return None;
+        }
         let dropped = top.dropped;
         let span = 1usize << dropped;
         let mut blocks: Vec<usize> = indices.iter().map(|index| index >> dropped).collect();
@@ -681,15 +757,20 @@ where
         indices: &[usize],
     ) -> Result<Vec<Proof<Commitment>>, Error> {
         let num_leaves = self.num_leaves();
-        let depth = self.depth();
-        let dropped = top.dropped;
-        let span = 1usize << dropped;
-        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> dropped).collect();
+        // A block is the `span` leaves under one kept frontier node: `2^d` at
+        // arity 2, `4^d` at arity 4.
+        let block_bits = if Self::arity() == 4 {
+            2 * top.dropped
+        } else {
+            top.dropped
+        };
+        let span = 1usize << block_bits;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
         blocks.sort_unstable();
         blocks.dedup();
         let leaves: Vec<usize> = blocks
             .iter()
-            .flat_map(|block| (block << dropped)..((block + 1) << dropped))
+            .flat_map(|block| (block << block_bits)..((block + 1) << block_bits))
             .collect();
         let gathering = std::time::Instant::now();
         let values = self.gather(&leaves)?;
@@ -700,7 +781,7 @@ where
         let rehashing = std::time::Instant::now();
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let frontier = (1usize << (depth - dropped)) - 1;
+        let frontier = self.frontier(top);
         // Each queried block's subtree depends on its own leaves alone, so the
         // blocks are re-hashed in parallel; the subtrees stay in block order
         // and the first block (in that order) whose root is not the kept node
@@ -734,7 +815,7 @@ where
         indices
             .iter()
             .map(|&index| {
-                let block = index >> dropped;
+                let block = index >> block_bits;
                 let at = blocks
                     .binary_search(&block)
                     .map_err(|_| Error::QueryOutOfRange {
@@ -748,14 +829,58 @@ where
                         bound: num_leaves,
                     })?
                     .merkle_path;
-                let mut pos = frontier + block;
-                while pos != 0 {
-                    merkle_path.push(top.nodes[sibling(pos)]);
-                    pos = (pos - 1) / 2;
-                }
+                self.push_kept_siblings(top, block, &mut merkle_path)?;
                 Ok(Proof { merkle_path })
             })
             .collect()
+    }
+
+    /// Where the kept top's frontier level (the nodes over the dropped
+    /// blocks) starts in its node vector.
+    fn frontier(&self, top: &TreeTop) -> usize {
+        if Self::arity() == 4 {
+            level_offsets4(&level_sizes4(self.num_leaves()))[top.dropped]
+        } else {
+            (1usize << (self.depth() - top.dropped)) - 1
+        }
+    }
+
+    /// The siblings of frontier node `block`'s path up the kept levels, read
+    /// from the top: one per level at arity 2; at arity 4 the three other
+    /// children of its group in child order, the padding digest where the
+    /// group is short (an odd tree's top), as `MerkleTree`'s own paths.
+    fn push_kept_siblings(
+        &self,
+        top: &TreeTop,
+        block: usize,
+        path: &mut Vec<Commitment>,
+    ) -> Result<(), Error> {
+        let missing = || Error::RecomputedCodewordMismatch { block };
+        if Self::arity() != 4 {
+            let mut pos = self.frontier(top) + block;
+            while pos != 0 {
+                path.push(*top.nodes.get(sibling(pos)).ok_or_else(missing)?);
+                pos = (pos - 1) / 2;
+            }
+            return Ok(());
+        }
+        let sizes = level_sizes4(self.num_leaves());
+        let offsets = level_offsets4(&sizes);
+        let pad = Backend::<F, H>::padding_node();
+        let mut pos = block;
+        for level in top.dropped..sizes.len() - 1 {
+            let first = pos / 4 * 4;
+            for c in (first..first + 4).filter(|&c| c != pos) {
+                let node = if c < sizes[level] {
+                    top.nodes.get(offsets[level] + c).copied()
+                } else {
+                    pad
+                };
+                path.push(node.ok_or_else(missing)?);
+            }
+            pos /= 4;
+        }
+        Ok(())
     }
 
     /// The fold blocks of `indices`, from wherever the codeword is.
@@ -913,7 +1038,9 @@ where
             return self.paths(indices);
         }
         let depth = self.depth();
-        if cap_height > depth {
+        let arity = Self::arity();
+        let levels = self.levels();
+        if cap_height > levels {
             return Err(Error::CapEmbedFailed {
                 reason: "cap taller than the tree",
             });
@@ -923,13 +1050,28 @@ where
         };
         let (mut proofs, cap) = if owner && let Some(top) = &self.top {
             // The cap is kept whole when it sits in the kept levels.
-            if cap_height > depth - top.dropped {
+            if cap_height > levels - top.dropped {
                 return Err(Error::CapEmbedFailed {
                     reason: "cap below the kept top of a retired tree",
                 });
             }
-            let start = (1usize << cap_height) - 1;
-            let cap = top.nodes[start..2 * start + 1].to_vec();
+            let range = if arity == 4 {
+                // The real nodes of the level `cap_height` below the root.
+                let sizes = level_sizes4(self.num_leaves());
+                let level = levels - cap_height;
+                let start = level_offsets4(&sizes)[level];
+                start..start + sizes[level]
+            } else {
+                let start = (1usize << cap_height) - 1;
+                start..2 * start + 1
+            };
+            let cap = top
+                .nodes
+                .get(range)
+                .ok_or(Error::CapEmbedFailed {
+                    reason: "cap below the kept top of a retired tree",
+                })?
+                .to_vec();
             (self.top_paths(top, indices)?, Some(cap))
         } else if owner {
             match &self.codeword {
@@ -968,7 +1110,21 @@ where
             Some(cap) => {
                 let mut refs: Vec<&mut Vec<Commitment>> =
                     proofs.iter_mut().map(|p| &mut p.merkle_path).collect();
-                embed_cap(&mut refs, depth, &cap).map_err(embed_failed)?;
+                embed_cap_arity(&mut refs, depth, &cap, arity).map_err(embed_failed)?;
+            }
+            None if arity == 4 => {
+                // Every path whole (three siblings a level), then cut to the
+                // levels under the cap.
+                let full = self.path_len();
+                let keep = 3 * (levels - cap_height);
+                for proof in &mut proofs {
+                    if proof.merkle_path.len() != full {
+                        return Err(Error::CapEmbedFailed {
+                            reason: "path or cap of the wrong length",
+                        });
+                    }
+                    proof.merkle_path.truncate(keep);
+                }
             }
             None => {
                 for proof in &mut proofs {
