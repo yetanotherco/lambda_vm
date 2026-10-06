@@ -690,8 +690,10 @@ pub(crate) fn grinding_check_constants(factor: u8) -> Vec<super::word::LfmWord> 
 }
 
 /// The POSEIDON1 arm of [`emit_grinding_check`]: `p1_commit::P1GrindDigest`'s
-/// two width-8 permutations, emulated ([`super::p1w16_emit::w8_permute`]),
-/// then the top `factor` bits of lane 0's canonical value.
+/// two width-8 permutations, emulated in their sparse form with the constant
+/// input lanes folded and only the lanes read computed
+/// ([`super::p1w16_emit::w8_permute_lanes`]: four for the inner digest, lane 0
+/// of the outer), then the top `factor` bits of lane 0's canonical value.
 ///
 /// The inner preimage is `PREFIX ‖ state ‖ factor` (41 bytes) read as 8-byte
 /// big-endian felts: the prefix felt, the state's four lanes (a Poseidon1
@@ -705,20 +707,34 @@ fn emit_p1_grinding_check(
     nonce: Felt,
     factor: u8,
 ) {
-    use super::p1w16_emit::w8_permute;
+    use super::p1w16_emit::{Lane, w8_permute_lanes};
 
     assert_eq!(seed.len(), 1, "a Poseidon1 transcript state is ONE cell");
     let [s0, s1, s2, s3] = b.unpack(seed[0]);
-    let prefix = b.felt_const(FE::from(u64::from_be_bytes(GRINDING_PREFIX)));
-    let fac = b.felt_const(FE::from(u64::from(factor) << 56));
-    let zero = b.felt_const(FE::zero());
-    let inner = w8_permute(b, [prefix, s0, s1, s2, s3, fac, zero, zero]);
-    let outer = w8_permute(
+    let prefix = FE::from(u64::from_be_bytes(GRINDING_PREFIX));
+    let fac = FE::from(u64::from(factor) << 56);
+    let (c, v) = (Lane::Const, Lane::Var);
+    let z = FE::zero();
+    let inner = w8_permute_lanes(
+        b,
+        [c(prefix), v(s0), v(s1), v(s2), v(s3), c(fac), c(z), c(z)],
+        4,
+    );
+    let outer = w8_permute_lanes(
         b,
         [
-            inner[0], inner[1], inner[2], inner[3], nonce, zero, zero, zero,
+            v(inner[0]),
+            v(inner[1]),
+            v(inner[2]),
+            v(inner[3]),
+            v(nonce),
+            c(z),
+            c(z),
+            c(z),
         ],
+        1,
     );
+    let zero = b.felt_const(FE::zero());
     let bits = b.bit_dec(outer[0], 64);
     for bit in &bits[64 - factor as usize..] {
         b.assert_eq(Felt(bit.addr()), zero);

@@ -281,6 +281,75 @@ fn the_emulated_width8_permutation_is_poseidon1_w8() {
     );
 }
 
+/// ★ The sparse form of the width-8 permutation is the textbook one: on the
+/// host (the precomputed constants and matrices) and emitted, at every input
+/// pattern the grind uses and with every lane variable, and it spends the
+/// rows its derivation says.
+#[test]
+fn the_sparse_width8_permutation_is_poseidon1_w8() {
+    for seed in [0u64, 1, 2, 0xFFFF] {
+        let input: [FE; 8] = core::array::from_fn(|i| felt(seed, i));
+        assert_eq!(w8_sparse_host(input), poseidon1_w8::permute(input), "host, seed {seed}");
+    }
+    // (constant lanes, kept lanes): all variable, the grind's inner and outer.
+    let patterns: [(&[usize], usize); 3] = [(&[], 8), (&[0, 5, 6, 7], 4), (&[5, 6, 7], 1)];
+    let mut rows = Vec::new();
+    for (consts, keep) in patterns {
+        for seed in [3u64, 4] {
+            let mut input: [FE; 8] = core::array::from_fn(|i| felt(seed, i));
+            for &i in consts {
+                if i >= 6 {
+                    input[i] = FE::zero();
+                }
+            }
+            let mut b = LfmBuilder::new();
+            let vars = hinted_felts(&mut b, 8);
+            let lanes: [Lane; 8] = core::array::from_fn(|i| {
+                if consts.contains(&i) {
+                    Lane::Const(input[i])
+                } else {
+                    Lane::Var(vars[i])
+                }
+            });
+            let out = w8_permute_lanes(&mut b, lanes, keep);
+            for f in &out {
+                b.public(f.as_cell());
+            }
+            let program = compile(b.finish());
+            // The permutation is the program's only arithmetic.
+            let spent = program
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, super::instr::Instr::BaseAlu { .. }))
+                .count();
+            super::validator::validate(&program).expect("admissible");
+            let exec = execute_serial(
+                &program,
+                &[input.iter().copied().map(base_word).collect()],
+                &HasherKind::Poseidon1W16,
+            )
+            .expect("executes");
+            let got: Vec<FE> = exec.public_words.iter().flat_map(|(_, w)| *w).collect();
+            let want = poseidon1_w8::permute(input);
+            let got_lanes: Vec<FE> = got.chunks(4).map(|w| w[0]).collect();
+            assert_eq!(got_lanes, want[..keep].to_vec(), "consts {consts:?} keep {keep}");
+            rows.push((consts.len(), keep, spent));
+        }
+    }
+    println!("SPARSE W8 ROWS (consts, keep, rows): {rows:?}");
+    // Dense: 8 + 8·(32 + 64) + 22·(4 + 64) = 2,272. Sparse, all variable: 8
+    // adds, 8 full rounds of 32 + 64, 22 partial rounds of 4 + 8 + 7, 7 more
+    // where the last partial round's seeds meet the terminal constant, and 8
+    // fewer in the unseeded last round, whose MDS rows each start from their
+    // coefficient-one term: 8 + 768 + 418 + 7 − 8 = 1,193. The grind's inner
+    // hash (four constant lanes, four kept) saves four adds, four S-boxes and
+    // 32 matrix terms in round 0 and four last-round outputs (32 − 4): 1,113;
+    // its outer (three constant lanes, lane 0 kept) 1,105 — 2,218 a check
+    // against the dense 4,544.
+    let spent: Vec<usize> = rows.iter().step_by(2).map(|r| r.2).collect();
+    assert_eq!(spent, vec![1_193, 1_113, 1_105], "all variable; inner; outer");
+}
+
 /// The transcript replay's Poseidon1 arm against `P1Transcript`: every append
 /// kind a sub-proof replays (constant bytes, a root, a felt, an extension
 /// element, machine bytes) and every draw (an extension element, index bits,
