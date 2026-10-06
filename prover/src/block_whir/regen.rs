@@ -1,5 +1,5 @@
 //! Regeneration on the WHIR block (D-WHIR-NODISK, #1013's D-REGEN): the shadow
-//! regenerator.
+//! regenerator, and live regeneration.
 //!
 //! `LAMBDA_VM_BLOCK_REGEN=shadow` runs the sequential regenerator beside phase
 //! B and drops nothing. Phase A records, per streamed chunk, a [`Recipe`]:
@@ -13,6 +13,12 @@
 //! been ready against phase B's groups as they ran, in the order they ran and
 //! with the groups that hold no streamed chunk first ([`Plan`]). The proof is
 //! the one the knob's absence makes.
+//!
+//! `auto` and `always` are live regeneration (#1013's R2, its no-disk P1):
+//! phase A drops a streamed chunk instead of keeping or spilling it once the
+//! spill's policy would move a table off the host (`always`: every one), and
+//! phase B's regenerator ([`run_live`]) deposits each into its slot, paced by
+//! the groups that take them ([`stark::multilinear_block::BlockRegen`]).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,6 +27,7 @@ use std::time::Instant;
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use stark::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 
 use crate::Error;
 use crate::tables::gpack::TraceForm;
@@ -36,6 +43,22 @@ pub enum RegenMode {
     /// `shadow`: phase A records every streamed chunk's recipe, and phase B
     /// regenerates each beside the prove, checks it and throws it away.
     Shadow,
+    /// `auto`: a tier of the spill's policy. Once it would move a table off
+    /// the host, a streamed chunk is dropped instead (and the parked ones are
+    /// dropped back), and phase B rebuilds the dropped ones. With the spill
+    /// policy `off` it still decides as `auto` does, with no store: no disk.
+    /// A block that never arms drops nothing.
+    Auto,
+    /// `always`: every streamed chunk is dropped and rebuilt — the
+    /// byte-identity test mode, not a policy.
+    Always,
+}
+
+impl RegenMode {
+    /// Whether phase A drops chunks for phase B to rebuild.
+    pub fn live(self) -> bool {
+        matches!(self, Self::Auto | Self::Always)
+    }
 }
 
 /// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN`; any other value is refused (an
@@ -49,10 +72,36 @@ pub(crate) fn parse_regen_mode(value: Option<&str>) -> Result<RegenMode, Error> 
     match value.map(str::trim) {
         None | Some("off") => Ok(RegenMode::Off),
         Some("shadow") => Ok(RegenMode::Shadow),
+        Some("auto") => Ok(RegenMode::Auto),
+        Some("always") => Ok(RegenMode::Always),
         Some(other) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_REGEN must be `off` or `shadow`, got `{other}`"
+            "LAMBDA_VM_BLOCK_REGEN must be `off`, `shadow`, `auto` or `always`, got `{other}`"
         ))),
     }
+}
+
+/// `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB` (default 4, as the spill read-back's
+/// window): the bytes the regenerator may hold deposited ahead of the groups
+/// that take them, counted from the window's frontier.
+pub(crate) fn regen_ahead_bytes() -> u64 {
+    gib_knob("LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB", 4.0)
+}
+
+/// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
+/// `auto` reserves for the regenerator in phase B once regeneration is armed —
+/// its walk state, windows, jobs and generators' outputs, and the columns
+/// deposited ahead of their groups. Never added unarmed.
+pub(crate) fn regen_reserve_bytes() -> u64 {
+    gib_knob("LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB", 10.0)
+}
+
+fn gib_knob(var: &str, default: f64) -> u64 {
+    let gib = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g >= 0.0)
+        .unwrap_or(default);
+    (gib * GIB) as u64
 }
 
 /// Generator threads of the regenerator: `LAMBDA_VM_BLOCK_REGEN_GENERATORS`
@@ -187,6 +236,9 @@ fn slot(table: StreamTable) -> Option<usize> {
 #[derive(Default)]
 pub(crate) struct Recorder {
     inner: Mutex<Recorded>,
+    /// Whether the layout's threads digest each chunk as they generate it
+    /// (the shadow; live regeneration digests what it drops, at the drop).
+    digests: bool,
 }
 
 #[derive(Default)]
@@ -195,14 +247,33 @@ struct Recorded {
     ends: [Vec<usize>; 8],
     windows: usize,
     recipes: BTreeMap<(usize, usize), Recipe>,
+    /// Each recipe's chunk, by its place in the hand-out.
+    by_order: Vec<(StreamTable, usize)>,
     /// Digests for a chunk with no recipe, and chunks of a table no recipe
     /// can hold.
     stray: usize,
 }
 
 impl Recorder {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    /// A recorder whose layout threads digest each chunk (`digests`, the
+    /// shadow's) or not (live regeneration's).
+    pub(crate) fn new(digests: bool) -> Self {
+        Self {
+            digests,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the layout's threads digest each chunk ([`Self::packed`]).
+    pub(crate) fn digests(&self) -> bool {
+        self.digests
+    }
+
+    /// The chunk handed out `order`-th, when one was: phase A places the
+    /// streamed chunks first, in hand-out order, so it is the table at block
+    /// index `order`.
+    pub(crate) fn chunk_at(&self, order: usize) -> Option<(StreamTable, usize)> {
+        self.lock().by_order.get(order).copied()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Recorded> {
@@ -229,6 +300,7 @@ impl Recorder {
             let start = job.index * ops;
             let first = first_window(&r.ends[t], start);
             let order = r.recipes.len();
+            r.by_order.push((job.table, job.index));
             r.recipes.insert(
                 (t, job.index),
                 Recipe {
@@ -261,9 +333,9 @@ impl Recorder {
     }
 
     /// The recipes in hand-out order, and the digests that found no recipe.
-    pub(crate) fn finish(self) -> (Vec<Recipe>, usize) {
-        let r = self.inner.into_inner().unwrap_or_else(|e| e.into_inner());
-        let mut recipes: Vec<Recipe> = r.recipes.into_values().collect();
+    pub(crate) fn recipes(&self) -> (Vec<Recipe>, usize) {
+        let r = self.lock();
+        let mut recipes: Vec<Recipe> = r.recipes.values().cloned().collect();
         recipes.sort_by_key(|recipe| recipe.order);
         (recipes, r.stray)
     }
@@ -281,13 +353,13 @@ fn first_window(ends: &[usize], start: usize) -> Option<(usize, usize)> {
 /// streams its windows and generates each streamed chunk packed, G-pack, and
 /// streams neither KECCAK_RND nor the MEMW-derived LT ops, whose chunks the
 /// regenerator does not cut). None otherwise, saying why.
-pub(crate) fn shadow_recorder(mode: RegenMode, streams: bool) -> Option<Recorder> {
+pub(crate) fn recorder(mode: RegenMode, streams: bool) -> Option<Recorder> {
     match (mode, streams) {
         (RegenMode::Off, _) => None,
-        (RegenMode::Shadow, true) => Some(Recorder::new()),
-        (RegenMode::Shadow, false) => {
+        (_, true) => Some(Recorder::new(mode == RegenMode::Shadow)),
+        (_, false) => {
             eprintln!(
-                "BLOCK REGEN: shadow wanted, but phase A does not stream its chunks packed (windows, \
+                "BLOCK REGEN: {mode:?} wanted, but phase A does not stream its chunks packed (windows, \
                  G-pack, narrow groups; KECCAK_RND and the MEMW-derived LT ops not streamed): off"
             );
             None
@@ -959,6 +1031,651 @@ pub(crate) fn recorded_line(
     )
 }
 
+/// Which streamed chunk a table is.
+pub(crate) type StreamKey = (StreamTable, usize);
+
+/// A generator alive while held (unwinding included).
+struct Alive<'a>(&'a AtomicUsize);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A job and the slot it fills: dropped undeposited (a generator that
+/// panicked outside its catch, a channel torn down), it fails its slot (R10).
+struct JobGuard {
+    job: Option<ChunkJob>,
+    slot: RegenSlot,
+    settled: bool,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.slot.fail("its generator stopped before depositing it");
+        }
+    }
+}
+
+/// What the live regenerator did.
+#[derive(Debug, Default)]
+pub(crate) struct LiveReport {
+    pub(crate) dropped: usize,
+    pub(crate) deposited: usize,
+    pub(crate) mismatches: usize,
+    /// Deposits refused because the window had closed.
+    pub(crate) closed: usize,
+    pub(crate) failures: Vec<String>,
+    /// Dropped chunks the slicer did not cut before a higher rank, failed at
+    /// once (R10).
+    pub(crate) skipped: usize,
+    /// Chunks cut that were not dropped, not generated.
+    pub(crate) beyond: usize,
+    pub(crate) windows: usize,
+    pub(crate) cycles: usize,
+    pub(crate) bytes: u64,
+    pub(crate) first_ready: Option<f64>,
+    pub(crate) last_ready: Option<f64>,
+    pub(crate) wall: f64,
+    /// Thread CPU: the executor, the walker (with its start state), the
+    /// generators summed (Linux only).
+    pub(crate) cpu: [Option<f64>; 3],
+    pub(crate) generators: usize,
+    pub(crate) error: Option<String>,
+    pub(crate) state_bytes: usize,
+}
+
+impl LiveReport {
+    pub(crate) fn cpu_total(&self) -> Option<f64> {
+        Some(self.cpu[0]? + self.cpu[1]? + self.cpu[2]?)
+    }
+
+    /// The `BLOCK REGEN live` line.
+    pub(crate) fn line(&self) -> String {
+        let secs = |s: Option<f64>| s.map_or("n/a".to_string(), |s| format!("{s:.1}"));
+        format!(
+            "BLOCK REGEN live: {} of {} dropped chunks deposited · {} mismatches · {} failed · {} \
+             skipped (not cut in rank order) · {} refused (window closed) · {} not dropped \
+             (skipped) · {} windows walked ({:.2} M cycles) · {:.2} GiB packed · ready from {} s \
+             to {} s · wall {:.2} s · CPU exec {} · walk {} · {} generators {} = {} s · walk state \
+             {:.2} GiB{}",
+            self.deposited,
+            self.dropped,
+            self.mismatches,
+            self.failures.len(),
+            self.skipped,
+            self.closed,
+            self.beyond,
+            self.windows,
+            self.cycles as f64 / 1e6,
+            self.bytes as f64 / GIB,
+            secs(self.first_ready),
+            secs(self.last_ready),
+            self.wall,
+            secs(self.cpu[0]),
+            secs(self.cpu[1]),
+            self.generators,
+            secs(self.cpu[2]),
+            secs(self.cpu_total()),
+            self.state_bytes as f64 / GIB,
+            self.error
+                .as_ref()
+                .map_or(String::new(), |e| format!(" · stopped: {e}")),
+        )
+    }
+}
+
+/// A test's faults in the live regenerator's exits and deposits (R2/R10):
+/// each makes one of them happen, so a test can check that no slot is left
+/// waiting and nothing wrong is proved. All off outside tests.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LiveFaults {
+    /// The walk fails at this window.
+    pub(crate) walk_error_at: Option<usize>,
+    /// The generator that takes the job of this rank panics outside its
+    /// catch.
+    pub(crate) generator_panics_at_rank: Option<u64>,
+    /// The slicer never hands out this rank's chunk.
+    pub(crate) skip_rank: Option<u64>,
+    /// The chunk of this rank is deposited with one packed bit flipped.
+    pub(crate) bend_rank: Option<u64>,
+    /// The window checks deposits on their shape alone (the digest off), so
+    /// a bent deposit reaches the kept tree's check.
+    pub(crate) digest_off: bool,
+}
+
+/// The live regenerator (D-REGEN §2.3, sequential form): `builder` walks the
+/// run of `program` on `private_input`, executed `window_cycles` cycles at a
+/// time on a thread of its own; every chunk it cuts that was dropped is
+/// generated in `form`, packed if it is not, and deposited into its slot on
+/// one of `generators` threads, in rank order of dispatch. Never panics; every
+/// exit leaves no slot waiting.
+///
+/// The ranks are phase A's hand-out order, window by window, so the windows
+/// must be phase A's: a rank the slicer cuts after a higher one is failed — its
+/// table refused, never waited on (R10).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_live(
+    program: &Elf,
+    private_input: &[u8],
+    builder: RegenBuilder,
+    window_cycles: usize,
+    window: Arc<RegenWindow>,
+    producer: RegenProducer,
+    dropped: Vec<(StreamKey, RegenSlot)>,
+    generators: usize,
+    form: TraceForm,
+    started: Instant,
+    faults: LiveFaults,
+) -> LiveReport {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    let mut builder = builder;
+    let mut report = LiveReport {
+        dropped: dropped.len(),
+        generators,
+        ..LiveReport::default()
+    };
+    #[cfg(test)]
+    if faults.digest_off {
+        window.set_verify(false);
+    }
+    // Position of each dropped chunk in rank order.
+    let position: BTreeMap<(usize, usize), usize> = dropped
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ((table, index), _))| Some(((slot(*table)?, *index), i)))
+        .collect();
+    let mut settled = vec![false; dropped.len()];
+    let fail_from = |settled: &mut [bool], from: usize, upto: usize, why: &str| -> usize {
+        let mut n = 0;
+        for i in from..upto {
+            if !settled[i] {
+                dropped[i].1.fail(why);
+                settled[i] = true;
+                n += 1;
+            }
+        }
+        n
+    };
+    let deposited = AtomicUsize::new(0);
+    let mismatches = AtomicUsize::new(0);
+    let closed = AtomicUsize::new(0);
+    let failures = Mutex::new(Vec::new());
+    let ready = Mutex::new((None::<f64>, None::<f64>, 0u64));
+    let generators = generators.max(1);
+    let (job_tx, job_rx) = mpsc::sync_channel::<JobGuard>(2 * generators);
+    let job_rx = Mutex::new(job_rx);
+    // Generators alive: when none is, the walker stops handing out (a full
+    // queue would otherwise hold it forever).
+    let alive = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let (log_tx, log_rx) = mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
+        let window_ref = &window;
+        let exec = std::thread::Builder::new()
+            .name("regen-exec".to_string())
+            .spawn_scoped(s, move || {
+                let cpu0 = thread_cpu_secs();
+                let run = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+                    let mut executor = Executor::new(program, private_input.to_vec())
+                        .map_err(|e| format!("the executor: {e}"))?;
+                    while let Some(logs) = executor
+                        .resume_with_limit(window_cycles)
+                        .map_err(|e| format!("the execution: {e}"))?
+                    {
+                        if window_ref.is_closed() || log_tx.send(logs.to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }))
+                .unwrap_or_else(|_| Err("the executor panicked".to_string()));
+                (run, cpu_since(cpu0))
+            });
+        let exec = match exec {
+            Ok(exec) => Some(exec),
+            Err(e) => {
+                report.error = Some(format!("the executor thread did not start: {e}"));
+                None
+            }
+        };
+        let mut gens = Vec::with_capacity(generators);
+        if exec.is_some() {
+            for g in 0..generators {
+                let Some(token) = window.producer() else {
+                    break;
+                };
+                let (job_rx, deposited, mismatches, closed, failures, ready, alive) = (
+                    &job_rx,
+                    &deposited,
+                    &mismatches,
+                    &closed,
+                    &failures,
+                    &ready,
+                    &alive,
+                );
+                alive.fetch_add(1, Ordering::SeqCst);
+                let spawned = std::thread::Builder::new()
+                    .name(format!("regen-gen-{g}"))
+                    .spawn_scoped(s, move || {
+                        let _token = token;
+                        let _alive = Alive(alive);
+                        let cpu0 = thread_cpu_secs();
+                        loop {
+                            let next = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(mut guard) = next else {
+                                break;
+                            };
+                            let Some(job) = guard.job.take() else {
+                                continue;
+                            };
+                            if faults.generator_panics_at_rank == Some(guard.slot.rank()) {
+                                panic!("a generator dies outside its catch (a test's fault)");
+                            }
+                            let (table, index) = (job.table, job.index);
+                            let built = catch_unwind(AssertUnwindSafe(|| {
+                                let mut trace = job.generate_as(form).trace;
+                                if trace.narrow_main().is_none() {
+                                    trace.pack_main_narrow();
+                                }
+                                // Moved out, not copied.
+                                trace.take_narrow_main()
+                            }));
+                            let packed = match built {
+                                Ok(Some(packed)) => packed,
+                                Ok(None) => {
+                                    let why = format!("{table:?}[{index}]: the columns did not pack");
+                                    guard.slot.fail(&why);
+                                    guard.settled = true;
+                                    failures.lock().unwrap_or_else(|e| e.into_inner()).push(why);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    let why = format!("{table:?}[{index}]: generation panicked");
+                                    guard.slot.fail(&why);
+                                    guard.settled = true;
+                                    failures.lock().unwrap_or_else(|e| e.into_inner()).push(why);
+                                    continue;
+                                }
+                            };
+                            let packed = if faults.bend_rank == Some(guard.slot.rank()) {
+                                bend(packed)
+                            } else {
+                                packed
+                            };
+                            let bytes = packed.data().len() as u64;
+                            let out = guard.slot.deposit(packed);
+                            // Deposited, refused or closed: the slot is settled
+                            // either way (a closed window settles every waiter).
+                            guard.settled = true;
+                            match out {
+                                Ok(()) => {
+                                    deposited.fetch_add(1, Ordering::Relaxed);
+                                    let at = started.elapsed().as_secs_f64();
+                                    let mut r = ready.lock().unwrap_or_else(|e| e.into_inner());
+                                    r.0 = Some(r.0.map_or(at, |f: f64| f.min(at)));
+                                    r.1 = Some(r.1.map_or(at, |l: f64| l.max(at)));
+                                    r.2 += bytes;
+                                }
+                                Err(RegenError::Mismatch) => {
+                                    mismatches.fetch_add(1, Ordering::Relaxed);
+                                }
+                                // Keep draining (R3): the walker may be waiting
+                                // on a full queue.
+                                Err(RegenError::Closed(_)) => {
+                                    closed.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(RegenError::Failed(why)) => {
+                                    failures
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(format!("{table:?}[{index}]: {why}"));
+                                }
+                            }
+                        }
+                        cpu_since(cpu0)
+                    });
+                match spawned {
+                    Ok(handle) => gens.push(handle),
+                    Err(e) => {
+                        alive.fetch_sub(1, Ordering::SeqCst);
+                        report
+                            .failures
+                            .push(format!("generator {g} did not start: {e}"));
+                    }
+                }
+            }
+        }
+        // This thread walks and cuts, and hands out the dropped chunks in rank
+        // order; a dropped chunk not cut before a higher rank is failed at once
+        // (R10).
+        let cpu0 = thread_cpu_secs();
+        let mut next = 0usize;
+        let mut stop: Option<String> = None;
+        if gens.is_empty() {
+            stop = Some(
+                report
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "no generator started".to_string()),
+            );
+        } else {
+            for logs in log_rx.iter() {
+                if window.is_closed() {
+                    stop = Some("the window closed".to_string());
+                    break;
+                }
+                if faults.walk_error_at == Some(report.windows) {
+                    stop = Some("the regeneration walk failed (a test's fault)".to_string());
+                    break;
+                }
+                report.windows += 1;
+                let jobs = match catch_unwind(AssertUnwindSafe(|| builder.push(&logs))) {
+                    Ok(Ok(jobs)) => jobs,
+                    Ok(Err(e)) => {
+                        stop = Some(format!("the regeneration walk: {e}"));
+                        break;
+                    }
+                    Err(_) => {
+                        stop = Some("the regeneration walk panicked".to_string());
+                        break;
+                    }
+                };
+                // The window's dropped chunks in rank order: within a window
+                // the order is the slicer's own, so only the windows must be
+                // phase A's.
+                let mut cut: Vec<(usize, ChunkJob)> = Vec::with_capacity(jobs.len());
+                for job in jobs {
+                    match slot(job.table).and_then(|t| position.get(&(t, job.index))) {
+                        Some(&pos) => cut.push((pos, job)),
+                        None => report.beyond += 1,
+                    }
+                }
+                cut.sort_by_key(|&(pos, _)| pos);
+                for (pos, job) in cut {
+                    if faults.skip_rank == Some(dropped[pos].1.rank()) {
+                        continue;
+                    }
+                    if pos < next || settled[pos] {
+                        continue;
+                    }
+                    report.skipped += fail_from(
+                        &mut settled,
+                        next,
+                        pos,
+                        "the slicer did not cut it before a higher rank",
+                    );
+                    settled[pos] = true;
+                    next = pos + 1;
+                    let mut guard = JobGuard {
+                        job: Some(job),
+                        slot: dropped[pos].1.clone(),
+                        settled: false,
+                    };
+                    // A job that cannot be handed out is dropped, and its
+                    // guard fails its slot.
+                    loop {
+                        match job_tx.try_send(guard) {
+                            Ok(()) => break,
+                            Err(mpsc::TrySendError::Full(back)) => {
+                                if alive.load(Ordering::SeqCst) == 0 {
+                                    drop(back);
+                                    stop = Some("every generator stopped".to_string());
+                                    break;
+                                }
+                                guard = back;
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                            Err(mpsc::TrySendError::Disconnected(back)) => {
+                                drop(back);
+                                stop = Some("the generators stopped".to_string());
+                                break;
+                            }
+                        }
+                    }
+                    if stop.is_some() {
+                        break;
+                    }
+                }
+                if stop.is_some() || next == dropped.len() {
+                    break;
+                }
+            }
+        }
+        // Every exit: what was not handed out fails, with why (R2).
+        let why = stop
+            .clone()
+            .unwrap_or_else(|| "the run ended before its chunk was cut".to_string());
+        let unsent = fail_from(&mut settled, next, dropped.len(), &why);
+        report.skipped += unsent;
+        match stop {
+            Some(stop) if stop != "the window closed" => {
+                report.error.get_or_insert(stop);
+            }
+            None if unsent > 0 => {
+                report.error.get_or_insert(why);
+            }
+            _ => {}
+        }
+        drop(log_rx);
+        drop(job_tx);
+        drop(producer);
+        report.cycles = builder.cycles();
+        report.state_bytes = builder.state_bytes();
+        report.cpu[1] = cpu_since(cpu0);
+        let mut gen_cpu = Some(0.0);
+        for g in gens {
+            let cpu = g.join().unwrap_or_else(|_| {
+                failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push("a generator panicked".to_string());
+                None
+            });
+            gen_cpu = gen_cpu.zip(cpu).map(|(a, b)| a + b);
+        }
+        // Jobs no generator took (every one stopped): their guards fail their
+        // slots now, not when this function returns.
+        while let Ok(guard) = job_rx.lock().unwrap_or_else(|e| e.into_inner()).try_recv() {
+            drop(guard);
+        }
+        report.cpu[2] = gen_cpu;
+        if let Some(exec) = exec {
+            match exec.join() {
+                Ok((run, cpu)) => {
+                    report.cpu[0] = cpu;
+                    if let Err(e) = run {
+                        report.error.get_or_insert(e);
+                    }
+                }
+                Err(_) => {
+                    report
+                        .error
+                        .get_or_insert("the executor thread panicked".to_string());
+                }
+            }
+        }
+    });
+    report.deposited = deposited.into_inner();
+    report.mismatches = mismatches.into_inner();
+    report.closed = closed.into_inner();
+    report
+        .failures
+        .extend(failures.into_inner().unwrap_or_else(|e| e.into_inner()));
+    let (first, last, bytes) = ready.into_inner().unwrap_or_else(|e| e.into_inner());
+    report.first_ready = first;
+    report.last_ready = last;
+    report.bytes = bytes;
+    report.wall = started.elapsed().as_secs_f64();
+    report
+}
+
+/// `packed` with the low bit of its first byte flipped: a wrong word of the
+/// same shape (a test's fault).
+fn bend(packed: multilinear::narrow::NarrowColumns) -> multilinear::narrow::NarrowColumns {
+    let (rows, widths, mut data) = packed.into_parts();
+    if let Some(b) = data.first_mut() {
+        *b ^= 1;
+    }
+    multilinear::narrow::NarrowColumns::from_parts(rows, widths, data)
+        .expect("one bit flipped keeps the shape")
+}
+
+/// The live regenerator on a thread of its own (`regen-walk`), for the phase
+/// B beside it. Dropped — the prove returned, refused or unwound — it closes
+/// the window, so a regenerator waiting to deposit for takers that are gone
+/// returns, and joins it (R4): no regenerator outlives its prove.
+pub(crate) struct LiveRun {
+    window: Arc<RegenWindow>,
+    handle: Option<std::thread::JoinHandle<LiveReport>>,
+    started: Instant,
+    dropped: usize,
+    spawn_error: Option<String>,
+}
+
+impl LiveRun {
+    /// [`run_live`] over the run of `elf_bytes` on `private_input`, executed
+    /// `window_cycles` at a time (phase A's windows), its chunks cut at
+    /// `max_rows` and generated in `form` (phase A's), on [`regen_generators`]
+    /// generators, depositing `dropped` into `window`; its times are from now.
+    /// A regenerator that cannot start drops `producer`, so every slot fails
+    /// at once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn(
+        elf_bytes: Vec<u8>,
+        private_input: Vec<u8>,
+        max_rows: crate::tables::MaxRowsConfig,
+        window_cycles: usize,
+        window: Arc<RegenWindow>,
+        producer: RegenProducer,
+        dropped: Vec<(StreamKey, RegenSlot)>,
+        form: TraceForm,
+        faults: LiveFaults,
+    ) -> Self {
+        let started = Instant::now();
+        let count = dropped.len();
+        let window_in = Arc::clone(&window);
+        let spawned = std::thread::Builder::new()
+            .name("regen-walk".to_string())
+            .spawn(move || {
+                let cpu0 = thread_cpu_secs();
+                let failed = |why: String, dropped: &[(StreamKey, RegenSlot)]| {
+                    for (_, slot) in dropped {
+                        slot.fail(&why);
+                    }
+                    LiveReport {
+                        dropped: dropped.len(),
+                        skipped: dropped.len(),
+                        error: Some(why),
+                        ..LiveReport::default()
+                    }
+                };
+                let program = match Elf::load(&elf_bytes) {
+                    Ok(program) => program,
+                    Err(e) => return failed(format!("the regenerator's ELF: {e}"), &dropped),
+                };
+                match RegenBuilder::new(&program, &private_input, &max_rows) {
+                    Ok(builder) => {
+                        let setup = cpu_since(cpu0);
+                        let mut report = run_live(
+                            &program,
+                            &private_input,
+                            builder,
+                            window_cycles,
+                            window_in,
+                            producer,
+                            dropped,
+                            regen_generators(),
+                            form,
+                            started,
+                            faults,
+                        );
+                        report.cpu[1] = report.cpu[1].zip(setup).map(|(walk, setup)| walk + setup);
+                        report
+                    }
+                    Err(e) => failed(format!("the regenerator: {e}"), &dropped),
+                }
+            });
+        let (handle, spawn_error) = match spawned {
+            Ok(handle) => (Some(handle), None),
+            // The closure went with the failed spawn, its producer with it:
+            // every slot has failed.
+            Err(e) => (None, Some(format!("the regenerator did not start: {e}"))),
+        };
+        Self {
+            window,
+            handle,
+            started,
+            dropped: count,
+            spawn_error,
+        }
+    }
+
+    /// When it started: every time its report gives is from here.
+    pub(crate) fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// Its report once the prove is done (the window closed first, so it
+    /// returns); a thread that did not start or that panicked is a report
+    /// with the error.
+    pub(crate) fn join(mut self) -> LiveReport {
+        self.window.close("the block's prove ended");
+        let failed = |error: String| LiveReport {
+            dropped: self.dropped,
+            error: Some(error),
+            ..LiveReport::default()
+        };
+        match self.handle.take() {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|_| failed("the regenerator panicked".to_string())),
+            None => failed(
+                self.spawn_error
+                    .take()
+                    .unwrap_or_else(|| "the regenerator did not start".to_string()),
+            ),
+        }
+    }
+}
+
+impl Drop for LiveRun {
+    fn drop(&mut self) {
+        self.window.close("the block's prove ended");
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The `BLOCK REGEN dropped` line: what phase A dropped, of `recipes` streamed
+/// chunks.
+pub(crate) fn dropped_line(
+    mode: RegenMode,
+    no_disk: bool,
+    report: &stark::multilinear_block::DropReport,
+    recipes: usize,
+) -> String {
+    let armed = match report.armed {
+        Some(at) => format!("armed at {at:.1} s"),
+        None if mode == RegenMode::Always => "always".to_string(),
+        None => "never armed".to_string(),
+    };
+    format!(
+        "BLOCK REGEN dropped: {mode:?}{} · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
+         {armed} · {recipes} recipes · {} refused (no longer on the host)",
+        if no_disk { " (no disk)" } else { "" },
+        report.tables,
+        report.bytes as f64 / GIB,
+        report.back_tables,
+        report.back_bytes as f64 / GIB,
+        report.refused_late,
+    )
+}
+
 /// The shadow's readout once phase B is done: the `BLOCK REGEN` lines (what
 /// phase A recorded against the `streamed` chunks of `streamed_cells` cells,
 /// what the shadow did and each mismatch and failure, the first 20; the plan
@@ -1020,6 +1737,7 @@ pub(crate) fn shadow_readout(
         error: report.error.clone(),
         would_wait_rest_first,
         lines,
+        ..RegenStamps::default()
     }
 }
 
@@ -1027,6 +1745,9 @@ pub(crate) fn shadow_readout(
 #[derive(Clone, Debug, Default)]
 pub struct RegenStamps {
     pub recipes: usize,
+    /// Live regeneration: the chunks phase A dropped, and their packed bytes.
+    pub dropped: usize,
+    pub dropped_bytes: u64,
     pub digested: usize,
     pub stray: usize,
     pub regenerated: usize,
@@ -1044,16 +1765,20 @@ pub struct RegenStamps {
 mod tests {
     use super::*;
 
-    /// `LAMBDA_VM_BLOCK_REGEN`: `off` (and unset) and `shadow`; anything else
-    /// is refused (an error, not a panic).
+    /// `LAMBDA_VM_BLOCK_REGEN`: `off` (and unset), `shadow`, `auto`, `always`;
+    /// anything else is refused (an error, not a panic).
     #[test]
     fn the_regen_mode_reads_its_knob() {
         assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
         assert_eq!(parse_regen_mode(Some(" off ")).unwrap(), RegenMode::Off);
         assert_eq!(parse_regen_mode(Some("shadow")).unwrap(), RegenMode::Shadow);
-        for bad in ["", "on", "Shadow", "1", "auto", "always"] {
+        assert_eq!(parse_regen_mode(Some("auto")).unwrap(), RegenMode::Auto);
+        assert_eq!(parse_regen_mode(Some("always")).unwrap(), RegenMode::Always);
+        for bad in ["", "on", "Shadow", "1", "Auto", "ALWAYS"] {
             assert!(parse_regen_mode(Some(bad)).is_err(), "{bad:?}");
         }
+        assert!(!RegenMode::Off.live() && !RegenMode::Shadow.live());
+        assert!(RegenMode::Auto.live() && RegenMode::Always.live());
     }
 
     /// A chunk's first op in the windows: lists of 3, 3, 9 and 14 ops after

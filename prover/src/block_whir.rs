@@ -1884,6 +1884,13 @@ pub(crate) struct Deviations {
     /// the prove's own ([`multilinear_block::block_prove_in_order`]): every
     /// order proves the same bytes.
     pub phase_b_order: Option<fn(usize) -> Vec<usize>>,
+    /// Live regeneration's faults ([`regen::LiveFaults`]): a regenerator that
+    /// dies or deposits wrong columns, which phase B must refuse, never prove
+    /// over.
+    pub regen_faults: regen::LiveFaults,
+    /// `auto`'s target for the host, in bytes, instead of the machine's
+    /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
+    pub spill_target: Option<u64>,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2596,7 +2603,10 @@ fn lay_out_chunk<'a>(
         ops
     });
     let mut chunk = job.generate_as(airs.form);
-    if let (Some(recorder), Some(packed)) = (recorder, chunk.trace.narrow_main()) {
+    if let (Some(recorder), Some(packed)) = (
+        recorder.filter(|r| r.digests()),
+        chunk.trace.narrow_main(),
+    ) {
         recorder.packed(chunk.table, chunk.index, packed);
     }
     let rows = ledger.map_or(0, |ledger| {
@@ -3359,18 +3369,34 @@ fn prove_streamed(
     // A new block: no memory pressure seen yet (`alloc_purge`).
     crate::alloc_purge::clear_memory_pressure();
     let stream_airs = StreamAirs::new(opts, stream_form);
-    // Regeneration (`BlockOptions::regen`): the shadow's recorder, when phase A
-    // can feed it — its chunks generated packed, and none of KECCAK_RND's or
-    // of the MEMW-derived LT ops streamed (chunks no regenerator cuts).
+    // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
+    // it — its chunks generated packed, and none of KECCAK_RND's or of the
+    // MEMW-derived LT ops streamed (chunks no regenerator cuts).
     let regen_mode = match options.regen {
         Some(mode) => mode,
         None => regen::regen_mode()?,
     };
-    let shadow_recorder = regen::shadow_recorder(
+    let regen_recorder = regen::recorder(
         regen_mode,
         stream_form == TraceForm::Narrow && !options.stream_keccak_rnd && !options.stream_memw_lt,
-    );
-    let recorder = shadow_recorder.as_ref();
+    )
+    .map(std::sync::Arc::new);
+    let recorder = regen_recorder.as_deref();
+    // Live regeneration: phase A drops the streamed chunks the policy moves off
+    // the host (`always`: every one). The streamed chunks are placed first, in
+    // hand-out order, so the table at block index `t` is the `t`-th chunk
+    // handed out when there was one.
+    let live_regen = regen_recorder
+        .as_ref()
+        .filter(|_| regen_mode.live())
+        .map(|recorder| {
+            let recorder = std::sync::Arc::clone(recorder);
+            multilinear_block::BlockRegen::new(
+                std::sync::Arc::new(move |t| recorder.chunk_at(t).map(|_| t as u64)),
+                regen::regen_ahead_bytes(),
+                regen_mode == regen::RegenMode::Always,
+            )
+        });
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
@@ -3391,7 +3417,7 @@ fn prove_streamed(
     // The spill (`BlockOptions::spill`): a store for this prove, unless the
     // policy is off. A store that does not open leaves every table in memory.
     let policy = options.spill;
-    let target = spill_target_bytes();
+    let target = deviations.spill_target.unwrap_or_else(spill_target_bytes);
     let policy_name = match policy {
         BlockSpillPolicy::Off => "off".to_string(),
         BlockSpillPolicy::Always => "always".to_string(),
@@ -3405,30 +3431,54 @@ fn prove_streamed(
     // (#1013's `Spill::host_most`).
     let host_most: std::sync::Arc<std::sync::Mutex<Option<HostReading>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
+    // Live regeneration with the spill off is no disk: the policy decides as
+    // `auto` does, with no store, and a table it would move off the host is
+    // dropped if phase B can rebuild it, else stays.
+    let no_disk = live_regen.is_some() && policy == BlockSpillPolicy::Off;
+    let decide = if no_disk {
+        BlockSpillPolicy::Auto
+    } else {
+        policy
+    };
+    // The host is read at each decision, whatever the policy: `auto` decides
+    // on it and the purge's pressure is noted from it (`note_pressure_past`).
+    // Once live regeneration has armed, its phase-B reserve counts.
+    let wanted: std::sync::Arc<multilinear_block::SpillWanted> = {
+        let host_most = std::sync::Arc::clone(&host_most);
+        let armed = live_regen.clone();
+        let reserve = regen::regen_reserve_bytes();
+        std::sync::Arc::new(move |kept, cells, bytes| {
+            let reading = HostReading::now();
+            {
+                let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
+                if most.is_none_or(|m| reading.bytes() > m.bytes()) {
+                    *most = Some(reading);
+                }
+            }
+            note_pressure_past(reading.bytes(), target);
+            let extra = if armed.as_ref().is_some_and(|r| r.is_armed()) {
+                reserve
+            } else {
+                0
+            };
+            spill_wanted(decide, target, kept, cells, bytes, || {
+                reading.bytes().saturating_add(extra)
+            })
+        })
+    };
     let spill = match policy {
-        BlockSpillPolicy::Off => None,
+        BlockSpillPolicy::Off if live_regen.is_none() => None,
+        BlockSpillPolicy::Off => Some(multilinear_block::BlockSpill::new(None, 0, wanted)),
         _ => {
             let store_options = stark::spill::SpillOptions::default();
             let queue = store_options.queue_bytes;
             match stark::spill::SpillStore::open(store_options) {
-                Ok(store) => {
-                    let host_most = std::sync::Arc::clone(&host_most);
-                    // The host is read at each decision, whatever the policy:
-                    // `auto` decides on it and the purge's pressure is noted
-                    // from it (`note_pressure_past`).
-                    let wanted: std::sync::Arc<multilinear_block::SpillWanted> =
-                        std::sync::Arc::new(move |kept, cells, bytes| {
-                            let reading = HostReading::now();
-                            {
-                                let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
-                                if most.is_none_or(|m| reading.bytes() > m.bytes()) {
-                                    *most = Some(reading);
-                                }
-                            }
-                            note_pressure_past(reading.bytes(), target);
-                            spill_wanted(policy, target, kept, cells, bytes, || reading.bytes())
-                        });
-                    Some(multilinear_block::BlockSpill::new(store, queue, wanted))
+                Ok(store) => Some(multilinear_block::BlockSpill::new(Some(store), queue, wanted)),
+                Err(e) if live_regen.is_some() => {
+                    stamps.spill = Some(format!(
+                        "{policy_name} · no store ({e}); live regeneration decides with none"
+                    ));
+                    Some(multilinear_block::BlockSpill::new(None, 0, wanted))
                 }
                 Err(e) => {
                     stamps.spill =
@@ -3437,7 +3487,11 @@ fn prove_streamed(
                 }
             }
         }
-    };
+    }
+    .map(|spill| match &live_regen {
+        Some(regen) => spill.with_regen(regen.clone()),
+        None => spill,
+    });
 
     // The streamed finish's byte gate: the rest's tables generated and not yet
     // placed ([`BlockOptions::finish_stream`]).
@@ -3994,7 +4048,10 @@ fn prove_streamed(
         crate::alloc_purge::purge_point("phase-a");
         // The shadow regenerator starts here, beside the rest of the prove; it
         // drops nothing, and any exit of the prove stops and joins it.
-        let shadow_recipes = shadow_recorder.map(regen::Recorder::finish);
+        let shadow_recipes = regen_recorder
+            .as_ref()
+            .filter(|r| r.digests())
+            .map(|r| r.recipes());
         let shadow = shadow_recipes.as_ref().map(|(recipes, _)| {
             regen::ShadowRun::spawn(
                 elf_bytes.to_vec(),
@@ -4006,6 +4063,53 @@ fn prove_streamed(
                 deviations.regen_drop_one_op,
             )
         });
+        // Live regeneration: what phase A dropped, rebuilt beside phase B in
+        // rank order. A dropped table is the chunk its rank names (the chunks
+        // are placed first, in hand-out order), or the prove stops here.
+        let live = match (block.regen().cloned(), &regen_recorder) {
+            (Some(live_regen), Some(recorder)) => {
+                let drops = live_regen.report();
+                let window_of = std::sync::Arc::clone(live_regen.window());
+                let run = match live_regen.into_plan() {
+                    Some((dropped, producer)) => {
+                        let mut keyed = Vec::with_capacity(dropped.len());
+                        for (rank, slot) in dropped {
+                            let key = recorder
+                                .chunk_at(rank as usize)
+                                .filter(|key| {
+                                    laid.streamed_air
+                                        .get(rank as usize)
+                                        .is_some_and(|&(t, i, _)| (t, i) == *key)
+                                })
+                                .ok_or_else(|| {
+                                    Error::Prover(format!(
+                                        "dropped table {rank} is not the chunk its rank names"
+                                    ))
+                                })?;
+                            keyed.push((key, slot));
+                        }
+                        Some(regen::LiveRun::spawn(
+                            elf_bytes.to_vec(),
+                            private_inputs.to_vec(),
+                            options.max_rows.clone(),
+                            window,
+                            std::sync::Arc::clone(&window_of),
+                            producer,
+                            keyed,
+                            stream_form,
+                            deviations.regen_faults,
+                        ))
+                    }
+                    None => None,
+                };
+                Some((drops, window_of, run))
+            }
+            _ => None,
+        };
+        // Phase B's order: the groups phase B rebuilds last (rest first), so
+        // the regenerator has the others' phase B as a head start; the group
+        // order when nothing was dropped.
+        let rebuilt = block.rebuilt_groups();
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
@@ -4074,12 +4178,23 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
-        // Phase B's order: the groups in group order, unless a test asks for
-        // another.
         let order: Vec<usize> = match deviations.phase_b_order {
             Some(order) => order(laid.groups.len()),
-            None => (0..laid.groups.len()).collect(),
+            None => multilinear_block::rebuilt_last(&rebuilt),
         };
+        // The regenerator deposits in rank order, the rebuilt groups' order: an
+        // order that takes them otherwise could wait on a deposit its window
+        // does not admit yet, so it is refused rather than run.
+        let taken: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&g| rebuilt.get(g).copied().unwrap_or(false))
+            .collect();
+        if taken.windows(2).any(|w| w[0] > w[1]) {
+            return Err(Error::Prover(
+                "phase B must take the rebuilt groups in group order".into(),
+            ));
+        }
         let phase_b_start = Instant::now();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
@@ -4095,6 +4210,44 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        if let Some((drops, window_of, run)) = live {
+            let recipes = recorder.map_or(0, |r| r.recipes().0.len());
+            let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
+            let offset = run.as_ref().map(|run| {
+                phase_b_start
+                    .saturating_duration_since(run.started())
+                    .as_secs_f64()
+            });
+            let report = run.map(regen::LiveRun::join);
+            if let Some(report) = &report {
+                lines.push(report.line());
+                for failure in report.failures.iter().take(20) {
+                    lines.push(format!("BLOCK REGEN FAILED {failure}"));
+                }
+            }
+            lines.push(format!("BLOCK REGEN window: {}", window_of.report()));
+            lines.push(format!(
+                "BLOCK REGEN phase B order: {} of {} groups rebuilt, taken last · phase B began {} \
+                 after the regenerator",
+                rebuilt.iter().filter(|&&r| r).count(),
+                rebuilt.len(),
+                offset.map_or("n/a".to_string(), |s| format!("{s:.2} s")),
+            ));
+            for line in &lines {
+                eprintln!("{line}");
+            }
+            stamps.regen = Some(regen::RegenStamps {
+                recipes,
+                dropped: drops.tables,
+                dropped_bytes: drops.bytes,
+                regenerated: report.as_ref().map_or(0, |r| r.deposited),
+                mismatches: report.as_ref().map_or(0, |r| r.mismatches),
+                failed: report.as_ref().map_or(0, |r| r.failures.len() + r.skipped),
+                error: report.as_ref().and_then(|r| r.error.clone()),
+                lines,
+                ..regen::RegenStamps::default()
+            });
+        }
         if let (Some(shadow), Some((recipes, stray))) = (shadow, &shadow_recipes) {
             let prove_offset = phase_b_start
                 .saturating_duration_since(shadow.started())
@@ -4143,14 +4296,17 @@ fn prove_streamed(
             }
             stamps.regen = Some(readout);
         }
-        if let Some(spill) = &spill {
+        if let Some((spill, store)) = spill
+            .as_ref()
+            .and_then(|spill| Some((spill, spill.store.as_ref()?)))
+        {
             let read_back = spill
                 .prefetch
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
                 .unwrap_or_else(|| "nothing to read back".to_string());
-            let stats = spill.store.stats();
+            let stats = store.stats();
             let g = |b: u64| b as f64 / (1u64 << 30) as f64;
             let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
                 Some(h) => format!(
@@ -4180,6 +4336,16 @@ fn prove_streamed(
                 "{policy_name} · {stats} · read-back {read_back}{host}{hand_off}"
             ));
             stamps.spill_stats = Some(stats);
+        } else if spill.is_some() && stamps.spill.is_none() {
+            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
+                Some(h) => format!(" · host at most {:.2} GiB", g(h.bytes())),
+                None => String::new(),
+            };
+            stamps.spill = Some(format!(
+                "{policy_name} · no store: live regeneration decides as `auto`, nothing \
+                 written{host}"
+            ));
         }
         if multilinear::whir_split::enabled() {
             let chain = multilinear::whir_split::take_chain();
