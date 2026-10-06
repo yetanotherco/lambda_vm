@@ -1427,6 +1427,208 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     }
 }
 
+/// A streamed prove under live regeneration `mode` and the spill `policy`,
+/// with `deviations`: its proof or why it was refused, and its stamps.
+fn regenerated(
+    elf: &[u8],
+    format: &BlockFormat,
+    mode: block_whir::regen::RegenMode,
+    policy: crate::block_whir::BlockSpillPolicy,
+    deviations: Deviations,
+) -> Result<(BlockWhirProof, block_whir::BlockStamps), crate::Error> {
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    o.drop_streamed_ops = true;
+    o.spill = policy;
+    o.regen = Some(mode);
+    prove_block_whir_with(
+        elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        format,
+        &o,
+        &deviations,
+    )
+}
+
+/// ★ Live regeneration moves no byte (D-WHIR-NODISK N2): with `always` every
+/// streamed chunk is dropped after its group's commit and rebuilt in phase B —
+/// with no store (no disk), and with the rest spilled — and `auto` armed from
+/// the start (a target of 0, no store: no disk) drops them all too; the proof
+/// is the one regeneration off proves, with the same partition, under the
+/// deterministic grind, and verifies. `auto` that never arms (a budget the
+/// block fits in) drops nothing and runs no regenerator.
+#[test]
+fn live_regeneration_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, plain_stamps) =
+        regenerated(&elf, &format, RegenMode::Off, BlockSpillPolicy::Off, Deviations::default())
+            .expect("prove");
+    assert!(plain_stamps.regen.is_none());
+    let streamed = plain_stamps.streamed.1;
+    assert!(streamed > 0);
+    for (what, mode, policy, target) in [
+        ("always, no disk", RegenMode::Always, BlockSpillPolicy::Off, None),
+        ("always, the rest spilled", RegenMode::Always, BlockSpillPolicy::Always, None),
+        ("auto armed, no disk", RegenMode::Auto, BlockSpillPolicy::Off, Some(0)),
+    ] {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            mode,
+            policy,
+            Deviations {
+                spill_target: target,
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let r = stamps.regen.expect("live regeneration's readout");
+        let lines = r.lines.join("\n");
+        assert_eq!(r.dropped, streamed, "{what}: every chunk dropped\n{lines}");
+        assert_eq!(r.regenerated, streamed, "{what}: every chunk back\n{lines}");
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{what}\n{lines}");
+        assert_eq!(r.error, None, "{what}\n{lines}");
+        assert!(lines.contains("groups rebuilt, taken last"), "{lines}");
+        if policy == BlockSpillPolicy::Off {
+            assert!(stamps.spill_stats.is_none(), "{what}: a store opened");
+            assert!(
+                stamps.spill.as_deref().is_some_and(|l| l.contains("no store")),
+                "{what}: {:?}",
+                stamps.spill
+            );
+        } else {
+            let stats = stamps.spill_stats.expect("the store's counters");
+            assert!(stats.slots > 0, "{what}: the rest spilled nothing: {stats}");
+        }
+        assert_eq!(proof.groups, plain.groups, "{what}: the partition");
+        assert!(verify(&proof, &elf, &format), "{what}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&proof), bytes(&plain), "{what}: the proof");
+        }
+    }
+    let (proof, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Auto,
+        BlockSpillPolicy::Budget(1 << 40),
+        Deviations::default(),
+    )
+    .expect("prove");
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert_eq!(r.dropped, 0, "{lines}");
+    assert!(lines.contains("never armed") && !lines.contains("BLOCK REGEN live:"), "{lines}");
+    assert!(lines.contains("0 of"), "{lines}");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&proof), bytes(&plain), "auto unarmed: the proof");
+    }
+}
+
+/// ★ Live regeneration never proves over columns it did not rebuild, and never
+/// hangs: a deposit one bit off is refused at its slot before any device work
+/// ("not the ones dropped"); with the digest off, the kept tree top refuses it
+/// in the opening; a walk that fails, a generator that dies outside its catch,
+/// or a chunk the slicer never cuts leaves its table refused ("did not bring
+/// its columns back"), the prove returning; and phase B told to take the
+/// rebuilt groups out of rank order is refused before it starts.
+#[test]
+fn live_regeneration_refuses_what_it_did_not_rebuild() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::{LiveFaults, RegenMode};
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
+    let cases: [(&str, LiveFaults, Option<fn(usize) -> Vec<usize>>, &str); 6] = [
+        (
+            "a bent deposit",
+            LiveFaults {
+                bend_rank: Some(1),
+                ..LiveFaults::default()
+            },
+            None,
+            "not the ones dropped",
+        ),
+        (
+            "a bent deposit, the digest off",
+            LiveFaults {
+                bend_rank: Some(1),
+                digest_off: true,
+                ..LiveFaults::default()
+            },
+            None,
+            "RecomputedCodewordMismatch",
+        ),
+        (
+            "a walk that fails",
+            LiveFaults {
+                walk_error_at: Some(0),
+                ..LiveFaults::default()
+            },
+            None,
+            "did not bring its columns back",
+        ),
+        (
+            "a generator that dies",
+            LiveFaults {
+                generator_panics_at_rank: Some(0),
+                ..LiveFaults::default()
+            },
+            None,
+            "did not bring its columns back",
+        ),
+        (
+            "a chunk never cut",
+            LiveFaults {
+                skip_rank: Some(0),
+                ..LiveFaults::default()
+            },
+            None,
+            "did not bring its columns back",
+        ),
+        (
+            "rebuilt groups out of order",
+            LiveFaults::default(),
+            Some(reversed),
+            "rebuilt groups in group order",
+        ),
+    ];
+    for (what, faults, order, why) in cases {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let elf = elf.clone();
+        let format = format.clone();
+        std::thread::spawn(move || {
+            let out = regenerated(
+                &elf,
+                &format,
+                RegenMode::Always,
+                BlockSpillPolicy::Off,
+                Deviations {
+                    regen_faults: faults,
+                    phase_b_order: order,
+                    ..Deviations::default()
+                },
+            );
+            let _ = tx.send(out.map(|_| ()).map_err(|e| format!("{e:?}")));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(600))
+            .unwrap_or_else(|_| panic!("{what}: the prove hung"));
+        match got {
+            Err(e) => assert!(e.contains(why), "{what}: refused for another reason: {e}"),
+            Ok(()) => panic!("{what}: proved"),
+        }
+    }
+}
+
 /// The streamed chunks laid out on three threads, and the rest of the run
 /// packed as it is laid out, are packed in the inline order all the same: the
 /// same groups and table counts as laid out on one thread, and the proofs
