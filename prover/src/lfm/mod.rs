@@ -197,6 +197,8 @@ mod p1w16_emit_tests;
 #[cfg(test)]
 mod p1w16_machine_tests;
 #[cfg(test)]
+mod p1w16_proof_tests;
+#[cfg(test)]
 mod p1w16_socket_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;

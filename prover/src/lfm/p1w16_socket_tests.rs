@@ -7,7 +7,7 @@ use stark::constraints::builder::{
     CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, num_base_from_meta,
 };
 use stark::frame::Frame;
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, BusValue, LinearTerm, Multiplicity};
+use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, BusValue, Multiplicity};
 use stark::proof::options::ProofOptions;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
@@ -73,37 +73,13 @@ fn real_row(form: OutForm, input: [FE; p1::STATE_FELTS]) -> (Vec<FE>, [FE; p1::S
     (row, out)
 }
 
-/// A bus value read off a row, as the LogUp fingerprint reads it.
+/// A bus value read off a row by the production evaluator,
+/// `BusValue::combine_from` (the LogUp fingerprint's, with its own i64
+/// coefficient conversion): one felt per socket value.
 fn bus_value(v: &BusValue, row: &[FE]) -> FE {
-    match v {
-        BusValue::Packed { start_column, .. } => row[*start_column],
-        BusValue::Linear(terms) => terms.iter().fold(FE::zero(), |acc, t| {
-            acc + match t {
-                LinearTerm::Column {
-                    coefficient,
-                    column,
-                } => {
-                    let k = if *coefficient >= 0 {
-                        FE::from(*coefficient as u64)
-                    } else {
-                        -FE::from(coefficient.unsigned_abs())
-                    };
-                    k * row[*column]
-                }
-                LinearTerm::ColumnUnsigned {
-                    coefficient,
-                    column,
-                } => FE::from(*coefficient) * row[*column],
-                LinearTerm::Constant(c) => {
-                    if *c >= 0 {
-                        FE::from(*c as u64)
-                    } else {
-                        -FE::from(c.unsigned_abs())
-                    }
-                }
-            }
-        }),
-    }
+    let got = v.combine_from(|c| row[c]);
+    assert_eq!(got.len(), 1, "a socket value is one felt");
+    got[0]
 }
 
 #[test]
