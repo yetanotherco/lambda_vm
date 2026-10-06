@@ -68,8 +68,8 @@ use stark::trace::TraceTable;
 use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
-    CollectedOps, DecodeArtifacts, DecodeTable, MemoryState, MemwBuckets, PreCounted,
-    RegisterState, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, bitwise,
+    BlockVec, CollectedOps, DecodeArtifacts, DecodeTable, MemoryState, MemwBuckets, PreCounted,
+    RegisterState, RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, bitwise, block_len,
     build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into, route_ops,
     route_ops_one_pass,
 };
@@ -133,8 +133,8 @@ pub struct WindowedTraceBuilder<'a> {
     /// The walked windows, in run order, kept as they were walked: moved here,
     /// never copied. `finish` concatenates them once, list by list.
     windows: Vec<WalkedWindow>,
-    /// The routing's segments (smaller lists), appended per window.
-    segments: RoutedSegments,
+    /// The routing's segments, appended per window in blocks.
+    segments: RoutedBlocks,
     emitted: StreamSkip,
     /// The BITWISE lookups of the walked windows' in-walk lookups and MEMW_R
     /// rows, counted as the windows arrive.
@@ -198,7 +198,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             register_state,
             cycles: 0,
             windows: Vec::new(),
-            segments: RoutedSegments::default(),
+            segments: RoutedBlocks::new(max_rows),
             emitted: StreamSkip::default(),
             counted: PreCounted {
                 histogram: bitwise::BitwiseHistogram::new(),
@@ -356,7 +356,10 @@ impl<'a> WindowedTraceBuilder<'a> {
                 "drop_streamed_ops after a window was walked".to_string(),
             ));
         }
-        self.kept = Some(Kept::new(self.artifacts.decode_trace.clone()));
+        self.kept = Some(Kept::new(
+            self.artifacts.decode_trace.clone(),
+            &self.max_rows,
+        ));
         Ok(self)
     }
 
@@ -408,6 +411,27 @@ impl<'a> WindowedTraceBuilder<'a> {
         parts.extend(self.segments.heap_parts());
         parts.extend(self.counted.heap_parts());
         parts.push(("memory state".to_string(), self.memory_state.heap_bytes()));
+        parts
+    }
+
+    /// Each list the builder holds, its largest single allocation (a block, a
+    /// window's list, or the list): the most one append or one list's growth
+    /// can allocate at once. A measurement (`LAMBDA_VM_BLOCK_MEMLOG`).
+    pub fn largest_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = self
+            .kept
+            .as_ref()
+            .map_or_else(Vec::new, Kept::largest_parts);
+        parts.push((
+            "windows".to_string(),
+            self.windows
+                .iter()
+                .map(WalkedWindow::heap_bytes)
+                .max()
+                .unwrap_or(0),
+        ));
+        parts.extend(self.segments.largest_parts());
+        parts.extend(self.counted.largest_parts());
         parts
     }
 
@@ -476,9 +500,10 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
-                let (cpu_ops, walk) = concatenate(windows);
+                let (cpu_ops, mut walk) = concatenate(windows);
                 super::build_stamps::mark("p0 concatenate");
-                let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+                let rest = KeptRest::from_walk(&mut walk);
+                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
                 (ops, artifacts.decode_trace.clone(), emitted, counted)
             }
@@ -486,9 +511,9 @@ impl<'a> WindowedTraceBuilder<'a> {
                 // The last window's ops, its in-walk lookups and its MEMW
                 // ops' LT ops are all still to count, as the tails are.
                 kept.append(last);
-                let (cpu_ops, walk, decode_trace) = kept.into_run();
+                let (cpu_ops, walk, rest, decode_trace) = kept.into_run();
                 super::build_stamps::mark("p0 concatenate");
-                let ops = assemble(cpu_ops, walk, segments, &mut register_state);
+                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
                 // With the MEMW-derived LT ops streamed, `memw_lt_done` counts
                 // the dropped ops too; without, it is zero and the dropped
@@ -645,7 +670,7 @@ pub struct Accumulator<'b> {
     pc_to_row: &'b decode::PcToRow,
     kept: Option<&'b mut Kept>,
     windows: &'b mut Vec<WalkedWindow>,
-    segments: &'b mut RoutedSegments,
+    segments: &'b mut RoutedBlocks,
     emitted: &'b mut StreamSkip,
     counted: &'b mut PreCounted,
     route_secs: &'b mut f64,
@@ -796,7 +821,7 @@ fn list_keccak(w: &WalkedWindow) -> &[super::keccak::KeccakOperation] {
 fn chunk_jobs(
     m: &crate::tables::MaxRowsConfig,
     windows: &[WalkedWindow],
-    segments: &RoutedSegments,
+    segments: &RoutedBlocks,
     e: &mut StreamSkip,
 ) -> Vec<ChunkJob> {
     let mut jobs = Vec::new();
@@ -862,7 +887,11 @@ fn chunk_jobs(
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index,
-            ops: ChunkOps::Store(store[index * m.store..(index + 1) * m.store].to_vec()),
+            ops: ChunkOps::Store(
+                store
+                    .range(index * m.store, (index + 1) * m.store)
+                    .into_owned(),
+            ),
         });
         e.store += 1;
     }
@@ -930,6 +959,15 @@ impl<T: Clone> Tail<T> {
         self.parts.iter().map(super::vec_heap_bytes).sum()
     }
 
+    /// The bytes its largest part (a window's list) takes on the heap.
+    fn largest_bytes(&self) -> usize {
+        self.parts
+            .iter()
+            .map(super::vec_heap_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The ops not handed out, as one list.
     fn into_vec(mut self) -> Vec<T> {
         if self.start == 0 && self.parts.len() == 1 {
@@ -952,15 +990,87 @@ struct Kept {
     load: Tail<super::LoadOperation>,
     lt: Tail<super::LtOperation>,
     shift: Tail<super::ShiftOperation>,
-    /// Every other walk list, the run so far (the streamed lists' fields stay
-    /// empty; the in-walk lookups only hold what is left to count).
-    rest: WalkOutputs,
+    /// Every other walk list, the run so far, in blocks (the in-walk lookups
+    /// only hold what is left to count).
+    rest: KeptRest,
     /// DECODE with the lookups of the CPU ops handed out counted.
     decode: Table,
 }
 
+/// The walk lists a run keeps whole to its end, each appended window by
+/// window into a [`BlockVec`] (blocks of its table's chunk, or 64 MiB).
+pub(super) struct KeptRest {
+    bitwise_ops: BlockVec<super::BitwiseOperation>,
+    commit_ops: BlockVec<super::CommitOperation>,
+    keccak_ops: BlockVec<super::keccak::KeccakOperation>,
+    blake3_ops: BlockVec<super::Blake3Operation>,
+    blake3_absorb_ops: BlockVec<super::blake3::Blake3AbsorbOperation>,
+    cpu32_ops: BlockVec<super::cpu32::Cpu32Operation>,
+    ecsm_ops: BlockVec<super::ecsm::EcsmOperation>,
+    ecdas_ops: BlockVec<super::ecdas::EcdasOperation>,
+    hint_ops: BlockVec<super::hint::HintOperation>,
+}
+
+/// ECDAS rows a block of the kept ECDAS ops holds: the block's ECDAS cut
+/// (`block_whir::BLOCK_ECDAS_ROWS_LOG2`), so a cut is a block; ≈ 245 MiB, the
+/// one list whose blocks pass 64 MiB.
+pub(super) const ECDAS_BLOCK_ROWS: usize = 1 << 17;
+
+impl KeptRest {
+    fn new(m: &crate::tables::MaxRowsConfig) -> Self {
+        fn list<T>(chunk: usize) -> BlockVec<T> {
+            BlockVec::new(block_len::<T>(chunk))
+        }
+        Self {
+            bitwise_ops: list(usize::MAX),
+            commit_ops: list(usize::MAX),
+            keccak_ops: list(usize::MAX),
+            blake3_ops: list(usize::MAX),
+            blake3_absorb_ops: list(usize::MAX),
+            cpu32_ops: list(m.cpu32),
+            ecsm_ops: list(usize::MAX),
+            ecdas_ops: BlockVec::new(ECDAS_BLOCK_ROWS),
+            hint_ops: list(usize::MAX),
+        }
+    }
+
+    /// A walk's lists as they are, one block each (a build that kept its
+    /// windows and concatenated them).
+    fn from_walk(walk: &mut WalkOutputs) -> Self {
+        Self {
+            bitwise_ops: BlockVec::from_vec(std::mem::take(&mut walk.bitwise_ops)),
+            commit_ops: BlockVec::from_vec(std::mem::take(&mut walk.commit_ops)),
+            keccak_ops: BlockVec::from_vec(std::mem::take(&mut walk.keccak_ops)),
+            blake3_ops: BlockVec::from_vec(std::mem::take(&mut walk.blake3_ops)),
+            blake3_absorb_ops: BlockVec::from_vec(std::mem::take(&mut walk.blake3_absorb_ops)),
+            cpu32_ops: BlockVec::from_vec(std::mem::take(&mut walk.cpu32_ops)),
+            ecsm_ops: BlockVec::from_vec(std::mem::take(&mut walk.ecsm_ops)),
+            ecdas_ops: BlockVec::from_vec(std::mem::take(&mut walk.ecdas_ops)),
+            hint_ops: BlockVec::from_vec(std::mem::take(&mut walk.hint_ops)),
+        }
+    }
+
+    /// Each list's (name, heap bytes, largest single allocation).
+    fn sizes(&self) -> [(&'static str, usize, usize); 9] {
+        fn of<T>(name: &'static str, list: &BlockVec<T>) -> (&'static str, usize, usize) {
+            (name, list.heap_bytes(), list.largest_bytes())
+        }
+        [
+            of("bitwise", &self.bitwise_ops),
+            of("commit", &self.commit_ops),
+            of("keccak", &self.keccak_ops),
+            of("blake3", &self.blake3_ops),
+            of("blake3_absorb", &self.blake3_absorb_ops),
+            of("cpu32", &self.cpu32_ops),
+            of("ecsm", &self.ecsm_ops),
+            of("ecdas", &self.ecdas_ops),
+            of("hint", &self.hint_ops),
+        ]
+    }
+}
+
 impl Kept {
-    fn new(decode: Table) -> Self {
+    fn new(decode: Table, max_rows: &crate::tables::MaxRowsConfig) -> Self {
         Self {
             cpu: Tail::new(),
             register_rows: Tail::new(),
@@ -969,7 +1079,7 @@ impl Kept {
             load: Tail::new(),
             lt: Tail::new(),
             shift: Tail::new(),
-            rest: WalkOutputs::with_capacity(0),
+            rest: KeptRest::new(max_rows),
             decode,
         }
     }
@@ -984,7 +1094,12 @@ impl Kept {
             + self.load.heap_bytes()
             + self.lt.heap_bytes()
             + self.shift.heap_bytes()
-            + self.rest.heap_bytes()
+            + self
+                .rest
+                .sizes()
+                .iter()
+                .map(|&(_, bytes, _)| bytes)
+                .sum::<usize>()
             + self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>()
     }
 
@@ -1003,7 +1118,39 @@ impl Kept {
                 self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
             ),
         ];
-        parts.extend(self.rest.heap_parts("kept rest "));
+        parts.extend(
+            self.rest
+                .sizes()
+                .iter()
+                .map(|&(name, bytes, _)| (format!("kept rest {name}"), bytes)),
+        );
+        parts
+    }
+
+    /// Each list's largest single allocation, named as in [`Self::heap_parts`].
+    fn largest_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = vec![
+            ("kept cpu".to_string(), self.cpu.largest_bytes()),
+            (
+                "kept memw_r".to_string(),
+                self.register_rows.largest_bytes(),
+            ),
+            ("kept memw_a".to_string(), self.aligned.largest_bytes()),
+            ("kept memw".to_string(), self.general.largest_bytes()),
+            ("kept load".to_string(), self.load.largest_bytes()),
+            ("kept lt".to_string(), self.lt.largest_bytes()),
+            ("kept shift".to_string(), self.shift.largest_bytes()),
+            (
+                "kept decode".to_string(),
+                self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
+            ),
+        ];
+        parts.extend(
+            self.rest
+                .sizes()
+                .iter()
+                .map(|&(name, _, largest)| (format!("kept rest {name}"), largest)),
+        );
         parts
     }
 
@@ -1044,8 +1191,9 @@ impl Kept {
         rest.hint_ops.extend(hint_ops);
     }
 
-    /// The run's lists with the handed-out ops left out, and DECODE.
-    fn into_run(self) -> (Vec<super::CpuOperation>, WalkOutputs, Table) {
+    /// The run's lists with the handed-out ops left out (the streamed tables'
+    /// tails in a walk's lists, the others in blocks), and DECODE.
+    fn into_run(self) -> (Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table) {
         let Kept {
             cpu,
             register_rows,
@@ -1054,18 +1202,19 @@ impl Kept {
             load,
             lt,
             shift,
-            mut rest,
+            rest,
             decode,
         } = self;
-        rest.memw = MemwBuckets {
+        let mut walk = WalkOutputs::with_capacity(0);
+        walk.memw = MemwBuckets {
             register_rows: register_rows.into_vec(),
             aligned: aligned.into_vec(),
             general: general.into_vec(),
         };
-        rest.load_ops = load.into_vec();
-        rest.lt_ops = lt.into_vec();
-        rest.shift_ops = shift.into_vec();
-        (cpu.into_vec(), rest, decode)
+        walk.load_ops = load.into_vec();
+        walk.lt_ops = lt.into_vec();
+        walk.shift_ops = shift.into_vec();
+        (cpu.into_vec(), walk, rest, decode)
     }
 }
 
@@ -1077,7 +1226,7 @@ fn tail_jobs(
     stream_memw_lt: bool,
     pc_to_row: &decode::PcToRow,
     kept: &mut Kept,
-    segments: &mut RoutedSegments,
+    segments: &mut RoutedBlocks,
     e: &mut StreamSkip,
     counted: &mut PreCounted,
 ) -> Vec<ChunkJob> {
@@ -1173,7 +1322,7 @@ fn tail_jobs(
                 table: StreamTable::KeccakRnd,
                 index,
                 ops: ChunkOps::KeccakRnd {
-                    ops: keccak[first..end].to_vec(),
+                    ops: keccak.range(first, end).into_owned(),
                     skip: index * rows - first * 24,
                     rows,
                 },
@@ -1181,10 +1330,10 @@ fn tail_jobs(
             e.keccak_rnd += 1;
         }
     }
-    // STORE's ops are a routing segment: its own tail.
+    // STORE's ops are a routing segment: its own tail, a chunk a block.
     let store = &mut segments.store_ops;
     while store.len() >= m.store {
-        let ops: Vec<store::StoreOperation> = store.drain(..m.store).collect();
+        let ops: Vec<store::StoreOperation> = store.take_front(m.store);
         for op in &ops {
             counted.histogram.add_ops(&op.collect_bitwise_ops());
         }
@@ -1414,15 +1563,20 @@ impl ChunkJob {
 fn assemble(
     cpu_ops: Vec<super::CpuOperation>,
     walk: WalkOutputs,
-    segments: RoutedSegments,
+    rest: KeptRest,
+    segments: RoutedBlocks,
     register_state: &mut RegisterState,
 ) -> CollectedOps {
+    // The streamed tables' lists (their tails); `rest` holds the others.
     let WalkOutputs {
         memw,
         load_ops,
-        mut lt_ops,
-        mut shift_ops,
-        mut bitwise_ops,
+        lt_ops,
+        shift_ops,
+        ..
+    } = walk;
+    let KeptRest {
+        bitwise_ops,
         commit_ops,
         keccak_ops,
         blake3_ops,
@@ -1431,7 +1585,7 @@ fn assemble(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
-    } = walk;
+    } = rest;
     let MemwBuckets {
         register_rows: mut memw_register_rows,
         aligned: mut memw_aligned_ops,
@@ -1445,7 +1599,7 @@ fn assemble(
     memw_aligned_ops.extend(halt.aligned);
     memw_ops.extend(halt.general);
 
-    let RoutedSegments {
+    let RoutedBlocks {
         branch_ops,
         mul_filter,
         dvrm_filter,
@@ -1461,16 +1615,18 @@ fn assemble(
         mul_dvrm_filter,
         mul_dvrm_cpu32,
     } = segments;
-    shift_ops.extend(shift_cpu32);
-    bitwise_ops.extend(bitwise_cpu32);
-    let mut mul_ops = mul_filter;
-    mul_ops.extend(mul_cpu32);
-    mul_ops.extend(mul_dvrm_filter);
-    mul_ops.extend(mul_dvrm_cpu32);
-    let mut dvrm_ops = dvrm_filter;
-    dvrm_ops.extend(dvrm_cpu32);
-    lt_ops.extend(lt_dvrm_filter);
-    lt_ops.extend(lt_dvrm_cpu32);
+    // Each list is its segments' blocks, in the routing's order, never
+    // concatenated: the tables chunk them as their concatenation.
+    let shift_ops = BlockVec::from_vec(shift_ops).chain(shift_cpu32);
+    let bitwise_ops = bitwise_ops.chain(bitwise_cpu32);
+    let mul_ops = mul_filter
+        .chain(mul_cpu32)
+        .chain(mul_dvrm_filter)
+        .chain(mul_dvrm_cpu32);
+    let dvrm_ops = dvrm_filter.chain(dvrm_cpu32);
+    let lt_ops = BlockVec::from_vec(lt_ops)
+        .chain(lt_dvrm_filter)
+        .chain(lt_dvrm_cpu32);
 
     CollectedOps {
         cpu_ops,
@@ -1532,5 +1688,18 @@ impl Traces {
             *slot = chunk.trace;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod block_tests {
+    /// The kept ECDAS ops' blocks are the block proof's ECDAS cut, so a cut is
+    /// one block.
+    #[test]
+    fn the_ecdas_block_is_the_blocks_ecdas_cut() {
+        assert_eq!(
+            super::ECDAS_BLOCK_ROWS,
+            1usize << crate::block_whir::BLOCK_ECDAS_ROWS_LOG2
+        );
     }
 }

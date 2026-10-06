@@ -3291,6 +3291,7 @@ fn prove_streamed(
                 if let Some(ledger) = ledger {
                     ledger.line("windows walked");
                     ledger.parts("builder", builder.heap_parts());
+                    ledger.largest("builder", builder.largest_parts());
                 }
                 // The walk is done and the block's size known: when the
                 // finish's forecast passes the pressure share, the parked

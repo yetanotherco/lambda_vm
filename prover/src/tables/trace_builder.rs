@@ -72,9 +72,11 @@ use super::types::{DecodeEntry, GoldilocksExtension, GoldilocksField};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
+mod blocks;
 #[cfg(test)]
 mod lean_walk_tests;
 mod windowed;
+use blocks::{BlockVec, block_len};
 pub use windowed::{
     Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
     WindowedTraceBuilder,
@@ -894,30 +896,6 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.ecsm_ops)
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
-    }
-
-    /// [`Self::heap_bytes`] list by list, each named `{prefix}{list}`.
-    pub(crate) fn heap_parts(&self, prefix: &str) -> Vec<(String, usize)> {
-        [
-            ("memw_r", vec_heap_bytes(&self.memw.register_rows)),
-            ("memw_a", vec_heap_bytes(&self.memw.aligned)),
-            ("memw", vec_heap_bytes(&self.memw.general)),
-            ("load", vec_heap_bytes(&self.load_ops)),
-            ("lt", vec_heap_bytes(&self.lt_ops)),
-            ("shift", vec_heap_bytes(&self.shift_ops)),
-            ("bitwise", vec_heap_bytes(&self.bitwise_ops)),
-            ("commit", vec_heap_bytes(&self.commit_ops)),
-            ("keccak", vec_heap_bytes(&self.keccak_ops)),
-            ("blake3", vec_heap_bytes(&self.blake3_ops)),
-            ("blake3_absorb", vec_heap_bytes(&self.blake3_absorb_ops)),
-            ("cpu32", vec_heap_bytes(&self.cpu32_ops)),
-            ("ecsm", vec_heap_bytes(&self.ecsm_ops)),
-            ("ecdas", vec_heap_bytes(&self.ecdas_ops)),
-            ("hint", vec_heap_bytes(&self.hint_ops)),
-        ]
-        .into_iter()
-        .map(|(name, bytes)| (format!("{prefix}{name}"), bytes))
-        .collect()
     }
 }
 
@@ -3890,6 +3868,10 @@ pub struct Traces {
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
 /// Phases 3-5 (LT extension, bitwise, trace generation).
 #[derive(Default)]
+///
+/// The lists a windowed build accumulates over the run (and those assembled
+/// from segments) are [`BlockVec`]s: the blocks they were appended in, never
+/// concatenated ([`blocks`]); a whole-run build's are one block each.
 struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
@@ -3897,26 +3879,26 @@ struct CollectedOps {
     /// Direct-fill MEMW_R rows (register fast path).
     memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
-    lt_ops: Vec<LtOperation>,
-    shift_ops: Vec<ShiftOperation>,
-    bitwise_ops: Vec<BitwiseOperation>,
-    branch_ops: Vec<BranchOperation>,
-    mul_ops: Vec<(MulOperation, bool)>,
-    dvrm_ops: Vec<(DvrmOperation, bool)>,
-    commit_ops: Vec<CommitOperation>,
-    keccak_ops: Vec<KeccakOperation>,
-    blake3_ops: Vec<Blake3Operation>,
-    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
+    lt_ops: BlockVec<LtOperation>,
+    shift_ops: BlockVec<ShiftOperation>,
+    bitwise_ops: BlockVec<BitwiseOperation>,
+    branch_ops: BlockVec<BranchOperation>,
+    mul_ops: BlockVec<(MulOperation, bool)>,
+    dvrm_ops: BlockVec<(DvrmOperation, bool)>,
+    commit_ops: BlockVec<CommitOperation>,
+    keccak_ops: BlockVec<KeccakOperation>,
+    blake3_ops: BlockVec<Blake3Operation>,
+    blake3_absorb_ops: BlockVec<blake3::Blake3AbsorbOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
-    eq_ops: Vec<eq::EqOperation>,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
-    store_ops: Vec<store::StoreOperation>,
-    cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    eq_ops: BlockVec<eq::EqOperation>,
+    bytewise_ops: BlockVec<bytewise::BytewiseOperation>,
+    store_ops: BlockVec<store::StoreOperation>,
+    cpu32_ops: BlockVec<cpu32::Cpu32Operation>,
     // EC scalar-multiplication accelerator chips.
-    ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    ecsm_ops: BlockVec<ecsm::EcsmOperation>,
+    ecdas_ops: BlockVec<ecdas::EcdasOperation>,
     // Non-constraining hint ecall.
-    hint_ops: Vec<hint::HintOperation>,
+    hint_ops: BlockVec<hint::HintOperation>,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -4008,6 +3990,18 @@ impl PreCounted {
             (
                 "counted memw_a_lt".to_string(),
                 self.memw_aligned_lt.heap_bytes(),
+            ),
+        ]
+    }
+
+    /// Each part's largest single allocation, named as in [`Self::heap_parts`].
+    pub(crate) fn largest_parts(&self) -> Vec<(String, usize)> {
+        vec![
+            ("counted histogram".to_string(), self.histogram.heap_bytes()),
+            ("counted memw_lt".to_string(), self.memw_lt.largest_bytes()),
+            (
+                "counted memw_a_lt".to_string(),
+                self.memw_aligned_lt.largest_bytes(),
             ),
         ]
     }
@@ -4420,22 +4414,48 @@ impl<'a, T: Clone> Segmented<'a, T> {
 /// deltas, `rhs` from the previous op's and `lhs` from its own `rhs`: a few
 /// bytes an op instead of 24. Every [`COMPACT_LT_BLOCK`] ops a sparse index
 /// records where the stream stands, so any range expands on its own. The
-/// ops expand exactly as pushed, in order.
+/// ops expand exactly as pushed, in order. The stream is stored in blocks of
+/// at most [`blocks::BLOCK_BYTES`] that are never reallocated once full
+/// ([`blocks`]); an op's two varints never straddle two blocks.
 #[derive(Default)]
 pub(crate) struct CompactLt {
-    bytes: Vec<u8>,
-    /// (byte offset, previous `rhs`) at op `k * COMPACT_LT_BLOCK`.
-    index: Vec<(usize, u64)>,
+    bytes: Vec<Vec<u8>>,
+    /// (block, byte offset in it, previous `rhs`) at op `k * COMPACT_LT_BLOCK`.
+    index: Vec<(u32, u32, u64)>,
     len: usize,
     last_rhs: u64,
     /// The ops as they are, 24 bytes each, instead of the stream (the A arm,
     /// `LAMBDA_VM_BLOCK_COMPACT_LT=0` on the block).
     raw: Option<Vec<LtOperation>>,
+    /// Bytes a block of the stream holds; 0 is [`blocks::BLOCK_BYTES`] (tests
+    /// set a small one, to cross blocks).
+    block_bytes: usize,
 }
 
 const COMPACT_LT_BLOCK: usize = 4096;
 
+/// The most bytes one compact LT op takes: two varints of at most ten.
+const COMPACT_LT_OP_BYTES: usize = 20;
+
 impl CompactLt {
+    /// A list whose stream is cut into blocks of `bytes` (at least an op's).
+    #[cfg(test)]
+    pub(crate) fn with_block_bytes(bytes: usize) -> Self {
+        Self {
+            block_bytes: bytes.max(COMPACT_LT_OP_BYTES),
+            ..Self::default()
+        }
+    }
+
+    /// Bytes a block of the stream holds.
+    fn block_bytes(&self) -> usize {
+        if self.block_bytes == 0 {
+            blocks::BLOCK_BYTES
+        } else {
+            self.block_bytes
+        }
+    }
+
     /// A list that keeps its ops as they are (the A arm of the compact form).
     pub(crate) fn raw() -> Self {
         Self {
@@ -4458,16 +4478,42 @@ impl CompactLt {
             out.push(v as u8);
         }
         let zigzag = |d: u64| (d << 1) ^ ((d as i64 >> 63) as u64);
+        let block_bytes = self.block_bytes();
         for op in ops {
             debug_assert!(
                 !op.signed && !op.invert,
                 "a compact LT op is unsigned, not inverted"
             );
-            if self.len.is_multiple_of(COMPACT_LT_BLOCK) {
-                self.index.push((self.bytes.len(), self.last_rhs));
+            // Room for the op in the last block: grown as a `Vec` grows up to a
+            // block's bytes, else a new block, allocated whole.
+            let room = self
+                .bytes
+                .last()
+                .is_some_and(|last| last.len() + COMPACT_LT_OP_BYTES <= block_bytes);
+            if !room {
+                let capacity = if self.bytes.is_empty() {
+                    4096.min(block_bytes)
+                } else {
+                    block_bytes
+                };
+                self.bytes.push(Vec::with_capacity(capacity));
             }
-            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(self.last_rhs)));
-            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(op.lhs)));
+            let block = self.bytes.len() - 1;
+            let Some(last) = self.bytes.last_mut() else {
+                continue;
+            };
+            if last.capacity() - last.len() < COMPACT_LT_OP_BYTES {
+                let want = (last.capacity() * 2)
+                    .min(block_bytes)
+                    .max(last.len() + COMPACT_LT_OP_BYTES);
+                last.reserve_exact(want - last.len());
+            }
+            if self.len.is_multiple_of(COMPACT_LT_BLOCK) {
+                self.index
+                    .push((block as u32, last.len() as u32, self.last_rhs));
+            }
+            put(last, zigzag(op.rhs.wrapping_sub(self.last_rhs)));
+            put(last, zigzag(op.rhs.wrapping_sub(op.lhs)));
             self.last_rhs = op.rhs;
             self.len += 1;
         }
@@ -4476,8 +4522,17 @@ impl CompactLt {
     /// The bytes it takes on the heap (capacities).
     pub(crate) fn heap_bytes(&self) -> usize {
         self.raw.as_ref().map_or(0, vec_heap_bytes)
-            + self.bytes.capacity()
-            + self.index.capacity() * std::mem::size_of::<(usize, u64)>()
+            + self.bytes.iter().map(Vec::capacity).sum::<usize>()
+            + self.bytes.capacity() * std::mem::size_of::<Vec<u8>>()
+            + self.index.capacity() * std::mem::size_of::<(u32, u32, u64)>()
+    }
+
+    /// The bytes its largest single allocation takes.
+    pub(crate) fn largest_bytes(&self) -> usize {
+        let blocks = self.bytes.iter().map(Vec::capacity).max().unwrap_or(0);
+        let raw = self.raw.as_ref().map_or(0, vec_heap_bytes);
+        let index = self.index.capacity() * std::mem::size_of::<(u32, u32, u64)>();
+        blocks.max(raw).max(index)
     }
 }
 
@@ -4495,10 +4550,10 @@ impl Expand<LtOperation> for CompactLt {
         if start >= end {
             return;
         }
-        let get = |at: &mut usize| {
+        let get = |bytes: &[u8], at: &mut usize| {
             let (mut v, mut shift) = (0u64, 0u32);
             loop {
-                let b = self.bytes[*at];
+                let b = bytes[*at];
                 *at += 1;
                 v |= u64::from(b & 0x7f) << shift;
                 if b < 0x80 {
@@ -4508,12 +4563,20 @@ impl Expand<LtOperation> for CompactLt {
             }
         };
         let unzigzag = |z: u64| (z >> 1) ^ (z & 1).wrapping_neg();
-        let block = start / COMPACT_LT_BLOCK;
-        let (mut at, mut prev) = self.index[block];
+        let first = start / COMPACT_LT_BLOCK;
+        let (block, at, mut prev) = self.index[first];
+        let (mut block, mut at) = (block as usize, at as usize);
         out.reserve(end - start);
-        for k in block * COMPACT_LT_BLOCK..end {
-            let rhs = prev.wrapping_add(unzigzag(get(&mut at)));
-            let lhs = rhs.wrapping_sub(unzigzag(get(&mut at)));
+        for k in first * COMPACT_LT_BLOCK..end {
+            // An op lies in one block: the next op starts the next block once
+            // this one ends.
+            if at >= self.bytes[block].len() {
+                block += 1;
+                at = 0;
+            }
+            let bytes = &self.bytes[block];
+            let rhs = prev.wrapping_add(unzigzag(get(bytes, &mut at)));
+            let lhs = rhs.wrapping_sub(unzigzag(get(bytes, &mut at)));
             prev = rhs;
             if k >= start {
                 out.push(LtOperation::new(lhs, rhs, false));
@@ -4597,50 +4660,52 @@ struct RoutedSegments {
     mul_dvrm_cpu32: Vec<(MulOperation, bool)>,
 }
 
-impl RoutedSegments {
-    /// The bytes its segments take on the heap.
-    fn heap_bytes(&self) -> usize {
-        vec_heap_bytes(&self.branch_ops)
-            + vec_heap_bytes(&self.mul_filter)
-            + vec_heap_bytes(&self.dvrm_filter)
-            + vec_heap_bytes(&self.eq_ops)
-            + vec_heap_bytes(&self.bytewise_ops)
-            + vec_heap_bytes(&self.store_ops)
-            + vec_heap_bytes(&self.shift_cpu32)
-            + vec_heap_bytes(&self.mul_cpu32)
-            + vec_heap_bytes(&self.dvrm_cpu32)
-            + vec_heap_bytes(&self.bitwise_cpu32)
-            + vec_heap_bytes(&self.lt_dvrm_filter)
-            + vec_heap_bytes(&self.lt_dvrm_cpu32)
-            + vec_heap_bytes(&self.mul_dvrm_filter)
-            + vec_heap_bytes(&self.mul_dvrm_cpu32)
-    }
+/// [`RoutedSegments`] accumulated over a run, window by window: each segment
+/// a [`BlockVec`] in blocks of its table's chunk (or [`blocks::BLOCK_BYTES`]),
+/// never reallocated as it grows. The same segments, in the same order.
+struct RoutedBlocks {
+    branch_ops: BlockVec<BranchOperation>,
+    mul_filter: BlockVec<(MulOperation, bool)>,
+    dvrm_filter: BlockVec<(DvrmOperation, bool)>,
+    eq_ops: BlockVec<eq::EqOperation>,
+    bytewise_ops: BlockVec<bytewise::BytewiseOperation>,
+    store_ops: BlockVec<store::StoreOperation>,
+    shift_cpu32: BlockVec<ShiftOperation>,
+    mul_cpu32: BlockVec<(MulOperation, bool)>,
+    dvrm_cpu32: BlockVec<(DvrmOperation, bool)>,
+    bitwise_cpu32: BlockVec<BitwiseOperation>,
+    lt_dvrm_filter: BlockVec<LtOperation>,
+    lt_dvrm_cpu32: BlockVec<LtOperation>,
+    mul_dvrm_filter: BlockVec<(MulOperation, bool)>,
+    mul_dvrm_cpu32: BlockVec<(MulOperation, bool)>,
+}
 
-    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
-    fn heap_parts(&self) -> Vec<(String, usize)> {
-        [
-            ("branch", vec_heap_bytes(&self.branch_ops)),
-            ("mul_filter", vec_heap_bytes(&self.mul_filter)),
-            ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
-            ("eq", vec_heap_bytes(&self.eq_ops)),
-            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
-            ("store", vec_heap_bytes(&self.store_ops)),
-            ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
-            ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
-            ("dvrm_cpu32", vec_heap_bytes(&self.dvrm_cpu32)),
-            ("bitwise_cpu32", vec_heap_bytes(&self.bitwise_cpu32)),
-            ("lt_dvrm_filter", vec_heap_bytes(&self.lt_dvrm_filter)),
-            ("lt_dvrm_cpu32", vec_heap_bytes(&self.lt_dvrm_cpu32)),
-            ("mul_dvrm_filter", vec_heap_bytes(&self.mul_dvrm_filter)),
-            ("mul_dvrm_cpu32", vec_heap_bytes(&self.mul_dvrm_cpu32)),
-        ]
-        .into_iter()
-        .map(|(name, bytes)| (format!("segments {name}"), bytes))
-        .collect()
+impl RoutedBlocks {
+    /// Empty segments, each in blocks of its table's chunk at `m`.
+    fn new(m: &super::MaxRowsConfig) -> Self {
+        fn list<T>(chunk: usize) -> BlockVec<T> {
+            BlockVec::new(block_len::<T>(chunk))
+        }
+        Self {
+            branch_ops: list(m.branch),
+            mul_filter: list(m.mul),
+            dvrm_filter: list(m.dvrm),
+            eq_ops: list(m.eq),
+            bytewise_ops: list(m.bytewise),
+            store_ops: list(m.store),
+            shift_cpu32: list(m.shift),
+            mul_cpu32: list(m.mul),
+            dvrm_cpu32: list(m.dvrm),
+            bitwise_cpu32: list(usize::MAX),
+            lt_dvrm_filter: list(m.lt),
+            lt_dvrm_cpu32: list(m.lt),
+            mul_dvrm_filter: list(m.mul),
+            mul_dvrm_cpu32: list(m.mul),
+        }
     }
 
     /// Appends a later window's segments, segment by segment.
-    fn append(&mut self, other: Self) {
+    fn append(&mut self, other: RoutedSegments) {
         self.branch_ops.extend(other.branch_ops);
         self.mul_filter.extend(other.mul_filter);
         self.dvrm_filter.extend(other.dvrm_filter);
@@ -4655,6 +4720,50 @@ impl RoutedSegments {
         self.lt_dvrm_cpu32.extend(other.lt_dvrm_cpu32);
         self.mul_dvrm_filter.extend(other.mul_dvrm_filter);
         self.mul_dvrm_cpu32.extend(other.mul_dvrm_cpu32);
+    }
+
+    /// Each segment's (name, heap bytes, largest single allocation).
+    fn sizes(&self) -> [(&'static str, usize, usize); 14] {
+        fn of<T>(name: &'static str, list: &BlockVec<T>) -> (&'static str, usize, usize) {
+            (name, list.heap_bytes(), list.largest_bytes())
+        }
+        [
+            of("branch", &self.branch_ops),
+            of("mul_filter", &self.mul_filter),
+            of("dvrm_filter", &self.dvrm_filter),
+            of("eq", &self.eq_ops),
+            of("bytewise", &self.bytewise_ops),
+            of("store", &self.store_ops),
+            of("shift_cpu32", &self.shift_cpu32),
+            of("mul_cpu32", &self.mul_cpu32),
+            of("dvrm_cpu32", &self.dvrm_cpu32),
+            of("bitwise_cpu32", &self.bitwise_cpu32),
+            of("lt_dvrm_filter", &self.lt_dvrm_filter),
+            of("lt_dvrm_cpu32", &self.lt_dvrm_cpu32),
+            of("mul_dvrm_filter", &self.mul_dvrm_filter),
+            of("mul_dvrm_cpu32", &self.mul_dvrm_cpu32),
+        ]
+    }
+
+    /// The bytes its segments take on the heap.
+    fn heap_bytes(&self) -> usize {
+        self.sizes().iter().map(|&(_, bytes, _)| bytes).sum()
+    }
+
+    /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
+    fn heap_parts(&self) -> Vec<(String, usize)> {
+        self.sizes()
+            .iter()
+            .map(|&(name, bytes, _)| (format!("segments {name}"), bytes))
+            .collect()
+    }
+
+    /// Each segment's largest single allocation, named `segments {name}`.
+    fn largest_parts(&self) -> Vec<(String, usize)> {
+        self.sizes()
+            .iter()
+            .map(|&(name, _, largest)| (format!("segments {name}"), largest))
+            .collect()
     }
 }
 
@@ -4881,9 +4990,9 @@ fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
     mut memw: MemwBuckets,
     load_ops: Vec<LoadOperation>,
-    mut lt_ops: Vec<LtOperation>,
-    mut shift_ops: Vec<ShiftOperation>,
-    mut bitwise_ops: Vec<BitwiseOperation>,
+    lt_ops: Vec<LtOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     blake3_ops: Vec<Blake3Operation>,
@@ -4932,17 +5041,18 @@ fn collect_all_ops(
         mul_dvrm_cpu32,
     } = route_ops(&cpu_ops, &cpu32_ops);
     // The lists are the segments in the order the routing always produced them:
-    // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies.
-    shift_ops.extend(shift_cpu32);
-    bitwise_ops.extend(bitwise_cpu32);
-    let mut mul_ops = mul_filter;
-    mul_ops.extend(mul_cpu32);
-    mul_ops.extend(mul_dvrm_filter);
-    mul_ops.extend(mul_dvrm_cpu32);
-    let mut dvrm_ops = dvrm_filter;
-    dvrm_ops.extend(dvrm_cpu32);
-    lt_ops.extend(lt_dvrm_filter);
-    lt_ops.extend(lt_dvrm_cpu32);
+    // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies,
+    // each segment a block of its own (no copies).
+    let shift_ops = BlockVec::from_vec(shift_ops).chain(BlockVec::from_vec(shift_cpu32));
+    let bitwise_ops = BlockVec::from_vec(bitwise_ops).chain(BlockVec::from_vec(bitwise_cpu32));
+    let mul_ops = BlockVec::from_vec(mul_filter)
+        .chain(BlockVec::from_vec(mul_cpu32))
+        .chain(BlockVec::from_vec(mul_dvrm_filter))
+        .chain(BlockVec::from_vec(mul_dvrm_cpu32));
+    let dvrm_ops = BlockVec::from_vec(dvrm_filter).chain(BlockVec::from_vec(dvrm_cpu32));
+    let lt_ops = BlockVec::from_vec(lt_ops)
+        .chain(BlockVec::from_vec(lt_dvrm_filter))
+        .chain(BlockVec::from_vec(lt_dvrm_cpu32));
 
     CollectedOps {
         cpu_ops,
@@ -4953,20 +5063,20 @@ fn collect_all_ops(
         lt_ops,
         shift_ops,
         bitwise_ops,
-        branch_ops,
+        branch_ops: BlockVec::from_vec(branch_ops),
         mul_ops,
         dvrm_ops,
-        commit_ops,
-        keccak_ops,
-        blake3_ops,
-        blake3_absorb_ops,
-        eq_ops,
-        bytewise_ops,
-        store_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ecdas_ops,
-        hint_ops,
+        commit_ops: BlockVec::from_vec(commit_ops),
+        keccak_ops: BlockVec::from_vec(keccak_ops),
+        blake3_ops: BlockVec::from_vec(blake3_ops),
+        blake3_absorb_ops: BlockVec::from_vec(blake3_absorb_ops),
+        eq_ops: BlockVec::from_vec(eq_ops),
+        bytewise_ops: BlockVec::from_vec(bytewise_ops),
+        store_ops: BlockVec::from_vec(store_ops),
+        cpu32_ops: BlockVec::from_vec(cpu32_ops),
+        ecsm_ops: BlockVec::from_vec(ecsm_ops),
+        ecdas_ops: BlockVec::from_vec(ecdas_ops),
+        hint_ops: BlockVec::from_vec(hint_ops),
     }
 }
 
@@ -5117,7 +5227,7 @@ fn build_traces<I: ImageSource + Sync>(
     let lt_concat: Vec<LtOperation>;
     let lt_ops = if skip.concat_lt {
         // The A arm: one list, each segment appended and then freed, as before.
-        let mut all = lt_ops;
+        let mut all = lt_ops.into_vec();
         memw_lt.expand_into(0, memw_lt.len(), &mut all);
         drop(memw_lt);
         all.extend(lt_from_memw);
@@ -5130,16 +5240,16 @@ fn build_traces<I: ImageSource + Sync>(
             parts: vec![Part::Ops(&lt_concat[..])],
         }
     } else {
-        Segmented {
-            parts: vec![
-                Part::Ops(&lt_ops[..]),
-                Part::Compact(&memw_lt),
-                Part::Ops(&lt_from_memw),
-                Part::Compact(&memw_aligned_lt),
-                Part::Ops(&lt_from_memw_aligned),
-                Part::Ops(&lt_from_hints),
-            ],
-        }
+        // The walk's LT ops and what DVRM implies are blocks of their own.
+        let mut parts: Vec<Part<'_, LtOperation>> = lt_ops.parts().map(Part::Ops).collect();
+        parts.extend([
+            Part::Compact(&memw_lt),
+            Part::Ops(&lt_from_memw),
+            Part::Compact(&memw_aligned_lt),
+            Part::Ops(&lt_from_memw_aligned),
+            Part::Ops(&lt_from_hints),
+        ]);
+        Segmented { parts }
     };
 
     build_stamps::mark("p3 lt");
@@ -5221,41 +5331,61 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             }
         }
-        for slice in mul_ops.chunks(p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk)) {
+        // MUL and DVRM deduplicate per instance: their slices are the
+        // instances of the concatenation (copied only where one straddles two
+        // blocks). The other sources are sums over their ops: block by block.
+        let mul_slice = p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk);
+        for k in 0..mul_ops.len().div_ceil(mul_slice) {
+            let mul_ops = &mul_ops;
             collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_mul(slice, mul_chunk))
+                let slice = mul_ops.range(k * mul_slice, (k + 1) * mul_slice);
+                h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
             }));
         }
-        for slice in dvrm_ops.chunks(p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk)) {
+        let dvrm_slice = p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk);
+        for k in 0..dvrm_ops.len().div_ceil(dvrm_slice) {
+            let dvrm_ops = &dvrm_ops;
             collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_dvrm(slice, dvrm_chunk))
+                let slice = dvrm_ops.range(k * dvrm_slice, (k + 1) * dvrm_slice);
+                h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
             }));
         }
-        for slice in branch_ops.chunks(p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk)) {
+        let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
+        for slice in branch_ops
+            .parts()
+            .flat_map(|part| part.chunks(branch_slice))
+        {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&collect_bitwise_from_branch(slice))
             }));
         }
-        for slice in shift_ops.chunks(p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk)) {
+        let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
+        for slice in shift_ops.parts().flat_map(|part| part.chunks(shift_slice)) {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&shift::collect_bitwise_from_shift(slice))
             }));
         }
-        for slice in bytewise_ops.chunks(p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk)) {
+        let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
+        for slice in bytewise_ops
+            .parts()
+            .flat_map(|part| part.chunks(bytewise_slice))
+        {
             collectors.push(Box::new(move |h| {
                 for op in slice {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }));
         }
-        for slice in eq_ops.chunks(p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk)) {
+        let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
+        for slice in eq_ops.parts().flat_map(|part| part.chunks(eq_slice)) {
             collectors.push(Box::new(move |h| {
                 for op in slice {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }));
         }
-        for slice in store_ops.chunks(p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk)) {
+        let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
+        for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
             collectors.push(Box::new(move |h| {
                 for op in slice {
                     h.add_ops(&op.collect_bitwise_ops());
@@ -5269,12 +5399,17 @@ fn build_traces<I: ImageSource + Sync>(
                 h.add_ops(&collect_bitwise_from_memw_aligned(slice))
             }));
         }
-        for slice in keccak_ops.chunks(p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk)) {
+        let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
+        for slice in keccak_ops
+            .parts()
+            .flat_map(|part| part.chunks(keccak_slice))
+        {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&collect_bitwise_from_keccak(slice))
             }));
         }
-        for slice in ecdas_ops.chunks(p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk)) {
+        let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
+        for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&collect_bitwise_from_ecdas(slice))
             }));
@@ -5297,44 +5432,72 @@ fn build_traces<I: ImageSource + Sync>(
                     }
                 }
             }) as Collector,
-            Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-            Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
+            // MUL and DVRM deduplicate per instance: instance by instance.
             Box::new(|h| {
-                for op in &bytewise_ops {
+                for k in 0..mul_ops.len().div_ceil(mul_chunk.max(1)) {
+                    let slice = mul_ops.range(k * mul_chunk, (k + 1) * mul_chunk);
+                    h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
+                }
+            }),
+            Box::new(|h| {
+                for k in 0..dvrm_ops.len().div_ceil(dvrm_chunk.max(1)) {
+                    let slice = dvrm_ops.range(k * dvrm_chunk, (k + 1) * dvrm_chunk);
+                    h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
+                }
+            }),
+            Box::new(|h| {
+                for part in branch_ops.parts() {
+                    h.add_ops(&collect_bitwise_from_branch(part))
+                }
+            }),
+            Box::new(|h| {
+                for part in shift_ops.parts() {
+                    h.add_ops(&shift::collect_bitwise_from_shift(part))
+                }
+            }),
+            Box::new(|h| {
+                for op in bytewise_ops.iter() {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }),
             Box::new(|h| {
-                for op in &eq_ops {
+                for op in eq_ops.iter() {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }),
             Box::new(|h| {
-                for op in &store_ops {
+                for op in store_ops.iter() {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }),
             Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+            Box::new(|h| {
+                for part in keccak_ops.parts() {
+                    h.add_ops(&collect_bitwise_from_keccak(part))
+                }
+            }),
+            Box::new(|h| {
+                for part in ecdas_ops.parts() {
+                    h.add_ops(&collect_bitwise_from_ecdas(part))
+                }
+            }),
         ]);
     }
     collectors.extend([
+        // Small lists, one block each at a block's size: whole.
         Box::new(|h: &mut bitwise::BitwiseHistogram| {
-            h.add_ops(&collect_bitwise_from_commit(&commit_ops))
+            h.add_ops(&collect_bitwise_from_commit(&commit_ops.whole()))
         }) as Collector,
         Box::new(|h| {
             if !strip_blake3_side_effects() {
                 h.add_ops(&collect_bitwise_from_blake3(
-                    &blake3_ops,
-                    &blake3_absorb_ops,
+                    &blake3_ops.whole(),
+                    &blake3_absorb_ops.whole(),
                 ));
             }
         }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ]);
     if let Some(image) = initial_image
@@ -5350,7 +5513,16 @@ fn build_traces<I: ImageSource + Sync>(
         Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
         None => (bitwise::BitwiseHistogram::new(), 0, 0),
     };
-    let uncounted_iw = &bitwise_ops[counted_iw..];
+    // The in-walk lookups past the counted ones, block by block.
+    let mut skip_iw = counted_iw;
+    let uncounted_iw: Vec<&[BitwiseOperation]> = bitwise_ops
+        .parts()
+        .filter_map(|part| {
+            let from = skip_iw.min(part.len());
+            skip_iw -= from;
+            (from < part.len()).then(|| &part[from..])
+        })
+        .collect();
     let uncounted_reg = &memw_register_rows[counted_reg..];
 
     #[cfg(feature = "parallel")]
@@ -5366,8 +5538,9 @@ fn build_traces<I: ImageSource + Sync>(
         // byte-identical multiplicities (same as the serial fallback below).
         let cap = rayon::current_num_threads().clamp(1, 8);
         let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
-        let iw_chunk = uncounted_iw.len().div_ceil(cap).max(1);
-        for slice in uncounted_iw.chunks(iw_chunk) {
+        let iw_total: usize = uncounted_iw.iter().map(|part| part.len()).sum();
+        let iw_chunk = iw_total.div_ceil(cap).max(1);
+        for slice in uncounted_iw.iter().flat_map(|part| part.chunks(iw_chunk)) {
             units.push(Box::new(move |h| h.add_ops(slice)));
         }
         let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
@@ -5401,14 +5574,17 @@ fn build_traces<I: ImageSource + Sync>(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        base.add_ops(uncounted_iw);
+        for part in &uncounted_iw {
+            base.add_ops(part);
+        }
         memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
         for f in &collectors {
             f(&mut base);
         }
     }
     let bitwise_histogram = base;
-    // The in-walk lookup Vec has been counted into the histogram; free it now.
+    // The in-walk lookups have been counted into the histogram; free them now.
+    drop(uncounted_iw);
     drop(bitwise_ops);
     #[cfg(feature = "instruments")]
     drop(__sp);
@@ -5543,8 +5719,8 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_shifts = || {
-        chunk_and_generate_skipping(
-            &shift_ops,
+        chunk_and_generate_segmented(
+            &shift_ops.segments(),
             max_rows.shift,
             skip.shift,
             skip.tails,
@@ -5555,27 +5731,36 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_muls = || {
-        chunk_and_generate_optional(
-            &mul_ops,
+        chunk_and_generate_segmented(
+            &mul_ops.segments(),
             max_rows.mul,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| mul::generate_mul_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_dvrms = || {
-        chunk_and_generate_optional(
-            &dvrm_ops,
+        chunk_and_generate_segmented(
+            &dvrm_ops.segments(),
             max_rows.dvrm,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| dvrm::generate_dvrm_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_branches = || {
-        chunk_and_generate_optional(
-            &branch_ops,
+        chunk_and_generate_segmented(
+            &branch_ops.segments(),
             max_rows.branch,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| branch::generate_branch_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5584,26 +5769,32 @@ fn build_traces<I: ImageSource + Sync>(
     // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
     // ops above.
     let gen_eqs = || {
-        chunk_and_generate_optional::<eq::EqOperation>(
-            &eq_ops,
+        chunk_and_generate_segmented::<eq::EqOperation>(
+            &eq_ops.segments(),
             max_rows.eq,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| eq::generate_eq_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_bytewises = || {
-        chunk_and_generate_optional::<bytewise::BytewiseOperation>(
-            &bytewise_ops,
+        chunk_and_generate_segmented::<bytewise::BytewiseOperation>(
+            &bytewise_ops.segments(),
             max_rows.bytewise,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| bytewise::generate_bytewise_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
     };
     let gen_stores = || {
-        chunk_and_generate_skipping(
-            &store_ops,
+        chunk_and_generate_segmented(
+            &store_ops.segments(),
             max_rows.store,
             skip.store,
             skip.tails,
@@ -5614,9 +5805,12 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_cpu32s = || {
-        chunk_and_generate_optional::<cpu32::Cpu32Operation>(
-            &cpu32_ops,
+        chunk_and_generate_segmented::<cpu32::Cpu32Operation>(
+            &cpu32_ops.segments(),
             max_rows.cpu32,
+            0,
+            false,
+            true,
             packed_by(pack, |ops| cpu32::generate_cpu32_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5640,7 +5834,7 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_commits = || {
         generate_optional(
-            &commit_ops,
+            &commit_ops.whole(),
             packed_by(pack, |ops| commit::generate_commit_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5648,7 +5842,7 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_keccaks = || {
         generate_optional(
-            &keccak_ops,
+            &keccak_ops.whole(),
             keccak::generate_keccak_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5684,7 +5878,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_blake3 = || {
         packed_if(
             pack,
-            blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops),
+            blake3::generate_blake3_trace(&blake3_ops.whole(), &blake3_absorb_ops.whole()),
         )
     };
     let gen_keccak_rc = || {
@@ -5725,7 +5919,7 @@ fn build_traces<I: ImageSource + Sync>(
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
         generate_optional(
-            &ecsm_ops,
+            &ecsm_ops.whole(),
             ecsm::generate_ecsm_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5733,7 +5927,7 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_ecdases = || {
         generate_optional(
-            &ecdas_ops,
+            &ecdas_ops.whole(),
             ecdas::generate_ecdas_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -5742,7 +5936,7 @@ fn build_traces<I: ImageSource + Sync>(
     // HINT table. Absent entirely for programs that make no hint ecalls.
     let gen_hints = || {
         generate_optional(
-            &hint_ops,
+            &hint_ops.whole(),
             packed_by(pack, |ops| hint::generate_hint_trace_as(ops, form)),
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -7492,9 +7686,27 @@ mod segmented_tests {
         for piece in ops.chunks(777) {
             raw.extend(piece);
         }
+        // The stream cut into blocks of a few ops: an op never straddles two,
+        // and every range crosses some.
+        let mut blocked = CompactLt::with_block_bytes(64);
+        for piece in ops.chunks(333) {
+            blocked.extend(piece);
+        }
+        assert!(
+            blocked.bytes.len() > n / 8,
+            "{} blocks",
+            blocked.bytes.len()
+        );
+        assert!(
+            blocked
+                .bytes
+                .iter()
+                .all(|b| b.len() <= 64 && b.capacity() <= 64)
+        );
+        assert!(blocked.largest_bytes() <= 64.max(blocked.index.capacity() * 16));
         assert!(whole.heap_bytes() < n * std::mem::size_of::<LtOperation>());
         assert!(raw.heap_bytes() >= n * std::mem::size_of::<LtOperation>());
-        for compact in [&whole, &pieces, &raw] {
+        for compact in [&whole, &pieces, &raw, &blocked] {
             assert_eq!(Expand::len(compact), n);
             for (start, end) in [
                 (0, n),
@@ -7548,7 +7760,7 @@ mod segmented_tests {
         );
         let mut compact_b = CompactLt::default();
         compact_b.extend(b);
-        let mut compact_c = CompactLt::default();
+        let mut compact_c = CompactLt::with_block_bytes(40);
         compact_c.extend(c);
         let segmented = Segmented {
             parts: vec![
