@@ -266,6 +266,11 @@ pub struct ChainFormat {
     /// How a proof's tables argue their constraints and buses (D-BATCH).
     /// [`ArgueFormat::PerTable`] = today.
     pub argue: ArgueFormat,
+    /// The Merkle cap policy of a hash whose trees are 4-ary (Poseidon1,
+    /// D-WHIR-P1 D2), its heights in 4-ary levels: [`cap`](Self::cap) prices
+    /// binary caps only. Read at arity 4 alone, so it cannot move a binary
+    /// hash's bytes; `Off` = today.
+    pub arity4_cap: CapPolicy,
 }
 
 impl ChainFormat {
@@ -276,6 +281,7 @@ impl ChainFormat {
         stack: StackVars::LEGACY,
         nonces: NonceLayout::Three,
         argue: ArgueFormat::PerTable,
+        arity4_cap: CapPolicy::Off,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -285,6 +291,17 @@ impl ChainFormat {
             && self.stack == StackVars::LEGACY
             && self.nonces == NonceLayout::Three
             && self.argue == ArgueFormat::PerTable
+            && self.arity4_cap.is_off()
+    }
+
+    /// The cap policy of trees with `arity` children per node:
+    /// [`cap`](Self::cap) at arity 2, [`arity4_cap`](Self::arity4_cap) at 4.
+    pub fn cap_policy_at(&self, arity: usize) -> CapPolicy {
+        if arity == 4 {
+            self.arity4_cap
+        } else {
+            self.cap
+        }
     }
 }
 
@@ -600,6 +617,16 @@ impl ChainConfig {
     /// prover, the host verifier and the in-guest emitter derive the same
     /// heights from the config alone. All zero at the default.
     pub fn tree_caps(&self, num_vars: usize) -> Vec<usize> {
+        self.tree_caps_at(num_vars, 2)
+    }
+
+    /// [`tree_caps`](Self::tree_caps) for trees of `arity` children per node:
+    /// the policy at that arity ([`ChainFormat::cap_policy_at`]) over that
+    /// arity's levels ([`crate::whir_commit::tree_cap_height`]). At arity 2 it
+    /// is `tree_caps`; the chain's prover and verifier call it with their
+    /// hash's arity.
+    pub fn tree_caps_at(&self, num_vars: usize, arity: usize) -> Vec<usize> {
+        let policy = self.format.cap_policy_at(arity);
         let mut domain_log = num_vars + self.log_blowup;
         self.schedule(num_vars)
             .iter()
@@ -611,7 +638,7 @@ impl ChainConfig {
                 } else {
                     2 * self.num_queries
                 };
-                self.format.cap.height(openings, domain_log)
+                crate::whir_commit::tree_cap_height(policy, openings, domain_log, arity)
             })
             .collect()
     }
@@ -1166,8 +1193,9 @@ where
     // several (`stacked_eval::prove` runs one per commitment).
     crate::whir_split::bump(&crate::whir_split::CHAIN_COUNT);
     let schedule = config.schedule(num_vars);
-    // One cap height per tree; all zero at the default format.
-    let caps = config.tree_caps(num_vars);
+    // One cap height per tree, in the hash's tree levels; all zero at the
+    // default format.
+    let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E, H>::Base(commitment);
@@ -1490,8 +1518,9 @@ where
     let mut alphas: Vec<FieldElement<E>> = Vec::with_capacity(num_vars);
     // Tree 0 is authenticated by the cap round 0's first current opening
     // carries; every later tree by the check the round that committed it
-    // returned. A verifier constant per tree, derived from the config alone.
-    let caps = config.tree_caps(num_vars);
+    // returned. A verifier constant per tree, derived from the config and the
+    // hash alone.
+    let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
     // Which nonce slots the proof carries: a verifier constant too.
     let layout = config.format.nonces;
     let mut current: TreeCheck<'a> = TreeCheck::Owner {
