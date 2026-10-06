@@ -729,8 +729,16 @@ fn a_non_boolean_index_bit_is_refused() {
             Err(e) => Err(format!("{e:?}")),
         }
     };
-    assert_eq!(round_trip(false), Ok(true), "the honest trace proves and verifies");
+    assert_eq!(
+        round_trip(false),
+        Ok(true),
+        "the honest trace proves and verifies"
+    );
     let forged = round_trip(true);
-    assert_ne!(forged, Ok(true), "a non-boolean index bit must be refused: {forged:?}");
+    assert_ne!(
+        forged,
+        Ok(true),
+        "a non-boolean index bit must be refused: {forged:?}"
+    );
     println!("non-boolean index bit: {forged:?}");
 }
