@@ -29,8 +29,8 @@ use super::whir_block::{
     leaf_program_with, out_halves, partition_groups, verify_block_tree, verify_block_tree_under,
 };
 use super::whir_block_tree::{
-    FailUnpublished, GroupMsg, Published, TreeAt, build_levels, in_arrival_order, node_flow,
-    prove_dataflow, top_streams, tree_order, wait_all,
+    FailEmpty, FailUnpublished, GroupMsg, ProgramSlot, Published, TreeAt, TreeBudget, build_levels,
+    in_arrival_order, node_flow, prove_dataflow, publish_each, top_streams, tree_order, wait_all,
 };
 use super::word::{LfmWord, base_word, word_as_ext};
 
@@ -1303,11 +1303,13 @@ fn toy_tree(
     });
     build_levels(
         &shape,
-        &leaf_refs,
+        &|i: usize| -> Result<&String, String> { Ok(leaf_refs[i]) },
+        leaf_refs.len(),
         &programs,
         &slots,
         |node: &String| node,
-        |lv, j, kids: &[&String], top| {
+        |_, _| Ok(()),
+        |lv, j, kids: &[&String], top, ()| {
             let late = shape[lv].arities.len() - j;
             std::thread::sleep(std::time::Duration::from_millis(4 * late as u64));
             finished.lock().expect("the log").push((lv, j));
@@ -1348,19 +1350,18 @@ fn toy_tree(
     (got, finished.into_inner().expect("the log"))
 }
 
-/// ★ The node pipe builds the serial builder's nodes, each in its own slot,
-/// whatever order a level's emissions finish in, and finishes every node (where
-/// it takes the card) off the rayon workers: the median's shape (23 leaves at
-/// fan-in 3), on pools of 2 to 4 threads, where each level's emissions finish
-/// out of order, and serially.
-#[test]
-fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
-    let arities = vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]];
+/// The median's tree shape: 23 leaves at fan-in 3.
+fn median_arities() -> Vec<Vec<usize>> {
+    vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]]
+}
+
+/// The toy tree's nodes over `leaves` leaves, level by level, as [`toy_tree`]
+/// names them.
+fn toy_want(leaves: usize, arities: &[Vec<usize>]) -> Vec<Vec<Option<Result<String, String>>>> {
     let group =
         |kids: &[String], top: bool| format!("{}({})", if top { "T" } else { "N" }, kids.join(","));
-    let leaves: Vec<String> = (0..23).map(|k| format!("L{k}")).collect();
     let mut want: Vec<Vec<String>> = Vec::new();
-    let mut below = leaves;
+    let mut below: Vec<String> = (0..leaves).map(|k| format!("L{k}")).collect();
     for (lv, a) in arities.iter().enumerate() {
         let top = lv + 1 == arities.len();
         let mut at = 0;
@@ -1374,10 +1375,20 @@ fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
         want.push(level.clone());
         below = level;
     }
-    let want: Vec<Vec<Option<Result<String, String>>>> = want
-        .into_iter()
+    want.into_iter()
         .map(|l| l.into_iter().map(|p| Some(Ok(p))).collect())
-        .collect();
+        .collect()
+}
+
+/// ★ The node pipe builds the serial builder's nodes, each in its own slot,
+/// whatever order a level's emissions finish in, and finishes every node (where
+/// it takes the card) off the rayon workers: the median's shape (23 leaves at
+/// fan-in 3), on pools of 2 to 4 threads, where each level's emissions finish
+/// out of order, and serially.
+#[test]
+fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
+    let arities = median_arities();
+    let want = toy_want(23, &arities);
     for threads in [None, Some(2), Some(3), Some(4)] {
         let (got, finished) = toy_tree(23, &arities, threads, None);
         assert_eq!(got, want, "{threads:?} threads");
@@ -1419,6 +1430,458 @@ fn a_failing_node_build_fails_every_node_above_it() {
             );
         }
     }
+}
+
+/// [`build_levels`] at the median's shape over toy leaves (`L3`) that
+/// [`publish_each`] builds one after another on another thread, each waited
+/// for where it is read, as [`build_nodes`] waits for a leaf's artifacts. While
+/// it builds the last leaf the publisher waits up to `poll` for the first
+/// node's program; the leaf at `fail_leaf` does not build. Returns every node
+/// slot's content and whether that program was out before the last leaf was
+/// built — or `None` if the two did not finish within 20 s.
+#[allow(clippy::type_complexity)]
+fn toy_tree_over_published_leaves(
+    threads: Option<usize>,
+    together: bool,
+    fail_leaf: Option<usize>,
+    poll: std::time::Duration,
+) -> Option<(Vec<Vec<Option<Result<String, String>>>>, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use super::per_table_aggregator::Level;
+        let n = 23;
+        let shape: Vec<Level> = median_arities()
+            .into_iter()
+            .map(|arities| Level { arities })
+            .collect();
+        let node_slots = || -> Vec<Vec<Published<String>>> {
+            shape
+                .iter()
+                .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+                .collect()
+        };
+        let (programs, slots) = (node_slots(), node_slots());
+        let leaves: Vec<Published<String>> = (0..n).map(|_| Published::new()).collect();
+        let pool = threads.map(|t| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .expect("a pool")
+        });
+        let early = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let ids: Vec<usize> = (0..n).collect();
+                publish_each(
+                    &ids,
+                    &leaves,
+                    !together,
+                    |_| true,
+                    |k, _| {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        if fail_leaf == Some(k) {
+                            return Err(format!("leaf {k} does not build"));
+                        }
+                        if k + 1 == n {
+                            let t = std::time::Instant::now();
+                            while programs[0][0].0.get().is_none() && t.elapsed() < poll {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            let out = programs[0][0].0.get().is_some();
+                            early.store(out, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(format!("L{k}"))
+                    },
+                )
+            });
+            build_levels(
+                &shape,
+                &|i: usize| leaves[i].wait(),
+                n,
+                &programs,
+                &slots,
+                |node: &String| node,
+                |_, _| Ok(()),
+                |_, _, kids: &[&String], top, ()| {
+                    let kids: Vec<&str> = kids.iter().map(|k| k.as_str()).collect();
+                    let text = format!("{}({})", if top { "T" } else { "N" }, kids.join(","));
+                    Ok((text.clone(), text))
+                },
+                |_, _, program: String| Ok(program),
+                pool.as_ref(),
+            );
+        });
+        let got: Vec<Vec<Option<Result<String, String>>>> = slots
+            .iter()
+            .map(|level| level.iter().map(|s| s.0.get().cloned()).collect())
+            .collect();
+        let _ = tx.send((got, early.into_inner()));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+}
+
+/// ★ Leaves published one at a time build the tree all of them published at
+/// once build, and nothing waits forever: serially and on pools of 1 to 4
+/// threads, where a node over leaves waits for its own on a pool worker.
+#[test]
+fn leaves_published_one_at_a_time_build_the_same_tree() {
+    let want = toy_want(23, &median_arities());
+    for threads in [None, Some(1), Some(2), Some(4)] {
+        for together in [false, true] {
+            let got =
+                toy_tree_over_published_leaves(threads, together, None, std::time::Duration::ZERO);
+            let (got, _) = got.unwrap_or_else(|| {
+                panic!("{threads:?} threads, together {together}: the tree hung")
+            });
+            assert_eq!(got, want, "{threads:?} threads, together {together}");
+        }
+    }
+}
+
+/// ★ A node over leaves is emitted once its own leaves are published, before
+/// the last leaf is built; with every leaf held back to the end (the default
+/// while every leaf's program is there), it cannot be.
+#[test]
+fn a_node_over_leaves_is_emitted_before_the_last_leaf_is_built() {
+    let want = toy_want(23, &median_arities());
+    for threads in [None, Some(2), Some(4)] {
+        for (together, poll) in [(false, 10_000), (true, 200)] {
+            let poll = std::time::Duration::from_millis(poll);
+            let (got, early) = toy_tree_over_published_leaves(threads, together, None, poll)
+                .unwrap_or_else(|| {
+                    panic!("{threads:?} threads, together {together}: the tree hung")
+                });
+            assert_eq!(got, want, "{threads:?} threads, together {together}");
+            assert_eq!(
+                early, !together,
+                "{threads:?} threads, together {together}: the first node's program \
+                 out before the last leaf was built"
+            );
+        }
+    }
+}
+
+/// A leaf that does not build fails the nodes over it and every node above,
+/// and the leaves after it fail too: nothing waits forever.
+#[test]
+fn a_leaf_that_does_not_build_fails_the_nodes_over_it() {
+    for threads in [None, Some(4)] {
+        for together in [false, true] {
+            let (got, _) = toy_tree_over_published_leaves(
+                threads,
+                together,
+                Some(4),
+                std::time::Duration::ZERO,
+            )
+            .unwrap_or_else(|| panic!("{threads:?} threads, together {together}: the tree hung"));
+            let at = format!("{threads:?} threads, together {together}");
+            assert_eq!(
+                got[0][0],
+                Some(Ok("N(L0,L1,L2)".to_string())),
+                "{at}: the node before it"
+            );
+            assert_eq!(
+                got[0][1],
+                Some(Err("leaf 4 does not build".to_string())),
+                "{at}: the node over it"
+            );
+            for (lv, level) in got.iter().enumerate() {
+                for (j, slot) in level.iter().enumerate().skip(usize::from(lv == 0) * 2) {
+                    assert!(
+                        matches!(slot, Some(Err(_))),
+                        "{at}: slot ({lv}, {j}) after a failed leaf: {slot:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// ★ [`publish_each`] holds what it built while each next input is there,
+/// publishing it all after the last; before an input that is not there yet it
+/// publishes what it holds, then each value as it is built. Here input 3
+/// arrives only once output 0 is out, as a leaf program the budget admits only
+/// once the provers take the leaves before it: holding across it (the mutation:
+/// ignore `ready`) waits forever, and the bounded wait fails the test instead.
+#[test]
+fn the_leaves_artifacts_are_published_before_a_wait_for_a_missing_program() {
+    let wait_for = |slot: &Published<usize>| -> Result<usize, String> {
+        let t = std::time::Instant::now();
+        while slot.0.get().is_none() {
+            if t.elapsed() > std::time::Duration::from_secs(10) {
+                return Err("an input that never came".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        slot.wait().copied()
+    };
+    // Every input there: one publication, after the last.
+    let inputs: Vec<Published<usize>> = (0..6).map(|_| Published::new()).collect();
+    for (k, input) in inputs.iter().enumerate() {
+        let _ = input.0.set(Ok(k));
+    }
+    let out: Vec<Published<usize>> = (0..6).map(|_| Published::new()).collect();
+    let from = publish_each(
+        &inputs,
+        &out,
+        false,
+        |k| inputs[k].0.get().is_some(),
+        |k, input| {
+            assert!(
+                out[0].0.get().is_none(),
+                "output 0 out before the last build ({k})"
+            );
+            wait_for(input).map(|v| v * 10)
+        },
+    );
+    assert_eq!(from, None);
+    let got: Vec<_> = out.iter().map(|s| s.0.get().cloned()).collect();
+    assert_eq!(got, (0..6).map(|k| Some(Ok(k * 10))).collect::<Vec<_>>());
+    // Input 3 comes only once output 0 is out.
+    let inputs: Vec<Published<usize>> = (0..6).map(|_| Published::new()).collect();
+    for (k, input) in inputs.iter().enumerate().take(3) {
+        let _ = input.0.set(Ok(k));
+    }
+    let out: Vec<Published<usize>> = (0..6).map(|_| Published::new()).collect();
+    let from = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            if wait_for(&out[0]).is_ok() {
+                for (k, input) in inputs.iter().enumerate().skip(3) {
+                    let _ = input.0.set(Ok(k));
+                }
+            }
+        });
+        publish_each(
+            &inputs,
+            &out,
+            false,
+            |k| inputs[k].0.get().is_some(),
+            |_, input| wait_for(input).map(|v| v * 10),
+        )
+    });
+    assert_eq!(
+        from,
+        Some(3),
+        "per-item publication begins at the missing input"
+    );
+    let got: Vec<_> = out.iter().map(|s| s.0.get().cloned()).collect();
+    assert_eq!(got, (0..6).map(|k| Some(Ok(k * 10))).collect::<Vec<_>>());
+}
+
+/// The W3 tree's programs composed as `prove_tree_pipelined` composes them,
+/// over toy programs (texts), at the median's shape: under `room`, the leaves
+/// the budget admits now are emitted at once and the rest by the streaming
+/// emitter as it admits them; the leaves' "artifacts" (their texts) published
+/// by [`publish_each`] against "is the next program there"; the nodes admitted
+/// in prove order on the builder's plain threads ([`build_levels`]); the
+/// provers taking programs in tree order, claiming each at the take and
+/// letting it go after its proof ([`prove_dataflow`], [`node_flow`]). Returns
+/// every node's text, how many leaves came in at once, where per-leaf
+/// publication began, the budget's summary and how many programs were never
+/// let go — or `None` after 30 s.
+#[allow(clippy::type_complexity)]
+fn toy_budget_tree(
+    threads: Option<usize>,
+    room: super::program_budget::Room,
+    ahead: usize,
+) -> Option<(
+    Vec<Vec<Option<Result<String, String>>>>,
+    usize,
+    Option<usize>,
+    String,
+    usize,
+)> {
+    use super::per_table_aggregator::Level;
+    use super::program_budget::{Permit, ProgramBudget, emit_ordered};
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let n = 23;
+        let shape: Vec<Level> = median_arities()
+            .into_iter()
+            .map(|arities| Level { arities })
+            .collect();
+        let budget = ProgramBudget::with_reading(room, ahead, Box::new(|| None));
+        let tb = TreeBudget::new(budget, &vec![1; n], &shape);
+        // Beside the base: the leaves admitted now, in order.
+        let permits: Vec<Permit> = (0..n)
+            .map_while(|k| tb.budget.try_acquire(k, tb.leaf_estimate(k)))
+            .collect();
+        let upto = permits.len();
+        let leaves: Vec<Published<ProgramSlot<String>>> =
+            (0..n).map(|_| Published::new()).collect();
+        for (k, mut permit) in permits.into_iter().enumerate() {
+            permit.emitted(1);
+            let _ = leaves[k]
+                .0
+                .set(Ok(ProgramSlot::new(format!("L{k}"), Some(permit))));
+        }
+        let built: Vec<Published<String>> = (0..n).map(|_| Published::new()).collect();
+        let node_slots = || -> Vec<Vec<Published<String>>> {
+            shape
+                .iter()
+                .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+                .collect()
+        };
+        let slots = node_slots();
+        let programs: Vec<Vec<Published<ProgramSlot<String>>>> = shape
+            .iter()
+            .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+            .collect();
+        let results: Vec<Vec<Published<String>>> = std::iter::once(n)
+            .chain(shape.iter().map(|l| l.arities.len()))
+            .map(|m| (0..m).map(|_| Published::new()).collect())
+            .collect();
+        let pool = threads.map(|t| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .expect("a pool")
+        });
+        let tb = &tb;
+        let from = std::thread::scope(|outer| {
+            if upto < n {
+                let leaves = &leaves;
+                outer.spawn(move || {
+                    let _fail = FailEmpty(&leaves[upto..], "the leaf emitter stopped");
+                    let emit = |k: usize| -> Result<ProgramSlot<String>, String> {
+                        let mut permit = tb.budget.acquire(k, tb.leaf_estimate(k))?;
+                        permit.emitted(1);
+                        Ok(ProgramSlot::new(format!("L{k}"), Some(permit)))
+                    };
+                    emit_ordered(upto..n, 4, &emit, &mut |k, slot| {
+                        let emitted = slot.is_ok();
+                        let _ = leaves[k].0.set(slot);
+                        emitted
+                    });
+                });
+            }
+            outer.spawn(|| {
+                build_levels(
+                    &shape,
+                    &|i: usize| built[i].wait(),
+                    n,
+                    &programs,
+                    &slots,
+                    |node: &String| node,
+                    |lv, j| {
+                        tb.budget
+                            .acquire(tb.node_order(lv, j), tb.node_estimate())
+                            .map(Some)
+                    },
+                    |_, _, kids: &[&String], top, permit: Option<Permit>| {
+                        let kids: Vec<&str> = kids.iter().map(|k| k.as_str()).collect();
+                        let text = format!("{}({})", if top { "T" } else { "N" }, kids.join(","));
+                        let mut permit = permit;
+                        if let Some(p) = permit.as_mut() {
+                            p.emitted(1);
+                        }
+                        Ok((ProgramSlot::new(text.clone(), permit), text))
+                    },
+                    |_, _, text: String| Ok(text),
+                    pool.as_ref(),
+                )
+            });
+            std::thread::scope(|scope| {
+                let artifacts = scope.spawn(|| {
+                    publish_each(
+                        &leaves,
+                        &built,
+                        false,
+                        |k| leaves[k].0.get().is_some(),
+                        |_, slot| Ok(slot.wait()?.get()?.program.clone()),
+                    )
+                });
+                prove_dataflow(
+                    &shape,
+                    &tree_order(n, &shape),
+                    &results,
+                    3,
+                    false,
+                    |at, kids: &[&Published<String>]| -> Result<String, String> {
+                        if at.lv == 0 {
+                            let slot = leaves[at.j].wait()?;
+                            slot.claim();
+                            let program = slot.get()?.program.clone();
+                            built[at.j].wait()?;
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            slot.release();
+                            return Ok(program);
+                        }
+                        node_flow(
+                            &programs,
+                            &slots,
+                            at,
+                            true,
+                            |slot: &ProgramSlot<String>| -> Result<String, String> {
+                                slot.claim();
+                                let program = slot.get()?.program.clone();
+                                wait_all(kids)?;
+                                slot.release();
+                                Ok(program)
+                            },
+                            |program, _: &String| Ok(program),
+                        )
+                    },
+                );
+                tb.budget.fail();
+                artifacts.join().expect("the artifacts thread")
+            })
+        });
+        let got: Vec<Vec<Option<Result<String, String>>>> = slots
+            .iter()
+            .map(|level| level.iter().map(|s| s.0.get().cloned()).collect())
+            .collect();
+        let kept = leaves
+            .iter()
+            .chain(programs.iter().flatten())
+            .filter(|slot| slot.wait().is_ok_and(|p| p.get().is_ok()))
+            .count();
+        let _ = tx.send((got, upto, from, tb.budget.summary(), kept));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30)).ok()
+}
+
+/// ★ No room at all (a one-byte budget; every program comes in among the next
+/// `ahead` the provers will take): the tree still completes with the same
+/// nodes, serially and on pools of 1 to 4 threads, ahead 1 and
+/// [`super::program_budget::AHEAD`]. The leaves' artifacts go out before the
+/// first missing program; holding them across it (or provers that never claim)
+/// deadlocks, which the bounded run turns into a failure. With room, every leaf
+/// comes in at once and the artifacts go out together, as before the budget.
+#[test]
+fn a_one_byte_budget_cannot_deadlock_the_w3_tree() {
+    use super::program_budget::{AHEAD, Room};
+    let want = toy_want(23, &median_arities());
+    for threads in [None, Some(1), Some(2), Some(4)] {
+        for ahead in [1, AHEAD] {
+            let (got, upto, from, summary, kept) = toy_budget_tree(threads, Room::Bytes(1), ahead)
+                .unwrap_or_else(|| panic!("{threads:?} threads, ahead {ahead}: the tree hung"));
+            assert_eq!(got, want, "{threads:?} threads, ahead {ahead}");
+            assert_eq!(kept, 0, "{threads:?} threads: programs never let go");
+            assert_eq!(upto, ahead, "{threads:?} threads: leaves in at once");
+            // The provers claim the leaves they take before those leaves'
+            // artifacts are out, so a few more programs may come in first; at
+            // the latest, the leaf after the three in flight is missing.
+            assert!(
+                from.is_some_and(|f| (ahead..=ahead + 3).contains(&f)),
+                "{threads:?} threads, ahead {ahead}: per-leaf from {from:?}"
+            );
+            assert!(
+                summary.contains(&format!("0 by room, 35 among the next {ahead}")),
+                "{threads:?} threads, ahead {ahead}: {summary}"
+            );
+        }
+    }
+    let (got, upto, from, summary, kept) =
+        toy_budget_tree(Some(4), Room::Unbounded, AHEAD).expect("the roomy tree hung");
+    assert_eq!(got, want);
+    assert_eq!(kept, 0, "programs never let go");
+    assert_eq!(
+        (upto, from),
+        (23, None),
+        "every leaf at once, published together"
+    );
+    assert!(summary.contains("35 by room, 0 among"), "{summary}");
 }
 
 /// One node's stamps in [`split_slot_flow`], in ms since the tree started:
@@ -1473,11 +1936,13 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
         scope.spawn(|| {
             build_levels(
                 &shape,
-                &leaf_refs,
+                &|i: usize| -> Result<&String, String> { Ok(leaf_refs[i]) },
+                leaf_refs.len(),
                 &programs,
                 &slots,
                 |node: &(String, u128)| &node.0,
-                |lv, j, kids: &[&String], _| {
+                |_, _| Ok(()),
+                |lv, j, kids: &[&String], _, ()| {
                     let late = shape[lv].arities.len() - j;
                     std::thread::sleep(std::time::Duration::from_millis(3 * late as u64));
                     let text = format!(

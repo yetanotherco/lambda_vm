@@ -133,6 +133,16 @@ pub struct WhirTreeConfig {
     /// `W3_EXEC_BESIDE_ARTIFACTS=0|1` (default 1): the leaves execute and fill
     /// while their artifacts are built, or (0, the control) after all of them.
     pub beside: bool,
+    /// `W3_LEAF_ARTIFACTS_EACH=0|1` (default 0): the leaves' artifacts are
+    /// published all at once after the last is built while every leaf's
+    /// program is there, and each as it is built from the first leaf whose
+    /// program is not ([`publish_each`]); or (1, a measurement arm) each as it
+    /// is built throughout.
+    pub leaves_each: bool,
+    /// `LAMBDA_VM_TREE_PROGRAM_BUDGET` (`auto` by default): how many bytes of
+    /// tree programs may exist ahead of their provers
+    /// ([`super::program_budget`]), against the spill target.
+    pub program_budget: super::program_budget::BudgetSetting,
     /// `W3_LEAF_DURING_PHASE_B=0|1` (default 1): the first leaf whose groups
     /// phase B finished while another group was still to come executes and
     /// fills right then, or (0, the control) with the others after the base.
@@ -187,6 +197,7 @@ impl WhirTreeConfig {
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
         let beside = count_knob("W3_EXEC_BESIDE_ARTIFACTS")?.is_none_or(|v| v != 0);
+        let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -279,6 +290,8 @@ impl WhirTreeConfig {
             siblings,
             fan_in,
             beside,
+            leaves_each,
+            program_budget: super::program_budget::setting_from_env()?,
             early_on,
             argue,
             format,
@@ -302,12 +315,157 @@ impl WhirTreeConfig {
 
 // ============================ the tree's machinery ========================
 
+/// A tree program as its emitter made it, with its admission under the tree's
+/// program budget (none without one). The program is declared first, so it is
+/// dropped before the permit that accounts for it.
+pub(crate) struct Admitted<P = LfmProgram> {
+    pub(crate) program: P,
+    permit: Option<super::program_budget::Permit>,
+}
+
+/// One program's place from its emission to its proof: shared by its
+/// artifacts' build and its execute, and let go once its proof is done, which
+/// frees the program (with the last of its users) and gives its bytes back to
+/// the budget.
+pub(crate) struct ProgramSlot<P = LfmProgram>(
+    std::sync::Mutex<Option<std::sync::Arc<Admitted<P>>>>,
+);
+
+impl<P> ProgramSlot<P> {
+    pub(crate) fn new(program: P, permit: Option<super::program_budget::Permit>) -> Self {
+        Self(std::sync::Mutex::new(Some(std::sync::Arc::new(Admitted {
+            program,
+            permit,
+        }))))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<std::sync::Arc<Admitted<P>>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The program, until its proof lets it go.
+    pub(crate) fn get(&self) -> Result<std::sync::Arc<Admitted<P>>, String> {
+        self.lock()
+            .clone()
+            .ok_or_else(|| "the program was let go after its proof".to_string())
+    }
+
+    /// A prover took the program ([`super::program_budget::Permit::claim`]).
+    pub(crate) fn claim(&self) {
+        if let Some(permit) = self.lock().as_ref().and_then(|a| a.permit.as_ref()) {
+            permit.claim();
+        }
+    }
+
+    /// Its proof is done: the slot lets go of the program.
+    pub(crate) fn release(&self) {
+        let program = self.lock().take();
+        drop(program);
+    }
+}
+
 /// A node's program as the builder emits it, before its artifacts: all its
 /// execute and fill need, and when it was emitted (seconds since the tree
 /// started).
 pub(crate) struct NodeProgram {
-    pub(crate) program: std::sync::Arc<LfmProgram>,
+    pub(crate) program: ProgramSlot,
     pub(crate) at: f64,
+}
+
+/// A leaf program's bytes before it is emitted, a group of it: 0.157 GiB at
+/// T200-R (130 leaves, 81.25 GiB of programs; I-T200 §11b), 0.55–0.63 GiB a
+/// leaf of 3–4 groups at p90 (I-WFULL §1.3). The budget learns the real bytes
+/// when the program is emitted.
+pub(crate) const LEAF_BYTES_PER_GROUP: u64 = 161 << 20;
+
+/// The streaming threads that emit, under a bounded budget, the leaf programs
+/// not admitted beside phase B (#1013's `DEFERRED_LEAF_EMITTERS`).
+const DEFERRED_LEAF_EMITTERS: usize = 4;
+
+/// A program's host bytes as held (capacities): its instructions with what
+/// they box, its column groups and its arena schema (#1013's
+/// `ProgramBytes::total`).
+pub(crate) fn program_bytes(p: &LfmProgram) -> u64 {
+    use super::instr::{Addr, Blake3Operands, Instr, KeccakOperands};
+    let mut bytes = p.instrs.capacity() * size_of::<Instr>();
+    for instr in &p.instrs {
+        bytes += match instr {
+            Instr::BitDec { bits, .. } => bits.capacity() * size_of::<(Addr, u64)>(),
+            Instr::KeccakF(_) => size_of::<KeccakOperands>(),
+            Instr::Blake3(_) => size_of::<Blake3Operands>(),
+            _ => 0,
+        };
+    }
+    let g = &p.groups;
+    for group in [
+        &g.const_, &g.balu, &g.xalu, &g.select, &g.bitdec, &g.hash, &g.keccak, &g.blake3, &g.lanes,
+        &g.hint, &g.public,
+    ] {
+        bytes += group.data.capacity() * size_of::<crate::tables::types::FE>();
+    }
+    (bytes + p.arena_schema.lens.capacity() * size_of::<u32>()) as u64
+}
+
+/// The tree's program budget as its emitters use it: each program admitted in
+/// prove order ([`tree_order`]'s numbering: the leaves, then each node level)
+/// with its estimated bytes before it is emitted.
+pub(crate) struct TreeBudget {
+    pub(crate) budget: std::sync::Arc<super::program_budget::ProgramBudget>,
+    /// Each leaf's estimate: [`LEAF_BYTES_PER_GROUP`] a group.
+    leaf_estimates: Vec<u64>,
+    /// Where each node level starts in prove order.
+    level_starts: Vec<usize>,
+    /// The largest node program emitted so far.
+    node_seen: std::sync::atomic::AtomicU64,
+}
+
+impl TreeBudget {
+    /// The budget of a tree of `shape` over leaves of `leaf_groups` groups each.
+    pub(crate) fn new(
+        budget: std::sync::Arc<super::program_budget::ProgramBudget>,
+        leaf_groups: &[usize],
+        shape: &[super::per_table_aggregator::Level],
+    ) -> Self {
+        let mut level_starts = Vec::with_capacity(shape.len());
+        let mut next = leaf_groups.len();
+        for level in shape {
+            level_starts.push(next);
+            next += level.arities.len();
+        }
+        Self {
+            budget,
+            leaf_estimates: leaf_groups
+                .iter()
+                .map(|&g| g as u64 * LEAF_BYTES_PER_GROUP)
+                .collect(),
+            level_starts,
+            node_seen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn leaf_estimate(&self, k: usize) -> u64 {
+        self.leaf_estimates.get(k).copied().unwrap_or(0)
+    }
+
+    /// Node `j` of node level `lv`'s place in prove order (0 = the level above
+    /// the leaves).
+    pub(crate) fn node_order(&self, lv: usize, j: usize) -> usize {
+        self.level_starts[lv] + j
+    }
+
+    /// A node program's estimate before it is emitted: the largest node seen,
+    /// or twice the largest leaf before the first (#1013's rule).
+    pub(crate) fn node_estimate(&self) -> u64 {
+        let leaf = self.leaf_estimates.iter().max().copied().unwrap_or(0);
+        self.node_seen
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .max(2 * leaf)
+    }
+
+    pub(crate) fn node_emitted(&self, bytes: u64) {
+        self.node_seen
+            .fetch_max(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A node built ahead of the proofs below it: its artifacts (what its prove
@@ -387,8 +545,8 @@ pub(crate) struct EarlyLeaf {
 }
 
 /// A value one thread publishes once and others wait for. A publisher that
-/// unwinds before publishing leaves an error behind ([`PublishGuard`]), so no
-/// waiter blocks on a value that will never come.
+/// unwinds before publishing leaves an error behind ([`FailUnpublished`]), so
+/// no waiter blocks on a value that will never come.
 pub(crate) struct Published<T>(pub(crate) std::sync::OnceLock<Result<T, String>>);
 
 impl<T> Published<T> {
@@ -407,24 +565,9 @@ impl<T> Published<T> {
     }
 }
 
-/// Publishes an error on drop unless [`PublishGuard::publish`] ran first.
-pub(crate) struct PublishGuard<'a, T>(pub(crate) &'a Published<T>);
-
-impl<T> PublishGuard<'_, T> {
-    pub(crate) fn publish(self, value: Result<T, String>) {
-        let _ = self.0.0.set(value);
-    }
-}
-
-impl<T> Drop for PublishGuard<'_, T> {
-    fn drop(&mut self) {
-        let _ = self.0.0.set(Err("the publisher unwound".to_string()));
-    }
-}
-
 /// The leaves' artifacts as their builder publishes them: per leaf, its
 /// artifacts, its derived shape and the seconds building them.
-pub(crate) type LeafBuilt = Vec<(super::registry::LfmArtifacts, DerivedChild, f64)>;
+pub(crate) type LeafBuilt = (super::registry::LfmArtifacts, DerivedChild, f64);
 
 /// Publishes an error into every slot still empty when it drops: a node
 /// builder that stops early (an error, or a panic) leaves no level waiting
@@ -439,33 +582,100 @@ impl<T> Drop for FailUnpublished<'_, T> {
     }
 }
 
-/// A tree's nodes built level by level from the leaves' shapes `leaves`, each
-/// published to its slot (level, node) as soon as it is built: `emit` makes a
-/// node's program from its level, index, children's shapes (in order) and
-/// whether it is the top, as the part published to `programs` at once (what a
-/// node executes) and the part `finish` builds the rest of the node from (its
+/// Publishes `why` into every slot of a row still empty when it drops: a
+/// publisher that stops early (an error, or a panic) leaves no waiter hanging
+/// on a value that will never come.
+pub(crate) struct FailEmpty<'a, T>(pub(crate) &'a [Published<T>], pub(crate) &'static str);
+
+impl<T> Drop for FailEmpty<'_, T> {
+    fn drop(&mut self) {
+        for slot in self.0 {
+            let _ = slot.0.set(Err(self.1.to_string()));
+        }
+    }
+}
+
+/// Each item's value built one after another on this thread and published to
+/// its slot. While `ready(k)` says item k's input is already there, the values
+/// are held and published all at once after the last (ULTRA 101: published one
+/// by one, each build queued behind a sibling's prove on the card, and the 1×
+/// tree's top waited 0.8 s for its last leaf). Before a build whose input is
+/// not there yet, everything held is published, and each value from then on
+/// as it is built (`each`: from the start), so nothing waits for an input
+/// while holding what others need: under a program budget a missing input is
+/// a program the budget admits only once the provers take the ones before it.
+/// Returns the item where per-item publication began, if it did. A build that
+/// fails is published at once and ends the run; every slot still empty when
+/// this returns or unwinds gets an error ([`FailEmpty`]).
+pub(crate) fn publish_each<I, T>(
+    items: &[I],
+    slots: &[Published<T>],
+    each: bool,
+    ready: impl Fn(usize) -> bool,
+    build: impl Fn(usize, &I) -> Result<T, String>,
+) -> Option<usize> {
+    let _fail = FailEmpty(slots, "the publisher stopped");
+    let mut held = Vec::new();
+    let mut from = each.then_some(0);
+    for ((k, item), slot) in items.iter().enumerate().zip(slots) {
+        if from.is_none() && !ready(k) {
+            from = Some(k);
+            for (one, slot) in held.drain(..).zip(slots) {
+                let _ = slot.0.set(one);
+            }
+        }
+        let one = build(k, item);
+        let failed = one.is_err();
+        if from.is_none() && !failed {
+            held.push(one);
+        } else {
+            let _ = slot.0.set(one);
+        }
+        if failed {
+            break;
+        }
+    }
+    for (one, slot) in held.into_iter().zip(slots) {
+        let _ = slot.0.set(one);
+    }
+    from
+}
+
+/// A tree's nodes built level by level from the leaves' shapes — leaf `i`'s
+/// from `leaf(i)`, of `n_leaves`, which may wait for it to be published: a node
+/// over leaves waits for its own children only — each node published to its
+/// slot (level, node) as soon as it is built: `admit` lets a node in (its
+/// level and index; under a program budget it may wait), then `emit` makes its
+/// program from its level, index, children's shapes (in order), whether it is
+/// the top and its admission, as the part published to `programs` at once (what
+/// a node executes) and the part `finish` builds the rest of the node from (its
 /// artifacts: it may take the card); `shape_of` gives a built node's shape for
 /// the level above. A node depends on its children's shapes, never on their
 /// proofs, so the whole tree can be built while the leaves prove.
 ///
-/// With `pool`, a level's programs are emitted together on the pool's threads,
-/// and this thread finishes each as its emission ends and publishes it into
-/// ITS OWN slot, whatever order they finish in; without, emitted and finished
-/// one after another here. `finish` always runs on this thread, never on a
-/// rayon worker: a worker that waits inside rayon while it holds the card runs
-/// queued jobs meanwhile, and a sibling that takes the card is a second hold on
-/// one thread (BIG 569). A node's program is published as its emission ends
-/// (on the pool, with `pool`), before its finish starts and whatever the other
-/// nodes' finishes are waiting for. A build that fails leaves its error in its slots, and every slot
-/// still empty when this returns or unwinds gets one ([`FailUnpublished`]).
+/// With `pool`, as many plain threads as the pool has take a level's nodes in
+/// order, each admitting its node there and emitting it on the pool, and this
+/// thread finishes each as its emission ends and publishes it into ITS OWN
+/// slot, whatever order they finish in; without, admitted, emitted and finished
+/// one after another here. An admission never waits on a rayon worker, nor
+/// ahead of a finish another node's prover needs. `finish` always runs on this
+/// thread, never on a rayon worker: a worker that waits inside rayon while it
+/// holds the card runs queued jobs meanwhile, and a sibling that takes the card
+/// is a second hold on one thread (BIG 569). A node's program is published as
+/// its emission ends, before its finish starts and whatever the other nodes'
+/// finishes are waiting for. A build that fails leaves its error in its slots,
+/// and every slot still empty when this returns or unwinds gets one
+/// ([`FailUnpublished`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
+pub(crate) fn build_levels<'l, C: Sync, A: Send, E: Send + Sync, P: Send, N: Send + Sync>(
     shape: &[super::per_table_aggregator::Level],
-    leaves: &[&C],
+    leaf: &(dyn Fn(usize) -> Result<&'l C, String> + Sync),
+    n_leaves: usize,
     programs: &[Vec<Published<E>>],
     slots: &[Vec<Published<N>>],
     shape_of: impl Fn(&N) -> &C + Sync,
-    emit: impl Fn(usize, usize, &[&C], bool) -> Result<(E, P), String> + Sync,
+    admit: impl Fn(usize, usize) -> Result<A, String> + Sync,
+    emit: impl Fn(usize, usize, &[&C], bool, A) -> Result<(E, P), String> + Sync,
     finish: impl Fn(usize, usize, P) -> Result<N, String>,
     pool: Option<&rayon::ThreadPool>,
 ) {
@@ -484,17 +694,27 @@ pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
     };
     for (lv, arities) in shape.iter().enumerate() {
         let top = lv + 1 == shape.len();
-        let below: Vec<&C> = match lv {
-            0 => leaves.to_vec(),
+        // The level below's shapes. Over the leaves each node waits for its
+        // own children as it is emitted (`leaf`); a node level is whole by the
+        // time the next one starts.
+        let below: Option<Vec<&C>> = match lv {
+            0 => None,
             _ => match slots[lv - 1]
                 .iter()
                 .map(|s| s.wait().map(&shape_of))
                 .collect::<Result<Vec<_>, String>>()
             {
-                Ok(below) => below,
+                Ok(below) => Some(below),
                 Err(_) => return,
             },
         };
+        let kids_of = |range: std::ops::Range<usize>| -> Result<Vec<&C>, String> {
+            match &below {
+                Some(below) => Ok(below[range].to_vec()),
+                None => range.map(leaf).collect(),
+            }
+        };
+        let n_below = below.as_ref().map_or(n_leaves, Vec::len);
         let mut at = 0usize;
         let groups: Vec<std::ops::Range<usize>> = arities
             .arities
@@ -504,27 +724,45 @@ pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
                 at - a..at
             })
             .collect();
-        if groups.last().map_or(0, |g| g.end) != below.len() {
+        if groups.last().map_or(0, |g| g.end) != n_below {
             let _ = slots[lv][0].0.set(Err(format!(
-                "level {}: arities cover {at} of {} children",
-                lv + 1,
-                below.len()
+                "level {}: arities cover {at} of {n_below} children",
+                lv + 1
             )));
             return;
         }
+        // A node's kids (over the leaves, each waited for), its admission,
+        // then its emission (on the pool, when there is one).
+        let made = |j: usize, on: Option<&rayon::ThreadPool>| -> Result<(E, P), String> {
+            let kids = kids_of(groups[j].clone())?;
+            let admitted = admit(lv, j)?;
+            match on {
+                Some(pool) => pool.install(|| emit(lv, j, &kids, top, admitted)),
+                None => emit(lv, j, &kids, top, admitted),
+            }
+        };
         match pool {
             Some(pool) => {
                 let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<P, String>)>();
-                pool.in_place_scope(|scope| {
-                    for (j, kids) in groups.iter().enumerate() {
-                        let (tx, emit, publish) = (tx.clone(), &emit, &publish);
-                        let kids = &below[kids.clone()];
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..pool.current_num_threads().max(1) {
+                        let (tx, made, publish, next, nodes) =
+                            (tx.clone(), &made, &publish, &next, groups.len());
                         // Each program is published here, as its emission
-                        // ends: never behind another node's finish, which
-                        // may wait for the card (BIG 622: a program queued
-                        // 2.1 s behind a sibling's artifacts).
-                        scope.spawn(move |_| {
-                            let _ = tx.send((j, publish(lv, j, emit(lv, j, kids, top))));
+                        // ends: never behind another node's finish, which may
+                        // wait for the card (BIG 622: a program queued 2.1 s
+                        // behind a sibling's artifacts).
+                        scope.spawn(move || {
+                            loop {
+                                let j = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if j >= nodes {
+                                    return;
+                                }
+                                if tx.send((j, publish(lv, j, made(j, Some(pool))))).is_err() {
+                                    return;
+                                }
+                            }
                         });
                     }
                     drop(tx);
@@ -536,9 +774,9 @@ pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
                 });
             }
             None => {
-                for (j, kids) in groups.iter().enumerate() {
-                    let rest = publish(lv, j, emit(lv, j, &below[kids.clone()], top));
-                    let _ = slots[lv][j].0.set(rest.and_then(|p| finish(lv, j, p)));
+                for (j, slot) in slots[lv].iter().enumerate() {
+                    let rest = publish(lv, j, made(j, None));
+                    let _ = slot.0.set(rest.and_then(|p| finish(lv, j, p)));
                 }
             }
         }
@@ -548,7 +786,9 @@ pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
 /// The tree's node programs and artifacts ([`build_levels`] over the leaves'
 /// derived shapes): each node's program published to `programs` as soon as it
 /// is emitted (what its execute and fill need), and the node with its
-/// artifacts to `slots` once they are built (what its prove needs).
+/// artifacts to `slots` once they are built (what its prove needs). Under a
+/// program `budget` each node is admitted in prove order before it is emitted
+/// ([`TreeBudget`]), its permit travelling with its program.
 ///
 /// With `pool` (`W3_NODE_PIPE`, on by default) a level's programs are emitted
 /// together on the pool's threads — the builder's own, not the global pool, on
@@ -562,42 +802,59 @@ pub(crate) fn build_levels<C: Sync, E: Send + Sync, P: Send, N: Send + Sync>(
 pub(crate) fn build_nodes(
     plan: &WhirBlockPlan,
     shape: &[super::per_table_aggregator::Level],
-    leaves: &Published<LeafBuilt>,
+    leaves: &[Published<LeafBuilt>],
     programs: &[Vec<Published<NodeProgram>>],
     slots: &[Vec<Published<TreeNode>>],
     wrap: &crate::ProofOptions,
     words: usize,
     t_tree: std::time::Instant,
     pool: Option<&rayon::ThreadPool>,
+    budget: Option<&TreeBudget>,
 ) {
-    let Ok(leaf_built) = leaves.wait() else {
-        let _fail_programs = FailUnpublished(programs);
-        let _fail = FailUnpublished(slots);
-        return;
+    type Emitted = (NodeProgram, (std::sync::Arc<Admitted>, f64));
+    let leaf = |i: usize| -> Result<&DerivedChild, String> {
+        leaves
+            .get(i)
+            .ok_or_else(|| format!("no leaf {i}"))?
+            .wait()
+            .map(|(_, derived, _)| derived)
     };
-    let leaf_shapes: Vec<&DerivedChild> = leaf_built.iter().map(|(_, d, _)| d).collect();
-    type Emitted = (NodeProgram, (std::sync::Arc<LfmProgram>, f64));
     build_levels(
         shape,
-        &leaf_shapes,
+        &leaf,
+        leaves.len(),
         programs,
         slots,
         |node: &TreeNode| &node.derived,
-        |_, _, kids: &[&DerivedChild], top| -> Result<Emitted, String> {
+        // Under a program budget each node is admitted in prove order before
+        // it is emitted: on an emitter's plain thread, never the pool's.
+        |lv, j| match budget {
+            Some(b) => b
+                .budget
+                .acquire(b.node_order(lv, j), b.node_estimate())
+                .map(Some),
+            None => Ok(None),
+        },
+        |_, _, kids: &[&DerivedChild], top, permit| -> Result<Emitted, String> {
             let t = std::time::Instant::now();
-            let program = std::sync::Arc::new(plan.node_program(kids, top)?);
+            let program = plan.node_program(kids, top)?;
+            let mut permit: Option<super::program_budget::Permit> = permit;
+            if let (Some(b), Some(permit)) = (budget, permit.as_mut()) {
+                let bytes = program_bytes(&program);
+                b.node_emitted(bytes);
+                permit.emitted(bytes);
+            }
+            let slot = ProgramSlot::new(program, permit);
+            let program = slot.get()?;
             let at = t_tree.elapsed().as_secs_f64();
             Ok((
-                NodeProgram {
-                    program: std::sync::Arc::clone(&program),
-                    at,
-                },
+                NodeProgram { program: slot, at },
                 (program, t.elapsed().as_secs_f64()),
             ))
         },
-        |_, _, (program, emitted): (std::sync::Arc<LfmProgram>, f64)| -> Result<TreeNode, String> {
+        |_, _, (program, emitted): (std::sync::Arc<Admitted>, f64)| -> Result<TreeNode, String> {
             let t = std::time::Instant::now();
-            let artifacts = artifacts_of(&program, wrap);
+            let artifacts = artifacts_of(&program.program, wrap);
             let derived = DerivedChild::from_artifacts(&artifacts, wrap, words)?;
             Ok(TreeNode {
                 artifacts,
@@ -823,47 +1080,64 @@ pub(crate) fn wait_all<'r, R>(kids: &[&'r Published<R>]) -> Result<Vec<&'r R>, S
     kids.iter().map(|k| k.wait()).collect()
 }
 
-/// The tree proved the way a prover would run it, with the leaves' programs
-/// emitted beforehand (`leaves`, while phase B ran):
+/// The tree proved the way a prover would run it, with the leaves' programs in
+/// `leaves`: those emitted beforehand (while phase B ran) already published,
+/// the rest emitted here as the program `budget` admits them, on
+/// [`DEFERRED_LEAF_EMITTERS`] streaming threads in leaf order:
 /// 1. the leaves' artifacts, one after another on a thread of their own (each
-///    holds the card);
+///    holds the card), all published at once after the last while every
+///    leaf's program is there, and each as it is built from the first whose
+///    program is not ([`publish_each`]; `leaves_each`: each throughout);
 /// 2. the nodes' programs and artifacts — functions of the leaves' artifacts,
 ///    not of any proof — on a thread of their own ([`build_nodes`]), each
-///    published to its slot as it is built, beside
+///    admitted under the budget, then published to its slot as it is built, a
+///    node over leaves once its own leaves' artifacts are, beside
 /// 3. every program proved `siblings` at a time, leaves first, each harvested
 ///    without its verify ([`prove_dataflow`]): with `beside`, each leaf
 ///    executes and fills its traces while the artifacts are built (neither
-///    reads them) and waits for them only to prove; without, it waits for every
-///    artifact first (the order before, `W3_EXEC_BESIDE_ARTIFACTS=0`); each
+///    reads them) and waits for its own only to prove; without, it waits for
+///    every leaf's first (the order before, `W3_EXEC_BESIDE_ARTIFACTS=0`); each
 ///    node as soon as its own children are proved and its program is in its
 ///    slot — with `dataflow` off (the control), once its whole level below is
 ///    proved; without `node_pipe` (that control), once the builder has built
 ///    the whole tree.
+///
+/// Each program's prover claims it as it takes it and lets it go once it is
+/// done with it — a leaf once proved, a node once filled (its artifacts' build
+/// holds its own reference) — so a program lives from its emission to its
+/// proof, and its admission with it. After the last proof of a level below the
+/// top, `LAMBDA_VM_TREE_LEVEL_PURGE` may purge the allocator
+/// ([`crate::alloc_purge::purge_after_level`], its line through `say`).
 ///
 /// `node_pipe` is the builder's own pool ([`build_nodes`]); `early`, when
 /// given, is a leaf that already executed and filled while phase B ran
 /// ([`EarlyLeaf`]): its worker joins it instead.
 ///
 /// Returns each level's timing and every proof with its artifacts, level by
-/// level, the top last — for the harness to verify off the clock — and the
-/// early leaf's arena, if any.
+/// level, the top last — for the harness to verify off the clock — the early
+/// leaf's arena, if any, and the leaf where per-leaf publication began, if it
+/// did.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn prove_tree_pipelined(
     plan: &WhirBlockPlan,
     proof: &BlockWhirProof,
-    leaves: Vec<std::sync::Arc<LfmProgram>>,
+    leaves: Vec<Published<ProgramSlot>>,
+    budget: Option<&TreeBudget>,
     siblings: usize,
     beside: bool,
+    leaves_each: bool,
     early: Option<EarlyLeaf>,
     node_pipe: Option<&rayon::ThreadPool>,
     dataflow: bool,
     stream_top: Option<&std::sync::OnceLock<bool>>,
     exec_early: bool,
+    say: &(dyn Fn(&str) + Sync),
 ) -> Result<
     (
         Vec<LevelTiming>,
         Vec<(super::registry::LfmArtifacts, LfmProof)>,
         Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>,
+        Option<usize>,
     ),
     String,
 > {
@@ -876,7 +1150,8 @@ pub(crate) fn prove_tree_pipelined(
     let shape = plan.levels();
     let mut timings = Vec::with_capacity(shape.len() + 1);
     let mut proofs = Vec::new();
-    let built: Published<LeafBuilt> = Published::new();
+    // Each leaf's artifacts ([`publish_each`]).
+    let built: Vec<Published<LeafBuilt>> = leaves.iter().map(|_| Published::new()).collect();
     let leaf_built_at: Vec<std::sync::Mutex<f64>> =
         leaves.iter().map(|_| std::sync::Mutex::new(0.0)).collect();
     let slots: Vec<Vec<Published<TreeNode>>> = shape
@@ -894,184 +1169,251 @@ pub(crate) fn prove_tree_pipelined(
         .map(|n| (0..n).map(|_| Published::new()).collect())
         .collect();
 
-    let n_leaves = std::thread::scope(|outer| -> Result<usize, String> {
+    // The programs a level still has to prove, for the purge after its last.
+    let remaining: Vec<std::sync::atomic::AtomicUsize> = results
+        .iter()
+        .map(|level| std::sync::atomic::AtomicUsize::new(level.len()))
+        .collect();
+
+    let (n_leaves, each_from) = std::thread::scope(|outer| -> Result<_, String> {
+        // 0. the leaves the budget left to the tree, emitted in leaf order as
+        // it admits them, on plain threads (an admission may wait).
+        let deferred = leaves.iter().position(|slot| slot.0.get().is_none());
+        if let Some(from) = deferred {
+            let (leaves, emit_leaf) = (&leaves, move |k: usize| -> Result<ProgramSlot, String> {
+                let b = budget.ok_or("a leaf left to the tree without a program budget")?;
+                let mut permit = b.budget.acquire(k, b.leaf_estimate(k))?;
+                let program = plan.leaf_program(k)?;
+                permit.emitted(program_bytes(&program));
+                Ok(ProgramSlot::new(program, Some(permit)))
+            });
+            outer.spawn(move || {
+                let _fail = FailEmpty(&leaves[from..], "the leaf emitter stopped");
+                super::program_budget::emit_ordered(
+                    from..leaves.len(),
+                    DEFERRED_LEAF_EMITTERS,
+                    &emit_leaf,
+                    &mut |k, slot| {
+                        let emitted = slot.is_ok();
+                        let _ = leaves[k].0.set(slot);
+                        emitted
+                    },
+                );
+            });
+        }
         // 2. the nodes' programs and artifacts, into their slots.
         let builder = outer.spawn(|| {
             build_nodes(
-                plan, &shape, &built, &programs, &slots, &wrap, words, t_tree, node_pipe,
+                plan, &shape, &built, &programs, &slots, &wrap, words, t_tree, node_pipe, budget,
             )
         });
-        std::thread::scope(|scope| {
+        let each_from = std::thread::scope(|scope| {
             // 1. the leaves' artifacts, one after another on this thread: each
             // build holds the card throughout (armed), so building them as
             // rayon jobs bought no overlap, and a holder on a rayon worker can
             // run a sibling build that takes the card again (BIG 569).
-            scope.spawn(|| {
-                let guard = PublishGuard(&built);
-                guard.publish(
-                    leaves
-                        .iter()
-                        .zip(&leaf_built_at)
-                        .map(|(program, at)| -> Result<_, String> {
-                            let t = std::time::Instant::now();
-                            let artifacts = artifacts_of(program, &wrap);
-                            let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
-                            *at.lock().map_err(|_| "a built-at stamp is poisoned")? =
-                                t_tree.elapsed().as_secs_f64();
-                            Ok((artifacts, derived, t.elapsed().as_secs_f64()))
-                        })
-                        .collect::<Result<_, String>>(),
-                );
+            let artifacts = scope.spawn(|| {
+                publish_each(
+                    &leaves,
+                    &built,
+                    leaves_each,
+                    |k| leaves[k].0.get().is_some(),
+                    |k, slot| {
+                        let program = slot.wait()?.get()?;
+                        let t = std::time::Instant::now();
+                        let artifacts = artifacts_of(&program.program, &wrap);
+                        drop(program);
+                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                        *leaf_built_at[k]
+                            .lock()
+                            .map_err(|_| "a built-at stamp is poisoned")? =
+                            t_tree.elapsed().as_secs_f64();
+                        Ok((artifacts, derived, t.elapsed().as_secs_f64()))
+                    },
+                )
             });
             // 3. every program of the tree, `siblings` at a time, leaves first;
             // each node as soon as its children are proved and its program is
             // in its slot ([`prove_dataflow`]).
-            prove_dataflow(
-                &shape,
-                &order,
-                &results,
-                siblings,
-                !dataflow,
-                |at, kids: &[&Published<ProvedProgram>]| -> Result<ProvedProgram, String> {
-                    let start = t_tree.elapsed().as_secs_f64();
-                    if at.lv == 0 {
-                        let k = at.j;
-                        let ahead = {
-                            let mut slot =
-                                early.lock().map_err(|_| "the early slot is poisoned")?;
-                            if slot.as_ref().is_some_and(|e| e.leaf == k) {
-                                slot.take()
-                            } else {
-                                None
-                            }
-                        };
-                        let t = std::time::Instant::now();
-                        let filled = match ahead {
-                            Some(e) => {
-                                let (filled, arena, started, secs) =
-                                    e.handle.join().map_err(|_| {
-                                        format!("leaf {k}: the early executor panicked")
-                                    })??;
-                                *early_out
-                                    .lock()
-                                    .map_err(|_| "the early readout is poisoned")? =
-                                    Some((k, arena, e.complete_at, started, secs));
-                                filled
-                            }
-                            None => {
-                                let arenas = block_leaf_arena(plan, proof, k)?;
-                                if !beside {
-                                    built.wait()?;
+            let prove_one = |at: TreeAt,
+                             kids: &[&Published<ProvedProgram>]|
+             -> Result<ProvedProgram, String> {
+                let start = t_tree.elapsed().as_secs_f64();
+                if at.lv == 0 {
+                    let k = at.j;
+                    // The leaf's program, once emitted: this prover takes it.
+                    let program = leaves[k].wait()?;
+                    program.claim();
+                    let ahead = {
+                        let mut slot = early.lock().map_err(|_| "the early slot is poisoned")?;
+                        if slot.as_ref().is_some_and(|e| e.leaf == k) {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    };
+                    let t = std::time::Instant::now();
+                    let filled = match ahead {
+                        Some(e) => {
+                            let (filled, arena, started, secs) = e
+                                .handle
+                                .join()
+                                .map_err(|_| format!("leaf {k}: the early executor panicked"))??;
+                            *early_out
+                                .lock()
+                                .map_err(|_| "the early readout is poisoned")? =
+                                Some((k, arena, e.complete_at, started, secs));
+                            filled
+                        }
+                        None => {
+                            let arenas = block_leaf_arena(plan, proof, k)?;
+                            if !beside {
+                                for slot in &built {
+                                    slot.wait()?;
                                 }
-                                lfm_execute_and_fill(
-                                    &leaves[k],
-                                    &arenas,
-                                    crate::hash_pin::BLOCK_HASHER,
-                                )
-                                .map_err(|e| format!("leaf {k}: {e:?}"))?
                             }
+                            let program = program.get()?;
+                            lfm_execute_and_fill(
+                                &program.program,
+                                &arenas,
+                                crate::hash_pin::BLOCK_HASHER,
+                            )
+                            .map_err(|e| format!("leaf {k}: {e:?}"))?
+                        }
+                    };
+                    let artifacts = &built[k].wait()?.0;
+                    let lfm = filled.prove(artifacts, &wrap, decide_lfm_residency());
+                    // Proved, so its artifacts are built: nothing reads
+                    // the program again.
+                    program.release();
+                    let lfm = lfm.map_err(|e| format!("leaf {k}: {e:?}"))?;
+                    let prove = t.elapsed().as_secs_f64();
+                    let times = ProgramTimes {
+                        program_at: 0.0,
+                        built_at: 0.0,
+                        start,
+                        end: t_tree.elapsed().as_secs_f64(),
+                        split: prove_split_now(),
+                    };
+                    let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm)?;
+                    return Ok(ProvedProgram {
+                        lfm,
+                        child,
+                        prove,
+                        built: 0.0,
+                        times,
+                    });
+                }
+                // The control of the node pipeline: no node proves before
+                // the whole tree is built, as when the builder joined level 0.
+                if node_pipe.is_none() {
+                    for slot in slots.iter().flatten() {
+                        slot.wait()?;
+                    }
+                }
+                // Execute and fill from the program as soon as it is
+                // emitted, prove once the node's own artifacts are built
+                // ([`node_flow`]); traces filled under the block hasher,
+                // which the node's artifacts are built for (the prove
+                // asserts it).
+                let hasher = crate::hash_pin::BLOCK_HASHER;
+                node_flow(
+                    &programs,
+                    &slots,
+                    at,
+                    exec_early,
+                    |emitted: &NodeProgram| -> Result<_, String> {
+                        let t = std::time::Instant::now();
+                        // This prover takes the node's program; once filled,
+                        // nothing but its artifacts' build (which holds its
+                        // own reference) reads it again.
+                        emitted.program.claim();
+                        let program = emitted.program.get()?;
+                        // The top streams only if a child is still unproved
+                        // now that it can execute; the choice is kept for
+                        // the readout.
+                        let streamed = match stream_top {
+                            Some(chose) if at.lv == shape.len() => {
+                                let streams = top_streams(kids);
+                                let _ = chose.set(streams);
+                                streams
+                            }
+                            _ => false,
                         };
-                        let artifacts = &built.wait()?[k].0;
+                        let filled = if streamed {
+                            execute_streamed(&program.program, kids, hasher)
+                                .map_err(|e| format!("the top, streamed: {e}"))?
+                        } else {
+                            let kids = wait_all(kids)?;
+                            let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
+                            for k in &kids {
+                                arenas.extend(try_child_arena_words(&k.child)?);
+                            }
+                            lfm_execute_and_fill(&program.program, &arenas, hasher)
+                                .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?
+                        };
+                        drop(program);
+                        emitted.program.release();
+                        Ok((filled, t, emitted.at))
+                    },
+                    |(filled, t, program_at), node: &TreeNode| {
                         let lfm = filled
-                            .prove(artifacts, &wrap, decide_lfm_residency())
-                            .map_err(|e| format!("leaf {k}: {e:?}"))?;
+                            .prove(&node.artifacts, &wrap, decide_lfm_residency())
+                            .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?;
                         let prove = t.elapsed().as_secs_f64();
                         let times = ProgramTimes {
-                            program_at: 0.0,
-                            built_at: 0.0,
+                            program_at,
+                            built_at: node.built_at,
                             start,
                             end: t_tree.elapsed().as_secs_f64(),
                             split: prove_split_now(),
                         };
-                        let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm)?;
-                        return Ok(ProvedProgram {
+                        let child = harvest_child(node.artifacts.clone(), wrap.clone(), &lfm)?;
+                        Ok(ProvedProgram {
                             lfm,
                             child,
                             prove,
-                            built: 0.0,
+                            built: node.built,
                             times,
-                        });
-                    }
-                    // The control of the node pipeline: no node proves before
-                    // the whole tree is built, as when the builder joined level 0.
-                    if node_pipe.is_none() {
-                        for slot in slots.iter().flatten() {
-                            slot.wait()?;
-                        }
-                    }
-                    // Execute and fill from the program as soon as it is
-                    // emitted, prove once the node's own artifacts are built
-                    // ([`node_flow`]); traces filled under the block hasher,
-                    // which the node's artifacts are built for (the prove
-                    // asserts it).
-                    let hasher = crate::hash_pin::BLOCK_HASHER;
-                    node_flow(
-                        &programs,
-                        &slots,
-                        at,
-                        exec_early,
-                        |program: &NodeProgram| -> Result<_, String> {
-                            let t = std::time::Instant::now();
-                            // The top streams only if a child is still unproved
-                            // now that it can execute; the choice is kept for
-                            // the readout.
-                            let streamed = match stream_top {
-                                Some(chose) if at.lv == shape.len() => {
-                                    let streams = top_streams(kids);
-                                    let _ = chose.set(streams);
-                                    streams
-                                }
-                                _ => false,
-                            };
-                            let filled = if streamed {
-                                execute_streamed(&program.program, kids, hasher)
-                                    .map_err(|e| format!("the top, streamed: {e}"))?
-                            } else {
-                                let kids = wait_all(kids)?;
-                                let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
-                                for k in &kids {
-                                    arenas.extend(try_child_arena_words(&k.child)?);
-                                }
-                                lfm_execute_and_fill(&program.program, &arenas, hasher)
-                                    .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?
-                            };
-                            Ok((filled, t, program.at))
-                        },
-                        |(filled, t, program_at), node: &TreeNode| {
-                            let lfm = filled
-                                .prove(&node.artifacts, &wrap, decide_lfm_residency())
-                                .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?;
-                            let prove = t.elapsed().as_secs_f64();
-                            let times = ProgramTimes {
-                                program_at,
-                                built_at: node.built_at,
-                                start,
-                                end: t_tree.elapsed().as_secs_f64(),
-                                split: prove_split_now(),
-                            };
-                            let child = harvest_child(node.artifacts.clone(), wrap.clone(), &lfm)?;
-                            Ok(ProvedProgram {
-                                lfm,
-                                child,
-                                prove,
-                                built: node.built,
-                                times,
-                            })
-                        },
-                    )
-                },
-            );
-        });
-        let leaf_built = built.wait()?;
+                        })
+                    },
+                )
+            };
+            let target = block_whir::spill_target_bytes();
+            prove_dataflow(&shape, &order, &results, siblings, !dataflow, |at, kids| {
+                let proved = prove_one(at, kids);
+                // The level's last program: its freed pages back to the OS
+                // before the levels above go on, where the host is short.
+                let left = remaining[at.lv].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if left == 1 && at.lv + 1 < remaining.len() {
+                    crate::alloc_purge::purge_after_level(at.lv, target, say);
+                }
+                proved
+            });
+            // Every program is proved or failed: an emitter still waiting for
+            // an admission (only after a failure) returns an error instead.
+            if let Some(b) = budget {
+                b.budget.fail();
+            }
+            artifacts
+                .join()
+                .map_err(|_| "the leaves' artifacts builder panicked".to_string())
+        })?;
+        for slot in &built {
+            slot.wait()?;
+        }
         builder
             .join()
             .map_err(|_| "the node builder panicked".to_string())?;
-        Ok(leaf_built.len())
+        Ok((built.len(), each_from))
     })?;
     // Each level's readout: a level's wall is from the level below's last
     // proof to its own (level 0: from the tree's start), now that a node may
     // prove before its level below is done.
-    let leaf_secs: Vec<f64> = built.wait()?.iter().map(|(_, _, s)| *s).collect();
+    let leaf_secs: Vec<f64> = built
+        .iter()
+        .map(|slot| slot.wait().map(|(_, _, s)| *s))
+        .collect::<Result<_, String>>()?;
     let mut level_proofs: Vec<Vec<LfmProof>> = Vec::with_capacity(results.len());
     let mut below_end = 0.0f64;
     for (lv, level) in results.into_iter().enumerate() {
@@ -1117,8 +1459,8 @@ pub(crate) fn prove_tree_pipelined(
     let mut level_proofs = level_proofs.into_iter();
     let leaf_lfms = level_proofs.next().unwrap_or_default();
     debug_assert_eq!(leaf_lfms.len(), n_leaves);
-    for ((artifacts, _, _), lfm) in built.take()?.into_iter().zip(leaf_lfms) {
-        proofs.push((artifacts, lfm));
+    for (slot, lfm) in built.into_iter().zip(leaf_lfms) {
+        proofs.push((slot.take()?.0, lfm));
     }
     for (level, lfms) in slots.into_iter().zip(level_proofs) {
         for (slot, lfm) in level.into_iter().zip(lfms) {
@@ -1128,7 +1470,7 @@ pub(crate) fn prove_tree_pipelined(
     let early_out = early_out
         .into_inner()
         .map_err(|_| "the early readout is poisoned")?;
-    Ok((timings, proofs, early_out))
+    Ok((timings, proofs, early_out, each_from))
 }
 
 // ================================ the driver ==============================
@@ -1180,7 +1522,9 @@ impl WhirTreeRun {
 /// the statement came and when the programs were ready, and the early leaf.
 type Planned = (
     WhirBlockPlan,
-    Vec<std::sync::Arc<LfmProgram>>,
+    Vec<Published<ProgramSlot>>,
+    usize,
+    Option<TreeBudget>,
     f64,
     f64,
     Option<EarlyLeaf>,
@@ -1276,6 +1620,15 @@ pub fn prove_whir_block_tree(
             });
         }
     };
+    // The tree programs' budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`): against the
+    // spill target, which `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` moves too; `off`
+    // emits every leaf beside phase B, as before.
+    let budget = match cfg.program_budget {
+        super::program_budget::BudgetSetting::Off => None,
+        setting => Some(super::program_budget::ProgramBudget::new(
+            super::program_budget::Room::of(setting, block_whir::spill_target_bytes()),
+        )),
+    };
     let (elf_ref, opts_ref, format_ref) = (elf, &opts, &format);
     let (proved, pre) = std::thread::scope(|scope| {
         let pre = scope.spawn(move || -> Result<Planned, String> {
@@ -1292,9 +1645,25 @@ pub fn prove_whir_block_tree(
                 fan_in,
                 Some(&roots),
             )?;
+            // Under a program budget, the leaves admitted now, in leaf order
+            // while it has room (`try_acquire` never waits: the next AHEAD
+            // always come in); the tree emits the rest as it admits them.
+            let n = plan.partition().num_leaves();
+            let tree_budget = budget.map(|b| {
+                let groups: Vec<usize> = (0..n).map(|k| plan.partition().leaf(k).len()).collect();
+                TreeBudget::new(b, &groups, &plan.levels())
+            });
+            let permits: Vec<Option<super::program_budget::Permit>> = match &tree_budget {
+                Some(b) => (0..n)
+                    .map_while(|k| b.budget.try_acquire(k, b.leaf_estimate(k)))
+                    .map(Some)
+                    .collect(),
+                None => (0..n).map(|_| None).collect(),
+            };
+            let upto = permits.len();
             // One plain thread a leaf, off the rayon pool phase B is using.
             let programs: Vec<LfmProgram> = std::thread::scope(|inner| {
-                let handles: Vec<_> = (0..plan.partition().num_leaves())
+                let handles: Vec<_> = (0..upto)
                     .map(|k| {
                         let plan = &plan;
                         inner.spawn(move || plan.leaf_program(k))
@@ -1308,8 +1677,19 @@ pub fn prove_whir_block_tree(
                     })
                     .collect::<Result<_, String>>()
             })?;
-            let programs: Vec<std::sync::Arc<LfmProgram>> =
-                programs.into_iter().map(std::sync::Arc::new).collect();
+            let programs: Vec<Published<ProgramSlot>> = programs
+                .into_iter()
+                .zip(permits)
+                .map(|(program, mut permit)| {
+                    if let Some(permit) = permit.as_mut() {
+                        permit.emitted(program_bytes(&program));
+                    }
+                    let slot = Published::new();
+                    let _ = slot.0.set(Ok(ProgramSlot::new(program, permit)));
+                    slot
+                })
+                .chain((upto..n).map(|_| Published::new()))
+                .collect();
             let ready = t0.elapsed().as_secs_f64();
             // The groups as phase B finishes them (none unless `early_on`):
             // the first leaf complete while a group is still to come runs
@@ -1339,7 +1719,8 @@ pub fn prove_whir_block_tree(
                 }
                 let partition = plan.partition();
                 let complete = (0..partition.num_leaves())
-                    .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()));
+                    .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()))
+                    .filter(|&k| k < upto);
                 if let Some(k) = complete {
                     let groups: Vec<Vec<LfmWord>> = partition
                         .leaf(k)
@@ -1347,13 +1728,19 @@ pub fn prove_whir_block_tree(
                         .map(|&g| words[g].clone().unwrap_or_default())
                         .collect();
                     let arena = leaf_arena(&block_roots, groups);
-                    let program = std::sync::Arc::clone(&programs[k]);
+                    // This executor takes the leaf's program.
+                    let slot = programs[k].wait()?;
+                    slot.claim();
+                    let program = slot.get()?;
                     let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
                         let started = t0.elapsed().as_secs_f64();
                         let t = std::time::Instant::now();
-                        let filled =
-                            lfm_execute_and_fill(&program, &arena, crate::hash_pin::BLOCK_HASHER)
-                                .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                        let filled = lfm_execute_and_fill(
+                            &program.program,
+                            &arena,
+                            crate::hash_pin::BLOCK_HASHER,
+                        )
+                        .map_err(|e| format!("early leaf {k}: {e:?}"))?;
                         Ok((filled, arena, started, t.elapsed().as_secs_f64()))
                     });
                     early = Some(EarlyLeaf {
@@ -1363,7 +1750,7 @@ pub fn prove_whir_block_tree(
                     });
                 }
             }
-            Ok((plan, programs, at, ready, early))
+            Ok((plan, programs, upto, tree_budget, at, ready, early))
         });
         let proved = block_whir::prove_block_whir_observed_groups(
             elf, input, &opts, &format, options, &observe, &on_group,
@@ -1379,7 +1766,7 @@ pub fn prove_whir_block_tree(
     // the block found its memory short, or as `LAMBDA_VM_ALLOC_PURGE` names it
     // (`alloc_purge`).
     crate::alloc_purge::purge_point("base");
-    let (plan, programs, stated_at, ready_at, early) = pre
+    let (plan, programs, upto, tree_budget, stated_at, ready_at, early) = pre
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;
     sink.write(&stamps.report());
@@ -1423,11 +1810,27 @@ pub fn prove_whir_block_tree(
     }
     sink.line(&format!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",
-        programs.len(),
+        if upto == programs.len() {
+            format!("{upto}")
+        } else {
+            format!("{upto} of {}", programs.len())
+        },
         if ready_at <= base {
             "inside the base"
         } else {
             "after the base"
+        }
+    ));
+    sink.line(&format!(
+        "W3 TREE PROGRAM BUDGET: {}",
+        match &tree_budget {
+            Some(b) => format!(
+                "{} · {upto} of {} leaf programs beside the base, the rest emitted in the tree as \
+                 the budget admits them",
+                b.budget.describe(),
+                programs.len()
+            ),
+            None => "off (every leaf program beside the base)".to_string(),
         }
     ));
     sink.line(&format!(
@@ -1441,13 +1844,17 @@ pub fn prove_whir_block_tree(
     ));
     // Each leaf's chips, real / padded rows: how far each sits from its next
     // doubling, and which one doubled when the in-guest work moves.
-    for (k, program) in programs.iter().enumerate() {
-        let chips: Vec<String> =
-            super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER)
-                .iter()
-                .filter(|c| c.real_rows > 0)
-                .map(|c| format!("{}={}/{}", c.name, c.real_rows, c.rows))
-                .collect();
+    // (The leaves emitted beside the base: the others do not exist yet.)
+    for (k, slot) in programs.iter().take(upto).enumerate() {
+        let program = slot.wait()?.get()?;
+        let chips: Vec<String> = super::airs::lfm_chip_census_with_hasher(
+            &program.program,
+            crate::hash_pin::BLOCK_HASHER,
+        )
+        .iter()
+        .filter(|c| c.real_rows > 0)
+        .map(|c| format!("{}={}/{}", c.name, c.real_rows, c.rows))
+        .collect();
         sink.line(&format!("W3 LEAF CENSUS {k}: {}", chips.join(" ")));
     }
 
@@ -1470,19 +1877,28 @@ pub fn prove_whir_block_tree(
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    let (timings, proofs, early_out) = prove_tree_pipelined(
+    let (timings, proofs, early_out, each_from) = prove_tree_pipelined(
         &plan,
         &proof,
         programs,
+        tree_budget.as_ref(),
         siblings,
         beside,
+        cfg.leaves_each,
         early,
         node_pipe.as_ref(),
         dataflow,
         stream_top.then_some(&top_streamed),
         exec_early,
+        &|line: &str| sink.line(line),
     )
     .map_err(|e| format!("the tree proves: {e}"))?;
+    if let Some(b) = &tree_budget {
+        sink.line(&format!(
+            "W3 TREE PROGRAM BUDGET end: {}",
+            b.budget.summary()
+        ));
+    }
     let tree = t.elapsed().as_secs_f64();
     let whole = t0.elapsed().as_secs_f64();
     for (lv, level) in timings.iter().enumerate() {
@@ -1605,6 +2021,35 @@ pub fn prove_whir_block_tree(
                 pool.current_num_threads()
             ),
             None => "off (one builder thread; level 1 waits for the whole tree)".to_string(),
+        }
+    ));
+    // How the leaves' artifacts were published ([`publish_each`]), when the
+    // first leaf was proved and the first node over the leaves had its
+    // program, against when the last leaf's artifacts were built.
+    let (first_leaf, last_leaf) = timings.first().map_or((f64::NAN, 0.0), |level| {
+        let first = level
+            .times
+            .iter()
+            .map(|t| t.end)
+            .fold(f64::INFINITY, f64::min);
+        let last = level.times.iter().map(|t| t.built_at).fold(0.0, f64::max);
+        (first, last)
+    });
+    let first_program = timings.get(1).map_or(f64::NAN, |level| {
+        level
+            .times
+            .iter()
+            .map(|t| t.program_at)
+            .fold(f64::INFINITY, f64::min)
+    });
+    sink.line(&format!(
+        "W3 LEAF ARTIFACTS: {} · first leaf proved@{first_leaf:.2} · first level-1 program@{first_program:.2} · last leaf built@{last_leaf:.2}",
+        match each_from {
+            None => "together (every leaf's published after the last is built)".to_string(),
+            Some(_) if cfg.leaves_each => "each published as it is built (W3_LEAF_ARTIFACTS_EACH=1)".to_string(),
+            Some(k) => format!(
+                "together until leaf {k}'s program was not there, then each published as it is built"
+            ),
         }
     ));
     sink.line(&format!(
@@ -1864,6 +2309,8 @@ mod tests {
             siblings: 3,
             fan_in: BLOCK_FAN_IN,
             beside: true,
+            leaves_each: false,
+            program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
