@@ -1663,10 +1663,17 @@ pub fn prove_whir_block_tree(
             None => "off (one builder thread; level 1 waits for the whole tree)".to_string(),
         }
     ));
-    // The first node over the leaves had its program before the last leaf's
-    // artifacts were built only if each leaf's are published as they are.
-    let last_leaf = timings.first().map_or(0.0, |level| {
-        level.times.iter().map(|t| t.built_at).fold(0.0, f64::max)
+    // When the first leaf was proved and the first node over the leaves had
+    // its program, against when the last leaf's artifacts were built: each
+    // published as it is built lets both come earlier.
+    let (first_leaf, last_leaf) = timings.first().map_or((f64::NAN, 0.0), |level| {
+        let first = level
+            .times
+            .iter()
+            .map(|t| t.end)
+            .fold(f64::INFINITY, f64::min);
+        let last = level.times.iter().map(|t| t.built_at).fold(0.0, f64::max);
+        (first, last)
     });
     let first_program = timings.get(1).map_or(f64::NAN, |level| {
         level
@@ -1676,7 +1683,7 @@ pub fn prove_whir_block_tree(
             .fold(f64::INFINITY, f64::min)
     });
     sink.line(&format!(
-        "W3 LEAF ARTIFACTS: {} · first level-1 program@{first_program:.2} · last leaf built@{last_leaf:.2}",
+        "W3 LEAF ARTIFACTS: {} · first leaf proved@{first_leaf:.2} · first level-1 program@{first_program:.2} · last leaf built@{last_leaf:.2}",
         if cfg.leaves_together {
             "together (every leaf's published after the last is built)"
         } else {
