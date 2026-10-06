@@ -270,6 +270,18 @@ impl Ledger {
         );
     }
 
+    /// One line of `what`'s parts' largest single allocations, the six
+    /// largest first, in MiB.
+    pub(crate) fn largest(&self, what: &str, mut parts: Vec<(String, usize)>) {
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        let listed: Vec<String> = parts
+            .iter()
+            .take(6)
+            .map(|(name, b)| format!("{name} {:.1}", *b as f64 / (1u64 << 20) as f64))
+            .collect();
+        eprintln!("BLOCK MEM {what} largest (MiB): {}", listed.join(" · "));
+    }
+
     /// Records the arena the calling thread allocates from, as `name`.
     pub(crate) fn thread(&self, name: &str) {
         if let (Some(arena), Ok(mut threads)) = (thread_arena(), self.threads.lock()) {

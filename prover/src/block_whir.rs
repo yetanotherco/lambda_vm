@@ -3150,6 +3150,7 @@ fn prove_streamed(
                 if let Some(ledger) = ledger {
                     ledger.line("windows walked");
                     ledger.parts("builder", builder.heap_parts());
+                    ledger.largest("builder", builder.largest_parts());
                 }
                 // The table phase's marks, for `finish` alone.
                 crate::tables::trace_builder::build_stamps::start();
