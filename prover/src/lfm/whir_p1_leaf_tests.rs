@@ -639,3 +639,98 @@ fn the_alu_point_is_pow_bits() {
     let rows = super::whir_chain::ChipRows::of(&program);
     assert_eq!((rows.select, rows.balu), (0, 2 * factors.len() - 1));
 }
+
+/// ★ The ALU fold point is sound only while each index bit is a bit, and the
+/// machine refuses a non-bit (the lead's item on `pow_bits_alu`, 10-06).
+///
+/// The index bits are `LFM_BITDEC`'s: it receives the drawn felt as the
+/// recomposition `Σ 2^i·B_i` of its 64 bit columns (`chips.rs`, `bitdec::
+/// bus_interactions`), constrains each `B_i·(1 − B_i) = 0` and canonicity
+/// (`BitDecConstraints`), and sends each kept bit as the cell's value. So a
+/// prover who wants another fold point must change a bit and keep the
+/// recomposition: here the index 2 = (b0, b1) = (0, 1) is rewritten as
+/// (2, 0), which recomposes to 2 as well, and every row reading those cells
+/// is recomputed so memory stays consistent. The point then reads
+/// `2·f0 − 1` where the transcript drew `f1`. Only booleanity is left
+/// violated, and the proof is refused; the untouched trace proves.
+#[test]
+fn a_non_boolean_index_bit_is_refused() {
+    use super::proof::{prove_traces_with_hasher, verify_against};
+    use super::registry::build_artifacts_with_hasher;
+    use super::trace::build_traces_with_hasher;
+    use crate::tables::types::VmTable;
+    use stark::proof::options::GoldilocksCubicProofOptions;
+
+    const KIND: HasherKind = crate::hash_pin::BLOCK_HASHER;
+    let (f0, f1) = (felt(11, 0), felt(11, 1));
+    let program = {
+        let mut b = p1_builder();
+        let a = b.declare_arena(1);
+        let idx = b.hint_felt(a, 0);
+        let bits = b.bit_dec(idx, 2);
+        let x = edsl::pow_bits_alu(&mut b, &bits, &[f0, f1]);
+        b.public(x.as_cell());
+        compile(b.finish())
+    };
+    validate(&program).expect("admissible");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let arena = vec![base_word(FE::from(2u64))];
+    let exec = execute(&program, std::slice::from_ref(&arena), &KIND).expect("executes");
+    assert_eq!(exec.public_words[0].1[0], f1, "index 2 reads f1");
+
+    let round_trip = |tamper: bool| -> Result<bool, String> {
+        let mut traces = build_traces_with_hasher(&program, &exec.records, KIND);
+        let mut public = exec.public_words.clone();
+        if tamper {
+            use super::chips::{balu, bitdec, public as pubc};
+            let set = |t: &mut stark::trace::TraceTable<F, E>, r: usize, c: usize, v: FE| {
+                t.main_table.set_fe(r, c, v)
+            };
+            let get = |t: &stark::trace::TraceTable<F, E>, r: usize, c: usize| *t.get_main(r, c);
+            // BITDEC: (0, 1) → (2, 0), the recomposition unchanged.
+            assert_eq!(get(&traces.bitdec, 0, bitdec::cols::BITS0), FE::zero());
+            assert_eq!(get(&traces.bitdec, 0, bitdec::cols::BITS0 + 1), FE::one());
+            set(&mut traces.bitdec, 0, bitdec::cols::BITS0, FE::from(2u64));
+            set(&mut traces.bitdec, 0, bitdec::cols::BITS0 + 1, FE::zero());
+            // BALU, in program order: chosen0 = 2·(f0 − 1) + 1, chosen1 = 1,
+            // the point = chosen0 · chosen1.
+            let chosen0 = FE::from(2u64) * (f0 - FE::one()) + FE::one();
+            assert_eq!(get(&traces.balu, 0, balu::cols::OUT), FE::one());
+            assert_eq!(get(&traces.balu, 1, balu::cols::OUT), f1);
+            set(&mut traces.balu, 0, balu::cols::A, FE::from(2u64));
+            set(&mut traces.balu, 0, balu::cols::OUT, chosen0);
+            set(&mut traces.balu, 1, balu::cols::A, FE::zero());
+            set(&mut traces.balu, 1, balu::cols::OUT, FE::one());
+            set(&mut traces.balu, 2, balu::cols::A, chosen0);
+            set(&mut traces.balu, 2, balu::cols::B, FE::one());
+            set(&mut traces.balu, 2, balu::cols::OUT, chosen0);
+            set(&mut traces.public, 0, pubc::cols::V0, chosen0);
+            public[0].1[0] = chosen0;
+        }
+        match prove_traces_with_hasher(
+            &artifacts,
+            &mut traces,
+            &public,
+            &opts,
+            KIND,
+            stark::residency_mode::ResidencyMode::Retain,
+        ) {
+            Ok(proof) => Ok(verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proof,
+                &public,
+                &opts,
+                KIND,
+                artifacts.chip_set,
+            )),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    };
+    assert_eq!(round_trip(false), Ok(true), "the honest trace proves and verifies");
+    let forged = round_trip(true);
+    assert_ne!(forged, Ok(true), "a non-boolean index bit must be refused: {forged:?}");
+    println!("non-boolean index bit: {forged:?}");
+}
