@@ -87,6 +87,11 @@ const CONFIG_ALLOWED: &[&str] = &[
     // Added when `80d746321` gave `lfm/algebraic_commit.rs` a host grinding
     // test spelling `GrindingDigest<RpxStarkHash>`.
     "GrindingDigest",
+    // `cap_policy_at_arity(format, arity)` reads the caller's format at the
+    // caller's arity and names no configuration: the in-guest shapes take the
+    // arity from the base format (`WrapHash::for_base`), the host from its
+    // configuration (`effective_cap_policy::<H>`). Added for P3a's arity-4 caps.
+    "cap_policy_at_arity",
 ];
 
 /// Every item named from `stark::config` on this line, `use` lists included.

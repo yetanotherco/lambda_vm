@@ -443,7 +443,11 @@ fn cap_opening(
     }
     let (hints, split) =
         super::harvest::path_to_cap(&path, depth, c, 4, true, Some(index)).expect("laid out");
-    assert_eq!(split.unwrap_or_default(), cap, "the cap rides on the owner path");
+    assert_eq!(
+        split.unwrap_or_default(),
+        cap,
+        "the cap rides on the owner path"
+    );
     assert_eq!(
         hints.len(),
         super::merkle_cap::path_hints(depth, c, 4),

@@ -176,8 +176,12 @@ fn the_block_front_replays_the_hosts_transcript() {
             .collect(),
         super::proof_arena::commitments_to_arena(&main),
     ];
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
-        .expect("the block front must execute");
+    let exec = execute(
+        &program,
+        &arenas,
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .expect("the block front must execute");
     let got = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
     assert_eq!(got(0), z, "z must be production's");
     assert_eq!(got(1), alpha, "α must be production's");
@@ -207,8 +211,12 @@ fn the_block_front_replays_the_hosts_transcript() {
     let mut over = arenas.clone();
     over[0][0] = base_word(FE::from(first + (1u64 << 32)));
     for (what, tampered) in [("a nonzero pad byte", padded), ("a half over 2^32", over)] {
-        let e = execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER)
-            .unwrap_or_else(|e| panic!("the front alone takes {what}: {e:?}"));
+        let e = execute(
+            &program,
+            &tampered,
+            &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        )
+        .unwrap_or_else(|e| panic!("the front alone takes {what}: {e:?}"));
         let words: Vec<LfmWord> = e.public_words.iter().map(|(_, w)| *w).collect();
         let honest: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
         assert_eq!(
@@ -242,8 +250,12 @@ fn the_commit_target_pins_every_output_half_to_its_bytes() {
     }
     let program = compile(b.finish());
     let honest: Vec<Vec<LfmWord>> = vec![halves.iter().copied().map(base_word).collect()];
-    let exec = execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
-        .expect("canonical halves execute");
+    let exec = execute(
+        &program,
+        &honest,
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .expect("canonical halves execute");
     let got: Vec<u8> = exec
         .public_words
         .iter()
@@ -259,7 +271,12 @@ fn the_commit_target_pins_every_output_half_to_its_bytes() {
     over[0][0] = base_word(FE::from(first + (1u64 << 32)));
     for (what, tampered) in [("a nonzero pad byte", padded), ("a half over 2^32", over)] {
         assert!(
-            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(
+                &program,
+                &tampered,
+                &program.hasher(crate::hash_pin::BLOCK_HASHER)
+            )
+            .is_err(),
             "{what} must not execute"
         );
     }
@@ -1126,8 +1143,15 @@ fn front_hash_rows(plan: &BlockTreePlan, wrap: WrapHash) -> usize {
     let main: Vec<super::epoch::RootCells> = (0..n)
         .map(|i| super::epoch::RootCells::hint(&mut b, a_main, per_root * i as u32))
         .collect();
-    let lanes: Vec<Vec<_>> = main.iter().map(super::epoch::RootCells::lanes_flat).collect();
-    let roots: Vec<Option<Commitment>> = plan.instances().iter().map(|i| i.precomputed_root).collect();
+    let lanes: Vec<Vec<_>> = main
+        .iter()
+        .map(super::epoch::RootCells::lanes_flat)
+        .collect();
+    let roots: Vec<Option<Commitment>> = plan
+        .instances()
+        .iter()
+        .map(|i| i.precomputed_root)
+        .collect();
     let phase_a: Vec<PhaseATable> = (0..n)
         .map(|i| PhaseATable {
             preprocessed_root: roots[i].as_ref().map(PhaseAPreprocessed::Constant),
@@ -1382,14 +1406,23 @@ fn a_nonzero_pad_byte_in_the_output_is_refused() {
     let partition = rb.plan.partition().clone();
     let program = block_leaf_program(&rb, 0);
     let arenas = block_leaf_arenas(&rb, &partition, 0);
-    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
-        .unwrap_or_else(|e| panic!("the honest leaf executes: {e:?}"));
+    execute(
+        &program,
+        &arenas,
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .unwrap_or_else(|e| panic!("the honest leaf executes: {e:?}"));
     let last = arenas[0].len() - 1;
     let v: u64 = arenas[0][last][0].canonical();
     let mut padded = arenas.clone();
     padded[0][last] = base_word(FE::from(v | (1u64 << 24)));
     assert!(
-        execute(&program, &padded, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        execute(
+            &program,
+            &padded,
+            &program.hasher(crate::hash_pin::BLOCK_HASHER)
+        )
+        .is_err(),
         "a nonzero pad byte in the last output half must not execute"
     );
     println!("BLOCK FIXTURE: a nonzero pad byte in the last output half is refused");
@@ -1454,9 +1487,13 @@ fn run_bindings(
 ) -> Result<Vec<LfmWord>, String> {
     let program = bindings_program(layout, words.len(), top, checks);
     let arenas: Vec<Vec<LfmWord>> = words.iter().map(|w| publics_arena(w)).collect();
-    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
-        .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
-        .map_err(|e| format!("{e:?}"))
+    execute(
+        &program,
+        &arenas,
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
+    .map_err(|e| format!("{e:?}"))
 }
 
 /// ★ (c)/(e) Every cross-child check refuses its tamper, and each is the one
@@ -1581,7 +1618,8 @@ pub(super) fn block_leaf_program_over(
     k: usize,
     carries: bool,
 ) -> LfmProgram {
-    let mut b = production_builder();
+    // A leaf verifies the base under its format's wrap hash, as the plan's do.
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::for_base(rb.plan.base()));
     emit_block_leaf_over(&mut b, &rb.plan, partition, k, carries);
     let program = compile(b.finish());
     super::validator::validate(&program).expect("a block leaf must be admissible");
@@ -1732,9 +1770,15 @@ pub(super) fn assert_top_claims_the_block(top: &RealChild, rb: &RealBlock) {
 // ============================ fixture-scale blocks ========================
 
 /// The small block's options: a real format at blowup 4 (every table's LDE pairs
-/// index at least one bit) with two queries, so the leaves stay small.
+/// index at least one bit) with two queries, so the leaves stay small. The base
+/// is the harness's (`NOEPOCH_BASE`, `NOEPOCH_P1_CAP`: RPX unset), so the same
+/// suites run a Poseidon1 base's leaves (P3a).
 fn fixture_block_options() -> crate::ProofOptions {
-    super::epoch_tests::from_proof_gate_options()
+    let mut opts = super::epoch_tests::from_proof_gate_options();
+    opts.format.base = crate::tests::noepoch_block_tests::noepoch_harness_options()
+        .format
+        .base;
+    opts
 }
 
 /// A small guest proved as one no-epoch block on the host: every table cut at
@@ -1833,8 +1877,12 @@ fn block_leaves_execute_over_a_real_block_proof() {
     for k in 0..partition.num_leaves() {
         let program = block_leaf_program(&rb, k);
         let arenas = block_leaf_arenas(&rb, &partition, k);
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
-            .unwrap_or_else(|e| panic!("leaf {k} must execute: {e:?}"));
+        let exec = execute(
+            &program,
+            &arenas,
+            &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        )
+        .unwrap_or_else(|e| panic!("leaf {k} must execute: {e:?}"));
         let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
         assert_eq!(
             got,
@@ -1879,8 +1927,51 @@ fn block_leaves_execute_over_a_real_block_proof() {
             );
             bad[at][0][0] += FE::from(1u64);
             assert!(
-                execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER).is_err(),
+                execute(
+                    &program,
+                    &bad,
+                    &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                )
+                .is_err(),
                 "leaf {k}: a tampered L of instance {i} must not execute"
+            );
+        }
+
+        // ---- a moved Merkle word of the leaf's last instance: the last sibling
+        // of its openings and of its FRI paths, and its first cap node when a
+        // tree is capped (P3a: every arity-4 hint and cap node is bound too).
+        let last = arenas.len() - 1;
+        let caps = rb.legs[*partition.leaf(k).last().expect("an instance")]
+            .caps_arena()
+            .is_some();
+        let (openings, fri) = if caps {
+            (last - 2, last - 1)
+        } else {
+            (last - 1, last)
+        };
+        let mut moved = vec![("an opening sibling", openings), ("a FRI sibling", fri)];
+        if caps {
+            moved.push(("a cap node", last));
+        }
+        for (what, at) in moved {
+            if arenas[at].is_empty() {
+                continue;
+            }
+            let mut bad = arenas.clone();
+            let w = if what == "a cap node" {
+                0
+            } else {
+                bad[at].len() - 1
+            };
+            bad[at][w][1] += FE::from(1u64);
+            assert!(
+                execute(
+                    &program,
+                    &bad,
+                    &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                )
+                .is_err(),
+                "leaf {k}: {what} moved and the leaf executed"
             );
         }
         println!(
@@ -1901,7 +1992,12 @@ fn block_leaves_execute_over_a_real_block_proof() {
     let mut over = arenas.clone();
     over[0][0] = base_word(FE::from(half0 + (1u64 << 32)));
     assert!(
-        execute(&program, &over, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        execute(
+            &program,
+            &over,
+            &program.hasher(crate::hash_pin::BLOCK_HASHER)
+        )
+        .is_err(),
         "an output half at or over 2^32 must not execute"
     );
     let live = rb.public_output.len() % 4;
@@ -1911,7 +2007,12 @@ fn block_leaves_execute_over_a_real_block_proof() {
         let mut padded = arenas.clone();
         padded[0][last] = base_word(FE::from(v | (1u64 << (8 * live))));
         assert!(
-            execute(&program, &padded, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(
+                &program,
+                &padded,
+                &program.hasher(crate::hash_pin::BLOCK_HASHER)
+            )
+            .is_err(),
             "a nonzero pad byte in the last output half must not execute"
         );
     } else {
