@@ -1744,8 +1744,9 @@ struct MemLedger {
     /// walked windows on their way to the accumulator.
     logs_bytes: std::sync::atomic::AtomicUsize,
     walked_bytes: std::sync::atomic::AtomicUsize,
-    /// The builder's run so far after the last absorbed window, the walk's
-    /// carried memory state, and the executor's memory, as last published.
+    /// The builder's run so far after the last absorbed window (0 once the
+    /// finish has consumed it), the walk's carried memory state, and the
+    /// executor's memory, as last published.
     builder_bytes: std::sync::atomic::AtomicUsize,
     walk_bytes: std::sync::atomic::AtomicUsize,
     executor_bytes: std::sync::atomic::AtomicUsize,
@@ -2671,6 +2672,8 @@ fn build_streamed<C: crate::hash_pin::BlockHash>(
             drop(sink);
             let finish_secs = t.elapsed().as_secs_f64();
             if let Some(ledger) = ledger {
+                // The finish consumed the builder: none of it is held now.
+                ledger.builder_bytes.store(0, Relaxed);
                 ledger.line("finish done");
             }
             eprintln!(
