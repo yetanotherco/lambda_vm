@@ -93,8 +93,8 @@ use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 pub(crate) use finish::{Emitted, RestHeader};
 pub use windowed::{
-    Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
+    WindowStamps, WindowedTraceBuilder,
 };
 
 // =============================================================================
@@ -938,7 +938,36 @@ pub(crate) fn vec_heap_bytes<T>(list: &Vec<T>) -> usize {
 /// each LOAD op's), which are a function of the CPU and LOAD ops it emits: the
 /// caller counts them from those ([`CpuOperation::count_bitwise_into`],
 /// [`LoadOperation::count_bitwise_into`]).
+#[inline]
 fn collect_ops_from_cpu_into(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    out: &mut WalkOutputs,
+    lookups: bool,
+) {
+    walk_cpu_ops::<true>(cpu_ops, memory_state, register_state, out, lookups);
+}
+
+/// The regeneration walk (D-REGEN §2.5): [`collect_ops_from_cpu_into`] without
+/// the in-walk lookups, reading and advancing the same state through the same
+/// code, but emitting only the lists of the tables a windowed build streams
+/// (MEMW_R, MEMW_A, MEMW, LOAD, LT, SHIFT). Everything only the finish reads
+/// (CPU32, COMMIT, KECCAK, BLAKE3, ECSM, ECDAS and HINT ops) is left out, and
+/// those lists stay empty.
+fn collect_streamed_ops_from_cpu_into(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    out: &mut WalkOutputs,
+) {
+    walk_cpu_ops::<false>(cpu_ops, memory_state, register_state, out, false);
+}
+
+/// The walk's one body: with `REST` every list ([`collect_ops_from_cpu_into`]),
+/// without it only the streamed tables' ([`collect_streamed_ops_from_cpu_into`]).
+/// The state advances the same either way.
+fn walk_cpu_ops<const REST: bool>(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
@@ -974,7 +1003,7 @@ fn collect_ops_from_cpu_into(
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
         // collector below so the MEMW table balances).
-        if op.decode.fields.word_instr {
+        if REST && op.decode.fields.word_instr {
             cpu32_ops.push(build_cpu32_op(op));
         }
 
@@ -999,11 +1028,13 @@ fn collect_ops_from_cpu_into(
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit() {
-            commit_ops.extend(expand_commit_operations_for_ecall(
-                op,
-                memory_state,
-                current_commit_index as u64,
-            ));
+            if REST {
+                commit_ops.extend(expand_commit_operations_for_ecall(
+                    op,
+                    memory_state,
+                    current_commit_index as u64,
+                ));
+            }
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw.extend_ops(reg_commit_ops);
             let count = u32::try_from(op.commit_count()).expect("commit_count exceeds u32 range");
@@ -1042,12 +1073,14 @@ fn collect_ops_from_cpu_into(
             let keccak_memw_ops =
                 collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
             memw.extend_ops(keccak_memw_ops);
-            keccak_ops.push(KeccakOperation {
-                timestamp: op.timestamp,
-                state_addr,
-                input,
-                output,
-            });
+            if REST {
+                keccak_ops.push(KeccakOperation {
+                    timestamp: op.timestamp,
+                    state_addr,
+                    input,
+                    output,
+                });
+            }
         }
 
         // Collect Blake3Compress ECALL operations
@@ -1079,31 +1112,35 @@ fn collect_ops_from_cpu_into(
                 &h, &m, t, block_len, flags,
             );
             // Previous content of the out region, read BEFORE the write ops
-            // below advance memory_state.
+            // below advance memory_state (only the BLAKE3 op holds it).
             let mut old_out = [0u8; 64];
-            for (b, byte) in old_out.iter_mut().enumerate() {
-                let byte_addr = state_addr
-                    .checked_add(112 + b as u64)
-                    .expect("blake3 state address range must be validated by the executor");
-                let (v, _ts) = memory_state.read_byte(byte_addr);
-                *byte = v;
+            if REST {
+                for (b, byte) in old_out.iter_mut().enumerate() {
+                    let byte_addr = state_addr
+                        .checked_add(112 + b as u64)
+                        .expect("blake3 state address range must be validated by the executor");
+                    let (v, _ts) = memory_state.read_byte(byte_addr);
+                    *byte = v;
+                }
             }
             let blake3_memw_ops =
                 collect_blake3_memw_ops(op, &words, &out, memory_state, register_state);
             if !strip_blake3_side_effects() {
                 memw.extend_ops(blake3_memw_ops);
             }
-            blake3_ops.push(Blake3Operation {
-                timestamp: op.timestamp,
-                state_addr,
-                h,
-                m,
-                t,
-                block_len,
-                flags,
-                old_out,
-                out,
-            });
+            if REST {
+                blake3_ops.push(Blake3Operation {
+                    timestamp: op.timestamp,
+                    state_addr,
+                    h,
+                    m,
+                    t,
+                    block_len,
+                    flags,
+                    old_out,
+                    out,
+                });
+            }
         }
 
         // Collect Blake3Absorb ECALL operations. One ecall becomes a whole GROUP
@@ -1119,7 +1156,9 @@ fn collect_ops_from_cpu_into(
             if !strip_blake3_side_effects() {
                 memw.extend_ops(absorb_memw);
             }
-            blake3_absorb_ops.push(absorb_op);
+            if REST {
+                blake3_absorb_ops.push(absorb_op);
+            }
         }
 
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
@@ -1127,15 +1166,19 @@ fn collect_ops_from_cpu_into(
             let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
             memw.extend_ops(ecsm_memw);
-            ecsm_ops.push(ecsm_op);
-            ecdas_ops.extend(ecdas_rows);
+            if REST {
+                ecsm_ops.push(ecsm_op);
+                ecdas_ops.extend(ecdas_rows);
+            }
         }
 
         // Collect Hint ecall operations (the 32-byte output write).
         if op.ecall_hint() {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
             memw.extend_ops(hint_memw);
-            hint_ops.push(hint_op);
+            if REST {
+                hint_ops.push(hint_op);
+            }
         }
 
         // --- ALU chip dispatch (no state tracking) ---
@@ -1178,9 +1221,11 @@ fn collect_ops_from_cpu_into(
 
     // Each ecall generates count+1 operations (count real rows + 1 end row).
     // Count only this call's rows, so subtract the carried start index.
-    debug_assert_eq!(
-        commit_ops.len() - commit_ops_before,
-        (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
+    debug_assert!(
+        !REST
+            || commit_ops.len() - commit_ops_before
+                == (current_commit_index - start_commit_index) as usize
+                    + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
 }
