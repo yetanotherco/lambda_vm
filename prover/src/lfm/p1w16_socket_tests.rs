@@ -31,9 +31,9 @@ const COLUMNS_VALUE_COLUMNS: usize = 332;
 /// Plus four LogUp aux columns at three cells each.
 const ONBUS_CELLS: usize = 328;
 const COLUMNS_CELLS: usize = 344;
-/// 1 + 300 (+ 16).
-const ONBUS_CONSTRAINTS: usize = 301;
-const COLUMNS_CONSTRAINTS: usize = 317;
+/// 1 + 4 + 300 (+ 16).
+const ONBUS_CONSTRAINTS: usize = 305;
+const COLUMNS_CONSTRAINTS: usize = 321;
 
 fn evaluate(form: OutForm, row: &[FE]) -> Vec<FE> {
     let set = P1W16SocketConstraints { form };
@@ -218,6 +218,27 @@ fn a_non_boolean_is_real_is_rejected() {
         let mut row = vec![FE::zero(); form.num_columns()];
         row[cols::IS_REAL] = FE::from(2u64);
         assert!(violations(form, &row).contains(&0), "{form:?}");
+    }
+}
+
+/// A padding row cannot write: an output multiplicity under `IS_REAL = 0`
+/// is rejected (its `IN` is unread, so the write would be prover-chosen).
+#[test]
+fn an_output_multiplicity_on_a_padding_row_is_rejected() {
+    for form in FORMS {
+        for k in 0..CELLS {
+            let mut row = vec![FE::zero(); form.num_columns()];
+            row[cols::MULT0 + k] = FE::one();
+            assert_eq!(violations(form, &row), vec![1 + k], "{form:?} cell {k}");
+            // The same multiplicity on a real row is fine.
+            let (mut real, _) = real_row(form, sample_input());
+            real[cols::MULT0 + k] = FE::from(3u64);
+            assert_eq!(
+                violations(form, &real),
+                Vec::<usize>::new(),
+                "{form:?} cell {k}"
+            );
+        }
     }
 }
 
