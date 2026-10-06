@@ -48,17 +48,17 @@ enum TreeCommit {
 }
 
 impl TreeCommit {
-    fn total_nodes_bytes(self, num_leaves: usize) -> usize {
+    fn total_nodes_bytes(self, hash: DeviceHash, num_leaves: usize) -> usize {
         match self {
             TreeCommit::LeavesOnly => num_leaves * 32,
-            TreeCommit::FullTree => (2 * num_leaves - 1) * 32,
+            TreeCommit::FullTree => crate::tree_nodes(hash, num_leaves) * 32,
         }
     }
 
-    fn leaves_offset_bytes(self, num_leaves: usize) -> usize {
+    fn leaves_offset_bytes(self, hash: DeviceHash, num_leaves: usize) -> usize {
         match self {
             TreeCommit::LeavesOnly => 0,
-            TreeCommit::FullTree => (num_leaves - 1) * 32,
+            TreeCommit::FullTree => crate::leaves_offset(hash, num_leaves) * 32,
         }
     }
 }
@@ -1188,8 +1188,8 @@ fn coset_lde_row_major_inner_col_major(
 )> {
     let lde_size = n * blowup_factor;
     let num_leaves = lde_size / rows_per_leaf;
-    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
-    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(hash, num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(hash, num_leaves);
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -1226,6 +1226,7 @@ fn coset_lde_row_major_inner_col_major(
     let tree = GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
+        arity: hash.arity(),
         root,
     };
     Ok((tree, buf, trace_col_major, Arc::new(ready)))
@@ -1273,6 +1274,9 @@ fn build_inner_tree_levels_for(
         DeviceHash::Rpx256 => {
             crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
         }
+        DeviceHash::Poseidon1 => {
+            crate::p1_stark::build_inner_tree_levels(stream, nodes_dev, leaves_len)
+        }
         DeviceHash::Rpo256 | DeviceHash::Poseidon => {
             unimplemented!("{hash:?} device commit not yet ported (inner tree levels)")
         }
@@ -1315,6 +1319,18 @@ pub(crate) fn launch_row_major_leaves(
         "column range in bounds"
     );
     let log_num_rows = num_rows.trailing_zeros() as u64;
+    if hash == DeviceHash::Poseidon1 {
+        return crate::p1_stark::launch_leaves_row_major(
+            stream,
+            buf,
+            m,
+            col_start,
+            col_end,
+            num_rows,
+            rows_per_leaf,
+            leaves_out,
+        );
+    }
     let full = col_start == 0 && col_end == m;
     if rows_per_leaf == 2 {
         return match (hash, full) {
@@ -1380,6 +1396,8 @@ pub(crate) fn launch_row_major_leaves(
                 log_num_rows,
                 leaves_out,
             ),
+            // Launched above (`p1_stark::launch_leaves_row_major`).
+            (DeviceHash::Poseidon1, _) => Err(crate::invalid_value()),
             (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
                 unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
             }
@@ -1399,6 +1417,8 @@ pub(crate) fn launch_row_major_leaves(
             &be.rpx_leaves_base_row_major_row_range,
             crate::rpx::rpx_launch_cfg(num_rows),
         ),
+        // Launched above (`p1_stark::launch_leaves_row_major`).
+        DeviceHash::Poseidon1 => return Err(crate::invalid_value()),
         DeviceHash::Rpo256 | DeviceHash::Poseidon => {
             unimplemented!("{hash:?} device commit not yet ported (row-major one-row leaves)")
         }
@@ -1513,7 +1533,7 @@ fn coset_lde_row_major_inner(
         return Ok((tree, col_major_dev, Vec::new(), trace_col_major, ready));
     }
     let num_leaves = lde_size / rows_per_leaf;
-    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(hash, num_leaves);
     let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
 
@@ -1536,7 +1556,7 @@ fn coset_lde_row_major_inner(
     // consecutive u64s (`lde_u64` is the bit-reverse modulus; the kernel emits
     // `lde_size / rows_per_leaf` leaves).
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
-    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(hash, num_leaves);
     {
         let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
         launch_row_major_leaves(
@@ -1623,6 +1643,7 @@ fn coset_lde_row_major_inner(
     let tree = GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
+        arity: hash.arity(),
         root,
     };
     Ok((
@@ -1828,8 +1849,8 @@ pub fn coset_lde_row_major_split_trees_rpl(
         "rows_per_leaf must be 1 or 2"
     );
     let num_leaves = lde_size / rows_per_leaf;
-    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
-    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(hash, num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(hash, num_leaves);
     let lde_u64 = lde_size as u64;
     let cols_u64 = m as u64;
 
@@ -1901,6 +1922,7 @@ pub fn coset_lde_row_major_split_trees_rpl(
         GpuMerkleTree {
             nodes: Arc::new(nodes_dev),
             leaves_len: num_leaves,
+            arity: hash.arity(),
             root,
         }
     };
@@ -1983,8 +2005,8 @@ fn coset_lde_row_major_split_trees_col_major(
 ) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     let lde_size = n * blowup_factor;
     let num_leaves = lde_size / rows_per_leaf;
-    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
-    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(hash, num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(hash, num_leaves);
     let (buf, trace_col_major) =
         expand_col_major_on_stream(stream, be, input, n, m, blowup_factor, weights, true)?;
 
@@ -2024,6 +2046,7 @@ fn coset_lde_row_major_split_trees_col_major(
         GpuMerkleTree {
             nodes: Arc::new(nodes_dev),
             leaves_len: num_leaves,
+            arity: hash.arity(),
             root,
         }
     };
@@ -2233,14 +2256,29 @@ impl GpuLdeExt3 {
 /// paths on device instead of copying the whole tree to host. Node layout
 /// matches the CPU tree (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]`
 /// are inner nodes (root at 0), `nodes[leaves_len-1..]` are the leaves, each 32
-/// bytes. Freed when the `nodes` Arc drops.
+/// bytes. At [`Self::arity`] 4 it is the CPU tree's arity-4 layout instead
+/// ([`crate::p1_stark`]). Freed when the `nodes` Arc drops.
 #[derive(Clone)]
 pub struct GpuMerkleTree {
     pub nodes: Arc<CudaSlice<u8>>,
     pub leaves_len: usize,
+    /// Children per node: 2, or 4 under [`DeviceHash::Poseidon1`].
+    pub arity: usize,
     /// The Merkle root (node 0), copied to host at build time so the commitment
     /// is available without copying the whole tree.
     pub root: [u8; 32],
+}
+
+impl GpuMerkleTree {
+    /// Stored nodes: the binary heap's `2·leaves − 1`, or the arity-4 layout's
+    /// count.
+    pub fn total_nodes(&self) -> usize {
+        if self.arity == crate::p1_stark::ARITY {
+            crate::p1_stark::tree_nodes(self.leaves_len)
+        } else {
+            2 * self.leaves_len - 1
+        }
+    }
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
@@ -2627,7 +2665,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     );
     assert_eq!(lde_size % rows_per_leaf, 0);
     let num_leaves = lde_size / rows_per_leaf;
-    let nodes_dev_bytes = commit.total_nodes_bytes(num_leaves);
+    let nodes_dev_bytes = commit.total_nodes_bytes(hash, num_leaves);
     assert_eq!(nodes_out.len(), nodes_dev_bytes);
 
     let be = backend()?;
@@ -2683,7 +2721,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     // written before any reader sees it: the keccak kernel fills the
     // leaves slab, the inner-tree pass (when present) fills the head.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
-    let leaves_offset_bytes = commit.leaves_offset_bytes(num_leaves);
+    let leaves_offset_bytes = commit.leaves_offset_bytes(hash, num_leaves);
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
@@ -2734,6 +2772,15 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
                 col_stride_u64,
                 m as u64,
                 lde_u64,
+                &mut leaves_view,
+            )?,
+            (DeviceHash::Poseidon1, _) => crate::p1_stark::launch_leaves_cols(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                rows_per_leaf,
                 &mut leaves_view,
             )?,
             (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
@@ -2931,10 +2978,10 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     // ahead of the drains below.
     let nodes = if let Some(nodes_out) = merkle_nodes_out {
         let num_leaves = lde_size / 2;
-        let tight_total_nodes = 2 * num_leaves - 1;
+        let tight_total_nodes = crate::tree_nodes(hash, num_leaves);
         assert_eq!(nodes_out.len(), tight_total_nodes * 32);
         let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
-        let leaves_offset_bytes = (num_leaves - 1) * 32;
+        let leaves_offset_bytes = crate::leaves_offset(hash, num_leaves) * 32;
         {
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
@@ -2973,6 +3020,17 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                     num_parts_u64,
                     lde_u64,
                     log_num_rows,
+                    &mut leaves_view,
+                )?,
+                // The composition leaf is the column-major row-pair leaf over
+                // the parts' 3·m slabs (`p1s_leaves_cols_pair`).
+                DeviceHash::Poseidon1 => crate::p1_stark::launch_leaves_cols(
+                    stream.as_ref(),
+                    &buf,
+                    col_stride_u64,
+                    3 * num_parts_u64,
+                    lde_u64,
+                    2,
                     &mut leaves_view,
                 )?,
                 DeviceHash::Rpo256 | DeviceHash::Poseidon => {
@@ -3520,8 +3578,8 @@ pub mod lde_bench {
         let w = weights(n);
         let lde_size = n * blowup;
         let num_leaves = lde_size / rows_per_leaf;
-        let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
-        let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
+        let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(hash, num_leaves);
+        let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(hash, num_leaves);
 
         stream.synchronize()?;
         let t0 = Instant::now();

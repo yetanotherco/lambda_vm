@@ -653,6 +653,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
+        arity: 2,
         root,
     })
 }
@@ -683,6 +684,7 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
+        arity: 2,
         root,
     })
 }
