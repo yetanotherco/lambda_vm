@@ -2846,6 +2846,12 @@ fn block_whir_on_a_real_block() {
     );
     let t = std::time::Instant::now();
     let ok = verify_block_whir(&proof, &elf, &opts, &format).expect("the verifier runs");
+    if !ok {
+        println!(
+            "BLOCK VERIFY WHY: {}",
+            verify_reason(&proof, &elf, &opts, &format)
+        );
+    }
     println!(
         "BLOCK VERIFY: {} in {:.2}s · proof {} tables, {} batched argues, {} groups, {} roots",
         if ok { "ACCEPTED" } else { "REJECTED" },
@@ -2971,4 +2977,118 @@ fn a_split_table_is_its_rows_in_order() {
             );
         }
     }
+}
+
+/// A diagnostic's copy of `verify_block_whir_with`: the step that refuses a
+/// block, and its error, where the verifier answers `false`.
+fn verify_reason(
+    proof: &BlockWhirProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+) -> String {
+    use crate::block_whir::{
+        GroupPrepared, absorb_block, block_frame, commit_groups, group_stacks, prepared_tables,
+    };
+    use crate::multilinear_prove::{layout_of, preprocessed_mles};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use multilinear::mle::Mle;
+    use stark::multilinear_block;
+    use stark::multilinear_table::{TableLayout, TableStatement};
+    type F = crate::test_utils::F;
+    let frame = match block_frame(proof.statement(), elf_bytes, proof_options, format) {
+        Ok(frame) => frame,
+        Err(e) => return format!("block_frame: {e:?}"),
+    };
+    let air_refs = frame.airs.air_refs();
+    let layouts: Vec<TableLayout<'_, F, E>> = match air_refs
+        .iter()
+        .zip(&frame.shapes)
+        .map(|(air, &(width, num_vars))| layout_of(*air, width, num_vars))
+        .collect::<Result<_, _>>()
+    {
+        Ok(l) => l,
+        Err(e) => return format!("layout_of: {e:?}"),
+    };
+    let preprocessed: Vec<Vec<Mle<F>>> = match air_refs
+        .iter()
+        .map(|air| preprocessed_mles(*air))
+        .collect::<Result<_, _>>()
+    {
+        Ok(p) => p,
+        Err(e) => return format!("preprocessed_mles: {e:?}"),
+    };
+    let statements: Vec<TableStatement<'_, F, E>> = layouts
+        .iter()
+        .zip(&preprocessed)
+        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .collect();
+    let statements: Vec<TableStatement<'_, F, E>> =
+        frame.order.iter().map(|&i| statements[i]).collect();
+    let prepared_columns = match prepared_tables(&frame.airs, &frame.page_configs, format) {
+        Ok(p) => p,
+        Err(e) => return format!("prepared_tables: {e:?}"),
+    };
+    crate::with_whir_hash!(|H| {
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_block(
+            &mut transcript,
+            elf_bytes,
+            &proof.public_output,
+            &proof.table_counts,
+            proof.num_private_input_pages,
+            &proof.runtime_page_ranges,
+            &proof.table_num_vars,
+            &frame.config,
+            &proof.groups,
+        );
+        let prepared: Vec<GroupPrepared<H>> = match group_stacks(prepared_columns, &proof.groups)
+            .and_then(|stacks| commit_groups::<H>(stacks, &frame.config))
+        {
+            Ok(prepared) => prepared,
+            Err(e) => return format!("group_stacks / commit_groups: {e:?}"),
+        };
+        let checks: Vec<multilinear_block::BlockPreparedCheck<'_, F>> = prepared
+            .iter()
+            .map(|p| multilinear_block::BlockPreparedCheck {
+                group: p.group,
+                tables: p.tables.clone(),
+                roots: &p.roots,
+                layout: p.commitment.layout(),
+                domain: p.commitment.domain(),
+            })
+            .collect();
+        let derived: Vec<multilinear::whir_commit::Commitment> = checks
+            .iter()
+            .flat_map(|c| c.roots.iter().copied())
+            .collect();
+        let mut probe = transcript.clone();
+        stark::multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &derived);
+        let z: FieldElement<E> = probe.sample_field_element();
+        let alpha: FieldElement<E> = probe.sample_field_element();
+        let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
+        else {
+            return "compute_commit_bus_offset: None".to_string();
+        };
+        match multilinear_block::block_verify_with::<_, _, _, H>(
+            &proof.proof,
+            &proof.argues,
+            &proof.prepared,
+            &checks,
+            &statements,
+            &frame.stack_layouts,
+            &frame.domains,
+            &frame.sizes,
+            &owed,
+            &frame.config,
+            &mut transcript,
+            false,
+            VerifierChecks::ALL,
+        ) {
+            Ok(()) => "block_verify_with: Ok (the verifier said false elsewhere)".to_string(),
+            Err(e) => format!("block_verify_with: {e:?}"),
+        }
+    })
 }
