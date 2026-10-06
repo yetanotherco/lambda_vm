@@ -289,7 +289,11 @@ fn the_emulated_width8_permutation_is_poseidon1_w8() {
 fn the_sparse_width8_permutation_is_poseidon1_w8() {
     for seed in [0u64, 1, 2, 0xFFFF] {
         let input: [FE; 8] = core::array::from_fn(|i| felt(seed, i));
-        assert_eq!(w8_sparse_host(input), poseidon1_w8::permute(input), "host, seed {seed}");
+        assert_eq!(
+            w8_sparse_host(input),
+            poseidon1_w8::permute(input),
+            "host, seed {seed}"
+        );
     }
     // (constant lanes, kept lanes): all variable, the grind's inner and outer.
     let patterns: [(&[usize], usize); 3] = [(&[], 8), (&[0, 5, 6, 7], 4), (&[5, 6, 7], 1)];
@@ -332,7 +336,11 @@ fn the_sparse_width8_permutation_is_poseidon1_w8() {
             let got: Vec<FE> = exec.public_words.iter().flat_map(|(_, w)| *w).collect();
             let want = poseidon1_w8::permute(input);
             let got_lanes: Vec<FE> = got.chunks(4).map(|w| w[0]).collect();
-            assert_eq!(got_lanes, want[..keep].to_vec(), "consts {consts:?} keep {keep}");
+            assert_eq!(
+                got_lanes,
+                want[..keep].to_vec(),
+                "consts {consts:?} keep {keep}"
+            );
             rows.push((consts.len(), keep, spent));
         }
     }
@@ -347,7 +355,11 @@ fn the_sparse_width8_permutation_is_poseidon1_w8() {
     // its outer (three constant lanes, lane 0 kept) 1,105 — 2,218 a check
     // against the dense 4,544.
     let spent: Vec<usize> = rows.iter().step_by(2).map(|r| r.2).collect();
-    assert_eq!(spent, vec![1_193, 1_113, 1_105], "all variable; inner; outer");
+    assert_eq!(
+        spent,
+        vec![1_193, 1_113, 1_105],
+        "all variable; inner; outer"
+    );
 }
 
 /// The transcript replay's Poseidon1 arm against `P1Transcript`: every append

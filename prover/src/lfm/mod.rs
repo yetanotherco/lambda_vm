@@ -229,10 +229,6 @@ mod whir_bus_tests;
 #[cfg(test)]
 mod whir_chain_tests;
 #[cfg(test)]
-mod whir_p1_census_tests;
-#[cfg(test)]
-mod whir_p1_leaf_tests;
-#[cfg(test)]
 mod whir_epoch_program_tests;
 /// Its tests, which stayed behind when the driver moved out.
 #[cfg(test)]
@@ -248,6 +244,10 @@ mod whir_global_tests;
 mod whir_leg_tests;
 #[cfg(test)]
 mod whir_open_tests;
+#[cfg(test)]
+mod whir_p1_census_tests;
+#[cfg(test)]
+mod whir_p1_leaf_tests;
 #[cfg(test)]
 mod whir_poly_tests;
 #[cfg(test)]
