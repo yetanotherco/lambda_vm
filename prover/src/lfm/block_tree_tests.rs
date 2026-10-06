@@ -1271,6 +1271,139 @@ fn p1_leaf_census_at_production_heights() {
     }
 }
 
+/// P3a's interior attribution (laptop instrument, no proof): what a node pays
+/// for each table of a leaf child, for leaf 0 of the production-height plan
+/// under RPX and under a P1 base at cap 1. Per child table: its padded height
+/// (the chip census), its width, its composition parts and committed FRI
+/// layers at the wrap options, and its legs' closed form
+/// (`table_permutations_for`) with the opening words a query reads. RYZEN 010's
+/// G4 found the P1 tree's nodes +15 % instructions and +19 % cells.
+#[test]
+#[ignore = "laptop instrument: production-height leaves, emission only (≈ 0.4 GiB a leaf)"]
+fn p1_node_leg_census() {
+    use super::airs::{ChipSet, LfmAirs, NUM_LFM_CHIPS, lfm_chip_census_with_hasher};
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    let wrap = super::proof::aggregation_wrap_options();
+    let arms = [
+        ("rpx", BaseFormat::RPX),
+        (
+            "p1-c1",
+            BaseFormat {
+                arity4_cap: CapPolicy::Fixed(1),
+                ..BaseFormat::P1
+            },
+        ),
+    ];
+    for (name, base) in arms {
+        let plan = spread_plan_under(13, 40, &super::proof::block_base_options_for(base));
+        let program = plan.leaf_program(0).expect("the leaf emits");
+        let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+        let census = lfm_chip_census_with_hasher(&program, hasher);
+        let airs = LfmAirs::new_with_hasher(
+            &[[0u8; 32]; NUM_LFM_CHIPS],
+            &wrap,
+            1,
+            hasher,
+            ChipSet::for_program_with_hasher(&program, hasher),
+        );
+        let refs = airs.air_refs();
+        let dw =
+            super::edsl::digest_words(&LfmBuilder::new().with_wrap_hash(WrapHash::production()))
+                as usize;
+        let (mut perms, mut words) = (0usize, 0usize);
+        for c in &census {
+            let Some(air) = refs.iter().find(|a| a.name() == c.name) else {
+                println!("NODE LEGS {name} {}: no AIR in the set", c.name);
+                continue;
+            };
+            let rows = (c.rows as usize).max(1);
+            let (v, _) = super::epoch_verify::TableVerifyShape::derive(*air, rows)
+                .expect("the child table's shape derives");
+            let p = super::epoch_verify::table_permutations_for(&v, WrapHash::production());
+            let w = v.opening_words(dw) + v.fri_words(dw);
+            perms += p;
+            words += w;
+            println!(
+                "NODE LEGS {name} {:<12} rows 2^{:<2} · cols {} + {} aux · parts {} · FRI layers {} · legs {p} perms \
+                 · query words {w}",
+                c.name,
+                rows.trailing_zeros(),
+                c.main_cols,
+                c.aux_cols,
+                v.quotient.num_composition_parts,
+                v.fri.num_committed()
+            );
+        }
+        println!("NODE LEGS {name}: one leaf child's legs {perms} perms · {words} query words");
+    }
+}
+
+/// P3a's interior, measured on the emitted programs (laptop instrument): the
+/// small spread plan's top node over its one leaf, under RPX and under a P1 base
+/// at cap 1 — the node's instructions and rows by group, and each child table's
+/// height, parts and closed-form legs.
+#[test]
+#[ignore = "laptop instrument: run with --exact --nocapture (≈ 2 min)"]
+fn p1_node_program_census() {
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    let wrap = super::proof::aggregation_wrap_options();
+    for (name, opts) in [
+        ("rpx", pinned_spread_plan_options()),
+        ("p1-c1", p1_spread_options(CapPolicy::Fixed(1))),
+    ] {
+        let _ = BaseFormat::RPX;
+        let plan = spread_plan_under(2, 4, &opts);
+        let leaf = plan.leaf_program(0).expect("the leaf emits");
+        let artifacts = super::block_plan::artifacts_of(&leaf, &wrap);
+        let words = plan.child_layout().total();
+        let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &wrap);
+        let heights = super::airs::LfmAirs::log_heights_in_air_order(&artifacts).expect("heights");
+        let dw = 1usize;
+        for (air, h) in airs.air_refs().into_iter().zip(heights) {
+            let (v, an) =
+                super::epoch_verify::TableVerifyShape::derive(air, 1usize << h).expect("derives");
+            let r = an.report();
+            println!(
+                "NODE CHILD {name} {:<12} 2^{h:<2} · cols {} · eval points {} · parts {} · alpha {} · \
+                 constraint IR nodes {} ext-alu {} mul-base {} consts {} · legs {} perms · words {}",
+                air.name(),
+                v.sub.deep.num_total_cols,
+                v.sub.deep.num_eval_points,
+                v.quotient.num_composition_parts,
+                v.num_alpha_powers,
+                r.nodes,
+                r.ext_alu,
+                r.mul_base,
+                r.constants,
+                super::epoch_verify::table_permutations_for(&v, WrapHash::production()),
+                v.opening_words(dw) + v.fri_words(dw)
+            );
+        }
+        let child = DerivedChild::from_artifacts(&artifacts, &wrap, words).expect("derives");
+        let top = plan.node_program(&[child], true).expect("the top emits");
+        let groups: Vec<String> = PROGRAM_GROUP_NAMES
+            .iter()
+            .zip(program_groups(&top))
+            .map(|(g, c)| format!("{g} {}", c.real_rows))
+            .collect();
+        println!(
+            "NODE PROGRAM {name}: leaf {} instructions · top {} instructions · {}",
+            leaf.instrs.len(),
+            top.instrs.len(),
+            groups.join(" · ")
+        );
+    }
+}
+
+/// [`pinned_spread_plan`]'s options.
+fn pinned_spread_plan_options() -> crate::ProofOptions {
+    let pair = crate::zf_format::ZfFormat {
+        logup: stark::proof::options::LogUpPolicy::Pair,
+        ..crate::zf_format::ZfFormat::DEFAULT
+    };
+    pair.base_options(crate::recursion::Preset::Blowup4.options())
+}
+
 /// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest.
 const SMALL_TREE_IDS: [(&str, &[&str]); 2] = [
     (
