@@ -26,7 +26,7 @@ use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
 use super::whir_block::{
     BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
     block_leaf_arena, emit_share, group_arena_words, id_words, leaf_arena, leaf_partition,
-    leaf_program_with, out_halves, partition_groups, verify_block_tree, verify_block_tree_under,
+    leaf_program_with, out_halves, partition_groups, verify_block_tree_under,
 };
 use super::whir_block_tree::{
     FailEmpty, FailUnpublished, GroupMsg, ProgramSlot, Published, TreeAt, TreeBudget, build_levels,
@@ -2377,7 +2377,18 @@ fn the_whir_block_tree_on_a_real_block() {
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
         .expect("read the input");
-    let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let mut cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    // `BLOCK_WHIR_BASE=p1|p1w|rpx` (production rpx): the block's base hash, a
+    // test word this harness maps into the format (`p1w` as long as `rpx`, for
+    // A/B arms of equal environment bytes); the library reads no environment
+    // for it.
+    let base = match std::env::var("BLOCK_WHIR_BASE").as_deref().map(str::trim) {
+        Ok("p1" | "p1w") => stark::proof::options::BaseFormat::P1_WHIR,
+        Ok("rpx") | Err(_) => stark::proof::options::BaseFormat::RPX,
+        Ok(other) => panic!("BLOCK_WHIR_BASE={other}: rpx, p1 or p1w"),
+    };
+    cfg.format.zf = cfg.format.zf.with_base(base);
+    println!("W3 BASE: {:?}", cfg.format.zf.base.hash);
     let run =
         prove_whir_block_tree(&elf, &input, &cfg, &StdoutSink).unwrap_or_else(|e| panic!("{e}"));
     let (proof, plan, proofs, early_out, base) = (
@@ -2497,7 +2508,12 @@ fn the_whir_block_tree_on_a_real_block() {
     // only when a knob moved the tree off them.
     let verdict =
         if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
-            verify_block_tree(&elf, proof.statement(), top)
+            super::whir_block::verify_block_tree_based(
+                &elf,
+                &format.zf.base,
+                proof.statement(),
+                top,
+            )
         } else {
             verify_block_tree_under(
                 &elf,

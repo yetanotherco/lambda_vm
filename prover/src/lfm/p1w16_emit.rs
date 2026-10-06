@@ -32,7 +32,7 @@
 //! not hints, so they cannot be anything else.
 //!
 //! [`walk4_child`] takes the siblings in ZisK's child order instead, as the
-//! proof carries them, and spends three more `Select`s a full level placing
+//! proof carries them, and spends two more `Select`s a full level placing
 //! them: its arena needs no leaf index (the WHIR leaf's, whose arena is filled
 //! from the proof alone).
 
@@ -163,9 +163,11 @@ pub fn walk4(
 ///
 /// With the current node at child `p = b0 + 2·b1`, the partner is sibling 0
 /// when `b1 = 0` and sibling 2 when `b1 = 1`, and the other pair is siblings
-/// `(1, 2)` or `(0, 1)`: three `Select`s on `b1` put them in [`hint_order`],
-/// and [`walk4`]'s level follows. Every placement is a `Select` on an index
-/// bit, so the node hashed is the one the index names, whatever the hints.
+/// `(1, 2)` or `(0, 1)`: hint order is the siblings rotated by one place when
+/// `b1 = 1`, two `Select`s on `b1` using both of their outputs — `(partner, y)`
+/// from `(s0, s2)`, then the other pair from `(s1, y)` — and [`walk4`]'s level
+/// follows. Every placement is a `Select` on an index bit, so the node hashed
+/// is the one the index names, whatever the hints.
 pub fn walk4_child(
     b: &mut LfmBuilder,
     leaf: WrapDigest,
@@ -185,9 +187,9 @@ pub fn walk4_child(
                 let s0 = s.next().expect("counted above");
                 let s1 = s.next().expect("counted above");
                 let s2 = s.next().expect("counted above");
-                let (partner, _) = b.select(*b1, s0, s2);
-                let (u0, _) = b.select(*b1, s1, s0);
-                let (u1, _) = b.select(*b1, s2, s1);
+                // b1 = 0: (s0, s2), then (s1, s2); b1 = 1: (s2, s0), then (s0, s1).
+                let (partner, y) = b.select(*b1, s0, s2);
+                let (u0, u1) = b.select(*b1, s1, y);
                 let (l, r) = b.select(*b0, cur, partner);
                 let (c0, c2) = b.select(*b1, l, u0);
                 let (c1, c3) = b.select(*b1, r, u1);
@@ -382,4 +384,305 @@ pub fn w8_permute(b: &mut LfmBuilder, state: [Felt; 8]) -> [Felt; 8] {
         });
     }
     a
+}
+
+// ============================ the sparse width-8 ============================
+
+/// The width-8 permutation's partial rounds in sparse form, precomputed from
+/// the textbook constants ([`sparse_w8`]); [`w8_sparse_host`] is its host
+/// form, held to `poseidon1_w8::permute` by test.
+///
+/// Two equivalences, both exact over the field:
+///
+/// - **Constants.** A partial round adds `c` before an S-box on lane 0 only,
+///   so `c`'s lanes 1..8 commute past the S-box and through the round's MDS
+///   into the next round's constant. Pushed forward, every partial round adds
+///   one scalar to lane 0, and the last one's residue joins the first
+///   terminal full round's constant.
+/// - **Matrices.** Any `A = [[a, vᵀ], [w, Â]]` with `Â` invertible is
+///   `Sp · D` with `D = diag(1, Â)` and `Sp = [[a, (Â⁻ᵀv)ᵀ], [w, I]]`. `D`
+///   touches neither lane 0 nor the S-box, so it moves to the round before,
+///   whose matrix becomes `D · M`; from the last partial round back, every
+///   partial round keeps a sparse `Sp` (15 multiply-adds against the MDS's
+///   64) and the first-half's last full round takes `D₀ · M`, still dense.
+///   `Â` is invertible at every step: `M̂` is (every square submatrix of an
+///   MDS matrix is), and each later `Â` is a product of invertible ones.
+pub struct SparseW8 {
+    /// Full rounds' constants, `[full round][lane]`: rounds 0–3, then 26–29
+    /// (the first of those carrying the partial block's residue).
+    full_rc: [[FE; W8]; 8],
+    /// The first half's last full round's matrix, `D₀ · M`.
+    first_matrix: [[FE; W8]; W8],
+    /// Per partial round: its lane-0 constant, and its `Sp = [[a, vᵀ], [w, I]]`.
+    partial_rc: [FE; w8::PARTIAL_ROUNDS],
+    sp_a: [FE; w8::PARTIAL_ROUNDS],
+    sp_v: [[FE; W8 - 1]; w8::PARTIAL_ROUNDS],
+    sp_w: [[FE; W8 - 1]; w8::PARTIAL_ROUNDS],
+}
+
+const W8: usize = w8::STATE_FELTS;
+
+fn w8_mds() -> [[FE; W8]; W8] {
+    core::array::from_fn(|i| {
+        core::array::from_fn(|j| FE::from(w8::constants::MDS_CIRC_ROW[(j + W8 - i) % W8]))
+    })
+}
+
+fn mat_mul(a: &[[FE; W8]; W8], b: &[[FE; W8]; W8]) -> [[FE; W8]; W8] {
+    core::array::from_fn(|i| {
+        core::array::from_fn(|j| (0..W8).fold(FE::zero(), |acc, k| acc + a[i][k] * b[k][j]))
+    })
+}
+
+fn mat_vec(a: &[[FE; W8]; W8], x: &[FE; W8]) -> [FE; W8] {
+    core::array::from_fn(|i| (0..W8).fold(FE::zero(), |acc, k| acc + a[i][k] * x[k]))
+}
+
+/// The inverse of a 7×7 matrix by Gauss–Jordan; `None` if singular.
+fn inverse7(m: &[[FE; W8 - 1]; W8 - 1]) -> Option<[[FE; W8 - 1]; W8 - 1]> {
+    const N: usize = W8 - 1;
+    let mut a = *m;
+    let mut inv: [[FE; N]; N] =
+        core::array::from_fn(|i| core::array::from_fn(|j| if i == j { FE::one() } else { FE::zero() }));
+    for col in 0..N {
+        let pivot = (col..N).find(|&r| a[r][col] != FE::zero())?;
+        a.swap(col, pivot);
+        inv.swap(col, pivot);
+        let p = a[col][col].inv().ok()?;
+        for j in 0..N {
+            a[col][j] *= p;
+            inv[col][j] *= p;
+        }
+        for r in 0..N {
+            if r != col && a[r][col] != FE::zero() {
+                let f = a[r][col];
+                for j in 0..N {
+                    let (ac, ic) = (a[col][j], inv[col][j]);
+                    a[r][j] = a[r][j] - f * ac;
+                    inv[r][j] = inv[r][j] - f * ic;
+                }
+            }
+        }
+    }
+    Some(inv)
+}
+
+/// [`SparseW8`], computed once from `poseidon1_w8`'s constants.
+pub fn sparse_w8() -> &'static SparseW8 {
+    static TABLE: std::sync::OnceLock<SparseW8> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let rc = |r: usize| -> [FE; W8] {
+            core::array::from_fn(|i| FE::from(w8::constants::ROUND_CONSTANTS[r][i]))
+        };
+        let m = w8_mds();
+        let half = w8::HALF_FULL_ROUNDS;
+        let partial = w8::PARTIAL_ROUNDS;
+        // Constants: push each partial round's lanes 1..8 forward.
+        let mut partial_rc = [FE::zero(); w8::PARTIAL_ROUNDS];
+        let mut carry = rc(half);
+        for (k, out) in partial_rc.iter_mut().enumerate() {
+            *out = carry[0];
+            let mut rest = carry;
+            rest[0] = FE::zero();
+            let pushed = mat_vec(&m, &rest);
+            carry = if k + 1 < partial {
+                let next = rc(half + k + 1);
+                core::array::from_fn(|i| next[i] + pushed[i])
+            } else {
+                pushed
+            };
+        }
+        let mut full_rc: [[FE; W8]; 8] = core::array::from_fn(|f| {
+            rc(if f < half { f } else { half + partial + f - half })
+        });
+        for (i, v) in full_rc[half].iter_mut().enumerate() {
+            *v += carry[i];
+        }
+        // Matrices: from the last partial round back.
+        let mut sp_a = [FE::zero(); w8::PARTIAL_ROUNDS];
+        let mut sp_v = [[FE::zero(); W8 - 1]; w8::PARTIAL_ROUNDS];
+        let mut sp_w = [[FE::zero(); W8 - 1]; w8::PARTIAL_ROUNDS];
+        let mut a = m;
+        for k in (0..partial).rev() {
+            let hat: [[FE; W8 - 1]; W8 - 1] =
+                core::array::from_fn(|i| core::array::from_fn(|j| a[i + 1][j + 1]));
+            let hat_inv = inverse7(&hat).expect("an MDS matrix's square submatrices are invertible");
+            sp_a[k] = a[0][0];
+            // ṽᵀ = vᵀ · Â⁻¹.
+            sp_v[k] = core::array::from_fn(|j| {
+                (0..W8 - 1).fold(FE::zero(), |acc, i| acc + a[0][i + 1] * hat_inv[i][j])
+            });
+            sp_w[k] = core::array::from_fn(|i| a[i + 1][0]);
+            let d: [[FE; W8]; W8] = core::array::from_fn(|i| {
+                core::array::from_fn(|j| match (i, j) {
+                    (0, 0) => FE::one(),
+                    (0, _) | (_, 0) => FE::zero(),
+                    _ => hat[i - 1][j - 1],
+                })
+            });
+            a = mat_mul(&d, &m);
+        }
+        SparseW8 {
+            full_rc,
+            first_matrix: a,
+            partial_rc,
+            sp_a,
+            sp_v,
+            sp_w,
+        }
+    })
+}
+
+/// The sparse form on the host: what [`w8_permute_lanes`] emits, round for
+/// round. Equal to `poseidon1_w8::permute` (`p1w16_emit_tests`).
+pub fn w8_sparse_host(input: [FE; W8]) -> [FE; W8] {
+    let t = sparse_w8();
+    let m = w8_mds();
+    let half = w8::HALF_FULL_ROUNDS;
+    let sbox = |x: FE| x * x * x * x * x * x * x;
+    let mut s = input;
+    for r in 0..half {
+        for i in 0..W8 {
+            s[i] = sbox(s[i] + t.full_rc[r][i]);
+        }
+        s = mat_vec(if r + 1 == half { &t.first_matrix } else { &m }, &s);
+    }
+    for k in 0..w8::PARTIAL_ROUNDS {
+        s[0] = sbox(s[0] + t.partial_rc[k]);
+        let s0 = s[0];
+        let y0 = (1..W8).fold(t.sp_a[k] * s0, |acc, j| acc + t.sp_v[k][j - 1] * s[j]);
+        for j in 1..W8 {
+            s[j] += t.sp_w[k][j - 1] * s0;
+        }
+        s[0] = y0;
+    }
+    for f in half..2 * half {
+        for i in 0..W8 {
+            s[i] = sbox(s[i] + t.full_rc[f][i]);
+        }
+        s = mat_vec(&m, &s);
+    }
+    s
+}
+
+/// `seed + Σ coeff·lane` in as few rows as the terms allow: constant terms
+/// fold into the seed; a variable term of coefficient one starts the chain
+/// when the seed is zero; every other variable term is one `Mul`/`MulAdd`.
+fn lin(b: &mut LfmBuilder, seed: FE, terms: &[(FE, Lane)]) -> Lane {
+    let mut seed = seed;
+    let mut vars: Vec<(FE, Felt)> = Vec::with_capacity(terms.len());
+    for &(k, lane) in terms {
+        match lane {
+            Lane::Const(v) => seed += k * v,
+            Lane::Var(f) if k != FE::zero() => vars.push((k, f)),
+            Lane::Var(_) => {}
+        }
+    }
+    if vars.is_empty() {
+        return Lane::Const(seed);
+    }
+    let mut acc: Option<Felt> = None;
+    if seed == FE::zero()
+        && let Some(at) = vars.iter().position(|(k, _)| *k == FE::one())
+    {
+        acc = Some(vars.remove(at).1);
+    }
+    for (k, f) in vars {
+        let kc = b.felt_const(k);
+        acc = Some(match acc {
+            Some(a) => b.mul_add(kc, f, a),
+            None if seed == FE::zero() => b.mul(kc, f),
+            None => {
+                let c = b.felt_const(seed);
+                b.mul_add(kc, f, c)
+            }
+        });
+    }
+    Lane::Var(acc.expect("at least one variable term"))
+}
+
+fn sbox_lane(b: &mut LfmBuilder, x: Lane) -> Lane {
+    match x {
+        Lane::Const(v) => Lane::Const(v * v * v * v * v * v * v),
+        Lane::Var(f) => Lane::Var(sbox7(b, f)),
+    }
+}
+
+/// ★ The width-8 permutation in its sparse form ([`SparseW8`]), with the
+/// constant input lanes folded at emit time and only the first `keep` output
+/// lanes computed. Each round's constant seeds the chains of the matrix before
+/// it, as [`w8_permute`] does, so after round 0 the constants cost nothing.
+///
+/// Rows: a partial round is its S-box (four `Mul`s) and `Sp` (eight for the
+/// new lane 0, seven `MulAdd`s for the rest) — 19 against the dense 68 — and
+/// a constant input lane costs no S-box and no matrix term in round 0.
+pub fn w8_permute_lanes(b: &mut LfmBuilder, input: [Lane; W8], keep: usize) -> Vec<Felt> {
+    assert!((1..=W8).contains(&keep), "keep 1..=8 output lanes");
+    let t = sparse_w8();
+    let m = w8_mds();
+    let half = w8::HALF_FULL_ROUNDS;
+    let partial = w8::PARTIAL_ROUNDS;
+    // Round 0's constant: added (a variable lane costs one `Add`).
+    let mut s: [Lane; W8] = core::array::from_fn(|i| match input[i] {
+        Lane::Const(v) => Lane::Const(v + t.full_rc[0][i]),
+        Lane::Var(f) if t.full_rc[0][i] == FE::zero() => Lane::Var(f),
+        Lane::Var(f) => {
+            let c = b.felt_const(t.full_rc[0][i]);
+            Lane::Var(b.add(f, c))
+        }
+    });
+    // The first half: full rounds, the last one's matrix `D₀ · M`, each seeded
+    // with the next round's constant (the first partial round's is lane 0's).
+    for r in 0..half {
+        let f: [Lane; W8] = core::array::from_fn(|i| sbox_lane(b, s[i]));
+        let matrix = if r + 1 == half { &t.first_matrix } else { &m };
+        s = core::array::from_fn(|o| {
+            let seed = if r + 1 < half {
+                t.full_rc[r + 1][o]
+            } else if o == 0 {
+                t.partial_rc[0]
+            } else {
+                FE::zero()
+            };
+            let terms: Vec<(FE, Lane)> = (0..W8).map(|i| (matrix[o][i], f[i])).collect();
+            lin(b, seed, &terms)
+        });
+    }
+    // The partial rounds: S-box on lane 0, then `Sp`, seeded with the next
+    // round's constant (after the last, the terminal full round's).
+    for k in 0..partial {
+        let s0 = sbox_lane(b, s[0]);
+        let next: [FE; W8] = if k + 1 < partial {
+            core::array::from_fn(|i| if i == 0 { t.partial_rc[k + 1] } else { FE::zero() })
+        } else {
+            t.full_rc[half]
+        };
+        let mut terms0: Vec<(FE, Lane)> = vec![(t.sp_a[k], s0)];
+        terms0.extend((1..W8).map(|j| (t.sp_v[k][j - 1], s[j])));
+        let y0 = lin(b, next[0], &terms0);
+        for j in 1..W8 {
+            s[j] = lin(b, next[j], &[(FE::one(), s[j]), (t.sp_w[k][j - 1], s0)]);
+        }
+        s[0] = y0;
+    }
+    // The terminal full rounds, the last computing only `keep` lanes.
+    for f in half..2 * half {
+        let x: [Lane; W8] = core::array::from_fn(|i| sbox_lane(b, s[i]));
+        let last = f + 1 == 2 * half;
+        let outputs = if last { keep } else { W8 };
+        let mut out = s;
+        for (o, slot) in out.iter_mut().enumerate().take(outputs) {
+            let seed = if last { FE::zero() } else { t.full_rc[f + 1][o] };
+            let terms: Vec<(FE, Lane)> = (0..W8).map(|i| (m[o][i], x[i])).collect();
+            *slot = lin(b, seed, &terms);
+        }
+        s = out;
+    }
+    s[..keep]
+        .iter()
+        .map(|lane| match *lane {
+            Lane::Const(v) => b.felt_const(v),
+            Lane::Var(f) => f,
+        })
+        .collect()
 }
