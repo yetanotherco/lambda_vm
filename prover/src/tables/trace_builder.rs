@@ -75,6 +75,7 @@ use crate::Error;
 use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
 
+mod clock;
 mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
@@ -458,6 +459,10 @@ fn collect_cpu_ops_into(
     first: usize,
     cpu_ops: &mut Vec<CpuOperation>,
 ) -> Result<(), Error> {
+    clock::check_clock(
+        clock::window_max_timestamp(first, logs.len()),
+        "the run's walk",
+    )?;
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location. The +4 stride reserves
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
@@ -5436,7 +5441,9 @@ fn build_traces<I: ImageSource + Sync>(
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
         // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
         // must match that last write to balance the memory argument.
-        register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
+        let final_pc = halt_timestamp + 4 * num_padding_rows as u64 + 1;
+        clock::check_clock(final_pc, "the CPU's last padding row")?;
+        register_state.write_pc(1, final_pc);
         (halt_timestamp, halt_next_pc)
     } else {
         (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)

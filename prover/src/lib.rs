@@ -761,6 +761,9 @@ pub enum Error {
     /// layout: unaligned or overflowing base, zero count, more pages than the
     /// proof can hold, or two pages covering the same address.
     MalformedPageLayout(String),
+    /// A timestamp would reach 2^32, past the CPU's 32-bit clock: the run's
+    /// buses cannot balance (`tables::trace_builder::clock`).
+    ClockPastLimit(String),
 }
 
 impl fmt::Display for Error {
@@ -791,6 +794,7 @@ impl fmt::Display for Error {
             }
             Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
             Error::MalformedPageLayout(msg) => write!(f, "malformed page layout: {msg}"),
+            Error::ClockPastLimit(msg) => write!(f, "clock past its limit: {msg}"),
         }
     }
 }
