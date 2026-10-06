@@ -364,19 +364,20 @@ fn canon(x: &FE) -> u64 {
 /// `-si` (the bounded-slot interpreter forced). Sizes: `P3_BENCH_LOGS`.
 ///
 /// Prints one `P3BENCH` line per arm and size, and with `instruments` the
-/// prover's round split for the last rep.
-#[cfg(feature = "cuda")]
+/// prover's round split for every prove. Without `cuda` it proves on the host
+/// (`engine host`): a format check for the box script's readout, not a number.
 #[test]
 #[ignore = "card: proves 2^18..2^20-row hash tables; run on the box with --ignored"]
 fn socket_prove_cost_on_the_card() {
     use std::time::Instant;
 
     use rayon::prelude::*;
+    #[cfg(feature = "cuda")]
     use stark::constraint_ir::gpu_interp::{
         GPU_COMPOSITION_COMPILED_CALLS, GPU_COMPOSITION_SI_CALLS, SiMode, SiTuning,
         override_compiled_constraints, override_interp_si,
     };
-    use stark::leaf_layout::table_leaf_layout;
+    use stark::leaf_layout::{LeafLayout, table_leaf_layout};
     use stark::prover::IsStarkProver;
     use stark::residency_mode::ResidencyMode;
     use stark::trace::TraceTable;
@@ -456,21 +457,19 @@ fn socket_prove_cost_on_the_card() {
         data
     };
 
-    // The preprocessed root of `data`'s first `prep` columns under the leaf
-    // layout the prover resolves for `air` at `n` rows.
-    let prep_root =
-        |data: &[FE],
-         w: usize,
-         prep: usize,
-         n: usize,
-         air: &dyn AIR<Field = Gl, FieldExtension = Gl3, PublicInputs = ()>| {
-            let columns: Vec<Vec<FE>> = (0..prep)
-                .map(|c| (0..n).map(|r| data[r * w + c]).collect())
-                .collect();
-            let layout = table_leaf_layout(air, n);
-            super::commit::commit_columns_with(&columns, &opts, layout)
-        };
+    // The preprocessed roots of `data`'s first `prep` columns under both leaf
+    // layouts (row pairs, one row): the prover asks for the one it resolves.
+    let prep_roots = |data: &[FE], w: usize, prep: usize, n: usize| {
+        let columns: Vec<Vec<FE>> = (0..prep)
+            .map(|c| (0..n).map(|r| data[r * w + c]).collect())
+            .collect();
+        let at = |layout| super::commit::commit_columns_with(&columns, &opts, layout);
+        (at(LeafLayout::RowPair), at(LeafLayout::Row))
+    };
 
+    // The composition engine for the next prove, and the counters that say
+    // which one ran.
+    #[cfg(feature = "cuda")]
     let set_eval = |forced_si: bool| {
         if forced_si {
             override_compiled_constraints(Some(false));
@@ -480,6 +479,17 @@ fn socket_prove_cost_on_the_card() {
             override_interp_si(None);
         }
     };
+    #[cfg(not(feature = "cuda"))]
+    let set_eval = |_forced_si: bool| {};
+    #[cfg(feature = "cuda")]
+    let engine_calls = || {
+        (
+            GPU_COMPOSITION_COMPILED_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            GPU_COMPOSITION_SI_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    #[cfg(not(feature = "cuda"))]
+    let engine_calls = || (0u64, 0u64);
 
     let prove = |air: &dyn AIR<Field = Gl, FieldExtension = Gl3, PublicInputs = ()>,
                  data: &[FE],
@@ -520,9 +530,9 @@ fn socket_prove_cost_on_the_card() {
                 "rpx" => {
                     let w = super::chips::hash::num_columns(HasherKind::Rpx);
                     let data = rpx_trace(n);
-                    let probe = rpx_air(&opts, [0u8; 32]);
-                    let root = prep_root(&data, w, rcols::PREP_WIDTH, n, &probe);
-                    (base, 325, w, data, Box::new(rpx_air(&opts, root)) as DynAir)
+                    let (pair, row) = prep_roots(&data, w, rcols::PREP_WIDTH, n);
+                    let a = rpx_air(&opts, pair).with_one_row_commitment(Some(row));
+                    (base, 325, w, data, Box::new(a) as DynAir)
                 }
                 _ => {
                     let form = if base == "p1bus" {
@@ -532,12 +542,18 @@ fn socket_prove_cost_on_the_card() {
                     };
                     let w = form.num_columns();
                     let data = socket_trace(form, n);
-                    let probe = air(form, &opts, [0u8; 32]);
-                    let root = prep_root(&data, w, cols::PREP_WIDTH, n, &probe);
-                    let a = Box::new(air(form, &opts, root)) as DynAir;
+                    let (pair, row) = prep_roots(&data, w, cols::PREP_WIDTH, n);
+                    let a = air(form, &opts, pair).with_one_row_commitment(Some(row));
+                    let a = Box::new(a) as DynAir;
                     (base, form.cells_per_permutation(), w, data, a)
                 }
             });
+        }
+        for (base, cells, w, _, a) in &chips {
+            println!(
+                "P3BENCH-CHIP {base} log {log} cols {w} cells {cells} layout {:?}",
+                table_leaf_layout(a.as_ref(), n)
+            );
         }
         for arm in &arms {
             let base = arm.trim_end_matches("-si");
@@ -551,19 +567,14 @@ fn socket_prove_cost_on_the_card() {
             let base = arm.trim_end_matches("-si");
             let (_, _, w, data, a) = chips.iter().find(|c| c.0 == base).expect("a chip");
             set_eval(arm.ends_with("-si"));
-            let (c0, s0) = (
-                GPU_COMPOSITION_COMPILED_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-                GPU_COMPOSITION_SI_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            let (c0, s0) = engine_calls();
             let secs = prove(a.as_ref(), data, *w);
-            let (c1, s1) = (
-                GPU_COMPOSITION_COMPILED_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-                GPU_COMPOSITION_SI_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            let (c1, s1) = engine_calls();
             let engine = match (c1 - c0, s1 - s0) {
                 (c, 0) if c > 0 => "compiled",
                 (0, s) if s > 0 => "si",
-                (0, 0) => "interp",
+                (0, 0) if cfg!(feature = "cuda") => "interp",
+                (0, 0) => "host",
                 _ => "mixed",
             };
             #[cfg(feature = "instruments")]
