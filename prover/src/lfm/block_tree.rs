@@ -1142,6 +1142,15 @@ pub(super) fn compose_block_tree_with(
             if top { " (the top)" } else { "" }
         ));
         walls.push(wall);
+        // `LAMBDA_VM_TREE_LEVEL_PURGE`: the level's freed pages back to the OS
+        // before the next level, only where the host is short.
+        if !top {
+            crate::alloc_purge::purge_after_level(
+                lv + 1,
+                crate::block::spill_target_bytes(),
+                &|l: &str| sink.line(l),
+            );
+        }
         level = next;
     }
     if level.len() != 1 {
@@ -1771,6 +1780,9 @@ pub fn prove_block_tree(
         "   BLOCK LEVEL 0: {k} leaves in {level0:.2}s · host peak {l0_peak:.3} GiB{}",
         pct(l0_peak)
     ));
+    crate::alloc_purge::purge_after_level(0, crate::block::spill_target_bytes(), &|l: &str| {
+        sink.line(l)
+    });
 
     // ---- the interior and the top.
     let siblings = cfg.siblings;

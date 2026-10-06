@@ -176,6 +176,99 @@ pub fn purge_point(point: &str) -> Option<Purge> {
     Some(purge)
 }
 
+/// `LAMBDA_VM_TREE_LEVEL_PURGE`: a purge after each level of the block tree.
+/// `auto` (unset or empty, the default) purges after a level only when the
+/// block's memory is short ([`note_memory_pressure`]) and the process's
+/// resident set has reached [`LEVEL_PURGE_SHARE`] of the host target, so a
+/// host with room never purges; `off` never purges there; `always` purges after
+/// every level (a measurement arm). A tree level frees what it allocated —
+/// its programs, its proofs' working sets — into pages the next level rarely
+/// reuses: at the p90 block on a 74 GiB emulated host the recursion's VmRSS
+/// peaked 12.9–30 GiB over its live heap (BIG 662, decay 0 against the
+/// posture, I-MEMFIT §1.7b).
+pub const LEVEL_PURGE_ENV: &str = "LAMBDA_VM_TREE_LEVEL_PURGE";
+
+/// `auto` purges after a level once VmRSS reaches this share of the host
+/// target. The p90 block's recursion reaches ≈ 94 GiB against a 110.7 GiB
+/// target on a 128 GiB host (85 %), so the purges stay off there.
+pub const LEVEL_PURGE_SHARE: f64 = 0.9;
+
+/// What [`LEVEL_PURGE_ENV`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelPurge {
+    Auto,
+    Off,
+    Always,
+}
+
+/// A value of [`LEVEL_PURGE_ENV`]; nonsense is an error.
+pub fn parse_level_purge(value: Option<&str>) -> Result<LevelPurge, String> {
+    match value.map(str::trim) {
+        None | Some("" | "auto") => Ok(LevelPurge::Auto),
+        Some("off") => Ok(LevelPurge::Off),
+        Some("always") => Ok(LevelPurge::Always),
+        Some(v) => Err(format!(
+            "{LEVEL_PURGE_ENV} must be auto, off or always, got `{v}`"
+        )),
+    }
+}
+
+/// Whether to purge after a level: the setting, the block's memory pressure,
+/// and the resident set against the target (no reading: no purge under
+/// `auto`). `Err` says why `auto` skipped it.
+fn level_decision(
+    setting: LevelPurge,
+    pressure: bool,
+    resident: Option<u64>,
+    target: u64,
+) -> Result<(), &'static str> {
+    match setting {
+        LevelPurge::Off => Err("off"),
+        LevelPurge::Always => Ok(()),
+        LevelPurge::Auto if !pressure => Err("auto, no memory pressure"),
+        LevelPurge::Auto => match resident {
+            Some(r) if r as f64 >= LEVEL_PURGE_SHARE * target as f64 => Ok(()),
+            Some(_) => Err("auto, the host has room"),
+            None => Err("auto, no resident reading"),
+        },
+    }
+}
+
+/// After the block tree's level `level` (0 = the leaves): purge every arena
+/// when [`LEVEL_PURGE_ENV`] says so against the host `target`, and print one
+/// `ALLOC PURGE level-N` line through `say` (what it did, or why `auto`
+/// skipped it; nothing for `off`). Returns the purge when it ran.
+pub fn purge_after_level(level: usize, target: u64, say: &dyn Fn(&str)) -> Option<Purge> {
+    let setting = match parse_level_purge(std::env::var(LEVEL_PURGE_ENV).ok().as_deref()) {
+        Ok(s) => s,
+        Err(why) => {
+            say(&format!("ALLOC PURGE level-{level}: {why}; not purged"));
+            return None;
+        }
+    };
+    let pressure = PRESSURE.load(std::sync::atomic::Ordering::Relaxed);
+    let resident = crate::lfm::program_budget::resident_bytes();
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if let Err(why) = level_decision(setting, pressure, resident, target) {
+        if setting != LevelPurge::Off {
+            say(&format!(
+                "ALLOC PURGE level-{level}: skipped ({why}; VmRSS {} of the target {:.2} GiB)",
+                resident.map_or("unread".to_string(), |r| format!("{:.2}", gib(r))),
+                gib(target)
+            ));
+        }
+        return None;
+    }
+    let purge = purge_all_arenas()?;
+    say(&format!(
+        "ALLOC PURGE level-{level}: {:.3}s · jemalloc resident {:.2} → {:.2} GiB",
+        purge.secs,
+        gib(purge.resident_before as u64),
+        gib(purge.resident_after as u64)
+    ));
+    Some(purge)
+}
+
 /// Purge every arena through the hooks, timed, with the resident bytes
 /// before and after.
 fn purge_all_arenas() -> Option<Purge> {
@@ -254,6 +347,40 @@ mod tests {
     /// `auto` (the default) purges at phase A's end and the base's end only
     /// under memory pressure, and says it skipped otherwise; never at `tree`;
     /// `off` purges nowhere; `all` and a list purge regardless of pressure.
+    #[test]
+    fn the_level_purge_knob_reads_auto_off_or_always() {
+        assert_eq!(parse_level_purge(None), Ok(LevelPurge::Auto));
+        assert_eq!(parse_level_purge(Some("")), Ok(LevelPurge::Auto));
+        assert_eq!(parse_level_purge(Some("off")), Ok(LevelPurge::Off));
+        assert_eq!(parse_level_purge(Some(" always ")), Ok(LevelPurge::Always));
+        assert!(parse_level_purge(Some("yes")).is_err());
+    }
+
+    /// `auto` purges after a level only under memory pressure and with the
+    /// host near its target; a host with room never purges.
+    #[test]
+    fn a_level_purge_needs_pressure_and_a_full_host() {
+        const G: u64 = 1 << 30;
+        let target = 100 * G;
+        use LevelPurge::*;
+        assert_eq!(level_decision(Auto, true, Some(95 * G), target), Ok(()));
+        assert_eq!(level_decision(Auto, true, Some(90 * G), target), Ok(()));
+        assert_eq!(
+            level_decision(Auto, true, Some(89 * G), target),
+            Err("auto, the host has room")
+        );
+        assert_eq!(
+            level_decision(Auto, false, Some(99 * G), target),
+            Err("auto, no memory pressure")
+        );
+        assert_eq!(
+            level_decision(Auto, true, None, target),
+            Err("auto, no resident reading")
+        );
+        assert_eq!(level_decision(Off, true, Some(99 * G), target), Err("off"));
+        assert_eq!(level_decision(Always, false, Some(G), target), Ok(()));
+    }
+
     #[test]
     fn auto_purges_only_under_memory_pressure() {
         for setting in [None, Some(""), Some("auto"), Some(" auto ")] {
