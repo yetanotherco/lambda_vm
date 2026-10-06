@@ -4540,6 +4540,69 @@ pub(crate) fn block_statement_bytes(
     bytes
 }
 
+/// The `append_bytes` calls [`absorb_block`] makes, in its order: what an
+/// in-guest verifier of a Poseidon1 base absorbs call by call, because that
+/// sponge binds each call's length (`P1Transcript::append_bytes`). Recorded
+/// from [`absorb_block`] itself, so the two cannot drift; their concatenation
+/// is [`block_statement_bytes`]. Refuses a statement whose absorb is not only
+/// byte strings, which the replay could not follow.
+pub(crate) fn block_statement_calls(
+    statement: BlockStatement<'_>,
+    tag: &[u8],
+    elf_bytes: &[u8],
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut calls = StatementCalls::default();
+    absorb_block(
+        &mut calls,
+        tag,
+        elf_bytes,
+        statement.public_output,
+        statement.table_counts,
+        statement.num_private_input_pages,
+        statement.runtime_page_ranges,
+        statement.table_num_vars,
+        config,
+        statement.groups,
+    );
+    if calls.foreign {
+        return Err("the block statement absorbs more than byte strings".to_string());
+    }
+    Ok(calls.bytes)
+}
+
+/// A transcript that records `append_bytes` calls and nothing else
+/// ([`block_statement_calls`]); any other call marks the record unusable.
+#[derive(Default)]
+struct StatementCalls {
+    bytes: Vec<Vec<u8>>,
+    foreign: bool,
+}
+
+impl IsTranscript<E> for StatementCalls {
+    fn append_field_element(&mut self, _element: &FieldElement<E>) {
+        self.foreign = true;
+    }
+
+    fn append_bytes(&mut self, new_bytes: &[u8]) {
+        self.bytes.push(new_bytes.to_vec());
+    }
+
+    fn state(&self) -> [u8; 32] {
+        [0; 32]
+    }
+
+    fn sample_field_element(&mut self) -> FieldElement<E> {
+        self.foreign = true;
+        FieldElement::zero()
+    }
+
+    fn sample_u64(&mut self, _upper_bound: u64) -> u64 {
+        self.foreign = true;
+        0
+    }
+}
+
 /// The statement's fields: everything of a [`BlockWhirProof`] the verifier
 /// reads before any root, which is everything but its argument.
 #[derive(Clone, Copy, Debug)]
