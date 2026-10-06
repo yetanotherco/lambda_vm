@@ -382,7 +382,14 @@ where
         } = self;
         let commitments = commitments
             .into_iter()
-            .map(|commitment| commitment.retire(drop, config.format.cap))
+            .map(|commitment| {
+                commitment.retire(
+                    drop,
+                    config
+                        .format
+                        .cap_policy_at(crate::whir_hash::arity::<F, H>()),
+                )
+            })
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(RetiredStack {
             layout,
