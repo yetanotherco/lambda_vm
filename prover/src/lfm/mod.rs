@@ -61,6 +61,7 @@ pub mod logup;
 pub mod merkle_cap;
 pub mod p1_commit;
 pub mod p1w16_chip;
+pub mod p1w16_emit;
 pub mod p1w16_socket;
 pub mod per_table_aggregator;
 pub mod poseidon;
@@ -191,6 +192,8 @@ mod one_row_tests;
 mod p1w16_census_tests;
 #[cfg(test)]
 mod p1w16_chip_tests;
+#[cfg(test)]
+mod p1w16_emit_tests;
 #[cfg(test)]
 mod p1w16_machine_tests;
 #[cfg(test)]
