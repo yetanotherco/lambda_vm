@@ -153,6 +153,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
     /// builds, 0 for one table.
     finish_keccak_rnd_rows: usize,
+    /// [`Self::cuts_at_finish`]: rows per KECCAK, ECSM and ECDAS table `finish`
+    /// builds, 0 for one table each.
+    finish_cut_rows: (usize, usize, usize),
     /// [`Self::pack_finished_tables`].
     pack_finished: bool,
     /// [`Self::generate_packed`].
@@ -214,6 +217,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             lean,
             decode,
             finish_keccak_rnd_rows: 0,
+            finish_cut_rows: (0, 0, 0),
             pack_finished: false,
             gpack: false,
         })
@@ -283,6 +287,28 @@ impl<'a> WindowedTraceBuilder<'a> {
             )));
         }
         self.finish_keccak_rnd_rows = rows;
+        Ok(self)
+    }
+
+    /// `finish` builds KECCAK, ECSM and ECDAS as the tables of `keccak`, `ecsm`
+    /// and `ecdas` rows the block's split makes of each whole table — each cut
+    /// built from the ops that reach it, and packed as it is built with
+    /// [`Self::pack_finished_tables`] — instead of one wide table each that the
+    /// split then copies apart. The words are the same. Each a power of two.
+    pub fn cuts_at_finish(
+        mut self,
+        keccak: usize,
+        ecsm: usize,
+        ecdas: usize,
+    ) -> Result<Self, Error> {
+        for (name, rows) in [("KECCAK", keccak), ("ECSM", ecsm), ("ECDAS", ecdas)] {
+            if !rows.is_power_of_two() {
+                return Err(Error::Prover(format!(
+                    "{name} cut at {rows} rows: a power of two is needed"
+                )));
+            }
+        }
+        self.finish_cut_rows = (keccak, ecsm, ecdas);
         Ok(self)
     }
 
@@ -478,6 +504,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept,
             stream_memw_lt,
             finish_keccak_rnd_rows,
+            finish_cut_rows,
             pack_finished,
             gpack,
             ..
@@ -492,9 +519,13 @@ impl<'a> WindowedTraceBuilder<'a> {
         } else {
             emitted
         };
+        let (keccak_rows, ecsm_rows, ecdas_rows) = finish_cut_rows;
         let emitted = StreamSkip {
             pack: pack_finished,
             gpack: pack_finished && gpack,
+            keccak_rows,
+            ecsm_rows,
+            ecdas_rows,
             ..emitted
         };
         let (ops, decode_trace, skip, pre) = match kept {
