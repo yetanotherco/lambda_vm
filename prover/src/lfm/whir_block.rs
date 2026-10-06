@@ -394,9 +394,11 @@ impl WhirBlockPlan {
         match crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))? {
             crate::block_whir::BlockHash::Binary => {
                 if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
-                    return Err("the block's recursion verifies a block proved over RPX; set \
+                    return Err(
+                        "the block's recursion verifies a block proved over RPX; set \
                          LAMBDA_VM_WHIR_HASH=rpx"
-                        .to_string());
+                            .to_string(),
+                    );
                 }
             }
             crate::block_whir::BlockHash::Poseidon1 => {}
@@ -407,12 +409,9 @@ impl WhirBlockPlan {
         let tag = crate::block_whir::block_statement_tag(base);
         let statement_bytes = block_statement_bytes(statement, &tag, &elf_digest, &frame.config);
         let statement_calls = match wrap_hash {
-            super::edsl::WrapHash::Poseidon1 => crate::block_whir::block_statement_calls(
-                statement,
-                &tag,
-                elf_bytes,
-                &frame.config,
-            )?,
+            super::edsl::WrapHash::Poseidon1 => {
+                crate::block_whir::block_statement_calls(statement, &tag, elf_bytes, &frame.config)?
+            }
             _ => Vec::new(),
         };
         let groups: Vec<Vec<usize>> = statement
@@ -1667,7 +1666,5 @@ fn commit_prepared(
     config: &multilinear::whir_chain::ChainConfig,
     base: &stark::proof::options::BaseFormat,
 ) -> Result<Vec<Commitment>, crate::Error> {
-    crate::with_block_hash!(*base, |H| {
-        Ok(commit_group::<H>(stack, config)?.roots)
-    })
+    crate::with_block_hash!(*base, |H| { Ok(commit_group::<H>(stack, config)?.roots) })
 }

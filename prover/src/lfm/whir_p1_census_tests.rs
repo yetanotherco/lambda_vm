@@ -16,7 +16,6 @@ use super::whir_block::{BlockPartition, WhirBlockPlan};
 use crate::block_whir::{BlockFormat, BlockStatement, OwnedBlockStatement};
 use stark::proof::options::BaseFormat;
 
-
 /// The median 25475471's tables (ULTRA mc12's BLOCK CENSUS, #1013), AIR order
 /// after the fixed tables: `(kind, [(rows, count)])`, and its 198 pages.
 const MEDIAN_MIX: &[(&str, &[(usize, usize)])] = &[
@@ -225,7 +224,13 @@ fn census_leaf(label: &str, program: &super::compiler::LfmProgram) -> u64 {
         chips
             .iter()
             .filter(|c| c.real_rows > 0)
-            .map(|c| format!("{}={}/{}x{}", c.name, c.real_rows, c.rows, c.main_cols + c.aux_cols))
+            .map(|c| format!(
+                "{}={}/{}x{}",
+                c.name,
+                c.real_rows,
+                c.rows,
+                c.main_cols + c.aux_cols
+            ))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -269,7 +274,13 @@ fn whir_p1_leaf_census() {
             costs
         );
         let heaviest = (0..plan.partition().num_leaves())
-            .max_by_key(|&k| plan.partition().leaf(k).iter().map(|&g| costs[g]).sum::<usize>())
+            .max_by_key(|&k| {
+                plan.partition()
+                    .leaf(k)
+                    .iter()
+                    .map(|&g| costs[g])
+                    .sum::<usize>()
+            })
             .expect("a leaf");
         let program = plan.leaf_program(heaviest).expect("the leaf emits");
         census_leaf(
@@ -316,7 +327,13 @@ fn whir_p1_leaf_census() {
         .expect("the plan derives at 2^17");
         let costs = plan.costs().to_vec();
         let heaviest = (0..plan.partition().num_leaves())
-            .max_by_key(|&k| plan.partition().leaf(k).iter().map(|&g| costs[g]).sum::<usize>())
+            .max_by_key(|&k| {
+                plan.partition()
+                    .leaf(k)
+                    .iter()
+                    .map(|&g| costs[g])
+                    .sum::<usize>()
+            })
             .expect("a leaf");
         println!(
             "CENSUS P1@2^17 PLAN: {} leaves · heaviest leaf {heaviest} groups {:?}",

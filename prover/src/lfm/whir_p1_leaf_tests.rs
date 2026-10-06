@@ -56,7 +56,11 @@ fn felt(seed: u64, i: usize) -> FE {
 }
 
 fn fee(seed: u64, i: usize) -> FEE {
-    FEE::new([felt(seed, 3 * i), felt(seed, 3 * i + 1), felt(seed, 3 * i + 2)])
+    FEE::new([
+        felt(seed, 3 * i),
+        felt(seed, 3 * i + 1),
+        felt(seed, 3 * i + 2),
+    ])
 }
 
 /// Compile, validate and run `b`'s program; the published words, flattened.
@@ -89,9 +93,7 @@ enum Call {
 #[test]
 fn the_p1_whir_transcript_replays_the_hosts_stream() {
     let root = |seed: u64| -> [u8; 32] {
-        crypto::hash::rpx::digest_to_commitment(&core::array::from_fn::<_, 4, _>(|k| {
-            felt(seed, k)
-        }))
+        crypto::hash::rpx::digest_to_commitment(&core::array::from_fn::<_, 4, _>(|k| felt(seed, k)))
     };
     let mut calls = vec![
         Call::Bytes(b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1/P1W16/C2".to_vec()),
@@ -211,8 +213,15 @@ fn the_p1_whir_transcript_replays_the_hosts_stream() {
             }
         }
     }
-    assert_eq!(got.len(), expect_words.len(), "one published word per output");
-    assert_eq!(got, expect_words, "the replay's draws and states are the host's");
+    assert_eq!(
+        got.len(),
+        expect_words.len(),
+        "one published word per output"
+    );
+    assert_eq!(
+        got, expect_words,
+        "the replay's draws and states are the host's"
+    );
 }
 
 /// The byte arm is untouched: a [`WhirTranscript::for_builder`] of an RPX
@@ -303,9 +312,17 @@ fn the_child_order_walk_reaches_the_hosts_root() {
                 arena.extend(hints.iter().copied());
                 let got = run(b, &[arena]).expect("the walks execute");
                 let (child_root, hint_root) = (&got[..4], &got[4..8]);
-                assert_eq!(hint_root, &root[..], "bits {bits} index {index}: hint order");
+                assert_eq!(
+                    hint_root,
+                    &root[..],
+                    "bits {bits} index {index}: hint order"
+                );
                 if moved.is_none() {
-                    assert_eq!(child_root, &root[..], "bits {bits} index {index}: child order");
+                    assert_eq!(
+                        child_root,
+                        &root[..],
+                        "bits {bits} index {index}: child order"
+                    );
                 } else {
                     assert_ne!(
                         child_root,
@@ -374,8 +391,7 @@ fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
     let f = pseudo_mle(num_vars, 11);
     let z = point(num_vars, 0);
     let y = f.evaluate_in::<E>(&z).expect("f takes its own point");
-    let (commitment, domain) =
-        commit::<F, P1Whir>(&f, &cfg, true).expect("the polynomial commits");
+    let (commitment, domain) = commit::<F, P1Whir>(&f, &cfg, true).expect("the polynomial commits");
     let mut proving = P1Transcript::new();
     let proof = prove::<F, E, _, P1Whir>(&f, &z, &commitment, &domain, &cfg, &mut proving)
         .expect("the chain proves");
@@ -460,9 +476,13 @@ fn hash16_rows(program: &LfmProgram) -> usize {
 fn chain_cases() -> Vec<(usize, ChainConfig)> {
     let mut cases = Vec::new();
     for cap4 in [CapPolicy::Off, CapPolicy::Fixed(2)] {
-        for (num_vars, num_queries, grind) in
-            [(5usize, 3usize, 0u8), (6, 4, 0), (9, 3, 0), (6, 3, 6), (9, 4, 6)]
-        {
+        for (num_vars, num_queries, grind) in [
+            (5usize, 3usize, 0u8),
+            (6, 4, 0),
+            (9, 3, 0),
+            (6, 3, 6),
+            (9, 4, 6),
+        ] {
             cases.push((num_vars, p1_config(num_queries, grind, cap4)));
         }
     }
