@@ -759,6 +759,8 @@ fn leaf_row_with_third_cell(
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
             super::trace::fill_rpx_witness(&mut row);
         }
+        // The width-16 socket has no twelve-felt LEAF mode to forge a row in.
+        HasherKind::Poseidon1W16 => {}
     }
     row
 }

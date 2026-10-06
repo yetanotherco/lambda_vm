@@ -148,9 +148,26 @@ pub struct LfmProgram {
     /// [`Self::blake3_chunking`]'s terms: each chunk commits its own
     /// instruction group, and the split is bound into `program_id`.
     pub hash_chunking: HashChunking,
+    /// Whether this program's `LFM_HASH` rows are width-16 (`Instr::Hash16`):
+    /// it then proves under `HasherKind::Poseidon1W16`
+    /// ([`LfmProgram::hasher`]). Program shape, read off the instructions at
+    /// compile time; the admission validator refuses a program that mixes the
+    /// two widths.
+    pub hash16: bool,
 }
 
 impl LfmProgram {
+    /// The `LFM_HASH` permutation this program proves under: the width-16
+    /// socket's for a program with `Hash16` rows, else `default` (the block
+    /// hasher every other program uses).
+    pub fn hasher(&self, default: super::hash::HasherKind) -> super::hash::HasherKind {
+        if self.hash16 {
+            super::hash::HasherKind::Poseidon1W16
+        } else {
+            default
+        }
+    }
+
     /// Replaces the `KECCAK_RND` chunking policy.
     ///
     /// Chunking affects only how the round-chip rows are distributed over AIR
@@ -386,6 +403,11 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                     mults[i] = take(outs[i], &mut written, &mut read_counts);
                 }
             }
+            Instr::Hash16(h) => {
+                for i in 0..4 {
+                    h.mults[i] = take(h.outs[i], &mut written, &mut read_counts);
+                }
+            }
             Instr::Public { .. } => {}
         }
     }
@@ -412,8 +434,10 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
     instrs.shrink_to_fit();
 
     let groups = emit_column_groups(&instrs, public_len);
+    let hash16 = instrs.iter().any(|i| matches!(i, Instr::Hash16(_)));
 
     LfmProgram {
+        hash16,
         instrs,
         num_addrs,
         arena_schema,
@@ -573,6 +597,20 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 hash.set(r, l::MULT0, fe(mults[0]));
                 hash.set(r, l::MULT1, fe(mults[1]));
                 hash.set(r, l::MULT2, fe(mults[2]));
+            }
+            Instr::Hash16(h) => {
+                // The width-16 socket's instruction group: the same 13 columns
+                // as the twelve-felt socket's, in its own order
+                // (`p1w16_socket::cols`). A program carries one or the other,
+                // so the group is never mixed (the admission validator).
+                use super::p1w16_socket::cols as l;
+                let r = hash.open_row();
+                for k in 0..4 {
+                    hash.set(r, l::IN_ADDR0 + k, fe(h.ins[k].0));
+                    hash.set(r, l::OUT_ADDR0 + k, fe(h.outs[k].0));
+                    hash.set(r, l::MULT0 + k, fe(h.mults[k]));
+                }
+                hash.set(r, l::IS_REAL, FE::one());
             }
             Instr::KeccakF(op) => {
                 use layout::keccak as k;

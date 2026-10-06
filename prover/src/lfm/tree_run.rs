@@ -159,10 +159,15 @@ pub(crate) fn census_panel(
     label: &str,
     fan_in: usize,
 ) -> (u64, usize, String) {
-    let (main, aux) =
-        super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
+    let (main, aux) = super::airs::lfm_cell_counts_with_hasher(
+        program,
+        program.hasher(crate::hash_pin::BLOCK_HASHER),
+    );
     let cells = main + 3 * aux;
-    let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
+    let panel = super::airs::lfm_chip_census_with_hasher(
+        program,
+        program.hasher(crate::hash_pin::BLOCK_HASHER),
+    );
     let text = census_panel_text(label, cells, program.instrs.len(), &panel, fan_in);
     (cells, program.instrs.len(), text)
 }

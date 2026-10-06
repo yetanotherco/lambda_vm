@@ -55,6 +55,10 @@ pub enum LfmViolation {
     /// placeholders with `mults` fixed to 0"; this is what makes that a rule
     /// rather than a comment.
     CompressSlotNotPlaceholder { instr: usize },
+    /// A program with both twelve-felt (`Hash`) and width-16 (`Hash16`)
+    /// `LFM_HASH` rows: one chip proves one of the two, so the other half could
+    /// never be proved. `instr` is the first row of the minority width met.
+    MixedHashWidths { instr: usize },
     /// Check 5 — opcode selectors not one-hot / flags not boolean on a real row.
     NonOneHotSelector { chip: &'static str, row: usize },
     /// Check 6 — nonzero data beyond the program length.
@@ -237,6 +241,17 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 if ins[mode.num_input_cells()..].iter().any(|a| *a != Addr(0)) {
                     return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
                 }
+                if program.hash16 {
+                    return Err(LfmViolation::MixedHashWidths { instr: idx });
+                }
+            }
+            Instr::Hash16(h) => {
+                for i in 0..4 {
+                    check(h.outs[i], h.mults[i])?;
+                }
+                if !program.hash16 {
+                    return Err(LfmViolation::MixedHashWidths { instr: idx });
+                }
             }
             Instr::KeccakF(k) => {
                 for i in 0..layout::keccak::NUM_WORDS {
@@ -324,12 +339,17 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         layout::xalu::SEL_ADD,
         layout::xalu::NUM_SELECTORS,
     )?;
-    one_hot(
-        &g.hash,
-        "LFM_HASH",
-        layout::hash::MODE_C,
-        layout::hash::NUM_SELECTORS,
-    )?;
+    if program.hash16 {
+        // The width-16 socket has ONE mode, so its is-real flag is a flag.
+        flag_is_one(&g.hash, "LFM_HASH", super::p1w16_socket::cols::IS_REAL)?;
+    } else {
+        one_hot(
+            &g.hash,
+            "LFM_HASH",
+            layout::hash::MODE_C,
+            layout::hash::NUM_SELECTORS,
+        )?;
+    }
     one_hot(&g.lanes, "LFM_LANES", layout::lanes::MODE_PACK, 2)?;
     one_hot(&g.keccak, "LFM_KECCAK", layout::keccak::MODE_PERM, 2)?;
     // `LFM_BLAKE3` has ONE mode, so its is-real flag is a flag rather than a
@@ -364,7 +384,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         }
     }
 
-    check_mult_ranges(g)?;
+    check_mult_ranges(g, program.hash16)?;
     Ok(())
 }
 
@@ -384,22 +404,22 @@ const MULT_HARD_CAP: u64 = 1 << 32;
 /// counts mirror `chips::*::bus_interactions`; over-counting only widens an
 /// upper bound (safe), under-counting would reject honest programs, so where
 /// two receivers are mutually exclusive the count rounds up.
-fn mult_bound(g: &LfmColumnGroups) -> u64 {
+fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
     let receives_per_row: [(&ColumnGroup, u64); 11] = [
-        (&g.const_, 0), // reads nothing
-        (&g.balu, 3),   // A, B, C
-        (&g.xalu, 3),   // A, B, C
-        (&g.select, 3), // BIT, IN_L, IN_R
-        (&g.bitdec, 1), // IN
-        (&g.hash, 3),   // IN0, IN1, IN2
+        (&g.const_, 0),                        // reads nothing
+        (&g.balu, 3),                          // A, B, C
+        (&g.xalu, 3),                          // A, B, C
+        (&g.select, 3),                        // BIT, IN_L, IN_R
+        (&g.bitdec, 1),                        // IN
+        (&g.hash, if hash16 { 4 } else { 3 }), // IN0..IN2, or the socket's four cells
         (
             &g.keccak,
             (layout::keccak::NUM_WORDS + layout::keccak::BLOCK_WORDS) as u64,
         ), // state + rate block
         (&g.blake3, layout::blake3::IN_WORDS as u64), // h | m | params
-        (&g.lanes, 5),  // the word (Unpack) or the four lanes (Pack)
-        (&g.hint, 0),   // reads nothing
-        (&g.public, 1), // the published cell
+        (&g.lanes, 5),                         // the word (Unpack) or the four lanes (Pack)
+        (&g.hint, 0),                          // reads nothing
+        (&g.public, 1),                        // the published cell
     ];
     let reads = receives_per_row.iter().fold(0u64, |acc, (group, per_row)| {
         acc.saturating_add((group.real_rows as u64).saturating_mul(*per_row))
@@ -414,7 +434,10 @@ fn mult_bound(g: &LfmColumnGroups) -> u64 {
 /// check 5 pins to 1. Every other receive gate is likewise a selector already
 /// pinned to `{0,1}` on real rows by check 5 and to 0 on padding rows by
 /// check 6 — the send gates listed here are the only unbounded ones.
-fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usize>)> {
+fn mult_columns(
+    g: &LfmColumnGroups,
+    hash16: bool,
+) -> Vec<(&'static str, &ColumnGroup, Vec<usize>)> {
     use layout::{balu, bitdec, blake3, const_, hash, hint, keccak, lanes, select, xalu};
     vec![
         ("LFM_CONST", &g.const_, vec![const_::MULT]),
@@ -433,7 +456,13 @@ fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usi
         (
             "LFM_HASH",
             &g.hash,
-            vec![hash::MULT0, hash::MULT1, hash::MULT2],
+            if hash16 {
+                (0..4)
+                    .map(|k| super::p1w16_socket::cols::MULT0 + k)
+                    .collect()
+            } else {
+                vec![hash::MULT0, hash::MULT1, hash::MULT2]
+            },
         ),
         (
             "LFM_KECCAK",
@@ -477,9 +506,9 @@ fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usi
 /// value near `p` and dies here.
 ///
 /// Padding rows are skipped: check 6 already pins them to all-zero.
-fn check_mult_ranges(g: &LfmColumnGroups) -> Result<(), LfmViolation> {
-    let bound = mult_bound(g);
-    for (chip, group, cols) in mult_columns(g) {
+fn check_mult_ranges(g: &LfmColumnGroups, hash16: bool) -> Result<(), LfmViolation> {
+    let bound = mult_bound(g, hash16);
+    for (chip, group, cols) in mult_columns(g, hash16) {
         for row in 0..group.real_rows {
             for &col in &cols {
                 let mult = GoldilocksField::canonical(group.at(row, col).value());
@@ -566,7 +595,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::ExtAlu { .. } => c.xalu += 1,
             Instr::Select { .. } => c.select += 1,
             Instr::BitDec { .. } => c.bitdec += 1,
-            Instr::Hash { .. } => c.hash += 1,
+            Instr::Hash { .. } | Instr::Hash16(_) => c.hash += 1,
             Instr::KeccakF(_) => c.keccak += 1,
             Instr::Blake3(_) => c.blake3 += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,

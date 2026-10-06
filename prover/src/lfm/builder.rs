@@ -450,6 +450,24 @@ impl LfmBuilder {
         outs.map(Cell)
     }
 
+    /// One width-16 Poseidon1 permutation (`Instr::Hash16`): four cells in,
+    /// all sixteen lanes permuted, four cells out. A program that emits one
+    /// emits no twelve-felt hash row (the admission validator), and proves
+    /// under `HasherKind::Poseidon1W16`.
+    pub fn hash16(&mut self, ins: [Cell; 4]) -> [Cell; 4] {
+        for c in &ins {
+            self.read(c.0);
+        }
+        let outs = [self.alloc(), self.alloc(), self.alloc(), self.alloc()];
+        self.instrs
+            .push(Instr::Hash16(Box::new(super::instr::Hash16Operands {
+                ins: ins.map(|c| c.0),
+                outs,
+                mults: [0; 4],
+            })));
+        outs.map(Cell)
+    }
+
     // ---- lane conversion (LFM_LANES) ----
 
     /// Split a word into its four lanes as base cells — the only route from

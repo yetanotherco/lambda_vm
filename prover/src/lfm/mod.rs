@@ -192,6 +192,8 @@ mod p1w16_census_tests;
 #[cfg(test)]
 mod p1w16_chip_tests;
 #[cfg(test)]
+mod p1w16_machine_tests;
+#[cfg(test)]
 mod p1w16_socket_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;

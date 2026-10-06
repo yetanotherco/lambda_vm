@@ -80,6 +80,10 @@ pub mod cols {
     pub const PREFIX_END: usize = IN0 + STATE_FELTS;
 }
 
+// The socket shares the twelve-felt socket's instruction column group width, so
+// the compiler's one `LFM_HASH` group serves both.
+const _: () = assert!(cols::PREP_WIDTH == super::layout::hash::PREP_WIDTH);
+
 /// Where the sixteen output lanes live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutForm {
@@ -89,6 +93,11 @@ pub enum OutForm {
     /// combination of its sixteen `x⁷` columns.
     OnBus,
 }
+
+/// The form the machine wires (`HasherKind::Poseidon1W16`'s `LFM_HASH`): the
+/// outputs on the bus. BIG 664: 1.042–1.049× RPX's prove time per
+/// permutation, against 1.067–1.094× with the outputs in columns.
+pub const SOCKET_FORM: OutForm = OutForm::OnBus;
 
 /// S-boxed lanes in round `r`.
 pub const fn sboxed_lanes(r: usize) -> usize {

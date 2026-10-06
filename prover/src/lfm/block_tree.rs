@@ -925,7 +925,11 @@ pub(crate) fn prove_program_with(
 ) -> Result<(HarvestedChild, LfmProof), String> {
     let t = Instant::now();
     let artifacts = built.unwrap_or_else(|| {
-        super::program_census::build_artifacts_counted(program, opts, crate::hash_pin::BLOCK_HASHER)
+        super::program_census::build_artifacts_counted(
+            program,
+            opts,
+            program.hasher(crate::hash_pin::BLOCK_HASHER),
+        )
     });
     let t_artifacts = t.elapsed().as_secs_f64();
     let t = Instant::now();
@@ -1292,7 +1296,7 @@ pub fn prove_block_tree(
                                     super::registry::build_artifacts_with_hasher(
                                         program,
                                         &wrap,
-                                        crate::hash_pin::BLOCK_HASHER,
+                                        program.hasher(crate::hash_pin::BLOCK_HASHER),
                                     )
                                 })?;
                                 (Arc::new(Pipe::filled(tree)), phases)
