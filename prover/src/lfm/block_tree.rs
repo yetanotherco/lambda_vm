@@ -1328,6 +1328,8 @@ pub fn prove_block_tree(
     // the pool beside the base, as before.
     let elf_beside = cfg.elf_beside;
     let elf_consts = cfg.elf_consts;
+    #[cfg(test)]
+    let forced_ahead = cfg.forced_leaves;
     // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
     // leaf programs (with `1`, every tree program and its artifacts, on the host)
     // from the shape the base hands out before its prove, and the levels prove
@@ -1389,6 +1391,20 @@ pub fn prove_block_tree(
                     let t = Instant::now();
                     let derived = pool.install(|| -> Result<_, String> {
                         let plan = BlockTreePlan::derive_with(&elf, &opts, &shape, c)?;
+                        // `NOEPOCH_LEAVES` (the harness's forced arm): the programs
+                        // ahead are emitted over the forced partition too, the one
+                        // the harvest takes, so level 0 proves what it publishes.
+                        #[cfg(test)]
+                        let plan = match forced_ahead {
+                            Some(k) => {
+                                let names: Vec<&str> =
+                                    plan.instances().iter().map(|i| i.name.as_str()).collect();
+                                let p = super::block_leaf::partition_by_rule(&names, &plan.costs(), k)
+                                    .map_err(|e| format!("the rule fills every leaf: {e}"))?;
+                                plan.with_partition(p)
+                            }
+                            None => plan,
+                        };
                         Ok(match mode {
                             AheadMode::Host => {
                                 let (tree, phases) = plan.derive_tree(&wrap, &|program| {
