@@ -651,7 +651,9 @@ fn windowed_streaming(
 
 /// ★ Dropping each streamed chunk's ops as it leaves builds the whole-run
 /// tables, table for table, at every window length, through `push` and through
-/// the split; with the MEMW-derived LT ops streamed as well it builds what that
+/// the split (the derived LT ops kept compact and LT's ops kept as segments,
+/// the default; or held at 24 bytes each and concatenated, the A arms); with
+/// the MEMW-derived LT ops streamed as well it builds what that
 /// builder builds, LT carrying the whole-run multiplicities. Also with CPU
 /// chunks of 24 rows, whose dropped chunks each pad 8 rows, and with chunks of 4
 /// rows (one op for the rarer tables), so that every streamed table drops
@@ -709,6 +711,26 @@ fn dropping_the_streamed_ops_builds_the_same_tables() {
                 );
                 dropped.extend(streamed);
                 same_traces(&reference, &dropping);
+                if !split {
+                    // The finish as it was: the derived LT ops held at 24
+                    // bytes each and LT's ops concatenated (the A arms); and
+                    // the compact ops concatenated. The same tables.
+                    let (raw, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                        b.drop_streamed_ops()
+                            .expect("before any window")
+                            .raw_memw_lt()
+                            .expect("before any window")
+                            .concat_lt()
+                    });
+                    same_traces(&reference, &raw);
+                    let (concat, _) =
+                        windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                            b.drop_streamed_ops()
+                                .expect("before any window")
+                                .concat_lt()
+                        });
+                    same_traces(&reference, &concat);
+                }
                 let (both, _) = windowed_with(&program, &logs, &max_rows, window, split, |b| {
                     b.stream_memw_lt()
                         .drop_streamed_ops()

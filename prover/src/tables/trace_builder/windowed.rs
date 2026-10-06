@@ -43,8 +43,8 @@
 //! the table phase would have read from a chunk's ops as the chunk leaves:
 //! BITWISE's lookups from LT, SHIFT, STORE, MEMW_A and MEMW_R, DECODE's lookups
 //! and the last ECALL from CPU are counted; the phase-3 LT ops of MEMW and
-//! MEMW_A are derived and kept (unless [`stream_memw_lt`] already put them in
-//! the windows' LT lists). The other walk lists are appended window by window;
+//! MEMW_A are derived and kept, compact ([`super::CompactLt`]: a few bytes an
+//! op), unless [`stream_memw_lt`] already put them in the windows' LT lists. The other walk lists are appended window by window;
 //! the in-walk BITWISE lookups are counted and dropped. [`finish`] then runs
 //! the table phase over the tails ([`StreamSkip::tails`]). The tables are the
 //! same as without it.
@@ -205,8 +205,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                 bitwise_ops: 0,
                 memw_register_rows: 0,
                 last_ecall: None,
-                memw_lt: Vec::new(),
-                memw_aligned_lt: Vec::new(),
+                memw_lt: super::CompactLt::default(),
+                memw_aligned_lt: super::CompactLt::default(),
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -319,6 +319,28 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// length.
     pub fn stream_memw_lt(mut self) -> Self {
         self.stream_memw_lt = true;
+        self
+    }
+
+    /// Keep the LT ops derived from the MEMW and MEMW_A ops this builder drops
+    /// at 24 bytes each instead of compact ([`super::CompactLt`]), the A arm of
+    /// the compact form. Before the first window only. The tables are the same.
+    pub fn raw_memw_lt(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "raw_memw_lt after a window was walked".to_string(),
+            ));
+        }
+        self.counted.memw_lt = super::CompactLt::raw();
+        self.counted.memw_aligned_lt = super::CompactLt::raw();
+        Ok(self)
+    }
+
+    /// `finish` concatenates LT's ops into one list before chunking them
+    /// ([`StreamSkip::concat_lt`]), as it did before keeping them as segments.
+    /// The tables are the same.
+    pub fn concat_lt(mut self) -> Self {
+        self.emitted.concat_lt = true;
         self
     }
 
@@ -1106,7 +1128,7 @@ fn tail_jobs(
             counted.histogram.add_ops(&lookups);
             if !stream_memw_lt {
                 let lt = super::collect_lt_from_memw_aligned(&ops);
-                counted.memw_aligned_lt.extend(lt);
+                counted.memw_aligned_lt.extend(&lt);
             }
         }
     );
@@ -1118,7 +1140,7 @@ fn tail_jobs(
         e.memw,
         |ops| {
             if !stream_memw_lt {
-                counted.memw_lt.extend(super::collect_lt_from_memw(&ops));
+                counted.memw_lt.extend(&super::collect_lt_from_memw(&ops));
             }
         }
     );

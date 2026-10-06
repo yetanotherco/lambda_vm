@@ -602,6 +602,24 @@ pub(crate) fn gpack_from_env() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_GPACK").is_ok_and(|v| v.trim() == "0")
 }
 
+/// `LAMBDA_VM_BLOCK_COMPACT_LT=0`: the LT ops derived from the MEMW ops the
+/// builder drops are held at 24 bytes each until the finish
+/// ([`WindowedTraceBuilder::raw_memw_lt`]), the A arm of keeping them compact;
+/// unset or anything else keeps them compact. The tables are the same (#1013's
+/// knob).
+fn compact_lt() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_COMPACT_LT").is_ok_and(|v| v.trim() == "0")
+}
+
+/// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
+/// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
+/// of keeping them as segments; off by default. With
+/// `LAMBDA_VM_BLOCK_COMPACT_LT=0` it is the finish as it was before both. The
+/// tables are the same (#1013's knob).
+fn lt_concat() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
+}
+
 /// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
 /// each transposition is parallel within its table, so a wave of a few
 /// tables keeps the cores busy while bounding the copies in flight.
@@ -3060,6 +3078,12 @@ fn prove_streamed(
                 }
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
+                }
+                if !compact_lt() {
+                    builder = builder.raw_memw_lt()?;
+                }
+                if lt_concat() {
+                    builder = builder.concat_lt();
                 }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);

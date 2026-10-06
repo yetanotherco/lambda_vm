@@ -3965,6 +3965,11 @@ pub struct StreamSkip {
     ///
     /// [`WindowedTraceBuilder::drop_streamed_ops`]: windowed::WindowedTraceBuilder::drop_streamed_ops
     pub tails: bool,
+    /// Phase 3 concatenates LT's ops into one list before chunking them, as it
+    /// did before keeping them as the segments they come from (the A arm of
+    /// the segments, `LAMBDA_VM_BLOCK_LT_CONCAT=1` on the block). The tables
+    /// are the same.
+    pub concat_lt: bool,
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -3985,26 +3990,24 @@ pub(crate) struct PreCounted {
     /// longer in their lists ([`StreamSkip::tails`] without the MEMW-derived LT
     /// ops streamed), in list order: phase 3 puts each before the LT ops of the
     /// list it derives from the ops left.
-    pub(crate) memw_lt: Vec<LtOperation>,
-    pub(crate) memw_aligned_lt: Vec<LtOperation>,
+    pub(crate) memw_lt: CompactLt,
+    pub(crate) memw_aligned_lt: CompactLt,
 }
 
 impl PreCounted {
     /// The bytes it takes on the heap: the histogram and the derived LT ops.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.histogram.heap_bytes()
-            + vec_heap_bytes(&self.memw_lt)
-            + vec_heap_bytes(&self.memw_aligned_lt)
+        self.histogram.heap_bytes() + self.memw_lt.heap_bytes() + self.memw_aligned_lt.heap_bytes()
     }
 
     /// [`Self::heap_bytes`] part by part.
     pub(crate) fn heap_parts(&self) -> Vec<(String, usize)> {
         vec![
             ("counted histogram".to_string(), self.histogram.heap_bytes()),
-            ("counted memw_lt".to_string(), vec_heap_bytes(&self.memw_lt)),
+            ("counted memw_lt".to_string(), self.memw_lt.heap_bytes()),
             (
                 "counted memw_a_lt".to_string(),
-                vec_heap_bytes(&self.memw_aligned_lt),
+                self.memw_aligned_lt.heap_bytes(),
             ),
         ]
     }
@@ -4293,13 +4296,35 @@ fn generate_chunks<T: Sync>(
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    generate_chunks_with(
+        op_chunks,
+        |chunk: &&[T], generate: &dyn Fn(&[T]) -> TraceTable<_, _>| generate(chunk),
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// [`generate_chunks`] over chunks that `view` hands to the generator as op
+/// slices, each made only when its generation starts (a chunk that straddles
+/// two segments is copied, or expanded, then, and freed with its table).
+fn generate_chunks_with<C: Send, T>(
+    chunks: Vec<C>,
+    view: impl Fn(
+        &C,
+        &dyn Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension>
+    + Sync,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
     // allocates, keeping trace memory bounded.
     #[cfg(feature = "disk-spill")]
     if storage_mode == StorageMode::Disk {
-        let mut tables = Vec::with_capacity(op_chunks.len());
-        for chunk in op_chunks {
-            let mut t = generate(chunk);
+        let mut tables = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let mut t = view(chunk, &generate);
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
@@ -4307,10 +4332,244 @@ fn generate_chunks<T: Sync>(
         }
         return Ok(tables);
     }
+    let generate = |chunk: C| view(&chunk, &generate);
     #[cfg(feature = "parallel")]
-    let tables = op_chunks.into_par_iter().map(generate).collect();
+    let tables = chunks.into_par_iter().map(generate).collect();
     #[cfg(not(feature = "parallel"))]
-    let tables = op_chunks.into_iter().map(generate).collect();
+    let tables = chunks.into_iter().map(generate).collect();
+    Ok(tables)
+}
+
+/// A list kept as the segments it is the concatenation of, never concatenated
+/// (phase 3's LT ops: the kept tail, the MEMW and MEMW_A prefixes and what the
+/// finish derives, each a list of its own).
+struct Segmented<'a, T> {
+    parts: Vec<Part<'a, T>>,
+}
+
+/// One segment of a [`Segmented`] list: ops in memory, or ops kept in a
+/// compact form that expands any range of them ([`CompactLt`]).
+enum Part<'a, T> {
+    Ops(&'a [T]),
+    Compact(&'a (dyn Expand<T> + Sync)),
+}
+
+impl<T> Clone for Part<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Part<'_, T> {}
+
+impl<T> Part<'_, T> {
+    fn len(&self) -> usize {
+        match self {
+            Part::Ops(ops) => ops.len(),
+            Part::Compact(c) => c.len(),
+        }
+    }
+}
+
+/// Ops kept in a compact form: how many, and any range of them expanded.
+trait Expand<T> {
+    fn len(&self) -> usize;
+    /// Ops `start..end`, appended to `out`.
+    fn expand_into(&self, start: usize, end: usize, out: &mut Vec<T>);
+}
+
+impl<'a, T: Clone> Segmented<'a, T> {
+    fn len(&self) -> usize {
+        self.parts.iter().map(Part::len).sum()
+    }
+
+    /// Ops `start..end` of the concatenation: borrowed when one in-memory
+    /// segment holds them, copied (or expanded) otherwise.
+    fn range(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
+        let mut at = 0usize;
+        let mut pieces: Vec<(Part<'a, T>, usize, usize)> = Vec::new();
+        for part in &self.parts {
+            let (lo, hi) = (at, at + part.len());
+            if hi > start && lo < end {
+                pieces.push((*part, start.max(lo) - lo, end.min(hi) - lo));
+            }
+            at = hi;
+            if at >= end {
+                break;
+            }
+        }
+        match pieces.as_slice() {
+            [] => std::borrow::Cow::Borrowed(&[]),
+            [(Part::Ops(ops), lo, hi)] => std::borrow::Cow::Borrowed(&ops[*lo..*hi]),
+            _ => {
+                let mut out = Vec::with_capacity(end.saturating_sub(start));
+                for (part, lo, hi) in pieces {
+                    match part {
+                        Part::Ops(ops) => out.extend_from_slice(&ops[lo..hi]),
+                        Part::Compact(c) => c.expand_into(lo, hi, &mut out),
+                    }
+                }
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+}
+
+/// LT ops with `signed` and `invert` false — the timestamp checks phase 3
+/// derives from MEMW and MEMW_A ops — kept as a stream of zigzag LEB128
+/// deltas, `rhs` from the previous op's and `lhs` from its own `rhs`: a few
+/// bytes an op instead of 24. Every [`COMPACT_LT_BLOCK`] ops a sparse index
+/// records where the stream stands, so any range expands on its own. The
+/// ops expand exactly as pushed, in order.
+#[derive(Default)]
+pub(crate) struct CompactLt {
+    bytes: Vec<u8>,
+    /// (byte offset, previous `rhs`) at op `k * COMPACT_LT_BLOCK`.
+    index: Vec<(usize, u64)>,
+    len: usize,
+    last_rhs: u64,
+    /// The ops as they are, 24 bytes each, instead of the stream (the A arm,
+    /// `LAMBDA_VM_BLOCK_COMPACT_LT=0` on the block).
+    raw: Option<Vec<LtOperation>>,
+}
+
+const COMPACT_LT_BLOCK: usize = 4096;
+
+impl CompactLt {
+    /// A list that keeps its ops as they are (the A arm of the compact form).
+    pub(crate) fn raw() -> Self {
+        Self {
+            raw: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Append `ops` (each with `signed` and `invert` false).
+    pub(crate) fn extend(&mut self, ops: &[LtOperation]) {
+        if let Some(raw) = &mut self.raw {
+            raw.extend_from_slice(ops);
+            return;
+        }
+        fn put(out: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                out.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let zigzag = |d: u64| (d << 1) ^ ((d as i64 >> 63) as u64);
+        for op in ops {
+            debug_assert!(
+                !op.signed && !op.invert,
+                "a compact LT op is unsigned, not inverted"
+            );
+            if self.len.is_multiple_of(COMPACT_LT_BLOCK) {
+                self.index.push((self.bytes.len(), self.last_rhs));
+            }
+            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(self.last_rhs)));
+            put(&mut self.bytes, zigzag(op.rhs.wrapping_sub(op.lhs)));
+            self.last_rhs = op.rhs;
+            self.len += 1;
+        }
+    }
+
+    /// The bytes it takes on the heap (capacities).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.raw.as_ref().map_or(0, vec_heap_bytes)
+            + self.bytes.capacity()
+            + self.index.capacity() * std::mem::size_of::<(usize, u64)>()
+    }
+}
+
+impl Expand<LtOperation> for CompactLt {
+    fn len(&self) -> usize {
+        self.raw.as_ref().map_or(self.len, Vec::len)
+    }
+
+    fn expand_into(&self, start: usize, end: usize, out: &mut Vec<LtOperation>) {
+        if let Some(raw) = &self.raw {
+            out.extend_from_slice(&raw[start.min(raw.len())..end.min(raw.len())]);
+            return;
+        }
+        let end = end.min(self.len);
+        if start >= end {
+            return;
+        }
+        let get = |at: &mut usize| {
+            let (mut v, mut shift) = (0u64, 0u32);
+            loop {
+                let b = self.bytes[*at];
+                *at += 1;
+                v |= u64::from(b & 0x7f) << shift;
+                if b < 0x80 {
+                    return v;
+                }
+                shift += 7;
+            }
+        };
+        let unzigzag = |z: u64| (z >> 1) ^ (z & 1).wrapping_neg();
+        let block = start / COMPACT_LT_BLOCK;
+        let (mut at, mut prev) = self.index[block];
+        out.reserve(end - start);
+        for k in block * COMPACT_LT_BLOCK..end {
+            let rhs = prev.wrapping_add(unzigzag(get(&mut at)));
+            let lhs = rhs.wrapping_sub(unzigzag(get(&mut at)));
+            prev = rhs;
+            if k >= start {
+                out.push(LtOperation::new(lhs, rhs, false));
+            }
+        }
+    }
+}
+
+/// [`chunk_and_generate_skipping`] over a [`Segmented`] list: the same chunks
+/// (whole multiples of `max_rows` of the concatenation, the same placeholders
+/// and padding rules), each made from the segments only as it is generated.
+fn chunk_and_generate_segmented<T: Clone + Sync>(
+    ops: &Segmented<'_, T>,
+    max_rows: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let len = ops.len();
+    let max_rows = max_rows.max(1);
+    let chunks: Vec<(usize, usize)> = (0..len.div_ceil(max_rows))
+        .map(|k| (k * max_rows, ((k + 1) * max_rows).min(len)))
+        .collect();
+    let (placeholders, chunks) = if skip == 0 {
+        // As `chunk_and_generate` / `chunk_and_generate_optional`: an empty
+        // list is one empty chunk, or no table at all when the table is
+        // optional.
+        let chunks = if len == 0 && !optional {
+            vec![(0, 0)]
+        } else {
+            chunks
+        };
+        (0, chunks)
+    } else if tails {
+        (skip, chunks)
+    } else {
+        if skip > chunks.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                chunks.len()
+            )));
+        }
+        (skip, chunks[skip..].to_vec())
+    };
+    let mut tables: Vec<_> = (0..placeholders).map(|_| streamed_placeholder()).collect();
+    tables.extend(generate_chunks_with(
+        chunks,
+        |&(start, end): &(usize, usize), generate: &dyn Fn(&[T]) -> TraceTable<_, _>| {
+            generate(&ops.range(start, end))
+        },
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?);
     Ok(tables)
 }
 
@@ -4804,7 +5063,7 @@ fn build_traces<I: ImageSource + Sync>(
         memw_aligned_ops,
         memw_register_rows,
         load_ops,
-        mut lt_ops,
+        lt_ops,
         shift_ops,
         bitwise_ops,
         branch_ops,
@@ -4826,30 +5085,62 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw(
-        &memw_ops[skip.memw_lt_done.min(memw_ops.len())..],
-    ));
+    // LT's list is these segments in this order, kept apart: concatenating them
+    // into one list reallocated multi-GiB copies at a block's finish.
+    let memw_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_lt))
+        .unwrap_or_default();
+    let lt_from_memw = collect_lt_from_memw(&memw_ops[skip.memw_lt_done.min(memw_ops.len())..]);
     build_stamps::mark("p3a lt from memw");
-    if let Some(pre) = pre.as_mut() {
-        lt_ops.extend(std::mem::take(&mut pre.memw_aligned_lt));
-    }
-    lt_ops.extend(collect_lt_from_memw_aligned(
+    let memw_aligned_lt = pre
+        .as_mut()
+        .map(|pre| std::mem::take(&mut pre.memw_aligned_lt))
+        .unwrap_or_default();
+    let lt_from_memw_aligned = collect_lt_from_memw_aligned(
         &memw_aligned_ops[skip.memw_aligned_lt_done.min(memw_aligned_ops.len())..],
-    ));
+    );
     build_stamps::mark("p3b lt from memw_a");
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
-    lt_ops.extend(hint_ops.iter().flat_map(|op| {
-        [
-            LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
-            LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-            LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
-        ]
-    }));
+    let lt_from_hints: Vec<LtOperation> = hint_ops
+        .iter()
+        .flat_map(|op| {
+            [
+                LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+                LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+                LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+            ]
+        })
+        .collect();
+    let lt_concat: Vec<LtOperation>;
+    let lt_ops = if skip.concat_lt {
+        // The A arm: one list, each segment appended and then freed, as before.
+        let mut all = lt_ops;
+        memw_lt.expand_into(0, memw_lt.len(), &mut all);
+        drop(memw_lt);
+        all.extend(lt_from_memw);
+        memw_aligned_lt.expand_into(0, memw_aligned_lt.len(), &mut all);
+        drop(memw_aligned_lt);
+        all.extend(lt_from_memw_aligned);
+        all.extend(lt_from_hints);
+        lt_concat = all;
+        Segmented {
+            parts: vec![Part::Ops(&lt_concat[..])],
+        }
+    } else {
+        Segmented {
+            parts: vec![
+                Part::Ops(&lt_ops[..]),
+                Part::Compact(&memw_lt),
+                Part::Ops(&lt_from_memw),
+                Part::Compact(&memw_aligned_lt),
+                Part::Ops(&lt_from_memw_aligned),
+                Part::Ops(&lt_from_hints),
+            ],
+        }
+    };
 
     build_stamps::mark("p3 lt");
 
@@ -4907,10 +5198,28 @@ fn build_traces<I: ImageSource + Sync>(
     // below; the rest stay one collector each.
     let mut collectors: Vec<Collector> = Vec::new();
     if p4_sliced() {
-        for slice in lt_ops.chunks(p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk)) {
-            collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_lt(slice))
-            }));
+        // LT's segments slice by slice; a compact one through a temporary of a
+        // slice's ops at a time.
+        let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
+        for part in &lt_ops.parts {
+            match *part {
+                Part::Ops(ops) => {
+                    for slice in ops.chunks(lt_slice) {
+                        collectors.push(Box::new(move |h| {
+                            h.add_ops(&collect_bitwise_from_lt(slice))
+                        }));
+                    }
+                }
+                Part::Compact(compact) => {
+                    for start in (0..compact.len()).step_by(lt_slice) {
+                        collectors.push(Box::new(move |h| {
+                            let mut slice = Vec::new();
+                            compact.expand_into(start, start + lt_slice, &mut slice);
+                            h.add_ops(&collect_bitwise_from_lt(&slice))
+                        }));
+                    }
+                }
+            }
         }
         for slice in mul_ops.chunks(p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk)) {
             collectors.push(Box::new(move |h| {
@@ -4975,7 +5284,18 @@ fn build_traces<I: ImageSource + Sync>(
         // control). The same multiplicities: the histogram is a commutative sum.
         collectors.extend([
             Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                h.add_ops(&collect_bitwise_from_lt(&lt_ops))
+                for part in &lt_ops.parts {
+                    match *part {
+                        Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt(ops)),
+                        Part::Compact(compact) => {
+                            for start in (0..compact.len()).step_by(1 << 20) {
+                                let mut slice = Vec::new();
+                                compact.expand_into(start, start + (1 << 20), &mut slice);
+                                h.add_ops(&collect_bitwise_from_lt(&slice));
+                            }
+                        }
+                    }
+                }
             }) as Collector,
             Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
             Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
@@ -5211,7 +5531,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_lts = || {
-        chunk_and_generate_skipping(
+        chunk_and_generate_segmented(
             &lt_ops,
             max_rows.lt,
             skip.lt,
@@ -7085,5 +7405,273 @@ mod kr_wave_tests {
         assert_eq!(KECCAK_RND_PACK_WAVE, 4);
         assert_eq!(kr_packed_wave_from(Some("4")), KECCAK_RND_PACK_WAVE);
         assert_eq!(kr_packed_wave_from(Some(" 16 ")), 16);
+    }
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// One column holding the ops, padded to a power of two.
+    fn table_of(ops: &[u64]) -> Table {
+        let rows = ops.len().next_power_of_two().max(4);
+        let mut data = crate::tables::types::zeroed_fe_vec(rows);
+        for (cell, &op) in data.iter_mut().zip(ops) {
+            *cell = crate::tables::types::FE::from(op);
+        }
+        TraceTable::new_main(data, 1, 1)
+    }
+
+    fn words(tables: &[Table]) -> Vec<(usize, Vec<u64>)> {
+        tables
+            .iter()
+            .map(|t| {
+                (
+                    t.main_table.width,
+                    t.main_table
+                        .row_major_data()
+                        .iter()
+                        .map(|v| v.canonical())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// LT ops with every kind of delta: increasing and decreasing `rhs`, `lhs`
+    /// above and below it, both ends of `u64`, and runs sharing one `rhs` (a
+    /// MEMW op's checks).
+    fn lt_ops(n: usize) -> Vec<LtOperation> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rhs = 1000u64;
+        (0..n)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (lhs, rhs) = match i % 7 {
+                    0 => (0, u64::MAX),
+                    1 => (u64::MAX, 0),
+                    2 => (x, x >> 3),
+                    3 | 4 => {
+                        rhs += x % 9;
+                        (rhs - x % 1000, rhs)
+                    }
+                    5 => (rhs - x % (1 << 40), rhs),
+                    _ => (x >> 1, rhs),
+                };
+                LtOperation::new(lhs, rhs, false)
+            })
+            .collect()
+    }
+
+    fn same_lt(a: &[LtOperation], b: &[LtOperation]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                (x.lhs, x.rhs, x.signed, x.invert) == (y.lhs, y.rhs, y.signed, y.invert)
+            })
+    }
+
+    /// The compact LT list expands to exactly the ops pushed, over any range:
+    /// within one index block, across blocks, from the start, to the end, past
+    /// it, and empty; pushed all at once or in pieces. The raw list (the A arm)
+    /// expands to them too.
+    #[test]
+    fn compact_lt_ops_expand_to_what_was_pushed() {
+        let n = 3 * COMPACT_LT_BLOCK + 123;
+        let ops = lt_ops(n);
+        let mut whole = CompactLt::default();
+        whole.extend(&ops);
+        let mut pieces = CompactLt::default();
+        for piece in ops.chunks(1000) {
+            pieces.extend(piece);
+        }
+        let mut raw = CompactLt::raw();
+        for piece in ops.chunks(777) {
+            raw.extend(piece);
+        }
+        assert!(whole.heap_bytes() < n * std::mem::size_of::<LtOperation>());
+        assert!(raw.heap_bytes() >= n * std::mem::size_of::<LtOperation>());
+        for compact in [&whole, &pieces, &raw] {
+            assert_eq!(Expand::len(compact), n);
+            for (start, end) in [
+                (0, n),
+                (0, 1),
+                (5, 17),
+                (COMPACT_LT_BLOCK - 3, COMPACT_LT_BLOCK + 3),
+                (COMPACT_LT_BLOCK, 2 * COMPACT_LT_BLOCK),
+                (2 * COMPACT_LT_BLOCK + 1, n),
+                (n - 1, n + 50),
+                (7, 7),
+                (n + 3, n + 9),
+            ] {
+                let mut out = Vec::new();
+                compact.expand_into(start, end, &mut out);
+                assert!(
+                    same_lt(&out, &ops[start.min(n)..end.min(n)]),
+                    "{start}..{end}"
+                );
+            }
+        }
+        // Empty lists expand to nothing.
+        for empty in [CompactLt::default(), CompactLt::raw()] {
+            assert_eq!(Expand::len(&empty), 0);
+            let mut out = Vec::new();
+            empty.expand_into(0, 10, &mut out);
+            assert!(out.is_empty());
+        }
+    }
+
+    /// LT generated as a table per chunk, its first column the lhs and its
+    /// second the rhs.
+    fn lt_table(ops: &[LtOperation]) -> Table {
+        let rows = ops.len().next_power_of_two().max(4);
+        let mut data = crate::tables::types::zeroed_fe_vec(rows * 2);
+        for (r, op) in ops.iter().enumerate() {
+            data[2 * r] = crate::tables::types::FE::from(op.lhs);
+            data[2 * r + 1] = crate::tables::types::FE::from(op.rhs);
+        }
+        TraceTable::new_main(data, 2, 1)
+    }
+
+    /// A list with compact segments chunks as its concatenation, as the
+    /// phase-3 LT list does with its MEMW-derived segments kept compact.
+    #[test]
+    fn a_list_with_compact_segments_chunks_as_its_concatenation() {
+        let all = lt_ops(2 * COMPACT_LT_BLOCK + 77);
+        let (a, b, c) = (
+            &all[..100],
+            &all[100..COMPACT_LT_BLOCK + 300],
+            &all[COMPACT_LT_BLOCK + 300..],
+        );
+        let mut compact_b = CompactLt::default();
+        compact_b.extend(b);
+        let mut compact_c = CompactLt::default();
+        compact_c.extend(c);
+        let segmented = Segmented {
+            parts: vec![
+                Part::Ops(a),
+                Part::Compact(&compact_b),
+                Part::Ops(&[]),
+                Part::Compact(&compact_c),
+            ],
+        };
+        for max in [1, 64, 1000, COMPACT_LT_BLOCK, 1 << 20] {
+            for (skip, tails) in [(0, false), (1, false)] {
+                let whole = chunk_and_generate_skipping(
+                    &all,
+                    max,
+                    skip,
+                    tails,
+                    true,
+                    lt_table,
+                    #[cfg(feature = "disk-spill")]
+                    StorageMode::Ram,
+                )
+                .expect("whole");
+                let split = chunk_and_generate_segmented(
+                    &segmented,
+                    max,
+                    skip,
+                    tails,
+                    true,
+                    lt_table,
+                    #[cfg(feature = "disk-spill")]
+                    StorageMode::Ram,
+                )
+                .expect("segmented");
+                assert_eq!(words(&whole), words(&split), "max {max} skip {skip}");
+            }
+        }
+    }
+
+    /// Chunked from its segments, a list gives the tables its concatenation
+    /// gives: every split of the segments (empty ones too), chunk sizes that
+    /// cut inside and across them, with and without chunks streamed ahead
+    /// (tails or whole lists), optional or not, and an empty list.
+    #[test]
+    fn a_segmented_list_chunks_as_its_concatenation() {
+        let all: Vec<u64> = (1..=37).collect();
+        let layouts: [&[usize]; 4] = [&[37], &[0, 10, 0, 27], &[5, 5, 5, 22], &[1, 36, 0]];
+        for layout in layouts {
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for &n in layout {
+                parts.push(Part::Ops(&all[at..at + n]));
+                at += n;
+            }
+            let segmented = Segmented { parts };
+            for max in [1, 4, 5, 10, 37, 100] {
+                for (skip, tails) in [(0, false), (2, true), (2, false)] {
+                    for optional in [true, false] {
+                        // With `tails`, the list is what is left past the
+                        // streamed chunks: the same list either way here.
+                        let whole = chunk_and_generate_skipping(
+                            &all,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        let split = chunk_and_generate_segmented(
+                            &segmented,
+                            max,
+                            skip,
+                            tails,
+                            optional,
+                            table_of,
+                            #[cfg(feature = "disk-spill")]
+                            StorageMode::Ram,
+                        );
+                        match (whole, split) {
+                            (Ok(a), Ok(b)) => assert_eq!(
+                                words(&a),
+                                words(&b),
+                                "{layout:?} max {max} skip {skip} tails {tails} optional {optional}"
+                            ),
+                            (Err(_), Err(_)) => {}
+                            (a, b) => panic!(
+                                "{layout:?} max {max} skip {skip}: {:?} vs {:?}",
+                                a.is_ok(),
+                                b.is_ok()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let empty: Segmented<'_, u64> = Segmented {
+            parts: vec![Part::Ops(&[]), Part::Ops(&[])],
+        };
+        for optional in [true, false] {
+            let a = chunk_and_generate_skipping(
+                &[] as &[u64],
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .expect("whole");
+            let b = chunk_and_generate_segmented(
+                &empty,
+                4,
+                0,
+                false,
+                optional,
+                table_of,
+                #[cfg(feature = "disk-spill")]
+                StorageMode::Ram,
+            )
+            .expect("segmented");
+            assert_eq!(words(&a), words(&b), "empty, optional {optional}");
+        }
     }
 }
