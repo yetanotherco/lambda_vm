@@ -144,7 +144,7 @@ impl FriCommitState {
 
         // Row-pair leaves: each leaf hashes two consecutive ext3 evals.
         let num_leaves = n_out / 2;
-        let tight_total_nodes = 2 * num_leaves - 1;
+        let tight_total_nodes = crate::tree_nodes(self.hash, num_leaves);
 
         // H2D zeta.
         let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
@@ -176,7 +176,7 @@ impl FriCommitState {
         // and build_inner_tree_levels writes every inner node [0, num_leaves-1), so all
         // tight_total_nodes * 32 bytes are initialised before the D2H below reads them.
         let mut nodes_dev = unsafe { self.stream.alloc::<u8>(tight_total_nodes * 32) }?;
-        let leaves_offset_bytes = (num_leaves - 1) * 32;
+        let leaves_offset_bytes = crate::leaves_offset(self.hash, num_leaves) * 32;
         {
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
@@ -212,10 +212,20 @@ impl FriCommitState {
                     num_leaves_u64,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
-                    "{:?} device commit not yet ported (FRI layer ext3 leaves)",
-                    self.hash
-                ),
+                // The pair leaf is the two-value group leaf (six felts).
+                DeviceHash::Poseidon1 => crate::p1_stark::launch_fri_group_leaves(
+                    self.stream.as_ref(),
+                    &out,
+                    num_leaves_u64,
+                    2,
+                    &mut leaves_view,
+                )?,
+                DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+                    unimplemented!(
+                        "{:?} device commit not yet ported (FRI layer ext3 leaves)",
+                        self.hash
+                    )
+                }
             }
         }
         match self.hash {
@@ -235,6 +245,11 @@ impl FriCommitState {
             DeviceHash::Rpx256 => crate::rpx::build_inner_tree_levels(
                 self.stream.as_ref(),
                 be,
+                &mut nodes_dev,
+                num_leaves,
+            )?,
+            DeviceHash::Poseidon1 => crate::p1_stark::build_inner_tree_levels(
+                self.stream.as_ref(),
                 &mut nodes_dev,
                 num_leaves,
             )?,
@@ -308,6 +323,7 @@ impl FriCommitState {
         let tree = crate::lde::GpuMerkleTree {
             nodes: std::sync::Arc::new(nodes_dev),
             leaves_len: num_leaves,
+            arity: self.hash.arity(),
             root,
         };
         Ok((layer_evals, out, tree))
@@ -440,6 +456,7 @@ impl FriCommitState {
         let tree = crate::lde::GpuMerkleTree {
             nodes: Arc::new(nodes_dev),
             leaves_len: num_leaves,
+            arity: self.hash.arity(),
             root,
         };
         Ok((layer_evals, Arc::clone(&self.current), tree))
@@ -474,16 +491,20 @@ fn commit_group_leaves(
 ) -> Result<CudaSlice<u8>> {
     assert!(num_leaves >= 2 && num_leaves.is_power_of_two());
     assert!(evals.len() as u64 >= 3 * num_leaves as u64 * group);
-    let tight_total_nodes = 2 * num_leaves - 1;
-    // SAFETY: the leaf kernel writes the leaves [num_leaves-1, 2*num_leaves-1)
-    // and the inner-level walk every node [0, num_leaves-1) before any read.
+    let tight_total_nodes = crate::tree_nodes(hash, num_leaves);
+    // SAFETY: the leaf kernel writes the leaves (the buffer's tail) and the
+    // inner-level walk every node before them, before any read.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
-    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    let leaves_offset_bytes = crate::leaves_offset(hash, num_leaves) * 32;
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
         let num_leaves_u64 = num_leaves as u64;
         let (kernel, cfg) = match hash {
+            DeviceHash::Poseidon1 => (
+                &crate::p1_stark::kernels()?.fri_group_leaves,
+                crate::p1_stark::launch_cfg(num_leaves_u64),
+            ),
             DeviceHash::Keccak256 => (
                 &be.keccak_fri_group_leaves_ext3,
                 crate::merkle::keccak_launch_cfg(num_leaves_u64),
@@ -523,6 +544,9 @@ fn commit_group_leaves(
         }
         DeviceHash::Rpx256 => {
             crate::rpx::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?
+        }
+        DeviceHash::Poseidon1 => {
+            crate::p1_stark::build_inner_tree_levels(stream.as_ref(), &mut nodes_dev, num_leaves)?
         }
         DeviceHash::Rpo256 | DeviceHash::Poseidon => {
             unimplemented!("{hash:?} device commit not yet ported (FRI group inner tree levels)")
