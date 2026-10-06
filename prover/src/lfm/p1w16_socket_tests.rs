@@ -628,3 +628,26 @@ fn socket_prove_cost_on_the_card() {
     }
     set_eval(false);
 }
+
+/// The programs the LFM proves (under its own options, `ZfFormat` stamped
+/// on) are the ones the compiled-kernel generator emitted: RPX's `LFM_HASH`
+/// and both socket forms have a kernel by key.
+#[test]
+fn the_hash_programs_have_compiled_kernels() {
+    use stark::constraint_ir::{DeviceProgram, codegen};
+    use stark::traits::AIR;
+    let opts = super::proof::aggregation_wrap_options();
+    let has = |prog: &stark::constraint_ir::ConstraintProgram<Gl, Gl3>| {
+        let key = codegen::structural_key(&DeviceProgram::lower(prog));
+        math_cuda::constraint_compiled_keys::COMPILED_COMPOSITION_KERNELS
+            .iter()
+            .any(|&(k, _)| k == key)
+    };
+    assert!(has(rpx_air(&opts, [0u8; 32]).constraint_program()), "rpx");
+    for form in FORMS {
+        assert!(
+            has(air(form, &opts, [0u8; 32]).constraint_program()),
+            "{form:?}"
+        );
+    }
+}

@@ -139,13 +139,43 @@ pub(crate) struct Compiled {
     program: Program,
 }
 
+/// Programs compiled past [`codegen::worth_compiling`]'s caps: the width-16
+/// Poseidon1 socket (P3, `lfm::p1w16_socket`), in both output forms. Its
+/// ~7,000 lowered nodes are over the node cap, and whether a compiled kernel
+/// carries its evaluation is what P3's stage 1 measures on the card.
+fn forced_programs(opts: &ProofOptions, suffix: &str) -> Vec<(String, Program)> {
+    use crate::lfm::p1w16_socket::{OutForm, air};
+    [OutForm::OnBus, OutForm::Columns]
+        .into_iter()
+        .map(|form| {
+            (
+                format!("LFM P1W16 {form:?}{suffix}"),
+                air(form, opts, [0u8; 32]).constraint_program().clone(),
+            )
+        })
+        .collect()
+}
+
 /// The compiled set: one kernel per distinct worthwhile program, by key.
 pub(crate) fn compiled_set() -> BTreeMap<u64, Compiled> {
     let mut set: BTreeMap<u64, Compiled> = BTreeMap::new();
     for (opts, extras, suffix) in compiled_option_sets() {
-        for (label, program) in production_programs(&opts, extras, suffix) {
+        let forced = if extras {
+            forced_programs(&opts, suffix)
+        } else {
+            Vec::new()
+        };
+        let programs = production_programs(&opts, extras, suffix)
+            .into_iter()
+            .map(|(label, program)| (label, program, false))
+            .chain(
+                forced
+                    .into_iter()
+                    .map(|(label, program)| (label, program, true)),
+            );
+        for (label, program, force) in programs {
             let dev = DeviceProgram::lower(&program);
-            if !codegen::worth_compiling(&dev) {
+            if !force && !codegen::worth_compiling(&dev) {
                 continue;
             }
             let entry = set

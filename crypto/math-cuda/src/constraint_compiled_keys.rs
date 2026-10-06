@@ -3,6 +3,7 @@
 /// Compiled composition kernels in `constraint_compiled.cu`: (structural key,
 /// kernel name), sorted by key.
 pub const COMPILED_COMPOSITION_KERNELS: &[(u64, &str)] = &[
+    (0x047ef85ee1a43087, "ccomp_047ef85ee1a43087"),
     (0x0b8d15837e1e77a3, "ccomp_0b8d15837e1e77a3"),
     (0x1431e6cd91a7afa0, "ccomp_1431e6cd91a7afa0"),
     (0x1a458e9093b449b7, "ccomp_1a458e9093b449b7"),
@@ -21,6 +22,7 @@ pub const COMPILED_COMPOSITION_KERNELS: &[(u64, &str)] = &[
     (0x530c0f77a3539dfa, "ccomp_530c0f77a3539dfa"),
     (0x6ba23d3dacf14f46, "ccomp_6ba23d3dacf14f46"),
     (0x7291cee4e3b00ed5, "ccomp_7291cee4e3b00ed5"),
+    (0x88b88ffdbe2b8ffa, "ccomp_88b88ffdbe2b8ffa"),
     (0x8e659483a146c1d8, "ccomp_8e659483a146c1d8"),
     (0x9479e5b0e116eb74, "ccomp_9479e5b0e116eb74"),
     (0x9e9300625b41b16f, "ccomp_9e9300625b41b16f"),
