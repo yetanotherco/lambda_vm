@@ -1056,6 +1056,164 @@ fn the_compact_program_form_keeps_every_production_height_tree_id() {
     );
 }
 
+/// [`pinned_spread_plan`]'s format with a Poseidon1 base at 4-ary cap
+/// `cap` (P3a).
+fn p1_spread_options(cap: stark::proof::options::CapPolicy) -> crate::ProofOptions {
+    let pair = crate::zf_format::ZfFormat {
+        logup: stark::proof::options::LogUpPolicy::Pair,
+        base: stark::proof::options::BaseFormat {
+            arity4_cap: cap,
+            ..stark::proof::options::BaseFormat::P1
+        },
+        ..crate::zf_format::ZfFormat::DEFAULT
+    };
+    pair.base_options(crate::recursion::Preset::Blowup4.options())
+}
+
+/// ★ P3a on the laptop, no proof: a small spread plan under a Poseidon1 base
+/// (cap 1, and uncapped, whose odd-depth trees walk a padded top) derives its
+/// whole tree. Every leaf's hash rows are width-16 socket rows (so its
+/// artifacts take the socket), every node and the top emit over those
+/// children on the pin, the plan names the P1 cost model, and no program id
+/// of the tree is one of the RPX tree's (the base is bound into every id).
+#[test]
+#[ignore = "laptop or box: run with --exact (≈ 1 min)"]
+fn a_p1_base_small_tree_derives() {
+    use super::hash::HasherKind;
+    use stark::proof::options::CapPolicy;
+    let rpx = tree_ids(&pinned_spread_plan(2, 4));
+    for cap in [CapPolicy::Fixed(1), CapPolicy::Off] {
+        let plan = spread_plan_under(2, 4, &p1_spread_options(cap));
+        assert_eq!(
+            plan.cost_model(),
+            super::block_plan::P1_PARTITION_COST_MODEL
+        );
+        for k in 0..plan.partition().num_leaves() {
+            let program = plan.leaf_program(k).expect("the P1 leaf emits");
+            assert!(program.hash16, "leaf {k} hashes on the width-16 socket");
+            assert_eq!(
+                program.hasher(crate::hash_pin::BLOCK_HASHER),
+                HasherKind::Poseidon1W16
+            );
+            println!(
+                "P1 LEAF {k} (cap {cap}): {} socket rows over {} instances",
+                program.groups.hash.real_rows,
+                plan.partition().leaf(k).len()
+            );
+        }
+        let ids = tree_ids(&plan);
+        println!("P1 TREE IDS (cap {cap}): {ids:?}");
+        assert!(
+            ids.iter().all(|id| !rpx.contains(id)),
+            "a P1 tree shares no program with the RPX tree"
+        );
+    }
+}
+
+/// The leaf's shared front alone — public output and main-root hints, the
+/// statement, Phase A, `z, α` and the state — in `leaf`'s builder: its hash
+/// rows are a leaf's overhead beside its instances.
+fn front_hash_rows(plan: &BlockTreePlan, wrap: WrapHash) -> usize {
+    let mut b = LfmBuilder::new().with_wrap_hash(wrap);
+    let statement = plan.statement();
+    let n = plan.num_instances();
+    let per_root = super::epoch::RootCells::words_per_root(&b);
+    let a_out = b.declare_arena(statement.out_halves() as u32);
+    let a_main = b.declare_arena(per_root * n as u32);
+    let out: Vec<_> = (0..statement.out_halves() as u32)
+        .map(|i| b.hint_felt(a_out, i))
+        .collect();
+    let main: Vec<super::epoch::RootCells> = (0..n)
+        .map(|i| super::epoch::RootCells::hint(&mut b, a_main, per_root * i as u32))
+        .collect();
+    let lanes: Vec<Vec<_>> = main.iter().map(super::epoch::RootCells::lanes_flat).collect();
+    let roots: Vec<Option<Commitment>> = plan.instances().iter().map(|i| i.precomputed_root).collect();
+    let phase_a: Vec<PhaseATable> = (0..n)
+        .map(|i| PhaseATable {
+            preprocessed_root: roots[i].as_ref().map(PhaseAPreprocessed::Constant),
+            main_root: &lanes[i][..],
+        })
+        .collect();
+    let front = replay_block_front(&mut b, statement, plan.elf_digest(), &out, &phase_a);
+    for c in front.state.cells() {
+        b.public(*c);
+    }
+    compile(b.finish()).groups.hash.real_rows
+}
+
+/// ★ P3a's census (laptop instrument, no proof): at production heights
+/// ([`production_height_plan`]'s shape) under RPX (the control) and a
+/// Poseidon1 base at caps 1 and 4, every leaf's hash rows split into the shared
+/// front, its instances' legs (the closed form, `table_permutations_for`) and
+/// the forks (what is left): the mean fork per instance is the cost model's
+/// fork constant (RPX's `FORK_PERMS`, 694, is the control). Also each leaf's
+/// other rows, where the emulated width-8 grind lands.
+#[test]
+#[ignore = "laptop instrument: production-height leaves, emitted one at a time (≈ 0.4 GiB each)"]
+fn p1_leaf_census_at_production_heights() {
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    let arms = [
+        ("rpx", BaseFormat::RPX),
+        (
+            "p1-c1",
+            BaseFormat {
+                arity4_cap: CapPolicy::Fixed(1),
+                ..BaseFormat::P1
+            },
+        ),
+        ("p1-c4", BaseFormat::P1),
+    ];
+    for (name, base) in arms {
+        let opts = super::proof::block_base_options_for(base);
+        let plan = spread_plan_under(13, 40, &opts);
+        let wrap = WrapHash::for_base(&base);
+        let front = front_hash_rows(&plan, wrap);
+        let (mut rows, mut legs, mut instances, mut other) = (0usize, 0usize, 0usize, 0usize);
+        for k in 0..plan.partition().num_leaves() {
+            let program = plan.leaf_program(k).expect("the leaf emits");
+            let leaf: &[usize] = plan.partition().leaf(k);
+            let leg: usize = leaf
+                .iter()
+                .map(|&i| {
+                    super::epoch_verify::table_permutations_for(&plan.instance(i).verify, wrap)
+                })
+                .sum();
+            let hash = program.groups.hash.real_rows;
+            let rest: usize = program_groups(&program)
+                .iter()
+                .map(|g| g.real_rows)
+                .sum::<usize>()
+                - hash;
+            println!(
+                "CENSUS {name} leaf {k}: {} instances · hash rows {hash} = front {front} + legs \
+                 {leg} + forks {} · other rows {rest}",
+                leaf.len(),
+                hash as i64 - front as i64 - leg as i64
+            );
+            let groups: Vec<String> = PROGRAM_GROUP_NAMES
+                .iter()
+                .zip(program_groups(&program))
+                .map(|(g, c)| format!("{g} {}×{}", c.real_rows, c.width))
+                .collect();
+            println!("CENSUS {name} leaf {k} groups: {}", groups.join(" · "));
+            rows += hash;
+            legs += leg;
+            instances += leaf.len();
+            other += rest;
+        }
+        let leaves = plan.partition().num_leaves();
+        let forks = rows as i64 - (leaves * front) as i64 - legs as i64;
+        println!(
+            "CENSUS {name}: {leaves} leaves · {instances} instances · hash rows {rows} · front \
+             {front}/leaf · legs {legs} · fork mean {:.1}/instance · other rows {other} · cost \
+             model {:#x} (Σ costs {})",
+            forks as f64 / instances as f64,
+            plan.cost_model(),
+            plan.costs().iter().sum::<usize>()
+        );
+    }
+}
+
 /// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest.
 const SMALL_TREE_IDS: [(&str, &[&str]); 2] = [
     (

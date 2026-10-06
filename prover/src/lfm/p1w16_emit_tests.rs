@@ -394,3 +394,137 @@ fn the_grinding_check_is_p1s() {
     assert!(check(good).is_ok(), "nonce {good}");
     assert!(check(bad).is_err(), "nonce {bad}");
 }
+
+/// Run `b`'s program over `arenas`, `Err` when it does not execute.
+fn try_run(b: LfmBuilder, arenas: &[Vec<LfmWord>]) -> Result<(), String> {
+    let program = compile(b.finish());
+    super::validator::validate(&program).map_err(|e| format!("{e:?}"))?;
+    execute_serial(&program, arenas, &HasherKind::Poseidon1W16)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// One opening of a host Poseidon1 tree checked in-guest at cap height `c`:
+/// the owner path as the proof carries it (the path to the cap, then the cap,
+/// `embed_cap_arity`) laid out by the harvest (`path_to_cap`), the cap
+/// authenticated against the root and the opening against the cap — or, at
+/// `c = 0`, walked to the root. `tamper` moves one arena word first.
+fn cap_opening(
+    depth: usize,
+    c: usize,
+    index: usize,
+    tamper: Option<(usize, usize)>,
+) -> Result<(), String> {
+    use super::algebraic_commit::{commitment_to_digest, digest_to_commitment};
+    use super::edsl::WrapHash;
+    use super::merkle_cap::CapCells;
+    use crypto::merkle_tree::merkle::MerkleTree;
+    use stark::config::Commitment;
+    type B = super::p1_commit::P1BatchBackend<crate::tables::types::GoldilocksField>;
+
+    let n = 1usize << depth;
+    let leaves: Vec<Commitment> = (0..n)
+        .map(|i| digest_to_commitment(&digest(depth as u64 + 31, i)))
+        .collect();
+    let tree = MerkleTree::<B>::build_from_hashed_leaves(leaves.clone()).expect("a tree");
+    let mut path = tree
+        .get_proof_by_pos(index)
+        .expect("a leaf")
+        .merkle_path
+        .clone();
+    let cap = if c == 0 {
+        Vec::new()
+    } else {
+        tree.cap(c).expect("the cap")
+    };
+    if c > 0 {
+        crypto::merkle_tree::cap::embed_cap_arity(&mut [&mut path], depth, &cap, 4)
+            .expect("the owner path");
+    }
+    let (hints, split) =
+        super::harvest::path_to_cap(&path, depth, c, 4, true, Some(index)).expect("laid out");
+    assert_eq!(split.unwrap_or_default(), cap, "the cap rides on the owner path");
+    assert_eq!(
+        hints.len(),
+        super::merkle_cap::path_hints(depth, c, 4),
+        "depth {depth} cap {c}"
+    );
+
+    let word = |c: &Commitment| -> LfmWord { commitment_to_digest(c) };
+    let mut arenas: Vec<Vec<LfmWord>> = vec![
+        vec![word(&leaves[index])],
+        vec![base_word(FE::from(index as u64))],
+        hints.iter().map(word).collect(),
+        cap.iter().map(word).collect(),
+        vec![word(&tree.root)],
+    ];
+    if let Some((a, w)) = tamper {
+        arenas[a][w][2] += FE::one();
+    }
+
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Poseidon1);
+    let lens: Vec<u32> = arenas.iter().map(|a| a.len() as u32).collect();
+    let ids: Vec<_> = lens.iter().map(|&l| b.declare_arena(l)).collect();
+    let leaf = WrapDigest::from_cell(b.hint_word(ids[0], 0));
+    let idx = b.hint_felt(ids[1], 0);
+    let bits = b.bit_dec(idx, depth);
+    let h: Vec<WrapDigest> = (0..lens[2])
+        .map(|i| WrapDigest::from_cell(b.hint_word(ids[2], i)))
+        .collect();
+    let root = b.hint_word(ids[4], 0);
+    let root_lanes = [b.unpack(root)];
+    if c == 0 {
+        let walked = super::edsl::wrap_merkle_walk(&mut b, leaf, &bits, &h);
+        super::edsl::assert_digest_eq_lanes(&mut b, walked, &root_lanes);
+    } else {
+        let nodes: Vec<WrapDigest> = (0..lens[3])
+            .map(|i| WrapDigest::from_cell(b.hint_word(ids[3], i)))
+            .collect();
+        let capped = CapCells::authenticate_at(&mut b, &nodes, c, &root_lanes);
+        assert_eq!(capped.height(), c);
+        capped.verify_path(&mut b, leaf, &bits, &h);
+    }
+    try_run(b, &arenas)
+}
+
+/// ★ Arity-4 caps against the host's own trees: at every depth (both
+/// parities) and every cap height up to the tree's levels, an opening checked
+/// against the host's cap (`MerkleTree::cap`, `4^c` or `2·4^(c−1)` nodes) over
+/// the path the proof carries executes; uncapped, the walk reaches the root
+/// (the odd top's padding supplied by the walk).
+#[test]
+fn an_arity4_cap_checks_the_hosts_openings() {
+    for depth in 1usize..=7 {
+        let n = 1usize << depth;
+        let levels = crypto::merkle_tree::cap::tree_levels(depth, 4);
+        for c in 0..=levels {
+            for index in [0, n / 2, n - 1, (5 * n) / 7] {
+                cap_opening(depth, c, index, None).unwrap_or_else(|e| {
+                    panic!("depth {depth} cap {c} index {index}: {e}");
+                });
+            }
+        }
+    }
+}
+
+/// Every word the check reads is bound: a moved hint, cap node or root makes
+/// the program unexecutable, at an even and an odd depth, capped and not.
+#[test]
+fn an_arity4_cap_refuses_a_moved_word() {
+    for (depth, c) in [(6usize, 2usize), (7, 1), (7, 0), (5, 3)] {
+        let index = (1usize << depth) - 3;
+        let hints = super::merkle_cap::path_hints(depth, c, 4);
+        let nodes = super::merkle_cap::cap_nodes(depth, c, 4);
+        let mut words = vec![(0usize, 0usize), (4, 0)];
+        words.extend((0..hints).map(|w| (2, w)));
+        if c > 0 {
+            words.extend((0..nodes).map(|w| (3, w)));
+        }
+        for (a, w) in words {
+            assert!(
+                cap_opening(depth, c, index, Some((a, w))).is_err(),
+                "depth {depth} cap {c}: arena {a} word {w} moved and the opening executed"
+            );
+        }
+    }
+}

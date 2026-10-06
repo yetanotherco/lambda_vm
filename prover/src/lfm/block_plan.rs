@@ -84,18 +84,22 @@ pub const PARTITION_COST_MODEL: u32 = 2;
 /// socket rows), with its own fork constant ([`P1_FORK_PERMS`]) and cap
 /// ([`P1_LEAF_PERMS_CAP`]).
 ///
-/// - v1: the P3a census.
+/// - v1: the P3a census at cap 1 (`p1_leaf_census_at_production_heights`).
 pub const P1_PARTITION_COST_MODEL: u32 = 0x5031_0001;
 
-/// [`FORK_PERMS`] under a Poseidon1 base, in socket rows: the fork's
-/// transcript (ZisK's sponge, twelve felts a permutation) per instance on top
-/// of its legs' closed form. The grinding check is two emulated width-8
-/// permutations, ALU rows, so it adds no socket row.
-pub const P1_FORK_PERMS: usize = 230;
+/// [`FORK_PERMS`] under a Poseidon1 base, in socket rows: a fork's transcript
+/// (ZisK's sponge, twelve felts a permutation) on top of its legs' closed
+/// form — the census mean, 123.5 a sub-proof over the production-height
+/// spread plan's 87. The grinding check is two emulated width-8 permutations,
+/// ALU rows, so it adds no socket row.
+pub const P1_FORK_PERMS: usize = 124;
 
-/// [`LEAF_PERMS_CAP`] under a Poseidon1 base: the same `LFM_HASH` table
-/// height, filled with socket rows (the socket is as wide as RPX's chip).
-pub const P1_LEAF_PERMS_CAP: usize = LEAF_PERMS_CAP;
+/// [`LEAF_PERMS_CAP`] under a Poseidon1 base: RPX's cap scaled by the census's
+/// hash rows a sub-proof (P1 at cap 1 / RPX: 10,696 / 18,443 = 0.580), so a P1
+/// leaf takes about as many sub-proofs as an RPX leaf and its ALU tables stay
+/// at RPX's heights. At RPX's 279,000 socket rows a P1 leaf took 26 sub-proofs
+/// and 1.48 M XALU rows (2^21; RPX's 18 take 1.00 M, 2^20).
+pub const P1_LEAF_PERMS_CAP: usize = 162_000;
 
 /// One partition cost model: its version, the per-instance fork constant and
 /// the leaf-load cap, in the base's hash rows.

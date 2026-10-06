@@ -510,7 +510,7 @@ fn leaf_index(iotas: Option<&[usize]>, q: usize, shift: usize) -> Result<Option<
 /// they are laid out in the walk's hint order for the opening at `index`
 /// ([`super::p1w16_emit::hint_order`], which drops an uncapped odd-depth top's
 /// two padding siblings), so an arity-4 path needs its leaf index.
-fn path_to_cap(
+pub(crate) fn path_to_cap(
     path: &[Commitment],
     depth: usize,
     c: usize,
