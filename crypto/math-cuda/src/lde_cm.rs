@@ -560,6 +560,17 @@ pub(crate) fn launch_col_major_leaves(
     // Every kernel derives rows as `__brevll(..) >> (64 - log_num_rows)`, UB
     // at `log_num_rows == 0`.
     assert!(num_rows >= 2 && num_rows.is_power_of_two());
+    if hash == DeviceHash::Poseidon1 {
+        return crate::p1_stark::launch_leaves_cols_ptr(
+            stream,
+            cols,
+            col_stride,
+            num_cols,
+            num_rows,
+            rows_per_leaf,
+            leaves,
+        );
+    }
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let threads = num_rows / rows_per_leaf as u64;
     let (kernel, cfg) = match (hash, rows_per_leaf) {
@@ -587,6 +598,7 @@ pub(crate) fn launch_col_major_leaves(
             &be.rpx_leaves_base_batched,
             crate::rpx::rpx_launch_cfg(threads),
         ),
+        (DeviceHash::Poseidon1, _) => unreachable!("Poseidon1 leaves launched above"),
         (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
             unimplemented!("{hash:?} device commit not yet ported (column-major leaves)")
         }

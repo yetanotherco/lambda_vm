@@ -58,6 +58,7 @@ pub(crate) const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
         CommitmentHash::Rpo256 => 2,
         CommitmentHash::Rpx256 => 3,
         CommitmentHash::Poseidon => 4,
+        CommitmentHash::Poseidon1 => 5,
     }
 }
 
