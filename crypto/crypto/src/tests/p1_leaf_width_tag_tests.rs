@@ -8,8 +8,10 @@
 use alloc::vec::Vec;
 
 use crate::hash::poseidon1_stark::{linear_hash, zisk_linear_hash};
-use crate::hash::poseidon1_w16::{Digest, Fp, compress4, permute};
-use crate::merkle_tree::cap::{tree_levels, verify_cap_shaped, verify_merkle_path_to_cap_from_leaf_hash};
+use crate::hash::poseidon1_w16::{Digest, Fp, compress4};
+use crate::merkle_tree::cap::{
+    tree_levels, verify_cap_shaped, verify_merkle_path_to_cap_from_leaf_hash,
+};
 use crate::merkle_tree::merkle::MerkleTree;
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 
@@ -25,7 +27,9 @@ fn lcg(seed: u64, n: usize) -> Vec<Fp> {
     let mut x = seed;
     (0..n)
         .map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             Fp::from(x % P)
         })
         .collect()
@@ -82,7 +86,9 @@ fn dual_family<B: IsMerkleTreeBackend<Node = [u64; 4], Data = Vec<Fp>>>(
     n_wide: usize,
 ) -> (Vec<Vec<Fp>>, Vec<Vec<Fp>>) {
     let span = 4usize.pow(m);
-    let narrow: Vec<Vec<Fp>> = (0..n_wide * span).map(|k| lcg(0xD0A1 + k as u64, w)).collect();
+    let narrow: Vec<Vec<Fp>> = (0..n_wide * span)
+        .map(|k| lcg(0xD0A1 + k as u64, w))
+        .collect();
     // Level digests of the narrow tree, bottom (leaf digests) first.
     let mut levels: Vec<Vec<[u64; 4]>> = vec![narrow.iter().map(B::hash_data).collect()];
     for _ in 1..m {
@@ -119,7 +125,11 @@ fn opens_all<B: IsMerkleTreeBackend<Node = [u64; 4], Data = Vec<Fp>>>(
     c: usize,
 ) -> bool {
     let levels = tree_levels(depth, 4);
-    let cap = if c == 0 { vec![tree.root] } else { tree.cap(c).expect("cap") };
+    let cap = if c == 0 {
+        vec![tree.root]
+    } else {
+        tree.cap(c).expect("cap")
+    };
     verify_cap_shaped::<B>(&cap, &tree.root, depth, c)
         && data.iter().enumerate().all(|(pos, row)| {
             let full = tree.get_proof_by_pos(pos).expect("in range").merkle_path;
@@ -138,7 +148,7 @@ fn opens_all<B: IsMerkleTreeBackend<Node = [u64; 4], Data = Vec<Fp>>>(
 /// leaf, and both open at every cap height. The STARK's width-tagged leaf parts
 /// every one of them: a P1 root binds its leaf width. w = 12, 18, 24 and 30.
 #[test]
-fn rp1j_the_shape_dual_family_and_the_width_tag() {
+fn the_width_tag_parts_the_shape_dual_family() {
     // (w, m): 2w = 12·(⌈w/12⌉ + m) felts.
     for (w, m) in [(12usize, 1u32), (18, 1), (24, 2), (30, 2)] {
         assert_eq!(2 * w, 12 * (w.div_ceil(12) + m as usize), "w {w}");
@@ -175,7 +185,7 @@ fn rp1j_the_shape_dual_family_and_the_width_tag() {
 /// The width tag also removes the 12-felt-leaf / zero-fourth-child identity
 /// (node(a, b, c, 0) = leaf(a ‖ b ‖ c)).
 #[test]
-fn rp1j_the_width_tag_parts_a_short_leaf_from_a_padded_node() {
+fn the_width_tag_parts_a_short_leaf_from_a_padded_node() {
     let row = lcg(77, 12);
     let d = |k: usize| -> Digest { core::array::from_fn(|j| row[4 * k + j]) };
     let node = compress4(&[d(0), d(1), d(2), [Fp::zero(); 4]]);
