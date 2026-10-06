@@ -1137,6 +1137,90 @@ fn the_plan_refuses_elf_constants_of_another_elf_or_options() {
     );
 }
 
+/// The ELF constants on a pool of their own, DECODE and the pages at once
+/// (`NOEPOCH_ELF_CONSTS`), are the ones computed a page at a time on the pool
+/// beside the base, at any width, and they are refused for another ELF or other
+/// options as those are.
+#[test]
+fn the_elf_constants_at_once_are_the_page_at_a_time_ones_and_still_refused() {
+    use super::block_plan::ElfConstants;
+    let opts = fixture_block_options();
+    let a = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let b = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let serial = ElfConstants::compute(&a, &opts).expect("the constants compute");
+    for threads in [1, 3, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool");
+        let at_once = pool
+            .install(|| ElfConstants::compute_parallel(&a, &opts))
+            .expect("the constants compute");
+        assert_eq!(at_once, serial, "{threads} thread(s)");
+    }
+    assert_ne!(
+        ElfConstants::compute_parallel(&b, &opts).expect("the constants compute"),
+        serial,
+        "another ELF's constants differ"
+    );
+    let at_once = ElfConstants::compute_parallel(&a, &opts).expect("the constants compute");
+    let shape = honest_fixture_shape(&executor::elf::Elf::load(&a).expect("load the ELF"));
+    assert!(
+        BlockTreePlan::derive_with(&b, &opts, &shape, &at_once).is_err(),
+        "another ELF's constants are refused"
+    );
+    let mut other = opts.clone();
+    other.blowup_factor *= 2;
+    assert!(
+        BlockTreePlan::derive_with(&a, &other, &shape, &at_once).is_err(),
+        "constants computed under other options are refused"
+    );
+    let plan = BlockTreePlan::derive_with(&a, &opts, &shape, &at_once).expect("the plan derives");
+    let inline = BlockTreePlan::derive(&a, &opts, &shape).expect("the plan derives");
+    assert_eq!(
+        plan.attested(),
+        inline.attested(),
+        "constants at once and inline give one plan"
+    );
+}
+
+/// The block ELF's constants a page at a time on four threads (the pool beside
+/// the base, before `NOEPOCH_ELF_CONSTS`) and at once on pools of 4, 8 and 16:
+/// the same constants at every width, each with its wall on an idle host.
+#[test]
+#[ignore = "box tier, production scale: the block ELF's constants (NOEPOCH_ELF)"]
+fn the_block_elfs_constants_at_once_are_the_same_at_every_width() {
+    use super::block_plan::ElfConstants;
+    let path =
+        std::env::var("NOEPOCH_ELF").unwrap_or_else(|_| panic!("NOEPOCH_ELF must name a file"));
+    let elf = std::fs::read(&path).unwrap_or_else(|e| panic!("NOEPOCH_ELF {path}: {e}"));
+    let opts = super::proof::block_base_options();
+    let on = |threads: usize, at_once: bool| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool");
+        let t = std::time::Instant::now();
+        let consts = pool
+            .install(|| {
+                if at_once {
+                    ElfConstants::compute_parallel(&elf, &opts)
+                } else {
+                    ElfConstants::compute(&elf, &opts)
+                }
+            })
+            .expect("the constants compute");
+        (consts, t.elapsed().as_secs_f64())
+    };
+    let (serial, secs) = on(4, false);
+    println!("ELF CONSTANTS: a page at a time on 4 threads in {secs:.2}s");
+    for threads in [4, 8, 16] {
+        let (at_once, secs) = on(threads, true);
+        println!("ELF CONSTANTS: at once on {threads} threads in {secs:.2}s");
+        assert_eq!(at_once, serial, "at once on {threads} threads");
+    }
+}
+
 /// The partition's cost model is part of the verifier's identity (it decides
 /// every leaf's instance list), so its output is pinned to its version: a change
 /// to the closed form, the fork constant, the cap or the rule's seeds fails
