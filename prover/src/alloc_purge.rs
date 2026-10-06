@@ -93,14 +93,18 @@ pub struct Purge {
 /// purges nowhere; `all`, or a list of the boundary names [`purge_point`] is
 /// called with, separated by commas or dots (`base.tree`, for job specs that
 /// split their knobs on commas), purges there regardless. The block's points:
-/// `phase-a` (phase A done, `block.rs`), `base` (the base proved) and `tree`
-/// (the top proved, before the block verifier), the last two in the
-/// whole-block harness.
+/// `drop-back` (live regeneration's drop-back is through, on the drop thread,
+/// `block.rs`), `phase-a` (phase A done, `block.rs`), `base` (the base proved)
+/// and `tree` (the top proved, before the block verifier), the last two in the
+/// whole-block driver. #1014's copy of this module has no `drop-back` point yet.
 pub const ALLOC_PURGE_ENV: &str = "LAMBDA_VM_ALLOC_PURGE";
 
 /// The points `auto` purges at under memory pressure. `tree` is not one: it
-/// trims the block verifier's start, not the proof's peak.
-const AUTO_POINTS: [&str; 2] = ["phase-a", "base"];
+/// trims the block verifier's start, not the proof's peak. `drop-back` returns
+/// the pages of the instances regeneration dropped back when it armed: phase A
+/// does not reuse them, and they set its peak on a small host (I-MEMFIT §4:
+/// 13.7–19.7 GiB at the p90 block on a 58–64 GiB host).
+const AUTO_POINTS: [&str; 3] = ["drop-back", "phase-a", "base"];
 
 /// Whether the block in progress found its memory short.
 static PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -384,7 +388,7 @@ mod tests {
     #[test]
     fn auto_purges_only_under_memory_pressure() {
         for setting in [None, Some(""), Some("auto"), Some(" auto ")] {
-            for point in ["phase-a", "base"] {
+            for point in ["drop-back", "phase-a", "base"] {
                 assert_eq!(
                     decide(setting, point, true),
                     Decision::Purge,
@@ -404,6 +408,18 @@ mod tests {
         }
         assert_eq!(decide(Some("base.tree"), "tree", false), Decision::Purge);
         assert_eq!(decide(Some("base.tree"), "phase-a", true), Decision::No);
+        // The control arm for the drop-back point: the two older points named,
+        // the new one not.
+        assert_eq!(
+            decide(Some("phase-a.base"), "drop-back", true),
+            Decision::No
+        );
+        assert_eq!(
+            decide(Some("phase-a.base"), "phase-a", false),
+            Decision::Purge
+        );
+        assert_eq!(decide(Some("off"), "drop-back", true), Decision::No);
+        assert_eq!(decide(Some("all"), "drop-back", false), Decision::Purge);
     }
 
     /// A purge goes through the hooks it is given: it reads the resident bytes

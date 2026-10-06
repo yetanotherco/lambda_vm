@@ -1962,7 +1962,27 @@ fn run_drops(
     ledger: Option<&MemLedger>,
 ) {
     let lock = || committed.lock().unwrap_or_else(|e| e.into_inner());
-    for job in jobs {
+    // The drop-back is through once regeneration has armed (it queues every
+    // drop-back before it marks itself armed) and the queue runs dry after at
+    // least one of them: its pages go back to the OS then, under memory
+    // pressure (`alloc_purge`'s `drop-back` point), once.
+    let mut dropped_back = false;
+    let mut purged = false;
+    loop {
+        let job = match jobs.try_recv() {
+            Ok(job) => job,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if dropped_back && !purged && live.is_armed() {
+                    purged = true;
+                    crate::alloc_purge::purge_point("drop-back");
+                }
+                match jobs.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        };
         let (narrow, held) = lock().get_mut(job.index).map_or((None, None), |entry| {
             let trace = &mut entry.0.trace;
             let narrow = trace.take_main_for_regen();
@@ -1991,6 +2011,7 @@ fn run_drops(
             ));
             continue;
         }
+        dropped_back |= job.back;
         if job.back
             && let Some(spill) = spill
         {
