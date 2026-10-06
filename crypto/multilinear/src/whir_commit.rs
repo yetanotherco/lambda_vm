@@ -693,56 +693,84 @@ where
         let Codeword::Device(device) = &self.codeword else {
             return None;
         };
-        // The card re-hashes binary subtrees only; an arity-4 tree's kept-top
-        // paths are served by the host (`host_top_paths`).
-        if Self::arity() != 2 {
-            return None;
-        }
+        let arity = Self::arity();
         let dropped = top.dropped;
-        let span = 1usize << dropped;
-        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> dropped).collect();
+        // A block is `2^dropped` leaves, or `4^dropped` at arity 4.
+        let block_bits = if arity == 4 { 2 * dropped } else { dropped };
+        let span = 1usize << block_bits;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
         blocks.sort_unstable();
         blocks.dedup();
         let nodes = device.block_subtrees(self.log_folding, &blocks, dropped, H::DEVICE)?;
-        let leaves = (blocks.len() << dropped).next_power_of_two().max(2);
-        if nodes.len() != 2 * leaves - 1 {
+        // The card's one tree over the gathered leaves, in the layout of this
+        // arity: the binary heap, or the arity-4 levels top-down.
+        let leaves = (blocks.len() << block_bits).next_power_of_two().max(2);
+        let sizes4 = level_sizes4(leaves);
+        let offsets4 = level_offsets4(&sizes4);
+        let expected = if arity == 4 {
+            sizes4.iter().sum()
+        } else {
+            2 * leaves - 1
+        };
+        if nodes.len() != expected {
             return None;
         }
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(
-            (blocks.len() << dropped) as u64,
+            (blocks.len() << block_bits) as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let frontier = (1usize << (self.depth() - dropped)) - 1;
-        // The blocks are `2^dropped`-aligned among the gathered leaves, so
-        // block `k`'s root sits `dropped` levels up, `k`-th on its level.
-        let roots_at = (leaves >> dropped) - 1;
+        let frontier = self.frontier(top);
+        // The blocks are `span`-aligned among the gathered leaves, so block
+        // `k`'s root sits `dropped` levels up, `k`-th on its level.
+        let roots_at = if arity == 4 {
+            offsets4[dropped]
+        } else {
+            (leaves >> dropped) - 1
+        };
         for (k, &block) in blocks.iter().enumerate() {
             if top.nodes.get(frontier + block) != Some(&nodes[roots_at + k]) {
                 return Some(Err(Error::RecomputedCodewordMismatch { block }));
             }
         }
+        let pad = Backend::<F, H>::padding_node();
         let paths = indices
             .iter()
             .map(|&index| {
-                let block = index >> dropped;
+                let block = index >> block_bits;
                 let k = blocks
                     .binary_search(&block)
                     .map_err(|_| Error::QueryOutOfRange {
                         index,
                         bound: self.num_leaves(),
                     })?;
-                let mut merkle_path = Vec::with_capacity(self.depth());
-                let mut pos = (leaves - 1) + (k << dropped) + (index & (span - 1));
-                for _ in 0..dropped {
-                    merkle_path.push(nodes[sibling(pos)]);
-                    pos = (pos - 1) / 2;
+                let mut merkle_path = Vec::with_capacity(self.path_len());
+                let leaf = (k << block_bits) + (index & (span - 1));
+                if arity == 4 {
+                    // Inside an aligned block every group is whole; the
+                    // padding arm is the layout's rule, not a case reached.
+                    let mut pos = leaf;
+                    for level in 0..dropped {
+                        let first = pos / 4 * 4;
+                        for c in (first..first + 4).filter(|&c| c != pos) {
+                            let node = if c < sizes4[level] {
+                                Some(nodes[offsets4[level] + c])
+                            } else {
+                                pad
+                            };
+                            merkle_path
+                                .push(node.ok_or(Error::RecomputedCodewordMismatch { block })?);
+                        }
+                        pos /= 4;
+                    }
+                } else {
+                    let mut pos = (leaves - 1) + leaf;
+                    for _ in 0..dropped {
+                        merkle_path.push(nodes[sibling(pos)]);
+                        pos = (pos - 1) / 2;
+                    }
                 }
-                let mut pos = frontier + block;
-                while pos != 0 {
-                    merkle_path.push(top.nodes[sibling(pos)]);
-                    pos = (pos - 1) / 2;
-                }
+                self.push_kept_siblings(top, block, &mut merkle_path)?;
                 Ok(Proof { merkle_path })
             })
             .collect();
@@ -1365,9 +1393,10 @@ mod tests {
     }
 
     /// ★ The card's re-hash of a retired tree's queried blocks (box only, a
-    /// codeword big enough for the card): at 4, 6 and 8 dropped levels, under
-    /// both hashes, the card's paths are the host's and the kept tree's, byte
-    /// for byte; a kept node flipped is refused on the card as on the host.
+    /// codeword big enough for the card): at 4, 6 and 8 dropped levels (2, 3
+    /// and 4 four-ary ones under Poseidon1), under every hash, the card's paths
+    /// are the host's and the kept tree's, byte for byte; a kept node flipped
+    /// is refused on the card as on the host.
     #[cfg(feature = "cuda")]
     #[test]
     fn the_card_rehashes_a_retired_trees_blocks_to_the_host_paths() {
@@ -1418,7 +1447,8 @@ mod tests {
                         "the codeword is on the card"
                     );
                     let top = c.top.clone().expect("a kept top");
-                    assert_eq!(top.dropped, d);
+                    let four = CodewordCommitment::<F, H>::arity() == 4;
+                    assert_eq!(top.dropped, if four { d / 2 } else { d });
                     let card = c
                         .card_top_paths(&top, &indices)
                         .expect("the card re-hashes")
@@ -1435,9 +1465,10 @@ mod tests {
                         "d {d}: card vs kept"
                     );
                     // A kept node under a queried block flipped: refused on both.
-                    let frontier = (1usize << (c.depth() - d)) - 1;
+                    let frontier = c.frontier(&top);
+                    let block_bits = if four { 2 * top.dropped } else { top.dropped };
                     let mut bad = top.clone();
-                    bad.nodes[frontier + (indices[0] >> d)][0] ^= 1;
+                    bad.nodes[frontier + (indices[0] >> block_bits)][0] ^= 1;
                     assert!(matches!(
                         c.card_top_paths(&bad, &indices),
                         Some(Err(Error::RecomputedCodewordMismatch { .. }))
@@ -1451,6 +1482,7 @@ mod tests {
         }
         check::<KeccakWhir>();
         check::<crate::whir_hash::RpxWhir>();
+        check::<crate::whir_hash::P1Whir>();
     }
 
     #[test]
