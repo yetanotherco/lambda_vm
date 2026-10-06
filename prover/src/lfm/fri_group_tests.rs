@@ -559,7 +559,7 @@ fn fri_layer_program(d: u32, c: usize, times: usize) -> LfmProgram {
     let zetas: Vec<_> = (0..fold)
         .map(|i| b.hint_word(arena, 4 + i).as_ext())
         .collect();
-    let mut at = commitment.hint_cap(&mut b, arena, 4 + fold, c);
+    let mut at = commitment.hint_cap(&mut b, arena, 4 + fold, c, shape.layer_depth(0));
     for _ in 0..times {
         let values = (0..n)
             .map(|_| {

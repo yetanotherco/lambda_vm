@@ -187,6 +187,10 @@ pub struct TranscriptReplay {
     /// override it with `with_wrap_hash` — so it cannot be decided at
     /// construction from the global configuration.
     sponge: Option<SpongeVar>,
+    /// ★ The POSEIDON1 arm's sponge (ZisK's transcript, `p1w16_emit`), lazily
+    /// like [`Self::sponge`] and for the same reason. Every append drains into
+    /// it in host order at the next builder-taking call.
+    p1: Option<super::p1w16_emit::P1SpongeVar>,
 }
 
 impl TranscriptReplay {
@@ -201,6 +205,7 @@ impl TranscriptReplay {
             buf: None,
             out_pos: SQUEEZE_LEN,
             sponge: None,
+            p1: None,
         };
         t.append_const_bytes(seed);
         t
@@ -262,6 +267,19 @@ impl TranscriptReplay {
     /// group would reduce, and reduction is what makes two different roots
     /// absorb identically.
     pub fn append_root_cells(&mut self, b: &mut LfmBuilder, cells: &[Cell]) {
+        if Self::is_p1(b) {
+            // `P1Transcript::append_bytes(root)`: the length 32, then the root's
+            // 8-byte big-endian groups — its four digest lanes, by the node
+            // encoding's cancellation (`digest_to_commitment`).
+            assert_eq!(cells.len(), 1, "a Poseidon1 root is ONE cell");
+            let mut sponge = self.drive_p1(b);
+            sponge.put_const(b, FE::from(32u64));
+            for lane in b.unpack(cells[0]) {
+                sponge.put_felt(b, lane);
+            }
+            self.p1 = Some(sponge);
+            return;
+        }
         if Self::is_algebraic(b) {
             assert_eq!(cells.len(), 1, "an algebraic root is ONE cell");
             let mut sponge = self.drive_chain(b);
@@ -285,7 +303,7 @@ impl TranscriptReplay {
     /// statement leg's position. Identical on the algebraic arm, which has no
     /// cursor at all.
     pub fn append_root_cells_misaligned(&mut self, b: &mut LfmBuilder, cells: &[Cell]) {
-        if Self::is_algebraic(b) {
+        if Self::is_algebraic(b) || Self::is_p1(b) {
             self.append_root_cells(b, cells);
             return;
         }
@@ -325,6 +343,15 @@ impl TranscriptReplay {
     /// decomposition and no byte swap. The byte arm's `felt_be_halves` was the
     /// price of a byte-oriented hash, not of the value.
     pub fn append_felt(&mut self, b: &mut LfmBuilder, v: Felt) {
+        if Self::is_p1(b) {
+            // `append_bytes(&canonical(v).to_be_bytes())`: the length 8, then the
+            // one 8-byte big-endian group, which is `v`.
+            let mut sponge = self.drive_p1(b);
+            sponge.put_const(b, FE::from(8u64));
+            sponge.put_felt(b, v);
+            self.p1 = Some(sponge);
+            return;
+        }
         if Self::is_algebraic(b) {
             let mut sponge = self.drive_chain(b);
             // Eight bytes of payload: the rule fixes the prefix and says there
@@ -373,6 +400,15 @@ impl TranscriptReplay {
     /// length-prefixed `append_bytes` calls where the host made one
     /// `append_field_element`, and that is exactly what the emitter gate caught.
     pub fn append_ext(&mut self, b: &mut LfmBuilder, coords: [Felt; 3]) {
+        if Self::is_p1(b) {
+            // `append_field_element`: the three coefficients, no length.
+            let mut sponge = self.drive_p1(b);
+            for c in coords {
+                sponge.put_felt(b, c);
+            }
+            self.p1 = Some(sponge);
+            return;
+        }
         if Self::is_algebraic(b) {
             let mut sponge = self.drive_chain(b);
             // `field_element_cell`'s layout, in the machine's spelling: lanes
@@ -449,6 +485,44 @@ impl TranscriptReplay {
     /// build whose default is algebraic.
     fn is_algebraic(b: &LfmBuilder) -> bool {
         b.wrap_hash() == WrapHash::Algebraic
+    }
+
+    /// Whether this builder replays ZisK's Poseidon1 transcript.
+    fn is_p1(b: &LfmBuilder) -> bool {
+        b.wrap_hash() == WrapHash::Poseidon1
+    }
+
+    /// The Poseidon1 arm's [`Self::drive_chain`]: every pending append into
+    /// the sponge, in order, under `P1Transcript::append_bytes`' encoding —
+    /// the length, then the bytes as 8-byte big-endian felts, the last
+    /// zero-padded.
+    fn drive_p1(&mut self, b: &mut LfmBuilder) -> super::p1w16_emit::P1SpongeVar {
+        let mut sponge = self
+            .p1
+            .take()
+            .unwrap_or_else(|| super::p1w16_emit::P1SpongeVar::new(b));
+        for append in core::mem::take(&mut self.segment) {
+            match append {
+                Append::Const(bytes) => {
+                    for v in super::p1_commit::P1Transcript::append_bytes_felts(&bytes) {
+                        sponge.put_const(b, v);
+                    }
+                }
+                Append::Bytes { halves, byte_len } => {
+                    sponge.put_const(b, FE::from(byte_len as u64));
+                    // The 32-byte cells of the big-endian grouping, cut back to
+                    // the host's felt count (the rule's 8-byte groups).
+                    let felts = byte_len.div_ceil(8);
+                    let cells = cells_from_halves_be(b, &halves, byte_len);
+                    let lanes: Vec<Felt> = cells.iter().flat_map(|c| b.unpack(*c)).collect();
+                    for lane in lanes.into_iter().take(felts) {
+                        sponge.put_felt(b, lane);
+                    }
+                }
+            }
+        }
+        self.segment_len = 0;
+        sponge
     }
 
     /// Drive every pending append into the algebraic chain, creating it on first
@@ -705,6 +779,12 @@ impl TranscriptReplay {
     /// `sample_u64` reaches the raw candidate stream, not the fixed schedule,
     /// and at a power-of-two bound it accepts its first candidate.
     pub fn sample_felt(&mut self, b: &mut LfmBuilder) -> Felt {
+        if Self::is_p1(b) {
+            let mut sponge = self.drive_p1(b);
+            let f = sponge.squeeze(b);
+            self.p1 = Some(sponge);
+            return f;
+        }
         let Some(h) = b.wrap_hash().byte_hash() else {
             // Lane 0 of one squeezed cell. ⚠ No host counterpart: an algebraic
             // transcript has no base-field draw — `sample_field_element` returns
@@ -755,6 +835,13 @@ impl TranscriptReplay {
     /// extension elements, so an ext draw is where the completeness bound is
     /// paid three times over.
     pub fn sample_ext(&mut self, b: &mut LfmBuilder) -> Ext {
+        if Self::is_p1(b) {
+            // `sample_field_element`: three consecutive squeezed felts.
+            let mut sponge = self.drive_p1(b);
+            let c: [Felt; 3] = core::array::from_fn(|_| sponge.squeeze(b));
+            self.p1 = Some(sponge);
+            return b.pack_ext(c[0], c[1], c[2]);
+        }
         if Self::is_algebraic(b) {
             // ★ ONE squeeze, not three. `sample_field_element` reads all three
             // coordinates off a single squeezed cell (lanes 0-2) where the byte
@@ -823,6 +910,14 @@ impl TranscriptReplay {
             "sample_u64_pow2: nbits must be at most 32, got {nbits} — above 32 the \
              answer would span both halves of the candidate"
         );
+        if Self::is_p1(b) {
+            // `P1Transcript::sample_u64`: one squeezed felt, canonical, masked —
+            // the low `nbits` of its canonical decomposition.
+            let mut sponge = self.drive_p1(b);
+            let f = sponge.squeeze(b);
+            self.p1 = Some(sponge);
+            return b.bit_dec(f, nbits);
+        }
         let Some(h) = b.wrap_hash().byte_hash() else {
             // `sample_u64` at a power-of-two bound is `canonical(cell[0]) &
             // (bound − 1)` — the low `nbits` of lane 0, which is exactly what
@@ -851,6 +946,13 @@ impl TranscriptReplay {
     /// every caller reaching grinding through a `sample` — and a re-emitted
     /// splice would only be redundant work, never a different value.
     pub fn state(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
+        if Self::is_p1(b) {
+            // `P1Transcript::state`: lanes 0..4 after flushing a COPY.
+            let sponge = self.drive_p1(b);
+            let cell = sponge.digest(b);
+            self.p1 = Some(sponge);
+            return edsl::WrapDigest::from_cell(cell);
+        }
         let Some(h) = b.wrap_hash().byte_hash() else {
             // The chain's state cell, which is what `AlgebraicTranscript::state`
             // serialises. Draining the pending appends here is not the extra
@@ -1385,6 +1487,10 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
         // why one arm serves them (`SOUNDNESS.md` §6.4).
         WrapHash::Algebraic => {
             super::algebraic_commit::AlgebraicRpoTranscriptHash::CANDIDATES_PER_COORDINATE
+        }
+        // ZisK's transcript squeezes canonical felts too: one per coordinate.
+        WrapHash::Poseidon1 => {
+            <super::p1_commit::P1TranscriptHash as TranscriptHash>::CANDIDATES_PER_COORDINATE
         }
     };
     schedule.map_or(1, core::num::NonZeroUsize::get)

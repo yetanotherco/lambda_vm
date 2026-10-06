@@ -196,6 +196,16 @@ pub struct Blake3Operands {
     pub rev: Option<Blake3ReversedDigest>,
 }
 
+/// One width-16 Poseidon1 permutation (`super::p1w16_socket`): four input
+/// words read, all sixteen lanes permuted, four output words written. Every
+/// output is allocated; one nobody reads takes multiplicity zero.
+#[derive(Debug, Clone)]
+pub struct Hash16Operands {
+    pub ins: [Addr; 4],
+    pub outs: [Addr; 4],
+    pub mults: [u64; 4],
+}
+
 /// The reversed-digest outputs of a BLAKE3 row (see `layout::blake3::REV_ADDR0`).
 #[derive(Debug, Clone)]
 pub struct Blake3ReversedDigest {
@@ -297,6 +307,14 @@ pub enum Instr {
     /// twice the next largest variant, and inlining them would grow every
     /// instruction in the program vector.
     Blake3(Box<Blake3Operands>),
+    /// One width-16 Poseidon1 permutation, the `LFM_HASH` row of a program
+    /// under `HasherKind::Poseidon1W16`. A program carries `Hash` rows or
+    /// `Hash16` rows, never both.
+    ///
+    /// Boxed for the reason `KeccakF` is: the 12-felt `Hash` is the default
+    /// path, and an inline 4-wide variant would grow every instruction of every
+    /// program.
+    Hash16(Box<Hash16Operands>),
     Public {
         addr: Addr,
         index: u32,
@@ -347,6 +365,7 @@ impl Instr {
             Instr::Hash { mode, outs, .. } => {
                 out.extend_from_slice(&outs[..mode.num_output_cells()])
             }
+            Instr::Hash16(h) => out.extend_from_slice(&h.outs),
             Instr::Public { .. } => {}
         }
     }
@@ -383,6 +402,7 @@ impl Instr {
             }
             Instr::BitDec { input, .. } => out.push(*input),
             Instr::Hash { mode, ins, .. } => out.extend_from_slice(&ins[..mode.num_input_cells()]),
+            Instr::Hash16(h) => out.extend_from_slice(&h.ins),
             Instr::Pack { lanes, .. } => out.extend_from_slice(lanes),
             Instr::Unpack { input, .. } => out.push(*input),
             Instr::KeccakF(k) => {
