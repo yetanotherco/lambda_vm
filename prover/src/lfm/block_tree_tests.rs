@@ -1551,6 +1551,9 @@ fn p1_one_table_per_leaf_sizing() {
         let (mut instrs, mut cells, mut cost, mut legs) = (0usize, 0u64, 0.0f64, 0usize);
         let (mut split, mut cells_ns, mut cost_ns, mut legs_ns) = (0usize, 0u64, 0.0f64, 0usize);
         let mut heights = std::collections::BTreeMap::<String, usize>::new();
+        let (mut lightest, mut heaviest) = (u64::MAX, 0u64);
+        let costs = plan.costs();
+        let mut over = i64::MIN;
         for k in 0..leaves {
             let program = plan.leaf_program(k).expect("the leaf emits");
             let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
@@ -1589,6 +1592,10 @@ fn p1_one_table_per_leaf_sizing() {
             *heights.entry(label).or_default() += 1;
             // The no-split rule: the socket table one padded table.
             let real: u64 = chunks.iter().map(|c| c.real_rows).sum();
+            lightest = lightest.min(real);
+            heaviest = heaviest.max(real);
+            let closed: usize = plan.partition().leaf(k).iter().map(|&i| costs[i]).sum();
+            over = over.max(real as i64 - closed as i64);
             let padded: u64 = chunks.iter().map(|c| c.rows).sum();
             let one = real.next_power_of_two();
             let width = (chunks[0].main_cols + chunks[0].aux_cols) as u64;
@@ -1603,8 +1610,9 @@ fn p1_one_table_per_leaf_sizing() {
         }
         let l1 = leaves.div_ceil(super::block_plan::BLOCK_FAN_IN);
         println!(
-            "ONE TABLE cap {cap}: {leaves} leaves ({l1} level-1 nodes) · socket tables {heights:?} ({split} split) · Σ {instrs} \
-             instructions · Σ {cells} cells · law Σ {cost:.2} s · node legs Σ {legs} perms"
+            "ONE TABLE cap {cap}: {leaves} leaves ({l1} level-1 nodes) · socket tables {heights:?} ({split} split) · socket \
+             rows {lightest}..{heaviest} (real − closed form ≤ {over}) · Σ {instrs} instructions · Σ {cells} cells · law Σ {cost:.2} s · node legs Σ \
+             {legs} perms"
         );
         println!(
             "ONE TABLE cap {cap} no-split: Σ {cells_ns} cells (+{}) · law Σ {cost_ns:.2} s (+{:.2}) · node legs Σ {legs_ns} perms ({:+})",
@@ -1788,6 +1796,41 @@ fn the_block_elfs_constants_at_once_are_the_same_at_every_width() {
         let (at_once, secs) = on(threads, true);
         println!("ELF CONSTANTS: at once on {threads} threads in {secs:.2}s");
         assert_eq!(at_once, serial, "at once on {threads} threads");
+    }
+}
+
+/// P1's cost model v2 keeps every production-height leaf's socket rows in one
+/// `LFM_HASH` table: over ¾ · 2^18 rows, so `HashChunking` does not split it,
+/// and at most 2^18 (v1's 162,000 cap split every one).
+#[test]
+fn no_production_height_p1_leaf_splits_its_hash_table() {
+    use super::airs::lfm_chip_census_with_hasher;
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    let base = BaseFormat {
+        arity4_cap: CapPolicy::Fixed(1),
+        ..BaseFormat::P1
+    };
+    let plan = spread_plan_under(13, 40, &super::proof::block_base_options_for(base));
+    assert_eq!(
+        plan.cost_model(),
+        super::block_plan::P1_PARTITION_COST_MODEL
+    );
+    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+    for k in 0..plan.partition().num_leaves() {
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let rows = program.groups.hash.real_rows;
+        assert!(
+            rows > 3 << 16 && rows <= 1 << 18,
+            "leaf {k}: {rows} socket rows, outside one 2^18 table's unsplit window"
+        );
+        let census =
+            lfm_chip_census_with_hasher(&program, program.hasher(crate::hash_pin::BLOCK_HASHER));
+        let tables: Vec<u64> = census
+            .iter()
+            .filter(|c| c.name == hash)
+            .map(|c| c.rows)
+            .collect();
+        assert_eq!(tables, vec![1u64 << 18], "leaf {k}: its LFM_HASH tables");
     }
 }
 

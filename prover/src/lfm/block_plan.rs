@@ -84,8 +84,11 @@ pub const PARTITION_COST_MODEL: u32 = 2;
 /// socket rows), with its own fork constant ([`P1_FORK_PERMS`]) and cap
 /// ([`P1_LEAF_PERMS_CAP`]).
 ///
-/// - v1: the P3a census at cap 1 (`p1_leaf_census_at_production_heights`).
-pub const P1_PARTITION_COST_MODEL: u32 = 0x5031_0001;
+/// - v1: the P3a census at cap 1 (`p1_leaf_census_at_production_heights`), the
+///   leaf cap at 162,000.
+/// - v2: the leaf cap at 260,000, so a leaf's socket rows fill one 2^18
+///   `LFM_HASH` table (`p1_one_table_per_leaf_sizing`).
+pub const P1_PARTITION_COST_MODEL: u32 = 0x5031_0002;
 
 /// [`FORK_PERMS`] under a Poseidon1 base, in socket rows: a fork's transcript
 /// (ZisK's sponge, twelve felts a permutation) on top of its legs' closed
@@ -94,12 +97,16 @@ pub const P1_PARTITION_COST_MODEL: u32 = 0x5031_0001;
 /// ALU rows, so it adds no socket row.
 pub const P1_FORK_PERMS: usize = 124;
 
-/// [`LEAF_PERMS_CAP`] under a Poseidon1 base: RPX's cap scaled by the census's
-/// hash rows a sub-proof (P1 at cap 1 / RPX: 10,696 / 18,443 = 0.580), so a P1
-/// leaf takes about as many sub-proofs as an RPX leaf and its ALU tables stay
-/// at RPX's heights. At RPX's 279,000 socket rows a P1 leaf took 26 sub-proofs
-/// and 1.48 M XALU rows (2^21; RPX's 18 take 1.00 M, 2^20).
-pub const P1_LEAF_PERMS_CAP: usize = 162_000;
+/// [`LEAF_PERMS_CAP`] under a Poseidon1 base, in socket rows. Over ¾ · 2^18
+/// real rows `HashChunking` keeps a leaf's `LFM_HASH` one 2^18 table; at v1's
+/// 162,000 every production leaf landed in (2^17, ¾ · 2^18] and split in two,
+/// and its parent verified both. At 260,000, over the real 1× and median
+/// shapes, the leaves are 219,516–227,012 and 249,805–257,341 socket rows (5 and
+/// 32 leaves, against 8 and 52); a leaf's rows ran from 1,190 under its closed
+/// form to ≈ 40 over, well inside the 2,144 rows left to 2^18. The parents'
+/// legs over them fall 41 % and 43 %. A block of 4 leaves or fewer can still
+/// land under ¾ · 2^18 and split.
+pub const P1_LEAF_PERMS_CAP: usize = 260_000;
 
 /// One partition cost model: its version, the per-instance fork constant and
 /// the leaf-load cap, in the base's hash rows.
