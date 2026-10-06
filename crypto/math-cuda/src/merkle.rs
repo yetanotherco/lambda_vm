@@ -173,6 +173,12 @@ pub(crate) fn build_inner_tree_levels(
             return crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len);
         }
         crate::DeviceHash::Rpx256 => (&be.rpx_merkle_level, &be.rpx_merkle_tail),
+        // ZisK's Poseidon1 trees are 4-ary in their own layout
+        // (`crate::p1_stark`): the caller allocated `crate::tree_nodes` nodes
+        // for it and wrote the leaves at `crate::leaves_offset`.
+        crate::DeviceHash::Poseidon1 => {
+            return crate::p1_stark::build_inner_tree_levels(stream, nodes_dev, leaves_len);
+        }
         // ⚠ REFUSE rather than fall through. BLAKE3 does have inner-tree
         // kernels, but they are walked by `crate::blake3` with its own tail
         // geometry; reaching them from here would build a second, differently

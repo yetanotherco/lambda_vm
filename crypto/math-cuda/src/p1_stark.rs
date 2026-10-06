@@ -60,6 +60,9 @@ pub struct Kernels {
     pub leaves_rm_pair: CudaFunction,
     pub leaves_rm_row: CudaFunction,
     pub fri_group_leaves: CudaFunction,
+    /// WHIR's coset leaves over a base / ext3 codeword (`crate::whir`).
+    pub leaves_base_coset: CudaFunction,
+    pub leaves_ext3_coset: CudaFunction,
     pub merkle_level4: CudaFunction,
     pub merkle_tail4: CudaFunction,
     pub gather_paths4: CudaFunction,
@@ -80,6 +83,8 @@ pub fn kernels() -> Result<&'static Kernels> {
         leaves_rm_pair: module.load_function("p1s_leaves_rm_pair")?,
         leaves_rm_row: module.load_function("p1s_leaves_rm_row")?,
         fri_group_leaves: module.load_function("p1s_fri_group_leaves")?,
+        leaves_base_coset: module.load_function("p1s_leaves_base_coset")?,
+        leaves_ext3_coset: module.load_function("p1s_leaves_ext3_coset")?,
         merkle_level4: module.load_function("p1s_merkle_level4")?,
         merkle_tail4: module.load_function("p1s_merkle_tail4")?,
         gather_paths4: module.load_function("p1s_gather_paths4")?,
@@ -126,6 +131,16 @@ pub fn depth(leaves: usize) -> usize {
 /// node-buffer prefix those levels occupy.
 pub fn top_levels_nodes(leaves: usize, levels: usize) -> usize {
     level_sizes(leaves).iter().rev().take(levels).sum()
+}
+
+/// Where each level of [`level_sizes`] starts in the node buffer, which holds
+/// the levels top-down (`crypto::merkle_tree::utils::level_offsets4`).
+pub fn level_offsets(sizes: &[usize]) -> Vec<usize> {
+    let mut offsets = vec![0; sizes.len()];
+    for j in (0..sizes.len().saturating_sub(1)).rev() {
+        offsets[j] = offsets[j + 1] + sizes[j + 1];
+    }
+    offsets
 }
 
 // ===========================================================================
