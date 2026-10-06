@@ -147,7 +147,8 @@ fn gpu_path_fires_end_to_end() {
         stark::config::CommitmentHash::Blake3
         | stark::config::CommitmentHash::Rpo256
         | stark::config::CommitmentHash::Rpx256
-        | stark::config::CommitmentHash::Poseidon => assert_eq!(
+        | stark::config::CommitmentHash::Poseidon
+        | stark::config::CommitmentHash::Poseidon1 => assert_eq!(
             gpu_grind_calls(),
             0,
             "the device grind implements the keccak digest only; a nonzero \
