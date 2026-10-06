@@ -27,6 +27,17 @@
 //! At `c = 0` the cap is `[root]` and the capped check is exactly
 //! [`verify_merkle_path_from_leaf_hash`] plus the two exact-length checks.
 //!
+//! **Arity 4** (a backend with [`IsMerkleTreeBackend::ARITY`] = 4). `depth`
+//! stays the binary depth `D = log2(leaves)` the shapes speak; the tree has
+//! `h = ⌈D/2⌉` levels of four children ([`tree_levels`]) and `c` counts those
+//! levels. The cap is the level `c` below the root, real nodes only:
+//! `2^(D − 2(h − c))` of them ([`cap_len`]: `4^c` at even `D`, `2·4^(c−1)` at
+//! odd `D`, whose top group is two real nodes and two padding digests), and
+//! [`cap_root`] folds it by four with the backend's padding. A path carries
+//! three siblings per level, so an opening keeps `3(h − c)` of them and lands
+//! on `cap[index >> 2(h − c)]`; the owner path is `3(h − c) + cap_len`. The
+//! four checks above hold with those lengths.
+//!
 //! **Wire encoding (the owner path).** A tree's cap rides at the end of the
 //! authentication path of that tree's first opening in proof order
 //! ([`embed_cap`] / [`split_owner_path`]); every other opening of the tree
@@ -96,6 +107,46 @@ fn shape_ok(depth: usize, cap_height: usize) -> bool {
     cap_height <= depth && cap_height <= MAX_CAP_HEIGHT && depth < usize::BITS as usize
 }
 
+/// Levels of a tree of `arity` children per node over `2^depth` leaves: `depth`
+/// at arity 2, `⌈depth / 2⌉` at arity 4. Cap heights count these levels.
+pub fn tree_levels(depth: usize, arity: usize) -> usize {
+    if arity == 4 { depth.div_ceil(2) } else { depth }
+}
+
+/// Nodes in the height-`cap_height` cap of a tree of `arity` children per node
+/// over `2^depth` leaves: `2^c` at arity 2; at arity 4 the real nodes of the
+/// level `c` below the root, `2^(depth − 2(h − c))` (`1` at `c = 0`, the root).
+/// `None` when the cap does not fit the tree, or when it would hold more than
+/// `2^MAX_CAP_HEIGHT` nodes.
+pub fn cap_len(depth: usize, cap_height: usize, arity: usize) -> Option<usize> {
+    if arity != 4 {
+        return shape_ok(depth, cap_height).then(|| 1usize << cap_height);
+    }
+    let h = tree_levels(depth, 4);
+    if depth >= usize::BITS as usize || cap_height > h || 2 * cap_height > MAX_CAP_HEIGHT {
+        return None;
+    }
+    if cap_height == 0 {
+        return Some(1);
+    }
+    Some(1usize << (depth - 2 * (h - cap_height)))
+}
+
+/// The arity-4 cap height whose cap has `len` nodes in a tree over `2^depth`
+/// leaves ([`cap_len`]'s inverse), if one has.
+fn cap_height4_of(len: usize, depth: usize) -> Option<usize> {
+    (0..=tree_levels(depth, 4)).find(|&c| cap_len(depth, c, 4) == Some(len))
+}
+
+/// Siblings an opening keeps under a height-`cap_height` cap.
+fn kept_siblings(depth: usize, cap_height: usize, arity: usize) -> usize {
+    if arity == 4 {
+        3 * (tree_levels(depth, 4) - cap_height)
+    } else {
+        depth - cap_height
+    }
+}
+
 impl<T: PartialEq + Eq> Proof<T> {
     /// Keep the first `depth − cap_height` siblings of a full path.
     ///
@@ -123,6 +174,20 @@ impl<T: PartialEq + Eq> Proof<T> {
 pub fn cap_root<B: IsMerkleTreeBackend>(cap: &[B::Node]) -> Option<B::Node> {
     cap_height_of(cap)?;
     let mut level: Vec<B::Node> = cap.to_vec();
+    if B::ARITY == 4 {
+        // Groups of four, a short group padded (`build4`'s rule): a cap of
+        // `2·4^(c−1)` nodes folds to two, then to the root with two paddings.
+        while level.len() > 1 {
+            level = level
+                .chunks(4)
+                .map(|group| {
+                    let child = |i: usize| group.get(i).cloned().unwrap_or_else(B::padding_node);
+                    B::hash_four(&[child(0), child(1), child(2), child(3)])
+                })
+                .collect();
+        }
+        return level.pop();
+    }
     while level.len() > 1 {
         level = level
             .chunks_exact(2)
@@ -144,6 +209,23 @@ pub fn verify_cap<B: IsMerkleTreeBackend>(
     cap_root::<B>(cap).is_some_and(|r| &r == root)
 }
 
+/// [`verify_cap`] for a tree over `2^depth` leaves at the backend's arity:
+/// `cap.len()` must be [`cap_len`]`(depth, cap_height, B::ARITY)` (at arity 4
+/// that depends on `depth`'s parity, not on `cap_height` alone) and the cap
+/// must hash up to `root`.
+pub fn verify_cap_shaped<B: IsMerkleTreeBackend>(
+    cap: &[B::Node],
+    root: &B::Node,
+    depth: usize,
+    cap_height: usize,
+) -> bool {
+    if B::ARITY != 4 {
+        return shape_ok(depth, cap_height) && verify_cap::<B>(cap, root, cap_height);
+    }
+    cap_len(depth, cap_height, 4) == Some(cap.len())
+        && cap_root::<B>(cap).is_some_and(|r| &r == root)
+}
+
 /// The capped inclusion check for one opening.
 ///
 /// `c = log2(cap.len())`. Accepts iff
@@ -162,13 +244,21 @@ pub fn verify_merkle_path_to_cap_from_leaf_hash<B: IsMerkleTreeBackend>(
 ) -> bool {
     if B::ARITY == 4 {
         // `depth` stays the binary depth `log2(leaves)` the shapes speak; the
-        // walk has `⌈depth / 2⌉` levels of three siblings. Caps are binary-only:
-        // an arity-4 tree verifies against its root.
-        return cap.len() == 1
-            && depth < usize::BITS as usize
-            && index >> depth == 0
-            && siblings.len() == 3 * depth.div_ceil(2)
-            && verify_merkle_path_from_leaf_hash::<B>(siblings, &cap[0], index, leaf_hash);
+        // walk has `h − c` levels of three siblings (`h = ⌈depth / 2⌉`) and
+        // lands on `cap[index >> 2(h − c)]` (module docs).
+        let Some(c) = cap_height4_of(cap.len(), depth) else {
+            return false;
+        };
+        let walked = tree_levels(depth, 4) - c;
+        return index >> depth == 0
+            && siblings.len() == 3 * walked
+            && verify_merkle_path_from_leaf_hash::<B>(
+                siblings,
+                // `2·walked ≤ 2·⌈depth / 2⌉` can reach the word size.
+                &cap[index.checked_shr(2 * walked as u32).unwrap_or(0)],
+                index,
+                leaf_hash,
+            );
     }
     let Some(c) = cap_height_of(cap) else {
         return false;
@@ -197,10 +287,34 @@ pub fn split_owner_path<N>(path: &[N], depth: usize, cap_height: usize) -> Optio
     (path.len() == expected).then(|| path.split_at(siblings))
 }
 
-/// [`embed_cap`] for a tree of `arity` children per node. At arity 4 only the
-/// uncapped form exists (`cap == [root]`): every path must be its full
-/// `3·⌈depth / 2⌉` siblings, `depth` being the binary depth `log2(leaves)`, and
-/// nothing moves.
+/// [`split_owner_path`] for a tree of `arity` children per node over
+/// `2^depth` leaves, `cap_height` counting that arity's levels: the owner path
+/// is the kept siblings (`3(h − c)` at arity 4) followed by the
+/// [`cap_len`]-node cap, or the full path at `c = 0`.
+pub fn split_owner_path_arity<N>(
+    path: &[N],
+    depth: usize,
+    cap_height: usize,
+    arity: usize,
+) -> Option<(&[N], &[N])> {
+    if arity != 4 {
+        return split_owner_path(path, depth, cap_height);
+    }
+    let len = cap_len(depth, cap_height, 4)?;
+    let siblings = kept_siblings(depth, cap_height, 4);
+    let expected = if cap_height == 0 {
+        siblings
+    } else {
+        siblings + len
+    };
+    (path.len() == expected).then(|| path.split_at(siblings))
+}
+
+/// [`embed_cap`] for a tree of `arity` children per node over `2^depth`
+/// leaves. At arity 4 every path must be its full `3·⌈depth / 2⌉` siblings;
+/// the cap's height is the one whose [`cap_len`] is `cap.len()`, every path is
+/// cut to `3(h − c)` siblings and the cap is appended to `paths[0]`. A cap of
+/// one node (the root) changes nothing.
 pub fn embed_cap_arity<N: Clone>(
     paths: &mut [&mut Vec<N>],
     depth: usize,
@@ -210,17 +324,27 @@ pub fn embed_cap_arity<N: Clone>(
     if arity != 4 {
         return embed_cap(paths, depth, cap);
     }
-    if cap.len() != 1 {
-        return Err(CapError::CapLength(cap.len()));
-    }
-    let expected = 3 * depth.div_ceil(2);
-    match paths.iter().find(|p| p.len() != expected) {
-        Some(p) => Err(CapError::PathLength {
+    let c = cap_height4_of(cap.len(), depth).ok_or(CapError::CapLength(cap.len()))?;
+    let expected = 3 * tree_levels(depth, 4);
+    if let Some(p) = paths.iter().find(|p| p.len() != expected) {
+        return Err(CapError::PathLength {
             expected,
             got: p.len(),
-        }),
-        None => Ok(()),
+        });
     }
+    if c == 0 {
+        return Ok(());
+    }
+    let keep = kept_siblings(depth, c, 4);
+    let Some((owner, rest)) = paths.split_first_mut() else {
+        return Err(CapError::NoOwner);
+    };
+    owner.truncate(keep);
+    owner.extend_from_slice(cap);
+    for path in rest {
+        path.truncate(keep);
+    }
+    Ok(())
 }
 
 /// Prover side of the owner-path encoding: cut every path of one tree to
@@ -300,15 +424,11 @@ impl<'a, N: PartialEq + Eq + Clone> CappedRoot<'a, N> {
         depth: usize,
         cap_height: usize,
     ) -> Option<(Self, &'a [N])> {
-        if B::ARITY == 4 {
-            // Uncapped only; the path's length is checked by `verify`.
-            return (cap_height == 0).then(|| (Self::uncapped(root, depth), owner_path));
-        }
-        let (siblings, cap) = split_owner_path(owner_path, depth, cap_height)?;
+        let (siblings, cap) = split_owner_path_arity(owner_path, depth, cap_height, B::ARITY)?;
         if cap_height == 0 {
             return Some((Self::uncapped(root, depth), siblings));
         }
-        if !verify_cap::<B>(cap, root, cap_height) {
+        if !verify_cap_shaped::<B>(cap, root, depth, cap_height) {
             return None;
         }
         Some((
