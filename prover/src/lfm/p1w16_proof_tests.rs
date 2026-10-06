@@ -580,7 +580,7 @@ fn the_gpu_fingerprint_descriptor_matches_the_host() {
     let alpha = FieldElement::<E>::new([FE::from(11u64), FE::from(13u64), FE::from(17u64)]);
     let powers: Vec<FieldElement<E>> = (0..d.alpha_powers_len.max(6))
         .scan(FieldElement::<E>::one(), |p, _| {
-            let cur = p.clone();
+            let cur = *p;
             *p = &*p * &alpha;
             Some(cur)
         })
