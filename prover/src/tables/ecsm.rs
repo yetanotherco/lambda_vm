@@ -22,7 +22,7 @@ use stark::trace::TraceTable;
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::INV_SHIFT_32;
-use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
+use ecsm::{B, EcdasStep, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
 pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
@@ -123,6 +123,14 @@ pub struct EcsmOperation {
     pub addr_k: u64,
     pub addr_xr: u64,
     pub witness: EcsmWitness,
+}
+
+impl EcsmOperation {
+    /// The heap its witness owns beyond the op: the double/add steps' buffer
+    /// (one ECDAS row each), which no ECSM table reads.
+    pub(crate) fn steps_heap_bytes(&self) -> usize {
+        self.witness.steps.capacity() * std::mem::size_of::<EcdasStep>()
+    }
 }
 
 // =========================================================================
