@@ -2228,12 +2228,14 @@ fn the_statement_bytes_are_what_absorb_block_appends() {
     let opts = ProofOptions::default_test_options();
     let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
     let digest = crate::statement::elf_digest(&elf);
-    let bytes = block_whir::block_statement_bytes(proof.statement(), &digest, &frame.config);
+    let tag = block_whir::block_statement_tag(&format.zf.base);
+    let bytes = block_whir::block_statement_bytes(proof.statement(), &tag, &digest, &frame.config);
     let (a, b) = crate::with_whir_hash!(|H| {
         type T = DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>;
         let mut host = T::new(&[]);
         block_whir::absorb_block(
             &mut host,
+            &tag,
             &elf,
             &proof.public_output,
             &proof.table_counts,
@@ -3144,11 +3146,29 @@ fn block_whir_on_a_real_block() {
         Err(_) => BlockFormat::production().argue,
         Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
     };
+    // `BLOCK_WHIR_BASE=p1|p1w|rpx` (production rpx): the block's base hash —
+    // ZisK's Poseidon1 at its 4-ary cap (`BaseFormat::P1_WHIR`; `p1w` is the
+    // spelling as long as `rpx`, for A/B arms of equal environment bytes). A
+    // test word this harness maps into the format; the library reads no
+    // environment for it.
+    let base = match std::env::var("BLOCK_WHIR_BASE").as_deref().map(str::trim) {
+        Ok("p1" | "p1w") => stark::proof::options::BaseFormat::P1_WHIR,
+        Ok("rpx") | Err(_) => stark::proof::options::BaseFormat::RPX,
+        Ok(other) => panic!("BLOCK_WHIR_BASE={other}: rpx, p1 or p1w"),
+    };
+    let production = BlockFormat::production();
     let format = BlockFormat {
+        zf: production.zf.with_base(base),
         prepared,
         argue,
-        ..BlockFormat::production()
+        ..production
     };
+    println!(
+        "BLOCK BASE: {:?} · arity-4 cap {} · statement tag {}",
+        base.hash,
+        base.arity4_cap,
+        String::from_utf8_lossy(&block_whir::block_statement_tag(&base)),
+    );
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 3; 0 is the inline layout) and
     // `BLOCK_WHIR_PACK_REST=0|1`, as the tree's harness takes them;
