@@ -104,6 +104,7 @@ pub(super) fn hash_ops(program: &LfmProgram, hash: WrapHash) -> usize {
             WrapHash::Keccak => matches!(i, Instr::KeccakF(_)),
             WrapHash::Blake3 => matches!(i, Instr::Blake3(_)),
             WrapHash::Algebraic => matches!(i, Instr::Hash { .. }),
+            WrapHash::Poseidon1 => matches!(i, Instr::Hash16(_)),
         })
         .count()
 }

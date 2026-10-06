@@ -280,3 +280,117 @@ fn the_emulated_width8_permutation_is_poseidon1_w8() {
         FE::from(9_350_316_517_402_464_675u64)
     );
 }
+
+/// The transcript replay's Poseidon1 arm against `P1Transcript`: every append
+/// kind a sub-proof replays (constant bytes, a root, a felt, an extension
+/// element, machine bytes) and every draw (an extension element, index bits,
+/// a felt, the state).
+#[test]
+fn the_replay_arm_is_p1_transcript() {
+    use super::edsl::WrapHash;
+    use super::p1_commit::P1Transcript;
+    use super::transcript_replay::TranscriptReplay;
+    use crate::tables::types::FEE;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let seed = b"p3 replay seed";
+    let root: [FE; 4] = digest(5, 0);
+    let felt_v = felt(6, 0);
+    let ext_v: [FE; 3] = core::array::from_fn(|i| felt(7, i));
+    let bytes: [u8; 8] = 0x0123_4567_89ab_cdefu64.to_le_bytes();
+    let nbits = 13usize;
+
+    // The host.
+    let mut host = P1Transcript::with_seed(seed);
+    host.append_bytes(&super::algebraic_commit::digest_to_commitment(&root));
+    host.append_bytes(&felt_v.canonical().to_be_bytes());
+    host.append_field_element(&FEE::new(ext_v));
+    host.append_bytes(&bytes);
+    let e = host.sample_field_element();
+    let idx = host.sample_u64(1 << nbits);
+    host.append_bytes(&[1, 2, 3]);
+    let state = host.state();
+    let f = host.sample_field_element();
+
+    // The machine.
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Poseidon1);
+    let a_root = b.declare_arena(1);
+    let a_felts = b.declare_arena(6);
+    let r = b.hint_word(a_root, 0);
+    let fv = b.hint_felt(a_felts, 0);
+    let ev: [Felt; 3] = core::array::from_fn(|i| b.hint_felt(a_felts, 1 + i as u32));
+    let halves = [b.hint_felt(a_felts, 4), b.hint_felt(a_felts, 5)];
+    let mut t = TranscriptReplay::new(seed);
+    t.append_root_cells(&mut b, &[r]);
+    t.append_felt(&mut b, fv);
+    t.append_ext(&mut b, ev);
+    t.append_halves(&halves);
+    let e_m = t.sample_ext(&mut b);
+    b.public(e_m.as_cell());
+    let bits = t.sample_u64_pow2(&mut b, nbits);
+    let idx_m = super::edsl::bits_to_felt(&mut b, &bits);
+    let zero = b.felt_const(FE::zero());
+    let w = b.pack_word([idx_m, zero, zero, zero]);
+    b.public(w);
+    t.append_const_bytes(&[1, 2, 3]);
+    let s = t.state(&mut b);
+    b.public(s.cells()[0]);
+    let f_m = t.sample_ext(&mut b);
+    b.public(f_m.as_cell());
+
+    let half = |k: usize| {
+        FE::from(u64::from(u32::from_le_bytes(
+            bytes[4 * k..4 * k + 4].try_into().unwrap(),
+        )))
+    };
+    let got = run(
+        b,
+        &[
+            vec![root],
+            [felt_v, ext_v[0], ext_v[1], ext_v[2], half(0), half(1)]
+                .map(base_word)
+                .to_vec(),
+        ],
+    );
+    let ext3 = |x: FEE| -> Vec<FE> {
+        let v = x.value();
+        vec![v[0], v[1], v[2], FE::zero()]
+    };
+    let mut want = ext3(e);
+    want.extend([FE::from(idx), FE::zero(), FE::zero(), FE::zero()]);
+    want.extend(super::algebraic_commit::commitment_to_digest(&state));
+    want.extend(ext3(f));
+    assert_eq!(got, want);
+}
+
+/// The grinding check accepts the host's nonce and refuses one that misses.
+#[test]
+fn the_grinding_check_is_p1s() {
+    use super::edsl::WrapHash;
+    use super::p1_commit::P1GrindDigest;
+
+    let lanes: [FE; 4] = digest(11, 0);
+    let seed = super::algebraic_commit::digest_to_commitment(&lanes);
+    let factor = 6u8;
+    let valid = |n: u64| crypto::grinding::is_valid_nonce::<P1GrindDigest>(&seed, n, factor);
+    let good = (0u64..).find(|&n| valid(n)).expect("a nonce");
+    let bad = (0u64..).find(|&n| !valid(n)).expect("a miss");
+
+    let check = |nonce: u64| {
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Poseidon1);
+        let a_seed = b.declare_arena(1);
+        let a_nonce = b.declare_arena(1);
+        let s = WrapDigest::from_cell(b.hint_word(a_seed, 0));
+        let n = b.hint_felt(a_nonce, 0);
+        super::epoch::emit_grinding_check(&mut b, s, n, factor);
+        let program = compile(b.finish());
+        execute_serial(
+            &program,
+            &[vec![lanes], vec![base_word(FE::from(nonce))]],
+            &HasherKind::Poseidon1W16,
+        )
+        .map(|_| ())
+    };
+    assert!(check(good).is_ok(), "nonce {good}");
+    assert!(check(bad).is_err(), "nonce {bad}");
+}
