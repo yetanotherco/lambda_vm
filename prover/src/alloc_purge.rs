@@ -269,6 +269,174 @@ pub fn purge_after_level(level: usize, target: u64, say: &dyn Fn(&str)) -> Optio
     Some(purge)
 }
 
+/// `LAMBDA_VM_ALLOC_WATERMARK`: a monitor beside the whole block that purges
+/// every arena when the block's memory is short ([`note_memory_pressure`]),
+/// the process's resident set has reached [`WATERMARK_SHARE`] of the host
+/// target, and the allocator holds at least [`WATERMARK_MIN_FREED`] of freed
+/// pages (resident − allocated), at most once per [`WATERMARK_SPACING`].
+/// `auto` (unset or empty, the default) runs it; `off` does not. It reaches the
+/// pages a phase frees and does not reuse *inside* the phase, which no
+/// boundary point can: at the p90 block on a 48 GiB emulated host the binding
+/// peaks were phase A's end and level 1's end, both retention made after the
+/// last purge point (BIG 683, I-MEMFIT §5.1–§6). A host with room never
+/// reaches the share, so it never fires there. Each fire prints one
+/// `ALLOC WATERMARK fire` line; [`Watermark::finish`] prints the count.
+pub const WATERMARK_ENV: &str = "LAMBDA_VM_ALLOC_WATERMARK";
+
+/// The watermark: this share of the host target (the level purges' share,
+/// [`LEVEL_PURGE_SHARE`]).
+pub const WATERMARK_SHARE: f64 = LEVEL_PURGE_SHARE;
+
+/// The least freed-and-held bytes worth a purge.
+pub const WATERMARK_MIN_FREED: u64 = 4 << 30;
+
+/// How often the monitor reads the host.
+const WATERMARK_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The least time between two fires.
+pub const WATERMARK_SPACING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What [`WATERMARK_ENV`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatermarkSetting {
+    Auto,
+    Off,
+}
+
+/// A value of [`WATERMARK_ENV`]; nonsense is an error.
+pub fn parse_watermark(value: Option<&str>) -> Result<WatermarkSetting, String> {
+    match value.map(str::trim) {
+        None | Some("" | "auto") => Ok(WatermarkSetting::Auto),
+        Some("off") => Ok(WatermarkSetting::Off),
+        Some(v) => Err(format!("{WATERMARK_ENV} must be auto or off, got `{v}`")),
+    }
+}
+
+/// Whether the watermark fires now: memory pressure, the resident set at or
+/// over the share of `target`, enough freed pages held, and the spacing since
+/// the last fire. No reading: no fire.
+fn watermark_fires(
+    pressure: bool,
+    resident: Option<u64>,
+    freed: Option<u64>,
+    target: u64,
+    since_last: Option<std::time::Duration>,
+) -> bool {
+    pressure
+        && resident.is_some_and(|r| r as f64 >= WATERMARK_SHARE * target as f64)
+        && freed.is_some_and(|f| f >= WATERMARK_MIN_FREED)
+        && since_last.is_none_or(|s| s >= WATERMARK_SPACING)
+}
+
+/// The running watermark monitor ([`start_watermark`]); stopped and joined by
+/// [`Watermark::finish`] or when dropped.
+pub struct Watermark {
+    stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    handle: Option<std::thread::JoinHandle<(usize, f64)>>,
+    target: u64,
+}
+
+/// Starts the watermark monitor against the host `target` (bytes), unless
+/// [`WATERMARK_ENV`] says `off` (or is nonsense, which it prints) or the build
+/// cannot read the allocator.
+pub fn start_watermark(target: u64) -> Option<Watermark> {
+    match parse_watermark(std::env::var(WATERMARK_ENV).ok().as_deref()) {
+        Ok(WatermarkSetting::Auto) => {}
+        Ok(WatermarkSetting::Off) => return None,
+        Err(why) => {
+            eprintln!("ALLOC WATERMARK: {why}; not started");
+            return None;
+        }
+    }
+    let hooks = hooks()?;
+    let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let flag = stop.clone();
+    let handle = std::thread::Builder::new()
+        .name("alloc-watermark".to_string())
+        .spawn(move || watch(hooks, target, &flag))
+        .ok()?;
+    Some(Watermark {
+        stop,
+        handle: Some(handle),
+        target,
+    })
+}
+
+/// The monitor's loop: a reading every [`WATERMARK_TICK`] until stopped.
+/// Returns the fires and their summed seconds.
+fn watch(
+    hooks: AllocatorHooks,
+    target: u64,
+    stop: &(std::sync::Mutex<bool>, std::sync::Condvar),
+) -> (usize, f64) {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let t0 = std::time::Instant::now();
+    let (mut fires, mut secs, mut last) = (0usize, 0.0f64, None::<std::time::Instant>);
+    let mut stopped = stop.0.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        stopped = stop
+            .1
+            .wait_timeout(stopped, WATERMARK_TICK)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        if *stopped {
+            return (fires, secs);
+        }
+        let pressure = PRESSURE.load(std::sync::atomic::Ordering::Relaxed);
+        if !pressure {
+            continue;
+        }
+        let resident = crate::lfm::program_budget::resident_bytes();
+        let freed = (hooks.stats)().map(|s| s.resident.saturating_sub(s.allocated) as u64);
+        if !watermark_fires(pressure, resident, freed, target, last.map(|l| l.elapsed())) {
+            continue;
+        }
+        let Some(purge) = purge_with(hooks) else {
+            continue;
+        };
+        let after = crate::lfm::program_budget::resident_bytes();
+        fires += 1;
+        secs += purge.secs;
+        last = Some(std::time::Instant::now());
+        eprintln!(
+            "ALLOC WATERMARK fire #{fires} at {:.1}s: VmRSS {:.2} → {} GiB · jemalloc resident {:.2} \
+             → {:.2} GiB · {:.3}s",
+            t0.elapsed().as_secs_f64(),
+            gib(resident.unwrap_or(0)),
+            after.map_or("unread".to_string(), |a| format!("{:.2}", gib(a))),
+            gib(purge.resident_before as u64),
+            gib(purge.resident_after as u64),
+            purge.secs
+        );
+    }
+}
+
+impl Watermark {
+    fn stop(&mut self) -> Option<(usize, f64)> {
+        *self.stop.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.stop.1.notify_all();
+        self.handle.take().and_then(|h| h.join().ok())
+    }
+
+    /// Stops the monitor and says what it did: the `ALLOC WATERMARK end` line.
+    pub fn finish(mut self) -> String {
+        let (fires, secs) = self.stop().unwrap_or((0, 0.0));
+        format!(
+            "ALLOC WATERMARK end: {fires} fire(s), Σ {secs:.2}s (auto: memory pressure, VmRSS ≥ \
+             {WATERMARK_SHARE:.2} × {:.2} GiB, ≥ {} GiB freed, ≥ {}s apart)",
+            self.target as f64 / (1u64 << 30) as f64,
+            WATERMARK_MIN_FREED >> 30,
+            WATERMARK_SPACING.as_secs()
+        )
+    }
+}
+
+impl Drop for Watermark {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 /// Purge every arena through the hooks, timed, with the resident bytes
 /// before and after.
 fn purge_all_arenas() -> Option<Purge> {
@@ -379,6 +547,72 @@ mod tests {
         );
         assert_eq!(level_decision(Off, true, Some(99 * G), target), Err("off"));
         assert_eq!(level_decision(Always, false, Some(G), target), Ok(()));
+    }
+
+    #[test]
+    fn the_watermark_knob_reads_auto_or_off() {
+        assert_eq!(parse_watermark(None), Ok(WatermarkSetting::Auto));
+        assert_eq!(parse_watermark(Some(" auto ")), Ok(WatermarkSetting::Auto));
+        assert_eq!(parse_watermark(Some("off")), Ok(WatermarkSetting::Off));
+        assert!(parse_watermark(Some("on")).is_err());
+    }
+
+    /// The watermark fires only under memory pressure, with the host at the
+    /// share of its target, enough freed pages held and the spacing kept.
+    #[test]
+    fn the_watermark_fires_only_under_pressure_on_a_full_host() {
+        const G: u64 = 1 << 30;
+        let target = 100 * G;
+        let s = std::time::Duration::from_secs;
+        assert!(watermark_fires(
+            true,
+            Some(90 * G),
+            Some(4 * G),
+            target,
+            None
+        ));
+        assert!(watermark_fires(
+            true,
+            Some(99 * G),
+            Some(9 * G),
+            target,
+            Some(s(5))
+        ));
+        assert!(
+            !watermark_fires(false, Some(99 * G), Some(9 * G), target, None),
+            "no pressure"
+        );
+        assert!(
+            !watermark_fires(true, Some(89 * G), Some(9 * G), target, None),
+            "the host has room"
+        );
+        assert!(
+            !watermark_fires(true, Some(99 * G), Some(3 * G), target, None),
+            "too little freed"
+        );
+        assert!(
+            !watermark_fires(true, Some(99 * G), Some(9 * G), target, Some(s(4))),
+            "too soon"
+        );
+        assert!(
+            !watermark_fires(true, None, Some(9 * G), target, None),
+            "no reading"
+        );
+        assert!(
+            !watermark_fires(true, Some(99 * G), None, target, None),
+            "no stats"
+        );
+    }
+
+    /// `off` starts no monitor; a started one stops and reports its fires.
+    #[test]
+    fn the_watermark_monitor_starts_and_stops() {
+        if std::env::var_os(WATERMARK_ENV).is_some() {
+            return;
+        }
+        let w = start_watermark(u64::MAX).expect("the test build reads its jemalloc");
+        let line = w.finish();
+        assert!(line.starts_with("ALLOC WATERMARK end: 0 fire(s)"), "{line}");
     }
 
     #[test]
