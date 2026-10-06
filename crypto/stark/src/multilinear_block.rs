@@ -328,6 +328,12 @@ pub struct BlockSpill {
     /// table past the first groups and the hand-off moves each to the store,
     /// so the store keeps one producer and the committer never waits on it.
     switched: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the block should switch to the store now, asked as each group
+    /// past the first is installed ([`Self::with_switch_when`]): the switch
+    /// during the walk. Never, unless set.
+    switch_when: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The block's memory log, for the hand-off's counts ([`Self::attach_mem`]).
+    mem: Arc<std::sync::Mutex<Option<Arc<BlockMem>>>>,
 }
 
 /// A committed table's packed columns parked by the spill: held here until the
@@ -409,7 +415,26 @@ impl BlockSpill {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hand_off: Arc::new(std::sync::Mutex::new(HandOff::default())),
             switched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            switch_when: Arc::new(|| false),
+            mem: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Asks `when` as each group past the first [`SPILL_RESIDENT_GROUPS`] is
+    /// installed, and switches the block to the store
+    /// ([`Self::switch_to_store`]) the first time it says yes: the switch
+    /// during the walk. Tables handed back while the walk still makes tables
+    /// of their sizes on the same threads free pages those tables reuse;
+    /// handed back after the walk, nothing reuses them (I-WFULL §4.5).
+    pub fn with_switch_when(mut self, when: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.switch_when = when;
+        self
+    }
+
+    /// The block's memory log, which a switch decided at an install gives the
+    /// hand-off for its counts.
+    fn attach_mem(&self, mem: Option<Arc<BlockMem>>) {
+        *self.mem.lock().unwrap_or_else(|e| e.into_inner()) = mem;
     }
 
     /// Parks `packed`, a table's columns, on the host, after every table
@@ -622,6 +647,15 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    // The switch during the walk, asked once a group: from here on every
+    // parked table and every table after goes to the store.
+    if g >= SPILL_RESIDENT_GROUPS
+        && !spill.switched.load(std::sync::atomic::Ordering::SeqCst)
+        && (spill.switch_when)()
+    {
+        let mem = spill.mem.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        spill.switch_to_store(mem);
+    }
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
         let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
         let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
@@ -1074,6 +1108,9 @@ where
         mem: Option<Arc<BlockMem>>,
         spill: Option<BlockSpill>,
     ) -> Result<Self, MlError> {
+        if let Some(spill) = &spill {
+            spill.attach_mem(mem.clone());
+        }
         let mut tables = Vec::new();
         let mut spilled: Vec<Option<Out>> = Vec::new();
         let mut sizes = Vec::new();

@@ -639,10 +639,23 @@ fn switch_to_store_at_walk_end(hwm: u64, cycles: u64, target: u64) -> bool {
     memory_short(finish_forecast(hwm, cycles), target)
 }
 
-/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the switch at the
-/// walk's end ([`switch_to_store_at_walk_end`]); `off` never switches (the
-/// parked tables stay on the host, as `auto` kept them). Anything else is
-/// `auto`.
+/// ★ THE SWITCH DURING THE WALK, asked as each group is installed: the same
+/// forecast as [`switch_to_store_at_walk_end`], on the cycles walked so far.
+/// The forecast only grows with the walk, so a block that would switch at the
+/// walk's end switches here first, mid-walk, while the walk still makes tables
+/// of the handed tables' sizes on the same threads; those reuse the pages the
+/// hand-off frees (660's S arm, which spilled at install, walked to 48.6 GiB).
+/// Switched at the walk's end, the freed pages found nothing to reuse them
+/// (BIG 671: phase A 106.8 GiB). The median never switches: its forecast at
+/// the walk's end is 81.4 GiB against BIG's 94.1.
+fn switch_during_the_walk(hwm: u64, cycles_walked: u64, target: u64) -> bool {
+    switch_to_store_at_walk_end(hwm, cycles_walked, target)
+}
+
+/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the switch during
+/// the walk ([`switch_during_the_walk`]) and at its end
+/// ([`switch_to_store_at_walk_end`]); `off` never switches (the parked tables
+/// stay on the host, as `auto` kept them). Anything else is `auto`.
 fn hand_off_from_env() -> bool {
     parse_hand_off(std::env::var("LAMBDA_VM_BLOCK_HAND_OFF").ok().as_deref())
 }
@@ -1837,6 +1850,9 @@ pub(crate) struct Deviations {
     /// At the walk's end, the block switched to the store whatever the
     /// forecast ([`switch_to_store_at_walk_end`]).
     pub hand_off_force: bool,
+    /// The switch during the walk taken at the first group it is asked at,
+    /// whatever the forecast ([`switch_during_the_walk`]).
+    pub switch_mid_walk: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -3117,6 +3133,8 @@ fn prove_streamed(
     // policy is off. A store that does not open leaves every table in memory.
     let policy = options.spill;
     let target = spill_target_bytes();
+    // The cycles the walk has absorbed so far, for the switch during the walk.
+    let cycles_walked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let policy_name = match policy {
         BlockSpillPolicy::Off => "off".to_string(),
         BlockSpillPolicy::Always => "always".to_string(),
@@ -3153,7 +3171,24 @@ fn prove_streamed(
                             note_pressure_past(reading.bytes(), target);
                             spill_wanted(policy, target, kept, cells, bytes, || reading.bytes())
                         });
-                    Some(multilinear_block::BlockSpill::new(store, queue, wanted))
+                    // The switch during the walk, asked as each group is
+                    // installed (`switch_during_the_walk`).
+                    let cycles = std::sync::Arc::clone(&cycles_walked);
+                    let (switch_on, forced) = (hand_off_from_env(), deviations.switch_mid_walk);
+                    let switch_when: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+                        std::sync::Arc::new(move || {
+                            forced
+                                || (switch_on
+                                    && switch_during_the_walk(
+                                        HostReading::now().hwm,
+                                        cycles.load(std::sync::atomic::Ordering::Relaxed),
+                                        target,
+                                    ))
+                        });
+                    Some(
+                        multilinear_block::BlockSpill::new(store, queue, wanted)
+                            .with_switch_when(switch_when),
+                    )
                 }
                 Err(e) => {
                     stamps.spill =
@@ -3203,6 +3238,7 @@ fn prove_streamed(
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
             let finish_ledger = logged.clone();
             let walk_spill = spill.clone();
+            let walk_cycles = std::sync::Arc::clone(&cycles_walked);
             let builder = scope.spawn(move || -> Result<BuilderReport, Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("builder");
@@ -3275,6 +3311,9 @@ fn prove_streamed(
                             if let Some(ledger) = ledger {
                                 ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
                             }
+                            // A window walked (the last may be short: an upper
+                            // bound), for the switch during the walk.
+                            walk_cycles.fetch_add(window as u64, Relaxed);
                             for job in accumulator.absorb(walked) {
                                 streamed += 1;
                                 if let Some(ledger) = ledger {
@@ -4193,7 +4232,7 @@ mod spill_policy_tests {
     use super::{
         BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, finish_forecast, memory_short,
         parse_hand_off, parse_spill_policy, parse_tree_drop, spill_reserve_bytes,
-        spill_target_from, spill_wanted, switch_to_store_at_walk_end,
+        spill_target_from, spill_wanted, switch_during_the_walk, switch_to_store_at_walk_end,
     };
 
     const GIB: u64 = 1 << 30;
@@ -4454,6 +4493,40 @@ mod spill_policy_tests {
         ));
         let small = spill_target_from(None, Some(64 * GIB));
         assert!(switch_to_store_at_walk_end(gib(40.0), windows(285), small));
+    }
+
+    /// The switch during the walk is the walk's-end forecast on the cycles
+    /// walked so far: at p90 (674 PT: VmHWM 84.96 at the walk's end, 584
+    /// windows) it holds by three quarters of the walk on a VmHWM still under
+    /// 80, and not at half; the median (653: 66.74, 285 windows) never holds,
+    /// even at its end; and it only grows with the cycles.
+    #[test]
+    fn the_switch_during_the_walk_holds_mid_walk_at_p90_and_never_at_the_median() {
+        let big = 129_584_070_656 - 10 * GIB;
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        let windows = |n: u64| n << 20;
+        assert!(
+            switch_during_the_walk(gib(78.0), windows(438), big),
+            "p90, 3/4 walked"
+        );
+        assert!(
+            !switch_during_the_walk(gib(65.0), windows(292), big),
+            "p90, half walked"
+        );
+        assert!(
+            !switch_during_the_walk(gib(66.74), windows(285), big),
+            "the median, all of it"
+        );
+        let mut fired = false;
+        for n in (0..=584).step_by(8) {
+            let now = switch_during_the_walk(gib(70.0), windows(n), big);
+            assert!(
+                !fired || now,
+                "once on, the forecast stays on as the walk goes ({n})"
+            );
+            fired |= now;
+        }
+        assert!(fired);
     }
 
     /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: unset is 8 on the card and 4 on the

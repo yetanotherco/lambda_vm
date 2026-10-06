@@ -907,6 +907,58 @@ fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
     }
 }
 
+/// ★ The switch during the walk moves no byte either: taken at the first group
+/// it is asked at (past the first two), before any table is parked, every
+/// table after goes to the store through the hand-off — all of them parked
+/// after the switch, none left on the host — and the proof is the held run's.
+#[test]
+fn the_switch_during_the_walk_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let proved = |spill: BlockSpillPolicy, switch_mid_walk: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                switch_mid_walk,
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(
+            verify(&proof, &elf, &format),
+            "{spill:?} mid-walk {switch_mid_walk}"
+        );
+        (proof, stamps)
+    };
+    let (held, _) = proved(BlockSpillPolicy::Off, false);
+    let (switched, stamps) = proved(BlockSpillPolicy::Budget(1 << 40), true);
+    let stats = stamps.spill_stats.expect("the store's counters");
+    assert!(stats.slots > 0, "nothing handed off: {stats}");
+    let line = stamps.spill.expect("the spill's line");
+    assert!(
+        line.contains(&format!("({} parked after the switch)", stats.slots))
+            && line.contains(", 0 left on the host"),
+        "{line}"
+    );
+    assert_eq!(held.groups, switched.groups, "the partition");
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&held), bytes(&switched), "the proof");
+    }
+}
+
 /// A table the hand-off moved to the store whose columns never come back is
 /// refused when phase B reaches its group: a prover error naming the table.
 #[test]
