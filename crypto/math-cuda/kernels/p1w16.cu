@@ -1009,6 +1009,33 @@ extern "C" __global__ void p1s_fri_group_leaves(const uint64_t *__restrict__ eva
     p1s::store_be(d, out + tid * 32);
 }
 
+// WHIR coset leaves (`P1BatchBackend::hash_data` over a fold block): leaf
+// `tid` hashes `codeword[tid + t·num_leaves]` (base) or that element's three
+// components (ext3), `t` in `[0, block)` — `rpx_leaves_*_coset`'s geometry
+// under the tagged leaf.
+extern "C" __global__ void p1s_leaves_base_coset(const uint64_t *__restrict__ codeword,
+                                                 uint64_t num_leaves, uint64_t block,
+                                                 uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2, true>(
+        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+extern "C" __global__ void p1s_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
+                                                 uint64_t num_leaves, uint64_t block,
+                                                 uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2, true>(
+        3 * block,
+        [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
 // One 4-ary level in place: parent `tid` of the level at `child_off`
 // (`n_children` nodes) into the level at `parent_off` (`n_parents` nodes).
 extern "C" __global__ void p1s_merkle_level4(uint8_t *nodes, uint64_t child_off, uint64_t n_children,

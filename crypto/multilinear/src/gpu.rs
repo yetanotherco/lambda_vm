@@ -485,6 +485,14 @@ const COMMIT_THRESHOLD: usize = 1 << 16;
 /// Per query an authentication path, and the tree's Merkle cap.
 pub(crate) type PathsAndCap = (Vec<Vec<[u8; 32]>>, Vec<[u8; 32]>);
 
+/// Siblings on a full path of a tree over `leaves` leaves under `hash`: one
+/// per level of a binary tree, three per level of an arity-4 one.
+#[cfg(feature = "cuda")]
+fn path_len(leaves: usize, hash: crate::whir_hash::DeviceHashKey) -> usize {
+    let arity = hash.arity();
+    (arity - 1) * crypto::merkle_tree::cap::tree_levels(leaves.trailing_zeros() as usize, arity)
+}
+
 /// A byte buffer of Merkle nodes, relabelled as nodes without copying.
 ///
 /// A tree over a stacked polynomial is hundreds of megabytes; chunking it into
@@ -1902,9 +1910,6 @@ where
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
 
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<Ext3>() {
-        return None;
-    }
-    if !hash.has_whir_device_arm() {
         return None;
     }
     if codeword.len() < COMMIT_THRESHOLD || codeword.len() >> log_folding < 2 {
@@ -5176,9 +5181,6 @@ where
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
         return None;
     }
-    if !hash.has_whir_device_arm() {
-        return None;
-    }
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
@@ -5236,9 +5238,6 @@ pub(crate) fn commit_resident(
     transient: bool,
     hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
-    if !hash.has_whir_device_arm() {
-        return None;
-    }
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
@@ -5445,9 +5444,6 @@ impl DeviceCodeword {
         log_folding: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<[u8; 32]> {
-        if !hash.has_whir_device_arm() {
-            return None;
-        }
         let root = self.0.commit(log_folding, hash.into_math_cuda()).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(root)
@@ -5467,9 +5463,6 @@ impl DeviceCodeword {
         nodes: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<[u8; 32]>> {
-        if !hash.has_whir_device_arm() {
-            return None;
-        }
         let bytes = self
             .0
             .top_nodes_to_host(log_folding, hash.into_math_cuda(), nodes)
@@ -5484,9 +5477,6 @@ impl DeviceCodeword {
         indices: &[usize],
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
-        if !hash.has_whir_device_arm() {
-            return None;
-        }
         let leaves = self.0.elements() >> log_folding;
         if indices.iter().any(|index| *index >= leaves) {
             return None;
@@ -5496,9 +5486,13 @@ impl DeviceCodeword {
             .0
             .paths(log_folding, &positions, hash.into_math_cuda())
             .ok()?;
-        let depth = leaves.trailing_zeros() as usize;
         let nodes = nodes_in_place(bytes)?;
-        Some(nodes.chunks_exact(depth).map(<[_]>::to_vec).collect())
+        Some(
+            nodes
+                .chunks_exact(path_len(leaves, hash))
+                .map(<[_]>::to_vec)
+                .collect(),
+        )
     }
 
     /// [`paths`](Self::paths) and the tree's Merkle cap at `cap_height` (its
@@ -5512,12 +5506,12 @@ impl DeviceCodeword {
         cap_height: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<PathsAndCap> {
-        if !hash.has_whir_device_arm() {
-            return None;
-        }
         let leaves = self.0.elements() >> log_folding;
         let depth = leaves.trailing_zeros() as usize;
-        if indices.iter().any(|index| *index >= leaves) || cap_height > depth {
+        let arity = hash.arity();
+        if indices.iter().any(|index| *index >= leaves)
+            || cap_height > crypto::merkle_tree::cap::tree_levels(depth, arity)
+        {
             return None;
         }
         let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
@@ -5526,20 +5520,27 @@ impl DeviceCodeword {
             .paths_and_cap(log_folding, &positions, cap_height, hash.into_math_cuda())
             .ok()?;
         let nodes = nodes_in_place(bytes)?;
-        // `2^c` nodes: copied rather than reinterpreted in place, because a
-        // cap is a few hundred bytes and its allocation's capacity is not ours
-        // to vouch for.
-        if cap_bytes.len() != 32usize << cap_height {
+        // `2^c` nodes (`cap_len` at arity 4): copied rather than reinterpreted
+        // in place, because a cap is a few hundred bytes and its allocation's
+        // capacity is not ours to vouch for.
+        let len = crypto::merkle_tree::cap::cap_len(depth, cap_height, arity)?;
+        if cap_bytes.len() != 32 * len {
             return None;
         }
         let cap: Vec<[u8; 32]> = cap_bytes
             .chunks_exact(32)
             .map(|node| <[u8; 32]>::try_from(node).ok())
             .collect::<Option<_>>()?;
-        if cap.len() != 1usize << cap_height {
+        if cap.len() != len {
             return None;
         }
-        Some((nodes.chunks_exact(depth).map(<[_]>::to_vec).collect(), cap))
+        Some((
+            nodes
+                .chunks_exact(path_len(leaves, hash))
+                .map(<[_]>::to_vec)
+                .collect(),
+            cap,
+        ))
     }
 
     /// The blocks `indices` open, gathered where they lie — one launch and one
@@ -5570,9 +5571,6 @@ impl DeviceCodeword {
         dropped: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<[u8; 32]>> {
-        if !hash.has_whir_device_arm() {
-            return None;
-        }
         let blocks: Vec<u64> = blocks.iter().map(|block| *block as u64).collect();
         let bytes = self
             .0
