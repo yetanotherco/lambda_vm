@@ -302,7 +302,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
         for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
             collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_ecdas(slice))
+                h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
             }));
         }
     } else {
@@ -369,7 +369,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             }),
             Box::new(|h| {
                 for part in ecdas_ops.parts() {
-                    h.add_ops(&collect_bitwise_from_ecdas(part))
+                    h.add_ops(&collect_bitwise_from_compact_ecdas(part))
                 }
             }),
         ]);
@@ -844,12 +844,17 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 pack,
                 form,
                 ecdas::rows_written_packed,
-                ecdas::generate_ecdas_rows_as,
+                |rows, num_rows, form| {
+                    ecdas::generate_ecdas_rows_of(rows, num_rows, form, ecdas::widen)
+                },
             );
         }
         generate_optional(
             &ecdas_ops.whole(),
-            ecdas::generate_ecdas_trace,
+            |rows| {
+                let num_rows = rows.len().next_power_of_two().max(4);
+                ecdas::generate_ecdas_rows_of(rows, num_rows, TraceForm::Wide, ecdas::widen)
+            },
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )

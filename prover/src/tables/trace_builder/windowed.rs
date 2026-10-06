@@ -1038,13 +1038,14 @@ pub(super) struct KeptRest {
     blake3_absorb_ops: BlockVec<super::blake3::Blake3AbsorbOperation>,
     cpu32_ops: BlockVec<super::cpu32::Cpu32Operation>,
     ecsm_ops: BlockVec<super::ecsm::EcsmOperation>,
-    ecdas_ops: BlockVec<super::ecdas::EcdasOperation>,
+    /// Held compact (their carries in 16 bits), widened as each is read.
+    ecdas_ops: BlockVec<super::ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<super::hint::HintOperation>,
 }
 
 /// ECDAS rows a block of the kept ECDAS ops holds: the block's ECDAS cut
-/// (`block_whir::BLOCK_ECDAS_ROWS_LOG2`), so a cut is a block; ≈ 245 MiB, the
-/// one list whose blocks pass 64 MiB.
+/// (`block_whir::BLOCK_ECDAS_ROWS_LOG2`), so a cut is a block; ≈ 91 MiB of
+/// compact rows, the one list whose blocks pass 64 MiB.
 pub(super) const ECDAS_BLOCK_ROWS: usize = 1 << 17;
 
 impl KeptRest {
@@ -1076,7 +1077,12 @@ impl KeptRest {
             blake3_absorb_ops: BlockVec::from_vec(std::mem::take(&mut walk.blake3_absorb_ops)),
             cpu32_ops: BlockVec::from_vec(std::mem::take(&mut walk.cpu32_ops)),
             ecsm_ops: BlockVec::from_vec(std::mem::take(&mut walk.ecsm_ops)),
-            ecdas_ops: BlockVec::from_vec(std::mem::take(&mut walk.ecdas_ops)),
+            ecdas_ops: BlockVec::from_vec(
+                walk.ecdas_ops
+                    .iter()
+                    .map(super::ecdas::CompactEcdasOp::from_op)
+                    .collect(),
+            ),
             hint_ops: BlockVec::from_vec(std::mem::take(&mut walk.hint_ops)),
         }
     }
@@ -1218,7 +1224,8 @@ impl Kept {
         rest.blake3_absorb_ops.extend(blake3_absorb_ops);
         rest.cpu32_ops.extend(cpu32_ops);
         rest.ecsm_ops.extend(ecsm_ops);
-        rest.ecdas_ops.extend(ecdas_ops);
+        rest.ecdas_ops
+            .extend(ecdas_ops.iter().map(super::ecdas::CompactEcdasOp::from_op));
         rest.hint_ops.extend(hint_ops);
     }
 
