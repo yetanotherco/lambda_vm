@@ -150,9 +150,13 @@ fn run_leaf(
         vec![arenas[0].len() as u32],
         "the leaf hints exactly the words its arena holds"
     );
-    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
-        .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
-        .map_err(|e| format!("{e:?}"))
+    execute(
+        &program,
+        &arenas,
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
+    .map_err(|e| format!("{e:?}"))
 }
 
 fn leaves_words(plan: &WhirBlockPlan, proof: &BlockWhirProof) -> Vec<Vec<LfmWord>> {
@@ -2753,4 +2757,214 @@ fn grind_bits_group_cost_census() {
             );
         }
     }
+}
+
+// ======================== the Poseidon1 base (S5) =========================
+
+/// [`small_format`] over a Poseidon1 base (`BaseFormat::P1_WHIR`: 4-ary trees
+/// capped at height 2, ZisK's sponge, the width-8 grind).
+fn p1_format() -> BlockFormat {
+    let small = small_format();
+    BlockFormat {
+        zf: small
+            .zf
+            .with_base(stark::proof::options::BaseFormat::P1_WHIR),
+        ..small
+    }
+}
+
+/// ★ The Poseidon1 leaves' front draws the host verifier's challenges:
+/// `P1Transcript` over the statement (call by call), every root, `z, α, β`,
+/// and a group fork's first draw.
+#[test]
+#[ignore = "executes a block leaf's front over a small block proof; box tier"]
+fn the_p1_block_front_draws_the_hosts_challenges() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use crypto::fiat_shamir::p1_transcript::P1Transcript;
+    let format = p1_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(1));
+    assert_eq!(plan.wrap_hash(), super::edsl::WrapHash::Poseidon1);
+    let g = plan.num_groups() - 1;
+    let program = super::whir_block::front_program(&plan, g);
+    assert!(program.hash16(), "the front's hash rows are the socket's");
+    let arena: Vec<LfmWord> = proof
+        .proof
+        .roots
+        .iter()
+        .map(super::algebraic_commit::commitment_to_digest)
+        .collect();
+    let words: Vec<LfmWord> = execute(
+        &program,
+        &[arena],
+        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+    )
+    .expect("the front executes")
+    .public_words
+    .iter()
+    .map(|(_, w)| *w)
+    .collect();
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
+    let derived: Vec<multilinear::whir_commit::Commitment> = plan
+        .prepared()
+        .iter()
+        .flat_map(|p| p.roots.iter().copied())
+        .collect();
+    let mut t = P1Transcript::new();
+    block_whir::absorb_block(
+        &mut t,
+        &block_whir::block_statement_tag(&format.zf.base),
+        &elf,
+        &proof.public_output,
+        &proof.table_counts,
+        proof.num_private_input_pages,
+        &proof.runtime_page_ranges,
+        &proof.table_num_vars,
+        &frame.config,
+        &proof.groups,
+    );
+    stark::multilinear_table::absorb_roots::<FEE_FIELD, _>(&mut t, &proof.proof.roots, &derived);
+    let mut host: Vec<FEE> = (0..3).map(|_| t.sample_field_element()).collect();
+    let mut fork = t.clone();
+    fork.append_bytes(&(g as u64).to_le_bytes());
+    host.push(fork.sample_field_element());
+    let machine: Vec<FEE> = words.iter().map(ext_of).collect();
+    assert_eq!(machine, host, "z, α, β and the fork's first draw");
+}
+
+/// ★ Poseidon1 leaves execute over a small Poseidon1 block proof — on the
+/// width-16 socket, with no twelve-felt hash row — publish one state, and
+/// their bus shares cancel.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn p1_block_leaves_execute_and_close_the_bus() {
+    let format = p1_format();
+    for (name, leaves) in [("test_commit_4", Some(2)), ("all_instructions_64", Some(3))] {
+        let (elf, proof) = small_block(name, &format);
+        let plan = plan_of(&elf, &proof, &format, leaves);
+        let layout = plan.child_layout();
+        println!(
+            "P1 WHIR BLOCK LEAVES {name}: {} groups, costs {:?} (socket rows), partition {:?}",
+            plan.num_groups(),
+            plan.costs(),
+            plan.partition().leaves(),
+        );
+        for k in 0..plan.partition().num_leaves() {
+            let program = plan.leaf_program(k).expect("the leaf emits");
+            assert!(program.hash16(), "leaf {k} proves on the socket");
+        }
+        let words = leaves_words(&plan, &proof);
+        let mut sum = FEE::zero();
+        for w in &words {
+            assert_eq!(w.len(), layout.total());
+            assert_eq!(w[layout.state(0)], words[0][layout.state(0)]);
+            sum += ext_of(&w[layout.sum()]);
+        }
+        assert_eq!(sum, FEE::zero(), "{name}: the leaves' shares cancel");
+    }
+}
+
+/// ★ A Poseidon1 leaf refuses a tampered witness: a group root, a table's
+/// argument, a Merkle sibling and a grind nonce of a group opening, and a
+/// prepared opening (the prepared check is the one refusing it).
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn a_p1_block_leaf_refuses_a_tampered_witness() {
+    use multilinear::whir_chain::RoundOpenings;
+    let format = p1_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(1));
+    run_leaf(&plan, &proof, 0, LeafChecks::ALL).expect("the honest leaf executes");
+
+    let mut root = proof.clone();
+    root.proof.roots[0][0] ^= 1;
+    assert!(run_leaf(&plan, &root, 0, LeafChecks::ALL).is_err(), "a group root");
+
+    let mut table = proof.clone();
+    table.proof.tables[0].bus_output.0 += FEE::one();
+    assert!(run_leaf(&plan, &table, 0, LeafChecks::ALL).is_err(), "a table argument");
+
+    let mut sibling = proof.clone();
+    match &mut sibling.proof.columns[0].polys[0].rounds[0].openings {
+        RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+    }
+    assert!(run_leaf(&plan, &sibling, 0, LeafChecks::ALL).is_err(), "a Merkle sibling");
+
+    let mut nonce = proof.clone();
+    nonce.proof.columns[0].polys[0].rounds[0].nonces.query ^= 1;
+    assert!(run_leaf(&plan, &nonce, 0, LeafChecks::ALL).is_err(), "a grind nonce");
+
+    let mut prepared = proof.clone();
+    prepared.prepared[0].polys[0].final_value += FEE::one();
+    assert!(
+        run_leaf(&plan, &prepared, 0, LeafChecks::ALL).is_err(),
+        "a prepared opening"
+    );
+    let without = LeafChecks {
+        prepared: false,
+        ..LeafChecks::ALL
+    };
+    assert!(
+        run_leaf(&plan, &prepared, 0, without).is_ok(),
+        "with the prepared openings left out the tamper executes"
+    );
+}
+
+/// ★ The Poseidon1 tree proves to the top its plan derives (leaves on the
+/// socket, nodes on RPX); the block's verifier accepts it under the Poseidon1
+/// base and refuses it under RPX's; and no leaf program of the Poseidon1 tree
+/// is one of the RPX tree's over the same statement.
+#[test]
+#[ignore = "proves block leaves and nodes over a small block; box tier"]
+fn the_p1_whir_block_tree_proves_to_the_derived_top() {
+    super::device_permit::arm(1);
+    let format = p1_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let (top, _) = compose(&plan, &proof, "P1 TREE").expect("the honest tree proves");
+    verify_block_tree_under(
+        &elf,
+        &opts,
+        &format,
+        proof.statement(),
+        Some(2),
+        BLOCK_FAN_IN,
+        &wrap,
+        &top,
+    )
+    .expect("the block's verifier accepts the honest top under the Poseidon1 base");
+    assert!(
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &small_format(),
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+        .is_err(),
+        "the Poseidon1 top under the RPX base"
+    );
+    let rpx = plan_of(&elf, &proof, &small_format(), Some(2));
+    let ids = |plan: &WhirBlockPlan| -> Vec<[u8; 32]> {
+        (0..plan.partition().num_leaves())
+            .map(|k| artifacts_of(&plan.leaf_program(k).expect("a leaf"), &wrap).program_id)
+            .collect()
+    };
+    let (p1_ids, rpx_ids) = (ids(&plan), ids(&rpx));
+    assert!(
+        p1_ids.iter().all(|id| !rpx_ids.contains(id)),
+        "no leaf id is shared across the bases"
+    );
+    println!(
+        "P1 TREE TOP: {} public words; leaves {:?}",
+        top.public_words.len(),
+        plan.partition().leaves()
+    );
 }

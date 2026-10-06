@@ -1276,7 +1276,7 @@ pub(crate) fn prove_tree_pipelined(
                             lfm_execute_and_fill(
                                 &program.program,
                                 &arenas,
-                                crate::hash_pin::BLOCK_HASHER,
+                                program.program.hasher(crate::hash_pin::BLOCK_HASHER),
                             )
                             .map_err(|e| format!("leaf {k}: {e:?}"))?
                         }
@@ -1738,7 +1738,7 @@ pub fn prove_whir_block_tree(
                         let filled = lfm_execute_and_fill(
                             &program.program,
                             &arena,
-                            crate::hash_pin::BLOCK_HASHER,
+                            program.program.hasher(crate::hash_pin::BLOCK_HASHER),
                         )
                         .map_err(|e| format!("early leaf {k}: {e:?}"))?;
                         Ok((filled, arena, started, t.elapsed().as_secs_f64()))
@@ -1849,7 +1849,7 @@ pub fn prove_whir_block_tree(
         let program = slot.wait()?.get()?;
         let chips: Vec<String> = super::airs::lfm_chip_census_with_hasher(
             &program.program,
-            crate::hash_pin::BLOCK_HASHER,
+            program.program.hasher(crate::hash_pin::BLOCK_HASHER),
         )
         .iter()
         .filter(|c| c.real_rows > 0)
