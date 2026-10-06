@@ -1107,7 +1107,7 @@ fn a_p1_base_small_tree_derives() {
         );
         for k in 0..plan.partition().num_leaves() {
             let program = plan.leaf_program(k).expect("the P1 leaf emits");
-            assert!(program.hash16, "leaf {k} hashes on the width-16 socket");
+            assert!(program.hash16(), "leaf {k} hashes on the width-16 socket");
             assert_eq!(
                 program.hasher(crate::hash_pin::BLOCK_HASHER),
                 HasherKind::Poseidon1W16
@@ -1118,6 +1118,27 @@ fn a_p1_base_small_tree_derives() {
                 plan.partition().leaf(k).len()
             );
         }
+        // The socket review's A1: a parent takes a P1W16 child's hasher from the
+        // child's artifacts — the hasher the pinned program id names — and
+        // builds the child's `LFM_HASH` as the socket from them.
+        let wrap = super::proof::aggregation_wrap_options();
+        let leaf = super::block_plan::artifacts_of(&plan.leaf_program(0).expect("emits"), &wrap);
+        assert_eq!(
+            leaf.hasher,
+            HasherKind::Poseidon1W16,
+            "the leaf's id names the socket"
+        );
+        let airs = super::airs::LfmAirs::for_artifacts(&leaf, &wrap);
+        let hash = airs
+            .air_refs()
+            .into_iter()
+            .find(|a| a.name() == "LFM_HASH")
+            .expect("LFM_HASH in the child's set");
+        assert_eq!(
+            hash.constraints_meta().len(),
+            super::p1w16_socket::SOCKET_FORM.num_constraints() + 4,
+            "the parent derives the child's LFM_HASH as the socket (its constraints and LogUp)"
+        );
         let ids = tree_ids(&plan);
         println!("P1 TREE IDS (cap {cap}): {ids:?}");
         assert!(

@@ -76,7 +76,7 @@ fn socket_violations(row: &[FE]) -> Vec<usize> {
 #[test]
 fn a_width16_program_compiles_admits_and_proves_under_the_socket() {
     let (program, _, _) = chained_program();
-    assert!(program.hash16);
+    assert!(program.hash16());
     assert_eq!(
         program.hasher(crate::hash_pin::BLOCK_HASHER),
         HasherKind::Poseidon1W16
@@ -151,12 +151,45 @@ fn a_twelve_felt_row_under_the_socket_is_refused() {
     let d = b.compress(a, c);
     b.public(d.as_cell());
     let program = compile(b.finish());
-    assert!(!program.hash16);
+    assert!(!program.hash16());
     let err = execute_serial(&program, &[], &HasherKind::Poseidon1W16).map(|_| ());
     assert!(
         matches!(err, Err(LfmExecError::HasherRejected(_))),
         "{err:?}"
     );
+}
+
+/// The socket review's A2: under the width-16 socket the twelve-felt contract
+/// hands out no hash at all — every hashing method refuses, so no host caller
+/// can take an unproved twelve-felt Poseidon1 value for a proved one. (The
+/// executor never gets that far: `admits` refuses the row first, as
+/// [`a_twelve_felt_row_under_the_socket_is_refused`] shows.)
+#[test]
+fn the_twelve_felt_contract_hands_out_no_hash_under_the_socket() {
+    use super::hash::LfmHasher;
+    let h = HasherKind::Poseidon1W16;
+    let w = word(3);
+    type Call = fn(HasherKind, [FE; 4]);
+    let calls: [(&str, Call); 4] = [
+        ("permute", |h, _| {
+            let _ = h.permute([FE::zero(); 12]);
+        }),
+        ("compress", |h, w| {
+            let _ = h.compress(&w, &w);
+        }),
+        ("transcript", |h, w| {
+            let _ = h.transcript(&w, &w);
+        }),
+        ("leaf", |h, w| {
+            let _ = h.leaf(&w, &w);
+        }),
+    ];
+    for (what, call) in calls {
+        assert!(
+            std::panic::catch_unwind(move || call(h, w)).is_err(),
+            "{what} returned a twelve-felt hash under the socket"
+        );
+    }
 }
 
 #[test]

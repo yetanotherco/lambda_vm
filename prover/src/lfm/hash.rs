@@ -200,18 +200,33 @@ pub trait LfmHasher {
 
 /// [`HasherKind::Poseidon1W16`]'s answers to the twelve-felt contract: none it
 /// can prove. The width-16 socket has no twelve-felt mode, so [`LfmHasher::admits`]
-/// refuses every one and the executor never reaches the other methods with a
-/// row. They still return a fixed function (the width-16 permutation of the
-/// state zero-extended, truncated to twelve lanes) because the trait is total;
-/// nothing proves it.
+/// refuses every one.
+///
+/// ✗ The hashing methods are unreachable by construction, and they panic rather
+/// than return: every value they could return would be a hash no AIR proves (the
+/// socket review's A2), as `Blake3Permutation::permute` does for its missing
+/// mode. The executor checks `admits` before it hashes a row, the twelve-felt
+/// trace filler runs only for programs without `Hash16` rows (`trace.rs`), and
+/// the host transcripts are built over the block hasher, never over this one.
+/// Every derived hashing method (`compress`, `transcript`, `leaf` and their
+/// `_out` forms) goes through [`LfmHasher::permute`], so that one refusal
+/// covers the contract. The IVs stay the zero constant: they are not hashes,
+/// and the executor reads `mode_iv` to build the state `admits` then refuses.
 pub struct Poseidon1W16Narrow;
 
+impl Poseidon1W16Narrow {
+    #[cold]
+    fn no_twelve_felt_mode() -> ! {
+        panic!(
+            "the width-16 Poseidon1 socket has no twelve-felt hash: emit Instr::Hash16 \
+             rows (admits refuses every twelve-felt mode)"
+        )
+    }
+}
+
 impl LfmHasher for Poseidon1W16Narrow {
-    fn permute(&self, state: [FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
-        let mut wide = [FE::zero(); 16];
-        wide[..HASH_STATE_FELTS].copy_from_slice(&state);
-        let out = crypto::hash::poseidon1_w16::permute(wide);
-        core::array::from_fn(|i| out[i])
+    fn permute(&self, _state: [FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
+        Self::no_twelve_felt_mode()
     }
 
     fn compress_iv(&self) -> LfmWord {

@@ -533,7 +533,7 @@ pub(super) fn build_traces_walked(
             chunk.as_ref().unwrap_or(&g.hash),
             hash::num_columns(hasher),
             |row, out| {
-                if program.hash16 {
+                if program.hash16() {
                     super::p1w16_socket::fill_row(
                         super::p1w16_socket::SOCKET_FORM,
                         records.hash16[base + row].ins,

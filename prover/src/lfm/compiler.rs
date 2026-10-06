@@ -152,11 +152,17 @@ pub struct LfmProgram {
     /// it then proves under `HasherKind::Poseidon1W16`
     /// ([`LfmProgram::hasher`]). Program shape, read off the instructions at
     /// compile time; the admission validator refuses a program that mixes the
-    /// two widths.
-    pub hash16: bool,
+    /// two widths. Private: only [`compile`] sets it, from the instructions
+    /// (the socket review's A4); read it through [`LfmProgram::hash16`].
+    hash16: bool,
 }
 
 impl LfmProgram {
+    /// Whether this program's `LFM_HASH` rows are width-16 (`Instr::Hash16`).
+    pub fn hash16(&self) -> bool {
+        self.hash16
+    }
+
     /// The `LFM_HASH` permutation this program proves under: the width-16
     /// socket's for a program with `Hash16` rows, else `default` (the block
     /// hasher every other program uses).

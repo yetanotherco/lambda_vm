@@ -241,7 +241,7 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 if ins[mode.num_input_cells()..].iter().any(|a| *a != Addr(0)) {
                     return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
                 }
-                if program.hash16 {
+                if program.hash16() {
                     return Err(LfmViolation::MixedHashWidths { instr: idx });
                 }
             }
@@ -249,7 +249,7 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 for i in 0..4 {
                     check(h.outs[i], h.mults[i])?;
                 }
-                if !program.hash16 {
+                if !program.hash16() {
                     return Err(LfmViolation::MixedHashWidths { instr: idx });
                 }
             }
@@ -339,7 +339,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         layout::xalu::SEL_ADD,
         layout::xalu::NUM_SELECTORS,
     )?;
-    if program.hash16 {
+    if program.hash16() {
         // The width-16 socket has ONE mode, so its is-real flag is a flag.
         flag_is_one(&g.hash, "LFM_HASH", super::p1w16_socket::cols::IS_REAL)?;
     } else {
@@ -384,7 +384,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         }
     }
 
-    check_mult_ranges(g, program.hash16)?;
+    check_mult_ranges(g, program.hash16())?;
     Ok(())
 }
 

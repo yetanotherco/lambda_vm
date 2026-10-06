@@ -1207,10 +1207,10 @@ fn execute_inner(
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas,
     };
-    let mut records = LfmRecords::with_capacity(&program.groups, program.hash16);
+    let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
     let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
     split.setup = t.elapsed().as_secs_f64();
-    split.record_bytes = LfmRecords::bytes(&program.groups, program.hash16);
+    split.record_bytes = LfmRecords::bytes(&program.groups, program.hash16());
 
     match &levels {
         None => {
@@ -1247,7 +1247,7 @@ fn execute_inner(
             // `LfmRecords::commit_slots`. This is the one call site, and it is
             // after the `?` so a failed walk never reaches it.
             unsafe {
-                records.commit_slots(&program.groups, program.hash16);
+                records.commit_slots(&program.groups, program.hash16());
                 assert!(public_words.capacity() >= program.groups.public.real_rows);
                 public_words.set_len(program.groups.public.real_rows);
             }
