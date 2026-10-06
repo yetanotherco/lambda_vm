@@ -712,12 +712,13 @@ fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
     Ok(program)
 }
 
-/// A tree program's artifacts, under the block hasher.
+/// A tree program's artifacts, under the block hasher (the width-16 socket's
+/// for a program with `Hash16` rows, [`LfmProgram::hasher`]).
 pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> LfmArtifacts {
     super::program_census::build_artifacts_counted(
         program,
         wrap_opts,
-        crate::hash_pin::BLOCK_HASHER,
+        program.hasher(crate::hash_pin::BLOCK_HASHER),
     )
 }
 

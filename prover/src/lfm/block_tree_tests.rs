@@ -770,6 +770,7 @@ fn a_block_leaf_programs_host_bytes_by_part() {
                     "BitDec"
                 }
                 Instr::Hash { .. } => "Hash",
+                Instr::Hash16(_) => "Hash16",
                 Instr::Hint { .. } => "Hint",
                 Instr::Pack { .. } => "Pack",
                 Instr::Unpack { .. } => "Unpack",

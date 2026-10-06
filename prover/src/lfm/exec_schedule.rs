@@ -176,7 +176,7 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
             // where it was.
             d = d.max(addr_depth.get(r.0 as usize).copied().unwrap_or(0));
         }
-        let is_hash = matches!(instr, Instr::Hash { .. });
+        let is_hash = matches!(instr, Instr::Hash { .. } | Instr::Hash16(_));
         if is_hash {
             d += 1;
         }
@@ -248,7 +248,7 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
     for (i, instr) in program.instrs.iter().enumerate() {
         let level = depth[i] as usize;
         record_row[i] = chip_rows.take(instr);
-        if matches!(instr, Instr::Hash { .. }) {
+        if matches!(instr, Instr::Hash { .. } | Instr::Hash16(_)) {
             hash_instr[row as usize] = i as u32;
             let at = &mut hash_cursor[level];
             hash_rows[*at as usize] = row;
@@ -309,7 +309,9 @@ impl ChipRows {
             Instr::ExtAlu { .. } => &mut self.xalu,
             Instr::Select { .. } => &mut self.select,
             Instr::BitDec { .. } => &mut self.bitdec,
-            Instr::Hash { .. } => &mut self.hash,
+            // One chip: a program's `LFM_HASH` rows are all `Hash` or all
+            // `Hash16`.
+            Instr::Hash { .. } | Instr::Hash16(_) => &mut self.hash,
             Instr::KeccakF(_) => &mut self.keccak,
             Instr::Blake3(_) => &mut self.blake3,
             // Pack and Unpack are one chip: both open an `LFM_LANES` row.
