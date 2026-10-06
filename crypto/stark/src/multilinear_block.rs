@@ -1819,6 +1819,81 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone,
 {
+    let order: Vec<usize> = (0..committed.sizes.len()).collect();
+    block_prove_in_order::<F, E, T, H>(
+        committed,
+        config,
+        transcript,
+        prepared,
+        deviations,
+        fork_of,
+        argue,
+        on_group,
+        &order,
+    )
+}
+
+/// The groups that hold a table whose columns phase B rebuilds rather than
+/// reads back (`rebuilt`, by group) last, each set in group order: an order
+/// for [`block_prove_in_order`] that gives the rebuilding the other groups'
+/// phase B as a head start. With nothing rebuilt it is the group order.
+pub fn rebuilt_last(rebuilt: &[bool]) -> Vec<usize> {
+    (0..rebuilt.len())
+        .filter(|&g| !rebuilt[g])
+        .chain((0..rebuilt.len()).filter(|&g| rebuilt[g]))
+        .collect()
+}
+
+/// A group's tables, mutably, and another group's (`next`), each a contiguous
+/// run of `tables` that does not meet the other.
+fn group_and_next<'s, X>(
+    tables: &'s mut [X],
+    (at, size): (usize, usize),
+    next: Option<(usize, usize)>,
+) -> (&'s mut [X], Option<&'s [X]>) {
+    match next {
+        None => (&mut tables[at..at + size], None),
+        Some((first, len)) if first >= at + size => {
+            let (head, tail) = tables.split_at_mut(first);
+            (&mut head[at..at + size], Some(&tail[..len]))
+        }
+        Some((first, len)) => {
+            let (head, tail) = tables.split_at_mut(at);
+            (&mut tail[..size], Some(&head[first..first + len]))
+        }
+    }
+}
+
+/// [`block_prove_on_forks_observed`] with phase B taking the groups in
+/// `order`, a permutation of their indices. Each group proves on its own fork
+/// `S_post ‖ g` and nothing one group proves enters another's transcript, so
+/// the proof — each group's share, assembled in group order — is the same in
+/// any order; only when each group's columns are needed moves. The next
+/// group's columns go up beside this group's argue in `order` too. An `order`
+/// that is not a permutation of the groups is refused.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn block_prove_in_order<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+    on_group: &dyn Fn(GroupOpened<'_, F, E>),
+    order: &[usize],
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone,
+{
     let BlockCommitted {
         mut tables,
         sizes,
@@ -1829,6 +1904,14 @@ where
         spill,
         mut spilled,
     } = committed;
+    let n = sizes.len();
+    let mut seen = vec![false; n];
+    if order.len() != n || !order.iter().all(|&g| g < n && !std::mem::replace(&mut seen[g], true)) {
+        return Err(MlError::QueryCountMismatch {
+            expected: n,
+            got: order.len(),
+        });
+    }
     let starts: Vec<usize> = sizes
         .iter()
         .scan(0usize, |at, &size| {
@@ -1848,23 +1931,25 @@ where
     let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
     let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
 
-    let mut table_proofs = Vec::with_capacity(tables.len());
-    let mut argues = Vec::new();
-    let mut openings = Vec::with_capacity(sizes.len());
-    let mut prepared_openings = Vec::with_capacity(prepared.len());
-    let mut at = 0usize;
+    // Each group's share, by group, assembled in group order at the end.
+    let mut retired: Vec<Option<RetiredStack<F>>> = groups.into_iter().map(Some).collect();
+    let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
+    let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
+    let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+    let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
     // The next group's columns, uploaded during this group's argument — the
     // card idles through the argument's host glue, and a group's store is a
     // few GiB beside the argument's working set, not beside its codewords.
     let mut pre_uploaded: Option<Store> = None;
-    // The spilled tables read back in group order, two groups' bytes ahead of
-    // their uploads.
+    // The spilled tables read back in phase B's order, two groups' bytes ahead
+    // of their uploads.
     let prefetch = spill.as_ref().and_then(|_| {
-        let reads: Vec<(ReadPhase, usize, SpilledMain)> = spilled
+        let reads: Vec<(ReadPhase, usize, SpilledMain)> = order
             .iter()
-            .enumerate()
-            .filter_map(|(t, slot)| {
-                slot.as_ref()
+            .flat_map(|&g| starts[g]..starts[g] + sizes[g])
+            .filter_map(|t| {
+                spilled[t]
+                    .as_ref()
                     .and_then(Out::handle)
                     .map(|handle| (ReadPhase::Fused, t, handle))
             })
@@ -1884,36 +1969,47 @@ where
             .unwrap_or(0);
         (!reads.is_empty()).then(|| Prefetch::start(reads, 2 * widest.max(1)))
     });
-    for (g, (retired, &size)) in groups.into_iter().zip(&sizes).enumerate() {
+    for (p, &g) in order.iter().enumerate() {
         stamps[g].start_b = entered.elapsed().as_secs_f64();
+        let (at, size) = (starts[g], sizes[g]);
+        let next_g = order.get(p + 1).copied();
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
-        let tables_before = table_proofs.len();
-        let argues_before = argues.len();
-        let prepared_before = prepared_openings.len();
         if spill.is_some() {
             // This group's columns and the next's, back before their uploads
             // (the next one's goes up beside this group's argue).
-            let end = (at + size + sizes.get(g + 1).copied().unwrap_or(0)).min(tables.len());
-            restore_group(
-                at,
-                &mut tables[at..end],
-                &mut spilled[at..end],
-                prefetch.as_ref(),
-                mem.as_deref(),
-            )?;
-            // No reader of these groups meets a table whose columns are still
-            // out: one whose slot did not come back is refused here, before
-            // its upload.
-            if let Some(k) = tables[at..end].iter().position(|t| t.is_spilled()) {
-                return Err(MlError::SpillFailed {
-                    table: at + k,
-                    reason: "its columns are still spilled when its group is read",
-                });
+            for (first, len) in std::iter::once((at, size))
+                .chain(next_g.map(|next| (starts[next], sizes[next])))
+            {
+                restore_group(
+                    first,
+                    &mut tables[first..first + len],
+                    &mut spilled[first..first + len],
+                    prefetch.as_ref(),
+                    mem.as_deref(),
+                )?;
+                // No reader of these groups meets a table whose columns are
+                // still out: one whose slot did not come back is refused here,
+                // before its upload.
+                if let Some(k) = tables[first..first + len]
+                    .iter()
+                    .position(|t| t.is_spilled())
+                {
+                    return Err(MlError::SpillFailed {
+                        table: first + k,
+                        reason: "its columns are still spilled when its group is read",
+                    });
+                }
             }
         }
-        let (head, tail) = tables.split_at_mut(at + size);
-        let group = &mut head[at..];
-        let next = sizes.get(g + 1).map(|&n| &tail[..n]);
+        let (group, next) = group_and_next(
+            &mut tables,
+            (at, size),
+            next_g.map(|next| (starts[next], sizes[next])),
+        );
+        let retired = retired[g].take().ok_or(MlError::QueryCountMismatch {
+            expected: n,
+            got: order.len(),
+        })?;
 
         let t = Instant::now();
         let store = match pre_uploaded.take() {
@@ -1937,6 +2033,8 @@ where
         multilinear::gpu::reset_reserved_window();
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
+        let mut proofs: Vec<TableProof<E>> = Vec::new();
+        let mut batched_argue: Option<BatchedArgue<E>> = None;
         let group_ref: &[CommittedTable<'_, F, E>] = group;
         let (argued, next_store, joined) = std::thread::scope(|scope| {
             let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
@@ -1949,7 +2047,7 @@ where
                                 points.push(point.clone());
                             }
                             values.extend(proof.constraint.reduce.column_values.iter().cloned());
-                            table_proofs.push(proof);
+                            proofs.push(proof);
                         }
                     }
                     ArgueFormat::Batched { bin_log_cells } => {
@@ -1973,7 +2071,7 @@ where
                             }
                             values.extend(claim.column_values);
                         }
-                        argues.push(proof);
+                        batched_argue = Some(proof);
                     }
                 }
                 Ok(())
@@ -1985,10 +2083,10 @@ where
         argued?;
         stamps[g].argue = t.elapsed().as_secs_f64() - joined;
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
-        if let Some(next_store) = next_store {
+        if let (Some(next_store), Some(next)) = (next_store, next_g) {
             // The wait for the upload after the argument ended is the next
             // group's upload cost; the rest of it hid behind this argument.
-            stamps[g + 1].upload_b += joined;
+            stamps[next].upload_b += joined;
             pre_uploaded = Some(next_store.map_err(|_| MlError::DeviceFailed {
                 stage: "uploading the next group's columns",
             })?);
@@ -2008,7 +2106,7 @@ where
         stamps[g].encode = t.elapsed().as_secs_f64();
         stamps[g].open_room = multilinear::gpu::ledger_reserved().saturating_sub(before_revive);
         let t = Instant::now();
-        openings.push(stacked_eval::prove::<F, E, T, H, _>(
+        let opening = stacked_eval::prove::<F, E, T, H, _>(
             &stacked,
             &columns,
             store.as_ref().map(|store| (&**store, 0)),
@@ -2016,7 +2114,7 @@ where
             &values,
             config,
             &mut fork,
-        )?);
+        )?;
         // The group's prepared tables, in table order: each opened at its own
         // point for its own prefix, on this fork.
         let firsts: Vec<usize> = group
@@ -2057,7 +2155,7 @@ where
                         .collect::<Result<_, _>>()?;
                 }
             }
-            prepared_openings.push(stacked_eval::prove::<F, E, T, H, _>(
+            group_prepared[g] = Some(stacked_eval::prove::<F, E, T, H, _>(
                 p.commitment,
                 p.columns,
                 None,
@@ -2069,16 +2167,17 @@ where
         }
         stamps[g].open = t.elapsed().as_secs_f64();
         stamps[g].open_reserved = multilinear::gpu::reserved_window_peak();
-        if let Some(opening) = openings.last() {
-            on_group(GroupOpened {
-                group: g,
-                roots: &roots,
-                argue: argues[argues_before..].first(),
-                tables: &table_proofs[tables_before..],
-                opening,
-                prepared: prepared_openings[prepared_before..].first(),
-            });
-        }
+        on_group(GroupOpened {
+            group: g,
+            roots: &roots,
+            argue: batched_argue.as_ref(),
+            tables: &proofs,
+            opening: &opening,
+            prepared: group_prepared[g].as_ref(),
+        });
+        group_tables[g] = proofs;
+        group_argue[g] = batched_argue;
+        group_opening[g] = Some(opening);
         drop(stacked);
         drop(columns);
         drop(handles);
@@ -2100,7 +2199,6 @@ where
             mem.mark(&format!("phase B group {g} end"));
         }
         stamps[g].end_b = entered.elapsed().as_secs_f64();
-        at += size;
     }
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
@@ -2112,15 +2210,24 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefetch.report());
     }
+    let openings = group_opening
+        .into_iter()
+        .map(|opening| {
+            opening.ok_or(MlError::QueryCountMismatch {
+                expected: n,
+                got: order.len(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((
         MultiProof {
             roots,
-            tables: table_proofs,
+            tables: group_tables.into_iter().flatten().collect(),
             columns: openings,
             preprocessed: None,
         },
-        argues,
-        prepared_openings,
+        group_argue.into_iter().flatten().collect(),
+        group_prepared.into_iter().flatten().collect(),
         stamps,
     ))
 }
@@ -2426,5 +2533,32 @@ mod spill_tests {
         let back = from_store(main).expect("converts back");
         assert_eq!(back.data().as_ptr(), at, "back");
         assert_eq!(back, copy);
+    }
+
+    /// The rebuilt groups go last, each set in group order; nothing rebuilt is
+    /// the group order.
+    #[test]
+    fn rebuilt_groups_go_last() {
+        assert_eq!(
+            super::rebuilt_last(&[true, true, false, true, false]),
+            vec![2, 4, 0, 1, 3]
+        );
+        assert_eq!(super::rebuilt_last(&[false; 4]), vec![0, 1, 2, 3]);
+        assert_eq!(super::rebuilt_last(&[true; 3]), vec![0, 1, 2]);
+    }
+
+    /// A group and another one, before it or after it, as two slices that do
+    /// not meet.
+    #[test]
+    fn a_group_and_the_next_are_disjoint_slices() {
+        let mut tables: Vec<u32> = (0..10).collect();
+        let (group, next) = super::group_and_next(&mut tables, (2, 3), Some((7, 2)));
+        assert_eq!((&*group, next), (&[2, 3, 4][..], Some(&[7, 8][..])));
+        let (group, next) = super::group_and_next(&mut tables, (6, 4), Some((0, 2)));
+        assert_eq!((&*group, next), (&[6, 7, 8, 9][..], Some(&[0, 1][..])));
+        let (group, next) = super::group_and_next(&mut tables, (0, 5), Some((5, 5)));
+        assert_eq!((&*group, next), (&[0, 1, 2, 3, 4][..], Some(&[5, 6, 7, 8, 9][..])));
+        let (group, next) = super::group_and_next(&mut tables, (3, 1), None);
+        assert_eq!((&*group, next), (&[3][..], None));
     }
 }
