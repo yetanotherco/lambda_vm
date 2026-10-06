@@ -330,8 +330,11 @@ impl ChainShape {
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
     for r in 0..shape.rounds() {
-        per_query +=
-            shape.opening_perms(shape.current_felts(r), shape.current_depth(r), shape.caps[r]);
+        per_query += shape.opening_perms(
+            shape.current_felts(r),
+            shape.current_depth(r),
+            shape.caps[r],
+        );
         if let Some(depth) = shape.next_depth(r) {
             per_query += shape.opening_perms(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }

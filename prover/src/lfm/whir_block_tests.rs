@@ -2506,26 +2506,23 @@ fn the_whir_block_tree_on_a_real_block() {
     let t = std::time::Instant::now();
     // The production verifier when the run is at its presets; the fixture form
     // only when a knob moved the tree off them.
-    let verdict =
-        if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
-            super::whir_block::verify_block_tree_based(
-                &elf,
-                &format.zf.base,
-                proof.statement(),
-                top,
-            )
-        } else {
-            verify_block_tree_under(
-                &elf,
-                &opts,
-                &format,
-                proof.statement(),
-                leaves,
-                fan_in,
-                &wrap,
-                top,
-            )
-        };
+    let verdict = if leaves.is_none()
+        && fan_in == BLOCK_FAN_IN
+        && argue == BlockFormat::production().argue
+    {
+        super::whir_block::verify_block_tree_based(&elf, &format.zf.base, proof.statement(), top)
+    } else {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            leaves,
+            fan_in,
+            &wrap,
+            top,
+        )
+    };
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {
@@ -2895,22 +2892,34 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
 
     let mut root = proof.clone();
     root.proof.roots[0][0] ^= 1;
-    assert!(run_leaf(&plan, &root, 0, LeafChecks::ALL).is_err(), "a group root");
+    assert!(
+        run_leaf(&plan, &root, 0, LeafChecks::ALL).is_err(),
+        "a group root"
+    );
 
     let mut table = proof.clone();
     table.proof.tables[0].bus_output.0 += FEE::one();
-    assert!(run_leaf(&plan, &table, 0, LeafChecks::ALL).is_err(), "a table argument");
+    assert!(
+        run_leaf(&plan, &table, 0, LeafChecks::ALL).is_err(),
+        "a table argument"
+    );
 
     let mut sibling = proof.clone();
     match &mut sibling.proof.columns[0].polys[0].rounds[0].openings {
         RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
     }
-    assert!(run_leaf(&plan, &sibling, 0, LeafChecks::ALL).is_err(), "a Merkle sibling");
+    assert!(
+        run_leaf(&plan, &sibling, 0, LeafChecks::ALL).is_err(),
+        "a Merkle sibling"
+    );
 
     let mut nonce = proof.clone();
     nonce.proof.columns[0].polys[0].rounds[0].nonces.query ^= 1;
-    assert!(run_leaf(&plan, &nonce, 0, LeafChecks::ALL).is_err(), "a grind nonce");
+    assert!(
+        run_leaf(&plan, &nonce, 0, LeafChecks::ALL).is_err(),
+        "a grind nonce"
+    );
 
     let mut prepared = proof.clone();
     prepared.prepared[0].polys[0].final_value += FEE::one();

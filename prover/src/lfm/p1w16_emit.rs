@@ -442,8 +442,9 @@ fn mat_vec(a: &[[FE; W8]; W8], x: &[FE; W8]) -> [FE; W8] {
 fn inverse7(m: &[[FE; W8 - 1]; W8 - 1]) -> Option<[[FE; W8 - 1]; W8 - 1]> {
     const N: usize = W8 - 1;
     let mut a = *m;
-    let mut inv: [[FE; N]; N] =
-        core::array::from_fn(|i| core::array::from_fn(|j| if i == j { FE::one() } else { FE::zero() }));
+    let mut inv: [[FE; N]; N] = core::array::from_fn(|i| {
+        core::array::from_fn(|j| if i == j { FE::one() } else { FE::zero() })
+    });
     for col in 0..N {
         let pivot = (col..N).find(|&r| a[r][col] != FE::zero())?;
         a.swap(col, pivot);
@@ -493,7 +494,11 @@ pub fn sparse_w8() -> &'static SparseW8 {
             };
         }
         let mut full_rc: [[FE; W8]; 8] = core::array::from_fn(|f| {
-            rc(if f < half { f } else { half + partial + f - half })
+            rc(if f < half {
+                f
+            } else {
+                half + partial + f - half
+            })
         });
         for (i, v) in full_rc[half].iter_mut().enumerate() {
             *v += carry[i];
@@ -506,7 +511,8 @@ pub fn sparse_w8() -> &'static SparseW8 {
         for k in (0..partial).rev() {
             let hat: [[FE; W8 - 1]; W8 - 1] =
                 core::array::from_fn(|i| core::array::from_fn(|j| a[i + 1][j + 1]));
-            let hat_inv = inverse7(&hat).expect("an MDS matrix's square submatrices are invertible");
+            let hat_inv =
+                inverse7(&hat).expect("an MDS matrix's square submatrices are invertible");
             sp_a[k] = a[0][0];
             // ṽᵀ = vᵀ · Â⁻¹.
             sp_v[k] = core::array::from_fn(|j| {
@@ -542,23 +548,26 @@ pub fn w8_sparse_host(input: [FE; W8]) -> [FE; W8] {
     let sbox = |x: FE| x * x * x * x * x * x * x;
     let mut s = input;
     for r in 0..half {
-        for i in 0..W8 {
-            s[i] = sbox(s[i] + t.full_rc[r][i]);
+        for (x, c) in s.iter_mut().zip(&t.full_rc[r]) {
+            *x = sbox(*x + *c);
         }
         s = mat_vec(if r + 1 == half { &t.first_matrix } else { &m }, &s);
     }
     for k in 0..w8::PARTIAL_ROUNDS {
         s[0] = sbox(s[0] + t.partial_rc[k]);
         let s0 = s[0];
-        let y0 = (1..W8).fold(t.sp_a[k] * s0, |acc, j| acc + t.sp_v[k][j - 1] * s[j]);
-        for j in 1..W8 {
-            s[j] += t.sp_w[k][j - 1] * s0;
+        let y0 = s[1..]
+            .iter()
+            .zip(&t.sp_v[k])
+            .fold(t.sp_a[k] * s0, |acc, (x, v)| acc + *v * *x);
+        for (x, w) in s[1..].iter_mut().zip(&t.sp_w[k]) {
+            *x += *w * s0;
         }
         s[0] = y0;
     }
     for f in half..2 * half {
-        for i in 0..W8 {
-            s[i] = sbox(s[i] + t.full_rc[f][i]);
+        for (x, c) in s.iter_mut().zip(&t.full_rc[f]) {
+            *x = sbox(*x + *c);
         }
         s = mat_vec(&m, &s);
     }
@@ -653,7 +662,13 @@ pub fn w8_permute_lanes(b: &mut LfmBuilder, input: [Lane; W8], keep: usize) -> V
     for k in 0..partial {
         let s0 = sbox_lane(b, s[0]);
         let next: [FE; W8] = if k + 1 < partial {
-            core::array::from_fn(|i| if i == 0 { t.partial_rc[k + 1] } else { FE::zero() })
+            core::array::from_fn(|i| {
+                if i == 0 {
+                    t.partial_rc[k + 1]
+                } else {
+                    FE::zero()
+                }
+            })
         } else {
             t.full_rc[half]
         };
@@ -672,7 +687,11 @@ pub fn w8_permute_lanes(b: &mut LfmBuilder, input: [Lane; W8], keep: usize) -> V
         let outputs = if last { keep } else { W8 };
         let mut out = s;
         for (o, slot) in out.iter_mut().enumerate().take(outputs) {
-            let seed = if last { FE::zero() } else { t.full_rc[f + 1][o] };
+            let seed = if last {
+                FE::zero()
+            } else {
+                t.full_rc[f + 1][o]
+            };
             let terms: Vec<(FE, Lane)> = (0..W8).map(|i| (m[o][i], x[i])).collect();
             *slot = lin(b, seed, &terms);
         }
