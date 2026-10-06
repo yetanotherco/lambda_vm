@@ -140,12 +140,40 @@ pub fn posture_line() -> String {
 /// constants on it.
 const ELF_BESIDE_THREADS: usize = 4;
 
-/// Threads of the ELF constants' own pool by default (`NOEPOCH_ELF_CONSTS`).
-/// On the four of the pool beside the base, one page at a time, they took
-/// 12.9 s against P1's 12.2 s 1× base: the harvest waited 3.7 s and every leaf
-/// program came late (RYZEN 011). Eight, with the pages at once, are sized to
-/// finish inside that base.
+/// Threads of the ELF constants' own pool by default under a Poseidon1 base
+/// (`NOEPOCH_ELF_CONSTS`). On the four of the pool beside the base, one page at
+/// a time, they took 12.9 s against P1's 12.2 s 1× base and the harvest waited
+/// 3.7 s (RYZEN 011); on eight, the pages at once, 6.6 s, no wait, the whole
+/// −3.40 s (RYZEN 022).
 const ELF_CONSTS_THREADS: usize = 8;
+
+/// Where the ELF constants beside the base are computed (`NOEPOCH_ELF_CONSTS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElfConstsPool {
+    /// Unset: a pool of their own of [`ELF_CONSTS_THREADS`] under a Poseidon1
+    /// base; the pool beside the base under RPX, whose longer base already
+    /// hides them: there their own pool was neutral (+0.04 s) and held the leaf
+    /// programs 6 s longer (+0.65 GiB of host peak, RYZEN 021).
+    ByBase,
+    /// `0`: the pool beside the base, one page at a time.
+    Beside,
+    /// `<threads>`: a host-only pool of their own, the pages at once.
+    Own(usize),
+}
+
+impl ElfConstsPool {
+    /// The own pool's threads for a block under `base`, or `None` for the
+    /// pool beside the base.
+    pub fn threads_for(self, base: &stark::proof::options::BaseFormat) -> Option<usize> {
+        match self {
+            Self::ByBase => (crate::hash_pin::base_of_hash(base.hash)
+                == crate::hash_pin::BaseHash::P1)
+                .then_some(ELF_CONSTS_THREADS),
+            Self::Beside => None,
+            Self::Own(threads) => Some(threads),
+        }
+    }
+}
 
 /// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`). Unset or `pipe`,
 /// the default (FAST 451: recursion −2.56 s): the leaf programs are emitted
@@ -203,10 +231,10 @@ pub struct BlockTreeConfig {
     pub elf_beside: Option<usize>,
     /// `NOEPOCH_ELF_CONSTS=<threads>`: beside the base, the ELF constants are
     /// computed on a host-only pool of their own with that many threads, DECODE
-    /// and the data pages at once, unset meaning [`ELF_CONSTS_THREADS`]; `0`
-    /// (`None`) computes them on the pool beside the base, one page at a time,
-    /// before it emits.
-    pub elf_consts: Option<usize>,
+    /// and the data pages at once; `0` computes them on the pool beside the
+    /// base, one page at a time, before it emits; unset decides by the base
+    /// ([`ElfConstsPool::ByBase`]).
+    pub elf_consts: ElfConstsPool,
     /// `NOEPOCH_TREE_AHEAD`: `0` (`None`), `1` or `pipe` (the default). Needs
     /// the ELF constants beside the base.
     pub tree_ahead: Option<AheadMode>,
@@ -292,14 +320,17 @@ fn parse_elf_beside(v: Option<&str>) -> Result<Option<usize>, String> {
     Ok(Some(threads).filter(|&t| t > 0))
 }
 
-fn parse_elf_consts(v: Option<&str>) -> Result<Option<usize>, String> {
-    let threads = match v {
-        Some(v) if !v.is_empty() => v
-            .parse::<usize>()
-            .map_err(|_| format!("NOEPOCH_ELF_CONSTS must be a thread count, got `{v}`"))?,
-        _ => ELF_CONSTS_THREADS,
-    };
-    Ok(Some(threads).filter(|&t| t > 0))
+fn parse_elf_consts(v: Option<&str>) -> Result<ElfConstsPool, String> {
+    match v {
+        Some(v) if !v.is_empty() => match v.parse::<usize>() {
+            Ok(0) => Ok(ElfConstsPool::Beside),
+            Ok(threads) => Ok(ElfConstsPool::Own(threads)),
+            Err(_) => Err(format!(
+                "NOEPOCH_ELF_CONSTS must be a thread count, got `{v}`"
+            )),
+        },
+        _ => Ok(ElfConstsPool::ByBase),
+    }
 }
 
 fn parse_tree_ahead(v: Option<&str>) -> Result<Option<AheadMode>, String> {
@@ -1324,12 +1355,13 @@ pub fn prove_block_tree(
     // by default): the plan's ELF-only input (DECODE's root, recomputed on the
     // host) computed off the provers' pool while the base proves, joined by the
     // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline. Beside the
-    // base they take a pool of their own (`NOEPOCH_ELF_CONSTS=<threads>`, eight by
-    // default), so the leaf programs, which need them, are not held behind a
-    // narrow one-page-at-a-time compute; `NOEPOCH_ELF_CONSTS=0` computes them on
-    // the pool beside the base, as before.
+    // base they take a pool of their own (`NOEPOCH_ELF_CONSTS=<threads>`; eight by
+    // default under Poseidon1, whose short base cannot hide them), so the leaf
+    // programs, which need them, are not held behind a narrow one-page-at-a-time
+    // compute; `NOEPOCH_ELF_CONSTS=0`, and RPX by default, compute them on the
+    // pool beside the base, as before.
     let elf_beside = cfg.elf_beside;
-    let elf_consts = cfg.elf_consts;
+    let elf_consts = cfg.elf_consts.threads_for(&cfg.base);
     #[cfg(test)]
     let forced_ahead = cfg.forced_leaves;
     // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
@@ -2157,11 +2189,21 @@ mod tests {
         assert_eq!(parse_elf_beside(Some("2")), Ok(Some(2)));
         assert!(parse_elf_beside(Some("four")).is_err());
 
-        assert_eq!(parse_elf_consts(None), Ok(Some(ELF_CONSTS_THREADS)));
-        assert_eq!(parse_elf_consts(Some("")), Ok(Some(ELF_CONSTS_THREADS)));
-        assert_eq!(parse_elf_consts(Some("0")), Ok(None));
-        assert_eq!(parse_elf_consts(Some("12")), Ok(Some(12)));
+        assert_eq!(parse_elf_consts(None), Ok(ElfConstsPool::ByBase));
+        assert_eq!(parse_elf_consts(Some("")), Ok(ElfConstsPool::ByBase));
+        assert_eq!(parse_elf_consts(Some("0")), Ok(ElfConstsPool::Beside));
+        assert_eq!(parse_elf_consts(Some("12")), Ok(ElfConstsPool::Own(12)));
         assert!(parse_elf_consts(Some("eight")).is_err());
+        // Unset, RPX keeps the pool beside the base (its default bytes and its
+        // memory) and a Poseidon1 base takes its own pool; set, both obey.
+        use stark::proof::options::BaseFormat;
+        assert_eq!(ElfConstsPool::ByBase.threads_for(&BaseFormat::RPX), None);
+        assert_eq!(
+            ElfConstsPool::ByBase.threads_for(&BaseFormat::P1),
+            Some(ELF_CONSTS_THREADS)
+        );
+        assert_eq!(ElfConstsPool::Own(8).threads_for(&BaseFormat::RPX), Some(8));
+        assert_eq!(ElfConstsPool::Beside.threads_for(&BaseFormat::P1), None);
 
         assert_eq!(parse_tree_ahead(None), Ok(Some(AheadMode::Pipe)));
         assert_eq!(parse_tree_ahead(Some("pipe")), Ok(Some(AheadMode::Pipe)));
