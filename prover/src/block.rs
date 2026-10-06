@@ -1080,7 +1080,7 @@ fn parse_spill_policy(value: Option<&str>, no_disk: bool) -> SpillPolicy {
 /// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
 /// smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`]) and
 /// `MemTotal`, less 10 GiB ([`spill_target_from`]).
-pub(crate) fn spill_target_bytes() -> u64 {
+pub fn spill_target_bytes() -> u64 {
     if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())

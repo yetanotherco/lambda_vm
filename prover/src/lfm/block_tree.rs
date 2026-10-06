@@ -93,7 +93,9 @@ impl BlockTreeSink for StderrSink {
 /// disk where live regeneration can drop, else the spill tier): the harness's
 /// env leaves it unset, and [`posture_line`] names what the memory knobs come
 /// to and why. The allocator's never-purge posture is compiled into the
-/// binary.
+/// binary. `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host
+/// target ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target
+/// up, 16 below it.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "8"),
     (POSTURE_VRAM_KNOB, "24000"),
@@ -104,6 +106,27 @@ pub const POSTURE: &[(&str, &str)] = &[
     ("LFM_TREE_SIBLINGS_L0", "8"),
     ("LFM_TREE_SIBLINGS", "4"),
 ];
+
+/// The precomputed-tree cache's knob, whose posture follows the host target.
+pub const POSTURE_TREE_CACHE_KNOB: &str = "LFM_PRECOMPUTED_TREE_CACHE_CAP";
+
+/// The host target (GiB, [`crate::block::spill_target_bytes`]) from which the
+/// posture keeps [`POSTURE`]'s 64 precomputed-tree cache entries.
+pub const POSTURE_TREE_CACHE_FULL_TARGET_GIB: u64 = 64;
+
+/// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture for a host `target` in bytes:
+/// 64 entries (≈ 100 MiB each, ≈ 6.2 GiB once full) from a
+/// [`POSTURE_TREE_CACHE_FULL_TARGET_GIB`] target up, 16 below it, where the
+/// ≈ 4.7 GiB they free count for more than the hits they lose. A miss only
+/// rebuilds the tree: the cache's key is the root, so nothing a proof commits
+/// to moves.
+pub fn posture_tree_cache_cap(target: u64) -> &'static str {
+    if target >= POSTURE_TREE_CACHE_FULL_TARGET_GIB << 30 {
+        "64"
+    } else {
+        "16"
+    }
+}
 
 /// The posture's VRAM budget: 24000 MB is the 32 GiB card's.
 pub const POSTURE_VRAM_KNOB: &str = "LAMBDA_VM_VRAM_BUDGET_MB";
@@ -120,6 +143,16 @@ pub const POSTURE_VRAM_MIN_GIB: f64 = 31.0;
 pub fn posture_line() -> String {
     let words: Vec<String> = POSTURE
         .iter()
+        .map(|&(name, want)| {
+            if name == POSTURE_TREE_CACHE_KNOB {
+                (
+                    name,
+                    posture_tree_cache_cap(crate::block::spill_target_bytes()),
+                )
+            } else {
+                (name, want)
+            }
+        })
         .map(|(name, want)| match std::env::var(name) {
             Ok(v) if v == *want => format!("{name}={v}"),
             Ok(v) => format!("{name}={v} (≠ posture {want})"),
