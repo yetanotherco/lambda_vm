@@ -431,6 +431,64 @@ fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
     }
 }
 
+/// With KECCAK, ECSM and ECDAS built as their cuts at the finish, the windowed
+/// build (its streamed ops dropped) is the whole-run build with those three
+/// split by the block's `split_rows`, table for table, at every cut size from
+/// one row to past the whole table; the other tables are untouched. And a cut
+/// that is not a power of two is refused.
+#[cfg(feature = "parallel")]
+#[test]
+fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
+    use crate::block_whir::{split_ecdas, split_ecsm, split_keccak};
+    let max_rows = MaxRowsConfig::small();
+    let mut cut_any = [false; 3];
+    for name in [
+        "test_keccak_multi",
+        "test_ecsm",
+        "test_ecsm_multi",
+        "test_ecsm_split",
+    ] {
+        let (program, logs) = run(name);
+        for log2 in [0usize, 1, 2, 3, 6] {
+            let rows = 1usize << log2;
+            let mut want = whole(&program, &logs, &max_rows);
+            let counts = [want.keccaks.len(), want.ecsms.len(), want.ecdases.len()];
+            split_keccak(&mut want, log2);
+            split_ecsm(&mut want, log2);
+            split_ecdas(&mut want, log2);
+            for (any, (before, after)) in cut_any.iter_mut().zip(counts.iter().zip([
+                want.keccaks.len(),
+                want.ecsms.len(),
+                want.ecdases.len(),
+            ])) {
+                *any |= after > *before;
+            }
+            for window in [7, 1000] {
+                let (cut, _) = windowed_with(&program, &logs, &max_rows, window, true, |b| {
+                    b.drop_streamed_ops()
+                        .expect("before any window")
+                        .cuts_at_finish(rows, rows, rows)
+                        .expect("powers of two")
+                });
+                same_traces(&want, &cut);
+            }
+        }
+    }
+    assert_eq!(
+        cut_any, [true; 3],
+        "every family was cut into several tables"
+    );
+    for (keccak, ecsm, ecdas) in [(6, 4, 4), (4, 0, 4), (4, 4, 12)] {
+        assert!(
+            WindowedTraceBuilder::new(&run("test_keccak").0, &[], &max_rows)
+                .expect("the builder")
+                .cuts_at_finish(keccak, ecsm, ecdas)
+                .is_err(),
+            "{keccak}/{ecsm}/{ecdas} is refused"
+        );
+    }
+}
+
 /// With KECCAK_RND built as its tables at the finish alone, the windowed build
 /// hands none out and is the whole-run build with KECCAK_RND split the same
 /// way, table for table — the split's copy without the copy.

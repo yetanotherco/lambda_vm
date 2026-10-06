@@ -68,6 +68,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         memlog: false,
         // The rest laid out in waves of 1 MiB: several at a test's size.
         finish_keccak_rnd_chunks: true,
+        finish_cuts: true,
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
         gpack: true,

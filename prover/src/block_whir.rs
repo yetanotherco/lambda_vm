@@ -291,6 +291,17 @@ pub struct BlockOptions {
     /// same. Production: on (BIG 561: the split's copy is the finish's last
     /// ≈ 6 GiB at 4.13×). A cut under 32 rows (tests) takes the split.
     pub finish_keccak_rnd_chunks: bool,
+    /// With windows: the finish builds KECCAK, ECSM and ECDAS as their
+    /// 2^`keccak_rows_log2` / 2^`ecsm_rows_log2` / 2^`ecdas_rows_log2`-row
+    /// tables ([`WindowedTraceBuilder::cuts_at_finish`]), each packed as it is
+    /// built with [`Self::pack_finished`], instead of one wide table each that
+    /// [`split_keccak`], [`split_ecsm`] and [`split_ecdas`] then copy apart;
+    /// the tables are the same. Production: on unless
+    /// `LAMBDA_VM_BLOCK_FINISH_PLAN=0` (the A arm: built whole and wide, then
+    /// split). At p90 the three are the rest's only wide tables (5.09 GiB) and
+    /// the rest's layout transposes them into fresh pages (+4.7 GiB VmRSS, BIG
+    /// 660).
+    pub finish_cuts: bool,
     /// With windows: `Some(bytes)` lays the rest of the run out in AIR order,
     /// in waves of at most `bytes` of rows (a larger table is a wave of its
     /// own), each wave in parallel; `None` lays every table out at once. A
@@ -588,6 +599,7 @@ impl BlockOptions {
             upload_ahead: true,
             memlog: memlog::from_env(),
             finish_keccak_rnd_chunks: true,
+            finish_cuts: finish_plan_from_env(),
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
             gpack: gpack_from_env(),
@@ -600,6 +612,12 @@ impl BlockOptions {
 /// unless `0`.
 pub(crate) fn gpack_from_env() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_GPACK").is_ok_and(|v| v.trim() == "0")
+}
+
+/// `LAMBDA_VM_BLOCK_FINISH_PLAN`: [`BlockOptions::finish_cuts`]'s production
+/// value, on unless `0`.
+pub(crate) fn finish_plan_from_env() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_FINISH_PLAN").is_ok_and(|v| v.trim() == "0")
 }
 
 /// `LAMBDA_VM_BLOCK_COMPACT_LT=0`: the LT ops derived from the MEMW ops the
@@ -3067,6 +3085,13 @@ fn prove_streamed(
                     builder = builder
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
+                if options.finish_cuts {
+                    builder = builder.cuts_at_finish(
+                        1usize << options.keccak_rows_log2,
+                        1usize << options.ecsm_rows_log2,
+                        1usize << options.ecdas_rows_log2,
+                    )?;
+                }
                 if options.pack_finished {
                     builder = builder.pack_finished_tables();
                     if options.gpack {
@@ -3170,9 +3195,13 @@ fn prove_streamed(
                 let mut rest = built_rest?;
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
-                split_ecdas(&mut rest, options.ecdas_rows_log2);
-                split_keccak(&mut rest, options.keccak_rows_log2);
-                split_ecsm(&mut rest, options.ecsm_rows_log2);
+                // Cut at the finish already, and held packed: a packed table
+                // has no rows for `split_rows` to copy.
+                if !options.finish_cuts {
+                    split_ecdas(&mut rest, options.ecdas_rows_log2);
+                    split_keccak(&mut rest, options.keccak_rows_log2);
+                    split_ecsm(&mut rest, options.ecsm_rows_log2);
+                }
                 if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
                     return Err(Error::Prover(
                         "omit_first_keccak_rnd is a non-streamed deviation: a streamed chunk \

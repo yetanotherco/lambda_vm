@@ -161,8 +161,30 @@ pub fn generate_ecsm_trace_as(
     ops: &[EcsmOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
+    generate_ecsm_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
+
+/// Whether [`generate_ecsm_rows_as`] in `form` writes its rows packed, with no
+/// 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier ECSM
+/// trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
+/// A ECSM table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each, one scalar multiplication a row), then the padding rows. A row reads its own op alone and
+/// the padding rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded
+/// table are this over the ops in that range with `num_rows = R`: the block's
+/// cut of the whole table, built on its own.
+pub fn generate_ecsm_rows_as(
+    ops: &[EcsmOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Padding rows are all zero.
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, op) in ops.iter().enumerate() {
             let w = &op.witness;

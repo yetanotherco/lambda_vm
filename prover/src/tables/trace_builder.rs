@@ -3940,6 +3940,13 @@ pub struct StreamSkip {
     pub keccak_rnd_rows: usize,
     /// KECCAK_RND chunks already handed out (with `keccak_rnd_rows`).
     pub keccak_rnd: usize,
+    /// Rows per KECCAK, ECSM and ECDAS table when the build cuts them into the
+    /// tables the block's split makes ([`cut_tables`], each packed as it is
+    /// built with [`Self::pack`]); zero builds each whole, as every build but
+    /// the block's.
+    pub keccak_rows: usize,
+    pub ecsm_rows: usize,
+    pub ecdas_rows: usize,
     /// MEMW (general) and MEMW_A ops whose phase-3 LT ops a windowed build has
     /// already put into the windows' LT lists (block path only, which may chunk
     /// LT differently from the whole-run build): the table phase derives LT
@@ -3949,7 +3956,8 @@ pub struct StreamSkip {
     /// Pack each table the build generates at the bytes its columns need as
     /// soon as it is generated (`TraceTable::pack_main_narrow`), so the build
     /// never holds its tables at eight bytes a cell; the words are the same.
-    /// KECCAK, ECSM, ECDAS and a whole KECCAK_RND stay wide: the block cuts
+    /// A whole KECCAK_RND, and KECCAK, ECSM and ECDAS when not cut at the
+    /// build (`keccak_rows` and the rest zero), stay wide: the block cuts
     /// them after the build. `false` everywhere but the WHIR block's windowed
     /// finish.
     pub pack: bool,
@@ -4126,6 +4134,66 @@ fn keccak_rnd_chunks_in_waves(
 /// KECCAK_RND chunks built and packed at once ([`keccak_rnd_chunks`]): each is
 /// ≈ 0.8 GiB at eight bytes a cell (1,480 columns of 2^16 rows) before its pack.
 const KECCAK_RND_PACK_WAVE: usize = 4;
+
+/// A table of one row an op (KECCAK, ECSM, ECDAS), built as the tables of
+/// `rows` rows the block's split makes of the whole padded table
+/// (`split_rows`): one table when the whole is no taller than `rows`, else
+/// `total / rows` cuts, cut k the ops of rows `[k·rows, (k+1)·rows)` and the
+/// padding to `rows` rows (`generate(ops, rows, form)`, a family's
+/// `generate_*_rows_as`). No ops, no table. Each cut is packed as it is built
+/// when `pack`. The words are the split's; the whole table and its split copy
+/// are never held.
+fn cut_tables<T: Sync>(
+    ops: &[T],
+    rows: usize,
+    pack: bool,
+    form: TraceForm,
+    written_packed: fn(TraceForm) -> bool,
+    generate: impl Fn(&[T], usize, TraceForm) -> TraceTable<GoldilocksField, GoldilocksExtension>
+    + Send
+    + Sync,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !rows.is_power_of_two() {
+        return Err(Error::Prover(format!(
+            "tables cut at {rows} rows: a power of two is needed"
+        )));
+    }
+    let n = ops.len();
+    let total = n.next_power_of_two().max(4);
+    if total <= rows {
+        return Ok(vec![packed_if(pack, generate(ops, total, form))]);
+    }
+    let cut = |k: usize| {
+        let (first, end) = ((k * rows).min(n), ((k + 1) * rows).min(n));
+        packed_if(pack, generate(&ops[first..end], rows, form))
+    };
+    let cuts = total / rows;
+    // Written packed once the family's widths are known (`tables::gpack`):
+    // until then a cut is built at 8 bytes a cell, so the first goes alone and
+    // leaves its widths for the rest.
+    #[cfg(feature = "parallel")]
+    {
+        let mut tables = Vec::with_capacity(cuts);
+        while tables.len() < cuts {
+            let first = tables.len();
+            let end = if written_packed(form) {
+                cuts
+            } else {
+                first + 1
+            };
+            tables.par_extend((first..end).into_par_iter().map(cut));
+        }
+        Ok(tables)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = written_packed;
+        Ok((0..cuts).map(cut).collect())
+    }
+}
 
 /// The ops whose rows reach KECCAK_RND chunk `chunk` of `rows` rows (24 rows an
 /// op), clamped to the `len` ops there are.
@@ -5647,6 +5715,16 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_keccaks = || {
+        if skip.keccak_rows > 0 {
+            return cut_tables(
+                &keccak_ops,
+                skip.keccak_rows,
+                pack,
+                form,
+                keccak::rows_written_packed,
+                keccak::generate_keccak_rows_as,
+            );
+        }
         generate_optional(
             &keccak_ops,
             keccak::generate_keccak_trace,
@@ -5724,6 +5802,16 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
+        if skip.ecsm_rows > 0 {
+            return cut_tables(
+                &ecsm_ops,
+                skip.ecsm_rows,
+                pack,
+                form,
+                ecsm::rows_written_packed,
+                ecsm::generate_ecsm_rows_as,
+            );
+        }
         generate_optional(
             &ecsm_ops,
             ecsm::generate_ecsm_trace,
@@ -5732,6 +5820,16 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_ecdases = || {
+        if skip.ecdas_rows > 0 {
+            return cut_tables(
+                &ecdas_ops,
+                skip.ecdas_rows,
+                pack,
+                form,
+                ecdas::rows_written_packed,
+                ecdas::generate_ecdas_rows_as,
+            );
+        }
         generate_optional(
             &ecdas_ops,
             ecdas::generate_ecdas_trace,
@@ -7673,5 +7771,212 @@ mod segmented_tests {
             .expect("segmented");
             assert_eq!(words(&a), words(&b), "empty, optional {optional}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod cut_tests {
+    use super::{
+        Error, GoldilocksExtension, GoldilocksField, KeccakOperation, TraceForm, cut_tables, ecdas,
+        ecsm, keccak,
+    };
+    use stark::trace::TraceTable;
+
+    type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// A table's main trace as words, row-major, whether it is held packed or wide.
+    fn words(table: &Table) -> Vec<u64> {
+        match table.narrow_main() {
+            Some(packed) => {
+                let columns: Vec<Vec<u64>> = (0..packed.cols()).map(|c| packed.column(c)).collect();
+                (0..packed.rows())
+                    .flat_map(|r| columns.iter().map(move |column| column[r]))
+                    .collect()
+            }
+            None => {
+                let main = &table.main_table;
+                (0..main.height)
+                    .flat_map(|r| (0..main.width).map(move |c| *main.get(r, c).value()))
+                    .collect()
+            }
+        }
+    }
+
+    /// Distinct bytes a value `i` and a field `f`, so a row in the wrong place differs.
+    fn bytes<const N: usize>(i: usize, f: u64) -> [u8; N] {
+        std::array::from_fn(|b| {
+            ((i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ f.wrapping_mul(31) ^ b as u64)
+                as u8
+        })
+    }
+
+    /// In-range carries (the generators' debug checks read them).
+    fn carries(i: usize) -> [i64; 64] {
+        std::array::from_fn(|k| ((i + k) % 7) as i64 - 3)
+    }
+
+    fn keccak_ops(n: usize) -> Vec<KeccakOperation> {
+        (0..n)
+            .map(|i| KeccakOperation {
+                timestamp: 4 * i as u64 + 1,
+                state_addr: 0x1000 + 0x100 * i as u64,
+                input: std::array::from_fn(|l| (i as u64 + 1).wrapping_mul(0x9e37_79b9) ^ l as u64),
+                output: std::array::from_fn(|l| {
+                    (i as u64 + 7).wrapping_mul(0xc2b2_ae3d) ^ l as u64
+                }),
+            })
+            .collect()
+    }
+
+    fn ecdas_step(i: usize) -> ::ecsm::EcdasStep {
+        ::ecsm::EcdasStep {
+            x_a: bytes(i, 1),
+            y_a: bytes(i, 2),
+            x_g: bytes(i, 3),
+            y_g: bytes(i, 4),
+            round: (i % 256) as u8,
+            op: (i % 2) as u8,
+            next_op: ((i + 1) % 2) as u8,
+            lambda: bytes(i, 5),
+            x_r: bytes(i, 6),
+            y_r: bytes(i, 7),
+            q0: bytes(i, 8),
+            q1: bytes(i, 9),
+            q2: bytes(i, 10),
+            c0: carries(i),
+            c1: carries(i + 1),
+            c2: carries(i + 2),
+        }
+    }
+
+    fn ecdas_ops(n: usize) -> Vec<ecdas::EcdasOperation> {
+        (0..n)
+            .map(|i| ecdas::EcdasOperation {
+                timestamp: 4 * i as u64 + 3,
+                step: ecdas_step(i),
+            })
+            .collect()
+    }
+
+    fn ecsm_ops(n: usize) -> Vec<ecsm::EcsmOperation> {
+        (0..n)
+            .map(|i| ecsm::EcsmOperation {
+                timestamp: 4 * i as u64 + 2,
+                addr_xg: 0x2000 + 0x40 * i as u64,
+                addr_k: 0x3000 + 0x40 * i as u64,
+                addr_xr: 0x4000 + 0x40 * i as u64,
+                witness: ::ecsm::EcsmWitness {
+                    x_g: bytes(i, 11),
+                    y_g: bytes(i, 12),
+                    k: bytes(i, 13),
+                    x2: bytes(i, 14),
+                    q0: bytes(i, 15),
+                    c0: carries(i),
+                    q1: bytes(i, 16),
+                    c1: carries(i + 3),
+                    x_g_sub_p: bytes(i, 17),
+                    k_sub_n: bytes(i, 18),
+                    x_r_sub_p: bytes(i, 19),
+                    len_k: (i % 256) as u8,
+                    x_r: bytes(i, 20),
+                    y_r: bytes(i, 21),
+                    steps: Vec::new(),
+                },
+            })
+            .collect()
+    }
+
+    /// `cut_tables` against the block's split of the whole wide table, for one
+    /// family: every op count around the cut sizes, every cut size from one row
+    /// to past the whole table, built wide, packed after the build, and
+    /// written packed. The same tables, word for word, in the same order.
+    fn cuts_are_the_split<T: Sync>(
+        name: &str,
+        ops: impl Fn(usize) -> Vec<T>,
+        whole: impl Fn(&[T]) -> Table,
+        written_packed: fn(TraceForm) -> bool,
+        rows_as: impl Fn(&[T], usize, TraceForm) -> Table + Send + Sync + Copy,
+    ) {
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 31, 33, 64, 65] {
+            let ops = ops(n);
+            for log2 in 0..=7 {
+                let rows = 1usize << log2;
+                let split = crate::block_whir::split_rows(whole(&ops), rows);
+                for (pack, form) in [
+                    (false, TraceForm::Wide),
+                    (true, TraceForm::Wide),
+                    (true, TraceForm::Narrow),
+                    (true, TraceForm::Narrow),
+                ] {
+                    let cut = cut_tables(&ops, rows, pack, form, written_packed, rows_as)
+                        .expect("the cuts");
+                    assert_eq!(
+                        cut.len(),
+                        split.len(),
+                        "{name} n {n} rows {rows}: table count"
+                    );
+                    for (k, (got, want)) in cut.iter().zip(&split).enumerate() {
+                        assert_eq!(
+                            got.num_rows(),
+                            want.num_rows(),
+                            "{name} n {n} rows {rows} cut {k}: height"
+                        );
+                        assert_eq!(
+                            got.narrow_main().is_some(),
+                            pack,
+                            "{name} n {n} rows {rows} cut {k}: packed"
+                        );
+                        assert!(
+                            words(got) == words(want),
+                            "{name} n {n} rows {rows} cut {k} (pack {pack}, {form:?}): words"
+                        );
+                    }
+                }
+            }
+        }
+        // No ops, no table, as the whole build's `generate_optional`.
+        assert!(
+            cut_tables(&ops(0), 4, true, TraceForm::Narrow, written_packed, rows_as)
+                .expect("no cuts")
+                .is_empty()
+        );
+        // A cut that is not a power of two is refused, not split some other way.
+        assert!(matches!(
+            cut_tables(&ops(9), 6, true, TraceForm::Narrow, written_packed, rows_as),
+            Err(Error::Prover(_))
+        ));
+    }
+
+    #[test]
+    fn keccak_cuts_are_the_split_of_the_whole_table() {
+        cuts_are_the_split(
+            "KECCAK",
+            keccak_ops,
+            keccak::generate_keccak_trace,
+            keccak::rows_written_packed,
+            keccak::generate_keccak_rows_as,
+        );
+    }
+
+    #[test]
+    fn ecsm_cuts_are_the_split_of_the_whole_table() {
+        cuts_are_the_split(
+            "ECSM",
+            ecsm_ops,
+            ecsm::generate_ecsm_trace,
+            ecsm::rows_written_packed,
+            ecsm::generate_ecsm_rows_as,
+        );
+    }
+
+    #[test]
+    fn ecdas_cuts_are_the_split_of_the_whole_table() {
+        cuts_are_the_split(
+            "ECDAS",
+            ecdas_ops,
+            ecdas::generate_ecdas_trace,
+            ecdas::rows_written_packed,
+            ecdas::generate_ecdas_rows_as,
+        );
     }
 }
