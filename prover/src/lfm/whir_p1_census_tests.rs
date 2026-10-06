@@ -368,17 +368,28 @@ fn whir_p1_leaf_census() {
     }
 }
 
-/// Every group of the median mix as a one-group Poseidon1 leaf: its socket,
-/// SELECT, HINT and BALU rows, its tables and prepared stacks — which group
-/// is the heaviest in each chip, and by how much over a "full" group's.
+/// ★ Every group of the median mix as a one-group Poseidon1 leaf, against the
+/// plan's rows for it — the lead's acceptance criterion (10-06): the rows the
+/// partition admits leaves by ARE the emitted ones, for every group shape the
+/// mix has, both prepared kinds included (DECODE's stack in group 0, the ELF
+/// pages' genesis), with no fallback: Select, base ALU and words exactly (the
+/// words from the arena counts alone), socket rows at most the plan's and
+/// within 64 of it. Then every leaf the plan builds, emitted, stays under
+/// every padded height.
+///
+/// Both prepared kinds need a real guest (a small one's pages are not dense
+/// enough for a genesis stack): `CENSUS_ELF=<path>` or `BLOCK_WHIR_ELF` (the
+/// box's), which then also asserts both kinds are present; else the small one.
+/// Prints `CENSUS GROUP …` and `CENSUS PLAN LEAF …` lines.
 #[test]
-#[ignore = "laptop instrument: run alone with --exact"]
+#[ignore = "instrument (laptop with CENSUS_ELF, box with BLOCK_WHIR_ELF): run with --exact"]
 fn whir_p1_group_census() {
-    // `CENSUS_ELF=<path>` (test word): a real guest, whose DECODE sizes group 0's
-    // prepared stack; else the instrument's small one.
-    let elf_bytes = match std::env::var("CENSUS_ELF") {
-        Ok(path) => std::fs::read(path).expect("read CENSUS_ELF"),
-        Err(_) => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
+    let real = std::env::var("CENSUS_ELF")
+        .or_else(|_| std::env::var("BLOCK_WHIR_ELF"))
+        .ok();
+    let elf_bytes = match &real {
+        Some(path) => std::fs::read(path).expect("read the guest ELF"),
+        None => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
     };
     let opts = super::proof::block_base_options();
     let production = BlockFormat::production();
@@ -401,6 +412,14 @@ fn whir_p1_group_census() {
     let n = plan.num_groups();
     let costs = plan.costs().to_vec();
     let prepared: Vec<usize> = plan.prepared().iter().map(|p| p.group).collect();
+    let (loads, front) = plan.chip_loads();
+    let (loads, front) = (loads.to_vec(), front);
+    if real.is_some() {
+        assert!(
+            prepared.contains(&0) && prepared.iter().any(|&g| g != 0),
+            "a real guest's mix has both prepared kinds, got groups {prepared:?}"
+        );
+    }
     let plan = plan.with_partition(
         BlockPartition::new((0..n).map(|g| vec![g]).collect(), n).expect("one group a leaf"),
     );
@@ -418,6 +437,19 @@ fn whir_p1_group_census() {
             *rows.entry(k).or_default() += 1;
         }
         let get = |k: &str| rows.get(k).copied().unwrap_or(0);
+        let planned = loads[g].plus(front);
+        assert_eq!(
+            (get("SELECT"), get("BALU"), get("HINT")),
+            (planned.select, planned.balu, planned.hint),
+            "group {g} (prepared {}): Select, base ALU and words are the plan's",
+            prepared.contains(&g)
+        );
+        assert!(
+            get("HASH16") <= planned.hash && get("HASH16") + 64 >= planned.hash,
+            "group {g}: socket rows {} against the plan's {}",
+            get("HASH16"),
+            planned.hash
+        );
         println!(
             "CENSUS GROUP {g}: tables {} · prepared {} · cost {cost} · HASH16 {} · SELECT {} · HINT {} · BALU {} · XALU {}",
             owned.groups[g].len(),
@@ -573,6 +605,32 @@ fn the_p1_partition_keeps_every_chip_under_its_height() {
             "{heavy:?} twice is past 2^19: split, not doubled"
         );
     }
+    // The Select-fold's rows (before the ALU point): a prepared group and two
+    // full ones fit the socket cap (125.9 k) but not Select (541 k). The
+    // partition splits them; with its chip check off — the socket-only
+    // partition RPX keeps — they share a leaf whose Select crosses 2^19.
+    let (full0, prepared0) = (
+        rows(38_646, 167_238, 117_270, 140_290),
+        rows(48_656, 206_796, 149_310, 185_114),
+    );
+    let set = [prepared0, full0, full0];
+    let p = leaf_partition_rows(&set, front, P1_LEAF_HEIGHTS).expect("fits");
+    assert_eq!(p.num_leaves(), 2, "split by Select");
+    for leaf in p.leaves() {
+        assert!(under(sums(&set, leaf, front), P1_LEAF_HEIGHTS));
+    }
+    let costs: Vec<usize> = set.iter().map(|r| r.hash).collect();
+    let socket_only =
+        super::whir_block::leaf_partition(&costs, None, P1_LEAF_HEIGHTS.hash - front.hash)
+            .expect("the socket-only partition");
+    assert!(
+        socket_only
+            .leaves()
+            .iter()
+            .any(|leaf| sums(&set, leaf, front).select > P1_LEAF_HEIGHTS.select),
+        "the check is what keeps Select under 2^19: {:?}",
+        socket_only.leaves()
+    );
     // Refusals: a group past a height, a front that fills a chip.
     let huge = rows(1_000, 600_000, 0, 0);
     assert!(leaf_partition_rows(&[FULL, huge], front, P1_LEAF_HEIGHTS).is_err());
