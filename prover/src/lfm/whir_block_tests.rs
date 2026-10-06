@@ -1963,6 +1963,34 @@ fn the_whir_block_tree_on_a_real_block() {
         &blake3::hash(&top_bytes).to_hex()[..32],
         top_bytes.len()
     );
+    // What phase A fixes before any challenge or grind: the group roots, the
+    // partition, the tables' heights and counts, the pages and the public
+    // output. Two runs over the same tables placed alike give the same one
+    // under LAMBDA_VM_FIXED_TRACE_HASH=1 alone, so a block too large to prove
+    // twice under the deterministic grind (≈ 23 s of serial grinding a group in
+    // phase B) gates its tables' identity on this.
+    let mut statement = blake3::Hasher::new();
+    for root in &proof.proof.roots {
+        statement.update(root);
+    }
+    for group in &proof.groups {
+        statement.update(&(group.len() as u64).to_le_bytes());
+        for table in group {
+            statement.update(&table.to_le_bytes());
+        }
+    }
+    statement.update(&proof.table_num_vars);
+    statement.update(format!("{:?}", proof.table_counts).as_bytes());
+    statement.update(format!("{:?}", proof.runtime_page_ranges).as_bytes());
+    statement.update(&proof.public_output);
+    statement.update(&(proof.num_private_input_pages as u64).to_le_bytes());
+    println!(
+        "W3 STATEMENT DIGEST: {} (blake3 of {} group roots, {} groups, {} tables' heights and counts)",
+        &statement.finalize().to_hex()[..32],
+        proof.proof.roots.len(),
+        proof.groups.len(),
+        proof.table_num_vars.len()
+    );
 
     // Off the clock: the harness's checks, the permit disarmed first. The
     // verifier derives the tree's programs and artifacts as rayon jobs
