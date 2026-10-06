@@ -106,7 +106,7 @@ fn the_walk_and_the_tree_reach_merkle4s_root() {
         let r = tree_root4(&mut b, &ds);
         b.public(r.cells()[0]);
         assert_eq!(
-            run(b, &[leaves.clone()]),
+            run(b, std::slice::from_ref(&leaves)),
             root.to_vec(),
             "tree, depth {depth}"
         );
