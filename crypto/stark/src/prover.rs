@@ -226,14 +226,20 @@ impl TopTree {
     /// Levels `0..=depth − subtree_levels` of `tree` (all of it but the
     /// bottom `subtree_levels`; just the root when the tree is that short).
     /// At arity 4 the bottom `⌊subtree_levels / 2⌋` 4-ary levels are dropped
-    /// (the same leaves a subtree, `2^subtree_levels`, at an even count).
+    /// (the same leaves a subtree, `2^subtree_levels`, at an even count), but
+    /// never the level of the tree's height-`cap_height` cap (4-ary levels),
+    /// which Round 4 reads from here ([`Self::cap`]). Binary trees ignore
+    /// `cap_height`.
     fn from_device(
         tree: &math_cuda::lde::GpuMerkleTree,
         subtree_levels: usize,
+        cap_height: usize,
     ) -> math_cuda::Result<Self> {
         if tree.arity == math_cuda::p1_stark::ARITY {
             let depth4 = math_cuda::p1_stark::depth(tree.leaves_len);
-            let sub = (subtree_levels / 2).min(depth4);
+            let sub = (subtree_levels / 2)
+                .min(depth4)
+                .min(depth4.saturating_sub(cap_height));
             let kept = math_cuda::p1_stark::top_levels_nodes(tree.leaves_len, depth4 - sub + 1);
             let nodes = crate::gpu_lde::download_tree_prefix(tree, kept)?;
             return Ok(Self {
@@ -320,11 +326,20 @@ impl TopTree {
         }
     }
 
-    /// The `2^c` nodes of level `c`, when it is kept. A 4-ary tree has no cap
-    /// above height 0 (its root).
+    /// The `2^c` nodes of level `c`, when it is kept. At arity 4, the real
+    /// nodes of the level `c` 4-ary levels below the root (the host tree's
+    /// `MerkleTree::cap`), when it is kept.
     fn cap(&self, c: usize) -> Option<Vec<Commitment>> {
         if self.arity == math_cuda::p1_stark::ARITY {
-            return (c == 0).then(|| vec![self.nodes[0]]);
+            let (sizes, offsets) = self.layout4();
+            let level = (sizes.len() - 1).checked_sub(c)?;
+            if level < self.top_level {
+                return None;
+            }
+            return self
+                .nodes
+                .get(offsets[level]..offsets[level] + sizes[level])
+                .map(<[Commitment]>::to_vec);
         }
         (c <= self.top_level).then(|| self.nodes[(1usize << c) - 1..(2usize << c) - 1].to_vec())
     }
@@ -6202,11 +6217,12 @@ pub trait IsStarkProver<
         // layout (row pairs `log2(lde) − 1`, one row `log2(lde)`) and each FRI
         // layer's from the fold layout (a group tree under a fold schedule),
         // so a capped `fri = dp` or one-row proof caps the trees it committed.
-        let caps = crate::merkle_caps::StarkCaps::from_layout(
+        let caps = crate::merkle_caps::StarkCaps::from_layout_arity(
             crate::config::effective_cap_policy::<H>(air.options().format.merkle_cap),
             number_of_queries,
             domain_size.trailing_zeros() as usize,
             &fri_layout,
+            H::ARITY,
         );
         if caps.fri.len() != fri_layers.len() {
             return Err(ProvingError::WrongParameter(format!(
@@ -6272,6 +6288,7 @@ pub trait IsStarkProver<
             depth: usize,
             cap: &[Commitment],
             what: &str,
+            arity: usize,
         ) -> Result<(), ProvingError> {
             let mut paths: Vec<&mut Vec<Commitment>> =
                 paths.collect::<Option<_>>().ok_or_else(|| {
@@ -6279,7 +6296,7 @@ pub trait IsStarkProver<
                         "Merkle cap: an opening of the {what} tree is missing"
                     ))
                 })?;
-            crypto::merkle_tree::cap::embed_cap(&mut paths, depth, cap).map_err(|e| {
+            crypto::merkle_tree::cap::embed_cap_arity(&mut paths, depth, cap, arity).map_err(|e| {
                 ProvingError::WrongParameter(format!("Merkle cap of the {what} tree: {e}"))
             })
         }
@@ -6329,6 +6346,7 @@ pub trait IsStarkProver<
                 depth,
                 &main_cap,
                 "main",
+                H::ARITY,
             )?;
             if let Some(tree) = round_1_result.main.precomputed_tree.as_ref() {
                 // Always a full host tree (the process-wide cache; its openings
@@ -6343,6 +6361,7 @@ pub trait IsStarkProver<
                     depth,
                     &cap,
                     "precomputed",
+                    H::ARITY,
                 )?;
             }
             if let Some(aux) = round_1_result.aux.as_ref() {
@@ -6360,6 +6379,7 @@ pub trait IsStarkProver<
                     depth,
                     &cap,
                     "aux",
+                    H::ARITY,
                 )?;
             }
             #[cfg(feature = "cuda")]
@@ -6382,6 +6402,7 @@ pub trait IsStarkProver<
                 depth,
                 &cap,
                 "composition",
+                H::ARITY,
             )?;
         }
 
@@ -6407,6 +6428,7 @@ pub trait IsStarkProver<
                 depth,
                 &cap,
                 &what,
+                H::ARITY,
             )?;
         }
         Ok(())
@@ -6431,9 +6453,12 @@ pub trait IsStarkProver<
         B: IsMerkleTreeBackend<Node = Commitment>,
     {
         if !host.is_root_only() {
-            if host.depth() != Some(depth) {
+            // `MerkleTree::depth` counts the tree's own levels (4-ary at arity 4).
+            let levels = crypto::merkle_tree::cap::tree_levels(depth, B::ARITY);
+            if host.depth() != Some(levels) {
                 return Err(ProvingError::WrongParameter(format!(
-                    "Merkle cap: the {what} tree has depth {:?}, the format expects {depth}",
+                    "Merkle cap: the {what} tree has {:?} levels, the format expects {levels} \
+                     (depth {depth})",
                     host.depth()
                 )));
             }
@@ -7626,7 +7651,17 @@ pub trait IsStarkProver<
                         committed.0.precomputed_root,
                         handle.tree.as_ref(),
                     ) {
-                        let top = TopTree::from_device(tree, k).map_err(|e| {
+                        // The trace trees' cap height (`StarkCaps`): Round 4
+                        // reads the cap off the kept levels, so they reach it.
+                        let cap_height = crate::merkle_caps::StarkCaps::tree_cap_height(
+                            crate::config::effective_cap_policy::<H>(
+                                air.options().format.merkle_cap,
+                            ),
+                            air.options().fri_number_of_queries,
+                            tree.leaves_len.trailing_zeros() as usize,
+                            H::ARITY,
+                        );
+                        let top = TopTree::from_device(tree, k, cap_height).map_err(|e| {
                             ProvingError::DevicePath(format!(
                                 "table {}: copying the tree's top levels: {e:?}",
                                 air.name()

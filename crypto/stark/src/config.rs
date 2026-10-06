@@ -276,22 +276,32 @@ pub trait StarkHash: Send + Sync + 'static {
     const COMMITMENT_HASH: CommitmentHash;
 
     /// Children per Merkle node in both families (`IsMerkleTreeBackend::ARITY`;
-    /// a configuration states it once, and its backends must agree). At 4,
-    /// Merkle caps are not defined: prover and verifier both commit and check
-    /// uncapped whatever the format's cap policy says.
+    /// a configuration states it once, and its backends must agree). At 4 the
+    /// format's binary cap policy does not apply: the trees take
+    /// [`Self::arity4_cap`] instead.
     const ARITY: usize = 2;
+
+    /// The cap policy of an arity-4 configuration's trees, heights in 4-ary
+    /// levels (`crypto::merkle_tree::cap`'s arity-4 shape). The format's
+    /// `merkle_cap` prices binary caps, so an arity-4 configuration states its
+    /// own. A verifier constant of the configuration, never read from a proof.
+    /// Unused at arity 2.
+    fn arity4_cap() -> crypto::merkle_tree::cap::CapPolicy {
+        crypto::merkle_tree::cap::CapPolicy::Off
+    }
 }
 
-/// The cap policy a configuration actually runs: the format's, or `Off` at
-/// arity 4, where caps are not defined ([`StarkHash::ARITY`]). A verifier
-/// constant, derived from the configuration and never from the proof.
+/// The cap policy a configuration actually runs: the format's at arity 2, the
+/// configuration's own [`StarkHash::arity4_cap`] at arity 4 (heights in 4-ary
+/// levels). A verifier constant, derived from the configuration and never
+/// from the proof.
 pub fn effective_cap_policy<H: StarkHash>(
     policy: crypto::merkle_tree::cap::CapPolicy,
 ) -> crypto::merkle_tree::cap::CapPolicy {
     if H::ARITY == 2 {
         policy
     } else {
-        crypto::merkle_tree::cap::CapPolicy::Off
+        H::arity4_cap()
     }
 }
 

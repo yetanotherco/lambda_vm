@@ -119,12 +119,45 @@ impl StarkCaps {
         lde_log: usize,
         layout: &crate::fri::terminal::FriFoldLayout,
     ) -> Self {
-        Self::with_depths(
+        Self::from_layout_arity(policy, num_queries, lde_log, layout, 2)
+    }
+
+    /// [`Self::from_layout`] for trees of `arity` children per node: the
+    /// depths stay binary (`log2(leaves)`), the heights count that arity's
+    /// levels ([`Self::with_depths_arity`]).
+    pub(crate) fn from_layout_arity(
+        policy: CapPolicy,
+        num_queries: usize,
+        lde_log: usize,
+        layout: &crate::fri::terminal::FriFoldLayout,
+        arity: usize,
+    ) -> Self {
+        Self::with_depths_arity(
             policy,
             num_queries,
             crate::leaf_layout::LeafLayout::from_one_row(layout.one_row).tree_depth(lde_log),
             layout.layer_depths(lde_log as u32),
+            arity,
         )
+    }
+
+    /// The cap height of one tree over `2^depth` leaves of `arity` children
+    /// per node, opened `num_queries` times: `policy.height` over the tree's
+    /// levels, and at arity 4 no taller than a cap of
+    /// `2^MAX_CAP_HEIGHT` nodes. Prover and verifier both call this.
+    pub fn tree_cap_height(
+        policy: CapPolicy,
+        num_queries: usize,
+        depth: usize,
+        arity: usize,
+    ) -> usize {
+        let levels = crypto::merkle_tree::cap::tree_levels(depth, arity);
+        let c = policy.height(num_queries, levels);
+        if arity == 4 {
+            c.min(crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 2)
+        } else {
+            c
+        }
     }
 
     /// The heights for trace trees of depth `trace_depth` and committed FRI
@@ -141,13 +174,26 @@ impl StarkCaps {
         trace_depth: usize,
         fri_depths: Vec<usize>,
     ) -> Self {
+        Self::with_depths_arity(policy, num_queries, trace_depth, fri_depths, 2)
+    }
+
+    /// [`Self::with_depths`] for trees of `arity` children per node
+    /// ([`Self::tree_cap_height`]). At arity 2 it is exactly
+    /// [`Self::with_depths`].
+    pub fn with_depths_arity(
+        policy: CapPolicy,
+        num_queries: usize,
+        trace_depth: usize,
+        fri_depths: Vec<usize>,
+        arity: usize,
+    ) -> Self {
         let fri = fri_depths
             .iter()
-            .map(|&d| policy.height(num_queries, d))
+            .map(|&d| Self::tree_cap_height(policy, num_queries, d, arity))
             .collect();
         Self {
             trace_depth,
-            trace: policy.height(num_queries, trace_depth),
+            trace: Self::tree_cap_height(policy, num_queries, trace_depth, arity),
             fri_depths,
             fri,
         }
@@ -178,7 +224,8 @@ impl<'a> TreeCheck<'a> {
     /// format touches no index a count guard has not covered. At `c > 0`,
     /// `owner_path` must return the tree's first opening's path (`None` when
     /// the proof has none, which rejects); its length must be exactly
-    /// `D − c + 2^c` and its cap must hash to `root`.
+    /// `D − c + 2^c` (at arity 4, `3(⌈D/2⌉ − c)` + the cap's
+    /// `crypto::merkle_tree::cap::cap_len`) and its cap must hash to `root`.
     pub fn build<B: IsMerkleTreeBackend<Node = Commitment>>(
         root: &'a Commitment,
         depth: usize,

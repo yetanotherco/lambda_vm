@@ -4174,13 +4174,31 @@ pub(crate) fn read_cap_dev(
             tree.leaves_len
         ));
     }
-    // Caps are not defined on a 4-ary tree (`effective_cap_policy`); height 0
-    // is its root either way.
-    if tree.arity != 2 && cap_height > 0 {
-        return Err(format!(
-            "a height-{cap_height} cap of an arity-{} device tree",
-            tree.arity
-        ));
+    // A 4-ary tree (top-down level layout, `math_cuda::p1_stark`): the real
+    // nodes of the level `cap_height` 4-ary levels below the root, the last
+    // level of the node buffer's top `cap_height + 1` levels.
+    if tree.arity == math_cuda::p1_stark::ARITY {
+        let sizes = math_cuda::p1_stark::level_sizes(tree.leaves_len);
+        let depth4 = sizes.len() - 1;
+        if cap_height > depth4 {
+            return Err(format!(
+                "cap height {cap_height} exceeds the arity-4 device tree's {depth4} levels"
+            ));
+        }
+        let prefix = math_cuda::p1_stark::top_levels_nodes(tree.leaves_len, cap_height + 1);
+        if tree.nodes.len() < prefix * 32 {
+            return Err(format!(
+                "device node buffer of {} bytes is too short for a height-{cap_height} cap",
+                tree.nodes.len()
+            ));
+        }
+        stream.synchronize().map_err(|e| format!("cudarc: {e:?}"))?;
+        let nodes = download_tree_prefix(tree, prefix).map_err(|e| format!("cudarc: {e:?}"))?;
+        let len = sizes[depth4 - cap_height];
+        return Ok(nodes[prefix - len..].to_vec());
+    }
+    if tree.arity != 2 {
+        return Err(format!("a cap of an arity-{} device tree", tree.arity));
     }
     let depth = tree.leaves_len.trailing_zeros() as usize;
     if cap_height > depth {

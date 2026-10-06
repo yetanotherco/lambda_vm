@@ -872,11 +872,12 @@ pub trait IsStarkVerifier<
         // Every depth from the table's layouts (row pairs: `log2(lde) − 1`;
         // one row: `log2(lde)`; a group tree per FRI layer under a fold
         // schedule) — at the default exactly `StarkCaps::new`'s.
-        let caps = StarkCaps::from_layout(
+        let caps = StarkCaps::from_layout_arity(
             crate::config::effective_cap_policy::<H>(options.format.merkle_cap),
             options.fri_number_of_queries,
             lde_log,
             &layout,
+            H::ARITY,
         );
         let fri_roots = proof.fri_layers_merkle_roots();
         if fri_roots.len() != num_committed {

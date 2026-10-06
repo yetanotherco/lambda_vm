@@ -241,6 +241,62 @@ pub fn base_hash() -> BaseHash {
     BaseHash::Rpx
 }
 
+/// `LAMBDA_VM_P1_CAP`: the Merkle cap height of every P1 tree, in 4-ary
+/// levels (`crypto::merkle_tree::cap`'s arity-4 shape): `off` or `0`, or
+/// `1..=8`; unset is [`P1_CAP_DEFAULT`]. Anything else aborts, naming these
+/// (a typo read as the default would make one arm of an A/B the other).
+pub const P1_CAP_ENV: &str = "LAMBDA_VM_P1_CAP";
+
+/// The P1 trees' default cap: 4-ary height 4 (binary height 8), the height
+/// that minimises the proof's bytes at 110 queries (I-P1C §5).
+pub const P1_CAP_DEFAULT: stark::proof::options::CapPolicy =
+    stark::proof::options::CapPolicy::Fixed(4);
+
+/// The value of [`P1_CAP_ENV`] as a cap policy; `None` is unset.
+pub fn parse_p1_cap(value: Option<&str>) -> Result<stark::proof::options::CapPolicy, String> {
+    use stark::proof::options::CapPolicy;
+    let Some(v) = value.map(|v| v.trim().to_ascii_lowercase()) else {
+        return Ok(P1_CAP_DEFAULT);
+    };
+    match v.as_str() {
+        "off" | "0" => Ok(CapPolicy::Off),
+        _ => match v.parse::<u8>() {
+            Ok(c @ 1..=8) => Ok(CapPolicy::Fixed(c)),
+            _ => Err(format!(
+                "{P1_CAP_ENV}={v:?}: expected `off`, `0` or a 4-ary height `1`..=`8` \
+                 (unset: 4)"
+            )),
+        },
+    }
+}
+
+/// ★ This process's P1 cap policy ([`P1_CAP_ENV`]), read once by the prover
+/// and the host verifier alike: a verifier constant of the P1 configuration
+/// (`P1StarkHash::arity4_cap`), never a field of the proof. Prints one line on
+/// the first read.
+#[cfg(not(target_os = "zkvm"))]
+pub fn p1_cap() -> stark::proof::options::CapPolicy {
+    static CAP: std::sync::OnceLock<stark::proof::options::CapPolicy> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var(P1_CAP_ENV).ok();
+        let cap = parse_p1_cap(raw.as_deref()).unwrap_or_else(|e| {
+            eprintln!("P1 CAP: {e}");
+            std::process::abort()
+        });
+        eprintln!(
+            "P1 CAP: {cap} (4-ary levels; {})",
+            raw.map_or("the default".to_string(), |v| format!("{P1_CAP_ENV}={v}"))
+        );
+        cap
+    })
+}
+
+/// The recursion guest verifies no P1 proof.
+#[cfg(target_os = "zkvm")]
+pub fn p1_cap() -> stark::proof::options::CapPolicy {
+    P1_CAP_DEFAULT
+}
+
 /// Refuse a path that has no P1 arm (the epoch pipeline, the LFM recursion)
 /// under [`BaseHash::P1`], rather than letting it mix RPX proofs with P1
 /// preprocessed roots. The error names the path; the caller types it.
@@ -397,6 +453,21 @@ pub type BlockVerifierOf<C, Field, FieldExtension, PI> =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The P1 cap knob's spellings: unset is the default height 4, `off`/`0`
+    /// uncapped, `1..=8` a height; anything else is refused.
+    #[test]
+    fn the_p1_cap_knob_accepts_off_and_heights_only() {
+        use stark::proof::options::CapPolicy;
+        assert_eq!(parse_p1_cap(None), Ok(CapPolicy::Fixed(4)));
+        assert_eq!(parse_p1_cap(Some("off")), Ok(CapPolicy::Off));
+        assert_eq!(parse_p1_cap(Some(" 0 ")), Ok(CapPolicy::Off));
+        assert_eq!(parse_p1_cap(Some("3")), Ok(CapPolicy::Fixed(3)));
+        assert_eq!(parse_p1_cap(Some("8")), Ok(CapPolicy::Fixed(8)));
+        for bad in ["9", "auto", "-1", "4x", ""] {
+            assert!(parse_p1_cap(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     /// The knob's spellings: unset and `rpx` are the pin, `p1` the exploration
     /// arm, anything else is refused (never read as the default).
